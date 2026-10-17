@@ -1,0 +1,257 @@
+# Recovery kits and `ndn-fwd recover`
+
+The namespace root lives on one device, the **root device** (see
+[root custody](../concepts/identity-and-keys.md#root-custody-where-a-namespace-root-key-lives)).
+If that device is lost, broken or stolen, a **recovery kit** lets another
+device become the root device without any node adopting the namespace again.
+
+Design: `docs/specs/personal-namespace.md`, flows F7 (create a kit) and F8
+(restore). Code: `ndn_cert::recovery` (library), `ndn-fwd`
+`recovery_kit.rs` and `recover.rs` (CLI).
+
+## A kit is a separate key, never a copy of the root
+
+A kit holds a **recovery key** of its own. On the root device, the root
+signs version `N+1` of the trust context with the recovery key's self-signed
+certificate added as an extra anchor, marked with the `recovery-anchor` role
+(context TLV `KeyRole`, `0x041E`, non-critical; every later version carries it
+over). Why not a copy of the root:
+
+- a hardware root (`yubikey-piv`) cannot be exported at all;
+- the root written down as words would simply be the root, exposed;
+- a separate key can be revoked alone, and several kits can coexist.
+
+The continuity rule (an update must be signed by an anchor of the held
+version, [context updates](./context-updates.md)) already lets *any* anchor
+sign the next version. So the recovery key can sign the version that installs
+a new root, and every node adopts it with no new trust machinery. A recovery
+anchor is **root-equivalent by design**: whoever holds the kit can take over
+the namespace. Keep it offline.
+
+A recovery key is named `<ns>/KEY/r<hex>`, the hex being the first 8 bytes of
+SHA-256 over its public key, so a word list alone rebuilds both the key and
+its name.
+
+## Formats
+
+The owner chooses; all are supported equally.
+
+| `--format` | Key | Where it lives | What opens it |
+|---|---|---|---|
+| `words` | Ed25519 from a 32-byte seed | 24 BIP39 English words, shown once; nothing is stored | the words (the last word's checksum refuses a mistyped list) |
+| `file` | Ed25519 | `--out <path>` (`0600`): an `ndn-trust://bag` envelope with the key in a SafeBag (PBES2: PBKDF2-SHA256 600 000 rounds, AES-256-CBC), plus the namespace and its expected fingerprint | the kit passphrase |
+| `yubikey` | P-256, generated on the token, never exportable | a second YubiKey's PIV slot (default `9d`; PIN policy `always`, `--touch-policy` default `always`) | the PIV PIN (and a touch); build with `--features yubikey-piv` |
+
+Kit secrets are read from `NDN_KIT_WORDS` / `NDN_KIT_PASSPHRASE` /
+`NDN_KIT_PIN`, else `--words-file` / `--kit-passphrase-file` /
+`--kit-pin-file`, else the terminal without echo — never the command line.
+
+## Creating, listing, checking, revoking
+
+On the root device (the root store unlocks for the one signature, as for
+[revoke](./revocation.md#unlocking-the-root)):
+
+```sh
+ndn-fwd recovery-kit create --format words [--pib <dir> | -c <config>]
+ndn-fwd recovery-kit create --format file --out /media/usb/bob.kit
+ndn-fwd recovery-kit create --format yubikey [--yubikey-serial <n>] [--yubikey-slot 9d]
+```
+
+The CLI makes the key, the root signs `N+1`, and the CLI hands it to the
+running daemon (`security/context-update`), which adopts it under the
+continuity rule, stores it in `<pib>/contexts/` and publishes it; with no
+daemon reachable it is stored for the daemon's next start. A file kit is
+written before the root signs and removed if the version does not land, so
+there is never an anchor without its kit. Other nodes adopt `N+1` at their
+next refresh.
+
+`ndn-fwd init` prints a recommendation to create a kit right away, and
+`ndn-fwd root-key status` shows `recovery_kits = <n>` (recommending one while
+there is none).
+
+```sh
+ndn-fwd recovery-kit list [--namespace <ns>]     # any node holding the context
+ndn-fwd recovery-kit check words|yubikey|<file> [--namespace <ns>]
+ndn-fwd recovery-kit revoke <recovery-key-name>  # root device
+```
+
+`list` shows each anchor of the held context as `root` or `recovery-kit`
+with its fingerprint, and the root device's keys. `check` opens the kit
+(words, passphrase, or token and PIN) and confirms its key is a recovery
+anchor of the held context; it signs nothing. `revoke` has the root sign a
+version without that anchor that also revokes its key: from then on a version
+the kit signs is refused by every node holding it.
+
+## Recovering: `ndn-fwd recover`
+
+On a **replacement device** whose own daemon runs and is linked to the
+namespace (directly, or through a relay):
+
+```sh
+ndn-fwd recover --kit words|yubikey|<kit-file> --old-root destroyed|compromised \
+    [--namespace <ns>] [--device <name>] [--root-store <store>] [-c <config>] [--from-held]
+```
+
+1. **The newest version, by name.** The daemon refreshes the context it holds
+   (as `ndn-fwd context refresh`, continuity rule included). A device that
+   holds none adopts it with a file kit's expected fingerprint; with a word
+   or YubiKey kit it is told to adopt first (`ndn-fwd adopt <link>`). A
+   context fetched with nothing to check it against could be a forgery that
+   lists the kit's (public) anchor — the recovery key would then sign it and
+   every node would adopt it. A failed refresh stops the recovery: recovering
+   from an older version than the namespace serves would fork it.
+   When **nothing answers** (no other node holding the namespace is
+   reachable: the lost root device was the only one, or every member is
+   offline), the refresh reports `unreachable` and `recover` stops with the
+   same reason; `--from-held` then recovers from the version this device
+   holds. The operator vouches that no newer version exists, and the output
+   says `newest_check = not confirmed …`. A version that answers and is
+   refused (forged, signed by a revoked key, an incomplete catch-up) still
+   stops the recovery with `--from-held`.
+2. **The kit.** It must open, and its key must be a recovery anchor of that
+   version, else nothing is signed or written.
+3. **The new root device.** A new root in the root store chosen with
+   `--root-store` (as `init`), a new CA key `<ns>/CA/KEY/<id>` certified by
+   it, and a new admin identity `<ns>/admin/<device>` certified by the new
+   CA — all with fresh key ids, so nothing collides with, or is revoked with,
+   the old keys. The recovery key signs `N+1`:
+   - anchors: the new root, the recovery anchors of `N`, and — when
+     `destroyed` — the old root;
+   - the new CA and admin keys replace the old ones' `root-device` role;
+   - schema, CA endpoint (`<ns>/CA`, unchanged) and earlier revocations are
+     carried over.
+
+   Then the new root signs `N+2`, the same content
+   (`ndn_cert::reissue_version`), so the newest version is signed by the root
+   (see [the expected fingerprint](#the-expected-fingerprint-after-a-recovery)).
+4. **Hand-over.** `N+1`, then `N+2`, go to the daemon, which adopts each by
+   the continuity rule, stores and publishes it. If it refuses `N+1`,
+   everything step 3 wrote is removed again. If it took `N+1` but refuses
+   `N+2`, the recovery stands (the new root is an anchor of `N+1`) and
+   `recover` says so: the newest version stays signed by the recovery key
+   until the root signs one (`ndn-fwd recovery-kit create`).
+
+`recover` prints the `[security]` and `[ca]` lines to restart the daemon with
+(copy the old root device's `[[ca.challenge]]` set): the replacement device
+then signs as its admin identity and runs the namespace CA. It also prints
+the anchor link and the `ndn-fwd-tokens` line with the new root's
+fingerprint.
+
+### `--old-root destroyed` or `compromised`
+
+There is no default; `recover` refuses without it and says why both exist:
+
+| | `destroyed` | `compromised` |
+|---|---|---|
+| Use when | the old root device is gone for good | someone else may hold it |
+| Old root | stays an anchor | removed and revoked |
+| Old CA key, old admin key | valid | revoked (the `root-device` keys of `N`) |
+| Devices enrolled under the old CA | keep working; renew with the new CA | stop validating once a node holds `N+1`; enroll again |
+
+Keeping a compromised root valid would leave the namespace in its holder's
+hands; revoking a destroyed one would cut off every device for nothing.
+
+**Data after `destroyed`.** The old CA's certificate was served by the lost
+root device; devices keep their issuer chain (`<pib>/issuers/`) and serve it.
+A validating forwarder that misses a certificate asks the routes for it and,
+when they have not answered within 50 ms, also the face the Data arrived on
+(NDNLPv2 `NextHopFaceId`, as ndn-cxx's `CertificateFetcherDirectFetch`), so a
+device's Data validates at any node with a cold cache, before it renews.
+Where a certificate came from never makes it trusted: every hop of the chain
+is verified up to an anchor (the old root, kept by `destroyed`).
+
+**Renewal after `destroyed`.** The new CA renews a current, unrevoked
+certificate of the namespace issued by an earlier CA of the same identity
+`<ns>/CA` when it validates under the CA's held trust context (the device
+sends its certificate and its issuer chain with the renewal), and serves that
+earlier CA's certificate from then on, so validators that fetch it by name
+still find it. See [certificate renewal](./renewal.md).
+
+**Re-enrolling after `compromised`.** On the new root device mint invites
+(`ndn-fwd-tokens new --ca <ns> --namespace <ns> --anchor-fp <new root
+fingerprint> --role member`); on each device, once it holds `N+1`
+(`ndn-fwd context refresh`), `ndn-fwd enroll <invite> --force`.
+
+## How other nodes follow
+
+Every node holding `N` adopts `N+1` by the continuity rule at its next
+refresh: the recovery key that signed it is an anchor of `N`. It then adopts
+`N+2` and every later version the new root signs: the new root is an anchor
+of `N+1`. A version signed by a revoked old root (or by a revoked kit) is
+refused, because its signer is not an anchor of the held version.
+
+A node that was offline across the recovery — still at `N`, or older —
+sees a newest version its held version's anchors did not sign. It follows
+the versions in between by exact name, oldest first, each under the
+continuity rule from the one before
+([catching up](./context-updates.md#catching-up-across-versions)):
+`N+1` (the recovery key), `N+2` (the new root), and on. Every node keeps and
+serves the versions it held, so this works from any relay or member that
+held them, whenever the node comes back; there is no window to keep `N+1` the
+newest in. A forged version in between, or one nobody serves while no later
+one follows without it, stops the walk and nothing changes.
+
+### The expected fingerprint after a recovery
+
+An anchor link or invite carries an expected fingerprint, and a device that
+holds nothing adopts the newest version only if **its signer** has that
+fingerprint — never because the fingerprint names some anchor the fetched,
+not yet authenticated context lists (a forger could list any public key).
+
+`N+1` is signed by the recovery key, so a link naming the new root could not
+adopt it. That is why the new root signs `N+2` right away: from then on the
+newest version is root-signed, and the new root's fingerprint (`anchor_fp`
+in `recover`'s output) is the namespace's expected fingerprint again. The
+anchor link `recover` prints carries it with `N+2` inline, and invites are
+minted with it:
+
+```sh
+ndn-fwd-tokens new --ca /home/bob --namespace /home/bob --anchor-fp <new root fingerprint> --role member
+```
+
+Links and invites minted before the recovery carry the old root's
+fingerprint: a device that already holds the context still enrolls with one
+when the old root stays an anchor (`destroyed`), but a device that holds
+nothing can no longer adopt with it. Mint new ones.
+
+Rejected alternatives: accepting a link whose fingerprint names any anchor
+of the fetched context (unauthenticated, see above); printing a link with
+the recovery key's fingerprint (it stops working as soon as the root signs
+anything, and puts the kit's fingerprint into circulation).
+
+## Refusals
+
+| Message | Cause |
+|---|---|
+| `recover needs --old-root destroyed\|compromised …` | the choice was not made |
+| `the kit's key … is not a recovery anchor of the trust context … held here (vN)` | a kit never added, revoked since, or of another namespace; nothing signed |
+| `these recovery words are refused: …` | a word outside the BIP39 list, not 24 words, or a checksum mismatch (a mistyped or swapped word); nothing signed |
+| `the kit passphrase does not open …` | wrong passphrase; nothing signed |
+| `… holds the root of … this already is a root device` | `recover` runs on a device without a namespace root |
+| `… exists: this PIB already holds a CA identity` | recover into the PIB of a device that runs no CA |
+| `could not get the newest trust context …` | a refresh that answered failed or was refused; recovering from an older version would fork it |
+| `nothing answered for the newest trust context … retry with --from-held` | no node holding the namespace is reachable; give the device a route to one, or vouch with `--from-held` that the held version is the newest |
+| `this device's daemon holds no trust context …` | adopt it first with the namespace's anchor link |
+| `… recovery kits are made and revoked on the root device` | `create`/`revoke` on a node without the root |
+
+## Code
+
+| Part | Where |
+|---|---|
+| Kit key naming, word kits, file kits, YubiKey kits | `ndn_cert::recovery::{recovery_key_name, RecoverySeed, seal_file_kit, FileKit, YubikeyKit}` |
+| Context versions | `ndn_cert::recovery::{add_recovery_anchor, remove_recovery_anchor, recovery_version, reissue_version, kit_anchor}` |
+| Recovering into a PIB | `ndn_cert::recovery::recover_namespace_in_pib` (`RecoveredNamespace::{version, root_version}`), `RecoveredNamespace::undo` |
+| Following a recovery | `ndn_cert::follow_versions` (refresh and `context_sync`); every version kept by `ndn_cert::context_store`, served by `ndn-fwd` `context_publisher.rs` |
+| Key roles in the context | `ndn_security::KeyRole`, `SignedTrustContext::{with_key_role, key_roles, keys_with_role}` |
+| `ndn-trust://bag` with namespace + fingerprint | `ndn_trust_envelope::TrustEnvelope::Bag` |
+| Hand-over verb | `security/context-update` (`ndn-mgmt`), `MgmtClient::security_context_update`, `ndn-fwd` `context_refresh::apply_update` |
+| Renewal at a later CA | `ndn_cert::CaState::accept_earlier_ca_certificates`, `ndn_cert::issuers`, `ndn_cert::renew_certificate` (kept issuers); ndn-mobile `NdnEnrolledIdentity::issuers` |
+| CLI | `ndn-fwd` `recovery_kit.rs`, `recover.rs` |
+| Asking the face the Data arrived on | `ndn_security::CertFetcher::{with_direct_fetch, fetch_from}`, `ndn_app::engine_direct_fetch_fn`, `ndn-engine` `ValidationStage::request_cert` |
+| Tests | `ndn-cert/tests/recovery.rs`, `ndn-cert/tests/renewal_earlier_ca.rs`, `ndn-cert/tests/context_update.rs` (`a_failed_refresh_never_drops_a_good_context`), `ndn-fwd` `context_refresh::tests` (incl. `a_refresh_nobody_answers_is_unreachable_not_refused`), `ndn-identity` `context_sync::tests`, `ndn-security` `cert_fetcher::tests`, `ndn-app` `engine_cert_fetch::the_face_that_delivered_the_data_serves_its_issuer_chain` |
+
+## See also
+
+- [Trust-context updates](./context-updates.md)
+- [Revoking a device](./revocation.md)
+- [Certificate renewal](./renewal.md)

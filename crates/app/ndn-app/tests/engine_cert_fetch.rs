@@ -166,6 +166,31 @@ async fn data_signed_by_uncached_intermediate_validates_after_cert_fetch() {
     shutdown.shutdown().await;
 }
 
+/// The routes for the cert lead to a node that never answers (after a
+/// namespace's root device was replaced, nobody there holds the earlier CA's
+/// certificate any more), but the producer that delivered the Data serves
+/// its own issuer chain: the engine asks the face the Data arrived on, and
+/// the Data validates. Before, it was dropped at its deadline.
+#[tokio::test]
+async fn the_face_that_delivered_the_data_serves_its_issuer_chain() {
+    let (engine, shutdown, mut consumer, producer) = engine_trusting_root().await;
+    let cancel = CancellationToken::new();
+    assert!(ndn_app::install_engine_cert_fetcher(&engine, cancel.child_token()));
+    let silent_id = engine.faces().alloc_id();
+    let (silent, silent_handle) = InProcFace::new(silent_id, 64);
+    engine.add_face(silent, cancel.child_token());
+    engine.fib().add_nexthop(&n("/home/phone/KEY"), silent_id, 0);
+    let cert_interests = spawn_producer(producer, true).await;
+
+    let got = fetch(&mut consumer, "/home/phone/photo/1", Duration::from_secs(3)).await;
+    assert_eq!(got.as_deref(), Some(&b"photo"[..]), "Data must validate through its own face");
+    assert_eq!(cert_interests.load(Ordering::SeqCst), 1, "the producer was asked once");
+    drop(silent_handle);
+
+    cancel.cancel();
+    shutdown.shutdown().await;
+}
+
 /// Control for the bug: the same engine without a fetcher (the old no-op
 /// placeholder's behaviour) drops the Data — the cert is never requested.
 #[tokio::test]

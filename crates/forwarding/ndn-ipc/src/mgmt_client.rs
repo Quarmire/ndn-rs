@@ -771,6 +771,26 @@ impl MgmtClient {
             .await
     }
 
+    /// `security/context-update`: hand the daemon `context_data`, a signed
+    /// trust-context Data made on this device (by `ndn-fwd recovery-kit` or
+    /// `ndn-fwd recover`), to adopt as the next version of the context it
+    /// holds — only if strictly newer and signed by an anchor of the held
+    /// version — then store and publish. The Data travels in the command's
+    /// ApplicationParameters. Success carries one `ndn_mgmt::ContextRefreshInfo`
+    /// as JSON in `status_text`.
+    pub async fn security_context_update(
+        &self,
+        context_data: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ControlParameters {
+            context_data: Some(context_data),
+            ..Default::default()
+        };
+        self.deferred_command(verb::CONTEXT_UPDATE, &params, timeout)
+            .await
+    }
+
     /// `security/renew`: ask the daemon to renew, now, every certificate a
     /// namespace CA issued to its keys (same key, no invite), rather than when
     /// its renewal timer would. The command Interest lives `timeout`, and so
@@ -793,8 +813,10 @@ impl MgmtClient {
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
         // A secret travels in ApplicationParameters, never in the Name (which
-        // forwarders log and key their tables by).
-        let (name, app_params) = if params.unlock_secret.is_some() {
+        // forwarders log and key their tables by); so does a context Data
+        // (kilobytes, too long for a Name component).
+        let (name, app_params) = if params.unlock_secret.is_some() || params.context_data.is_some()
+        {
             (dataset_name(module::SECURITY, verb), Some(params.encode()))
         } else {
             (command_name(module::SECURITY, verb, params), None)

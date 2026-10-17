@@ -574,6 +574,9 @@ pub enum RefreshState {
     /// This node holds the namespace root key: it is where new versions
     /// are made, so it does not fetch them.
     Source,
+    /// Nothing answered for the namespace's newest version (no route, no
+    /// reply): whether a newer one exists is unknown; the held version stays.
+    Unreachable,
     /// The check failed or the update was refused; the held version stays.
     Failed,
 }
@@ -632,7 +635,9 @@ pub struct RenewalInfo {
 /// Backend for the trust-admin verbs: adopt a trust context
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
 /// revoke a device on the root device (`security/revoke`), refresh held
-/// contexts (`security/context-refresh`), renew this node's certificates
+/// contexts (`security/context-refresh`), take a newer version of a held
+/// context made on this device (`security/context-update`), renew this node's
+/// certificates
 /// (`security/renew`), and report the identity the node signs with now. The
 /// spec crate owns the trait; the forwarder (`ndn-fwd`)
 /// implements it over its engine, keyring, PIB, CA, context store and
@@ -669,6 +674,20 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not refresh trust contexts at runtime".to_owned(),
+        })
+    }
+
+    /// Adopt `context_data` (a signed trust-context Data) as the next version
+    /// of a held context, under the continuity rule a refresh applies, then
+    /// store and publish it.
+    async fn update_context(
+        &self,
+        context_data: bytes::Bytes,
+    ) -> Result<ContextRefreshInfo, TrustRefusal> {
+        let _ = context_data;
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not take trust-context updates at runtime".to_owned(),
         })
     }
 

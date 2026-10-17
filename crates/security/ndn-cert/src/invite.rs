@@ -354,6 +354,12 @@ pub struct IssuedCertificate {
     pub cert: Certificate,
     /// The key that signed it (the CA's, `/<ns>/CA/KEY/<k>`).
     pub issuer: Option<Name>,
+    /// The issuer certificates of its chain, in walk order, as they were
+    /// fetched to check it (an anchor is never fetched, so it is never
+    /// here). A node keeps them ([`crate::issuers`]): they prove the
+    /// certificate's chain at a renewal, at a later CA of the namespace that
+    /// did not issue it, once nobody else serves its CA's certificate.
+    pub issuers: Vec<Data>,
 }
 
 /// The outcome of [`enroll_with_invite`].
@@ -471,10 +477,10 @@ where
     let data = crate::client::fetch_issued_cert_via(exchange, &invite.ca_prefix, &cert_name)
         .await
         .map_err(|e| InviteEnrollError::from_cert(e, invite))?;
-    let issued = check_issued(&data, device_key.as_ref())
+    let mut issued = check_issued(&data, device_key.as_ref())
         .await
         .map_err(|e| e.into_invite(invite))?;
-    check_chain(&data, keyring, exchange, &invite.namespace)
+    issued.issuers = check_chain(&data, keyring, exchange, &invite.namespace)
         .await
         .map_err(|e| e.into_invite(invite))?;
     Ok(issued)
@@ -515,13 +521,14 @@ pub const INVITE_ENROLL_MAX_EXCHANGES: u32 = 5 + MAX_ISSUER_FETCHES as u32;
 /// context under its schema. Checked by a validator over `keyring` alone (not
 /// the forwarder's, whose keyring may differ), fetching each missing issuer
 /// certificate through `exchange`; each hop's signature is verified by the
-/// chain walk, so a fetched certificate is never trusted by itself.
+/// chain walk, so a fetched certificate is never trusted by itself. Returns
+/// the issuer certificate Data fetched for the walk, in walk order.
 pub(crate) async fn check_chain<E>(
     data: &Data,
     keyring: &Arc<Keyring>,
     exchange: &mut E,
     namespace: &Name,
-) -> Result<(), IssuedCheckError>
+) -> Result<Vec<Data>, IssuedCheckError>
 where
     E: CaExchange + ?Sized,
 {
@@ -533,9 +540,10 @@ where
         None,
         MAX_FETCHES + 1,
     );
+    let mut fetched = Vec::new();
     for _ in 0..=MAX_FETCHES {
         match validator.validate_chain_cached(data).await {
-            (ValidationResult::Valid(_), _) => return Ok(()),
+            (ValidationResult::Valid(_), _) => return Ok(fetched),
             (ValidationResult::Invalid(e), _) => {
                 return Err(refused(format!(
                     "it does not chain to the root of {namespace} under its schema: {e}"
@@ -557,6 +565,7 @@ where
                     refused(format!("its issuer certificate {missing} is malformed: {e}"))
                 })?;
                 validator.cert_cache().insert(cert);
+                fetched.push(reply);
             }
         }
     }
@@ -602,6 +611,7 @@ pub(crate) async fn check_issued(
             .map_err(|e| refused(format!("not a Data packet: {e}")))?,
         cert,
         issuer,
+        issuers: Vec::new(),
     })
 }
 

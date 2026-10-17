@@ -33,7 +33,7 @@ per role, and renewal keeps every renewable device enrolled.
 | The certificate expired | Renewal needs a *current* certificate: an expired key proves nothing the CA can still vouch for | A new invite (`ndn-fwd enroll`) |
 | The key is revoked (at the CA or in the trust context) | A revoked key is never renewed, whichever certificate of it is presented | Enroll a new key with a new invite |
 | The role is not in `renewable_roles` (guest by default) | The owner chose that access ends at expiry | A new invite, if the owner wants to extend it |
-| The certificate was not issued by this CA, is for another key, or the proof does not verify | Renewal is for the holder of a certificate this CA issued | — |
+| The certificate was not issued by this CA (nor by an earlier CA of its identity, chaining to the namespace root), is for another key, or the proof does not verify | Renewal is for the holder of a certificate of the namespace's CA | — |
 | The CA's policy renews nothing | It does not offer the `renewal` challenge | — |
 
 ## Design
@@ -62,12 +62,33 @@ not see). The CA offers it when its issuance policy renews
 5. The device checks the new certificate: it certifies the device key, is
    valid now and chains to the root of the namespace's trust context.
 
+### Renewal at a later CA of the same namespace
+
+When the root device that ran the CA is replaced through a recovery kit, the
+new root device runs a new CA key under the same CA identity
+(`<ns>/CA/KEY/<fresh id>`), and the earlier CA's certificate — which lived
+on the lost device — is served by nobody any more. Devices therefore keep
+the issuer certificates of their certificates' chains (`ndn-fwd`:
+`<pib>/issuers/`, served beside its own certificates; a phone:
+`NdnEnrolledIdentity::issuers`, persisted beside the SafeBag) and pass them
+to `renew_certificate`, whose walk of the current certificate's chain takes
+each issuer certificate from them before the network (verifying every hop,
+as for a fetched one). The CHALLENGE also carries `certificate` (the current
+certificate) and `issuers` (the walked issuer chain).
+The new CA renews a certificate it did not issue when it was issued by an
+earlier key of its identity, is not revoked, and chains to an anchor of the
+trust context the CA's node holds, under its schema — a context that
+revokes the earlier CA's key refuses it. From then on the new CA serves
+the earlier CA's certificate itself, so validators that fetch it by key name
+from `<ns>/CA` find it there.
+
 ## Code
 
 | Piece | Where |
 |---|---|
 | Protocol, device side: `renew_certificate`, `renewal_proof_message`, `RenewalError` | `ndn-cert/src/renewal.rs` |
-| CA side: built-in `renewal` challenge (`CaState::verify_renewal`); issued cert name in the CHALLENGE response | `ndn-cert/src/ca.rs`; `ChallengeResponseTlv::issued_cert_name` in `ndn-cert/src/tlv.rs` |
+| Issuer certificates a node keeps: `keep_issuer_certs`, `stored_issuer_certs` | `ndn-cert/src/issuers.rs` |
+| CA side: built-in `renewal` challenge (`CaState::verify_renewal`, `accept_earlier_ca_certificates`); issued cert name in the CHALLENGE response | `ndn-cert/src/ca.rs`; `ChallengeResponseTlv::issued_cert_name` in `ndn-cert/src/tlv.rs` |
 | Per-role lifetime and renewability: `RolePolicy::with_validity` / `with_renewable`, `RoleTerms` | `ndn-cert/src/policy.rs` |
 | Engine binding `renew_via_engine`, schedule `RenewBefore`, `backoff_delay`; `NdncertRenewer` for `start_renewal` | `ndn-identity/src/renewal.rs` |
 | Daemon: `security/renew` verb and renewal timer | `ndn-fwd/binaries/ndn-fwd/src/renewal.rs` |
@@ -114,5 +135,8 @@ ndn-ctl status                    # signing: … key=… valid_until=… days_le
 `ndn-fwd renew` prints each certificate's previous and new expiry, or why it
 was refused (and exits non-zero). On a phone, the host app calls
 `certificate_validity()` to schedule (`renew_at_secs`) and
-`renew_certificate(safebag, password)` to renew; it persists the returned
-SafeBag in place of the old one.
+`renew_certificate(safebag, password, issuers)` to renew, passing the
+`issuers` it persisted from the enrollment or last renewal (without them a
+namespace whose root device was replaced through a recovery kit cannot
+renew the phone's certificate); it persists the returned SafeBag and
+`issuers` in place of the old ones.

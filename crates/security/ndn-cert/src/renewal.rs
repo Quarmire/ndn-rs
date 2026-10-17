@@ -4,7 +4,7 @@
 //!
 //! Renewal is an NDNCERT 0.3 exchange (NEW → CHALLENGE) whose challenge is
 //! the CA's built-in [`RENEWAL_CHALLENGE`]. The device proves it
-//! holds the private key of a certificate the CA issued by signing
+//! holds the private key of the certificate it renews by signing
 //! [`renewal_proof_message`] — the CA-chosen request id of this very
 //! exchange plus the certificate's name — with that key. The proof travels
 //! inside the CHALLENGE envelope, which is encrypted under the exchange's
@@ -14,10 +14,22 @@
 //! The CA ([`CaState`](crate::ca::CaState)) re-certifies the key when:
 //!
 //! - the certificate named is one it issued (it serves it on cert-fetch),
-//!   for the key the request certifies, with the same public key — renewal
-//!   never certifies a new key; a new key is a new enrollment;
+//!   **or** — when the CA accepts earlier CAs' certificates
+//!   ([`CaState::accept_earlier_ca_certificates`](crate::ca::CaState::accept_earlier_ca_certificates))
+//!   — a current certificate of the namespace issued by an earlier CA of the
+//!   same CA identity (`<prefix>/CA/KEY/<other id>`: the CA of a root device
+//!   that was replaced through a recovery kit) that chains to an anchor of
+//!   the trust context the CA holds, under its schema, through no revoked
+//!   key. Nobody may serve the earlier CA's certificate any more, so the
+//!   device sends its certificate ([`CERTIFICATE_PARAM`]) and the issuer
+//!   certificates of its chain ([`ISSUERS_PARAM`]); once the proof holds,
+//!   the CA serves the earlier CA's certificates of that chain itself;
+//! - the certificate is for the key the request certifies, with the same
+//!   public key — renewal never certifies a new key; a new key is a new
+//!   enrollment;
 //! - the certificate is valid now: an **expired** device needs a new invite;
-//! - no certificate it issued for that key is **revoked**;
+//! - no certificate it issued for that key is **revoked** (nor, for an
+//!   earlier CA's certificate, does the trust context revoke it);
 //! - the proof verifies under the certificate's key;
 //! - its [`IssuancePolicy`](crate::IssuancePolicy) issues on a renewal (for
 //!   [`RolePolicy`](crate::RolePolicy): the role is renewable — guests are
@@ -29,14 +41,22 @@
 //! answer that fetch with the certificate it replaces. Old and new
 //! certificate coexist until the old one expires.
 //!
-//! [`renew_certificate`] is the device side: it runs the exchange and checks
-//! that the new certificate certifies the device key, is valid now, and
-//! chains to the root of the namespace's trust context.
+//! [`renew_certificate`] is the device side. Renewal goes to the namespace's
+//! CA — the `<prefix>/CA` the certificate's KeyLocator names
+//! ([`issuing_ca_prefix`]); after a recovery that is a later CA key of the
+//! same CA identity, not the CA key that issued the certificate. It walks the
+//! current certificate's chain to send it with the proof, answering the
+//! walk's certificate Interests from the issuer certificates the device kept
+//! ([`IssuedCertificate::issuers`], [`crate::issuers`]) before the network,
+//! runs the exchange and checks that the new certificate certifies the
+//! device key, is valid now, and chains to the root of the namespace's trust
+//! context.
 
 use std::sync::Arc;
 
 use base64::Engine;
-use ndn_packet::{Data, Name};
+use bytes::Bytes;
+use ndn_packet::{Data, Interest, Name};
 use ndn_security::{Certificate, Keyring, Signer};
 
 use crate::client::CaExchange;
@@ -53,12 +73,19 @@ pub const CERT_NAME_PARAM: &str = "cert_name";
 /// CHALLENGE parameter: base64url (no padding) signature, by the
 /// certificate's key, over [`renewal_proof_message`].
 pub const PROOF_PARAM: &str = "signature";
+/// CHALLENGE parameter: base64url (no padding) wire of the certificate being
+/// renewed, for a CA that did not issue it.
+pub const CERTIFICATE_PARAM: &str = "certificate";
+/// CHALLENGE parameter: JSON array of the base64url (no padding) wires of
+/// the issuer certificates of the renewed certificate's chain, in walk
+/// order, for a CA that did not issue it.
+pub const ISSUERS_PARAM: &str = "issuers";
 
-/// Exchanges (Interest → Data) [`renew_certificate`] makes at most: NEW,
-/// CHALLENGE, the renewed certificate, and the issuer certificates of its
-/// chain. Times the per-Interest timeout, it bounds how long a renewal can
-/// take.
-pub const RENEWAL_MAX_EXCHANGES: u32 = 3 + crate::invite::MAX_ISSUER_FETCHES as u32;
+/// Exchanges (Interest → Data) [`renew_certificate`] makes at most: the
+/// issuer certificates of the current certificate's chain, NEW, CHALLENGE,
+/// the renewed certificate, and the issuer certificates of its chain. Times
+/// the per-Interest timeout, it bounds how long a renewal can take.
+pub const RENEWAL_MAX_EXCHANGES: u32 = 3 + 2 * crate::invite::MAX_ISSUER_FETCHES as u32;
 
 /// What the device signs to prove it holds the key of `cert_name` in the
 /// exchange with request id `request_id_hex` (the CA's NEW response,
@@ -67,9 +94,11 @@ pub fn renewal_proof_message(request_id_hex: &str, cert_name: &Name) -> Vec<u8> 
     format!("ndncert-renewal\n{request_id_hex}\n{cert_name}").into_bytes()
 }
 
-/// The prefix of the CA that issued `cert` (its NDNCERT names are
+/// The prefix of the namespace's CA that `cert` names (its NDNCERT names are
 /// `<prefix>/CA/…`): the certificate's KeyLocator `/<prefix>/CA/KEY/<id>…`
-/// minus `/CA/KEY/…`. `None` when the issuer is not named that way.
+/// minus `/CA/KEY/…`. Renewal goes there: after a recovery the CA at that
+/// prefix signs with a later key of the same CA identity than the one that
+/// issued `cert`. `None` when the issuer is not named that way.
 pub fn issuing_ca_prefix(cert: &Certificate) -> Option<Name> {
     let issuer = cert.issuer.as_deref()?;
     let comps = issuer.components();
@@ -90,8 +119,8 @@ pub enum RenewalError {
     #[error("certificate {cert} does not certify the key {key}")]
     OtherKey { cert: String, key: String },
     #[error(
-        "certificate {cert} does not name the CA that issued it (its issuer is {issuer}, not \
-         /<prefix>/CA/KEY/<id>); renewal goes to the issuing CA"
+        "certificate {cert} does not name its namespace's CA (its issuer is {issuer}, not \
+         /<prefix>/CA/KEY/<id>); renewal goes to the namespace's CA, /<prefix>/CA"
     )]
     NoIssuingCa { cert: String, issuer: String },
     #[error(
@@ -158,17 +187,28 @@ fn iso(ns: u64) -> String {
     format!("{}Z", String::from_utf8_lossy(&basic))
 }
 
-/// Renew `current` — a certificate Data for `device_key`, issued by a CA —
-/// at the CA that issued it ([`issuing_ca_prefix`]), through `exchange`.
-/// Returns the new certificate for the same key, checked: it certifies
-/// `device_key`, is valid now and chains to the root of a trust context in
-/// `keyring` (issuer certificates are fetched for the walk). Nothing is
-/// stored; keeping the new certificate is the caller's. An expired `current`
-/// is refused before anything is sent.
+/// Renew `current` — a certificate Data for `device_key`, issued by a CA of
+/// its namespace — at the namespace's CA ([`issuing_ca_prefix`]), through
+/// `exchange`. After a recovery that CA signs with a later key of the same CA
+/// identity, which accepts `current` with its chain. The renewal carries
+/// `current` and the issuer certificates of its chain, as walked to the root
+/// of a trust context in `keyring` (when the walk fails, it carries none: the
+/// CA key that issued `current` needs none). The walk takes each issuer
+/// certificate from `issuers` — the ones the device kept from its enrollment
+/// or an earlier renewal ([`IssuedCertificate::issuers`]) — before fetching it
+/// through `exchange`; a kept certificate is never trusted by itself, the
+/// walk verifies every hop. Returns the new certificate for the same key,
+/// checked: it certifies `device_key`, is valid now and chains to the root of
+/// a trust context in `keyring` (issuer certificates are fetched for the
+/// walk, from the network only, and returned in
+/// [`IssuedCertificate::issuers`] for the caller to keep). Nothing is stored;
+/// keeping the new certificate is the caller's. An expired `current` is
+/// refused before anything is sent.
 pub async fn renew_certificate<E>(
     keyring: &Arc<Keyring>,
     exchange: &mut E,
     current: &Data,
+    issuers: &[Data],
     device_key: Arc<dyn Signer>,
 ) -> Result<IssuedCertificate, RenewalError>
 where
@@ -198,6 +238,22 @@ where
         });
     }
 
+    // The current certificate's chain travels with the proof: a later CA of
+    // the namespace that did not issue it (its root device was replaced)
+    // verifies the chain with these issuer certificates, which nobody but
+    // this device may serve any more — so the walk takes them from the ones
+    // it kept first. A failed walk does not stop the renewal: the CA key that
+    // issued the certificate needs none of them.
+    let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let certificate = b64.encode(current.raw());
+    let mut walk = KeptIssuersFirst::new(issuers, exchange);
+    let issuers: Vec<serde_json::Value> = check_chain(current, keyring, &mut walk, &ca_prefix)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|issuer| b64.encode(issuer.raw()).into())
+        .collect();
+
     let signer = Arc::clone(&device_key);
     let proven = cert_name.clone();
     let session = crate::client::run_session(
@@ -210,6 +266,8 @@ where
         move |round| {
             let signer = Arc::clone(&signer);
             let proven = proven.clone();
+            let certificate = certificate.clone();
+            let issuers = issuers.clone();
             async move {
                 if round.round > 0 {
                     // The CA decides in one round; it never asks again.
@@ -227,6 +285,8 @@ where
                         .encode(&proof)
                         .into(),
                 );
+                params.insert(CERTIFICATE_PARAM.into(), certificate.into());
+                params.insert(ISSUERS_PARAM.into(), serde_json::Value::Array(issuers));
                 Ok(Some(params))
             }
         },
@@ -254,13 +314,61 @@ where
             data.name
         )));
     }
-    let issued = check_issued(&data, device_key.as_ref())
+    let mut issued = check_issued(&data, device_key.as_ref())
         .await
         .map_err(|e| RenewalError::from_check(e, &ca_prefix, &cert_name))?;
-    check_chain(&data, keyring, exchange, &ca_prefix)
+    issued.issuers = check_chain(&data, keyring, exchange, &ca_prefix)
         .await
         .map_err(|e| RenewalError::from_check(e, &ca_prefix, &cert_name))?;
     Ok(issued)
+}
+
+/// The exchange of the walk of the current certificate's chain: a
+/// certificate Interest is answered from the issuer certificates the device
+/// kept — by exact name, or with CanBePrefix the newest valid one under it
+/// (else the newest) — and anything they do not answer goes through the
+/// network. A kept certificate is only an answer: the chain walk verifies
+/// every hop, exactly as for a fetched one.
+struct KeptIssuersFirst<'a, E: ?Sized> {
+    kept: Vec<(Certificate, &'a Data)>,
+    network: &'a mut E,
+}
+
+impl<'a, E: ?Sized> KeptIssuersFirst<'a, E> {
+    /// Kept Data that is not a certificate is skipped.
+    fn new(kept: &'a [Data], network: &'a mut E) -> Self {
+        let kept = kept
+            .iter()
+            .filter_map(|data| Certificate::decode(data).ok().map(|cert| (cert, data)))
+            .collect();
+        Self { kept, network }
+    }
+
+    fn answer(&self, interest: &Bytes) -> Option<Data> {
+        let interest = Interest::decode(interest.clone()).ok()?;
+        let can_be_prefix = interest.selectors().can_be_prefix;
+        self.kept
+            .iter()
+            .filter(|(cert, _)| {
+                if can_be_prefix {
+                    cert.name.has_prefix(&interest.name)
+                } else {
+                    *cert.name == *interest.name
+                }
+            })
+            .max_by_key(|(cert, _)| (cert.is_valid_now(), cert.valid_from))
+            .and_then(|(_, data)| Data::decode(data.raw().clone()).ok())
+    }
+}
+
+impl<E: CaExchange + ?Sized> CaExchange for KeptIssuersFirst<'_, E> {
+    fn express(&mut self, interest: Bytes) -> impl Future<Output = Result<Data, CertError>> + Send {
+        use futures::future::{Either, ready};
+        match self.answer(&interest) {
+            Some(kept) => Either::Left(ready(Ok(kept))),
+            None => Either::Right(self.network.express(interest)),
+        }
+    }
 }
 
 #[cfg(test)]

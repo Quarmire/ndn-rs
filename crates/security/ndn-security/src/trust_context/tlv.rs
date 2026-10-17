@@ -17,8 +17,8 @@
 //!   [`SCHEMA_FORMAT`], [`SCHEMA_BODY`]. Without the anchors or schema a
 //!   context is meaningless, so a node that can't parse them must reject it.
 //! - Additive → **even**: [`CA_ENDPOINT`], [`ENROLLMENT_HINT`],
-//!   [`REVOCATION`]. An old node skips an unknown one and still validates with
-//!   the anchors + schema it does understand.
+//!   [`REVOCATION`], [`KEY_ROLE`]. An old node skips an unknown one and still
+//!   validates with the anchors + schema it does understand.
 //!
 //! (The design note's draft had the parity inverted for the must-understand
 //! fields; renumbered here per the note's own "verify criticality parity"
@@ -69,6 +69,16 @@ pub const SOURCE_BUNDLE_HASH: u64 = 0x041A;
 /// members writing `/<ns>/shared`). Non-critical (even): an old node skips it
 /// and keeps the floor.
 pub const SCHEMA_AUTHORITATIVE: u64 = 0x041C;
+
+/// What a key the context names is for, repeatable: one role code byte
+/// followed by the key's `Name` (`0x07`) — see
+/// [`KeyRole`](super::KeyRole). Recovery anchors are anchors kept offline to
+/// sign the next version when the root device is lost; root-device keys are
+/// the CA and admin keys that live on the root device beside the root (what a
+/// recovery after a compromise revokes). Non-critical (even): an old node
+/// skips it and treats every anchor alike, which is what a recovery anchor is.
+/// Unknown role codes are kept and re-emitted.
+pub const KEY_ROLE: u64 = 0x041E;
 
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;

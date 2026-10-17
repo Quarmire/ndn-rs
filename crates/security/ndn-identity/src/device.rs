@@ -95,9 +95,11 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
     manager.cert_cache().insert(cert.clone());
     manager.add_trust_anchor(cert);
 
-    // Auto-renewal renews the issued certificate at the same CA over a fresh router
-    // connection, proving possession of the current certificate's key (the CA's
-    // `renewal` challenge) — the factory credential is not re-presented.
+    // Auto-renewal renews the issued certificate at the namespace's CA over a fresh
+    // router connection, proving possession of the current certificate's key (the CA's
+    // `renewal` challenge) — the factory credential is not re-presented. After a
+    // recovery that CA runs a later CA key, which accepts an earlier CA's certificate
+    // with its kept chain.
     let renewer: Arc<dyn CertRenewer> = Arc::new(NdncertRenewer {
         connect: Arc::new(|| {
             Box::pin(async {

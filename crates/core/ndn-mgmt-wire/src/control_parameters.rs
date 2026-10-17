@@ -60,6 +60,10 @@ pub mod tlv {
     // root-signing trust-admin verb (`security/revoke`) needs. Carried only in
     // ApplicationParameters, never in a Name.
     pub const UNLOCK_SECRET: u64 = 0xB2;
+    // A signed trust-context Data (ndn-rs extension): the newer version of a
+    // held context `security/context-update` hands to the daemon. Carried in
+    // ApplicationParameters (it is kilobytes).
+    pub const CONTEXT_DATA: u64 = 0xB4;
 
     pub const NAME: u64 = 0x07;
     pub const NAME_COMPONENT: u64 = 0x08;
@@ -124,6 +128,9 @@ pub struct ControlParameters {
     /// the namespace root's store, for a root-signing trust-admin verb. The
     /// management dispatcher refuses it in a command Name.
     pub unlock_secret: Option<UnlockSecret>,
+    /// A signed trust-context Data wire (ndn-rs extension), for
+    /// `security/context-update`.
+    pub context_data: Option<Bytes>,
     /// NFD `BaseCongestionMarkingInterval`, microseconds.
     pub base_cong_interval: Option<u64>,
     /// NFD `DefaultCongestionThreshold`, bytes.
@@ -247,6 +254,9 @@ impl ControlParameters {
         }
         if let Some(secret) = &self.unlock_secret {
             w.write_tlv(tlv::UNLOCK_SECRET, secret.expose());
+        }
+        if let Some(data) = &self.context_data {
+            w.write_tlv(tlv::CONTEXT_DATA, data);
         }
         if let Some(v) = self.base_cong_interval {
             write_non_neg_int(w, tlv::BASE_CONG_INTERVAL, v);
@@ -401,6 +411,9 @@ impl ControlParameters {
                 }
                 tlv::UNLOCK_SECRET => {
                     params.unlock_secret = Some(UnlockSecret::new(val.to_vec()));
+                }
+                tlv::CONTEXT_DATA => {
+                    params.context_data = Some(val);
                 }
                 tlv::BASE_CONG_INTERVAL => {
                     params.base_cong_interval = Some(read_non_neg_int(&val)?);
@@ -695,6 +708,7 @@ mod tests {
             mtu: Some(8800),
             shm_control_token: Some(Bytes::from(vec![0x5Au8; 32])),
             unlock_secret: Some(UnlockSecret::new(b"pw".to_vec())),
+            context_data: Some(Bytes::from_static(b"\x06\x03ctx")),
             base_cong_interval: Some(100_000),
             def_cong_threshold: Some(64 * 1024),
             capacity: Some(1024 * 1024),

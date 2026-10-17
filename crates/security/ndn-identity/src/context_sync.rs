@@ -41,6 +41,14 @@
 //! adopted from the group — first adoption needs a link or invite
 //! (`ndn-fwd adopt` / `ndn-fwd enroll`).
 //!
+//! When the newest version is not signed by an anchor of the held one — a
+//! recovery kit installed a new root in a version this node missed — the
+//! publisher's earlier sequence numbers (each the version it republished)
+//! are fetched oldest first and followed one by one, each under the
+//! continuity rule from the one before ([`ndn_cert::follow_versions`], the
+//! same walk as the pull refresh); the newest is adopted only if the walk
+//! reaches it.
+//!
 //! # Transport seam
 //!
 //! `ndn-sync` is sans-IO (the caller wires the SVS Interest channels to a
@@ -63,9 +71,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_cert::{UpdateRefusal, open_context_update};
-use ndn_packet::{Data, Name};
-use ndn_security::{Keyring, context_namespace_of};
+use ndn_cert::{UpdateRefusal, Unfetched, VersionSource, follow_versions, open_context_update};
+use ndn_packet::{Data, Name, NameComponent};
+use ndn_security::{Keyring, SignedTrustContext, context_namespace_of};
 use ndn_sync::{SyncHandle, SyncUpdate};
 use tokio_util::sync::CancellationToken;
 
@@ -103,11 +111,14 @@ pub enum ContextSyncOutcome {
 }
 
 /// Fetch, check, and adopt the context advertised by one [`SyncUpdate`].
-/// Only the highest sequence is fetched — a trust context fully supersedes its
-/// predecessor, so older versions in the gap need not be retrieved. The
-/// fetched signed context is adopted only if it passes
-/// [`open_context_update`] against the held version of its namespace and
-/// [`Keyring::adopt_update`] (strictly newer, atomic); see the module docs.
+/// The highest sequence is fetched first: a trust context fully supersedes
+/// its predecessor, so when the newest is signed by an anchor of the held
+/// version nothing else is needed. When it is not, the sequence numbers in
+/// between (from the first one newer than the held version) are followed
+/// oldest first ([`follow_versions`]). The newest is adopted only if it
+/// passes [`open_context_update`] against the held version of its namespace
+/// — directly or through that walk — and [`Keyring::adopt_update`]
+/// (strictly newer, atomic); see the module docs.
 pub async fn process_update(
     update: &SyncUpdate,
     fetcher: &dyn ContextFetcher,
@@ -133,6 +144,38 @@ pub async fn process_update(
 
     let ctx = match open_context_update(&held, &data).await {
         Ok((ctx, _signer)) => Arc::new(ctx),
+        Err(refusal @ UpdateRefusal::NotSignedByHeldAnchor { .. }) => {
+            // The sequence numbers are the versions republished: start at
+            // the first one newer than the held version.
+            let first = update.low_seq.max(held.version() + 1);
+            if first >= update.high_seq {
+                return ContextSyncOutcome::Refused(refusal);
+            }
+            let offered = data
+                .name
+                .components()
+                .last()
+                .and_then(NameComponent::as_version)
+                .unwrap_or(update.high_seq);
+            let mut group = GroupVersions {
+                fetcher,
+                group: &update.name,
+                newest: Some((update.high_seq, data)),
+            };
+            match follow_versions(&held, first..=update.high_seq, &mut group).await {
+                Ok(mut walked) => match walked.pop() {
+                    Some(newest) => newest.context,
+                    None => return ContextSyncOutcome::Refused(refusal),
+                },
+                Err(stop) => {
+                    return ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
+                        held: held.version(),
+                        offered,
+                        stop,
+                    });
+                }
+            }
+        }
         Err(refusal) => return ContextSyncOutcome::Refused(refusal),
     };
     match keyring.adopt_update(Arc::clone(&ctx)) {
@@ -152,6 +195,32 @@ pub async fn process_update(
             held: now_held,
         }),
         Err(None) => ContextSyncOutcome::NotHeld { namespace },
+    }
+}
+
+/// The walk's [`VersionSource`] over a sync group: position `n` is the
+/// publisher's group Data `<group>/seg=n`, whose Content is a signed context
+/// Data.
+struct GroupVersions<'a> {
+    fetcher: &'a dyn ContextFetcher,
+    group: &'a Name,
+    /// The newest version, fetched already.
+    newest: Option<(u64, Data)>,
+}
+
+impl VersionSource for GroupVersions<'_> {
+    async fn fetch(&mut self, position: u64, _from: &SignedTrustContext) -> Result<Data, Unfetched> {
+        if let Some((_, data)) = self.newest.take_if(|(seq, _)| *seq == position) {
+            return Ok(data);
+        }
+        let name = self.group.clone().append_segment(position);
+        let content = self
+            .fetcher
+            .fetch_content(name.clone())
+            .await
+            .ok_or_else(|| Unfetched::Missing(format!("nothing published at {name}")))?;
+        Data::decode(content)
+            .map_err(|e| Unfetched::Missing(format!("{name} carries no Data packet: {e}")))
     }
 }
 
@@ -204,8 +273,8 @@ mod tests {
     use super::*;
     use dashmap::DashMap;
 
-    use ndn_cert::{NamespaceInit, anchor_fingerprint, init_namespace};
-    use ndn_security::{SecurityManager, SignedTrustContext};
+    use ndn_cert::{CatchUpStop, NamespaceInit, anchor_fingerprint, init_namespace};
+    use ndn_security::{Ed25519Signer, SecurityManager, Signer};
 
     const GROUP: &str = "/home/bob/_sync/v1/devices/device-a";
 
@@ -408,5 +477,81 @@ mod tests {
             process_update(&update_at(1), &fetcher, &keyring).await,
             ContextSyncOutcome::DecodeFailed
         ));
+    }
+
+    /// A node that missed a recovery follows it from the group: it holds v2
+    /// (listing a recovery key); the publisher republished v3 (the recovery
+    /// key installs a new root) and v4 (the new root's, newest). v4 alone
+    /// does not follow from v2, so the sequence numbers in between are
+    /// followed one by one. A forged v3 stops it and the held version stays.
+    #[tokio::test]
+    async fn a_node_behind_a_recovery_follows_the_sequence_numbers_in_between() {
+        let root = Root::new();
+        let ns = n("/home/bob");
+        let root_signer = root.mgr.get_signer_sync(&root.init.anchor_key).unwrap();
+        let seed = ndn_cert::RecoverySeed::generate().unwrap();
+        let recovery: Arc<dyn Signer> = Arc::new(seed.signer(&ns));
+        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery)).await.unwrap();
+        let v2 = ndn_cert::add_recovery_anchor(root_signer.as_ref(), &root.init.context_data, &kit)
+            .await
+            .unwrap();
+        let keyring = node_holding(&root);
+        let fetcher = MapFetcher::new();
+        fetcher.publish(2, &v2.data);
+        assert!(matches!(
+            process_update(&update_at(2), &fetcher, &keyring).await,
+            ContextSyncOutcome::Adopted { version: 2, .. }
+        ));
+
+        let new_root_mgr = SecurityManager::new();
+        let new_root_key = n("/home/bob/KEY/root2");
+        new_root_mgr.generate_ed25519(new_root_key.clone()).unwrap();
+        let new_root = new_root_mgr.get_signer_sync(&new_root_key).unwrap();
+        let new_anchor = new_root_mgr
+            .issue_self_signed_async(&new_root_key, new_root.public_key().unwrap(), u64::MAX)
+            .await
+            .unwrap();
+        let plan = ndn_cert::RecoveryPlan {
+            new_root: &new_anchor,
+            new_root_device_keys: &[],
+            old_root: ndn_cert::OldRoot::Destroyed,
+        };
+        let v3 = ndn_cert::recovery_version(recovery.as_ref(), &v2.data, &plan)
+            .await
+            .unwrap()
+            .bump;
+        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data).await.unwrap();
+        let missed = SyncUpdate {
+            low_seq: 3,
+            ..update_at(4)
+        };
+
+        let stranger: Arc<dyn Signer> =
+            Arc::new(Ed25519Signer::from_seed(&[7; 32], n("/home/bob/KEY/stranger")));
+        let forged = SignedTrustContext::decode_content(v2.data.content().unwrap(), 3).unwrap();
+        forged.add_anchor(ndn_cert::recovery_anchor(Arc::clone(&stranger)).await.unwrap());
+        let forged_group = MapFetcher::new();
+        forged_group.publish(3, &forged.sign_into_data_async(stranger.as_ref()).await.unwrap());
+        forged_group.publish(4, &v4.data);
+        match process_update(&missed, &forged_group, &keyring).await {
+            ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
+                stop: CatchUpStop::Refused { version: 3, .. },
+                ..
+            }) => {}
+            other => panic!("a forged intermediate version was not refused: {other:?}"),
+        }
+        assert_eq!(held_version(&keyring), 2, "the held version stays");
+
+        fetcher.publish(3, &v3.data);
+        fetcher.publish(4, &v4.data);
+        match process_update(&missed, &fetcher, &keyring).await {
+            ContextSyncOutcome::Adopted {
+                previous: 2,
+                version: 4,
+                ..
+            } => {}
+            other => panic!("the recovery was not followed: {other:?}"),
+        }
+        assert_eq!(held_version(&keyring), 4);
     }
 }

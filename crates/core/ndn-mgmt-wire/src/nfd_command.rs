@@ -143,6 +143,14 @@ pub mod verb {
     /// a newer version and adopt it if the held version's root signed it.
     /// Authorized like [`CONTEXT_ADOPT`].
     pub const CONTEXT_REFRESH: &[u8] = b"context-refresh";
+    /// `security/context-update` — adopt the signed trust-context Data in
+    /// `ControlParameters.context_data` (in ApplicationParameters) as the
+    /// next version of a held context, under the same continuity rule a
+    /// refresh applies (signed by an anchor of the held version, strictly
+    /// newer), then store and publish it: how `ndn-fwd recovery-kit` and
+    /// `ndn-fwd recover` hand the version they signed to the running daemon.
+    /// Authorized like [`CONTEXT_ADOPT`].
+    pub const CONTEXT_UPDATE: &[u8] = b"context-update";
     /// `security/renew` — renew, now, every certificate a namespace CA issued
     /// to this node's keys: each is re-certified for the same key by the CA
     /// that issued it, on proof of the current certificate (no invite), then

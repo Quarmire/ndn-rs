@@ -15,10 +15,12 @@ pub mod context_update;
 pub mod ecdh;
 pub mod error;
 pub mod invite;
+pub mod issuers;
 pub mod namespace;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
+pub mod recovery;
 pub mod renewal;
 pub mod roles;
 pub mod root_store;
@@ -32,7 +34,13 @@ pub use ca::{CaConfig, CaRevocation, CaState};
 pub use store::{CaSnapshot, CaStore, FileCaStore};
 pub use root_store::{
     NewRootStore, RootSecret, RootStore, RootStoreError, RootStoreKind, RootUnlockKind,
-    os_keychain_reachable, read_root_secret,
+    os_keychain_reachable, read_root_secret, read_secret,
+};
+pub use recovery::{
+    FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError, RecoveryPlan, RecoverySeed,
+    RecoveryVersion, YubikeyKit, add_recovery_anchor, kit_anchor, recover_namespace_in_pib,
+    recovery_anchor, recovery_key_name, recovery_version, reissue_version, remove_recovery_anchor,
+    seal_file_kit,
 };
 pub use challenge::email::{EmailChallenge, EmailSender};
 pub use challenge::nop::NopChallenge;
@@ -46,12 +54,14 @@ pub use client::{CaExchange, ChallengeRound, EnrollmentSession};
 pub use ecdh::{EcdhKeypair, SessionKey};
 pub use error::CertError;
 pub use context_store::{
-    ContextStoreError, adopt_envelope_into_store, context_file_path, load_persisted_contexts,
-    persist_context, read_stored_context, read_stored_contexts,
+    ContextStoreError, adopt_envelope_into_store, context_file_path, context_version_path,
+    context_versions_dir, load_persisted_contexts, persist_context, read_stored_context,
+    read_stored_contexts, read_stored_versions, remove_stored_context,
 };
 pub use context_update::{
-    BumpError, ContextBump, ContextRefresh, ContextUpdate, RefreshError, UpdateRefusal,
-    bump_context_revoking, key_name_of, open_context_update, refresh_context,
+    BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
+    MAX_CATCH_UP_VERSIONS, RefreshError, Unfetched, UpdateRefusal, VersionSource,
+    bump_context_revoking, follow_versions, key_name_of, open_context_update, refresh_context,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,

@@ -37,20 +37,26 @@ pub fn renew_via_engine_budget() -> Duration {
     ndn_app::DEFAULT_TIMEOUT * ndn_cert::renewal::RENEWAL_MAX_EXCHANGES
 }
 
-/// Renew `current` (a certificate Data for `device_key`) at the CA that
-/// issued it, through `engine`: Interests go out on a short-lived in-process
-/// consumer face, so the engine's FIB forwards them toward the CA. The new
+/// Renew `current` (a certificate Data for `device_key`) at its namespace's
+/// CA, through `engine`: Interests go out on a short-lived in-process
+/// consumer face, so the engine's FIB forwards them toward the CA. After the
+/// namespace's root device is replaced through a recovery kit, that CA signs
+/// with a later key of the same CA identity and accepts `current` with its
+/// chain, walked from `issuers` — the issuer certificates the device kept
+/// ([`IssuedCertificate::issuers`]) — before the network. The new
 /// certificate is for the same key, checked to chain to the root of a trust
-/// context in `keyring`. Storing and serving it is the caller's. See
+/// context in `keyring`. Storing and serving it (and its
+/// [`IssuedCertificate::issuers`]) is the caller's. See
 /// [`ndn_cert::renew_certificate`].
 pub async fn renew_via_engine(
     engine: &ForwarderEngine,
     keyring: &Arc<Keyring>,
     current: &Data,
+    issuers: &[Data],
     device_key: Arc<dyn Signer>,
 ) -> Result<IssuedCertificate, ndn_cert::RenewalError> {
     let mut exchange = EngineExchange::new(engine);
-    ndn_cert::renew_certificate(keyring, &mut exchange, current, device_key).await
+    ndn_cert::renew_certificate(keyring, &mut exchange, current, issuers, device_key).await
 }
 
 /// When a certificate is due for renewal: once its remaining validity falls
@@ -136,11 +142,13 @@ pub type ConsumerConnect = Arc<
 >;
 
 /// The built-in renewer: renews the key's current certificate
-/// ([`current_certificate`]) at the CA that issued it with
-/// [`ndn_cert::renew_certificate`] over a fresh `connect`ion, and installs
-/// the new certificate into the validation cache. The manager's keyring must
-/// hold the namespace's trust context: the new certificate is checked to
-/// chain to its root.
+/// ([`current_certificate`]) at its namespace's CA with
+/// [`ndn_cert::renew_certificate`] over a fresh `connect`ion — after a
+/// recovery a later CA key of the same CA identity, which accepts an earlier
+/// CA's certificate with its chain (the issuer certificates the manager's
+/// cert cache holds) — and installs the new certificate into the validation
+/// cache. The manager's keyring must hold the namespace's trust context: the
+/// new certificate is checked to chain to its root.
 pub struct NdncertRenewer {
     pub connect: ConsumerConnect,
 }
@@ -165,8 +173,10 @@ impl CertRenewer for NdncertRenewer {
             .await
             .map_err(|e| RenewalError::Connect(e.to_string()))?;
         let mut client = NdncertClient::new(consumer, ca_prefix);
+        let issuers = cached_issuers(manager, &current);
         let issued =
-            ndn_cert::renew_certificate(manager.keyring(), &mut client, &data, signer).await?;
+            ndn_cert::renew_certificate(manager.keyring(), &mut client, &data, &issuers, signer)
+                .await?;
         let cert_name = (*issued.cert.name).clone();
         // Install the renewed leaf into the validation cert cache — NOT as a trust anchor.
         // `add_trust_anchor` would promote every renewed end-entity cert to a
@@ -176,6 +186,28 @@ impl CertRenewer for NdncertRenewer {
         manager.cert_cache().insert(issued.cert);
         Ok(cert_name)
     }
+}
+
+/// The issuer certificates of `cert`'s chain that `manager`'s cert cache
+/// holds, in walk order, up to the first it does not hold. The renewal's
+/// chain walk verifies each one; none is trusted by itself.
+fn cached_issuers(manager: &SecurityManager, cert: &Certificate) -> Vec<Data> {
+    const MAX_CHAIN: usize = 8;
+    let mut issuers: Vec<Data> = Vec::new();
+    let mut locator = cert.issuer.clone();
+    while let Some(key) = locator.take() {
+        let Some(issuer) = manager.cert_cache().get_valid(&key) else { break };
+        let Some(data) = issuer.data_wire().and_then(|wire| Data::decode(wire).ok()) else {
+            break;
+        };
+        // A self-signed anchor or a cycle ends the walk.
+        if issuers.len() == MAX_CHAIN || issuers.iter().any(|kept| kept.name == data.name) {
+            break;
+        }
+        locator = issuer.issuer.clone();
+        issuers.push(data);
+    }
+    issuers
 }
 
 pub struct RenewalHandle {

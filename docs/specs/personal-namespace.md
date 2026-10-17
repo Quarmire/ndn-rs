@@ -48,7 +48,8 @@ Terms used throughout:
 
 | Actor | Name | Key | Lives on | Online? |
 |---|---|---|---|---|
-| Root | `/<ns>/KEY/root` | Ed25519, root-signed self cert | root device (owner's choice of store) + recovery kit | rarely needed |
+| Root | `/<ns>/KEY/<k>` (`root` from `init`, a fresh id after a recovery) | Ed25519 (P-256 on a YubiKey), root-signed self cert | root device (owner's choice of store) | rarely needed |
+| Recovery key | `/<ns>/KEY/r<hex>` | separate key, self-signed anchor marked a recovery anchor in the context | recovery kit, offline (words / sealed file / second YubiKey) | only to replace a lost root device |
 | CA | `/<ns>/CA` | delegated, cert issued by root | relay (preferred) or root device | always, if on a relay |
 | Admin device | `/<ns>/admin/<device>` | per device, cert issued by CA | owner's devices marked admin | sometimes |
 | Member device | `/<ns>/member/<device>` | per device, cert issued by CA | everything else | sometimes |
@@ -98,7 +99,10 @@ unattended. A relay never holds the root.
   `token` (from an invite) and `device-approval` (admin approves).
 - **Revocation** — context revocation list (authoritative, root-signed) and
   CA revocation set (immediate, CA-signed REVOKE).
-- **Recovery kit** — NEW wrapper: see §6.
+- **Recovery kit** — a separate recovery key whose anchor the context lists
+  with role `recovery-anchor` (context TLV `KeyRole`, 0x041E); file kits are
+  an `ndn-trust://bag` envelope that also names the namespace and its
+  expected fingerprint (**have**: F7).
 
 ## 4. Generated trust schema
 
@@ -145,8 +149,9 @@ Each flow lists steps, what is stored where, failure handling, and status
    `/<ns>/admin/<dev>` (CA-certified; device name defaults to the sanitized
    host name), root-signed context carrying the generated schema, in the
    PIB (**have**).
-2. Recovery kit offered immediately (F7). The owner may decline; the UI keeps
-   reminding until one exists.
+2. Recovery kit offered immediately (F7): `init` prints the command, and
+   `ndn-fwd root-key status` counts the recovery anchors and keeps
+   recommending one while there is none (**have**). The owner may decline.
 3. Optional: delegate the CA to a relay (F3).
 
 ### F2 Add a device
@@ -231,23 +236,70 @@ refuses them like any other Data. If it was the root device, continue with F8.
    chooses to re-enroll everything; the UI asks.
 3. QUIC pins for that relay are dropped from the links peers configure to it.
 
-### F7 Create a recovery kit
-The owner chooses one or more formats; all are supported equally:
-- **Encrypted file** — passphrase-encrypted SafeBag of the root key
-  (format exists: `ndn-sec export`), wrapped as an `ndn-trust://bag` envelope.
-- **Word list** — the root key seed encoded as words with a checksum, for
-  paper or a password manager (**gap**: encoder/decoder; NEW TLV-free format).
-- **Hardware** — a second YubiKey holding a root copy, where the owner's
-  hardware allows import.
-Each kit also carries the public context name and fingerprint so restoration
-can find and verify the namespace. Kits never leave the device unencrypted
-except as the owner-chosen word list.
+### F7 Create a recovery kit (**have**)
+A kit holds a **separate recovery key**, never a copy of the root: a
+hardware root cannot be exported, and a copy of the root written as words
+would be the root itself. On the root device, `ndn-fwd recovery-kit create
+--format words|file|yubikey` makes the key and the root (unlocked from its
+store for this one signature) signs version `N+1` listing its self-signed
+certificate as an extra anchor, marked `recovery-anchor` (context TLV
+`KeyRole`; carried over by every later version). The key is named
+`/<ns>/KEY/r<first 8 bytes of SHA-256(public key), hex>`, so a word list
+alone rebuilds it. All formats are supported equally; several may coexist:
+- **Word list** — Ed25519 from a 32-byte seed shown once as 24 BIP39 English
+  words (the checksum refuses a mistyped word); nothing is stored.
+- **Encrypted file** — the key in a SafeBag sealed by a kit passphrase
+  (PBES2 as the root store), in an `ndn-trust://bag` envelope that also
+  carries the namespace and its expected fingerprint, written `0600`.
+- **Hardware** — P-256 generated on a second YubiKey's PIV slot (default
+  `9d`, PIN policy `always`, touch policy chosen), non-exportable.
+`recovery-kit list` shows the anchors of the held context, `check <kit>`
+opens a kit and confirms its key is a recovery anchor (signs nothing),
+`revoke <key>` has the root sign a version without that anchor and revoking
+its key. The CLI signs and hands the version to the running daemon
+(`security/context-update`, adopted under the continuity rule, stored,
+published). A recovery anchor is root-equivalent by design: keep it offline.
 
-### F8 Restore after losing the root device
-1. New device: `recover <kit>` → root key restored into the chosen store.
-2. Root bump: revoke the lost root device's admin cert; the new device
-   enrolls itself as admin.
-3. Everything else keeps working; no other device re-adopts or re-enrolls.
+### F8 Restore after losing the root device (**have**)
+On a replacement device whose daemon holds the namespace's context (linked
+through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
+--old-root destroyed|compromised [--root-store …] [--device <name>]`.
+1. The daemon fetches the newest version by name (as `context refresh`); a
+   device holding none adopts it with a file kit's expected fingerprint, or
+   is told to adopt first (a context with nothing to check it against could
+   be a forgery the recovery key would then sign). The kit's key must be a
+   recovery anchor of that version.
+2. A new root (in the chosen store), a new CA key `/<ns>/CA/KEY/<id>` and a
+   new admin identity `/<ns>/admin/<device>`, all with fresh key ids; the
+   recovery key signs `N+1`: anchors = new root + recovery anchors (+ the old
+   root when `destroyed`); the CA endpoint stays `/<ns>/CA`; the new root
+   device's CA and admin keys get the `root-device` role. The new root then
+   signs `N+2`, the same content (`ndn_cert::reissue_version`), so the newest
+   version is root-signed and the new root's fingerprint is the namespace's
+   expected fingerprint for anchor links and invites from then on (an
+   expected fingerprint authenticates the signer of the version adopted,
+   never merely an anchor the fetched context lists).
+3. `destroyed`: every certificate the old root and CA issued stays valid;
+   devices renew with the new CA, which accepts a current, unrevoked
+   certificate of the namespace issued by an earlier CA of `/<ns>/CA` that
+   still validates under its context, and serves that CA's certificate from
+   then on. `compromised`: `N+1` revokes the old root, the old CA key and the
+   old root device's admin key (the `root-device` keys); devices whose
+   certificates chain through the old CA stop validating and enroll again
+   with invites from the new root device.
+4. `N+1`, then `N+2`, go to the daemon, which adopts, stores and publishes
+   each; every node holding `N` adopts both by the continuity rule (`N+1`
+   signed by an anchor of `N`, `N+2` by an anchor of `N+1`). A node that
+   missed them — offline across the recovery and later root-signed versions —
+   follows the versions in between by exact name, oldest first, each under
+   the continuity rule from the one before (`ndn_cert::follow_versions`, at
+   most 128 versions); every node keeps and serves each version it held
+   (`<pib>/contexts/<hex(ns)>.versions/`), so the chain of signed versions,
+   not the timing of refreshes, carries it. The operator restarts the daemon
+   with the printed `[security]` and `[ca]` lines.
+Gaps: the old root's admin key of a namespace made before root-device roles
+were recorded must be revoked by hand; a store written before versions were
+kept serves only the versions held since.
 
 ### F9 Share with a friend (scoped, time-limited)
 1. Admin issues a guest cert `/<ns>/guest/<who>` with short validity, plus a
@@ -264,7 +316,11 @@ proof of possession of the current certificate's key; same key re-certified
 under a new certificate name, the old one kept until it expires;
 refused for an expired certificate, a revoked key or a non-renewable role —
 guests by default; per-role lifetimes and `[ca] renewable_roles` in
-`ndn_cert::RolePolicy`; the `ndn-fwd` renewal timer `[security] renew_before`
+`ndn_cert::RolePolicy`; renewal goes to the namespace's CA and carries the
+issuer chain the device kept, so after a recovery the new CA key renews an
+earlier CA's certificate — `ndn-fwd` keeps the chain in `<pib>/issuers/`, a
+phone persists `NdnEnrolledIdentity::issuers` and passes it back to
+`renew_certificate`; the `ndn-fwd` renewal timer `[security] renew_before`
 and `ndn-fwd renew`; mobile `NdnEngine::renew_certificate` /
 `certificate_validity`; see the wiki's reference/renewal.md). Rotating to a
 new device key is a new enrollment (invite or admin approval) (**gap**: no
@@ -286,8 +342,11 @@ local segment (§9).
                       (`<key>/<issuer-id>/<version>`; legacy cert.data still loads)
 <pib>/default-identity  identity loaded when [security] identity is unset
                       (set by `ndn-fwd enroll`)
-<pib>/contexts/*.tc   adopted signed contexts (loaded at startup, re-verified,
-                      published by name unless [security] serve_contexts = false)
+<pib>/contexts/*.tc   adopted signed contexts, newest version per namespace
+                      (loaded at startup, re-verified, published by name
+                      unless [security] serve_contexts = false)
+<pib>/contexts/*.versions/<N>.tc  every version held, served by exact name
+                      so nodes behind can follow version by version
 <pib>/ca/             CA cert, anchor cert, node cert, issued/, revoked/,
                       redeemed-tokens/   (CA hosts only)
 <pib>/root/           root store of a root device: store.toml (kind, key,
@@ -312,7 +371,7 @@ the user's profile (see `ndn_security::secure_fs`).
 2. `adopt` by fingerprint + `enroll` by invite (**have**) and remote admin approval (F2).
 3. `revoke` + context bump/publish + pulled updates (F4, F5) — **have**;
    `devices list` is still to build.
-4. Recovery kit formats + `recover` (F7, F8).
+4. Recovery kit formats + `recover` (F7, F8) — **have**.
 5. CA delegation round trip (F3), then F6 tooling.
 6. Guest flow (F9), root rotation (F10).
 7. Two-process testbed scenario covering F1→F2→F4→F8.

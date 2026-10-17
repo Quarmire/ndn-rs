@@ -88,7 +88,9 @@ complete the enrollment and to check `ndn-ctl status` before retrying.
 <pib>/keys/<hash>/private.pkcs8.der   device key (never leaves the daemon)
 <pib>/keys/<hash>/certs/<hash>.data   each certificate of the key (signed Data, as issued; a renewal adds one)
 <pib>/default-identity                the identity loaded when [security] identity is unset
-<pib>/contexts/<ns-hex>.tc            the adopted context
+<pib>/contexts/<ns-hex>.tc            the adopted context (newest version)
+<pib>/contexts/<ns-hex>.versions/     every version of it held, by version
+<pib>/issuers/<hash>.data             issuer certificates of the device's chain (sent with a renewal)
 ```
 
 The config file is never edited. At start the daemon loads `[security]

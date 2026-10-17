@@ -161,7 +161,8 @@ A `FilePib` directory looks like this:
     cert.ndnc, cert.data    0600  legacy summary / certificate (still loaded)
   anchors/<sha256(name)>/   0700  trust anchors (cert.ndnc, name.uri)
   default-identity          0600
-  contexts/*.tc             0600  adopted signed trust contexts
+  contexts/*.tc             0600  adopted signed trust contexts (newest version)
+  contexts/*.versions/      0700  every version held, <N>.tc (0600), served by name
   ca/                       0700  CA state on CA hosts (certs, issued/,
                                   revoked/, redeemed-tokens/)
 ```
@@ -236,7 +237,8 @@ which PIB the connected forwarder uses.
 
 ## Root custody: where a namespace root key lives
 
-A namespace root `<ns>/KEY/root` is what every adopter trusts, and it
+A namespace root (`<ns>/KEY/root` from `init`, `<ns>/KEY/<id>` after a
+recovery) is what every adopter trusts, and it
 signs rarely — the anchor, the CA's certificate, each new trust-context
 version (a revocation). So `ndn-fwd init` puts it in a **root store**,
 not with the keys the daemon uses unattended, and records the store in
@@ -265,6 +267,38 @@ The CA key and the device's admin key stay in the FilePib: the daemon
 signs with them without anyone present (every issued certificate, every
 management response). What they can do is bounded by the certificate the
 root signed and by the context the root controls.
+
+## Recovery kits: when the root device is lost
+
+A root store protects the root on its device; a **recovery kit** is what
+survives losing that device. A kit holds a separate **recovery key**, never
+a copy of the root — a YubiKey root cannot be exported, and the root written
+out as words would simply be the root. The root signs a context version that
+lists the recovery key as an extra anchor, marked `recovery-anchor`; as every
+anchor of the held version may sign the next one, the recovery key can later
+sign the version that installs a new root, and every node adopts it without
+new trust machinery. A recovery anchor is root-equivalent: keep the kit
+offline.
+
+```sh
+ndn-fwd recovery-kit create --format words          # 24 BIP39 words, shown once
+ndn-fwd recovery-kit create --format file --out kit # SafeBag under a kit passphrase
+ndn-fwd recovery-kit create --format yubikey        # P-256 on a second token
+ndn-fwd recovery-kit list | check <kit> | revoke <key>
+ndn-fwd recover --kit words --old-root destroyed     # on a replacement device
+```
+
+The recovery key is named `<ns>/KEY/r<hex>` from its public key, so a word
+list alone rebuilds it; the last word's checksum refuses a mistyped list.
+`recover` makes a new root, CA key and admin identity with fresh key ids,
+and the recovery key signs the version that lists the new root —
+keeping the old root an anchor (`--old-root destroyed`: devices keep their
+certificates and renew with the new CA) or revoking it with the old CA and
+admin keys (`--old-root compromised`: devices enroll again). The new root
+then signs the next version, so its fingerprint is the expected fingerprint
+of anchor links and invites from then on. Nodes that missed the recovery
+follow these versions one by one, from any node that kept them. See
+[Recovery kits and `ndn-fwd recover`](../reference/recovery.md).
 
 ## When you need more: `Identity`
 

@@ -1,6 +1,7 @@
 //! Where a namespace root key lives on its root device: the **root store**.
 //!
-//! The root key `<ns>/KEY/root` signs rarely — the namespace anchor, the CA's
+//! The root key (`<ns>/KEY/root` from `ndn-fwd init`, `<ns>/KEY/<id>` after a
+//! recovery, [`crate::recovery`]) signs rarely — the namespace anchor, the CA's
 //! certificate and each new version of the trust context (a revocation) —
 //! and always because an operator asked. So it is kept apart from the keys
 //! the daemon uses unattended and is unlocked for one operation at a time.
@@ -49,7 +50,7 @@ use ndn_security::{
 };
 use zeroize::Zeroizing;
 
-use crate::namespace::{ANCHOR_CERT_FILE, CA_DIR, root_key_name};
+use crate::namespace::{ANCHOR_CERT_FILE, CA_DIR};
 
 /// Directory (under the PIB root) of the root store.
 pub const ROOT_STORE_DIR: &str = "root";
@@ -316,7 +317,7 @@ pub fn descriptor_path(pib_root: &Path) -> PathBuf {
 
 /// Whether two encodings of a public key are the same key (an Ed25519 key
 /// is stored raw by in-memory signers and as SPKI in some certificates).
-pub(crate) fn same_public_key(a: &[u8], b: &[u8]) -> bool {
+pub fn same_public_key(a: &[u8], b: &[u8]) -> bool {
     let norm = |k: &[u8]| -> Vec<u8> {
         if ndn_security::spki::is_ed25519_spki(k)
             && let Some(raw) = ndn_security::spki::unwrap_ed25519(k)
@@ -479,7 +480,7 @@ impl RootStore {
         &self.namespace
     }
 
-    /// The root key, `<ns>/KEY/root`.
+    /// The root key, as the descriptor records it (`<ns>/KEY/<id>`).
     pub fn key_name(&self) -> &Name {
         &self.key_name
     }
@@ -774,6 +775,7 @@ impl RootStore {
         let pkcs8 = self.export_pkcs8(current)?;
         let anchor = self.anchor_wire(pib)?;
         let pending = PendingRoot {
+            key: self.key_name.clone(),
             signer: Arc::new(
                 Ed25519Signer::from_pkcs8_der(&pkcs8, self.key_name.clone())
                     .map_err(RootStoreError::Trust)?,
@@ -908,6 +910,7 @@ async fn verify_signs(signer: &dyn Signer, public_key: &[u8]) -> Result<(), Root
 /// [`signer`](Self::signer), then [`commit`](Self::commit) it with the
 /// anchor certificate.
 pub(crate) struct PendingRoot {
+    key: Name,
     signer: Arc<dyn Signer>,
     seal: Seal,
 }
@@ -932,16 +935,18 @@ impl PendingRoot {
         Arc::clone(&self.signer)
     }
 
-    /// Generate the root key `<namespace>/KEY/root` in the store `spec`.
+    /// Generate the root key `key` (`<namespace>/KEY/<id>`) in the store
+    /// `spec`.
     pub(crate) async fn create(
         pib: &FilePib,
-        namespace: &Name,
+        key: &Name,
         spec: &NewRootStore,
     ) -> Result<PendingRoot, RootStoreError> {
-        let key = root_key_name(namespace);
+        let key = key.clone();
         match spec {
             NewRootStore::File => Ok(PendingRoot {
                 signer: Arc::new(pib.generate_ed25519(&key)?),
+                key,
                 seal: Seal::File,
             }),
             NewRootStore::SealedFile { passphrase } => {
@@ -979,7 +984,8 @@ impl PendingRoot {
                 .map_err(|e| RootStoreError::Trust(TrustError::KeyStore(e.to_string())))?,
         );
         Ok(PendingRoot {
-            signer: Arc::new(Ed25519Signer::from_seed(&seed, key)),
+            signer: Arc::new(Ed25519Signer::from_seed(&seed, key.clone())),
+            key,
             seal: Seal::Software {
                 pkcs8,
                 passphrase,
@@ -1007,7 +1013,7 @@ impl PendingRoot {
         let pin_policy = YubikeyPinPolicy::Always;
         let (signer, _spki) = token
             .generate_with_policy(
-                key,
+                key.clone(),
                 slot_id,
                 pin_policy,
                 touch,
@@ -1016,6 +1022,7 @@ impl PendingRoot {
             .await
             .map_err(|e| RootStoreError::Yubikey(e.to_string()))?;
         Ok(PendingRoot {
+            key,
             signer,
             seal: Seal::Yubikey(YubikeyRoot {
                 serial: token.serial(),
@@ -1112,7 +1119,7 @@ impl PendingRoot {
         namespace: &Name,
         anchor: &Certificate,
     ) -> Result<RootStore, RootStoreError> {
-        let key = root_key_name(namespace);
+        let key = self.key.clone();
         if matches!(self.seal, Seal::File) {
             pib.store_cert(&key, anchor)?;
         }
@@ -1332,8 +1339,30 @@ pub fn read_root_secret(
     confirm: bool,
     purpose: &str,
 ) -> Result<RootSecret, RootStoreError> {
-    let what = kind.as_str();
-    let secret = if let Some(var) = kind.env_var()
+    read_secret(
+        kind.env_var(),
+        &format!("--{}-file", kind.as_str()),
+        file,
+        confirm,
+        purpose,
+        &format!("root key {}", kind.as_str()),
+    )
+}
+
+/// A secret for a CLI (a root store's or a recovery kit's): from the
+/// environment variable `env`, else the first line of `file` (the option
+/// `file_flag` names it), else asked on the terminal without echo — twice
+/// when `confirm`. Never from the command line. An empty secret is refused.
+/// `label` names the secret in prompts and errors.
+pub fn read_secret(
+    env: Option<&str>,
+    file_flag: &str,
+    file: Option<&Path>,
+    confirm: bool,
+    purpose: &str,
+    label: &str,
+) -> Result<RootSecret, RootStoreError> {
+    let secret = if let Some(var) = env
         && let Ok(value) = std::env::var(var)
     {
         Zeroizing::new(value)
@@ -1347,30 +1376,26 @@ pub fn read_root_secret(
                 .to_string(),
         )
     } else {
-        let first = tty::read_hidden(&format!("{purpose} — root key {what}: "))
-            .map_err(|e| no_terminal(kind, e))?;
+        let no_terminal = |e: std::io::Error| {
+            RootStoreError::Secret(format!(
+                "cannot ask for the {label} ({e}): no terminal. Set {} or pass {file_flag} \
+                 <path>",
+                env.unwrap_or("-")
+            ))
+        };
+        let first = tty::read_hidden(&format!("{purpose} — {label}: ")).map_err(no_terminal)?;
         if confirm {
-            let again = tty::read_hidden(&format!("Repeat the {what}: "))
-                .map_err(|e| no_terminal(kind, e))?;
+            let again = tty::read_hidden(&format!("Repeat the {label}: ")).map_err(no_terminal)?;
             if *first != *again {
-                return Err(RootStoreError::Secret(format!("the two {what}s differ")));
+                return Err(RootStoreError::Secret(format!("the two {label}s differ")));
             }
         }
         first
     };
     if secret.is_empty() {
-        return Err(RootStoreError::Secret(format!("refusing an empty {what}")));
+        return Err(RootStoreError::Secret(format!("refusing an empty {label}")));
     }
     Ok(RootSecret::new(secret.as_bytes().to_vec()))
-}
-
-fn no_terminal(kind: RootUnlockKind, e: std::io::Error) -> RootStoreError {
-    RootStoreError::Secret(format!(
-        "cannot ask for the root key {what} ({e}): no terminal. Set {env} or pass \
-         --{what}-file <path>",
-        what = kind.as_str(),
-        env = kind.env_var().unwrap_or("-"),
-    ))
 }
 
 mod tty {

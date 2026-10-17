@@ -203,6 +203,30 @@ impl EnrollmentHint {
     }
 }
 
+/// What a key a context names is for ([`tlv::KEY_ROLE`]), beyond what the
+/// anchor set and the schema already say. Policy in data: it is signed with
+/// the context and carried to every version made from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyRole(pub u8);
+
+impl KeyRole {
+    /// An anchor that is a **recovery key**: generated for a recovery kit,
+    /// kept offline, root-equivalent (as every anchor, it can sign the next
+    /// version of the context) and used only to replace a lost root device.
+    pub const RECOVERY_ANCHOR: KeyRole = KeyRole(1);
+    /// A key that lives on the root device beside the root: its CA key and
+    /// its admin device key. A recovery after a compromise revokes them.
+    pub const ROOT_DEVICE: KeyRole = KeyRole(2);
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RECOVERY_ANCHOR => "recovery-anchor",
+            Self::ROOT_DEVICE => "root-device",
+            _ => "unknown",
+        }
+    }
+}
+
 /// One anchor-rooted namespace relationship in a [`Keyring`](crate::Keyring).
 ///
 /// A context owns the anchor set and schema for its `namespace`. Hierarchical
@@ -241,6 +265,8 @@ pub struct SignedTrustContext {
     /// back to the root of authority. Non-critical; `None` when unprojected
     /// (locally authored). See [`tlv::SOURCE_BUNDLE_HASH`].
     source_bundle_hash: Option<[u8; 32]>,
+    /// Roles of keys the context names ([`tlv::KEY_ROLE`]), in wire order.
+    key_roles: Vec<(KeyRole, Name)>,
 }
 
 impl SignedTrustContext {
@@ -257,6 +283,7 @@ impl SignedTrustContext {
             schema_blobs: Vec::new(),
             schema_authoritative: false,
             source_bundle_hash: None,
+            key_roles: Vec::new(),
         }
     }
 
@@ -346,6 +373,18 @@ impl SignedTrustContext {
         self.source_bundle_hash = Some(digest);
         self
     }
+    /// Give `key` (a key name) the role `role` (no duplicate entries).
+    pub fn with_key_role(mut self, role: KeyRole, key: Name) -> Self {
+        if !self.key_roles.iter().any(|(r, k)| *r == role && *k == key) {
+            self.key_roles.push((role, key));
+        }
+        self
+    }
+    /// Drop every role entry `drop` selects.
+    pub fn without_key_roles(mut self, drop: impl Fn(KeyRole, &Name) -> bool) -> Self {
+        self.key_roles.retain(|(r, k)| !drop(*r, k));
+        self
+    }
 
     // ── accessors ───────────────────────────────────────────────────────────
 
@@ -377,6 +416,21 @@ impl SignedTrustContext {
     /// projected from one (the F9 provenance hint).
     pub fn source_bundle_hash(&self) -> Option<&[u8; 32]> {
         self.source_bundle_hash.as_ref()
+    }
+    /// Every role entry ([`KeyRole`], key name), in wire order.
+    pub fn key_roles(&self) -> &[(KeyRole, Name)] {
+        &self.key_roles
+    }
+    /// The keys that have `role`.
+    pub fn keys_with_role(&self, role: KeyRole) -> impl Iterator<Item = &Name> {
+        self.key_roles
+            .iter()
+            .filter(move |(r, _)| *r == role)
+            .map(|(_, k)| k)
+    }
+    /// Whether `key` has `role`.
+    pub fn has_key_role(&self, key: &Name, role: KeyRole) -> bool {
+        self.key_roles.iter().any(|(r, k)| *r == role && k == key)
     }
 
     /// Shared handle to this context's anchor set. The chain walk terminates
@@ -553,6 +607,11 @@ impl SignedTrustContext {
             if let Some(digest) = &self.source_bundle_hash {
                 w.write_tlv(tlv::SOURCE_BUNDLE_HASH, digest);
             }
+            for (role, key) in &self.key_roles {
+                let mut value = vec![role.0];
+                value.extend_from_slice(&key.encode_to_tlv());
+                w.write_tlv(tlv::KEY_ROLE, &value);
+            }
         });
         w.finish()
     }
@@ -645,6 +704,7 @@ impl SignedTrustContext {
         let mut enrollment_hint: Option<EnrollmentHint> = None;
         let mut revocations: Vec<Name> = Vec::new();
         let mut source_bundle_hash: Option<[u8; 32]> = None;
+        let mut key_roles: Vec<(KeyRole, Name)> = Vec::new();
 
         let mut cur = value;
         while !cur.is_empty() {
@@ -720,6 +780,13 @@ impl SignedTrustContext {
                             .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
+                // A role byte, then the key's Name. A malformed entry is a
+                // hint lost, not a rejected context (non-critical).
+                tlv::KEY_ROLE if fval.len() > 1 => {
+                    if let Ok(key) = Name::decode_from_tlv(Bytes::copy_from_slice(&fval[1..])) {
+                        key_roles.push((KeyRole(fval[0]), key));
+                    }
+                }
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
                     return Err(SignedTrustContextError::Truncated(
@@ -753,6 +820,7 @@ impl SignedTrustContext {
             schema_blobs,
             schema_authoritative,
             source_bundle_hash,
+            key_roles,
         })
     }
 
@@ -1097,6 +1165,25 @@ mod tests {
         // The TLV code is even, so an old node that doesn't understand it skips
         // it rather than rejecting the whole context (NDN evolvability rule).
         assert_eq!(tlv::SOURCE_BUNDLE_HASH % 2, 0);
+    }
+
+    /// Key roles survive a re-encode (so every version made from a context
+    /// keeps them), unknown role codes included, and the TLV is non-critical.
+    #[test]
+    fn key_roles_roundtrip_and_are_non_critical() {
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(3)
+            .with_key_role(KeyRole::RECOVERY_ANCHOR, n("/home/bob/KEY/r0011223344556677"))
+            .with_key_role(KeyRole::ROOT_DEVICE, n("/home/bob/CA/KEY/ca"))
+            .with_key_role(KeyRole(9), n("/home/bob/x/KEY/k"));
+        let decoded = SignedTrustContext::decode_content(&ctx.encode_content(), 3).unwrap();
+        assert_eq!(decoded.key_roles(), ctx.key_roles());
+        assert!(decoded.has_key_role(&n("/home/bob/CA/KEY/ca"), KeyRole::ROOT_DEVICE));
+        assert_eq!(
+            decoded.keys_with_role(KeyRole::RECOVERY_ANCHOR).collect::<Vec<_>>(),
+            [&n("/home/bob/KEY/r0011223344556677")]
+        );
+        assert_eq!(tlv::KEY_ROLE % 2, 0);
     }
 
     // ── F10: in-process authoring (construct → sign → serialize → adopt) ────

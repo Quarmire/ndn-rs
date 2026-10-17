@@ -52,6 +52,9 @@ sha2         = { workspace = true }
 toml         = "0.8"
 zeroize      = "1"
 keyring      = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+# Recovery kits (`recovery`): a recovery key's 32-byte seed shown as 24
+# BIP39 English words, whose checksum catches a mistyped word.
+bip39        = { version = "2.2", default-features = false, features = ["std"] }
 
 # Root store: reading a passphrase / PIN from the terminal without echo.
 [target.'cfg(unix)'.dependencies]

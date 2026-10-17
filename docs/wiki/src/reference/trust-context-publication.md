@@ -19,9 +19,14 @@ that exact name.
 
 | Interest | Answer | Signed by |
 |---|---|---|
-| `/<ns>/32=trust-context/32=metadata` (CanBePrefix, MustBeFresh) | metadata Data `/<ns>/32=trust-context/32=metadata/v=<N>/seg=0`; Content = the Name `/<ns>/32=trust-context/v=<N>` only; FreshnessPeriod 1 s | DigestSha256 |
-| `/<ns>/32=trust-context/v=<N>` (exact) | the stored context Data, byte for byte as adopted | the namespace root (`/<ns>/KEY/…`), as signed at `init` |
-| anything else under `/<ns>/32=trust-context` (another version, …) | Nack `NoRoute` | — |
+| `/<ns>/32=trust-context/32=metadata` (CanBePrefix, MustBeFresh) | metadata Data `/<ns>/32=trust-context/32=metadata/v=<N>/seg=0`; Content = the Name `/<ns>/32=trust-context/v=<N>` of the newest version held, only; FreshnessPeriod 1 s | DigestSha256 |
+| `/<ns>/32=trust-context/v=<M>` (exact), for every version `M` the node held | the stored context Data, byte for byte as adopted | the key that made that version: the namespace root, or a recovery key (`/<ns>/KEY/…`) |
+| anything else under `/<ns>/32=trust-context` (a version not held, …) | Nack `NoRoute` | — |
+
+Older versions are served so a node holding one can follow the namespace
+version by version when the newest is not signed by an anchor of the version
+it holds (a recovery installed a new root in between; see
+[catching up](./context-updates.md#catching-up-across-versions)).
 
 The metadata Content carries no segment fields: a context is one Data packet.
 `ndn_app::rdr::MetaData` encodes and decodes both this Name-only form and the
@@ -74,20 +79,27 @@ reply whose name differs from the pointer. It never verifies a signature;
 At startup the daemon reads every context in `<pib_path>/contexts/` (its own
 namespace's context from `ndn-fwd init` and those added by `ndn-fwd adopt`),
 re-verifies each against its own anchors, and serves the ones that pass from
-one in-process face with one FIB entry `/<ns>/32=trust-context` per context.
-That entry is more specific than a `[ca]` entry `/<ns>`, so both coexist.
-A file that fails verification is logged and not published. The store keeps
-one file — the newest adopted version — per namespace.
+one in-process face with one FIB entry `/<ns>/32=trust-context` per
+namespace. That entry is more specific than a `[ca]` entry `/<ns>`, so both
+coexist. A file that fails verification is logged and not published. The
+store keeps, per namespace, the newest version held
+(`<pib_path>/contexts/<hex(ns)>.tc`, what the metadata names and the keyring
+loads) and every version held (`<pib_path>/contexts/<hex(ns)>.versions/<N>.tc`,
+each served by its exact name); the newest file only moves forward. A store
+written before versions were kept holds the newest only.
 
 The store is read at startup. A context the running daemon adopts
-(`ndn-fwd adopt`, see [Adopting a trust context](./context-adoption.md)) is added to
-the published set at once, replacing an older version of its namespace. The
-same holds for a newer version it adopts by refreshing
-([Trust-context updates](./context-updates.md)) and for a version the root
-device makes ([`ndn-fwd revoke`](./revocation.md)): every holder republishes
-an update as soon as it adopts it, so updates travel hop by hop — a device
-behind a relay fetches the new version from the relay, which fetched it from
-the root device — and no node needs a route to the root device.
+(`ndn-fwd adopt`, see [Adopting a trust context](./context-adoption.md)) is
+added to the published set at once, beside the versions of its namespace
+served already, and the metadata names it when it is the newest. The same
+holds for a newer version it adopts by refreshing
+([Trust-context updates](./context-updates.md)) — with the versions it walked
+through to reach it — and for a version made on the device
+([`ndn-fwd revoke`](./revocation.md), `ndn-fwd recovery-kit`, `ndn-fwd
+recover`): every holder republishes an update as soon as it adopts it, so
+updates travel hop by hop — a device behind a relay fetches the new version
+from the relay, which fetched it from the root device — and no node needs a
+route to the root device.
 
 While the daemon itself fetches a namespace's context (`ndn-fwd adopt` with a
 fingerprint-only link, or a refresh), its FIB entry `/<ns>/32=trust-context`
@@ -102,7 +114,7 @@ serve_contexts = true   # default; false publishes nothing
 ```
 
 Code: `binaries/ndn-fwd/src/context_publisher.rs` (ndn-fwd repository);
-the store reader is `ndn_cert::read_stored_contexts`.
+the store readers are `ndn_cert::{read_stored_contexts, read_stored_versions}`.
 
 ## Trying it
 

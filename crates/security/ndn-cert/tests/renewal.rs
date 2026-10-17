@@ -140,6 +140,7 @@ async fn renew(ns: &Namespace, device: &Device) -> Result<ndn_cert::IssuedCertif
         &device.keyring,
         &mut CaWire(Arc::clone(&ns.ca)),
         &device.cert,
+        &[],
         Arc::clone(&device.key),
     )
     .await

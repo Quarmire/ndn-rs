@@ -61,7 +61,7 @@ pub mod yubikey;
 pub use active_signer::ActiveSigner;
 pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
-pub use cert_fetcher::{CertFetcher, FetchFn};
+pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn};
 pub use confidentiality::{ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck};
 pub use error::TrustError;
 pub use keychain::{KeyAlgorithm, KeyChain};
@@ -82,7 +82,7 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    ContextExplanation, EnrollmentHint, OpenContextError, SchemaBlob, SchemaFormat,
+    ContextExplanation, EnrollmentHint, KeyRole, OpenContextError, SchemaBlob, SchemaFormat,
     SignedTrustContext, SignedTrustContextError, SigningPair, anchor_fingerprint,
     context_namespace_of, dryrun_orphans,
 };

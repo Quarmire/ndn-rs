@@ -215,8 +215,18 @@ pub enum TrustEnvelope {
     },
     /// A recovery bundle (public history; carries no private keys).
     Recovery { bundle: Bytes },
-    /// A password-encrypted SafeBag and the key name it carries.
-    Bag { key_name: String, safebag: Bytes },
+    /// A password-encrypted SafeBag and the key name it carries. A recovery
+    /// kit also names the namespace the key recovers and the namespace's
+    /// expected fingerprint when the kit was made (the root that signed the
+    /// context then), so a device that holds no context of the namespace can
+    /// adopt the right one before recovering. Both are optional on the wire:
+    /// a plain key-migration bag carries neither.
+    Bag {
+        key_name: String,
+        safebag: Bytes,
+        namespace: Option<String>,
+        fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]>,
+    },
     /// An ephemeral scoped capability (pairing).
     Capability(Capability),
 }
@@ -298,9 +308,20 @@ impl TrustEnvelope {
             TrustEnvelope::Recovery { bundle } => {
                 w.write_tlv(T_WIRE, bundle);
             }
-            TrustEnvelope::Bag { key_name, safebag } => {
+            TrustEnvelope::Bag {
+                key_name,
+                safebag,
+                namespace,
+                fingerprint,
+            } => {
                 w.write_tlv(T_KEY_NAME, key_name.as_bytes());
                 w.write_tlv(T_WIRE, safebag);
+                if let Some(ns) = namespace {
+                    w.write_tlv(T_NAMESPACE, ns.as_bytes());
+                }
+                if let Some(fp) = fingerprint {
+                    w.write_tlv(T_ANCHOR_FINGERPRINT, fp);
+                }
             }
             TrustEnvelope::Capability(c) => {
                 w.write_tlv(T_DIRECTION, &[c.direction.code()]);
@@ -427,6 +448,8 @@ impl TrustEnvelope {
             TrustKind::Bag => TrustEnvelope::Bag {
                 key_name: key_name.ok_or(need("key name"))?,
                 safebag: wire.ok_or(need("safebag"))?,
+                namespace,
+                fingerprint,
             },
             TrustKind::Capability => TrustEnvelope::Capability(Capability {
                 direction: CapDirection::from_code(direction.ok_or(need("direction"))?)?,
@@ -656,6 +679,14 @@ mod tests {
         round_trip(&TrustEnvelope::Bag {
             key_name: "/ndn/mobile/alice/KEY/18b5e7d515966f90".into(),
             safebag: Bytes::from_static(b"\x80\x10encrypted-safebag"),
+            namespace: None,
+            fingerprint: None,
+        });
+        round_trip(&TrustEnvelope::Bag {
+            key_name: "/home/bob/KEY/r0011223344556677".into(),
+            safebag: Bytes::from_static(b"\x80\x10encrypted-safebag"),
+            namespace: Some("/home/bob".into()),
+            fingerprint: Some([7; ANCHOR_FINGERPRINT_LEN]),
         });
     }
 

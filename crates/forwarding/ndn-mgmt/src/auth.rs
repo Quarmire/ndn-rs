@@ -273,6 +273,10 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     ),
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::CONTEXT_UPDATE,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::RENEW,
     ),
 ];
@@ -539,6 +543,7 @@ mod trust_admin_tests {
         assert!(is_trust_admin_verb(b"security", b"enroll"));
         assert!(is_trust_admin_verb(b"security", b"revoke"));
         assert!(is_trust_admin_verb(b"security", b"context-refresh"));
+        assert!(is_trust_admin_verb(b"security", b"context-update"));
         assert!(is_trust_admin_verb(b"security", b"renew"));
         assert!(!is_trust_admin_verb(b"security", b"ca-enroll"));
         assert!(!is_trust_admin_verb(b"security", b"anchor-list"));

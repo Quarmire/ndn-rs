@@ -165,7 +165,8 @@ pub trait IssuancePolicy: Send + Sync {
     /// [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE): the CA
     /// offers renewal only then. A renewal reaches [`decide`](Self::decide)
     /// with a `renewal` attestation leaf once the CA has checked that the
-    /// requester holds a current, unrevoked certificate it issued for the
+    /// requester holds a current, unrevoked certificate it issued (or an
+    /// earlier CA of its identity issued, see [`crate::renewal`]) for the
     /// same key; the policy then decides whether that certificate's role is
     /// renewable and for how long. Default `false`: no renewal.
     fn offers_renewal(&self) -> bool {
@@ -272,9 +273,10 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 /// - `admin` and `node` certificates are never issued on a token alone;
 /// - a **renewal** (the CA's built-in [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE):
 ///   the requester proved it holds a current, unrevoked certificate this CA
-///   issued for the same key) admits the role of that certificate when the
-///   role is renewable ([`RoleTerms::renewable`]; every role but `guest` by
-///   default, so guest access simply ends);
+///   — or an earlier CA of its identity — issued for the same key) admits
+///   the role of that certificate when the role is renewable
+///   ([`RoleTerms::renewable`]; every role but `guest` by default, so guest
+///   access simply ends);
 /// - other challenges (pin, email, nop, …) admit no role;
 /// - a device identity `/<ns>/<role>/<device>` holds one certified key at a
 ///   time ([`single_key_identity`](IssuancePolicy::single_key_identity)): a

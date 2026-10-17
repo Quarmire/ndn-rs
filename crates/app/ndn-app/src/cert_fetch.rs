@@ -26,17 +26,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_engine::ForwarderEngine;
+use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::InterestBuilder;
-use ndn_security::{CertCache, CertFetcher, FetchFn};
+use ndn_security::{CertCache, CertFetcher, DirectFetchFn, FetchFn};
+use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, InProcConnection};
 use crate::{Consumer, DemuxConnection, EngineAppExt};
+
+/// In-process face buffer depth of the direct-fetch face (as an app face's).
+const DIRECT_FACE_BUFFER: usize = 256;
 
 /// Upper bound on one certificate fetch, and the back-off before a failed
 /// name is fetched again.
 pub const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The cert Interest both fetch paths express: see [`engine_fetch_fn`].
+fn cert_interest(name: Name) -> InterestBuilder {
+    InterestBuilder::new(name)
+        .can_be_prefix()
+        .must_be_fresh()
+        .lifetime(CERT_FETCH_TIMEOUT)
+}
 
 /// A [`FetchFn`] that expresses each cert Interest through `engine` on one
 /// in-process app face (tied to `cancel`). Concurrent fetches share the face;
@@ -52,12 +65,40 @@ pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> F
     Arc::new(move |name: Name| {
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
-            let wire = InterestBuilder::new(name)
-                .can_be_prefix()
-                .must_be_fresh()
-                .lifetime(CERT_FETCH_TIMEOUT)
-                .build();
+            let wire = cert_interest(name).build();
             consumer.fetch_wire(wire, CERT_FETCH_TIMEOUT).await.ok()
+        })
+    })
+}
+
+/// A [`DirectFetchFn`]: the same cert Interest, expressed through `engine`
+/// out of one given face (NDNLPv2 `NextHopFaceId`, bypassing the FIB) — the
+/// face the Data being validated arrived on, whose producer serves its own
+/// issuer chain. The in-process face it is sent from opts into LocalFields,
+/// without which the forwarder ignores `NextHopFaceId`. A face the FIB
+/// already routes the name to is not asked again: the routed fetch went
+/// there.
+pub fn engine_direct_fetch_fn(
+    engine: &ForwarderEngine,
+    cancel: CancellationToken,
+) -> DirectFetchFn {
+    let face_id = engine.faces().alloc_id();
+    let (face, handle) = InProcFace::new(face_id, DIRECT_FACE_BUFFER);
+    engine.add_face(face, cancel);
+    engine.set_local_fields(face_id, true);
+    let conn: Arc<dyn Connection> = DemuxConnection::new(Arc::new(InProcConnection::new(handle)));
+    let fib = engine.fib();
+    Arc::new(move |name: Name, face: u64| {
+        let face = FaceId(face);
+        let routed_there = fib
+            .lpm(&name)
+            .is_some_and(|entry| entry.nexthops.iter().any(|hop| hop.face_id == face));
+        let mut consumer = Consumer::new(Arc::clone(&conn));
+        Box::pin(async move {
+            if routed_there {
+                return None;
+            }
+            consumer.fetch_with_on(face, cert_interest(name)).await.ok()
         })
     })
 }
@@ -69,11 +110,10 @@ pub fn engine_cert_fetcher(
     cache: Arc<CertCache>,
     cancel: CancellationToken,
 ) -> Arc<CertFetcher> {
-    Arc::new(CertFetcher::new(
-        cache,
-        engine_fetch_fn(engine, cancel),
-        CERT_FETCH_TIMEOUT,
-    ))
+    Arc::new(
+        CertFetcher::new(cache, engine_fetch_fn(engine, cancel.clone()), CERT_FETCH_TIMEOUT)
+            .with_direct_fetch(engine_direct_fetch_fn(engine, cancel)),
+    )
 }
 
 /// Attach an engine-backed [`CertFetcher`] to the engine's own data-path

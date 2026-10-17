@@ -9,7 +9,9 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use dashmap::{DashMap, DashSet};
-use ndn_security::{Certificate, SecurityManager, Signer};
+use ndn_security::{
+    CertCache, Certificate, Keyring, SecurityManager, Signer, ValidationResult, Validator,
+};
 
 use crate::{
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState},
@@ -113,7 +115,9 @@ pub struct CaState {
     /// certificate of a key revokes the key, so its other certificates (a
     /// renewal's included) are refused too and it is never certified again.
     revoked_keys: DashSet<String>,
-    /// Issued cert wire bytes, served on the cert-fetch Interest.
+    /// Issued cert wire bytes, served on the cert-fetch Interest — and the
+    /// certificates of earlier CAs of this CA's identity that a renewal's
+    /// chain went through ([`accept_earlier_ca_certificates`](Self::accept_earlier_ca_certificates)).
     served_certs: DashMap<String, Vec<u8>>,
     /// Durable backing for `served_certs` / `revoked`; `None` keeps both
     /// in memory only.
@@ -125,6 +129,10 @@ pub struct CaState {
     /// one of them is refused before its challenge runs, so the loser of a
     /// race spends no one-time token.
     in_flight: DashSet<String>,
+    /// The trust contexts a renewal of a certificate issued by an earlier CA
+    /// of this CA's identity is verified under; unset, the CA renews only
+    /// the certificates it issued.
+    earlier_ca: std::sync::OnceLock<Arc<Keyring>>,
 }
 
 impl CaState {
@@ -141,6 +149,7 @@ impl CaState {
             store: None,
             issuing: tokio::sync::Mutex::new(()),
             in_flight: DashSet::new(),
+            earlier_ca: std::sync::OnceLock::new(),
         };
         state.serve_own_certificate();
         state
@@ -166,6 +175,21 @@ impl CaState {
         Ok(state)
     }
 
+    /// Renew certificates issued by an earlier CA of this CA's identity —
+    /// e.g. the CA of a root device that was replaced through a recovery
+    /// kit — besides the ones this CA issued. Such a renewal carries the
+    /// certificate and the issuer certificates of its chain
+    /// ([`crate::renewal`]), verified under the trust contexts in `keyring`
+    /// (the node's own): the certificate must chain to an anchor of its
+    /// namespace's context under that context's schema, through no revoked
+    /// key. This CA serves (and persists, with a store) the earlier CA's
+    /// certificates of an accepted chain from then on, so validators that
+    /// fetch them by key name from `<identity>` find them here. Set once: a
+    /// later call is ignored.
+    pub fn accept_earlier_ca_certificates(&self, keyring: Arc<Keyring>) {
+        let _ = self.earlier_ca.set(keyring);
+    }
+
     /// Serve the CA's own certificate on cert-fetch so requesters can walk
     /// an issued cert's chain up to the anchor they hold.
     fn serve_own_certificate(&self) {
@@ -175,6 +199,15 @@ impl CaState {
             self.served_certs
                 .insert(cert.name.to_string(), serialize_cert(&cert));
         }
+    }
+
+    /// Whether `key` is a key of this CA's identity other than the one it
+    /// signs with — the key of an earlier CA of the same identity. The
+    /// identity is the signing key name minus `KEY/<id>`. Certificates of
+    /// such keys are never ones this CA issued.
+    fn is_earlier_ca_key(&self, key: &ndn_packet::Name) -> bool {
+        self.signing_key_name()
+            .is_some_and(|own| is_other_key_of_identity(&own, key))
     }
 
     pub fn cleanup_expired(&self, ttl_secs: u64) {
@@ -268,11 +301,14 @@ impl CaState {
     }
 
     /// The built-in renewal challenge ([`crate::renewal`]): approved when
-    /// `params` name a certificate this CA issued for the request's key and
-    /// public key, valid now, of a key with no revoked certificate, and prove
-    /// that key with a signature over this exchange's request id and the
-    /// certificate's name. The issuance policy then decides whether the role
-    /// renews and for how long.
+    /// `params` name a certificate this CA issued — or, when it
+    /// [accepts them](Self::accept_earlier_ca_certificates), carry one an
+    /// earlier CA of its identity issued that chains to the namespace root
+    /// ([`earlier_ca_certificate`](Self::earlier_ca_certificate)) — for the
+    /// request's key and public key, valid now, of a key with no revoked
+    /// certificate, and prove that key with a signature over this exchange's
+    /// request id and the certificate's name. The issuance policy then
+    /// decides whether the role renews and for how long.
     async fn verify_renewal(
         &self,
         request_id: &str,
@@ -296,15 +332,20 @@ impl CaState {
         };
         let own = self.ca_certificate().is_some_and(|ca| *ca.name == cert_name);
         let canonical = cert_name.to_string();
-        let Some(cert) = (!own)
+        // A certificate this CA issued: neither its own nor an earlier CA's
+        // it serves.
+        let issued_here =
+            !own && !self.is_earlier_ca_key(&ndn_security::cert_name::key_name_of(&cert_name));
+        let issued = issued_here
             .then(|| self.served_certs.get(&canonical))
             .flatten()
-            .and_then(|wire| deserialize_cert(&wire))
-        else {
-            return deny(format!(
-                "{cert_name} is not a certificate this CA issued: it renews only those; enroll \
-                 with an invite instead"
-            ));
+            .and_then(|wire| deserialize_cert(&wire));
+        let (cert, earlier_cas) = match issued {
+            Some(cert) => (cert, Vec::new()),
+            None => match self.earlier_ca_certificate(&cert_name, params).await {
+                Ok(found) => found,
+                Err(reason) => return deny(reason),
+            },
         };
         // The certificate renewed is `<key>/<issuer>/<version>`, or a
         // certificate an earlier release named after its key (`<key>`).
@@ -356,11 +397,144 @@ impl CaState {
                 "the renewal proof does not verify under the key of {cert_name}"
             ));
         }
+        self.serve_earlier_ca_certificates(earlier_cas);
         ChallengeOutcome::Approved {
             attestation: Some(crate::attestation::AttestationSet::single(
                 crate::attestation::ChallengeAttestation::of_kind(RENEWAL_CHALLENGE)
                     .with_evidence("certificate", canonical.into()),
             )),
+        }
+    }
+
+    /// The certificate `cert_name` a renewal names that this CA did not
+    /// issue, taken when the CA [accepts earlier CAs'
+    /// certificates](Self::accept_earlier_ca_certificates): the renewal
+    /// carries it ([`CERTIFICATE_PARAM`](crate::renewal::CERTIFICATE_PARAM))
+    /// with the issuer certificates of its chain
+    /// ([`ISSUERS_PARAM`](crate::renewal::ISSUERS_PARAM)); it must be
+    /// `cert_name`, issued by an earlier CA of this CA's identity, not revoked
+    /// by its namespace's trust context, and chain to an anchor of that
+    /// context under its schema — the walk refuses a revoked key on the way.
+    /// Returns it with the earlier CA certificates (`(name URI, wire)`) its
+    /// chain went through. `Err` is the reason to refuse.
+    async fn earlier_ca_certificate(
+        &self,
+        cert_name: &ndn_packet::Name,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(Certificate, Vec<(String, Vec<u8>)>), String> {
+        use crate::renewal::CERTIFICATE_PARAM;
+        let not_issued = || {
+            format!(
+                "{cert_name} is not a certificate this CA issued: it renews only those; enroll \
+                 with an invite instead"
+            )
+        };
+        let (Some(keyring), Some(carried)) = (
+            self.earlier_ca.get(),
+            params.get(CERTIFICATE_PARAM).and_then(|v| v.as_str()),
+        ) else {
+            return Err(not_issued());
+        };
+        let data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(carried)
+            .ok()
+            .and_then(|wire| ndn_packet::Data::decode(bytes::Bytes::from(wire)).ok())
+            .ok_or_else(|| {
+                format!(
+                    "the certificate the renewal carries ({CERTIFICATE_PARAM}) is not a Data packet"
+                )
+            })?;
+        let cert = Certificate::decode(&data).map_err(|e| {
+            format!("the certificate the renewal carries ({CERTIFICATE_PARAM}) is malformed: {e}")
+        })?;
+        if *cert.name != *cert_name {
+            return Err(format!(
+                "the renewal names {cert_name} but carries the certificate {}",
+                cert.name
+            ));
+        }
+        let issuer = cert.issuer.as_deref().map(ndn_security::cert_name::key_name_of);
+        if !issuer.as_ref().is_some_and(|key| self.is_earlier_ca_key(key)) {
+            return Err(format!(
+                "{cert_name} is not a certificate this CA issued, nor one an earlier CA of its \
+                 identity issued (its issuer is {}): it renews only those; enroll with an invite \
+                 instead",
+                issuer.map_or_else(|| "unnamed".to_string(), |key| key.to_string())
+            ));
+        }
+        if keyring.context_for(cert_name).is_revoked(cert_name) {
+            return Err(format!(
+                "the trust context of its namespace revokes {cert_name}, and a revoked key is \
+                 never renewed: enroll a new key with a new invite"
+            ));
+        }
+        let no_chain = |why: String| {
+            format!(
+                "{cert_name} is not a certificate this CA issued, and it does not chain to the \
+                 namespace root under this node's trust context: {why}"
+            )
+        };
+        let validator = Validator::with_keyring(
+            Arc::clone(keyring),
+            Arc::new(CertCache::new()),
+            None,
+            EARLIER_CA_MAX_CHAIN,
+        );
+        for issuer in carried_issuers(params) {
+            validator.cert_cache().insert(issuer);
+        }
+        let walked = match validator.validate_chain_cached(&data).await {
+            // Only a certificate chain proves anything: a digest "signature"
+            // validates whatever KeyLocator it names.
+            (ValidationResult::Valid(safe), _) => match safe.trust_path() {
+                ndn_security::safe_data::TrustPath::CertChain(walked) => walked.clone(),
+                _ => return Err(no_chain("it is not signed by a certified key".into())),
+            },
+            (ValidationResult::Invalid(e), _) => return Err(no_chain(e.to_string())),
+            (ValidationResult::Pending, missing) => {
+                return Err(no_chain(format!(
+                    "the renewal does not carry the certificate of {}, on its chain",
+                    missing.map_or_else(|| "an issuer".to_string(), |name| name.to_string())
+                )));
+            }
+        };
+        // The KeyLocators the walk resolved, each to the newest valid
+        // certificate of its key the renewal carried: those of earlier CAs.
+        let earlier_cas = walked
+            .iter()
+            .filter(|locator| {
+                self.is_earlier_ca_key(&ndn_security::cert_name::key_name_of(locator))
+            })
+            .filter_map(|locator| validator.cert_cache().get_valid(locator))
+            .map(|ca| (ca.name.to_string(), serialize_cert(&ca)))
+            .collect();
+        Ok((cert, earlier_cas))
+    }
+
+    /// Serve `certs` — earlier CA certificates (`(name URI, wire)`) a
+    /// renewal's chain went through — on cert-fetch from now on, written
+    /// through the store as issued certificates are, so a restart keeps
+    /// serving them. One already served is left as it is. A failed write is
+    /// logged, and the certificate served until the CA stops: the renewal
+    /// it proved does not depend on it.
+    fn serve_earlier_ca_certificates(&self, certs: Vec<(String, Vec<u8>)>) {
+        for (name, wire) in certs {
+            if self.served_certs.contains_key(&name) {
+                continue;
+            }
+            if let Some(store) = &self.store
+                && let Err(e) = store.record_issued(&name, &wire)
+            {
+                tracing::warn!(
+                    certificate = %name, error = %e,
+                    "CA could not persist an earlier CA's certificate; it is served until restart"
+                );
+            }
+            tracing::info!(
+                certificate = %name,
+                "CA serves an earlier CA's certificate of a renewed certificate's chain"
+            );
+            self.served_certs.insert(name, wire);
         }
     }
 
@@ -831,10 +1005,11 @@ impl CaState {
     }
 
     /// Only certificates this CA issued (those it serves on cert-fetch, its
-    /// own cert excepted) can be revoked. The request's possession proof —
-    /// a signature over the cert name — must verify under that cert's own
-    /// key (its holder revokes it) or under the CA's signing key (the CA
-    /// revokes any cert it issued); any other key is refused.
+    /// own and earlier CAs' certificates excepted) can be revoked. The
+    /// request's possession proof — a signature over the cert name — must
+    /// verify under that cert's own key (its holder revokes it) or under the
+    /// CA's signing key (the CA revokes any cert it issued); any other key is
+    /// refused.
     async fn do_revoke(&self, body: &[u8]) -> u8 {
         let req = match RevokeRequestTlv::decode(bytes::Bytes::copy_from_slice(body)) {
             Ok(r) => r,
@@ -846,7 +1021,11 @@ impl CaState {
             Err(_) => return REVOKE_STATUS_NOT_FOUND,
         };
         let own_key = self.signing_key_name();
-        if own_key.as_ref() == Some(&ndn_security::cert_name::key_name_of(&cert_name)) {
+        let key = ndn_security::cert_name::key_name_of(&cert_name);
+        if own_key
+            .as_ref()
+            .is_some_and(|own| *own == key || is_other_key_of_identity(own, &key))
+        {
             return REVOKE_STATUS_NOT_FOUND;
         }
         // Canonical URI: the key `served_certs`, `revoked` and the store use.
@@ -906,8 +1085,8 @@ impl CaState {
     }
 
     /// The certificates this CA issued under `prefix` (an identity, a key
-    /// name or a certificate name), its own excepted, each with whether it
-    /// is revoked (itself or through its key).
+    /// name or a certificate name), its own and earlier CAs' certificates
+    /// excepted, each with whether it is revoked (itself or through its key).
     pub fn issued_under(&self, prefix: &ndn_packet::Name) -> Vec<(ndn_packet::Name, bool)> {
         let own = self.signing_key_name();
         let mut issued: Vec<_> = self
@@ -915,8 +1094,11 @@ impl CaState {
             .iter()
             .filter_map(|entry| {
                 let name: ndn_packet::Name = entry.key().parse().ok()?;
-                let own_cert = own.as_ref() == Some(&ndn_security::cert_name::key_name_of(&name));
-                (name.has_prefix(prefix) && !own_cert).then(|| (name, self.is_revoked(entry.key())))
+                let key = ndn_security::cert_name::key_name_of(&name);
+                let ca_cert = own
+                    .as_ref()
+                    .is_some_and(|own| *own == key || is_other_key_of_identity(own, &key));
+                (name.has_prefix(prefix) && !ca_cert).then(|| (name, self.is_revoked(entry.key())))
             })
             .collect();
         issued.sort_by_key(|(name, _)| name.to_string());
@@ -1088,6 +1270,51 @@ async fn verify_possession(message: &[u8], signature: &[u8], public_key: &[u8]) 
         }
     }
     false
+}
+
+/// The longest chain an earlier CA's certificate is walked along to an
+/// anchor, and the most issuer certificates taken from a renewal.
+const EARLIER_CA_MAX_CHAIN: usize = 8;
+
+/// The issuer certificates a renewal carries
+/// ([`ISSUERS_PARAM`](crate::renewal::ISSUERS_PARAM)): a JSON array of
+/// base64url (no padding) certificate Data wires, which arrives as JSON text
+/// (every non-string CHALLENGE parameter does). Entries that do not decode
+/// are skipped.
+fn carried_issuers(params: &serde_json::Map<String, serde_json::Value>) -> Vec<Certificate> {
+    let parsed: Vec<serde_json::Value>;
+    let entries: &[serde_json::Value] = match params.get(crate::renewal::ISSUERS_PARAM) {
+        Some(serde_json::Value::Array(entries)) => entries,
+        Some(serde_json::Value::String(text)) => {
+            parsed = serde_json::from_str(text).unwrap_or_default();
+            &parsed
+        }
+        _ => &[],
+    };
+    entries
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .take(EARLIER_CA_MAX_CHAIN)
+        .filter_map(|entry| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(entry)
+                .ok()
+        })
+        .filter_map(|wire| deserialize_cert(&wire))
+        .collect()
+}
+
+/// Whether `key` is another key of the identity `own` is a key of: `own` is
+/// `<identity>/KEY/<id>`, `key` is `<identity>/KEY/<other id>`.
+fn is_other_key_of_identity(own: &ndn_packet::Name, key: &ndn_packet::Name) -> bool {
+    let (mine, theirs) = (own.components(), key.components());
+    let n = mine.len();
+    n >= 2
+        && theirs.len() == n
+        && mine[n - 2].typ == ndn_packet::tlv_type::NAME_COMPONENT
+        && mine[n - 2].value.as_ref() == b"KEY"
+        && mine[..n - 1] == theirs[..n - 1]
+        && mine[n - 1] != theirs[n - 1]
 }
 
 fn generate_request_id_bytes() -> [u8; 8] {

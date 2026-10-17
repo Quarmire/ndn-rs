@@ -312,14 +312,15 @@ async fn a_failed_refresh_never_drops_a_good_context() {
         .unwrap()
         .unwrap();
 
-    // Nothing answers.
+    // Nothing answers: the namespace could not be asked at all.
     let mut silent = Upstream {
         replies: Vec::new(),
         sent: Vec::new(),
     };
     let res = refresh_context(&relay, Some(&validator), &mut silent, &ns).await;
-    assert!(matches!(res, Err(RefreshError::Fetch { held: 1, .. })), "{res:?}");
-    // The metadata announces v2, the context itself never arrives.
+    assert!(matches!(res, Err(RefreshError::NoAnswer { held: 1, .. })), "{res:?}");
+    // The metadata announces v2, the context itself never arrives: something
+    // answered, so this is not "nothing answered".
     let mut half = Upstream::serving(&v2.data);
     half.replies.truncate(1);
     let res = refresh_context(&relay, Some(&validator), &mut half, &ns).await;

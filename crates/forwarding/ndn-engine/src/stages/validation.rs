@@ -28,6 +28,7 @@ use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_packet::Name;
 use ndn_security::{TrustError, ValidationResult, Validator};
+use ndn_transport::FaceId;
 
 struct PendingEntry {
     ctx: PacketContext,
@@ -184,13 +185,16 @@ impl ValidationStage {
     }
 
     /// Kick off a background fetch of `cert_name` through the validator's
-    /// fetcher, if one is attached. Never awaited on the pipeline.
-    fn request_cert(&self, validator: &Validator, cert_name: &Arc<Name>) {
+    /// fetcher, if one is attached: routed by the FIB and, where the fetcher
+    /// can, also asked of `in_face`, the neighbour that delivered the Data
+    /// waiting on it (a producer serves its own issuer chain). Never awaited
+    /// on the pipeline.
+    fn request_cert(&self, validator: &Validator, cert_name: &Arc<Name>, in_face: FaceId) {
         if let Some(fetcher) = validator.cert_fetcher() {
             let fetcher = Arc::clone(fetcher);
             let cn = Arc::clone(cert_name);
             self.runtime.spawn(Box::pin(async move {
-                let _ = fetcher.fetch(&cn).await;
+                let _ = fetcher.fetch_from(&cn, Some(in_face.0)).await;
             }));
         }
     }
@@ -267,7 +271,7 @@ impl ValidationStage {
                     self.stats.pending.fetch_add(1, Ordering::Relaxed);
                     debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, awaiting certificate (queued)");
 
-                    self.request_cert(validator, &cert_name);
+                    self.request_cert(validator, &cert_name, ctx.face_id);
 
                     let now = self.runtime.now();
                     let mut pending = self.pending.lock().await;
@@ -333,7 +337,7 @@ impl ValidationStage {
                         // deadline bounds the whole resolution).
                         (ValidationResult::Pending, Some(next)) if now < deadline => {
                             debug!(target: t::SECURITY, name=%data.name, cert=%next, "validation: next cert in chain missing, re-queuing");
-                            self.request_cert(validator, &next);
+                            self.request_cert(validator, &next, ctx.face_id);
                             self.pending.lock().await.push(ctx, next, deadline);
                         }
                         (ValidationResult::Pending, _) => {

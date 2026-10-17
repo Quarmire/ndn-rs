@@ -6,6 +6,14 @@
 //! recent failures (a negative cache) so a stream of Data signed by an
 //! unfetchable key costs one cert Interest per backoff window rather than one
 //! per packet.
+//!
+//! A fetcher may also ask the neighbour that delivered the Data being
+//! validated ([`CertFetcher::with_direct_fetch`], [`CertFetcher::fetch_from`]),
+//! as ndn-cxx's `CertificateFetcherDirectFetch` does: a producer serves its
+//! own issuer chain, which matters when nobody the routes lead to holds it
+//! any more (an earlier CA whose root device was replaced). Where a
+//! certificate came from never makes it trusted: the chain walk verifies
+//! every hop up to an anchor.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,9 +30,15 @@ use crate::cert_cache::{CertCache, Certificate};
 pub type FetchFn =
     Arc<dyn Fn(Name) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
 
+/// Fetch a certificate name out of one face (a forwarder face id), bypassing
+/// the FIB.
+pub type DirectFetchFn =
+    Arc<dyn Fn(Name, u64) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
+
 pub struct CertFetcher {
     cert_cache: Arc<CertCache>,
     fetch_fn: FetchFn,
+    direct_fn: Option<DirectFetchFn>,
     in_flight: DashMap<Arc<Name>, broadcast::Sender<Option<Certificate>>>,
     /// Names whose last fetch failed → instant until which re-fetching is
     /// suppressed. Bounded: pruned of expired entries once it exceeds
@@ -37,6 +51,12 @@ pub struct CertFetcher {
 /// Size at which expired negative-cache entries are swept.
 const NEGATIVE_CACHE_PRUNE_AT: usize = 1024;
 
+/// How long a routed fetch has to answer before the neighbour that delivered
+/// the packet is asked too ([`CertFetcher::fetch_from`]). Well above a
+/// forwarder's retransmission-suppression window (NFD and ndn-rs: 10 ms), so
+/// the second Interest is forwarded rather than aggregated.
+const DIRECT_FETCH_AFTER: Duration = Duration::from_millis(50);
+
 impl CertFetcher {
     /// `timeout` bounds each fetch; a failed fetch suppresses re-fetching the
     /// same name for `timeout` as well (see [`Self::with_negative_ttl`]).
@@ -44,6 +64,7 @@ impl CertFetcher {
         Self {
             cert_cache,
             fetch_fn,
+            direct_fn: None,
             in_flight: DashMap::new(),
             failed: DashMap::new(),
             timeout,
@@ -55,6 +76,13 @@ impl CertFetcher {
     /// (`Duration::ZERO` disables the negative cache).
     pub fn with_negative_ttl(mut self, ttl: Duration) -> Self {
         self.negative_ttl = ttl;
+        self
+    }
+
+    /// Also ask the face a validated packet arrived on, in parallel with the
+    /// routed fetch, when [`Self::fetch_from`] names one.
+    pub fn with_direct_fetch(mut self, direct_fn: DirectFetchFn) -> Self {
+        self.direct_fn = Some(direct_fn);
         self
     }
 
@@ -76,6 +104,18 @@ impl CertFetcher {
     /// any follower awaiting `rx.recv()` unblocks with `RecvError::Closed`
     /// mapped to `CertNotFound` instead of hanging.
     pub async fn fetch(&self, cert_name: &Arc<Name>) -> Result<Certificate, TrustError> {
+        self.fetch_from(cert_name, None).await
+    }
+
+    /// [`Self::fetch`], also asking the neighbour on `face` (the face the
+    /// packet being validated arrived on) when a direct fetch is configured:
+    /// both are asked at once and the first certificate under `cert_name`
+    /// answers.
+    pub async fn fetch_from(
+        &self,
+        cert_name: &Arc<Name>,
+        face: Option<u64>,
+    ) -> Result<Certificate, TrustError> {
         if let Some(cert) = self.cert_cache.get_valid(cert_name) {
             return Ok(cert);
         }
@@ -120,7 +160,7 @@ impl CertFetcher {
             cert_name: Arc::clone(cert_name),
         };
 
-        let result = self.do_fetch(cert_name).await;
+        let result = self.do_fetch(cert_name, face).await;
 
         if result.is_err() && !self.negative_ttl.is_zero() {
             let now = tokio::time::Instant::now();
@@ -138,10 +178,35 @@ impl CertFetcher {
         result
     }
 
-    async fn do_fetch(&self, cert_name: &Arc<Name>) -> Result<Certificate, TrustError> {
+    async fn do_fetch(
+        &self,
+        cert_name: &Arc<Name>,
+        face: Option<u64>,
+    ) -> Result<Certificate, TrustError> {
         let name = cert_name.as_ref().clone();
+        let routed = (self.fetch_fn)(name.clone());
+        let answer = async {
+            let (Some(face), Some(direct)) = (face, &self.direct_fn) else {
+                return routed.await;
+            };
+            // The neighbour is asked only when the routed fetch has not
+            // answered within `DIRECT_FETCH_AFTER`, and never sooner: the
+            // same Interest arriving at the forwarder twice within its
+            // retransmission-suppression window aggregates into one PIT
+            // entry, so the later of the two would never be sent.
+            let started = tokio::time::Instant::now();
+            tokio::pin!(routed);
+            match tokio::time::timeout(DIRECT_FETCH_AFTER, &mut routed).await {
+                Ok(Some(data)) => Some(data),
+                Ok(None) => {
+                    tokio::time::sleep_until(started + DIRECT_FETCH_AFTER).await;
+                    direct(name, face).await
+                }
+                Err(_) => first_some(routed, direct(name, face)).await,
+            }
+        };
 
-        let data = tokio::time::timeout(self.timeout, (self.fetch_fn)(name))
+        let data = tokio::time::timeout(self.timeout, answer)
             .await
             .map_err(|_| TrustError::CertNotFound {
                 name: format!("timeout fetching {}", cert_name),
@@ -160,6 +225,25 @@ impl CertFetcher {
         }
         self.cert_cache.insert(cert.clone());
         Ok(cert)
+    }
+}
+
+/// The first of `a` and `b` to answer `Some`; `None` once both answered `None`.
+async fn first_some<A, B>(a: A, b: B) -> Option<Data>
+where
+    A: Future<Output = Option<Data>>,
+    B: Future<Output = Option<Data>>,
+{
+    tokio::pin!(a, b);
+    tokio::select! {
+        found = &mut a => match found {
+            Some(data) => Some(data),
+            None => b.await,
+        },
+        found = &mut b => match found {
+            Some(data) => Some(data),
+            None => a.await,
+        },
     }
 }
 
@@ -458,5 +542,62 @@ mod tests {
             assert!(fetcher.fetch(&name).await.is_err());
         }
         assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+
+    /// A routed fetch that never answers (the routes lead to a node that no
+    /// longer holds the certificate: an earlier CA after its root device was
+    /// replaced) is rescued by the neighbour that delivered the packet,
+    /// asked on its face no sooner than `DIRECT_FETCH_AFTER` — so the two
+    /// Interests are not aggregated into one PIT entry.
+    #[tokio::test]
+    async fn the_delivering_face_answers_when_the_routed_fetch_cannot() {
+        let cert_name = make_cert_name("earlier-ca");
+        let routed: FetchFn = Arc::new(|_| Box::pin(std::future::pending()));
+        let asked = Arc::new(std::sync::OnceLock::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (cn, log, n) = (Arc::clone(&cert_name), Arc::clone(&asked), Arc::clone(&count));
+        let started = tokio::time::Instant::now();
+        let direct: DirectFetchFn = Arc::new(move |_, face| {
+            n.fetch_add(1, Ordering::Relaxed);
+            let _ = log.set((face, started.elapsed()));
+            let data = make_cert_data(&cn, &[7; 32]);
+            Box::pin(async move { Some(data) })
+        });
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
+            .with_direct_fetch(direct);
+
+        let cert = fetcher.fetch_from(&cert_name, Some(9)).await.unwrap();
+        assert_eq!(cert.public_key.as_ref(), &[7; 32]);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        let (face, after) = *asked.get().unwrap();
+        assert_eq!(face, 9, "asked on the face the packet arrived on");
+        assert!(after >= DIRECT_FETCH_AFTER, "asked too soon: {after:?}");
+    }
+
+    /// A routed fetch that answers in time is all that is sent; without a
+    /// face, or without a direct fetch configured, the neighbour is never
+    /// asked.
+    #[tokio::test]
+    async fn the_delivering_face_is_not_asked_when_the_routes_answer() {
+        let cert_name = make_cert_name("current-ca");
+        let cn = Arc::clone(&cert_name);
+        let routed: FetchFn = Arc::new(move |_| {
+            let data = make_cert_data(&cn, &[8; 32]);
+            Box::pin(async move { Some(data) })
+        });
+        let direct_count = Arc::new(AtomicUsize::new(0));
+        let dc = Arc::clone(&direct_count);
+        let direct: DirectFetchFn = Arc::new(move |_, _| {
+            dc.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { None })
+        });
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
+            .with_direct_fetch(direct);
+        assert!(fetcher.fetch_from(&cert_name, Some(9)).await.is_ok());
+        assert_eq!(direct_count.load(Ordering::Relaxed), 0);
+
+        let unrouted = make_cert_name("unrouted");
+        assert!(fetcher.fetch(&unrouted).await.is_err());
+        assert_eq!(direct_count.load(Ordering::Relaxed), 0, "no face named, none asked");
     }
 }

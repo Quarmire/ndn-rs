@@ -41,10 +41,13 @@ pub async fn adopt_anchor_link_via_engine(
 
 /// Check `namespace` for a newer version of the context held in `keyring`
 /// and adopt it if it is signed by an anchor of the held version and newer
-/// (see [`ndn_cert::refresh_context`]). The Interests go out through
-/// `engine`'s FIB — the caller makes sure they reach the forwarders upstream
-/// rather than a local publisher of the version already held. Persisting
-/// and publishing an adopted update are the caller's.
+/// — or, when it is not, if the versions in between lead to it, each signed
+/// by an anchor of the one before (see [`ndn_cert::refresh_context`]). The
+/// Interests go out through `engine`'s FIB — the caller makes sure they
+/// reach the forwarders upstream rather than a local publisher of the
+/// versions already held. Persisting and publishing an adopted update, and
+/// the versions it walked through (`ContextUpdate::walked`), are the
+/// caller's.
 pub async fn refresh_context_via_engine(
     engine: &ForwarderEngine,
     keyring: &Keyring,

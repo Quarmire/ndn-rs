@@ -18,6 +18,8 @@ fn main() {
         Some("bag") if args.len() == 3 => TrustEnvelope::Bag {
             key_name: args[2].clone(),
             safebag: read_artifact(&args[1]),
+            namespace: None,
+            fingerprint: None,
         },
         // `<signed-context-data-file>` is a signed context Data wire, e.g. the
         // `<pib>/contexts/<hex>.tc` file `ndn-fwd init` / `ndn-fwd adopt` write.

@@ -80,6 +80,7 @@
 - [Certificate renewal (`ndn-fwd renew`)](./reference/renewal.md)
 - [Revoking a device (`ndn-fwd revoke`)](./reference/revocation.md)
 - [Trust-context updates (`ndn-fwd context refresh`)](./reference/context-updates.md)
+- [Recovery kits and `ndn-fwd recover`](./reference/recovery.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 

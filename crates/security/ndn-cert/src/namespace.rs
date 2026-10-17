@@ -19,13 +19,15 @@ use std::sync::Arc;
 
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, EnrollmentHint, FilePib, PibError, SecurityManager, SignedTrustContext,
+    Certificate, EnrollmentHint, FilePib, KeyRole, PibError, SecurityManager, SignedTrustContext,
     SignedTrustContextError, TrustError,
 };
 use ndn_trust_envelope::TrustEnvelope;
 
 use crate::ca::serialize_cert;
-use crate::context_store::{ContextStoreError, context_file_path, persist_context};
+use crate::context_store::{
+    ContextStoreError, context_file_path, persist_context, remove_stored_context,
+};
 use crate::onboarding::anchor_fingerprint;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
@@ -106,15 +108,18 @@ pub fn init_namespace(
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
     // In-memory Ed25519 signers never suspend: drive the future inline.
-    futures::executor::block_on(build_namespace(mgr, namespace, None))
+    futures::executor::block_on(build_namespace(mgr, namespace, None, &[]))
 }
 
 /// Build the namespace around the root key `root_key_name(namespace)` already held
-/// by `mgr` (in memory or a hardware signer registered with it).
+/// by `mgr` (in memory or a hardware signer registered with it). The
+/// `root_device_keys` (the CA and admin keys that will live beside the root)
+/// get the [`KeyRole::ROOT_DEVICE`] role in the context.
 async fn build_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
     ca_endpoint: Option<Name>,
+    root_device_keys: &[Name],
 ) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
@@ -129,6 +134,9 @@ async fn build_namespace(
         .schema_authoritative();
     if let Some(ca) = ca_endpoint {
         context = context.with_ca_endpoint(ca);
+    }
+    for key in root_device_keys {
+        context = context.with_key_role(KeyRole::ROOT_DEVICE, key.clone());
     }
     context.add_anchor(anchor.clone());
     let context_data = context.sign_into_data_async(signer.as_ref()).await?;
@@ -288,15 +296,24 @@ pub async fn init_namespace_in_pib(
         pib.delete_key(&ca_key)?;
         pib.delete_key(&device_key)?;
         pib.remove_trust_anchor(&anchor_key)?;
+        // The versions of the namespace being replaced are not the new
+        // root's: none of them may be served beside its v1.
+        remove_stored_context(pib.root(), namespace)?;
     }
 
     // Root: generated in its store (in memory for a sealed one, on the token
     // for a YubiKey), held by an in-process manager for the signing steps
     // below, and recorded once the anchor is signed.
-    let pending = PendingRoot::create(pib, namespace, root).await?;
+    let pending = PendingRoot::create(pib, &anchor_key, root).await?;
     let mgr = SecurityManager::new();
     mgr.register_signer(anchor_key.clone(), pending.signer());
-    let init = build_namespace(&mgr, namespace, Some(namespace.clone().append("CA"))).await?;
+    let init = build_namespace(
+        &mgr,
+        namespace,
+        Some(namespace.clone().append("CA")),
+        &[ca_key.clone(), device_key.clone()],
+    )
+    .await?;
     let root_store = pending.commit(pib, namespace, &init.anchor)?;
     pib.add_trust_anchor(&anchor_key, &init.anchor)?;
 
@@ -360,7 +377,7 @@ pub async fn init_namespace_in_pib(
 /// Generate `key` in the PIB and store a cert for it issued by `issuer`
 /// (held by `mgr`, possibly a hardware signer), named
 /// `<key>/<issuer_id>/<version>`.
-async fn certify_new_key(
+pub(crate) async fn certify_new_key(
     pib: &FilePib,
     mgr: &SecurityManager,
     key: &Name,

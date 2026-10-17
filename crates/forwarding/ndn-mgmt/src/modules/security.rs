@@ -290,6 +290,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::CONTEXT_REFRESH {
             return security_context_refresh(params, ctx.trust_context_handler);
         }
+        if verb == verb::CONTEXT_UPDATE {
+            return security_context_update(params, ctx.trust_context_handler);
+        }
         if verb == verb::RENEW {
             return security_renew(ctx.trust_context_handler);
         }
@@ -494,6 +497,37 @@ fn security_context_refresh(
     let backend = Arc::clone(backend);
     MgmtResponse::Deferred(Box::pin(async move {
         json_answer(backend.refresh_contexts(params.name).await)
+    }))
+}
+
+/// `security/context-update`: adopt the signed trust-context Data in
+/// `ControlParameters.context_data` as the next version of a held context —
+/// only if it is strictly newer and signed by an anchor of the held version —
+/// then store and publish it. Already authorized by the trust-admin
+/// peer-credential gate (and refused over `/localhop`). Answered deferred.
+/// Success: `200` with a [`crate::ContextRefreshInfo`] as JSON status text.
+fn security_context_update(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not take trust-context updates at runtime: run it against an \
+             ndn-fwd daemon",
+        )
+        .into();
+    };
+    let Some(data) = params.context_data else {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "context-update needs the signed trust-context Data in ContextData",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move {
+        json_answer(backend.update_context(data).await)
     }))
 }
 #[cfg(test)]

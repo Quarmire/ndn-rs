@@ -13,10 +13,19 @@
 //!   anchor of the version held now — never merely by an anchor the update
 //!   lists itself — and strictly newer. A refused or failed refresh changes
 //!   nothing: the held version stays in force.
+//! - **Catch-up** ([`follow_versions`]): when the newest version is not
+//!   signed by an anchor of the held one — a recovery kit installed a new
+//!   root in a version this node missed — the versions in between are
+//!   fetched by exact name, oldest first, and each must be signed by an
+//!   anchor of the one before it. Every node keeps and serves each version
+//!   it held ([`crate::context_store`]), so the chain of signed versions, not
+//!   the timing of refreshes, carries a node from any version it held to the
+//!   newest. Bounded by [`MAX_CATCH_UP_VERSIONS`].
 //!
 //! See `docs/wiki/src/reference/revocation.md` and
 //! `docs/wiki/src/reference/context-updates.md`.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,6 +38,7 @@ use ndn_security::{
 use crate::client::CaExchange;
 use crate::onboarding::{
     CONTEXT_EXPECTATION_TTL, FetchContextError, fetch_context_pointer, fetch_versioned_context,
+    rdr_prefix,
 };
 
 // ── Bump (root device) ─────────────────────────────────────────────────────
@@ -165,6 +175,16 @@ pub async fn bump_context_revoking(
 
 // ── Refresh (every node) ───────────────────────────────────────────────────
 
+/// How many versions a refresh follows one by one ([`follow_versions`]) at
+/// most, when the newest is not signed by an anchor of the held version. A
+/// version is one operator action on the root device (a revocation, a
+/// recovery kit added or revoked, a recovery), so this covers a node that
+/// was offline across years of a namespace's changes, at one Interest per
+/// version and within a management command's wait; a node further behind
+/// adopts the namespace again from a current anchor link, which costs one
+/// fetch.
+pub const MAX_CATCH_UP_VERSIONS: u64 = 128;
+
 /// Why a fetched update was not adopted.
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateRefusal {
@@ -181,6 +201,100 @@ pub enum UpdateRefusal {
     NotSignedByHeldAnchor { signer: String, held: u64 },
     #[error("this node's forwarder dropped it: {0}")]
     DroppedByForwarder(String),
+    /// The newest version does not follow from the held one directly, and
+    /// the versions in between did not carry this node to it.
+    #[error(
+        "v{offered} does not follow from the held version v{held} directly, and following the \
+         versions in between failed: {stop}"
+    )]
+    CatchUp {
+        held: u64,
+        offered: u64,
+        stop: CatchUpStop,
+    },
+}
+
+/// `v<first>` or `v<first>..=v<last>`.
+fn versions(first: &u64, last: &u64) -> String {
+    if first == last {
+        format!("v{first}")
+    } else {
+        format!("v{first}..=v{last}")
+    }
+}
+
+/// Why [`follow_versions`] did not reach the newest version. Nothing is
+/// adopted in any case.
+#[derive(Debug, thiserror::Error)]
+pub enum CatchUpStop {
+    #[error(
+        "that is {gap} versions, more than the {max} a refresh follows one by one; adopt the \
+         namespace again from a current anchor link (`ndn-fwd adopt <link>`)"
+    )]
+    TooFar { gap: u64, max: u64 },
+    #[error(
+        "v{version} was refused: {refusal}. Whatever served it does not serve this namespace's \
+         versions; if the namespace changed its root, adopt it again from a current anchor link \
+         (`ndn-fwd adopt <link>`)"
+    )]
+    Refused {
+        version: u64,
+        refusal: Box<UpdateRefusal>,
+    },
+    #[error(
+        "{} could not be fetched ({reason}), and v{version} does not follow without them \
+         ({refusal}); retry once a node that kept them is reachable (every node serves the \
+         versions it held), or adopt the namespace again from a current anchor link",
+        versions(.first, .last)
+    )]
+    Missing {
+        first: u64,
+        last: u64,
+        reason: String,
+        version: u64,
+        refusal: Box<UpdateRefusal>,
+    },
+    #[error("v{version} could not be fetched ({reason}); retry once it is reachable")]
+    Unreachable { version: u64, reason: String },
+    #[error("{0}")]
+    InProgress(#[from] ExpectContextError),
+}
+
+/// One version a walk went through ([`follow_versions`]).
+#[derive(Debug)]
+pub struct ContextStep {
+    pub context: Arc<SignedTrustContext>,
+    /// The signed Data exactly as received (what to persist and publish).
+    pub data: Data,
+    /// The anchor of the version before it that signed it.
+    pub signer: Certificate,
+}
+
+/// Why a [`VersionSource`] returned no Data for a position.
+#[derive(Debug)]
+pub enum Unfetched {
+    /// Nothing usable arrived (no route, no answer, a reply under another
+    /// name, not a Data packet): why.
+    Missing(String),
+    /// Something arrived, and this node's forwarder dropped it: why.
+    Dropped(String),
+    /// Another adoption or update of the namespace runs on this node.
+    InProgress(ExpectContextError),
+}
+
+/// Where [`follow_versions`] gets the signed context Data of each position
+/// of a walk: a version fetched by its exact name (a refresh), or a sync
+/// group's sequence number, which is the version its publisher republished
+/// (`ndn_identity::context_sync`).
+pub trait VersionSource {
+    /// The signed context Data at `position`, fetched as an update of
+    /// `from` — the version the walk has reached, which a validating
+    /// forwarder is told to expect an update of.
+    fn fetch(
+        &mut self,
+        position: u64,
+        from: &SignedTrustContext,
+    ) -> impl Future<Output = Result<Data, Unfetched>> + Send;
 }
 
 /// Why [`refresh_context`] could not check for, or adopt, an update. The held
@@ -189,6 +303,19 @@ pub enum UpdateRefusal {
 pub enum RefreshError {
     #[error("no trust context is held for {0}; adopt it first (`ndn-fwd adopt`)")]
     NotHeld(String),
+    /// Nothing answered the Interest for the newest version's name (no
+    /// route, no reply, a Nack): the namespace could not be asked at all.
+    /// Unlike [`Self::Fetch`], nothing announced a version either.
+    #[error(
+        "nothing answered for the newest trust context of {namespace} ({source}); the held \
+         version v{held} stays in force"
+    )]
+    NoAnswer {
+        namespace: String,
+        held: u64,
+        #[source]
+        source: FetchContextError,
+    },
     #[error(
         "could not check {namespace} for a newer trust context ({source}); the held version \
          v{held} stays in force"
@@ -226,7 +353,7 @@ pub enum ContextRefresh {
 }
 
 /// A newer context adopted by [`refresh_context`]. Persisting and publishing
-/// it are the caller's.
+/// it — and the versions in `walked` — are the caller's.
 #[derive(Debug)]
 pub struct ContextUpdate {
     /// The version held before.
@@ -234,10 +361,16 @@ pub struct ContextUpdate {
     pub context: Arc<SignedTrustContext>,
     /// The signed Data exactly as received (what to persist and publish).
     pub data: Data,
-    /// The held anchor that signed it.
+    /// The anchor that signed it: of the held version, or — after a walk —
+    /// of the last version in `walked`.
     pub signer: Certificate,
-    /// Revocation entries this version adds.
+    /// Revocation entries this version adds to the held one.
     pub revoked: Vec<Name>,
+    /// The versions between `previous` and `context` this node followed one
+    /// by one, oldest first, because the newest is not signed by an anchor
+    /// of the held version ([`follow_versions`]); empty when it is. Keep and
+    /// serve them too, so the nodes behind this one can follow the same way.
+    pub walked: Vec<ContextStep>,
 }
 
 /// Open `data` as an update of the held context `held`: a self-consistent
@@ -277,6 +410,169 @@ pub async fn open_context_update(
     Ok((ctx, held_anchor))
 }
 
+/// Why [`fetch_update`] returned no Data.
+enum UpdateFetchError {
+    Fetch(FetchContextError),
+    /// Something answered, and this node's forwarder dropped it: why.
+    Dropped(String),
+    InProgress(ExpectContextError),
+}
+
+impl From<UpdateFetchError> for Unfetched {
+    fn from(e: UpdateFetchError) -> Self {
+        match e {
+            UpdateFetchError::Fetch(source) => Unfetched::Missing(source.to_string()),
+            UpdateFetchError::Dropped(reason) => Unfetched::Dropped(reason),
+            UpdateFetchError::InProgress(e) => Unfetched::InProgress(e),
+        }
+    }
+}
+
+/// Fetch the context named `versioned` as an update of `from`. Through a
+/// validating forwarder (`forwarder`), it is told to expect an update signed
+/// by an anchor of `from` ([`Validator::expect_context_update`]), so it
+/// admits it even if it does not hold the context itself, and a refused one
+/// is reported with why.
+async fn fetch_update<E>(
+    exchange: &mut E,
+    forwarder: Option<&Validator>,
+    from: &SignedTrustContext,
+    versioned: &Name,
+) -> Result<Data, UpdateFetchError>
+where
+    E: CaExchange + ?Sized,
+{
+    let expectation = forwarder
+        .map(|v| v.expect_context_update(from, CONTEXT_EXPECTATION_TTL))
+        .transpose()
+        .map_err(UpdateFetchError::InProgress)?;
+    let fetched = fetch_versioned_context(exchange, versioned).await;
+    let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
+    fetched.map_err(|source| match outcome.refused {
+        Some(reason) => UpdateFetchError::Dropped(reason),
+        None => UpdateFetchError::Fetch(source),
+    })
+}
+
+/// A refresh's [`VersionSource`]: each version fetched by its exact name,
+/// `<ns>/32=trust-context/v=<N>`, from wherever the namespace is served.
+struct ByName<'a, E: ?Sized> {
+    exchange: &'a mut E,
+    forwarder: Option<&'a Validator>,
+    namespace: &'a Name,
+    /// The newest version, already fetched once (and not following from the
+    /// held version directly), so the walk does not fetch it again.
+    newest: Option<(u64, Data)>,
+}
+
+impl<E> VersionSource for ByName<'_, E>
+where
+    E: CaExchange + Send + ?Sized,
+{
+    async fn fetch(&mut self, position: u64, from: &SignedTrustContext) -> Result<Data, Unfetched> {
+        if let Some((_, data)) = self.newest.take_if(|(version, _)| *version == position) {
+            return Ok(data);
+        }
+        let versioned = rdr_prefix(self.namespace).append_version(position);
+        Ok(fetch_update(&mut *self.exchange, self.forwarder, from, &versioned).await?)
+    }
+}
+
+/// Follow `held`'s namespace from `held` through `positions`, in order —
+/// the versions this node is missing, oldest first — adopting nothing:
+/// each version must be signed by an anchor of the version before it (the
+/// continuity rule, [`open_context_update`]), the first by an anchor of
+/// `held`. So a node holding `N` follows `N+1`, signed by a recovery key
+/// that is an anchor of `N`, and then `N+2`, signed by the new root that
+/// `N+1` installed, though `N+2` alone is not signed by any anchor of `N`.
+///
+/// - A position whose Data cannot be fetched is passed over — a version the
+///   upstream never held, or a sequence number that carries none — as long
+///   as a later one follows from the version reached; otherwise the walk
+///   ends at that later one, naming the versions it missed.
+/// - A Data that arrives and is refused (forged, foreign, or not signed by
+///   an anchor of the version before it) ends the walk.
+/// - A position carrying a version not newer than the one reached is passed
+///   over, except the last.
+/// - The last position must be fetched and must follow.
+///
+/// At most [`MAX_CATCH_UP_VERSIONS`] positions are walked; a longer range
+/// is refused before anything is fetched. Returns every version reached,
+/// oldest first: the last is the one at the last position (empty only for
+/// an empty range). A walk that stops returns why, and the caller adopts
+/// nothing: a node changes its held version only to the newest, so a
+/// stopped walk changes nothing.
+pub async fn follow_versions<S>(
+    held: &SignedTrustContext,
+    positions: RangeInclusive<u64>,
+    source: &mut S,
+) -> Result<Vec<ContextStep>, CatchUpStop>
+where
+    S: VersionSource + ?Sized,
+{
+    let (first, last) = (*positions.start(), *positions.end());
+    if first > last {
+        return Ok(Vec::new());
+    }
+    let gap = last - first + 1;
+    if gap > MAX_CATCH_UP_VERSIONS {
+        return Err(CatchUpStop::TooFar {
+            gap,
+            max: MAX_CATCH_UP_VERSIONS,
+        });
+    }
+    let mut steps: Vec<ContextStep> = Vec::new();
+    // Positions passed over since the last version reached: first, last, why.
+    let mut passed: Option<(u64, u64, String)> = None;
+    for position in positions {
+        let from: &SignedTrustContext = steps.last().map_or(held, |s| s.context.as_ref());
+        let refusal = match source.fetch(position, from).await {
+            Ok(data) => match open_context_update(from, &data).await {
+                Ok((context, signer)) => {
+                    steps.push(ContextStep {
+                        context: Arc::new(context),
+                        data,
+                        signer,
+                    });
+                    passed = None;
+                    continue;
+                }
+                Err(UpdateRefusal::NotNewer { .. }) if position < last => continue,
+                Err(refusal) => refusal,
+            },
+            Err(Unfetched::Dropped(reason)) => UpdateRefusal::DroppedByForwarder(reason),
+            Err(Unfetched::InProgress(e)) => return Err(e.into()),
+            Err(Unfetched::Missing(reason)) if position < last => {
+                passed = Some(match passed {
+                    Some((first, _, _)) => (first, position, reason),
+                    None => (position, position, reason),
+                });
+                continue;
+            }
+            Err(Unfetched::Missing(reason)) => {
+                return Err(CatchUpStop::Unreachable {
+                    version: position,
+                    reason,
+                });
+            }
+        };
+        return Err(match passed {
+            Some((first, last, reason)) => CatchUpStop::Missing {
+                first,
+                last,
+                reason,
+                version: position,
+                refusal: Box::new(refusal),
+            },
+            None => CatchUpStop::Refused {
+                version: position,
+                refusal: Box::new(refusal),
+            },
+        });
+    }
+    Ok(steps)
+}
+
 /// Check the namespace `namespace` for a newer version of the context held
 /// in `keyring`, and adopt it if it passes [`open_context_update`]:
 ///
@@ -288,10 +584,17 @@ pub async fn open_context_update(
 ///    update signed by an anchor of the held version
 ///    ([`Validator::expect_context_update`]), so it admits it even if it does
 ///    not hold the context itself, and a refused one is reported with why.
-/// 3. Continuity and version ([`open_context_update`]), then adopt with
-///    [`Keyring::adopt_update`] (strictly newer, atomic).
+/// 3. Continuity and version ([`open_context_update`]). When it is not
+///    signed by an anchor of the held version (or the forwarder dropped it)
+///    and there are versions in between, follow them by exact name, oldest
+///    first, each under the continuity rule from the one before
+///    ([`follow_versions`], the forwarder expecting each in turn).
+/// 4. Adopt the newest with [`Keyring::adopt_update`] (strictly newer,
+///    atomic). The versions walked through are returned for the caller to
+///    keep and serve; they are not adopted one by one.
 ///
-/// A refused or failed refresh leaves the held version in force.
+/// A refused or failed refresh — the newest not reached — leaves the held
+/// version in force.
 pub async fn refresh_context<E>(
     keyring: &Keyring,
     forwarder: Option<&Validator>,
@@ -299,7 +602,7 @@ pub async fn refresh_context<E>(
     namespace: &Name,
 ) -> Result<ContextRefresh, RefreshError>
 where
-    E: CaExchange + ?Sized,
+    E: CaExchange + Send + ?Sized,
 {
     let held = keyring
         .contexts()
@@ -319,7 +622,14 @@ where
 
     let pointer = fetch_context_pointer(exchange, namespace)
         .await
-        .map_err(fetch_failed)?;
+        .map_err(|source| match source {
+            FetchContextError::Transport { .. } => RefreshError::NoAnswer {
+                namespace: namespace.to_string(),
+                held: held.version(),
+                source,
+            },
+            source => fetch_failed(source),
+        })?;
     // `fetch_context_pointer` confines the pointer to `<ns>/32=trust-context/v=<N>`.
     let offered = pointer
         .components()
@@ -336,19 +646,57 @@ where
         });
     }
 
-    let expectation = forwarder
-        .map(|v| v.expect_context_update(&held, CONTEXT_EXPECTATION_TTL))
-        .transpose()?;
-    let fetched = fetch_versioned_context(exchange, &pointer).await;
-    let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
-    let data = fetched.map_err(|source| match outcome.refused {
-        // Something answered, and this node's forwarder dropped it: say why.
-        Some(reason) => refused(UpdateRefusal::DroppedByForwarder(reason)),
-        None => fetch_failed(source),
-    })?;
+    let mut versions = ByName {
+        exchange,
+        forwarder,
+        namespace,
+        newest: None,
+    };
+    let direct = match fetch_update(&mut *versions.exchange, forwarder, &held, &pointer).await {
+        Ok(data) => match open_context_update(&held, &data).await {
+            Ok((context, signer)) => Ok(ContextStep {
+                context: Arc::new(context),
+                data,
+                signer,
+            }),
+            Err(refusal) => {
+                versions.newest = Some((offered, data));
+                Err(refusal)
+            }
+        },
+        Err(UpdateFetchError::Dropped(reason)) => Err(UpdateRefusal::DroppedByForwarder(reason)),
+        Err(UpdateFetchError::InProgress(e)) => return Err(e.into()),
+        Err(UpdateFetchError::Fetch(source)) => return Err(fetch_failed(source)),
+    };
+    let (newest, walked) = match direct {
+        Ok(newest) => (newest, Vec::new()),
+        // Not signed by an anchor of the held version: a version in between
+        // may have installed the key that signed it (a recovery).
+        Err(UpdateRefusal::NotSignedByHeldAnchor { .. } | UpdateRefusal::DroppedByForwarder(_))
+            if offered > held.version() + 1 =>
+        {
+            let mut walked = follow_versions(&held, held.version() + 1..=offered, &mut versions)
+                .await
+                .map_err(|stop| {
+                    refused(UpdateRefusal::CatchUp {
+                        held: held.version(),
+                        offered,
+                        stop,
+                    })
+                })?;
+            let newest = walked
+                .pop()
+                .expect("a walk that succeeds ends at its last position");
+            (newest, walked)
+        }
+        Err(refusal) => return Err(refused(refusal)),
+    };
 
-    let (ctx, signer) = open_context_update(&held, &data).await.map_err(refused)?;
-    let context = Arc::new(ctx);
+    let ContextStep {
+        context,
+        data,
+        signer,
+    } = newest;
     keyring
         .adopt_update(Arc::clone(&context))
         .map_err(|now_held| match now_held {
@@ -370,5 +718,6 @@ where
         data,
         signer,
         revoked,
+        walked,
     }))
 }

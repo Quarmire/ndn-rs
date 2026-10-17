@@ -86,8 +86,9 @@ The daemon, under one lock shared with the context refresh:
    key, and any it would issue later — and drops them from its certificate
    cache (`CaState::revoke_issued_under`).
 7. Context: adopts `N+1` into its keyring (`Keyring::adopt_update`, strictly
-   newer), stores it in `<pib_path>/contexts/` in place of `N`, and publishes
-   it by name (unless `[security] serve_contexts = false`).
+   newer), stores it in `<pib_path>/contexts/` as the newest version (`N`
+   stays stored beside it), and publishes it by name (unless `[security]
+   serve_contexts = false`).
 
 The root device refuses the key at once. Every other node refuses it once it
 has fetched `N+1`; see [context updates](./context-updates.md).
