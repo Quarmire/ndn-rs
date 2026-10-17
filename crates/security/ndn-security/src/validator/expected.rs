@@ -25,7 +25,7 @@
 //! nothing.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,11 +41,16 @@ use super::{ValidationResult, Validator, now_ns};
 
 /// One active expectation, held by the validator.
 pub(super) struct Expectation {
+    /// Unique per registration, so a guard withdraws only its own.
+    id: u64,
     namespace: Name,
     expected_fingerprint: [u8; 32],
     deadline: Instant,
     outcome: ExpectationOutcome,
 }
+
+/// Source of [`Expectation::id`].
+static NEXT_EXPECTATION_ID: AtomicU64 = AtomicU64::new(0);
 
 /// What happened under an expectation, returned by
 /// [`ContextExpectation::finish`].
@@ -86,6 +91,10 @@ pub enum ExpectContextError {
 pub struct ContextExpectation<'a> {
     validator: &'a Validator,
     namespace: Name,
+    /// The registration this guard owns: withdrawing by it never removes a
+    /// newer expectation registered for the same namespace (after `finish`,
+    /// or after this one's ttl passed).
+    id: u64,
 }
 
 impl ContextExpectation<'_> {
@@ -96,14 +105,14 @@ impl ContextExpectation<'_> {
 
     /// Withdraw the expectation and return what happened under it.
     pub fn finish(self) -> ExpectationOutcome {
-        // Drop runs `withdraw` again, which then finds nothing.
-        self.validator.withdraw_expectation(&self.namespace)
+        // Drop runs `withdraw` again, which then finds nothing of its own.
+        self.validator.withdraw_expectation(self.id)
     }
 }
 
 impl Drop for ContextExpectation<'_> {
     fn drop(&mut self) {
-        self.validator.withdraw_expectation(&self.namespace);
+        self.validator.withdraw_expectation(self.id);
     }
 }
 
@@ -131,7 +140,9 @@ impl Validator {
         if list.iter().any(|e| e.namespace == namespace) {
             return Err(ExpectContextError::AlreadyExpected(namespace.to_string()));
         }
+        let id = NEXT_EXPECTATION_ID.fetch_add(1, Ordering::Relaxed);
         list.push(Expectation {
+            id,
             namespace: namespace.clone(),
             expected_fingerprint,
             deadline: now + ttl,
@@ -141,17 +152,18 @@ impl Validator {
         Ok(ContextExpectation {
             validator: self,
             namespace,
+            id,
         })
     }
 
-    fn withdraw_expectation(&self, namespace: &Name) -> ExpectationOutcome {
+    fn withdraw_expectation(&self, id: u64) -> ExpectationOutcome {
         let mut list = self
             .expectations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let outcome = list
             .iter()
-            .position(|e| e.namespace == *namespace)
+            .position(|e| e.id == id)
             .map(|i| list.swap_remove(i).outcome)
             .unwrap_or_default();
         self.expecting.store(!list.is_empty(), Ordering::Release);
@@ -224,5 +236,30 @@ impl Validator {
             },
             verified_at: now_ns(),
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trust_schema::TrustSchema;
+
+    /// A guard withdraws only its own expectation: finishing (or dropping)
+    /// an expired one never removes a newer one for the same namespace.
+    #[test]
+    fn a_guard_never_withdraws_a_newer_expectation() {
+        let v = Validator::new(TrustSchema::new());
+        let ns: Name = "/home/bob".parse().unwrap();
+        let old = v.expect_context(ns.clone(), [1; 32], Duration::ZERO).unwrap();
+        let new = v
+            .expect_context(ns.clone(), [2; 32], Duration::from_secs(30))
+            .expect("the old one expired");
+        old.finish();
+        assert!(matches!(
+            v.expect_context(ns.clone(), [3; 32], Duration::from_secs(30)),
+            Err(ExpectContextError::AlreadyExpected(_))
+        ));
+        drop(new);
+        assert!(v.expect_context(ns, [3; 32], Duration::from_secs(30)).is_ok());
     }
 }

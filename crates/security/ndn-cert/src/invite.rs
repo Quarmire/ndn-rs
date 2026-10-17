@@ -20,7 +20,13 @@
 //!    with the `token` challenge, fetches the issued certificate, and checks
 //!    it: it certifies that key, is valid now, and chains to the root of the
 //!    namespace's trust context under its schema (the issuer certificates
-//!    are fetched for the walk; each hop's signature is verified).
+//!    are fetched for the walk; each hop's signature is verified). The
+//!    request names no lifetime: the CA's policy (`[ca] cert_validity_days`
+//!    on a namespace CA) decides it.
+//!
+//! A token minted with an expiry (`ndn-fwd-tokens new --ttl`) carries it
+//! ([`crate::roles::token_expiry`]); an expired invite is refused before
+//! anything is sent, and the CA refuses the token after it too.
 //!
 //! The device key is the caller's: it is generated and kept wherever the
 //! caller keeps keys (the `ndn-fwd` daemon's PIB, a phone's key store); only
@@ -42,13 +48,9 @@ use ndn_trust_envelope::TrustEnvelope;
 use crate::client::CaExchange;
 use crate::error::CertError;
 use crate::onboarding::{AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint};
-use crate::roles::{Role, RoleError, token_role, validate_device_name, validate_namespace};
-
-/// Certificate lifetime a device asks for: 90 days, the lifetime a namespace CA
-/// issues by default (`[ca] cert_validity_days`). A CA configured for
-/// less issues less; the issued certificate's validity period is the actual
-/// expiry. Renewal (not built yet) will allow shorter lifetimes.
-pub const INVITE_CERT_VALIDITY_SECS: u64 = 90 * 24 * 3600;
+use crate::roles::{
+    Role, RoleError, token_expiry, token_role, validate_device_name, validate_namespace,
+};
 
 /// What an `ndn-trust://invite` link asks a device to do: enroll a key under
 /// [`identity_prefix`](Self::identity_prefix) with the CA at
@@ -68,6 +70,8 @@ pub struct InviteLink {
     /// SHA-256 of the namespace's root anchor public key, when the invite
     /// carries it (`ndn-fwd-tokens new --anchor-fp`).
     pub expected_fingerprint: Option<[u8; 32]>,
+    /// When the token stops being redeemable (Unix seconds), if it expires.
+    pub expires_at_secs: Option<u64>,
 }
 
 impl InviteLink {
@@ -117,6 +121,18 @@ impl InviteLink {
             return Err(bad("token", token));
         }
         let token_admits = token_role(token).unwrap_or(Role::Member);
+        let expires_at_secs = token_expiry(token);
+        if let Some(at) = expires_at_secs {
+            let now = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now >= at {
+                return Err(InviteEnrollError::TokenExpired {
+                    expired_at: iso_secs(at),
+                });
+            }
+        }
         if token_admits != role {
             return Err(InviteEnrollError::TokenRole {
                 token_role: token_admits,
@@ -131,6 +147,7 @@ impl InviteLink {
             identity_prefix,
             token: token.clone(),
             expected_fingerprint: *anchor_fingerprint,
+            expires_at_secs,
         })
     }
 
@@ -253,6 +270,8 @@ pub enum InviteEnrollError {
          and only before it expires; ask for a new invite"
     )]
     TokenRefused(String),
+    #[error("the invite expired at {expired_at}; ask for a new invite")]
+    TokenExpired { expired_at: String },
     #[error("the CA refused the request: {0}")]
     CaRefused(String),
     #[error(
@@ -407,21 +426,21 @@ where
 /// `forwarder` is the validator of the forwarder `exchange`'s Interests go
 /// through, if any: it admits the expected context during adoption. Nothing
 /// is stored; `device_key` must be named `<identity_prefix>/<device>/KEY/<id>`
-/// ([`new_device_key_name`]).
+/// ([`new_device_key_name`]). The certificate's lifetime is the CA's to
+/// decide: the request names none.
 pub async fn enroll_with_invite<E>(
     keyring: &Arc<Keyring>,
     forwarder: Option<&Validator>,
     exchange: &mut E,
     invite: &InviteLink,
     device_key: Arc<dyn Signer>,
-    validity_secs: u64,
 ) -> Result<InviteEnrollment, InviteEnrollFailure>
 where
     E: CaExchange + ?Sized,
 {
     invite.device_of_key(device_key.key_name())?;
     let adopted = ensure_invite_context(keyring, forwarder, exchange, invite).await?;
-    match issue(exchange, keyring, invite, device_key, validity_secs).await {
+    match issue(exchange, keyring, invite, device_key).await {
         Ok(issued) => Ok(InviteEnrollment { adopted, issued }),
         Err(error) => Err(InviteEnrollFailure { adopted, error }),
     }
@@ -432,7 +451,6 @@ async fn issue<E>(
     keyring: &Arc<Keyring>,
     invite: &InviteLink,
     device_key: Arc<dyn Signer>,
-    validity_secs: u64,
 ) -> Result<IssuedCertificate, InviteEnrollError>
 where
     E: CaExchange + ?Sized,
@@ -447,7 +465,8 @@ where
         exchange,
         &invite.ca_prefix,
         Arc::clone(&device_key),
-        validity_secs,
+        // An empty validity window: the CA issues what its policy allows.
+        0,
         "token",
         |_| std::future::ready(Ok(params.take())),
     )
@@ -460,6 +479,16 @@ where
     check_chain(&data, keyring, exchange, invite).await?;
     Ok(issued)
 }
+
+/// Issuer certificates [`enroll_with_invite`] fetches at most to walk the
+/// issued certificate's chain.
+const MAX_ISSUER_FETCHES: usize = 5;
+
+/// Exchanges (Interest → Data) [`enroll_with_invite`] makes at most: the
+/// context's metadata and the context, NEW, CHALLENGE, the issued
+/// certificate, and the issuer certificates. Times the per-Interest timeout,
+/// it bounds how long an enrollment can take.
+pub const INVITE_ENROLL_MAX_EXCHANGES: u32 = 5 + MAX_ISSUER_FETCHES as u32;
 
 /// The issued certificate must chain to the root of the namespace's trust
 /// context under its schema. Checked by a validator over `keyring` alone (not
@@ -475,7 +504,7 @@ async fn check_chain<E>(
 where
     E: CaExchange + ?Sized,
 {
-    const MAX_FETCHES: usize = 4;
+    const MAX_FETCHES: usize = MAX_ISSUER_FETCHES - 1;
     let refused = |why: String| InviteEnrollError::IssuedCertificate(why);
     let validator = Validator::with_keyring(
         Arc::clone(keyring),
@@ -558,6 +587,11 @@ fn held_context(keyring: &Keyring, namespace: &Name) -> Option<Arc<SignedTrustCo
         .contexts()
         .into_iter()
         .find(|c| c.namespace() == namespace)
+}
+
+fn iso_secs(secs: u64) -> String {
+    let basic = ndn_security::iso8601::format_iso_basic(secs.saturating_mul(1_000_000_000));
+    format!("{}Z", String::from_utf8_lossy(&basic))
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -141,7 +141,6 @@ async fn enroll(
         &mut root_dev.wire.clone(),
         &invite,
         key,
-        ndn_cert::INVITE_CERT_VALIDITY_SECS,
     )
     .await
     .map(|e| e.issued.cert)
@@ -176,11 +175,18 @@ async fn a_token_never_certifies_a_second_key_for_a_device_name() {
         1,
         "racing keys for one name: {a:?} / {b:?}"
     );
-    let loser = if a.is_ok() {
-        key("laptop", 4)
+    let (loser, loser_token) = if a.is_ok() {
+        (key("laptop", 4), "member-4")
     } else {
-        key("laptop", 3)
+        (key("laptop", 3), "member-3")
     };
+    assert!(
+        matches!(if a.is_ok() { &b } else { &a }, Err(InviteEnrollError::NameRefused(_))),
+        "the race loser is refused by name: {a:?} / {b:?}"
+    );
+    enroll(&root_dev, loser_token, key("desk", 6))
+        .await
+        .expect("the race loser did not spend its token");
     let again = enroll(&root_dev, "member-5", loser).await;
     assert!(
         matches!(again, Err(InviteEnrollError::NameRefused(_))),

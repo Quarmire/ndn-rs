@@ -250,9 +250,10 @@ pub(crate) async fn authorize_command(
 }
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
-/// (adopting a trust context, enrolling). Beyond the signed-command gate they
-/// require the caller to be a local trust administrator — see
-/// [`authorize_trust_admin`]. Add every future trust-mutating verb here.
+/// (adopting a trust context, enrolling). Instead of the signed-command gate
+/// they require the caller to be a local trust administrator — see
+/// [`authorize_trust_admin`] — and they are refused over `/localhop`. Add
+/// every future trust-mutating verb here.
 const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,

@@ -141,7 +141,6 @@ async fn run(
         &mut wire,
         &invite,
         device_key(&invite, device),
-        86_400,
     )
     .await
     .map(|e| e.issued.cert)
@@ -229,12 +228,41 @@ async fn other_root_or_foreign_key_is_refused_before_contacting_the_ca() {
         &DEVICE_SEED,
         "/home/bob/admin/phone/KEY/k".parse().unwrap(),
     ));
-    let result = enroll_with_invite(&keyring, None, &mut wire, &invite, foreign, 86_400).await;
+    let result = enroll_with_invite(&keyring, None, &mut wire, &invite, foreign).await;
     assert!(matches!(
         result.map_err(|f| f.error),
         Err(InviteEnrollError::KeyOutsideInvite { .. })
     ));
     assert!(sent.lock().unwrap().is_empty());
+}
+
+/// The invite names no lifetime: the certificate lasts what the CA's policy
+/// issues (this CA: one day by default, a year at most).
+#[tokio::test]
+async fn the_ca_policy_decides_the_certificate_lifetime() {
+    let root_dev = root_dev(&[("member-aa", "member")]).await;
+    let keyring = device_keyring(&root_dev);
+    let uri = invite("/home/bob/member", "member-aa", root_dev.fingerprint);
+    let (result, _) = run(&root_dev, &keyring, &uri, "phone").await;
+    let cert = result.expect("enrolls");
+    let secs = (cert.valid_until - cert.valid_from) / 1_000_000_000;
+    assert!((86_400 - 60..=86_400 + 60).contains(&secs), "lifetime {secs}s");
+}
+
+/// A token carrying an expiry is refused once it has passed, before
+/// anything is sent; before it, the invite reads normally.
+#[test]
+fn an_expired_invite_is_refused() {
+    use ndn_cert::roles::token_with_expiry;
+    let expired = invite("/home/bob/member", &token_with_expiry("member-aa", 1), [1; 32]);
+    assert!(matches!(
+        InviteLink::from_uri(&expired),
+        Err(InviteEnrollError::TokenExpired { .. })
+    ));
+    let later = token_with_expiry("member-aa", u64::from(u32::MAX));
+    let link = InviteLink::from_uri(&invite("/home/bob/member", &later, [1; 32])).unwrap();
+    assert_eq!(link.expires_at_secs, Some(u64::from(u32::MAX)));
+    assert_eq!(link.role, ndn_cert::roles::Role::Member);
 }
 
 /// Malformed or misdirected invites are refused with a reason, never a

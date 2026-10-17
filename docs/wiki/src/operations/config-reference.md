@@ -106,7 +106,7 @@ cost = 100        # optional
 | Key | Default | Use |
 |---|---|---|
 | `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data verbatim. Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
-| `trust_admin_groups` | `[]` | Unix groups whose members may change this node's trust (`security/context-adopt`) over the local management socket. The daemon's own user and root are always allowed; everyone else is refused. Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
+| `trust_admin_groups` | `[]` | Unix groups whose members may change this node's trust (`security/context-adopt`, `security/enroll`) over the local management socket. The daemon's own user and root are always allowed; everyone else is refused, and these verbs are always refused over `/localhop`. Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
 
 ## `[ca]` — embedded NDNCERT CA
 
@@ -126,7 +126,7 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
 | `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<namespace>/<role>`. |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
-| `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days; also the maximum it advertises in INFO. Devices enrolling by invite ask for 90; a lower value caps them and `ndn-fwd enroll` prints the expiry issued. 90 keeps an enrolled device valid while certificate renewal is not built; renewal will allow shorter lifetimes. `0` is refused at startup. |
+| `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days; also the maximum it advertises in INFO. Devices enrolling by invite name no lifetime, so they get exactly this; `ndn-fwd enroll` prints the expiry issued. 90 keeps an enrolled device valid while certificate renewal is not built; renewal will allow shorter lifetimes. `0` is refused at startup. |
 
 Without `ephemeral`, the CA loads its key from the PIB and its certificate
 (issued by the namespace root) from `<pib_path>/ca/ca-cert.data`; the root's anchor

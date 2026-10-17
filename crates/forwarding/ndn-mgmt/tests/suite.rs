@@ -32,5 +32,7 @@ mod security_safebag_import;
 mod security_v1_verbs;
 #[path = "status_bridge.rs"]
 mod status_bridge;
+#[path = "trust_admin_localhop_refused.rs"]
+mod trust_admin_localhop_refused;
 #[path = "web_wire_e2e.rs"]
 mod web_wire_e2e;

@@ -299,10 +299,11 @@ impl MgmtModule for SecurityModule {
     }
 }
 
-/// `security/context-adopt`: adopt the network the `ndn-trust://anchor` link
-/// in `ControlParameters.uri` names. Already authorized by the trust-admin
-/// peer-credential gate. Answered deferred: a fingerprint-only link fetches
-/// the context over the network, which must not stall other mgmt clients.
+/// `security/context-adopt`: adopt the trust context the `ndn-trust://anchor`
+/// link in `ControlParameters.uri` names. Already authorized by the
+/// trust-admin peer-credential gate (and refused over `/localhop`). Answered
+/// deferred: a fingerprint-only link fetches the context over the network,
+/// which must not stall other mgmt clients.
 /// Success: `200` with [`crate::AdoptedContextInfo`] as JSON status text.
 fn security_context_adopt(
     params: ControlParameters,
@@ -311,7 +312,7 @@ fn security_context_adopt(
     let Some(backend) = backend else {
         return ControlResponse::error(
             status::NOT_FOUND,
-            "this node does not adopt networks at runtime; adopt offline with \
+            "this node does not adopt trust contexts at runtime; adopt offline with \
              `ndn-fwd adopt <link> --pib <dir>` and restart it",
         )
         .into();
@@ -341,7 +342,8 @@ fn security_context_adopt(
 /// `security/enroll`: enroll the identity in `ControlParameters.name` with the
 /// CA the `ndn-trust://invite` link in `ControlParameters.uri` names
 /// ([`verb::ENROLL_FORCE`] in `Flags`: although already enrolled). Already
-/// authorized by the trust-admin peer-credential gate. Answered deferred: it
+/// authorized by the trust-admin peer-credential gate (and refused over
+/// `/localhop`). Answered deferred: it
 /// takes several round trips to the CA. Success: `200` with
 /// [`crate::EnrollOutcome`] as JSON status text.
 fn security_enroll(

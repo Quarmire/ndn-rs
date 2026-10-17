@@ -115,6 +115,10 @@ pub struct CaState {
     /// Held from the single-key check to recording the issued cert, so two
     /// requests for one identity cannot both pass the check.
     issuing: tokio::sync::Mutex<()>,
+    /// Single-key identities whose challenge is running. Another request for
+    /// one of them is refused before its challenge runs, so the loser of a
+    /// race spends no one-time token.
+    in_flight: DashSet<String>,
 }
 
 impl CaState {
@@ -129,6 +133,7 @@ impl CaState {
             served_certs: DashMap::new(),
             store: None,
             issuing: tokio::sync::Mutex::new(()),
+            in_flight: DashSet::new(),
         };
         state.serve_own_certificate();
         state
@@ -202,6 +207,26 @@ impl CaState {
             .ok()?;
         let held = self.certified_to_other_key(&rule.identity, &public_key)?;
         Some((rule, held))
+    }
+
+    /// Reserve `req`'s single-key identity while its challenge runs.
+    /// `Err(identity)` when another request holds it; `Ok(None)` when no
+    /// single-key rule applies.
+    fn reserve_identity(&self, req: &CertRequest) -> Result<Option<InFlight<'_>>, String> {
+        let Some(key_name) = req.name.parse::<ndn_packet::Name>().ok() else {
+            return Ok(None);
+        };
+        let Some(rule) = self.config.issuance.single_key_identity(&key_name) else {
+            return Ok(None);
+        };
+        let identity = rule.identity.to_string();
+        if !self.in_flight.insert(identity.clone()) {
+            return Err(identity);
+        }
+        Ok(Some(InFlight {
+            set: &self.in_flight,
+            identity,
+        }))
     }
 
     /// Wire of an issued cert for cert-fetch; `None` once it is revoked.
@@ -448,6 +473,29 @@ impl CaState {
             .ok_or_else(|| {
                 CertError::InvalidRequest(format!("unsupported challenge type: {challenge_type}"))
             })?;
+
+        // Reserve the identity first, so that of two concurrent requests for
+        // one single-key identity the loser is refused here, before its
+        // challenge runs, instead of after redeeming a one-time token. Held
+        // until this step ends (past issuance).
+        let _reservation = match self.reserve_identity(&cert_request) {
+            Ok(r) => r,
+            Err(identity) => {
+                self.pending.remove(request_id);
+                let response = refused(
+                    ErrorCode::NameNotAllowed,
+                    format!(
+                        "another request for {identity} is being certified right now; refused \
+                         before the `{challenge_type}` challenge ran, so nothing was redeemed"
+                    ),
+                );
+                return session_key.seal_envelope(
+                    &response.encode(),
+                    &request_id_bytes,
+                    &mut enc_iv,
+                );
+            }
+        };
 
         // A request the single-key rule refuses whatever this challenge
         // proves is refused before the challenge runs, so it spends nothing:
@@ -811,6 +859,18 @@ fn generate_request_id_bytes() -> [u8; 8] {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
     bytes
+}
+
+/// A single-key identity reserved by a running challenge; released on drop.
+struct InFlight<'a> {
+    set: &'a DashSet<String>,
+    identity: String,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.set.remove(&self.identity);
+    }
 }
 
 /// A CHALLENGE response refusing the request with `code` and `reason`.

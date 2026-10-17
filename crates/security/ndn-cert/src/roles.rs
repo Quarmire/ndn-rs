@@ -302,6 +302,28 @@ pub fn token_role(token: &str) -> Option<Role> {
     Role::from_str(role).ok()
 }
 
+/// The separator between a token and the expiry it carries.
+const TOKEN_EXPIRY_MARK: &str = "-until";
+
+/// `token` with an absolute expiry (Unix seconds) appended:
+/// `<token>-until<secs>`. The expiry travels inside the token, so the CA
+/// (which reads tokens from its config) and the invitee (which reads the
+/// invite) both see the same deadline, however long the token sat in a
+/// config file or a message.
+pub fn token_with_expiry(token: &str, expires_at_secs: u64) -> String {
+    format!("{token}{TOKEN_EXPIRY_MARK}{expires_at_secs}")
+}
+
+/// The expiry (Unix seconds) a token carries ([`token_with_expiry`]), if
+/// any. A token without one does not expire.
+pub fn token_expiry(token: &str) -> Option<u64> {
+    let (_, secs) = token.rsplit_once(TOKEN_EXPIRY_MARK)?;
+    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    secs.parse().ok()
+}
+
 /// The generated namespace schema for one namespace (see the module
 /// docs): LVS for the fixed-shape rules, native text for the rest; the trust
 /// context carries both, OR'd.

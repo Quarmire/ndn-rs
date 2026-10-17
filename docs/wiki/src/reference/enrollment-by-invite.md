@@ -28,7 +28,14 @@ things:
 A token admits only `member` or `guest`; admin and node certificates need an
 admin's approval. A role-carrying token (`member-…`, `guest-…`) must match
 the invite's role (checked locally), and the CA refuses any request outside
-the token's scope.
+the token's scope. `ndn-fwd-tokens qr` for a token without a role prefix
+makes a member invite (the namespace CA scopes such a token to members).
+
+An invite expires when its token was minted with `ndn-fwd-tokens new --ttl
+<dur>`: the token carries its expiry (`…-until<unix-secs>`), so the CA, which
+reads `[ca] tokens` from its config, refuses it after that time, and `ndn-fwd
+enroll` refuses the invite before contacting the CA. A token minted without
+`--ttl` stays redeemable until it is used.
 
 A device name holds one certified key at a time. The namespace CA (`RolePolicy`)
 refuses to certify a key for `/<ns>/<role>/<device>` while it holds a valid,
@@ -37,31 +44,40 @@ approves the new key (`device-approval`). So a member token cannot be used to
 enroll as an existing device and publish under its name. The CA checks this
 before running the token challenge, so a refused request does not redeem the
 token: enroll again under another `--device` name, or revoke the old
-certificate first. Certifying the same key again is not refused.
+certificate first. Certifying the same key again is not refused. Of two
+requests for one device name running at once, the CA reserves the name for
+the first before its challenge runs; the second is refused before its own
+challenge runs, so it spends no token either.
 
-Certificates last 90 days: the namespace CA issues `[ca] cert_validity_days`
-(default 90) and the device asks for 90. A CA set to fewer days caps the
-certificate, and the enroll output states the expiry it issued. Renewal is not
-built yet; once it is, lifetimes can be shorter.
+Certificates last what the namespace CA issues: `[ca] cert_validity_days`
+(default 90). The request names no lifetime, so the CA's setting alone decides
+it, and the enroll output states the expiry issued. Renewal is not built yet;
+once it is, lifetimes can be shorter.
 
 ## Flow and packets
 
 | Step | Who | What |
 |---|---|---|
 | 1 | CLI | reads the invite, derives `/<ns>/<role>/<device>` (device default: the host name, sanitized), sends `security/enroll` (Uri = invite, Name = identity, Flags bit 1 = force) over the daemon's Unix socket |
-| 2 | daemon mgmt | trust-admin gate: the peer credentials must be the daemon's user, root, or a `[security] trust_admin_groups` member |
+| 2 | daemon mgmt | trust-admin gate: the peer credentials must be the daemon's user, root, or a `[security] trust_admin_groups` member; a `/localhop` enroll command is refused outright |
 | 3 | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`) |
 | 4 | daemon | generates `/<ns>/<role>/<device>/KEY/<16 hex>` (Ed25519) in its PIB |
 | 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
 | 7 | daemon → CA | fetches the issued certificate and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
 | 8 | daemon | stores `cert.data` (signed Data, as issued) and the summary beside the key, then sets the PIB's default identity — the last step |
-| 9 | daemon | switches the signer of its management responses, discovery records and DV routing to the new key; the key also enters the engine's key store |
+| 9 | daemon | switches the signer of its management responses and discovery records to the new key; the key also enters the engine's key store |
 
 A failure at any step after 4 deletes the new key; the default identity and
 the signer stay as they were. A context adopted in step 5 is kept (it passed
-the fingerprint check on its own). A failure after the CA issued (step 7–8)
-spends the token: the message says so.
+the fingerprint check on its own); the refusal says so, or why storing it
+failed. Once the CA has issued (step 7–8) the token is spent: a failure to
+store the certificate says so; a failure to store the adopted context keeps
+the certificate and reports that the context is held for this run only.
+
+If the CLI gets no answer within its wait (the longest the daemon's
+enrollment can take: every exchange timing out), it says the daemon may still
+complete the enrollment and to check `ndn-ctl status` before retrying.
 
 ## Where state lives
 
@@ -80,14 +96,20 @@ the PIB but the configured one keeps signing; the answer says so.
 
 ## Live signer switch
 
-Management responses, discovery records and DV routing sign through one
-shared `ndn_security::ActiveSigner`: the current signer behind an atomic swap
+Management responses and discovery records sign through one shared
+`ndn_security::ActiveSigner`: the current signer behind an atomic swap
 (`ndn-fwd` `active_identity.rs` holds it). Each packet takes one snapshot and
 uses it for both its KeyLocator and its signature, so a packet always names
 the key that signed it, and every switch applies from the next packet on
 (`ndn-ctl status` shows `signing: identity=… key=…`). There is no limit on
-how many times a run switches. DV neighbours whose `[routing.dv.trust]` lists
-trusted keys must trust the new key, as they would after a restart.
+how many times a run switches.
+
+DV routing with `[routing.dv.trust] mode = "static"` or `"lvs"` keeps signing
+with the key the node started with: its neighbours accept only the keys in
+their `trusted_keys`, so switching would silently cut the node off from
+routing. It signs with the enrolled key after the next start; the enroll
+output reminds the operator to add that key to every DV neighbour's
+`trusted_keys` first.
 
 ## Refusals
 
@@ -100,7 +122,8 @@ trusted keys must trust the new key, as they would after a restart.
 | the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or have an admin approve the device. The token is not redeemed |
 | held context from another root | 403 | the two fingerprints |
 | no route / no answer | 504 | the device needs a link and a route for `/<ns>` toward a forwarder that serves it (an invite carries no host, so enrolling never creates them) |
-| token spent, expired or out of scope | 403 | the CA's reason; ask for a new invite |
+| invite expired (`--ttl`) | 400/403 | the expiry; ask for a new invite (refused by the CLI before anything is sent, and by the CA) |
+| token spent or out of scope | 403 | the CA's reason; ask for a new invite |
 | unauthorized local user | 403 | who may enroll and how to grant it |
 
 ## Code
@@ -114,7 +137,7 @@ trusted keys must trust the new key, as they would after a restart.
 | Daemon backend | `ndn-fwd` `enroll.rs`, `context_adopt.rs` (`TrustAdmin`), `active_identity.rs` |
 | Startup selection | `ndn-fwd` `security_init.rs`; `FilePib::{set,get}_default_identity`, `store_issued_cert` |
 | CLI | `ndn-fwd` `onboard.rs` (`run_enroll`) |
-| Mobile | `NdnEngine::enroll_with_invite(invite_uri, device, persist_password)` |
+| Mobile | `NdnEngine::enroll_with_invite(invite_uri, device, persist_password)`; the result's `adopted_context` (or `NdnError::EnrollmentFailed`'s) carries the context to persist and pass to `adopt_context` at launch |
 
 ## Not yet
 

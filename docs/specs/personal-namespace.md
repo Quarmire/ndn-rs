@@ -125,18 +125,23 @@ Each flow lists steps, what is stored where, failure handling, and status
 
 ### F2 Add a device
 - **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
-  --role member|guest --anchor-fp <fp>`, **have**; the token carries its role
-  and the CA scopes it to `/<ns>/<role>`) → QR/link carries CA prefix,
+  --role member|guest --anchor-fp <fp> [--ttl <dur>]`, **have**; the token
+  carries its role and, with `--ttl`, its expiry, and the CA scopes it to
+  `/<ns>/<role>` and refuses it once expired) → QR/link carries CA prefix,
   namespace, token, expected root fingerprint. New device: `ndn-fwd enroll
   <invite> [--device <name>]` = adopt the trust context by namespace +
   expected fingerprint if not held (no version floor: an invite names none),
   generate the device key in the daemon's PIB, enroll with the token, check
   the issued certificate's chain to the root, store it and make the identity
   the PIB's default (loaded at start unless `[security] identity` names
-  another), and switch the running daemon's signer (**have**:
+  another), and switch the running daemon's signer for its management
+  responses and discovery records (DV with `static`/`lvs` trust keeps its
+  startup key until a restart) (**have**:
   `ndn_cert::enroll_with_invite`, `ndn_identity::enroll_with_invite_via_engine`,
   `security/enroll` gated like `security/context-adopt` by the management
-  socket's peer credentials, mobile `NdnEngine::enroll_with_invite` — see
+  socket's peer credentials and never accepted over `/localhop`, mobile
+  `NdnEngine::enroll_with_invite`, which returns the adopted context for the
+  app to persist — see
   `docs/wiki/src/reference/enrollment-by-invite.md`; adoption from a
   fingerprint-only link: `docs/wiki/src/reference/context-adoption.md`).
 - **By approval:** new device scans the anchor QR, requests enrollment with
@@ -150,9 +155,12 @@ Each flow lists steps, what is stored where, failure handling, and status
 - One key per device name: the CA refuses a new key for `/<ns>/<role>/<dev>`
   while a valid certificate it issued for that name to another key is
   unrevoked, unless an admin approves the new key; the refusal comes before
-  the token is redeemed (**have**: `IssuancePolicy::single_key_identity`).
-- Lifetime: certificates from the namespace CA last 90 days (`[ca] cert_validity_days`),
-  the lifetime a device requests, until renewal (F10) allows shorter ones.
+  the token is redeemed, also for the loser of two concurrent requests for
+  one name (**have**: `IssuancePolicy::single_key_identity`, the CA's
+  in-flight reservation).
+- Lifetime: certificates from the namespace CA last `[ca] cert_validity_days`
+  (default 90); a device's request names no lifetime, so the CA's setting
+  decides, until renewal (F10) allows shorter ones.
 
 ### F3 Delegate the CA to a relay
 1. The relay generates `/<ns>/CA` key locally; produces a cert request.

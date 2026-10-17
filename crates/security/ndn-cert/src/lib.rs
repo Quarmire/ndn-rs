@@ -47,7 +47,7 @@ pub use namespace::{
     device_key_name, init_namespace, init_namespace_in_pib, root_key_name,
 };
 pub use invite::{
-    INVITE_CERT_VALIDITY_SECS, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
+    INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
     InviteLink, IssuedCertificate, enroll_with_invite, ensure_invite_context, new_device_key_name,
 };
 pub use onboarding::{

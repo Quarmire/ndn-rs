@@ -210,9 +210,9 @@ pub struct CaTomlConfig {
     /// Lifetime, in days, of the certificates this CA issues (also the
     /// maximum it advertises in INFO). Default 90: until certificate renewal
     /// is built, an enrolled device must stay valid between enrollments;
-    /// renewal will allow shorter lifetimes. Devices enrolling by invite
-    /// request 90 days; a shorter setting caps them, and `ndn-fwd enroll`
-    /// reports the expiry the CA issued.
+    /// renewal will allow shorter lifetimes. Devices enrolling by invite name
+    /// no lifetime, so they get exactly this; `ndn-fwd enroll` reports the
+    /// expiry the CA issued.
     #[serde(default = "CaTomlConfig::default_cert_validity_days")]
     pub cert_validity_days: u32,
 }

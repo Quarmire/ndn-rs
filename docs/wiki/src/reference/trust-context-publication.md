@@ -83,6 +83,13 @@ The store is read at startup. A context the running daemon adopts
 (`ndn-fwd adopt`, see [Adopting a trust context](./context-adoption.md)) is added to
 the published set at once, replacing an older version of its namespace.
 
+While the daemon itself fetches a namespace's context (`ndn-fwd adopt` with a
+fingerprint-only link), its FIB entry `/<ns>/32=trust-context` toward the
+publisher is withdrawn, so the fetch goes to the forwarders serving `/<ns>`
+rather than being answered with the version this node already holds; it is
+restored when the fetch ends. Other devices' fetches during that window
+follow the same `/<ns>` route.
+
 ```toml
 [security]
 serve_contexts = true   # default; false publishes nothing

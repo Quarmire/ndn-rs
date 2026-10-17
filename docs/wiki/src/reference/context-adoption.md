@@ -56,12 +56,21 @@ The daemon:
 2. adopts it with `ndn_identity::adopt_anchor_link_via_engine`: an inline
    context is checked directly; a fingerprint-only link registers the
    expectation, fetches the context over RDR (`ndn_cert::fetch_context`)
-   through an in-process consumer face, and checks it;
+   through an in-process consumer face, and checks it. While it fetches, this
+   node's own publisher is taken out of the route for
+   `/<ns>/32=trust-context`, so the fetch reaches the forwarders serving
+   `/<ns>` instead of being answered with the version this node already
+   holds (otherwise a newer version could never be fetched);
 3. adopts it into the keyring its validator uses (trusted at once);
 4. stores the signed Data in `<pib_path>/contexts/` (loaded again at every
    start);
 5. publishes it by name (unless `[security] serve_contexts = false`), so other
    devices can fetch it from this one.
+
+Steps 4–5 hold one lock and check the version the keyring holds: of two
+adoptions of one namespace running at once, the disk and the publisher end up
+with the newest version, never an older one (the adoption that lost is
+answered `409`).
 
 The command is answered from a task of its own, so a slow fetch does not stall
 other management clients. Refusals say why and what to do: no route toward a
@@ -87,7 +96,9 @@ trust_admin_groups = ["ndn"]   # default: none
 
 Everyone else is refused with an explanation of how to grant access. The gate
 is `ndn_mgmt::auth::authorize_trust_admin`; trust-changing verbs are listed in
-`TRUST_ADMIN_VERBS`.
+`TRUST_ADMIN_VERBS`. These verbs are refused (`403`) when they arrive as
+`/localhop/nfd/...` commands, whoever signed them: a neighbour never changes
+this node's trust; run `ndn-fwd adopt` on the node itself.
 
 ## Usage
 
@@ -107,7 +118,11 @@ ndn-fwd adopt 'ndn-trust://anchor/_QRwS_…' -c device.toml
 ```
 
 Apps with an embedded engine (ndn-mobile) call the same function:
-`NdnEngine::adopt_context_link(link_uri)`.
+`NdnEngine::adopt_context_link(link_uri)`. The engine keeps the context in
+memory only; the result carries the signed context and the expected
+fingerprint, which the app persists and passes to `adopt_context` at every
+launch. `NdnTrust::parse` returns a fingerprint-only link as an `Anchor`
+without `context_data`, to be handed to `adopt_context_link`.
 
 ## Code
 
@@ -117,7 +132,7 @@ Apps with an embedded engine (ndn-mobile) call the same function:
 | Expectations | `ndn-security/src/validator/expected.rs` |
 | Link parsing, checks, adoption | `ndn_cert::{AnchorLink, adopt_anchor_link}` |
 | Engine binding | `ndn_identity::adopt_anchor_link_via_engine` |
-| Management verb, backend trait | `ndn-mgmt` `security/context-adopt`, `TrustContextMgmtBackend` |
+| Management verb, backend trait | `ndn-mgmt` `security/context-adopt`, `TrustAdminMgmtBackend` |
 | Daemon backend, publisher | `ndn-fwd` `context_adopt.rs`, `context_publisher.rs` |
 | CLI | `ndn-fwd` `onboard.rs` (`run_adopt`) |
 

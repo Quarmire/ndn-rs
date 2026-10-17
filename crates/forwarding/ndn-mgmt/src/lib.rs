@@ -482,11 +482,9 @@ pub struct EnrolledInfo {
     pub issuer: String,
     /// Certificate validity end, ISO 8601 (UTC).
     pub valid_until: String,
-    /// The issued certificate's lifetime in seconds: shorter than
-    /// `requested_validity_secs` when the CA caps lifetimes below the request.
+    /// The issued certificate's lifetime in seconds, as the CA's policy
+    /// (`[ca] cert_validity_days`) decided it.
     pub validity_secs: u64,
-    /// The lifetime the node asked the CA for, in seconds.
-    pub requested_validity_secs: u64,
     /// The trust context adopted on the way; `None` when it was already held.
     pub adopted_context: Option<AdoptedContextInfo>,
     /// The PIB directory holding the key and certificate.
@@ -775,13 +773,35 @@ pub async fn run_ndn_mgmt_handler(
         // public. See `is_public_dataset_verb`.
         let is_public_read =
             !is_localhop_command && is_public_dataset_verb(&parsed.module, &parsed.verb);
-        // Trust-changing verbs (adopting a network) are authorized by who is
-        // on the other end of the local management socket — its peer
-        // credentials — not by a command signature: a device that has no
-        // identity yet must still be able to adopt its first network. Never
-        // over `/localhop`. See `auth::authorize_trust_admin`.
-        let is_trust_admin =
-            !is_localhop_command && is_trust_admin_verb(&parsed.module, &parsed.verb);
+        // Trust-changing verbs (adopting a trust context, enrolling) are
+        // authorized by who is on the other end of the local management
+        // socket — its peer credentials — instead of by a command signature:
+        // a device that has no identity yet must still be able to adopt its
+        // first trust context. Over `/localhop` they are refused outright: a
+        // neighbour must never change this node's trust. See
+        // `auth::authorize_trust_admin`.
+        let is_trust_admin_command = is_trust_admin_verb(&parsed.module, &parsed.verb);
+        if is_localhop_command && is_trust_admin_command {
+            tracing::warn!(
+                target: "mgmt.security",
+                name = %interest.name,
+                "nfd-mgmt: trust change over /localhop refused"
+            );
+            let resp = ControlResponse::error(
+                status::UNAUTHORIZED,
+                "trust changes are accepted only on this node's local management socket; \
+                 run `ndn-fwd adopt` / `ndn-fwd enroll` on the node itself",
+            );
+            send_response(
+                &handle,
+                &interest.name,
+                &resp,
+                mgmt_handles.response_signer().as_deref(),
+            )
+            .await;
+            continue;
+        }
+        let is_trust_admin = is_trust_admin_command;
         if is_trust_admin {
             if let Err(reason) = authorize_trust_admin(source_face, &engine, config.as_ref()) {
                 tracing::warn!(

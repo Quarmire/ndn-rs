@@ -16,18 +16,25 @@ use ndn_security::{Keyring, Signer};
 
 use crate::engine_exchange::EngineExchange;
 
+/// The longest [`enroll_with_invite_via_engine`] can take: every exchange it
+/// may make ([`ndn_cert::INVITE_ENROLL_MAX_EXCHANGES`]) timing out at the
+/// engine consumer's per-Interest timeout.
+pub fn enroll_via_engine_budget() -> std::time::Duration {
+    ndn_app::DEFAULT_TIMEOUT * ndn_cert::INVITE_ENROLL_MAX_EXCHANGES
+}
+
 /// Enroll `device_key` with the CA `invite` names, through `engine`: adopt
 /// the invite's trust context into `keyring` if it is not held, run NDNCERT
 /// with the invite's token, fetch and check the issued certificate (its
-/// chain is checked against `keyring`). Storing the key's certificate,
-/// persisting an adopted context and selecting the identity are the
-/// caller's. See [`ndn_cert::enroll_with_invite`].
+/// chain is checked against `keyring`). The CA's policy decides the
+/// certificate's lifetime. Storing the key's certificate, persisting an
+/// adopted context and selecting the identity are the caller's. See
+/// [`ndn_cert::enroll_with_invite`].
 pub async fn enroll_with_invite_via_engine(
     engine: &ForwarderEngine,
     keyring: &Arc<Keyring>,
     invite: &InviteLink,
     device_key: Arc<dyn Signer>,
-    validity_secs: u64,
 ) -> Result<InviteEnrollment, InviteEnrollFailure> {
     let validator = engine.validator();
     let mut exchange = EngineExchange::new(engine);
@@ -37,7 +44,6 @@ pub async fn enroll_with_invite_via_engine(
         &mut exchange,
         invite,
         device_key,
-        validity_secs,
     )
     .await
 }
