@@ -51,8 +51,9 @@ fn link(a: &ForwarderEngine, b: &ForwarderEngine, cancel: &CancellationToken) ->
     (a_id, b_id)
 }
 
-/// Answer the Interests `producer` receives from `served` (exact name), else
-/// Nack them.
+/// Answer the Interests `producer` receives from `served`: by exact name,
+/// or with CanBePrefix the first Data under the Interest's name (a
+/// certificate fetched by its key name); else Nack them.
 fn serve(producer: Producer, served: Vec<(Name, Bytes)>) {
     let served = Arc::new(served);
     tokio::spawn(async move {
@@ -60,7 +61,10 @@ fn serve(producer: Producer, served: Vec<(Name, Bytes)>) {
             .serve(move |interest, responder| {
                 let served = Arc::clone(&served);
                 async move {
-                    match served.iter().find(|(name, _)| *name == *interest.name) {
+                    let prefix = interest.selectors().can_be_prefix;
+                    match served.iter().find(|(name, _)| {
+                        *name == *interest.name || (prefix && name.has_prefix(&interest.name))
+                    }) {
                         Some((_, wire)) => responder.respond_bytes(wire.clone()).await.ok(),
                         None => responder.nack(NackReason::NoRoute).await.ok(),
                     };
@@ -86,11 +90,13 @@ impl Namespace {
     }
 
     fn ca_cert(&self) -> (Name, Bytes) {
-        (self.ns.ca_key.clone(), std::fs::read(&self.ns.ca_cert_path).unwrap().into())
+        let name = (*self.ns.ca_cert.name).clone();
+        (name, std::fs::read(&self.ns.ca_cert_path).unwrap().into())
     }
 
     fn device_cert(&self) -> (Name, Bytes) {
-        (self.ns.device_key.clone(), std::fs::read(&self.ns.device_cert_path).unwrap().into())
+        let name = (*self.ns.device_cert.name).clone();
+        (name, std::fs::read(&self.ns.device_cert_path).unwrap().into())
     }
 
     /// `/home/bob/admin/desk/data/<suffix>`, signed by the device's key.

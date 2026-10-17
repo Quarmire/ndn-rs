@@ -131,8 +131,16 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     let member = n("/home/bob/member/phone/KEY/k1");
     root_mgr.generate_ed25519(member.clone()).unwrap();
     let member_pk = root_mgr.get_signer_sync(&member).unwrap().public_key().unwrap();
+    // As the CA issues it: `<key>/NDNCERT/<version>`.
     let member_cert = root_mgr
-        .certify(&member, member_pk, &root_dev.ca_key, 3_600_000)
+        .certify_as(
+            &member,
+            member_pk,
+            &root_dev.ca_key,
+            3_600_000,
+            ndn_security::cert_name::NDNCERT_ISSUER,
+            None,
+        )
         .await
         .unwrap();
     let ca_cert = Data::decode(bytes::Bytes::from(std::fs::read(&root_dev.ca_cert_path).unwrap()))

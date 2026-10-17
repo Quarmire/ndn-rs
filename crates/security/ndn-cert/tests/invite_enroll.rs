@@ -50,7 +50,7 @@ impl CaExchange for CaWire {
         } else {
             let wire = self
                 .ca
-                .get_served_cert(&interest.name.to_string())
+                .cert_for_interest(&interest.name, interest.selectors().can_be_prefix)
                 .ok_or_else(|| proto(format!("no served cert {}", interest.name)))?;
             return Data::decode(Bytes::from(wire)).map_err(|e| proto(format!("{e:?}")));
         };

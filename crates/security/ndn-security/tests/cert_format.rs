@@ -67,25 +67,35 @@ async fn issue_cert_data(
 /// C.07 — cert NAME must end with `/KEY/<keyid>/<issuer>/<version>`
 /// (≥ 4 trailing components) per ndn-cxx
 /// `Certificate::isValidName` (`security/certificate.cpp:112-116`).
+/// The certificate's name, not the key's: the key is `<id>/KEY/<keyid>`.
 #[test]
 fn c07_keychain_ephemeral_cert_name_has_four_trailing_components() {
     let kc = KeyChain::ephemeral("/test/alice").expect("ephemeral must succeed");
-    let key_name = kc.key_name();
-    let comps = key_name.components();
+    let cert_name = kc.cert_name().expect("ephemeral identity has a certificate");
+    let comps = cert_name.components();
     let n = comps.len();
 
     // ndn-cxx MIN_CERT_NAME_LENGTH = 4; the last four components must be
     // KEY / <keyid> / <issuer> / <version>.
     assert!(
         n >= 4,
-        "cert/key name must have at least 4 components per ndn-cxx \
-         Certificate::isValidName; got {n}: {key_name}"
+        "cert name must have at least 4 components per ndn-cxx \
+         Certificate::isValidName; got {n}: {cert_name}"
     );
     assert_eq!(
         comps[n - 4].value.as_ref(),
         b"KEY",
-        "fourth-from-last component must be literal `KEY`; got {:?} in {key_name}",
+        "fourth-from-last component must be literal `KEY`; got {:?} in {cert_name}",
         comps[n - 4].value
+    );
+    assert!(
+        comps[n - 1].as_version().is_some(),
+        "last component must be a version; got {cert_name}"
+    );
+    assert!(
+        cert_name.has_prefix(kc.key_name()) && n == kc.key_name().len() + 2,
+        "cert name must be <key-name>/<issuer>/<version>; key {} cert {cert_name}",
+        kc.key_name()
     );
 }
 

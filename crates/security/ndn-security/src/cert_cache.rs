@@ -65,12 +65,57 @@ impl Certificate {
     }
 
     pub fn is_valid_now(&self) -> bool {
-        let now = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        self.is_valid_at(now)
+        self.is_valid_at(now_ns())
     }
+
+    /// The key this certificate certifies: its name without the
+    /// `<issuer-id>/<version>` tail ([`crate::cert_name::key_name_of`]); a
+    /// legacy key-named certificate is its own key name.
+    pub fn key_name(&self) -> Name {
+        crate::cert_name::key_name_of(&self.name)
+    }
+
+    /// The certificate as its signed Data wire, rebuilt from the retained
+    /// signed region and signature value. `None` for a certificate that
+    /// carries neither (an unsigned test fixture).
+    pub fn data_wire(&self) -> Option<Bytes> {
+        let (signed_region, sig_value) = (self.signed_region.as_ref()?, self.sig_value.as_ref()?);
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_nested(tlv_type::DATA, |w| {
+            w.write_raw(signed_region);
+            w.write_tlv(tlv_type::SIGNATURE_VALUE, sig_value);
+        });
+        Some(w.finish())
+    }
+
+    /// Whether `self` should be preferred over `other` among certificates of
+    /// one key: issued later (`valid_from`), then the greater name (the
+    /// later version).
+    fn is_newer_than(&self, other: &Certificate) -> bool {
+        (self.valid_from, self.name.as_ref()) > (other.valid_from, other.name.as_ref())
+    }
+}
+
+fn now_ns() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// The newest of `certs` valid at `now`, else the newest of all.
+fn pick_newest(certs: impl IntoIterator<Item = Certificate>, now: u64) -> Option<Certificate> {
+    let mut valid: Option<Certificate> = None;
+    let mut any: Option<Certificate> = None;
+    for c in certs {
+        if c.is_valid_at(now) && valid.as_ref().is_none_or(|v| c.is_newer_than(v)) {
+            valid = Some(c.clone());
+        }
+        if any.as_ref().is_none_or(|a| c.is_newer_than(a)) {
+            any = Some(c);
+        }
+    }
+    valid.or(any)
 }
 
 /// Parse `(valid_from_ns, valid_until_ns)` from the cert's `ValidityPeriod`
@@ -119,54 +164,141 @@ fn decode_validity_period(signed_region: &[u8]) -> (u64, u64) {
     (0, u64::MAX)
 }
 
-/// In-memory certificate cache, indexed by both certificate name and
-/// SHA-256 of the public key. Both indices are populated on `insert` so
-/// callers resolving a `KeyLocator::Name` or `KeyLocator::KeyDigest` hit
-/// the same entries.
+/// In-memory certificate cache, indexed by certificate name, by key name and
+/// by SHA-256 of the public key.
+///
+/// A key may hold several certificates at once (NDN Certificate Format v2:
+/// `<key>/<issuer-id>/<version>`, e.g. the certificate a renewal replaced and
+/// its successor), so lookups take a *prefix*: [`get`](Self::get) with a key
+/// name resolves to that key's newest currently valid certificate, with a
+/// full certificate name to that certificate. Legacy key-named certificates
+/// (named exactly after their key) are found the same way.
 pub struct CertCache {
     local: DashMap<Arc<Name>, Certificate>,
-    by_digest: DashMap<[u8; 32], Arc<Name>>,
+    /// Key name → names of its cached certificates.
+    by_key: DashMap<Name, Vec<Arc<Name>>>,
+    /// SHA-256 of a public key → the key name it is certified under.
+    by_digest: DashMap<[u8; 32], Name>,
 }
 
 impl CertCache {
     pub fn new() -> Self {
         Self {
             local: DashMap::new(),
+            by_key: DashMap::new(),
             by_digest: DashMap::new(),
         }
     }
 
-    pub fn get(&self, key_name: &Arc<Name>) -> Option<Certificate> {
-        self.local.get(key_name).map(|r| r.clone())
+    /// The certificate `name` resolves to: among cached certificates whose
+    /// name starts with `name` (a key name, a full certificate name, or a
+    /// certificate name without its version), the newest one valid now; when
+    /// none is valid, the newest one regardless, so a caller can tell an
+    /// expired certificate from a missing one. See
+    /// [`get_valid`](Self::get_valid) for valid certificates only.
+    pub fn get(&self, name: &Arc<Name>) -> Option<Certificate> {
+        pick_newest(self.matching(name), now_ns())
     }
 
-    /// Look up a certificate by the SHA-256 of its public key. Only matches
-    /// certs already in the cache — `KeyDigest` cannot drive a network
-    /// fetch because the cert's name is not known to the caller.
+    /// As [`get`](Self::get), but only a certificate valid now: `None` when
+    /// every cached certificate under `name` has expired (or is not yet
+    /// valid), so the caller fetches a current one — e.g. the certificate a
+    /// renewal issued in place of an expired one it still caches.
+    pub fn get_valid(&self, name: &Name) -> Option<Certificate> {
+        let now = now_ns();
+        pick_newest(self.matching(name).filter(|c| c.is_valid_at(now)), now)
+    }
+
+    /// Every cached certificate under `name` (see [`get`](Self::get)), in no
+    /// particular order.
+    pub fn all(&self, name: &Name) -> Vec<Certificate> {
+        self.matching(name).collect()
+    }
+
+    fn matching(&self, name: &Name) -> impl Iterator<Item = Certificate> + '_ {
+        let mut names: Vec<Arc<Name>> = key_candidates(name)
+            .into_iter()
+            .find_map(|key| self.by_key.get(&key).map(|r| r.value().clone()))
+            .unwrap_or_default();
+        // A name outside the `…/KEY/<id>` layout (test fixtures, ad-hoc
+        // keys) cannot be indexed by key; look its certificates up by prefix.
+        if names.is_empty() && !name.components().iter().any(|c| c.value.as_ref() == b"KEY") {
+            names = self
+                .local
+                .iter()
+                .filter(|r| r.key().has_prefix(name))
+                .map(|r| Arc::clone(r.key()))
+                .collect();
+        }
+        let name = name.clone();
+        names
+            .into_iter()
+            .filter(move |cn| cn.has_prefix(&name))
+            .filter_map(|cn| self.local.get(&cn).map(|r| r.value().clone()))
+    }
+
+    /// Look up a certificate by the SHA-256 of its public key: the newest
+    /// valid certificate of the key holding that public key. Only matches
+    /// certs already in the cache — `KeyDigest` cannot drive a network fetch
+    /// because the cert's name is not known to the caller.
     pub fn get_by_key_digest(&self, digest: &[u8]) -> Option<Certificate> {
-        let key: &[u8; 32] = digest.try_into().ok()?;
-        let name = self.by_digest.get(key)?.clone();
-        self.local.get(&name).map(|r| r.clone())
+        use sha2::{Digest, Sha256};
+        let digest: &[u8; 32] = digest.try_into().ok()?;
+        let key_name = self.by_digest.get(digest)?.value().clone();
+        // A key name may (rarely) be certified for other public keys too;
+        // only certificates of the digested public key answer.
+        let of_key = |c: &Certificate| <[u8; 32]>::from(Sha256::digest(&c.public_key)) == *digest;
+        pick_newest(self.matching(&key_name).filter(of_key), now_ns())
     }
 
     pub fn insert(&self, cert: Certificate) {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(&cert.public_key);
-        let digest_arr: [u8; 32] = digest.into();
-        self.by_digest.insert(digest_arr, Arc::clone(&cert.name));
+        let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
+        let key_name = cert.key_name();
+        self.by_digest.insert(digest, key_name.clone());
+        {
+            let mut names = self.by_key.entry(key_name).or_default();
+            if !names.iter().any(|n| *n == cert.name) {
+                names.push(Arc::clone(&cert.name));
+            }
+        }
         self.local.insert(Arc::clone(&cert.name), cert);
     }
 
-    /// Evict the certificate named `key_name` (e.g. once it is revoked), so
-    /// a chain walk no longer resolves it from the cache. Returns it if held.
-    pub fn remove(&self, key_name: &Name) -> Option<Certificate> {
-        let (_, cert) = self.local.remove(key_name)?;
+    /// Evict every certificate under `name` (e.g. once its key is revoked):
+    /// with a key name, all certificates of that key; with a certificate
+    /// name, that certificate. Returns the newest evicted, if any.
+    pub fn remove(&self, name: &Name) -> Option<Certificate> {
         use sha2::{Digest, Sha256};
-        let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
-        self.by_digest
-            .remove_if(&digest, |_, name| name.as_ref() == key_name);
-        Some(cert)
+        let removed: Vec<Certificate> = self
+            .matching(name)
+            .filter_map(|cert| self.local.remove(&cert.name).map(|(_, c)| c))
+            .collect();
+        for cert in &removed {
+            let key_name = cert.key_name();
+            if let Some(mut names) = self.by_key.get_mut(&key_name) {
+                names.retain(|cn| *cn != cert.name);
+            }
+            self.by_key.remove_if(&key_name, |_, names| names.is_empty());
+            if !self.by_key.contains_key(&key_name) {
+                let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
+                self.by_digest.remove_if(&digest, |_, k| *k == key_name);
+            }
+        }
+        pick_newest(removed, now_ns())
     }
+}
+
+/// The key names a lookup for `name` can fall under: the key of a full
+/// certificate name or of a key name ([`crate::cert_name::key_name_of`]), and
+/// for `<key>/<issuer-id>` (a certificate name without its version) that key.
+fn key_candidates(name: &Name) -> Vec<Name> {
+    let mut keys = vec![crate::cert_name::key_name_of(name)];
+    let comps = name.components();
+    if comps.len() >= 3 && comps[comps.len() - 3].value.as_ref() == b"KEY" {
+        keys.push(Name::from_components(comps[..comps.len() - 1].iter().cloned()));
+    }
+    keys
 }
 
 impl Default for CertCache {
@@ -378,5 +510,51 @@ mod tests {
         assert!(cert.is_valid_at(1500));
         assert!(cert.is_valid_at(2000));
         assert!(!cert.is_valid_at(2001));
+    }
+
+    fn cert(name: &str, valid_from: u64, valid_until: u64) -> Certificate {
+        Certificate {
+            name: Arc::new(name.parse().unwrap()),
+            public_key: Bytes::from_static(&[4; 32]),
+            valid_from,
+            valid_until,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        }
+    }
+
+    /// A key name resolves to the key's newest valid certificate, a full
+    /// certificate name to that certificate, and a legacy key-named
+    /// certificate is found by its key name too.
+    #[test]
+    fn key_name_resolves_to_newest_valid_certificate() {
+        let cache = CertCache::new();
+        let key: Arc<Name> = Arc::new("/a/KEY/k".parse().unwrap());
+        cache.insert(cert("/a/KEY/k", 1, u64::MAX)); // legacy key-named
+        cache.insert(cert("/a/KEY/k/NDNCERT/v=2", 2, u64::MAX));
+        cache.insert(cert("/a/KEY/k/NDNCERT/v=3", 3, u64::MAX));
+        cache.insert(cert("/a/KEY/k/NDNCERT/v=4", 4, 5)); // expired
+        cache.insert(cert("/a/KEY/other/NDNCERT/v=9", 9, u64::MAX));
+
+        let got = cache.get(&key).unwrap();
+        assert_eq!(got.name.to_string(), "/a/KEY/k/NDNCERT/v=3");
+        assert_eq!(cache.get_valid(&key).unwrap().name, got.name);
+        let exact: Arc<Name> = Arc::new("/a/KEY/k/NDNCERT/v=2".parse().unwrap());
+        assert_eq!(cache.get(&exact).unwrap().name, exact);
+        let issuer: Arc<Name> = Arc::new("/a/KEY/k/NDNCERT".parse().unwrap());
+        assert_eq!(cache.get(&issuer).unwrap().name.to_string(), "/a/KEY/k/NDNCERT/v=3");
+        assert_eq!(cache.all(&key).len(), 4);
+
+        // An expired certificate alone: `get` still reports it, `get_valid` does not.
+        let expired: Arc<Name> = Arc::new("/a/KEY/k/NDNCERT/v=4".parse().unwrap());
+        assert!(cache.get(&expired).is_some());
+        assert!(cache.get_valid(&expired).is_none());
+
+        // Removing the key evicts every certificate of it, and only those.
+        assert!(cache.remove(&key).is_some());
+        assert!(cache.get(&key).is_none());
+        assert!(cache.get(&Arc::new("/a/KEY/other".parse().unwrap())).is_some());
     }
 }

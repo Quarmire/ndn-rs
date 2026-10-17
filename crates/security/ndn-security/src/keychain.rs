@@ -60,7 +60,7 @@ pub enum KeyAlgorithm {
 const DEFAULT_CERT_VALIDITY_MS: u64 = 365 * 24 * 3600 * 1_000;
 
 /// 8 random bytes formatted as 16 lowercase hex chars; populates the
-/// `<keyid>` slot of certificate names.
+/// `<key-id>` slot of the key name.
 fn ephemeral_keyid() -> String {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
@@ -68,10 +68,11 @@ fn ephemeral_keyid() -> String {
 }
 
 impl KeyChain {
-    /// Ephemeral in-memory identity with a fresh Ed25519 key, self-signed
-    /// with a 365-day cert and registered as a trust anchor. Not
-    /// persisted — use [`open_or_create`](Self::open_or_create) for
-    /// long-lived identities.
+    /// Ephemeral in-memory identity with a fresh Ed25519 key
+    /// `<name>/KEY/<key-id>`, self-signed with a 365-day certificate
+    /// `<key>/self/<version>` ([`cert_name`](Self::cert_name)) registered as
+    /// a trust anchor. Not persisted — use
+    /// [`open_or_create`](Self::open_or_create) for long-lived identities.
     pub fn ephemeral(name: impl AsRef<str>) -> Result<Self, TrustError> {
         Self::ephemeral_with_algo(name, crate::KeyAlgorithm::Ed25519)
     }
@@ -92,9 +93,9 @@ impl KeyChain {
             .parse()
             .map_err(|_| TrustError::KeyStore(format!("invalid NDN name: {}", name.as_ref())))?;
 
-        // Cert/key name ends with `KEY/<keyid>/<issuer>/<version>`
-        // (Certificate Format v2). Ephemeral uses a random keyid, literal
-        // `self` as issuer, and version 0.
+        // NDN Certificate Format v2: the key is `<name>/KEY/<key-id>` (a
+        // random key id); `issue_self_signed` names its certificate
+        // `<key>/self/<version>`.
         let mgr = SecurityManager::new();
         let keyid = ephemeral_keyid();
         let key_name = name
@@ -102,11 +103,7 @@ impl KeyChain {
             .append("KEY")
             .append_component(ndn_packet::NameComponent::generic(
                 bytes::Bytes::copy_from_slice(keyid.as_bytes()),
-            ))
-            .append_component(ndn_packet::NameComponent::generic(
-                bytes::Bytes::from_static(b"self"),
-            ))
-            .append_version(0);
+            ));
         match algo {
             crate::KeyAlgorithm::Ed25519 => {
                 mgr.generate_ed25519(key_name.clone())?;
@@ -177,6 +174,20 @@ impl KeyChain {
         &self.key_name
     }
 
+    /// The name of this key's current certificate,
+    /// `<key>/<issuer-id>/<version>`: the newest currently valid certificate
+    /// of [`key_name`](Self::key_name) held in the cache (the self-signed one
+    /// of an [`ephemeral`](Self::ephemeral) identity, the CA-issued one of an
+    /// enrolled key), else the newest one held. `None` when no certificate
+    /// of the key is held, e.g. a [`from_parts`](Self::from_parts) keychain
+    /// over a bare signer.
+    pub fn cert_name(&self) -> Option<Name> {
+        self.mgr
+            .cert_cache()
+            .get(&Arc::new(self.key_name.clone()))
+            .map(|cert| (*cert.name).clone())
+    }
+
     pub fn signer(&self) -> Result<Arc<dyn Signer>, TrustError> {
         self.mgr.get_signer_sync(&self.key_name)
     }
@@ -206,21 +217,14 @@ impl KeyChain {
                     }
                 })?;
                 // Cert name is `<identity>/KEY/<keyid>/<issuer>/<version>`;
-                // key name drops the trailing `<issuer>/<version>` pair.
-                // Try the cert name first (ndn-rs indexes signers under
-                // it), then fall back to the truncated KEY name (ndn-cxx).
+                // the key name drops the trailing `<issuer>/<version>` pair.
+                // Try the cert name first (a legacy PIB key stored under its
+                // certificate's name), then the key.
                 if let Ok(signer) = self.mgr.get_signer_sync(cert_name) {
                     return Ok(Some(signer));
                 }
-                let comps: Vec<_> = cert_name.components().to_vec();
-                if comps.len() >= 6
-                    && comps
-                        .get(comps.len() - 4)
-                        .map(|c| c.value.as_ref() == b"KEY")
-                        .unwrap_or(false)
-                {
-                    let key_name =
-                        ndn_packet::Name::from_components(comps[..comps.len() - 2].iter().cloned());
+                if crate::cert_name::is_cert_name(cert_name) {
+                    let key_name = crate::cert_name::key_name_of(cert_name);
                     return Ok(Some(self.mgr.get_signer_sync(&key_name)?));
                 }
                 Err(TrustError::CertNotFound {
@@ -375,11 +379,19 @@ impl std::fmt::Debug for KeyChain {
 mod tests {
     use super::*;
 
+    /// An ephemeral key is named `<id>/KEY/<key-id>`; its self-signed
+    /// certificate `<key>/self/<version>` is a separate, cert-v2 name.
     #[test]
     fn ephemeral_generates_key_and_anchor() {
         let kc = KeyChain::ephemeral("/test/alice").unwrap();
         assert_eq!(kc.name().to_string(), "/test/alice");
-        assert!(kc.key_name().to_string().contains("/KEY/"));
+        let key = kc.key_name();
+        assert_eq!(key.len(), 4, "{key}");
+        assert!(key.has_prefix(&"/test/alice/KEY".parse().unwrap()), "{key}");
+        assert!(!crate::cert_name::is_cert_name(key), "{key}");
+        let cert = kc.cert_name().expect("self-signed certificate");
+        assert!(crate::cert_name::is_cert_of(&cert, key), "{cert}");
+        assert_eq!(cert.components()[key.len()].value.as_ref(), b"self");
         assert!(kc.signer().is_ok());
         let _v = kc.validator();
     }
@@ -649,7 +661,7 @@ mod tests {
         use crate::SigningInfo;
         use ndn_packet::{Data, encode::DataBuilder};
         let identity: Name = "/test/s12/cert".parse().unwrap();
-        let key_name: Name = "/test/s12/cert/KEY/kc/self/v=0".parse().unwrap();
+        let key_name: Name = "/test/s12/cert/KEY/kc".parse().unwrap();
         let mgr = Arc::new(SecurityManager::new());
         mgr.generate_ed25519(key_name.clone()).unwrap();
         let pub_key = mgr
@@ -690,7 +702,7 @@ mod tests {
     /// Keychain `/com/example/alice` whose manager also holds bob's key.
     fn alice_with_bob() -> (KeyChain, Name) {
         let kc = KeyChain::ephemeral("/com/example/alice").unwrap();
-        let bob_key: Name = "/com/example/bob/KEY/b0/self/v=0".parse().unwrap();
+        let bob_key: Name = "/com/example/bob/KEY/b0".parse().unwrap();
         kc.manager_arc().generate_ed25519(bob_key.clone()).unwrap();
         (kc, bob_key)
     }

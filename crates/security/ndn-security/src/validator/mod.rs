@@ -107,6 +107,17 @@ pub struct Validator {
     /// forwarder builds the localhop validator before its engine exists, then
     /// attaches an engine-backed fetcher via [`Self::set_cert_fetcher`]).
     pub(super) cert_fetcher: std::sync::OnceLock<Arc<CertFetcher>>,
+    /// Whether a chain must reach a trust anchor (the default), or the
+    /// packet's signature verified against its signer's certificate suffices
+    /// ([`Self::accept_signed`]).
+    pub(super) require_anchor: bool,
+    /// Certificate packets refused because their chain ends at a self-signed
+    /// certificate that is no trust anchor, by the key each certifies, with
+    /// the instant (ns) until which each answers for its key. A walk resolves
+    /// a key from here before fetching it, so Data under such a chain is
+    /// refused at once instead of waiting for a fetch whose answer this
+    /// validator already refused.
+    pub(super) refused_certs: DashMap<Name, (Certificate, u64)>,
     /// Monotonic counters bumped on terminal `Valid` / `Invalid` results;
     /// `Pending` is not counted (re-validation bumps when the cert lands).
     pub(super) verified_total: AtomicU64,
@@ -134,6 +145,8 @@ impl Validator {
             rejected_total: AtomicU64::new(0),
             expectations: Default::default(),
             expecting: Default::default(),
+            require_anchor: true,
+            refused_certs: DashMap::new(),
         }
     }
 
@@ -164,6 +177,8 @@ impl Validator {
             rejected_total: AtomicU64::new(0),
             expectations: Default::default(),
             expecting: Default::default(),
+            require_anchor: true,
+            refused_certs: DashMap::new(),
         }
     }
 
@@ -190,7 +205,24 @@ impl Validator {
             rejected_total: AtomicU64::new(0),
             expectations: Default::default(),
             expecting: Default::default(),
+            require_anchor: true,
+            refused_certs: DashMap::new(),
         }
+    }
+
+    /// Verify each packet's signature against its signer's certificate —
+    /// resolved from the cache or fetched, a self-signed certificate
+    /// included — without walking the chain on to a trust anchor: the
+    /// [`SecurityProfile::AcceptSigned`](crate::SecurityProfile::AcceptSigned)
+    /// posture. A signer that is a trust anchor is still verified against the
+    /// anchor, and revocations and the governing context's schema still apply.
+    ///
+    /// The signer's certificate is trusted as resolved: on a forwarder it is
+    /// itself a packet the engine validated this way (against its own
+    /// signer) before the certificate fetch received it.
+    pub fn accept_signed(mut self) -> Self {
+        self.require_anchor = false;
+        self
     }
 
     /// The keyring this validator dispatches against.
@@ -395,15 +427,18 @@ impl Validator {
             None => return ValidationResult::Invalid(TrustError::InvalidSignature),
         };
 
-        if !self
-            .keyring
-            .context_for(&data.name)
-            .authorizes(&data.name, &key_name)
-        {
+        // The signer as its KeyLocator names it, as the certificate that
+        // resolves to, or as its key (`SignedTrustContext::authorizes_hop`).
+        let cert = self.cert_cache.get(&key_name);
+        if !self.keyring.context_for(&data.name).authorizes_hop(
+            &data.name,
+            &key_name,
+            cert.as_ref().map(|c| c.name.as_ref()),
+        ) {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
 
-        let Some(cert) = self.cert_cache.get(&key_name) else {
+        let Some(cert) = cert else {
             return ValidationResult::Pending;
         };
 
@@ -478,15 +513,16 @@ impl Validator {
             None => return InterestValidationOutcome::Invalid(TrustError::InvalidSignature),
         };
 
-        if !self
-            .keyring
-            .context_for(&interest.name)
-            .authorizes(&interest.name, &key_name)
-        {
+        let cert = self.cert_cache.get(&key_name);
+        if !self.keyring.context_for(&interest.name).authorizes_hop(
+            &interest.name,
+            &key_name,
+            cert.as_ref().map(|c| c.name.as_ref()),
+        ) {
             return InterestValidationOutcome::Invalid(TrustError::SchemaMismatch);
         }
 
-        let Some(cert) = self.cert_cache.get(&key_name) else {
+        let Some(cert) = cert else {
             return InterestValidationOutcome::Pending;
         };
 

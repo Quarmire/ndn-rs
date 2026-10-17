@@ -287,8 +287,9 @@ async fn handle_interest(
 
     debug!(name = %name_str, "NDNCERT: received Interest");
 
-    // Cert-fetch: ship the pre-signed Data wire verbatim.
-    if let Some(wire) = state.get_served_cert(&name_str) {
+    // Cert-fetch: ship the pre-signed Data wire verbatim. A CanBePrefix
+    // Interest for a key name gets the newest valid certificate of the key.
+    if let Some(wire) = state.cert_for_interest(name, interest.selectors().can_be_prefix) {
         debug!(name = %name_str, "NDNCERT: serving issued cert");
         return Some(CaReply::Wire(bytes::Bytes::from(wire)));
     }

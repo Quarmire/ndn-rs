@@ -8,14 +8,28 @@
 //! whole trust schema from the namespace:
 //!
 //! ```text
-//! /<ns>/KEY/<k>, /<ns>/32=trust-context/<v>  signed by  /<ns>/KEY/<k>        (root)
-//! /<ns>/CA/KEY/<k>                           signed by  /<ns>/KEY/<k>
-//! /<ns>/<role>/<dev>/KEY/<k>                 signed by  /<ns>/CA/KEY/<k>
+//! /<ns>/KEY/<k>/self/<v>, /<ns>/32=trust-context/<v>  signed by  the root key    (root)
+//! /<ns>/CA/KEY/<k>/<issuer>/<v>               signed by  the root key
+//! /<ns>/<role>/<dev>/KEY/<k>/NDNCERT/<v>      signed by  /<ns>/CA/KEY/<k>
 //! <requested device key>/ndncert-approve/<id> signed by /<ns>/admin/<dev>/KEY/<k>
-//! /<ns>/<role>/<dev>/<**data>                signed by  /<ns>/<role>/<dev>/KEY/<k>
-//! /<ns>/CA/<**data>                          signed by  /<ns>/CA/KEY/<k>
-//! /<ns>/shared/<**data>                      signed by  /<ns>/{admin,member}/<dev>/KEY/<k>
+//! /<ns>/<role>/<dev>/<**data>                 signed by  /<ns>/<role>/<dev>/KEY/<k>
+//! /<ns>/CA/<**data>                           signed by  /<ns>/CA/KEY/<k>
+//! /<ns>/shared/<**data>                       signed by  /<ns>/{admin,member}/<dev>/KEY/<k>
 //! ```
+//!
+//! Certificates follow NDN Certificate Format v2: a certificate of the key
+//! `…/KEY/<k>` is `…/KEY/<k>/<issuer-id>/<version>` — the root's
+//! self-signed `/<ns>/KEY/<k>/self/<v>`, a device's CA-issued
+//! `…/KEY/<k>/NDNCERT/<v>` (the issuer id also keeps a certificate apart from
+//! an approval `…/KEY/<k>/ndncert-approve/<id>`). The LVS rules match
+//! certificate names, signers included, as python-ndn / NDNts schemas do; the
+//! native rules name signers by key. A signer may be named either way in a
+//! KeyLocator: ndn-rs's chain walk judges each hop by the KeyLocator, by the
+//! certificate it resolves to and by the key name
+//! ([`SignedTrustContext::authorizes_hop`](ndn_security::SignedTrustContext::authorizes_hop)).
+//! Contexts published by earlier releases carry their key-name schema; the
+//! same walk judges a cert-v2 certificate there by its key name, so they keep
+//! working.
 //!
 //! The fixed-shape rules (root, context, CA and device certificates,
 //! approvals) are LightVerSec, compiled in-tree to the portable binary. Two
@@ -36,15 +50,14 @@
 //! purpose) and the schema is checked on every certificate hop, so a key is
 //! only as good as its issuer's right to certify it.
 //!
-//! Signers are named by key name (`…/KEY/<k>`): ndn-rs signs with key-name
-//! KeyLocators and its CA names each certificate after its key. Full
-//! certificate names (`…/KEY/<k>/<issuer>/<v>`) are not admitted; leaving them
-//! out keeps the schema — and the anchor envelope carrying it — QR-sized.
+//! The schema travels in the anchor envelope, which must fit one QR code: the
+//! approval rule therefore covers every role's request with one pattern.
 
 use std::fmt;
 use std::str::FromStr;
 
 use ndn_packet::{Name, NameComponent};
+use ndn_security::cert_name::NDNCERT_ISSUER;
 use ndn_security::{LvsCompileError, SchemaBlob, compile_lvs_to_binary};
 
 /// One of the four roles a device holds in a namespace.
@@ -360,27 +373,32 @@ pub fn namespace_schema(namespace: &Name) -> Result<NamespaceSchema, RoleError> 
     // value is also its URI form.
     let ns = namespace.to_string();
 
-    // Only `_device` is a named pattern: the key id, version and request id
-    // stay anonymous (`_`), which spares the envelope a tag symbol for each.
+    // Only `_device` is a named pattern: the key id, issuer id, version and
+    // request id stay anonymous (`_`), which spares the envelope a tag symbol
+    // for each. Certificates and their signers are cert-v2 certificate names,
+    // as in python-ndn / NDNts schemas (a device certificate is the CA's
+    // `…/KEY/<k>/NDNCERT/<v>`); a chain walk matches a signer named by its key
+    // through the certificate that key resolves to.
     let mut lvs = format!(
-        "// Generated namespace trust schema for {ns}. Signers are key names.\n\
-         #root: {lvs_ns}/\"KEY\"/_ <= #root\n\
+        "// Generated namespace trust schema for {ns}. Signers are certificate names.\n\
+         #root: {lvs_ns}/\"KEY\"/_/_/_ <= #root\n\
          #context: {lvs_ns}/\"32=trust-context\"/_ <= #root\n\
-         #ca: {lvs_ns}/\"CA\"/\"KEY\"/_ <= #root\n"
+         #ca: {lvs_ns}/\"CA\"/\"KEY\"/_/_/_ <= #root\n"
     );
     for role in Role::ALL {
         lvs.push_str(&format!(
-            "#{role}: {lvs_ns}/\"{role}\"/_device/\"KEY\"/_ <= #ca\n"
+            "#{role}: {lvs_ns}/\"{role}\"/_device/\"KEY\"/_/\"{NDNCERT_ISSUER}\"/_ <= #ca\n"
         ));
     }
-    lvs.push_str("// Enrollment approvals for any device key, signed by an admin device.\n");
-    for role in Role::ALL {
-        lvs.push_str(&format!(
-            "#approve_{role}: {lvs_ns}/\"{role}\"/_device/\"KEY\"/_/\"ndncert-approve\"/_ \
-             <= #admin\n"
-        ));
-    }
+    // Enrollment approvals for any device key (whatever its role), signed by
+    // an admin device. One rule: the envelope carrying the schema must stay
+    // QR-sized.
+    lvs.push_str(&format!(
+        "#approve: {lvs_ns}/_/_device/\"KEY\"/_/\"ndncert-approve\"/_ <= #admin\n"
+    ));
 
+    // Signers by key name; the validator also accepts a signer named by one
+    // of its certificates (it judges a certificate name by its key's).
     let mut native = format!("{ns}/CA/<!KEY>/<**data> => {ns}/CA/KEY/<key>\n");
     for role in Role::ALL {
         native.push_str(&format!(
@@ -555,6 +573,33 @@ mod tests {
             .schema_authoritative()
     }
 
+    /// The certificate a signer's key name resolves to, named as this
+    /// namespace names it (NDN Certificate Format v2): the root's
+    /// self-signed `…/self/<v>`, the CA's root-issued `…/NA/<v>`, a device's
+    /// CA-issued `…/NDNCERT/<v>`.
+    fn cert_of(key: &Name) -> Name {
+        let issuer = if key.has_prefix(&n("/home/bob/KEY")) {
+            "self"
+        } else if key.has_prefix(&n("/home/bob/CA/KEY")) {
+            "NA"
+        } else {
+            "NDNCERT"
+        };
+        ndn_security::cert_name::cert_name(key, issuer, 9)
+    }
+
+    /// Whether a chain walk authorizes `data` signed by `key` — with the
+    /// KeyLocator naming the key (ndn-rs) and naming its certificate (other
+    /// stacks); both forms must give the same verdict.
+    fn hop(ctx: &SignedTrustContext, data: &str, key: &str) -> bool {
+        let (data, key) = (n(data), n(key));
+        let cert = cert_of(&key);
+        let by_key = ctx.authorizes_hop(&data, &key, Some(&cert));
+        let by_cert = ctx.authorizes_hop(&data, &cert, Some(&cert));
+        assert_eq!(by_key, by_cert, "{data} by {key}: the KeyLocator form changed the verdict");
+        by_key
+    }
+
     #[test]
     fn generated_schema_allows_the_role_layout() {
         let ctx = context();
@@ -563,15 +608,15 @@ mod tests {
         let admin = "/home/bob/admin/laptop/KEY/k1";
         let member = "/home/bob/member/phone/KEY/k1";
         let allowed = [
-            // root, context and CA certificates
-            (root, root),
+            // root, context and CA certificates (cert-v2 names)
+            ("/home/bob/KEY/root/self/v=1", root),
             ("/home/bob/32=trust-context/v=3", root),
-            (ca, root),
-            // every role's device keys, signed by the CA
-            (admin, ca),
-            (member, ca),
-            ("/home/bob/node/vps/KEY/k1", ca),
-            ("/home/bob/guest/alice/KEY/k1", ca),
+            ("/home/bob/CA/KEY/ca/NA/v=1", root),
+            // every role's device certificates, issued by the CA
+            ("/home/bob/admin/laptop/KEY/k1/NDNCERT/v=1", ca),
+            ("/home/bob/member/phone/KEY/k1/NDNCERT/v=2", ca),
+            ("/home/bob/node/vps/KEY/k1/NDNCERT/v=3", ca),
+            ("/home/bob/guest/alice/KEY/k1/NDNCERT/v=4", ca),
             // CA service data under its own name
             ("/home/bob/CA/INFO/v=1", ca),
             // device data under the device's own name, by its own key
@@ -593,16 +638,20 @@ mod tests {
             ("/home/bob/shared/calendar/2026", member),
         ];
         for (data, key) in allowed {
-            let (data, key) = (n(data), n(key));
-            let why = ctx.explain(&data, &key);
-            assert!(
-                ctx.authorizes(&data, &key),
-                "{data} by {key} must be allowed"
-            );
-            assert!(
-                why.allowed() && why.rule.is_some(),
-                "{data} by {key}: {why:?}"
-            );
+            assert!(hop(&ctx, data, key), "{data} by {key} must be allowed");
+        }
+        // The certificate hops, as LVS (python-ndn, NDNts) reads them: the
+        // published LVS alone admits them with certificate-name signers.
+        let lvs = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_schema_blob(SchemaBlob::lvs(namespace_schema(&n("/home/bob")).unwrap().lvs_binary))
+            .unwrap()
+            .schema_authoritative();
+        for (data, key) in [
+            ("/home/bob/CA/KEY/ca/NA/v=1", "/home/bob/KEY/root/self/v=1"),
+            ("/home/bob/member/phone/KEY/k1/NDNCERT/v=2", "/home/bob/CA/KEY/ca/NA/v=1"),
+            ("/home/bob/32=trust-context/v=3", "/home/bob/KEY/root/self/v=1"),
+        ] {
+            assert!(lvs.authorizes(&n(data), &n(key)), "LVS: {data} by {key}");
         }
     }
 
@@ -623,6 +672,16 @@ mod tests {
                 "/home/bob/admin/tablet/KEY/k1/ndncert-approve/req-1",
                 "/home/bob/node/vps/KEY/k1",
             ),
+            // an approval is no certificate: the CA does not sign one, and an
+            // admin does not issue a device certificate
+            (
+                "/home/bob/member/tablet/KEY/k1/ndncert-approve/req-1",
+                "/home/bob/CA/KEY/ca",
+            ),
+            (
+                "/home/bob/member/tablet/KEY/k1/NDNCERT/v=1",
+                "/home/bob/admin/laptop/KEY/k1",
+            ),
             // a member signs another device's data, or another role's
             (
                 "/home/bob/member/laptop/notes",
@@ -636,7 +695,7 @@ mod tests {
             ("/home/bob/shared/calendar", "/home/bob/guest/alice/KEY/k1"),
             ("/home/bob/shared/calendar", "/home/bob/node/vps/KEY/k1"),
             // device keys not issued by the CA: self-signed, by the root, by a
-            // device, or by an admin
+            // device, or by an admin — in either certificate naming
             (
                 "/home/bob/member/phone/KEY/k2",
                 "/home/bob/member/phone/KEY/k1",
@@ -645,7 +704,12 @@ mod tests {
                 "/home/bob/member/phone/KEY/k1/self/v=1",
                 "/home/bob/member/phone/KEY/k1",
             ),
+            (
+                "/home/bob/member/phone/KEY/k2/NDNCERT/v=1",
+                "/home/bob/member/phone/KEY/k1",
+            ),
             ("/home/bob/member/phone/KEY/k1", "/home/bob/KEY/root"),
+            ("/home/bob/member/phone/KEY/k1/NDNCERT/v=1", "/home/bob/KEY/root"),
             (
                 "/home/bob/admin/laptop/KEY/k1",
                 "/home/bob/admin/desk/KEY/k1",
@@ -653,6 +717,8 @@ mod tests {
             // the CA key is certified by the root only; the CA cannot sign the
             // context; the root does not sign device data
             ("/home/bob/CA/KEY/ca2", "/home/bob/CA/KEY/ca"),
+            ("/home/bob/CA/KEY/ca2/NA/v=1", "/home/bob/CA/KEY/ca"),
+            ("/home/bob/KEY/root2/self/v=1", "/home/bob/CA/KEY/ca"),
             ("/home/bob/32=trust-context/v=4", "/home/bob/CA/KEY/ca"),
             ("/home/bob/member/phone/notes", "/home/bob/KEY/root"),
             // names outside the layout
@@ -661,20 +727,58 @@ mod tests {
                 "/home/alice/member/phone/x",
                 "/home/alice/member/phone/KEY/k1",
             ),
-            // full certificate names are not signers (key names only)
-            (
-                "/home/bob/member/phone/notes",
-                "/home/bob/member/phone/KEY/k1/NDNCERT/v=1",
-            ),
         ];
         for (data, key) in denied {
-            let (data, key) = (n(data), n(key));
-            assert!(
-                !ctx.authorizes(&data, &key),
-                "{data} by {key} must be denied"
-            );
-            assert!(!ctx.explain(&data, &key).allowed(), "{data} by {key}");
+            // Under either KeyLocator form (checked equal by `hop`).
+            assert!(!hop(&ctx, data, key), "{data} by {key} must be denied");
         }
+    }
+
+    /// A context published by an earlier release carries the schema it
+    /// generated then, over key names (`…/KEY/<k>` certificates, key-name
+    /// signers). Its namespaces keep working once their CA issues cert-v2
+    /// certificates: a chain walk judges a certificate by its key name too,
+    /// and the old denials still hold.
+    #[test]
+    fn earlier_releases_schema_accepts_cert_v2_names() {
+        let ns = "/\"home\"/\"bob\"";
+        let mut lvs = format!(
+            "#root: {ns}/\"KEY\"/_ <= #root\n#context: {ns}/\"32=trust-context\"/_ <= #root\n\
+             #ca: {ns}/\"CA\"/\"KEY\"/_ <= #root\n"
+        );
+        for role in Role::ALL {
+            lvs.push_str(&format!("#{role}: {ns}/\"{role}\"/_device/\"KEY\"/_ <= #ca\n"));
+            lvs.push_str(&format!(
+                "#approve_{role}: {ns}/\"{role}\"/_device/\"KEY\"/_/\"ndncert-approve\"/_ <= #admin\n"
+            ));
+        }
+        let mut native = String::from("/home/bob/CA/<!KEY>/<**data> => /home/bob/CA/KEY/<key>\n");
+        for role in Role::ALL {
+            native.push_str(&format!(
+                "/home/bob/{role}/<device>/<!KEY>/<**data> => /home/bob/{role}/<device>/KEY/<key>\n"
+            ));
+        }
+        let old = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_schema_blobs(vec![
+                SchemaBlob::lvs(compile_lvs_to_binary(&lvs).unwrap()),
+                SchemaBlob::native_text(native),
+            ])
+            .unwrap()
+            .schema_authoritative();
+        let ca_key = n("/home/bob/CA/KEY/ca");
+        let ca_cert = n("/home/bob/CA/KEY/ca"); // key-named, as the old CA's certificate is
+        let member = n("/home/bob/member/phone/KEY/k1");
+        let renewed = n("/home/bob/member/phone/KEY/k1/NDNCERT/v=5");
+        // The CA's cert-v2 certificate of a device, by the CA's key.
+        assert!(old.authorizes_hop(&renewed, &ca_key, Some(&ca_cert)));
+        // Device data signed under either KeyLocator form.
+        let notes = n("/home/bob/member/phone/notes");
+        assert!(old.authorizes_hop(&notes, &member, Some(&renewed)));
+        assert!(old.authorizes_hop(&notes, &renewed, Some(&renewed)));
+        // Still denied: a device certifying itself, or another device's data.
+        let self_issued = n("/home/bob/member/phone/KEY/k2/NDNCERT/v=1");
+        assert!(!old.authorizes_hop(&self_issued, &member, Some(&renewed)));
+        assert!(!old.authorizes_hop(&n("/home/bob/member/laptop/x"), &renewed, Some(&renewed)));
     }
 
     #[test]
@@ -683,7 +787,7 @@ mod tests {
         let model = ndn_security::LvsModel::decode(&schema.lvs_binary).unwrap();
         // The rendered binary names every rule of the source.
         let text = model.to_text();
-        for rule in ["#root:", "#context:", "#ca:", "#guest:", "#approve_node:"] {
+        for rule in ["#root:", "#context:", "#ca:", "#guest:", "#approve:"] {
             assert!(text.contains(rule), "{rule} missing from:\n{text}");
         }
         assert!(namespace_schema(&n("/")).is_err());

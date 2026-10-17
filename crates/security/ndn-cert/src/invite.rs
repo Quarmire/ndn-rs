@@ -180,14 +180,10 @@ impl InviteLink {
 }
 
 /// A fresh key name for `identity`: `<identity>/KEY/<16 hex digits>`, the key
-/// id random so a re-enrollment never collides with an earlier key.
+/// id random so a re-enrollment never collides with an earlier key
+/// ([`ndn_security::cert_name::new_key_name`]).
 pub fn new_device_key_name(identity: &Name) -> Name {
-    let mut id = [0u8; 8];
-    // The system RNG failing leaves the id zero; the name is still valid and
-    // a collision is refused by the caller's key store.
-    let _ = getrandom::getrandom(&mut id);
-    let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
-    identity.clone().append("KEY").append(hex.as_str())
+    ndn_security::cert_name::new_key_name(identity)
 }
 
 /// Why enrollment with an invite did not produce a certificate. Every message
@@ -547,8 +543,11 @@ where
             }
             (ValidationResult::Pending, missing) => {
                 let Some(missing) = missing else { break };
+                // `missing` is a KeyLocator, normally a key name: ask for its
+                // newest certificate (`CanBePrefix`), never a stale cached one.
                 let interest = InterestBuilder::new((*missing).clone())
                     .can_be_prefix()
+                    .must_be_fresh()
                     .build();
                 let reply = exchange
                     .express(interest)
@@ -574,7 +573,8 @@ pub(crate) async fn check_issued(
 ) -> Result<IssuedCertificate, IssuedCheckError> {
     let refused = IssuedCheckError::Refused;
     let cert = Certificate::decode(data).map_err(|e| refused(format!("not a certificate: {e}")))?;
-    if !cert.name.has_prefix(device_key.key_name()) {
+    let device_key_name = ndn_security::cert_name::key_name_of(device_key.key_name());
+    if !cert.name.has_prefix(&device_key_name) {
         return Err(refused(format!(
             "it names {}, not the device key {}",
             cert.name,

@@ -41,12 +41,20 @@ pub const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// A [`FetchFn`] that expresses each cert Interest through `engine` on one
 /// in-process app face (tied to `cancel`). Concurrent fetches share the face;
 /// each gets the reply (Data or Nack) to its own Interest.
+///
+/// The Interest names a key (or one certificate) and carries `CanBePrefix`,
+/// so it is answered by a certificate `<key>/<issuer-id>/<version>` (NDN
+/// Certificate Format v2), and `MustBeFresh`, so a content store holding a
+/// stale copy of an older certificate of the key does not answer it — after a
+/// renewal the new certificate comes from its producer.
 pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> FetchFn {
     let conn: Arc<dyn Connection> = DemuxConnection::new(engine.app_face(cancel));
     Arc::new(move |name: Name| {
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
             let wire = InterestBuilder::new(name)
+                .can_be_prefix()
+                .must_be_fresh()
                 .lifetime(CERT_FETCH_TIMEOUT)
                 .build();
             consumer.fetch_wire(wire, CERT_FETCH_TIMEOUT).await.ok()

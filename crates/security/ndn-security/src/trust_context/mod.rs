@@ -394,8 +394,34 @@ impl SignedTrustContext {
         true
     }
 
+    /// Whether `name` (a key name or a certificate name) names an anchor of
+    /// this context — see [`anchor_for`](Self::anchor_for).
     pub fn is_anchor(&self, name: &Name) -> bool {
-        self.anchors.iter().any(|r| r.key().as_ref() == name)
+        self.anchor_for(name).is_some()
+    }
+
+    /// The anchor `name` refers to. Anchors match by key: a KeyLocator naming
+    /// the anchor's key (`/<id>/KEY/<k>`), the anchor certificate itself
+    /// (`/<id>/KEY/<k>/self/<v>`) or another certificate of that key all
+    /// resolve to the anchor, which is trusted for its key. An anchor
+    /// stored under exactly `name` wins; among several of one key, the newest
+    /// valid one.
+    pub fn anchor_for(&self, name: &Name) -> Option<Certificate> {
+        if let Some(exact) = self.anchors.get(name) {
+            return Some(exact.value().clone());
+        }
+        let key = crate::cert_name::key_name_of(name);
+        let now = crate::validator::now_ns();
+        self.anchors
+            .iter()
+            // Same key, or (for a key named outside the `…/KEY/<id>` layout)
+            // a certificate `<name>/<issuer>/<version>` of it.
+            .filter(|r| {
+                crate::cert_name::key_name_of(r.key()) == key
+                    || (r.key().len() == name.len() + 2 && r.key().has_prefix(name))
+            })
+            .map(|r| r.value().clone())
+            .max_by_key(|c| (c.is_valid_at(now), c.valid_from, Arc::clone(&c.name)))
     }
 
     /// Whether `name` is revoked by this context: equal to a revocation
@@ -441,6 +467,34 @@ impl SignedTrustContext {
             .allows(data_name, key_name)
     }
 
+    /// Authorization of one signing hop as a chain walk decides it: `signed`
+    /// (a packet name, or a certificate name at a certificate hop) signed by
+    /// the key its KeyLocator `locator` names, whose certificate the walk
+    /// resolved to `signer_cert` (when it has).
+    ///
+    /// NDN Certificate Format v2 gives a key several names — `…/KEY/<k>` and
+    /// each certificate `…/KEY/<k>/<issuer>/<v>` — and schemas are written
+    /// for either: python-ndn / NDNts LVS rules match certificate names,
+    /// ndn-rs's key names, and earlier ndn-rs releases named certificates
+    /// after their key. So the pair is authorized when
+    /// [`authorizes`](Self::authorizes) admits any of: the signer as its
+    /// KeyLocator names it, as its resolved certificate, or as its key; for a
+    /// certificate `signed`, the certificate's own name or its key name. Every
+    /// form names the same key, so no form grants authority another one lacks.
+    pub fn authorizes_hop(&self, signed: &Name, locator: &Name, signer_cert: Option<&Name>) -> bool {
+        if self.authorizes(signed, locator) {
+            return true;
+        }
+        use crate::cert_name::{is_cert_name, key_name_of};
+        let signed_key = is_cert_name(signed).then(|| key_name_of(signed));
+        let locator_key = is_cert_name(locator).then(|| key_name_of(locator));
+        let signers = [Some(locator), signer_cert, locator_key.as_ref()];
+        [Some(signed), signed_key.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|s| signers.iter().flatten().any(|k| self.authorizes(s, k)))
+    }
+
     /// Why [`authorizes`](Self::authorizes) decides as it does for
     /// `(data_name, key_name)`: the hierarchy floor's verdict (if enforced)
     /// and the schema rule that admits the pair. For inspection tooling;
@@ -471,7 +525,7 @@ impl SignedTrustContext {
             // AnchorSet — concatenated Data (0x06) certs.
             w.write_nested(tlv::ANCHOR_SET, |w| {
                 for r in self.anchors.iter() {
-                    if let Some(wire) = cert_to_data_wire(r.value()) {
+                    if let Some(wire) = r.value().data_wire() {
                         w.write_raw(&wire);
                     }
                 }
@@ -757,18 +811,10 @@ impl SignedTrustContext {
         let signer = sig_info
             .key_locator_name()
             .ok_or(OpenContextError::MissingKeyLocator)?;
-        // Exact anchor (cert) name first, else the anchor cert under the
-        // signer's key name (`/<id>/KEY/<k>` locating `/<id>/KEY/<k>/<issuer>/<v>`).
+        // The anchor of the signer's key, whether the KeyLocator names the key
+        // or one of its certificates.
         let anchor = ctx
-            .anchors()
-            .get(&signer)
-            .map(|r| r.value().clone())
-            .or_else(|| {
-                ctx.anchors()
-                    .iter()
-                    .find(|r| r.key().has_prefix(&signer))
-                    .map(|r| r.value().clone())
-            })
+            .anchor_for(&signer)
             .ok_or_else(|| OpenContextError::SignerNotAnchor(signer.to_string()))?;
 
         // Only public-key signatures authenticate a signer; a digest or
@@ -839,19 +885,6 @@ fn read_tlv(input: &[u8]) -> Result<(u64, &[u8], &[u8]), SignedTrustContextError
         return Err(SignedTrustContextError::Truncated("value"));
     }
     Ok((t, &input[header..total], &input[total..]))
-}
-
-/// Reconstruct an anchor's `Data` wire from its retained signed region and
-/// signature value. `None` for test-only certs that carry neither.
-fn cert_to_data_wire(cert: &Certificate) -> Option<Bytes> {
-    let sr = cert.signed_region.as_ref()?;
-    let sv = cert.sig_value.as_ref()?;
-    let mut w = TlvWriter::new();
-    w.write_nested(ndn_packet::tlv_type::DATA, |w| {
-        w.write_raw(sr);
-        w.write_tlv(ndn_packet::tlv_type::SIGNATURE_VALUE, sv);
-    });
-    Some(w.finish())
 }
 
 /// Recover the signing identity from a key/cert name by dropping a trailing

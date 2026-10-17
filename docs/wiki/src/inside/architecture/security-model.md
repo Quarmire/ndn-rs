@@ -110,6 +110,22 @@ Trust policy is a `TrustSchema` (`crates/security/ndn-security/src/trust_schema.
 consumer-side validator that trusts only certificates under a given anchor
 prefix. You reach an accept-all posture only by asking for it by name.
 
+A chain that ends at a self-signed certificate which is not an anchor of the
+governing context is refused with `TrustError::UntrustedSelfSigned`, naming the
+certificate and the context and saying what to do (adopt the namespace's trust
+context, or add the certificate as an anchor). A self-signed certificate is its
+own signer's certificate, so validating one never fetches its key — on a
+forwarder that fetch would be answered by the very certificate waiting for it.
+A certificate refused this way answers for its key for as long as the
+`CertFetcher` would not fetch that key again, so Data signed under it is
+refused at once rather than parked until a fetch timeout.
+
+`Validator::accept_signed()` (the forwarder's `accept-signed` profile) stops
+the walk at the packet's signer: the signature must verify against the
+signer's certificate — fetched if not cached, a self-signed one included — but
+that certificate need not reach an anchor. On a forwarder the certificate is
+itself Data the engine validated the same way before the fetch received it.
+
 ### Interoperable trust schemas (LVS)
 
 Beyond ndn-rs's native `SchemaRule`s, a schema can import a **LightVerSec (LVS)**

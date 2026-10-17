@@ -19,6 +19,7 @@ pub mod abe;
 pub mod capability;
 pub mod cert_cache;
 pub mod cert_fetcher;
+pub mod cert_name;
 pub mod confidentiality;
 #[cfg(feature = "custodian")]
 #[cfg_attr(docsrs, doc(cfg(feature = "custodian")))]

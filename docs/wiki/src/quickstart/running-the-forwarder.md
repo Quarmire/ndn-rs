@@ -29,7 +29,9 @@ With the default config the forwarder:
 - Listens on `/run/ndn-fwd/ndn-fwd.sock` for application IPC (the
   management/face socket; built-in default when no config is given:
   `/run/nfd/nfd.sock`).
-- Auto-generates its identity on first startup (`[security] auto_init`).
+- Auto-generates its identity on first startup (`[security] auto_init`):
+  a key `<identity>/KEY/<random hex>` with a self-signed certificate
+  `<key>/self/v=<ms>`.
 - Logs to stderr at `info` (override with `RUST_LOG` or the config's
   logging section).
 

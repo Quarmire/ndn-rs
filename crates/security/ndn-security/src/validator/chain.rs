@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ndn_packet::{Data, Interest, KeyLocator, Name, SignatureType};
 
 use crate::cert_cache::Certificate;
+use crate::cert_name::{is_cert_name, is_cert_of, is_reserved_non_cert, key_name_of};
 use crate::safe_data::TrustPath;
 use crate::verifier::verify_by_sig_type;
 use crate::{SafeData, TrustError, VerifyOutcome};
@@ -13,17 +15,37 @@ use super::{
     ValidationResult, Validator, now_ns,
 };
 
+/// A signing hop of a chain walk whose authorization waits for its signer's
+/// certificate (see [`SignedTrustContext::authorizes_hop`](crate::SignedTrustContext::authorizes_hop)).
+enum Hop {
+    /// The validated packet itself, by this name.
+    Packet(Name),
+    /// A certificate of the chain.
+    Cert(Arc<Name>),
+}
+
 /// Outcome of [`Validator::walk_to_anchor`] — the shared chain-walk core used by
 /// both the Data and signed-Interest fetch-enabled validation paths.
 enum WalkOutcome {
-    /// The chain reached a trust anchor; carries the cert names walked.
-    Anchored(Vec<Name>),
+    /// The chain reached a trust anchor — or, under
+    /// [`Validator::accept_signed`], the packet's signer verified it; carries
+    /// the cert names walked.
+    Trusted(Vec<Name>),
     /// A cert in the chain couldn't be resolved (cache miss + no/failed fetch);
     /// carries the name of the first unresolved cert.
     Pending(Arc<Name>),
     /// The chain is invalid (bad signature, schema mismatch, revoked, cycle, …).
     Invalid(TrustError),
 }
+
+/// How long a refused certificate answers for its key
+/// ([`Validator::refused_certs`]) when no fetcher is attached; with one, as
+/// long as the fetcher would not fetch that key again anyway
+/// ([`CertFetcher::retry_after`](crate::CertFetcher::retry_after)).
+const REFUSED_CERT_TTL: Duration = Duration::from_secs(8);
+/// Bound on [`Validator::refused_certs`]; past it, expired entries are
+/// swept, and a new refusal is not remembered while none has expired.
+const REFUSED_CERTS_MAX: usize = 256;
 
 impl Validator {
     /// Validate by walking the full certificate chain.
@@ -118,10 +140,11 @@ impl Validator {
                 data.sig_value(),
                 sig_info.sig_type,
                 fetch,
+                Some(data),
             )
             .await
         {
-            WalkOutcome::Anchored(chain_names) => {
+            WalkOutcome::Trusted(chain_names) => {
                 let Ok(inner) = Data::decode(data.raw().clone()) else {
                     return result(ValidationResult::Invalid(TrustError::InvalidSignature));
                 };
@@ -185,10 +208,11 @@ impl Validator {
                 sig_value,
                 sig_info.sig_type,
                 true,
+                None,
             )
             .await
         {
-            WalkOutcome::Anchored(_) => InterestValidationOutcome::Valid,
+            WalkOutcome::Trusted(_) => InterestValidationOutcome::Valid,
             WalkOutcome::Pending(_) => InterestValidationOutcome::Pending,
             WalkOutcome::Invalid(e) => InterestValidationOutcome::Invalid(e),
         }
@@ -199,7 +223,25 @@ impl Validator {
     /// cert → issuer until a trust anchor of the context governing
     /// `context_name` terminates the chain. Missing certs are fetched via the
     /// `CertFetcher` when `fetch` is set and one is configured (→
-    /// [`WalkOutcome::Pending`] naming the unresolved cert on a miss).
+    /// [`WalkOutcome::Pending`] naming the unresolved cert on a miss). Under
+    /// [`Validator::accept_signed`] the walk ends at the packet's verified
+    /// signer.
+    ///
+    /// KeyLocators name a key (or one certificate of it); each resolves to the
+    /// key's newest valid certificate, or to the anchor of that key. Every hop
+    /// is authorized with [`SignedTrustContext::authorizes_hop`]: a
+    /// certificate hop once its issuer is resolved, so a schema written over
+    /// certificate names sees the issuer's certificate name.
+    ///
+    /// `packet` is the validated Data (`None` for an Interest). A certificate
+    /// signed by its own key is its own signer's certificate: it is never
+    /// fetched — the fetch would be answered by this very packet, which waits
+    /// for it. A chain ending at a self-signed certificate that is no anchor
+    /// is refused ([`TrustError::UntrustedSelfSigned`]); a certificate packet
+    /// refused so is remembered for its key ([`Self::refused_certs`]).
+    ///
+    /// [`SignedTrustContext::authorizes_hop`]: crate::SignedTrustContext::authorizes_hop
+    #[allow(clippy::too_many_arguments)]
     async fn walk_to_anchor(
         &self,
         context_name: &Name,
@@ -208,16 +250,38 @@ impl Validator {
         first_sig_value: &[u8],
         first_sig_type: SignatureType,
         fetch: bool,
+        packet: Option<&Data>,
     ) -> WalkOutcome {
         let ctx = self.keyring.context_for(context_name);
-        if !ctx.authorizes(context_name, &first_key) {
-            return WalkOutcome::Invalid(TrustError::SchemaMismatch);
-        }
-        let anchors = ctx.anchors();
+        let authoritative = ctx.schema_is_authoritative();
 
         let now = now_ns();
         let mut chain_names: Vec<Name> = Vec::new();
         let mut seen: HashSet<Arc<Name>> = HashSet::new();
+
+        // The hop whose authorization waits for its signer to resolve: the
+        // packet's own hop when its KeyLocator alone (or its key name) is not
+        // enough — a schema over certificate names needs the signer's
+        // certificate — then each certificate, checked against its issuer.
+        let mut pending: Option<Hop> = (!ctx.authorizes_hop(context_name, &first_key, None))
+            .then(|| Hop::Packet(context_name.clone()));
+        let hop_refused = |hop: &Option<Hop>, signer: &Name, signer_cert: &Name| match hop {
+            Some(Hop::Packet(name)) if !ctx.authorizes_hop(name, signer, Some(signer_cert)) => {
+                Some(WalkOutcome::Invalid(TrustError::SchemaMismatch))
+            }
+            // An authoritative schema governs every certificate hop, as LVS
+            // validation does: e.g. a device key is accepted only when the CA
+            // certified it, not when another device self-issued it.
+            Some(Hop::Cert(cert))
+                if authoritative && !ctx.authorizes_hop(cert, signer, Some(signer_cert)) =>
+            {
+                Some(WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+                    cert: cert.to_string(),
+                    issuer: signer.to_string(),
+                }))
+            }
+            _ => None,
+        };
 
         let mut current_signed_region: &[u8] = first_signed_region;
         let mut current_sig_value: &[u8] = first_sig_value;
@@ -227,7 +291,7 @@ impl Validator {
         let mut owned_signed_region: bytes::Bytes;
         let mut owned_sig_value: bytes::Bytes;
 
-        for _depth in 0..self.max_chain {
+        for depth in 0..self.max_chain {
             if !seen.insert(Arc::clone(&current_key_name)) {
                 return WalkOutcome::Invalid(TrustError::ChainCycle {
                     name: current_key_name.to_string(),
@@ -243,11 +307,16 @@ impl Validator {
                 });
             }
 
-            if let Some(anchor) = anchors.get(&current_key_name) {
+            // Anchors match by key: a KeyLocator naming the anchor's key or any
+            // certificate of it terminates the chain there.
+            if let Some(anchor) = ctx.anchor_for(&current_key_name) {
                 if !anchor.is_valid_at(now) {
                     return WalkOutcome::Invalid(TrustError::CertNotFound {
                         name: format!("expired trust anchor: {}", current_key_name),
                     });
+                }
+                if let Some(refused) = hop_refused(&pending, &current_key_name, &anchor.name) {
+                    return refused;
                 }
                 return match verify_by_sig_type(
                     current_sig_type,
@@ -259,7 +328,7 @@ impl Validator {
                 {
                     Ok(VerifyOutcome::Valid) => {
                         chain_names.push(current_key_name.as_ref().clone());
-                        WalkOutcome::Anchored(chain_names)
+                        WalkOutcome::Trusted(chain_names)
                     }
                     Ok(VerifyOutcome::Invalid) => {
                         WalkOutcome::Invalid(TrustError::InvalidSignature)
@@ -268,46 +337,117 @@ impl Validator {
                 };
             }
 
-            let cert = match self.resolve_cert(&current_key_name, fetch).await {
-                Some(c) => c,
-                None => return WalkOutcome::Pending(current_key_name),
+            let cached = self.cert_cache.get_valid(&current_key_name);
+            // The packet certifies the key that signed it (self-signed).
+            let own = match packet {
+                Some(p)
+                    if depth == 0
+                        && cached.is_none()
+                        && is_cert_name(&p.name)
+                        && is_cert_of(&p.name, &key_name_of(&current_key_name)) =>
+                {
+                    Certificate::decode(p).ok()
+                }
+                _ => None,
+            };
+            // `verified`: the certificate already verified the current signature.
+            let (cert, verified) = match cached.or(own) {
+                Some(c) => (c, false),
+                None => match self
+                    .refused_signer(
+                        &current_key_name,
+                        current_signed_region,
+                        current_sig_value,
+                        current_sig_type,
+                    )
+                    .await
+                {
+                    Some(c) => (c, true),
+                    None => match self.resolve_uncached(&current_key_name, fetch).await {
+                        Some(c) => (c, false),
+                        // Nothing can fetch the certificate that might authorize the
+                        // packet: it is refused as before, not left pending forever.
+                        // (A cache-only walk reports it missing, for its caller to fetch.)
+                        None if fetch
+                            && matches!(pending, Some(Hop::Packet(_)))
+                            && self.cert_fetcher.get().is_none() =>
+                        {
+                            return WalkOutcome::Invalid(TrustError::SchemaMismatch);
+                        }
+                        None => return WalkOutcome::Pending(current_key_name),
+                    },
+                },
             };
 
             if !cert.is_valid_at(now) {
                 return WalkOutcome::Invalid(TrustError::CertNotFound {
-                    name: format!("expired or not-yet-valid: {}", current_key_name),
+                    name: format!("expired or not-yet-valid: {}", cert.name),
                 });
             }
+            // A KeyLocator naming the key resolves to one of its certificates;
+            // a revocation naming that certificate refuses it too.
+            if ctx.is_revoked(&cert.name) {
+                return WalkOutcome::Invalid(TrustError::Revoked {
+                    name: cert.name.to_string(),
+                });
+            }
+            // Data that merely shares the certificate name shape is no
+            // certificate (an NDNCERT approval `<key>/ndncert-approve/<id>`).
+            if crate::cert_name::is_reserved_non_cert(&cert.name) {
+                return WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+                    cert: cert.name.to_string(),
+                    issuer: current_key_name.to_string(),
+                });
+            }
+            if let Some(refused) = hop_refused(&pending, &current_key_name, &cert.name) {
+                return refused;
+            }
 
-            match verify_by_sig_type(
-                current_sig_type,
-                current_signed_region,
-                current_sig_value,
-                &cert.public_key,
-            )
-            .await
-            {
-                Ok(VerifyOutcome::Valid) => {}
-                Ok(VerifyOutcome::Invalid) => {
-                    return WalkOutcome::Invalid(TrustError::InvalidSignature);
+            if !verified {
+                match verify_by_sig_type(
+                    current_sig_type,
+                    current_signed_region,
+                    current_sig_value,
+                    &cert.public_key,
+                )
+                .await
+                {
+                    Ok(VerifyOutcome::Valid) => {}
+                    Ok(VerifyOutcome::Invalid) => {
+                        return WalkOutcome::Invalid(TrustError::InvalidSignature);
+                    }
+                    Err(e) => return WalkOutcome::Invalid(e),
                 }
-                Err(e) => return WalkOutcome::Invalid(e),
             }
 
             chain_names.push(current_key_name.as_ref().clone());
+            if !self.require_anchor {
+                return WalkOutcome::Trusted(chain_names);
+            }
 
             let Some(issuer) = &cert.issuer else {
                 return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("cert has no issuer: {}", cert.name),
                 });
             };
-            // An authoritative schema governs every certificate hop, as LVS
-            // validation does: e.g. a device key is accepted only when the CA
-            // certified it, not when another device self-issued it.
-            if ctx.schema_is_authoritative() && !ctx.authorizes(&cert.name, issuer) {
-                return WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+            // A self-signed certificate that is no anchor (an anchor of its
+            // key ended the walk above) ends the chain: nothing vouches for it.
+            if key_name_of(issuer) == cert.key_name() {
+                if let Some(p) =
+                    packet.filter(|p| is_cert_name(&p.name) && !is_reserved_non_cert(&p.name))
+                {
+                    let packet_cert = if cert.name == p.name {
+                        Some(cert.clone())
+                    } else {
+                        Certificate::decode(p).ok()
+                    };
+                    if let Some(c) = packet_cert {
+                        self.remember_refused(c);
+                    }
+                }
+                return WalkOutcome::Invalid(TrustError::UntrustedSelfSigned {
                     cert: cert.name.to_string(),
-                    issuer: issuer.to_string(),
+                    namespace: ctx.namespace().to_string(),
                 });
             }
             let Some(sr) = &cert.signed_region else {
@@ -327,6 +467,7 @@ impl Validator {
             current_sig_value = &owned_sig_value;
             current_key_name = Arc::clone(issuer);
             current_sig_type = cert.sig_type;
+            pending = Some(Hop::Cert(Arc::clone(&cert.name)));
         }
 
         WalkOutcome::Invalid(TrustError::ChainTooDeep {
@@ -462,14 +603,84 @@ impl Validator {
         }
     }
 
+    /// The certificate `name` (a KeyLocator: key name or certificate name)
+    /// resolves to. A cached certificate valid now wins. Otherwise a current
+    /// one is fetched when `fetch` is set — a key whose cached certificate
+    /// expired may have been renewed under a new certificate name. Without a
+    /// fetch, `None` (pending) when a fetcher could still find a current
+    /// certificate of the key, else the cached expired one so the caller
+    /// reports it as expired.
     async fn resolve_cert(&self, name: &Arc<Name>, fetch: bool) -> Option<Certificate> {
-        if let Some(cert) = self.cert_cache.get(name) {
-            return Some(cert);
+        match self.cert_cache.get_valid(name) {
+            Some(cert) => Some(cert),
+            None => self.resolve_uncached(name, fetch).await,
         }
+    }
+
+    /// [`Self::resolve_cert`] once no certificate valid now is cached.
+    async fn resolve_uncached(&self, name: &Arc<Name>, fetch: bool) -> Option<Certificate> {
+        let cached = self.cert_cache.get(name);
         match self.cert_fetcher.get() {
-            Some(fetcher) if fetch => fetcher.fetch(name).await.ok(),
+            Some(fetcher) if fetch => fetcher.fetch(name).await.ok().or(cached),
+            Some(_) if !is_cert_name(name) => None,
+            _ => cached,
+        }
+    }
+
+    /// Whether a walk resolves `name` (a KeyLocator) without fetching: a
+    /// certificate valid now is cached, or a certificate of it was refused
+    /// recently ([`Self::refused_certs`]). The forwarder's validation stage
+    /// re-validates Data parked for `name` once this holds.
+    pub fn can_resolve(&self, name: &Name) -> bool {
+        self.cert_cache.get_valid(name).is_some() || self.refused_cert(name).is_some()
+    }
+
+    /// The refused certificate answering for `name`, while it does.
+    fn refused_cert(&self, name: &Name) -> Option<Certificate> {
+        if self.refused_certs.is_empty() {
+            return None;
+        }
+        let entry = self.refused_certs.get(&key_name_of(name))?;
+        let (cert, until) = entry.value();
+        let now = now_ns();
+        (now < *until && cert.is_valid_at(now) && cert.name.has_prefix(name)).then(|| cert.clone())
+    }
+
+    /// The refused certificate answering for `key`, if it verifies the
+    /// current signature. One that does not cannot refuse the packet — a
+    /// certificate anyone could have sent for that key name — so the key is
+    /// resolved as usual instead.
+    async fn refused_signer(
+        &self,
+        key: &Name,
+        signed_region: &[u8],
+        sig_value: &[u8],
+        sig_type: SignatureType,
+    ) -> Option<Certificate> {
+        let cert = self.refused_cert(key)?;
+        match verify_by_sig_type(sig_type, signed_region, sig_value, &cert.public_key).await {
+            Ok(VerifyOutcome::Valid) => Some(cert),
             _ => None,
         }
+    }
+
+    /// Remember `cert`, a certificate packet just refused for its chain, as
+    /// the answer for its key for as long as a fetch of that key would not be
+    /// retried anyway.
+    fn remember_refused(&self, cert: Certificate) {
+        let now = now_ns();
+        if self.refused_certs.len() >= REFUSED_CERTS_MAX {
+            self.refused_certs.retain(|_, (_, until)| *until > now);
+            if self.refused_certs.len() >= REFUSED_CERTS_MAX {
+                return;
+            }
+        }
+        let ttl = self
+            .cert_fetcher
+            .get()
+            .map_or(REFUSED_CERT_TTL, |f| f.retry_after());
+        let until = now.saturating_add(u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX));
+        self.refused_certs.insert(cert.key_name(), (cert, until));
     }
 }
 
@@ -1013,6 +1224,9 @@ mod tests {
         assert_eq!((v0, r0), (v1, r1));
     }
 
+    /// A walk ends: at a self-signed certificate that is no anchor with the
+    /// untrusted-root verdict (it once surfaced as a chain cycle), and at two
+    /// keys certifying each other with a chain cycle.
     #[tokio::test]
     async fn chain_walk_depth_limit() {
         let seed = [23u8; 32];
@@ -1032,6 +1246,22 @@ mod tests {
         let validator = Validator::new(wildcard_schema());
         validator.cert_cache().insert(cert);
 
+        match validator.validate_chain(&data).await {
+            ValidationResult::Invalid(TrustError::UntrustedSelfSigned { .. }) => {}
+            other => panic!("expected UntrustedSelfSigned, got: {other:?}"),
+        }
+
+        let a = Ed25519Signer::from_seed(&[24u8; 32], name1("ka"));
+        let b = Ed25519Signer::from_seed(&[25u8; 32], name1("kb"));
+        let validator = Validator::new(wildcard_schema());
+        for (subject, issuer) in [(&a, &b), (&b, &a)] {
+            let wire =
+                make_cert_data_packet(subject.key_name(), &subject.public_key_bytes(), issuer)
+                    .await;
+            let cert = Certificate::decode(&Data::decode(wire).unwrap()).unwrap();
+            validator.cert_cache().insert(cert);
+        }
+        let data = Data::decode(make_signed_data(&a, "data", "ka").await).unwrap();
         match validator.validate_chain(&data).await {
             ValidationResult::Invalid(TrustError::ChainCycle { .. }) => {}
             other => panic!("expected ChainCycle, got: {other:?}"),
@@ -1093,5 +1323,158 @@ mod tests {
             }
             other => panic!("expected Invalid(Revoked), got {other:?}"),
         }
+    }
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// The key `/lab/eph/KEY/k1` (from `seed`) and its self-signed
+    /// certificate Data `/lab/eph/KEY/k1/self/v=1`.
+    async fn self_signed_key(seed: u8) -> (Ed25519Signer, Bytes) {
+        let signer = Ed25519Signer::from_seed(&[seed; 32], n("/lab/eph/KEY/k1"));
+        let cert = make_cert_data_packet(
+            &n("/lab/eph/KEY/k1/self/v=1"),
+            &signer.public_key_bytes(),
+            &signer,
+        )
+        .await;
+        (signer, cert)
+    }
+
+    /// Data `name` signed by `signer`, its KeyLocator naming `signer`'s key.
+    fn data_signed_by(name: &str, signer: &Ed25519Signer) -> Data {
+        let wire = ndn_packet::encode::DataBuilder::new(n(name), b"payload").sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(signer.key_name()),
+            |region| signer.sign_sync(region).unwrap(),
+        );
+        Data::decode(wire).unwrap()
+    }
+
+    /// Attach a fetcher answering every fetch with `served`; counts fetches.
+    fn serve_on_fetch(
+        validator: &Validator,
+        served: Bytes,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fetches);
+        let fetcher = Arc::new(crate::CertFetcher::new(
+            validator.cert_cache_arc(),
+            Arc::new(move |_| {
+                f.fetch_add(1, Ordering::Relaxed);
+                let data = Data::decode(served.clone()).ok();
+                Box::pin(async move { data })
+            }),
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(validator.set_cert_fetcher(fetcher).is_ok());
+        fetches
+    }
+
+    fn fetch_count(fetches: &std::sync::atomic::AtomicUsize) -> usize {
+        fetches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `accept_signed`: a self-signed certificate verifies itself — without a
+    /// fetch of its own key, which on a forwarder would be answered by this
+    /// very certificate, parked waiting for it — and Data signed by that key
+    /// validates once the certificate is fetched; no trust anchor involved.
+    #[tokio::test]
+    async fn accept_signed_validates_self_signed_certificate_and_its_data() {
+        let (signer, cert_wire) = self_signed_key(40).await;
+        let validator = Validator::new(wildcard_schema()).accept_signed();
+        let fetches = serve_on_fetch(&validator, cert_wire.clone());
+
+        let cert = Data::decode(cert_wire).unwrap();
+        let (result, missing) = validator.validate_chain_cached(&cert).await;
+        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+        assert!(missing.is_none());
+        assert_eq!(fetch_count(&fetches), 0, "a self-signed cert is its own signer");
+
+        let data = data_signed_by("/lab/eph/photo", &signer);
+        let (result, missing) = validator.validate_chain_cached(&data).await;
+        assert!(matches!(result, ValidationResult::Pending));
+        assert_eq!(missing.as_deref(), Some(signer.key_name()));
+        let result = validator.validate_chain(&data).await;
+        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+        assert_eq!(fetch_count(&fetches), 1);
+
+        // A signature the certificate's key did not make still fails.
+        let (impostor, _) = self_signed_key(41).await;
+        let forged = data_signed_by("/lab/eph/photo", &impostor);
+        assert!(matches!(
+            validator.validate_chain(&forged).await,
+            ValidationResult::Invalid(TrustError::InvalidSignature)
+        ));
+    }
+
+    /// An anchored walk refuses a self-signed certificate that is no anchor
+    /// with a verdict saying so — at once, without fetching its own key — and
+    /// then refuses Data signed by that key at once too, while Data merely
+    /// naming the key (signed by another) is resolved as usual.
+    #[tokio::test]
+    async fn anchored_walk_refuses_untrusted_self_signed_chain_without_fetching() {
+        let (signer, cert_wire) = self_signed_key(42).await;
+        let validator = Validator::new(wildcard_schema());
+        let fetches = serve_on_fetch(&validator, cert_wire.clone());
+
+        let cert = Data::decode(cert_wire).unwrap();
+        let (result, missing) = validator.validate_chain_cached(&cert).await;
+        match result {
+            ValidationResult::Invalid(e @ TrustError::UntrustedSelfSigned { .. }) => {
+                let msg = e.to_string();
+                assert!(msg.contains("/lab/eph/KEY/k1/self/v=1"), "{msg}");
+                assert!(msg.contains("not a trust anchor"), "{msg}");
+                assert!(msg.contains("adopt the trust context"), "{msg}");
+            }
+            other => panic!("expected UntrustedSelfSigned, got {other:?}"),
+        }
+        assert!(missing.is_none());
+        assert_eq!(fetch_count(&fetches), 0);
+        assert!(validator.can_resolve(signer.key_name()));
+
+        let data = data_signed_by("/lab/eph/photo", &signer);
+        let (result, missing) = validator.validate_chain_cached(&data).await;
+        assert!(
+            matches!(result, ValidationResult::Invalid(TrustError::UntrustedSelfSigned { .. })),
+            "got {result:?}"
+        );
+        assert!(missing.is_none());
+
+        let (impostor, _) = self_signed_key(43).await;
+        let other = data_signed_by("/lab/eph/photo", &impostor);
+        let (result, missing) = validator.validate_chain_cached(&other).await;
+        assert!(matches!(result, ValidationResult::Pending), "got {result:?}");
+        assert_eq!(missing.as_deref(), Some(signer.key_name()));
+        assert_eq!(fetch_count(&fetches), 0);
+    }
+
+    /// A fetched self-signed signer certificate ends an anchored walk with
+    /// the untrusted-root verdict, not a chain cycle.
+    #[tokio::test]
+    async fn anchored_walk_refuses_data_whose_fetched_signer_is_self_signed() {
+        let (signer, cert_wire) = self_signed_key(44).await;
+        let validator = Validator::new(wildcard_schema());
+        let fetches = serve_on_fetch(&validator, cert_wire);
+
+        let data = data_signed_by("/lab/eph/photo", &signer);
+        assert!(matches!(
+            validator.validate_chain(&data).await,
+            ValidationResult::Invalid(TrustError::UntrustedSelfSigned { .. })
+        ));
+        assert_eq!(fetch_count(&fetches), 1);
+    }
+
+    /// A self-signed certificate that IS an anchor still validates.
+    #[tokio::test]
+    async fn anchored_walk_accepts_self_signed_anchor_certificate() {
+        let (_, cert_wire) = self_signed_key(45).await;
+        let cert = Data::decode(cert_wire).unwrap();
+        let validator = Validator::new(wildcard_schema());
+        assert!(validator.add_trust_anchor(Certificate::decode(&cert).unwrap()));
+        let (result, _) = validator.validate_chain_cached(&cert).await;
+        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
     }
 }

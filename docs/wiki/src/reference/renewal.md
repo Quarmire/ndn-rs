@@ -10,11 +10,18 @@ per role, and renewal keeps every renewable device enrolled.
 - **Proof of possession, not a token.** The device proves it holds the
   private key of a certificate the CA issued. An invite token is spent once;
   the key is what keeps the device enrolled.
-- **Same key, same name.** Renewal re-certifies the key the certificate
+- **Same key, new name.** Renewal re-certifies the key the certificate
   certifies; it never certifies a new key. A new key (a lost or rotated
   device key) is a new enrollment: an invite or an admin's device approval.
-  The CA names a certificate after its key, so the renewed certificate
-  replaces the old one under the same name.
+  Certificates follow NDN Certificate Format v2: a key is
+  `/<identity>/KEY/<key-id>`, each certificate of it
+  `<key>/<issuer-id>/<version>`. The renewed certificate is a new one,
+  `<key>/NDNCERT/v=<new>`; the old one stays valid and stored until it
+  expires.
+- **Verifiers find it by key name.** KeyLocators name the key; a verifier
+  fetches it with CanBePrefix + MustBeFresh and takes the newest currently
+  valid certificate. A cached certificate that has expired triggers a
+  re-fetch, which is how the renewed one is found.
 - **Per-role terms.** `[ca] cert_validity_days` sets each role's lifetime;
   `[ca] renewable_roles` says which roles renew. Guests do not by default:
   guest access simply ends at expiry.
@@ -49,10 +56,9 @@ not see). The CA offers it when its issuance policy renews
    key is revoked, and that the signature verifies under the certificate's
    key. Then its issuance policy decides: `RolePolicy` issues for a renewable
    role, at that role's lifetime.
-4. The CA answers with the new certificate **inline** in the (encrypted,
-   never cached) CHALLENGE response. Because the renewed certificate keeps
-   its name, a fetch by name could be answered from a content store with the
-   old one.
+4. The CA answers with the new certificate's name in the CHALLENGE response
+   and serves the certificate under it; the device fetches it by that name.
+   The name is new, so no cache can answer with the old certificate.
 5. The device checks the new certificate: it certifies the device key, is
    valid now and chains to the root of the namespace's trust context.
 
@@ -61,7 +67,7 @@ not see). The CA offers it when its issuance policy renews
 | Piece | Where |
 |---|---|
 | Protocol, device side: `renew_certificate`, `renewal_proof_message`, `RenewalError` | `ndn-cert/src/renewal.rs` |
-| CA side: built-in `renewal` challenge (`CaState::verify_renewal`), inline issued cert | `ndn-cert/src/ca.rs`; `ChallengeResponseTlv::issued_cert` (TLV `0xB2`) in `ndn-cert/src/tlv.rs` |
+| CA side: built-in `renewal` challenge (`CaState::verify_renewal`); issued cert name in the CHALLENGE response | `ndn-cert/src/ca.rs`; `ChallengeResponseTlv::issued_cert_name` in `ndn-cert/src/tlv.rs` |
 | Per-role lifetime and renewability: `RolePolicy::with_validity` / `with_renewable`, `RoleTerms` | `ndn-cert/src/policy.rs` |
 | Engine binding `renew_via_engine`, schedule `RenewBefore`, `backoff_delay`; `NdncertRenewer` for `start_renewal` | `ndn-identity/src/renewal.rs` |
 | Daemon: `security/renew` verb and renewal timer | `ndn-fwd/binaries/ndn-fwd/src/renewal.rs` |
@@ -93,9 +99,10 @@ renew_before = 0.333     # or "30d"; 0 = only `ndn-fwd renew`
 ```
 
 The daemon renews every certificate the namespace CA issued to its keys
-(`<pib>/keys/*/cert.data`) once `renew_before` of its lifetime is left,
-stores the new one in the PIB, serves it by name and keeps signing with the
-same key. A failed attempt is retried (about a minute, doubling up to an
+(`<pib>/keys/<hash>/certs/*.data`) once `renew_before` of its lifetime is
+left, stores the new one in the PIB beside the old one, serves both by name
+(an Interest for the key name gets the newest valid one) and keeps signing
+with the same key. A failed attempt is retried (about a minute, doubling up to an
 hour; an hour after a refusal) and logged as a WARN with `days_left`; an
 expired certificate is reported once, as an ERROR.
 

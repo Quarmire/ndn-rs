@@ -22,6 +22,14 @@ pub enum TrustError {
          CA the schema names)"
     )]
     CertNotAuthorized { cert: String, issuer: String },
+    /// The chain ends at a self-signed certificate that is no trust anchor of
+    /// the trust context governing the packet: nothing vouches for it.
+    #[error(
+        "certificate chain ends at self-signed certificate {cert}, which is not a trust anchor \
+         of the trust context for {namespace}: adopt the trust context of the namespace that \
+         issued it (`ndn-fwd adopt <anchor link>`), or add {cert} as a trust anchor"
+    )]
+    UntrustedSelfSigned { cert: String, namespace: String },
     #[error("key store error: {0}")]
     KeyStore(String),
     #[error("unsupported signature type: {name} (code {code})")]

@@ -58,14 +58,25 @@ impl CertFetcher {
         self
     }
 
-    /// Fetch a certificate by name, deduplicating concurrent requests.
+    /// How long after a fetch of a name begins that name may next be fetched
+    /// when the fetch fails: the fetch timeout plus the failure back-off.
+    pub fn retry_after(&self) -> Duration {
+        self.timeout + self.negative_ttl
+    }
+
+    /// Fetch the certificate `cert_name` resolves to (a key name — the
+    /// newest certificate of that key — or a full certificate name),
+    /// deduplicating concurrent requests. A cached certificate answers only
+    /// while it is valid: once the cached one expires, a fresh one is fetched
+    /// (the fetch function asks with `CanBePrefix` and `MustBeFresh`, so a
+    /// renewed certificate is found rather than a cached copy of the old).
     ///
     /// Panic-safe: if the leader's `do_fetch` panics, `InFlightGuard`
     /// removes the in-flight entry on unwind, all `Sender` clones drop, and
     /// any follower awaiting `rx.recv()` unblocks with `RecvError::Closed`
     /// mapped to `CertNotFound` instead of hanging.
     pub async fn fetch(&self, cert_name: &Arc<Name>) -> Result<Certificate, TrustError> {
-        if let Some(cert) = self.cert_cache.get(cert_name) {
+        if let Some(cert) = self.cert_cache.get_valid(cert_name) {
             return Ok(cert);
         }
 
@@ -92,7 +103,7 @@ impl CertFetcher {
                     // have succeeded (it caches before publishing).
                     _ => self
                         .cert_cache
-                        .get(cert_name)
+                        .get_valid(cert_name)
                         .ok_or_else(|| TrustError::CertNotFound {
                             name: cert_name.to_string(),
                         }),
@@ -140,6 +151,13 @@ impl CertFetcher {
             })?;
 
         let cert = Certificate::decode(&data)?;
+        // The answer to a prefix Interest must be a certificate under the
+        // requested name; anything else would be cached as the wrong key's.
+        if !cert.name.has_prefix(cert_name) {
+            return Err(TrustError::CertNotFound {
+                name: format!("{} answered the fetch for {cert_name}", cert.name),
+            });
+        }
         self.cert_cache.insert(cert.clone());
         Ok(cert)
     }

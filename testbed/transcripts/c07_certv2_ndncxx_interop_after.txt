@@ -1,0 +1,447 @@
+########## ndn-rs: cargo run -p ndn-security --example certv2_interop_chain
+/tmp/tmp.WznM0GpWmu/ecdsa/root.cert: /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+/tmp/tmp.WznM0GpWmu/ecdsa/ca.cert: /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634
+/tmp/tmp.WznM0GpWmu/ecdsa/dev.cert: /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+/tmp/tmp.WznM0GpWmu/ecdsa/data.data: /interop/ecdsa/member/dev/data/v=1792217525640
+/tmp/tmp.WznM0GpWmu/ed25519/root.cert: /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+/tmp/tmp.WznM0GpWmu/ed25519/ca.cert: /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645
+/tmp/tmp.WznM0GpWmu/ed25519/dev.cert: /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646
+/tmp/tmp.WznM0GpWmu/ed25519/data.data: /interop/ed25519/member/dev/data/v=1792217525647
+########## ecdsa: check.sh -K -d data.data dev.cert ca.cert root.cert
+INFO: ndn-cxx 0.9.0 (/nix/store/aczx03qd7lhrx0fzc342avvbvbh9fnxc-ndn-cxx-0.9.0/lib)
+### ndnsec cert-dump (0.9.0)
+--- /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+Certificate Name:
+  /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOsTtDMSajNdy89YkZlfTS1EeDO27
+  IiDJ0MjVJgsA5thw0bjoqynnHsq5TDonFBchS57SqpxfcnLx40jFKb0LSA==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2026-11-16T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+--- /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+Certificate Name:
+  /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFG2EZppJzo7H1NLcdTJkPnXqV3sR
+  FJtxODZGE3oF0qbkB4DXRtyf15Zqcq5PilD/gMLc8vV94fE73UcsFy03gQ==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/KEY/0d8fc089e28e917a
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+--- /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+Certificate Name:
+  /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHNiThP4KFV613wC3wpK/Bm1GTpcv
+  44q+t94l2ff622IY6rEEVeHZGbMH3vEbnf8XHM4GTJkAJFFGcT6I2IO1Ag==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/KEY/0d8fc089e28e917a
+  Self-Signed: yes
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+### ndn-cxx certificate inspection
+=== /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+INFO: identity=/interop/ecdsa/member/dev key=/interop/ecdsa/member/dev/KEY/287f6033f0807d52 key-id=287f6033f0807d52 issuer-id=NDNCERT
+PASS: last name component is a VersionNameComponent: v=1792217525637
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20261116T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+=== /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634
+INFO: identity=/interop/ecdsa/CA key=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae key-id=71266d4f9f0b79ae issuer-id=NA
+PASS: last name component is a VersionNameComponent: v=1792217525634
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/KEY/0d8fc089e28e917a
+=== /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+INFO: identity=/interop/ecdsa key=/interop/ecdsa/KEY/0d8fc089e28e917a key-id=0d8fc089e28e917a issuer-id=self
+PASS: last name component is a VersionNameComponent: v=1792217525631
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/KEY/0d8fc089e28e917a
+PASS: self-signature verifies (ndn-cxx verifySignature)
+### certificate chain: /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert -> anchor /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+INFO: target /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (SignatureSha256WithEcdsa, KeyLocator /interop/ecdsa/CA/KEY/71266d4f9f0b79ae)
+INFO: anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: KeyLocator of /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 is the issuer key name /interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+PASS: chain hop /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 <- /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: KeyLocator of /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 is the issuer key name /interop/ecdsa/KEY/0d8fc089e28e917a
+PASS: chain hop /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 <- /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: chain reaches trust anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+NOTE: ndn-cxx Validator (hierarchical policy, offline fetcher): Policy violation (Packet /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (KeyLocator=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae) cannot pass any checker.
+Checker 0: expanded names /interop/ecdsa/CA and /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 do not satisfy is-prefix-of relation
+Checker 1: signature type does not match the checker SignatureSha256WithEcdsa != SignatureSha256WithRsa)
+### Data /tmp/tmp.WznM0GpWmu/ecdsa/data.data -> anchor /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+INFO: target /interop/ecdsa/member/dev/data/v=1792217525640 (SignatureSha256WithEcdsa, KeyLocator /interop/ecdsa/member/dev/KEY/287f6033f0807d52)
+INFO: anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: KeyLocator of /interop/ecdsa/member/dev/data/v=1792217525640 is the issuer key name /interop/ecdsa/member/dev/KEY/287f6033f0807d52
+PASS: chain hop /interop/ecdsa/member/dev/data/v=1792217525640 <- /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: KeyLocator of /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 is the issuer key name /interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+PASS: chain hop /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 <- /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: KeyLocator of /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 is the issuer key name /interop/ecdsa/KEY/0d8fc089e28e917a
+PASS: chain hop /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 <- /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: chain reaches trust anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): /interop/ecdsa/member/dev/data/v=1792217525640
+NOTE: ndn-cxx Validator (hierarchical policy, offline fetcher): Policy violation (Packet /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (KeyLocator=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae) cannot pass any checker.
+Checker 0: expanded names /interop/ecdsa/CA and /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 do not satisfy is-prefix-of relation
+Checker 1: signature type does not match the checker SignatureSha256WithEcdsa != SignatureSha256WithRsa)
+SUMMARY: 36 PASS, 0 FAIL, 0 UNSUPPORTED
+########## ecdsa-tampered: check.sh -K -d tampered.data dev.cert ca.cert root.cert
+INFO: ndn-cxx 0.9.0 (/nix/store/aczx03qd7lhrx0fzc342avvbvbh9fnxc-ndn-cxx-0.9.0/lib)
+### ndnsec cert-dump (0.9.0)
+--- /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+Certificate Name:
+  /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOsTtDMSajNdy89YkZlfTS1EeDO27
+  IiDJ0MjVJgsA5thw0bjoqynnHsq5TDonFBchS57SqpxfcnLx40jFKb0LSA==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2026-11-16T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+--- /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+Certificate Name:
+  /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFG2EZppJzo7H1NLcdTJkPnXqV3sR
+  FJtxODZGE3oF0qbkB4DXRtyf15Zqcq5PilD/gMLc8vV94fE73UcsFy03gQ==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/KEY/0d8fc089e28e917a
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+--- /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+Certificate Name:
+  /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+Public Key:
+  Key Type: 256-bit EC
+  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEHNiThP4KFV613wC3wpK/Bm1GTpcv
+  44q+t94l2ff622IY6rEEVeHZGbMH3vEbnf8XHM4GTJkAJFFGcT6I2IO1Ag==
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureSha256WithEcdsa
+  Key Locator: Name=/interop/ecdsa/KEY/0d8fc089e28e917a
+  Self-Signed: yes
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+### ndn-cxx certificate inspection
+=== /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+INFO: identity=/interop/ecdsa/member/dev key=/interop/ecdsa/member/dev/KEY/287f6033f0807d52 key-id=287f6033f0807d52 issuer-id=NDNCERT
+PASS: last name component is a VersionNameComponent: v=1792217525637
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20261116T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+=== /tmp/tmp.WznM0GpWmu/ecdsa/ca.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634
+INFO: identity=/interop/ecdsa/CA key=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae key-id=71266d4f9f0b79ae issuer-id=NA
+PASS: last name component is a VersionNameComponent: v=1792217525634
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/KEY/0d8fc089e28e917a
+=== /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+INFO: identity=/interop/ecdsa key=/interop/ecdsa/KEY/0d8fc089e28e917a key-id=0d8fc089e28e917a issuer-id=self
+PASS: last name component is a VersionNameComponent: v=1792217525631
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: EC (91-byte SPKI)
+INFO: signature type SignatureSha256WithEcdsa
+PASS: KeyLocator is a KEY name: /interop/ecdsa/KEY/0d8fc089e28e917a
+PASS: self-signature verifies (ndn-cxx verifySignature)
+### certificate chain: /tmp/tmp.WznM0GpWmu/ecdsa/dev.cert -> anchor /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+INFO: target /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (SignatureSha256WithEcdsa, KeyLocator /interop/ecdsa/CA/KEY/71266d4f9f0b79ae)
+INFO: anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: KeyLocator of /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 is the issuer key name /interop/ecdsa/CA/KEY/71266d4f9f0b79ae
+PASS: chain hop /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 <- /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: KeyLocator of /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 is the issuer key name /interop/ecdsa/KEY/0d8fc089e28e917a
+PASS: chain hop /interop/ecdsa/CA/KEY/71266d4f9f0b79ae/NA/v=1792217525634 <- /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+PASS: chain reaches trust anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637
+NOTE: ndn-cxx Validator (hierarchical policy, offline fetcher): Policy violation (Packet /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (KeyLocator=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae) cannot pass any checker.
+Checker 0: expanded names /interop/ecdsa/CA and /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 do not satisfy is-prefix-of relation
+Checker 1: signature type does not match the checker SignatureSha256WithEcdsa != SignatureSha256WithRsa)
+### Data /tmp/tmp.WznM0GpWmu/ecdsa/tampered.data -> anchor /tmp/tmp.WznM0GpWmu/ecdsa/root.cert
+INFO: target /interop/ecdsa/member/dev/data/v=1792217525640 (SignatureSha256WithEcdsa, KeyLocator /interop/ecdsa/member/dev/KEY/287f6033f0807d52)
+INFO: anchor /interop/ecdsa/KEY/0d8fc089e28e917a/self/v=1792217525631
+PASS: KeyLocator of /interop/ecdsa/member/dev/data/v=1792217525640 is the issuer key name /interop/ecdsa/member/dev/KEY/287f6033f0807d52
+FAIL: chain hop /interop/ecdsa/member/dev/data/v=1792217525640 <- /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 [SignatureSha256WithEcdsa, ndn-cxx verifySignature]
+FAIL: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): Signature verification failed (Data /interop/ecdsa/member/dev/data/v=1792217525640)
+NOTE: ndn-cxx Validator (hierarchical policy, offline fetcher): Policy violation (Packet /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 (KeyLocator=/interop/ecdsa/CA/KEY/71266d4f9f0b79ae) cannot pass any checker.
+Checker 0: expanded names /interop/ecdsa/CA and /interop/ecdsa/member/dev/KEY/287f6033f0807d52/NDNCERT/v=1792217525637 do not satisfy is-prefix-of relation
+Checker 1: signature type does not match the checker SignatureSha256WithEcdsa != SignatureSha256WithRsa)
+SUMMARY: 29 PASS, 2 FAIL, 0 UNSUPPORTED
+########## ed25519: check.sh -K -d data.data dev.cert ca.cert root.cert
+INFO: ndn-cxx 0.9.0 (/nix/store/aczx03qd7lhrx0fzc342avvbvbh9fnxc-ndn-cxx-0.9.0/lib)
+### ndnsec cert-dump (0.9.0)
+--- /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+Certificate Name:
+  /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEAoXEG9wxsUqbw6j3H5pl/ki5zVMIiodiuIGCDgdyBIvY=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2026-11-16T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/CA/KEY/f663ea04d840e3d7
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+--- /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+Certificate Name:
+  /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEAN2bG/TvUxNmR4QyUxNvGOHzBzAeHDWthNvNxWx0Bw08=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/KEY/37187356b7b3cb6e
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+--- /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+Certificate Name:
+  /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEABx2U6IfsDpGoi21jHFlJNJFRsMzkZ1uPUfR1RpQXMN8=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/KEY/37187356b7b3cb6e
+  Self-Signed: yes
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+### ndn-cxx certificate inspection
+=== /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646
+INFO: identity=/interop/ed25519/member/dev key=/interop/ed25519/member/dev/KEY/4e08e87099b100bb key-id=4e08e87099b100bb issuer-id=NDNCERT
+PASS: last name component is a VersionNameComponent: v=1792217525646
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20261116T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/CA/KEY/f663ea04d840e3d7
+=== /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645
+INFO: identity=/interop/ed25519/CA key=/interop/ed25519/CA/KEY/f663ea04d840e3d7 key-id=f663ea04d840e3d7 issuer-id=NA
+PASS: last name component is a VersionNameComponent: v=1792217525645
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/KEY/37187356b7b3cb6e
+=== /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+INFO: identity=/interop/ed25519 key=/interop/ed25519/KEY/37187356b7b3cb6e key-id=37187356b7b3cb6e issuer-id=self
+PASS: last name component is a VersionNameComponent: v=1792217525644
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/KEY/37187356b7b3cb6e
+PASS: self-signature verifies (OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier))
+### certificate chain: /tmp/tmp.WznM0GpWmu/ed25519/dev.cert -> anchor /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+INFO: target /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (SignatureEd25519, KeyLocator /interop/ed25519/CA/KEY/f663ea04d840e3d7)
+INFO: anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+PASS: KeyLocator of /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 is the issuer key name /interop/ed25519/CA/KEY/f663ea04d840e3d7
+PASS: chain hop /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 <- /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: KeyLocator of /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 is the issuer key name /interop/ed25519/KEY/37187356b7b3cb6e
+PASS: chain hop /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 <- /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: chain reaches trust anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+UNSUPPORTED: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (KeyLocator=/interop/ed25519/CA/KEY/f663ea04d840e3d7) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+UNSUPPORTED: ndn-cxx Validator (hierarchical policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (KeyLocator=/interop/ed25519/CA/KEY/f663ea04d840e3d7) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+### Data /tmp/tmp.WznM0GpWmu/ed25519/data.data -> anchor /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+INFO: target /interop/ed25519/member/dev/data/v=1792217525647 (SignatureEd25519, KeyLocator /interop/ed25519/member/dev/KEY/4e08e87099b100bb)
+INFO: anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+PASS: KeyLocator of /interop/ed25519/member/dev/data/v=1792217525647 is the issuer key name /interop/ed25519/member/dev/KEY/4e08e87099b100bb
+PASS: chain hop /interop/ed25519/member/dev/data/v=1792217525647 <- /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: KeyLocator of /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 is the issuer key name /interop/ed25519/CA/KEY/f663ea04d840e3d7
+PASS: chain hop /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 <- /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: KeyLocator of /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 is the issuer key name /interop/ed25519/KEY/37187356b7b3cb6e
+PASS: chain hop /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 <- /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: chain reaches trust anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+UNSUPPORTED: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/data/v=1792217525647 (KeyLocator=/interop/ed25519/member/dev/KEY/4e08e87099b100bb) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+UNSUPPORTED: ndn-cxx Validator (hierarchical policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/data/v=1792217525647 (KeyLocator=/interop/ed25519/member/dev/KEY/4e08e87099b100bb) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+SUMMARY: 34 PASS, 0 FAIL, 4 UNSUPPORTED
+########## ed25519-tampered: check.sh -K -d tampered.data dev.cert ca.cert root.cert
+INFO: ndn-cxx 0.9.0 (/nix/store/aczx03qd7lhrx0fzc342avvbvbh9fnxc-ndn-cxx-0.9.0/lib)
+### ndnsec cert-dump (0.9.0)
+--- /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+Certificate Name:
+  /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEAoXEG9wxsUqbw6j3H5pl/ki5zVMIiodiuIGCDgdyBIvY=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2026-11-16T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/CA/KEY/f663ea04d840e3d7
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+--- /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+Certificate Name:
+  /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEAN2bG/TvUxNmR4QyUxNvGOHzBzAeHDWthNvNxWx0Bw08=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/KEY/37187356b7b3cb6e
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+--- /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+Certificate Name:
+  /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+Public Key:
+  Key Type: 0-bit NONE
+  MCowBQYDK2VwAyEABx2U6IfsDpGoi21jHFlJNJFRsMzkZ1uPUfR1RpQXMN8=
+Validity:
+  Not Before: 2026-10-17T06:12:05
+  Not After: 2027-10-17T06:12:05
+Signature Information:
+  Signature Type: SignatureEd25519
+  Key Locator: Name=/interop/ed25519/KEY/37187356b7b3cb6e
+  Self-Signed: yes
+
+PASS: ndnsec cert-dump -p parses /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+### ndn-cxx certificate inspection
+=== /tmp/tmp.WznM0GpWmu/ed25519/dev.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646
+INFO: identity=/interop/ed25519/member/dev key=/interop/ed25519/member/dev/KEY/4e08e87099b100bb key-id=4e08e87099b100bb issuer-id=NDNCERT
+PASS: last name component is a VersionNameComponent: v=1792217525646
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20261116T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/CA/KEY/f663ea04d840e3d7
+=== /tmp/tmp.WznM0GpWmu/ed25519/ca.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645
+INFO: identity=/interop/ed25519/CA key=/interop/ed25519/CA/KEY/f663ea04d840e3d7 key-id=f663ea04d840e3d7 issuer-id=NA
+PASS: last name component is a VersionNameComponent: v=1792217525645
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/KEY/37187356b7b3cb6e
+=== /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+PASS: ndn-cxx decodes as v2 Certificate: /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+INFO: identity=/interop/ed25519 key=/interop/ed25519/KEY/37187356b7b3cb6e key-id=37187356b7b3cb6e issuer-id=self
+PASS: last name component is a VersionNameComponent: v=1792217525644
+PASS: ContentType is KEY (2)
+PASS: validity period (20261017T061205, 20271017T061205) covers now
+PASS: public key parses: Ed25519 (SPKI)
+INFO: signature type SignatureEd25519
+PASS: KeyLocator is a KEY name: /interop/ed25519/KEY/37187356b7b3cb6e
+PASS: self-signature verifies (OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier))
+### certificate chain: /tmp/tmp.WznM0GpWmu/ed25519/dev.cert -> anchor /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+INFO: target /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (SignatureEd25519, KeyLocator /interop/ed25519/CA/KEY/f663ea04d840e3d7)
+INFO: anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+PASS: KeyLocator of /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 is the issuer key name /interop/ed25519/CA/KEY/f663ea04d840e3d7
+PASS: chain hop /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 <- /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: KeyLocator of /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 is the issuer key name /interop/ed25519/KEY/37187356b7b3cb6e
+PASS: chain hop /interop/ed25519/CA/KEY/f663ea04d840e3d7/NA/v=1792217525645 <- /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+PASS: chain reaches trust anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+UNSUPPORTED: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (KeyLocator=/interop/ed25519/CA/KEY/f663ea04d840e3d7) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+UNSUPPORTED: ndn-cxx Validator (hierarchical policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 (KeyLocator=/interop/ed25519/CA/KEY/f663ea04d840e3d7) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+### Data /tmp/tmp.WznM0GpWmu/ed25519/tampered.data -> anchor /tmp/tmp.WznM0GpWmu/ed25519/root.cert
+INFO: target /interop/ed25519/member/dev/data/v=1792217525647 (SignatureEd25519, KeyLocator /interop/ed25519/member/dev/KEY/4e08e87099b100bb)
+INFO: anchor /interop/ed25519/KEY/37187356b7b3cb6e/self/v=1792217525644
+PASS: KeyLocator of /interop/ed25519/member/dev/data/v=1792217525647 is the issuer key name /interop/ed25519/member/dev/KEY/4e08e87099b100bb
+FAIL: chain hop /interop/ed25519/member/dev/data/v=1792217525647 <- /interop/ed25519/member/dev/KEY/4e08e87099b100bb/NDNCERT/v=1792217525646 [SignatureEd25519, OpenSSL Ed25519 over ndn-cxx extractSignedRanges (ndn-cxx 0.9 has no Ed25519 verifier)]
+UNSUPPORTED: ndn-cxx Validator (keylocator-v2-name policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/data/v=1792217525647 (KeyLocator=/interop/ed25519/member/dev/KEY/4e08e87099b100bb) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+UNSUPPORTED: ndn-cxx Validator (hierarchical policy, offline fetcher): Ed25519 in chain, ndn-cxx 0.9 cannot verify it (Policy violation (Packet /interop/ed25519/member/dev/data/v=1792217525647 (KeyLocator=/interop/ed25519/member/dev/KEY/4e08e87099b100bb) cannot pass any checker.
+Checker 0: signature type does not match the checker SignatureEd25519 != SignatureSha256WithEcdsa
+Checker 1: signature type does not match the checker SignatureEd25519 != SignatureSha256WithRsa))
+SUMMARY: 28 PASS, 1 FAIL, 4 UNSUPPORTED
+########## expectations
+PASS: ecdsa: check.sh exits 0 (no FAIL line)
+PASS: ecdsa: ndnsec cert-dump parses root, CA and device certificates
+PASS: ecdsa: ndn-cxx decodes all three as v2 Certificates (version, ContentType KEY, validity)
+PASS: ecdsa: every KeyLocator (2 certificate-chain + 3 Data-chain hops) is the issuer key name
+PASS: ecdsa: root self-signature and all 5 chain hops verify
+PASS: ed25519: check.sh exits 0 (no FAIL line)
+PASS: ed25519: ndnsec cert-dump parses root, CA and device certificates
+PASS: ed25519: ndn-cxx decodes all three as v2 Certificates (version, ContentType KEY, validity)
+PASS: ed25519: every KeyLocator (2 certificate-chain + 3 Data-chain hops) is the issuer key name
+PASS: ed25519: root self-signature and all 5 chain hops verify
+PASS: ecdsa: ndn-cxx Validator accepts the device certificate and the Data
+PASS: ecdsa: NFD hierarchical rule refuses /interop/ecdsa/CA certifying /interop/ecdsa/member/dev (namespace trust schema governs)
+PASS: ecdsa-tampered: check.sh exits 1
+PASS: ecdsa-tampered: ndn-cxx Validator refuses the tampered Data
+PASS: ecdsa-tampered: the Data hop is the only failed hop
+PASS: ed25519: ndn-cxx Validator UNSUPPORTED for the device certificate and the Data (no Ed25519 in ndn-cxx 0.9)
+PASS: ed25519: hops verified with OpenSSL Ed25519 over ndn-cxx signed ranges
+PASS: ed25519-tampered: check.sh exits 1
+PASS: ed25519-tampered: the Data hop is refused
+
+ecdsa: 36 PASS, 0 FAIL, 0 UNSUPPORTED
+ecdsa-tampered: 29 PASS, 2 FAIL, 0 UNSUPPORTED
+ed25519: 34 PASS, 0 FAIL, 4 UNSUPPORTED
+ed25519-tampered: 28 PASS, 1 FAIL, 4 UNSUPPORTED
+=== C.07 cert-v2 ndn-cxx interop PASS — 19/19 expectations hold ===

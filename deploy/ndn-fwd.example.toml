@@ -124,7 +124,7 @@ auto_init = true
 identity = "/com/example/ndn"
 
 # Validation profile. `default` = hierarchical: chains every Data
-# back to a configured trust anchor. `accept_signed` = permissive
+# back to a configured trust anchor. `accept-signed` = permissive
 # (signature required, no chain check) — for early-development only.
 profile = "default"
 

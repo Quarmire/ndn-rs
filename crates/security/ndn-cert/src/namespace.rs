@@ -267,11 +267,26 @@ pub fn init_namespace_in_pib(
     pib.add_trust_anchor(&anchor_key, &init.anchor)?;
 
     // The CA is certified by the root; the primary device by the CA, as the
-    // schema's chain requires of every device.
-    let ca_cert = certify_new_key(pib, &mgr, &ca_key, &anchor_key, CA_CERT_VALIDITY_MS)?;
+    // schema's chain requires of every device. Certificates are cert-v2
+    // named: the CA's `<ca key>/NA/<v>` (ndn-cxx's default issuer id), the
+    // device's `<device key>/NDNCERT/<v>` like every certificate the CA issues.
+    let ca_cert = certify_new_key(
+        pib,
+        &mgr,
+        &ca_key,
+        &anchor_key,
+        CA_CERT_VALIDITY_MS,
+        ndn_security::cert_name::DEFAULT_ISSUER,
+    )?;
     mgr.register_signer(ca_key.clone(), pib.get_signer(&ca_key)?);
-    let device_cert =
-        certify_new_key(pib, &mgr, &device_key, &ca_key, DEVICE_CERT_VALIDITY_MS)?;
+    let device_cert = certify_new_key(
+        pib,
+        &mgr,
+        &device_key,
+        &ca_key,
+        DEVICE_CERT_VALIDITY_MS,
+        ndn_security::cert_name::NDNCERT_ISSUER,
+    )?;
 
     let ca_dir = pib.root().join(CA_DIR);
     let io = |path: &Path| {
@@ -306,17 +321,25 @@ pub fn init_namespace_in_pib(
 }
 
 /// Generate `key` in the PIB and store a cert for it issued by `issuer`
-/// (held by `mgr`).
+/// (held by `mgr`), named `<key>/<issuer_id>/<version>`.
 fn certify_new_key(
     pib: &FilePib,
     mgr: &SecurityManager,
     key: &Name,
     issuer: &Name,
     validity_ms: u64,
+    issuer_id: &str,
 ) -> Result<Certificate, NamespaceInitError> {
     let signer = pib.generate_ed25519(key)?;
     let pk = ndn_security::Signer::public_key(&signer).unwrap_or_default();
-    let cert = futures::executor::block_on(mgr.certify(key, pk, issuer, validity_ms))?;
+    let cert = futures::executor::block_on(mgr.certify_as(
+        key,
+        pk,
+        issuer,
+        validity_ms,
+        issuer_id,
+        None,
+    ))?;
     pib.store_cert(key, &cert)?;
     Ok(cert)
 }
@@ -372,7 +395,13 @@ mod tests {
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas[0].format, ndn_security::SchemaFormat::Lvs);
         assert_eq!(schemas[0].body.as_ref(), namespace_schema(&n("/home/bob")).unwrap().lvs_binary);
-        assert!(init.context.authorizes(&n("/home/bob/CA/KEY/ca"), &init.anchor_key));
+        // The root certifies the CA (judged by the root's certificate name).
+        assert!(ndn_security::cert_name::is_cert_name(&init.anchor.name));
+        assert!(init.context.authorizes_hop(
+            &n("/home/bob/CA/KEY/ca/NA/v=1"),
+            &init.anchor_key,
+            Some(&init.anchor.name)
+        ));
         assert!(!init.context.authorizes(&n("/home/bob/anything"), &init.anchor_key));
         assert_eq!(
             init.context.enrollment_hint(),
@@ -475,7 +504,8 @@ mod tests {
         // The persisted signed cert is signed by the CA key.
         let wire = std::fs::read(&out.device_cert_path).unwrap();
         let data = Data::decode(bytes::Bytes::from(wire)).unwrap();
-        assert_eq!(*data.name, out.device_key);
+        assert!(data.name.has_prefix(&out.device_key) && data.name.len() == out.device_key.len() + 2);
+        assert_eq!(data.name.components()[out.device_key.len()].value.as_ref(), b"NDNCERT");
         let outcome = futures::executor::block_on(ndn_security::verifier::verify_by_sig_type(
             data.sig_info().unwrap().sig_type,
             data.signed_region(),
@@ -590,7 +620,11 @@ mod tests {
         let member = n("/home/bob/member/phone/KEY/k1");
         mgr.generate_ed25519(member.clone()).unwrap();
         let pk = mgr.get_signer_sync(&member).unwrap().public_key().unwrap();
-        let cert = mgr.certify(&member, pk, &out.ca_key, 3_600_000).await.unwrap();
+        let cert = mgr
+            .certify_as(&member, pk, &out.ca_key, 3_600_000, "NDNCERT", None)
+            .await
+            .unwrap();
+        assert!(ndn_security::cert_name::is_cert_name(&cert.name), "{}", cert.name);
         v.cert_cache().insert(cert);
         // The member self-issues an "admin" key.
         let forged = n("/home/bob/admin/phone/KEY/k1");

@@ -40,14 +40,24 @@ impl From<PibError> for TrustError {
 ///                           # carries Ed25519 / ECDSA-P256 / …)
 ///     private.key           # Legacy 32-byte raw Ed25519 seed — read
 ///                           # path kept for back-compat
-///     cert.ndnc             # NDNC-format certificate (optional)
-///     cert.data             # the issued certificate as signed Data, as the
-///                           # CA returned it (optional; `store_issued_cert`)
+///     certs/<sha256>.data   # each certificate of the key as signed Data,
+///                           # named `<key>/<issuer-id>/<version>`
+///     cert.ndnc             # NDNC summary of a certificate that has no
+///                           # signed wire (and legacy PIBs' summary)
+///     cert.data             # legacy: the issued certificate as signed Data
+///                           # (read only; new certificates go to certs/)
 ///   anchors/<sha256>/
 ///     name.uri
 ///     cert.ndnc
 ///   default-identity        # the node's default identity, NDN URI (optional)
 /// ```
+///
+/// A key holds any number of certificates (NDN Certificate Format v2): a
+/// renewal adds one under a new name while the one it replaces stays valid.
+/// [`get_cert`](Self::get_cert) returns the newest valid one,
+/// [`certs`](Self::certs) all of them. PIBs written by earlier releases keep
+/// loading: their `cert.data` / `cert.ndnc` (a certificate named after its
+/// key) count as one more certificate of the key and are never rewritten.
 ///
 /// Key directories use SHA-256 of the canonical name bytes to avoid
 /// filesystem special characters; `name.uri` carries the human form.
@@ -173,7 +183,7 @@ impl FilePib {
     /// Keys stored for `identity`, sorted by name: every key whose name
     /// starts with `<identity>/KEY/`. Covers each naming form in use —
     /// `<identity>/KEY/<keyid>`, `/KEY/root`, legacy `/KEY/self`, and
-    /// `ndn-sec keygen`'s cert-named `<identity>/KEY/<keyid>/self/v=0`.
+    /// the cert-named `<identity>/KEY/<keyid>/self/v=0` earlier `ndn-sec keygen` releases stored.
     pub fn identity_keys(&self, identity: &Name) -> Result<Vec<Name>, PibError> {
         let mut keys: Vec<Name> = self
             .list_keys()?
@@ -203,10 +213,75 @@ impl FilePib {
         Ok(certified.or_else(|| keys.into_iter().next()))
     }
 
+    /// Store `cert` as a certificate of `key_name`. A certificate carrying
+    /// its signed wire is kept as Data under its own name next to the key's
+    /// other certificates, so certificates of one key (e.g. before and after
+    /// a renewal) coexist; stored certificates of the key that have expired
+    /// are dropped. A certificate without wire bytes is kept as the key's
+    /// NDNC summary.
     pub fn store_cert(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         let dir = self.key_dir(key_name)?;
-        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(cert))?;
+        match cert.data_wire() {
+            Some(wire) => self.store_cert_wire(&dir, &cert.name, &wire),
+            None => {
+                secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(cert))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Write a signed certificate Data under `<dir>/certs/`, then drop the
+    /// key's stored certificates that have expired (never the new one).
+    fn store_cert_wire(&self, dir: &Path, cert_name: &Name, wire: &[u8]) -> Result<(), PibError> {
+        let certs = dir.join(CERTS_DIR);
+        secure_fs::create_private_dir_all(&certs)?;
+        let file = certs.join(format!("{}.data", name_hash(cert_name)));
+        secure_fs::write_private(&file, wire)?;
+        for (path, cert) in stored_cert_files(&certs) {
+            if path != file && cert.valid_until < crate::validator::now_ns() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         Ok(())
+    }
+
+    /// Every certificate stored for `key_name`: those under `certs/`, a
+    /// legacy `cert.data`, and — only when the key has no signed certificate
+    /// at all — its NDNC summary (named after the key). Unordered.
+    pub fn certs(&self, key_name: &Name) -> Result<Vec<Certificate>, PibError> {
+        Ok(self
+            .cert_entries(key_name)?
+            .into_iter()
+            .map(|(cert, _)| cert)
+            .collect())
+    }
+
+    /// Each stored certificate of `key_name` with its signed Data wire
+    /// (`None` for an NDNC summary).
+    fn cert_entries(&self, key_name: &Name) -> Result<Vec<(Certificate, Option<Bytes>)>, PibError> {
+        let Some(dir) = self.existing_key_dir(key_name) else {
+            return Ok(Vec::new());
+        };
+        let mut entries: Vec<(Certificate, Option<Bytes>)> = stored_cert_files(&dir.join(CERTS_DIR))
+            .into_iter()
+            .filter_map(|(path, cert)| {
+                let wire = std::fs::read(path).ok()?;
+                Some((cert, Some(Bytes::from(wire))))
+            })
+            .collect();
+        // Legacy: the issued certificate earlier releases kept beside the key.
+        if let Ok(wire) = std::fs::read(dir.join(LEGACY_CERT_DATA))
+            && let Some(cert) = decode_cert_wire(&wire)
+            && !entries.iter().any(|(c, _)| c.name == cert.name)
+        {
+            entries.push((cert, Some(Bytes::from(wire))));
+        }
+        if entries.is_empty()
+            && let Ok(data) = std::fs::read(dir.join("cert.ndnc"))
+        {
+            entries.push((decode_cert(Arc::new(key_name.clone()), &data)?, None));
+        }
+        Ok(entries)
     }
 
     /// Import an ndn-cxx-compatible `SafeBag` (TLV 0x80 wrapping a Data +
@@ -230,7 +305,10 @@ impl FilePib {
             .map_err(|e| PibError::Corrupt(format!("cert Data decode: {e:?}")))?;
         let cert = Certificate::decode(&cert_data)
             .map_err(|e| PibError::Corrupt(format!("Certificate decode: {e}")))?;
-        if *cert.name != *key_name {
+        // The bag's certificate is `key_name` itself (a key named after its
+        // certificate, or a legacy key-named certificate) or one of its
+        // certificates `<key_name>/<issuer>/<version>`.
+        if *cert.name != *key_name && !crate::cert_name::is_cert_of(&cert.name, key_name) {
             return Err(PibError::Corrupt(format!(
                 "SafeBag cert name {} does not match requested key {}",
                 cert.name, key_name
@@ -241,7 +319,7 @@ impl FilePib {
         let dir = self.key_dir(key_name)?;
         secure_fs::write_private(&dir.join("private.pkcs8.der"), &pkcs8)?;
         secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
-        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(&cert))?;
+        self.store_cert_wire(&dir, &cert.name, &bag.certificate)?;
         Ok(cert)
     }
 
@@ -272,49 +350,57 @@ impl FilePib {
     }
 
     /// Export a stored identity as an ndn-cxx-compatible `SafeBag` (TLV
-    /// 0x80): a freshly self-signed certificate Data wrapping the public
-    /// key, alongside the PKCS#8 private key encrypted under `passphrase`
-    /// (PBES2 / PBKDF2-HMAC-SHA256 + AES-256-CBC, matching `ndnsec export`).
+    /// 0x80): the key's current certificate (newest valid, as `ndnsec
+    /// export` exports the default certificate) alongside the PKCS#8 private
+    /// key encrypted under `passphrase` (PBES2 / PBKDF2-HMAC-SHA256 +
+    /// AES-256-CBC, matching `ndnsec export`).
     ///
     /// Works for both Ed25519 and ECDSA-P256 keys — the algorithm is taken
-    /// from the stored PKCS#8 OID via [`Self::get_signer`]. The embedded
-    /// certificate is signed *now* with the key itself, so the SafeBag is a
-    /// self-contained, verifiable bundle even when the PIB only kept the
-    /// compact NDNC cert summary.
+    /// from the stored PKCS#8 OID via [`Self::get_signer`]. When the key has
+    /// only an NDNC summary (no signed certificate), a certificate
+    /// `<key>/self/<version>` is self-signed now with the key itself, so the
+    /// SafeBag is still a self-contained, verifiable bundle.
     pub fn export_safebag(&self, key_name: &Name, passphrase: &[u8]) -> Result<Vec<u8>, PibError> {
         use crate::safebag::SafeBag;
         let pkcs8 = self.export_pkcs8(key_name)?;
         let signer = self.get_signer(key_name)?;
-        let cert = self.get_cert(key_name)?;
-        // Re-issue a self-signed cert Data so the SafeBag carries a real,
-        // verifiable Data TLV (the on-disk NDNC summary drops the signature).
-        let cert_wire = futures::executor::block_on(crate::manager::encode_cert_data(
-            key_name,
-            &cert.public_key,
-            signer.as_ref(),
-            cert.valid_from,
-            cert.valid_until,
-        ))
-        .map_err(|e| PibError::Corrupt(format!("re-sign cert for export: {e}")))?;
+        let cert_wire = match self.get_issued_cert(key_name)? {
+            Some(wire) => wire,
+            None => {
+                let cert = self.get_cert(key_name)?;
+                let cert_name = if crate::cert_name::is_cert_name(key_name) {
+                    key_name.clone()
+                } else {
+                    crate::cert_name::new_cert_name(key_name, crate::cert_name::SELF_ISSUER)
+                };
+                futures::executor::block_on(crate::manager::encode_cert_data(
+                    &cert_name,
+                    &cert.public_key,
+                    signer.as_ref(),
+                    cert.valid_from,
+                    cert.valid_until,
+                ))
+                .map_err(|e| PibError::Corrupt(format!("re-sign cert for export: {e}")))?
+            }
+        };
         let bag = SafeBag::encrypt(cert_wire, &pkcs8, passphrase)
             .map_err(|e| PibError::Corrupt(format!("SafeBag encrypt: {e}")))?;
         Ok(bag.encode().to_vec())
     }
 
+    /// The key's current certificate: the newest one valid now among
+    /// [`certs`](Self::certs) (latest `valid_from`, then the later name),
+    /// else the newest one. Legacy summaries are named after the key.
     pub fn get_cert(&self, key_name: &Name) -> Result<Certificate, PibError> {
-        let dir = self
-            .existing_key_dir(key_name)
-            .ok_or_else(|| PibError::CertNotFound(name_to_uri(key_name)))?;
-        let data = std::fs::read(dir.join("cert.ndnc"))
-            .map_err(|_| PibError::CertNotFound(name_to_uri(key_name)))?;
-        decode_cert(Arc::new(key_name.clone()), &data)
+        newest(self.cert_entries(key_name)?)
+            .map(|(cert, _)| cert)
+            .ok_or_else(|| PibError::CertNotFound(name_to_uri(key_name)))
     }
 
     /// Store the certificate a CA issued for `key_name` exactly as received
-    /// (`cert_data`, the signed Certificate v2 Data), next to the NDNC summary
-    /// [`store_cert`](Self::store_cert) writes — the summary drops the issuer's
-    /// signature and the full certificate name, which revoking it later needs.
-    /// The key must already be in the PIB and the certificate must name it.
+    /// (`cert_data`, the signed Certificate v2 Data) as one more certificate
+    /// of the key (see [`store_cert`](Self::store_cert)). The key must already
+    /// be in the PIB and the certificate must be one of its certificates.
     pub fn store_issued_cert(&self, key_name: &Name, cert_data: &[u8]) -> Result<Certificate, PibError> {
         let dir = self
             .existing_key_dir(key_name)
@@ -329,22 +415,32 @@ impl FilePib {
                 cert.name, key_name
             )));
         }
-        secure_fs::write_private(&dir.join("cert.data"), cert_data)?;
-        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(&cert))?;
+        self.store_cert_wire(&dir, &cert.name, cert_data)?;
         Ok(cert)
     }
 
-    /// The issued certificate Data stored by
-    /// [`store_issued_cert`](Self::store_issued_cert), `None` if none was.
+    /// The signed Data of the key's current certificate (as
+    /// [`get_cert`](Self::get_cert) picks it, among certificates stored with
+    /// their wire), `None` if the key has none.
     pub fn get_issued_cert(&self, key_name: &Name) -> Result<Option<Bytes>, PibError> {
-        let Some(dir) = self.existing_key_dir(key_name) else {
-            return Ok(None);
-        };
-        match std::fs::read(dir.join("cert.data")) {
-            Ok(wire) => Ok(Some(Bytes::from(wire))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(PibError::Io(e)),
-        }
+        Ok(newest(
+            self.cert_entries(key_name)?
+                .into_iter()
+                .filter(|(_, wire)| wire.is_some()),
+        )
+        .and_then(|(_, wire)| wire))
+    }
+
+    /// The signed Data of every stored certificate of `key_name` that is
+    /// valid now (a renewed key's old and new certificate, until the old
+    /// one expires).
+    pub fn valid_cert_wires(&self, key_name: &Name) -> Result<Vec<Bytes>, PibError> {
+        Ok(self
+            .cert_entries(key_name)?
+            .into_iter()
+            .filter(|(cert, _)| cert.is_valid_now())
+            .filter_map(|(_, wire)| wire)
+            .collect())
     }
 
     /// Make `identity` the PIB's default identity — the one a node loads when
@@ -369,6 +465,9 @@ impl FilePib {
         }
     }
 
+    /// Store `cert` as a trust anchor, indexed by `key_name` (the anchor's
+    /// key; anchors match by key). A certificate with its signed wire is kept
+    /// as Data too, so it reloads under its own (cert-v2) name.
     pub fn add_trust_anchor(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         if !cert.is_valid_now() {
             return Err(PibError::Corrupt(format!(
@@ -378,6 +477,12 @@ impl FilePib {
         }
         let dir = self.anchor_dir(key_name)?;
         secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(cert))?;
+        match cert.data_wire() {
+            Some(wire) => secure_fs::write_private(&dir.join(LEGACY_CERT_DATA), &wire)?,
+            None => {
+                let _ = std::fs::remove_file(dir.join(LEGACY_CERT_DATA));
+            }
+        }
         secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
         Ok(())
     }
@@ -402,9 +507,18 @@ impl FilePib {
             if !path.is_dir() {
                 continue;
             }
-            let name_uri = std::fs::read_to_string(path.join("name.uri")).unwrap_or_default();
-            let name = name_from_uri(name_uri.trim()).unwrap_or_else(|_| Name::root());
-            if let Ok(data) = std::fs::read(path.join("cert.ndnc"))
+            // An anchor whose name file is missing or malformed is skipped, like one
+            // whose certificate does not decode — never loaded under the root name.
+            // The signed certificate wins when stored; an NDNC-only anchor (and
+            // every anchor of earlier releases) is named by its `name.uri`.
+            if let Some(cert) = std::fs::read(path.join(LEGACY_CERT_DATA))
+                .ok()
+                .and_then(|wire| decode_cert_wire(&wire))
+            {
+                certs.push(cert);
+            } else if let Ok(name_uri) = std::fs::read_to_string(path.join("name.uri"))
+                && let Ok(name) = name_from_uri(name_uri.trim())
+                && let Ok(data) = std::fs::read(path.join("cert.ndnc"))
                 && let Ok(cert) = decode_cert(Arc::new(name), &data)
             {
                 certs.push(cert);
@@ -442,6 +556,39 @@ const DEFAULT_IDENTITY_FILE: &str = "default-identity";
 const NDNC_MAGIC: &[u8; 4] = b"NDNC";
 const NDNC_VERSION_V1: u8 = 1;
 const NDNC_VERSION_V2: u8 = 2;
+/// Per-key directory of the key's certificates as signed Data.
+const CERTS_DIR: &str = "certs";
+/// Earlier releases' single issued certificate per key (read only).
+const LEGACY_CERT_DATA: &str = "cert.data";
+
+fn decode_cert_wire(wire: &[u8]) -> Option<Certificate> {
+    let data = ndn_packet::Data::decode(Bytes::copy_from_slice(wire)).ok()?;
+    Certificate::decode(&data).ok()
+}
+
+/// The decodable certificate files in a key's `certs/` directory.
+fn stored_cert_files(dir: &Path) -> Vec<(PathBuf, Certificate)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "data"))
+        .filter_map(|p| {
+            let cert = decode_cert_wire(&std::fs::read(&p).ok()?)?;
+            Some((p, cert))
+        })
+        .collect()
+}
+
+/// The newest of `entries` valid now (latest `valid_from`, then the greater
+/// name), else the newest of all.
+fn newest<T>(entries: impl IntoIterator<Item = (Certificate, T)>) -> Option<(Certificate, T)> {
+    let now = crate::validator::now_ns();
+    entries.into_iter().max_by(|(a, _), (b, _)| {
+        (a.is_valid_at(now), a.valid_from, &a.name).cmp(&(b.is_valid_at(now), b.valid_from, &b.name))
+    })
+}
 
 /// Dispatch a stored PKCS#8 PrivateKeyInfo DER to the concrete signer
 /// matching its algorithm OID.
@@ -1044,5 +1191,84 @@ mod tests {
         let cert = pib.store_issued_cert(&key, &wire).unwrap();
         assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(wire));
         assert_eq!(pib.get_cert(&key).unwrap().public_key, cert.public_key);
+    }
+
+    /// A key keeps every certificate under its own cert-v2 name: a renewal's
+    /// new certificate and the old one coexist, the newest valid one is the
+    /// key's certificate, and an expired one is dropped on the next store.
+    #[test]
+    fn certificates_of_a_key_coexist_and_the_newest_valid_wins() {
+        let n = |s: &str| s.parse::<Name>().unwrap();
+        let (_dir, pib) = tmp_pib();
+        let key = n("/home/bob/member/phone/KEY/a");
+        let signer = pib.generate_ed25519(&key).unwrap();
+        let pk = signer.public_key().unwrap();
+        let hour = 3_600_000_000_000u64;
+        let issue = |name: &str, from: u64, until: u64| {
+            futures::executor::block_on(crate::manager::encode_cert_data(
+                &n(name), &pk, &signer, from, until,
+            ))
+            .unwrap()
+        };
+        let now = now_ns();
+        let old = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=1", now - 2 * hour, now + hour);
+        let new = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=2", now - hour, now + 2 * hour);
+        pib.store_issued_cert(&key, &old).unwrap();
+        pib.store_issued_cert(&key, &new).unwrap();
+
+        assert_eq!(pib.certs(&key).unwrap().len(), 2);
+        assert_eq!(pib.valid_cert_wires(&key).unwrap().len(), 2);
+        assert_eq!(
+            pib.get_cert(&key).unwrap().name.to_string(),
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=2"
+        );
+        assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(new));
+
+        let expired = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=0", now - 3 * hour, now - hour);
+        pib.store_issued_cert(&key, &expired).unwrap();
+        let third = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=3", now, now + 3 * hour);
+        pib.store_issued_cert(&key, &third).unwrap();
+        let names: Vec<String> = pib.certs(&key).unwrap().iter().map(|c| c.name.to_string()).collect();
+        assert_eq!(names.len(), 3, "the expired certificate is dropped: {names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("v=0")));
+    }
+
+    /// A PIB written by an earlier release (a key-named certificate as
+    /// `cert.data` plus its `cert.ndnc` summary) still loads; a newer cert-v2
+    /// certificate stored later supersedes it without rewriting it.
+    #[test]
+    fn legacy_key_named_certificate_still_loads() {
+        let n = |s: &str| s.parse::<Name>().unwrap();
+        let (_dir, pib) = tmp_pib();
+        let key = n("/home/bob/member/phone/KEY/a");
+        let signer = pib.generate_ed25519(&key).unwrap();
+        let pk = signer.public_key().unwrap();
+        let now = now_ns();
+        let hour = 3_600_000_000_000u64;
+        let legacy = futures::executor::block_on(crate::manager::encode_cert_data(
+            &key, &pk, &signer, now - hour, now + hour,
+        ))
+        .unwrap();
+        let dir = pib.existing_key_dir(&key).unwrap();
+        std::fs::write(dir.join("cert.data"), &legacy).unwrap();
+        std::fs::write(dir.join("cert.ndnc"), encode_cert(&decode_cert_wire(&legacy).unwrap()))
+            .unwrap();
+
+        let cert = pib.get_cert(&key).unwrap();
+        assert_eq!(*cert.name, key, "the legacy certificate is named after its key");
+        assert_eq!(pib.certs(&key).unwrap().len(), 1, "summary and Data are one certificate");
+        assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(legacy.clone()));
+
+        let renewed = futures::executor::block_on(crate::manager::encode_cert_data(
+            &n("/home/bob/member/phone/KEY/a/NDNCERT/v=5"), &pk, &signer, now, now + 2 * hour,
+        ))
+        .unwrap();
+        pib.store_issued_cert(&key, &renewed).unwrap();
+        assert_eq!(
+            pib.get_cert(&key).unwrap().name.to_string(),
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=5"
+        );
+        assert_eq!(std::fs::read(dir.join("cert.data")).unwrap(), legacy.to_vec());
+        assert_eq!(pib.valid_cert_wires(&key).unwrap().len(), 2);
     }
 }

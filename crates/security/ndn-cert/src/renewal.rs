@@ -23,11 +23,11 @@
 //!   [`RolePolicy`](crate::RolePolicy): the role is renewable — guests are
 //!   not by default) and sets the new lifetime.
 //!
-//! The CA names a certificate after its key, so the renewed certificate has
-//! the name of the one it replaces. It therefore travels inline in the
-//! (encrypted, never cached) CHALLENGE response
-//! ([`ChallengeResponseTlv::issued_cert`](crate::tlv::ChallengeResponseTlv::issued_cert))
-//! rather than by a fetch that a cache could answer with the old one.
+//! The CA names every certificate `<key>/NDNCERT/<version>` (NDN Certificate
+//! Format v2), so the renewed certificate has a name of its own: the device
+//! fetches it by the name the CHALLENGE response reports, and no cache can
+//! answer that fetch with the certificate it replaces. Old and new
+//! certificate coexist until the old one expires.
 //!
 //! [`renew_certificate`] is the device side: it runs the exchange and checks
 //! that the new certificate certifies the device key, is valid now, and
@@ -55,9 +55,10 @@ pub const CERT_NAME_PARAM: &str = "cert_name";
 pub const PROOF_PARAM: &str = "signature";
 
 /// Exchanges (Interest → Data) [`renew_certificate`] makes at most: NEW,
-/// CHALLENGE, and the issuer certificates of the new certificate's chain.
-/// Times the per-Interest timeout, it bounds how long a renewal can take.
-pub const RENEWAL_MAX_EXCHANGES: u32 = 2 + crate::invite::MAX_ISSUER_FETCHES as u32;
+/// CHALLENGE, the renewed certificate, and the issuer certificates of its
+/// chain. Times the per-Interest timeout, it bounds how long a renewal can
+/// take.
+pub const RENEWAL_MAX_EXCHANGES: u32 = 3 + crate::invite::MAX_ISSUER_FETCHES as u32;
 
 /// What the device signs to prove it holds the key of `cert_name` in the
 /// exchange with request id `request_id_hex` (the CA's NEW response,
@@ -176,7 +177,7 @@ where
     let cert =
         Certificate::decode(current).map_err(|e| RenewalError::BadCertificate(e.to_string()))?;
     let cert_name = (*cert.name).clone();
-    if !cert_name.has_prefix(device_key.key_name()) {
+    if !cert_name.has_prefix(&ndn_security::cert_name::key_name_of(device_key.key_name())) {
         return Err(RenewalError::OtherKey {
             cert: cert_name.to_string(),
             key: device_key.key_name().to_string(),
@@ -232,19 +233,25 @@ where
     )
     .await
     .map_err(|e| RenewalError::from_cert(e, &ca_prefix, &cert_name))?;
-    // A renewed certificate keeps its name (the CA names it after its key),
-    // so the CA sends it inline: fetched by name, a cache on the way could
-    // answer with the previous one.
-    let wire = session.issued_cert().cloned().ok_or_else(|| {
-        RenewalError::IssuedCertificate("the CA did not send the renewed certificate".into())
+    let issued_name = session.issued_cert_name().cloned().ok_or_else(|| {
+        RenewalError::IssuedCertificate("the CA reported no issued certificate".into())
     })?;
-    let data = Data::decode(wire)
-        .map_err(|e| RenewalError::IssuedCertificate(format!("not a Data packet: {e}")))?;
-    if session.issued_cert_name() != Some(&*data.name) {
+    // A CA of an earlier release names a renewed certificate like the one it
+    // replaces; fetched by that name, a cache could answer with the old
+    // certificate, so such a renewal is not taken.
+    if issued_name == cert_name {
         return Err(RenewalError::IssuedCertificate(format!(
-            "the CA sent {} but reported {:?} as issued",
-            data.name,
-            session.issued_cert_name().map(Name::to_string)
+            "the CA reissued {cert_name} under the same name (a CA of an earlier release that \
+             names certificates after their key); upgrade the CA to renew"
+        )));
+    }
+    let data = crate::client::fetch_issued_cert_via(exchange, &ca_prefix, &issued_name)
+        .await
+        .map_err(|e| RenewalError::from_cert(e, &ca_prefix, &cert_name))?;
+    if *data.name != issued_name {
+        return Err(RenewalError::IssuedCertificate(format!(
+            "fetching {issued_name} returned {}",
+            data.name
         )));
     }
     let issued = check_issued(&data, device_key.as_ref())

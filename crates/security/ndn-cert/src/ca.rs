@@ -106,7 +106,13 @@ pub struct CaState {
     config: CaConfig,
     manager: Arc<SecurityManager>,
     pending: DashMap<String, PendingRequest>,
+    /// Revoked certificate names (canonical URIs) — and, for a certificate
+    /// named after its key by an earlier release, that key name.
     revoked: DashSet<String>,
+    /// Keys with a revoked certificate (canonical URIs): revoking one
+    /// certificate of a key revokes the key, so its other certificates (a
+    /// renewal's included) are refused too and it is never certified again.
+    revoked_keys: DashSet<String>,
     /// Issued cert wire bytes, served on the cert-fetch Interest.
     served_certs: DashMap<String, Vec<u8>>,
     /// Durable backing for `served_certs` / `revoked`; `None` keeps both
@@ -130,6 +136,7 @@ impl CaState {
             manager,
             pending: DashMap::new(),
             revoked: DashSet::new(),
+            revoked_keys: DashSet::new(),
             served_certs: DashMap::new(),
             store: None,
             issuing: tokio::sync::Mutex::new(()),
@@ -153,7 +160,7 @@ impl CaState {
             state.served_certs.insert(name, wire);
         }
         for name in snapshot.revoked {
-            state.revoked.insert(name);
+            state.insert_revoked(name);
         }
         state.store = Some(store);
         Ok(state)
@@ -175,8 +182,22 @@ impl CaState {
         self.pending.retain(|_, v| v.created_at >= cutoff);
     }
 
+    /// Whether `cert_name` (a certificate or key name, canonical URI) is
+    /// revoked: it was revoked itself, or its key has a revoked certificate.
     pub fn is_revoked(&self, cert_name: &str) -> bool {
         self.revoked.contains(cert_name)
+            || cert_name.parse::<ndn_packet::Name>().is_ok_and(|n| {
+                self.revoked_keys
+                    .contains(&ndn_security::cert_name::key_name_of(&n).to_string())
+            })
+    }
+
+    fn insert_revoked(&self, cert_uri: String) {
+        if let Ok(name) = cert_uri.parse::<ndn_packet::Name>() {
+            self.revoked_keys
+                .insert(ndn_security::cert_name::key_name_of(&name).to_string());
+        }
+        self.revoked.insert(cert_uri);
     }
 
     /// A valid, unrevoked certificate this CA issued under `identity` for a
@@ -285,8 +306,8 @@ impl CaState {
                  with an invite instead"
             ));
         };
-        // This CA names a certificate after its key (`<key>`); a full
-        // certificate name (`<key>/<issuer>/<version>`) is accepted too.
+        // The certificate renewed is `<key>/<issuer>/<version>`, or a
+        // certificate an earlier release named after its key (`<key>`).
         if crate::context_update::key_name_of(&cert_name).as_ref() != Some(&key_name) {
             return deny(format!(
                 "{cert_name} is not a certificate of {key_name}, the key this request certifies"
@@ -343,12 +364,40 @@ impl CaState {
         }
     }
 
-    /// Wire of an issued cert for cert-fetch; `None` once it is revoked.
+    /// Wire of the issued cert named exactly `cert_name` for cert-fetch;
+    /// `None` once it (or its key) is revoked.
     pub fn get_served_cert(&self, cert_name: &str) -> Option<Vec<u8>> {
         if self.is_revoked(cert_name) {
             return None;
         }
         self.served_certs.get(cert_name).map(|r| r.clone())
+    }
+
+    /// Wire of the certificate a `CanBePrefix` cert-fetch for `prefix` (a key
+    /// name, or a certificate name) is answered with: among the unrevoked
+    /// certificates this CA serves under `prefix`, the newest one valid now
+    /// (latest `valid_from`, then the later name). `None` when none is valid.
+    pub fn served_cert_under(&self, prefix: &ndn_packet::Name) -> Option<Vec<u8>> {
+        self.served_certs
+            .iter()
+            .filter(|e| !self.is_revoked(e.key()))
+            .filter(|e| e.key().parse::<ndn_packet::Name>().is_ok_and(|n| n.has_prefix(prefix)))
+            .filter_map(|e| Some((deserialize_cert(e.value())?, e.value().clone())))
+            .filter(|(cert, _)| cert.is_valid_now())
+            .max_by(|(a, _), (b, _)| (a.valid_from, &a.name).cmp(&(b.valid_from, &b.name)))
+            .map(|(_, wire)| wire)
+    }
+
+    /// The certificate answering a cert-fetch Interest for `name`: with
+    /// `can_be_prefix`, [`served_cert_under`](Self::served_cert_under) (a key
+    /// name finds the key's newest valid certificate); without, exactly the
+    /// certificate `name` ([`get_served_cert`](Self::get_served_cert)).
+    pub fn cert_for_interest(&self, name: &ndn_packet::Name, can_be_prefix: bool) -> Option<Vec<u8>> {
+        if can_be_prefix {
+            self.served_cert_under(name)
+        } else {
+            self.get_served_cert(&name.to_string())
+        }
     }
 
     /// The key the CA signs with: [`CaConfig::signing_key`] when set, else
@@ -665,7 +714,6 @@ impl CaState {
                     issued_cert_name: None,
                     error_code: Some(7),
                     error_info: Some(reason),
-                    issued_cert: None,
                 }
             }
 
@@ -687,7 +735,6 @@ impl CaState {
                     issued_cert_name: None,
                     error_code: None,
                     error_info: None,
-                    issued_cert: None,
                 }
             }
 
@@ -739,16 +786,8 @@ impl CaState {
                                 )
                             }
                             _ => {
-                                // A renewed certificate keeps its name, so
-                                // it travels inline: a fetch by name could
-                                // be answered from a cache with the old one.
-                                self.issue(
-                                    &pending.cert_request,
-                                    validity,
-                                    &attestation_set,
-                                    renewal,
-                                )
-                                .await?
+                                self.issue(&pending.cert_request, validity, &attestation_set)
+                                    .await?
                             }
                         }
                     }
@@ -762,7 +801,6 @@ impl CaState {
                         // policy denial; OutOfTries (7) is the closest match.
                         error_code: Some(7),
                         error_info: Some(reason),
-                        issued_cert: None,
                     },
                 }
             }
@@ -807,18 +845,28 @@ impl CaState {
             Ok(n) => n,
             Err(_) => return REVOKE_STATUS_NOT_FOUND,
         };
-        if self.signing_key_name().as_ref() == Some(&cert_name) {
+        let own_key = self.signing_key_name();
+        if own_key.as_ref() == Some(&ndn_security::cert_name::key_name_of(&cert_name)) {
             return REVOKE_STATUS_NOT_FOUND;
         }
         // Canonical URI: the key `served_certs`, `revoked` and the store use.
+        // The request names one certificate, or a key: then any certificate
+        // this CA issued for it (revoking one revokes the key).
         let cert_uri = cert_name.to_string();
         let Some(cert) = self
             .served_certs
             .get(&cert_uri)
             .and_then(|wire| deserialize_cert(&wire))
+            .or_else(|| {
+                self.served_certs.iter().find_map(|e| {
+                    let cert = deserialize_cert(e.value())?;
+                    ndn_security::cert_name::is_cert_of(&cert.name, &cert_name).then_some(cert)
+                })
+            })
         else {
             return REVOKE_STATUS_NOT_FOUND;
         };
+        let (cert_uri, cert_name) = (cert.name.to_string(), (*cert.name).clone());
 
         // The proof signs the cert name exactly as the requester sent it.
         let signed = req.cert_name.as_bytes();
@@ -846,17 +894,20 @@ impl CaState {
     /// refuse the cert now; the error says a restart would forget it.
     fn mark_revoked(&self, cert_uri: String, cert_name: &ndn_packet::Name) -> Result<(), CertError> {
         let persisted = match &self.store {
-            Some(store) if !self.is_revoked(&cert_uri) => store.record_revoked(&cert_uri),
+            Some(store) if !self.revoked.contains(&cert_uri) => store.record_revoked(&cert_uri),
             _ => Ok(()),
         };
-        self.revoked.insert(cert_uri);
-        self.manager.cert_cache().remove(cert_name);
+        self.insert_revoked(cert_uri);
+        // Every certificate of the key leaves the cache with it.
+        self.manager
+            .cert_cache()
+            .remove(&ndn_security::cert_name::key_name_of(cert_name));
         persisted
     }
 
     /// The certificates this CA issued under `prefix` (an identity, a key
     /// name or a certificate name), its own excepted, each with whether it
-    /// is revoked.
+    /// is revoked (itself or through its key).
     pub fn issued_under(&self, prefix: &ndn_packet::Name) -> Vec<(ndn_packet::Name, bool)> {
         let own = self.signing_key_name();
         let mut issued: Vec<_> = self
@@ -864,8 +915,8 @@ impl CaState {
             .iter()
             .filter_map(|entry| {
                 let name: ndn_packet::Name = entry.key().parse().ok()?;
-                (name.has_prefix(prefix) && own.as_ref() != Some(&name))
-                    .then(|| (name, self.is_revoked(entry.key())))
+                let own_cert = own.as_ref() == Some(&ndn_security::cert_name::key_name_of(&name));
+                (name.has_prefix(prefix) && !own_cert).then(|| (name, self.is_revoked(entry.key())))
             })
             .collect();
         issued.sort_by_key(|(name, _)| name.to_string());
@@ -893,14 +944,15 @@ impl CaState {
         outcome
     }
 
-    /// Mint, persist and serve the certificate for an approved request;
-    /// with `inline`, the response carries the certificate too.
+    /// Mint, persist and serve the certificate for an approved request. It is
+    /// named `<key>/NDNCERT/<version>` (NDN Certificate Format v2), so every
+    /// certificate of a key — a renewal's included — has a name of its own and
+    /// the requester fetches it by that name.
     async fn issue(
         &self,
         req: &CertRequest,
         validity: Duration,
         attestation_set: &crate::attestation::AttestationSet,
-        inline: bool,
     ) -> Result<ChallengeResponseTlv, CertError> {
         let attestation_ad = if self.config.emit_attestations {
             attestation_set.encode_additional_description()
@@ -918,7 +970,6 @@ impl CaState {
         if let Some(store) = &self.store {
             store.record_issued(&cert_name_str, &cert_bytes)?;
         }
-        let issued_cert = inline.then(|| bytes::Bytes::copy_from_slice(&cert_bytes));
         self.served_certs.insert(cert_name_str.clone(), cert_bytes);
 
         Ok(ChallengeResponseTlv {
@@ -929,7 +980,6 @@ impl CaState {
             issued_cert_name: Some(cert_name_str),
             error_code: None,
             error_info: None,
-            issued_cert,
         })
     }
 
@@ -951,9 +1001,10 @@ impl CaState {
             .decode(&req.public_key)
             .map_err(|_| CertError::InvalidRequest("invalid public key base64".to_string()))?;
 
+        // A key with a revoked certificate is never certified again.
         if self.is_revoked(&req.name) {
             return Err(CertError::PolicyDenied(format!(
-                "certificate {} has been revoked",
+                "key {} has a revoked certificate",
                 req.name
             )));
         }
@@ -973,11 +1024,12 @@ impl CaState {
 
         let cert = self
             .manager
-            .certify_with_additional_description(
+            .certify_as(
                 &subject_name,
                 bytes::Bytes::from(public_key),
                 &ca_key_name,
                 validity_ms,
+                ndn_security::cert_name::NDNCERT_ISSUER,
                 additional_description,
             )
             .await
@@ -1076,7 +1128,6 @@ fn refused(code: ErrorCode, reason: String) -> ChallengeResponseTlv {
         issued_cert_name: None,
         error_code: Some(code.into()),
         error_info: Some(reason),
-        issued_cert: None,
     }
 }
 

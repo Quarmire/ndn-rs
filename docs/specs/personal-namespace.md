@@ -101,7 +101,9 @@ The fixed-shape rows (root, context, CA and device keys, approvals) are LVS.
 The `<**data>` rows are native rules OR'd with it: LVS patterns are
 fixed-length, and "the device's own key" needs data/key tag equality, which the
 in-tree compiler does not lower nor the evaluator check. Signers are key names
-(`…/KEY/<k>`), as ndn-rs signs and names certificates. The context is
+(`…/KEY/<k>`): KeyLocators name the key, and each certificate of it is
+`<key>/<issuer-id>/<version>` (NDN Certificate Format v2; issuer `self`,
+`NDNCERT` from the CA, `NA` for the CA's cert from the root). The context is
 *schema-authoritative*: no hierarchy floor (approvals and `shared` are
 cross-identity by design) and the schema is checked on every certificate hop,
 so a device cannot self-issue keys. For a short namespace the inline anchor
@@ -177,9 +179,10 @@ Gap: the request/sign round trip.
 On the root device: `ndn-fwd revoke /<ns>/<role>/<dev>` (or a key or
 certificate name) does both steps at once (**have**: `security/revoke`, a
 trust-admin verb; see `docs/wiki/src/reference/revocation.md`):
-1. CA (immediate): every certificate the CA issued for the device's keys is
-   marked revoked (`<pib>/ca/revoked/`): no longer served, the key is never
-   certified again, the device name is free to enroll with a new key.
+1. CA (immediate): the device's key names are marked revoked
+   (`<pib>/ca/revoked/`), covering every certificate of them, also any issued
+   later: no longer served, the key is never certified again, the device name
+   is free to enroll with a new key.
 2. Context bump: version `N+1` lists the key names as revoked, signed by the
    root key, stored and published. Every node refuses a chain through those
    keys once it holds `N+1`, which it pulls at its next refresh and
@@ -237,7 +240,8 @@ except as the owner-chosen word list.
 ### F10 Rotate keys
 Device certificates renew before expiry without an invite (**have**:
 `ndn_cert::renew_certificate` against the CA's built-in `renewal` challenge,
-proof of possession of the current certificate's key; same key re-certified;
+proof of possession of the current certificate's key; same key re-certified
+under a new certificate name, the old one kept until it expires;
 refused for an expired certificate, a revoked key or a non-renewable role —
 guests by default; per-role lifetimes and `[ca] renewable_roles` in
 `ndn_cert::RolePolicy`; the `ndn-fwd` renewal timer `[security] renew_before`
@@ -258,7 +262,8 @@ local segment (§9).
 
 ```
 <pib>/                FilePib keys + certs (default); ndnsec-compat may read ~/.ndn
-<pib>/keys/*/cert.data  issued certificate Data, as the CA returned it
+<pib>/keys/*/certs/*.data  each certificate of the key as the CA returned it
+                      (`<key>/<issuer-id>/<version>`; legacy cert.data still loads)
 <pib>/default-identity  identity loaded when [security] identity is unset
                       (set by `ndn-fwd enroll`)
 <pib>/contexts/*.tc   adopted signed contexts (loaded at startup, re-verified,

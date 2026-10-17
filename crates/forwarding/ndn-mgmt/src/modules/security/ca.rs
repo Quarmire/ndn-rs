@@ -112,12 +112,15 @@ pub(super) async fn security_ca_enroll(
         face_cancel.cancel();
 
         match result {
-            Ok(cert) => {
+            Ok(cert_data) => {
                 match ndn_security::FilePib::open(&pib_path) {
-                    Ok(pib) => match pib.store_cert(&identity_name, &cert) {
-                        Ok(()) => tracing::info!(
+                    // One more certificate of the key, stored as received;
+                    // refused unless it certifies this key.
+                    Ok(pib) => match pib.store_issued_cert(&identity_name, cert_data.raw()) {
+                        Ok(cert) => tracing::info!(
                             target: "mgmt.security",
                             name = %identity_name,
+                            certificate = %cert.name,
                             "ca-enroll: certificate installed"
                         ),
                         Err(e) => tracing::error!(target: "mgmt.security", error = %e, "ca-enroll: failed to store cert"),
@@ -168,14 +171,14 @@ impl ndn_cert::CaExchange for InProcExchange {
 }
 
 /// One CHALLENGE round carrying `{"code": challenge_param}`, then fetch the
-/// issued cert.
+/// issued certificate Data.
 async fn run_enrollment(
     exchange: &mut InProcExchange,
     ca_prefix: &Name,
     signer: std::sync::Arc<dyn ndn_security::Signer>,
     challenge_type: &str,
     challenge_param: &str,
-) -> Result<ndn_security::Certificate, String> {
+) -> Result<ndn_packet::Data, String> {
     let mut params = serde_json::Map::new();
     params.insert(
         "code".to_owned(),
@@ -205,9 +208,7 @@ async fn run_enrollment(
     .await
     .map_err(|e| e.to_string())?;
 
-    let cert_data = ndn_cert::client::fetch_issued_cert(exchange, &cert_name)
+    ndn_cert::client::fetch_issued_cert(exchange, &cert_name)
         .await
-        .map_err(|e| format!("cert fetch: {e}"))?;
-    ndn_security::Certificate::decode(&cert_data)
-        .map_err(|e| format!("could not decode issued certificate: {e}"))
+        .map_err(|e| format!("cert fetch: {e}"))
 }

@@ -75,7 +75,7 @@ impl CaExchange for CaWire {
         } else {
             let wire = self
                 .0
-                .get_served_cert(&interest.name.to_string())
+                .cert_for_interest(&interest.name, interest.selectors().can_be_prefix)
                 .ok_or_else(|| proto(format!("no served cert {}", interest.name)))?;
             return Data::decode(Bytes::from(wire)).map_err(|e| proto(format!("{e:?}")));
         };
@@ -131,10 +131,13 @@ async fn configured_signing_key_signs_issued_certs_not_first_anchor() {
     assert!(signed_by(&issued, &ca_cert).await, "signed by the CA key");
 
     let (_, locator) = ca.response_signer().expect("CA has a response signer");
-    assert_eq!(locator, ca_key());
-    assert_eq!(*ca.ca_certificate().unwrap().name, ca_key());
-    // The CA cert itself is fetchable so requesters can walk the chain.
-    assert!(ca.get_served_cert(&ca_key().to_string()).is_some());
+    // Responses name the CA certificate `<ca key>/<issuer>/<version>`.
+    assert_eq!(ndn_security::cert_name::key_name_of(&locator), ca_key());
+    assert_eq!(ca.ca_certificate().unwrap().key_name(), ca_key());
+    // The CA cert itself is fetchable (by its key name, CanBePrefix) so
+    // requesters can walk the chain.
+    assert!(ca.cert_for_interest(&ca_key(), true).is_some());
+    assert!(ca.get_served_cert(&locator.to_string()).is_some());
 }
 
 #[tokio::test]

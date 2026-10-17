@@ -595,6 +595,9 @@ impl PacketDispatcher {
             }
             match self.validation.process(ctx).await {
                 Action::Satisfy(ctx) => ctx,
+                // Parked awaiting its certificate: the stage logged it and
+                // re-validates the Data once the certificate arrives.
+                Action::Drop(DropReason::ValidationPending) => return,
                 Action::Drop(r) => {
                     debug!(target: t::SECURITY, reason=?r, "data validation failed");
                     return;

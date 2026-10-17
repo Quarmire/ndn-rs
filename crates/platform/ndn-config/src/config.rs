@@ -1675,8 +1675,9 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub require_signed: bool,
 
-    /// Auto-generate a self-signed key `<identity>/KEY/self` on startup
-    /// if the PIB holds no key for `identity`. Requires `identity`.
+    /// Auto-generate a key `<identity>/KEY/<random key-id>` with a signed
+    /// self-signed certificate `<key>/self/<version>` on startup if the PIB
+    /// holds no key for `identity`. Requires `identity`.
     #[serde(default)]
     pub auto_init: bool,
 

@@ -27,7 +27,7 @@ use crate::observability::targets as t;
 
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
 use ndn_packet::Name;
-use ndn_security::{ValidationResult, Validator};
+use ndn_security::{TrustError, ValidationResult, Validator};
 
 struct PendingEntry {
     ctx: PacketContext,
@@ -120,7 +120,12 @@ impl PendingQueue {
                 continue;
             }
 
-            if validator.cert_cache().get(&entry.needed_cert).is_some() {
+            // The KeyLocator names a key: the Data is ready once a currently
+            // valid certificate of it is cached (an expired one cached from
+            // before a renewal does not count — the fetch replaces it), or
+            // once the validator refused the certificate that answered the
+            // fetch (re-validating then yields that verdict, not a timeout).
+            if validator.can_resolve(&entry.needed_cert) {
                 let entry = self.entries.remove(i).unwrap();
                 self.total_bytes -= entry.byte_size;
                 results.push(DrainResult::Ready(Box::new(entry.ctx), entry.deadline));
@@ -260,7 +265,7 @@ impl ValidationStage {
                     span.record("outcome", "pending");
                     span.record("reason", "awaiting-cert");
                     self.stats.pending.fetch_add(1, Ordering::Relaxed);
-                    debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, queuing");
+                    debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, awaiting certificate (queued)");
 
                     self.request_cert(validator, &cert_name);
 
@@ -268,7 +273,7 @@ impl ValidationStage {
                     let mut pending = self.pending.lock().await;
                     let deadline = pending.deadline_from(now);
                     pending.push(ctx, cert_name, deadline);
-                    Action::Drop(DropReason::ValidationFailed)
+                    Action::Drop(DropReason::ValidationPending)
                 } else {
                     span.record("outcome", "dropped");
                     span.record("reason", "no-key-locator");
@@ -278,10 +283,11 @@ impl ValidationStage {
                 }
             }
             ValidationResult::Invalid(e) => {
+                let (reason, what) = invalid_reason(&e);
                 span.record("outcome", "invalid");
-                span.record("reason", "bad-signature");
+                span.record("reason", reason);
                 self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-                warn!(target: t::SECURITY, name=%name, error=%e, "validation: FAILED — forged/invalid signature");
+                warn!(target: t::SECURITY, name=%name, error=%e, "validation: {what}");
                 Action::Drop(DropReason::ValidationFailed)
             }
         }
@@ -336,8 +342,9 @@ impl ValidationStage {
                             actions.push(Action::Drop(DropReason::ValidationFailed));
                         }
                         (ValidationResult::Invalid(e), _) => {
+                            let (_, what) = invalid_reason(&e);
                             self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-                            warn!(target: t::SECURITY, name=%data.name, error=%e, "validation: FAILED — forged/invalid after cert fetch");
+                            warn!(target: t::SECURITY, name=%data.name, error=%e, "validation: {what} (after cert fetch)");
                             actions.push(Action::Drop(DropReason::ValidationFailed));
                         }
                     }
@@ -346,6 +353,25 @@ impl ValidationStage {
         }
 
         actions
+    }
+}
+
+/// An `Invalid` verdict as the span's `reason` and the log line's wording:
+/// a revoked key or a schema refusal is not a forged signature.
+fn invalid_reason(e: &TrustError) -> (&'static str, &'static str) {
+    match e {
+        TrustError::Revoked { .. } => ("revoked", "REFUSED — certificate revoked in trust context"),
+        TrustError::InvalidSignature | TrustError::InvalidKey => {
+            ("bad-signature", "FAILED — forged/invalid signature")
+        }
+        TrustError::SchemaMismatch | TrustError::CertNotAuthorized { .. } => {
+            ("schema", "REFUSED — not authorized by the trust schema")
+        }
+        TrustError::UntrustedSelfSigned { .. } => (
+            "untrusted-root",
+            "REFUSED — chain ends at a self-signed certificate that is not a trust anchor",
+        ),
+        _ => ("chain", "FAILED — certificate chain rejected"),
     }
 }
 
@@ -495,7 +521,7 @@ mod tests {
         let action = stage
             .process(ctx_for(signed_data("/t/leaf/photo", &leaf)))
             .await;
-        assert!(matches!(action, Action::Drop(DropReason::ValidationFailed)));
+        assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
 
         wait_cached(&validator, leaf.key_name()).await;
         assert!(
@@ -532,7 +558,7 @@ mod tests {
             let action = stage
                 .process(ctx_for(signed_data(&format!("/t/ghost/{i}"), &ghost)))
                 .await;
-            assert!(matches!(action, Action::Drop(DropReason::ValidationFailed)));
+            assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(stage.drain_pending().await.is_empty(), "nothing ready yet");

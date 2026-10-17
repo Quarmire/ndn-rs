@@ -927,7 +927,7 @@ fn resolve_security_profile(
                      hierarchical validation."
                 );
             }
-            Some(Arc::new(Validator::new(TrustSchema::accept_all())))
+            Some(Arc::new(Validator::new(TrustSchema::accept_all()).accept_signed()))
         }
 
         (SecurityProfile::AcceptSigned, Some(mgr)) => {
@@ -936,12 +936,15 @@ fn resolve_security_profile(
             mgr.keyring()
                 .ambient()
                 .set_schema(TrustSchema::accept_all());
-            Some(Arc::new(Validator::with_keyring(
-                Arc::clone(mgr.keyring()),
-                mgr.cert_cache_arc(),
-                None,
-                1,
-            )))
+            Some(Arc::new(
+                Validator::with_keyring(
+                    Arc::clone(mgr.keyring()),
+                    mgr.cert_cache_arc(),
+                    None,
+                    1,
+                )
+                .accept_signed(),
+            ))
         }
 
         (SecurityProfile::Default, Some(mgr)) => {

@@ -27,10 +27,10 @@ pub struct CustodianSigner {
     sig_type: SignatureType,
     public_key: Option<Bytes>,
     /// Certificate name to advertise in the `KeyLocator` of signed
-    /// Interests/Data. NDN validators key trust anchors by *certificate*
-    /// name, so a signed command whose KeyLocator names only the bare key
-    /// can't be resolved to a self-signed anchor — set this to the operator
-    /// cert's full name when known.
+    /// Interests/Data instead of the key name. Optional: NDN Certificate
+    /// Format v2 KeyLocators name the key, which validators resolve to its
+    /// newest valid certificate; naming one certificate exactly pins it, so
+    /// signatures stop verifying once that certificate expires, renewed or not.
     cert_name: Option<Name>,
 }
 
@@ -53,9 +53,9 @@ impl CustodianSigner {
         }
     }
 
-    /// Advertise `cert_name` in the `KeyLocator` of signed Interests/Data.
-    /// Without it, the KeyLocator falls back to the bare key name, which a
-    /// validator can't resolve to a certificate-keyed trust anchor.
+    /// Advertise `cert_name` in the `KeyLocator` of signed Interests/Data
+    /// instead of the key name (the default, which validators resolve to the
+    /// key's newest valid certificate).
     pub fn with_cert_name(mut self, cert_name: Name) -> Self {
         self.cert_name = Some(cert_name);
         self

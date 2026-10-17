@@ -133,6 +133,12 @@ impl SecurityManager {
 
     /// Issue a self-signed certificate and register it as a trust anchor.
     ///
+    /// The certificate is named `<key_name>/self/<version>` (NDN Certificate
+    /// Format v2; [`crate::cert_name`]). A legacy key stored under a
+    /// certificate-shaped name `…/KEY/<id>/<issuer>/<version>` (what earlier
+    /// releases' `ephemeral` and `ndn-sec keygen` created) names the
+    /// certificate itself, so the KeyLocator its signer stamps still resolves.
+    ///
     /// `validity_ms` is the lifetime in milliseconds; `u64::MAX` for
     /// non-expiring anchors. The resulting cert carries the full wire-
     /// format Data so it can be shipped across NDNCERT and other
@@ -149,6 +155,11 @@ impl SecurityManager {
         } else {
             now_ns.saturating_add(validity_ms.saturating_mul(1_000_000))
         };
+        let cert_name = if crate::cert_name::is_cert_name(key_name) {
+            key_name.clone()
+        } else {
+            crate::cert_name::new_cert_name(key_name, crate::cert_name::SELF_ISSUER)
+        };
 
         // Self-sign with the matching keystore key. Falls back to an
         // unsigned cert struct when the signer is missing; not expected
@@ -156,7 +167,7 @@ impl SecurityManager {
         let cert = match self.get_signer_sync(key_name) {
             Ok(signer) => {
                 let wire = futures::executor::block_on(encode_cert_data(
-                    key_name,
+                    &cert_name,
                     &public_key_bytes,
                     signer.as_ref(),
                     now_ns,
@@ -168,7 +179,7 @@ impl SecurityManager {
                 Certificate::decode(&data)?
             }
             Err(_) => Certificate {
-                name: Arc::new(key_name.clone()),
+                name: Arc::new(cert_name),
                 public_key: public_key_bytes,
                 valid_from: now_ns,
                 valid_until,
@@ -185,7 +196,9 @@ impl SecurityManager {
     }
 
     /// Issue a certificate for `subject_key` signed by `issuer_key`. Both
-    /// must already exist in the key store; the result is cached.
+    /// must already exist in the key store; the result is cached. The
+    /// certificate is named `<subject key>/NA/<version>` (ndn-cxx's default
+    /// issuer id); [`certify_as`](Self::certify_as) picks the issuer id.
     pub async fn certify(
         &self,
         subject_key_name: &Name,
@@ -193,11 +206,12 @@ impl SecurityManager {
         issuer_key_name: &Name,
         validity_ms: u64,
     ) -> Result<Certificate, TrustError> {
-        self.certify_with_additional_description(
+        self.certify_as(
             subject_key_name,
             subject_public_key,
             issuer_key_name,
             validity_ms,
+            crate::cert_name::DEFAULT_ISSUER,
             None,
         )
         .await
@@ -207,8 +221,7 @@ impl SecurityManager {
     /// `AdditionalDescription` (TLV 0x0102) in the issued cert's
     /// `SignatureInfo`. `additional_description` is the already-encoded
     /// value of that TLV (the concatenated `DescriptionEntry` elements).
-    /// The bytes are covered by the issuer's signature. `ndn-cert` uses
-    /// this to carry challenge attestations.
+    /// The bytes are covered by the issuer's signature.
     pub async fn certify_with_additional_description(
         &self,
         subject_key_name: &Name,
@@ -217,13 +230,39 @@ impl SecurityManager {
         validity_ms: u64,
         additional_description: Option<&[u8]>,
     ) -> Result<Certificate, TrustError> {
+        self.certify_as(
+            subject_key_name,
+            subject_public_key,
+            issuer_key_name,
+            validity_ms,
+            crate::cert_name::DEFAULT_ISSUER,
+            additional_description,
+        )
+        .await
+    }
+
+    /// Issue a certificate for the key `subject_key_name`, signed by
+    /// `issuer_key_name` and named `<subject key>/<issuer_id>/<version>`
+    /// with a fresh version ([`crate::cert_name::new_cert_name`]), so every
+    /// certificate of a key — a renewal's included — has its own name.
+    /// `ndn-cert`'s CA issues with [`crate::cert_name::NDNCERT_ISSUER`].
+    pub async fn certify_as(
+        &self,
+        subject_key_name: &Name,
+        subject_public_key: Bytes,
+        issuer_key_name: &Name,
+        validity_ms: u64,
+        issuer_id: &str,
+        additional_description: Option<&[u8]>,
+    ) -> Result<Certificate, TrustError> {
         let issuer_signer = self.get_signer_sync(issuer_key_name)?;
 
         let now_ns = now_ns();
-        let valid_until = now_ns + validity_ms * 1_000_000;
+        let valid_until = now_ns.saturating_add(validity_ms.saturating_mul(1_000_000));
+        let cert_name = crate::cert_name::new_cert_name(subject_key_name, issuer_id);
 
         let wire = encode_cert_data_with_description(
-            subject_key_name,
+            &cert_name,
             &subject_public_key,
             issuer_signer.as_ref(),
             now_ns,
@@ -248,29 +287,26 @@ impl SecurityManager {
         self.keyring.ambient().add_anchor(cert)
     }
 
-    /// Remove a trust anchor by name; returns whether anything was
-    /// removed. Does not evict the cert from the cache — it can still
-    /// participate in chain walks, just no longer as a root.
+    /// Remove the trust anchor(s) of `name`'s key (`name` is a key name or
+    /// a certificate name; see [`SignedTrustContext::anchor_for`]); returns
+    /// whether anything was removed. Does not evict the cert from the cache —
+    /// it can still participate in chain walks, just no longer as a root.
     pub fn remove_trust_anchor(&self, key_name: &Name) -> bool {
         let anchors = self.keyring.ambient().anchors();
-        let key_arc = anchors
-            .iter()
-            .find(|r| r.key().as_ref() == key_name)
-            .map(|r| Arc::clone(r.key()));
-        if let Some(k) = key_arc {
-            anchors.remove(&k).is_some()
-        } else {
-            false
-        }
+        let key = crate::cert_name::key_name_of(key_name);
+        let before = anchors.len();
+        anchors.retain(|n, _| {
+            !(n.as_ref() == key_name
+                || crate::cert_name::key_name_of(n) == key
+                || (n.len() == key_name.len() + 2 && n.has_prefix(key_name)))
+        });
+        anchors.len() != before
     }
 
+    /// The ambient trust anchor of `key_name`'s key (a key name or a
+    /// certificate name), see [`SignedTrustContext::anchor_for`].
     pub fn trust_anchor(&self, key_name: &Name) -> Option<Certificate> {
-        self.keyring
-            .ambient()
-            .anchors()
-            .iter()
-            .find(|r| r.key().as_ref() == key_name)
-            .map(|r| r.value().clone())
+        self.keyring.ambient().anchor_for(key_name)
     }
 
     pub fn trust_anchor_names(&self) -> Vec<Arc<Name>> {
@@ -303,7 +339,7 @@ impl SecurityManager {
 
     /// Default key name of `identity`: the first key registered under
     /// `<identity>/KEY/` (any naming form — `/KEY/<kid>`, `/KEY/self`,
-    /// `/KEY/root`, cert-named `/KEY/<kid>/self/v=0`). `None` when no key of
+    /// `/KEY/root`, legacy cert-named `/KEY/<kid>/self/v=0`). `None` when no key of
     /// that identity is held.
     pub fn identity_key_name(&self, identity: &Name) -> Option<Name> {
         if let Some(key) = self.by_identity.get(identity) {
@@ -363,7 +399,9 @@ impl SecurityManager {
         let signer = pib.get_signer(key_name)?;
         mgr.insert_key(key_name.clone(), signer);
 
-        if let Ok(cert) = pib.get_cert(key_name) {
+        // Every stored certificate of the key (a renewed key's old and new
+        // one); the cache resolves the key name to the newest valid one.
+        for cert in pib.certs(key_name)? {
             mgr.cert_cache.insert(cert);
         }
 
@@ -377,8 +415,9 @@ impl SecurityManager {
     /// Auto-initialize `identity` from a PIB directory (created if absent).
     /// Loads the identity's key when the PIB holds one under
     /// `<identity>/KEY/` (keys of other identities are ignored); otherwise
-    /// generates `<identity>/KEY/self` with a self-signed anchor. The
-    /// returned `bool` is `true` when a new key was generated.
+    /// generates `<identity>/KEY/<random key-id>` with a self-signed anchor
+    /// certificate `<key>/self/<version>`. The returned `bool` is `true` when
+    /// a new key was generated.
     pub fn auto_init(
         identity: &Name,
         pib_path: &std::path::Path,
@@ -394,7 +433,7 @@ impl SecurityManager {
             return Ok((mgr, false));
         }
 
-        let key_name = append_key_component(identity);
+        let key_name = crate::cert_name::new_key_name(identity);
         // ECDSA-P256 so the identity is verifiable by ndn-cxx tooling,
         // which doesn't support Ed25519. Ed25519 stays available via
         // explicit `pib.generate_ed25519` for ndn-rs-only deployments.
@@ -403,16 +442,17 @@ impl SecurityManager {
         let pk = signer.public_key().unwrap_or_default();
         let now_ns = now_ns();
         let one_year_ns = 365 * 24 * 3600 * 1_000_000_000u64;
-        let cert = Certificate {
-            name: Arc::new(key_name.clone()),
-            public_key: pk,
-            valid_from: now_ns,
-            valid_until: now_ns.saturating_add(one_year_ns),
-            issuer: Some(Arc::new(key_name.clone())),
-            signed_region: None,
-            sig_value: None,
-            sig_type: ndn_packet::SignatureType::SignatureSha256WithEcdsa,
-        };
+        let cert_name = crate::cert_name::new_cert_name(&key_name, crate::cert_name::SELF_ISSUER);
+        let wire = futures::executor::block_on(encode_cert_data(
+            &cert_name,
+            &pk,
+            &signer,
+            now_ns,
+            now_ns.saturating_add(one_year_ns),
+        ))?;
+        let data = ndn_packet::Data::decode(wire)
+            .map_err(|e| TrustError::KeyStore(format!("failed to decode self-signed cert: {e}")))?;
+        let cert = Certificate::decode(&data)?;
         pib.store_cert(&key_name, &cert)?;
         pib.add_trust_anchor(&key_name, &cert)?;
 
@@ -421,18 +461,10 @@ impl SecurityManager {
     }
 }
 
-fn append_key_component(identity: &Name) -> Name {
-    use ndn_packet::NameComponent;
-    let mut components: Vec<NameComponent> = identity.components().to_vec();
-    components.push(NameComponent::generic(Bytes::from_static(b"KEY")));
-    components.push(NameComponent::generic(Bytes::from_static(b"self")));
-    Name::from_components(components)
-}
-
 /// Whether `key_name` is a key of `identity`: it starts with
 /// `<identity>/KEY/` and names at least a key id after `KEY`. Accepts every
-/// naming form in use — `/KEY/<kid>`, `/KEY/self`, `/KEY/root`, and
-/// `ndn-sec keygen`'s cert-named `/KEY/<kid>/self/v=0`.
+/// naming form in use — `/KEY/<kid>`, `/KEY/self`, `/KEY/root`, and the
+/// cert-named `/KEY/<kid>/self/v=0` earlier `ndn-sec keygen` releases stored.
 pub(crate) fn is_key_of(key_name: &Name, identity: &Name) -> bool {
     key_name.len() > identity.len() + 1
         && key_name.has_prefix(identity)
@@ -576,14 +608,21 @@ mod tests {
         assert!(mgr.generate_ed25519(kn.clone()).is_ok());
     }
 
+    /// A self-signed certificate is `<key>/self/<version>`, and the key name
+    /// resolves to it as an anchor and from the cache.
     #[test]
     fn issue_self_signed_adds_anchor() {
         let mgr = SecurityManager::new();
-        let kn = key_name("anchor");
+        let kn: Name = "/alice/KEY/k1".parse().unwrap();
         let pk = Bytes::from_static(&[0xAB; 32]);
         let cert = mgr.issue_self_signed(&kn, pk, u64::MAX).unwrap();
-        assert_eq!(*cert.name, kn);
+        assert!(crate::cert_name::is_cert_name(&cert.name), "{}", cert.name);
+        assert_eq!(cert.key_name(), kn);
+        assert_eq!(cert.name.components()[kn.len()].value.as_ref(), b"self");
+        assert!(cert.name.components()[kn.len() + 1].as_version().is_some());
         assert!(mgr.trust_anchor(&kn).is_some());
+        assert!(mgr.trust_anchor(&cert.name).is_some());
+        assert_eq!(mgr.cert_cache().get(&Arc::new(kn)).unwrap().name, cert.name);
     }
 
     #[test]
@@ -712,11 +751,38 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(*cert.name, subj_name);
+        // `<subject key>/<issuer-id>/<version>`, found by the key name.
+        assert!(cert.name.len() == subj_name.len() + 2 && cert.name.has_prefix(&subj_name));
+        assert!(cert.name.components()[subj_name.len() + 1].as_version().is_some());
         assert_eq!(cert.public_key, subj_pk);
         assert!(cert.valid_until > cert.valid_from);
 
         assert!(mgr.cert_cache().get(&Arc::new(subj_name)).is_some());
+    }
+
+    /// Each certificate of one key gets its own name, and the key name
+    /// resolves to the newest one.
+    #[tokio::test]
+    async fn certify_as_names_each_certificate_of_a_key_apart() {
+        let mgr = SecurityManager::new();
+        let ca: Name = "/ns/CA/KEY/ca".parse().unwrap();
+        let dev: Name = "/ns/member/d/KEY/k".parse().unwrap();
+        mgr.generate_ed25519(ca.clone()).unwrap();
+        let pk = Bytes::from_static(&[3; 32]);
+        let first = mgr
+            .certify_as(&dev, pk.clone(), &ca, 60_000, crate::cert_name::NDNCERT_ISSUER, None)
+            .await
+            .unwrap();
+        let second = mgr
+            .certify_as(&dev, pk, &ca, 60_000, crate::cert_name::NDNCERT_ISSUER, None)
+            .await
+            .unwrap();
+        assert_ne!(first.name, second.name);
+        for cert in [&first, &second] {
+            assert_eq!(cert.key_name(), dev);
+            assert_eq!(cert.name.components()[dev.len()].value.as_ref(), b"NDNCERT");
+        }
+        assert_eq!(mgr.cert_cache().get(&Arc::new(dev)).unwrap().name, second.name);
     }
 
     #[tokio::test]
@@ -766,7 +832,15 @@ mod tests {
         let (first, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert!(generated);
         let (key, pk) = identity_signer(&first, &identity);
-        assert_eq!(key, identity.clone().append("KEY").append("self"));
+        assert!(is_key_of(&key, &identity) && key.len() == identity.len() + 2, "{key}");
+        // Its self-signed anchor is a cert-v2 certificate of the key.
+        let anchor = first.trust_anchor(&key).expect("self anchor");
+        assert!(crate::cert_name::is_cert_name(&anchor.name), "{}", anchor.name);
+        assert_eq!(anchor.key_name(), key);
+        assert_eq!(
+            anchor.name.components()[key.len()].value.as_ref(),
+            crate::cert_name::SELF_ISSUER.as_bytes()
+        );
         drop(first);
 
         // Simulated restart: fresh managers over the same directory.
@@ -813,7 +887,7 @@ mod tests {
     }
 
     /// Every key naming form already persisted in FilePibs loads for its
-    /// identity: `ndn-sec keygen`'s cert-named `/KEY/<kid>/self/v=0`,
+    /// identity: earlier `ndn-sec keygen` releases' cert-named `/KEY/<kid>/self/v=0`,
     /// `auto_init`'s `/KEY/self`, a namespace root's `/KEY/root`, and `/KEY/<kid>`.
     #[test]
     fn every_key_naming_form_loads_for_its_identity() {

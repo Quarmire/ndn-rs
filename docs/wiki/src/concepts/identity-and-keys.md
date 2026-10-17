@@ -36,6 +36,7 @@ certificate. To hold several identities, hold several keychains.
 let keychain = KeyChain::ephemeral("/alice")?;
 let _name = keychain.name();          // /alice
 let _key_name = keychain.key_name();  // /alice/KEY/<key-id>
+let _cert = keychain.cert_name();     // Some(/alice/KEY/<key-id>/self/<version>)
 let _signer = keychain.signer()?;     // signs with that key
 # Ok(()) }
 ```
@@ -51,6 +52,14 @@ A certificate is a signed `Data` packet whose content is the identity's
 public key, with a validity period and a key locator pointing to the
 issuer's key. A fresh keychain's cert is **self-signed** — it is its own
 trust anchor; a CA-issued cert chains to the CA instead.
+
+Naming follows NDN Certificate Format v2: the key is
+`/<identity>/KEY/<key-id>` and each certificate of it
+`<key>/<issuer-id>/<version>`, with issuer id `self` (self-signed),
+`NDNCERT` (issued by the namespace CA) or `NA`. A key can hold several
+certificates — a renewal adds a new one, the old stays valid until it
+expires. KeyLocators name the key; a verifier fetches by key name
+(CanBePrefix + MustBeFresh) and uses the newest valid certificate.
 
 | Verb | API |
 |---|---|
@@ -118,9 +127,10 @@ The lower-level PIB type is `ndn_security::pib::FilePib` (file-backed),
 the default native PIB. A PIB can hold several identities. `open_or_create`,
 `SecurityManager::auto_init` and `SecurityManager::from_pib` load only the
 requested identity's key, i.e. any key whose name starts with
-`/<identity>/KEY/`. That covers every naming form in use:
-`/KEY/<key-id>/self/v=0` (`ndn-sec keygen`), `/KEY/self` (`auto_init`),
-`/KEY/root` (namespace root) and `/KEY/<key-id>`. When an identity has several
+`/<identity>/KEY/`. On first start `auto_init` generates
+`/<identity>/KEY/<random 8-byte hex>` with a signed self-signed certificate
+`<key>/self/v=<ms>`; namespace roots use `/KEY/root`, and PIBs from earlier
+releases may still hold `/KEY/self`. When an identity has several
 keys, `FilePib::default_key` picks the one whose valid certificate was
 issued most recently, falling back to name order. Use `FilePib` directly
 for the SafeBag import/export below; SafeBag is also the portable way to
@@ -146,7 +156,9 @@ A `FilePib` directory looks like this:
   keys/<sha256(name)>/      0700  one directory per key
     private.pkcs8.der       0600  the private key (PKCS#8 DER)
     name.uri                0600  the key name
-    cert.ndnc, cert.data    0600  certificate summary / issued cert Data
+    certs/<sha256(cert)>.data 0600  each certificate of the key (signed Data);
+                                  storing one drops the key's expired ones
+    cert.ndnc, cert.data    0600  legacy summary / certificate (still loaded)
   anchors/<sha256(name)>/   0700  trust anchors (cert.ndnc, name.uri)
   default-identity          0600
   contexts/*.tc             0600  adopted signed trust contexts

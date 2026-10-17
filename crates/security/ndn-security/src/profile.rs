@@ -25,7 +25,12 @@ pub enum SecurityProfile {
     Default,
 
     /// Verify that signatures are present and cryptographically valid,
-    /// but skip trust schema and chain walking.
+    /// but skip chain walking: each Data packet is verified against its
+    /// signer's certificate — fetched when not cached, a self-signed one
+    /// included — and accepted without that certificate reaching a trust
+    /// anchor ([`Validator::accept_signed`]). On a forwarder the signer's
+    /// certificate is itself Data validated this way before it is used.
+    /// The ambient schema accepts any name relationship.
     ///
     /// Useful for testing or deployments where any valid signature
     /// is sufficient (e.g., all participants share a trust domain).

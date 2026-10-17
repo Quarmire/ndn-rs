@@ -67,8 +67,8 @@ key without an invite, if the CA renews the role — see
 | 4 | daemon | generates `/<ns>/<role>/<device>/KEY/<16 hex>` (Ed25519) in its PIB |
 | 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
-| 7 | daemon → CA | fetches the issued certificate and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
-| 8 | daemon | stores `cert.data` (signed Data, as issued) and the summary beside the key, then sets the PIB's default identity — the last step |
+| 7 | daemon → CA | fetches the issued certificate by the name the CA reports in the CHALLENGE response (`<key>/NDNCERT/v=<ms>`, NDN Certificate Format v2), and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
+| 8 | daemon | stores the certificate (signed Data, as issued) under the key's `certs/`, then sets the PIB's default identity — the last step |
 | 9 | daemon | switches the signer of its management responses and discovery records to the new key; the key also enters the engine's key store |
 
 A failure at any step after 4 deletes the new key; the default identity and
@@ -86,8 +86,7 @@ complete the enrollment and to check `ndn-ctl status` before retrying.
 
 ```
 <pib>/keys/<hash>/private.pkcs8.der   device key (never leaves the daemon)
-<pib>/keys/<hash>/cert.ndnc           certificate summary (validity, public key)
-<pib>/keys/<hash>/cert.data           the issued certificate Data
+<pib>/keys/<hash>/certs/<hash>.data   each certificate of the key (signed Data, as issued; a renewal adds one)
 <pib>/default-identity                the identity loaded when [security] identity is unset
 <pib>/contexts/<ns-hex>.tc            the adopted context
 ```

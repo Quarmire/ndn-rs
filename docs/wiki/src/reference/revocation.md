@@ -27,9 +27,9 @@ certificate whose KeyLocator or issuer name *starts with* a revoked entry is
 refused with `certificate revoked in trust context: <entry>`. So one entry
 covers:
 
-- every certificate of that key, in both naming forms (ndn-rs locates a
-  certificate by key name; other stacks by the full certificate name
-  `/<identity>/KEY/<key-id>/<issuer>/<version>`);
+- every certificate of that key, `/<identity>/KEY/<key-id>/<issuer>/<version>`
+  (a renewed certificate is a new one under the same key), whether a
+  KeyLocator names the key or a full certificate name;
 - certificates of that key issued later;
 - Data signed by any key whose chain passes through it.
 
@@ -63,9 +63,10 @@ The daemon, under one lock shared with the context refresh:
    decoded verbatim — anchors, schema blobs, CA endpoints, earlier
    revocations — plus the new entries, signed with the root key. Keys already
    revoked are not added twice; when all are, no new version is made.
-6. CA, immediate: marks every certificate it issued for each key revoked in
-   `<pib_path>/ca/revoked/` (kept across restarts) and drops it from its
-   certificate cache (`CaState::revoke_issued_under`).
+6. CA, immediate: records each key name revoked in `<pib_path>/ca/revoked/`
+   (kept across restarts) — covering every certificate it issued for the
+   key, and any it would issue later — and drops them from its certificate
+   cache (`CaState::revoke_issued_under`).
 7. Context: adopts `N+1` into its keyring (`Keyring::adopt_update`, strictly
    newer), stores it in `<pib_path>/contexts/` in place of `N`, and publishes
    it by name (unless `[security] serve_contexts = false`).

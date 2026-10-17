@@ -81,18 +81,20 @@ impl RenewBefore {
     }
 }
 
-/// The certificate `manager` holds for `key_name`: cached under the key name
-/// itself, else the newest one cached for the public key of `key_name`'s
-/// signer.
+/// The certificate `manager` holds for `key_name`: the newest currently
+/// valid one cached under the key name (a renewed key has several), else
+/// the newest valid one cached for the public key of `key_name`'s signer.
+/// An expired certificate is not current: it cannot be renewed.
 pub fn current_certificate(manager: &SecurityManager, key_name: &Name) -> Option<Certificate> {
     use sha2::{Digest, Sha256};
-    if let Some(cert) = manager.cert_cache().get(&Arc::new(key_name.clone())) {
+    if let Some(cert) = manager.cert_cache().get_valid(key_name) {
         return Some(cert);
     }
     let public_key = manager.get_signer_sync(key_name).ok()?.public_key()?;
     manager
         .cert_cache()
         .get_by_key_digest(&Sha256::digest(&public_key)[..])
+        .filter(Certificate::is_valid_now)
 }
 
 /// Obtains + installs a fresh certificate for an identity whose current cert is nearing
@@ -324,9 +326,10 @@ mod tests {
         ndn_security::Certificate {
             name: Arc::new(key_name.clone()),
             public_key: bytes::Bytes::from_static(&[0u8; 32]),
-            // 99% elapsed: well under any sane threshold.
-            valid_from: now.saturating_sub(99),
-            valid_until: now.saturating_add(1),
+            // 99% elapsed, still valid for the test's duration: well under
+            // any sane threshold.
+            valid_from: now.saturating_sub(99_000_000_000),
+            valid_until: now.saturating_add(1_000_000_000),
             issuer: None,
             signed_region: None,
             sig_value: None,

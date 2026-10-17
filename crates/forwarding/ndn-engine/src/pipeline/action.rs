@@ -18,6 +18,10 @@ pub enum DropReason {
     /// Awaiting more fragments; not an error.
     FragmentCollect,
     ValidationFailed,
+    /// Parked while the signing certificate is fetched; not a failure. The
+    /// Data is re-validated once the certificate arrives, or dropped with
+    /// [`ValidationTimeout`](Self::ValidationTimeout).
+    ValidationPending,
     ValidationTimeout,
     /// `SubscriptionRequest` sub-TLV present but out of range
     /// (wrong version, zero count/lifetime, or lifetime above max).
@@ -55,6 +59,7 @@ mod tests {
             DropReason::ScopeViolation,
             DropReason::FragmentCollect,
             DropReason::ValidationFailed,
+            DropReason::ValidationPending,
             DropReason::ValidationTimeout,
             DropReason::InvalidPersistentRequest,
             DropReason::Other,

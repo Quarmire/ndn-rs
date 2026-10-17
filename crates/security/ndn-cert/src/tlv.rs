@@ -65,9 +65,6 @@ pub const TLV_ISSUED_CERT_NAME: u64 = 0xA9;
 pub const TLV_ERROR_CODE: u64 = 0xAB;
 pub const TLV_ERROR_INFO: u64 = 0xAD;
 pub const TLV_AUTH_TAG: u64 = 0xAF;
-/// ndn-rs extension to the CHALLENGE response: the issued certificate inline
-/// ([`ChallengeResponseTlv::issued_cert`]). Even, so non-critical.
-pub const TLV_ISSUED_CERT: u64 = 0xB2;
 
 /// CHALLENGE parameter codec — NDNCERT v0.3 §2.4.3. Non-string JSON values
 /// are written as compact JSON text so they round-trip.
@@ -477,16 +474,11 @@ pub struct ChallengeResponseTlv {
     pub challenge_status: Option<String>,
     pub remaining_tries: Option<u8>,
     pub remaining_time_secs: Option<u32>,
-    /// NDN URI string; the client fetches the cert separately.
+    /// NDN URI string of the issued certificate
+    /// (`<key>/<issuer-id>/<version>`); the client fetches it by this name.
     pub issued_cert_name: Option<String>,
     pub error_code: Option<u8>,
     pub error_info: Option<String>,
-    /// ndn-rs extension ([`TLV_ISSUED_CERT`]): the issued certificate Data
-    /// itself, sent by the CA on a renewal. A renewed certificate keeps the
-    /// name of the one it replaces (this CA names a certificate after its
-    /// key), so fetching it by name could be answered from a cache with the
-    /// old one.
-    pub issued_cert: Option<Bytes>,
 }
 
 /// NDNCERT v0.3 status codes.
@@ -520,9 +512,6 @@ impl ChallengeResponseTlv {
         if let Some(ref ei) = self.error_info {
             w.write_tlv(TLV_ERROR_INFO, ei.as_bytes());
         }
-        if let Some(cert) = &self.issued_cert {
-            w.write_tlv(TLV_ISSUED_CERT, cert);
-        }
         w.finish()
     }
 
@@ -535,7 +524,6 @@ impl ChallengeResponseTlv {
         let mut issued_cert_name = None;
         let mut error_code = None;
         let mut error_info = None;
-        let mut issued_cert = None;
 
         while !r.is_empty() {
             let (typ, val) = r
@@ -563,9 +551,6 @@ impl ChallengeResponseTlv {
                 TLV_ERROR_INFO => {
                     error_info = std::str::from_utf8(&val).ok().map(str::to_string);
                 }
-                TLV_ISSUED_CERT => {
-                    issued_cert = Some(val);
-                }
                 _ => {}
             }
         }
@@ -578,7 +563,6 @@ impl ChallengeResponseTlv {
             issued_cert_name,
             error_code,
             error_info,
-            issued_cert,
         })
     }
 }
@@ -788,19 +772,17 @@ mod tests {
             challenge_status: None,
             remaining_tries: None,
             remaining_time_secs: None,
-            issued_cert_name: Some("/com/acme/alice/KEY/v=0".to_string()),
+            issued_cert_name: Some("/com/acme/alice/KEY/k1/NDNCERT/v=1".to_string()),
             error_code: None,
             error_info: None,
-            issued_cert: Some(Bytes::from_static(b"\x06\x00")),
         };
         let encoded = resp.encode();
         let decoded = ChallengeResponseTlv::decode(encoded).unwrap();
         assert_eq!(decoded.status, STATUS_SUCCESS);
         assert_eq!(
             decoded.issued_cert_name.as_deref(),
-            Some("/com/acme/alice/KEY/v=0")
+            Some("/com/acme/alice/KEY/k1/NDNCERT/v=1")
         );
-        assert_eq!(decoded.issued_cert.as_deref(), Some(&b"\x06\x00"[..]));
     }
 
     #[test]
