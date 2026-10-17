@@ -86,7 +86,8 @@ pub(super) async fn security_yubikey_generate(
         };
         entries.retain(|e| e["name"].as_str() != Some(&key_name.to_string()));
         entries.push(entry);
-        let _ = std::fs::write(
+        // Lives in the PIB, which is owner-only throughout.
+        let _ = ndn_security::secure_fs::write_private(
             &slot_file,
             serde_json::to_vec_pretty(&entries).unwrap_or_default(),
         );

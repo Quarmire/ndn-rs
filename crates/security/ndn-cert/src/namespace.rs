@@ -278,14 +278,16 @@ pub fn init_namespace_in_pib(
         let path = path.to_path_buf();
         move |source| NamespaceInitError::Io { path, source }
     };
-    std::fs::create_dir_all(&ca_dir).map_err(io(&ca_dir))?;
+    // Owner-only like the rest of the PIB (`ndn_security::secure_fs`).
+    ndn_security::secure_fs::create_private_dir_all(&ca_dir).map_err(io(&ca_dir))?;
     let ca_cert_path = ca_dir.join(CA_CERT_FILE);
-    std::fs::write(&ca_cert_path, serialize_cert(&ca_cert)).map_err(io(&ca_cert_path))?;
+    ndn_security::secure_fs::write_private(&ca_cert_path, serialize_cert(&ca_cert))
+        .map_err(io(&ca_cert_path))?;
     let anchor_cert_path = ca_dir.join(ANCHOR_CERT_FILE);
-    std::fs::write(&anchor_cert_path, serialize_cert(&init.anchor))
+    ndn_security::secure_fs::write_private(&anchor_cert_path, serialize_cert(&init.anchor))
         .map_err(io(&anchor_cert_path))?;
     let device_cert_path = ca_dir.join(DEVICE_CERT_FILE);
-    std::fs::write(&device_cert_path, serialize_cert(&device_cert))
+    ndn_security::secure_fs::write_private(&device_cert_path, serialize_cert(&device_cert))
         .map_err(io(&device_cert_path))?;
 
     let context_path = persist_context(pib.root(), &init.context, &init.context_data)?;

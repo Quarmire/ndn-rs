@@ -40,6 +40,7 @@ pub mod profile;
 pub mod replay_guard;
 pub mod safe_data;
 pub mod safebag;
+pub mod secure_fs;
 pub mod sign_ext;
 pub mod signer;
 pub mod signing_info;

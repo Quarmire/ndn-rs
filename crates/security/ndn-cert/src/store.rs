@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use ndn_security::secure_fs;
+
 use crate::{ca::deserialize_cert, error::CertError};
 
 /// What a [`CaStore`] holds, as loaded at CA startup.
@@ -60,6 +62,11 @@ pub trait CaStore: Send + Sync {
 /// leaves a truncated entry. Issued entries are keyed by the name the wire itself
 /// decodes to; entries that fail to decode are skipped with a warning rather
 /// than failing startup.
+///
+/// The store is owner-only (directories `0700`, entries `0600`, via
+/// [`ndn_security::secure_fs`]): the redeemed-token hashes and the issuance
+/// record are the CA's private state. Opening an existing store tightens
+/// group/other-accessible entries and refuses ones owned by another user.
 pub struct FileCaStore {
     dir: PathBuf,
 }
@@ -69,8 +76,9 @@ impl FileCaStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, CertError> {
         let dir = dir.into();
         for sub in ["issued", "revoked", REDEEMED_TOKENS_DIR] {
-            std::fs::create_dir_all(dir.join(sub)).map_err(|e| io_err(&dir.join(sub), e))?;
+            secure_fs::create_private_dir_all(&dir.join(sub)).map_err(|e| io_err(&dir.join(sub), e))?;
         }
+        secure_fs::repair_tree(&dir).map_err(|e| io_err(&dir, e))?;
         Ok(Self { dir })
     }
 
@@ -79,9 +87,7 @@ impl FileCaStore {
     }
 
     fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CertError> {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| io_err(&tmp, e))?;
-        std::fs::rename(&tmp, path).map_err(|e| io_err(path, e))
+        secure_fs::write_private(path, bytes).map_err(|e| io_err(path, e))
     }
 }
 

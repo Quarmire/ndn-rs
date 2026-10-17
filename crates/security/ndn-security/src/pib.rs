@@ -7,7 +7,7 @@ use thiserror::Error;
 use ndn_packet::Name;
 
 use crate::signer::{EcdsaP256Signer, Ed25519Signer};
-use crate::{Signer, TrustError, cert_cache::Certificate};
+use crate::{Signer, TrustError, cert_cache::Certificate, secure_fs};
 
 #[derive(Debug, Error)]
 pub enum PibError {
@@ -52,6 +52,12 @@ impl From<PibError> for TrustError {
 /// Key directories use SHA-256 of the canonical name bytes to avoid
 /// filesystem special characters; `name.uri` carries the human form.
 ///
+/// Permissions: the whole PIB is owner-only — directories `0700`, files
+/// `0600`, each file created with its mode before any content is written
+/// (see [`crate::secure_fs`]). [`new`](Self::new) and [`open`](Self::open)
+/// tighten group/other-accessible entries of an existing PIB (with a warning)
+/// and refuse one containing entries owned by another user.
+///
 /// NDNC v2 cert format: 4B magic `NDNC`, 1B version=2, 2B SignatureType
 /// (BE), 8B valid_from (ns, BE), 8B valid_until (ns, BE; `u64::MAX` =
 /// never), 4B pk_len (BE), then the public key bytes. V1 omits the
@@ -63,8 +69,9 @@ pub struct FilePib {
 impl FilePib {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, PibError> {
         let root = root.into();
-        std::fs::create_dir_all(root.join("keys"))?;
-        std::fs::create_dir_all(root.join("anchors"))?;
+        secure_fs::create_private_dir_all(&root.join("keys"))?;
+        secure_fs::create_private_dir_all(&root.join("anchors"))?;
+        secure_fs::repair_tree(&root)?;
         Ok(Self { root })
     }
 
@@ -79,6 +86,7 @@ impl FilePib {
                 ),
             )));
         }
+        secure_fs::repair_tree(&root)?;
         Ok(Self { root })
     }
 
@@ -97,8 +105,8 @@ impl FilePib {
         let pkcs8 = crate::safebag::ed25519_seed_to_pkcs8(&seed)
             .map_err(|e| PibError::Corrupt(format!("ed25519 → pkcs8: {e}")))?;
         let dir = self.key_dir(key_name)?;
-        std::fs::write(dir.join("private.pkcs8.der"), &pkcs8)?;
-        std::fs::write(dir.join("name.uri"), name_to_uri(key_name))?;
+        secure_fs::write_private(&dir.join("private.pkcs8.der"), &pkcs8)?;
+        secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
         Ok(signer)
     }
 
@@ -115,8 +123,8 @@ impl FilePib {
         let signer = EcdsaP256Signer::from_pkcs8_der(pkcs8.as_bytes(), key_name.clone())
             .map_err(|e| PibError::Corrupt(format!("ecdsa from_pkcs8: {e}")))?;
         let dir = self.key_dir(key_name)?;
-        std::fs::write(dir.join("private.pkcs8.der"), pkcs8.as_bytes())?;
-        std::fs::write(dir.join("name.uri"), name_to_uri(key_name))?;
+        secure_fs::write_private(&dir.join("private.pkcs8.der"), pkcs8.as_bytes())?;
+        secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
         Ok(signer)
     }
 
@@ -197,7 +205,7 @@ impl FilePib {
 
     pub fn store_cert(&self, key_name: &Name, cert: &Certificate) -> Result<(), PibError> {
         let dir = self.key_dir(key_name)?;
-        std::fs::write(dir.join("cert.ndnc"), encode_cert(cert))?;
+        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(cert))?;
         Ok(())
     }
 
@@ -231,9 +239,9 @@ impl FilePib {
         // Fail fast on unsupported algorithms before writing to disk.
         let _ = signer_from_pkcs8(&pkcs8, key_name)?;
         let dir = self.key_dir(key_name)?;
-        std::fs::write(dir.join("private.pkcs8.der"), &pkcs8)?;
-        std::fs::write(dir.join("name.uri"), name_to_uri(key_name))?;
-        std::fs::write(dir.join("cert.ndnc"), encode_cert(&cert))?;
+        secure_fs::write_private(&dir.join("private.pkcs8.der"), &pkcs8)?;
+        secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
+        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(&cert))?;
         Ok(cert)
     }
 
@@ -321,8 +329,8 @@ impl FilePib {
                 cert.name, key_name
             )));
         }
-        std::fs::write(dir.join("cert.data"), cert_data)?;
-        std::fs::write(dir.join("cert.ndnc"), encode_cert(&cert))?;
+        secure_fs::write_private(&dir.join("cert.data"), cert_data)?;
+        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(&cert))?;
         Ok(cert)
     }
 
@@ -341,15 +349,13 @@ impl FilePib {
 
     /// Make `identity` the PIB's default identity — the one a node loads when
     /// its configuration names none. The PIB must hold a key of `identity`.
-    /// The record is replaced atomically (write, then rename), so a reader
+    /// The record is replaced atomically (temp file, then rename), so a reader
     /// sees the old default or the new one, never a partial name.
     pub fn set_default_identity(&self, identity: &Name) -> Result<(), PibError> {
         if self.identity_keys(identity)?.is_empty() {
             return Err(PibError::KeyNotFound(name_to_uri(identity)));
         }
-        let tmp = self.root.join(".default-identity.tmp");
-        std::fs::write(&tmp, name_to_uri(identity))?;
-        std::fs::rename(&tmp, self.root.join(DEFAULT_IDENTITY_FILE))?;
+        secure_fs::write_private(&self.root.join(DEFAULT_IDENTITY_FILE), name_to_uri(identity))?;
         Ok(())
     }
 
@@ -371,8 +377,8 @@ impl FilePib {
             )));
         }
         let dir = self.anchor_dir(key_name)?;
-        std::fs::write(dir.join("cert.ndnc"), encode_cert(cert))?;
-        std::fs::write(dir.join("name.uri"), name_to_uri(key_name))?;
+        secure_fs::write_private(&dir.join("cert.ndnc"), encode_cert(cert))?;
+        secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;
         Ok(())
     }
 
@@ -414,7 +420,7 @@ impl FilePib {
     /// Key directory for `name`, creating it on demand.
     fn key_dir(&self, name: &Name) -> Result<PathBuf, PibError> {
         let dir = self.root.join("keys").join(name_hash(name));
-        std::fs::create_dir_all(&dir)?;
+        secure_fs::create_private_dir_all(&dir)?;
         Ok(dir)
     }
 
@@ -426,7 +432,7 @@ impl FilePib {
 
     fn anchor_dir(&self, name: &Name) -> Result<PathBuf, PibError> {
         let dir = self.root.join("anchors").join(name_hash(name));
-        std::fs::create_dir_all(&dir)?;
+        secure_fs::create_private_dir_all(&dir)?;
         Ok(dir)
     }
 }
@@ -653,6 +659,49 @@ mod tests {
     fn open_nonexistent_pib_errors() {
         let r = FilePib::open("/tmp/ndn_pib_nonexistent_xyz_abc");
         assert!(r.is_err());
+    }
+
+    /// Every entry under `root` is owner-only (no group/other bits).
+    #[cfg(unix)]
+    fn assert_owner_only(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{} is {:o}", root.display(), mode & 0o777);
+        if root.is_dir() {
+            for e in std::fs::read_dir(root).unwrap() {
+                assert_owner_only(&e.unwrap().path());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keys_and_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A world-readable PIB root must not leak keys either.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pib = FilePib::new(dir.path()).unwrap();
+        pib.generate_ed25519(&key_name("a")).unwrap();
+        pib.generate_ecdsa_p256(&key_name("b")).unwrap();
+        assert_owner_only(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_tightens_existing_pib() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, pib) = tmp_pib();
+        pib.generate_ed25519(&key_name("a")).unwrap();
+        let keydir = pib.existing_key_dir(&key_name("a")).unwrap();
+        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        set(&keydir.join("private.pkcs8.der"), 0o644);
+        set(&keydir, 0o755);
+        set(&dir.path().join("keys"), 0o755);
+        set(dir.path(), 0o755);
+        let pib = FilePib::open(dir.path()).unwrap();
+        assert_owner_only(dir.path());
+        assert!(pib.get_signer(&key_name("a")).is_ok());
     }
 
     #[test]

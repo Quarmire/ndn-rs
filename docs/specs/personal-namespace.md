@@ -230,6 +230,16 @@ local segment (§9).
 $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs
 ```
 
+Everything under `<pib>/` is owner-only: directories `0700`, files `0600`,
+each file created with its mode before any byte is written, so a namespace's
+root key minted by `init` is never readable by another local user, whatever
+the umask. Opening a PIB (`FilePib::new`/`open`, also `FileCaStore::open` for
+`ca/`) tightens group/other-accessible entries with a warning, and refuses
+entries owned by another uid as well as symlinks inside the PIB. The
+self-signed TLS cache is `0700`/`0600` too. On non-unix targets nothing is
+enforced: files inherit the parent directory's ACL, so keep the PIB inside
+the user's profile (see `ndn_security::secure_fs`).
+
 ## 7. Build order
 
 1. Generated schema + role naming in `init` and enrollment (F1, F2 roles) — **have**.

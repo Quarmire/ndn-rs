@@ -137,6 +137,40 @@ ignores). `FileTpm` can also export and import SafeBags directly. The
 feature pulls in bundled SQLite, so it is off by default and does not
 build for wasm.
 
+### On-disk layout and permissions
+
+A `FilePib` directory looks like this:
+
+```text
+<pib>/                      0700
+  keys/<sha256(name)>/      0700  one directory per key
+    private.pkcs8.der       0600  the private key (PKCS#8 DER)
+    name.uri                0600  the key name
+    cert.ndnc, cert.data    0600  certificate summary / issued cert Data
+  anchors/<sha256(name)>/   0700  trust anchors (cert.ndnc, name.uri)
+  default-identity          0600
+  contexts/*.tc             0600  adopted signed trust contexts
+  ca/                       0700  CA state on CA hosts (certs, issued/,
+                                  revoked/, redeemed-tokens/)
+```
+
+The whole PIB is owner-only, not just the private keys, so a single rule
+covers everything in it. Every file is created with its final mode before
+any content is written (a temp file opened `0600`, then renamed into place),
+so a key is never readable by others, not even briefly. This holds
+regardless of umask. `FilePib::new` and `FilePib::open` check an existing
+PIB. A directory or file that group or other can access is tightened to
+owner-only, and a warning names the path and its old mode. An entry owned
+by a different user, or a symlink inside the PIB, is refused with an error
+rather than used. `FileTpm` follows the same rule, writing key files `0400`
+the way ndn-cxx's `tpm-file` does. `ndn-sec export` writes SafeBag files
+`0600`. The helpers are in `ndn_security::secure_fs`.
+
+On non-unix targets there are no permission bits. Files inherit the ACL of
+their parent directory, and the repair and ownership checks do nothing. On
+Windows, keep the PIB under the user's profile directory, which only that
+user (plus SYSTEM and Administrators) can read.
+
 ## SafeBag — exporting identities
 
 A `SafeBag` is a passphrase-encrypted bundle of an identity's

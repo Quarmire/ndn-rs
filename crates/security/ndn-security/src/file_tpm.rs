@@ -23,8 +23,6 @@
 //! no separate public-key files.
 
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -124,14 +122,13 @@ pub struct FileTpm {
 }
 
 impl FileTpm {
-    /// Open or create a TPM at `root`, creating it with `0o700` if absent.
+    /// Open or create a TPM at `root` (`0o700`). An existing TPM's
+    /// group/other-accessible entries are tightened to owner-only and
+    /// foreign-owned entries refused ([`crate::secure_fs::repair_tree`]).
     pub fn open(root: impl AsRef<Path>) -> Result<Self, FileTpmError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
-        #[cfg(unix)]
-        {
-            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
-        }
+        crate::secure_fs::create_private_dir_all(&root)?;
+        crate::secure_fs::repair_tree(&root)?;
         Ok(Self { root })
     }
 
@@ -161,7 +158,9 @@ impl FileTpm {
         self.root.join(format!("{stem}.{}", kind.extension()))
     }
 
-    /// Save raw DER bytes (base64-encoded, `0o400`). `der` must already
+    /// Save raw DER bytes, base64-encoded, `0o400` like ndn-cxx's tpm-file
+    /// (which chmods to `S_IRUSR` after writing; here the mode is set at
+    /// creation, and the file atomically replaced). `der` must already
     /// be in the algorithm's canonical form: PKCS#1 RSA, SEC1 ECDSA, or
     /// PKCS#8 Ed25519.
     pub fn save_raw(
@@ -172,11 +171,7 @@ impl FileTpm {
     ) -> Result<(), FileTpmError> {
         let path = self.path_for(key_name, kind);
         let body = b64_encode(der);
-        fs::write(&path, body.as_bytes())?;
-        #[cfg(unix)]
-        {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
-        }
+        crate::secure_fs::write_private_with_mode(&path, body.as_bytes(), 0o400)?;
         Ok(())
     }
 

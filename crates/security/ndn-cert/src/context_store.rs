@@ -62,7 +62,8 @@ pub fn context_file_path(pib_root: &Path, namespace: &Name) -> PathBuf {
 
 /// Persist `context_data` (the signed Data of `context`) under `pib_root`,
 /// replacing any earlier version of the same namespace. The write is atomic
-/// (temp file + rename) so a crash never leaves a truncated context.
+/// (temp file + rename) so a crash never leaves a truncated context, and
+/// owner-only like the rest of the PIB (`ndn_security::secure_fs`).
 pub fn persist_context(
     pib_root: &Path,
     context: &SignedTrustContext,
@@ -74,10 +75,8 @@ pub fn persist_context(
         move |source| ContextStoreError::Io { path, source }
     };
     let dir = pib_root.join(CONTEXTS_DIR);
-    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let tmp = path.with_extension("tc.tmp");
-    std::fs::write(&tmp, context_data.raw()).map_err(io(&tmp))?;
-    std::fs::rename(&tmp, &path).map_err(io(&path))?;
+    ndn_security::secure_fs::create_private_dir_all(&dir).map_err(io(&dir))?;
+    ndn_security::secure_fs::write_private(&path, context_data.raw()).map_err(io(&path))?;
     Ok(path)
 }
 

@@ -74,6 +74,10 @@ rusqlite      = { version = "0.32", features = ["bundled"], optional = true }
 pkcs1         = { version = "0.7",  features = ["std", "alloc"], optional = true }
 sec1          = { version = "0.7",  default-features = false, features = ["std", "alloc", "der", "pem", "pkcs8"], optional = true }
 
+# `secure_fs`: euid for the key-store ownership check.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 yubikey-piv = ["dep:yubikey"]
 # Read/write ndn-cxx's `~/.ndn` key store: `sqlite_pib::SqlitePib`
