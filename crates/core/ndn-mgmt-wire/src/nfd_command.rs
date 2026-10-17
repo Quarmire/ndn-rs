@@ -132,12 +132,6 @@ pub mod verb {
     pub const ENROLL: &[u8] = b"enroll";
     /// `security/enroll` flag bit: enroll although already enrolled.
     pub const ENROLL_FORCE: u64 = 1;
-    /// `security/revoke` — on the root device: revoke the device identity,
-    /// key or certificate in `ControlParameters.name` at this node's CA and
-    /// in a new version of the namespace's trust context, signed by the root
-    /// key from the PIB, stored and published. Authorized like
-    /// [`CONTEXT_ADOPT`].
-    pub const REVOKE: &[u8] = b"revoke";
     /// `security/context-refresh` — check the held trust context of the
     /// namespace in `ControlParameters.name` (every held one when absent) for
     /// a newer version and adopt it if the held version's root signed it.
@@ -147,9 +141,11 @@ pub mod verb {
     /// `ControlParameters.context_data` (in ApplicationParameters) as the
     /// next version of a held context, under the same continuity rule a
     /// refresh applies (signed by an anchor of the held version, strictly
-    /// newer), then store and publish it: how `ndn-fwd recovery-kit` and
-    /// `ndn-fwd recover` hand the version they signed to the running daemon.
-    /// Authorized like [`CONTEXT_ADOPT`].
+    /// newer), then store and publish it: how `ndn-fwd revoke`, `ndn-fwd
+    /// recovery-kit` and `ndn-fwd recover` hand the version they signed to
+    /// the running daemon. A namespace CA on the node then stops serving every
+    /// certificate the adopted version revokes. Authorized like
+    /// [`CONTEXT_ADOPT`].
     pub const CONTEXT_UPDATE: &[u8] = b"context-update";
     /// `security/renew` — renew, now, every certificate a namespace CA issued
     /// to this node's keys: each is re-certified for the same key by the CA

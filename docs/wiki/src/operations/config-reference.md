@@ -50,14 +50,25 @@ key order rather than by recency, its accounting can drift under concurrent
 insert, and eviction is O(N) per insert (a recency-indexed rewrite is tracked).
 In-memory `lru` / `sharded-lru` remain the default and are unaffected.
 
-## `[mgmt]` — management plane
+## `[management]` — management socket
 
 | Key | Default | Use |
 |---|---|---|
-| `socket` | `/tmp/ndn-fwd.sock` | IPC socket the management protocol listens on. |
-| `prefix` | `/localhost/ndn-fwd` | Management protocol prefix. |
-| `auth.require` | `false` | Require signed mgmt commands on non-Unix faces. |
-| `auth.signer` | (none) | Identity name allowed to sign mgmt commands. |
+| `face_socket` | `/run/nfd/nfd.sock` (Windows: `\\.\pipe\ndn`) | Unix socket (Named Pipe) on which apps, `ndn-ctl` and the dashboard connect and send management commands. |
+
+## `[security.mgmt]` — who may manage this forwarder
+
+On the local Unix socket the kernel reports who is connecting (peer
+credentials). A **local operator** — the daemon's own user, root, or a member
+of a group in `[security] trust_admin_groups` — is authenticated by that
+alone: its commands are accepted without a signature, whatever the settings
+below. Everyone else (another local user, or any network face) must sign.
+
+| Key | Default | Use |
+|---|---|---|
+| `require_signed_commands` | `true` | Commands from anyone but a local operator must carry a key-backed signature that a key under `trust_anchor_pib` verifies; an unsigned (or DigestSha256-only) command is refused `403` with the reason and what to do. `false` accepts unsigned commands of the standard NFD modules (`faces`, `fib`, `rib`, `cs`, `strategy-choice`, `status`) from any caller; the ndn-rs extension modules (e.g. `security`) still need a local operator or a signature. Public read-only datasets (`*/list`, `status/general`, `cs/info`, …) are always served unsigned. |
+| `trust_anchor_pib` | (none) | PIB whose anchors verify signed commands. Unset: only local operators can issue commands. Startup fails if set but unreadable or empty. |
+| `localhop_trust_anchor_pib` | (none) | PIB whose anchors verify `/localhop/nfd/rib/{register,unregister}` from neighbours. Unset: every `/localhop` command is refused. Trust-changing verbs are refused over `/localhop` regardless. |
 
 ## `[[face]]` — face listeners
 
@@ -106,8 +117,9 @@ cost = 100        # optional
 | Key | Default | Use |
 |---|---|---|
 | `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the newest stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data of each version held, verbatim (so nodes behind this one can follow the namespace version by version). Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
-| `trust_admin_groups` | `[]` | Unix groups whose members may change this node's trust over the local management socket: the verbs in `TRUST_ADMIN_VERBS` (`ndn-mgmt/src/auth.rs`) — `security/context-adopt` (`ndn-fwd adopt`), `security/enroll` (`ndn-fwd enroll`), `security/renew` (`ndn-fwd renew`), `security/revoke` (`ndn-fwd revoke`), `security/context-refresh` (`ndn-fwd context refresh`) and `security/context-update` (`ndn-fwd recovery-kit`, `ndn-fwd recover`). The daemon's own user and root are always allowed; everyone else is refused, and these verbs are always refused over `/localhop`. Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
+| `trust_admin_groups` | `[]` | Unix groups whose members are local operators on the management socket, alongside the daemon's own user and root. Only local operators may change this node's trust: the verbs in `TRUST_ADMIN_VERBS` (`ndn-mgmt/src/auth.rs`) — `security/context-adopt` (`ndn-fwd adopt`), `security/enroll` (`ndn-fwd enroll`), `security/renew` (`ndn-fwd renew`), `security/context-refresh` (`ndn-fwd context refresh`) and `security/context-update` (`ndn-fwd revoke`, `ndn-fwd recovery-kit`, `ndn-fwd recover`); everyone else is refused, and these verbs are always refused over `/localhop`. Local operators' other commands need no signature either (see [`[security.mgmt]`](#securitymgmt--who-may-manage-this-forwarder)). Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
 | `context_refresh_secs` | `300` | How often, in seconds, the daemon checks every held trust context for a newer version (RDR metadata upstream) and adopts one signed by an anchor of the held version and strictly newer — or, when a recovery installed a new root in between, follows the versions in between one by one — then stores and republishes it — how a [revocation](../reference/revocation.md) reaches this node. The first check runs `min(context_refresh_secs, 30)` s after start. `0` disables the periodic check; `ndn-fwd context refresh` still works. A missed check only delays an update. The root device (whose PIB holds the root key) does not fetch its own namespace. See [Trust-context updates](../reference/context-updates.md). |
+| `context_sync` | `false` | Also join every held namespace's trust-context sync group (SVS, `/<ns>/32=trust-context/32=sync`; a namespace adopted later is joined when it is adopted). The root device (whose root store holds an anchor key of the version) puts each version it keeps into the group — a revocation, a version handed over with `security/context-update`, a recovery — and every other member fetches it at once and adopts it under the same rule as `context_refresh_secs`, then stores and republishes it the same way. Refusals are logged with their reason. The group is routed over the faces the namespace is routed over and toward the faces members' Sync Interests arrive on; a relay between the root device and a device carries it only if it runs `context_sync` too. The periodic refresh keeps running beside it. See [Trust-context updates](../reference/context-updates.md#push-over-the-namespaces-sync-group). |
 | `renew_before` | `0.333` | When the daemon renews the certificates a namespace CA issued to its keys: once the remaining validity falls below this. A number between 0 and 1 is a fraction of the lifetime; a string `"<n>d"` / `"<n>h"` / `"<n>m"` / `"<n>s"` is a fixed time before expiry (a time at least the lifetime the CA issues renews at a third of the lifetime instead, with a WARN); `0` turns the timer off (`ndn-fwd renew` still works). Failures retry with a jittered backoff (30–60 s doubling to 30–60 min; 30–60 min after a refusal) and log a WARN with the days left. See [Certificate renewal](../reference/renewal.md). |
 
 ## `[ca]` — embedded NDNCERT CA
@@ -158,7 +170,7 @@ advice; `sealed-file`, `yubikey-piv`, `file`), recorded in
 `<pib_path>/root/store.toml` — no config key selects it; see
 [root custody](../concepts/identity-and-keys.md#root-custody-where-a-namespace-root-key-lives).
 The daemon reports it in `security/identity-status` (`root_store=`,
-`root_unlock=`; shown by `ndn-ctl status`) and warns at startup when it is
+`root_key=`; shown by `ndn-ctl status`) and warns at startup when it is
 `file`. `ndn-fwd` builds with the `os-keyring` feature by default;
 `yubikey-piv` is opt-in.
 

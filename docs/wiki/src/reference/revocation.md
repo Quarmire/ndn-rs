@@ -4,17 +4,19 @@ A lost or compromised device keeps its private key and its certificate. To
 stop the namespace from trusting it, the owner **revokes** the device's key on
 the namespace's **root device**: the node where `ndn-fwd init --namespace …`
 ran, which holds the namespace root key in its root store and runs the namespace's
-CA. Revocation happens in two places:
+CA. A revocation is one thing — a new, root-signed version of the trust
+context — and two parties act on it:
 
-| Where | Effect | When it takes effect |
+| Who | Effect | When it takes effect |
 |---|---|---|
-| The namespace CA | the CA stops serving the key's certificates, never certifies that key again, and the device name is free for a new key | at once, on the root device |
-| The trust context | version `N+1` of the namespace's context lists the key name as revoked, signed by the root key | on each node once it holds `N+1`, which it fetches at its next refresh ([context updates](./context-updates.md)) |
+| Every validator | refuses a chain through the key | on each node once it holds version `N+1`, which lists the key name as revoked; other nodes fetch it at their next refresh ([context updates](./context-updates.md)) |
+| The namespace CA | stops serving the key's certificates, never certifies that key again, and the device name is free for a new key | as soon as the daemon running the CA holds `N+1`: at once on the root device |
 
-The CA side alone is not enough: a node that already has the certificate
-(fetched earlier, or carried in a KeyLocator chain) would keep accepting it.
-The context entry is what every validator checks, and only the root key can
-add one.
+The CA side alone would not be enough: a node that already has the
+certificate (fetched earlier, or carried in a KeyLocator chain) would keep
+accepting it. The context entry is what every validator checks, and only the
+root key can add one. The CA acts on that signed entry, never on a separate
+request ([the CA follows the trust context](#the-ca-follows-the-trust-context)).
 
 Design: `docs/specs/personal-namespace.md`, flows F4 (lose a member device)
 and F5 (lose an admin device).
@@ -22,8 +24,9 @@ and F5 (lose an admin device).
 ## Unlocking the root
 
 The root signs the new context version, so a revocation unlocks it for that
-one signature. `ndn-fwd revoke` asks the daemon (`security/identity-status`,
-`root_unlock=`) what its root store needs:
+one signature — in the `ndn-fwd revoke` command itself, which opens the root
+store of the PIB (`--pib`, or `[security] pib_path` of `-c <config>`) and asks
+for what it needs:
 
 | Root store (`ndn-fwd root-key status`) | `revoke` asks for |
 |---|---|
@@ -32,13 +35,11 @@ one signature. `ndn-fwd revoke` asks the daemon (`security/identity-status`,
 | `yubikey-piv` | the PIV PIN: `NDN_ROOT_PIN`, else `--pin-file <path>`, else the terminal; then a touch if the policy says so |
 | `file` | nothing (plaintext, unprotected; seal it with `ndn-fwd root-key move --to os-keyring`) |
 
-The secret is never taken from the command line. The CLI sends it with the
-command over the local management socket (peer-credential gated, refused over
-`/localhop`), in the command's ApplicationParameters — never in its Name. The
-daemon decrypts or unlocks the root, signs, and drops the key (zeroed). The
-passphrase or PIN itself is zeroed where it is held as a secret value (the
-CLI's prompt result, the decoded command parameter); the packet buffers that
-carry it between the two processes are freed without being overwritten.
+The secret is never taken from the command line, and never leaves the
+command: it unlocks the root there, the root signs, and the key is dropped
+(a software key zeroed). The daemon receives only the signed version. Every
+check that needs no key runs before the secret is asked for (see
+[refusals](#refusals)), so a refused revocation never asks.
 
 ## What a revocation entry covers
 
@@ -61,47 +62,76 @@ context revokes.
 
 ## What `revoke` does
 
-`ndn-fwd revoke <name> [-c <config>]` sends `security/revoke` (the name in
-`ControlParameters.Name`) to the running daemon. `<name>` is one of:
+`ndn-fwd revoke <name> [--pib <dir> | -c <config>]`, on the root device.
+`<name>` is one of:
 
-- a device identity, e.g. `/home/bob/member/phone`: every key the CA issued a
-  certificate for to exactly that identity;
+- a device identity, e.g. `/home/bob/member/phone`: every key the namespace
+  CA issued a certificate for to exactly that identity, read from the CA
+  store in the PIB (`<pib_path>/ca/issued/`);
 - a key name, e.g. `/home/bob/member/phone/KEY/eba4f4f2af5d697b`, also for a
   key this CA did not certify;
 - a certificate name: reduced to its key name.
 
-The daemon, under one lock shared with the context refresh:
+The command, before asking for any secret:
 
-1. Finds the held context whose namespace is the longest prefix of the name,
-   and its signed Data as stored in `<pib_path>/contexts/`.
-2. Checks it can sign the next version: the PIB must hold the private key of
-   the anchor that signed the held version, with the same public key. Nothing
-   changes otherwise.
-3. Checks it runs the namespace's CA (`[ca]` with identity `<ns>/CA`).
-4. Works out the key names (above). The CA's own key and any name covering a
-   root anchor are refused.
-5. Makes version `N+1` (`ndn_cert::bump_context_revoking`): the held Content
-   decoded verbatim — anchors, schema blobs, CA endpoints, earlier
-   revocations — plus the new entries, signed with the root key. Keys already
-   revoked are not added twice; when all are, no new version is made.
-6. CA, immediate: records each key name revoked in `<pib_path>/ca/revoked/`
-   (kept across restarts) — covering every certificate it issued for the
-   key, and any it would issue later — and drops them from its certificate
-   cache (`CaState::revoke_issued_under`).
-7. Context: adopts `N+1` into its keyring (`Keyring::adopt_update`, strictly
-   newer), stores it in `<pib_path>/contexts/` as the newest version (`N`
-   stays stored beside it), and publishes it by name (unless `[security]
-   serve_contexts = false`).
+1. Opens the PIB's root store and the context stored for its namespace
+   (`<pib_path>/contexts/`); the root store must hold an anchor of that
+   version (`RootStore::holds_anchor_of`, public keys only), else this is not
+   the root device.
+2. Works out the key names (above). A name in the namespace CA's identity
+   (`<ns>/CA`), a name outside the namespace, and a key covering a root
+   anchor are refused (`ndn_cert::revocations_to_add`).
+3. Keys the held version revokes already are not added again; when it
+   revokes all of them, nothing is signed and the command says so.
+4. When a daemon listens on the management socket, checks it uses the same
+   PIB (`security/identity-status` `pib_path=`).
+
+Then it unlocks the root, makes version `N+1`
+(`ndn_cert::bump_context_revoking`: the held Content decoded verbatim —
+anchors, schema blobs, CA endpoints, earlier revocations — plus the new
+entries, signed with the root key) and hands it to the daemon with
+`security/context-update`, as `ndn-fwd recovery-kit` does
+([versions made on this device](./context-updates.md#versions-made-on-this-device-securitycontext-update)):
+the daemon adopts it under the continuity rule (signed by an anchor of the
+held version, strictly newer), stores it in `<pib_path>/contexts/` as the
+newest version (`N` stays stored beside it), and publishes it by name
+(unless `[security] serve_contexts = false`). With no daemon listening, the
+version is stored there for the daemon's next start.
+
+The outcome comes from the daemon's answer: a refusal means nothing was
+revoked (the context and the CA are unchanged); without an answer, the
+command says it does not know, and running it again once the daemon is idle
+reports the keys revoked if the daemon took the version, or signs it again if
+not.
 
 The root device refuses the key at once. Every other node refuses it once it
 has fetched `N+1`; see [context updates](./context-updates.md).
 
+## The CA follows the trust context
+
+Whenever the daemon keeps a version of a context — handed over by a CLI,
+fetched by a refresh, adopted by link — and the node runs the CA of that
+namespace (`[ca]` with identity `<ns>/CA`), the CA follows the version
+(`TrustAdmin::keep` → `revoke::ca_follow`): every certificate it issued under
+a name the version revokes is recorded in `<pib_path>/ca/revoked/` (kept
+across restarts) and dropped from its certificate cache
+(`CaState::revoke_issued_under`): no longer served, that key is never
+certified again, and the device name is free for a new key. When the CA
+starts, it follows the versions loaded from `<pib_path>/contexts/` the same
+way (`revoke::ca_follow_held`), which covers a version stored for the next
+start and a revocation its store could not record. Following a version
+again changes nothing. The CA's state is therefore derived from the signed
+context alone: a CA on a relay that refreshes the context follows a
+revocation made on the root device, too.
+
 ## Who may revoke
 
-`security/revoke` is a trust-admin verb (`TRUST_ADMIN_VERBS` in
-`ndn-mgmt/src/auth.rs`): only the daemon's own user, root, or a member of a
-group in `[security] trust_admin_groups` may send it over the management
-socket, and it is refused (`403`) over `/localhop`, whoever signed it. See
+Only the holder of the root key signs a revocation. Handing the version to
+the daemon (`security/context-update`) is a trust-admin verb
+(`TRUST_ADMIN_VERBS` in `ndn-mgmt/src/auth.rs`): only the daemon's own user,
+root, or a member of a group in `[security] trust_admin_groups` may send it
+over the management socket, and it is refused (`403`) over `/localhop`,
+whoever signed it. See
 [Adopting a trust context](./context-adoption.md#who-may-adopt).
 
 The network NDNCERT `REVOKE` request (a device revoking its own certificate
@@ -111,25 +141,26 @@ make a new context version.
 ## Usage
 
 ```sh
-# on the root device
-ndn-fwd revoke /home/bob/member/phone -c root.toml
-# ndn-fwd revoke (by the running daemon at <management socket>)
-namespace        = /home/bob
-revoked_key      = /home/bob/member/phone/KEY/eba4f4f2af5d697b
-ca_revoked       = /home/bob/member/phone/KEY/eba4f4f2af5d697b (no longer served by the CA)
-trust_context    = v1 -> v2 (signed by the root, stored and published)
-stored           = <pib>/contexts/2f686f6d652f626f62.tc
+# on the root device (sealed-file root: asks for the passphrase)
+ndn-fwd revoke /home/rv/member/phone -c root.toml
+# ndn-fwd revoke
+namespace      = /home/rv
+revoked_key    = /home/rv/member/phone/KEY/4c60a77af0f3ce14
+trust_context  = v1 -> v2 (signed by the root /home/rv/KEY/root)
+handed_over    = the daemon at <management socket> adopted v2 (signed by /home/rv/KEY/root/self/v=…, an anchor of v1); stored <pib>/contexts/2f686f6d652f7276.tc and published; this node's CA no longer serves /home/rv/member/phone/KEY/4c60a77af0f3ce14/NDNCERT/v=… (the version revokes their keys) and their device names are free for a new key
 
-# This node and its CA refuse the key now. Every other node refuses it once it
-# holds v2: it fetches it at its next refresh ([security]
-# context_refresh_secs, default 300 s), or at once with `ndn-fwd context refresh`.
-# The device name is free to enroll again with a new key.
+# The CA of /home/rv stops serving the certificates of these keys once its
+# daemon holds v2, and the device name is free to enroll again with a
+# new key. Every other node refuses the keys once it holds v2: at its next
+# refresh ([security] context_refresh_secs, default 300 s), or at once with
+# `ndn-fwd context refresh`.
 ```
 
-On another node, after its refresh, Data signed by the revoked key is dropped:
+Data the revoked key signed is refused wherever v2 is held, the root device
+included:
 
 ```text
-validation: FAILED name=/home/bob/member/phone/data/photo2/… error=certificate revoked in trust context: /home/bob/member/phone/KEY/eba4f4f2af5d697b
+WARN security: validation: REFUSED — certificate revoked in trust context name=/home/rv/member/phone/data/note/v=…/seg=0 error=certificate revoked in trust context: /home/rv/member/phone/KEY/4c60a77af0f3ce14 in_face=face#2
 ```
 
 ## Cached Data
@@ -180,25 +211,31 @@ first hit on its cached copy evicts it.
 
 ## Refusals
 
-| Status | Cause | What to do |
-|---|---|---|
-| 401 | this node's root store holds no anchor of the held context (not the root device) | run `ndn-fwd revoke` on the root device |
-| 401 | the root store needs its passphrase / PIN and none came with the command | run `ndn-fwd revoke` (it asks), or set `NDN_ROOT_PASSPHRASE` / `NDN_ROOT_PIN` |
-| 403 | wrong passphrase, or the YubiKey refused the PIN | retry with the right one; nothing was signed |
-| 503 | the OS keychain is not reachable, or lost the root's entry | unlock the keychain (log in to the desktop session) |
-| 404 | this node holds no context for a namespace containing the name | run it on the root device of that namespace |
-| 404 | this node runs no CA for the namespace | run it on the root device, which runs the CA |
-| 404 | the CA issued no certificate for that identity | pass the identity as enrolled (`/<ns>/<role>/<device>`) or a key name |
-| 400 | the name is not a key name under the namespace, or covers a root anchor | revoke a device key, never the root |
-| 400 | the name is the CA's own key | replacing the CA (F6, a compromised relay) is not built; revoke the devices one by one |
-| 409 | the context changed while the revocation ran | revoke again |
-| 500 | the stored context is unreadable, or differs from the held version | restart the daemon so both agree, then revoke again |
+Before the root is unlocked (nothing is asked, nothing signed):
 
-A refusal changes nothing: neither the CA store nor the context.
+| Cause | What to do |
+|---|---|
+| the PIB holds no namespace root, or its root store holds no anchor of the held context (not the root device) | run `ndn-fwd revoke` on the root device (`--pib` / `-c` naming its PIB) |
+| the PIB holds no trust context for the root's namespace | adopt it first (`ndn-fwd adopt <link>`) |
+| the name is outside the namespace | name a device, key or certificate of that namespace |
+| the name is the namespace CA or one of its keys | replacing the CA (F6, a compromised relay) is not built; revoke the devices one by one |
+| the name is not a key name under the namespace, or covers a root anchor | revoke a device key, never the root |
+| the CA issued no certificate for that identity | pass the identity as enrolled (`/<ns>/<role>/<device>`) or a key name |
+| the daemon on the socket uses another PIB | pass `-c` with that daemon's config, or `--pib` with its PIB |
 
-`ca_not_persisted` in the answer means the CA marked the certificate revoked
-in memory but could not write `<pib_path>/ca/revoked/`; the context entry is
-still made, and the CA refusal lasts until it restarts.
+Unlocking: a wrong passphrase, a refused PIN, or an unreachable OS keychain
+fails before anything is signed; retry with the right one (or unlock the
+keychain by logging in to the desktop session).
+
+Handing over: the daemon refuses a version that is not signed by an anchor of
+the version it holds or not newer than it (`403`, the root signed a version
+made from a context the daemon no longer holds: run `revoke` again), or when
+the context changed meanwhile (`409`). A refusal changes nothing — neither
+the context nor the CA.
+
+When the CA cannot record a revocation in `<pib_path>/ca/revoked/`, the
+daemon's answer says so: the CA stops serving the certificate for this run,
+and follows the stored context again when it next starts.
 
 ## Code
 
@@ -212,10 +249,11 @@ still made, and the CA refusal lasts until it restarts.
 | Entry stamp; hit-time re-check | `CsInsertStage`, `CsLookupStage` (`ndn-engine` `stages/cs.rs`); `revocation_purge::recheck` |
 | Stamp storage | `ndn_store::{CsEntry::revocation_epoch, ContentStore::restamp, EARLIER_PROCESS_EPOCH}`; store generation in `ndn-store` `cs_keycodec.rs` |
 | CS eviction on adoption | `ndn-engine` `revocation_purge.rs` (`install`) |
-| CA side | `ndn_cert::CaState::{issued_under, revoke_issued_under}` |
+| Checks before signing | `ndn_cert::revocations_to_add` |
+| CA following the context | `ndn-fwd` `revoke.rs` (`ca_follow`, `ca_follow_held`), called from `TrustAdmin::keep` (`context_adopt.rs`) and the CA's start (`ca.rs`); `ndn_cert::CaState::{issued_under, revoke_issued_under}` |
 | Stored context | `ndn_cert::read_stored_context` |
-| Management verb | `ndn-mgmt` `security/revoke`, `RevokedInfo`; `ndn-ipc` `MgmtClient::security_revoke` |
-| Daemon | `ndn-fwd` `revoke.rs`; CLI `onboard.rs` (`run_revoke`) |
+| Hand-over | `security/context-update` (`ndn-ipc` `MgmtClient::security_context_update`; daemon `context_refresh::apply_update`) |
+| CLI | `ndn-fwd` `revoke.rs` (`run`); hand-over `recovery_kit.rs` (`hand_over`) |
 
 ## See also
 

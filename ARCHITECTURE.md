@@ -525,12 +525,13 @@ expiry_task → drains expired PIT entries (1 ms tick)
 ## Security
 
 `ndn-fwd` always has a signing identity. At startup it reads (or generates) a
-key from the PIB path configured under `[security]`. The `[security.mgmt]` block
-controls signed-command enforcement: `require_signed_commands = true` (default)
-rejects management Interests without valid `InterestSignatureInfo`; a
-`trust_anchor_pib` path points at the anchor certificates that management clients
-must chain to. The `ndn-ctl --identity`/`--pib` flags pick the signing key for
-command Interests.
+key from the PIB path configured under `[security]`. Management commands on the
+local Unix socket are authenticated by the caller's kernel peer credentials: the
+daemon's user, root, and `[security] trust_admin_groups` members (local
+operators) need no signature. Everyone else is governed by `[security.mgmt]`:
+`require_signed_commands = true` (default) rejects their commands unless a
+key-backed signature chains to an anchor in `trust_anchor_pib`. The
+`ndn-ctl --identity`/`--pib` flags pick the signing key for command Interests.
 
 `Validator` dispatches on `SignatureType`: Ed25519, ECDSA-SHA-256, RSA-SHA-256,
 HMAC-SHA-256, DigestSha256, and BLAKE3 plain/keyed verifiers are all wired.

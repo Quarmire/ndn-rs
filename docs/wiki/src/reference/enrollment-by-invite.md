@@ -63,7 +63,8 @@ key without an invite, if the CA renews the role — see
 |---|---|---|
 | 1 | CLI | reads the invite, derives `/<ns>/<role>/<device>` (device default: the host name, sanitized), sends `security/enroll` (Uri = invite, Name = identity, Flags bit 1 = force) over the daemon's Unix socket |
 | 2 | daemon mgmt | trust-admin gate: the peer credentials must be the daemon's user, root, or a `[security] trust_admin_groups` member; a `/localhop` enroll command is refused outright |
-| 3 | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`); a certificate whose key the held context revokes does not count |
+| 3 | daemon | context held: checks the namespace for a newer version first, through the `context refresh` path ([Trust-context updates](./context-updates.md)): adopted only under the continuity rule, stored and published. It waits at most two exchanges (a catch-up across several versions is left to `ndn-fwd context refresh`) |
+| 3a | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`); a certificate whose chain the context — as checked in step 3 — revokes does not count. When the check could not confirm the held version is the newest, the refusal says it judged against that version |
 | 4 | daemon | generates `/<ns>/<role>/<device>/KEY/<16 hex>` (Ed25519) in its PIB |
 | 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
@@ -78,9 +79,18 @@ failed. Once the CA has issued (step 7–8) the token is spent: a failure to
 store the certificate says so; a failure to store the adopted context keeps
 the certificate and reports that the context is held for this run only.
 
-If the CLI gets no answer within its wait (the longest the daemon's
-enrollment can take: every exchange timing out), it says the daemon may still
-complete the enrollment and to check `ndn-ctl status` before retrying.
+After enrolling, the answer lists the other certificates the node holds in
+the namespace — still valid, or unusable because the context revokes their
+chain — judged against the context held now (the one checked in step 3, or
+the one adopted in step 5, checked then if there is anything to judge). The
+check itself is in the answer (`context_check`); when it did not confirm the
+version held is the newest (no answer, a failure, or an upstream serving an
+older one), the CLI says the listing reflects version `N` held.
+
+If the CLI gets no answer within its wait (the context check plus the
+longest the daemon's enrollment can take: every exchange timing out), it says
+the daemon may still complete the enrollment and to check `ndn-ctl status`
+before retrying.
 
 ## Where state lives
 

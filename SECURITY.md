@@ -50,4 +50,7 @@ Out of scope here (separate repositories, report there): `ndn-ext`, `ndn-fwd`,
   from untrusted peers — the PIT is not hard-capped (see
   [security pitfalls](docs/wiki/src/guides/security-pitfalls.md)).
 - Prefer the SQLite Content-Store backend for persistent caches.
-- Keep `require_signed_commands = true` (the default) on the management plane.
+- Keep `require_signed_commands = true` (the default) on the management plane,
+  and keep `[security] trust_admin_groups` to the groups you mean: their
+  members, like the daemon's user and root, manage the forwarder over the
+  local socket without signing.

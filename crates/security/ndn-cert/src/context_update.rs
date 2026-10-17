@@ -104,15 +104,45 @@ pub struct ContextBump {
     pub added: Vec<Name>,
 }
 
+/// The entries of `revoke` that a version after `ctx` would add to its
+/// revocations — the ones `ctx` does not revoke already, each once; empty when
+/// it revokes all of them. Refused when an entry is not a key name
+/// ([`key_name_of`]) under the namespace, or is the key of one of its anchors.
+/// Needs no key: a caller checks a revocation with it before unlocking the
+/// root that signs it ([`bump_context_revoking`] applies the same checks).
+pub fn revocations_to_add(ctx: &SignedTrustContext, revoke: &[Name]) -> Result<Vec<Name>, BumpError> {
+    let namespace = ctx.namespace();
+    let mut added = Vec::new();
+    for name in revoke {
+        if !name.has_prefix(namespace) || key_name_of(name).as_ref() != Some(name) {
+            return Err(BumpError::NotAKeyOfNamespace {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+            });
+        }
+        if let Some(anchor) = ctx.anchors().iter().find(|a| a.key().has_prefix(name)) {
+            return Err(BumpError::CoversRoot {
+                name: name.to_string(),
+                anchor: anchor.key().to_string(),
+                namespace: namespace.to_string(),
+            });
+        }
+        if !ctx.is_revoked(name) && !added.contains(name) {
+            added.push(name.clone());
+        }
+    }
+    Ok(added)
+}
+
 /// Version `N+1` of the held context `held` (its signed Data, version `N`)
 /// with the key names `revoke` added to its revocations, signed by `signer`
 /// — the key of an anchor of `held` (the namespace root from its root store,
 /// or any other anchor the held version lists), through its async signing
 /// path, so hardware and custodian signers work. Every other field is carried
-/// over verbatim. Each entry must be a key name ([`key_name_of`]) under the
-/// namespace that does not cover one of its anchors. Entries already revoked
-/// are not repeated; `Ok(None)` when all of them are (no new version is
-/// needed, nothing is signed). Pure: nothing is adopted, stored or published.
+/// over verbatim. The entries are checked as [`revocations_to_add`] does;
+/// ones already revoked are not repeated, and `Ok(None)` when all of them are
+/// (no new version is needed, nothing is signed). Pure: nothing is adopted,
+/// stored or published.
 pub async fn bump_context_revoking(
     signer: &dyn Signer,
     held: &Data,
@@ -134,25 +164,7 @@ pub async fn bump_context_revoking(
         });
     }
 
-    let mut added = Vec::new();
-    for name in revoke {
-        if !name.has_prefix(&namespace) || key_name_of(name).as_ref() != Some(name) {
-            return Err(BumpError::NotAKeyOfNamespace {
-                name: name.to_string(),
-                namespace: namespace.to_string(),
-            });
-        }
-        if let Some(anchor) = ctx.anchors().iter().find(|a| a.key().has_prefix(name)) {
-            return Err(BumpError::CoversRoot {
-                name: name.to_string(),
-                anchor: anchor.key().to_string(),
-                namespace: namespace.to_string(),
-            });
-        }
-        if !ctx.is_revoked(name) && !added.contains(name) {
-            added.push(name.clone());
-        }
-    }
+    let added = revocations_to_add(&ctx, revoke)?;
     if added.is_empty() {
         return Ok(None);
     }

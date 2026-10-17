@@ -18,15 +18,24 @@
 //!
 //! # Wire
 //!
+//! A namespace's group is [`group_prefix`]: `/<ns>/32=trust-context/32=sync`,
+//! beside the RDR publication of its versions. A member's SVS node name is
+//! `<group>/<member>`, so the Data it publishes, `<group>/<member>/seg=N`,
+//! is routed like the group itself.
+//!
 //! The synced payload is the context's **signed Data** exactly as the root
 //! signed it (`/<ns>/32=trust-context/v=<N>`, the wire of
 //! [`sign_into_data`](ndn_security::SignedTrustContext::sign_into_data) or of
 //! a stored context), carried as the Content of the group Data at
-//! `<group>/<publisher>/seg=N`. The SVS sequence number is the version the
-//! publisher republishes at; whether the update is adopted is decided by the
-//! signed version inside. Anchors, schema blobs, CA endpoints, enrollment
-//! hint, revocations and source-bundle hash arrive intact because the signed
-//! Content is carried verbatim.
+//! `<group>/<publisher>/seg=N` ([`group_data`]). The SVS sequence number is
+//! the version the publisher republishes at; whether the update is adopted is
+//! decided by the signed version inside. Anchors, schema blobs, CA endpoints,
+//! enrollment hint, revocations and source-bundle hash arrive intact because
+//! the signed Content is carried verbatim. The group Data itself is signed
+//! with DigestSha256 (integrity only), like the RDR metadata: what it carries
+//! is checked by its own signature, and a validating forwarder admits a
+//! DigestSha256 Data without a schema rule for its name, where a key-signed
+//! one would be dropped one hop away.
 //!
 //! # Adoption rule
 //!
@@ -67,15 +76,16 @@
 //!
 //! # Relation to the pull refresh
 //!
-//! The `ndn-fwd` daemon does **not** use this module: it keeps held contexts
-//! current by pulling ([`ndn_cert::refresh_context`] via
-//! [`crate::refresh_context_via_engine`]) — the newest version's name over
-//! RDR metadata, then the signed context Data itself — and stores and
-//! republishes each adopted version so updates travel hop by hop through
-//! relays that hold the context. That path needs no sync group and no
-//! per-namespace setup. This module is for fleets that already run an SVS
-//! group per context and want updates without waiting for a poll; both apply
-//! the same check, so neither can adopt what the other would refuse.
+//! The pull refresh ([`ndn_cert::refresh_context`] via
+//! [`crate::refresh_context_via_engine`]) fetches the newest version's name
+//! over RDR metadata, then the signed context Data itself, and every holder
+//! stores and republishes each adopted version so updates travel hop by hop
+//! through relays that hold the context. It needs no sync group and no
+//! per-namespace setup; its latency is the refresh period. This module adds
+//! the push: a version the root puts into the group reaches the members at
+//! once. Both apply the same check, so neither can adopt what the other
+//! would refuse. The `ndn-fwd` daemon runs both when `[security]
+//! context_sync = true` (the refresh alone by default).
 
 use std::sync::Arc;
 
@@ -88,6 +98,28 @@ use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{Keyring, SignedTrustContext, context_namespace_of};
 use ndn_sync::{SyncHandle, SyncUpdate};
 use tokio_util::sync::CancellationToken;
+
+/// The name of `namespace`'s context-sync group:
+/// `/<ns>/32=trust-context/32=sync`.
+pub fn group_prefix(namespace: &Name) -> Name {
+    ndn_cert::rdr_prefix(namespace).append_component(NameComponent::keyword(Bytes::from_static(
+        b"sync",
+    )))
+}
+
+/// The group Data a member named `publisher` (`<group>/<member>`) publishes
+/// for the signed context Data `context`: named
+/// `<publisher>/seg=<version>`, Content = `context`'s wire verbatim, signed
+/// with DigestSha256. `None` when `context` is not named
+/// `/<ns>/32=trust-context/v=<N>`.
+pub fn group_data(publisher: &Name, context: &Data) -> Option<Bytes> {
+    context_namespace_of(&context.name)?;
+    let version = context.name.components().last()?.as_version()?;
+    Some(
+        ndn_packet::encode::DataBuilder::new(publisher.clone().append_segment(version), context.raw())
+            .build(),
+    )
+}
 
 /// Fetches the Content bytes of the Data published at a name. The caller backs
 /// this with its consumer/face; an in-process engine, an `ndn-app` `Consumer`,
@@ -285,7 +317,7 @@ pub async fn run(
                             target: "ndn::trust",
                             previous = adopted.previous,
                             version = adopted.context.version(),
-                            revoked = ?adopted.revoked,
+                            revoked = ?adopted.revoked.iter().map(Name::to_string).collect::<Vec<_>>(),
                             publisher = %update.publisher,
                             "context-sync adopted a newer trust context"
                         );

@@ -730,29 +730,6 @@ impl MgmtClient {
         self.deferred_command(verb::ENROLL, &params, timeout).await
     }
 
-    /// `security/revoke` (on the namespace's root device): revoke the device
-    /// identity, key or certificate `name` at the daemon's CA and in a new,
-    /// root-signed version of the namespace's trust context, which the daemon
-    /// stores and publishes. `unlock` is the passphrase or PIN of the root
-    /// key's store when it needs one (`identity-status` reports
-    /// `root_store=`); it travels in the command's ApplicationParameters,
-    /// never in its Name. The command Interest lives `timeout`, and so does
-    /// the wait. Success carries `ndn_mgmt::RevokedInfo` as JSON in
-    /// `status_text`; a refusal's `status_text` says why and where to run it.
-    pub async fn security_revoke(
-        &self,
-        name: &ndn_packet::Name,
-        unlock: Option<ndn_mgmt_wire::UnlockSecret>,
-        timeout: std::time::Duration,
-    ) -> Result<ControlResponse, ForwarderError> {
-        let params = ControlParameters {
-            name: Some(name.clone()),
-            unlock_secret: unlock,
-            ..Default::default()
-        };
-        self.deferred_command(verb::REVOKE, &params, timeout).await
-    }
-
     /// `security/context-refresh`: ask the daemon to check the held trust
     /// context of `namespace` (every held one when `None`) for a newer
     /// version now, rather than at its next periodic check. The command
@@ -772,12 +749,12 @@ impl MgmtClient {
     }
 
     /// `security/context-update`: hand the daemon `context_data`, a signed
-    /// trust-context Data made on this device (by `ndn-fwd recovery-kit` or
-    /// `ndn-fwd recover`), to adopt as the next version of the context it
-    /// holds — only if strictly newer and signed by an anchor of the held
-    /// version — then store and publish. The Data travels in the command's
-    /// ApplicationParameters. Success carries one `ndn_mgmt::ContextRefreshInfo`
-    /// as JSON in `status_text`.
+    /// trust-context Data made on this device (by `ndn-fwd revoke`,
+    /// `ndn-fwd recovery-kit` or `ndn-fwd recover`), to adopt as the next
+    /// version of the context it holds — only if strictly newer and signed by
+    /// an anchor of the held version — then store and publish. The Data
+    /// travels in the command's ApplicationParameters. Success carries one
+    /// `ndn_mgmt::ContextRefreshInfo` as JSON in `status_text`.
     pub async fn security_context_update(
         &self,
         context_data: bytes::Bytes,
@@ -812,11 +789,9 @@ impl MgmtClient {
         params: &ControlParameters,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
-        // A secret travels in ApplicationParameters, never in the Name (which
-        // forwarders log and key their tables by); so does a context Data
-        // (kilobytes, too long for a Name component).
-        let (name, app_params) = if params.unlock_secret.is_some() || params.context_data.is_some()
-        {
+        // A context Data travels in ApplicationParameters (kilobytes, too
+        // long for a Name component).
+        let (name, app_params) = if params.context_data.is_some() {
             (dataset_name(module::SECURITY, verb), Some(params.encode()))
         } else {
             (command_name(module::SECURITY, verb, params), None)

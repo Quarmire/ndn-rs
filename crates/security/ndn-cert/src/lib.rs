@@ -62,7 +62,7 @@ pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, Unfetched, UpdateRefusal,
     VersionSource, bump_context_revoking, follow_versions, key_name_of, open_context_update,
-    refresh_context,
+    refresh_context, revocations_to_add,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,

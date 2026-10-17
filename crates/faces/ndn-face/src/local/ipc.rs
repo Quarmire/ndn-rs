@@ -137,8 +137,9 @@ impl PlatformListener {
         // ownership and the process umask — typically denying connect() to
         // the unprivileged user running ndn-ctl or the dashboard. Make it
         // world-RW so local management clients can connect; commands are
-        // still gated by `require_signed_commands`. Mirrors NFD, whose local
-        // unix socket is reachable by local clients.
+        // authorized per connection by the caller's peer credentials (or a
+        // command signature). Mirrors NFD, whose local unix socket is
+        // reachable by local clients.
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));

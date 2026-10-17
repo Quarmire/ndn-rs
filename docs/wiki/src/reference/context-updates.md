@@ -117,8 +117,7 @@ holder keeps, not the timing of refreshes.
    through (`walked`, each with its signed Data, to store and republish too).
 
 The daemon runs refreshes without its `context_change` lock (taken by
-`revoke` and `security/context-update`), so a slow catch-up never holds
-those up.
+`security/context-update`), so a slow catch-up never holds it up.
 
 `ndn_identity::refresh_context_via_engine(engine, keyring, ns)` runs it over a
 short-lived consumer face of an engine, with the engine's validator as the
@@ -144,13 +143,19 @@ its own namespace (state `source`).
 
 ### Versions made on this device: `security/context-update`
 
-`ndn-fwd recovery-kit create|revoke` (root device) and `ndn-fwd recover`
-(replacement device) sign the new version in the CLI — the root store, the
-kit, are opened there — and hand it to the running daemon with
+`ndn-fwd revoke` and `ndn-fwd recovery-kit create|revoke` (root device) and
+`ndn-fwd recover` (replacement device) sign the new version in the CLI — the
+root store, the kit, are opened there, and their passphrase or PIN never
+leaves the command — and hand it to the running daemon with
 `security/context-update` (the signed Data in `ControlParameters.ContextData`,
 TLV `0xB4`, in ApplicationParameters). The daemon applies the same continuity
 rule as a refresh, then stores and publishes it; a refusal leaves the held
 version in force. It is a trust-admin verb like `context-refresh`.
+
+However a version is adopted — handed over, refreshed, adopted by link — a
+node running the namespace CA makes the CA follow it as it keeps it
+(`TrustAdmin::keep`): the CA stops serving every certificate it issued that
+the version revokes ([revocation](./revocation.md#the-ca-follows-the-trust-context)).
 
 Its answer says what became of the version, so the CLI undoes its own work
 (a file kit, a recovered root) only on a refusal: `200` once the version is
@@ -162,26 +167,65 @@ to the daemon that uses the PIB it read the held version from (its
 `security/identity-status` `pib_path`), so a version is never adopted by a
 daemon whose PIB stays behind.
 
-## Push: `context_sync` over SVS
+## Push over the namespace's sync group
 
-`ndn_identity::context_sync` is the alternative for fleets that already run an
-SVS group per context. A publisher puts the context's signed Data (the same
-bytes as the RDR publication) into the group at `<group>/<publisher>/seg=<N>`,
-the sequence number being the version; each subscriber fetches the newest
-sequence and adopts it under the same continuity rule
-(`open_context_update` + `Keyring::adopt_update_from`). When the newest is not
-signed by an anchor of the held version, the subscriber follows the earlier
-sequence numbers (from the first newer than the held version) one by one,
-the same walk as the pull refresh. A group member that is not the namespace
-root therefore cannot produce an update anyone adopts, whether or not the
-group Data itself is validated. A namespace the subscriber does not hold yet
-is never adopted from the group: first adoption goes through a link or
-invite. `ContextSyncOutcome::Adopted` carries an `ndn_cert::ContextUpdate`
-(the signed Data and the versions walked, as a pull refresh returns), and
-`context_sync::run` hands each to the caller's `keep`, which persists and
-serves them.
+With `[security] context_sync = true` the daemon also joins each held
+namespace's SVS group, `/<ns>/32=trust-context/32=sync`
+(`ndn_identity::context_sync::group_prefix`), so a new version reaches it as
+soon as the root device makes it instead of at the next refresh. The refresh
+keeps running beside it.
 
-### Why pull is the default
+- **Who is in the group.** Every namespace held at start, and every one
+  adopted later (link, invite), is joined. Each node is the member
+  `<group>/<member>`, where `<member>` is a hash of the machine's id and the
+  PIB's path, so it stays the same across restarts.
+- **Who publishes.** Every version the daemon keeps — a revocation, a version
+  handed over with `security/context-update` (`ndn-fwd revoke`,
+  `ndn-fwd recovery-kit`, `ndn-fwd recover`), a refresh — is handed to the
+  group. When the node's root store holds an anchor key of that version (the
+  root device; after a recovery, the replacement), it serves the version's
+  signed Data, byte for byte, as the Content of `<group>/<member>/seg=<N>`
+  (`context_sync::group_data`, DigestSha256), and advances its sequence
+  number to `N`. Its stored versions are served the same way from start.
+  Other members only subscribe.
+- **What a member adopts.** It fetches the newest sequence a member
+  announces and adopts it only under the [continuity
+  rule](#the-continuity-rule) (`open_context_update` +
+  `Keyring::adopt_update_from`). When the newest is not signed by an anchor
+  of the held version, it follows the earlier sequence numbers (from the
+  first newer than the held version) one by one, the [same
+  walk](#catching-up-across-versions) as a refresh. A member that is not the
+  namespace root therefore cannot produce an update anyone adopts, whatever
+  it announces; a namespace not held yet is never adopted from the group.
+- **What a member keeps.** An adopted version and the versions walked
+  through are stored and published by the code a refresh keeps with
+  (`ndn-fwd` `context_refresh::keep_update`), so the nodes behind it can
+  fetch them by name.
+- **Refusals** are logged at WARN (`context-sync refused a trust-context
+  update; the held version stays`) with the reason from the
+  [table below](#refusals); a version not newer than the one held is logged
+  at DEBUG.
+
+### Routes
+
+SVS floods each Sync Interest to every member (multicast strategy on the
+group prefix), so the group needs a route both ways:
+
+- **Up:** the group is routed over the non-local faces the namespace itself
+  is routed over (the route a device has toward the root device or a relay),
+  taken again before each Sync Interest the node sends.
+- **Down:** each face a Sync Interest of the group arrives on is added to the
+  group's route. The root device needs no route configured toward the
+  devices: it learns their faces from their Sync Interests, sent every
+  ~15 s (and when they announce something).
+
+A new version is announced at once. A member that just (re)started is
+reached once its first Sync Interest got through, within ~15 s; a lost
+announcement is repeated within the same period. A relay between the root
+device and a device carries the group only if it runs `context_sync` too;
+otherwise the devices behind it get updates by refresh.
+
+### Why pull stays on
 
 - It reuses the RDR publication every holder already serves: no sync group, no
   per-namespace setup, no extra state.
@@ -190,14 +234,15 @@ serves them.
 - Its failure mode is delay, bounded by the refresh period; correctness never
   depends on it.
 
-Push gives lower latency when the group exists. The `ndn-fwd` daemon does not
-run it.
+Push only lowers the latency; both apply the same check, so neither can adopt
+what the other would refuse.
 
 ## Usage
 
 ```toml
 [security]
 context_refresh_secs = 300   # default; 0 = only on `ndn-fwd context refresh`
+context_sync = true          # default false: also join each namespace's sync group
 ```
 
 The daemon checks every held context every `context_refresh_secs`; the first
@@ -271,9 +316,9 @@ timeout, malformed metadata) and `no trust context is held for <ns>`.
 | Strictly-newer adoption | `ndn_security::Keyring::{adopt_update, adopt_update_from}` |
 | Forwarder expectation | `ndn_security::Validator::expect_context_update` (`validator/expected.rs`) |
 | Engine binding | `ndn_identity::refresh_context_via_engine` |
-| Push over SVS | `ndn_identity::context_sync` |
+| Push over SVS | `ndn_identity::context_sync::{run, process_update, group_prefix, group_data}`; daemon groups, routes, root publishing: `ndn-fwd` `context_sync.rs` (test `a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused`) |
 | Management verb | `ndn-mgmt` `security/context-refresh`, `security/context-update`, `ContextRefreshInfo`, `RefreshState`; `ndn-ipc` `MgmtClient::security_context_refresh`, `security_context_update` |
-| Daemon, timer | `ndn-fwd` `context_refresh.rs` (`apply_update` for `context-update`); CLI `onboard.rs` (`run_context`) |
+| Daemon, timer | `ndn-fwd` `context_refresh.rs` (`keep_update`, shared by refresh and sync; `apply_update` for `context-update`); CLI `onboard.rs` (`run_context`) |
 | Mobile | `ndn-boltffi` `NdnEngine::refresh_contexts`, `NdnContextRefresh` |
 
 ## See also

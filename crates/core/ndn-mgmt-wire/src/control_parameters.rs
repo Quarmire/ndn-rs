@@ -56,10 +56,6 @@ pub mod tlv {
     // the region/wakeup fds (`shm://` Option-A bootstrap). 0xAD–0xD7 is free of
     // NFD and other ndn-rs ControlParameters assignments.
     pub const SHM_CONTROL_TOKEN: u64 = 0xB0;
-    // Root-key unlock secret (ndn-rs extension): the passphrase or PIN a
-    // root-signing trust-admin verb (`security/revoke`) needs. Carried only in
-    // ApplicationParameters, never in a Name.
-    pub const UNLOCK_SECRET: u64 = 0xB2;
     // A signed trust-context Data (ndn-rs extension): the newer version of a
     // held context `security/context-update` hands to the daemon. Carried in
     // ApplicationParameters (it is kilobytes).
@@ -124,10 +120,6 @@ pub struct ControlParameters {
     /// secret presented on the derived control socket to receive the region +
     /// wakeup fds. 32 bytes in practice; validated by the consumer.
     pub shm_control_token: Option<Bytes>,
-    /// Root-key unlock secret (ndn-rs extension): the passphrase or PIN of
-    /// the namespace root's store, for a root-signing trust-admin verb. The
-    /// management dispatcher refuses it in a command Name.
-    pub unlock_secret: Option<UnlockSecret>,
     /// A signed trust-context Data wire (ndn-rs extension), for
     /// `security/context-update`.
     pub context_data: Option<Bytes>,
@@ -158,41 +150,6 @@ pub struct ControlParameters {
     /// `(option_name, reason)` reported by idempotent faces/create on
     /// partial apply; empty in every other response body.
     pub partial_failures: Vec<(String, String)>,
-}
-
-/// A secret in transit to the daemon (a root store's passphrase or PIN).
-/// Its `Debug` is redacted and this value's bytes are overwritten when it is
-/// dropped. The encoded command carries further copies — the encoded
-/// ApplicationParameters and the signed Interest in the CLI, the receive
-/// buffers and the decoded Interest in the daemon — which are freed, not
-/// overwritten: the secret is protected in transit by the local, peer-
-/// credential-gated management socket, not by wiping memory.
-#[derive(Clone, PartialEq, Eq)]
-pub struct UnlockSecret(Vec<u8>);
-
-impl UnlockSecret {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    /// The secret bytes.
-    pub fn expose(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl core::fmt::Debug for UnlockSecret {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("UnlockSecret(<redacted>)")
-    }
-}
-
-impl Drop for UnlockSecret {
-    fn drop(&mut self) {
-        self.0.fill(0);
-        // Keep the overwrite: the buffer is observed after it.
-        core::hint::black_box(&self.0);
-    }
 }
 
 impl ControlParameters {
@@ -256,9 +213,6 @@ impl ControlParameters {
         }
         if let Some(ref token) = self.shm_control_token {
             w.write_tlv(tlv::SHM_CONTROL_TOKEN, token);
-        }
-        if let Some(secret) = &self.unlock_secret {
-            w.write_tlv(tlv::UNLOCK_SECRET, secret.expose());
         }
         if let Some(data) = &self.context_data {
             w.write_tlv(tlv::CONTEXT_DATA, data);
@@ -413,9 +367,6 @@ impl ControlParameters {
                 }
                 tlv::SHM_CONTROL_TOKEN => {
                     params.shm_control_token = Some(val);
-                }
-                tlv::UNLOCK_SECRET => {
-                    params.unlock_secret = Some(UnlockSecret::new(val.to_vec()));
                 }
                 tlv::CONTEXT_DATA => {
                     params.context_data = Some(val);
@@ -596,19 +547,6 @@ fn decode_name(value: Bytes) -> Result<Name, ControlParametersError> {
 mod tests {
     use super::*;
 
-    /// The unlock secret round-trips and never shows in `Debug` output.
-    #[test]
-    fn unlock_secret_round_trips_and_is_redacted() {
-        let params = ControlParameters {
-            unlock_secret: Some(UnlockSecret::new(b"correct horse".to_vec())),
-            ..Default::default()
-        };
-        let back = ControlParameters::decode(params.encode()).unwrap();
-        assert_eq!(back.unlock_secret.as_ref().unwrap().expose(), b"correct horse");
-        let shown = alloc::format!("{back:?}");
-        assert!(!shown.contains("correct horse"), "{shown}");
-    }
-
     fn name(components: &[&[u8]]) -> Name {
         Name::from_components(
             components
@@ -712,7 +650,6 @@ mod tests {
             strategy: Some(name(&[b"ndn", b"strategy", b"multicast"])),
             mtu: Some(8800),
             shm_control_token: Some(Bytes::from(vec![0x5Au8; 32])),
-            unlock_secret: Some(UnlockSecret::new(b"pw".to_vec())),
             context_data: Some(Bytes::from_static(b"\x06\x03ctx")),
             base_cong_interval: Some(100_000),
             def_cong_threshold: Some(64 * 1024),

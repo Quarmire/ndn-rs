@@ -65,8 +65,8 @@ pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
 use auth::{
-    authorize_command, authorize_trust_admin, effective_require_signed, is_public_dataset_verb,
-    is_trust_admin_verb, resolve_control_parameters,
+    CommandAuth, authorize_command, authorize_trust_admin, effective_require_signed,
+    is_public_dataset_verb, is_trust_admin_verb, local_command_auth, resolve_control_parameters,
 };
 use wire::{send_dataset, send_response};
 
@@ -459,16 +459,6 @@ pub struct EnrollRequest {
     pub force: bool,
 }
 
-/// What `security/revoke` asks: revoke the device identity, key or
-/// certificate `name`, unlocking the namespace root's store with `unlock`
-/// (its passphrase or PIN) when the store needs one. The secret arrived in
-/// the command's ApplicationParameters over the local management socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevokeRequest {
-    pub name: Name,
-    pub unlock: Option<ndn_mgmt_wire::UnlockSecret>,
-}
-
 /// Where this node keeps the root key of the namespace it is the root device
 /// of (`security/identity-status` reports it as `root_store=<kind>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,9 +467,6 @@ pub struct RootStoreInfo {
     pub kind: String,
     /// The root key, `<ns>/KEY/root`.
     pub key: Name,
-    /// What a root-signing verb needs from the operator: `passphrase`,
-    /// `pin`, or `none`.
-    pub unlock: String,
 }
 
 /// The answer to `security/enroll`, JSON in the ControlResponse status text,
@@ -522,7 +509,8 @@ pub struct EnrolledInfo {
     pub at_next_start: Vec<String>,
     /// Certificates in this namespace this node held before a `force`
     /// enrollment that still validate: each until its validity end (or a
-    /// revocation), as `<key> (valid until <ISO 8601>)`.
+    /// revocation), as `<key> (valid until <ISO 8601>)`. Judged against the
+    /// trust context [`Self::context_check`] reports.
     pub still_valid: Vec<String>,
     /// Certificates this node holds in this namespace whose chain the held
     /// trust context revokes — the key itself or an issuer up its chain
@@ -530,6 +518,14 @@ pub struct EnrolledInfo {
     /// their key needs enrolling anew. `<key> (revoked: <name>)`.
     #[serde(default)]
     pub unusable: Vec<String>,
+    /// The check for a newer version of the namespace's trust context made
+    /// before judging the certificates held (a `security/context-refresh` of
+    /// that namespace). Unless its state is `updated`, `current` or
+    /// `source`, `still_valid` and `unusable` reflect the version held
+    /// (`version`), which may be stale. `None` when no certificate was held
+    /// to judge and the context was not held before.
+    #[serde(default)]
+    pub context_check: Option<ContextRefreshInfo>,
 }
 
 /// The key the node currently signs its own packets with.
@@ -541,31 +537,6 @@ pub struct SigningIdentityInfo {
     /// When the key's certificate expires (ns since the Unix epoch), if the
     /// node holds one for it.
     pub valid_until: Option<u64>,
-}
-
-/// The outcome of a successful `security/revoke`, JSON in the
-/// ControlResponse status text.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RevokedInfo {
-    pub namespace: String,
-    /// The key names now revoked by the trust context (each covers every
-    /// certificate of that key).
-    pub keys: Vec<String>,
-    /// Certificates this node's CA revoked now: no longer served, and the
-    /// device name they held is free for a new key.
-    pub ca_revoked: Vec<String>,
-    /// Set when a CA revocation could not be written to its store: it holds
-    /// until the CA restarts.
-    pub ca_not_persisted: Option<String>,
-    /// The context version before.
-    pub previous_version: u64,
-    /// The context version now (equal to `previous_version` when every key
-    /// was already revoked by it).
-    pub version: u64,
-    /// Where the new version was stored.
-    pub stored: Option<String>,
-    /// Whether this node now publishes the new version by name.
-    pub published: bool,
 }
 
 /// What a `security/context-refresh` found for one namespace.
@@ -641,11 +612,10 @@ pub struct RenewalInfo {
 
 /// Backend for the trust-admin verbs: adopt a trust context
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
-/// revoke a device on the root device (`security/revoke`), refresh held
-/// contexts (`security/context-refresh`), take a newer version of a held
-/// context made on this device (`security/context-update`), renew this node's
-/// certificates
-/// (`security/renew`), and report the identity the node signs with now. The
+/// refresh held contexts (`security/context-refresh`), take a newer version
+/// of a held context made on this device (`security/context-update`), renew
+/// this node's certificates (`security/renew`), and report the identity the
+/// node signs with now. The
 /// spec crate owns the trait; the forwarder (`ndn-fwd`)
 /// implements it over its engine, keyring, PIB, CA, context store and
 /// publisher. Authorization happens before a verb reaches the backend (the
@@ -659,15 +629,6 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not enroll at runtime".to_owned(),
-        })
-    }
-
-    /// Revoke the device identity, key or certificate `request.name`.
-    async fn revoke(&self, request: RevokeRequest) -> Result<RevokedInfo, TrustRefusal> {
-        let _ = request;
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not revoke at runtime".to_owned(),
         })
     }
 
@@ -1007,9 +968,10 @@ pub async fn run_ndn_mgmt_handler(
                 continue;
             }
         } else if !is_public_read {
-            let (active_validator, effective_required) = if is_localhop_command {
+            // `None`: the caller is already authenticated by its credentials.
+            let signature_check = if is_localhop_command {
                 match mgmt_handles.localhop_command_validator.as_deref() {
-                    Some(v) => (Some(v), true),
+                    Some(v) => Some((Some(v), true)),
                     None => {
                         let resp = ControlResponse::error(
                             status::UNAUTHORIZED,
@@ -1026,13 +988,44 @@ pub async fn run_ndn_mgmt_handler(
                     }
                 }
             } else {
-                (
-                    mgmt_handles.command_validator.as_deref(),
-                    effective_require_signed(
-                        &parsed.module,
-                        mgmt_handles.effective_require_signed_commands(),
-                    ),
-                )
+                let required = effective_require_signed(
+                    &parsed.module,
+                    mgmt_handles.effective_require_signed_commands(),
+                );
+                let validator = mgmt_handles.command_validator.as_deref();
+                // On the local management socket the kernel's peer
+                // credentials authenticate the caller, as for trust changes:
+                // a local operator's command needs no signature. Any other
+                // face (and any other local user) is decided by the
+                // signature. See `auth::local_command_auth`.
+                match local_command_auth(
+                    source_face,
+                    &engine,
+                    config.as_ref(),
+                    &interest,
+                    required,
+                    validator.is_some(),
+                ) {
+                    CommandAuth::LocalOperator => None,
+                    CommandAuth::Signature => Some((validator, required)),
+                    CommandAuth::Refused(reason) => {
+                        tracing::warn!(
+                            target: "mgmt.security",
+                            name = %interest.name,
+                            %reason,
+                            "nfd-mgmt: unsigned local command refused"
+                        );
+                        let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                        send_response(
+                            &handle,
+                            &interest.name,
+                            &resp,
+                            mgmt_handles.response_signer().as_deref(),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
             };
             // Reflexive cert distribution: a `/localhop` registrant attaches a
             // reflexive name so we can pull its certificate back along the reverse
@@ -1053,13 +1046,14 @@ pub async fn run_ndn_mgmt_handler(
                 });
                 reflexive_prefetch_localhop_cert(consumer, &interest, validator).await;
             }
-            if let Err(reason) = authorize_command(
-                &interest,
-                active_validator,
-                effective_required,
-                mgmt_handles.command_replay_cache.as_ref(),
-            )
-            .await
+            if let Some((active_validator, effective_required)) = signature_check
+                && let Err(reason) = authorize_command(
+                    &interest,
+                    active_validator,
+                    effective_required,
+                    mgmt_handles.command_replay_cache.as_ref(),
+                )
+                .await
             {
                 let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
                 send_response(
@@ -1074,28 +1068,15 @@ pub async fn run_ndn_mgmt_handler(
         }
 
         // ControlParameters MUST appear in exactly one location (name
-        // component or AppParameters), never both. An unlock secret only
-        // ever travels in AppParameters: a Name is logged and keys tables.
-        let params_in_name = parsed.params.clone();
+        // component or AppParameters), never both.
         let params_in_app = interest
             .app_parameters()
             .and_then(|app| ControlParameters::decode(app.clone()).ok());
-        let secret_in_name = params_in_name
-            .as_ref()
-            .is_some_and(|p| p.unlock_secret.is_some());
-        let resolved = if secret_in_name {
-            Err("an unlock secret travels in ApplicationParameters, never in the command Name")
-        } else {
-            resolve_control_parameters(params_in_name, params_in_app)
-        };
+        let resolved = resolve_control_parameters(parsed.params.clone(), params_in_app);
         let params = match resolved {
             Ok(opt) => opt.unwrap_or_default(),
             Err(reason) => {
-                if secret_in_name {
-                    tracing::warn!(target: "engine", %reason, "nfd-mgmt: rejecting");
-                } else {
-                    tracing::warn!(target: "engine", name = %interest.name, %reason, "nfd-mgmt: rejecting");
-                }
+                tracing::warn!(target: "engine", name = %interest.name, %reason, "nfd-mgmt: rejecting");
                 let resp = ControlResponse::error(status::BAD_PARAMS, reason);
                 send_response(
                     &handle,

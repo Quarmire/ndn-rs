@@ -1616,20 +1616,26 @@ pub struct TrustRuleConfig {
     pub key: String,
 }
 
-/// Whether privileged management commands require key-backed signed
-/// Interests. Default is on; opt out only for local dev without a
-/// provisioned trust anchor.
+/// How management commands are authenticated. On the local Unix socket the
+/// kernel's peer credentials authenticate the caller: the daemon's user,
+/// root, and members of `[security] trust_admin_groups` are accepted
+/// without a signature. Every other caller must sign.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MgmtSecurityConfig {
-    /// When `true` (default), DigestSha256-only or unsigned command
-    /// Interests are rejected 403; key-backed signatures must pass the
-    /// validator loaded from `trust_anchor_pib`.
+    /// When `true` (default), a command from anyone but a local operator
+    /// (see above) must carry a key-backed signature that passes the
+    /// validator loaded from `trust_anchor_pib`; DigestSha256-only or
+    /// unsigned commands are rejected 403. `false` accepts unsigned
+    /// commands of the standard NFD modules (`faces`, `fib`, `rib`, `cs`,
+    /// `strategy-choice`, `status`) from any caller; the ndn-rs extension
+    /// modules (e.g. `security`) still need a local operator or a signature.
     #[serde(default = "default_require_signed_commands")]
     pub require_signed_commands: bool,
 
-    /// Required when `require_signed_commands = true`; ndn-fwd aborts
-    /// at startup if missing or empty.
+    /// PIB whose anchors verify signed commands. Unset: only local
+    /// operators can issue commands. ndn-fwd aborts at startup if it is set
+    /// but unreadable or empty.
     #[serde(default)]
     pub trust_anchor_pib: Option<String>,
 
@@ -1733,10 +1739,11 @@ pub struct SecurityConfig {
     #[serde(default = "default_serve_contexts")]
     pub serve_contexts: bool,
 
-    /// Unix groups whose members may change this node's trust (e.g.
-    /// `security/context-adopt`) over the local management socket, in
-    /// addition to the daemon's own user and root. Empty (default) = only
-    /// the daemon's user and root.
+    /// Unix groups whose members are local operators on the management
+    /// socket, in addition to the daemon's own user and root: they may
+    /// change this node's trust (e.g. `security/context-adopt`) and issue
+    /// any other command without a signature. Empty (default) = only the
+    /// daemon's user and root.
     #[serde(default)]
     pub trust_admin_groups: Vec<String>,
 
@@ -1748,6 +1755,15 @@ pub struct SecurityConfig {
     /// an update; it never weakens what is accepted. Default 300.
     #[serde(default = "default_context_refresh_secs")]
     pub context_refresh_secs: u64,
+
+    /// Also join each held namespace's trust-context sync group
+    /// (`/<ns>/32=trust-context/32=sync`, SVS), so a new version reaches
+    /// this node as soon as the root device makes it instead of at the next
+    /// refresh; the root device puts every new version into the group. An
+    /// update arriving this way is adopted under the same rule as a
+    /// refreshed one. The refresh keeps running beside it. Default `false`.
+    #[serde(default)]
+    pub context_sync: bool,
 
     /// When this node renews its certificates: once the remaining validity
     /// falls below this. A number between 0 and 1 is a fraction of the
@@ -1876,6 +1892,7 @@ impl Default for SecurityConfig {
             serve_contexts: default_serve_contexts(),
             trust_admin_groups: Vec::new(),
             context_refresh_secs: default_context_refresh_secs(),
+            context_sync: false,
             renew_before: RenewBeforeConfig::default(),
         }
     }

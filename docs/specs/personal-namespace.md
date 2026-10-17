@@ -69,10 +69,12 @@ in `<pib>/root/store.toml` (**have**, `ndn_cert::root_store`):
 
 Root operations (`init`, `revoke`, `ndn-trust-context build --sign-key`)
 take the passphrase / PIN from the operator per operation (env var, a
-`--passphrase-file`/`--pin-file`, else the terminal; never argv); `revoke`
-sends it with the command over the local, peer-credential-gated management
-socket. Whether a node is the root device is decided from the descriptor
-and the context's anchor public keys, never by loading the key. `ndn-fwd
+`--passphrase-file`/`--pin-file`, else the terminal; never argv). The secret
+never leaves the command: `revoke` and `recovery-kit` sign the new context
+version in the CLI and hand only the signed Data to the daemon
+(`security/context-update`). Whether a node is the root device is decided
+from the descriptor and the context's anchor public keys, never by loading
+the key. `ndn-fwd
 root-key move --to <store>` moves a software root (new store signs first,
 then the plaintext copy is overwritten and deleted); a software (Ed25519)
 root cannot move onto PIV, so a hardware root is a new namespace or F10.
@@ -89,8 +91,9 @@ unattended. A relay never holds the root.
   by name and republished by each holder, adopted only if signed by an anchor
   of the held version and strictly newer (**have**: `ndn-fwd context refresh`,
   `[security] context_refresh_secs`; see
-  `docs/wiki/src/reference/context-updates.md`); `context_sync` pushes the
-  same signed Data over SVS under the same rule (library only).
+  `docs/wiki/src/reference/context-updates.md`); the root device also pushes
+  each version over the namespace's SVS group, adopted under the same rule
+  (**have**: `[security] context_sync`, `ndn-fwd` `context_sync.rs`).
 - **Envelope** — `ndn-trust://` (`ndn-trust-envelope`): `anchor` (signed
   context or fingerprint pointer: namespace + expected fingerprint +
   version), `invite` (CA prefix + namespace + token + expected fingerprint),
@@ -202,21 +205,24 @@ Gap: the request/sign round trip.
 
 ### F4 Lose a member device
 On the root device: `ndn-fwd revoke /<ns>/<role>/<dev>` (or a key or
-certificate name) does both steps at once (**have**: `security/revoke`, a
-trust-admin verb; see `docs/wiki/src/reference/revocation.md`):
-1. CA (immediate): the device's key names are marked revoked
-   (`<pib>/ca/revoked/`), covering every certificate of them, also any issued
-   later: no longer served, the key is never certified again, the device name
-   is free to enroll with a new key.
-2. Context bump: version `N+1` lists the key names as revoked, signed by the
-   root key, stored and published. Every node refuses a chain through those
-   keys once it holds `N+1`, which it pulls at its next refresh and
-   republishes for the nodes behind it (`context_refresh_secs`, default
-   300 s, or `ndn-fwd context refresh`). A node that adopts the revoking
-   version evicts from its Content Store the Data the revoked key signed (and
-   that key's certificate) at once, so it never serves them from cache
-   afterwards; a node still on the old version may, but every node holding
-   the new version refuses that Data.
+certificate name) (**have**; see `docs/wiki/src/reference/revocation.md`):
+1. Context bump, in the CLI: version `N+1` lists the device's key names as
+   revoked, signed by the root key unlocked there for that one signature,
+   and is handed to the daemon of the same PIB (`security/context-update`,
+   continuity rule), which stores and publishes it. Every node refuses a
+   chain through those keys once it holds `N+1`, which it pulls at its next
+   refresh and republishes for the nodes behind it (`context_refresh_secs`,
+   default 300 s, or `ndn-fwd context refresh`). A node that adopts the
+   revoking version evicts from its Content Store the Data the revoked key
+   signed (and that key's certificate) at once, so it never serves them from
+   cache afterwards; a node still on the old version may, but every node
+   holding the new version refuses that Data.
+2. CA, following the signed version: whenever a node running the namespace
+   CA keeps a version (handed over, refreshed, adopted) and when the CA
+   starts, the CA marks every certificate it issued that the version revokes
+   (`<pib>/ca/revoked/`): no longer served, the key is never certified
+   again, the device name is free to enroll with a new key. The CA acts on
+   the signed version only, never on a separate request.
 Gap: revoking from an admin device other than the root device (the root key
 signs the bump, so the command runs where the root key is).
 

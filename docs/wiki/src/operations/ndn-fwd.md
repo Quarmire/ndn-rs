@@ -62,15 +62,24 @@ only needed for `[engine]` and `[face.*]` listener changes.
 
 ## Management trust & bootstrap
 
-Privileged management commands (adding a trust anchor, importing a key,
-editing the trust schema or routes) are **always** signed and validated
-by the forwarder — even when `require_signed_commands = false`. A fresh
-forwarder with no configured trust anchor therefore *refuses* them with
-`403 … no validator is configured`. This is intentional: forwarder trust
-cannot be bootstrapped over the unauthenticated management channel
-(anyone with socket access could otherwise install anchors).
+Who may manage the forwarder is decided per command:
 
-Bootstrap trust **out-of-band**, once per forwarder:
+- **On the local Unix socket**, the kernel reports who is connecting. The
+  daemon's own user, root, and members of `[security] trust_admin_groups` are
+  *local operators*: their commands (`ndn-ctl route add`, an app registering
+  its prefix, `ndn-fwd adopt`, …) are accepted without a signature, with the
+  default configuration. Run `ndn-ctl` as the daemon's user, or add a group you
+  belong to to `trust_admin_groups`.
+- **Anyone else** — another local user, or a command arriving on a network
+  face — must sign the command with a key the forwarder trusts
+  (`[security.mgmt] trust_anchor_pib`). With no anchor configured such
+  commands are refused `403`, and the refusal says why and what to do.
+- Trust-changing verbs (`adopt`, `enroll`, `renew`, `revoke`, `context
+  refresh`, recovery) are accepted only from local operators, never from a
+  signature alone, and never over `/localhop`.
+
+To manage the forwarder from another user or host, bootstrap a command
+anchor **out-of-band**, once per forwarder:
 
 ```bash
 # 1. Create the operator identity + a self-signed trust anchor.
@@ -78,18 +87,17 @@ ndn-sec --pib /etc/ndn/mgmt-pib keygen --anchor /op/alice
 
 # 2. Point the forwarder at that anchor PIB and restart.
 #    [security.mgmt]
-#    require_signed_commands = true
 #    trust_anchor_pib = "/etc/ndn/mgmt-pib"
 
 # 3. Export the operator identity to carry into the dashboard / another host.
 ndn-sec --pib /etc/ndn/mgmt-pib export /op/alice -o op-alice.safebag
 ```
 
-Now the operator can issue signed commands: `ndn-ctl` reads the PIB
+Now that operator can issue signed commands: `ndn-ctl` reads the PIB
 directly, and the dashboard signs after you import `op-alice.safebag`
 (its key is loaded into the dashboard keyring; commands validate against
 the anchor configured in step 2). Read-only datasets (`*/list`,
-`status/general`, `cs/info`) stay unsigned and work without any of this.
+`status/general`, `cs/info`) stay unsigned and work for everyone.
 
 > **Mind the section.** `trust_anchor_pib` lives under `[security.mgmt]`
 > — it configures *who may manage this forwarder*. It is **not** the same

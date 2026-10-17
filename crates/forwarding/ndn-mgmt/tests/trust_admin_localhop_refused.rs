@@ -1,5 +1,5 @@
 //! Invariant: a trust-changing verb (`security/context-adopt`,
-//! `security/enroll`, `security/revoke`, `security/context-refresh`)
+//! `security/enroll`, `security/context-update`, `security/context-refresh`)
 //! arriving over `/localhop` never reaches the trust-admin backend, even when
 //! it is signed by a key the localhop validator accepts. Trust changes are
 //! accepted only on the node's local management socket.
@@ -13,7 +13,7 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::{InProcFace, InProcHandle};
 use ndn_mgmt::{
     AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, MgmtHandles,
-    RevokeRequest, RevokedInfo, TrustAdminMgmtBackend, TrustRefusal, mount_management,
+    TrustAdminMgmtBackend, TrustRefusal, mount_management,
 };
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name};
@@ -49,7 +49,10 @@ impl TrustAdminMgmtBackend for CountingBackend {
         })
     }
 
-    async fn revoke(&self, _request: RevokeRequest) -> Result<RevokedInfo, TrustRefusal> {
+    async fn update_context(
+        &self,
+        _context_data: bytes::Bytes,
+    ) -> Result<ContextRefreshInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(TrustRefusal {
             status_code: 500,
@@ -186,12 +189,12 @@ async fn localhop_trust_admin_verbs_never_run() {
     let cr = send_localhop(&app_handle, &signer, &key_name, b"enroll", &enroll).await;
     assert_eq!(cr.status_code, 403, "localhop enroll: {:?}", cr.status_text);
 
-    let revoke = ControlParameters {
-        name: Some("/home/member/phone".parse().unwrap()),
+    let update = ControlParameters {
+        context_data: Some(bytes::Bytes::from_static(b"\x06\x00")),
         ..Default::default()
     };
-    let cr = send_localhop(&app_handle, &signer, &key_name, b"revoke", &revoke).await;
-    assert_eq!(cr.status_code, 403, "localhop revoke: {:?}", cr.status_text);
+    let cr = send_localhop(&app_handle, &signer, &key_name, b"context-update", &update).await;
+    assert_eq!(cr.status_code, 403, "localhop context-update: {:?}", cr.status_text);
 
     let refresh = ControlParameters::default();
     let cr = send_localhop(&app_handle, &signer, &key_name, b"context-refresh", &refresh).await;

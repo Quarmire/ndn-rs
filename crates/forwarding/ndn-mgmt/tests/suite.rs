@@ -22,6 +22,8 @@ mod faces_create_idempotent;
 mod faces_update_tier2;
 #[path = "ipc_seam.rs"]
 mod ipc_seam;
+#[path = "local_operator_commands.rs"]
+mod local_operator_commands;
 #[path = "ndnsd_adapter.rs"]
 mod ndnsd_adapter;
 #[path = "notifications.rs"]

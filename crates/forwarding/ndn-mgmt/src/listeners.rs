@@ -10,8 +10,8 @@ use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
 /// Accept NDN face connections on `path` and register each as an
-/// operator-trusted `FaceKind::Management` face (the NFD management socket;
-/// trust is gated by `0600`/`0666` filesystem perms + signed-command auth).
+/// `FaceKind::Management` face (the NFD management socket; each command is
+/// authorized by the connection's peer credentials or by its signature).
 ///
 /// `path` is a Unix domain socket path on Unix (e.g. `/run/nfd/nfd.sock`)
 /// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn`).

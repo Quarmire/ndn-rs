@@ -184,16 +184,18 @@ pub(crate) async fn authorize_command(
         return Ok(());
     }
     let Some(validator) = validator else {
-        return Err("command authentication required but no validator is configured".to_string());
+        return Err("refused: this command must be signed by a key trusted by \
+             `[security.mgmt] trust_anchor_pib`, and none is configured. Send it over \
+             this node's local management socket as the daemon's user, root, or a \
+             member of `[security] trust_admin_groups`, or set trust_anchor_pib in \
+             the daemon config."
+            .to_string());
     };
     // DigestSha256 verifies byte integrity but carries no key identity.
     // Per NFD command-authenticator.cpp, only key-backed signature types
     // (Ed25519, ECDSA, RSA, BLAKE3) are accepted when a key validator is
     // present. DigestSha256-only Interests are treated as unsigned here.
-    if matches!(
-        interest.sig_info().map(|s| s.sig_type),
-        None | Some(ndn_packet::SignatureType::DigestSha256)
-    ) {
+    if !is_key_signed(interest) {
         return Err("command rejected: key-backed signature required \
              (DigestSha256 does not establish key identity)"
             .to_string());
@@ -250,7 +252,7 @@ pub(crate) async fn authorize_command(
 }
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
-/// (adopting, refreshing a trust context, enrolling, renewing, revoking).
+/// (adopting, refreshing or updating a trust context, enrolling, renewing).
 /// Instead of the signed-command gate they require the caller to be a local
 /// trust administrator — see [`authorize_trust_admin`] — and they are refused
 /// over `/localhop`. Add every future trust-mutating verb here.
@@ -262,10 +264,6 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::ENROLL,
-    ),
-    (
-        ndn_mgmt_wire::nfd_command::module::SECURITY,
-        ndn_mgmt_wire::nfd_command::verb::REVOKE,
     ),
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
@@ -289,13 +287,98 @@ pub(crate) fn is_trust_admin_verb(module: &[u8], verb: &[u8]) -> bool {
         .any(|&(m, v)| m == module && v == verb)
 }
 
+/// Who the kernel says is on the other end of the face a command arrived on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// The face carries no kernel-attested identity: anything but the local
+    /// management socket.
+    Unidentified,
+    /// A local operator: the daemon's effective user, root, or a member of a
+    /// group in `[security] trust_admin_groups`.
+    Operator,
+    /// Another local user.
+    OtherUser { uid: u32 },
+}
+
+/// The local-operator credential set and how it is configured, rendered for a
+/// refusal: who the daemon accepts and how to become one of them.
+struct OperatorSet {
+    daemon_uid: u32,
+    configured: String,
+}
+
+impl OperatorSet {
+    fn new(daemon_uid: u32, groups: &[String]) -> Self {
+        let configured = if groups.is_empty() {
+            "none configured".to_owned()
+        } else {
+            format!("currently: {}", groups.join(", "))
+        };
+        Self {
+            daemon_uid,
+            configured,
+        }
+    }
+}
+
+/// Pure classification behind [`identify_caller`]. `in_allowed_group` is consulted
+/// only when `groups` is non-empty, so an empty list grants nothing beyond
+/// the daemon's user and root.
+fn classify_caller(
+    peer: Option<PeerCredentials>,
+    daemon_uid: u32,
+    in_allowed_group: impl Fn(&PeerCredentials) -> bool,
+    groups: &[String],
+) -> Caller {
+    let Some(peer) = peer else {
+        return Caller::Unidentified;
+    };
+    if peer.uid == daemon_uid || peer.uid == 0 || (!groups.is_empty() && in_allowed_group(&peer))
+    {
+        Caller::Operator
+    } else {
+        Caller::OtherUser { uid: peer.uid }
+    }
+}
+
+/// Classify the caller behind `fid` by its local-socket peer credentials,
+/// alongside the operator set used to explain a refusal.
+fn identify_caller(
+    fid: FaceId,
+    engine: &ForwarderEngine,
+    config: &dyn MgmtConfig,
+) -> (Caller, OperatorSet) {
+    let groups = config.trust_admin_groups();
+    #[cfg(unix)]
+    {
+        let peer = engine
+            .faces()
+            .get(fid)
+            .and_then(|face| face.peer_credentials());
+        let daemon_uid = unix_ids::daemon_euid();
+        (
+            classify_caller(
+                peer,
+                daemon_uid,
+                |p| unix_ids::peer_in_any_group(p, groups),
+                groups,
+            ),
+            OperatorSet::new(daemon_uid, groups),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fid, engine);
+        (Caller::Unidentified, OperatorSet::new(0, groups))
+    }
+}
+
 /// Authorise a trust-changing verb by the kernel-attested credentials of the
 /// process connected to the management socket. Internally generated
-/// commands (`source_face == None`) pass. Otherwise the peer must be the
-/// daemon's effective user, root, or a member of a group named in
-/// `[security] trust_admin_groups`; a face without peer credentials (not
-/// the local socket) is refused. The `Err` text is shown to the operator
-/// verbatim.
+/// commands (`source_face == None`) pass. Otherwise the caller must be a
+/// local operator ([`Caller::Operator`]); a face without peer credentials
+/// (not the local socket) is refused. The `Err` text is shown to the
+/// operator verbatim.
 pub(crate) fn authorize_trust_admin(
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
@@ -304,69 +387,126 @@ pub(crate) fn authorize_trust_admin(
     let Some(fid) = source_face else {
         return Ok(());
     };
-    #[cfg(unix)]
-    {
-        let peer = engine
-            .faces()
-            .get(fid)
-            .and_then(|face| face.peer_credentials());
-        let groups = config.trust_admin_groups();
-        let daemon_uid = unix_ids::daemon_euid();
-        trust_admin_decision(
-            peer,
-            daemon_uid,
-            |p| unix_ids::peer_in_any_group(p, groups),
-            groups,
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (fid, engine, config);
-        Err("refused: changing this node's trust is authorized by the caller's \
-             local-socket peer credentials (user and groups), and this platform \
-             provides none, so trust changes over management are unavailable here."
-            .to_owned())
-    }
+    let (caller, set) = identify_caller(fid, engine, config);
+    trust_admin_decision(&caller, &set)
 }
 
-/// Pure decision behind [`authorize_trust_admin`]. `in_allowed_group` is
-/// consulted only when `groups` is non-empty, so an empty list grants
-/// nothing beyond the daemon's user and root.
-fn trust_admin_decision(
-    peer: Option<PeerCredentials>,
-    daemon_uid: u32,
-    in_allowed_group: impl Fn(&PeerCredentials) -> bool,
-    groups: &[String],
-) -> Result<(), String> {
-    let configured = if groups.is_empty() {
-        "none configured".to_owned()
-    } else {
-        format!("currently: {}", groups.join(", "))
-    };
-    let Some(peer) = peer else {
-        return Err(format!(
+fn trust_admin_decision(caller: &Caller, set: &OperatorSet) -> Result<(), String> {
+    let OperatorSet {
+        daemon_uid,
+        configured,
+    } = set;
+    match caller {
+        Caller::Operator => Ok(()),
+        Caller::Unidentified => Err(format!(
             "refused: changing this node's trust must be requested over the \
              forwarder's local management socket, where the kernel reports who \
              is asking; this request arrived on a face that carries no caller \
              identity. Run the command on this node against the daemon's Unix \
              socket, as the daemon's user (uid {daemon_uid}), root, or a member \
              of a group in `[security] trust_admin_groups` ({configured})."
-        ));
+        )),
+        Caller::OtherUser { uid } => Err(format!(
+            "refused: only the daemon's user (uid {daemon_uid}), root, or members of \
+             `[security] trust_admin_groups` ({configured}) may change this node's \
+             trust; this request came from uid {uid}. Run the command as the daemon's \
+             user or root, or add a group you belong to to `[security] \
+             trust_admin_groups` in the daemon config and restart."
+        )),
+    }
+}
+
+/// How a command that is not a trust-changing verb is authenticated.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CommandAuth {
+    /// The kernel attests the caller is a local operator and the command
+    /// claims no signer: the socket's peer credentials authenticate it.
+    LocalOperator,
+    /// Decided by the command signature ([`authorize_command`]).
+    Signature,
+    /// Refused; the text is shown to the operator verbatim.
+    Refused(String),
+}
+
+/// Authenticate a non-trust-admin, non-`/localhop` command by who sent it.
+/// On the local management socket the peer credentials authenticate the
+/// caller exactly as for trust-changing verbs, so a local operator's
+/// unsigned (or DigestSha256) command needs no signature; a key-signed one
+/// names a signer, and that claim is verified like any other. Any other
+/// local user must sign the command (with a key under `[security.mgmt]
+/// trust_anchor_pib`) when signatures are required. Every other face, and
+/// internally generated commands, are decided by the signature.
+pub(crate) fn local_command_auth(
+    source_face: Option<FaceId>,
+    engine: &ForwarderEngine,
+    config: &dyn MgmtConfig,
+    interest: &ndn_packet::Interest,
+    require_signed: bool,
+    has_validator: bool,
+) -> CommandAuth {
+    let Some(fid) = source_face else {
+        return CommandAuth::Signature;
     };
-    if peer.uid == daemon_uid || peer.uid == 0 {
-        return Ok(());
+    let (caller, set) = identify_caller(fid, engine, config);
+    local_command_decision(
+        &caller,
+        &set,
+        is_key_signed(interest),
+        require_signed,
+        has_validator,
+    )
+}
+
+fn local_command_decision(
+    caller: &Caller,
+    set: &OperatorSet,
+    key_signed: bool,
+    require_signed: bool,
+    has_validator: bool,
+) -> CommandAuth {
+    match caller {
+        Caller::Operator if !key_signed => CommandAuth::LocalOperator,
+        Caller::Operator if require_signed && !has_validator => CommandAuth::Refused(
+            "refused: this command is signed by a key, but no `[security.mgmt] \
+             trust_anchor_pib` is configured to verify that key. You are a local \
+             operator on this socket, so send the command unsigned (without \
+             `--identity`), or set trust_anchor_pib in the daemon config and restart."
+                .to_owned(),
+        ),
+        Caller::Operator | Caller::Unidentified => CommandAuth::Signature,
+        Caller::OtherUser { .. } if !require_signed || (key_signed && has_validator) => {
+            CommandAuth::Signature
+        }
+        Caller::OtherUser { uid } => {
+            let OperatorSet {
+                daemon_uid,
+                configured,
+            } = set;
+            let anchor = if has_validator {
+                ""
+            } else {
+                " (none is configured yet)"
+            };
+            CommandAuth::Refused(format!(
+                "refused: unsigned management commands are accepted on the local socket \
+                 only from the daemon's user (uid {daemon_uid}), root, or members of \
+                 `[security] trust_admin_groups` ({configured}); this request came from \
+                 uid {uid}. Run the command as the daemon's user or root, add a group you \
+                 belong to to `[security] trust_admin_groups` in the daemon config and \
+                 restart, or sign the command with a key trusted by `[security.mgmt] \
+                 trust_anchor_pib`{anchor}."
+            ))
+        }
     }
-    if !groups.is_empty() && in_allowed_group(&peer) {
-        return Ok(());
-    }
-    Err(format!(
-        "refused: only the daemon's user (uid {daemon_uid}), root, or members of \
-         `[security] trust_admin_groups` ({configured}) may change this node's \
-         trust; this request came from uid {}. Run the command as the daemon's \
-         user or root, or add a group you belong to to `[security] \
-         trust_admin_groups` in the daemon config and restart.",
-        peer.uid
-    ))
+}
+
+/// `true` when the Interest carries a key-backed signature (DigestSha256
+/// proves integrity only, not who signed).
+fn is_key_signed(interest: &ndn_packet::Interest) -> bool {
+    !matches!(
+        interest.sig_info().map(|s| s.sig_type),
+        None | Some(ndn_packet::SignatureType::DigestSha256)
+    )
 }
 
 /// User / group database lookups backing the `trust_admin_groups` check.
@@ -541,7 +681,6 @@ mod trust_admin_tests {
     fn trust_admin_verb_table() {
         assert!(is_trust_admin_verb(b"security", b"context-adopt"));
         assert!(is_trust_admin_verb(b"security", b"enroll"));
-        assert!(is_trust_admin_verb(b"security", b"revoke"));
         assert!(is_trust_admin_verb(b"security", b"context-refresh"));
         assert!(is_trust_admin_verb(b"security", b"context-update"));
         assert!(is_trust_admin_verb(b"security", b"renew"));
@@ -550,30 +689,111 @@ mod trust_admin_tests {
         assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));
     }
 
+    /// Trust decision for a peer, as `authorize_trust_admin` makes it.
+    fn trust(
+        peer: Option<PeerCredentials>,
+        in_group: impl Fn(&PeerCredentials) -> bool,
+        g: &[String],
+    ) -> Result<(), String> {
+        trust_admin_decision(
+            &classify_caller(peer, DAEMON, in_group, g),
+            &OperatorSet::new(DAEMON, g),
+        )
+    }
+
     #[test]
     fn foreign_uid_outside_allowed_groups_is_refused() {
         let g = groups(&["ndnadmin"]);
-        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |_| false, &g).is_err());
+        assert!(trust(peer(1000, 1000), |_| false, &g).is_err());
     }
 
     #[test]
     fn missing_peer_credentials_are_refused() {
         let g = groups(&["ndnadmin"]);
-        assert!(trust_admin_decision(None, DAEMON, |_| true, &g).is_err());
-        assert!(trust_admin_decision(None, DAEMON, |_| true, &[]).is_err());
+        assert!(trust(None, |_| true, &g).is_err());
+        assert!(trust(None, |_| true, &[]).is_err());
     }
 
     #[test]
     fn daemon_user_root_and_group_member_are_allowed() {
-        assert!(trust_admin_decision(peer(DAEMON, 5), DAEMON, |_| false, &[]).is_ok());
-        assert!(trust_admin_decision(peer(0, 0), DAEMON, |_| false, &[]).is_ok());
+        assert!(trust(peer(DAEMON, 5), |_| false, &[]).is_ok());
+        assert!(trust(peer(0, 0), |_| false, &[]).is_ok());
         let g = groups(&["ndnadmin"]);
-        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |p| p.uid == 1000, &g).is_ok());
+        assert!(trust(peer(1000, 1000), |p| p.uid == 1000, &g).is_ok());
     }
 
     #[test]
     fn empty_group_list_grants_nothing() {
-        assert!(trust_admin_decision(peer(1000, 1000), DAEMON, |_| true, &[]).is_err());
+        assert!(trust(peer(1000, 1000), |_| true, &[]).is_err());
+    }
+
+    /// Ordinary-command decision for a peer, signatures required.
+    fn command(
+        peer: Option<PeerCredentials>,
+        key_signed: bool,
+        has_validator: bool,
+    ) -> CommandAuth {
+        local_command_decision(
+            &classify_caller(peer, DAEMON, |_| false, &[]),
+            &OperatorSet::new(DAEMON, &[]),
+            key_signed,
+            true,
+            has_validator,
+        )
+    }
+
+    /// The local-socket peer credentials that authorise trust changes also
+    /// authenticate ordinary commands: a local operator needs no signature,
+    /// with or without a command trust anchor configured.
+    #[test]
+    fn local_operator_commands_need_no_signature() {
+        for has_validator in [false, true] {
+            assert_eq!(command(peer(DAEMON, 5), false, has_validator), CommandAuth::LocalOperator);
+            assert_eq!(command(peer(0, 0), false, has_validator), CommandAuth::LocalOperator);
+        }
+    }
+
+    /// A key-signed command names a signer; a local operator's claim is
+    /// verified like anyone's, never waved through on credentials.
+    #[test]
+    fn local_operator_key_signature_is_still_verified() {
+        assert_eq!(command(peer(DAEMON, 5), true, true), CommandAuth::Signature);
+        assert!(matches!(command(peer(DAEMON, 5), true, false), CommandAuth::Refused(_)));
+    }
+
+    /// Another local user's unsigned command is refused; a key-signed one goes
+    /// to signature verification when there is a validator to verify it.
+    #[test]
+    fn other_local_user_must_sign() {
+        for has_validator in [false, true] {
+            assert!(matches!(
+                command(peer(1000, 1000), false, has_validator),
+                CommandAuth::Refused(_)
+            ));
+        }
+        assert!(matches!(command(peer(1000, 1000), true, false), CommandAuth::Refused(_)));
+        assert_eq!(command(peer(1000, 1000), true, true), CommandAuth::Signature);
+    }
+
+    /// A face without peer credentials (every non-local face) is never
+    /// authenticated by credentials: the signature decides.
+    #[test]
+    fn faces_without_credentials_are_decided_by_signature() {
+        assert_eq!(command(None, false, false), CommandAuth::Signature);
+        assert_eq!(command(None, false, true), CommandAuth::Signature);
+    }
+
+    /// With signatures not required, credentials never refuse a command.
+    #[test]
+    fn signatures_not_required_refuses_nothing() {
+        let decision = local_command_decision(
+            &classify_caller(peer(1000, 1000), DAEMON, |_| false, &[]),
+            &OperatorSet::new(DAEMON, &[]),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(decision, CommandAuth::Signature);
     }
 }
 
@@ -765,11 +985,7 @@ mod e01_tests {
         let cmd_name: Name = "/localhop/nfd/rib/register".parse().unwrap();
         let interest = Interest::decode(encode_interest(&cmd_name, None)).unwrap();
         let result = authorize_command(&interest, None, true, None).await;
-        let reason = result.expect_err("no validator must reject the command");
-        assert!(
-            reason.contains("no validator"),
-            "rejection reason must explain why; got: {reason}"
-        );
+        assert!(result.is_err(), "no validator must reject the command");
     }
 
     /// End-to-end replay protection: decoding the same signed Interest

@@ -6,8 +6,10 @@
 # Severity:    RESOLVED 2026-05-07 (testbed leg)
 # Spec ref:    NFD Developer Guide §7; NFD daemon/mgmt/command-authenticator.cpp
 # Witness:     INTEROP-SCRIPT — boots ndn-fwd with require_signed_commands=true
-#              and a /test trust anchor; asserts three cases:
-#              1. unsigned (DigestSha256) command → 403 rejected
+#              and a /test trust anchor; asserts:
+#              1a. unsigned command from the daemon's own user (a local
+#                  operator, authenticated by peer credentials) → 200
+#              1b. unsigned command from another uid → 403 rejected
 #              2. /test/admin-signed command → 200 accepted, RIB updated
 #              3. /intruder-signed command (untrusted key) → 403 rejected
 #
@@ -121,14 +123,33 @@ check_fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
 # the client surfaces as a non-zero exit) rather than racing the FIB
 # inspection.  This is the same signal NFD's own `nfdc` exposes.
 
-# ── Case 1: unsigned (DigestSha256) command → 403 ─────────────────────────────
-echo "=== Case 1: unsigned command rejected ==="
+# ── Case 1a: unsigned command from the daemon's user → 200 ───────────────────
+echo "=== Case 1a: unsigned command from a local operator accepted ==="
 if "$NDN_CTL" --socket "$FWD_SOCK" route add /e01/test --face 1 \
        >"$TRANSCRIPT_DIR/e01_signed_mgmt_ndn_fwd_case1.txt" 2>&1; then
-    check_fail "unsigned route add must be rejected (got 200)"
-    cat "$TRANSCRIPT_DIR/e01_signed_mgmt_ndn_fwd_case1.txt"
+    check_pass "local operator's unsigned route add accepted (200)"
 else
-    check_pass "unsigned route add rejected (403)"
+    check_fail "local operator's unsigned route add was rejected (expected 200)"
+    cat "$TRANSCRIPT_DIR/e01_signed_mgmt_ndn_fwd_case1.txt"
+fi
+echo
+
+# ── Case 1b: unsigned command from another uid → 403 ─────────────────────────
+# A user namespace maps us to root and uid 1 to a subordinate id, so the
+# daemon sees a foreign uid on the socket. Skipped where unavailable.
+echo "=== Case 1b: unsigned command from another uid rejected ==="
+if unshare --map-auto --map-root-user true 2>/dev/null; then
+    chmod 755 "$WORK"
+    if unshare --map-auto --map-root-user sh -c \
+           "setpriv --reuid=1 --regid=1 --clear-groups '$NDN_CTL' --socket '$FWD_SOCK' route add /e01/other --face 1" \
+           >"$TRANSCRIPT_DIR/e01_signed_mgmt_ndn_fwd_case1b.txt" 2>&1; then
+        check_fail "another uid's unsigned route add must be rejected (got 200)"
+        cat "$TRANSCRIPT_DIR/e01_signed_mgmt_ndn_fwd_case1b.txt"
+    else
+        check_pass "another uid's unsigned route add rejected (403)"
+    fi
+else
+    echo "  SKIP: user namespaces unavailable"
 fi
 echo
 
