@@ -126,6 +126,19 @@ pub fn read_stored_contexts(
         .collect())
 }
 
+/// The stored context of `namespace` under `pib_root`, re-verified as
+/// [`read_stored_contexts`] does; `None` when none is stored.
+pub fn read_stored_context(
+    pib_root: &Path,
+    namespace: &Name,
+) -> Result<Option<(SignedTrustContext, Data)>, ContextStoreError> {
+    let path = context_file_path(pib_root, namespace);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_one(pib_root, &path).map(Some)
+}
+
 fn read_one(
     pib_root: &Path,
     path: &Path,

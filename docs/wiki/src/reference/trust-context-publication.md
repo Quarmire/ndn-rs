@@ -81,13 +81,19 @@ one file — the newest adopted version — per namespace.
 
 The store is read at startup. A context the running daemon adopts
 (`ndn-fwd adopt`, see [Adopting a trust context](./context-adoption.md)) is added to
-the published set at once, replacing an older version of its namespace.
+the published set at once, replacing an older version of its namespace. The
+same holds for a newer version it adopts by refreshing
+([Trust-context updates](./context-updates.md)) and for a version the root
+device makes ([`ndn-fwd revoke`](./revocation.md)): every holder republishes
+an update as soon as it adopts it, so updates travel hop by hop — a device
+behind a relay fetches the new version from the relay, which fetched it from
+the root device — and no node needs a route to the root device.
 
 While the daemon itself fetches a namespace's context (`ndn-fwd adopt` with a
-fingerprint-only link), its FIB entry `/<ns>/32=trust-context` toward the
-publisher is withdrawn, so the fetch goes to the forwarders serving `/<ns>`
-rather than being answered with the version this node already holds; it is
-restored when the fetch ends. Other devices' fetches during that window
+fingerprint-only link, or a refresh), its FIB entry `/<ns>/32=trust-context`
+toward the publisher is withdrawn, so the fetch goes to the forwarders serving
+`/<ns>` rather than being answered with the version this node already holds;
+it is restored when the fetch ends. Other devices' fetches during that window
 follow the same `/<ns>` route.
 
 ```toml
@@ -123,3 +129,5 @@ and drops any other — see [Adopting a trust context](./context-adoption.md).
 
 - [Trust policies](./trust-policies.md) — contexts, schemas and the validator.
 - [NDNCERT setup](../guides/ndncert-setup.md) — `ndn-fwd init` and enrollment.
+- [Trust-context updates](./context-updates.md) — how a holder adopts a newer
+  version (continuity rule) and republishes it.

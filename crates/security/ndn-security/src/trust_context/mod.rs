@@ -224,7 +224,10 @@ pub struct SignedTrustContext {
     ca_endpoints: Vec<Name>,
     /// Which challenge(s) gate issuance.
     enrollment_hint: Option<EnrollmentHint>,
-    /// Dead anchors/intermediates by cert name or key digest.
+    /// Dead keys and certificates, by name. An entry covers that name and
+    /// every name under it ([`is_revoked`](Self::is_revoked)): a revoked key
+    /// name `/<id>/KEY/<k>` covers each certificate of that key
+    /// (`/<id>/KEY/<k>/<issuer>/<version>`), including ones issued later.
     revocations: Vec<Name>,
     /// Schema blobs to re-emit verbatim on encode (preserves a published LVS
     /// blob exactly), OR'd into the runtime schema; empty means derive a
@@ -395,9 +398,13 @@ impl SignedTrustContext {
         self.anchors.iter().any(|r| r.key().as_ref() == name)
     }
 
-    /// Whether `name` is listed as revoked in this context.
+    /// Whether `name` is revoked by this context: equal to a revocation
+    /// entry or under one. A chain walk checks every key/certificate name it
+    /// passes, so revoking a key name refuses every certificate of that key —
+    /// whichever form a KeyLocator names it in (key name or certificate
+    /// name), and certificates issued after the revocation too.
     pub fn is_revoked(&self, name: &Name) -> bool {
-        self.revocations.iter().any(|r| r == name)
+        self.revocations.iter().any(|r| name.has_prefix(r))
     }
 
     pub fn set_schema(&self, schema: TrustSchema) {

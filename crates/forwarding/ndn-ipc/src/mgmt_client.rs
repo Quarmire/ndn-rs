@@ -727,6 +727,42 @@ impl MgmtClient {
         self.deferred_command(verb::ENROLL, &params, timeout).await
     }
 
+    /// `security/revoke` (on the namespace's root device): revoke the device
+    /// identity, key or certificate `name` at the daemon's CA and in a new,
+    /// root-signed version of the namespace's trust context, which the daemon
+    /// stores and publishes. The command Interest lives `timeout`, and so
+    /// does the wait. Success carries `ndn_mgmt::RevokedInfo` as JSON in
+    /// `status_text`; a refusal's `status_text` says why and where to run it.
+    pub async fn security_revoke(
+        &self,
+        name: &ndn_packet::Name,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        self.deferred_command(verb::REVOKE, &params, timeout).await
+    }
+
+    /// `security/context-refresh`: ask the daemon to check the held trust
+    /// context of `namespace` (every held one when `None`) for a newer
+    /// version now, rather than at its next periodic check. The command
+    /// Interest lives `timeout`, and so does the wait. Success carries a JSON
+    /// list of `ndn_mgmt::ContextRefreshInfo` in `status_text`.
+    pub async fn security_context_refresh(
+        &self,
+        namespace: Option<&ndn_packet::Name>,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ControlParameters {
+            name: namespace.cloned(),
+            ..Default::default()
+        };
+        self.deferred_command(verb::CONTEXT_REFRESH, &params, timeout)
+            .await
+    }
+
     /// A `security/<verb>` command the daemon answers only after network
     /// round trips: the Interest lives `timeout` and the wait is as long.
     async fn deferred_command(

@@ -472,7 +472,7 @@ where
     )
     .await
     .map_err(|e| InviteEnrollError::from_cert(e, invite))?;
-    let data = crate::client::fetch_issued_cert(exchange, &cert_name)
+    let data = crate::client::fetch_issued_cert_via(exchange, &invite.ca_prefix, &cert_name)
         .await
         .map_err(|e| InviteEnrollError::from_cert(e, invite))?;
     let issued = check_issued(&data, device_key.as_ref()).await?;

@@ -9,7 +9,9 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{CsCapacity, CsEntry, CsMeta, CsStats, ErasedContentStore, InsertResult};
+use crate::{
+    CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, ErasedContentStore, InsertResult,
+};
 
 #[derive(Debug)]
 pub enum CsEvent {
@@ -133,6 +135,20 @@ impl ErasedContentStore for ObservableCs {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
         Box::pin(async move {
             let evicted = self.inner.evict_prefix_erased(prefix, limit).await;
+            self.counters
+                .evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+            evicted
+        })
+    }
+
+    fn evict_matching_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        matches: &'a CsEntryFilter,
+    ) -> std::pin::Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+        Box::pin(async move {
+            let evicted = self.inner.evict_matching_erased(prefix, matches).await;
             self.counters
                 .evictions
                 .fetch_add(evicted as u64, Ordering::Relaxed);

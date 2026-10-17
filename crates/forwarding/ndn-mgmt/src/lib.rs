@@ -510,12 +510,72 @@ pub struct SigningIdentityInfo {
     pub ephemeral: bool,
 }
 
+/// The outcome of a successful `security/revoke`, JSON in the
+/// ControlResponse status text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevokedInfo {
+    pub namespace: String,
+    /// The key names now revoked by the trust context (each covers every
+    /// certificate of that key).
+    pub keys: Vec<String>,
+    /// Certificates this node's CA revoked now: no longer served, and the
+    /// device name they held is free for a new key.
+    pub ca_revoked: Vec<String>,
+    /// Set when a CA revocation could not be written to its store: it holds
+    /// until the CA restarts.
+    pub ca_not_persisted: Option<String>,
+    /// The context version before.
+    pub previous_version: u64,
+    /// The context version now (equal to `previous_version` when every key
+    /// was already revoked by it).
+    pub version: u64,
+    /// Where the new version was stored.
+    pub stored: Option<String>,
+    /// Whether this node now publishes the new version by name.
+    pub published: bool,
+}
+
+/// What a `security/context-refresh` found for one namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefreshState {
+    /// A newer version was adopted, stored and published.
+    Updated,
+    /// The namespace serves the version held.
+    Current,
+    /// What answered serves an older version than held; nothing changed.
+    UpstreamOlder,
+    /// This node holds the namespace root key: it is where new versions
+    /// are made, so it does not fetch them.
+    Source,
+    /// The check failed or the update was refused; the held version stays.
+    Failed,
+}
+
+/// One namespace's `security/context-refresh` result (the answer is a JSON
+/// list of these).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextRefreshInfo {
+    pub namespace: String,
+    pub state: RefreshState,
+    /// The version held before the check.
+    pub held_version: u64,
+    /// The version held now.
+    pub version: u64,
+    /// Revocation entries the adopted version adds.
+    pub revoked: Vec<String>,
+    /// Why, for `failed`; what answered, otherwise.
+    pub detail: String,
+}
+
 /// Backend for the trust-admin verbs: adopt a trust context
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
-/// and report the identity the node signs with now. The spec crate owns the
-/// trait; the forwarder (`ndn-fwd`) implements it over its engine, keyring,
-/// PIB, context store and publisher. Authorization happens before a verb
-/// reaches the backend (the trust-admin peer-credential gate).
+/// revoke a device on the root device (`security/revoke`), refresh held
+/// contexts (`security/context-refresh`), and report the identity the node
+/// signs with now. The spec crate owns the trait; the forwarder (`ndn-fwd`)
+/// implements it over its engine, keyring, PIB, CA, context store and
+/// publisher. Authorization happens before a verb reaches the backend (the
+/// trust-admin peer-credential gate).
 #[async_trait::async_trait]
 pub trait TrustAdminMgmtBackend: Send + Sync {
     async fn adopt(&self, link_uri: String) -> Result<AdoptedContextInfo, TrustRefusal>;
@@ -525,6 +585,28 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not enroll at runtime".to_owned(),
+        })
+    }
+
+    /// Revoke the device identity, key or certificate `name`.
+    async fn revoke(&self, name: Name) -> Result<RevokedInfo, TrustRefusal> {
+        let _ = name;
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not revoke at runtime".to_owned(),
+        })
+    }
+
+    /// Check the held context of `namespace` (every held one when `None`)
+    /// for a newer version.
+    async fn refresh_contexts(
+        &self,
+        namespace: Option<Name>,
+    ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
+        let _ = namespace;
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not refresh trust contexts at runtime".to_owned(),
         })
     }
 
@@ -790,7 +872,8 @@ pub async fn run_ndn_mgmt_handler(
             let resp = ControlResponse::error(
                 status::UNAUTHORIZED,
                 "trust changes are accepted only on this node's local management socket; \
-                 run `ndn-fwd adopt` / `ndn-fwd enroll` on the node itself",
+                 run `ndn-fwd adopt` / `enroll` / `revoke` / `context refresh` on the node \
+                 itself",
             );
             send_response(
                 &handle,

@@ -237,6 +237,10 @@ impl ValidationStage {
         // ndn-rs validates everything, including /localhost mgmt responses
         // (signed with DigestSha256). NFD reaches the same effect via an
         // explicit `m_localhostValidator` allowlist.
+        //
+        // The revocation epoch is read BEFORE the context is consulted, so a
+        // revoking update that the check below did not see moves it.
+        let epoch = validator.keyring().revocation_epoch();
         let (result, missing) = validator
             .validate_chain_cached(data)
             .instrument(span.clone())
@@ -248,6 +252,7 @@ impl ValidationStage {
                 self.stats.valid.fetch_add(1, Ordering::Relaxed);
                 trace!(target: t::SECURITY, name=%name, "validation: valid");
                 ctx.verified = true;
+                ctx.revocation_epoch = Some(epoch);
                 Action::Satisfy(ctx)
             }
             ValidationResult::Pending => {
@@ -307,11 +312,13 @@ impl ValidationStage {
                             continue;
                         }
                     };
+                    let epoch = validator.keyring().revocation_epoch();
                     match validator.validate_chain_cached(data).await {
                         (ValidationResult::Valid(_), _) => {
                             self.stats.valid.fetch_add(1, Ordering::Relaxed);
                             trace!(target: t::SECURITY, name=%data.name, "validation: re-validated after cert fetch");
                             ctx.verified = true;
+                            ctx.revocation_epoch = Some(epoch);
                             actions.push(Action::Satisfy(ctx));
                         }
                         // The next hop up the chain is missing: fetch it and wait

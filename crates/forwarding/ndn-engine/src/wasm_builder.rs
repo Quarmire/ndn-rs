@@ -245,6 +245,9 @@ impl WasmEngineBuilder {
         ));
 
         let validator = self.validator;
+        if let Some(v) = &validator {
+            crate::revocation_purge::install(v, &cs, Arc::clone(&runtime));
+        }
 
         let replay_guard: Option<Arc<ndn_security::ReplayGuard>> = match self.replay_guard_override
         {
@@ -342,6 +345,7 @@ impl WasmEngineBuilder {
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
+                validator: validator.clone(),
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,

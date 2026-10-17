@@ -123,7 +123,7 @@ impl NdncertClient {
         )
         .await?;
 
-        let cert_data = ndn_cert::client::fetch_issued_cert(self, &cert_name).await?;
+        let cert_data = ndn_cert::client::fetch_issued_cert_via(self, &ca_prefix, &cert_name).await?;
         Ok(ndn_security::Certificate::decode(&cert_data)?)
     }
 }

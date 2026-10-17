@@ -47,6 +47,13 @@ pub struct PacketContext {
     /// Store: measured 0.17% hit rate and 37 retained entries against NFD's
     /// 7.33% and 12033 on the same workload.
     pub validation_not_configured: bool,
+    /// The validator keyring's [revocation epoch] read just before
+    /// `ValidationStage` judged this Data valid; `None` if no validator ran.
+    /// `CsInsertStage` compares it with the current epoch so Data validated
+    /// just before a revoking trust-context update is not cached after it.
+    ///
+    /// [revocation epoch]: ndn_security::Keyring::revocation_epoch
+    pub revocation_epoch: Option<u64>,
     /// Set by `PitMatchStage` when an incoming Data matched no PIT entry. Such
     /// Data is never forwarded (`out_faces` stays empty); whether it is cached
     /// is decided by the engine's `UnsolicitedDataPolicy`.
@@ -71,6 +78,7 @@ impl PacketContext {
             cs_hit: false,
             verified: false,
             validation_not_configured: false,
+            revocation_epoch: None,
             unsolicited: false,
             arrival,
             tags: AnyMap::new(),

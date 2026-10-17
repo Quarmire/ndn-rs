@@ -65,8 +65,12 @@ PIV, or a `FilePib` directory. A relay never holds the root.
   `/<ns>/32=trust-context/v=N`: anchors, schema, CA endpoints, revocations.
   Distributed by envelope (first contact), by name over RDR (any `ndn-fwd`
   publishes the contexts in its store, **have**: see
-  `docs/wiki/src/reference/trust-context-publication.md`) and `context_sync`
-  (updates).
+  `docs/wiki/src/reference/trust-context-publication.md`). Updates are pulled
+  by name and republished by each holder, adopted only if signed by an anchor
+  of the held version and strictly newer (**have**: `ndn-fwd context refresh`,
+  `[security] context_refresh_secs`; see
+  `docs/wiki/src/reference/context-updates.md`); `context_sync` pushes the
+  same signed Data over SVS under the same rule (library only).
 - **Envelope** — `ndn-trust://` (`ndn-trust-envelope`): `anchor` (signed
   context or fingerprint pointer: namespace + expected fingerprint +
   version), `invite` (CA prefix + namespace + token + expected fingerprint),
@@ -170,18 +174,36 @@ Each flow lists steps, what is stored where, failure handling, and status
 Gap: the request/sign round trip.
 
 ### F4 Lose a member device
-1. Any admin: `devices revoke <name>` → CA REVOKE (immediate at the CA, cert no
-   longer served) (**have** at the CA level; **gap**: admin-side command).
-2. Next time the root is available: context bump with the revocation entry,
-   propagated by `context_sync` so every node refuses the key (**gap**: revoke
-   command that edits, re-signs and publishes the context).
+On the root device: `ndn-fwd revoke /<ns>/<role>/<dev>` (or a key or
+certificate name) does both steps at once (**have**: `security/revoke`, a
+trust-admin verb; see `docs/wiki/src/reference/revocation.md`):
+1. CA (immediate): every certificate the CA issued for the device's keys is
+   marked revoked (`<pib>/ca/revoked/`): no longer served, the key is never
+   certified again, the device name is free to enroll with a new key.
+2. Context bump: version `N+1` lists the key names as revoked, signed by the
+   root key, stored and published. Every node refuses a chain through those
+   keys once it holds `N+1`, which it pulls at its next refresh and
+   republishes for the nodes behind it (`context_refresh_secs`, default
+   300 s, or `ndn-fwd context refresh`). A node that adopts the revoking
+   version evicts from its Content Store the Data the revoked key signed (and
+   that key's certificate) at once, so it never serves them from cache
+   afterwards; a node still on the old version may, but every node holding
+   the new version refuses that Data.
+Gap: revoking from an admin device other than the root device (the root key
+signs the bump, so the command runs where the root key is).
 
 ### F5 Lose an admin device
-As F4, plus: pending approvals signed by that device are refused after the
-bump. If it was the root device, continue with F8.
+As F4: `ndn-fwd revoke /<ns>/admin/<dev>` (**have**). Approvals are given on
+the CA host's management socket (`ca approve`), not signed by a device, so
+there are no device-signed approvals to refuse yet; when remote admin approval
+(F2 gap) exists, its approvals chain through the admin key and the bump
+refuses them like any other Data. If it was the root device, continue with F8.
 
 ### F6 Relay compromised
-1. Root bump: revoke `/<ns>/CA` cert and the node cert, add a new CA endpoint.
+1. Root bump: revoke the relay's node key (**have**: `ndn-fwd revoke
+   /<ns>/node/<name>`). Revoking `/<ns>/CA` and adding a new CA endpoint is a
+   **gap**: `revoke` refuses the CA's own key, since every device certificate
+   chains to it; replacing the CA needs F3's round trip first.
 2. Devices keep their certs (issued before compromise) unless the owner
    chooses to re-enroll everything; the UI asks.
 3. QUIC pins for that relay are dropped from the links peers configure to it.
@@ -252,7 +274,8 @@ the user's profile (see `ndn_security::secure_fs`).
 
 1. Generated schema + role naming in `init` and enrollment (F1, F2 roles) — **have**.
 2. `adopt` by fingerprint + `enroll` by invite (**have**) and remote admin approval (F2).
-3. `devices list|revoke` + context bump/publish (F4, F5).
+3. `revoke` + context bump/publish + pulled updates (F4, F5) — **have**;
+   `devices list` is still to build.
 4. Recovery kit formats + `recover` (F7, F8).
 5. CA delegation round trip (F3), then F6 tooling.
 6. Guest flow (F9), root rotation (F10).

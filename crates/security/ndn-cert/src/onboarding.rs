@@ -510,6 +510,21 @@ pub async fn fetch_context<E>(exchange: &mut E, namespace: &Name) -> Result<Data
 where
     E: CaExchange + ?Sized,
 {
+    let versioned = fetch_context_pointer(exchange, namespace).await?;
+    fetch_versioned_context(exchange, &versioned).await
+}
+
+/// Step 1–2 of [`fetch_context`]: ask for the newest version's name
+/// (`/<ns>/32=trust-context/32=metadata`, MustBeFresh) and return it, confined
+/// to `/<ns>/32=trust-context/v=<N>`. An updater compares `N` with the version
+/// it holds before fetching anything else.
+pub async fn fetch_context_pointer<E>(
+    exchange: &mut E,
+    namespace: &Name,
+) -> Result<Name, FetchContextError>
+where
+    E: CaExchange + ?Sized,
+{
     let meta_name = rdr_metadata_name(namespace);
     let meta = exchange
         .express(
@@ -531,8 +546,18 @@ where
         });
     }
     let content = meta.content().ok_or(FetchContextError::MetadataEmpty)?;
-    let versioned = context_pointer(namespace, content)?;
+    context_pointer(namespace, content)
+}
 
+/// Step 3 of [`fetch_context`]: fetch the context Data named exactly
+/// `versioned` (a [`context_pointer`]); a reply under another name is refused.
+pub async fn fetch_versioned_context<E>(
+    exchange: &mut E,
+    versioned: &Name,
+) -> Result<Data, FetchContextError>
+where
+    E: CaExchange + ?Sized,
+{
     let data = exchange
         .express(InterestBuilder::new(versioned.clone()).build())
         .await
@@ -540,7 +565,7 @@ where
             name: versioned.to_string(),
             source,
         })?;
-    if *data.name != versioned {
+    if *data.name != *versioned {
         return Err(FetchContextError::ContextName {
             expected: versioned.to_string(),
             found: data.name.to_string(),

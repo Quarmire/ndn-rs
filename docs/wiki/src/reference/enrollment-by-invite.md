@@ -44,7 +44,8 @@ approves the new key (`device-approval`). So a member token cannot be used to
 enroll as an existing device and publish under its name. The CA checks this
 before running the token challenge, so a refused request does not redeem the
 token: enroll again under another `--device` name, or revoke the old
-certificate first. Certifying the same key again is not refused. Of two
+key first ([`ndn-fwd revoke`](./revocation.md) on the root device frees the
+name). Certifying the same key again is not refused. Of two
 requests for one device name running at once, the CA reserves the name for
 the first before its challenge runs; the second is refused before its own
 challenge runs, so it spends no token either.
@@ -60,7 +61,7 @@ once it is, lifetimes can be shorter.
 |---|---|---|
 | 1 | CLI | reads the invite, derives `/<ns>/<role>/<device>` (device default: the host name, sanitized), sends `security/enroll` (Uri = invite, Name = identity, Flags bit 1 = force) over the daemon's Unix socket |
 | 2 | daemon mgmt | trust-admin gate: the peer credentials must be the daemon's user, root, or a `[security] trust_admin_groups` member; a `/localhop` enroll command is refused outright |
-| 3 | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`) |
+| 3 | daemon | refuses if its PIB already holds a valid certificate in `/<ns>` (unless `--force`); a certificate whose key the held context revokes does not count |
 | 4 | daemon | generates `/<ns>/<role>/<device>/KEY/<16 hex>` (Ed25519) in its PIB |
 | 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |

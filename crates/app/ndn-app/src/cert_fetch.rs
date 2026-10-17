@@ -14,16 +14,27 @@
 //! on the pipeline and drops a waiting Data at its original deadline; a cert's
 //! own Data is validated like any other, so resolving a chain costs at most one
 //! fetch per missing hop, bounded by the validator's max chain depth.
+//!
+//! Resolving a chain keeps several fetches in flight on the one face at once:
+//! the leaf cert's Data is itself parked until its issuer's cert is fetched.
+//! Each fetch therefore awaits its reply **by name**
+//! ([`DemuxConnection::fetch_correlated`]); a shared receive queue would hand
+//! the issuer's cert to the leaf fetch, which discards it as a straggler, and
+//! both fetches time out.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use ndn_engine::ForwarderEngine;
-use ndn_packet::Name;
+use ndn_packet::encode::InterestBuilder;
+use ndn_packet::lp::{LpPacket, is_lp_packet};
+use ndn_packet::{Data, Name};
 use ndn_security::{CertCache, CertFetcher, FetchFn};
 use tokio_util::sync::CancellationToken;
 
-use crate::EngineAppExt;
+use crate::connection::Connection;
+use crate::{DemuxConnection, EngineAppExt};
 
 /// Upper bound on one certificate fetch, and the back-off before a failed
 /// name is fetched again.
@@ -31,13 +42,39 @@ pub const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// A [`FetchFn`] that expresses each cert Interest through `engine` on one
 /// in-process app face (tied to `cancel`). Concurrent fetches share the face;
-/// replies are demultiplexed by name.
+/// each reply (Data or Nack) is routed to its fetch by name.
 pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> FetchFn {
-    let node = Arc::new(engine.app_node(cancel));
+    let demux = DemuxConnection::new(engine.app_face(cancel));
+    // Every fetch on this face awaits its reply by name, so what is left — a
+    // reply arriving after its fetch gave up — has no reader: drain it rather
+    // than let it pile up. Ends when the face closes.
+    let unclaimed = Arc::clone(&demux);
+    crate::rt::spawn(async move { while unclaimed.recv().await.is_some() {} });
     Arc::new(move |name: Name| {
-        let node = Arc::clone(&node);
-        Box::pin(async move { node.fetch(name).await.ok() })
+        let demux = Arc::clone(&demux);
+        Box::pin(async move {
+            let wire = InterestBuilder::new(name.clone())
+                .lifetime(CERT_FETCH_TIMEOUT)
+                .build();
+            let reply = demux
+                .fetch_correlated(name, wire, CERT_FETCH_TIMEOUT)
+                .await
+                .ok()?;
+            reply_data(reply)
+        })
     })
+}
+
+/// The Data in a correlated reply; `None` for a Nack.
+fn reply_data(reply: Bytes) -> Option<Data> {
+    if !is_lp_packet(&reply) {
+        return Data::decode(reply).ok();
+    }
+    let lp = LpPacket::decode(reply).ok()?;
+    if lp.nack.is_some() {
+        return None;
+    }
+    Data::decode(lp.fragment?).ok()
 }
 
 /// A [`CertFetcher`] over `engine` that fills `cache` (normally the cache of

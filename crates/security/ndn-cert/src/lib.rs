@@ -11,6 +11,7 @@ pub mod ca;
 pub mod challenge;
 pub mod client;
 pub mod context_store;
+pub mod context_update;
 pub mod ecdh;
 pub mod error;
 pub mod invite;
@@ -25,7 +26,7 @@ pub mod tlv;
 pub use attestation::{
     ATTESTATION_DESCRIPTION_KEY, AttestationSet, ChallengeAttestation, Combinator,
 };
-pub use ca::{CaConfig, CaState};
+pub use ca::{CaConfig, CaRevocation, CaState};
 pub use store::{CaSnapshot, CaStore, FileCaStore};
 pub use challenge::email::{EmailChallenge, EmailSender};
 pub use challenge::nop::NopChallenge;
@@ -40,7 +41,11 @@ pub use ecdh::{EcdhKeypair, SessionKey};
 pub use error::CertError;
 pub use context_store::{
     ContextStoreError, adopt_envelope_into_store, context_file_path, load_persisted_contexts,
-    persist_context, read_stored_contexts,
+    persist_context, read_stored_context, read_stored_contexts,
+};
+pub use context_update::{
+    BumpError, ContextBump, ContextRefresh, ContextUpdate, RefreshError, UpdateRefusal,
+    bump_context_revoking, key_name_of, open_context_update, refresh_context,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
@@ -54,7 +59,8 @@ pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL,
     FetchContextError, LinkAdoption, adopt_anchor_envelope, adopt_anchor_link,
     adopt_unsigned_legacy_with_tofu, adopt_with_tofu, anchor_fingerprint, context_pointer,
-    fetch_context, open_signed_context, rdr_metadata_name, rdr_prefix,
+    fetch_context, fetch_context_pointer, fetch_versioned_context, open_signed_context,
+    rdr_metadata_name, rdr_prefix,
 };
 pub use policy::{
     AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,

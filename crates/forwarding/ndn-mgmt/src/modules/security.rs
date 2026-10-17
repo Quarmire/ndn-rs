@@ -283,6 +283,12 @@ impl MgmtModule for SecurityModule {
         if verb == verb::ENROLL {
             return security_enroll(params, ctx.trust_context_handler);
         }
+        if verb == verb::REVOKE {
+            return security_revoke(params, ctx.trust_context_handler);
+        }
+        if verb == verb::CONTEXT_REFRESH {
+            return security_context_refresh(params, ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -390,6 +396,74 @@ fn security_enroll(
             },
             Err(refusal) => ControlResponse::error(refusal.status_code, refusal.reason),
         }
+    }))
+}
+
+/// The JSON answer of a deferred trust-admin verb.
+fn json_answer<T: serde::Serialize>(
+    result: Result<T, crate::TrustRefusal>,
+) -> ControlResponse {
+    match result {
+        Ok(info) => match serde_json::to_string(&info) {
+            Ok(json) => ControlResponse::ok_empty(json),
+            Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
+        },
+        Err(refusal) => ControlResponse::error(refusal.status_code, refusal.reason),
+    }
+}
+
+/// `security/revoke`: revoke the device identity, key or certificate in
+/// `ControlParameters.name` — at this node's CA and in a new, root-signed
+/// version of the namespace's trust context (root device only). Already
+/// authorized by the trust-admin peer-credential gate (and refused over
+/// `/localhop`). Answered deferred. Success: `200` with
+/// [`crate::RevokedInfo`] as JSON status text.
+fn security_revoke(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not revoke at runtime: run `ndn-fwd revoke` against the ndn-fwd \
+             daemon on the namespace's root device",
+        )
+        .into();
+    };
+    let Some(name) = params.name else {
+        return ControlResponse::error(
+            status::BAD_PARAMS,
+            "revoke needs the device identity, key or certificate name in Name",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move {
+        json_answer(backend.revoke(name).await)
+    }))
+}
+
+/// `security/context-refresh`: check the held trust context of the
+/// namespace in `ControlParameters.name` (every held one when absent) for a
+/// newer version, and adopt, store and publish it if the held version's root
+/// signed it. Already authorized by the trust-admin peer-credential gate (and
+/// refused over `/localhop`). Answered deferred. Success: `200` with a JSON
+/// list of [`crate::ContextRefreshInfo`] as status text.
+fn security_context_refresh(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not refresh trust contexts at runtime: run `ndn-fwd context \
+             refresh` against an ndn-fwd daemon",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move {
+        json_answer(backend.refresh_contexts(params.name).await)
     }))
 }
 #[cfg(test)]
@@ -677,10 +751,24 @@ mod security_v1_handler_tests {
         assert_eq!(refused(security_context_adopt(params, None)), status::NOT_FOUND);
         let params = ControlParameters {
             uri: Some("ndn-trust://invite/x".into()),
-            name: Some(identity),
+            name: Some(identity.clone()),
             ..Default::default()
         };
         assert_eq!(refused(security_enroll(params, None)), status::NOT_FOUND);
+
+        // revoke: needs a name, and a backend (the root device's daemon).
+        let no_name = ControlParameters::default();
+        assert_eq!(refused(security_revoke(no_name, Some(&backend))), status::BAD_PARAMS);
+        let params = ControlParameters {
+            name: Some(identity),
+            ..Default::default()
+        };
+        assert_eq!(refused(security_revoke(params, None)), status::NOT_FOUND);
+        // context-refresh: every held namespace when no name; needs a backend.
+        assert_eq!(
+            refused(security_context_refresh(ControlParameters::default(), None)),
+            status::NOT_FOUND
+        );
     }
 }
 

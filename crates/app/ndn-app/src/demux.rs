@@ -69,21 +69,26 @@ fn route(serves: &Serves, pkt: &Bytes) -> Option<mpsc::UnboundedSender<Bytes>> {
         .map(|(_, tx)| tx.clone())
 }
 
-/// Decode the name of an inbound Data packet (unwrapping an NDNLP fragment if
-/// present). Returns `None` for non-Data (Nacks, Interests) — those fall back.
-fn data_name(pkt: &Bytes) -> Option<Name> {
-    let raw = if is_lp_packet(pkt) {
-        LpPacket::decode(pkt.clone()).ok()?.fragment?
-    } else {
-        pkt.clone()
-    };
-    Data::decode(raw).ok().map(|d| (*d.name).clone())
+/// The name an inbound reply answers: a Data's own name (unwrapping an NDNLP
+/// fragment if present), or for an NDNLP Nack the name of the Interest it
+/// encloses. `None` for anything else (Interests, idle LP frames) — those fall
+/// back.
+fn reply_name(pkt: &Bytes) -> Option<Name> {
+    if !is_lp_packet(pkt) {
+        return Data::decode(pkt.clone()).ok().map(|d| (*d.name).clone());
+    }
+    let lp = LpPacket::decode(pkt.clone()).ok()?;
+    let fragment = lp.fragment?;
+    if lp.nack.is_some() {
+        return Interest::decode(fragment).ok().map(|i| (*i.name).clone());
+    }
+    Data::decode(fragment).ok().map(|d| (*d.name).clone())
 }
 
-/// If `pkt` is a Data whose name matches a registered waiter, take that waiter's
-/// sender (removing it). Otherwise `None` so the packet falls back.
+/// If `pkt` is a Data or Nack answering a registered waiter, take that
+/// waiter's sender (removing it). Otherwise `None` so the packet falls back.
 fn route_data(pending: &Pending, pkt: &Bytes) -> Option<oneshot::Sender<Bytes>> {
-    let name = data_name(pkt)?;
+    let name = reply_name(pkt)?;
     pending.lock().unwrap().remove(&name)
 }
 
@@ -124,7 +129,8 @@ impl DemuxConnection {
     /// caller by name so concurrent fetches over the one connection never steal
     /// each other's replies (the bare `recv` FIFO does). `expected` is the full
     /// Interest name including any `ParametersSha256Digest`, which the responder
-    /// echoes as the Data name. Returns the raw reply wire (Data, possibly NDNLP).
+    /// echoes as the Data name. Returns the raw reply wire: the Data (possibly
+    /// NDNLP-wrapped), or the NDNLP Nack of the Interest named `expected`.
     pub async fn fetch_correlated(
         &self,
         expected: Name,

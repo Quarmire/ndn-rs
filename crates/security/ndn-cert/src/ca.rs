@@ -698,20 +698,66 @@ impl CaState {
             return REVOKE_STATUS_UNAUTHORIZED;
         }
 
-        // Revoke in memory even if the write fails: the CA must refuse the
-        // cert now; the error flags that a restart would forget it.
-        if !self.is_revoked(&cert_uri)
-            && let Some(store) = &self.store
-            && let Err(e) = store.record_revoked(&cert_uri)
-        {
+        if let Err(e) = self.mark_revoked(cert_uri, &cert_name) {
             tracing::error!(
-                cert = %cert_uri, error = %e,
+                cert = %cert_name, error = %e,
                 "CA could not persist revocation; it will be lost on restart"
             );
         }
-        self.revoked.insert(cert_uri);
-        self.manager.cert_cache().remove(&cert_name);
         REVOKE_STATUS_REVOKED
+    }
+
+    /// Revoke `cert_name` (canonical URI `cert_uri`): refused on cert-fetch
+    /// from now on, and no longer holding its identity under a single-key
+    /// rule. Applied in memory even if the store write fails — the CA must
+    /// refuse the cert now; the error says a restart would forget it.
+    fn mark_revoked(&self, cert_uri: String, cert_name: &ndn_packet::Name) -> Result<(), CertError> {
+        let persisted = match &self.store {
+            Some(store) if !self.is_revoked(&cert_uri) => store.record_revoked(&cert_uri),
+            _ => Ok(()),
+        };
+        self.revoked.insert(cert_uri);
+        self.manager.cert_cache().remove(cert_name);
+        persisted
+    }
+
+    /// The certificates this CA issued under `prefix` (an identity, a key
+    /// name or a certificate name), its own excepted, each with whether it
+    /// is revoked.
+    pub fn issued_under(&self, prefix: &ndn_packet::Name) -> Vec<(ndn_packet::Name, bool)> {
+        let own = self.signing_key_name();
+        let mut issued: Vec<_> = self
+            .served_certs
+            .iter()
+            .filter_map(|entry| {
+                let name: ndn_packet::Name = entry.key().parse().ok()?;
+                (name.has_prefix(prefix) && own.as_ref() != Some(&name))
+                    .then(|| (name, self.is_revoked(entry.key())))
+            })
+            .collect();
+        issued.sort_by_key(|(name, _)| name.to_string());
+        issued
+    }
+
+    /// Revoke, as this CA's operator, every certificate it issued under
+    /// `prefix` — a key name covers each certificate of that key. No
+    /// possession proof: this is the CA host's own administration (its
+    /// local management socket decides who may ask), not the network
+    /// `REVOKE` endpoint. Afterwards the CA no longer serves those
+    /// certificates, and a single-key identity they held is free for a new
+    /// key. Already revoked certificates are skipped.
+    pub fn revoke_issued_under(&self, prefix: &ndn_packet::Name) -> CaRevocation {
+        let mut outcome = CaRevocation::default();
+        for (name, already) in self.issued_under(prefix) {
+            if already {
+                continue;
+            }
+            if let Err(e) = self.mark_revoked(name.to_string(), &name) {
+                outcome.not_persisted.get_or_insert(e);
+            }
+            outcome.revoked.push(name);
+        }
+        outcome
     }
 
     /// Mint, persist and serve the certificate for an approved request.
@@ -859,6 +905,16 @@ fn generate_request_id_bytes() -> [u8; 8] {
     let mut bytes = [0u8; 8];
     let _ = getrandom::getrandom(&mut bytes);
     bytes
+}
+
+/// What [`CaState::revoke_issued_under`] revoked.
+#[derive(Debug, Default)]
+pub struct CaRevocation {
+    /// Certificates newly revoked (refused on cert-fetch from now on).
+    pub revoked: Vec<ndn_packet::Name>,
+    /// The first store write that failed: those revocations hold in memory
+    /// only, until the CA restarts.
+    pub not_persisted: Option<CertError>,
 }
 
 /// A single-key identity reserved by a running challenge; released on drop.

@@ -605,6 +605,11 @@ impl EngineBuilder {
         }
 
         let engine_validator = validator.clone();
+        // Cached Data a newly revoked key signed leaves the CS when the
+        // revoking context version is adopted (nothing on the hit path).
+        if let Some(v) = &engine_validator {
+            crate::revocation_purge::install(v, &cs, Arc::clone(&runtime));
+        }
 
         // Persistent-attach (subscription Interest) validation is separate from
         // data-path validation. A forwarder whose data validation is `Disabled`
@@ -780,6 +785,7 @@ impl EngineBuilder {
                     .admission
                     .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
                 admit_unverified: self.config.cs_admit_unverified,
+                validator: engine_validator.clone(),
             },
             unsolicited_policy: self.config.unsolicited_data,
             channel_cap: self.config.pipeline_channel_cap,

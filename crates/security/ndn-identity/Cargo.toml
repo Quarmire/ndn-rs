@@ -33,6 +33,7 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 ndn-engine    = { workspace = true }
 ndn-face     = { workspace = true }
 ndn-transport = { workspace = true }
+tempfile      = "3"
 
 [lints]
 workspace = true

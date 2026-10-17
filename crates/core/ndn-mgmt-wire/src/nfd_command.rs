@@ -115,10 +115,11 @@ pub mod verb {
     pub const POLICY_SET: &[u8] = b"policy-set";
     pub const VALIDATION_STATS: &[u8] = b"validation-stats";
     pub const VALIDATE: &[u8] = b"validate";
-    /// `security/context-adopt` — adopt a network from an `ndn-trust://anchor`
-    /// link carried in `ControlParameters.uri` (inline context, or fetched by
-    /// name when the link carries only the expected fingerprint). Authorized
-    /// by the peer credentials of the local management socket.
+    /// `security/context-adopt` — adopt a namespace's trust context from an
+    /// `ndn-trust://anchor` link carried in `ControlParameters.uri` (inline
+    /// context, or fetched by name when the link carries only the expected
+    /// fingerprint). Authorized by the peer credentials of the local
+    /// management socket.
     pub const CONTEXT_ADOPT: &[u8] = b"context-adopt";
     /// `security/enroll` — enroll this node with the CA an `ndn-trust://invite`
     /// link (in `ControlParameters.uri`) names: the daemon generates the key
@@ -131,6 +132,17 @@ pub mod verb {
     pub const ENROLL: &[u8] = b"enroll";
     /// `security/enroll` flag bit: enroll although already enrolled.
     pub const ENROLL_FORCE: u64 = 1;
+    /// `security/revoke` — on the root device: revoke the device identity,
+    /// key or certificate in `ControlParameters.name` at this node's CA and
+    /// in a new version of the namespace's trust context, signed by the root
+    /// key from the PIB, stored and published. Authorized like
+    /// [`CONTEXT_ADOPT`].
+    pub const REVOKE: &[u8] = b"revoke";
+    /// `security/context-refresh` — check the held trust context of the
+    /// namespace in `ControlParameters.name` (every held one when absent) for
+    /// a newer version and adopt it if the held version's root signed it.
+    /// Authorized like [`CONTEXT_ADOPT`].
+    pub const CONTEXT_REFRESH: &[u8] = b"context-refresh";
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

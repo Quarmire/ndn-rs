@@ -1591,14 +1591,27 @@ pub struct SecurityConfig {
     /// the daemon's user and root.
     #[serde(default)]
     pub trust_admin_groups: Vec<String>,
+
+    /// How often, in seconds, the daemon checks each trust context it holds
+    /// for a newer version (`/<ns>/32=trust-context/32=metadata`, fetched
+    /// upstream) and adopts one signed by the held version's root — how a
+    /// revocation reaches this node. `0` disables the periodic check
+    /// (`ndn-fwd context refresh` still works). A missed check only delays
+    /// an update; it never weakens what is accepted. Default 300.
+    #[serde(default = "default_context_refresh_secs")]
+    pub context_refresh_secs: u64,
 }
 
 fn default_serve_contexts() -> bool {
     true
 }
 
-/// An absent `[security]` block: zero values, except `serve_contexts`, which
-/// defaults on as it does in TOML.
+fn default_context_refresh_secs() -> u64 {
+    300
+}
+
+/// An absent `[security]` block: zero values, except `serve_contexts` and
+/// `context_refresh_secs`, which default as they do in TOML.
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -1619,6 +1632,7 @@ impl Default for SecurityConfig {
             mgmt: MgmtSecurityConfig::default(),
             serve_contexts: default_serve_contexts(),
             trust_admin_groups: Vec::new(),
+            context_refresh_secs: default_context_refresh_secs(),
         }
     }
 }

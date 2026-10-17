@@ -54,6 +54,10 @@ pub struct CsStats {
     pub evictions: u64,
 }
 
+/// A predicate over a cached Data's wire bytes (see
+/// [`ContentStore::evict_matching`]).
+pub type CsEntryFilter = dyn Fn(&Bytes) -> bool + Send + Sync;
+
 /// Content store interface. Methods are `async` so persistent (disk-backed)
 /// implementations are supported; in-memory ones complete synchronously.
 pub trait ContentStore: Send + Sync + 'static {
@@ -111,6 +115,16 @@ pub trait ContentStore: Send + Sync + 'static {
         async { 0 }
     }
 
+    /// Evict every entry named under `prefix` whose Data wire satisfies
+    /// `matches`; returns how many were evicted. Scans that subtree and
+    /// may decode each entry: for rare events (a signing key revoked), never
+    /// the forwarding path. An entry replaced while it is judged is kept.
+    fn evict_matching(
+        &self,
+        prefix: &Name,
+        matches: &CsEntryFilter,
+    ) -> impl Future<Output = usize> + Send;
+
     fn stats(&self) -> CsStats {
         CsStats::default()
     }
@@ -140,6 +154,12 @@ pub trait ErasedContentStore: Send + Sync + 'static {
         &'a self,
         prefix: &'a Name,
         limit: Option<usize>,
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
+
+    fn evict_matching_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        matches: &'a CsEntryFilter,
     ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
 
     fn capacity(&self) -> CsCapacity;
@@ -185,6 +205,14 @@ impl<T: ContentStore> ErasedContentStore for T {
         limit: Option<usize>,
     ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
         Box::pin(self.evict_prefix(prefix, limit))
+    }
+
+    fn evict_matching_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        matches: &'a CsEntryFilter,
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+        Box::pin(self.evict_matching(prefix, matches))
     }
 
     fn capacity(&self) -> CsCapacity {
@@ -269,6 +297,9 @@ impl ContentStore for NullCs {
     }
     async fn evict(&self, _: &Name) -> bool {
         false
+    }
+    async fn evict_matching(&self, _: &Name, _: &CsEntryFilter) -> usize {
+        0
     }
     fn capacity(&self) -> CsCapacity {
         CsCapacity::zero()

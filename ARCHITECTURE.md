@@ -598,11 +598,16 @@ as an LVS blob plus a native-text blob, OR'd (a context may carry several
 (`SignedTrustContext::schema_authoritative`, flag TLV `0x041C`): no hierarchy
 floor, and the chain walk checks the schema on every certificate hop, not only
 the first signature. The chain walk
-also honours a context's `revocations`, so an issuing-CA compromise is
-contained by a pulled context bump (no re-bootstrap). Fleet nodes receive those
-bumps via `ndn_identity::context_sync`, which carries the context's own
-`encode_content()` bytes over SVS (revocations, enrollment hint and schema blobs
-verbatim) and adopts them into the `Keyring`.
+also honours a context's `revocations` (a revoked key name covers every
+certificate of that key), so a device or issuing-CA compromise is contained by
+a context bump signed by the root (`ndn-fwd revoke`, no re-bootstrap). Nodes
+receive bumps by pulling (`ndn_cert::refresh_context`: RDR metadata, then the
+signed context Data; `ndn-fwd` runs it every `[security] context_refresh_secs`
+and republishes what it adopts, so updates travel hop by hop) or by push over
+SVS (`ndn_identity::context_sync`, which carries the same signed Data). Both
+adopt an update only under the continuity rule
+(`ndn_cert::open_context_update`): signed by an anchor of the held version and
+strictly newer.
 
 ## Routing
 

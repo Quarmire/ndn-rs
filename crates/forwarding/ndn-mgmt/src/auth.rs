@@ -250,10 +250,10 @@ pub(crate) async fn authorize_command(
 }
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
-/// (adopting a trust context, enrolling). Instead of the signed-command gate
-/// they require the caller to be a local trust administrator — see
-/// [`authorize_trust_admin`] — and they are refused over `/localhop`. Add
-/// every future trust-mutating verb here.
+/// (adopting, refreshing a trust context, enrolling, revoking). Instead of
+/// the signed-command gate they require the caller to be a local trust
+/// administrator — see [`authorize_trust_admin`] — and they are refused over
+/// `/localhop`. Add every future trust-mutating verb here.
 const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
@@ -262,6 +262,14 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::ENROLL,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::REVOKE,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::CONTEXT_REFRESH,
     ),
 ];
 
@@ -525,6 +533,8 @@ mod trust_admin_tests {
     fn trust_admin_verb_table() {
         assert!(is_trust_admin_verb(b"security", b"context-adopt"));
         assert!(is_trust_admin_verb(b"security", b"enroll"));
+        assert!(is_trust_admin_verb(b"security", b"revoke"));
+        assert!(is_trust_admin_verb(b"security", b"context-refresh"));
         assert!(!is_trust_admin_verb(b"security", b"ca-enroll"));
         assert!(!is_trust_admin_verb(b"security", b"anchor-list"));
         assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));

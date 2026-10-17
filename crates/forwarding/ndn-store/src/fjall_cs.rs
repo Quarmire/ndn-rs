@@ -17,7 +17,7 @@ use ndn_packet::{Interest, Name};
 use crate::cs_keycodec::{
     STALE_AT_LEN, decode_value, encode_value, key_to_name, name_to_key, now_ns,
 };
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
+use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
 /// Persistent CS. `max_bytes` bounds *logical* Data bytes (excludes LSM
 /// overhead); data survives process restarts.
@@ -255,6 +255,36 @@ impl ContentStore for FjallCs {
             let _ = self.keyspace.remove(key.as_slice());
             self.current_bytes.fetch_sub(*data_len, Ordering::Relaxed);
             self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        evicted
+    }
+
+    async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
+        let prefix_key = name_to_key(prefix);
+        let victims: Vec<(Vec<u8>, Bytes)> = self
+            .keyspace
+            .prefix(&prefix_key)
+            .filter_map(|guard| {
+                let (key, val) = guard.into_inner().ok()?;
+                let (_, data) = decode_value(&val)?;
+                matches(&data).then(|| (key.to_vec(), data))
+            })
+            .collect();
+        let mut evicted = 0;
+        for (key, data) in victims {
+            // Kept if replaced since it was judged.
+            let still = self
+                .keyspace
+                .get(&key)
+                .ok()
+                .flatten()
+                .and_then(|val| decode_value(&val))
+                .is_some_and(|(_, now)| now == data);
+            if still && self.keyspace.remove(key.as_slice()).is_ok() {
+                self.current_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                evicted += 1;
+            }
         }
         evicted
     }

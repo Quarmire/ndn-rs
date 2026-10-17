@@ -23,6 +23,12 @@
 //! second time. Expectations end when the adopter finishes or drops its guard,
 //! or at their deadline, whichever comes first; an expired expectation admits
 //! nothing.
+//!
+//! An **update** of a held context is expected the same way
+//! ([`Validator::expect_context_update`]), with the fingerprints of the held
+//! version's anchors instead of one from an invite: the update must be signed
+//! by a root this node already trusts (continuity), never merely by an anchor
+//! it lists itself.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,9 +50,20 @@ pub(super) struct Expectation {
     /// Unique per registration, so a guard withdraws only its own.
     id: u64,
     namespace: Name,
-    expected_fingerprint: [u8; 32],
+    /// Fingerprints of the anchors whose signature admits a context.
+    expected_fingerprints: Vec<[u8; 32]>,
+    purpose: Purpose,
     deadline: Instant,
     outcome: ExpectationOutcome,
+}
+
+/// Why a context is expected; decides only how a refusal is worded.
+#[derive(Clone, Copy)]
+enum Purpose {
+    /// First contact: the fingerprint comes from an invite/QR.
+    Adoption,
+    /// An update of a held context: the fingerprints are its anchors'.
+    Update { held_version: u64 },
 }
 
 /// Source of [`Expectation::id`].
@@ -79,8 +96,8 @@ pub struct AdmittedContext {
 #[derive(Debug, thiserror::Error)]
 pub enum ExpectContextError {
     #[error(
-        "an adoption of {0} is already in progress on this node; wait for it to finish \
-         (it ends by itself within its timeout) and retry"
+        "an adoption or update of {0}'s trust context is already in progress on this node; \
+         wait for it to finish (it ends by itself within its timeout) and retry"
     )]
     AlreadyExpected(String),
 }
@@ -131,6 +148,48 @@ impl Validator {
         expected_fingerprint: [u8; 32],
         ttl: Duration,
     ) -> Result<ContextExpectation<'_>, ExpectContextError> {
+        self.register_expectation(namespace, vec![expected_fingerprint], Purpose::Adoption, ttl)
+    }
+
+    /// Expect an **update** of the held context `held`: while the guard
+    /// lives, a Data named `<namespace>/32=trust-context/v=<N>` is admitted
+    /// only if it is a self-consistent context of that namespace signed by a
+    /// key that is an anchor of `held` (continuity: an update is authorized
+    /// by the version it replaces, not by anchors it lists itself), and
+    /// refused with a recorded reason otherwise. The version rule (strictly
+    /// newer than `held`) is the updater's, which sees the fetched Data.
+    ///
+    /// Needed where this validator does not hold `held` itself (an app's
+    /// embedded engine keeps contexts in its own keyring), and so that a
+    /// refused update is reported with its reason rather than as a timeout.
+    /// One expectation per namespace, as [`expect_context`](Self::expect_context).
+    pub fn expect_context_update(
+        &self,
+        held: &SignedTrustContext,
+        ttl: Duration,
+    ) -> Result<ContextExpectation<'_>, ExpectContextError> {
+        let fingerprints = held
+            .anchors()
+            .iter()
+            .map(|r| anchor_fingerprint(r.value()))
+            .collect();
+        self.register_expectation(
+            held.namespace().clone(),
+            fingerprints,
+            Purpose::Update {
+                held_version: held.version(),
+            },
+            ttl,
+        )
+    }
+
+    fn register_expectation(
+        &self,
+        namespace: Name,
+        expected_fingerprints: Vec<[u8; 32]>,
+        purpose: Purpose,
+        ttl: Duration,
+    ) -> Result<ContextExpectation<'_>, ExpectContextError> {
         let mut list = self
             .expectations
             .lock()
@@ -144,7 +203,8 @@ impl Validator {
         list.push(Expectation {
             id,
             namespace: namespace.clone(),
-            expected_fingerprint,
+            expected_fingerprints,
+            purpose,
             deadline: now + ttl,
             outcome: ExpectationOutcome::default(),
         });
@@ -189,7 +249,7 @@ impl Validator {
             return None;
         }
         let namespace = context_namespace_of(&data.name)?;
-        let expected = {
+        let (expected, purpose) = {
             let mut list = self
                 .expectations
                 .lock()
@@ -197,9 +257,8 @@ impl Validator {
             let now = Instant::now();
             list.retain(|e| e.deadline > now);
             self.expecting.store(!list.is_empty(), Ordering::Release);
-            list.iter()
-                .find(|e| e.namespace == namespace)?
-                .expected_fingerprint
+            let e = list.iter().find(|e| e.namespace == namespace)?;
+            (e.expected_fingerprints.clone(), e.purpose)
         };
         let refused = |reason: String| {
             self.record(&namespace, |o| o.refused = Some(reason.clone()));
@@ -212,12 +271,20 @@ impl Validator {
             Ok(opened) => opened,
             Err(e) => return refused(e.to_string()),
         };
-        if anchor_fingerprint(&anchor) != expected {
-            return refused(format!(
-                "it is signed by {}, whose fingerprint is not the expected fingerprint \
-                 from the invite/QR",
-                anchor.name
-            ));
+        if !expected.contains(&anchor_fingerprint(&anchor)) {
+            return refused(match purpose {
+                Purpose::Adoption => format!(
+                    "it is signed by {}, whose fingerprint is not the expected fingerprint \
+                     from the invite/QR",
+                    anchor.name
+                ),
+                Purpose::Update { held_version } => format!(
+                    "it is signed by {}, which is not an anchor of the held version \
+                     v{held_version} (an update must be signed by the root this node already \
+                     trusts)",
+                    anchor.name
+                ),
+            });
         }
         let Ok(inner) = Data::decode(data.raw().clone()) else {
             return refused("Data does not re-decode".into());

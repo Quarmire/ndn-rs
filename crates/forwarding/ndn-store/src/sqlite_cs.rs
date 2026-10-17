@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use ndn_packet::{Interest, Name};
 
 use crate::cs_keycodec::{name_to_key, now_ns, prefix_upper_bound};
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, InsertResult};
+use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
 /// Persistent CS backed by bundled SQLite. `max_bytes` bounds *logical* Data
 /// bytes (the `data` column; excludes SQLite page overhead); rows survive
@@ -373,6 +373,68 @@ impl ContentStore for SqliteCs {
                 .is_ok()
             {
                 self.current_bytes.fetch_sub(*data_len, Ordering::Relaxed);
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
+        let prefix_key = name_to_key(prefix);
+        let upper = prefix_upper_bound(&prefix_key);
+        // Judge a snapshot outside the lock (the filter may decode every
+        // row), then delete the rows still holding the judged bytes.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+            let Ok(conn) = self.conn.lock() else {
+                return 0;
+            };
+            let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(Vec<u8>, Vec<u8>)> {
+                Ok((r.get(0)?, r.get(1)?))
+            };
+            let collected = match &upper {
+                Some(upper) => conn
+                    .prepare("SELECT key, data FROM cs WHERE key >= ?1 AND key < ?2")
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map(
+                                rusqlite::params![prefix_key.as_slice(), upper.as_slice()],
+                                read,
+                            )?
+                            .collect::<rusqlite::Result<Vec<_>>>();
+                        rows
+                    }),
+                None => conn
+                    .prepare("SELECT key, data FROM cs WHERE key >= ?1")
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map([prefix_key.as_slice()], read)?
+                            .collect::<rusqlite::Result<Vec<_>>>();
+                        rows
+                    }),
+            };
+            collected.unwrap_or_default()
+        };
+        let victims: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, data)| matches(&Bytes::copy_from_slice(data)))
+            .collect();
+        if victims.is_empty() {
+            return 0;
+        }
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        let mut evicted = 0;
+        for (key, data) in &victims {
+            let deleted = conn
+                .execute(
+                    "DELETE FROM cs WHERE key = ?1 AND data = ?2",
+                    rusqlite::params![key.as_slice(), data.as_slice()],
+                )
+                .unwrap_or(0);
+            if deleted == 1 {
+                self.current_bytes.fetch_sub(data.len(), Ordering::Relaxed);
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
                 evicted += 1;
             }

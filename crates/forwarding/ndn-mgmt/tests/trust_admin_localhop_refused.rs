@@ -1,7 +1,8 @@
 //! Invariant: a trust-changing verb (`security/context-adopt`,
-//! `security/enroll`) arriving over `/localhop` never reaches the trust-admin
-//! backend, even when it is signed by a key the localhop validator accepts.
-//! Trust changes are accepted only on the node's local management socket.
+//! `security/enroll`, `security/revoke`, `security/context-refresh`)
+//! arriving over `/localhop` never reaches the trust-admin backend, even when
+//! it is signed by a key the localhop validator accepts. Trust changes are
+//! accepted only on the node's local management socket.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,8 +12,8 @@ use ndn_config::{ControlParameters, ControlResponse};
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::{InProcFace, InProcHandle};
 use ndn_mgmt::{
-    AdoptedContextInfo, EnrollOutcome, EnrollRequest, MgmtHandles, TrustAdminMgmtBackend,
-    TrustRefusal, mount_management,
+    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, MgmtHandles,
+    RevokedInfo, TrustAdminMgmtBackend, TrustRefusal, mount_management,
 };
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name};
@@ -41,6 +42,25 @@ impl TrustAdminMgmtBackend for CountingBackend {
     }
 
     async fn enroll(&self, _request: EnrollRequest) -> Result<EnrollOutcome, TrustRefusal> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(TrustRefusal {
+            status_code: 500,
+            reason: "backend reached".into(),
+        })
+    }
+
+    async fn revoke(&self, _name: Name) -> Result<RevokedInfo, TrustRefusal> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(TrustRefusal {
+            status_code: 500,
+            reason: "backend reached".into(),
+        })
+    }
+
+    async fn refresh_contexts(
+        &self,
+        _namespace: Option<Name>,
+    ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(TrustRefusal {
             status_code: 500,
@@ -165,6 +185,17 @@ async fn localhop_trust_admin_verbs_never_run() {
     };
     let cr = send_localhop(&app_handle, &signer, &key_name, b"enroll", &enroll).await;
     assert_eq!(cr.status_code, 403, "localhop enroll: {:?}", cr.status_text);
+
+    let revoke = ControlParameters {
+        name: Some("/home/member/phone".parse().unwrap()),
+        ..Default::default()
+    };
+    let cr = send_localhop(&app_handle, &signer, &key_name, b"revoke", &revoke).await;
+    assert_eq!(cr.status_code, 403, "localhop revoke: {:?}", cr.status_text);
+
+    let refresh = ControlParameters::default();
+    let cr = send_localhop(&app_handle, &signer, &key_name, b"context-refresh", &refresh).await;
+    assert_eq!(cr.status_code, 403, "localhop context-refresh: {:?}", cr.status_text);
 
     assert_eq!(
         backend.calls.load(Ordering::SeqCst),

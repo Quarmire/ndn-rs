@@ -176,6 +176,12 @@ impl NdncertCa {
         &self.prefix
     }
 
+    /// The CA's state, shared with the running service: its host
+    /// administers it directly (e.g. [`CaState::revoke_issued_under`]).
+    pub fn state(&self) -> Arc<CaState> {
+        Arc::clone(&self.state)
+    }
+
     /// Run the `/CA/*` service and a canonical (validator-checked)
     /// [`ApprovalFeed`](crate::ApprovalFeed) concurrently, each until its
     /// connection closes. Use this instead of [`serve`](Self::serve) when the

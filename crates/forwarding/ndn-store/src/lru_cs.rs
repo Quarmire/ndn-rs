@@ -1,6 +1,6 @@
 use portable_atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult, NameTrie};
+use crate::{
+    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult, NameTrie,
+};
 
 /// In-memory LRU content store, bounded by total byte capacity. `get()` skips
 /// the Mutex via an atomic empty check so cache-cold paths are lock-free.
@@ -251,6 +253,43 @@ impl ContentStore for LruCs {
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
                 evicted += 1;
             }
+        }
+        evicted
+    }
+
+    async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
+        // Judge a snapshot outside the lock (the filter may decode every
+        // entry), then evict the entries still holding the judged bytes.
+        let candidates: Vec<(Arc<Name>, Bytes)> = {
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner
+                .prefix_index
+                .descendants(prefix)
+                .into_iter()
+                .filter_map(|name| {
+                    let data = inner.cache.peek(name.as_ref())?.data.clone();
+                    Some((name, data))
+                })
+                .collect()
+        };
+        let victims: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, data)| matches(data))
+            .collect();
+        if victims.is_empty() {
+            return 0;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut evicted = 0;
+        for (name, data) in victims {
+            if inner.cache.peek(name.as_ref()).is_none_or(|e| e.data != data) {
+                continue;
+            }
+            inner.cache.pop(name.as_ref());
+            inner.current_bytes = inner.current_bytes.saturating_sub(data.len());
+            inner.prefix_index.remove(name.as_ref());
+            self.entry_count.fetch_sub(1, Ordering::Relaxed);
+            evicted += 1;
         }
         evicted
     }

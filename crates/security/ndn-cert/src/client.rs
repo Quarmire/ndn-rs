@@ -416,6 +416,27 @@ where
         .await
 }
 
+/// [`fetch_issued_cert`] steered to the CA at `ca_prefix` by a
+/// ForwardingHint. A forwarder that routes the device's own prefix toward the
+/// device — which serves its certificate once it holds one — would otherwise
+/// send this fetch to the device that is still waiting for it.
+pub async fn fetch_issued_cert_via<E>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    cert_name: &Name,
+) -> Result<Data, CertError>
+where
+    E: CaExchange + ?Sized,
+{
+    exchange
+        .express(
+            InterestBuilder::new(cert_name.clone())
+                .forwarding_hint(vec![ca_prefix.clone()])
+                .build(),
+        )
+        .await
+}
+
 /// Ask the CA at `ca_prefix` to revoke `cert_name` (NDNCERT 0.3
 /// `<ca-prefix>/CA/REVOKE`). `signer` proves the authority to revoke: it must
 /// be the revoked certificate's own key (its holder) or the CA's signing key.

@@ -77,6 +77,8 @@
 - [Trust-context publication (RDR)](./reference/trust-context-publication.md)
 - [Adopting a trust context (`ndn-fwd adopt`)](./reference/context-adoption.md)
 - [Enrolling with an invite (`ndn-fwd enroll`)](./reference/enrollment-by-invite.md)
+- [Revoking a device (`ndn-fwd revoke`)](./reference/revocation.md)
+- [Trust-context updates (`ndn-fwd context refresh`)](./reference/context-updates.md)
 - [Dashboard extensions](./reference/dashboard-extensions.md)
 - [Spec compliance](./reference/spec-compliance.md)
 

@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, PacketContext};
+use crate::revocation_purge;
 use ndn_packet::CachePolicyType;
+use ndn_security::Validator;
 use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
 
 use crate::stages::decode::LpCachePolicy;
@@ -52,6 +54,11 @@ pub struct CsInsertStage {
     ///
     /// This never admits Data a validator RAN and REJECTED, at any setting.
     pub admit_unverified: bool,
+    /// The validator whose keyring's revocations apply to Data validated
+    /// before a revoking trust-context update and inserted after it (the
+    /// update's CS purge cannot see Data not inserted yet). `None`: no
+    /// validator, so nothing was validated (`ctx.revocation_epoch` is `None`).
+    pub validator: Option<Arc<Validator>>,
 }
 
 impl CsInsertStage {
@@ -97,9 +104,37 @@ impl CsInsertStage {
             let stale_at = now_ns + freshness_ms * 1_000_000;
 
             let meta = CsMeta { stale_at };
+
+            // A revoking trust-context update may have been adopted since
+            // this Data was validated, and its CS purge ran before the Data
+            // got here. One atomic load while nothing is revoked; only when
+            // the epoch moved is the Data checked against the revocations.
+            let revocations = match (&self.validator, ctx.revocation_epoch) {
+                (Some(v), Some(validated_at)) => Some((v, validated_at)),
+                _ => None,
+            };
+            let mut checked_at = 0;
+            if let Some((v, validated_at)) = revocations {
+                checked_at = v.keyring().revocation_epoch();
+                if checked_at != validated_at && revocation_purge::revoked_now(v, data) {
+                    debug!(target: t::SECURITY, name=%data.name, "cs-insert: not admitted (key revoked since validation)");
+                    return Action::Satisfy(ctx);
+                }
+            }
+
             self.cs
                 .insert_erased(ctx.raw_bytes.clone(), data.name.clone(), meta)
                 .await;
+
+            // An update adopted during the insert: its purge may have scanned
+            // before the entry landed, but then this load sees its epoch.
+            if let Some((v, _)) = revocations
+                && v.keyring().revocation_epoch() != checked_at
+                && revocation_purge::evict_if_revoked(&*self.cs, v, &data.name).await > 0
+            {
+                debug!(target: t::SECURITY, name=%data.name, "cs-insert: evicted (key revoked during insert)");
+                return Action::Satisfy(ctx);
+            }
             trace!(target: t::FWD_CS, name=%data.name, freshness_ms, "cs-insert: cached");
         }
         Action::Satisfy(ctx)
@@ -142,6 +177,7 @@ mod tests {
             cs: Arc::clone(&cs) as Arc<dyn ndn_store::ErasedContentStore>,
             admission: Arc::new(AdmitAllPolicy),
             admit_unverified: false,
+            validator: None,
         };
         (stage, cs)
     }

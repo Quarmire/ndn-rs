@@ -36,6 +36,7 @@ pub mod rate_limit_hook;
 pub mod readvertise;
 pub mod reflexive;
 pub mod replay_guard_config;
+mod revocation_purge;
 pub mod rib;
 pub mod routing;
 #[cfg(not(target_arch = "wasm32"))]

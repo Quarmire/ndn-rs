@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsMeta, CsStats, InsertResult};
+use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult};
 
 /// Shards a `ContentStore` across N instances to reduce lock contention.
 /// Shard selection hashes the first name component so related content
@@ -89,6 +89,19 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
     async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
         let idx = self.shard_for(prefix);
         self.shards[idx].evict_prefix(prefix, limit).await
+    }
+
+    async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
+        // A non-empty prefix lives in one shard; the root spans them all.
+        if prefix.is_empty() {
+            let mut evicted = 0;
+            for shard in &self.shards {
+                evicted += shard.evict_matching(prefix, matches).await;
+            }
+            return evicted;
+        }
+        let idx = self.shard_for(prefix);
+        self.shards[idx].evict_matching(prefix, matches).await
     }
 
     fn stats(&self) -> CsStats {
