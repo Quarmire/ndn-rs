@@ -98,10 +98,10 @@ pub use validator::{
 };
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
-    ed25519_verify_batch,
+    ed25519_verify_batch, verify_by_sig_type,
 };
 #[cfg(feature = "yubikey-piv")]
-pub use yubikey::{YubikeyPiv, YubikeySlot};
+pub use yubikey::{YubikeyPinPolicy, YubikeyPiv, YubikeySlot, YubikeyTouchPolicy};
 
 pub use did::{
     DereferencedResource, DidController, DidDocument, DidDocumentMetadata, DidError,

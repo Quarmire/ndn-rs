@@ -1,9 +1,10 @@
 //! Changing a trust context after it was adopted.
 //!
 //! - **Bump** ([`bump_context_revoking`], root device only): version `N+1` of
-//!   the held context with keys added to its revocation list, signed by the
-//!   namespace root key from the PIB. Nothing else changes: anchors, schema,
-//!   CA endpoints and earlier revocations are carried over verbatim.
+//!   the held context with keys added to its revocation list, signed by an
+//!   anchor key of the held version — the namespace root, unlocked from its
+//!   root store ([`crate::root_store`]). Nothing else changes: anchors,
+//!   schema, CA endpoints and earlier revocations are carried over verbatim.
 //! - **Refresh** ([`refresh_context`], every node): ask the namespace for its
 //!   newest version by name (RDR metadata, the publication of
 //!   `docs/wiki/src/reference/trust-context-publication.md`) and, if it is
@@ -21,8 +22,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, ExpectContextError, FilePib, Keyring, OpenContextError, SignedTrustContext,
-    SignedTrustContextError, Validator,
+    Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
+    SignedTrustContextError, Signer, Validator,
 };
 
 use crate::client::CaExchange;
@@ -55,11 +56,15 @@ pub enum BumpError {
     #[error("the held context is not a valid signed trust context: {0}")]
     Unreadable(#[from] OpenContextError),
     #[error(
-        "this node does not hold the root key of {namespace} ({root}), so it cannot sign a new \
-         version of its trust context: run this on the root device (where `ndn-fwd init \
-         --namespace {namespace}` ran)"
+        "{key} is not an anchor of the held trust context of {namespace} (v{version}), so it \
+         cannot sign its next version: only the namespace root signs it — run this on the \
+         root device (where `ndn-fwd init --namespace {namespace}` ran)"
     )]
-    NotRootDevice { namespace: String, root: String },
+    NotAnAnchor {
+        key: String,
+        namespace: String,
+        version: u64,
+    },
     #[error("{name} is not a key name (<identity>/KEY/<key-id>) under {namespace}")]
     NotAKeyOfNamespace { name: String, namespace: String },
     #[error(
@@ -88,30 +93,33 @@ pub struct ContextBump {
 }
 
 /// Version `N+1` of the held context `held` (its signed Data, version `N`)
-/// with the key names `revoke` added to its revocations, signed by the
-/// namespace root key held in `pib` — the key of the anchor that signed
-/// `held`. Every other field is carried over verbatim. Each entry must be a
-/// key name ([`key_name_of`]) under the namespace that does not cover one of
-/// its anchors. Entries already revoked are not repeated; `Ok(None)` when all
-/// of them are (no new version is needed). Pure: nothing is adopted, stored
-/// or published.
-pub fn bump_context_revoking(
-    pib: &FilePib,
+/// with the key names `revoke` added to its revocations, signed by `signer`
+/// — the key of an anchor of `held` (the namespace root from its root store,
+/// or any other anchor the held version lists), through its async signing
+/// path, so hardware and custodian signers work. Every other field is carried
+/// over verbatim. Each entry must be a key name ([`key_name_of`]) under the
+/// namespace that does not cover one of its anchors. Entries already revoked
+/// are not repeated; `Ok(None)` when all of them are (no new version is
+/// needed, nothing is signed). Pure: nothing is adopted, stored or published.
+pub async fn bump_context_revoking(
+    signer: &dyn Signer,
     held: &Data,
     revoke: &[Name],
 ) -> Result<Option<ContextBump>, BumpError> {
-    // The verifiers never suspend; drive the future inline.
-    let (ctx, signed_by) = futures::executor::block_on(SignedTrustContext::open_signed(held))?;
+    let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
     let namespace = ctx.namespace().clone();
 
-    let root_key = key_name_of(&signed_by.name).unwrap_or_else(|| (*signed_by.name).clone());
-    let not_root = || BumpError::NotRootDevice {
-        namespace: namespace.to_string(),
-        root: root_key.to_string(),
-    };
-    let signer = pib.get_signer(&root_key).map_err(|_| not_root())?;
-    if signer.public_key().as_deref() != Some(signed_by.public_key.as_ref()) {
-        return Err(not_root());
+    let is_anchor = signer.public_key().is_some_and(|pk| {
+        ctx.anchors()
+            .iter()
+            .any(|a| crate::root_store::same_public_key(&a.value().public_key, &pk))
+    });
+    if !is_anchor {
+        return Err(BumpError::NotAnAnchor {
+            key: signer.key_name().to_string(),
+            namespace: namespace.to_string(),
+            version: ctx.version(),
+        });
     }
 
     let mut added = Vec::new();
@@ -147,7 +155,7 @@ pub fn bump_context_revoking(
     for name in &added {
         next = next.with_revocation(name.clone());
     }
-    let data = next.sign_into_data(signer.as_ref())?;
+    let data = next.sign_into_data_async(signer).await?;
     Ok(Some(ContextBump {
         context: next,
         data,

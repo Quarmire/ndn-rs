@@ -21,6 +21,7 @@ pub mod policy;
 pub mod protocol;
 pub mod renewal;
 pub mod roles;
+pub mod root_store;
 pub mod store;
 pub mod tlv;
 
@@ -29,6 +30,10 @@ pub use attestation::{
 };
 pub use ca::{CaConfig, CaRevocation, CaState};
 pub use store::{CaSnapshot, CaStore, FileCaStore};
+pub use root_store::{
+    NewRootStore, RootSecret, RootStore, RootStoreError, RootStoreKind, RootUnlockKind,
+    os_keychain_reachable, read_root_secret,
+};
 pub use challenge::email::{EmailChallenge, EmailSender};
 pub use challenge::nop::NopChallenge;
 pub use challenge::pin::PinChallenge;

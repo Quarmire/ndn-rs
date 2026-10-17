@@ -10,8 +10,9 @@
 //! ([`crate::roles::namespace_schema`]) and makes it authoritative, so names
 //! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-namespace.md`
 //! §2, §4). [`init_namespace_in_pib`] is the persistent form `ndn-fwd init`
-//! runs: root key, CA identity, the primary device's admin identity and
-//! the signed context all land in the node's PIB (same document, §6).
+//! runs: the root key lands in the root store the operator chose
+//! ([`crate::root_store`]); the CA identity, the primary device's admin
+//! identity and the signed context land in the node's PIB (same document, §6).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::ca::serialize_cert;
 use crate::context_store::{ContextStoreError, context_file_path, persist_context};
 use crate::onboarding::anchor_fingerprint;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
+use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
 /// Directory (under the PIB root) holding the root device's certificate Data wires
 /// (CA, root anchor, primary device) and the CA's persistent state.
@@ -103,12 +105,13 @@ pub fn init_namespace(
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
-    build_namespace(mgr, namespace, None)
+    // In-memory Ed25519 signers never suspend: drive the future inline.
+    futures::executor::block_on(build_namespace(mgr, namespace, None))
 }
 
 /// Build the namespace around the root key `root_key_name(namespace)` already held
-/// by `mgr`.
-fn build_namespace(
+/// by `mgr` (in memory or a hardware signer registered with it).
+async fn build_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
     ca_endpoint: Option<Name>,
@@ -116,7 +119,7 @@ fn build_namespace(
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
     let pk = signer.public_key().unwrap_or_default();
-    let anchor = mgr.issue_self_signed(&anchor_key, pk, u64::MAX)?;
+    let anchor = mgr.issue_self_signed_async(&anchor_key, pk, u64::MAX).await?;
 
     let schema = namespace_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
@@ -128,7 +131,7 @@ fn build_namespace(
         context = context.with_ca_endpoint(ca);
     }
     context.add_anchor(anchor.clone());
-    let context_data = context.sign_into_data(signer.as_ref())?;
+    let context_data = context.sign_into_data_async(signer.as_ref()).await?;
     let context = Arc::new(context);
 
     let envelope = TrustEnvelope::Anchor {
@@ -171,6 +174,8 @@ pub struct PersistedNamespace {
     pub anchor_cert_path: PathBuf,
     /// `<pib>/ca/device-cert.data`.
     pub device_cert_path: PathBuf,
+    /// Where the root key lives now.
+    pub root_store: RootStore,
 }
 
 /// Why [`init_namespace_in_pib`] failed.
@@ -185,6 +190,8 @@ pub enum NamespaceInitError {
         pib: String,
         what: String,
     },
+    #[error(transparent)]
+    RootStore(#[from] RootStoreError),
     /// The namespace or the device name does not fit the role layout.
     #[error(transparent)]
     Role(#[from] RoleError),
@@ -204,9 +211,12 @@ pub enum NamespaceInitError {
 }
 
 /// Persistent namespace init: the [`init_namespace`] flow with every secret and
-/// artefact written to `pib` so the root device survives restarts —
+/// artefact written so the root device survives restarts —
 ///
-/// - root key `<ns>/KEY/root` (+ its cert, registered as a PIB trust anchor);
+/// - root key `<ns>/KEY/root` in the root store `root` ([`crate::root_store`]:
+///   OS keychain, passphrase-sealed file, YubiKey PIV, or plaintext `file`),
+///   recorded in `<pib>/root/store.toml`; its self-signed anchor cert is a PIB
+///   trust anchor;
 /// - CA signing identity `<ns>/CA` (key `<ns>/CA/KEY/ca`) with a cert issued
 ///   by the root, plus both certs as signed Data in `<pib>/ca/`;
 /// - the primary device's admin identity `<ns>/admin/<device>` (key
@@ -217,15 +227,21 @@ pub enum NamespaceInitError {
 ///   `<ns>/CA`) in the node's adopted-context store, so the root device validates its
 ///   own namespace.
 ///
+/// The root signs the anchor, the context and the CA cert through its async
+/// signer, so a hardware root works. The CA and device keys stay in the
+/// FilePib: the daemon uses them unattended.
+///
 /// `device` must pass [`crate::roles::validate_device_name`]. An existing
 /// root, CA key, device key or stored context for `namespace` is never
 /// silently replaced: without `force` this fails with
-/// [`NamespaceInitError::AlreadyInitialized`].
-pub fn init_namespace_in_pib(
+/// [`NamespaceInitError::AlreadyInitialized`]. A PIB holding the root of
+/// another namespace is refused even with `force`.
+pub async fn init_namespace_in_pib(
     pib: &FilePib,
     namespace: &Name,
     device: &str,
     force: bool,
+    root: &NewRootStore,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
@@ -233,11 +249,24 @@ pub fn init_namespace_in_pib(
     let device_identity = device_identity(namespace, Role::Admin, device)?;
     let device_key = device_key_name(&device_identity);
     let context_path = context_file_path(pib.root(), namespace);
-    let existing = if pib.get_signer(&anchor_key).is_ok() {
+    let held_root = RootStore::open(pib)?;
+    if let Some(held) = &held_root
+        && held.namespace() != namespace
+    {
+        return Err(RootStoreError::OtherNamespace {
+            pib: pib.root().display().to_string(),
+            held: held.namespace().to_string(),
+            requested: namespace.to_string(),
+        }
+        .into());
+    }
+    let existing = if let Some(held) = &held_root {
+        Some(format!("root key {anchor_key} ({} root store)", held.kind()))
+    } else if pib.has_private_key(&anchor_key) {
         Some(format!("root key {anchor_key}"))
-    } else if pib.get_signer(&ca_key).is_ok() {
+    } else if pib.has_private_key(&ca_key) {
         Some(format!("CA key {ca_key}"))
-    } else if pib.get_signer(&device_key).is_ok() {
+    } else if pib.has_private_key(&device_key) {
         Some(format!("device key {device_key}"))
     } else if context_path.exists() {
         Some(format!("trust context {}", context_path.display()))
@@ -252,18 +281,23 @@ pub fn init_namespace_in_pib(
                 what,
             });
         }
+        if let Some(held) = &held_root {
+            held.destroy(pib)?;
+        }
         pib.delete_key(&anchor_key)?;
         pib.delete_key(&ca_key)?;
         pib.delete_key(&device_key)?;
         pib.remove_trust_anchor(&anchor_key)?;
     }
 
-    // Root: generated straight into the PIB, then held by an in-process
-    // manager for the signing steps below.
+    // Root: generated in its store (in memory for a sealed one, on the token
+    // for a YubiKey), held by an in-process manager for the signing steps
+    // below, and recorded once the anchor is signed.
+    let pending = PendingRoot::create(pib, namespace, root).await?;
     let mgr = SecurityManager::new();
-    mgr.install_signer(pib.generate_ed25519(&anchor_key)?);
-    let init = build_namespace(&mgr, namespace, Some(namespace.clone().append("CA")))?;
-    pib.store_cert(&anchor_key, &init.anchor)?;
+    mgr.register_signer(anchor_key.clone(), pending.signer());
+    let init = build_namespace(&mgr, namespace, Some(namespace.clone().append("CA"))).await?;
+    let root_store = pending.commit(pib, namespace, &init.anchor)?;
     pib.add_trust_anchor(&anchor_key, &init.anchor)?;
 
     // The CA is certified by the root; the primary device by the CA, as the
@@ -277,7 +311,8 @@ pub fn init_namespace_in_pib(
         &anchor_key,
         CA_CERT_VALIDITY_MS,
         ndn_security::cert_name::DEFAULT_ISSUER,
-    )?;
+    )
+    .await?;
     mgr.register_signer(ca_key.clone(), pib.get_signer(&ca_key)?);
     let device_cert = certify_new_key(
         pib,
@@ -286,7 +321,8 @@ pub fn init_namespace_in_pib(
         &ca_key,
         DEVICE_CERT_VALIDITY_MS,
         ndn_security::cert_name::NDNCERT_ISSUER,
-    )?;
+    )
+    .await?;
 
     let ca_dir = pib.root().join(CA_DIR);
     let io = |path: &Path| {
@@ -317,12 +353,14 @@ pub fn init_namespace_in_pib(
         ca_cert_path,
         anchor_cert_path,
         device_cert_path,
+        root_store,
     })
 }
 
 /// Generate `key` in the PIB and store a cert for it issued by `issuer`
-/// (held by `mgr`), named `<key>/<issuer_id>/<version>`.
-fn certify_new_key(
+/// (held by `mgr`, possibly a hardware signer), named
+/// `<key>/<issuer_id>/<version>`.
+async fn certify_new_key(
     pib: &FilePib,
     mgr: &SecurityManager,
     key: &Name,
@@ -332,14 +370,9 @@ fn certify_new_key(
 ) -> Result<Certificate, NamespaceInitError> {
     let signer = pib.generate_ed25519(key)?;
     let pk = ndn_security::Signer::public_key(&signer).unwrap_or_default();
-    let cert = futures::executor::block_on(mgr.certify_as(
-        key,
-        pk,
-        issuer,
-        validity_ms,
-        issuer_id,
-        None,
-    ))?;
+    let cert = mgr
+        .certify_as(key, pk, issuer, validity_ms, issuer_id, None)
+        .await?;
     pib.store_cert(key, &cert)?;
     Ok(cert)
 }
@@ -439,6 +472,22 @@ mod tests {
             .unwrap()
     }
 
+    /// `init_namespace_in_pib` with the root in the FilePib (`file` store).
+    fn init_in_pib(
+        pib: &FilePib,
+        ns: &Name,
+        device: &str,
+        force: bool,
+    ) -> Result<PersistedNamespace, NamespaceInitError> {
+        futures::executor::block_on(init_namespace_in_pib(
+            pib,
+            ns,
+            device,
+            force,
+            &NewRootStore::File,
+        ))
+    }
+
     /// `ndn-fwd init` regression: the root, the CA identity and the signed
     /// context must outlive the process (they used to live in a dropped
     /// in-memory manager), and a re-run must not silently replace the root.
@@ -447,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_in_pib(&pib, &ns, "laptop", false).unwrap();
 
         // Root key + cert + anchor are in the PIB.
         let root = root_key_name(&ns);
@@ -493,7 +542,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root = root_key_name(&ns);
 
         assert_eq!(out.device_identity, n("/home/bob/admin/laptop"));
@@ -536,7 +585,7 @@ mod tests {
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
         for bad in ["", "KEY", "CA", "admin", "guest", "a/b", "-x"] {
-            let err = init_namespace_in_pib(&pib, &ns, bad, false)
+            let err = init_in_pib(&pib, &ns, bad, false)
                 .err()
                 .expect("invalid device name must be refused");
             assert!(
@@ -544,7 +593,7 @@ mod tests {
                 "{bad:?}: {err}"
             );
         }
-        let err = init_namespace_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
+        let err = init_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
         assert!(matches!(err, NamespaceInitError::Role(RoleError::InvalidNamespace { .. })));
         assert!(pib.list_keys().unwrap().is_empty(), "nothing written");
     }
@@ -554,17 +603,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let first = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let first = init_in_pib(&pib, &ns, "laptop", false).unwrap();
         let root_before = root_public_key(&pib, &ns);
 
-        let err = init_namespace_in_pib(&pib, &ns, "laptop", false)
+        let err = init_in_pib(&pib, &ns, "laptop", false)
             .err()
             .expect("re-init must fail");
         assert!(matches!(err, NamespaceInitError::AlreadyInitialized { .. }), "{err}");
         assert_eq!(root_public_key(&pib, &ns), root_before, "root untouched");
 
         // With force a fresh root replaces it (and the stored context follows).
-        let second = init_namespace_in_pib(&pib, &ns, "laptop", true).unwrap();
+        let second = init_in_pib(&pib, &ns, "laptop", true).unwrap();
         assert_ne!(second.device_cert.public_key, first.device_cert.public_key);
         assert_ne!(root_public_key(&pib, &ns), root_before);
         assert_ne!(
@@ -601,7 +650,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
         let ns = n("/home/bob");
-        let out = init_namespace_in_pib(&pib, &ns, "laptop", false).unwrap();
+        let out = init_namespace_in_pib(&pib, &ns, "laptop", false, &NewRootStore::File)
+            .await
+            .unwrap();
         let v = Validator::with_chain(
             TrustSchema::new(),
             Arc::new(CertCache::new()),

@@ -115,7 +115,10 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     let ns = n("/home/bob");
 
     let root_pib = FilePib::new(root_dir.path()).unwrap();
-    let root_dev = init_namespace_in_pib(&root_pib, &ns, "laptop", false).unwrap();
+    let root_dev =
+        init_namespace_in_pib(&root_pib, &ns, "laptop", false, &ndn_cert::NewRootStore::File)
+            .await
+            .unwrap();
     let uri = root_dev.init.envelope.to_uri();
 
     // The adopting node only ever sees the scanned URI.

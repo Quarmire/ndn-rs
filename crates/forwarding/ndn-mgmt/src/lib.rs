@@ -459,6 +459,29 @@ pub struct EnrollRequest {
     pub force: bool,
 }
 
+/// What `security/revoke` asks: revoke the device identity, key or
+/// certificate `name`, unlocking the namespace root's store with `unlock`
+/// (its passphrase or PIN) when the store needs one. The secret arrived in
+/// the command's ApplicationParameters over the local management socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeRequest {
+    pub name: Name,
+    pub unlock: Option<ndn_mgmt_wire::UnlockSecret>,
+}
+
+/// Where this node keeps the root key of the namespace it is the root device
+/// of (`security/identity-status` reports it as `root_store=<kind>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootStoreInfo {
+    /// The store kind: `os-keyring`, `sealed-file`, `yubikey-piv`, `file`.
+    pub kind: String,
+    /// The root key, `<ns>/KEY/root`.
+    pub key: Name,
+    /// What a root-signing verb needs from the operator: `passphrase`,
+    /// `pin`, or `none`.
+    pub unlock: String,
+}
+
 /// The answer to `security/enroll`, JSON in the ControlResponse status text,
 /// tagged by `state`. A token enrollment completes in one exchange
 /// (`enrolled`); enrollment by an admin's approval will answer `pending`
@@ -627,9 +650,9 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         })
     }
 
-    /// Revoke the device identity, key or certificate `name`.
-    async fn revoke(&self, name: Name) -> Result<RevokedInfo, TrustRefusal> {
-        let _ = name;
+    /// Revoke the device identity, key or certificate `request.name`.
+    async fn revoke(&self, request: RevokeRequest) -> Result<RevokedInfo, TrustRefusal> {
+        let _ = request;
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not revoke at runtime".to_owned(),
@@ -661,6 +684,12 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
     /// The key the node signs with now, if the backend tracks it (it can
     /// change at runtime through `security/enroll`).
     fn signing_identity(&self) -> Option<SigningIdentityInfo> {
+        None
+    }
+
+    /// Where this node keeps the root key of a namespace it is the root
+    /// device of; `None` on every other node.
+    fn root_store(&self) -> Option<RootStoreInfo> {
         None
     }
 }
@@ -1019,15 +1048,28 @@ pub async fn run_ndn_mgmt_handler(
         }
 
         // ControlParameters MUST appear in exactly one location (name
-        // component or AppParameters), never both.
+        // component or AppParameters), never both. An unlock secret only
+        // ever travels in AppParameters: a Name is logged and keys tables.
         let params_in_name = parsed.params.clone();
         let params_in_app = interest
             .app_parameters()
             .and_then(|app| ControlParameters::decode(app.clone()).ok());
-        let params = match resolve_control_parameters(params_in_name, params_in_app) {
+        let secret_in_name = params_in_name
+            .as_ref()
+            .is_some_and(|p| p.unlock_secret.is_some());
+        let resolved = if secret_in_name {
+            Err("an unlock secret travels in ApplicationParameters, never in the command Name")
+        } else {
+            resolve_control_parameters(params_in_name, params_in_app)
+        };
+        let params = match resolved {
             Ok(opt) => opt.unwrap_or_default(),
             Err(reason) => {
-                tracing::warn!(target: "engine", name = %interest.name, %reason, "nfd-mgmt: rejecting");
+                if secret_in_name {
+                    tracing::warn!(target: "engine", %reason, "nfd-mgmt: rejecting");
+                } else {
+                    tracing::warn!(target: "engine", name = %interest.name, %reason, "nfd-mgmt: rejecting");
+                }
                 let resp = ControlResponse::error(status::BAD_PARAMS, reason);
                 send_response(
                     &handle,

@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::{
-    BumpError, CaExchange, CertError, ContextRefresh, PersistedNamespace, RefreshError,
-    UpdateRefusal, anchor_fingerprint, bump_context_revoking, open_context_update,
-    rdr_metadata_name, refresh_context,
+    BumpError, CaExchange, CertError, ContextBump, ContextRefresh, NewRootStore,
+    PersistedNamespace, RefreshError, RootStore, UpdateRefusal, anchor_fingerprint,
+    bump_context_revoking, open_context_update, rdr_metadata_name, refresh_context,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
@@ -24,11 +24,30 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-/// A root device: namespace `/home/bob` initialized into a PIB at `dir`.
+/// A root device: namespace `/home/bob` initialized into a PIB at `dir`,
+/// its root in the PIB (`file` store).
 fn root_device(dir: &Path) -> (FilePib, PersistedNamespace) {
     let pib = FilePib::new(dir).unwrap();
-    let ns = ndn_cert::init_namespace_in_pib(&pib, &n("/home/bob"), "desk", false).unwrap();
+    let ns = futures::executor::block_on(ndn_cert::init_namespace_in_pib(
+        &pib,
+        &n("/home/bob"),
+        "desk",
+        false,
+        &NewRootStore::File,
+    ))
+    .unwrap();
     (pib, ns)
+}
+
+/// Bump `held` with the root of `pib`'s root store.
+async fn bump(
+    pib: &FilePib,
+    held: &Data,
+    revoke: &[Name],
+) -> Result<Option<ContextBump>, BumpError> {
+    let store = RootStore::open(pib).unwrap().expect("a root device");
+    let signer = store.signer(None).await.unwrap();
+    bump_context_revoking(signer.as_ref(), held, revoke).await
 }
 
 /// An in-memory upstream: answers an Interest whose name equals a
@@ -129,7 +148,8 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
     ));
 
     // The root device revokes the device's key: v2, signed by the root.
-    let bump = bump_context_revoking(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let bump = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+        .await
         .unwrap()
         .expect("a new version");
     assert_eq!(bump.context.version(), 2);
@@ -189,11 +209,12 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
     // Another root for the same namespace name, with a higher version that
     // lists only itself — what an impersonator would serve.
     let (forged_pib, forged) = root_device(forged_dir.path());
-    let forged_v2 = bump_context_revoking(
+    let forged_v2 = bump(
         &forged_pib,
         &forged.init.context_data,
         &[genuine.device_key.clone()],
     )
+    .await
     .unwrap()
     .unwrap();
 
@@ -240,7 +261,8 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
 async fn a_lower_or_equal_version_never_replaces_the_held_one() {
     let dir = tempfile::tempdir().unwrap();
     let (pib, root) = root_device(dir.path());
-    let v2 = bump_context_revoking(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+        .await
         .unwrap()
         .unwrap();
     let (relay, _) = node_holding(&root);
@@ -285,7 +307,8 @@ async fn a_failed_refresh_never_drops_a_good_context() {
     let (pib, root) = root_device(dir.path());
     let (relay, validator) = node_holding(&root);
     let ns = n("/home/bob");
-    let v2 = bump_context_revoking(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+        .await
         .unwrap()
         .unwrap();
 
@@ -320,44 +343,51 @@ async fn a_failed_refresh_never_drops_a_good_context() {
     assert!(matches!(res, Err(RefreshError::NotHeld(_))), "{res:?}");
 }
 
-#[test]
-fn only_the_root_key_bumps_and_never_against_the_root() {
+#[tokio::test]
+async fn only_the_root_key_bumps_and_never_against_the_root() {
     let (root_dir, other_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let (pib, root) = root_device(root_dir.path());
     let held = &root.init.context_data;
 
-    // A PIB without the root key (any other device).
+    // A PIB without a namespace root (any other device) has no root store.
     let other = FilePib::new(other_dir.path()).unwrap();
+    assert!(RootStore::open(&other).unwrap().is_none());
+    // A key that is not an anchor — the admin device's own, or another
+    // root under the same name — does not sign this namespace.
+    let device = pib.get_signer(&root.device_key).unwrap();
     assert!(matches!(
-        bump_context_revoking(&other, held, &[root.device_key.clone()]),
-        Err(BumpError::NotRootDevice { .. })
+        bump_context_revoking(device.as_ref(), held, &[root.device_key.clone()]).await,
+        Err(BumpError::NotAnAnchor { .. })
     ));
-    // Another root key under the same name does not sign this namespace.
     let (forged_pib, _) = root_device(other_dir.path().join("forged").as_path());
+    let forged = RootStore::open(&forged_pib).unwrap().unwrap();
+    let forged = forged.signer(None).await.unwrap();
     assert!(matches!(
-        bump_context_revoking(&forged_pib, held, &[root.device_key.clone()]),
-        Err(BumpError::NotRootDevice { .. })
+        bump_context_revoking(forged.as_ref(), held, &[root.device_key.clone()]).await,
+        Err(BumpError::NotAnAnchor { .. })
     ));
 
     for name in ["/home/bob/KEY/root", "/home/bob"] {
-        let res = bump_context_revoking(&pib, held, &[n(name)]);
+        let res = bump(&pib, held, &[n(name)]).await;
         assert!(res.is_err(), "{name}: {res:?}");
     }
     assert!(matches!(
-        bump_context_revoking(&pib, held, &[n("/home/bob/admin/desk")]),
+        bump(&pib, held, &[n("/home/bob/admin/desk")]).await,
         Err(BumpError::NotAKeyOfNamespace { .. })
     ));
     assert!(matches!(
-        bump_context_revoking(&pib, held, &[n("/home/eve/member/x/KEY/k")]),
+        bump(&pib, held, &[n("/home/eve/member/x/KEY/k")]).await,
         Err(BumpError::NotAKeyOfNamespace { .. })
     ));
 
     // Revoking twice adds nothing.
-    let v2 = bump_context_revoking(&pib, held, &[root.device_key.clone()])
+    let v2 = bump(&pib, held, &[root.device_key.clone()])
+        .await
         .unwrap()
         .unwrap();
     assert!(
-        bump_context_revoking(&pib, &v2.data, &[root.device_key.clone()])
+        bump(&pib, &v2.data, &[root.device_key.clone()])
+            .await
             .unwrap()
             .is_none()
     );

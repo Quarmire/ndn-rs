@@ -85,7 +85,14 @@ impl Namespace {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let pib = FilePib::new(dir.path()).unwrap();
-        let ns = ndn_cert::init_namespace_in_pib(&pib, &n("/home/bob"), "desk", false).unwrap();
+        let ns = futures::executor::block_on(ndn_cert::init_namespace_in_pib(
+            &pib,
+            &n("/home/bob"),
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        ))
+        .unwrap();
         Self { _dir: dir, pib, ns }
     }
 
@@ -246,11 +253,14 @@ async fn a_relay_never_serves_cached_data_of_a_key_revoked_by_an_update() {
     assert_eq!(relay.fetch(&photo1).await.as_deref(), Some(&b"photo"[..]));
     assert_eq!(relay.cs_hits(), hits + 1, "the repeat is answered from the CS");
 
+    let root = ndn_cert::RootStore::open(&ns.pib).unwrap().unwrap();
+    let root = root.signer(None).await.unwrap();
     let bump = ndn_cert::bump_context_revoking(
-        &ns.pib,
+        root.as_ref(),
         &ns.ns.init.context_data,
         &[ns.ns.device_key.clone()],
     )
+    .await
     .unwrap()
     .expect("a new version");
     relay.keyring.adopt_update(Arc::new(bump.context)).unwrap();

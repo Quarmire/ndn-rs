@@ -49,6 +49,9 @@ impl From<PibError> for TrustError {
 ///   anchors/<sha256>/
 ///     name.uri
 ///     cert.ndnc
+///   root/                   # a namespace root device's root store, kept by
+///     store.toml            # `ndn_cert::root_store`: where the root key
+///     root.safebag          # lives, and its passphrase-sealed SafeBag
 ///   default-identity        # the node's default identity, NDN URI (optional)
 /// ```
 ///
@@ -169,11 +172,24 @@ impl FilePib {
         }
     }
 
+    /// Delete `key_name` with its certificates. Its private key file is
+    /// overwritten before removal ([`secure_fs::shred_file`]).
     pub fn delete_key(&self, key_name: &Name) -> Result<(), PibError> {
         if let Some(dir) = self.existing_key_dir(key_name) {
+            for secret in ["private.pkcs8.der", "private.key"] {
+                secure_fs::shred_file(&dir.join(secret))?;
+            }
             std::fs::remove_dir_all(dir)?;
         }
         Ok(())
+    }
+
+    /// Whether the PIB holds the private key of `key_name` (without reading
+    /// it).
+    pub fn has_private_key(&self, key_name: &Name) -> bool {
+        self.existing_key_dir(key_name).is_some_and(|dir| {
+            dir.join("private.pkcs8.der").is_file() || dir.join("private.key").is_file()
+        })
     }
 
     pub fn list_keys(&self) -> Result<Vec<Name>, PibError> {

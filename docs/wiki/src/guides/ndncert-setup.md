@@ -147,7 +147,9 @@ token presented with it is not redeemed.
 
 `ndn-fwd` embeds a CA through its `[ca]` section (full key list in the
 [configuration reference](../operations/config-reference.md)). On the root
-device, `ndn-fwd init --namespace /<ns>` writes the root anchor, a
+device, `ndn-fwd init --namespace /<ns>` writes the root anchor (the root key
+itself into its root store, `--root-store`; see
+[root custody](../concepts/identity-and-keys.md#root-custody-where-a-namespace-root-key-lives)), a
 `/<ns>/CA` signing identity certified by it, and the root device's admin
 identity `/<ns>/admin/<device>` (`--device` names it; default: the host name,
 sanitized) certified by the CA into the node PIB, stores the root-signed

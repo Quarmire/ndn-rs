@@ -3,7 +3,7 @@
 A lost or compromised device keeps its private key and its certificate. To
 stop the namespace from trusting it, the owner **revokes** the device's key on
 the namespace's **root device**: the node where `ndn-fwd init --namespace …`
-ran, which holds the namespace root key in its PIB and runs the namespace's
+ran, which holds the namespace root key in its root store and runs the namespace's
 CA. Revocation happens in two places:
 
 | Where | Effect | When it takes effect |
@@ -18,6 +18,24 @@ add one.
 
 Design: `docs/specs/personal-namespace.md`, flows F4 (lose a member device)
 and F5 (lose an admin device).
+
+## Unlocking the root
+
+The root signs the new context version, so a revocation unlocks it for that
+one signature. `ndn-fwd revoke` asks the daemon (`security/identity-status`,
+`root_unlock=`) what its root store needs:
+
+| Root store (`ndn-fwd root-key status`) | `revoke` asks for |
+|---|---|
+| `os-keyring` | nothing — the OS keychain releases the sealing secret to the logged-in user |
+| `sealed-file` | the passphrase: `NDN_ROOT_PASSPHRASE`, else `--passphrase-file <path>`, else the terminal (no echo) |
+| `yubikey-piv` | the PIV PIN: `NDN_ROOT_PIN`, else `--pin-file <path>`, else the terminal; then a touch if the policy says so |
+| `file` | nothing (plaintext, unprotected; seal it with `ndn-fwd root-key move --to os-keyring`) |
+
+The secret is never taken from the command line. The CLI sends it with the
+command over the local management socket (peer-credential gated, refused over
+`/localhop`), in the command's ApplicationParameters — never in its Name. The
+daemon decrypts or unlocks the root, signs, and drops the key (zeroed).
 
 ## What a revocation entry covers
 
@@ -156,7 +174,10 @@ first hit on its cached copy evicts it.
 
 | Status | Cause | What to do |
 |---|---|---|
-| 403 | this node's PIB does not hold the key that signed the held context (not the root device) | run `ndn-fwd revoke` on the root device |
+| 401 | this node's root store holds no anchor of the held context (not the root device) | run `ndn-fwd revoke` on the root device |
+| 401 | the root store needs its passphrase / PIN and none came with the command | run `ndn-fwd revoke` (it asks), or set `NDN_ROOT_PASSPHRASE` / `NDN_ROOT_PIN` |
+| 403 | wrong passphrase, or the YubiKey refused the PIN | retry with the right one; nothing was signed |
+| 503 | the OS keychain is not reachable, or lost the root's entry | unlock the keychain (log in to the desktop session) |
 | 404 | this node holds no context for a namespace containing the name | run it on the root device of that namespace |
 | 404 | this node runs no CA for the namespace | run it on the root device, which runs the CA |
 | 404 | the CA issued no certificate for that identity | pass the identity as enrolled (`/<ns>/<role>/<device>`) or a key name |

@@ -152,6 +152,16 @@ carrying the generated role schema (`ndn-fwd schema show`), and prints the
 (`identity = "/<ns>/admin/<device>"`, `pib_path = "<pib>"`); without them the
 forwarder falls back to an ephemeral key. Init never edits config files.
 
+The root key itself goes to the root store chosen with `init --root-store`
+(`os-keyring` by default when an OS keychain is reachable, else refused with
+advice; `sealed-file`, `yubikey-piv`, `file`), recorded in
+`<pib_path>/root/store.toml` — no config key selects it; see
+[root custody](../concepts/identity-and-keys.md#root-custody-where-a-namespace-root-key-lives).
+The daemon reports it in `security/identity-status` (`root_store=`,
+`root_unlock=`; shown by `ndn-ctl status`) and warns at startup when it is
+`file`. `ndn-fwd` builds with the `os-keyring` feature by default;
+`yubikey-piv` is opt-in.
+
 A PIB-backed CA whose identity is `/<ns>/CA`, certified by the namespace root
 `/<ns>/KEY/…`, serves the namespace `/<ns>`: it issues only device keys
 `/<ns>/<role>/<device>/KEY/<id>` (role `admin`, `member`, `node`, `guest`);

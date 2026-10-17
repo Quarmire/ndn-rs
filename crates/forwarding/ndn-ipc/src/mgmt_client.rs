@@ -733,16 +733,21 @@ impl MgmtClient {
     /// `security/revoke` (on the namespace's root device): revoke the device
     /// identity, key or certificate `name` at the daemon's CA and in a new,
     /// root-signed version of the namespace's trust context, which the daemon
-    /// stores and publishes. The command Interest lives `timeout`, and so
-    /// does the wait. Success carries `ndn_mgmt::RevokedInfo` as JSON in
+    /// stores and publishes. `unlock` is the passphrase or PIN of the root
+    /// key's store when it needs one (`identity-status` reports
+    /// `root_store=`); it travels in the command's ApplicationParameters,
+    /// never in its Name. The command Interest lives `timeout`, and so does
+    /// the wait. Success carries `ndn_mgmt::RevokedInfo` as JSON in
     /// `status_text`; a refusal's `status_text` says why and where to run it.
     pub async fn security_revoke(
         &self,
         name: &ndn_packet::Name,
+        unlock: Option<ndn_mgmt_wire::UnlockSecret>,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
             name: Some(name.clone()),
+            unlock_secret: unlock,
             ..Default::default()
         };
         self.deferred_command(verb::REVOKE, &params, timeout).await
@@ -787,9 +792,16 @@ impl MgmtClient {
         params: &ControlParameters,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
-        let name = command_name(module::SECURITY, verb, params);
+        // A secret travels in ApplicationParameters, never in the Name (which
+        // forwarders log and key their tables by).
+        let (name, app_params) = if params.unlock_secret.is_some() {
+            (dataset_name(module::SECURITY, verb), Some(params.encode()))
+        } else {
+            (command_name(module::SECURITY, verb, params), None)
+        };
         let interest_wire =
-            build_signed_interest_with_lifetime(&self.signing, name, Some(timeout)).await?;
+            build_signed_interest_with_lifetime(&self.signing, name, Some(timeout), app_params)
+                .await?;
         let _guard = self.recv_lock.lock().await;
         let data_wire = self
             .exchange_timeout(&interest_wire, timeout)
@@ -1149,21 +1161,26 @@ async fn build_signed_interest_with_policy(
     signing: &SigningPolicy,
     name: Name,
 ) -> Result<Bytes, ForwarderError> {
-    build_signed_interest_with_lifetime(signing, name, None).await
+    build_signed_interest_with_lifetime(signing, name, None, None).await
 }
 
 /// As [`build_signed_interest_with_policy`] with an explicit Interest
 /// lifetime (`None`: the default), for commands the daemon answers only after
-/// network round trips.
+/// network round trips, and optional ApplicationParameters (the command's
+/// ControlParameters when they must stay out of the Name).
 async fn build_signed_interest_with_lifetime(
     signing: &SigningPolicy,
     name: Name,
     lifetime: Option<std::time::Duration>,
+    app_params: Option<Bytes>,
 ) -> Result<Bytes, ForwarderError> {
-    let builder = match lifetime {
+    let mut builder = match lifetime {
         Some(d) => InterestBuilder::new(name).lifetime(d),
         None => InterestBuilder::new(name),
     };
+    if let Some(params) = app_params {
+        builder = builder.app_parameters(params.to_vec());
+    }
     match signing {
         SigningPolicy::DigestSha256 => Ok(builder.sign_digest_sha256()),
         SigningPolicy::Key(signer) => {

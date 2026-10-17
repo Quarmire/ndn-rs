@@ -8,16 +8,20 @@ use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status
 use ndn_security::FilePib;
 
 /// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>][
-/// valid_until=<ISO 8601> days_left=<n>]`. With a trust-admin backend
-/// tracking the key the node signs with (it can change at runtime through
-/// `security/enroll`), that key, its identity and — when the node holds a
-/// certificate for it — the certificate's expiry are reported; otherwise the
-/// configured identity, else the first trust anchor's.
+/// valid_until=<ISO 8601> days_left=<n>][ root_store=<kind>
+/// root_key=<key> root_unlock=<passphrase|pin|none>]`. With a trust-admin
+/// backend tracking the key the node signs with (it can change at runtime
+/// through `security/enroll`), that key, its identity and — when the node
+/// holds a certificate for it — the certificate's expiry are reported;
+/// otherwise the configured identity, else the first trust anchor's. On a
+/// namespace's root device, where its root key lives and what a
+/// root-signing verb needs to unlock it.
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
     config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
     signing: Option<crate::SigningIdentityInfo>,
+    root_store: Option<crate::RootStoreInfo>,
 ) -> ControlResponse {
     let identity_of = |key: String| match key.find("/KEY/") {
         Some(pos) => key[..pos].to_string(),
@@ -51,8 +55,16 @@ pub(super) fn security_identity_status(
 
     let key = key.map(|k| format!(" key={k}")).unwrap_or_default();
     let expiry = valid_until.map(expiry_fields).unwrap_or_default();
+    let root = root_store
+        .map(|r| {
+            format!(
+                " root_store={} root_key={} root_unlock={}",
+                r.kind, r.key, r.unlock
+            )
+        })
+        .unwrap_or_default();
     let text = format!(
-        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}\n"
+        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}{root}\n"
     );
     ControlResponse::ok_empty(text)
 }

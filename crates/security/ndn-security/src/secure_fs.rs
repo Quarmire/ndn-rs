@@ -97,6 +97,33 @@ pub fn write_private_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::R
     result
 }
 
+/// Remove the secret file `path` after overwriting its contents with zeros
+/// and syncing, so the old bytes are not left in the freed blocks of a
+/// filesystem that rewrites in place (ext4, xfs). Copy-on-write and
+/// log-structured filesystems (btrfs, zfs, f2fs) and SSD wear levelling may
+/// still keep an old copy: keeping a secret off such a disk takes full-disk
+/// encryption. A missing `path` is not an error.
+pub fn shred_file(path: &Path) -> io::Result<()> {
+    let len = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return Err(io::Error::other(format!("{} is not a file", path.display()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        let zeros = [0u8; 4096];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        file.sync_all()?;
+    }
+    std::fs::remove_file(path)
+}
+
 /// Tighten `path` to owner-only if group/other has any access (`0700` for a
 /// directory, `0600` for a file, keeping a stricter owner mode like `0400`).
 /// Returns the previous mode when it changed. Refuses (`PermissionDenied`) an

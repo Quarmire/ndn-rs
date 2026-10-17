@@ -16,6 +16,14 @@ default = ["yubikey-challenge"]
 yubikey-challenge = ["dep:ring"]
 # Browser/wasm enrollment client — minimal surface, no native challenges.
 wasm-client = []
+# A namespace root kept in the platform keychain (`root_store`, kind
+# `os-keyring`): Secret Service on Linux/BSD, Keychain on macOS, Credential
+# Manager on Windows. libdbus is built from source (`vendored`), so no
+# system dbus development files are needed.
+os-keyring = ["dep:keyring"]
+# A namespace root generated on a YubiKey PIV slot (`root_store`, kind
+# `yubikey-piv`). Needs pcscd at run time.
+yubikey-piv = ["ndn-security/yubikey-piv"]
 
 [dependencies]
 ndn-tlv      = { workspace = true, features = ["std"] }
@@ -39,6 +47,15 @@ p256         = { workspace = true }
 aes-gcm      = { workspace = true }
 hkdf         = { workspace = true }
 sha2         = { workspace = true }
+# Root store (`root_store`): the descriptor `<pib>/root/store.toml`, and
+# zeroing the passphrases / PINs that unlock it.
+toml         = "0.8"
+zeroize      = "1"
+keyring      = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+
+# Root store: reading a passphrase / PIN from the terminal without echo.
+[target.'cfg(unix)'.dependencies]
+libc         = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

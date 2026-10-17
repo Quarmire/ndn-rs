@@ -575,19 +575,56 @@ impl SignedTrustContext {
     /// [`decode_content`](Self::decode_content) (version from the RDR name) and
     /// adopts via [`Keyring::adopt`](crate::Keyring::adopt) (anti-rollback).
     ///
-    /// `signer` is any [`Signer`](crate::signer::Signer) — typically obtained
-    /// from a `SecurityManager`/`KeyChain` for the publishing identity.
+    /// `signer` is any [`Signer`](crate::signer::Signer) whose key signs
+    /// synchronously (an in-memory Ed25519/ECDSA key). A signer that signs
+    /// only asynchronously — a hardware token, a custodian, a remote signer —
+    /// is refused with an error, never turned into an empty signature: use
+    /// [`sign_into_data_async`](Self::sign_into_data_async) for those.
     pub fn sign_into_data(
         &self,
         signer: &dyn crate::signer::Signer,
     ) -> Result<Data, SignedTrustContextError> {
         let content = self.encode_content();
+        let mut failure = None;
         let wire = ndn_packet::encode::DataBuilder::new(self.rdr_name(), &content).sign_sync(
             signer.sig_type(),
             Some(signer.key_name()),
-            |region| signer.sign_sync(region).unwrap_or_default(),
+            |region| match signer.sign_sync(region) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    failure = Some(e);
+                    Bytes::new()
+                }
+            },
         );
-        Data::decode(wire).map_err(|e| SignedTrustContextError::Sign(e.to_string()))
+        if let Some(e) = failure {
+            return Err(SignedTrustContextError::Sign(format!(
+                "{} cannot sign synchronously ({e}); sign with sign_into_data_async",
+                signer.key_name()
+            )));
+        }
+        signed_context_data(wire, signer)
+    }
+
+    /// [`sign_into_data`](Self::sign_into_data) through the signer's async
+    /// [`sign`](crate::signer::Signer::sign): works with every signer,
+    /// including hardware tokens and custodians whose key sits behind an I/O
+    /// boundary. A failed signature is an error, never an empty one.
+    pub async fn sign_into_data_async(
+        &self,
+        signer: &dyn crate::signer::Signer,
+    ) -> Result<Data, SignedTrustContextError> {
+        let content = self.encode_content();
+        let wire = ndn_packet::encode::DataBuilder::new(self.rdr_name(), &content)
+            .sign_fallible(signer.sig_type(), Some(signer.key_name()), |region| {
+                let region = region.to_vec();
+                async move { signer.sign(&region).await }
+            })
+            .await
+            .map_err(|e| {
+                SignedTrustContextError::Sign(format!("{} did not sign: {e}", signer.key_name()))
+            })?;
+        signed_context_data(wire, signer)
     }
 
     /// Decode a context from the `Content` bytes of its NDN object. The
@@ -867,6 +904,22 @@ pub fn dryrun_orphans(candidate: &SignedTrustContext, live: &[SigningPair]) -> V
         .collect()
 }
 
+/// Decode the signed context Data `wire`; a missing signature value is an
+/// error (a signer that produced none never yields a "signed" context).
+fn signed_context_data(
+    wire: Bytes,
+    signer: &dyn crate::signer::Signer,
+) -> Result<Data, SignedTrustContextError> {
+    let data = Data::decode(wire).map_err(|e| SignedTrustContextError::Sign(e.to_string()))?;
+    if data.sig_value().is_empty() {
+        return Err(SignedTrustContextError::Sign(format!(
+            "{} produced an empty signature",
+            signer.key_name()
+        )));
+    }
+    Ok(data)
+}
+
 /// ndn-cxx evolvability rule: `type <= 31 || (type & 1)`.
 fn is_critical(t: u64) -> bool {
     t <= 31 || (t & 1) == 1
@@ -1082,5 +1135,71 @@ mod tests {
         // Anti-rollback: a lower version is refused.
         let older = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
         assert!(!keyring.adopt(Arc::new(older)), "older version refused");
+    }
+
+    /// A signer with only an async `sign` (a hardware token, a custodian):
+    /// signs through `inner`, or fails when `inner` is `None`.
+    struct AsyncOnly {
+        inner: Option<crate::signer::Ed25519Signer>,
+        key: Name,
+    }
+
+    impl crate::signer::Signer for AsyncOnly {
+        fn sig_type(&self) -> ndn_packet::SignatureType {
+            ndn_packet::SignatureType::SignatureEd25519
+        }
+        fn key_name(&self) -> &Name {
+            &self.key
+        }
+        fn sign<'a>(
+            &'a self,
+            region: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes, crate::TrustError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                match &self.inner {
+                    Some(s) => s.sign(region).await,
+                    None => Err(crate::TrustError::KeyStore("token unplugged".into())),
+                }
+            })
+        }
+    }
+
+    /// An async-only signer never yields a context with an empty signature:
+    /// the sync path refuses it, the async path signs for real (verifiable
+    /// under the key), and a failing signer is an error.
+    #[tokio::test]
+    async fn async_only_signers_never_produce_empty_signatures() {
+        use crate::signer::{Ed25519Signer, Signer};
+        let key = n("/home/bob/KEY/root");
+        let ed = Ed25519Signer::from_seed(&[4u8; 32], key.clone());
+        let pk = ed.public_key().unwrap();
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
+
+        let signer = AsyncOnly {
+            inner: Some(ed),
+            key: key.clone(),
+        };
+        assert!(matches!(
+            ctx.sign_into_data(&signer),
+            Err(SignedTrustContextError::Sign(_))
+        ));
+        let data = ctx.sign_into_data_async(&signer).await.unwrap();
+        assert!(!data.sig_value().is_empty());
+        let outcome = crate::verifier::verify_by_sig_type(
+            ndn_packet::SignatureType::SignatureEd25519,
+            data.signed_region(),
+            data.sig_value(),
+            &pk,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, crate::VerifyOutcome::Valid);
+
+        let unplugged = AsyncOnly { inner: None, key };
+        assert!(matches!(
+            ctx.sign_into_data_async(&unplugged).await,
+            Err(SignedTrustContextError::Sign(_))
+        ));
     }
 }

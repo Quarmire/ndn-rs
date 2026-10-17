@@ -47,6 +47,7 @@ async fn handle_security(
     is_ephemeral: bool,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
     signing: Option<crate::SigningIdentityInfo>,
+    root_store: Option<crate::RootStoreInfo>,
 ) -> ControlResponse {
     // Verbs that don't need the PIB.
     match verb_name {
@@ -59,7 +60,7 @@ async fn handle_security(
         v if v == verb::SCHEMA_LIST => return security_schema_list(engine),
         v if v == verb::SCHEMA_SET => return security_schema_set(params, engine),
         v if v == verb::IDENTITY_STATUS => {
-            return security_identity_status(engine, config, is_ephemeral, signing);
+            return security_identity_status(engine, config, is_ephemeral, signing, root_store);
         }
         v if v == verb::POLICY_GET => return security_policy_get(config, runtime_policy),
         v if v == verb::POLICY_SET => {
@@ -302,6 +303,9 @@ impl MgmtModule for SecurityModule {
             ctx.runtime_policy,
             ctx.trust_context_handler
                 .and_then(|backend| backend.signing_identity()),
+            ctx.trust_context_handler
+                .filter(|_| verb == verb::IDENTITY_STATUS)
+                .and_then(|backend| backend.root_store()),
         )
         .await
         .into()
@@ -417,10 +421,11 @@ fn json_answer<T: serde::Serialize>(
 
 /// `security/revoke`: revoke the device identity, key or certificate in
 /// `ControlParameters.name` — at this node's CA and in a new, root-signed
-/// version of the namespace's trust context (root device only). Already
-/// authorized by the trust-admin peer-credential gate (and refused over
-/// `/localhop`). Answered deferred. Success: `200` with
-/// [`crate::RevokedInfo`] as JSON status text.
+/// version of the namespace's trust context (root device only), unlocking
+/// the root's store with `ControlParameters.unlock_secret` when it needs a
+/// passphrase or PIN. Already authorized by the trust-admin peer-credential
+/// gate (and refused over `/localhop`). Answered deferred. Success: `200`
+/// with [`crate::RevokedInfo`] as JSON status text.
 fn security_revoke(
     params: ControlParameters,
     backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
@@ -440,9 +445,13 @@ fn security_revoke(
         )
         .into();
     };
+    let request = crate::RevokeRequest {
+        name,
+        unlock: params.unlock_secret,
+    };
     let backend = Arc::clone(backend);
     MgmtResponse::Deferred(Box::pin(async move {
-        json_answer(backend.revoke(name).await)
+        json_answer(backend.revoke(request).await)
     }))
 }
 

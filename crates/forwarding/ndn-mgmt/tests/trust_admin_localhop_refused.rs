@@ -13,7 +13,7 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::{InProcFace, InProcHandle};
 use ndn_mgmt::{
     AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, MgmtHandles,
-    RevokedInfo, TrustAdminMgmtBackend, TrustRefusal, mount_management,
+    RevokeRequest, RevokedInfo, TrustAdminMgmtBackend, TrustRefusal, mount_management,
 };
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name};
@@ -49,7 +49,7 @@ impl TrustAdminMgmtBackend for CountingBackend {
         })
     }
 
-    async fn revoke(&self, _name: Name) -> Result<RevokedInfo, TrustRefusal> {
+    async fn revoke(&self, _request: RevokeRequest) -> Result<RevokedInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(TrustRefusal {
             status_code: 500,

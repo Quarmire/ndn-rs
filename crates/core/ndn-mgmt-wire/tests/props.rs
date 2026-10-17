@@ -87,6 +87,7 @@ fn arb_control_parameters() -> impl Strategy<Value = ControlParameters> {
             strategy,
             mtu,
             shm_control_token: token.map(Bytes::from),
+            unlock_secret: None,
             base_cong_interval: base_cong,
             def_cong_threshold: def_cong,
             capacity,

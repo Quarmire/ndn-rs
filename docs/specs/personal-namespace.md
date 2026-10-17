@@ -55,9 +55,28 @@ Terms used throughout:
 | Relay | `/<ns>/node/<name>` | per relay, cert issued by CA | VPS / home server at a reachable address (QUIC listener) | always |
 | Guest | `/<ns>/guest/<who>` | guest's key, short-lived cert | friend's device | — |
 
-The root device (the primary device) is the first admin. Root key storage
-options on it (owner picks): OS keyring / secure enclave custodian, YubiKey
-PIV, or a `FilePib` directory. A relay never holds the root.
+The root device (the primary device) is the first admin. The root key lives
+in a **root store** the owner picks at `ndn-fwd init --root-store`, recorded
+in `<pib>/root/store.toml` (**have**, `ndn_cert::root_store`):
+
+| Store | Private key | Unlock per root operation |
+|---|---|---|
+| `os-keyring` (default when a keychain is reachable) | SafeBag `<pib>/root/root-keychain.safebag`, sealed by a random secret kept in the OS keychain (Secret Service / macOS Keychain / Windows Credential Manager) | none (the user's login) |
+| `sealed-file` | SafeBag `<pib>/root/root.safebag` (PBES2: PBKDF2-SHA256 600k, AES-256-CBC) under the owner's passphrase | the passphrase |
+| `yubikey-piv` | generated on a PIV slot (P-256, non-exportable; PIN policy `always`, touch policy recorded) | the PIN (+ touch) |
+| `file` | plaintext PKCS#8 in the FilePib (namespaces made before root stores; tests) | none — unprotected; the daemon warns |
+
+Root operations (`init`, `revoke`, `ndn-trust-context build --sign-key`)
+take the passphrase / PIN from the operator per operation (env var, a
+`--passphrase-file`/`--pin-file`, else the terminal; never argv); `revoke`
+sends it with the command over the local, peer-credential-gated management
+socket. Whether a node is the root device is decided from the descriptor
+and the context's anchor public keys, never by loading the key. `ndn-fwd
+root-key move --to <store>` moves a software root (new store signs first,
+then the plaintext copy is overwritten and deleted); a software (Ed25519)
+root cannot move onto PIV, so a hardware root is a new namespace or F10.
+The CA key and admin device keys stay in the FilePib: the daemon uses them
+unattended. A relay never holds the root.
 
 ## 3. Wire objects (all exist today unless marked NEW)
 
@@ -121,10 +140,11 @@ Each flow lists steps, what is stored where, failure handling, and status
 (**have** = implemented, **gap** = to build).
 
 ### F1 Create a namespace (root device)
-1. `ndn-fwd init --namespace /<ns> [--device <name>]` → root, CA,
-   the primary device as `/<ns>/admin/<dev>` (CA-certified; device name
-   defaults to the sanitized host name), root-signed context carrying the
-   generated schema, all in the PIB (**have**).
+1. `ndn-fwd init --namespace /<ns> [--device <name>] [--root-store <store>]`
+   → root (in its root store, §2), CA, the primary device as
+   `/<ns>/admin/<dev>` (CA-certified; device name defaults to the sanitized
+   host name), root-signed context carrying the generated schema, in the
+   PIB (**have**).
 2. Recovery kit offered immediately (F7). The owner may decline; the UI keeps
    reminding until one exists.
 3. Optional: delegate the CA to a relay (F3).
@@ -270,6 +290,9 @@ local segment (§9).
                       published by name unless [security] serve_contexts = false)
 <pib>/ca/             CA cert, anchor cert, node cert, issued/, revoked/,
                       redeemed-tokens/   (CA hosts only)
+<pib>/root/           root store of a root device: store.toml (kind, key,
+                      public key, anchor cert), root.safebag /
+                      root-keychain.safebag (sealed roots)
 $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs
 ```
 

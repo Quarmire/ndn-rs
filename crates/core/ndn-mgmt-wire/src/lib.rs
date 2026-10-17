@@ -29,7 +29,7 @@ pub mod control_surface;
 pub mod nfd_command;
 pub mod nfd_dataset;
 
-pub use control_parameters::ControlParameters;
+pub use control_parameters::{ControlParameters, UnlockSecret};
 pub use control_response::ControlResponse;
 pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};

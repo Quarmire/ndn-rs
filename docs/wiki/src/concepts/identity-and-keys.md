@@ -234,6 +234,38 @@ The dashboard's Security view performs the same import/anchor
 operations over the management protocol, and its Settings view shows
 which PIB the connected forwarder uses.
 
+## Root custody: where a namespace root key lives
+
+A namespace root `<ns>/KEY/root` is what every adopter trusts, and it
+signs rarely — the anchor, the CA's certificate, each new trust-context
+version (a revocation). So `ndn-fwd init` puts it in a **root store**,
+not with the keys the daemon uses unattended, and records the store in
+`<pib>/root/store.toml` (`ndn_cert::root_store`):
+
+| `--root-store` | Private key | A root operation needs |
+|---|---|---|
+| `os-keyring` (default when reachable) | SafeBag `root/root-keychain.safebag`, sealed by a random 32-byte secret in the OS keychain (Secret Service, macOS Keychain, Windows Credential Manager; `keyring` crate) | nothing beyond the user's login |
+| `sealed-file` | SafeBag `root/root.safebag` under your passphrase (PBES2, 600 000 PBKDF2 rounds) | the passphrase |
+| `yubikey-piv` | generated on a YubiKey PIV slot (P-256, never exportable; PIN policy `always`) | the PIN, and a touch per the recorded touch policy |
+| `file` | plaintext in the FilePib, file modes only | nothing — the daemon warns at startup |
+
+Without a reachable keychain (a headless Linux box with no Secret Service)
+`init` refuses and says to pass `--root-store sealed-file`. Passphrases and
+PINs come from `NDN_ROOT_PASSPHRASE` / `NDN_ROOT_PIN`, a
+`--passphrase-file` / `--pin-file`, else the terminal without echo — never
+the command line. `ndn-fwd root-key status` shows the store; `ndn-fwd
+root-key move --to os-keyring|sealed-file` moves a software root (the new
+store must sign as the root before the old copy goes; a plaintext file is
+overwritten, then deleted — on copy-on-write filesystems and SSDs only
+full-disk encryption guarantees the old blocks are gone). An Ed25519 root
+cannot move onto a YubiKey (PIV keeps only P-256 keys generated on it): a
+hardware root means a new namespace, or root rotation once it exists.
+
+The CA key and the device's admin key stay in the FilePib: the daemon
+signs with them without anyone present (every issued certificate, every
+management response). What they can do is bounded by the certificate the
+root signed and by the context the root controls.
+
 ## When you need more: `Identity`
 
 `KeyChain` is the atom — sign and verify; most code needs nothing

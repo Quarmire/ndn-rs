@@ -149,6 +149,22 @@ impl SecurityManager {
         public_key_bytes: Bytes,
         validity_ms: u64,
     ) -> Result<Certificate, TrustError> {
+        futures::executor::block_on(self.issue_self_signed_async(
+            key_name,
+            public_key_bytes,
+            validity_ms,
+        ))
+    }
+
+    /// [`issue_self_signed`](Self::issue_self_signed) through the signer's
+    /// async path, for callers already in async code (no nested executor)
+    /// and for hardware / custodian signers.
+    pub async fn issue_self_signed_async(
+        &self,
+        key_name: &Name,
+        public_key_bytes: Bytes,
+        validity_ms: u64,
+    ) -> Result<Certificate, TrustError> {
         let now_ns = now_ns();
         let valid_until = if validity_ms == u64::MAX {
             u64::MAX
@@ -166,13 +182,14 @@ impl SecurityManager {
         // in practice but preserves no-key callers.
         let cert = match self.get_signer_sync(key_name) {
             Ok(signer) => {
-                let wire = futures::executor::block_on(encode_cert_data(
+                let wire = encode_cert_data(
                     &cert_name,
                     &public_key_bytes,
                     signer.as_ref(),
                     now_ns,
                     valid_until,
-                ))?;
+                )
+                .await?;
                 let data = ndn_packet::Data::decode(wire).map_err(|e| {
                     TrustError::KeyStore(format!("failed to decode self-signed cert: {e}"))
                 })?;
