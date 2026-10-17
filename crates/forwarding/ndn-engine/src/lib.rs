@@ -81,8 +81,8 @@ pub use routing::{
 pub use wasm_builder::{WasmEngineBuilder, WasmEngineConfig};
 
 pub use pipeline::{
-    Action, AnyMap, DecodedPacket, DropReason, ForwardingAction, NackReason, PacketContext,
-    PipelineStage,
+    Action, AnyMap, DecodedPacket, DownstreamInterest, DropReason, ForwardingAction, NackReason,
+    PacketContext, PipelineStage,
 };
 pub use rate_limit_hook::{Decision, PacketKind, RateLimitHook, SharedRateLimitHook};
 pub use reflexive::{ReflexiveConfig, ReflexiveStatus, ReflexiveTable};

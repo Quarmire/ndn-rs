@@ -40,7 +40,7 @@ pub use error::PacketError;
 pub use interest::{Interest, Selector};
 pub use lp::{CachePolicyType, LpHeaders, LpPacket, encode_lp_packet};
 pub use meta_info::MetaInfo;
-pub use nack::{Nack, NackHeader, NackReason};
+pub use nack::{Nack, NackHeader, NackReason, Refusal};
 pub use name::{Name, NameComponent};
 pub use ndn_foundation_types::{Hash, KeyLocator, SignatureValue};
 pub use prefix_announcement::PrefixAnnouncement;

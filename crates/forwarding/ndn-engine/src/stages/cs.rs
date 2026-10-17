@@ -405,8 +405,8 @@ mod tests {
 
         let action = validation.process(ctx).await;
         assert!(
-            matches!(action, Action::Drop(_)),
-            "ValidationStage must drop Data with bogus signature"
+            matches!(action, Action::Refuse(_, ndn_packet::Refusal::BadSignature)),
+            "ValidationStage must refuse Data with bogus signature"
         );
     }
 

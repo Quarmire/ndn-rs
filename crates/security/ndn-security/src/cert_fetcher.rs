@@ -14,6 +14,17 @@
 //! any more (an earlier CA whose root device was replaced). Where a
 //! certificate came from never makes it trusted: the chain walk verifies
 //! every hop up to an anchor.
+//!
+//! A fetch the forwarder answers with a refusal ([`FetchMiss::Refused`]: it
+//! refused the certificate Data itself) ends at once with that reason: the
+//! validator remembers the refused certificate for its key, so asking the
+//! neighbour too could not change the verdict on the Data waiting on it.
+//!
+//! A fetch every source it asked answered definitively — none to be had
+//! there ([`FetchMiss::Absent`], a NoRoute Nack), or a refusal — leaves the
+//! certificate known absent ([`CertFetcher::known_absent`]) for as long as
+//! the fetcher would not ask again: Data waiting on it can be given a final
+//! verdict. A fetch that timed out never does; the network may only be slow.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,13 +38,46 @@ use tokio::sync::broadcast;
 use crate::TrustError;
 use crate::cert_cache::{CertCache, Certificate};
 
-pub type FetchFn =
-    Arc<dyn Fn(Name) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
+/// Why a [`FetchFn`] or [`DirectFetchFn`] brought no certificate Data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchMiss {
+    /// Nothing usable answered in time: a timeout, or a Nack that may not
+    /// hold for long (congestion, a duplicate).
+    Unanswered,
+    /// Answered that the certificate cannot be had where it was asked: a
+    /// NoRoute Nack.
+    Absent,
+    /// This host's forwarder refused the Data that answered: a final verdict
+    /// on that certificate.
+    Refused(ndn_packet::Refusal),
+    /// A [`DirectFetchFn`] that asked nobody, because the routed fetch already
+    /// goes to that face: the routed fetch's answer stands for both.
+    NotAsked,
+}
+
+impl FetchMiss {
+    /// What two sources that both brought no certificate add up to: absent
+    /// only when each said so (one that asked nobody defers to the other).
+    fn and(self, other: FetchMiss) -> FetchMiss {
+        match (self, other) {
+            (FetchMiss::NotAsked, miss) | (miss, FetchMiss::NotAsked) => miss,
+            (FetchMiss::Absent, FetchMiss::Absent) => FetchMiss::Absent,
+            _ => FetchMiss::Unanswered,
+        }
+    }
+}
+
+pub type FetchFn = Arc<
+    dyn Fn(Name) -> Pin<Box<dyn Future<Output = Result<Data, FetchMiss>> + Send>> + Send + Sync,
+>;
 
 /// Fetch a certificate name out of one face (a forwarder face id), bypassing
 /// the FIB.
-pub type DirectFetchFn =
-    Arc<dyn Fn(Name, u64) -> Pin<Box<dyn Future<Output = Option<Data>> + Send>> + Send + Sync>;
+pub type DirectFetchFn = Arc<
+    dyn Fn(Name, u64) -> Pin<Box<dyn Future<Output = Result<Data, FetchMiss>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// What a fetch is deduplicated and backed off by: the certificate name and
 /// the delivering face asked directly (`None`: routes only). A fetch that
@@ -46,12 +90,37 @@ pub struct CertFetcher {
     fetch_fn: FetchFn,
     direct_fn: Option<DirectFetchFn>,
     in_flight: DashMap<FetchKey, broadcast::Sender<Option<Certificate>>>,
-    /// Fetches whose last attempt failed → instant until which re-fetching
-    /// is suppressed. Bounded: pruned of expired entries once it exceeds
-    /// [`NEGATIVE_CACHE_PRUNE_AT`].
-    failed: DashMap<FetchKey, tokio::time::Instant>,
+    /// Fetches whose last attempt failed: until when re-fetching is
+    /// suppressed, and whether the certificate is known absent. Bounded:
+    /// pruned of expired entries once it exceeds [`NEGATIVE_CACHE_PRUNE_AT`].
+    failed: DashMap<FetchKey, Failed>,
     timeout: Duration,
     negative_ttl: Duration,
+}
+
+/// A fetch that brought no certificate.
+#[derive(Clone, Copy)]
+struct Failed {
+    /// The key is not fetched again before this.
+    retry_at: tokio::time::Instant,
+    /// Every source the fetch asked answered definitively (none to be had
+    /// there, or a refusal), rather than not answering in time.
+    absent: bool,
+}
+
+/// Why [`CertFetcher::do_fetch`] brought no certificate.
+struct Miss {
+    error: TrustError,
+    absent: bool,
+}
+
+impl From<TrustError> for Miss {
+    fn from(error: TrustError) -> Self {
+        Self {
+            error,
+            absent: false,
+        }
+    }
 }
 
 /// Size at which expired negative-cache entries are swept.
@@ -98,6 +167,19 @@ impl CertFetcher {
         self.timeout + self.negative_ttl
     }
 
+    /// Whether `cert_name` is known absent where [`Self::fetch_from`] asks
+    /// for it (with `face` asked too): its last fetch ended with every source
+    /// it asked answering that none is to be had there (a NoRoute Nack), or
+    /// with this host's forwarder refusing what answered — not merely without
+    /// an answer in time, which the network's slowness can explain. Holds for
+    /// as long as the fetcher would not ask again.
+    pub fn known_absent(&self, cert_name: &Arc<Name>, face: Option<u64>) -> bool {
+        let face = face.filter(|_| self.direct_fn.is_some());
+        self.failed
+            .get(&(Arc::clone(cert_name), face))
+            .is_some_and(|f| f.absent && tokio::time::Instant::now() < f.retry_at)
+    }
+
     /// Fetch the certificate `cert_name` resolves to (a key name — the
     /// newest certificate of that key — or a full certificate name),
     /// deduplicating concurrent requests. A cached certificate answers only
@@ -132,11 +214,12 @@ impl CertFetcher {
 
         // Negative cache: a recent failure for this name short-circuits, so
         // Data signed by an unreachable key cannot drive a fetch per packet.
-        let failed_until = self.failed.get(&key).map(|e| *e.value());
-        if let Some(until) = failed_until {
-            if tokio::time::Instant::now() < until {
+        let failed = self.failed.get(&key).map(|e| *e.value());
+        if let Some(failed) = failed {
+            if tokio::time::Instant::now() < failed.retry_at {
+                let why = if failed.absent { "known absent" } else { "recently failed" };
                 return Err(TrustError::CertNotFound {
-                    name: format!("recently failed: {cert_name}"),
+                    name: format!("{why}: {cert_name}"),
                 });
             }
             self.failed.remove(&key);
@@ -172,26 +255,30 @@ impl CertFetcher {
 
         let result = self.do_fetch(cert_name, face).await;
 
-        if result.is_err() && !self.negative_ttl.is_zero() {
+        if let Err(miss) = &result
+            && !self.negative_ttl.is_zero()
+        {
             let now = tokio::time::Instant::now();
             if self.failed.len() >= NEGATIVE_CACHE_PRUNE_AT {
-                self.failed.retain(|_, until| *until > now);
+                self.failed.retain(|_, f| f.retry_at > now);
             }
-            self.failed.insert(key, now + self.negative_ttl);
+            self.failed.insert(
+                key,
+                Failed {
+                    retry_at: now + self.negative_ttl,
+                    absent: miss.absent,
+                },
+            );
         }
 
         let cert = result.as_ref().ok().cloned();
         let _ = tx.send(cert);
         drop(guard);
 
-        result
+        result.map_err(|miss| miss.error)
     }
 
-    async fn do_fetch(
-        &self,
-        cert_name: &Arc<Name>,
-        face: Option<u64>,
-    ) -> Result<Certificate, TrustError> {
+    async fn do_fetch(&self, cert_name: &Arc<Name>, face: Option<u64>) -> Result<Certificate, Miss> {
         let name = cert_name.as_ref().clone();
         let routed = (self.fetch_fn)(name.clone());
         let answer = async {
@@ -206,23 +293,50 @@ impl CertFetcher {
             let started = tokio::time::Instant::now();
             tokio::pin!(routed);
             match tokio::time::timeout(DIRECT_FETCH_AFTER, &mut routed).await {
-                Ok(Some(data)) => Some(data),
-                Ok(None) => {
+                // Data, or a refusal: the verdict on the certificate.
+                Ok(answered @ (Ok(_) | Err(FetchMiss::Refused(_)))) => answered,
+                Ok(Err(miss)) => {
                     tokio::time::sleep_until(started + DIRECT_FETCH_AFTER).await;
-                    direct(name, face).await
+                    then_ask(miss, direct(name, face)).await
                 }
-                Err(_) => first_some(routed, direct(name, face)).await,
+                Err(_) => first_answer(routed, direct(name, face)).await,
             }
         };
 
-        let data = tokio::time::timeout(self.timeout, answer)
-            .await
-            .map_err(|_| TrustError::CertNotFound {
-                name: format!("timeout fetching {}", cert_name),
-            })?
-            .ok_or_else(|| TrustError::CertNotFound {
-                name: cert_name.to_string(),
-            })?;
+        let data = match tokio::time::timeout(self.timeout, answer).await {
+            Err(_) => {
+                return Err(TrustError::CertNotFound {
+                    name: format!("timeout fetching {}", cert_name),
+                }
+                .into());
+            }
+            Ok(Err(FetchMiss::Unanswered | FetchMiss::NotAsked)) => {
+                return Err(TrustError::CertNotFound {
+                    name: cert_name.to_string(),
+                }
+                .into());
+            }
+            Ok(Err(FetchMiss::Absent)) => {
+                return Err(Miss {
+                    error: TrustError::CertNotFound {
+                        name: format!("{cert_name}: none to be had where it was asked"),
+                    },
+                    absent: true,
+                });
+            }
+            Ok(Err(FetchMiss::Refused(refusal))) => {
+                return Err(Miss {
+                    error: TrustError::CertNotFound {
+                        name: format!(
+                            "{cert_name}: the forwarder refused the certificate that answered \
+                             ({refusal})"
+                        ),
+                    },
+                    absent: true,
+                });
+            }
+            Ok(Ok(data)) => data,
+        };
 
         // The answer to a prefix Interest must be a certificate of the
         // requested key under the requested name — not other Data under it
@@ -237,7 +351,8 @@ impl CertFetcher {
                     "{} answered the fetch for {cert_name} but is no certificate of that key",
                     data.name
                 ),
-            });
+            }
+            .into());
         }
         let cert = Certificate::decode(&data)?;
         self.cert_cache.insert(cert.clone());
@@ -245,22 +360,35 @@ impl CertFetcher {
     }
 }
 
-/// The first of `a` and `b` to answer `Some`; `None` once both answered `None`.
-async fn first_some<A, B>(a: A, b: B) -> Option<Data>
+/// The first of `a` and `b` to answer with Data or a refusal; once neither
+/// did, what their misses add up to ([`FetchMiss::and`]).
+async fn first_answer<A, B>(a: A, b: B) -> Result<Data, FetchMiss>
 where
-    A: Future<Output = Option<Data>>,
-    B: Future<Output = Option<Data>>,
+    A: Future<Output = Result<Data, FetchMiss>>,
+    B: Future<Output = Result<Data, FetchMiss>>,
 {
     tokio::pin!(a, b);
     tokio::select! {
         found = &mut a => match found {
-            Some(data) => Some(data),
-            None => b.await,
+            Err(miss) if !matches!(miss, FetchMiss::Refused(_)) => then_ask(miss, b).await,
+            answered => answered,
         },
         found = &mut b => match found {
-            Some(data) => Some(data),
-            None => a.await,
+            Err(miss) if !matches!(miss, FetchMiss::Refused(_)) => then_ask(miss, a).await,
+            answered => answered,
         },
+    }
+}
+
+/// `other`'s answer (Data, or a refusal) after a source that brought `miss`;
+/// if it misses too, what the two misses add up to.
+async fn then_ask<F>(miss: FetchMiss, other: F) -> Result<Data, FetchMiss>
+where
+    F: Future<Output = Result<Data, FetchMiss>>,
+{
+    match other.await {
+        Err(other) if !matches!(other, FetchMiss::Refused(_)) => Err(miss.and(other)),
+        answered => answered,
     }
 }
 
@@ -355,7 +483,7 @@ mod tests {
         let fc = Arc::clone(&fetch_count);
         let fetch_fn: FetchFn = Arc::new(move |_| {
             fc.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { None })
+            Box::pin(async { Err(FetchMiss::Unanswered) })
         });
 
         let fetcher = CertFetcher::new(cache, fetch_fn, Duration::from_secs(1));
@@ -372,7 +500,7 @@ mod tests {
         let cn = Arc::clone(&cert_name);
         let fetch_fn: FetchFn = Arc::new(move |_| {
             let data = make_cert_data(&cn, &[2; 32]);
-            Box::pin(async move { Some(data) })
+            Box::pin(async move { Ok(data) })
         });
 
         let fetcher = CertFetcher::new(Arc::clone(&cache), fetch_fn, Duration::from_secs(1));
@@ -390,7 +518,7 @@ mod tests {
         let fetch_fn: FetchFn = Arc::new(|_| {
             Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                None
+                Err(FetchMiss::Unanswered)
             })
         });
 
@@ -412,7 +540,7 @@ mod tests {
             let data = make_cert_data(&cn, &[3; 32]);
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Some(data)
+                Ok(data)
             })
         });
 
@@ -501,7 +629,7 @@ mod tests {
         let c = Arc::clone(&count);
         let fetch_fn: FetchFn = Arc::new(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { None })
+            Box::pin(async { Err(FetchMiss::Unanswered) })
         });
         (fetch_fn, count)
     }
@@ -578,7 +706,7 @@ mod tests {
             n.fetch_add(1, Ordering::Relaxed);
             let _ = log.set((face, started.elapsed()));
             let data = make_cert_data(&cn, &[7; 32]);
-            Box::pin(async move { Some(data) })
+            Box::pin(async move { Ok(data) })
         });
         let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
             .with_direct_fetch(direct);
@@ -600,13 +728,13 @@ mod tests {
         let cn = Arc::clone(&cert_name);
         let routed: FetchFn = Arc::new(move |_| {
             let data = make_cert_data(&cn, &[8; 32]);
-            Box::pin(async move { Some(data) })
+            Box::pin(async move { Ok(data) })
         });
         let direct_count = Arc::new(AtomicUsize::new(0));
         let dc = Arc::clone(&direct_count);
         let direct: DirectFetchFn = Arc::new(move |_, _| {
             dc.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { None })
+            Box::pin(async { Err(FetchMiss::Unanswered) })
         });
         let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
             .with_direct_fetch(direct);
@@ -616,6 +744,31 @@ mod tests {
         let unrouted = make_cert_name("unrouted");
         assert!(fetcher.fetch(&unrouted).await.is_err());
         assert_eq!(direct_count.load(Ordering::Relaxed), 0, "no face named, none asked");
+    }
+
+    /// A routed fetch the forwarder answers with a refusal ends at once with
+    /// that reason, and the neighbour is not asked: the verdict on the
+    /// certificate stands whoever serves it.
+    #[tokio::test]
+    async fn a_refused_certificate_ends_the_fetch_at_once() {
+        let cert_name = make_cert_name("revoked");
+        let routed: FetchFn = Arc::new(|_| {
+            Box::pin(async { Err(FetchMiss::Refused(ndn_packet::Refusal::Revoked)) })
+        });
+        let direct_count = Arc::new(AtomicUsize::new(0));
+        let dc = Arc::clone(&direct_count);
+        let direct: DirectFetchFn = Arc::new(move |_, _| {
+            dc.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(FetchMiss::Unanswered) })
+        });
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(5))
+            .with_direct_fetch(direct);
+        let started = tokio::time::Instant::now();
+        let err = fetcher.fetch_from(&cert_name, Some(9)).await.unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert!(started.elapsed() < DIRECT_FETCH_AFTER, "waited: {:?}", started.elapsed());
+        tokio::time::sleep(DIRECT_FETCH_AFTER * 2).await;
+        assert_eq!(direct_count.load(Ordering::Relaxed), 0, "the neighbour was asked");
     }
 
     /// Only a certificate of the requested key answers its fetch: other Data
@@ -636,7 +789,7 @@ mod tests {
             let cache = Arc::new(CertCache::new());
             let fetch_fn: FetchFn = Arc::new(move |_| {
                 let data = make_cert_data(&answered, &[5; 32]);
-                Box::pin(async move { Some(data) })
+                Box::pin(async move { Ok(data) })
             });
             let fetcher = CertFetcher::new(Arc::clone(&cache), fetch_fn, Duration::from_secs(1));
             assert!(fetcher.fetch(&asked).await.is_err(), "{asked} accepted a foreign answer");
@@ -648,7 +801,7 @@ mod tests {
             let answered: Name = answered.parse().unwrap();
             let fetch_fn: FetchFn = Arc::new(move |_| {
                 let data = make_cert_data(&answered, &[5; 32]);
-                Box::pin(async move { Some(data) })
+                Box::pin(async move { Ok(data) })
             });
             let fetcher =
                 CertFetcher::new(Arc::new(CertCache::new()), fetch_fn, Duration::from_secs(1));
@@ -662,17 +815,17 @@ mod tests {
     #[tokio::test]
     async fn each_delivering_face_is_asked_for_its_own_packet() {
         let cert_name = make_cert_name("earlier-ca");
-        let routed: FetchFn = Arc::new(|_| Box::pin(async { None }));
+        let routed: FetchFn = Arc::new(|_| Box::pin(async { Err(FetchMiss::Unanswered) }));
         let cn = Arc::clone(&cert_name);
         // Only face 2 holds the certificate; face 1 answers late, with nothing.
         let direct: DirectFetchFn = Arc::new(move |_, face| {
             let data = make_cert_data(&cn, &[6; 32]);
             Box::pin(async move {
                 if face == 2 {
-                    Some(data)
+                    Ok(data)
                 } else {
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    None
+                    Err(FetchMiss::Unanswered)
                 }
             })
         });
@@ -693,17 +846,117 @@ mod tests {
         // Face 1's fetch failed and is backed off; face 2 is still asked.
         let fetcher = CertFetcher::new(
             Arc::new(CertCache::new()),
-            Arc::new(|_| Box::pin(async { None })),
+            Arc::new(|_| Box::pin(async { Err(FetchMiss::Unanswered) })),
             Duration::from_secs(5),
         )
         .with_direct_fetch({
             let cn = Arc::clone(&cert_name);
             Arc::new(move |_, face| {
                 let data = make_cert_data(&cn, &[6; 32]);
-                Box::pin(async move { (face == 2).then_some(data) })
+                Box::pin(async move { (face == 2).then_some(data).ok_or(FetchMiss::Unanswered) })
             })
         });
         assert!(fetcher.fetch_from(&cert_name, Some(1)).await.is_err());
         assert!(fetcher.fetch_from(&cert_name, Some(2)).await.is_ok());
+    }
+
+    fn answering(miss: FetchMiss) -> (FetchFn, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let fetch_fn: FetchFn = Arc::new(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Err(miss) })
+        });
+        (fetch_fn, count)
+    }
+
+    fn direct_answering(miss: FetchMiss) -> DirectFetchFn {
+        Arc::new(move |_, _| Box::pin(async move { Err(miss) }))
+    }
+
+    /// A fetch every source answered "none here" (NoRoute) — the routes and
+    /// the delivering face — leaves the certificate known absent for that
+    /// face while the back-off lasts, and the back-off still holds: no
+    /// second Interest. Another face's packet is not answered by it.
+    #[tokio::test]
+    async fn a_certificate_every_source_says_is_absent_is_known_absent() {
+        let name = make_cert_name("unenrolled");
+        let (routed, count) = answering(FetchMiss::Absent);
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
+            .with_negative_ttl(Duration::from_millis(100))
+            .with_direct_fetch(direct_answering(FetchMiss::Absent));
+
+        assert!(!fetcher.known_absent(&name, Some(9)), "not before it was asked");
+        assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
+        assert!(fetcher.known_absent(&name, Some(9)));
+        assert!(!fetcher.known_absent(&name, Some(4)), "only for the face asked");
+        assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 1, "backed off as before");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !fetcher.known_absent(&name, Some(9)),
+            "once it may be asked again, it is no longer known"
+        );
+
+        // A routes-only fetch: the one source asked decides.
+        let (routed, _) = answering(FetchMiss::Absent);
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1));
+        assert!(fetcher.fetch(&name).await.is_err());
+        assert!(fetcher.known_absent(&name, None));
+    }
+
+    /// Absent is final only when every source asked answered definitively:
+    /// a source that did not answer in time (or answered a transient Nack)
+    /// leaves it unknown — the network may only be slow. A direct fetch that
+    /// asked nobody (the routes already lead to that face) defers to the
+    /// routed answer.
+    #[tokio::test]
+    async fn absence_needs_every_source_asked_to_answer_it() {
+        let name = make_cert_name("maybe");
+        let cases = [
+            (FetchMiss::Absent, FetchMiss::Unanswered, false),
+            (FetchMiss::Unanswered, FetchMiss::Absent, false),
+            (FetchMiss::Absent, FetchMiss::NotAsked, true),
+            (FetchMiss::Unanswered, FetchMiss::NotAsked, false),
+        ];
+        for (routed, direct, absent) in cases {
+            let (routed_fn, _) = answering(routed);
+            let fetcher =
+                CertFetcher::new(Arc::new(CertCache::new()), routed_fn, Duration::from_secs(1))
+                    .with_direct_fetch(direct_answering(direct));
+            assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
+            assert_eq!(fetcher.known_absent(&name, Some(9)), absent, "{routed:?} + {direct:?}");
+        }
+
+        // The routes say none, the neighbour never answers: the fetch times
+        // out, and nothing is known.
+        let (routed, _) = answering(FetchMiss::Absent);
+        let fetcher =
+            CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_millis(200))
+                .with_direct_fetch(Arc::new(|_, _| Box::pin(std::future::pending())));
+        assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
+        assert!(!fetcher.known_absent(&name, Some(9)));
+
+        // The routes say none, the neighbour holds it: found.
+        let (routed, _) = answering(FetchMiss::Absent);
+        let cn = Arc::clone(&name);
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
+            .with_direct_fetch(Arc::new(move |_, _| {
+                let data = make_cert_data(&cn, &[3; 32]);
+                Box::pin(async move { Ok(data) })
+            }));
+        assert!(fetcher.fetch_from(&name, Some(9)).await.is_ok());
+        assert!(!fetcher.known_absent(&name, Some(9)));
+    }
+
+    /// A refusal of what answered is a definitive answer too.
+    #[tokio::test]
+    async fn a_refused_certificate_is_known_absent() {
+        let name = make_cert_name("refused");
+        let (routed, _) = answering(FetchMiss::Refused(ndn_packet::Refusal::Revoked));
+        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
+            .with_direct_fetch(direct_answering(FetchMiss::Unanswered));
+        assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
+        assert!(fetcher.known_absent(&name, Some(9)));
     }
 }

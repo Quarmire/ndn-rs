@@ -34,6 +34,8 @@ sha2      = { workspace = true }
 # `web_time` shims them to `Date.now()` / `performance.now()` on wasm
 # and re-exports the real `std::time` types on native.
 web-time  = { workspace = true }
+# `Notify`: the PIT wakes its expiry task when an entry expiring sooner comes in.
+tokio     = { workspace = true, features = ["sync"] }
 
 # Native gets `ring` for any other native-only digest paths plus the
 # real `ndn-packet` std feature (which itself pulls ring).

@@ -26,7 +26,7 @@ pub struct ValidationStats {
 use crate::observability::targets as t;
 
 use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
-use ndn_packet::Name;
+use ndn_packet::{Name, Refusal};
 use ndn_security::{TrustError, ValidationResult, Validator};
 use ndn_transport::FaceId;
 
@@ -41,6 +41,9 @@ enum DrainResult {
     /// The awaited cert landed; re-validate. Carries the entry's original
     /// deadline so a re-queue (next missing hop) cannot extend it.
     Ready(Box<PacketContext>, Instant),
+    /// The awaited cert is known absent where it was fetched: a final
+    /// verdict on the Data.
+    Absent(Box<PacketContext>, Arc<Name>),
     Timeout,
 }
 
@@ -133,6 +136,21 @@ impl PendingQueue {
                 continue;
             }
 
+            // Every source the cert's fetch asked answered that it is not to
+            // be had there (a NoRoute Nack, or a refusal of what answered):
+            // the Data can never be verified from where it came, so it gets
+            // its verdict now instead of waiting out its deadline. A fetch
+            // that timed out never says so; the network may only be slow.
+            if validator
+                .cert_fetcher()
+                .is_some_and(|f| f.known_absent(&entry.needed_cert, Some(entry.ctx.face_id.0)))
+            {
+                let entry = self.entries.remove(i).unwrap();
+                self.total_bytes -= entry.byte_size;
+                results.push(DrainResult::Absent(Box::new(entry.ctx), entry.needed_cert));
+                continue;
+            }
+
             i += 1;
         }
 
@@ -148,10 +166,12 @@ impl PendingQueue {
 /// bounded pending queue and spawns a fetch through the validator's
 /// [`CertFetcher`](ndn_security::CertFetcher) (attached after engine build, see
 /// `ndn_app::install_engine_cert_fetcher`); the drain task re-validates once
-/// the cert is cached, walking one missing hop at a time, and drops the Data
-/// when its original deadline passes. The fetcher dedups concurrent requests
-/// and backs off after a failure, and every re-queue keeps the original
-/// deadline, so a missing cert cannot loop or amplify.
+/// the cert is cached, walking one missing hop at a time, refuses the Data as
+/// `unverifiable` once the fetcher knows the cert absent where it asked
+/// ([`CertFetcher::known_absent`](ndn_security::CertFetcher::known_absent)),
+/// and drops it when its original deadline passes. The fetcher dedups
+/// concurrent requests and backs off after a failure, and every re-queue
+/// keeps the original deadline, so a missing cert cannot loop or amplify.
 pub struct ValidationStage {
     pub validator: Option<Arc<Validator>>,
     pending: Arc<Mutex<PendingQueue>>,
@@ -280,19 +300,19 @@ impl ValidationStage {
                     Action::Drop(DropReason::ValidationPending)
                 } else {
                     span.record("outcome", "dropped");
-                    span.record("reason", "no-key-locator");
+                    span.record("reason", Refusal::Unverifiable.as_str());
                     self.stats.dropped_no_key.fetch_add(1, Ordering::Relaxed);
                     warn!(target: t::SECURITY, name=%name, "validation: DROPPED — unverifiable (no key locator)");
-                    Action::Drop(DropReason::ValidationFailed)
+                    Action::Refuse(ctx, Refusal::Unverifiable)
                 }
             }
             ValidationResult::Invalid(e) => {
-                let (reason, what) = invalid_reason(&e);
+                let (refusal, what) = invalid_reason(&e);
                 span.record("outcome", "invalid");
-                span.record("reason", reason);
+                span.record("reason", refusal.as_str());
                 self.stats.invalid.fetch_add(1, Ordering::Relaxed);
                 warn!(target: t::SECURITY, name=%name, error=%e, "validation: {what}");
-                Action::Drop(DropReason::ValidationFailed)
+                Action::Refuse(ctx, refusal)
             }
         }
     }
@@ -312,6 +332,11 @@ impl ValidationStage {
                     self.stats.dropped_timeout.fetch_add(1, Ordering::Relaxed);
                     warn!(target: t::SECURITY, "validation: DROPPED — cert fetch timed out");
                     actions.push(Action::Drop(DropReason::ValidationTimeout));
+                }
+                DrainResult::Absent(ctx, cert) => {
+                    self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+                    warn!(target: t::SECURITY, cert=%cert, "validation: REFUSED — unverifiable: the signing certificate is not to be had where it was fetched");
+                    actions.push(Action::Refuse(*ctx, Refusal::Unverifiable));
                 }
                 DrainResult::Ready(ctx, deadline) => {
                     let mut ctx = *ctx;
@@ -346,10 +371,10 @@ impl ValidationStage {
                             actions.push(Action::Drop(DropReason::ValidationFailed));
                         }
                         (ValidationResult::Invalid(e), _) => {
-                            let (_, what) = invalid_reason(&e);
+                            let (refusal, what) = invalid_reason(&e);
                             self.stats.invalid.fetch_add(1, Ordering::Relaxed);
                             warn!(target: t::SECURITY, name=%data.name, error=%e, "validation: {what} (after cert fetch)");
-                            actions.push(Action::Drop(DropReason::ValidationFailed));
+                            actions.push(Action::Refuse(ctx, refusal));
                         }
                     }
                 }
@@ -360,22 +385,32 @@ impl ValidationStage {
     }
 }
 
-/// An `Invalid` verdict as the span's `reason` and the log line's wording:
-/// a revoked key or a schema refusal is not a forged signature.
-fn invalid_reason(e: &TrustError) -> (&'static str, &'static str) {
+/// An `Invalid` verdict as the refusal the local downstreams are told (also
+/// the span's `reason`) and the log line's wording: a revoked key or a
+/// schema refusal is not a forged signature.
+fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
     match e {
-        TrustError::Revoked { .. } => ("revoked", "REFUSED — certificate revoked in trust context"),
-        TrustError::InvalidSignature | TrustError::InvalidKey => {
-            ("bad-signature", "FAILED — forged/invalid signature")
-        }
-        TrustError::SchemaMismatch | TrustError::CertNotAuthorized { .. } => {
-            ("schema", "REFUSED — not authorized by the trust schema")
-        }
+        TrustError::Revoked { .. } => (
+            Refusal::Revoked,
+            "REFUSED — certificate revoked in trust context",
+        ),
+        TrustError::InvalidSignature | TrustError::InvalidKey => (
+            Refusal::BadSignature,
+            "FAILED — forged/invalid signature",
+        ),
+        TrustError::SchemaMismatch | TrustError::CertNotAuthorized { .. } => (
+            Refusal::Schema,
+            "REFUSED — not authorized by the trust schema",
+        ),
         TrustError::UntrustedSelfSigned { .. } => (
-            "untrusted-root",
+            Refusal::UntrustedRoot,
             "REFUSED — chain ends at a self-signed certificate that is not a trust anchor",
         ),
-        _ => ("chain", "FAILED — certificate chain rejected"),
+        TrustError::ExpectedContextRefused { .. } => (
+            Refusal::Context,
+            "REFUSED — trust context does not meet the adoption/update expectation",
+        ),
+        _ => (Refusal::Chain, "FAILED — certificate chain rejected"),
     }
 }
 
@@ -411,7 +446,7 @@ mod tests {
 
         let action = validation.process(ctx).await;
         assert!(
-            matches!(action, Action::Drop(DropReason::ValidationFailed)),
+            matches!(action, Action::Refuse(_, Refusal::BadSignature)),
             "/localhost Data must go through validation instead of bypassing it"
         );
     }
@@ -442,10 +477,12 @@ mod tests {
     }
 
     /// Validator anchored at `root`, with a fetcher answering from `served`
-    /// (name → cert Data wire) and counting every fetch attempt.
+    /// (name → cert Data wire), `unserved` for any other name, and counting
+    /// every fetch attempt.
     fn validator_with_fetcher(
         root: &Ed25519Signer,
         served: HashMap<Name, Bytes>,
+        unserved: ndn_security::FetchMiss,
     ) -> (Arc<Validator>, Arc<AtomicUsize>) {
         let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
         validator.add_trust_anchor(Certificate {
@@ -463,7 +500,7 @@ mod tests {
         let fetch_fn: FetchFn = Arc::new(move |name: Name| {
             f.fetch_add(1, Ordering::Relaxed);
             let data = served.get(&name).map(|w| Data::decode(w.clone()).unwrap());
-            Box::pin(async move { data })
+            Box::pin(async move { data.ok_or(unserved) })
         });
         let fetcher = Arc::new(CertFetcher::new(
             validator.cert_cache_arc(),
@@ -515,7 +552,8 @@ mod tests {
             (mid.key_name().clone(), mid_cert),
             (leaf.key_name().clone(), leaf_cert),
         ]);
-        let (validator, fetches) = validator_with_fetcher(&root, served);
+        let (validator, fetches) =
+            validator_with_fetcher(&root, served, ndn_security::FetchMiss::Unanswered);
         let stage = ValidationStage::new(
             Some(Arc::clone(&validator)),
             PendingQueueConfig::default(),
@@ -541,14 +579,16 @@ mod tests {
         assert_eq!(fetches.load(Ordering::Relaxed), 2);
     }
 
-    /// A cert nobody serves: every Data naming it is parked, ONE fetch goes out
-    /// (dedup + negative cache — no per-packet retry storm), and each Data is
-    /// dropped by timeout once its deadline passes.
+    /// A cert nobody answers for (no answer in time, which says nothing
+    /// about whether it exists): every Data naming it is parked, ONE fetch
+    /// goes out (dedup + negative cache — no per-packet retry storm), and each
+    /// Data is dropped by timeout once its deadline passes, refused to nobody.
     #[tokio::test]
     async fn missing_cert_times_out_without_retry_storm() {
         let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
         let ghost = Ed25519Signer::from_seed(&[9; 32], n("/t/ghost/KEY/g/root/v1"));
-        let (validator, fetches) = validator_with_fetcher(&root, HashMap::new());
+        let (validator, fetches) =
+            validator_with_fetcher(&root, HashMap::new(), ndn_security::FetchMiss::Unanswered);
         let stage = ValidationStage::new(
             Some(validator),
             PendingQueueConfig {
@@ -582,5 +622,41 @@ mod tests {
             1,
             "20 Data naming one missing cert must cost one fetch"
         );
+    }
+
+    /// A cert whose fetch was answered that none is to be had where it was
+    /// asked (a NoRoute Nack): the Data waiting on it can never be verified
+    /// from there, and is refused `unverifiable` at the next drain rather
+    /// than dropped at its deadline.
+    #[tokio::test]
+    async fn data_whose_certificate_is_known_absent_is_refused_unverifiable() {
+        let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+        let ghost = Ed25519Signer::from_seed(&[9; 32], n("/t/ghost/KEY/g/root/v1"));
+        let (validator, fetches) =
+            validator_with_fetcher(&root, HashMap::new(), ndn_security::FetchMiss::Absent);
+        let stage = ValidationStage::new(
+            Some(validator),
+            PendingQueueConfig::default(),
+            ndn_runtime::default_runtime(),
+        );
+
+        let action = stage
+            .process(ctx_for(signed_data("/t/ghost/doc", &ghost)))
+            .await;
+        assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
+        let mut actions = Vec::new();
+        for _ in 0..200 {
+            actions = stage.drain_pending().await;
+            if !actions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            matches!(actions.as_slice(), [Action::Refuse(_, Refusal::Unverifiable)]),
+            "the Data is refused unverifiable, well before its deadline"
+        );
+        assert_eq!(stage.stats().invalid.load(Ordering::Relaxed), 1);
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
     }
 }

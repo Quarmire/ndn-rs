@@ -72,6 +72,7 @@ fn fixture_fetcher(expected: Name, cert: Certificate) -> Arc<CertFetcher> {
                 buf.extend_from_slice(&wire);
                 ndn_packet::Data::decode(buf.freeze()).expect("test wire decodes")
             })
+            .ok_or(ndn_security::FetchMiss::Unanswered)
         })
     });
     let fetcher = Arc::new(CertFetcher::new(

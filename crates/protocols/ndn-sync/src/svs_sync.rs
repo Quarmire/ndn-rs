@@ -23,6 +23,11 @@
 //! Timer model — the driver is a two-state machine (ndn-svs
 //! `SVSyncCore`):
 //!
+//! * **Join announcement.** On joining the group the node emits one
+//!   Sync Interest at once (ndn-svs `SVSyncCore::sendInitialInterest`,
+//!   ndnd `SvSync.main`), so its peers learn its state — and the face it
+//!   is reachable on — now rather than a full period later. It is not
+//!   suppressible: a peer Interest arriving first does not cancel it.
 //! * **Steady state.** A jittered periodic timer fires every
 //!   `[sync_interval ± jitter_ms]`, emitting one Sync Interest. When a
 //!   peer's Interest *covers* the local vector, this timer is reset to a
@@ -342,6 +347,16 @@ impl GroupCore {
         }
     }
 
+    /// Join announcement: emit the current state vector at once and start the
+    /// periodic timer. Both reference implementations send a Sync Interest when
+    /// a node starts (ndn-svs `SVSyncCore::sendInitialInterest`, 100 ms after
+    /// its prefix registration; ndnd `SvSync.main`, immediately) instead of
+    /// waiting a period; a driver calls this once per group, as it starts it.
+    pub(crate) async fn announce(&mut self, send: &mpsc::Sender<Bytes>) {
+        self.emit(send).await;
+        self.next_send = Instant::now() + jitter_interval(&self.config);
+    }
+
     /// The group's `next_send` timer fired: emit the periodic or suppressed
     /// catch-up Sync Interest and reschedule.
     pub(crate) async fn on_timer(&mut self, send: &mpsc::Sender<Bytes>) {
@@ -497,6 +512,7 @@ async fn svs_task(
     cancel: CancellationToken,
 ) {
     let mut gc = GroupCore::new(group, &local_name, config, update_tx, observed);
+    gc.announce(&send).await;
 
     loop {
         // Deliver buffered gaps without blocking (N-11): a blocking send here
@@ -1130,6 +1146,33 @@ mod tests {
         );
     }
 
+    /// A node announces itself when it joins (ndn-svs `sendInitialInterest`,
+    /// ndnd `SvSync.main`): with a 60 s period, its first Sync Interest still
+    /// goes out at once, so peers learn of it without waiting a period.
+    #[tokio::test]
+    async fn join_announces_without_waiting_a_period() {
+        let (send_tx, mut send_rx) = mpsc::channel(16);
+        let (_recv_tx, recv_rx) = mpsc::channel(16);
+        let group: Name = "/test/svs".parse().unwrap();
+        let config = SvsConfig {
+            sync_interval: Duration::from_secs(60),
+            jitter_ms: 0,
+            ..Default::default()
+        };
+        let _handle = join_svs_group(
+            group.clone(),
+            "/test/svs/joiner".parse().unwrap(),
+            send_tx,
+            recv_rx,
+            config,
+        );
+        let raw = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("no Sync Interest at join")
+            .expect("channel open");
+        assert!(parse_sync_interest(&group, &raw, V2).is_some());
+    }
+
     #[tokio::test]
     async fn reply_to_stale_fires_within_suppression_window() {
         // A node that is *ahead* of an incoming (stale) peer vector must
@@ -1151,6 +1194,11 @@ mod tests {
         };
 
         let handle = join_svs_group(group.clone(), local.clone(), send_tx, recv_rx, config);
+        // Drain the join announcement.
+        let _ = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("join announcement")
+            .expect("channel open");
 
         // Publish so we advance to seq 1 (now ahead of any peer at 0).
         handle.publish(local.clone()).await.expect("publish");
@@ -1175,9 +1223,9 @@ mod tests {
     #[tokio::test]
     async fn steady_state_suppression_defers_periodic_interest() {
         // When a peer's vector already covers us, our next periodic
-        // Interest is pushed out (interest-storm suppression). With a
-        // short interval but a covering peer arriving each round, the
-        // node should stay quiet rather than emit back-to-back.
+        // Interest is pushed out (interest-storm suppression): a covering
+        // peer arriving halfway through the period keeps the node quiet
+        // past the point where the unsuppressed periodic would have fired.
         let (send_tx, mut send_rx) = mpsc::channel(16);
         let (recv_tx, recv_rx) = mpsc::channel(16);
 
@@ -1185,7 +1233,7 @@ mod tests {
         let local: Name = "/test/svs/node-q".parse().unwrap();
 
         let config = SvsConfig {
-            sync_interval: Duration::from_millis(120),
+            sync_interval: Duration::from_millis(300),
             jitter_ms: 0,
             suppression_period: Duration::from_millis(40),
             ..Default::default()
@@ -1193,18 +1241,20 @@ mod tests {
 
         let _handle = join_svs_group(group.clone(), local.clone(), send_tx, recv_rx, config);
 
-        // Drain the first periodic Interest.
+        // Drain the join announcement; the periodic one is due 300 ms later.
         let _ = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
             .await
-            .expect("first interest")
+            .expect("join announcement")
             .expect("channel open");
 
-        // A peer that already covers us (knows our seq=0) arrives — should
-        // reset our periodic timer, so no Interest in the next ~80 ms.
+        // Halfway through the period a peer that already covers us (knows our
+        // seq=0) arrives — it resets our periodic timer to a fresh 300 ms, so
+        // nothing is sent at the 300 ms mark.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let covering = peer_sync_interest(&group, &[("/test/svs/node-q", 0)]);
         recv_tx.send(covering).await.expect("send covering");
 
-        let quiet = tokio::time::timeout(Duration::from_millis(80), send_rx.recv()).await;
+        let quiet = tokio::time::timeout(Duration::from_millis(250), send_rx.recv()).await;
         assert!(
             quiet.is_err(),
             "covering peer should defer our periodic Interest"
@@ -1313,6 +1363,11 @@ mod tests {
         };
 
         let handle = join_svs_group(group.clone(), local.clone(), send_tx, recv_rx, config);
+        // Drain the join announcement (it carries no mapping yet).
+        let _ = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("join announcement")
+            .expect("channel open");
 
         handle
             .publish_with_mapping(local.clone(), Bytes::from_static(b"test-mapping"))
@@ -1511,8 +1566,12 @@ mod tests {
         let handle = join_svs_group(group.clone(), local.clone(), send_tx, recv_rx, config);
         let obs = handle.observed().expect("observed present");
 
-        // (60 s interval → no immediate periodic; the only send is the forced
-        // post-publish announce captured below.)
+        // (60 s interval → after the join announcement, drained here, the only
+        // send is the forced post-publish announce captured below.)
+        let _ = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("join announcement")
+            .expect("channel open");
         // Peer claims it has stored our data to seq 7.
         recv_tx
             .send(peer_sync_interest(

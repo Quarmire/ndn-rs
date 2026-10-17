@@ -142,11 +142,23 @@ pub fn group_data(publisher: &Name, context: &Data) -> Option<Bytes> {
 /// Fetches the Content bytes of the Data published at a name. The caller backs
 /// this with its consumer/face; an in-process engine, an `ndn-app` `Consumer`,
 /// or a test stub all satisfy it. For a context-sync group the Content is the
-/// signed context Data wire. `Err` says why nothing usable arrived (a
-/// timeout, a Nack and its reason, ...), for the log.
+/// signed context Data wire. `Err` says why nothing usable arrived.
 #[async_trait::async_trait]
 pub trait ContextFetcher: Send + Sync {
-    async fn fetch_content(&self, name: Name) -> Result<Bytes, String>;
+    async fn fetch_content(&self, name: Name) -> Result<Bytes, ContextFetchError>;
+}
+
+/// Why [`ContextFetcher::fetch_content`] brought nothing.
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum ContextFetchError {
+    /// Nothing usable arrived (a timeout, a Nack and its reason, no
+    /// Content): why. The version may be fetched later.
+    #[error("{0}")]
+    Missing(String),
+    /// This node's forwarder refused the Data that answered: why. A final
+    /// verdict on that Data — it is refused for what it is, not lost.
+    #[error("this node's forwarder refused it ({0})")]
+    Refused(String),
 }
 
 /// What happened when a sync update was processed.
@@ -192,11 +204,16 @@ pub async fn process_update(
     let fetch_name = update.name.clone().append_segment(update.high_seq);
     let content = match fetcher.fetch_content(fetch_name.clone()).await {
         Ok(content) => content,
-        Err(reason) => {
+        Err(ContextFetchError::Missing(reason)) => {
             return ContextSyncOutcome::FetchFailed {
                 name: fetch_name,
                 reason,
             };
+        }
+        Err(ContextFetchError::Refused(reason)) => {
+            return ContextSyncOutcome::Refused(UpdateRefusal::DroppedByForwarder(format!(
+                "{fetch_name}: {reason}"
+            )));
         }
     };
     let Ok(data) = Data::decode(content) else {
@@ -306,11 +323,12 @@ impl VersionSource for GroupVersions<'_> {
             return Ok(data);
         }
         let name = self.group.clone().append_segment(position);
-        let content = self
-            .fetcher
-            .fetch_content(name.clone())
-            .await
-            .map_err(|reason| Unfetched::Missing(format!("{name} could not be fetched: {reason}")))?;
+        let content = self.fetcher.fetch_content(name.clone()).await.map_err(|e| match e {
+            ContextFetchError::Missing(reason) => {
+                Unfetched::Missing(format!("{name} could not be fetched: {reason}"))
+            }
+            ContextFetchError::Refused(reason) => Unfetched::Dropped(format!("{name}: {reason}")),
+        })?;
         Data::decode(content)
             .map_err(|e| Unfetched::Missing(format!("{name} carries no Data packet: {e}")))
     }
@@ -352,12 +370,17 @@ struct Pending {
 /// the group for the context and spawns this on its runtime. The keyring
 /// holds an adopted version in memory only: `keep` is handed each adoption
 /// to persist and serve its signed Data and the versions walked through.
+/// `announced` sees each update as it arrives, before it is fetched: the
+/// versions the group says exist (its sequence numbers), whether or not
+/// they are obtained.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut handle: SyncHandle,
     namespace: Name,
     fetcher: Arc<dyn ContextFetcher>,
     keyring: Arc<Keyring>,
     keep: impl Fn(&ContextUpdate) + Send,
+    announced: impl Fn(&SyncUpdate) + Send,
     retry: Retry,
     cancel: CancellationToken,
 ) {
@@ -370,6 +393,7 @@ pub async fn run(
             _ = cancel.cancelled() => break,
             update = handle.recv() => {
                 let Some(mut update) = update else { break };
+                announced(&update);
                 // A new announcement is tried at once, and backs off from
                 // the start again.
                 if let Some(earlier) = pending.remove(&update.name) {
@@ -525,11 +549,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContextFetcher for MapFetcher {
-        async fn fetch_content(&self, name: Name) -> Result<Bytes, String> {
+        async fn fetch_content(&self, name: Name) -> Result<Bytes, ContextFetchError> {
             self.0
                 .get(&name.to_string())
                 .map(|c| c.value().clone())
-                .ok_or_else(|| "nothing published".to_string())
+                .ok_or_else(|| ContextFetchError::Missing("nothing published".to_string()))
         }
     }
 
@@ -811,7 +835,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContextFetcher for Flaky {
-        async fn fetch_content(&self, name: Name) -> Result<Bytes, String> {
+        async fn fetch_content(&self, name: Name) -> Result<Bytes, ContextFetchError> {
             *self.fetches.entry(name.to_string()).or_insert(0) += 1;
             let lost = self
                 .failing
@@ -822,7 +846,7 @@ mod tests {
                 )
                 .is_ok();
             if lost {
-                return Err("timed out".into());
+                return Err(ContextFetchError::Missing("timed out".into()));
             }
             self.group.fetch_content(name).await
         }
@@ -853,6 +877,7 @@ mod tests {
             move |_| {
                 kept.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
+            |_| {},
             QUICK,
             cancel.clone(),
         ));

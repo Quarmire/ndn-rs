@@ -215,13 +215,14 @@ async fn multi_task(
                         let (publish_tx, publish_rx) = mpsc::channel(64);
                         let (ack_tx, ack_rx) = mpsc::channel(64);
                         let observed = Arc::new(ObservedState::default());
-                        let gc = GroupCore::new(
+                        let mut gc = GroupCore::new(
                             group.clone(),
                             &local_name,
                             config,
                             update_tx,
                             Arc::clone(&observed),
                         );
+                        gc.announce(&send).await;
                         groups.insert(group.clone(), gc);
                         publish_map.insert(group.clone(), ReceiverStream::new(publish_rx));
                         ack_map.insert(group.clone(), ReceiverStream::new(ack_rx));
@@ -356,5 +357,28 @@ mod tests {
             .expect("update");
         assert_eq!(upd.publisher, "/node/a");
         assert_eq!(upd.high_seq, 1);
+    }
+
+    /// Each group joined on the shared driver announces itself at once, as a
+    /// single-group task does: with a 60 s period the first Sync Interest of
+    /// the new group still goes out immediately.
+    #[tokio::test]
+    async fn a_joined_group_announces_without_waiting_a_period() {
+        let (send, mut send_rx) = mpsc::channel::<Bytes>(16);
+        let (_in, recv) = mpsc::channel::<Bytes>(16);
+        let driver = spawn_multi_svs("/node/a".parse().unwrap(), send, recv);
+        let group: Name = "/g".parse().unwrap();
+        let config = SvsConfig {
+            sync_interval: Duration::from_secs(60),
+            jitter_ms: 0,
+            ..Default::default()
+        };
+        let _handle = driver.join(group.clone(), config).await.expect("join");
+        let raw = tokio::time::timeout(Duration::from_secs(1), send_rx.recv())
+            .await
+            .expect("no Sync Interest at join")
+            .expect("channel open");
+        let interest = Interest::decode(raw).expect("decode");
+        assert_eq!(interest.name.components()[..1], group.components()[..]);
     }
 }

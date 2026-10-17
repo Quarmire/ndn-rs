@@ -519,7 +519,8 @@ face_task (one per Face)
 pipeline_runner → per-packet processing inline
                   stages → dispatch → face_table.get(id).send(bytes)
 
-expiry_task → drains expired PIT entries (1 ms tick)
+expiry_task → drains expired PIT entries at the soonest deadline (woken early by an
+              insert that expires sooner; housekeeping at most once a second)
 ```
 
 ## Security

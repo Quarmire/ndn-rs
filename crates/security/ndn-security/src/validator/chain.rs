@@ -156,7 +156,20 @@ impl Validator {
                 result(ValidationResult::Valid(Box::new(safe)))
             }
             WalkOutcome::Pending(missing) => (ValidationResult::Pending, Some(missing)),
-            WalkOutcome::Invalid(e) => result(ValidationResult::Invalid(e)),
+            WalkOutcome::Invalid(e) => {
+                // A certificate refused with a final verdict answers for its
+                // key for a while (`refused_certs`): Data parked waiting for
+                // that key is then re-walked through it and refused with the
+                // same verdict (e.g. its issuer is revoked) at once, instead
+                // of timing out while the fetch could not change the answer.
+                if is_cert_name(&data.name)
+                    && !is_reserved_non_cert(&data.name)
+                    && let Ok(cert) = Certificate::decode(data)
+                {
+                    self.remember_refused(cert);
+                }
+                result(ValidationResult::Invalid(e))
+            }
         }
     }
 
@@ -237,8 +250,9 @@ impl Validator {
     /// signed by its own key is its own signer's certificate: it is never
     /// fetched — the fetch would be answered by this very packet, which waits
     /// for it. A chain ending at a self-signed certificate that is no anchor
-    /// is refused ([`TrustError::UntrustedSelfSigned`]); a certificate packet
-    /// refused so is remembered for its key ([`Self::refused_certs`]).
+    /// is refused ([`TrustError::UntrustedSelfSigned`]). A certificate packet
+    /// refused for any reason is remembered for its key
+    /// ([`Self::refused_certs`]) by the Data validation that refused it.
     ///
     /// [`SignedTrustContext::authorizes_hop`]: crate::SignedTrustContext::authorizes_hop
     #[allow(clippy::too_many_arguments)]
@@ -460,18 +474,6 @@ impl Validator {
             // A self-signed certificate that is no anchor (an anchor of its
             // key ended the walk above) ends the chain: nothing vouches for it.
             if key_name_of(issuer) == cert.key_name() {
-                if let Some(p) =
-                    packet.filter(|p| is_cert_name(&p.name) && !is_reserved_non_cert(&p.name))
-                {
-                    let packet_cert = if cert.name == p.name {
-                        Some(cert.clone())
-                    } else {
-                        Certificate::decode(p).ok()
-                    };
-                    if let Some(c) = packet_cert {
-                        self.remember_refused(c);
-                    }
-                }
                 return WalkOutcome::Invalid(TrustError::UntrustedSelfSigned {
                     cert: cert.name.to_string(),
                     namespace: ctx.namespace().to_string(),
@@ -691,9 +693,9 @@ impl Validator {
         }
     }
 
-    /// Remember `cert`, a certificate packet just refused for its chain, as
-    /// the answer for its key for as long as a fetch of that key would not be
-    /// retried anyway.
+    /// Remember `cert`, a certificate packet just refused with a final
+    /// verdict, as the answer for its key for as long as a fetch of that key
+    /// would not be retried anyway.
     fn remember_refused(&self, cert: Certificate) {
         let now = now_ns();
         if self.refused_certs.len() >= REFUSED_CERTS_MAX {
@@ -898,7 +900,7 @@ mod tests {
             validator.cert_cache_arc(),
             Arc::new(move |_| {
                 f.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async { None })
+                Box::pin(async { Err(crate::FetchMiss::Unanswered) })
             }),
             std::time::Duration::from_secs(1),
         ));
@@ -983,7 +985,11 @@ mod tests {
         let fetch_fn: FetchFn = Arc::new(move |name: Name| {
             let wire = cert_wire.clone();
             let want = want.clone();
-            Box::pin(async move { (name == want).then(|| Data::decode(wire).unwrap()) })
+            Box::pin(async move {
+                (name == want)
+                    .then(|| Data::decode(wire).unwrap())
+                    .ok_or(crate::FetchMiss::Unanswered)
+            })
         });
         let fetcher = Arc::new(CertFetcher::new(
             validator.cert_cache_arc(),
@@ -1036,7 +1042,11 @@ mod tests {
         let fetch_fn: FetchFn = Arc::new(move |name: Name| {
             let wire = cert_wire.clone();
             let want = want.clone();
-            Box::pin(async move { (name == want).then(|| Data::decode(wire).unwrap()) })
+            Box::pin(async move {
+                (name == want)
+                    .then(|| Data::decode(wire).unwrap())
+                    .ok_or(crate::FetchMiss::Unanswered)
+            })
         });
         let fetcher = Arc::new(CertFetcher::new(
             validator.cert_cache_arc(),
@@ -1477,7 +1487,7 @@ mod tests {
             validator.cert_cache_arc(),
             Arc::new(move |_| {
                 f.fetch_add(1, Ordering::Relaxed);
-                let data = Data::decode(served.clone()).ok();
+                let data = Data::decode(served.clone()).map_err(|_| crate::FetchMiss::Unanswered);
                 Box::pin(async move { data })
             }),
             std::time::Duration::from_secs(1),
@@ -1586,5 +1596,66 @@ mod tests {
         assert!(validator.add_trust_anchor(Certificate::decode(&cert).unwrap()));
         let (result, _) = validator.validate_chain_cached(&cert).await;
         assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+    }
+
+    /// A certificate refused for its chain (its issuer is revoked) answers
+    /// for its key: Data signed by that key gets the same verdict at once,
+    /// not `Pending` on a certificate the fetch could only refuse again.
+    #[tokio::test]
+    async fn data_signed_by_a_refused_certificate_gets_its_verdict() {
+        use crate::Keyring;
+        use crate::cert_cache::CertCache;
+        use crate::trust_context::SignedTrustContext;
+        use dashmap::DashMap;
+
+        let root = Ed25519Signer::from_seed(&[70; 32], n("/lab/KEY/root"));
+        let ca = Ed25519Signer::from_seed(&[71; 32], n("/lab/CA/KEY/ca"));
+        let member = Ed25519Signer::from_seed(&[72; 32], n("/lab/m/KEY/k1"));
+        let ca_cert =
+            make_cert_data_packet(&n("/lab/CA/KEY/ca/root/v=1"), &ca.public_key_bytes(), &root)
+                .await;
+        let member_cert =
+            make_cert_data_packet(&n("/lab/m/KEY/k1/ca/v=1"), &member.public_key_bytes(), &ca)
+                .await;
+
+        let ambient = SignedTrustContext::ambient(wildcard_schema(), Arc::new(DashMap::new()))
+            .with_revocation(ca.key_name().clone());
+        ambient.add_anchor(Certificate {
+            name: Arc::new(root.key_name().clone()),
+            public_key: Bytes::copy_from_slice(&root.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        });
+        let cache = Arc::new(CertCache::new());
+        cache.insert(Certificate::decode(&Data::decode(ca_cert).unwrap()).unwrap());
+        let validator = Validator::with_keyring(
+            Arc::new(Keyring::with_ambient(Arc::new(ambient))),
+            cache,
+            None,
+            5,
+        );
+
+        let data = data_signed_by("/lab/m/photo", &member);
+        let (result, _) = validator.validate_chain_cached(&data).await;
+        assert!(matches!(result, ValidationResult::Pending), "got {result:?}");
+
+        let (result, _) = validator
+            .validate_chain_cached(&Data::decode(member_cert).unwrap())
+            .await;
+        assert!(
+            matches!(result, ValidationResult::Invalid(TrustError::Revoked { .. })),
+            "got {result:?}"
+        );
+        assert!(validator.can_resolve(member.key_name()));
+        let (result, missing) = validator.validate_chain_cached(&data).await;
+        assert!(
+            matches!(result, ValidationResult::Invalid(TrustError::Revoked { .. })),
+            "got {result:?}"
+        );
+        assert!(missing.is_none());
     }
 }

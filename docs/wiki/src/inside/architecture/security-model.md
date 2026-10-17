@@ -179,8 +179,9 @@ Type-enforced verification pays off at the forwarder too. The design goal in
 is forwarded on a validating face*. In `ndn-engine` this is realised by the
 validation stage (`crates/forwarding/ndn-engine/src/stages/validation.rs`):
 on a face that carries a `Validator`, a Data packet that fails validation is
-dropped (`Action::Drop(DropReason::ValidationFailed)`) and never propagates,
-while a packet that validates sets `ctx.verified = true` on its `PacketContext`.
+refused (`Action::Refuse(ctx, Refusal)`, see [Local refusal](#local-refusal))
+and never propagates, while a packet that validates sets `ctx.verified = true`
+on its `PacketContext`.
 The Content Store admission gate (`crates/forwarding/ndn-engine/src/stages/cs.rs`)
 then admits only `ctx.verified` Data, so unverified bytes cannot poison the
 cache for downstream consumers.
@@ -191,6 +192,50 @@ itself — the `SafeData`/`Unverified` type discipline is the *application-layer
 enforcement, and the pipeline mirrors it with the flag. Both express the same
 invariant: data that cannot be authenticated does not flow where authenticated
 data is required.
+
+### Local refusal
+
+A Data the validation stage refuses with a **final verdict** is not
+forwarded. Instead every *local* downstream whose Interest it answered (an
+app, or the forwarder's own consumers: certificate fetches, trust-context
+refresh, sync) gets a Nack for its own Interest whose NackReason says why, so
+it learns at once instead of waiting out the Interest lifetime:
+
+| Code | Token | Verdict |
+|---|---|---|
+| 170 | `chain` | chain rejected otherwise (too deep, a cycle, unsupported signature type, key store error) |
+| 171 | `revoked` | a certificate on the chain is revoked in the governing trust context |
+| 172 | `bad-signature` | the signature does not verify: forged, or altered in transit |
+| 173 | `schema` | the trust schema/context does not authorize the signer for the name |
+| 174 | `untrusted-root` | the chain ends at a self-signed certificate that is no trust anchor |
+| 175 | `context` | a trust context being adopted/updated failed the expectation |
+| 176 | `unverifiable` | the Data names no signing key (no KeyLocator), or its signing certificate is not to be had where it was fetched (see [Missing certificates](#missing-certificates)) |
+
+(`ndn_packet::Refusal`, `NackReason::Refused`; ndn-rs-private codes, beside
+`NotYet` = 160.) Rules:
+
+- **Final verdicts only.** Data parked waiting for a certificate, a
+  certificate fetch that times out, and "still no certificate" drops send
+  nothing: the certificate could still appear, so there is no verdict to
+  report. A fetch every source answered definitively is a verdict
+  (`unverifiable`, below).
+- **Local faces only** (`FaceScope::Local`). To the network a refused Data is
+  a dropped one, as NDN specifies; a remote peer learns nothing it could probe
+  with. A refusal *arriving* from a non-local upstream is an unverified claim
+  (anyone could forge "revoked"): it is relayed as `NoRoute` and the strategy
+  treats it as `NoRoute` (that upstream has nothing usable; another may). A
+  refusal from a local upstream (a forwarder on this host) is relayed as a
+  refusal to local downstreams only.
+- **Why a Nack:** NackReason is NDNLPv2's field for "why this Interest is not
+  satisfied", and a receiver that does not know a reason code must treat it
+  as a Nack without reason, not drop it — so an NFD/ndn-cxx app on a local
+  face still fails fast. A separate LP header field would be a second place to
+  look; delivering the Data with a "refused" flag would let an app that ignores
+  the flag accept it.
+- **Consumers do not retry a refusal.** `ndn_app` maps it to
+  `AppError::Refused { reason }` (`AppError::from_nack`); `fetch_with_retry`,
+  object fetches and segment pipelines stop at once, the certificate fetcher
+  ends the fetch, and `ndn-peek` exits 3 with `refused: <token>`.
 
 ### Missing certificates
 
@@ -212,6 +257,16 @@ in-process app face. Without it, a Data signed by an uncached cert is dropped
 at its deadline. The `CertFetcher` dedups concurrent requests per name and
 remembers a failure for its timeout, so a stream of Data signed by an
 unreachable key costs one cert Interest per backoff window, not one per packet.
+
+A fetch whose every source answered that the certificate is not to be had
+there — a `NoRoute` Nack, or this host's forwarder refusing what answered —
+leaves it **known absent** (`CertFetcher::known_absent`) for that backoff
+window: the routed fetch and, when it asked the delivering face directly,
+that face too (a direct fetch skipped because the routes already lead to
+that face defers to the routed answer). Data parked for it is then refused
+`unverifiable` at the next drain instead of dropped at its deadline. A
+source that did not answer in time, or answered a transient Nack
+(congestion, duplicate), keeps it unknown: the network may only be slow.
 
 ## See also
 

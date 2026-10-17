@@ -33,17 +33,16 @@ impl CaExchange for EngineExchange {
         self.consumer
             .fetch_wire(interest, ndn_app::DEFAULT_TIMEOUT)
             .await
-            .map_err(|e| {
-                CertError::Transport(match e {
-                    AppError::Nacked {
-                        reason: Some(NackReason::NoRoute),
-                    } => format!("this forwarder has no route for {name}"),
-                    AppError::Timeout => format!(
-                        "no answer to {name} within {:.1} s",
-                        ndn_app::DEFAULT_TIMEOUT.as_secs_f32()
-                    ),
-                    e => format!("{name}: {e}"),
-                })
+            .map_err(|e| match e {
+                AppError::Refused { reason } => CertError::Refused { name, reason },
+                AppError::Nacked {
+                    reason: Some(NackReason::NoRoute),
+                } => CertError::Transport(format!("this forwarder has no route for {name}")),
+                AppError::Timeout => CertError::Transport(format!(
+                    "no answer to {name} within {:.1} s",
+                    ndn_app::DEFAULT_TIMEOUT.as_secs_f32()
+                )),
+                e => CertError::Transport(format!("{name}: {e}")),
             })
     }
 }

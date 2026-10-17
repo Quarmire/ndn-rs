@@ -75,14 +75,15 @@ impl Strategy for MulticastStrategy {
             .collect();
         // ALL upstreams merely suppressed is NOT NoRoute — it means "not
         // now". NFD `continue`s past a SUPPRESS verdict and sends nothing,
-        // leaving the PIT entry pending. Answering NoRoute here tells the
-        // consumer the name is unreachable and kills the stream: measured on
-        // the fleet as video dropping to ZERO and telemetry gapping the moment
-        // suppression went live, because the emptiness check below originally
-        // meant "the FIB has no nexthop" and the filter silently changed what
-        // empty means.
+        // leaving the PIT entry pending: `Suppress`. Answering NoRoute here
+        // tells the consumer the name is unreachable and kills the stream:
+        // measured on the fleet as video dropping to ZERO and telemetry
+        // gapping the moment suppression went live, because the emptiness
+        // check below originally meant "the FIB has no nexthop" and the filter
+        // silently changed what empty means. An empty action list would do
+        // the same: the engine answers it NoRoute.
         if faces.is_empty() {
-            return Some(SmallVec::new());
+            return Some(smallvec![ForwardingAction::Suppress]);
         }
         Some(smallvec![ForwardingAction::Forward(faces)])
     }
@@ -156,7 +157,10 @@ mod tests {
             !actions.iter().any(|a| matches!(a, ForwardingAction::Nack(_))),
             "suppression must never answer Nack"
         );
-        assert!(actions.is_empty(), "nothing is sent while every upstream is suppressed");
+        assert!(
+            matches!(actions.as_slice(), [ForwardingAction::Suppress]),
+            "nothing is sent while every upstream is suppressed, and the Interest stays pending"
+        );
     }
 
     /// A genuinely empty nexthop set is still NoRoute.

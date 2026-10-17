@@ -39,6 +39,43 @@ impl PacketDispatcher {
         self.face_link_type(face_id) == LinkType::PointToPoint
     }
 
+    /// Whether `face_id` is a local face (same host: an app, an internal
+    /// consumer, a loopback peer). A face gone from the table is not.
+    pub(super) fn is_local_face(&self, face_id: FaceId) -> bool {
+        self.face_table
+            .get(face_id)
+            .is_some_and(|f| f.scope() == FaceScope::Local)
+    }
+
+    /// The validation stage refused `ctx`'s Data with a final verdict
+    /// (`refusal`). Each local downstream whose Interest it consumed gets a
+    /// Nack carrying the refusal and its own Interest, so the app (or this
+    /// node's own consumer) learns at once why nothing came instead of
+    /// waiting out its Interest lifetime. A non-local downstream gets
+    /// nothing: to the network a refused Data is a dropped one, as NDN
+    /// specifies.
+    async fn refuse(&self, ctx: PacketContext, refusal: ndn_packet::Refusal) {
+        for d in &ctx.out_interests {
+            if !self.is_local_face(d.face) {
+                trace!(target: t::SECURITY, face=%d.face, name=%d.name, refusal=%refusal, "refusal not told to a non-local downstream");
+                continue;
+            }
+            debug!(target: t::SECURITY, face=%d.face, name=%d.name, refusal=%refusal, "telling a local downstream its Data was refused");
+            let intent = EgressIntent {
+                headers: LpHeaders {
+                    pit_token: d.lp_pit_token.clone(),
+                    ..Default::default()
+                },
+                nack: Some(ndn_packet::NackReason::Refused(refusal)),
+            };
+            if let Some(state) = self.face_states.get(&d.face) {
+                state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
+            }
+            let interest = ndn_packet::Nack::interest_wire(&d.name, &d.selector, d.nonce);
+            self.enqueue_send(d.face, interest, intent).await;
+        }
+    }
+
     /// Classify an outbound packet into a [`TrafficClass`](crate::egress::TrafficClass).
     /// `TrafficClass::DEFAULT` when no classifier is configured (the FIFO default path
     /// ignores the class anyway).
@@ -200,6 +237,7 @@ impl PacketDispatcher {
                 self.satisfy(ctx).await;
             }
             Action::Drop(r) => debug!(target: t::FWD_PIPELINE, reason=?r, "packet dropped"),
+            Action::Refuse(ctx, refusal) => self.refuse(ctx, refusal).await,
             Action::Nack(ctx, reason) => {
                 trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, name=?ctx.name, reason=?reason, "dispatch: Nack");
                 if !self.nacks_allowed_on_face(ctx.face_id) {

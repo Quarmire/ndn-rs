@@ -87,7 +87,8 @@ impl<'a> ReplySource<'a> {
     }
 
     /// The reply to the Interest identified by `expected` + `can_be_prefix`:
-    /// its Data with LP local fields, or its Nack as [`AppError::Nacked`].
+    /// its Data with LP local fields, or its Nack as [`AppError::Nacked`]
+    /// ([`AppError::Refused`] when the forwarder refused the Data).
     /// `meta` reads the shared queue with [`Connection::recv_with_meta`] so an
     /// in-process face's ingress face id is kept.
     async fn answer(
@@ -99,7 +100,7 @@ impl<'a> ReplySource<'a> {
         match self {
             Self::Correlated(replies) => match replies.recv().await {
                 Some(Reply::Data(data, lp)) => Ok((data, lp)),
-                Some(Reply::Nack(reason)) => Err(AppError::Nacked { reason }),
+                Some(Reply::Nack(reason)) => Err(AppError::from_nack(reason)),
                 None => Err(AppError::Closed),
             },
             Self::Shared(conn) => loop {
@@ -113,7 +114,7 @@ impl<'a> ReplySource<'a> {
                 };
                 match judge_reply(expected, can_be_prefix, reply) {
                     ReplyVerdict::Ours(data) => return Ok((*data, lp)),
-                    ReplyVerdict::Nacked(reason) => return Err(AppError::Nacked { reason }),
+                    ReplyVerdict::Nacked(reason) => return Err(AppError::from_nack(reason)),
                     ReplyVerdict::Straggler => continue,
                 }
             },
@@ -121,14 +122,19 @@ impl<'a> ReplySource<'a> {
     }
 
     /// The next reply in a segment pipeline fetching `versioned/<seg>`:
-    /// `Some(Some((data, congestion_marked)))` for a segment Data,
-    /// `Some(None)` for anything else (a Nack, a straggler) — the pipeline's
-    /// retransmit recovers real loss — and `None` once the connection closed.
-    async fn next_segment(&mut self, versioned: &Name) -> Option<Option<(Data, bool)>> {
+    /// `Some(Data(..))` for a segment Data, `Some(Refused(..))` when this
+    /// host's forwarder refused a segment (final: the fetch stops),
+    /// `Some(Other)` for anything else (another Nack, a straggler) — the
+    /// pipeline's retransmit recovers real loss — and `None` once the
+    /// connection closed.
+    async fn next_segment(&mut self, versioned: &Name) -> Option<SegmentReply> {
         match self {
             Self::Correlated(replies) => Some(match replies.recv().await? {
-                Reply::Data(data, lp) => Some((data, lp.congestion_mark.is_some())),
-                Reply::Nack(_) => None,
+                Reply::Data(data, lp) => SegmentReply::Data(data, lp.congestion_mark.is_some()),
+                Reply::Nack(reason) => match reason.and_then(|r| r.refusal()) {
+                    Some(refusal) => SegmentReply::Refused(refusal),
+                    None => SegmentReply::Other,
+                },
             }),
             Self::Shared(conn) => {
                 let wire = conn.recv().await?;
@@ -136,17 +142,31 @@ impl<'a> ReplySource<'a> {
                 // before unwrapping.
                 let marked = is_lp_packet(&wire)
                     && LpPacket::decode(wire.clone()).is_ok_and(|lp| lp.congestion_mark.is_some());
-                Some(
-                    decode_data_lp(wire)
-                        .ok()
-                        .filter(|d| {
-                            d.name.len() == versioned.len() + 1 && d.name.has_prefix(versioned)
-                        })
-                        .map(|d| (d, marked)),
-                )
+                let ours =
+                    |name: &Name| name.len() == versioned.len() + 1 && name.has_prefix(versioned);
+                Some(match decode_data_lp(wire.clone()) {
+                    Ok(d) if ours(&d.name) => SegmentReply::Data(d, marked),
+                    // A refusal of one of this pipeline's segment Interests.
+                    Err(AppError::Refused { reason })
+                        if interest_identity(&wire).is_ok_and(|i| ours(&i.name)) =>
+                    {
+                        SegmentReply::Refused(reason)
+                    }
+                    _ => SegmentReply::Other,
+                })
             }
         }
     }
+}
+
+/// One reply off the face of a segment pipeline ([`ReplySource::next_segment`]).
+enum SegmentReply {
+    /// A segment Data, and whether it carried a congestion mark.
+    Data(Data, bool),
+    /// This host's forwarder refused a segment.
+    Refused(ndn_packet::Refusal),
+    /// Anything else.
+    Other,
 }
 
 async fn accept_content(
@@ -359,7 +379,8 @@ impl Consumer {
 
     /// `timeout` should be at least the Interest lifetime encoded in
     /// `wire`. Returns [`AppError::Nacked`] on a forwarder Nack **for this
-    /// Interest**.
+    /// Interest**, and [`AppError::Refused`] at once when this host's
+    /// forwarder refused the Data that answered it.
     ///
     /// ## Pairing contract (NS-6a)
     ///
@@ -530,7 +551,8 @@ impl Consumer {
     }
 
     /// Exponential back-off: `base_delay`, `2×base_delay`, … up to
-    /// `max_attempts` total tries.
+    /// `max_attempts` total tries. A refusal ([`AppError::Refused`]) is final
+    /// and ends the retries at once.
     pub async fn fetch_with_retry(
         &mut self,
         name: impl Into<Name>,
@@ -544,6 +566,7 @@ impl Consumer {
         for attempt in 0..attempts {
             match self.fetch(name.clone()).await {
                 Ok(data) => return Ok(data),
+                Err(e @ AppError::Refused { .. }) => return Err(e),
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < attempts {
@@ -979,8 +1002,11 @@ impl Consumer {
             match recv_res {
                 // Non-segment / Nack packets are ignored; the retransmit path
                 // recovers any real loss.
-                Ok(Some(None)) => continue,
-                Ok(Some(Some((data, marked)))) => {
+                Ok(Some(SegmentReply::Other)) => continue,
+                // A refused segment is refused again if asked again: the
+                // object cannot be fetched.
+                Ok(Some(SegmentReply::Refused(reason))) => return Err(AppError::Refused { reason }),
+                Ok(Some(SegmentReply::Data(data, marked))) => {
                     let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
                     else {
                         continue;
@@ -1064,7 +1090,8 @@ impl Consumer {
 
     /// Issue an Interest built by `make` (rebuilt with a fresh nonce each try),
     /// re-expressing on timeout/Nack up to [`OBJECT_FETCH_ATTEMPTS`] times with
-    /// exponential back-off. Resilience for the RDR fetch over lossy radios.
+    /// exponential back-off. Resilience for the RDR fetch over lossy radios;
+    /// a refusal is final and not re-expressed.
     async fn fetch_object_with_retry(
         &mut self,
         mut make: impl FnMut() -> InterestBuilder,
@@ -1075,6 +1102,7 @@ impl Consumer {
             let (wire, timeout) = make().build_with_timeout();
             match self.fetch_wire(wire, timeout).await {
                 Ok(data) => return Ok(data),
+                Err(e @ AppError::Refused { .. }) => return Err(e),
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < OBJECT_FETCH_ATTEMPTS {
@@ -1320,9 +1348,7 @@ pub(crate) fn decode_data_lp(reply: Bytes) -> Result<Data, AppError> {
         && let Ok(lp) = LpPacket::decode(reply.clone())
     {
         if let Some(header) = lp.nack {
-            return Err(AppError::Nacked {
-                reason: header.reason,
-            });
+            return Err(AppError::from_nack(header.reason));
         }
         if let Some(fragment) = lp.fragment {
             return Data::decode(fragment).map_err(|e| AppError::Protocol(e.to_string()));
@@ -2038,6 +2064,29 @@ mod fetch_pairing_tests {
             .await
             .expect_err("our own Nack is an answer");
         assert!(matches!(err, AppError::Nacked { .. }), "got {err:?}");
+    }
+
+    /// `fetch_with_retry` retries a Nack but never a refusal: the Data that
+    /// would answer the retry is never asked for.
+    #[tokio::test]
+    async fn retry_stops_at_a_refusal() {
+        let refused = ndn_packet::NackReason::Refused(ndn_packet::Refusal::Revoked);
+        let conn = ScriptedConn::new([encode_lp_nack(refused, &interest("/x/2")), data("/x/2")]);
+        let err = Consumer::new(conn)
+            .fetch_with_retry(ndn_packet::name!("/x/2"), 3, Duration::from_millis(1))
+            .await
+            .expect_err("a refusal is final");
+        assert!(
+            matches!(err, AppError::Refused { reason: ndn_packet::Refusal::Revoked }),
+            "got {err:?}"
+        );
+
+        let nack = encode_lp_nack(ndn_packet::NackReason::NoRoute, &interest("/x/2"));
+        let conn = ScriptedConn::new([nack, data("/x/2")]);
+        Consumer::new(conn)
+            .fetch_with_retry(ndn_packet::name!("/x/2"), 3, Duration::from_millis(1))
+            .await
+            .expect("an ordinary Nack is retried");
     }
 
     /// `CanBePrefix` accepts a descendant (the segmented-publication shape,

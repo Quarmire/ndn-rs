@@ -32,6 +32,17 @@ pub struct PacketContext {
     /// Per-egress NDNLPv2 PitToken to echo on the return path. Parallel to
     /// `out_faces`; `None` at index `i` means no LP wrap for that face.
     pub out_pit_tokens: SmallVec<[Option<Bytes>; 4]>,
+    /// The Interest of each classical (one-shot) downstream the Data
+    /// consumed, kept by `PitMatchStage` only when
+    /// [`record_downstream`](Self::record_downstream) is set (empty
+    /// otherwise), so a refusal Nack can echo each local downstream's own
+    /// Interest. Persistent subscriptions are not listed: their in-records
+    /// outlive the Data, and a Nack would end them.
+    pub out_interests: SmallVec<[DownstreamInterest; 1]>,
+    /// Set by the dispatcher before PIT match on a Data it will validate:
+    /// PIT match then fills [`out_interests`](Self::out_interests). Data that
+    /// is never validated pays nothing for it.
+    pub record_downstream: bool,
     /// Link-layer sender id (from `InboundMeta`), used to key NDNLPv2
     /// reassembly per-sender on a multi-access face. `0` = unicast / no source.
     pub endpoint_id: u64,
@@ -62,6 +73,21 @@ pub struct PacketContext {
     pub tags: AnyMap,
 }
 
+/// A downstream's Interest as a refusal Nack must carry it: consumers
+/// (ndn-cxx's `Face`, `ndn-app`) match a Nack to their pending Interest by
+/// name and selectors.
+#[derive(Clone, Debug)]
+pub struct DownstreamInterest {
+    pub face: FaceId,
+    /// The NDNLPv2 PitToken the downstream sent, to echo.
+    pub lp_pit_token: Option<Bytes>,
+    /// The PIT entry's name: the Interest's, which for a `CanBePrefix`
+    /// downstream is a prefix of the Data's.
+    pub name: Arc<Name>,
+    pub selector: ndn_packet::Selector,
+    pub nonce: u32,
+}
+
 impl PacketContext {
     pub fn new(raw_bytes: Bytes, face_id: FaceId, arrival: u64) -> Self {
         Self {
@@ -74,6 +100,8 @@ impl PacketContext {
             lp_pit_token: None,
             out_faces: SmallVec::new(),
             out_pit_tokens: SmallVec::new(),
+            out_interests: SmallVec::new(),
+            record_downstream: false,
             endpoint_id: 0,
             cs_hit: false,
             verified: false,

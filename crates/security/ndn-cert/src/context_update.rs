@@ -38,6 +38,7 @@ use ndn_security::{
 };
 
 use crate::client::CaExchange;
+use crate::error::CertError;
 use crate::onboarding::{
     CONTEXT_EXPECTATION_TTL, FetchContextError, fetch_context_pointer, fetch_versioned_context,
     rdr_prefix,
@@ -467,7 +468,9 @@ impl From<UpdateFetchError> for Unfetched {
 /// validating forwarder (`forwarder`), it is told to expect an update signed
 /// by an anchor of `from` ([`Validator::expect_context_update`]), so it
 /// admits it even if it does not hold the context itself, and a refused one
-/// is reported with why.
+/// is reported with why — at once: the forwarder answers the refused Data's
+/// Interest with a refusal Nack ([`CertError::Refused`]) rather than letting
+/// it time out.
 async fn fetch_update<E>(
     exchange: &mut E,
     forwarder: Option<&Validator>,
@@ -483,9 +486,16 @@ where
         .map_err(UpdateFetchError::InProgress)?;
     let fetched = fetch_versioned_context(exchange, versioned).await;
     let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
-    fetched.map_err(|source| match outcome.refused {
-        Some(reason) => UpdateFetchError::Dropped(reason),
-        None => UpdateFetchError::Fetch(source),
+    fetched.map_err(|source| match (outcome.refused, source) {
+        (Some(reason), _) => UpdateFetchError::Dropped(reason),
+        (
+            None,
+            FetchContextError::Transport {
+                source: CertError::Refused { reason, .. },
+                ..
+            },
+        ) => UpdateFetchError::Dropped(format!("refused it ({reason})")),
+        (None, source) => UpdateFetchError::Fetch(source),
     })
 }
 

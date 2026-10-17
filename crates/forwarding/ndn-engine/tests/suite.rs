@@ -27,6 +27,8 @@ mod forwarding_hint;
 mod incoming_face_id_local_fields;
 #[path = "local_data_validation.rs"]
 mod local_data_validation;
+#[path = "local_refusal.rs"]
+mod local_refusal;
 #[path = "nack_counters.rs"]
 mod nack_counters;
 #[path = "next_hop_face_id_local_fields.rs"]
@@ -43,5 +45,7 @@ mod pit_fan_out_witness;
 mod rejected_interest_pit;
 #[path = "self_learning.rs"]
 mod self_learning;
+#[path = "simultaneous_interests.rs"]
+mod simultaneous_interests;
 #[path = "traceroute_responder.rs"]
 mod traceroute_responder;

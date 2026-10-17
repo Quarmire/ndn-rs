@@ -58,11 +58,13 @@ impl Strategy for BestRouteStrategy {
             return Some(smallvec![ForwardingAction::Nack(NackReason::NoRoute)]);
         };
         // NFD best-route-strategy.cpp: a retransmission arriving inside the
-        // entry's exponential suppression window is dropped, not forwarded.
-        // Checked before nexthop selection so a suppressed retransmission does
-        // not consume an untried upstream.
+        // entry's exponential suppression window is dropped, not forwarded,
+        // and stays pending on the entry for the Data of the upstream already
+        // asked: `Suppress`, never an empty action list, which the engine
+        // answers NoRoute. Checked before nexthop selection so a suppressed
+        // retransmission does not consume an untried upstream.
         if ctx.entry_retx_suppressed {
-            return Some(SmallVec::new());
+            return Some(smallvec![ForwardingAction::Suppress]);
         }
         // Prefer an upstream not yet tried for this Interest (D.09 failover);
         // fall back to any non-incoming nexthop for liveness once every
@@ -215,6 +217,26 @@ mod tests {
             actions.as_slice(),
             [ForwardingAction::Nack(NackReason::NoRoute)]
         ));
+    }
+
+    /// Inside the entry's suppression window the Interest is suppressed: it
+    /// waits on the entry for the upstream already asked. Never NoRoute, and
+    /// never an empty action list (the engine answers that NoRoute).
+    #[tokio::test]
+    async fn a_suppressed_interest_stays_pending() {
+        let strategy = BestRouteStrategy::new();
+        let name = Arc::new(Name::root());
+        let measurements = MeasurementsTable::new();
+        let fib = FibEntry {
+            nexthops: vec![FibNexthop {
+                face_id: FaceId(2),
+                cost: 0,
+            }],
+        };
+        let mut ctx = make_ctx(&name, FaceId(1), Some(&fib), &measurements);
+        ctx.entry_retx_suppressed = true;
+        let actions = strategy.after_receive_interest(&ctx);
+        assert!(matches!(actions.as_slice(), [ForwardingAction::Suppress]));
     }
 
     #[tokio::test]

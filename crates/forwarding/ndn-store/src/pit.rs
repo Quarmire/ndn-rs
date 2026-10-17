@@ -1,10 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]
 use dashmap::DashMap;
 use smallvec::SmallVec;
+use tokio::sync::Notify;
 
 use ndn_packet::lp::TraceId;
 use ndn_packet::{Name, NameComponent, Selector};
@@ -381,10 +383,14 @@ impl PitEntry {
     /// Fixed `RETX_SUPPRESS_INITIAL_NS` window: NFD inserts the interval on the
     /// out-record but never grows it on this path — only `decidePerPitEntry`
     /// grows. An upstream with no out-record is NEW and never suppressed.
+    ///
+    /// The entry is judged as it stood at `now_ns`: an out-record sent later
+    /// (`sent_at` is the forwarded Interest's arrival; a parallel pipeline can
+    /// forward a later Interest first) did not exist then.
     pub fn suppressed_upstreams(&self, now_ns: u64) -> SmallVec<[u64; 4]> {
         self.out_records
             .iter()
-            .filter(|r| now_ns.saturating_sub(r.sent_at) < RETX_SUPPRESS_INITIAL_NS)
+            .filter(|r| r.sent_at <= now_ns && now_ns - r.sent_at < RETX_SUPPRESS_INITIAL_NS)
             .map(|r| r.face_id)
             .collect()
     }
@@ -393,9 +399,17 @@ impl PitEntry {
     /// `decidePerPitEntry`, used by `best-route`). Read-only: the window grows
     /// in [`Self::note_forward_decision`], once per forward.
     ///
-    /// An entry with no out-records is NEW and never suppressed.
+    /// An entry with no out-records is NEW and never suppressed. As in
+    /// [`Self::suppressed_upstreams`], out-records sent after `now_ns` are
+    /// not counted.
     pub fn entry_retx_suppressed(&self, now_ns: u64) -> bool {
-        let Some(last_out) = self.out_records.iter().map(|r| r.sent_at).max() else {
+        let Some(last_out) = self
+            .out_records
+            .iter()
+            .map(|r| r.sent_at)
+            .filter(|&sent_at| sent_at <= now_ns)
+            .max()
+        else {
             return false;
         };
         let interval = if self.retx_suppress_interval_ns == 0 {
@@ -403,7 +417,7 @@ impl PitEntry {
         } else {
             self.retx_suppress_interval_ns
         };
-        now_ns.saturating_sub(last_out) < interval
+        now_ns - last_out < interval
     }
 
     pub fn in_record_faces(&self) -> impl Iterator<Item = u64> + '_ {
@@ -459,6 +473,13 @@ pub struct Pit {
     orphans: DashMap<bytes::Bytes, OrphanedSubscription>,
     #[cfg(target_arch = "wasm32")]
     orphans: std::sync::Mutex<std::collections::HashMap<bytes::Bytes, OrphanedSubscription>>,
+    /// No entry expires before this (epoch ns; `u64::MAX`: none). It may be early (the entry it
+    /// was set for was satisfied, or its deadline moved later), never late: an insert lowers it,
+    /// and a drain sets it to the soonest of the entries it leaves. A deadline changed in place
+    /// (`with_entry_mut`, `on_existing`) may only move later.
+    next_expiry: AtomicU64,
+    /// Woken when an insert lowers `next_expiry`.
+    expiry_moved: Notify,
 }
 
 impl Pit {
@@ -473,6 +494,8 @@ impl Pit {
             orphans: DashMap::new(),
             #[cfg(target_arch = "wasm32")]
             orphans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_expiry: AtomicU64::new(u64::MAX),
+            expiry_moved: Notify::new(),
         }
     }
 
@@ -508,9 +531,29 @@ impl Pit {
         }
     }
 
+    /// An entry expiring at `at` is in: the expiry task is told if it sleeps past that.
+    fn note_expiry(&self, at: u64) {
+        if self.next_expiry.fetch_min(at, Ordering::SeqCst) > at {
+            self.expiry_moved.notify_one();
+        }
+    }
+
+    /// No entry expires before this (epoch ns; `u64::MAX` when none): the expiry task sleeps
+    /// until then. It may be early, never late.
+    pub fn next_expiry(&self) -> u64 {
+        self.next_expiry.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once an insert has lowered [`Self::next_expiry`] since the last time it did
+    /// (one waiter: the expiry task).
+    pub async fn expiry_moved(&self) {
+        self.expiry_moved.notified().await;
+    }
+
     pub fn insert(&self, token: PitToken, entry: PitEntry) {
         // Notify BEFORE storing: see `PitObserver::on_pit_insert`.
         self.notify_insert(&entry);
+        let at = entry.expires_at;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.entries.insert(token, entry);
@@ -519,6 +562,7 @@ impl Pit {
         {
             self.entries.lock().unwrap().insert(token, entry);
         }
+        self.note_expiry(at);
     }
 
     pub fn contains(&self, token: &PitToken) -> bool {
@@ -576,7 +620,9 @@ impl Pit {
                 Entry::Occupied(mut e) => on_existing(e.get_mut()),
                 Entry::Vacant(v) => {
                     let (entry, ret) = on_new();
+                    let at = entry.expires_at;
                     v.insert(entry);
+                    self.note_expiry(at);
                     ret
                 }
             }
@@ -589,7 +635,9 @@ impl Pit {
                 Entry::Occupied(mut e) => on_existing(e.get_mut()),
                 Entry::Vacant(v) => {
                     let (entry, ret) = on_new();
+                    let at = entry.expires_at;
                     v.insert(entry);
+                    self.note_expiry(at);
                     ret
                 }
             }
@@ -633,14 +681,25 @@ impl Pit {
 
     /// Drain expired PIT entries with their full entry state. Forwarders use
     /// this when erasure needs more than the in-record face IDs, such as
-    /// populating the Dead Nonce List.
+    /// populating the Dead Nonce List. [`Self::next_expiry`] becomes the
+    /// soonest deadline of the entries left.
     pub fn drain_expired_entries(&self, now_ns: u64) -> Vec<(PitToken, PitEntry)> {
+        // Reset before the scan: an entry inserted during it lowers the value
+        // again itself, whether or not the scan sees it.
+        self.next_expiry.store(u64::MAX, Ordering::SeqCst);
+        let mut soonest = u64::MAX;
+        let mut expiring = |expires_at: u64| {
+            if expires_at > now_ns {
+                soonest = soonest.min(expires_at);
+            }
+            expires_at <= now_ns
+        };
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        let out = {
             let expired: Vec<PitToken> = self
                 .entries
                 .iter()
-                .filter(|r| r.expires_at <= now_ns)
+                .filter(|r| expiring(r.expires_at))
                 .map(|r| *r.key())
                 .collect();
             let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
@@ -654,13 +713,13 @@ impl Pit {
                 }
             }
             out
-        }
+        };
         #[cfg(target_arch = "wasm32")]
-        {
+        let out = {
             let mut entries = self.entries.lock().unwrap();
             let expired: Vec<PitToken> = entries
                 .iter()
-                .filter(|(_, e)| e.expires_at <= now_ns)
+                .filter(|(_, e)| expiring(e.expires_at))
                 .map(|(k, _)| *k)
                 .collect();
             let mut out: Vec<(PitToken, PitEntry)> = Vec::with_capacity(expired.len());
@@ -672,7 +731,9 @@ impl Pit {
                 }
             }
             out
-        }
+        };
+        self.next_expiry.fetch_min(soonest, Ordering::SeqCst);
+        out
     }
 
     pub fn len(&self) -> usize {

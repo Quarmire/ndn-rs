@@ -16,6 +16,15 @@ use crate::observability::targets as t;
 use crate::rib::Rib;
 use std::sync::atomic::Ordering;
 
+/// The dead nonce list's purge and the orphaned subscription budgets' reap need no precision:
+/// the list treats expired entries as absent anyway (and bounds itself on insert), and the
+/// budgets carry minute-scale deadlines. They run at most this far apart, and the PIT task never
+/// sleeps longer, which also bounds how long a wall-clock step can delay it.
+const HOUSEKEEPING: Duration = Duration::from_secs(1);
+
+/// Expires PIT entries at their deadlines: the task sleeps until the soonest one the PIT may
+/// hold ([`Pit::next_expiry`]), woken earlier when an entry expiring sooner comes in, and wakes
+/// at most every [`HOUSEKEEPING`] otherwise. An idle forwarder does not spin.
 #[tracing::instrument(
     level = "info",
     target = "engine",
@@ -30,51 +39,47 @@ pub async fn run_expiry_task(
     cancel: CancellationToken,
     runtime: Arc<dyn Runtime>,
 ) {
-    let interval = Duration::from_millis(1);
-    // Orphaned subscription budgets (F15) carry minute-scale deadlines, so
-    // sweeping them on the 1ms PIT cadence is wasteful; throttle to ~1s.
-    let mut tick: u64 = 0;
+    // Housekeeping goes by the monotonic clock, PIT deadlines by the wall clock they are set in
+    // (epoch ns via the runtime seam, so a virtual runtime drives PIT expiry deterministically).
+    let mut housekeeping_at = runtime.now() + HOUSEKEEPING;
     loop {
-        let sleep = runtime.sleep(interval);
+        let to_expiry =
+            Duration::from_nanos(pit.next_expiry().saturating_sub(runtime.unix_nanos()));
+        let to_housekeeping = housekeeping_at.saturating_duration_since(runtime.now());
+        let sleep = runtime.sleep(to_expiry.min(to_housekeeping));
         tokio::select! {
-            biased;            _ = cancel.cancelled() => break,
-            _ = sleep => {
-                // Wall-clock epoch ns via the runtime seam, so a virtual runtime drives PIT
-                // expiry deterministically (production default reads the system clock).
-                let now = runtime.unix_nanos();
-                tick = tick.wrapping_add(1);
-                if tick.is_multiple_of(1024) {
-                    pit.reap_orphans(now);
-                }
-                let expired_entries = pit.drain_expired_entries(now);
-                let expired: Vec<_> = expired_entries
-                    .into_iter()
-                    .map(|(token, entry)| {
-                        crate::stages::pit::insert_dead_nonces(&dead_nonce_list, &entry, now);
-                        let faces: smallvec::SmallVec<[u64; 4]> =
-                            entry.in_records.iter().map(|r| r.face_id).collect();
-                        (token, faces)
-                    })
-                    .collect();
-                if let Some(dnl) = dead_nonce_list.as_ref() {
-                    dnl.purge_expired(now);
-                }
-                if !expired.is_empty() {
-                    tracing::trace!(target: t::FWD_PIT, count = expired.len(), "PIT entries expired");
-                    // Credit `NUnsatisfiedInterests` on every in-face whose
-                    // PIT entry timed out without matching Data.
-                    for (_token, faces) in &expired {
-                        for face_id_raw in faces {
-                            if let Some(state) = face_states.get(&FaceId(*face_id_raw)) {
-                                state
-                                    .counters
-                                    .in_unsatisfied_interests
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+            biased;
+            _ = cancel.cancelled() => break,
+            // An entry expiring sooner came in: sleep until it instead.
+            _ = pit.expiry_moved() => continue,
+            _ = sleep => {}
+        }
+        let now = runtime.unix_nanos();
+        if pit.next_expiry() <= now {
+            let expired = pit.drain_expired_entries(now);
+            if !expired.is_empty() {
+                tracing::trace!(target: t::FWD_PIT, count = expired.len(), "PIT entries expired");
+            }
+            for (_token, entry) in &expired {
+                crate::stages::pit::insert_dead_nonces(&dead_nonce_list, entry, now);
+                // Credit `NUnsatisfiedInterests` on every in-face whose PIT entry timed out
+                // without matching Data.
+                for record in &entry.in_records {
+                    if let Some(state) = face_states.get(&FaceId(record.face_id)) {
+                        state
+                            .counters
+                            .in_unsatisfied_interests
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
+        }
+        if runtime.now() >= housekeeping_at {
+            pit.reap_orphans(now);
+            if let Some(dnl) = dead_nonce_list.as_ref() {
+                dnl.purge_expired(now);
+            }
+            housekeeping_at = runtime.now() + HOUSEKEEPING;
         }
     }
 }
@@ -226,6 +231,55 @@ mod tests {
             runtime,
         ));
         tokio::time::sleep(Duration::from_millis(5)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("expiry task did not stop after cancellation")
+            .expect("task panicked");
+    }
+
+    /// The task sleeps until the soonest deadline the PIT holds: an entry inserted while it
+    /// sleeps toward a later one (here the housekeeping second) must still expire on time.
+    #[tokio::test]
+    async fn entry_inserted_while_sleeping_expires_on_time() {
+        use ndn_packet::Name;
+        use ndn_store::{PitEntry, PitToken};
+
+        let pit = Arc::new(Pit::new());
+        let cancel = CancellationToken::new();
+        let runtime = ndn_runtime::default_runtime();
+        let face_states = Arc::new(DashMap::<FaceId, FaceState>::new());
+        let task = tokio::spawn(run_expiry_task(
+            Arc::clone(&pit),
+            None,
+            face_states,
+            cancel.clone(),
+            Arc::clone(&runtime),
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let later: Name = "/expiry/later".parse().unwrap();
+        let soon: Name = "/expiry/soon".parse().unwrap();
+        let (later_token, soon_token) = (
+            PitToken::from_interest(&later),
+            PitToken::from_interest(&soon),
+        );
+        pit.insert(
+            later_token,
+            PitEntry::new(Arc::new(later), runtime.unix_nanos(), 4_000),
+        );
+        pit.insert(
+            soon_token,
+            PitEntry::new(Arc::new(soon), runtime.unix_nanos(), 30),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !pit.contains(&soon_token),
+            "an entry 30 ms from expiry must be gone 250 ms later"
+        );
+        assert!(
+            pit.contains(&later_token),
+            "an entry 4 s from expiry must still be there"
+        );
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(200), task)
             .await

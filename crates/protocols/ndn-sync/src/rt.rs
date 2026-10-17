@@ -10,7 +10,11 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Monotonic clock: `std::time::Instant` natively, `performance.now()` on wasm.
+/// Monotonic clock, the one [`sleep`] runs on: tokio's natively (so the periodic deadlines move
+/// with a paused, virtual tokio clock exactly as the sleeps do), `performance.now()` on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub use tokio::time::Instant;
+#[cfg(target_arch = "wasm32")]
 pub use web_time::Instant;
 
 /// Spawn a background task on the ambient executor. The future must be `Send`

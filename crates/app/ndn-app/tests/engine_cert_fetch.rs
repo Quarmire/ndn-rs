@@ -205,24 +205,35 @@ async fn without_engine_fetcher_uncached_intermediate_is_dropped() {
     shutdown.shutdown().await;
 }
 
-/// A cert nobody serves: every Data naming it is dropped, and the fetcher
-/// sends ONE cert Interest for the whole burst (dedup + failure back-off) —
-/// no per-packet retry storm.
+/// A cert whose fetch is answered NoRoute (the producer has none): every
+/// Data naming it is refused `unverifiable` at once — the certificate is
+/// known absent where it was fetched — and the fetcher sends ONE cert
+/// Interest for the whole burst (dedup + failure back-off), no per-packet
+/// retry storm.
 #[tokio::test]
-async fn missing_cert_drops_data_without_retry_storm() {
+async fn a_cert_answered_no_route_refuses_data_without_retry_storm() {
     let (engine, shutdown, mut consumer, producer) = engine_trusting_root().await;
     let cancel = CancellationToken::new();
     assert!(ndn_app::install_engine_cert_fetcher(&engine, cancel.child_token()));
     let cert_interests = spawn_producer(producer, false).await;
 
     for i in 0..4 {
-        let got = fetch(
-            &mut consumer,
-            &format!("/home/phone/photo/{i}"),
-            Duration::from_millis(200),
-        )
-        .await;
-        assert!(got.is_none(), "Data {i} must be dropped: its cert is unavailable");
+        let got = consumer
+            .fetch_with(
+                InterestBuilder::new(n(&format!("/home/phone/photo/{i}")))
+                    .lifetime(Duration::from_millis(200)),
+            )
+            .await;
+        assert!(
+            matches!(
+                got.as_ref().err(),
+                Some(ndn_app::AppError::Refused {
+                    reason: ndn_packet::Refusal::Unverifiable
+                })
+            ),
+            "Data {i} must be refused unverifiable: its cert is not to be had (got {:?})",
+            got.err()
+        );
     }
     assert_eq!(
         cert_interests.load(Ordering::SeqCst),

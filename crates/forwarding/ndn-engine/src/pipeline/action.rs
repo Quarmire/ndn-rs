@@ -37,6 +37,10 @@ pub enum Action {
     Satisfy(super::context::PacketContext),
     Drop(DropReason),
     Nack(super::context::PacketContext, NackReason),
+    /// The validation stage refused this Data with a final verdict: its
+    /// local downstreams are told why (a refusal Nack), the others get
+    /// nothing. Never cached, never forwarded.
+    Refuse(super::context::PacketContext, ndn_packet::Refusal),
 }
 
 #[cfg(test)]

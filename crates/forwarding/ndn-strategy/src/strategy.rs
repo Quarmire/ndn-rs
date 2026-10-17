@@ -69,6 +69,11 @@ pub trait Strategy: Send + Sync + 'static {
     /// Sans-io: a synchronous decision returning [`ForwardingAction`]s for the
     /// pipeline to execute. Implementations must not block or do I/O — defer
     /// via [`Self::schedule`] or [`ForwardingAction::ForwardAfter`].
+    ///
+    /// The engine answers an empty list with a NoRoute Nack. To send nothing
+    /// and leave the Interest pending on its PIT entry (retransmission
+    /// suppression: an upstream was already asked), return
+    /// [`ForwardingAction::Suppress`].
     fn after_receive_interest(
         &self,
         ctx: &StrategyContext,

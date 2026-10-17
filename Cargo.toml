@@ -256,3 +256,20 @@ codegen-units = 1
 inherits = "dev"
 debug = true
 opt-level = 0
+
+# Key-derivation and cipher code is unusably slow unoptimized: one SafeBag
+# seal/open (PBKDF2-SHA256, 600 000 iterations) takes ~7 s in a dev build and
+# ~0.1 s optimized. Optimize just these crates so dev builds and tests pay
+# the real cost of a passphrase, not the debug one.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.pkcs5]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.cbc]
+opt-level = 3

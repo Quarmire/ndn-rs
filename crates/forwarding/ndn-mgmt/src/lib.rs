@@ -549,6 +549,12 @@ pub enum RefreshState {
     Current,
     /// What answered serves an older version than held; nothing changed.
     UpstreamOlder,
+    /// What answered named a version older than one this node knows exists
+    /// (announced over the namespace's sync group) but does not hold: a
+    /// cache may answer with the previous metadata for up to its
+    /// FreshnessPeriod after a new version, or the upstream has not
+    /// refreshed yet. Nothing changed; refresh again.
+    Behind,
     /// This node holds the namespace root key: it is where new versions
     /// are made, so it does not fetch them.
     Source,

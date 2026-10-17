@@ -63,6 +63,10 @@ Points worth noting:
   back out the arrival face). `ctx.fib_entry` is `None` when there is no route —
   answer that with `Nack(NoRoute)`.
 - Actions are *returned*, never sent. The engine performs the egress.
+- To send nothing and leave the Interest pending on its PIT entry (it was
+  already sent upstream inside `ctx.suppressed_faces` /
+  `ctx.entry_retx_suppressed`), return `Suppress`. An empty action list is
+  answered with a NoRoute Nack.
 
 ## Registration
 

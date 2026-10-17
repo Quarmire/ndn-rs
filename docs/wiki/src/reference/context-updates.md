@@ -141,6 +141,29 @@ answered with the version it holds.
 The root device holds the root key; it makes new versions and does not fetch
 its own namespace (state `source`).
 
+### Stale metadata
+
+The metadata carries a 1 s FreshnessPeriod, so a Content Store may answer a
+MustBeFresh discovery Interest with the previous pointer for up to 1 s after
+a new version. Two evictions keep a node's own store out of that:
+
+- **Publishing purges.** When the newest version a node publishes changes
+  (handed over, refreshed, pushed over sync), `PublishedContexts::publish`
+  evicts `<ns>/32=trust-context/32=metadata/...` from the node's Content
+  Store before it returns: the new set is swapped in first, then the store
+  is purged, so no Interest after the publish is answered with the old
+  pointer. The versioned contexts are immutable and stay cached.
+- **Asking purges.** Before a refresh (and an adoption by fetch) the node
+  drops the metadata it cached itself
+  (`context_publisher::forget_cached_metadata`): the question is "what is
+  newest now", not what it fetched a moment ago.
+
+A relay in between may still answer from its own store for up to 1 s. When
+the node's sync group announced a version newer than the answer (and the
+node does not hold it), the refresh reports `behind` instead of `current` or
+`upstream-older`, naming the member that announced it; nothing changes, and
+refreshing again shortly after gets the new version.
+
 ### Versions made on this device: `security/context-update`
 
 `ndn-fwd revoke` and `ndn-fwd recovery-kit create|revoke` (root device) and
@@ -227,8 +250,8 @@ group prefix), so the group needs a route both ways:
   sends or receives.
 - **Down:** each face a Sync Interest of the group arrives on is added to the
   group's route. The root device needs no route configured toward the
-  devices: it learns their faces from their Sync Interests, sent every
-  ~15 s (and when they announce something).
+  devices: it learns their faces from their Sync Interests, sent when a
+  device joins the group, every ~15 s, and when it announces something.
 
 Each of those faces routes both the Sync Interests (`<group>/v=2`, the SVS
 dialect's version) and the group Data (`<group>`). The node's own SVS face
@@ -238,9 +261,10 @@ to the publisher, or is Nacked when there are none, and is never held by
 the node's own SVS, which would leave the node's own fetch of the same
 version aggregated onto it until both time out.
 
-A new version is announced at once. A member that just (re)started is
-reached once its first Sync Interest got through, within ~15 s; a lost
-announcement is repeated within the same period. A relay between the root
+A new version is announced at once. A member that just (re)started
+announces itself when it joins the group, once the face its route toward
+the namespace names is up, so the root device reaches it at once; a lost
+announcement is repeated within ~15 s. A relay between the root
 device and a device carries the group only if it runs `context_sync` too;
 otherwise the devices behind it get updates by refresh.
 
@@ -265,8 +289,9 @@ context_sync = true          # default false: also join each namespace's sync gr
 ```
 
 The daemon checks every held context every `context_refresh_secs`; the first
-check runs `min(context_refresh_secs, 30)` seconds after start, so a node that
-was off catches up quickly. To check at once:
+check runs as soon as the route of each namespace it fetches has its face up
+(at most `min(context_refresh_secs, 30)` seconds after start), so a node that
+was off catches up at once. To check at once:
 
 ```sh
 ndn-fwd context refresh [<namespace>] [-c <config>]
@@ -293,6 +318,7 @@ refused over `/localhop`. It exits 1 if any namespace failed.
 | `updated` | a newer version was adopted, stored and published |
 | `current` | the namespace serves the version held |
 | `upstream-older` | the node that answered serves an older version; nothing changed |
+| `behind` | the answer names a version older than one the node's sync group announced and the node does not hold: a cache answered with the previous metadata, or the upstream has not refreshed yet; nothing changed — refresh again |
 | `source` | this node holds the root key; new versions are made here |
 | `unreachable` | nothing answered for the namespace's newest version (no route, no reply); the held version stays |
 | `failed` | a reply that could not be used, or a refused update (reason given); the held version stays |

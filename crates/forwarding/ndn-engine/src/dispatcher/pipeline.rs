@@ -466,7 +466,12 @@ impl PacketDispatcher {
             ndn_packet::NackReason::Duplicate => NackReason::Duplicate,
             ndn_packet::NackReason::Congestion => NackReason::Congestion,
             ndn_packet::NackReason::NotYet => NackReason::NotYet,
-            ndn_packet::NackReason::Other(_) => NackReason::NoRoute,
+            // A local upstream forwarder refused the Data (only a local face
+            // carries a refusal): to the strategy, that upstream has nothing
+            // usable — another may.
+            ndn_packet::NackReason::Refused(_) | ndn_packet::NackReason::Other(_) => {
+                NackReason::NoRoute
+            }
         };
 
         let strategy = self
@@ -510,11 +515,22 @@ impl PacketDispatcher {
             ForwardingAction::Nack(_reason) => {
                 if let Some((_, entry)) = self.strategy.pit.remove(&token) {
                     let interest_wire = nack.interest.raw().clone();
-                    let packet_reason = nack.reason.unwrap_or(ndn_packet::NackReason::NoRoute);
+                    // Only a local upstream (a forwarder on this host) may
+                    // say it refused the Data; from anyone else a refusal is
+                    // an unverified claim, passed on as NoRoute.
+                    let packet_reason = match nack.reason {
+                        Some(r) if r.refusal().is_none() || self.is_local_face(ctx.face_id) => r,
+                        _ => ndn_packet::NackReason::NoRoute,
+                    };
                     for face_id_raw in entry.in_record_faces() {
                         let face_id = FaceId(face_id_raw);
                         if !self.nacks_allowed_on_face(face_id) {
                             debug!(target: t::FWD_STRATEGY, face=%face_id, "nack propagation suppressed on multi-access/ad-hoc in-record face");
+                            continue;
+                        }
+                        // A refusal is told to local downstreams only (see
+                        // `refuse`); a non-local one gets nothing.
+                        if packet_reason.refusal().is_some() && !self.is_local_face(face_id) {
                             continue;
                         }
                         let intent = crate::engine::EgressIntent {
@@ -538,7 +554,7 @@ impl PacketDispatcher {
         }
     }
 
-    async fn data_pipeline(&self, ctx: PacketContext) {
+    async fn data_pipeline(&self, mut ctx: PacketContext) {
         // G1 congestion bridge (opt-in; `None` ⇒ one untaken branch). A returning
         // Data carrying an NDNLP congestion mark means the link it arrived over is
         // congesting; record it for the per-face signal the strategy reads. Done
@@ -551,6 +567,32 @@ impl PacketDispatcher {
         {
             fb.observe(ctx.face_id);
         }
+
+        // Local faces (IPC or a loopback remote) are trusted by OS-level
+        // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
+        // NonLocal here, so its Data is verified — unlike the old kind-only
+        // classification, which trusted any browser peer.
+        //
+        // A face may opt OUT of the local fast-path via
+        // `require_data_validation` (multi-tenant host: forged Data from one
+        // local app must not poison the shared CS or spoof another app's
+        // namespace). When required, validation runs as for a NonLocal face,
+        // and fail-closes if no validator is configured.
+        let scope = self
+            .face_table
+            .get(ctx.face_id)
+            .map(|f| f.scope())
+            .unwrap_or(FaceScope::NonLocal);
+        let is_local = scope == FaceScope::Local;
+        let require_local_validation = is_local
+            && self
+                .face_states
+                .get(&ctx.face_id)
+                .is_some_and(|s| s.require_data_validation());
+        let validate = !is_local || require_local_validation;
+        // A Data that is validated may be refused: PIT match then keeps each
+        // downstream's Interest, which the refusal Nack echoes.
+        ctx.record_downstream = validate && self.validation.validator.is_some();
 
         let ctx = match self.pit_match.process(ctx) {
             Action::Continue(ctx) => ctx,
@@ -570,40 +612,12 @@ impl PacketDispatcher {
         // or opportunistically cache when overheard on a broadcast/ad-hoc
         // bearer. Admission still flows through validation below, so only
         // verified Data ever enters the CS (fail-secure).
-        if ctx.unsolicited {
-            let scope = self
-                .face_table
-                .get(ctx.face_id)
-                .map(|f| f.scope())
-                .unwrap_or(FaceScope::NonLocal);
-            if !self.unsolicited_policy.admits(scope) {
-                debug!(target: t::FWD_PIT, face=%ctx.face_id, "unsolicited data dropped (policy)");
-                return;
-            }
+        if ctx.unsolicited && !self.unsolicited_policy.admits(scope) {
+            debug!(target: t::FWD_PIT, face=%ctx.face_id, "unsolicited data dropped (policy)");
+            return;
         }
 
-        // Local faces (IPC or a loopback remote) are trusted by OS-level
-        // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
-        // NonLocal here, so its Data is verified — unlike the old kind-only
-        // classification, which trusted any browser peer.
-        //
-        // A face may opt OUT of the local fast-path via
-        // `require_data_validation` (multi-tenant host: forged Data from one
-        // local app must not poison the shared CS or spoof another app's
-        // namespace). When required, validation runs as for a NonLocal face,
-        // and fail-closes if no validator is configured.
-        let is_local = self
-            .face_table
-            .get(ctx.face_id)
-            .map(|f| f.scope() == FaceScope::Local)
-            .unwrap_or(false);
-        let require_local_validation = is_local
-            && self
-                .face_states
-                .get(&ctx.face_id)
-                .is_some_and(|s| s.require_data_validation());
-
-        let ctx = if is_local && !require_local_validation {
+        let ctx = if !validate {
             let mut ctx = ctx;
             ctx.verified = true;
             ctx
@@ -625,6 +639,8 @@ impl PacketDispatcher {
                     debug!(target: t::SECURITY, reason=?r, "data validation failed");
                     return;
                 }
+                // Refused (the stage logged why): the local downstreams are
+                // told, see `refuse`.
                 other => {
                     self.dispatch_action(other).await;
                     return;

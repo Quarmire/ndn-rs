@@ -29,12 +29,12 @@ use ndn_engine::ForwarderEngine;
 use ndn_face::local::InProcFace;
 use ndn_packet::Name;
 use ndn_packet::encode::InterestBuilder;
-use ndn_security::{CertCache, CertFetcher, DirectFetchFn, FetchFn};
+use ndn_security::{CertCache, CertFetcher, DirectFetchFn, FetchFn, FetchMiss};
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{Connection, InProcConnection};
-use crate::{Consumer, DemuxConnection, EngineAppExt};
+use crate::{AppError, Consumer, DemuxConnection, EngineAppExt};
 
 /// In-process face buffer depth of the direct-fetch face (as an app face's).
 const DIRECT_FACE_BUFFER: usize = 256;
@@ -49,6 +49,20 @@ fn cert_interest(name: Name) -> InterestBuilder {
         .can_be_prefix()
         .must_be_fresh()
         .lifetime(CERT_FETCH_TIMEOUT)
+}
+
+/// A fetch's error as the [`CertFetcher`] reads it: the forwarder's refusal
+/// of the certificate Data is a verdict, a NoRoute Nack says none is to be
+/// had where it was asked; anything else (a timeout, a transient Nack) is no
+/// answer.
+fn miss(e: AppError) -> FetchMiss {
+    match e {
+        AppError::Refused { reason } => FetchMiss::Refused(reason),
+        AppError::Nacked {
+            reason: Some(ndn_packet::NackReason::NoRoute),
+        } => FetchMiss::Absent,
+        _ => FetchMiss::Unanswered,
+    }
 }
 
 /// A [`FetchFn`] that expresses each cert Interest through `engine` on one
@@ -66,7 +80,7 @@ pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> F
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
             let wire = cert_interest(name).build();
-            consumer.fetch_wire(wire, CERT_FETCH_TIMEOUT).await.ok()
+            consumer.fetch_wire(wire, CERT_FETCH_TIMEOUT).await.map_err(miss)
         })
     })
 }
@@ -76,8 +90,8 @@ pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> F
 /// face the Data being validated arrived on, whose producer serves its own
 /// issuer chain. The in-process face it is sent from opts into LocalFields,
 /// without which the forwarder ignores `NextHopFaceId`. A face the FIB
-/// already routes the name to is not asked again: the routed fetch went
-/// there.
+/// already routes the name to is not asked again
+/// ([`FetchMiss::NotAsked`]): the routed fetch went there.
 pub fn engine_direct_fetch_fn(
     engine: &ForwarderEngine,
     cancel: CancellationToken,
@@ -96,9 +110,9 @@ pub fn engine_direct_fetch_fn(
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
             if routed_there {
-                return None;
+                return Err(FetchMiss::NotAsked);
             }
-            consumer.fetch_with_on(face, cert_interest(name)).await.ok()
+            consumer.fetch_with_on(face, cert_interest(name)).await.map_err(miss)
         })
     })
 }

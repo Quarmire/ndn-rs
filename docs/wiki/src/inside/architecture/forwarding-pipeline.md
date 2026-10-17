@@ -60,7 +60,14 @@ path:
    incoming face) drops that face's in-record, and the whole entry once no
    downstream waits on it (NFD `rejectPendingInterest`), so a later Interest
    for the name from another face is forwarded instead of aggregated onto an
-   entry nothing will satisfy.
+   entry nothing will satisfy. An Interest finding the entry already sent
+   upstream inside the retransmission-suppression window is suppressed
+   (`Suppress`: nothing sent, it waits on the entry for that upstream's
+   Data); an empty action list is answered NoRoute. The parallel pipeline
+   can run two strategy passes for one entry at once, or a later Interest's
+   first: each pass judges the entry as at its own Interest's arrival (NFD's
+   serial order), and an upstream another pass sent the entry's Interest to
+   meanwhile is not sent it again, so one upstream Data answers both.
 5. **Egress** — chosen next-hops are LP-framed and queued to each face's sender
    task.
 
@@ -71,7 +78,12 @@ path:
 2. **Validate** — on faces that require it, the signature is checked before the
    Data is allowed to propagate. This is where the
    [security model](./security-model.md) becomes load-bearing: a router will
-   not forward Data it cannot authenticate on a validating face.
+   not forward Data it cannot authenticate on a validating face. A Data
+   refused with a final verdict (revoked signer, bad signature, schema,
+   untrusted root, …) is not forwarded; each **local** downstream it would
+   have answered gets a Nack carrying the reason instead
+   ([local refusal](./security-model.md#local-refusal)), a non-local one gets
+   nothing.
 3. **CS insert** — admissible Data is cached (admission policy decides what is
    worth caching; the default admits only Data with a non-zero freshness
    period, matching NFD).

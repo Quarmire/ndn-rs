@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::trace;
 
 use crate::observability::targets as t;
-use crate::pipeline::{Action, DecodedPacket, DropReason, PacketContext};
+use crate::pipeline::{Action, DecodedPacket, DownstreamInterest, DropReason, PacketContext};
 use ndn_store::{
     DeadNonceList, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
     PitKeyDiscriminator, PitToken,
@@ -398,8 +398,14 @@ impl PitCheckStage {
 }
 
 /// A CanBePrefix in-record drained during the prefix-walk: (face id, LP PIT
-/// token to echo, trace ids for fan-out instrumentation).
-type DrainedInRecord = (u64, Option<bytes::Bytes>, Vec<ndn_packet::lp::TraceId>);
+/// token to echo, trace ids for fan-out instrumentation, selectors + nonce
+/// for a refusal Nack).
+type DrainedInRecord = (
+    u64,
+    Option<bytes::Bytes>,
+    Vec<ndn_packet::lp::TraceId>,
+    (ndn_packet::Selector, u32),
+);
 
 enum PersistentMatchResult {
     /// Persistent entry: faces collected, per-subscriber counter decremented.
@@ -480,6 +486,8 @@ impl PitMatchStage {
         let mut tokens: SmallVec<[Option<bytes::Bytes>; 4]> = SmallVec::new();
         let mut seen: SmallVec<[u64; 8]> = SmallVec::new();
         let mut fan_out: Vec<(u64, Vec<ndn_packet::lp::TraceId>)> = Vec::new();
+        let mut interests: SmallVec<[DownstreamInterest; 1]> = SmallVec::new();
+        let record = ctx.record_downstream;
         // The Data's arrival is the time we stamp into the Dead-Nonce-List on consume
         // (deterministic under a virtual runtime). (ndn-lab slice 0b.)
         let arrival = ctx.arrival;
@@ -492,6 +500,7 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            record.then_some(&mut interests),
             arrival,
         );
         self.consume_entry(
@@ -501,6 +510,7 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            record.then_some(&mut interests),
             arrival,
         );
         if let Some(alt) = stripped_token.as_ref() {
@@ -511,6 +521,7 @@ impl PitMatchStage {
                 &mut tokens,
                 &mut seen,
                 &mut fan_out,
+                record.then_some(&mut interests),
                 arrival,
             );
         }
@@ -530,6 +541,7 @@ impl PitMatchStage {
                     &mut tokens,
                     &mut seen,
                     &mut fan_out,
+                    record.then_some(&mut interests),
                     arrival,
                 );
             }
@@ -542,6 +554,7 @@ impl PitMatchStage {
             trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data_name, out_faces=?faces, action="satisfy", "pit op");
             ctx.out_faces = faces;
             ctx.out_pit_tokens = tokens;
+            ctx.out_interests = interests;
             return Action::Continue(ctx);
         }
 
@@ -556,11 +569,12 @@ impl PitMatchStage {
 
     /// Consume a single PIT entry identified by `token`, appending its
     /// downstream faces + LP tokens to `faces`/`tokens` (deduped via `seen` by
-    /// face id). `cbp_only` restricts participation to CanBePrefix in-records —
-    /// the prefix-walk case — so exact-match subscribers at a shorter prefix
-    /// are left untouched. Handles per-subscriber persistent-credit decrement
-    /// and entry reaping. A no-op when no entry exists at `token`.
-    #[allow(clippy::too_many_arguments)]
+    /// face id) and, when `interests` is given, each classical downstream's
+    /// Interest to it. `cbp_only` restricts participation to CanBePrefix
+    /// in-records — the prefix-walk case — so exact-match subscribers at a
+    /// shorter prefix are left untouched. Handles per-subscriber
+    /// persistent-credit decrement and entry reaping. A no-op when no entry
+    /// exists at `token`.
     #[allow(clippy::too_many_arguments)]
     fn consume_entry(
         &self,
@@ -570,6 +584,7 @@ impl PitMatchStage {
         tokens: &mut SmallVec<[Option<bytes::Bytes>; 4]>,
         seen: &mut SmallVec<[u64; 8]>,
         fan_out: &mut Vec<(u64, Vec<ndn_packet::lp::TraceId>)>,
+        mut interests: Option<&mut SmallVec<[DownstreamInterest; 1]>>,
         now_ns: u64,
     ) {
         // Persistent-aware path: per-subscriber credit pools, survives until
@@ -660,6 +675,7 @@ impl PitMatchStage {
             // exact-match subscribers (who want Data named exactly at the
             // prefix) pending — removing the whole entry would silently starve
             // them. Reap the entry only once it is empty.
+            let record = interests.is_some();
             let drained = self.pit.with_entry_mut(token, |entry| {
                 let mut taken: SmallVec<[DrainedInRecord; 4]> = SmallVec::new();
                 let mut i = 0;
@@ -670,20 +686,31 @@ impl PitMatchStage {
                             r.face_id,
                             r.lp_pit_token,
                             r.trace_ids.iter().copied().collect(),
+                            (r.selector, r.nonce),
                         ));
                     } else {
                         i += 1;
                     }
                 }
-                (taken, entry.in_records.is_empty())
+                let name = record.then(|| Arc::clone(&entry.name));
+                (taken, entry.in_records.is_empty(), name)
             });
-            if let Some((taken, now_empty)) = drained {
-                for (face_id, lp_token, trace_ids) in taken {
+            if let Some((taken, now_empty, entry_name)) = drained {
+                for (face_id, lp_token, trace_ids, (selector, nonce)) in taken {
                     if seen.contains(&face_id) {
                         continue;
                     }
                     seen.push(face_id);
                     faces.push(FaceId(face_id));
+                    if let (Some(list), Some(name)) = (interests.as_deref_mut(), &entry_name) {
+                        list.push(DownstreamInterest {
+                            face: FaceId(face_id),
+                            lp_pit_token: lp_token.clone(),
+                            name: Arc::clone(name),
+                            selector,
+                            nonce,
+                        });
+                    }
                     tokens.push(lp_token);
                     fan_out.push((face_id, trace_ids));
                 }
@@ -704,6 +731,15 @@ impl PitMatchStage {
                 faces.push(FaceId(r.face_id));
                 tokens.push(r.lp_pit_token.clone());
                 fan_out.push((r.face_id, r.trace_ids.iter().copied().collect()));
+                if let Some(list) = interests.as_deref_mut() {
+                    list.push(DownstreamInterest {
+                        face: FaceId(r.face_id),
+                        lp_pit_token: r.lp_pit_token.clone(),
+                        name: Arc::clone(&entry.name),
+                        selector: r.selector.clone(),
+                        nonce: r.nonce,
+                    });
+                }
             }
         }
     }

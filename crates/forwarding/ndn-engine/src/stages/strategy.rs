@@ -248,40 +248,48 @@ impl StrategyStage {
             &built_extensions
         };
 
-        // Upstreams already forwarded to for this PIT entry (D.09). Empty on the
-        // first forward; populated when PitCheck re-forwards a retransmission,
-        // so the strategy picks an untried nexthop instead of the same one.
-        let tried_faces: SmallVec<[ndn_transport::FaceId; 4]> = ctx
-            .pit_token
-            .and_then(|tok| {
-                self.pit.with_entry(&tok, |e| {
-                    e.out_records
-                        .iter()
-                        .map(|r| ndn_transport::FaceId(r.face_id))
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
-
-        // Retransmission suppression state, read from the same PIT entry as
-        // `tried_faces` (NFD RetxSuppressionExponential). Read-only here: the
-        // per-entry window grows in `add_out_record`, i.e. when a forward
-        // actually happens, so merely consulting a strategy never advances it.
-        let now_ns = self.runtime.unix_nanos();
-        let (suppressed_faces, entry_retx_suppressed) = ctx
+        // The PIT entry as this Interest found it on arrival. NFD runs the
+        // Interests of an entry one at a time in arrival order; the parallel
+        // pipeline can run two strategy passes for one entry together (the PIT
+        // check sends a new downstream's Interest to the strategy while
+        // nothing went upstream yet), or a later Interest's first. An
+        // out-record sent for an Interest that arrived later (`sent_at` is
+        // that Interest's arrival) is not part of this view, and suppression
+        // is judged at this arrival: the time base of `sent_at` and of the
+        // PIT check's retransmission window. `seen` is also what the
+        // out-record commit below checks against.
+        let arrival = ctx.arrival;
+        let (seen, suppressed_faces, entry_retx_suppressed) = ctx
             .pit_token
             .and_then(|tok| {
                 self.pit.with_entry(&tok, |e| {
                     (
-                        e.suppressed_upstreams(now_ns)
+                        e.out_records
+                            .iter()
+                            .filter(|r| r.sent_at <= arrival)
+                            .map(|r| (r.face_id, r.last_nonce, r.sent_at))
+                            .collect::<SmallVec<[(u64, u32, u64); 4]>>(),
+                        // Retransmission suppression (NFD
+                        // RetxSuppressionExponential). Read-only here: the
+                        // per-entry window grows in `note_forward_decision`,
+                        // i.e. when a forward actually happens, so merely
+                        // consulting a strategy never advances it.
+                        e.suppressed_upstreams(arrival)
                             .into_iter()
                             .map(ndn_transport::FaceId)
                             .collect::<SmallVec<[ndn_transport::FaceId; 4]>>(),
-                        e.entry_retx_suppressed(now_ns),
+                        e.entry_retx_suppressed(arrival),
                     )
                 })
             })
             .unwrap_or_default();
+        // Upstreams already forwarded to for this PIT entry (D.09). Empty on the
+        // first forward; populated when PitCheck re-forwards a retransmission,
+        // so the strategy picks an untried nexthop instead of the same one.
+        let tried_faces: SmallVec<[ndn_transport::FaceId; 4]> = seen
+            .iter()
+            .map(|&(face_id, _, _)| ndn_transport::FaceId(face_id))
+            .collect();
 
         let sctx = StrategyContext {
             name: &name,
@@ -377,7 +385,13 @@ impl StrategyStage {
                     }
                     // Outgoing-Interest loop avoidance: record (face_id,
                     // nonce) in out-records and suppress re-sends matching
-                    // an existing pair.
+                    // an existing pair. An upstream whose out-record is not
+                    // the one this pass `seen` is skipped too: another pass
+                    // for this entry sent there meanwhile, or for a later
+                    // Interest. In NFD's serial order one of the two would
+                    // have found the other's out-record and been suppressed;
+                    // the Interest pending there brings the Data that
+                    // satisfies this downstream as well.
                     let interest_nonce = match &ctx.packet {
                         DecodedPacket::Interest(i) => i.nonce(),
                         _ => None,
@@ -389,16 +403,25 @@ impl StrategyStage {
                             effective_faces
                                 .into_iter()
                                 .filter(|fid| {
-                                    let dup = self.pit.with_entry_mut(&token, |entry| {
-                                        let already = entry.out_records.iter().any(|or| {
-                                            or.face_id == fid.0 && or.last_nonce == nonce
-                                        });
-                                        if !already {
+                                    let skip = self.pit.with_entry_mut(&token, |entry| {
+                                        let skip = entry
+                                            .out_records
+                                            .iter()
+                                            .find(|or| or.face_id == fid.0)
+                                            .is_some_and(|or| {
+                                                or.last_nonce == nonce
+                                                    || !seen.contains(&(
+                                                        or.face_id,
+                                                        or.last_nonce,
+                                                        or.sent_at,
+                                                    ))
+                                            });
+                                        if !skip {
                                             entry.add_out_record(fid.0, nonce, now);
                                         }
-                                        already
+                                        skip
                                     });
-                                    !dup.unwrap_or(false)
+                                    !skip.unwrap_or(false)
                                 })
                                 .collect()
                         } else {
@@ -422,6 +445,7 @@ impl StrategyStage {
                             None => surviving_faces,
                         };
                     if surviving_faces.is_empty() {
+                        trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, action="drop", "strategy decision: no chosen upstream left (each already has this entry's Interest, or is the ingress node)");
                         return Action::Drop(DropReason::Suppressed);
                     }
                     // One forward DECISION -> one growth of the per-entry
@@ -658,5 +682,166 @@ mod tests {
             })
             .unwrap();
         assert!(!other_face, "same nonce on a fresh face is allowed");
+    }
+}
+
+/// Two Interests for one PIT entry whose strategy passes run in an order the
+/// parallel pipeline allows: both pass the PIT check (the second arrives from
+/// a new downstream before anything went upstream), then the passes run one
+/// after the other in the order under test, through the real stages.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod concurrent_pass_tests {
+    use super::*;
+    use crate::stages::pit::{PitCheckStage, PitMatchStage};
+    use ndn_packet::encode::{InterestBuilder, encode_data_unsigned};
+    use ndn_packet::{Data, Interest};
+    use ndn_strategy::BestRouteStrategy;
+    use ndn_transport::FaceId;
+
+    const A: FaceId = FaceId(1);
+    const B: FaceId = FaceId(2);
+    const UPSTREAM: FaceId = FaceId(3);
+
+    struct Rig {
+        name: Name,
+        check: PitCheckStage,
+        strategy: StrategyStage,
+        matcher: PitMatchStage,
+        /// Arrival of the first Interest, read from the runtime clock that
+        /// stamps arrivals in the engine; the second arrives 0.1 ms later.
+        t0: u64,
+        t1: u64,
+    }
+
+    /// Best-route, with `route` the only nexthop for `name`.
+    fn rig(name: &str, route: FaceId) -> Rig {
+        let name: Name = name.parse().unwrap();
+        let pit = Arc::new(Pit::new());
+        let face_table = Arc::new(ndn_transport::FaceTable::new());
+        let fib = Arc::new(Fib::new());
+        fib.add_nexthop(&name, route, 0);
+        let runtime = ndn_runtime::default_runtime();
+        let t0 = runtime.unix_nanos();
+        Rig {
+            check: PitCheckStage {
+                pit: Arc::clone(&pit),
+                face_table: Arc::clone(&face_table),
+                dead_nonce_list: None,
+                validator: None,
+                replay_guard: None,
+            },
+            strategy: StrategyStage {
+                strategy_table: Arc::new(StrategyTable::new()),
+                default_strategy: Arc::new(BestRouteStrategy::new()),
+                fib,
+                measurements: Arc::new(MeasurementsTable::new()),
+                signals: Arc::new(SignalsTable::new()),
+                pit: Arc::clone(&pit),
+                face_table,
+                enrichers: Vec::new(),
+                runtime,
+                network_region: Arc::new(NetworkRegionTable::new(Vec::new())),
+            },
+            matcher: PitMatchStage {
+                pit,
+                dead_nonce_list: None,
+            },
+            name,
+            t0,
+            t1: t0 + 100_000,
+        }
+    }
+
+    impl Rig {
+        /// An Interest for the name from `face`, arrived at `arrival`, past
+        /// the PIT check and on its way to the strategy.
+        async fn arrive(&self, face: FaceId, arrival: u64) -> PacketContext {
+            let wire = InterestBuilder::new(self.name.clone()).build();
+            let interest = Interest::decode(wire.clone()).unwrap();
+            let mut ctx = PacketContext::new(wire, face, arrival);
+            ctx.name = Some(Arc::clone(&interest.name));
+            ctx.packet = DecodedPacket::Interest(Box::new(interest));
+            match self.check.process(ctx).await {
+                Action::Continue(ctx) => ctx,
+                other => panic!("PIT check: {}", verdict(&other)),
+            }
+        }
+
+        /// The downstreams the upstream's Data reaches.
+        fn data_reaches(&self) -> Vec<FaceId> {
+            let wire = encode_data_unsigned(&self.name, b"x");
+            let mut ctx = PacketContext::new(wire.clone(), UPSTREAM, self.t1 + 1_000_000);
+            ctx.packet = DecodedPacket::Data(Box::new(Data::decode(wire).unwrap()));
+            match self.matcher.process(ctx) {
+                Action::Continue(ctx) => {
+                    let mut faces = ctx.out_faces.to_vec();
+                    faces.sort_by_key(|f| f.0);
+                    faces
+                }
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    fn verdict(action: &Action) -> String {
+        match action {
+            Action::Send(_, faces) => format!("Send{faces:?}"),
+            Action::Nack(_, reason) => format!("Nack({reason:?})"),
+            Action::Drop(reason) => format!("Drop({reason:?})"),
+            Action::Continue(_) => "Continue".into(),
+            _ => "other".into(),
+        }
+    }
+
+    /// The interleaving traced on the engine: B's pass runs after A's sent
+    /// A's Interest upstream. B is suppressed and waits on the entry, so the
+    /// upstream's one Data reaches both. It used to be Nacked NoRoute, with
+    /// its in-record released: the strategy's "suppressed" read as "no route".
+    #[tokio::test]
+    async fn a_pass_finding_the_interest_already_sent_upstream_waits_for_its_data() {
+        let rig = rig("/race/second-pass-later", UPSTREAM);
+        let a = rig.arrive(A, rig.t0).await;
+        let b = rig.arrive(B, rig.t1).await;
+
+        let a = rig.strategy.process(a).await;
+        assert_eq!(verdict(&a), format!("Send{:?}", [UPSTREAM]));
+        let b = rig.strategy.process(b).await;
+        assert_eq!(verdict(&b), "Drop(Suppressed)", "B waits on the entry");
+        assert_eq!(rig.data_reaches(), [A, B]);
+    }
+
+    /// The passes the other way round: B's pass forwards first. A's pass
+    /// judges the entry as at A's arrival, before B's Interest went upstream,
+    /// so it picks the same upstream, which already has the entry's Interest:
+    /// nothing is sent again, and A waits for that Data with B.
+    #[tokio::test]
+    async fn an_earlier_interest_whose_pass_runs_second_does_not_ask_the_upstream_again() {
+        let rig = rig("/race/first-pass-later", UPSTREAM);
+        let a = rig.arrive(A, rig.t0).await;
+        let b = rig.arrive(B, rig.t1).await;
+
+        let b = rig.strategy.process(b).await;
+        assert_eq!(verdict(&b), format!("Send{:?}", [UPSTREAM]));
+        let a = rig.strategy.process(a).await;
+        assert_eq!(verdict(&a), "Drop(Suppressed)", "A waits on the entry");
+        assert_eq!(rig.data_reaches(), [A, B]);
+    }
+
+    /// B's Interest has no route but back to B; A's, arrived just after,
+    /// goes to B and its pass ran first. Judged as at B's arrival, when
+    /// nothing was sent, B's Interest has no route and is Nacked, as NFD's
+    /// arrival order gives. Suppressed instead, it would wait on its own
+    /// face, while B aggregates A's Interest onto B's own entry: both would
+    /// wait out their lifetimes.
+    #[tokio::test]
+    async fn an_interest_routed_only_back_is_nacked_though_a_later_one_went_there() {
+        let rig = rig("/race/route-back", B);
+        let b = rig.arrive(B, rig.t0).await;
+        let a = rig.arrive(A, rig.t1).await;
+
+        let a = rig.strategy.process(a).await;
+        assert_eq!(verdict(&a), format!("Send{:?}", [B]));
+        let b = rig.strategy.process(b).await;
+        assert_eq!(verdict(&b), "Nack(NoRoute)");
     }
 }
