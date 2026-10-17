@@ -201,6 +201,16 @@ keeps running beside it.
   through are stored and published by the code a refresh keeps with
   (`ndn-fwd` `context_refresh::keep_update`), so the nodes behind it can
   fetch them by name.
+- **A fetch that failed is tried again.** SVS reports each sequence number
+  once. While a member's announced sequence number (the version it put into
+  the group) is newer than the held version, a failed fetch — or a walk
+  stopped by a version it could not fetch — is tried again after 1 s,
+  doubling to once a minute (`context_sync::Retry`), each attempt logged at
+  WARN with why it failed (`context-sync could not obtain an announced
+  trust-context version; trying again`). It stops once the held version
+  reaches that sequence number (from this retry, another member's
+  announcement, or a refresh) or the version is refused. At most one retry
+  is pending per member, and fetches run one at a time.
 - **Refusals** are logged at WARN (`context-sync refused a trust-context
   update; the held version stays`) with the reason from the
   [table below](#refusals); a version not newer than the one held is logged
@@ -213,11 +223,20 @@ group prefix), so the group needs a route both ways:
 
 - **Up:** the group is routed over the non-local faces the namespace itself
   is routed over (the route a device has toward the root device or a relay),
-  taken again before each Sync Interest the node sends.
+  taken when the group is joined and again for each Sync Interest the node
+  sends or receives.
 - **Down:** each face a Sync Interest of the group arrives on is added to the
   group's route. The root device needs no route configured toward the
   devices: it learns their faces from their Sync Interests, sent every
   ~15 s (and when they announce something).
+
+Each of those faces routes both the Sync Interests (`<group>/v=2`, the SVS
+dialect's version) and the group Data (`<group>`). The node's own SVS face
+routes the Sync Interests only: a neighbour's fetch of
+`<group>/<member>/seg=N` passing through goes on toward the faces that lead
+to the publisher, or is Nacked when there are none, and is never held by
+the node's own SVS, which would leave the node's own fetch of the same
+version aggregated onto it until both time out.
 
 A new version is announced at once. A member that just (re)started is
 reached once its first Sync Interest got through, within ~15 s; a lost
@@ -316,7 +335,7 @@ timeout, malformed metadata) and `no trust context is held for <ns>`.
 | Strictly-newer adoption | `ndn_security::Keyring::{adopt_update, adopt_update_from}` |
 | Forwarder expectation | `ndn_security::Validator::expect_context_update` (`validator/expected.rs`) |
 | Engine binding | `ndn_identity::refresh_context_via_engine` |
-| Push over SVS | `ndn_identity::context_sync::{run, process_update, group_prefix, group_data}`; daemon groups, routes, root publishing: `ndn-fwd` `context_sync.rs` (test `a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused`) |
+| Push over SVS | `ndn_identity::context_sync::{run, Retry, process_update, group_prefix, group_data}`; daemon groups, routes, root publishing: `ndn-fwd` `context_sync.rs` (tests `a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused`, `a_neighbours_fetch_of_group_data_does_not_hold_up_this_nodes_own`) |
 | Management verb | `ndn-mgmt` `security/context-refresh`, `security/context-update`, `ContextRefreshInfo`, `RefreshState`; `ndn-ipc` `MgmtClient::security_context_refresh`, `security_context_update` |
 | Daemon, timer | `ndn-fwd` `context_refresh.rs` (`keep_update`, shared by refresh and sync; `apply_update` for `context-update`); CLI `onboard.rs` (`run_context`) |
 | Mobile | `ndn-boltffi` `NdnEngine::refresh_contexts`, `NdnContextRefresh` |

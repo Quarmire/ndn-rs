@@ -15,8 +15,11 @@
 #
 # Exit codes:  0 PASS / 1 FAIL / 2 SKIP
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-TRANSCRIPT_DIR="$(dirname "$0")/transcripts"
+# ndn-fwd, ndn-ctl and ndn-sec are built in the ndn-fwd workspace, a sibling
+# of ndn-rs. The committed transcripts live in testbed/transcripts/.
+WORKSPACE_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+FWD_ROOT="$WORKSPACE_ROOT/ndn-fwd"
+TRANSCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)/transcripts"
 mkdir -p "$TRANSCRIPT_DIR"
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
@@ -24,22 +27,32 @@ if ! command -v cargo >/dev/null 2>&1; then
     echo "SKIP: cargo missing" >&2
     exit 2
 fi
-if ! command -v ndn-ctl >/dev/null 2>&1 && \
-   [ ! -f "$REPO_ROOT/target/debug/ndn-ctl" ]; then
-    echo "SKIP: ndn-ctl not built — run 'cargo build -p ndn-tools --bin ndn-ctl'" >&2
+if [ ! -f "$FWD_ROOT/Cargo.toml" ]; then
+    echo "SKIP: no ndn-fwd workspace at $FWD_ROOT" >&2
     exit 2
 fi
 
-# Build required binaries if not already present.
-if ! cargo build -p ndn-fwd -p ndn-tools --bins --quiet 2>/tmp/e01_build.log; then
-    echo "FAIL: build failed"
-    cat /tmp/e01_build.log
-    exit 1
+# Ask cargo where it puts the binaries: a shared target dir (CARGO_TARGET_DIR,
+# or the workspace's .cargo/config.toml) redirects them out of the repo.
+if ! TARGET_DIR="$(cd "$FWD_ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"; then
+    echo "SKIP: cannot locate the cargo target directory of $FWD_ROOT" >&2
+    exit 2
 fi
 
-NDN_FWD="$REPO_ROOT/target/debug/ndn-fwd"
-NDN_CTL="$REPO_ROOT/target/debug/ndn-ctl"
-NDN_SEC="$REPO_ROOT/target/debug/ndn-sec"
+# Always build: a stale binary would witness old behaviour.
+BUILD_LOG="$(mktemp)"
+if ! (cd "$FWD_ROOT" && cargo build -p ndn-fwd -p ndn-tools --bins --quiet) 2>"$BUILD_LOG"; then
+    echo "FAIL: build failed"
+    cat "$BUILD_LOG"
+    rm -f "$BUILD_LOG"
+    exit 1
+fi
+rm -f "$BUILD_LOG"
+
+NDN_FWD="$TARGET_DIR/debug/ndn-fwd"
+NDN_CTL="$TARGET_DIR/debug/ndn-ctl"
+NDN_SEC="$TARGET_DIR/debug/ndn-sec"
 
 WORK="$(mktemp -d)"
 PASS=0

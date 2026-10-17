@@ -338,7 +338,30 @@ impl PacketDispatcher {
         }
 
         let action = self.strategy.process(ctx).await;
+        if let Action::Nack(ctx, _) = &action {
+            self.release_nacked_interest(ctx);
+        }
         self.dispatch_action(action).await;
+    }
+
+    /// The strategy Nacked this Interest instead of forwarding it: its
+    /// downstream no longer waits on the entry. Drop that in-record, and the
+    /// entry itself once no downstream waits on it (NFD
+    /// `rejectPendingInterest`); left in place, it would aggregate every later
+    /// Interest for the name from other faces until it expires, and nothing
+    /// would ever satisfy them. An in-record of another face stays: that
+    /// Interest has its own strategy pass (the PIT check sends a new
+    /// downstream's Interest to the strategy while nothing went upstream),
+    /// which forwards it or Nacks and releases it in turn.
+    fn release_nacked_interest(&self, ctx: &PacketContext) {
+        let Some(token) = ctx.pit_token else { return };
+        let release = self.strategy.pit.with_entry_mut(&token, |e| {
+            e.in_records.retain(|r| r.face_id != ctx.face_id.0);
+            e.in_records.is_empty()
+        });
+        if release == Some(true) {
+            self.strategy.pit.remove(&token);
+        }
     }
 
     async fn nack_pipeline(&self, ctx: PacketContext) {

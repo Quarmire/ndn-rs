@@ -1,1 +1,6 @@
-Error: management command failed: 403 command rejected: key-backed signature required (DigestSha256 does not establish key identity)
+✓ 200 OK
+  name:      /e01/test
+  face-id:   1
+  cost:      10
+  origin:    app (0)
+  flags:     child-inherit (0x1)

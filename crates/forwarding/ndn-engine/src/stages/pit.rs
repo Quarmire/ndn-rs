@@ -192,6 +192,9 @@ impl PitCheckStage {
                         return CheckResult::Loop;
                     }
                 }
+                // Before its in-record is added: whether this face is a new
+                // downstream of the entry (see the no-out-record rule below).
+                let new_downstream = !entry.in_records.iter().any(|r| r.face_id == ctx.face_id.0);
                 let expires_at = now_ns + lifetime_ms * 1_000_000;
                 // NS-11 (with the always-re-forward below): a persistent re-express
                 // from a face REPLACES that face's prior standing in-record rather
@@ -253,6 +256,22 @@ impl PitCheckStage {
                     // last upstream send elapses, let it re-forward so the
                     // strategy can move to an untried upstream — driving failover
                     // past a silently-lost upstream that never Nacks.
+                    CheckResult::ReForward
+                } else if new_downstream && entry.out_records.is_empty() {
+                    // Nothing was sent upstream yet: the Interest that made the
+                    // entry is still in its strategy pass, which excludes the
+                    // face IT came in on, and may end in a Nack (only nexthop
+                    // = its own in-face) that releases the entry. Aggregated
+                    // here, an Interest from another face would then never be
+                    // forwarded, though the face the first one excluded may be
+                    // its route (seen in ndn-fwd/testbed/e2e `lifecycle-push`:
+                    // a relay's fetch reached a device just before the device
+                    // fetched the same name through that relay; the device's
+                    // fetch was lost). It gets its own strategy pass, as NFD
+                    // dispatches every Interest to the strategy; the
+                    // strategy's retransmission suppression sees the first's
+                    // out-records once they exist. A same-face duplicate still
+                    // aggregates.
                     CheckResult::ReForward
                 } else {
                     CheckResult::Aggregated
@@ -1930,11 +1949,13 @@ mod d09_retx_tests {
         );
     }
 
-    /// A fresh entry with no upstream out-record (never forwarded) must
-    /// aggregate a second arrival, not re-forward — the original is still in
-    /// flight through the strategy.
+    /// A fresh entry with no upstream out-record (never forwarded): a second
+    /// arrival from the SAME face aggregates (the original is still in its
+    /// strategy pass); one from ANOTHER face gets its own strategy pass, since
+    /// the original's pass excludes the original's in-face and may end in a
+    /// Nack that releases the entry.
     #[tokio::test]
-    async fn second_arrival_before_any_forward_aggregates() {
+    async fn second_arrival_before_any_forward_aggregates_only_from_the_same_face() {
         let pit = Arc::new(Pit::new());
         let check = check_stage(Arc::clone(&pit));
         let name: Name = "/d09/retx/inflight".parse().unwrap();
@@ -1946,10 +1967,17 @@ mod d09_retx_tests {
         pit.insert(token, entry);
 
         let wire = InterestBuilder::new(name.clone()).build();
-        let action = check.process(interest_ctx(wire, FaceId(2))).await;
+        let action = check.process(interest_ctx(wire, FaceId(1))).await;
         assert!(
             matches!(action, Action::Drop(DropReason::Suppressed)),
-            "with no upstream out-record yet, a second arrival must aggregate"
+            "with no upstream out-record yet, a second arrival from the same face must aggregate"
+        );
+
+        let wire = InterestBuilder::new(name.clone()).build();
+        let action = check.process(interest_ctx(wire, FaceId(2))).await;
+        assert!(
+            matches!(action, Action::Continue(_)),
+            "with no upstream out-record yet, an arrival from another face must reach the strategy"
         );
     }
 }

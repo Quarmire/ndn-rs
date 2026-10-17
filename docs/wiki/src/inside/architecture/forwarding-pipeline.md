@@ -45,12 +45,22 @@ path:
 3. **PIT** — the Interest is looked up by `PitToken`. If an entry already
    exists (someone else asked for this name), the new Interest is *aggregated*:
    its incoming face is added as an in-record and the Interest is **not**
-   forwarded again. If it is new, an entry is created. This is where flow
-   balance and loop detection (nonce + dead-nonce-list) happen.
+   forwarded again. Two exceptions reach the strategy instead: a
+   retransmission once the suppression window since the last upstream send
+   has passed, and an Interest from a new downstream face while nothing was
+   sent upstream yet (the first Interest's strategy pass excludes the face
+   *it* came in on, which may be the new one's route, and may end in a Nack).
+   If it is new, an entry is created. This is where flow balance and loop
+   detection (nonce + dead-nonce-list) happen.
 4. **Strategy** — a fresh (un-aggregated) Interest is handed to the strategy
    registered for its longest-matching prefix. The strategy reads the FIB entry
    and returns a `ForwardingAction`: forward to some faces, forward after a
    delay, Nack, or suppress. See [Add a forwarding strategy](../cookbook/add-a-strategy.md).
+   A Nack (no eligible next-hop, e.g. the only route leads back to the
+   incoming face) drops that face's in-record, and the whole entry once no
+   downstream waits on it (NFD `rejectPendingInterest`), so a later Interest
+   for the name from another face is forwarded instead of aggregated onto an
+   entry nothing will satisfy.
 5. **Egress** — chosen next-hops are LP-framed and queued to each face's sender
    task.
 

@@ -39,6 +39,8 @@ mod partitioned_parity;
 mod path_control;
 #[path = "pit_fan_out_witness.rs"]
 mod pit_fan_out_witness;
+#[path = "rejected_interest_pit.rs"]
+mod rejected_interest_pit;
 #[path = "self_learning.rs"]
 mod self_learning;
 #[path = "traceroute_responder.rs"]
