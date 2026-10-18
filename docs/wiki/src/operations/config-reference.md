@@ -89,11 +89,28 @@ kind = "webtransport"
 listen = "0.0.0.0:4443"
 cert = "/etc/ndn-fwd/wt.pem"
 key  = "/etc/ndn-fwd/wt.key"
+
+[[face]]
+kind = "quic"
+bind = "0.0.0.0:6367"
 ```
 
 Face kinds: `udp`, `tcp`, `unix`, `multicast`, `ether`,
-`webtransport`, `ws`, `webrtc`, `shm`, `serial`, `bluetooth`.
+`webtransport`, `ws`, `webrtc`, `shm`, `serial`, `bluetooth`, `quic`.
 See [Face transports](../reference/face-transports.md) for the per-kind options.
+
+`kind = "quic"` is this device's QUIC link socket: it listens for links from
+other devices, and the links this device dials (its `[[peer]]` entries) go
+out from it, so other devices see this one at `bind`. `bind` is an address
+and UDP port (`"0.0.0.0:6367"`; `"[::]:6367"` takes both IPv4 and IPv6);
+anything that is not an address and port is refused. `listen = false`
+(default `true`) makes it dial-only: it accepts no links, and a device picks
+the address it dials from this way (`bind = "192.0.2.7:0"`, port `0` lets
+the system pick the port); a dial-only socket with no `[[peer]] endpoint` to
+dial is refused. Without a quic `[[face]]`, links are dialled from an
+address and port the system picks. A daemon has at most one. Who may link
+in is decided by the devices' keys, not by this entry. See
+[QUIC links](../reference/face-transports.md#quic-links).
 
 ## `[[route]]` — static routes
 
@@ -103,6 +120,60 @@ prefix = "/lab"
 face = 0          # face index from [[face]] order
 cost = 100        # optional
 ```
+
+A `[[route]]` cannot name a `kind = "quic"` face: that face is the link
+socket rather than a link. Routes over a link go in its `[[peer]] routes`.
+
+## `[[peer]]` — QUIC links
+
+Repeated table: the devices this one links to over QUIC, or lets link in.
+Each entry names one device; a link to it is identified by its key, never
+by an address. See [Linking devices](../reference/links.md).
+
+```toml
+[[peer]]
+device = "/home/node/relay"
+endpoint = "relay.example.net:6367"
+```
+
+| Key | Default | Use |
+|---|---|---|
+| `device` | (none) | The peer's device name `/<namespace>/<role>/<device>` (at least three components). The link is admitted when the peer's certificate validates in a namespace this device holds and names this device. |
+| `key` | (none) | Expected fingerprint of the peer's key: 64 hex digits, the SHA-256 of its public key, as the peer's daemon logs it at startup (`this device's link key`, `fingerprint=…`). For a device of another namespace, or one not enrolled or adopted yet. With `device` too, the key must match and a certificate that validates must name that device. |
+| `endpoint` | (none) | Where to dial it: `"host:port"`, or a list tried in order. None: this device does not dial it — it is reached through `relay`, or it links in. |
+| `relay` | (none) | The `device` or `key` of another `[[peer]]`: reach this peer through that peer's link. This peer's routes are installed on the relay's link at cost 10 (a direct link costs 0). |
+| `routes` | see below | Prefixes routed over this link. |
+| `persistent` | `true` | Keep the link up: redial whenever it drops, with backoff from 0.5 s to 30 s, and 60 s after the peer refused this device's key. |
+| `reliability` | `false` | NDNLPv2 reliability (retransmission of lost frames) on this link. |
+
+When `routes` is unset: a peer that validates as a `node` device (a relay)
+gets its namespace prefix `/<ns>`; any other peer that validates gets its
+device name `/<ns>/<role>/<device>`; a peer admitted by `key` alone gets its
+`device` if set, else no route. On an enrollment link (a device not
+enrolled yet linking to a relay of its namespace, see
+[Linking devices](../reference/links.md#add-a-device-that-is-only-reachable-over-quic)),
+the device routes `/<ns>` over it and the relay installs no route. Routes
+are installed when the link comes up and removed with it.
+
+A `[[peer]]` with neither `endpoint` nor `relay` only says that device may
+link in — useful with `key`, for a device the namespace does not vouch for.
+
+Validation (the daemon refuses to start, naming the entry):
+
+- each entry has `device` or `key`;
+- `key` is exactly 64 hex digits; `device` is an NDN name of at least three
+  components;
+- each `endpoint` is `host:port` with a non-zero port;
+- each of `routes` is an NDN name starting with `/`;
+- `relay` names another `[[peer]]` (its `device` or `key`), and that peer has
+  an `endpoint`;
+- no two entries name the same device or key;
+- unknown keys are refused.
+
+Older QUIC configuration is refused: `[listeners]` takes only
+`webtransport`, `webrtc` and `ble`, `[[face]] kind = "quic"` takes only
+`bind` and `listen`, and a QUIC face dialled to an address is now a
+`[[peer]]` with `endpoint` and the peer's `key`.
 
 ## `[discovery]` — neighbour discovery
 
@@ -212,6 +283,9 @@ the namespace's trust context. See
 | `approval_roles` | `["admin", "node"]` | Roles issued only on an admin's approval; the others enroll by invite. |
 | `approval_requires_invite` | `false` | An approval request must also redeem one of this CA's invite tokens. |
 | `approval_request_ttl_days` | `7` | How long a pending request waits; a decided record is kept as long again. `0` is refused. |
+| `link_roles` | unset (context's; default: every role) | Roles whose devices may link (`[[peer]]` QUIC links). `[]`: every role. |
+| `relay_roles` | unset (context's; default `["node"]`) | Roles a device may relay through; each must be in `link_roles` when that is not empty. |
+| `enrollment_links` | unset (context's; default `true`) | A relay of the namespace admits an unknown device on an enrollment link that carries only its enrollment (CA endpoints, trust context); effective when the namespace has a CA. |
 
 A namespace CA enforces the policy its trust context's enrollment hint
 advertises (`ndn-fwd init` writes it from these keys, and `ndn-fwd schema
@@ -222,6 +296,14 @@ refuses to start (the message names the context's policy). With
 `approval_requires_invite = true` the CA needs a `token` challenge, or it
 refuses to start. A namespace CA offers `device-approval` even when
 `[[ca.challenge]]` does not list it (logged).
+The link keys are the trust context's link policy, never the CA's own:
+`ndn-fwd init -c <config>` writes them (unset keys: the default) and prints
+`link_policy = …`; `ndn-fwd schema update -c <config>` changes them (unset
+keys: what the context says), refusing a narrowing — a role that could link
+no longer can, `[]` turned into a list, a relay role removed, enrollment
+links turned off — unless `--accept-narrowing`. A namespace CA whose link
+keys disagree with its context refuses to start, naming the context's policy.
+Unknown roles, and a relay role that may not link, are refused.
 `[ca.require_attestation]` (`prefix`/`kind`/`require_signed`/
 `accept_local_operator`) gates issuance on a challenge attestation (on a
 namespace CA, on top of the role layout); under `require_signed` a local

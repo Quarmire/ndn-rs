@@ -321,12 +321,14 @@ impl MgmtClient {
     /// can decide (its CA's, or as an admin device its namespaces' CAs'
     /// pending ones). Local operators only (trust-admin verb). On an admin
     /// device the daemon asks the CAs over the network: the Interest lives
-    /// `timeout`, and so does the wait. A refusal (nothing to approve on this
-    /// node, a CA unreachable) is [`ForwarderError::Command`] with its reason.
+    /// `timeout`, and so does the wait. A CA that could not be asked is a
+    /// note in the listing beside the rows that could be; a refusal (nothing
+    /// to approve on this node, or nothing could be listed) is
+    /// [`ForwarderError::Command`] with its reason.
     pub async fn ca_list_approvals(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, ForwarderError> {
+    ) -> Result<ndn_mgmt_wire::ApprovalListing, ForwarderError> {
         let interest_wire = InterestBuilder::new(dataset_name(module::CA, verb::LIST_APPROVALS))
             .can_be_prefix()
             .must_be_fresh()
@@ -340,7 +342,7 @@ impl MgmtClient {
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
         let content = data.content().map(|c| c.as_ref()).unwrap_or_default();
-        // A refusal is a ControlResponse; the dataset is PendingApproval rows.
+        // A refusal is a ControlResponse; the dataset is the listing.
         if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
         {
             let resp = ControlResponse::decode(Bytes::copy_from_slice(content))
@@ -350,7 +352,7 @@ impl MgmtClient {
                 text: resp.status_text,
             });
         }
-        Ok(ndn_mgmt_wire::PendingApproval::decode_all(content))
+        Ok(ndn_mgmt_wire::ApprovalListing::decode(content))
     }
 
     /// `ca/approve`: approve the pending request `target` names (its request

@@ -28,8 +28,13 @@ pub enum CertError {
     #[error("transport error: {0}")]
     Transport(String),
     /// This node's forwarder refused the Data that answered the Interest for
-    /// `name` (a final verdict, told at once rather than as a timeout).
-    #[error("this node's forwarder refused the Data answering {name} ({reason})")]
+    /// `name`, told at once rather than as a timeout. A final verdict unless
+    /// [`Refusal::is_final`](ndn_packet::Refusal::is_final) says otherwise
+    /// (`unverifiable`: refused for now, ask again later).
+    #[error(
+        "this node's forwarder refused the Data answering {name} ({reason}): {}",
+        reason.next_step()
+    )]
     Refused {
         name: String,
         reason: ndn_packet::Refusal,

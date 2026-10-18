@@ -239,6 +239,10 @@ pub mod ca_tlv {
     pub const EXPIRES: u64 = 0xDE; // NonNegativeInteger, Unix seconds
     pub const APPROVER: u64 = 0xE0; // UTF-8 string, optional (who decided)
     pub const REASON: u64 = 0xE2; // UTF-8 string, optional (a denial's reason)
+    /// Top-level UTF-8 string beside the entries: a namespace whose requests
+    /// could not be listed, why, and what to do (`/home/bob: unreachable
+    /// (…); its requests are not shown — retry when it is up`).
+    pub const NOTE: u64 = 0xE4;
 }
 
 /// One request for an admin's approval, as `ca/list-approvals` lists it.
@@ -267,12 +271,22 @@ pub struct PendingApproval {
     pub reason: String,
 }
 
-impl PendingApproval {
-    /// Encode rows into the `ca/list-approvals` dataset body. Empty optional
+/// The `ca/list-approvals` answer: the rows that could be listed, plus a
+/// note for each namespace whose requests could not be (its CA is
+/// unreachable). A listing with notes is partial, never an error: the
+/// daemon refuses only when nothing at all could be listed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApprovalListing {
+    pub rows: alloc::vec::Vec<PendingApproval>,
+    pub notes: alloc::vec::Vec<String>,
+}
+
+impl ApprovalListing {
+    /// Encode into the `ca/list-approvals` dataset body. Empty optional
     /// strings are omitted (decoders default them to `""`).
-    pub fn encode_all(rows: &[PendingApproval]) -> Bytes {
+    pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
-        for r in rows {
+        for r in &self.rows {
             w.write_nested(ca_tlv::PENDING_APPROVAL, |inner| {
                 let mut text = |typ: u64, s: &str| {
                     if !s.is_empty() {
@@ -295,18 +309,25 @@ impl PendingApproval {
                 }
             });
         }
+        for note in &self.notes {
+            w.write_tlv(ca_tlv::NOTE, note.as_bytes());
+        }
         w.finish()
     }
 
     /// Decode the dataset body. Unknown TLVs are skipped (evolvability); an
     /// entry missing `request_id` or `key_name` is dropped.
-    pub fn decode_all(bytes: &[u8]) -> alloc::vec::Vec<PendingApproval> {
-        let mut out = alloc::vec::Vec::new();
+    pub fn decode(bytes: &[u8]) -> ApprovalListing {
+        let mut out = ApprovalListing::default();
         let mut reader = TlvReader::new(Bytes::copy_from_slice(bytes));
         while !reader.is_empty() {
             let Ok((typ, body)) = reader.read_tlv() else {
                 break;
             };
+            if typ == ca_tlv::NOTE {
+                out.notes.push(String::from_utf8_lossy(&body).into_owned());
+                continue;
+            }
             if typ != ca_tlv::PENDING_APPROVAL {
                 continue;
             }
@@ -331,7 +352,7 @@ impl PendingApproval {
                 }
             }
             if !row.request_id.is_empty() && !row.key_name.is_empty() {
-                out.push(row);
+                out.rows.push(row);
             }
         }
         out
@@ -366,9 +387,12 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let wire = PendingApproval::encode_all(&rows);
-        let back = PendingApproval::decode_all(&wire);
-        assert_eq!(back, rows);
+        let listing = ApprovalListing {
+            rows,
+            notes: alloc::vec!["/home/carol: unreachable (no answer); its requests are not shown".into()],
+        };
+        let wire = listing.encode();
+        assert_eq!(ApprovalListing::decode(&wire), listing);
         // The first byte is the nested entry type.
         assert_eq!(wire[0] as u64, ca_tlv::PENDING_APPROVAL);
     }
@@ -380,7 +404,7 @@ mod tests {
         w.write_nested(ca_tlv::PENDING_APPROVAL, |i| {
             i.write_tlv(ca_tlv::REQUEST_ID, b"orphan");
         });
-        assert!(PendingApproval::decode_all(&w.finish()).is_empty());
+        assert!(ApprovalListing::decode(&w.finish()).rows.is_empty());
     }
 
     #[test]

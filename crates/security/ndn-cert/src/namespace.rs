@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, EnrollmentHint, FilePib, KeyRole, PibError, SecurityManager, SignedTrustContext,
+    Certificate, EnrollmentHint, FilePib, KeyRole, LinkPolicy, PibError, SecurityManager, SignedTrustContext,
     SignedTrustContextError, TrustError,
 };
 use ndn_trust_envelope::TrustEnvelope;
@@ -118,6 +118,7 @@ pub fn init_namespace(
         None,
         &[],
         EnrollmentHint::namespace_default(),
+        LinkPolicy::default(),
     ))
 }
 
@@ -131,6 +132,7 @@ async fn build_namespace(
     ca_endpoint: Option<Name>,
     root_device_keys: &[Name],
     hint: EnrollmentHint,
+    link: LinkPolicy,
 ) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
@@ -141,6 +143,7 @@ async fn build_namespace(
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
         .with_version(1)
         .with_enrollment_hint(hint)
+        .with_link_policy(link)
         .with_schema_blobs(schema.blobs())?
         .schema_authoritative();
     if let Some(ca) = ca_endpoint {
@@ -257,8 +260,8 @@ pub enum NamespaceInitError {
 /// another namespace is refused even with `force`.
 ///
 /// The context advertises the default enrollment policy
-/// ([`ApprovalPolicy::default`]); [`init_namespace_in_pib_with`] takes
-/// another.
+/// ([`ApprovalPolicy::default`]) and states the default link policy
+/// ([`LinkPolicy::default`]); [`init_namespace_in_pib_with`] takes others.
 pub async fn init_namespace_in_pib(
     pib: &FilePib,
     namespace: &Name,
@@ -266,13 +269,23 @@ pub async fn init_namespace_in_pib(
     force: bool,
     root: &NewRootStore,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
-    init_namespace_in_pib_with(pib, namespace, device, force, root, &ApprovalPolicy::default())
-        .await
+    init_namespace_in_pib_with(
+        pib,
+        namespace,
+        device,
+        force,
+        root,
+        &ApprovalPolicy::default(),
+        &LinkPolicy::default(),
+    )
+    .await
 }
 
 /// [`init_namespace_in_pib`] whose context advertises `approval` — which
 /// roles enroll only on an admin's approval, and whether with an invite too
-/// — the policy the namespace's CA (`[ca]`) then enforces.
+/// — the policy the namespace's CA (`[ca]`) then enforces, and states
+/// `link`: which devices may link and relay, and whether relays admit
+/// enrollment links.
 pub async fn init_namespace_in_pib_with(
     pib: &FilePib,
     namespace: &Name,
@@ -280,6 +293,7 @@ pub async fn init_namespace_in_pib_with(
     force: bool,
     root: &NewRootStore,
     approval: &ApprovalPolicy,
+    link: &LinkPolicy,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
@@ -343,6 +357,7 @@ pub async fn init_namespace_in_pib_with(
         Some(namespace.clone().append("CA")),
         &[ca_key.clone(), device_key.clone()],
         approval.to_hint(),
+        link.clone(),
     )
     .await?;
     let root_store = pending.commit(pib, namespace, &init.anchor)?;

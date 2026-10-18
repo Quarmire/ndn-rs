@@ -15,16 +15,23 @@
 //! certificate came from never makes it trusted: the chain walk verifies
 //! every hop up to an anchor.
 //!
-//! A fetch the forwarder answers with a refusal ([`FetchMiss::Refused`]: it
-//! refused the certificate Data itself) ends at once with that reason: the
-//! validator remembers the refused certificate for its key, so asking the
-//! neighbour too could not change the verdict on the Data waiting on it.
+//! A refusal is about what one source served, not about the certificate: a
+//! fetch the forwarder answers with a refusal ([`FetchMiss::Refused`]: it
+//! refused the certificate Data that source returned) is a miss for that
+//! source only, and the other source is still asked. A neighbour on the path
+//! serving one bogus certificate does not keep the genuine one, served by the
+//! face that delivered the Data, from being fetched. A genuine refusal still
+//! reaches the Data waiting on it at once: the validator remembers the
+//! refused certificate for its key, and the Data it verifies gets that
+//! verdict.
 //!
 //! A fetch every source it asked answered definitively — none to be had
-//! there ([`FetchMiss::Absent`], a NoRoute Nack), or a refusal — leaves the
-//! certificate known absent ([`CertFetcher::known_absent`]) for as long as
-//! the fetcher would not ask again: Data waiting on it can be given a final
-//! verdict. A fetch that timed out never does; the network may only be slow.
+//! there ([`FetchMiss::Absent`], a NoRoute Nack), or a refusal of what it
+//! served — leaves the certificate known absent ([`CertFetcher::known_absent`])
+//! for as long as the fetcher would not ask again: Data waiting on it is
+//! refused `unverifiable`, which is not final — a consumer asks again after
+//! the back-off, and so does the fetcher. A fetch that timed out never
+//! leaves it known absent; the network may only be slow.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,8 +54,9 @@ pub enum FetchMiss {
     /// Answered that the certificate cannot be had where it was asked: a
     /// NoRoute Nack.
     Absent,
-    /// This host's forwarder refused the Data that answered: a final verdict
-    /// on that certificate.
+    /// This host's forwarder refused the certificate Data that answered from
+    /// this source. A miss for this source only: another may serve a
+    /// certificate of the key that is accepted.
     Refused(ndn_packet::Refusal),
     /// A [`DirectFetchFn`] that asked nobody, because the routed fetch already
     /// goes to that face: the routed fetch's answer stands for both.
@@ -56,11 +64,15 @@ pub enum FetchMiss {
 }
 
 impl FetchMiss {
-    /// What two sources that both brought no certificate add up to: absent
-    /// only when each said so (one that asked nobody defers to the other).
+    /// What two sources that both brought no certificate add up to:
+    /// definitive only when each said none is to be had there or served what
+    /// was refused (a refusal is kept, for the log); one that asked nobody
+    /// defers to the other.
     fn and(self, other: FetchMiss) -> FetchMiss {
         match (self, other) {
             (FetchMiss::NotAsked, miss) | (miss, FetchMiss::NotAsked) => miss,
+            (FetchMiss::Refused(r), FetchMiss::Absent | FetchMiss::Refused(_))
+            | (FetchMiss::Absent, FetchMiss::Refused(r)) => FetchMiss::Refused(r),
             (FetchMiss::Absent, FetchMiss::Absent) => FetchMiss::Absent,
             _ => FetchMiss::Unanswered,
         }
@@ -169,10 +181,10 @@ impl CertFetcher {
 
     /// Whether `cert_name` is known absent where [`Self::fetch_from`] asks
     /// for it (with `face` asked too): its last fetch ended with every source
-    /// it asked answering that none is to be had there (a NoRoute Nack), or
-    /// with this host's forwarder refusing what answered — not merely without
-    /// an answer in time, which the network's slowness can explain. Holds for
-    /// as long as the fetcher would not ask again.
+    /// it asked answering that none is to be had there (a NoRoute Nack) or
+    /// serving a certificate this host's forwarder refused — not merely
+    /// without an answer in time, which the network's slowness can explain.
+    /// Holds for as long as the fetcher would not ask again.
     pub fn known_absent(&self, cert_name: &Arc<Name>, face: Option<u64>) -> bool {
         let face = face.filter(|_| self.direct_fn.is_some());
         self.failed
@@ -293,8 +305,10 @@ impl CertFetcher {
             let started = tokio::time::Instant::now();
             tokio::pin!(routed);
             match tokio::time::timeout(DIRECT_FETCH_AFTER, &mut routed).await {
-                // Data, or a refusal: the verdict on the certificate.
-                Ok(answered @ (Ok(_) | Err(FetchMiss::Refused(_)))) => answered,
+                Ok(Ok(data)) => Ok(data),
+                // No certificate from the routes — none there, a refusal of
+                // what they served, a transient Nack: the neighbour may
+                // still serve one.
                 Ok(Err(miss)) => {
                     tokio::time::sleep_until(started + DIRECT_FETCH_AFTER).await;
                     then_ask(miss, direct(name, face)).await
@@ -328,8 +342,8 @@ impl CertFetcher {
                 return Err(Miss {
                     error: TrustError::CertNotFound {
                         name: format!(
-                            "{cert_name}: the forwarder refused the certificate that answered \
-                             ({refusal})"
+                            "{cert_name}: no source asked served an acceptable certificate (the \
+                             forwarder refused what answered: {refusal})"
                         ),
                     },
                     absent: true,
@@ -360,8 +374,8 @@ impl CertFetcher {
     }
 }
 
-/// The first of `a` and `b` to answer with Data or a refusal; once neither
-/// did, what their misses add up to ([`FetchMiss::and`]).
+/// The first certificate Data `a` or `b` brings; once neither did, what
+/// their misses add up to ([`FetchMiss::and`]).
 async fn first_answer<A, B>(a: A, b: B) -> Result<Data, FetchMiss>
 where
     A: Future<Output = Result<Data, FetchMiss>>,
@@ -370,26 +384,23 @@ where
     tokio::pin!(a, b);
     tokio::select! {
         found = &mut a => match found {
-            Err(miss) if !matches!(miss, FetchMiss::Refused(_)) => then_ask(miss, b).await,
-            answered => answered,
+            Err(miss) => then_ask(miss, b).await,
+            data => data,
         },
         found = &mut b => match found {
-            Err(miss) if !matches!(miss, FetchMiss::Refused(_)) => then_ask(miss, a).await,
-            answered => answered,
+            Err(miss) => then_ask(miss, a).await,
+            data => data,
         },
     }
 }
 
-/// `other`'s answer (Data, or a refusal) after a source that brought `miss`;
-/// if it misses too, what the two misses add up to.
+/// `other`'s certificate Data after a source that brought `miss`; if it
+/// misses too, what the two misses add up to.
 async fn then_ask<F>(miss: FetchMiss, other: F) -> Result<Data, FetchMiss>
 where
     F: Future<Output = Result<Data, FetchMiss>>,
 {
-    match other.await {
-        Err(other) if !matches!(other, FetchMiss::Refused(_)) => Err(miss.and(other)),
-        answered => answered,
-    }
+    other.await.map_err(|other| miss.and(other))
 }
 
 /// Drop-driven cleanup for `CertFetcher::in_flight`. Removes the per-key
@@ -746,29 +757,32 @@ mod tests {
         assert_eq!(direct_count.load(Ordering::Relaxed), 0, "no face named, none asked");
     }
 
-    /// A routed fetch the forwarder answers with a refusal ends at once with
-    /// that reason, and the neighbour is not asked: the verdict on the
-    /// certificate stands whoever serves it.
+    /// A refusal of what the routes served is a miss for the routes only:
+    /// the face that delivered the Data is still asked (no sooner than
+    /// `DIRECT_FETCH_AFTER`), and the certificate it serves answers the
+    /// fetch. One bogus certificate on the path does not make the genuine
+    /// one unfetchable.
     #[tokio::test]
-    async fn a_refused_certificate_ends_the_fetch_at_once() {
-        let cert_name = make_cert_name("revoked");
+    async fn a_refusal_is_a_miss_for_its_source_only() {
+        let cert_name = make_cert_name("genuine");
         let routed: FetchFn = Arc::new(|_| {
-            Box::pin(async { Err(FetchMiss::Refused(ndn_packet::Refusal::Revoked)) })
+            Box::pin(async { Err(FetchMiss::Refused(ndn_packet::Refusal::BadSignature)) })
         });
-        let direct_count = Arc::new(AtomicUsize::new(0));
-        let dc = Arc::clone(&direct_count);
+        let asked = Arc::new(std::sync::OnceLock::new());
+        let (cn, log) = (Arc::clone(&cert_name), Arc::clone(&asked));
+        let started = tokio::time::Instant::now();
         let direct: DirectFetchFn = Arc::new(move |_, _| {
-            dc.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Err(FetchMiss::Unanswered) })
+            let _ = log.set(started.elapsed());
+            let data = make_cert_data(&cn, &[4; 32]);
+            Box::pin(async move { Ok(data) })
         });
         let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(5))
             .with_direct_fetch(direct);
-        let started = tokio::time::Instant::now();
-        let err = fetcher.fetch_from(&cert_name, Some(9)).await.unwrap_err();
-        assert!(err.to_string().contains("refused"), "{err}");
-        assert!(started.elapsed() < DIRECT_FETCH_AFTER, "waited: {:?}", started.elapsed());
-        tokio::time::sleep(DIRECT_FETCH_AFTER * 2).await;
-        assert_eq!(direct_count.load(Ordering::Relaxed), 0, "the neighbour was asked");
+        let cert = fetcher.fetch_from(&cert_name, Some(9)).await.unwrap();
+        assert_eq!(cert.public_key.as_ref(), &[4; 32]);
+        assert!(!fetcher.known_absent(&cert_name, Some(9)));
+        let after = *asked.get().expect("the delivering face was asked");
+        assert!(after >= DIRECT_FETCH_AFTER, "asked too soon: {after:?}");
     }
 
     /// Only a certificate of the requested key answers its fetch: other Data
@@ -905,19 +919,25 @@ mod tests {
         assert!(fetcher.known_absent(&name, None));
     }
 
-    /// Absent is final only when every source asked answered definitively:
-    /// a source that did not answer in time (or answered a transient Nack)
-    /// leaves it unknown — the network may only be slow. A direct fetch that
-    /// asked nobody (the routes already lead to that face) defers to the
-    /// routed answer.
+    /// Absent only when every source asked answered definitively — none to
+    /// be had there, or a refusal of what it served: a source that did not
+    /// answer in time (or answered a transient Nack) leaves it unknown — the
+    /// network may only be slow. A direct fetch that asked nobody (the
+    /// routes already lead to that face) defers to the routed answer.
     #[tokio::test]
     async fn absence_needs_every_source_asked_to_answer_it() {
         let name = make_cert_name("maybe");
+        let refused = FetchMiss::Refused(ndn_packet::Refusal::Revoked);
         let cases = [
             (FetchMiss::Absent, FetchMiss::Unanswered, false),
             (FetchMiss::Unanswered, FetchMiss::Absent, false),
             (FetchMiss::Absent, FetchMiss::NotAsked, true),
             (FetchMiss::Unanswered, FetchMiss::NotAsked, false),
+            (refused, FetchMiss::Unanswered, false),
+            (FetchMiss::Unanswered, refused, false),
+            (refused, FetchMiss::Absent, true),
+            (FetchMiss::Absent, refused, true),
+            (refused, FetchMiss::NotAsked, true),
         ];
         for (routed, direct, absent) in cases {
             let (routed_fn, _) = answering(routed);
@@ -947,16 +967,5 @@ mod tests {
             }));
         assert!(fetcher.fetch_from(&name, Some(9)).await.is_ok());
         assert!(!fetcher.known_absent(&name, Some(9)));
-    }
-
-    /// A refusal of what answered is a definitive answer too.
-    #[tokio::test]
-    async fn a_refused_certificate_is_known_absent() {
-        let name = make_cert_name("refused");
-        let (routed, _) = answering(FetchMiss::Refused(ndn_packet::Refusal::Revoked));
-        let fetcher = CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_secs(1))
-            .with_direct_fetch(direct_answering(FetchMiss::Unanswered));
-        assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
-        assert!(fetcher.known_absent(&name, Some(9)));
     }
 }

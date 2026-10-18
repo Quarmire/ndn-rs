@@ -82,8 +82,8 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    ContextExplanation, EnrollmentHint, KeyRole, OpenContextError, SchemaBlob, SchemaFormat,
-    SignedTrustContext, SignedTrustContextError, SigningPair, anchor_fingerprint,
+    ContextExplanation, EnrollmentHint, KeyRole, LinkPolicy, OpenContextError, SchemaBlob,
+    SchemaFormat, SignedTrustContext, SignedTrustContextError, SigningPair, anchor_fingerprint,
     context_namespace_of, dryrun_orphans,
 };
 pub use trust_schema::{

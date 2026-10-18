@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_mgmt_wire::{
-    ControlParameters, ControlResponse, FaceStatus, FibEntry, GeneralStatus, PendingApproval,
+    ApprovalListing, ControlParameters, ControlResponse, FaceStatus, FibEntry, GeneralStatus,
     RibEntry, StrategyChoice, parse_command_name,
 };
 use proptest::prelude::*;
@@ -126,7 +126,7 @@ proptest! {
         let _ = FibEntry::decode_all(&data);
         let _ = RibEntry::decode_all(&data);
         let _ = StrategyChoice::decode_all(&data);
-        let _ = PendingApproval::decode_all(&data);
+        let _ = ApprovalListing::decode(&data);
         // parse_command_name takes a Name; feed it whatever names the fuzz
         // bytes happen to decode into.
         if let Ok(name) = Name::decode(raw) {

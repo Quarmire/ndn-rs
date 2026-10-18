@@ -143,6 +143,18 @@ impl TokenStore {
         matches!(self.check_and_consume(token, None), TokenCheck::Ok)
     }
 
+    /// [`consume`](Self::consume), telling why a refused token was refused.
+    pub fn redeem(&self, token: &str) -> TokenCheck {
+        self.check_and_consume(token, None)
+    }
+
+    /// Whether `token` is issued, unexpired and unredeemed (consumes nothing).
+    pub fn is_live(&self, token: &str) -> bool {
+        self.tokens
+            .get(token)
+            .is_some_and(|m| m.expires_at_ns.is_none_or(|exp| now_ns() <= exp))
+    }
+
     /// Single-use consume enforcing TTL and (if set) that `request_name` is
     /// under the token's scope. The token is consumed only when valid and
     /// in-scope; an out-of-scope or expired token is *not* silently accepted.

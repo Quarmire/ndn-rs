@@ -51,10 +51,10 @@ fn cert_interest(name: Name) -> InterestBuilder {
         .lifetime(CERT_FETCH_TIMEOUT)
 }
 
-/// A fetch's error as the [`CertFetcher`] reads it: the forwarder's refusal
-/// of the certificate Data is a verdict, a NoRoute Nack says none is to be
-/// had where it was asked; anything else (a timeout, a transient Nack) is no
-/// answer.
+/// A fetch's error as the [`CertFetcher`] reads it: the forwarder refused
+/// what this source served, or a NoRoute Nack says none is to be had where it
+/// was asked — both definitive for this source only — while anything else (a
+/// timeout, a transient Nack) is no answer.
 fn miss(e: AppError) -> FetchMiss {
     match e {
         AppError::Refused { reason } => FetchMiss::Refused(reason),

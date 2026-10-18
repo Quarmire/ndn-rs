@@ -174,6 +174,16 @@ impl RenewalError {
                 cert: cert.to_string(),
                 reason,
             },
+            // The CA's answer could not be verified yet (its signer's
+            // certificate was not to be had): as if it had not arrived.
+            CertError::Refused { name, reason } if !reason.is_final() => Self::CaUnreachable {
+                ca_prefix: ca_prefix.to_string(),
+                detail: format!(
+                    "this node's forwarder refused the Data answering {name} for now \
+                     ({reason}: {})",
+                    reason.next_step()
+                ),
+            },
             other => Self::Refused {
                 cert: cert.to_string(),
                 reason: other.to_string(),
@@ -407,5 +417,22 @@ mod tests {
         let b: Name = "/home/bob/member/phone/KEY/k/i/v2".parse().unwrap();
         assert_ne!(renewal_proof_message("00", &a), renewal_proof_message("01", &a));
         assert_ne!(renewal_proof_message("00", &a), renewal_proof_message("00", &b));
+    }
+
+    /// A CA answer this node's forwarder refused for now (`unverifiable`)
+    /// leaves the renewal to be tried again soon; a final refusal does not.
+    #[test]
+    fn a_refusal_for_now_does_not_end_the_renewal() {
+        let (ca, cert): (Name, Name) =
+            ("/home/bob".parse().unwrap(), "/home/bob/c".parse().unwrap());
+        let refused = |reason| CertError::Refused {
+            name: "/home/bob/CA/RENEW".to_string(),
+            reason,
+        };
+        let for_now =
+            RenewalError::from_cert(refused(ndn_packet::Refusal::Unverifiable), &ca, &cert);
+        assert!(!for_now.is_final(), "{for_now}");
+        let revoked = RenewalError::from_cert(refused(ndn_packet::Refusal::Revoked), &ca, &cert);
+        assert!(revoked.is_final(), "{revoked}");
     }
 }

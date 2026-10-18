@@ -8,7 +8,8 @@
 //! - **Schema update** ([`bump_context_schema`], root device only): version
 //!   `N+1` carrying a new schema (for a namespace made by `ndn-fwd init`, the
 //!   current generated one, [`crate::roles::namespace_schema`]) and the
-//!   enrollment hint of the policy the namespace's CA enforces; everything
+//!   enrollment hint of the policy the namespace's CA enforces, and the link
+//!   policy `[ca]` states, else the held one; everything
 //!   else is carried over verbatim. This is how a namespace made before a
 //!   rule existed gets it (the `#deny` and `#pending` rules of enrollment by
 //!   approval), without being initialized again. It is its own operator
@@ -25,6 +26,9 @@
 //!   in with `ndn-trust-context`, or the key-name schema of the earliest
 //!   releases, whose rules read differently even where they grant the same —
 //!   and is then refused until the operator has read the rules it drops.
+//!   A link policy is held to the same rule: the update is refused unless
+//!   the caller consents when a role that could link no longer can, a relay
+//!   role is removed, or enrollment links are turned off.
 //!   The new version is schema-authoritative, as the generated schema
 //!   requires (its cross-identity grants are what the hierarchy floor
 //!   forbids).
@@ -57,7 +61,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, EnrollmentHint, ExpectContextError, Keyring, LvsModel, OpenContextError,
+    Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy, LvsModel, OpenContextError,
     SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext, SignedTrustContextError, Signer,
     Validator,
 };
@@ -131,6 +135,23 @@ pub enum BumpError {
         version: u64,
         /// The held schema's rules the new one no longer grants.
         removed: Vec<String>,
+    },
+    #[error(
+        "refusing to narrow which devices of {namespace} may link: the new link policy ({after}) \
+         takes away what the held version (v{version}, {before}) allows — {}. A device relying \
+         on it would lose its links once its node holds the new version. If that is intended, \
+         sign the update with consent to narrow (`ndn-fwd schema update --accept-narrowing`); \
+         otherwise set [ca] link_roles / relay_roles / enrollment_links to the held policy or \
+         remove them",
+        .narrowed.join("; ")
+    )]
+    LinkNarrowing {
+        namespace: String,
+        version: u64,
+        before: String,
+        after: String,
+        /// What devices could do under the held policy and no longer can.
+        narrowed: Vec<String>,
     },
     #[error("the schema cannot be read: {0}")]
     Schema(String),
@@ -256,6 +277,13 @@ pub struct SchemaChange {
     pub hint: EnrollmentHint,
     /// The held version is not schema-authoritative; the new one is.
     pub becomes_authoritative: bool,
+    /// The held version's link policy (stated, else the default).
+    pub link_before: LinkPolicy,
+    /// The link policy the new version carries.
+    pub link: LinkPolicy,
+    /// What devices could do under `link_before` and no longer can under
+    /// `link`. Non-empty only with consent to narrowing.
+    pub link_narrowed: Vec<String>,
 }
 
 impl SchemaChange {
@@ -264,14 +292,43 @@ impl SchemaChange {
         self.hint_before.as_ref() != Some(&self.hint)
     }
 
-    /// Nothing to sign: the held version carries these rules, this hint and
-    /// the authoritative flag already.
+    /// Whether the new version carries another link policy.
+    pub fn changes_link(&self) -> bool {
+        self.link_before != self.link
+    }
+
+    /// Nothing to sign: the held version carries these rules, this hint,
+    /// this link policy and the authoritative flag already.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.removed.is_empty()
             && !self.changes_hint()
+            && !self.changes_link()
             && !self.becomes_authoritative
     }
+}
+
+/// What devices may do under `before` and no longer under `after`: a role
+/// that could link and no longer can (every role → a list counts), a relay
+/// role removed, enrollment links turned off. Empty: `after` only widens.
+pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
+    let mut narrowed = Vec::new();
+    if before.roles.is_empty() && !after.roles.is_empty() {
+        narrowed.push(format!(
+            "every role could link, now only {}",
+            after.roles.join(", ")
+        ));
+    }
+    for role in before.roles.iter().filter(|r| !after.allows_link(r)) {
+        narrowed.push(format!("{role} devices may no longer link"));
+    }
+    for role in before.relay_roles.iter().filter(|r| !after.relay_roles.contains(r)) {
+        narrowed.push(format!("{role} devices may no longer relay"));
+    }
+    if before.enrollment_links && !after.enrollment_links {
+        narrowed.push("relays no longer admit enrollment links".to_string());
+    }
+    narrowed
 }
 
 /// A schema update signed by [`bump_context_schema`].
@@ -339,17 +396,21 @@ fn grants_missing(next: &[(String, String)], held: &[(String, String)]) -> Vec<S
         .collect()
 }
 
-/// What a version after `ctx` carrying `schema` and `hint` would change:
-/// the rules it adds and removes, and whether the hint or the authoritative
-/// flag change ([`SchemaChange::is_empty`]: nothing to sign). Refused
-/// ([`BumpError::Narrowing`], listing the rules devices would lose) when a
-/// rule of `ctx` is missing from `schema`, unless `accept_narrowing`.
-/// Needs no key: a caller checks a schema update with it before unlocking
-/// the root that signs it ([`bump_context_schema`] applies the same checks).
+/// What a version after `ctx` carrying `schema`, `hint` and the link policy
+/// `link` (`None`: the held one, carried verbatim) would change: the rules
+/// it adds and removes, and whether the hint, the link policy or the
+/// authoritative flag change ([`SchemaChange::is_empty`]: nothing to sign).
+/// Refused unless `accept_narrowing` when a rule of `ctx` is missing from
+/// `schema` ([`BumpError::Narrowing`], listing the rules devices would
+/// lose) or `link` takes away what the held policy allows
+/// ([`BumpError::LinkNarrowing`], [`link_narrowing`]). Needs no key: a
+/// caller checks a schema update with it before unlocking the root that
+/// signs it ([`bump_context_schema`] applies the same checks).
 pub fn schema_change(
     ctx: &SignedTrustContext,
     schema: &[SchemaBlob],
     hint: &EnrollmentHint,
+    link: Option<&LinkPolicy>,
     accept_narrowing: bool,
 ) -> Result<SchemaChange, BumpError> {
     let held = schema_grants(&ctx.published_schemas())?;
@@ -362,12 +423,27 @@ pub fn schema_change(
             removed,
         });
     }
+    let link_before = ctx.link_policy();
+    let link = link.cloned().unwrap_or_else(|| link_before.clone());
+    let link_narrowed = link_narrowing(&link_before, &link);
+    if !link_narrowed.is_empty() && !accept_narrowing {
+        return Err(BumpError::LinkNarrowing {
+            namespace: ctx.namespace().to_string(),
+            version: ctx.version(),
+            before: link_before.describe(),
+            after: link.describe(),
+            narrowed: link_narrowed,
+        });
+    }
     Ok(SchemaChange {
         added: grants_missing(&next, &held),
         removed,
         hint_before: ctx.enrollment_hint().cloned(),
         hint: hint.clone(),
         becomes_authoritative: !ctx.schema_is_authoritative(),
+        link_before,
+        link,
+        link_narrowed,
     })
 }
 
@@ -377,21 +453,24 @@ pub fn schema_change(
 /// [`NamespaceSchema::blobs`](crate::roles::NamespaceSchema::blobs) gives)
 /// and the enrollment hint `hint`, schema-authoritative, signed by `signer`
 /// — the key of an anchor of `held`, as for [`bump_context_revoking`].
-/// Anchors, CA endpoints, revocations and key roles are carried over
-/// verbatim. Checked as [`schema_change`] checks (a narrowing refused
-/// unless `accept_narrowing`); `Ok(None)` when `held` carries these rules
-/// and this hint already (nothing is signed). Pure: nothing is adopted,
-/// stored or published.
+/// It states the link policy `link` when that differs from the held one;
+/// otherwise (and with `link` `None`) the held link policy is carried over
+/// verbatim, like anchors, CA endpoints, revocations and key roles. Checked
+/// as [`schema_change`] checks (a narrowing of the schema or the link
+/// policy refused unless `accept_narrowing`); `Ok(None)` when `held`
+/// carries these rules, this hint and this link policy already (nothing is
+/// signed). Pure: nothing is adopted, stored or published.
 pub async fn bump_context_schema(
     signer: &dyn Signer,
     held: &Data,
     schema: &[SchemaBlob],
     hint: &EnrollmentHint,
+    link: Option<&LinkPolicy>,
     accept_narrowing: bool,
 ) -> Result<Option<SchemaBump>, BumpError> {
     let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
     ensure_anchor(signer, &ctx)?;
-    let change = schema_change(&ctx, schema, hint, accept_narrowing)?;
+    let change = schema_change(&ctx, schema, hint, link, accept_narrowing)?;
     if change.is_empty() {
         return Ok(None);
     }
@@ -399,11 +478,14 @@ pub async fn bump_context_schema(
     let version = next_version(&ctx)?;
     // `held` verified above, so its Content is present and decodes.
     let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
-    let next = SignedTrustContext::decode_content(content, version)?
+    let mut next = SignedTrustContext::decode_content(content, version)?
         .with_schema_blobs(schema.to_vec())
         .map_err(|e| BumpError::Schema(e.to_string()))?
         .with_enrollment_hint(hint.clone())
         .schema_authoritative();
+    if change.changes_link() {
+        next = next.with_link_policy(change.link.clone());
+    }
     let data = next.sign_into_data_async(signer).await?;
     Ok(Some(SchemaBump {
         bump: ContextBump {
@@ -715,13 +797,15 @@ where
     let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
     fetched.map_err(|source| match (outcome.refused, source) {
         (Some(reason), _) => UpdateFetchError::Dropped(reason),
+        // A final refusal is about what the version is; one for now
+        // (`unverifiable`) is a fetch to try again, like no answer.
         (
             None,
             FetchContextError::Transport {
                 source: CertError::Refused { reason, .. },
                 ..
             },
-        ) => UpdateFetchError::Dropped(format!("refused it ({reason})")),
+        ) if reason.is_final() => UpdateFetchError::Dropped(format!("refused it ({reason})")),
         (None, source) => UpdateFetchError::Fetch(source),
     })
 }

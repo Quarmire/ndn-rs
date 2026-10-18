@@ -207,9 +207,9 @@ async fn without_engine_fetcher_uncached_intermediate_is_dropped() {
 
 /// A cert whose fetch is answered NoRoute (the producer has none): every
 /// Data naming it is refused `unverifiable` at once — the certificate is
-/// known absent where it was fetched — and the fetcher sends ONE cert
-/// Interest for the whole burst (dedup + failure back-off), no per-packet
-/// retry storm.
+/// known absent where it was fetched; refused for now, not final — and the
+/// fetcher sends ONE cert Interest for the whole burst (dedup + failure
+/// back-off), no per-packet retry storm.
 #[tokio::test]
 async fn a_cert_answered_no_route_refuses_data_without_retry_storm() {
     let (engine, shutdown, mut consumer, producer) = engine_trusting_root().await;

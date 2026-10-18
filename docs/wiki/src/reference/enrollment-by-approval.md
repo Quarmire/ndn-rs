@@ -70,9 +70,10 @@ identity` is set).
 key, asked, and expires, certificate or reason.
 
 `approvals list` prints per request: request, code, state, namespace,
-device (role and name), key, created, expires (pending) or kept_until
-(decided), decided_by and reason. A code may be typed `482913`, `482 913`
-or `482-913`.
+device (role and name), key, created, expires and the copyable `approve`
+command (pending) or kept_until (decided), decided_by and reason. A code
+may be typed `482913`, `482 913` (quoted, or pasted unquoted as listed) or
+`482-913`.
 
 `approvals` picks its path per namespace:
 
@@ -84,8 +85,12 @@ or `482-913`.
   **admin key** — fetches `<ca>/CA/PENDING`, signs the decision, pushes it
   to `<ca>/CA/APPROVAL`. The CA records `admin key <key>` with the signed
   decision as evidence.
-- A node with neither is refused (404) with what to do; an unreachable CA
-  is refused (504) naming it. The command waits up to 60 s.
+- A node with neither is refused (404) with what to do. `list` shows the
+  rows it could fetch and a `# <ns>: unreachable (…); its requests are not
+  shown — retry when it is up` line per namespace whose CA did not answer;
+  it is refused (504) only when no namespace could be listed. A decision
+  whose CA is unreachable is refused (504) naming it. The command waits up
+  to 60 s.
 
 A code that matches more than one pending request is refused; use the
 request id.
@@ -110,7 +115,13 @@ device waiting for days sends one small Interest per 30 s.
 
 - **Approved**: the device runs the issuance exchange at once — a fresh
   NDNCERT NEW + CHALLENGE (`device-approval`, `request=<id>`), which issues
-  the certificate — and installs it with no further action.
+  the certificate — and installs it with no further action. The NEW and
+  CHALLENGE answers are not signed by the CA, so nothing they say (a
+  denial, an unreadable answer) ends the request, and neither does an
+  issued certificate that fails its checks (the device may hold a stale
+  trust context: refresh it): the key and the record are kept, the failure
+  is logged with what to do, and the device asks again until the
+  certificate is kept or a CA-signed status says denied or expired.
 - **Denied / expired**: the record says why and what to do (expired: ask
   again), and the generated key is deleted. The device acts on such an
   answer only if it is signed by the CA's key under the namespace schema
@@ -121,12 +132,26 @@ device waiting for days sends one small Interest per 30 s.
   restarts loses the Interests it held; each device sends its next one when
   its Interest expires, so a decision made right after a CA restart reaches
   a device within one status lifetime (30 s).
+- **The CA never answers**: a request still pending one day past its
+  expiry ends on the device itself as `expired` ("the CA never answered
+  before the request expired; ask again"), its key is deleted, and asking
+  again sends a new request.
 - **Limits**: the CA holds at most 4 status Interests per request and 1024
   in all; one more is Nacked (`Congestion`, logged at the CA with why) and
   the device backs off. The Interest is unsigned and carries no parameters,
   so relays aggregate identical ones; the answer has no FreshnessPeriod and
   the Interest is `MustBeFresh`, so no Content Store answers it with an old
   state.
+- **Pending requests**: one key name has at most one pending request (a
+  second, for another public key, is refused naming the waiting one: resume
+  it, or have an admin deny it, or wait for its expiry); the CA holds at most
+  256 pending requests (1024 / 4, the held-status budget), at most 32 under
+  one prefix (the parent of the device's identity, e.g. `/<ns>/node`). A
+  refused request records nothing: decide the waiting ones
+  (`ndn-fwd approvals list`), then ask again.
+- **Decisions**: a pushed decision is validated (signature, chain, admin
+  role) before the CA looks at the request it names; a refusal never echoes
+  the request's code or key.
 
 A decided record stays at the CA one more TTL, so a device that was
 offline still learns the outcome.
@@ -195,7 +220,9 @@ accept_local_operator = false  # under require_signed, count a local operator's 
 The namespace CA enforces what the hint advertises, refuses to start when
 `[ca]` says otherwise, and offers `device-approval` whenever approval roles
 exist. Tokens admit member and guest only. With invite-also, the request
-redeems a token once, when it is opened. Under `require_signed`, a local
+redeems a token once, when it is opened, and only after the request is
+saved: a request the CA could not record leaves the invite unspent. Under
+`require_signed`, a local
 operator's approval carries no signature and counts only with
 `accept_local_operator`.
 

@@ -160,10 +160,13 @@ a new version. Two evictions keep a node's own store out of that:
   newest now", not what it fetched a moment ago.
 
 A relay in between may still answer from its own store for up to 1 s. When
-the node's sync group announced a version newer than the answer (and the
-node does not hold it), the refresh reports `behind` instead of `current` or
-`upstream-older`, naming the member that announced it; nothing changes, and
-refreshing again shortly after gets the new version.
+the node knows a version newer than the answer exists — a member of its
+sync group served that version's signed Data and it passed the continuity
+rule from the held version (or from a version walked through), yet the
+node does not hold it — the refresh reports `behind` instead of `current`
+or `upstream-older`, naming that member; nothing changes, and refreshing
+again shortly after gets the new version. A sequence number announced in
+the group never counts: the group's Sync Interests are not authenticated.
 
 ### Versions made on this device: `security/context-update`
 
@@ -210,6 +213,7 @@ rules_added    = 2
   + #pending: /"home"/"bob"/"CA"/"PENDING"/_ <= #admin
 narrowed       = none (every rule of v2 is kept)
 enrollment     = admin, node by an admin's approval; member, guest by invite
+link_policy    = links: any role; relays: node; enrollment links: on (unchanged)
 handed_over    = …
 ```
 
@@ -221,10 +225,13 @@ policy; for a context made before the hint named its approval roles, the
 policy the CA enforces for it — `[ca] approval_roles` /
 `approval_requires_invite` of `-c` (give the daemon's config), else the
 default. A held hint that `[ca]` contradicts is refused, as the CA's start
-refuses it. Anchors, CA endpoints, revocations and key roles are carried
-over verbatim. It is checked, signed, handed over and stored like a
-revocation (`--passphrase-file` / `--pin-file` unlock the root); with the
-schema and hint current, nothing is signed.
+refuses it. It carries the held link policy verbatim unless `[ca]
+link_roles` / `relay_roles` / `enrollment_links` of `-c` state another
+(unset keys: the held policy's); then it states that one and prints
+`link_policy = <before> -> <after>`. Anchors, CA endpoints, revocations and
+key roles are carried over verbatim. It is checked, signed, handed over and
+stored like a revocation (`--passphrase-file` / `--pin-file` unlock the
+root); with the schema, hint and link policy current, nothing is signed.
 
 **Never a silent narrowing.** The command compares every grant of the held
 schema — each LVS rule's data pattern with each of its signers, by pattern
@@ -236,6 +243,12 @@ a namespace made by an earlier `ndn-fwd init` only adds rules. It narrows
 when the held schema is not the generated one: a custom schema signed in
 with `ndn-trust-context`, or the key-name schema of the earliest releases
 (its rules read differently even where they grant the same).
+
+The link policy is held to the same rule: a role that could link and no
+longer can (including every role → a list), a relay role removed, or
+enrollment links turned off is a narrowing — refused before the root is
+unlocked, naming what devices would lose; `--accept-narrowing` signs it and
+prints it as `link_narrowed`. A widening applies without it.
 
 The namespace CA validates admins' decisions and pending listings under the
 version its daemon holds, so it applies the new rules as soon as the
@@ -277,16 +290,40 @@ keeps running beside it.
   through are stored and published by the code a refresh keeps with
   (`ndn-fwd` `context_refresh::keep_update`), so the nodes behind it can
   fetch them by name.
+- **What an announcement proves.** Nothing by itself: the group runs
+  `SvsConfig::wan()`, whose Sync Interests are not authenticated, so anyone
+  reaching the group can name any member and any sequence number. Only a
+  version whose signed Data a member served and that passed the continuity
+  rule (directly, or as a version walked through before a walk stopped)
+  counts as known to exist (`context_sync::Processed::verified`,
+  `VerifiedVersion`); that alone can make a refresh report `behind`, which
+  `ndn-fwd recover` refuses to fork from.
 - **A fetch that failed is tried again.** SVS reports each sequence number
   once. While a member's announced sequence number (the version it put into
-  the group) is newer than the held version, a failed fetch — or a walk
-  stopped by a version it could not fetch — is tried again after 1 s,
-  doubling to once a minute (`context_sync::Retry`), each attempt logged at
-  WARN with why it failed (`context-sync could not obtain an announced
-  trust-context version; trying again`). It stops once the held version
-  reaches that sequence number (from this retry, another member's
-  announcement, or a refresh) or the version is refused. At most one retry
-  is pending per member, and fetches run one at a time.
+  the group) is newer than the held version and the newest version itself
+  could not be fetched, the fetch is tried again after 1 s, doubling to once
+  a minute (`context_sync::Retry`), each attempt logged at WARN with why it
+  failed (`context-sync could not obtain an announced trust-context version;
+  trying again`). It stops once the held version reaches that sequence
+  number (from this retry, another member's announcement, or a refresh) or
+  the version is refused. A walk that stopped (the newest does not follow
+  from the held version, and the versions in between did not carry the node
+  to it) is not tried again for that announcement: a member can serve a
+  forged newest and let every version in between time out. The refresh
+  follows a genuine one by name.
+- **What a group can cost.** Each announcement costs one fetch of the
+  newest version, plus — when it does not follow from the held version — a
+  walk of at most 128 positions that starts no fetch after 40 s (the
+  refresh's `MAX_CATCH_UP_VERSIONS`, `MAX_CATCH_UP_TIME`). A member none of
+  whose announced versions ever passed the continuity rule is tried 6 times
+  at most (`context_sync::UNPROVEN_TRIES`, about half a minute), and at
+  most 8 such members wait to be tried again (`UNPROVEN_PENDING`; one more
+  that fails is tried once), logged at WARN (`… does not try again; the
+  periodic refresh fetches the namespace's newest version by name`). A
+  member whose announced version passed is tried again while its
+  announcement is newer than the held version, and goes first when retries
+  are due. At most one retry is pending per member; fetches run one at a
+  time, new announcements before retries.
 - **Refusals** are logged at WARN (`context-sync refused a trust-context
   update; the held version stays`) with the reason from the
   [table below](#refusals); a version not newer than the one held is logged
@@ -371,7 +408,7 @@ refused over `/localhop`. It exits 1 if any namespace failed.
 | `updated` | a newer version was adopted, stored and published |
 | `current` | the namespace serves the version held |
 | `upstream-older` | the node that answered serves an older version; nothing changed |
-| `behind` | the answer names a version older than one the node's sync group announced and the node does not hold: a cache answered with the previous metadata, or the upstream has not refreshed yet; nothing changed — refresh again |
+| `behind` | the answer names a version older than one the node verified exists (its signed Data, served over the node's sync group, passed the continuity rule) and does not hold: a cache answered with the previous metadata, or the upstream has not refreshed yet; nothing changed — refresh again |
 | `source` | this node holds the root key; new versions are made here |
 | `unreachable` | nothing answered for the namespace's newest version (no route, no reply); the held version stays |
 | `failed` | a reply that could not be used, or a refused update (reason given); the held version stays |
@@ -415,7 +452,7 @@ timeout, malformed metadata) and `no trust context is held for <ns>`.
 | Strictly-newer adoption | `ndn_security::Keyring::{adopt_update, adopt_update_from}` |
 | Forwarder expectation | `ndn_security::Validator::expect_context_update` (`validator/expected.rs`) |
 | Engine binding | `ndn_identity::refresh_context_via_engine` |
-| Push over SVS | `ndn_identity::context_sync::{run, Retry, process_update, group_prefix, group_data}`; daemon groups, routes, root publishing: `ndn-fwd` `context_sync.rs` (tests `a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused`, `a_neighbours_fetch_of_group_data_does_not_hold_up_this_nodes_own`) |
+| Push over SVS | `ndn_identity::context_sync::{run, Retry, process_update, Processed, VerifiedVersion, UNPROVEN_TRIES, UNPROVEN_PENDING, group_prefix, group_data}` (tests `unverified_announcement_is_not_a_known_version`, `refused_newest_version_is_not_retried_unbounded`, `retries_of_members_that_never_served_a_version_are_bounded`); daemon groups, routes, root publishing, verified versions: `ndn-fwd` `context_sync.rs` (tests `a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused`, `a_neighbours_fetch_of_group_data_does_not_hold_up_this_nodes_own`, `a_refresh_answered_older_than_a_verified_version_is_behind`) |
 | Management verb | `ndn-mgmt` `security/context-refresh`, `security/context-update`, `ContextRefreshInfo`, `RefreshState`; `ndn-ipc` `MgmtClient::security_context_refresh`, `security_context_update` |
 | Daemon, timer | `ndn-fwd` `context_refresh.rs` (`keep_update`, shared by refresh and sync; `apply_update` for `context-update`); CLI `onboard.rs` (`run_context`) |
 | Mobile | `ndn-boltffi` `NdnEngine::refresh_contexts`, `NdnContextRefresh` |

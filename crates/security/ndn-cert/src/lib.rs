@@ -72,7 +72,8 @@ pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
     UpdateRefusal, VersionSource, bump_context_revoking, bump_context_schema, follow_versions,
-    key_name_of, open_context_update, refresh_context, revocations_to_add, schema_change,
+    key_name_of, link_narrowing, open_context_update, refresh_context, revocations_to_add,
+    schema_change,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,

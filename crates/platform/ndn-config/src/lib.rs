@@ -30,7 +30,7 @@ pub use config::{
     AcmeTomlConfig, CertSourceConfig, CertValidityDays, ChallengeConfig, CsConfig, CaTomlConfig,
     DiscoveryTomlConfig, EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ListenersConfig,
     LoggingConfig, ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
-    ObservabilityTomlConfig, QuicListenerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
+    ObservabilityTomlConfig, PeerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
     RenewBeforeConfig, RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig,
     SelfSignedDevConfig, SmtpConfig, TrustRuleConfig, WebRtcListenerConfig,
     WebTransportListenerConfig, WtIceServers, WtTurnServer,

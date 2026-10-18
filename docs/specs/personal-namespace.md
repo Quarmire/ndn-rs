@@ -53,7 +53,7 @@ Terms used throughout:
 | CA | `/<ns>/CA` | delegated, cert issued by root | relay (preferred) or root device | always, if on a relay |
 | Admin device | `/<ns>/admin/<device>` | per device, cert issued by CA | owner's devices marked admin | sometimes |
 | Member device | `/<ns>/member/<device>` | per device, cert issued by CA | everything else | sometimes |
-| Relay | `/<ns>/node/<name>` | per relay, cert issued by CA | VPS / home server at a reachable address (QUIC listener) | always |
+| Relay | `/<ns>/node/<name>` | per relay, cert issued by CA | VPS / home server at a reachable address (QUIC listener: `[[face]] kind = "quic"`) | always |
 | Guest | `/<ns>/guest/<who>` | guest's key, short-lived cert | friend's device | — |
 
 The root device (the primary device) is the first admin. The root key lives
@@ -266,7 +266,10 @@ device, continue with F8.
    chains to it; replacing the CA needs F3's round trip first.
 2. Devices keep their certs (issued before compromise) unless the owner
    chooses to re-enroll everything; the UI asks.
-3. QUIC pins for that relay are dropped from the links peers configure to it.
+3. Links of the revoked relay close on each device as soon as it adopts the
+   revocation. A device that linked to the relay by expected fingerprint
+   (`[[peer]] key`, not tied to the namespace) keeps that link until its
+   admin removes the `[[peer]]` entry.
 
 ### F7 Create a recovery kit (**have**)
 A kit holds a **separate recovery key**, never a copy of the root: a
@@ -370,9 +373,12 @@ rotation-by-renewal). Root rotation = new root signs a context that lists both
 roots for one version, then drops the old one (**gap**).
 
 ### F11 Travel / carrier-grade NAT
-Devices dial out to a relay (a configured link over QUIC, or WebTransport from
-browsers and restrictive networks) and route `/<ns>` over that link; the relay
-forwards. Adoption and enrollment do not depend on inbound reachability, but
+Devices dial out to a relay — a QUIC link from `[[peer]] device =
+"/<ns>/node/<relay>" endpoint = "<host:port>"`, or WebTransport from browsers
+and restrictive networks — and route `/<ns>` over that link; the relay
+forwards. Two devices behind NATs reach each other **relay-first**: each
+links to the relay, which forwards between the two links (no hole punching
+yet). Adoption and enrollment do not depend on inbound reachability, but
 they do need that link and route whenever the context or the CA is not on the
 local segment (§9).
 
@@ -394,7 +400,8 @@ local segment (§9).
 <pib>/root/           root store of a root device: store.toml (kind, key,
                       public key, anchor cert), root.safebag /
                       root-keychain.safebag (sealed roots)
-$XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed listener certs
+$XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed WebTransport listener
+                      certs (QUIC links use the device key, nothing here)
 ```
 
 Everything under `<pib>/` is owner-only: directories `0700`, files `0600`,
@@ -437,12 +444,11 @@ root key storage (§2) are likewise the owner's choice.
 Two separate planes, configured separately:
 
 - **Host-centric: links, relays, routes.** A link is a face between two
-  forwarders (`[[face]]`, `ndn-ctl face create`); it names a host and port.
-  A relay is a forwarder at a reachable address (a VPS, a home server with a
-  forwarded port) that other forwarders link to. A route (`[[route]]`,
-  `ndn-ctl route add`) says which prefixes go over which links. None of this
-  knows about namespaces' keys: a link carries any Interest the routes send
-  it.
+  forwarders (`[[face]]`, `[[peer]]`, `ndn-ctl face create`). A relay is a
+  forwarder at a reachable address (a VPS, a home server with a forwarded
+  port) that other forwarders link to. A route (`[[route]]`, `[[peer]]
+  routes`, `ndn-ctl route add`) says which prefixes go over which links. A
+  link carries any Interest the routes send it.
 - **Data-centric: trust and enrollment.** Adopting a trust context decides
   which signed Data under `/<ns>` this node accepts; enrolling gives this
   node's key a certificate under `/<ns>/<role>/<device>`. Both are statements
@@ -462,3 +468,53 @@ Consequences:
   fingerprint-only adoption or an enrollment can reach the context or the
   CA. The relay itself only forwards; it need not hold the CA (F3 is
   optional) and never holds the root.
+- **The one deliberate coupling: admitting a QUIC link reads the trust
+  plane.** Who may link, and on what terms (a full link, or an enrollment
+  link), is decided from held trust contexts (below); a full link carries
+  whatever the routes send it.
+
+### QUIC links
+
+- **Identified by keys.** Each end of a QUIC link presents its NDN device
+  key in the TLS handshake (raw public keys); no addresses, host names or
+  certificate files identify a device. Config names a peer by device name
+  (`[[peer]] device`) or by its key's fingerprint (`[[peer]] key`).
+- **Admitted from held trust contexts or expected fingerprints.** A link is
+  admitted when the peer's device certificate validates in a namespace this
+  device holds (not revoked, within validity, its role allowed), or when its
+  key is one a `[[peer]] key` expects — for another namespace or before
+  enrollment. Otherwise it is closed with a reason saying what to do.
+- **Link policy lives in the trust context** (`LINK_POLICY`): which roles
+  may link, which may relay, and whether a relay admits an unknown device on
+  an enrollment link that carries only its enrollment (CA endpoints, trust
+  context). Default: any device role may link; a relay must be a `node`
+  device; enrollment links on when the namespace has a CA. `ndn-fwd init -c
+  <config>` states it from `[ca] link_roles` / `relay_roles` /
+  `enrollment_links` (else the default); `ndn-fwd schema update -c <config>`
+  changes it, refusing a narrowing without `--accept-narrowing`; a namespace
+  CA whose `[ca]` link keys disagree with the context refuses to start.
+- **Enrolling across networks: enrollment links.** A relay of the namespace
+  (it holds a certificate of a role the link policy lets relay) admits a
+  device whose key it does not know on an enrollment link when the policy
+  allows them and the context names a CA endpoint. The device, holding no
+  certificate in the namespace of the relay its `[[peer]]` names, links to
+  it on the same terms. The link carries Interests under the namespace's CA
+  endpoints, `/<ns>/32=trust-context` and certificate names (`…/KEY/…`) from
+  the device, and their answers back — nothing else in either direction; a
+  dropped Interest is Nacked at once. It is rate-limited (32 per relay, 4 per
+  source address, Interests bounded per link) and closed after 120 s
+  carrying nothing. When the device switches to its enrolled key it closes
+  the enrollment link and dials again with its certificate: a full link, by
+  itself. So "add this device" works for a device reachable only over QUIC,
+  by invite or by approval.
+- **Revocation closes links.** When a device adopts a version that revokes a
+  peer's certificate or an issuer, its links to that peer close at once. A
+  link admitted only by expected fingerprint ends when the admin removes the
+  `[[peer]] key` (F6). A revoked key gets no enrollment link.
+- **Relay-first.** Devices that cannot reach each other link to a shared
+  relay, which routes each one's device name over its link; each device
+  routes `/<ns>` to the relay. A device that only dials picks its source
+  address with `[[face]] kind = "quic"`, `listen = false`, `bind`.
+- **Not done yet.** Hole punching and endpoint discovery: there is no direct
+  path between two NATed devices yet; a link is the pair of keys, so one can
+  be added later without changing identity.

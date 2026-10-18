@@ -67,20 +67,42 @@
 //! comes back with the version it adopted, and the nodes behind it can follow
 //! the same versions by name.
 //!
+//! # What an announcement proves
+//!
+//! Nothing. A group's Sync Interests are not authenticated (the daemon
+//! joins with an insecure SVS signer and validator), so anyone reaching the
+//! group can name any member and any sequence number. A version is known to
+//! exist only once its signed Data, fetched from the group, passed
+//! [`ndn_cert::open_context_update`] against the held version or against a
+//! version walked through from it ([`Processed::verified`]); [`run`] hands
+//! those, and only those, to its caller's `verified`.
+//!
 //! # Retries
 //!
 //! SVS reports each sequence number once, so a version whose fetch was lost
 //! would otherwise wait for the publisher's next version or the next pull
-//! refresh. [`run`] keeps each publisher's announcement until it is
-//! obtained: while that sequence number (the version the publisher put into
-//! the group) is newer than the held version, a failed fetch — or a walk
-//! stopped by a version it could not fetch — is tried again with
-//! exponential backoff ([`Retry`]), each failure logged with its reason.
-//! The announcement is dropped once the held version reaches it (adopted
-//! from another publisher, by refresh, or by this retry) or the version is
-//! refused for what it is. At most one entry per publisher, one fetch at a
-//! time, so a group cannot make a node fetch faster than its announcements
-//! plus one try per publisher per backoff step.
+//! refresh. [`run`] keeps a publisher's announcement while its sequence
+//! number (the version the publisher put into the group) is newer than the
+//! held version and the newest version itself could not be fetched (or
+//! another adoption replaced the held version while it was checked), and
+//! tries again with exponential backoff ([`Retry`]), each failure logged
+//! with its reason. The announcement is dropped once the held version
+//! reaches it (adopted from another publisher, by refresh, or by this
+//! retry), once the version is refused for what it is, and once a walk to
+//! it stopped: a walk is not tried again for that announcement, since a
+//! member can serve a forged newest version and let every version in
+//! between time out; the pull refresh follows a genuine one by name.
+//!
+//! What an announcement can cost is bounded. Each costs one
+//! fetch of the newest version, plus — when it does not follow from the
+//! held version — a walk of at most [`ndn_cert::MAX_CATCH_UP_VERSIONS`]
+//! positions that starts no fetch after [`ndn_cert::MAX_CATCH_UP_TIME`].
+//! Retries of a member none of whose announced versions ever passed the
+//! continuity rule stop after [`UNPROVEN_TRIES`] tries, and at most
+//! [`UNPROVEN_PENDING`] such members wait at once; a member whose announced
+//! version passed is retried while its announcement is newer than the held
+//! version (at most one try per backoff step), and goes first when retries
+//! are due. Fetches run one at a time, new announcements before retries.
 //!
 //! # Transport seam
 //!
@@ -102,13 +124,13 @@
 //! would refuse. The `ndn-fwd` daemon runs both when `[security]
 //! context_sync = true` (the refresh alone by default).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_cert::{
-    CatchUpStop, ContextStep, ContextUpdate, UpdateRefusal, Unfetched, VersionSource,
+    ContextStep, ContextUpdate, MAX_CATCH_UP_TIME, UpdateRefusal, Unfetched, VersionSource,
     follow_versions, open_context_update,
 };
 use ndn_packet::{Data, Name, NameComponent};
@@ -187,19 +209,49 @@ pub enum ContextSyncOutcome {
     DecodeFailed,
 }
 
+/// What [`process_update`] did with one update, and which version it proved
+/// to exist.
+#[derive(Debug)]
+pub struct Processed {
+    pub outcome: ContextSyncOutcome,
+    /// The newest version whose signed context Data this update's group
+    /// Data carried and that passed [`open_context_update`] against the held
+    /// version, or against a version walked through from it: a version of
+    /// the namespace known to exist, whether or not it was adopted (a walk
+    /// that stopped past it, another adoption meanwhile). `None` when
+    /// nothing fetched passed. The sequence number alone proves nothing: a
+    /// group's Sync Interests are not authenticated, so anyone reaching the
+    /// group can name any member and any number.
+    pub verified: Option<u64>,
+}
+
 /// Fetch, check, and adopt the context advertised by one [`SyncUpdate`].
 /// The highest sequence is fetched first: a trust context fully supersedes
 /// its predecessor, so when the newest is signed by an anchor of the held
 /// version nothing else is needed. When it is not, the sequence numbers in
 /// between (from the first one newer than the held version) are followed
-/// oldest first ([`follow_versions`]). The newest is adopted only if it
-/// passes [`open_context_update`] against the held version of its namespace
-/// — directly or through that walk — and [`Keyring::adopt_update_from`]
-/// (that version still held, strictly newer, atomic); see the module docs.
+/// oldest first ([`follow_versions`]), fetching for [`MAX_CATCH_UP_TIME`] at
+/// most, as a refresh does. The newest is adopted only if it passes
+/// [`open_context_update`] against the held version of its namespace —
+/// directly or through that walk — and [`Keyring::adopt_update_from`] (that
+/// version still held, strictly newer, atomic); see the module docs.
 pub async fn process_update(
     update: &SyncUpdate,
     fetcher: &dyn ContextFetcher,
     keyring: &Keyring,
+) -> Processed {
+    let mut verified = None;
+    let outcome = check_and_adopt(update, fetcher, keyring, &mut verified).await;
+    Processed { outcome, verified }
+}
+
+/// [`process_update`], recording in `verified` each version that passed the
+/// continuity rule.
+async fn check_and_adopt(
+    update: &SyncUpdate,
+    fetcher: &dyn ContextFetcher,
+    keyring: &Keyring,
+    verified: &mut Option<u64>,
 ) -> ContextSyncOutcome {
     let fetch_name = update.name.clone().append_segment(update.high_seq);
     let content = match fetcher.fetch_content(fetch_name.clone()).await {
@@ -256,8 +308,15 @@ pub async fn process_update(
                 fetcher,
                 group: &update.name,
                 newest: Some((update.high_seq, data)),
+                reached: held.version(),
+                deadline: Instant::now() + MAX_CATCH_UP_TIME,
             };
-            match follow_versions(&held, first..=update.high_seq, &mut group).await {
+            let walk = follow_versions(&held, first..=update.high_seq, &mut group).await;
+            // Each version the walk went on from passed the continuity rule.
+            if group.reached > held.version() {
+                *verified = Some(group.reached);
+            }
+            match walk {
                 Ok(mut walked) => match walked.pop() {
                     Some(newest) => (newest, walked),
                     None => return ContextSyncOutcome::Refused(refusal),
@@ -278,6 +337,7 @@ pub async fn process_update(
         data,
         signer,
     } = newest;
+    *verified = Some(context.version());
     match keyring.adopt_update_from(&held, Arc::clone(&context)) {
         Ok(()) => ContextSyncOutcome::Adopted(ContextUpdate {
             previous: held.version(),
@@ -315,12 +375,26 @@ struct GroupVersions<'a> {
     group: &'a Name,
     /// The newest version, fetched already.
     newest: Option<(u64, Data)>,
+    /// The newest version the walk went on from: the held one, or one that
+    /// passed the continuity rule from it.
+    reached: u64,
+    /// No fetch starts after this ([`MAX_CATCH_UP_TIME`], as a refresh's
+    /// walk): a publisher that serves the newest version and lets every
+    /// version in between time out costs that long at most.
+    deadline: Instant,
 }
 
 impl VersionSource for GroupVersions<'_> {
-    async fn fetch(&mut self, position: u64, _from: &SignedTrustContext) -> Result<Data, Unfetched> {
+    async fn fetch(&mut self, position: u64, from: &SignedTrustContext) -> Result<Data, Unfetched> {
+        self.reached = self.reached.max(from.version());
         if let Some((_, data)) = self.newest.take_if(|(seq, _)| *seq == position) {
             return Ok(data);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(Unfetched::Missing(format!(
+                "the walk fetches for {}s at most",
+                MAX_CATCH_UP_TIME.as_secs()
+            )));
         }
         let name = self.group.clone().append_segment(position);
         let content = self.fetcher.fetch_content(name.clone()).await.map_err(|e| match e {
@@ -336,8 +410,9 @@ impl VersionSource for GroupVersions<'_> {
 
 /// How [`run`] tries again to obtain a version announced in the group that
 /// it could not obtain: after `first`, then after twice the previous delay,
-/// at most `max` apart, for as long as the announcement is newer than the
-/// held version (see the module docs, *Retries*).
+/// at most `max` apart, while the announcement is newer than the held
+/// version — [`UNPROVEN_TRIES`] times at most for a member that never served
+/// a version passing the continuity rule (see the module docs, *Retries*).
 #[derive(Clone, Copy, Debug)]
 pub struct Retry {
     pub first: Duration,
@@ -354,9 +429,30 @@ impl Default for Retry {
     }
 }
 
+/// How many times [`run`] tries to obtain an announcement of a member none
+/// of whose announced versions ever passed the continuity rule, the first
+/// try included, before leaving the version to the pull refresh: with
+/// [`Retry::default`], over about half a minute.
+pub const UNPROVEN_TRIES: u32 = 6;
+
+/// How many announcements of such members [`run`] keeps to try again at
+/// once; one more that fails is tried once only.
+pub const UNPROVEN_PENDING: usize = 8;
+
+/// A version of the namespace [`run`] found exists
+/// ([`Processed::verified`]): its signed Data passed the continuity rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedVersion {
+    pub version: u64,
+    /// The member (`<group>/<member>`) whose group Data carried it.
+    pub served_by: Name,
+}
+
 /// A publisher's announcement not obtained yet.
 struct Pending {
     update: SyncUpdate,
+    /// The tries that failed so far.
+    tries: u32,
     /// The delay `at` was set with.
     delay: Duration,
     at: Instant,
@@ -370,9 +466,9 @@ struct Pending {
 /// the group for the context and spawns this on its runtime. The keyring
 /// holds an adopted version in memory only: `keep` is handed each adoption
 /// to persist and serve its signed Data and the versions walked through.
-/// `announced` sees each update as it arrives, before it is fetched: the
-/// versions the group says exist (its sequence numbers), whether or not
-/// they are obtained.
+/// `verified` is handed each version an update proved to exist
+/// ([`Processed::verified`]), adopted or not — never a bare sequence
+/// number, which anyone reaching the group can send.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut handle: SyncHandle,
@@ -380,41 +476,62 @@ pub async fn run(
     fetcher: Arc<dyn ContextFetcher>,
     keyring: Arc<Keyring>,
     keep: impl Fn(&ContextUpdate) + Send,
-    announced: impl Fn(&SyncUpdate) + Send,
+    verified: impl Fn(&VerifiedVersion) + Send,
     retry: Retry,
     cancel: CancellationToken,
 ) {
     // By publisher (its node name): the announcement to try again.
     let mut pending: HashMap<Name, Pending> = HashMap::new();
+    // The publishers whose announced version passed the continuity rule at
+    // least once: tried again for as long as they announce a version newer
+    // than the held one. Each joined with a version newer than the one held
+    // then, so the set grows no faster than the namespace root makes
+    // versions.
+    let mut proven: HashSet<Name> = HashSet::new();
     loop {
         let due = pending.values().map(|p| p.at).min();
-        let (update, delay) = tokio::select! {
+        let (update, tries, delay) = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             update = handle.recv() => {
                 let Some(mut update) = update else { break };
-                announced(&update);
                 // A new announcement is tried at once, and backs off from
-                // the start again.
+                // the start again; the tries it already cost still count.
+                let mut tries = 0;
                 if let Some(earlier) = pending.remove(&update.name) {
                     update.low_seq = update.low_seq.min(earlier.update.low_seq);
                     update.high_seq = update.high_seq.max(earlier.update.high_seq);
+                    tries = earlier.tries;
                 }
-                (update, retry.first)
+                (update, tries, retry.first)
             }
             () = sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                // A due announcement of a proven publisher goes first: those
+                // of members that never served a version cannot hold it up.
+                let now = Instant::now();
                 let Some(publisher) = pending
                     .iter()
-                    .min_by_key(|(_, p)| p.at)
+                    .filter(|(_, p)| p.at <= now)
+                    .min_by_key(|(publisher, p)| (!proven.contains(*publisher), p.at))
                     .map(|(publisher, _)| publisher.clone())
                 else {
                     continue;
                 };
                 let Some(again) = pending.remove(&publisher) else { continue };
-                (again.update, again.delay.saturating_mul(2).min(retry.max))
+                (again.update, again.tries, again.delay.saturating_mul(2).min(retry.max))
             }
         };
-        let reason = match obtain(&update, &namespace, fetcher.as_ref(), &keyring).await {
+        let obtained = obtain(&update, &namespace, fetcher.as_ref(), &keyring).await;
+        if let Some(version) = obtained.verified {
+            verified(&VerifiedVersion {
+                version,
+                served_by: update.name.clone(),
+            });
+        }
+        if obtained.proven {
+            proven.insert(update.name.clone());
+        }
+        let reason = match obtained.result {
             Ok(Some(adopted)) => {
                 keep(&adopted);
                 continue;
@@ -422,12 +539,39 @@ pub async fn run(
             Ok(None) => continue,
             Err(reason) => reason,
         };
+        let tries = tries.saturating_add(1);
+        if !proven.contains(&update.name) {
+            let waiting = pending.keys().filter(|p| !proven.contains(*p)).count();
+            let given_up = if tries >= UNPROVEN_TRIES {
+                Some(format!("tried {tries} times"))
+            } else if waiting >= UNPROVEN_PENDING {
+                Some(format!("{waiting} such announcements already wait"))
+            } else {
+                None
+            };
+            if let Some(given_up) = given_up {
+                tracing::warn!(
+                    target: "ndn::trust",
+                    publisher = %update.publisher,
+                    announced = update.high_seq,
+                    held = ?keyring.version_of(&namespace),
+                    %reason,
+                    %given_up,
+                    "context-sync could not obtain a trust-context version announced by a member \
+                     that never served one passing the continuity rule, and does not try again; \
+                     the periodic refresh fetches the namespace's newest version by name (run \
+                     `ndn-fwd context refresh` to fetch it now)"
+                );
+                continue;
+            }
+        }
         tracing::warn!(
             target: "ndn::trust",
             publisher = %update.publisher,
             announced = update.high_seq,
             held = ?keyring.version_of(&namespace),
             %reason,
+            tries,
             retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             "context-sync could not obtain an announced trust-context version; trying again"
         );
@@ -435,6 +579,7 @@ pub async fn run(
             update.name.clone(),
             Pending {
                 update,
+                tries,
                 delay,
                 at: Instant::now() + delay,
             },
@@ -442,17 +587,28 @@ pub async fn run(
     }
 }
 
+/// What [`obtain`] made of one announcement.
+struct Obtained {
+    /// `Ok(Some(_))` adopted, to keep; `Ok(None)` not needed, or refused for
+    /// what it is (logged); `Err(why)` not obtained for now, worth trying
+    /// again.
+    result: Result<Option<ContextUpdate>, String>,
+    /// [`Processed::verified`].
+    verified: Option<u64>,
+    /// The announced version itself passed the continuity rule (adopted, or
+    /// checked while another adoption replaced the held version).
+    proven: bool,
+}
+
 /// Obtain the version `update` announces, unless the held version of
 /// `namespace` already reaches it (a publisher's sequence number is the
-/// version it put into the group): `Ok(Some(_))` adopted, to keep;
-/// `Ok(None)` not needed, or refused for what it is (logged); `Err(why)`
-/// not obtained for now, worth trying again.
+/// version it put into the group).
 async fn obtain(
     update: &SyncUpdate,
     namespace: &Name,
     fetcher: &dyn ContextFetcher,
     keyring: &Keyring,
-) -> Result<Option<ContextUpdate>, String> {
+) -> Obtained {
     match keyring.version_of(namespace) {
         Some(held) if held < update.high_seq => {}
         held => {
@@ -460,10 +616,19 @@ async fn obtain(
                 target: "ndn::trust", announced = update.high_seq, ?held, publisher = %update.publisher,
                 "context-sync announcement is not newer than the held version"
             );
-            return Ok(None);
+            return Obtained {
+                result: Ok(None),
+                verified: None,
+                proven: false,
+            };
         }
     }
-    match process_update(update, fetcher, keyring).await {
+    let Processed { outcome, verified } = process_update(update, fetcher, keyring).await;
+    let proven = matches!(
+        outcome,
+        ContextSyncOutcome::Adopted(_) | ContextSyncOutcome::ChangedMeanwhile { .. }
+    );
+    let result = match outcome {
         ContextSyncOutcome::Adopted(adopted) => {
             tracing::info!(
                 target: "ndn::trust",
@@ -482,17 +647,22 @@ async fn obtain(
             );
             Ok(None)
         }
-        // The walk stopped at a version it could not fetch (or another
-        // update of the namespace ran): the versions may be fetched later.
-        ContextSyncOutcome::Refused(
-            refusal @ UpdateRefusal::CatchUp {
-                stop:
-                    CatchUpStop::Missing { .. }
-                    | CatchUpStop::Unreachable { .. }
-                    | CatchUpStop::InProgress(_),
-                ..
-            },
-        ) => Err(refusal.to_string()),
+        // The newest does not follow from the held version, and the walk
+        // through the publisher's earlier sequence numbers did not reach it.
+        // Final for this announcement: whoever announced it may serve a
+        // forged newest and let every version in between time out, and
+        // trying again would cost that walk each time. A genuine version
+        // still arrives by name through the refresh's own walk.
+        ContextSyncOutcome::Refused(refusal @ UpdateRefusal::CatchUp { .. }) => {
+            tracing::warn!(
+                target: "ndn::trust", %refusal, publisher = %update.publisher, ?verified,
+                "context-sync could not follow the announced trust-context version from the held \
+                 one and does not try this announcement again; the held version stays, and the \
+                 periodic refresh follows the namespace's versions by name (run `ndn-fwd context \
+                 refresh` to follow them now)"
+            );
+            Ok(None)
+        }
         ContextSyncOutcome::Refused(refusal) => {
             tracing::warn!(
                 target: "ndn::trust", %refusal, publisher = %update.publisher,
@@ -513,6 +683,11 @@ async fn obtain(
             );
             Ok(None)
         }
+    };
+    Obtained {
+        result,
+        verified,
+        proven,
     }
 }
 
@@ -620,7 +795,7 @@ mod tests {
         let v2 = root.version(2, &[revoked]);
         fetcher.publish(2, &v2);
 
-        match process_update(&update_at(2), &fetcher, &keyring).await {
+        match process_update(&update_at(2), &fetcher, &keyring).await.outcome {
             ContextSyncOutcome::Adopted(adopted) => {
                 assert_eq!((adopted.previous, adopted.context.version()), (1, 2));
                 assert_eq!(adopted.revoked, vec![n(revoked)]);
@@ -653,7 +828,7 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(9, &forged.version(9, &["/home/bob/admin/desk/KEY/device"]));
 
-        match process_update(&update_at(9), &fetcher, &keyring).await {
+        match process_update(&update_at(9), &fetcher, &keyring).await.outcome {
             ContextSyncOutcome::Refused(UpdateRefusal::NotSignedByHeldAnchor {
                 held: 1, ..
             }) => {}
@@ -664,7 +839,7 @@ mod tests {
         // Bare Content (the old wire) is unauthenticated and never adopted.
         fetcher.publish_raw(10, root.init.context.encode_content());
         assert!(matches!(
-            process_update(&update_at(10), &fetcher, &keyring).await,
+            process_update(&update_at(10), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::DecodeFailed
         ));
         // Neither is a genuine context whose signature no longer verifies.
@@ -674,7 +849,7 @@ mod tests {
         wire[last] ^= 0xff;
         fetcher.publish_raw(11, Bytes::from(wire));
         assert!(matches!(
-            process_update(&update_at(11), &fetcher, &keyring).await,
+            process_update(&update_at(11), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::Refused(UpdateRefusal::Unauthentic(_))
         ));
         assert_eq!(held_version(&keyring), 1, "the held version stays");
@@ -687,7 +862,7 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(5, &root.version(5, &[]));
         assert!(matches!(
-            process_update(&update_at(5), &fetcher, &keyring).await,
+            process_update(&update_at(5), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::Adopted(a) if a.context.version() == 5
         ));
         // A different v5 and an older v3, both genuinely signed.
@@ -695,7 +870,7 @@ mod tests {
         fetcher.publish(3, &root.version(3, &[]));
         for seq in [6, 3] {
             assert!(matches!(
-                process_update(&update_at(seq), &fetcher, &keyring).await,
+                process_update(&update_at(seq), &fetcher, &keyring).await.outcome,
                 ContextSyncOutcome::Refused(UpdateRefusal::NotNewer { held: 5, .. })
             ));
         }
@@ -711,7 +886,7 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(2, &root.version(2, &[]));
         assert!(matches!(
-            process_update(&update_at(2), &fetcher, &keyring).await,
+            process_update(&update_at(2), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::NotHeld { .. }
         ));
         assert!(keyring.is_empty());
@@ -722,12 +897,12 @@ mod tests {
         let keyring = Keyring::new();
         let fetcher = MapFetcher::new();
         assert!(matches!(
-            process_update(&update_at(1), &fetcher, &keyring).await,
+            process_update(&update_at(1), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::FetchFailed { .. }
         ));
         fetcher.publish_raw(1, Bytes::from_static(b"not a trust context"));
         assert!(matches!(
-            process_update(&update_at(1), &fetcher, &keyring).await,
+            process_update(&update_at(1), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::DecodeFailed
         ));
     }
@@ -752,7 +927,7 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(2, &v2.data);
         assert!(matches!(
-            process_update(&update_at(2), &fetcher, &keyring).await,
+            process_update(&update_at(2), &fetcher, &keyring).await.outcome,
             ContextSyncOutcome::Adopted(a) if a.context.version() == 2
         ));
 
@@ -787,7 +962,7 @@ mod tests {
         let forged_group = MapFetcher::new();
         forged_group.publish(3, &forged.sign_into_data_async(stranger.as_ref()).await.unwrap());
         forged_group.publish(4, &v4.data);
-        match process_update(&missed, &forged_group, &keyring).await {
+        match process_update(&missed, &forged_group, &keyring).await.outcome {
             ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
                 stop: CatchUpStop::Refused { version: 3, .. },
                 ..
@@ -798,7 +973,7 @@ mod tests {
 
         fetcher.publish(3, &v3.data);
         fetcher.publish(4, &v4.data);
-        match process_update(&missed, &fetcher, &keyring).await {
+        match process_update(&missed, &fetcher, &keyring).await.outcome {
             ContextSyncOutcome::Adopted(adopted) => {
                 assert_eq!((adopted.previous, adopted.context.version()), (2, 4));
                 // The newest and the version walked through, as signed: what
@@ -857,18 +1032,27 @@ mod tests {
         max: std::time::Duration::from_millis(80),
     };
 
+    /// The versions [`run`] handed to `verified`, in order.
+    type Verified = tokio::sync::mpsc::UnboundedReceiver<VerifiedVersion>;
+
+    fn drain(verified: &mut Verified) -> Vec<VerifiedVersion> {
+        std::iter::from_fn(|| verified.try_recv().ok()).collect()
+    }
+
     /// [`run`] over `keyring` and `fetcher`, fed the updates sent on the
-    /// returned channel; the number of adoptions kept is counted in `kept`.
+    /// returned channel; the number of adoptions kept is counted in `kept`,
+    /// and the versions verified are returned.
     fn subscribe(
         keyring: &Arc<Keyring>,
         fetcher: &Arc<Flaky>,
         kept: &Arc<std::sync::atomic::AtomicUsize>,
         cancel: &CancellationToken,
-    ) -> tokio::sync::mpsc::Sender<SyncUpdate> {
+    ) -> (tokio::sync::mpsc::Sender<SyncUpdate>, Verified) {
         let (updates, rx) = tokio::sync::mpsc::channel(8);
         let (publish, _) = tokio::sync::mpsc::channel(1);
         let handle = SyncHandle::new(rx, publish, CancellationToken::new());
         let kept = Arc::clone(kept);
+        let (record, verified) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(run(
             handle,
             n("/home/bob"),
@@ -877,11 +1061,13 @@ mod tests {
             move |_| {
                 kept.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
-            |_| {},
+            move |v| {
+                let _ = record.send(v.clone());
+            },
             QUICK,
             cancel.clone(),
         ));
-        updates
+        (updates, verified)
     }
 
     async fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -907,7 +1093,7 @@ mod tests {
         fetcher.group.publish(2, &root.version(2, &["/home/bob/member/phone/KEY/k1"]));
         let kept = Arc::default();
         let cancel = CancellationToken::new();
-        let updates = subscribe(&keyring, &fetcher, &kept, &cancel);
+        let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
 
         updates.send(update_at(2)).await.unwrap();
         until("the lost version was never fetched again", || held_version(&keyring) == 2).await;
@@ -932,7 +1118,7 @@ mod tests {
             .insert(other.clone().append_segment(2).to_string(), root.version(2, &[]).raw().clone());
         let kept = Arc::default();
         let cancel = CancellationToken::new();
-        let updates = subscribe(&keyring, &fetcher, &kept, &cancel);
+        let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
         let unreachable = n(GROUP).append_segment(2);
 
         updates.send(update_at(2)).await.unwrap();
@@ -969,6 +1155,177 @@ mod tests {
         assert_eq!(fetcher.fetches(&n(GROUP).append_segment(3)), 1);
         assert_eq!(held_version(&keyring), 2);
         assert_eq!(kept.load(std::sync::atomic::Ordering::SeqCst), 1);
+        cancel.cancel();
+    }
+
+    /// `<group>/<name>`, the member `name` of the test group.
+    fn member(name: &str) -> Name {
+        n(&format!("/home/bob/_sync/v1/devices/{name}"))
+    }
+
+    fn update_from(name: &str, low_seq: u64, high_seq: u64) -> SyncUpdate {
+        SyncUpdate {
+            publisher: name.into(),
+            name: member(name),
+            low_seq,
+            high_seq,
+            mapping: None,
+            serving_party: None,
+        }
+    }
+
+    impl Flaky {
+        /// Serve `context` as member `name`'s group Data at `seq`.
+        fn serve(&self, name: &str, seq: u64, context: &Data) {
+            self.group
+                .0
+                .insert(member(name).append_segment(seq).to_string(), context.raw().clone());
+        }
+    }
+
+    /// The group's Sync Interests are not authenticated: a sequence number
+    /// alone, or a version that does not follow from the held one, never
+    /// counts as a version that exists (the daemon would report `behind`
+    /// and refuse `ndn-fwd recover` over it). A version whose signed Data
+    /// passed the continuity rule does — the newest, or one a walk went
+    /// through before it stopped.
+    #[tokio::test]
+    async fn unverified_announcement_is_not_a_known_version() {
+        let root = Root::new();
+        let keyring = Arc::new(node_holding(&root));
+        let fetcher = Flaky::new(0);
+        let kept = Arc::default();
+        let cancel = CancellationToken::new();
+        let (updates, mut verified) = subscribe(&keyring, &fetcher, &kept, &cancel);
+
+        // A made-up member announcing v1000 and serving nothing, and one
+        // serving a v9 another root signed.
+        fetcher.serve("forger", 9, &Root::new().version(9, &[]));
+        updates.send(update_from("ghost", 1000, 1000)).await.unwrap();
+        updates.send(update_from("forger", 1, 9)).await.unwrap();
+        until("the announcements were not tried", || {
+            fetcher.fetches(&member("ghost").append_segment(1000)) >= UNPROVEN_TRIES as usize
+                && fetcher.fetches(&member("forger").append_segment(8)) == 1
+        })
+        .await;
+        assert_eq!(drain(&mut verified), vec![], "an unverified version counted");
+        assert_eq!(held_version(&keyring), 1);
+
+        fetcher.serve("device-b", 2, &root.version(2, &[]));
+        updates.send(update_from("device-b", 2, 2)).await.unwrap();
+        let mut seen = Vec::new();
+        until("the genuine v2 was not verified", || {
+            seen.extend(drain(&mut verified));
+            !seen.is_empty()
+        })
+        .await;
+        let v2 = VerifiedVersion {
+            version: 2,
+            served_by: member("device-b"),
+        };
+        assert_eq!(seen, vec![v2]);
+        assert_eq!(held_version(&keyring), 2);
+
+        // A walk through a genuine v3, stopped by a forged v4: v3 exists,
+        // v4 does not.
+        fetcher.serve("device-c", 3, &root.version(3, &[]));
+        fetcher.serve("device-c", 4, &Root::new().version(4, &[]));
+        updates.send(update_from("device-c", 3, 4)).await.unwrap();
+        let mut seen = Vec::new();
+        until("the walked v3 was not verified", || {
+            seen.extend(drain(&mut verified));
+            !seen.is_empty()
+        })
+        .await;
+        let v3 = VerifiedVersion {
+            version: 3,
+            served_by: member("device-c"),
+        };
+        assert_eq!(seen, vec![v3]);
+        assert_eq!(held_version(&keyring), 2, "nothing adopted from a stopped walk");
+        cancel.cancel();
+    }
+
+    /// A member serving a newest version that does not follow from the held
+    /// one, and nothing in between, costs one walk per announcement: a
+    /// stopped walk is not tried again, and the walk starts no fetch after
+    /// [`MAX_CATCH_UP_TIME`].
+    #[tokio::test]
+    async fn refused_newest_version_is_not_retried_unbounded() {
+        let root = Root::new();
+        let keyring = Arc::new(node_holding(&root));
+        let fetcher = Flaky::new(0);
+        fetcher.serve("forger", 100, &Root::new().version(100, &[]));
+        let kept = Arc::default();
+        let cancel = CancellationToken::new();
+        let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
+
+        updates.send(update_from("forger", 1, 100)).await.unwrap();
+        until("the walk did not run", || {
+            fetcher.fetches(&member("forger").append_segment(99)) == 1
+        })
+        .await;
+        // Retries under QUICK would have walked again several times by now.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for seq in 2..=100 {
+            let fetches = fetcher.fetches(&member("forger").append_segment(seq));
+            assert_eq!(fetches, 1, "seq {seq} fetched {fetches} times");
+        }
+        assert_eq!(held_version(&keyring), 1);
+        cancel.cancel();
+
+        // Past the deadline no position in between is fetched.
+        let held = keyring.context_for(&n("/home/bob"));
+        let group = member("forger");
+        let counting = Flaky::new(0);
+        let mut walk = GroupVersions {
+            fetcher: counting.as_ref(),
+            group: &group,
+            newest: Some((100, Root::new().version(100, &[]))),
+            reached: held.version(),
+            deadline: Instant::now(),
+        };
+        assert!(matches!(
+            follow_versions(&held, 2..=100, &mut walk).await,
+            Err(CatchUpStop::Missing {
+                first: 2,
+                last: 99,
+                version: 100,
+                ..
+            })
+        ));
+        assert!(counting.fetches.is_empty(), "fetched past the walk's deadline");
+    }
+
+    /// Member names are made up at will: a member that never served a
+    /// version passing the continuity rule is tried [`UNPROVEN_TRIES`] times
+    /// at most, and at most [`UNPROVEN_PENDING`] such members wait to be
+    /// tried again.
+    #[tokio::test]
+    async fn retries_of_members_that_never_served_a_version_are_bounded() {
+        let root = Root::new();
+        let keyring = Arc::new(node_holding(&root));
+        let fetcher = Flaky::new(0);
+        let kept = Arc::default();
+        let cancel = CancellationToken::new();
+        let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
+
+        let ghosts = 20;
+        for i in 0..ghosts {
+            updates.send(update_from(&format!("ghost-{i}"), 5, 5)).await.unwrap();
+        }
+        let total = || fetcher.fetches.iter().map(|e| *e.value()).sum::<usize>();
+        // Under QUICK the last retry is due 300 ms after the first try.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let settled = total();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(total(), settled, "still trying");
+        let bound = ghosts + UNPROVEN_PENDING * (UNPROVEN_TRIES as usize - 1);
+        assert!(settled <= bound, "{settled} fetches, more than {bound}");
+        for i in 0..ghosts {
+            let fetches = fetcher.fetches(&member(&format!("ghost-{i}")).append_segment(5));
+            assert!(fetches <= UNPROVEN_TRIES as usize, "ghost-{i} fetched {fetches} times");
+        }
         cancel.cancel();
     }
 }

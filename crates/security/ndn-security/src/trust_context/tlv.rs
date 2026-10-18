@@ -80,6 +80,15 @@ pub const SCHEMA_AUTHORITATIVE: u64 = 0x041C;
 /// Unknown role codes are kept and re-emitted.
 pub const KEY_ROLE: u64 = 0x041E;
 
+/// Which devices of the namespace may link to its devices, which may be
+/// relays, and whether relays admit enrollment links — see
+/// [`LinkPolicy`](super::LinkPolicy): UTF-8 `<roles>;<relay
+/// roles>;<enrollment|no-enrollment>`, comma-separated role names, an empty
+/// role list meaning every device role (a missing third field means
+/// `enrollment`). Non-critical (even): an old node skips it and links by the
+/// default (any enrolled device; relays are `node` devices).
+pub const LINK_POLICY: u64 = 0x0412;
+
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;
 /// `SchemaFormat` value: stock LightVerSec binary (portable / published form).

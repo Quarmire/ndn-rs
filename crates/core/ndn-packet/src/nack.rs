@@ -61,13 +61,20 @@ impl NackReason {
     }
 }
 
-/// Why a validating forwarder refused the Data that answered an Interest: a
-/// final verdict on that Data (never "still awaiting a certificate"). A
+/// Why a validating forwarder refused the Data that answered an Interest. A
 /// forwarder sends it as a Nack ([`NackReason::Refused`]) to its **local**
 /// downstreams only — apps and its own internal consumers — so they learn at
 /// once why nothing came instead of waiting out the Interest lifetime. A
 /// non-local downstream gets nothing, as NDN specifies for Data a forwarder
 /// drops.
+///
+/// Every refusal but one is a final verdict on that Data
+/// ([`is_final`](Self::is_final)): asking again gets the same answer.
+/// [`Unverifiable`](Self::Unverifiable) is "refused for now": the signing
+/// certificate was definitely not to be had when the forwarder fetched it,
+/// which can change (a route converges, the producer comes back), so a
+/// consumer asks again after the forwarder's certificate-fetch back-off.
+/// [`next_step`](Self::next_step) says what to do about each.
 ///
 /// The codes are ndn-rs-private (`170..=176`); [`as_str`](Self::as_str) is a
 /// stable token for logs, spans and tools.
@@ -89,9 +96,11 @@ pub enum Refusal {
     /// failed that expectation (a foreign fingerprint, or an update not
     /// signed by an anchor of the held version).
     Context,
-    /// The Data can never be validated from where it came: it names no
-    /// signing key (no KeyLocator), or its signing certificate is not to be
-    /// had where it was fetched (each source asked answered NoRoute).
+    /// The Data cannot be verified now: it names no signing key (no
+    /// KeyLocator), or every source the forwarder asked for its signing
+    /// certificate — the routes and the face that delivered the Data —
+    /// answered that none is to be had there (NoRoute) or refused what it
+    /// served. Not final ([`is_final`](Refusal::is_final)).
     Unverifiable,
 }
 
@@ -140,6 +149,50 @@ impl Refusal {
     /// The token back ([`as_str`](Self::as_str)).
     pub fn from_token(token: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| r.as_str() == token)
+    }
+
+    /// Whether asking again gets the same answer. `false` only for
+    /// [`Unverifiable`](Self::Unverifiable): a certificate absent now may be
+    /// reachable once the forwarder's certificate-fetch back-off has passed,
+    /// so a consumer retries it within its retry budget. Every other refusal
+    /// is a verdict on what the Data is, and retrying it is pointless.
+    pub fn is_final(self) -> bool {
+        !matches!(self, Refusal::Unverifiable)
+    }
+
+    /// What to do about this refusal, in one user-facing line.
+    pub fn next_step(self) -> &'static str {
+        match self {
+            Refusal::Chain => {
+                "the signer's certificate chain is unusable (too deep, a cycle, an unsupported \
+                 signature type): the publisher must sign with a certificate issued in the \
+                 namespace"
+            }
+            Refusal::Revoked => {
+                "the signer's certificate was revoked: the publisher must enroll again"
+            }
+            Refusal::BadSignature => {
+                "the signature does not verify (forged or altered in transit): fetch it over \
+                 another path, or ask the publisher to publish it again"
+            }
+            Refusal::Schema => {
+                "the trust schema does not let this signer publish under this name: publish \
+                 under a name the signer is authorized for, or have an admin change the schema"
+            }
+            Refusal::UntrustedRoot => {
+                "the signer chains to a root this node does not trust: adopt the namespace's \
+                 anchor link"
+            }
+            Refusal::Context => {
+                "the trust context is not the one expected (a foreign fingerprint, or an update \
+                 not signed by an anchor of the held version): check the anchor link or \
+                 fingerprint you adopted"
+            }
+            Refusal::Unverifiable => {
+                "retry later: the signing certificate could not be fetched (if it never can, the \
+                 publisher has no certificate, or signed without a KeyLocator)"
+            }
+        }
     }
 }
 
@@ -278,6 +331,15 @@ mod tests {
         }
         assert_eq!(NackReason::from_code(169), NackReason::Other(169));
         assert_eq!(NackReason::from_code(177), NackReason::Other(177));
+    }
+
+    /// Only a definite certificate absence is refused for now (a consumer
+    /// retries it); every other refusal is final.
+    #[test]
+    fn only_unverifiable_is_refused_for_now() {
+        for r in Refusal::ALL {
+            assert_eq!(r.is_final(), r != Refusal::Unverifiable, "{r}");
+        }
     }
 
     #[test]

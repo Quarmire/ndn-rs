@@ -11,11 +11,27 @@ pub enum AppError {
         reason: Option<ndn_packet::NackReason>,
     },
     /// This host's forwarder refused the Data that answered the Interest
-    /// (revoked key, untrusted chain, schema refusal, bad signature, …): a
-    /// final verdict, told at once instead of a timeout. Asking again gets
-    /// the same answer; like [`Unverified`](Self::Unverified) it is a trust
-    /// event, not a transient condition. Only a local face carries it.
-    #[error("the forwarder refused the Data: {reason}")]
+    /// (revoked key, untrusted chain, schema refusal, bad signature, …), told
+    /// at once instead of a timeout. Only a local face carries it.
+    ///
+    /// Whether asking again can help is [`Refusal::is_final`]: every
+    /// refusal but `unverifiable` is a final verdict on the Data — like
+    /// [`Unverified`](Self::Unverified) a trust event, not a transient
+    /// condition. `unverifiable` (the signing certificate was definitely not
+    /// to be had) is refused for now: [`Consumer::fetch_with_retry`], object
+    /// fetches and segment pipelines retry it within their retry budget, and
+    /// an application retrying on its own should wait out the forwarder's
+    /// certificate-fetch back-off first. The message says which, and
+    /// [`Refusal::next_step`].
+    ///
+    /// [`Refusal::is_final`]: ndn_packet::Refusal::is_final
+    /// [`Refusal::next_step`]: ndn_packet::Refusal::next_step
+    /// [`Consumer::fetch_with_retry`]: crate::Consumer::fetch_with_retry
+    #[error(
+        "the forwarder refused the Data ({reason}, {}): {}",
+        if reason.is_final() { "final" } else { "refused for now" },
+        reason.next_step()
+    )]
     Refused { reason: ndn_packet::Refusal },
     /// An external [`ndn_ipc::ForwarderClient`] operation failed. Only the
     /// Unix-socket `connect()` paths produce this, so it's native-only.
@@ -63,8 +79,8 @@ mod tests {
     use super::*;
     use ndn_packet::{NackReason, Refusal};
 
-    /// A refusal Nack is `Refused` (a verdict, not retried); every other
-    /// reason, and none, stays `Nacked`.
+    /// A refusal Nack is `Refused` (retried only when not final); every
+    /// other reason, and none, stays `Nacked`.
     #[test]
     fn from_nack_separates_refusals_from_other_nacks() {
         for r in Refusal::ALL {

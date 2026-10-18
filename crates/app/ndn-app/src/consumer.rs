@@ -123,10 +123,10 @@ impl<'a> ReplySource<'a> {
 
     /// The next reply in a segment pipeline fetching `versioned/<seg>`:
     /// `Some(Data(..))` for a segment Data, `Some(Refused(..))` when this
-    /// host's forwarder refused a segment (final: the fetch stops),
-    /// `Some(Other)` for anything else (another Nack, a straggler) — the
-    /// pipeline's retransmit recovers real loss — and `None` once the
-    /// connection closed.
+    /// host's forwarder refused a segment (a final refusal stops the fetch,
+    /// one refused for now is retransmitted like a loss), `Some(Other)` for
+    /// anything else (another Nack, a straggler) — the pipeline's retransmit
+    /// recovers real loss — and `None` once the connection closed.
     async fn next_segment(&mut self, versioned: &Name) -> Option<SegmentReply> {
         match self {
             Self::Correlated(replies) => Some(match replies.recv().await? {
@@ -551,8 +551,12 @@ impl Consumer {
     }
 
     /// Exponential back-off: `base_delay`, `2×base_delay`, … up to
-    /// `max_attempts` total tries. A refusal ([`AppError::Refused`]) is final
-    /// and ends the retries at once.
+    /// `max_attempts` total tries. A final refusal ([`AppError::Refused`]
+    /// with [`Refusal::is_final`](ndn_packet::Refusal::is_final)) ends the
+    /// retries at once; one refused for now (`unverifiable`) is retried like
+    /// a timeout. To give the forwarder's certificate fetch a chance to
+    /// answer in between, the back-off should reach past its back-off
+    /// (`ndn_app::CERT_FETCH_TIMEOUT` twice, for the engine-backed fetcher).
     pub async fn fetch_with_retry(
         &mut self,
         name: impl Into<Name>,
@@ -566,7 +570,7 @@ impl Consumer {
         for attempt in 0..attempts {
             match self.fetch(name.clone()).await {
                 Ok(data) => return Ok(data),
-                Err(e @ AppError::Refused { .. }) => return Err(e),
+                Err(e @ AppError::Refused { reason }) if reason.is_final() => return Err(e),
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < attempts {
@@ -891,6 +895,10 @@ impl Consumer {
         let mut received: u64 = done.iter().filter(|&&d| d).count() as u64;
         on_progress(received, total);
         let mut stalls: u32 = 0; // consecutive no-progress stalls; reset on any new segment
+        // A segment refused for now (`unverifiable`) is retransmitted like a
+        // loss; if the stall budget runs out while one is, the fetch ends
+        // with that refusal rather than a bare timeout. Cleared on progress.
+        let mut refused_for_now: Option<ndn_packet::Refusal> = None;
         // Diagnostics: distinguish loss (high retransmits) from a stuck window.
         let mut retransmits: u64 = 0;
         let mut total_stalls: u64 = 0;
@@ -956,6 +964,7 @@ impl Consumer {
                     done[$seg as usize] = true;
                     received += 1;
                     stalls = 0; // progress — reset the no-progress stall budget
+                    refused_for_now = None;
                     if $marked {
                         cc.on_congestion_mark();
                     } else {
@@ -1003,9 +1012,17 @@ impl Consumer {
                 // Non-segment / Nack packets are ignored; the retransmit path
                 // recovers any real loss.
                 Ok(Some(SegmentReply::Other)) => continue,
-                // A refused segment is refused again if asked again: the
-                // object cannot be fetched.
-                Ok(Some(SegmentReply::Refused(reason))) => return Err(AppError::Refused { reason }),
+                // A final refusal of a segment is refused again if asked
+                // again: the object cannot be fetched.
+                Ok(Some(SegmentReply::Refused(reason))) if reason.is_final() => {
+                    return Err(AppError::Refused { reason });
+                }
+                // Refused for now: the stall path retransmits it, within the
+                // same no-progress budget as a loss.
+                Ok(Some(SegmentReply::Refused(reason))) => {
+                    refused_for_now = Some(reason);
+                    continue;
+                }
                 Ok(Some(SegmentReply::Data(data, marked))) => {
                     let Some(seg) = data.name.components().last().and_then(|c| c.as_segment())
                     else {
@@ -1059,7 +1076,8 @@ impl Consumer {
                     stalls += 1;
                     total_stalls += 1;
                     if stalls >= SEG_MAX_STALLS {
-                        return Err(AppError::Timeout);
+                        return Err(refused_for_now
+                            .map_or(AppError::Timeout, |reason| AppError::Refused { reason }));
                     }
                     for seg in inflight.keys().copied().collect::<Vec<_>>() {
                         *inflight.get_mut(&seg).expect("seg in inflight") += 1;
@@ -1091,7 +1109,8 @@ impl Consumer {
     /// Issue an Interest built by `make` (rebuilt with a fresh nonce each try),
     /// re-expressing on timeout/Nack up to [`OBJECT_FETCH_ATTEMPTS`] times with
     /// exponential back-off. Resilience for the RDR fetch over lossy radios;
-    /// a refusal is final and not re-expressed.
+    /// a final refusal is not re-expressed, one refused for now
+    /// (`unverifiable`) is, like a timeout.
     async fn fetch_object_with_retry(
         &mut self,
         mut make: impl FnMut() -> InterestBuilder,
@@ -1102,7 +1121,7 @@ impl Consumer {
             let (wire, timeout) = make().build_with_timeout();
             match self.fetch_wire(wire, timeout).await {
                 Ok(data) => return Ok(data),
-                Err(e @ AppError::Refused { .. }) => return Err(e),
+                Err(e @ AppError::Refused { reason }) if reason.is_final() => return Err(e),
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < OBJECT_FETCH_ATTEMPTS {
@@ -2066,16 +2085,16 @@ mod fetch_pairing_tests {
         assert!(matches!(err, AppError::Nacked { .. }), "got {err:?}");
     }
 
-    /// `fetch_with_retry` retries a Nack but never a refusal: the Data that
-    /// would answer the retry is never asked for.
+    /// `fetch_with_retry` stops at a final refusal: the Data that would
+    /// answer the retry is never asked for.
     #[tokio::test]
-    async fn retry_stops_at_a_refusal() {
+    async fn final_refusal_stops_retry() {
         let refused = ndn_packet::NackReason::Refused(ndn_packet::Refusal::Revoked);
         let conn = ScriptedConn::new([encode_lp_nack(refused, &interest("/x/2")), data("/x/2")]);
         let err = Consumer::new(conn)
             .fetch_with_retry(ndn_packet::name!("/x/2"), 3, Duration::from_millis(1))
             .await
-            .expect_err("a refusal is final");
+            .expect_err("a revocation is final");
         assert!(
             matches!(err, AppError::Refused { reason: ndn_packet::Refusal::Revoked }),
             "got {err:?}"
@@ -2087,6 +2106,35 @@ mod fetch_pairing_tests {
             .fetch_with_retry(ndn_packet::name!("/x/2"), 3, Duration::from_millis(1))
             .await
             .expect("an ordinary Nack is retried");
+    }
+
+    /// An `unverifiable` refusal (the signing certificate was not to be had
+    /// when the forwarder fetched it) is refused for now: `fetch_with_retry`
+    /// asks again, and the Data that answers once the certificate is
+    /// reachable is returned; when every attempt is refused, the refusal is
+    /// the error.
+    #[tokio::test]
+    async fn unverifiable_refusal_is_retried() {
+        let refused = ndn_packet::NackReason::Refused(ndn_packet::Refusal::Unverifiable);
+        let conn = ScriptedConn::new([encode_lp_nack(refused, &interest("/x/2")), data("/x/2")]);
+        let got = Consumer::new(conn)
+            .fetch_with_retry(ndn_packet::name!("/x/2"), 3, Duration::from_millis(1))
+            .await
+            .expect("refused for now, then answered");
+        assert_eq!(got.name.to_string(), "/x/2");
+
+        let conn = ScriptedConn::new([
+            encode_lp_nack(refused, &interest("/x/2")),
+            encode_lp_nack(refused, &interest("/x/2")),
+        ]);
+        let err = Consumer::new(conn)
+            .fetch_with_retry(ndn_packet::name!("/x/2"), 2, Duration::from_millis(1))
+            .await
+            .expect_err("refused on every attempt");
+        assert!(
+            matches!(err, AppError::Refused { reason: ndn_packet::Refusal::Unverifiable }),
+            "got {err:?}"
+        );
     }
 
     /// `CanBePrefix` accepts a descendant (the segmented-publication shape,

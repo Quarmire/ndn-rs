@@ -108,6 +108,25 @@ pub const MAX_STATUS_HOLD: Duration = Duration::from_secs(60);
 pub const MAX_HELD_PER_REQUEST: usize = 4;
 /// Status Interests the CA holds at once in all.
 pub const MAX_HELD_STATUS: usize = 1024;
+/// Requests a CA holds waiting for a decision at once: the held-STATUS
+/// budget serves this many ([`MAX_HELD_STATUS`] / [`MAX_HELD_PER_REQUEST`]),
+/// so unauthenticated requesters cannot starve real devices of it.
+pub const MAX_PENDING: usize = MAX_HELD_STATUS / MAX_HELD_PER_REQUEST;
+/// Requests waiting at once under one prefix (the parent of the key's
+/// identity, e.g. one role of a namespace), so one flood cannot take the
+/// whole [`MAX_PENDING`] budget.
+pub const MAX_PENDING_PER_PREFIX: usize = 32;
+
+/// Consumes a new request's one-time invite (see
+/// [`ApprovalStore::open_request`]); `Err` says why and what to do.
+pub(crate) type Redeem<'r> = Box<dyn FnOnce() -> Result<(), String> + 'r>;
+
+/// The prefix [`MAX_PENDING_PER_PREFIX`] counts under: the parent of the
+/// key's identity (`/ns/role/device/KEY/x` → `/ns/role`).
+fn pending_group(key_uri: &str) -> &str {
+    let identity = key_uri.rsplit_once("/KEY/").map_or(key_uri, |(id, _)| id);
+    identity.rsplit_once('/').map_or(identity, |(parent, _)| parent)
+}
 /// The challenge type of enrollment by approval.
 pub const DEVICE_APPROVAL: &str = "device-approval";
 /// CHALLENGE parameter naming the request a poll resumes.
@@ -482,14 +501,16 @@ impl ApprovalStore {
 
     /// The record a poll for `key_name` (with `public_key`) is about:
     /// `resume` names the request it continues; without it, the key's
-    /// current record, or a new one (`invite` runs only then: `Ok(true)`
-    /// records that an invite token was redeemed with it).
-    pub(crate) fn open_request(
+    /// current record, or a new one. `invite` runs only for a new one:
+    /// `Ok(None)` when no invite is needed, `Ok(Some(redeem))` when one is,
+    /// and `redeem` consumes it — called only once the new record is saved,
+    /// so a storage failure never burns the one-time invite.
+    pub(crate) fn open_request<'r>(
         &self,
         key_name: &Name,
         public_key: &[u8],
         resume: Option<&str>,
-        invite: impl FnOnce() -> Result<bool, String>,
+        invite: impl FnOnce() -> Result<Option<Redeem<'r>>, String>,
     ) -> Result<ApprovalRecord, OpenRefusal> {
         self.prune();
         let now = now_secs();
@@ -522,7 +543,37 @@ impl ApprovalStore {
             }
             self.forget(&mut records, &record.request_id);
         }
-        let invite = invite().map_err(OpenRefusal::Refused)?;
+        let live: Vec<&ApprovalRecord> = records
+            .values()
+            .filter(|r| r.is_pending() && now <= r.expires_secs)
+            .collect();
+        if let Some(other) = live.iter().find(|r| r.key_name == key_uri) {
+            return Err(OpenRefusal::Refused(format!(
+                "request {} for {key_uri} (another public key) is already waiting for an \
+                 admin's decision; only one request per key name may wait: if it is yours, \
+                 resume it; otherwise ask an admin to deny it, or wait until it expires at {}",
+                other.request_id,
+                iso_secs(other.expires_secs)
+            )));
+        }
+        if live.len() >= MAX_PENDING {
+            return Err(OpenRefusal::Refused(format!(
+                "this CA already holds {MAX_PENDING} requests waiting for an admin's decision; \
+                 nothing is pending for {key_uri}: ask an admin to decide the waiting requests \
+                 (`ndn-fwd approvals list`), then ask again"
+            )));
+        }
+        let group = pending_group(&key_uri);
+        if live.iter().filter(|r| pending_group(&r.key_name) == group).count()
+            >= MAX_PENDING_PER_PREFIX
+        {
+            return Err(OpenRefusal::Refused(format!(
+                "{MAX_PENDING_PER_PREFIX} requests under {group} are already waiting for an \
+                 admin's decision; nothing is pending for {key_uri}: ask an admin to decide \
+                 them (`ndn-fwd approvals list`), then ask again"
+            )));
+        }
+        let redeem = invite().map_err(OpenRefusal::Refused)?;
         let request_id = new_request_id();
         let device = self
             .inner
@@ -539,15 +590,23 @@ impl ApprovalStore {
             device: device.map(|d| d.device),
             created_secs: now,
             expires_secs: now.saturating_add(self.inner.ttl.as_secs()),
-            invite,
+            invite: redeem.is_some(),
             state: ApprovalState::Pending,
         };
         self.save(&record).map_err(|e| {
             OpenRefusal::Refused(format!(
-                "the CA could not record the request durably ({e}); nothing is pending: try \
-                 again later"
+                "the CA could not record the request durably ({e}); nothing is pending and \
+                 any invite was not used: ask again once the CA operator has fixed its storage"
             ))
         })?;
+        // The invite is consumed only now that the request is durable; if
+        // consuming it fails, the request goes again.
+        if let Some(redeem) = redeem
+            && let Err(why) = redeem()
+        {
+            self.forget(&mut records, &request_id);
+            return Err(OpenRefusal::Refused(why));
+        }
         records.insert(request_id, record.clone());
         tracing::info!(
             request = %record.request_id,
@@ -668,6 +727,10 @@ impl ApprovalStore {
                 data.name
             ))
         })?;
+        // Only an authorized admin learns anything about the request: the
+        // signature, chain and admin role are checked before the record is
+        // compared, and no refusal echoes the record's code or key.
+        let signer = validate_admin_data(&data, packets, keyring, trusted, &is_revoked).await?;
         let record = self.get(&request_id).ok_or_else(|| {
             refuse(
                 RefusalKind::NotFound,
@@ -676,8 +739,8 @@ impl ApprovalStore {
         })?;
         if record.key_name != key_name.to_string() {
             return Err(bad(format!(
-                "the decision names {key_name}, but request {request_id} is for {}",
-                record.key_name
+                "request {request_id} is not for {key_name}; nothing changed: check the request \
+                 id and key on the device (`ndn-fwd approvals list`)"
             )));
         }
         let content = data
@@ -687,9 +750,8 @@ impl ApprovalStore {
         let decision = if kind == APPROVE_COMPONENT {
             if normalize_code(&content).as_deref() != Some(record.code.as_str()) {
                 return Err(bad(format!(
-                    "the approval carries the code {content:?}, but request {request_id} shows \
-                     {}: the approver compared another request's code; nothing changed",
-                    record.code
+                    "the approval's code does not match request {request_id}; nothing changed: \
+                     re-read the code shown on the device and approve the request showing it"
                 )));
             }
             Decision::Approve
@@ -702,7 +764,6 @@ impl ApprovalStore {
                 },
             }
         };
-        let signer = validate_admin_data(&data, packets, keyring, trusted, &is_revoked).await?;
         let evidence = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data.raw());
         self.record_decision(
             &request_id,
@@ -1497,10 +1558,13 @@ pub struct PendingRequest {
 /// Why a poll did not end pending or issued.
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalEnrollError {
-    /// An admin denied the request (final).
+    /// The CHALLENGE answer says an admin denied the request. That answer
+    /// is not signed, so it ends nothing: only a CA-signed STATUS answer
+    /// ([`request_status`]) ends a request (not final).
     #[error("{0}")]
     Denied(String),
-    /// The request expired or is gone (final): ask again.
+    /// The CHALLENGE answer says the request expired or is gone: ask again.
+    /// Unsigned, like [`Self::Denied`] (not final).
     #[error("{0}")]
     Expired(String),
     #[error(
@@ -1517,7 +1581,12 @@ pub enum ApprovalEnrollError {
     CaRefused(String),
     #[error("signing the request with the device key failed: {0}")]
     Signing(String),
-    #[error("the certificate the CA issued was refused ({0}); nothing was kept")]
+    /// The certificate the CA issued failed its checks (not final: the
+    /// device's trust context may be out of date, and the approval stands).
+    #[error(
+        "the certificate the CA issued was refused ({0}): if this device's trust context is out \
+         of date, refresh it (adopt the namespace's current context), then ask again"
+    )]
     IssuedCertificate(String),
     /// An answer about the request did not chain to the namespace root
     /// under its schema (only the CA key signs `<ca>/CA/…`), or was about
@@ -1530,9 +1599,15 @@ pub enum ApprovalEnrollError {
 }
 
 impl ApprovalEnrollError {
-    /// Whether asking again later can change the outcome.
+    /// Whether this error alone may end a request (delete its key). The
+    /// NEW and CHALLENGE answers are not signed by the CA, so nothing they
+    /// say — a denial, an expiry, a refusal, an unreadable answer — and no
+    /// failed check of the issued certificate (the device may hold a stale
+    /// context) is final: the request is kept and asked about again until a
+    /// CA-signed STATUS answer ([`request_status`]) says denied or expired.
+    /// Only a local failure of the device key to sign is final.
     pub fn is_final(&self) -> bool {
-        !matches!(self, Self::CaUnreachable { .. } | Self::UntrustedAnswer(_))
+        matches!(self, Self::Signing(_))
     }
 
     fn from_cert(e: CertError, ca_prefix: &Name) -> Self {
@@ -1725,6 +1800,23 @@ pub struct OutgoingRequest {
     pub state: OutgoingState,
 }
 
+/// How long past its expiry a pending [`OutgoingRequest`] is still waited
+/// for (clock skew; a CA briefly offline whose signed answer then says
+/// expired). Past it the requester ends the request itself
+/// ([`RequestStore::expire_overdue`]): the CA never answered, and it forgets
+/// requests by then.
+pub const OUTGOING_EXPIRY_GRACE: Duration = Duration::from_secs(86_400);
+
+impl OutgoingRequest {
+    /// Pending past its expiry plus [`OUTGOING_EXPIRY_GRACE`] at `now`
+    /// (Unix s): no CA answer will come.
+    pub fn overdue(&self, now: u64) -> bool {
+        self.state == OutgoingState::Pending
+            && self.expires_secs != 0
+            && now > self.expires_secs.saturating_add(OUTGOING_EXPIRY_GRACE.as_secs())
+    }
+}
+
 /// Where an outgoing request stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
@@ -1820,11 +1912,36 @@ impl RequestStore {
 
     /// The request for `identity` still pending, if any: asking again while
     /// one is pending answers with it (no second key, no second request).
+    /// An [overdue](OutgoingRequest::overdue) one is not: a new request may
+    /// go out ([`expire_overdue`](Self::expire_overdue) ends it).
     pub fn outstanding(&self, identity: &str) -> Result<Option<OutgoingRequest>, CertError> {
+        let now = now_secs();
         Ok(self
             .list()?
             .into_iter()
-            .find(|r| r.identity == identity && r.state == OutgoingState::Pending))
+            .find(|r| r.identity == identity && r.state == OutgoingState::Pending && !r.overdue(now)))
+    }
+
+    /// End every [overdue](OutgoingRequest::overdue) pending request as
+    /// expired (the CA never answered before it expired; ask again) and
+    /// delete the sealed key kept beside it. Returns those ended: the
+    /// caller deletes their keys from its own key store, if it keeps them.
+    pub fn expire_overdue(&self) -> Result<Vec<OutgoingRequest>, CertError> {
+        let now = now_secs();
+        let mut ended = Vec::new();
+        for mut r in self.list()?.into_iter().filter(|r| r.overdue(now)) {
+            r.state = OutgoingState::Expired {
+                reason: format!(
+                    "the CA never answered before request {} expired (at {}); ask again",
+                    r.request_id,
+                    iso_secs(r.expires_secs)
+                ),
+            };
+            self.remove_sealed_key(&r.key_name)?;
+            self.save(&r)?;
+            ended.push(r);
+        }
+        Ok(ended)
     }
 
     fn key_path(&self, key_name: &str) -> PathBuf {

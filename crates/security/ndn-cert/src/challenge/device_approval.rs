@@ -14,7 +14,7 @@ use ndn_packet::Name;
 use crate::{
     approval::{
         ApprovalRecord, ApprovalState, ApprovalStore, Approver, CODE_PARAM, DEVICE_APPROVAL,
-        EXPIRES_PARAM, OpenRefusal, POLL_SESSION_SECS, REQUEST_PARAM, TOKEN_PARAM,
+        EXPIRES_PARAM, OpenRefusal, POLL_SESSION_SECS, REQUEST_PARAM, Redeem, TOKEN_PARAM,
     },
     attestation::{AttestationSet, ChallengeAttestation},
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState, token::TokenStore},
@@ -67,20 +67,21 @@ impl DeviceApprovalChallenge {
         &self.store
     }
 
-    /// Redeem the invite a new request for `key` needs, if it needs one.
-    fn redeem_invite(
-        &self,
+    /// The invite a new request for `key` needs, if it needs one: checked
+    /// now, consumed by the returned [`Redeem`] once the request is saved.
+    fn redeem_invite<'a>(
+        &'a self,
         key: &Name,
-        params: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<bool, String> {
+        params: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<Redeem<'a>>, String> {
         let Some(req) = &self.invite else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(device) = crate::roles::parse_device_key(&req.namespace, key) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !req.roles.contains(&device.role) {
-            return Ok(false);
+            return Ok(None);
         }
         let role = device.role;
         let Some(token) = params.get(TOKEN_PARAM).and_then(|v| v.as_str()) else {
@@ -89,15 +90,25 @@ impl DeviceApprovalChallenge {
                  invite link of this namespace (`ndn-fwd enroll <invite link> --role {role}`)"
             ));
         };
-        if req.tokens.consume(token) {
-            Ok(true)
-        } else {
-            Err(format!(
+        let refused = move || {
+            format!(
                 "the invite token was not accepted (already redeemed, expired, or not this \
                  CA's); a {role} device needs a valid invite beside an admin's approval: ask \
                  for a new invite"
-            ))
+            )
+        };
+        if !req.tokens.is_live(token) {
+            return Err(refused());
         }
+        Ok(Some(Box::new(move || match req.tokens.redeem(token) {
+            crate::challenge::token::TokenCheck::Ok => Ok(()),
+            crate::challenge::token::TokenCheck::NotRecorded(e) => Err(format!(
+                "the CA could not record the invite's redemption durably ({e}); nothing is \
+                 pending and the invite was not used: ask again once the CA operator has fixed \
+                 its storage"
+            )),
+            _ => Err(refused()),
+        })))
     }
 }
 

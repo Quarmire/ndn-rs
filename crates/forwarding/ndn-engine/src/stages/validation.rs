@@ -137,10 +137,11 @@ impl PendingQueue {
             }
 
             // Every source the cert's fetch asked answered that it is not to
-            // be had there (a NoRoute Nack, or a refusal of what answered):
-            // the Data can never be verified from where it came, so it gets
-            // its verdict now instead of waiting out its deadline. A fetch
-            // that timed out never says so; the network may only be slow.
+            // be had there (a NoRoute Nack, or a refusal of what it served):
+            // the Data cannot be verified now, so it is refused
+            // `unverifiable` — not final, the consumer asks again after the
+            // back-off — instead of waiting out its deadline. A fetch that
+            // timed out never says so; the network may only be slow.
             if validator
                 .cert_fetcher()
                 .is_some_and(|f| f.known_absent(&entry.needed_cert, Some(entry.ctx.face_id.0)))
@@ -167,7 +168,9 @@ impl PendingQueue {
 /// [`CertFetcher`](ndn_security::CertFetcher) (attached after engine build, see
 /// `ndn_app::install_engine_cert_fetcher`); the drain task re-validates once
 /// the cert is cached, walking one missing hop at a time, refuses the Data as
-/// `unverifiable` once the fetcher knows the cert absent where it asked
+/// `unverifiable` (refused for now, not final: see
+/// [`Refusal::is_final`](ndn_packet::Refusal::is_final)) once the fetcher
+/// knows the cert absent everywhere it asked
 /// ([`CertFetcher::known_absent`](ndn_security::CertFetcher::known_absent)),
 /// and drops it when its original deadline passes. The fetcher dedups
 /// concurrent requests and backs off after a failure, and every re-queue
@@ -335,7 +338,7 @@ impl ValidationStage {
                 }
                 DrainResult::Absent(ctx, cert) => {
                     self.stats.invalid.fetch_add(1, Ordering::Relaxed);
-                    warn!(target: t::SECURITY, cert=%cert, "validation: REFUSED — unverifiable: the signing certificate is not to be had where it was fetched");
+                    warn!(target: t::SECURITY, cert=%cert, "validation: REFUSED for now — unverifiable: every source asked for the signing certificate had none (or served one refused); the consumer may retry after the fetch back-off");
                     actions.push(Action::Refuse(*ctx, Refusal::Unverifiable));
                 }
                 DrainResult::Ready(ctx, deadline) => {

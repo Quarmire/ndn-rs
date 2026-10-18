@@ -267,6 +267,114 @@ impl KeyRole {
     }
 }
 
+/// Which devices of a namespace may link to its devices, by the role in
+/// their certificate's name (`/<ns>/<role>/<device>`), which roles may act
+/// as a relay for other devices, and whether a relay admits enrollment
+/// links ([`tlv::LINK_POLICY`]). Policy in data: signed with the context, so
+/// every device of the namespace admits links by the same rule, and carried
+/// to every version made from it. A context without one has the default
+/// ([`LinkPolicy::default`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkPolicy {
+    /// Roles whose devices may link. Empty: every device role.
+    pub roles: Vec<String>,
+    /// Roles a device may use as a relay (a link other devices are reached
+    /// through).
+    pub relay_roles: Vec<String>,
+    /// Whether a relay of the namespace admits a link from a device it does
+    /// not know yet as an *enrollment link*: one that carries only Interests
+    /// for the namespace's CA endpoints and its trust context, and their
+    /// answers, so a device reachable only over QUIC can enroll. Takes
+    /// effect only when the context names a CA endpoint
+    /// ([`SignedTrustContext::admits_enrollment_links`]).
+    pub enrollment_links: bool,
+}
+
+impl Default for LinkPolicy {
+    /// Any enrolled device of the namespace may link; relays are `node`
+    /// devices; relays admit enrollment links.
+    fn default() -> Self {
+        Self {
+            roles: Vec::new(),
+            relay_roles: vec!["node".into()],
+            enrollment_links: true,
+        }
+    }
+}
+
+/// [`LinkPolicy`] wire words for `enrollment_links`.
+const ENROLLMENT_LINKS_ON: &str = "enrollment";
+const ENROLLMENT_LINKS_OFF: &str = "no-enrollment";
+
+impl LinkPolicy {
+    /// Whether a device with `role` may link.
+    pub fn allows_link(&self, role: &str) -> bool {
+        self.roles.is_empty() || self.roles.iter().any(|r| r == role)
+    }
+
+    /// Whether a device with `role` may be a relay.
+    pub fn allows_relay(&self, role: &str) -> bool {
+        self.allows_link(role) && self.relay_roles.iter().any(|r| r == role)
+    }
+
+    /// One line for a person: `links: any role; relays: node; enrollment
+    /// links: on`.
+    pub fn describe(&self) -> String {
+        let list = |roles: &[String], empty: &str| {
+            if roles.is_empty() {
+                empty.to_string()
+            } else {
+                roles.join(", ")
+            }
+        };
+        format!(
+            "links: {}; relays: {}; enrollment links: {}",
+            list(&self.roles, "any role"),
+            list(&self.relay_roles, "none"),
+            if self.enrollment_links { "on" } else { "off" }
+        )
+    }
+
+    /// `<roles>;<relay roles>;<enrollment|no-enrollment>`, roles
+    /// comma-separated.
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{};{};{}",
+            self.roles.join(","),
+            self.relay_roles.join(","),
+            if self.enrollment_links {
+                ENROLLMENT_LINKS_ON
+            } else {
+                ENROLLMENT_LINKS_OFF
+            }
+        )
+        .into_bytes()
+    }
+
+    fn decode(value: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(value).ok()?;
+        let mut fields = text.split(';');
+        let list = |s: &str| -> Vec<String> {
+            s.split(',')
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let roles = list(fields.next()?);
+        let relay_roles = list(fields.next()?);
+        let enrollment_links = match fields.next() {
+            Some(ENROLLMENT_LINKS_OFF) => false,
+            Some(ENROLLMENT_LINKS_ON) | None => true,
+            Some(_) => return None,
+        };
+        Some(Self {
+            roles,
+            relay_roles,
+            enrollment_links,
+        })
+    }
+}
+
 /// One anchor-rooted namespace relationship in a [`Keyring`](crate::Keyring).
 ///
 /// A context owns the anchor set and schema for its `namespace`. Hierarchical
@@ -307,6 +415,8 @@ pub struct SignedTrustContext {
     source_bundle_hash: Option<[u8; 32]>,
     /// Roles of keys the context names ([`tlv::KEY_ROLE`]), in wire order.
     key_roles: Vec<(KeyRole, Name)>,
+    /// Which devices may link ([`tlv::LINK_POLICY`]); `None` is the default.
+    link_policy: Option<LinkPolicy>,
 }
 
 impl SignedTrustContext {
@@ -324,6 +434,7 @@ impl SignedTrustContext {
             schema_authoritative: false,
             source_bundle_hash: None,
             key_roles: Vec::new(),
+            link_policy: None,
         }
     }
 
@@ -428,6 +539,11 @@ impl SignedTrustContext {
         self.key_roles.retain(|(r, k)| !drop(*r, k));
         self
     }
+    /// Set which devices of the namespace may link and relay.
+    pub fn with_link_policy(mut self, policy: LinkPolicy) -> Self {
+        self.link_policy = Some(policy);
+        self
+    }
 
     // ── accessors ───────────────────────────────────────────────────────────
 
@@ -474,6 +590,21 @@ impl SignedTrustContext {
     /// Whether `key` has `role`.
     pub fn has_key_role(&self, key: &Name, role: KeyRole) -> bool {
         self.key_roles.iter().any(|(r, k)| *r == role && k == key)
+    }
+    /// Which devices of the namespace may link and relay: the context's
+    /// policy, else the default.
+    pub fn link_policy(&self) -> LinkPolicy {
+        self.link_policy.clone().unwrap_or_default()
+    }
+    /// The link policy the context carries, `None` when it carries none (and
+    /// [`link_policy`](Self::link_policy) is the default).
+    pub fn stated_link_policy(&self) -> Option<&LinkPolicy> {
+        self.link_policy.as_ref()
+    }
+    /// Whether a relay of this namespace admits enrollment links: its link
+    /// policy allows them and the context names a CA endpoint to enroll at.
+    pub fn admits_enrollment_links(&self) -> bool {
+        self.link_policy().enrollment_links && !self.ca_endpoints.is_empty()
     }
 
     /// Shared handle to this context's anchor set. The chain walk terminates
@@ -685,6 +816,9 @@ impl SignedTrustContext {
                 value.extend_from_slice(&key.encode_to_tlv());
                 w.write_tlv(tlv::KEY_ROLE, &value);
             }
+            if let Some(policy) = &self.link_policy {
+                w.write_tlv(tlv::LINK_POLICY, &policy.encode());
+            }
         });
         w.finish()
     }
@@ -778,6 +912,7 @@ impl SignedTrustContext {
         let mut revocations: Vec<Name> = Vec::new();
         let mut source_bundle_hash: Option<[u8; 32]> = None;
         let mut key_roles: Vec<(KeyRole, Name)> = Vec::new();
+        let mut link_policy: Option<LinkPolicy> = None;
 
         let mut cur = value;
         while !cur.is_empty() {
@@ -860,6 +995,9 @@ impl SignedTrustContext {
                         key_roles.push((KeyRole(fval[0]), key));
                     }
                 }
+                // A malformed policy is a field lost (the default applies),
+                // not a rejected context (non-critical).
+                tlv::LINK_POLICY => link_policy = LinkPolicy::decode(fval),
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
                     return Err(SignedTrustContextError::Truncated(
@@ -894,6 +1032,7 @@ impl SignedTrustContext {
             schema_authoritative,
             source_bundle_hash,
             key_roles,
+            link_policy,
         })
     }
 
@@ -1210,6 +1349,39 @@ mod tests {
         assert!(!decoded.require_all);
         assert_eq!(decoded.challenges, vec!["token", "device-approval"]);
         assert_eq!(decoded.approval_roles, vec!["admin", "node"]);
+    }
+
+    #[test]
+    fn a_link_policy_survives_the_wire_and_its_absence_is_the_default() {
+        let policy = LinkPolicy {
+            roles: vec!["admin".into(), "node".into()],
+            relay_roles: vec!["node".into()],
+            enrollment_links: false,
+        };
+        let ctx = SignedTrustContext::hierarchical(n("/home"))
+            .with_version(3)
+            .with_ca_endpoint(n("/home/CA"))
+            .with_link_policy(policy.clone());
+        let decoded = SignedTrustContext::decode_content(&ctx.encode_content(), 3).unwrap();
+        assert_eq!(decoded.link_policy(), policy);
+        assert_eq!(decoded.stated_link_policy(), Some(&policy));
+        assert!(!decoded.link_policy().allows_link("member"));
+        assert!(decoded.link_policy().allows_relay("node"));
+        assert!(!decoded.admits_enrollment_links(), "the policy turned them off");
+
+        let bare = SignedTrustContext::hierarchical(n("/home")).with_version(1);
+        let decoded = SignedTrustContext::decode_content(&bare.encode_content(), 1).unwrap();
+        let default = decoded.link_policy();
+        assert_eq!(decoded.stated_link_policy(), None);
+        assert!(["admin", "member", "node", "guest"].iter().all(|r| default.allows_link(r)));
+        assert!(default.allows_relay("node") && !default.allows_relay("member"));
+        assert!(default.enrollment_links);
+        assert!(!decoded.admits_enrollment_links(), "no CA endpoint to enroll at");
+        let with_ca = SignedTrustContext::hierarchical(n("/home"))
+            .with_version(1)
+            .with_ca_endpoint(n("/home/CA"));
+        assert!(with_ca.admits_enrollment_links(), "default on for a namespace with a CA");
+        assert_eq!(tlv::LINK_POLICY % 2, 0, "an old node must be able to skip it");
     }
 
     // ── F9: source-bundle provenance hint ──────────────────────────────────

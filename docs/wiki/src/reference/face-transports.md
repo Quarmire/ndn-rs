@@ -23,7 +23,7 @@ for writing a new transport see [Implementing a face](../guides/implementing-a-f
 | Serial (UART) | `ndn-ext/crates/faces/ndn-face-serial/src/lib.rs` | `serial` | Embedded / microcontroller. |
 | WebSocket | `ndn-ext/crates/faces/ndn-face-websocket/` | `ws` | Browser-to-forwarder over WebSocket. |
 | WebTransport | `ndn-ext/crates/faces/ndn-face-webtransport/`; wasm: `ndn-ext/crates/faces/ndn-face-webtransport-wasm/` | `[listeners.webtransport]`; dial via `[[face]] kind = "web-transport"` or `faces/create wts://…` | Browser↔forwarder and forwarder↔forwarder (NAT-traversing) over QUIC datagrams; oversized packets are NDNLPv2-fragmented to `maxDatagramSize` (interoperates with NDNts `H3Transport`). |
-| QUIC | `ndn-ext/crates/faces/ndn-face-quic/` | `[listeners.quic]`; dial via `[[face]] kind = "quic"` or `faces/create quic://…` | Forwarder-to-forwarder backbone over raw QUIC (TLS 1.3, **connection migration**, 0-RTT); one reliable bidi stream of NDN TLV. No HTTP/3 layer (does not reach browsers). |
+| QUIC links | `ndn-ext/crates/faces/ndn-face-quic/` | `quic` (listens for links: `bind`); links are dialled from `[[peer]]` | Device-to-device and device-to-relay links across networks. Each end is identified by its NDN device key (TLS 1.3 with raw public keys); NDN packets ride QUIC datagrams, NDNLPv2-fragmented; a link survives an address change (connection migration). No HTTP/3 layer (does not reach browsers). See [QUIC links](#quic-links). |
 | WebRTC datachannel | `ndn-ext/crates/faces/ndn-face-webrtc/` | `webrtc` | Browser ↔ browser, browser ↔ relay. |
 | SharedWorker | `ndn-ext/crates/faces/ndn-face-shared-worker/` | (programmatic) | Per-origin engine sharing across tabs. |
 | Callback / Tap | `crates/faces/ndn-face/src/callback.rs` | (Instrument tier) | Researcher: virtual face whose send-path is a closure. |
@@ -51,38 +51,35 @@ Its local IP is the `bind` IP when that is a specific address; with
 `bind` IP of the other family than `remote`, or one the host does not hold,
 is refused with the reason in the log (`failed to create UDP face`).
 
-TLS faces — **WebTransport** (browser↔forwarder and NAT-traversing
-forwarder↔forwarder over QUIC datagrams) and **QUIC** (native router-to-router
-backbone, TLS 1.3 with connection migration) — share one listener `cert_source`
-shape (`self_signed_dev` / `pem` / `acme`, resolved by `ndn-acme`) and one
-dialer trust policy (`cert_sha256` leaf-pin or `webpki`):
+**WebTransport** (browser↔forwarder and NAT-traversing forwarder↔forwarder
+over QUIC datagrams) takes a listener `cert_source` (`self_signed_dev` /
+`pem` / `acme`, resolved by `ndn-acme`) and a dialer trust policy
+(`cert_sha256` leaf-pin or `webpki`):
 
 ```toml
-[listeners.webtransport]    # or [listeners.quic]
+[listeners.webtransport]
 enabled = true
 listen = "0.0.0.0:4443"
 cert_source = { type = "self_signed_dev", hostnames = ["localhost"] }
 
 [[face]]                     # outbound dial
-kind = "web-transport"       # or "quic"
+kind = "web-transport"
 remote = "wts://peer.example:4443"
 cert_sha256 = "ab12…64hex"   # pin the peer's logged leaf hash; or webpki = true
 ```
 
 A self-signed WebTransport cert is capped at 13 days (Chrome's
-`serverCertificateHashes` limit); a self-signed QUIC cert is long-lived (a
-pinned dialer trusts the leaf hash, not the expiry). The self-signed key and
-cert are persisted (files `0600`) under `cache_dir` — default
-`$XDG_STATE_HOME/ndn-fwd/tls`, else `~/.local/state/ndn-fwd/tls` — keyed by
-listener kind + `hostnames`, so the pinned hash survives restarts: the QUIC
-cert is reused until it expires, and the WebTransport cert is re-issued from
-the same key when within a day of expiry. Changing `hostnames` mints a new key
-and cert; give co-hosted nodes distinct `cache_dir`s to keep their pins
-distinct. Listener cert status
+`serverCertificateHashes` limit). The self-signed key and cert are persisted
+(files `0600`) under `cache_dir` — default `$XDG_STATE_HOME/ndn-fwd/tls`,
+else `~/.local/state/ndn-fwd/tls` — keyed by `hostnames`, so the pinned hash
+survives restarts: the cert is re-issued from the same key when within a day
+of expiry. Changing `hostnames` mints a new key and cert; give co-hosted
+nodes distinct `cache_dir`s to keep their pins distinct. Listener cert status
 (notAfter, renewal state) is readable via
 `/localhost/nfd/webtransport/cert-status`. The WebTransport face interoperates
-with **ndnd**'s HTTP/3 face (witness `testbed/tests/audit/wt02_ndnd_interop.sh`);
-QUIC does not reach browsers — that is WebTransport's role.
+with **ndnd**'s HTTP/3 face (witness `testbed/tests/audit/wt02_ndnd_interop.sh`).
+WebTransport is the way to reach browsers; QUIC links (below) do not, and
+they use no certificate files at all.
 
 A shared-memory face (`kind = "shm"`, `path`, `capacity_mb`) gives per-host IPC.
 The full per-kind option set is in `examples/ndn-fwd.example.toml`.
@@ -111,6 +108,154 @@ neighbour discovery is a separate path. As with every wire face, NDNLPv2
 framing and fragmentation are owned by the paired `LpLinkService`: the face is
 payload-only and reports a 1500-byte send-MTU, so the link service fragments
 once at the Ethernet boundary (it does **not** re-frame at the transport).
+
+## QUIC links
+
+A QUIC link joins two devices — two `ndn-fwd` daemons — across networks: a
+laptop to a home server, a phone to a relay on a VPS. For the person using
+them this is "link my devices" or "use my relay"; the steps are on
+[Linking devices](./links.md). This section is the reference.
+
+**Identity is the device's NDN key.** Both ends run TLS 1.3 with raw public
+keys (RFC 7250): the key each side presents *is* its NDN device key (Ed25519
+or P-256), and the handshake signature is made with it. There is no CA, no
+host name, no certificate file and no session resumption; ALPN is
+`ndn-link/1`. A device is named in config by its key's **fingerprint**: the
+SHA-256 of the public key as an NDN certificate carries it (Ed25519: the raw
+32 bytes; P-256: the SubjectPublicKeyInfo DER), 64 lowercase hex digits —
+the same function as a trust-anchor fingerprint. The daemon logs its own at
+startup (`this device's link key`, `fingerprint=…`, target `face.quic`). A
+daemon whose key signs only asynchronously (a hardware token, a custodian)
+cannot link and refuses to start links with that reason; so does a daemon
+running without a signing key.
+
+**Admission.** After the handshake each side sends its device certificate
+and the issuer certificates it keeps; each side then decides. A link is
+admitted when either
+
+- the certificate validates in a namespace this device holds — with the
+  certificates the peer sent and the ones this device already serves or
+  caches, nothing fetched — certifies the key the handshake proved, is a
+  device certificate `/<ns>/<role>/<device>/KEY/…` within its validity, is
+  not revoked (nor its key or an issuer) by the held trust-context version,
+  the namespace's link policy lets that role link, and, when a `[[peer]]`
+  names `device = …`, it is that device; or
+- the key matches a `[[peer]] key` (an expected fingerprint) — for a device
+  of another namespace, or one not enrolled or adopted yet. A certificate
+  that validates and names another device than the `[[peer]]` says, or a
+  revoked one, is still refused.
+
+Otherwise the link is closed with a reason code and a sentence saying why
+and what to do — unless it can be an **enrollment link** (below); the face
+exists only once both sides admitted the link, and the verdict each side
+sends says whether it admitted a full link or an enrollment link.
+The **link policy** is data in the trust context (field `LINK_POLICY`,
+`0x0412`): which roles may link, which may act as relays, and whether a relay
+of the namespace admits an unknown device on an enrollment link that carries
+only its enrollment (the CA endpoints, the trust context and certificates). When the
+context carries none, any device role may link, a relay must be a `node`
+device, and enrollment links are on when the namespace has a CA. `ndn-fwd
+init -c <config>` writes it from `[ca] link_roles` / `relay_roles` /
+`enrollment_links` (else the default), and `ndn-fwd schema update -c
+<config>` changes it — a narrowing only with `--accept-narrowing` (see
+[Context updates](context-updates.md)). A revocation, once this device adopts it, closes every live link
+whose certificate or issuer it revokes. Renewal keeps the key, so links
+survive renewals. When both devices dial each other, both keep the link
+dialled by the device with the smaller fingerprint; otherwise a newer link
+to the same device replaces the older one.
+
+**Enrollment links.** A device not enrolled yet can enroll over QUIC. A
+relay — this device holds a certificate of a role the namespace's link
+policy lets relay — admits a device whose key it does not know on an
+enrollment link when that policy allows them and the trust context names a
+CA endpoint. The device, holding no certificate in the namespace of the
+relay its `[[peer]]` names, cannot confirm the relay yet and links to it on
+the same terms. An enrollment link carries only Interests whose names are
+under a CA endpoint of the namespace, under `/<ns>/32=trust-context`, or
+name a certificate or key in it (a `KEY` component), and the Data and Nacks
+answering them: the relay takes such Interests and sends their answers, the
+device the other way round; nothing else crosses in either direction.
+The face drops what the scope does not carry — judging each NDNLPv2 frame
+by its packet's name, a fragment by its first fragment's — and answers a
+dropped Interest with a Nack (NoRoute). On the relay no route points over
+the link (answers return the way their Interests came); the device routes
+`/<ns>` over it. Per relay: at most 32 enrollment links, 4 from one source
+address, 32 Interests at once refilled at 4 per second on each, and a link
+that carried nothing for 120 s (twice the longest a CA holds a STATUS
+request) is closed with code `0x02`; the device dials again. A key revoked
+by the held version gets no enrollment link (`0x12`). When the device
+switches to its enrolled key, it closes its enrollment links for that
+namespace (code `0x03`) and dials again, now presenting the certificate.
+
+| Close code | Reason |
+|---|---|
+| `0x00` | The device is shutting down; it links again when it is back. |
+| `0x01` | A newer link to the same device took this one's place. |
+| `0x02` | An enrollment link carried nothing for its idle lifetime (120 s). |
+| `0x03` | The device enrolled; it links again as an enrolled device. |
+| `0x10` | The key has no valid certificate in a namespace this device holds, no `[[peer]]` expects it, and this device admits no enrollment link (the sentence says why). |
+| `0x11` | The certificate sent is for another key than the one the handshake proved. |
+| `0x12` | The key, or a certificate on its chain, is revoked. |
+| `0x13` | The namespace's link policy does not let the peer's role link (or relay) here. |
+| `0x14` | A valid device, but not the one a `[[peer]]` expects there. |
+| `0x15` | Malformed link messages. |
+| `0x16` | Too many link attempts at once from that address, or in total; or too many enrollment links. |
+| `0x17` | The device has no usable link key. |
+
+**Datagrams and fragmentation.** NDN packets ride QUIC DATAGRAM frames, one
+NDNLPv2 frame per datagram. The face's `LpLinkService` fragments packets
+larger than the connection's current maximum datagram size, which grows with
+path MTU discovery from the QUIC minimum (~1200-byte packets). No data
+travels on streams, so a lost packet holds up nothing behind it. `[[peer]]
+reliability = true` turns on NDNLPv2 reliability for that link. The face
+has kind `quic`, remote URI `quic4://ip:port` or `quic6://…`, persistency
+persistent, and is removed when the link ends.
+
+**Keep-alive and idle.** Keep-alive every 10 s, idle timeout 30 s — sized
+for NAT bindings. A link keeps going across an address change (connection
+migration). After a crash and restart, a peer's next packet gets a QUIC
+stateless reset (its key is derived from the device key), so the peer
+redials at once instead of waiting out the idle timeout.
+
+**Rate limits.** An unauthenticated attempt costs one handshake, so
+attempts are bounded: at most 64 not yet admitted at once (handshake, hello
+and verdict), 4 per source address, and a source refused 8 times is refused
+outright for 60 s. Once half of those 64 are in use, a source whose address
+is not yet validated gets a QUIC Retry first. Attempts over these limits are
+refused before the handshake (QUIC `CONNECTION_REFUSED`; the dialer reports
+code `0x16`). The hello and the verdict each have 10 s.
+
+**Config.** One link socket per daemon, and one `[[peer]]` per device to
+link with (full field list in the [config reference](../operations/config-reference.md#peer--quic-links)):
+
+```toml
+[[face]]
+kind = "quic"
+bind = "0.0.0.0:6367"        # "[::]:6367" for both families
+# listen = false             # dial only, from bind (e.g. "192.0.2.7:0")
+
+[[peer]]
+device = "/home/node/relay"  # or key = "<64 hex>" (expected fingerprint)
+endpoint = "relay.example.net:6367"
+```
+
+Routes come with the link: a relay (a `node` device this one has a
+`[[peer]]` for) gets its namespace prefix `/<ns>`, any other device its
+device name, and a peer reached through a relay (`relay = …`) is routed over
+the relay's link at cost 10 (a direct link costs 0). A `[[route]]` cannot
+name the QUIC link socket; set `[[peer]] routes` instead. Dialing uses the
+link socket when the address family matches, so the other side sees one
+address for this device — the one `bind` names. A device that only dials
+picks its source address with `listen = false` (no links accepted; port `0`
+lets the system pick the port); without a quic `[[face]]` it dials from an
+address and port the system picks. On SIGTERM every link is closed with
+code `0x00` and persistent peers redial. `ndn-ctl face create quic://…` is
+refused with the `[[peer]]` config to write instead.
+
+Not done yet: hole punching and endpoint discovery. Two devices behind NATs
+link **relay-first** — each links to a relay, which forwards between the two
+links. A link is the pair of keys, not an address, so a later direct path
+needs no change of identity.
 
 ## Bluetooth LE
 
@@ -253,5 +398,6 @@ own faces.
 - [Implementing a face](../guides/implementing-a-face.md) — author
   guide.
 - [Config reference](../operations/config-reference.md) — every
-  `[[face]]` listener key.
+  `[[face]]` listener key and `[[peer]]`.
+- [Linking devices](./links.md) — linking devices over QUIC, step by step.
 - `crates/core/ndn-transport/` — the trait surface.

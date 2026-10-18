@@ -355,13 +355,7 @@ impl PacketDispatcher {
     /// which forwards it or Nacks and releases it in turn.
     fn release_nacked_interest(&self, ctx: &PacketContext) {
         let Some(token) = ctx.pit_token else { return };
-        let release = self.strategy.pit.with_entry_mut(&token, |e| {
-            e.in_records.retain(|r| r.face_id != ctx.face_id.0);
-            e.in_records.is_empty()
-        });
-        if release == Some(true) {
-            self.strategy.pit.remove(&token);
-        }
+        self.strategy.pit.release_in_record(&token, ctx.face_id.0);
     }
 
     async fn nack_pipeline(&self, ctx: PacketContext) {

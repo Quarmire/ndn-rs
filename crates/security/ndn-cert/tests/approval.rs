@@ -25,7 +25,7 @@ use ndn_cert::{
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{Ed25519Signer, FilePib, Keyring, SecurityManager, Signer};
+use ndn_security::{Ed25519Signer, FilePib, Keyring, LinkPolicy, SecurityManager, Signer};
 use ndn_cert::{
     ApprovalPolicy, BumpError, RootStore, bump_context_schema, namespace_schema,
     open_context_update, read_stored_context,
@@ -919,7 +919,7 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
 
     // The namespace as an earlier `ndn-fwd init` left it.
     let (old_schema, old_hint) = old_generated_schema();
-    let old = bump_context_schema(root.as_ref(), &v1, &old_schema, &old_hint, true)
+    let old = bump_context_schema(root.as_ref(), &v1, &old_schema, &old_hint, None, true)
         .await
         .unwrap()
         .unwrap();
@@ -938,7 +938,7 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
 
     let current = namespace_schema(&ns()).unwrap().blobs();
     let hint = ApprovalPolicy::default().to_hint();
-    let update = bump_context_schema(root.as_ref(), &old.bump.data, &current, &hint, false)
+    let update = bump_context_schema(root.as_ref(), &old.bump.data, &current, &hint, None, false)
         .await
         .unwrap()
         .expect("the old schema lacks rules");
@@ -959,9 +959,12 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
     assert!(matches!(denied.state, ApprovalState::Denied { .. }), "{denied:?}");
     assert!(produces(&rd, &phone, &member).await);
 
-    let again = bump_context_schema(root.as_ref(), &update.bump.data, &current, &hint, false).await;
+    let again =
+        bump_context_schema(root.as_ref(), &update.bump.data, &current, &hint, None, false).await;
     assert!(matches!(again, Ok(None)), "nothing to sign: {again:?}");
-    match bump_context_schema(root.as_ref(), &update.bump.data, &old_schema, &hint, false).await {
+    match bump_context_schema(root.as_ref(), &update.bump.data, &old_schema, &hint, None, false)
+        .await
+    {
         Err(BumpError::Narrowing { removed, .. }) => {
             assert_eq!(removed.len(), 2, "{removed:?}");
             assert!(removed.iter().any(|r| r.contains("ndncert-deny")));
@@ -969,4 +972,146 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
         }
         other => panic!("a narrowing needs consent: {other:?}"),
     }
+}
+
+/// A schema update carries the held link policy unchanged unless `[ca]`
+/// states another; a widening applies as is, a narrowing only with consent.
+#[tokio::test]
+async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
+    let rd = RootDevice::new().await;
+    let root = RootStore::open(&FilePib::open(rd.dir.path()).unwrap())
+        .unwrap()
+        .expect("the root device")
+        .signer(None)
+        .await
+        .unwrap();
+    let (_, v1) = read_stored_context(rd.dir.path(), &ns()).unwrap().unwrap();
+    let schema = namespace_schema(&ns()).unwrap().blobs();
+    let hint = ApprovalPolicy::default().to_hint();
+    let held = LinkPolicy {
+        roles: vec!["admin".into(), "node".into()],
+        relay_roles: vec!["node".into()],
+        enrollment_links: true,
+    };
+    let v2 = bump_context_schema(root.as_ref(), &v1, &schema, &hint, Some(&held), true)
+        .await
+        .unwrap()
+        .expect("another link policy");
+    assert_eq!(v2.bump.context.stated_link_policy(), Some(&held));
+
+    // No [ca] link keys: the held policy is carried, field for field.
+    let other_hint = ApprovalPolicy {
+        invite_also: true,
+        ..ApprovalPolicy::default()
+    }
+    .to_hint();
+    let v3 = bump_context_schema(root.as_ref(), &v2.bump.data, &schema, &other_hint, None, false)
+        .await
+        .unwrap()
+        .expect("another hint");
+    assert!(!v3.change.changes_link());
+    assert_eq!(v3.bump.context.stated_link_policy(), Some(&held));
+
+    // Widening: a role added, a relay role added.
+    let wider = LinkPolicy {
+        roles: vec!["admin".into(), "node".into(), "member".into()],
+        relay_roles: vec!["node".into(), "admin".into()],
+        enrollment_links: true,
+    };
+    let v4 = bump_context_schema(root.as_ref(), &v3.bump.data, &schema, &other_hint, Some(&wider), false)
+        .await
+        .unwrap()
+        .expect("a wider link policy");
+    assert!(v4.change.link_narrowed.is_empty());
+    assert_eq!(v4.bump.context.stated_link_policy(), Some(&wider));
+
+    // Each narrowing is refused without consent and applies with it.
+    for narrower in [
+        LinkPolicy { roles: vec!["admin".into(), "node".into()], ..wider.clone() },
+        LinkPolicy { relay_roles: vec!["node".into()], ..wider.clone() },
+        LinkPolicy { enrollment_links: false, ..wider.clone() },
+    ] {
+        let refused = bump_context_schema(
+            root.as_ref(),
+            &v4.bump.data,
+            &schema,
+            &other_hint,
+            Some(&narrower),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(BumpError::LinkNarrowing { narrowed, .. }) if narrowed.len() == 1),
+            "{refused:?}"
+        );
+        let applied =
+            bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&narrower), true)
+                .await
+                .unwrap()
+                .expect("consented narrowing");
+        assert_eq!(applied.bump.context.stated_link_policy(), Some(&narrower));
+    }
+}
+
+/// Nothing an unsigned NEW/CHALLENGE answer says ends a request: a denial
+/// in it keeps the approved key until a CA-signed STATUS says denied.
+#[test]
+fn unauthenticated_denial_keeps_key() {
+    for e in [
+        ApprovalEnrollError::Denied("denied by someone".into()),
+        ApprovalEnrollError::Expired("gone".into()),
+        ApprovalEnrollError::CaRefused("unreadable answer".into()),
+        ApprovalEnrollError::NameRefused("taken".into()),
+    ] {
+        assert!(!e.is_final(), "{e}");
+    }
+    assert!(ApprovalEnrollError::Signing("no key".into()).is_final());
+}
+
+/// An issued certificate failing its checks (e.g. a stale trust context)
+/// leaves the approval standing: retry, and say how.
+#[test]
+fn stale_issued_cert_is_retryable() {
+    let e = ApprovalEnrollError::IssuedCertificate("does not chain to the root".into());
+    assert!(!e.is_final());
+    assert!(e.to_string().contains("refresh"), "{e}");
+}
+
+/// A pending request past its expiry plus the grace ends locally: its
+/// sealed key is deleted, it is no longer outstanding, a new one may go out.
+#[test]
+fn expired_outgoing_request_ends_locally() {
+    use ndn_cert::approval::{OUTGOING_EXPIRY_GRACE, OutgoingRequest, OutgoingState, RequestStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = RequestStore::open(dir.path().join("requests")).unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let request = |device: &str, expires_secs| OutgoingRequest {
+        namespace: "/home/bob".into(),
+        ca_prefix: "/home/bob".into(),
+        identity: format!("/home/bob/device/{device}"),
+        key_name: format!("/home/bob/device/{device}/KEY/1"),
+        request_id: device.into(),
+        code: "0000".into(),
+        created_secs: 1,
+        expires_secs,
+        state: OutgoingState::Pending,
+    };
+    let stale = request("old", now - OUTGOING_EXPIRY_GRACE.as_secs() - 10);
+    let live = request("new", now + 3600);
+    for r in [&stale, &live] {
+        store.save(r).unwrap();
+        store.save_sealed_key(&r.key_name, b"sealed").unwrap();
+    }
+    assert_eq!(store.outstanding(&stale.identity).unwrap(), None);
+    let ended = store.expire_overdue().unwrap();
+    assert_eq!(ended.len(), 1);
+    match &ended[0].state {
+        OutgoingState::Expired { reason } => {
+            assert!(reason.contains("never answered") && reason.contains("ask again"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(store.sealed_key(&stale.key_name).unwrap(), None);
+    assert!(store.sealed_key(&live.key_name).unwrap().is_some());
+    assert_eq!(store.outstanding(&live.identity).unwrap(), Some(live));
 }

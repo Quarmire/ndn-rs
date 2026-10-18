@@ -399,3 +399,59 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
     );
     assert_eq!(ndn_cert::key_name_of(&n("/home/bob/admin/desk")), None);
 }
+
+/// An upstream whose newest version this node's forwarder refuses for
+/// `reason` (as `ndn-fwd` reports it: [`CertError::Refused`]).
+struct RefusingVersion {
+    upstream: Upstream,
+    versioned: Name,
+    reason: ndn_packet::Refusal,
+}
+
+impl CaExchange for RefusingVersion {
+    async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
+        let name = (*Interest::decode(interest.clone()).unwrap().name).clone();
+        if name == self.versioned {
+            return Err(CertError::Refused {
+                name: name.to_string(),
+                reason: self.reason,
+            });
+        }
+        self.upstream.express(interest).await
+    }
+}
+
+/// A version refused for now (`unverifiable`: its signer's certificate
+/// could not be fetched yet) is a fetch to try again, not a refusal of the
+/// update; a final refusal is one.
+#[tokio::test]
+async fn a_version_refused_for_now_is_fetched_again_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pib, root) = root_device(dir.path());
+    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+        .await
+        .unwrap()
+        .expect("a new version");
+    let (relay, _) = node_holding(&root);
+    for reason in [ndn_packet::Refusal::Unverifiable, ndn_packet::Refusal::Revoked] {
+        let mut upstream = RefusingVersion {
+            upstream: Upstream::serving(&v2.data),
+            versioned: (*v2.data.name).clone(),
+            reason,
+        };
+        let res = refresh_context(&relay, None, &mut upstream, &n("/home/bob")).await;
+        match (reason.is_final(), res) {
+            (false, Err(RefreshError::Fetch { held: 1, .. })) => {}
+            (
+                true,
+                Err(RefreshError::Refused {
+                    refusal: UpdateRefusal::DroppedByForwarder(_),
+                    held: 1,
+                    ..
+                }),
+            ) => {}
+            (_, other) => panic!("{reason}: {other:?}"),
+        }
+    }
+    assert_eq!(relay.version_of(&n("/home/bob")), Some(1));
+}

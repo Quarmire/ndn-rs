@@ -16,6 +16,11 @@ pub struct ForwarderConfig {
     #[serde(default, rename = "route")]
     pub routes: Vec<RouteConfig>,
 
+    /// Devices this one links to over QUIC, or lets link in, identified by
+    /// their key (`[[peer]]`). See [`PeerConfig`].
+    #[serde(default, rename = "peer")]
+    pub peers: Vec<PeerConfig>,
+
     /// Boot-time strategy choices. Strategy selection is otherwise only
     /// reachable over the management socket, so a forwarder restart silently
     /// reverts every prefix to the default strategy while `[[route]]` entries
@@ -241,6 +246,28 @@ pub struct CaTomlConfig {
     /// Unset: what the context says (default `false`).
     #[serde(default)]
     pub approval_requires_invite: Option<bool>,
+    /// Roles whose devices may link to the namespace's devices (`[[peer]]`
+    /// QUIC links). Policy in data: `ndn-fwd init -c <config>` writes the
+    /// link policy into the namespace's trust context and `ndn-fwd schema
+    /// update -c <config>` changes it (a narrowing only with
+    /// `--accept-narrowing`); a namespace CA refuses to start when this key
+    /// disagrees with the context. Empty list: every role. Unset: what the
+    /// context says (default: every role).
+    #[serde(default)]
+    pub link_roles: Option<Vec<String>>,
+    /// Roles a device may use as a relay (a link other devices are reached
+    /// through); each must be one of `link_roles` when that is not empty.
+    /// Written and checked like `link_roles`. Unset: what the context says
+    /// (default `["node"]`).
+    #[serde(default)]
+    pub relay_roles: Option<Vec<String>>,
+    /// Whether a relay of the namespace admits an unknown device on an
+    /// enrollment link that carries only its enrollment (the CA endpoints
+    /// and the trust context). Written and checked like `link_roles`.
+    /// Unset: what the context says (default on when the namespace has a
+    /// CA).
+    #[serde(default)]
+    pub enrollment_links: Option<bool>,
     /// How long a request for an admin's approval waits for a decision, in
     /// days, before it expires (the device is then told to ask again); a
     /// decision is kept as long for a device that was offline to learn it.
@@ -501,39 +528,23 @@ impl Default for CaTomlConfig {
             renewable_roles: Self::default_renewable_roles(),
             approval_roles: None,
             approval_requires_invite: None,
+            link_roles: None,
+            relay_roles: None,
+            enrollment_links: None,
             approval_request_ttl_days: Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS,
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenersConfig {
     #[serde(default)]
     pub webtransport: Option<WebTransportListenerConfig>,
     #[serde(default)]
-    pub quic: Option<QuicListenerConfig>,
-    #[serde(default)]
     pub webrtc: Option<WebRtcListenerConfig>,
     #[serde(default)]
     pub ble: Option<BleListenerConfig>,
-}
-
-/// Raw-QUIC backbone listener (forwarder-to-forwarder).
-///
-/// Shares the [`CertSourceConfig`] cert-provisioning shape with the
-/// WebTransport listener, so a QUIC backbone can equally serve a self-signed
-/// (pin the logged leaf SHA-256), PEM, or ACME-provisioned certificate.
-/// Defaults to a long-lived self-signed cert for `localhost`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct QuicListenerConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Bind address, e.g. `0.0.0.0:6367`.
-    pub listen: String,
-    /// TLS certificate source. Defaults to a self-signed cert for `localhost`
-    /// (dialers pin the leaf SHA-256 logged at startup).
-    #[serde(default)]
-    pub cert_source: CertSourceConfig,
 }
 
 /// BLE GATT-server (peripheral) listener. When enabled, the forwarder binds
@@ -600,7 +611,7 @@ pub struct WebTransportListenerConfig {
 }
 
 /// TLS certificate source for a cert-bearing face listener (WebTransport,
-/// WS-TLS, raw QUIC).
+/// WS-TLS). QUIC links need none: their TLS identity is the device's NDN key.
 ///
 /// Structurally mirrors `ndn_acme::CertSource` — the forwarder round-trips this
 /// into it — so `ndn-config` stays decoupled from the ACME/QUIC stack and keeps
@@ -991,7 +1002,39 @@ impl ForwarderConfig {
                     "route prefix must not be empty".into(),
                 ));
             }
+            if let Some(FaceConfig::Quic { .. }) = self.faces.get(route.face) {
+                return Err(ConfigError::Invalid(format!(
+                    "[[route]] {} names [[face]] #{} (kind \"quic\"), which is this device's \
+                     link socket rather than a link: put routes over a link in its [[peer]] routes",
+                    route.prefix, route.face
+                )));
+            }
         }
+
+        let quic_sockets: Vec<bool> = self
+            .faces
+            .iter()
+            .filter_map(|f| match f {
+                FaceConfig::Quic { listen, .. } => Some(*listen),
+                _ => None,
+            })
+            .collect();
+        if quic_sockets.len() > 1 {
+            return Err(ConfigError::Invalid(format!(
+                "{} [[face]] entries of kind \"quic\": a device has one link socket, which \
+                 listens and dials (bind \"[::]:6367\" to take both IPv4 and IPv6)",
+                quic_sockets.len()
+            )));
+        }
+        if quic_sockets == [false] && !self.peers.iter().any(|p| !p.endpoint.is_empty()) {
+            return Err(ConfigError::Invalid(
+                "[[face]] kind = \"quic\" with listen = false only dials, and no [[peer]] has an \
+                 endpoint to dial: give a [[peer]] an endpoint, or set listen = true to accept \
+                 links"
+                    .into(),
+            ));
+        }
+        validate_peers(&self.peers)?;
 
         if self.engine.cs_capacity_mb > 65536 {
             return Err(ConfigError::Invalid(format!(
@@ -1130,36 +1173,13 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 (None, true) => {}
             }
         }
-        FaceConfig::Quic {
-            remote,
-            cert_sha256,
-            webpki,
-        } => {
-            if !remote.starts_with("quic://") {
-                return Err(ConfigError::Invalid(format!(
-                    "QUIC remote must start with quic://: {remote}"
-                )));
-            }
-            match (cert_sha256.as_deref(), webpki) {
-                (Some(_), true) => {
-                    return Err(ConfigError::Invalid(
-                        "QUIC face: set either cert_sha256 or webpki, not both".into(),
-                    ));
-                }
-                (None, false) => {
-                    return Err(ConfigError::Invalid(
-                        "QUIC face requires cert_sha256 (self-signed peer) or webpki = true".into(),
-                    ));
-                }
-                (Some(hex), false) => {
-                    if parse_cert_sha256_hex(hex).is_none() {
-                        return Err(ConfigError::Invalid(format!(
-                            "QUIC cert_sha256 must be 64 hex chars (32 bytes): {hex}"
-                        )));
-                    }
-                }
-                (None, true) => {}
-            }
+        FaceConfig::Quic { bind, .. } => {
+            bind.parse::<std::net::SocketAddr>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "[[face]] kind = \"quic\": bind must be an address and port such as \
+                     \"0.0.0.0:6367\", not {bind:?}"
+                ))
+            })?;
         }
         FaceConfig::Ether {
             interface,
@@ -1400,19 +1420,20 @@ pub enum FaceConfig {
         #[serde(default)]
         webpki: bool,
     },
-    /// Outbound raw-QUIC dial (forwarder-to-forwarder backbone link; TLS 1.3,
-    /// connection migration). The inbound side is `[listeners.quic]`.
+    /// This device's QUIC link socket: it listens for links from other
+    /// devices, and `[[peer]]` links are dialled from it, so the other
+    /// device sees this one at `bind`. Who may link is decided by the
+    /// devices' keys, not by this entry: see [`PeerConfig`].
     Quic {
-        /// Peer to dial as `quic://host:port`.
-        remote: String,
-        /// Pin the peer's leaf cert by SHA-256 (hex) — for self-signed peers.
-        /// Mutually exclusive with `webpki`.
-        #[serde(default)]
-        cert_sha256: Option<String>,
-        /// Validate the peer's chain against the bundled WebPKI roots (a
-        /// publicly-trusted / ACME cert). Mutually exclusive with `cert_sha256`.
-        #[serde(default)]
-        webpki: bool,
+        /// Address and UDP port, e.g. `0.0.0.0:6367`. A dial-only device
+        /// (`listen = false`) picks its source address here; port `0` lets
+        /// the system choose the port.
+        bind: String,
+        /// Accept links from other devices. `false`: the socket only dials
+        /// the `[[peer]]` endpoints, from `bind`. Without any quic
+        /// `[[face]]`, a device dials from an address the system picks.
+        #[serde(default = "default_true")]
+        listen: bool,
     },
     Serial {
         path: String,
@@ -1497,6 +1518,160 @@ pub struct RadioDeviceConfig {
 
 fn default_baud() -> u32 {
     115200
+}
+
+/// One `[[peer]]`: a device this one links to over QUIC, or lets link in,
+/// identified by its key — never by an address or a TLS certificate.
+///
+/// A peer is named by its device name (`device`, resolved to a key by the
+/// certificate it presents, valid in a namespace this device holds), by its
+/// expected fingerprint (`key`, for a device of another namespace or before
+/// adoption), or both. With an `endpoint` this device dials it; without one
+/// it is reached through `relay`, or it dials in.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    /// Expected fingerprint of the peer's key: 64 hex digits, the SHA-256
+    /// of its public key (what `ndn-fwd` prints as this device's link key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The peer's device name, `/<namespace>/<role>/<device>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Where to dial it: `host:port`, or a list of them tried in order.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub endpoint: Vec<String>,
+    /// Reach this peer through the link to another `[[peer]]` (its `device`
+    /// or `key`): the relay forwards between the two links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Prefixes routed to this peer. Unset: the peer's namespace when it is a
+    /// relay (a `node` device), else its device name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<String>>,
+    /// Keep the link up: dial again, with backoff, whenever it drops.
+    #[serde(default = "default_true")]
+    pub persistent: bool,
+    /// NDNLPv2 reliability (retransmission of lost frames) on this link.
+    #[serde(default)]
+    pub reliability: bool,
+}
+
+impl PeerConfig {
+    /// How the config refers to this peer in messages and in `relay`.
+    pub fn label(&self) -> String {
+        self.device
+            .clone()
+            .or_else(|| self.key.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `reference` (a `relay` value) names this peer.
+    pub fn is_named(&self, reference: &str) -> bool {
+        self.device.as_deref() == Some(reference)
+            || self
+                .key
+                .as_deref()
+                .is_some_and(|k| k.eq_ignore_ascii_case(reference))
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+fn validate_peers(peers: &[PeerConfig]) -> Result<(), ConfigError> {
+    let invalid = |peer: &PeerConfig, why: String| {
+        ConfigError::Invalid(format!("[[peer]] {}: {why}", peer.label()))
+    };
+    for (i, peer) in peers.iter().enumerate() {
+        if peer.key.is_none() && peer.device.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "[[peer]] #{}: name the device (device = \"/<namespace>/<role>/<device>\") or its \
+                 expected fingerprint (key = \"<64 hex digits>\")",
+                i + 1
+            )));
+        }
+        if let Some(key) = &peer.key
+            && (key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(invalid(
+                peer,
+                format!("key must be the 64 hex digits of the device's fingerprint, not {key:?}"),
+            ));
+        }
+        if let Some(device) = &peer.device {
+            let parsed = device.parse::<ndn_packet::Name>().ok();
+            if !device.starts_with('/') || parsed.is_none_or(|n| n.len() < 3) {
+                return Err(invalid(
+                    peer,
+                    format!("device must be a device name /<namespace>/<role>/<device>, not {device:?}"),
+                ));
+            }
+        }
+        for endpoint in &peer.endpoint {
+            let port = endpoint.rsplit_once(':').map(|(_, p)| p.parse::<u16>());
+            if !matches!(port, Some(Ok(p)) if p != 0) {
+                return Err(invalid(
+                    peer,
+                    format!("endpoint must be host:port, such as \"relay.example.net:6367\", not {endpoint:?}"),
+                ));
+            }
+        }
+        for route in peer.routes.iter().flatten() {
+            if route.parse::<ndn_packet::Name>().is_err() || !route.starts_with('/') {
+                return Err(invalid(peer, format!("route {route:?} is not an NDN name")));
+            }
+        }
+        if let Some(relay) = &peer.relay {
+            match peers.iter().find(|p| !std::ptr::eq(*p, peer) && p.is_named(relay)) {
+                Some(r) if r.endpoint.is_empty() => {
+                    return Err(invalid(
+                        peer,
+                        format!("relay {relay:?} has no endpoint, so this device cannot reach it"),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(invalid(
+                        peer,
+                        format!("relay {relay:?} is not the device or key of another [[peer]]"),
+                    ));
+                }
+            }
+        }
+        if let Some(other) = peers[..i].iter().find(|p| {
+            (p.device.is_some() && p.device == peer.device)
+                || (p.key.is_some()
+                    && peer.key.as_deref().is_some_and(|k| p.is_named(k)))
+        }) {
+            return Err(invalid(
+                peer,
+                format!("names the same device as [[peer]] {}; merge the two", other.label()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Automatic multicast face creation and OS interface hotplug.
@@ -2421,11 +2596,11 @@ channel = 161
     #[test]
     fn self_signed_cache_dir_parses_and_round_trips() {
         let cfg = ForwarderConfig::from_str(
-            "[listeners.quic]\nenabled = true\nlisten = \"0.0.0.0:6367\"\n\
+            "[listeners.webtransport]\nenabled = true\nlisten = \"0.0.0.0:6367\"\n\
              cert_source = { type = \"self_signed_dev\", cache_dir = \"/var/lib/ndn-fwd/tls\" }\n",
         )
         .unwrap();
-        let src = cfg.listeners.quic.unwrap().cert_source;
+        let src = cfg.listeners.webtransport.unwrap().cert_source;
         let CertSourceConfig::SelfSignedDev(s) = &src else {
             panic!("expected self_signed_dev, got {src:?}");
         };
@@ -2437,5 +2612,59 @@ channel = 161
         // Unset stays absent rather than `null`.
         let json = serde_json::to_value(CertSourceConfig::default()).unwrap();
         assert!(json.get("cache_dir").is_none());
+    }
+
+    #[test]
+    fn peers_parse_with_one_or_many_endpoints() {
+        let fp = "ab".repeat(32);
+        let cfg = ForwarderConfig::from_str(&format!(
+            "[[face]]\nkind = \"quic\"\nbind = \"0.0.0.0:6367\"\n\
+             [[peer]]\ndevice = \"/home/node/relay\"\nendpoint = \"relay.example.net:6367\"\n\
+             [[peer]]\nkey = \"{fp}\"\nendpoint = [\"10.0.0.1:6367\", \"[::1]:6367\"]\n\
+             persistent = false\n\
+             [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"/home/node/relay\"\n"
+        ))
+        .unwrap();
+        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: true } if bind == "0.0.0.0:6367"));
+        assert_eq!(cfg.peers[0].endpoint, vec!["relay.example.net:6367"]);
+        assert!(cfg.peers[0].persistent);
+        assert_eq!(cfg.peers[1].endpoint.len(), 2);
+        assert!(!cfg.peers[1].persistent);
+        assert!(cfg.peers[2].endpoint.is_empty());
+        assert_eq!(cfg.peers[2].relay.as_deref(), Some("/home/node/relay"));
+    }
+
+    #[test]
+    fn a_dial_only_socket_picks_the_source_address_and_needs_something_to_dial() {
+        let cfg = ForwarderConfig::from_str(
+            "[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n\
+             [[peer]]\ndevice = \"/home/node/relay\"\nendpoint = \"relay.example.net:6367\"\n",
+        )
+        .unwrap();
+        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false } if bind == "192.0.2.7:0"));
+        let err = ForwarderConfig::from_str("[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n")
+            .err()
+            .expect("a socket that neither listens nor dials is refused");
+        assert!(err.to_string().contains("no [[peer]] has an endpoint"), "{err}");
+    }
+
+    #[test]
+    fn a_peer_that_cannot_be_identified_or_reached_is_refused() {
+        for bad in [
+            "[[peer]]\nendpoint = \"h:1\"\n",
+            "[[peer]]\nkey = \"abc\"\n",
+            "[[peer]]\ndevice = \"/home\"\n",
+            "[[peer]]\ndevice = \"/home/node/r\"\nendpoint = \"nohost\"\n",
+            "[[peer]]\ndevice = \"/home/member/a\"\nrelay = \"/home/node/r\"\n",
+            "[[peer]]\ndevice = \"/home/node/r\"\n\
+             [[peer]]\ndevice = \"/home/member/a\"\nrelay = \"/home/node/r\"\n",
+            "[[peer]]\ndevice = \"/home/node/r\"\nendpoint = \"h:1\"\n\
+             [[peer]]\ndevice = \"/home/node/r\"\nendpoint = \"h:2\"\n",
+            "[[peer]]\ndevice = \"/home/node/r\"\ncert_sha256 = \"00\"\n",
+            "[listeners.quic]\nenabled = true\nlisten = \"0.0.0.0:6367\"\n",
+            "[[face]]\nkind = \"quic\"\nremote = \"quic://h:1\"\n",
+        ] {
+            assert!(ForwarderConfig::from_str(bad).is_err(), "accepted: {bad}");
+        }
     }
 }

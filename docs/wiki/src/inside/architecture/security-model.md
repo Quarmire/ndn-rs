@@ -195,11 +195,11 @@ data is required.
 
 ### Local refusal
 
-A Data the validation stage refuses with a **final verdict** is not
-forwarded. Instead every *local* downstream whose Interest it answered (an
-app, or the forwarder's own consumers: certificate fetches, trust-context
-refresh, sync) gets a Nack for its own Interest whose NackReason says why, so
-it learns at once instead of waiting out the Interest lifetime:
+A Data the validation stage refuses is not forwarded. Instead every *local*
+downstream whose Interest it answered (an app, or the forwarder's own
+consumers: certificate fetches, trust-context refresh, sync) gets a Nack for
+its own Interest whose NackReason says why, so it learns at once instead of
+waiting out the Interest lifetime:
 
 | Code | Token | Verdict |
 |---|---|---|
@@ -209,16 +209,21 @@ it learns at once instead of waiting out the Interest lifetime:
 | 173 | `schema` | the trust schema/context does not authorize the signer for the name |
 | 174 | `untrusted-root` | the chain ends at a self-signed certificate that is no trust anchor |
 | 175 | `context` | a trust context being adopted/updated failed the expectation |
-| 176 | `unverifiable` | the Data names no signing key (no KeyLocator), or its signing certificate is not to be had where it was fetched (see [Missing certificates](#missing-certificates)) |
+| 176 | `unverifiable` | the Data names no signing key (no KeyLocator), or every source asked for its signing certificate had none or served one this forwarder refused (see [Missing certificates](#missing-certificates)). **Refused for now**, not final |
 
 (`ndn_packet::Refusal`, `NackReason::Refused`; ndn-rs-private codes, beside
 `NotYet` = 160.) Rules:
 
-- **Final verdicts only.** Data parked waiting for a certificate, a
-  certificate fetch that times out, and "still no certificate" drops send
-  nothing: the certificate could still appear, so there is no verdict to
-  report. A fetch every source answered definitively is a verdict
-  (`unverifiable`, below).
+- **Verdicts only.** Data parked waiting for a certificate, a certificate
+  fetch that times out, and "still no certificate" drops send nothing: the
+  certificate could still appear, so there is no verdict to report. A fetch
+  every source answered definitively is a verdict (`unverifiable`, below).
+- **Final, or refused for now.** Every refusal but `unverifiable` is final
+  (`Refusal::is_final`): it is about what the Data is, and asking again gets
+  the same answer. `unverifiable` says the signing certificate was not to be
+  had *when the forwarder fetched it*; a route converging or a producer coming
+  back changes that, so it is retried after the fetcher's back-off.
+  `Refusal::next_step` is the one-line "what to do" for each.
 - **Local faces only** (`FaceScope::Local`). To the network a refused Data is
   a dropped one, as NDN specifies; a remote peer learns nothing it could probe
   with. A refusal *arriving* from a non-local upstream is an unverified claim
@@ -232,10 +237,14 @@ it learns at once instead of waiting out the Interest lifetime:
   face still fails fast. A separate LP header field would be a second place to
   look; delivering the Data with a "refused" flag would let an app that ignores
   the flag accept it.
-- **Consumers do not retry a refusal.** `ndn_app` maps it to
-  `AppError::Refused { reason }` (`AppError::from_nack`); `fetch_with_retry`,
-  object fetches and segment pipelines stop at once, the certificate fetcher
-  ends the fetch, and `ndn-peek` exits 3 with `refused: <token>`.
+- **Consumers do not retry a final refusal.** `ndn_app` maps a refusal to
+  `AppError::Refused { reason }` (`AppError::from_nack`), whose message says
+  whether it is final and what to do next. `fetch_with_retry` and object
+  fetches stop at once on a final one and retry `unverifiable` within their
+  attempts, like a timeout; segment pipelines stop on a final one and
+  retransmit an `unverifiable` segment within their no-progress budget
+  (ending with the refusal if it runs out). `ndn-peek` exits 3 with
+  `refused: <token>` and the next step on stderr.
 
 ### Missing certificates
 
@@ -259,14 +268,19 @@ remembers a failure for its timeout, so a stream of Data signed by an
 unreachable key costs one cert Interest per backoff window, not one per packet.
 
 A fetch whose every source answered that the certificate is not to be had
-there — a `NoRoute` Nack, or this host's forwarder refusing what answered —
+there — a `NoRoute` Nack, or a certificate this host's forwarder refused —
 leaves it **known absent** (`CertFetcher::known_absent`) for that backoff
 window: the routed fetch and, when it asked the delivering face directly,
 that face too (a direct fetch skipped because the routes already lead to
 that face defers to the routed answer). Data parked for it is then refused
-`unverifiable` at the next drain instead of dropped at its deadline. A
-source that did not answer in time, or answered a transient Nack
-(congestion, duplicate), keeps it unknown: the network may only be slow.
+`unverifiable` — refused for now — at the next drain instead of dropped at
+its deadline. A refusal of what one source served is a miss for that source
+only: the other source is still asked, so one bogus certificate on the path
+does not hide the genuine one the delivering face serves (a genuine refusal
+still reaches the parked Data at once, through the refused certificate the
+validator remembers for its key). A source that did not answer in time, or
+answered a transient Nack (congestion, duplicate), keeps it unknown: the
+network may only be slow.
 
 ## See also
 

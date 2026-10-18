@@ -284,8 +284,9 @@ async fn pending_data_is_refused_to_nobody() {
 }
 
 /// Data whose signer's certificate the fetch was told is not to be had
-/// where it was asked (a NoRoute Nack) can never be verified from there: a
-/// final `unverifiable` verdict, told to the local consumer at once.
+/// where it was asked (a NoRoute Nack) cannot be verified now: refused
+/// `unverifiable` (refused for now, not final), told to the local consumer
+/// at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_whose_certificate_is_absent_is_refused_unverifiable() {
     let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));

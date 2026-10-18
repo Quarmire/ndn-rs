@@ -79,11 +79,11 @@ path:
    Data is allowed to propagate. This is where the
    [security model](./security-model.md) becomes load-bearing: a router will
    not forward Data it cannot authenticate on a validating face. A Data
-   refused with a final verdict (revoked signer, bad signature, schema,
-   untrusted root, …) is not forwarded; each **local** downstream it would
-   have answered gets a Nack carrying the reason instead
-   ([local refusal](./security-model.md#local-refusal)), a non-local one gets
-   nothing.
+   refused with a verdict (revoked signer, bad signature, schema, untrusted
+   root, …, all final; or `unverifiable`, refused for now) is not forwarded;
+   each **local** downstream it would have answered gets a Nack carrying the
+   reason instead ([local refusal](./security-model.md#local-refusal)), a
+   non-local one gets nothing.
 3. **CS insert** — admissible Data is cached (admission policy decides what is
    worth caching; the default admits only Data with a non-zero freshness
    period, matching NFD).

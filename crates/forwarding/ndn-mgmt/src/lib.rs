@@ -371,8 +371,10 @@ pub trait BleMgmtBackend: Send + Sync {
 /// peer-credential gate), never over `/localhop`.
 #[async_trait::async_trait]
 pub trait ApprovalMgmtBackend: Send + Sync {
-    /// Every request this node can see.
-    async fn list(&self) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, TrustRefusal>;
+    /// Every request this node can see, plus a note for each namespace whose
+    /// requests could not be listed (its CA unreachable). Refuse only when
+    /// nothing at all could be listed.
+    async fn list(&self) -> Result<ndn_mgmt_wire::ApprovalListing, TrustRefusal>;
     /// Decide the pending request `target` names (its request id or its
     /// verification code). `operator` is the local operator the kernel
     /// attests (`uid 1000 (alice)`): the approver a CA host records.
@@ -427,8 +429,11 @@ pub fn approval_refusal(refusal: ndn_cert::ApprovalRefusal) -> TrustRefusal {
 
 #[async_trait::async_trait]
 impl ApprovalMgmtBackend for ndn_cert::ApprovalStore {
-    async fn list(&self) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, TrustRefusal> {
-        Ok(self.records().iter().map(approval_row).collect())
+    async fn list(&self) -> Result<ndn_mgmt_wire::ApprovalListing, TrustRefusal> {
+        Ok(ndn_mgmt_wire::ApprovalListing {
+            rows: self.records().iter().map(approval_row).collect(),
+            notes: Vec::new(),
+        })
     }
 
     async fn decide(
@@ -599,9 +604,10 @@ pub enum RefreshState {
     /// What answered serves an older version than held; nothing changed.
     UpstreamOlder,
     /// What answered named a version older than one this node knows exists
-    /// (announced over the namespace's sync group) but does not hold: a
-    /// cache may answer with the previous metadata for up to its
-    /// FreshnessPeriod after a new version, or the upstream has not
+    /// (its signed Data, served over the namespace's sync group, passed the
+    /// continuity rule; an announced sequence number alone never counts) but
+    /// does not hold: a cache may answer with the previous metadata for up
+    /// to its FreshnessPeriod after a new version, or the upstream has not
     /// refreshed yet. Nothing changed; refresh again.
     Behind,
     /// This node holds the namespace root key: it is where new versions

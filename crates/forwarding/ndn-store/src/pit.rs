@@ -679,6 +679,36 @@ impl Pit {
         out
     }
 
+    /// Drop `face_id`'s in-record from the entry at `token`, and the entry
+    /// itself if no in-record remains, under one shard lock. A separate
+    /// mutate-then-remove would race an Interest from another face that
+    /// aggregates into the entry in between: that in-record would be removed
+    /// with the entry and its Interest never answered. Returns the removed
+    /// entry (the observer is told), or `None` if the entry stays or is absent.
+    pub fn release_in_record(&self, token: &PitToken, face_id: u64) -> Option<PitEntry> {
+        let release = |e: &mut PitEntry| {
+            e.in_records.retain(|r| r.face_id != face_id);
+            e.in_records.is_empty()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let out = self
+            .entries
+            .remove_if_mut(token, |_, e| release(e))
+            .map(|(_, e)| e);
+        #[cfg(target_arch = "wasm32")]
+        let out = {
+            let mut entries = self.entries.lock().unwrap();
+            match entries.get_mut(token) {
+                Some(e) if release(e) => entries.remove(token),
+                _ => None,
+            }
+        };
+        if let Some(e) = out.as_ref() {
+            self.notify_remove(e);
+        }
+        out
+    }
+
     /// Drain expired PIT entries with their full entry state. Forwarders use
     /// this when erasure needs more than the in-record face IDs, such as
     /// populating the Dead Nonce List. [`Self::next_expiry`] becomes the
@@ -1116,6 +1146,39 @@ mod tests {
         .expect("entry2 should exist");
 
         assert!(pit.contains(&token3));
+    }
+
+    /// Releasing a Nacked downstream must not take another face's in-record
+    /// (aggregated after the Nack) down with the entry.
+    #[test]
+    fn release_keeps_entry_with_other_in_records() {
+        let mut pit = Pit::new();
+        let removed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Count(Arc<std::sync::atomic::AtomicUsize>);
+        impl PitObserver for Count {
+            fn on_pit_insert(&self, _: &Name) {}
+            fn on_pit_remove(&self, _: &Name) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        pit.set_observer(Arc::new(Count(Arc::clone(&removed))));
+        let token = PitToken(0xCD);
+        let mut entry = PitEntry::new(Arc::new(make_name(&["nacked"])), 0, 4000);
+        entry.add_in_record(1, 1, 999, None, Selector::default());
+        entry.add_in_record(2, 2, 999, None, Selector::default());
+        pit.insert(token, entry);
+
+        assert!(pit.release_in_record(&token, 1).is_none());
+        assert_eq!(removed.load(Ordering::SeqCst), 0);
+        let faces: Vec<u64> = pit
+            .with_entry(&token, |e| e.in_record_faces().collect())
+            .expect("entry with another in-record stays");
+        assert_eq!(faces, vec![2]);
+
+        // The last in-record goes: so does the entry, and the observer hears.
+        assert!(pit.release_in_record(&token, 2).is_some());
+        assert!(!pit.contains(&token));
+        assert_eq!(removed.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //! the kernel attests (`uid 1000 (alice)`) is handed to the backend, which
 //! records it as the approver of a decision made on the CA host.
 //!
-//! `list-approvals` answers a dataset of `PendingApproval` rows
-//! ([`ndn_mgmt_wire::PendingApproval`]); `approve` takes the request id or
+//! `list-approvals` answers a dataset of `PendingApproval` rows plus a note
+//! per namespace whose CA could not be asked
+//! ([`ndn_mgmt_wire::ApprovalListing`]); `approve` takes the request id or
 //! verification code in `Uri`, `deny` takes `<id or code>[:<reason>]`. Both
 //! answer a sentence saying what was recorded.
 
@@ -47,7 +48,7 @@ fn handle_ca(
             handler
                 .list()
                 .await
-                .map(|rows| PendingApproval::encode_all(&rows))
+                .map(|listing| listing.encode())
                 .map_err(|r| ControlResponse::error(r.status_code, r.reason))
         })),
         v if v == verb::APPROVE || v == verb::DENY => {
@@ -134,6 +135,7 @@ impl MgmtModule for CaModule {
 #[cfg(test)]
 mod ca_tests {
     use super::*;
+    use ndn_mgmt_wire::ApprovalListing;
     use parking_lot::Mutex;
 
     /// Records what reached the backend.
@@ -144,8 +146,8 @@ mod ca_tests {
 
     #[async_trait]
     impl ApprovalMgmtBackend for Recording {
-        async fn list(&self) -> Result<Vec<PendingApproval>, crate::TrustRefusal> {
-            Ok(Vec::new())
+        async fn list(&self) -> Result<ApprovalListing, crate::TrustRefusal> {
+            Ok(ApprovalListing::default())
         }
         async fn decide(
             &self,
