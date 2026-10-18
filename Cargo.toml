@@ -273,3 +273,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.cbc]
 opt-level = 3
+
+# Line tables keep backtraces and panics readable; full debug info made the
+# shared target directory grow by hundreds of GB across the workspaces.
+[profile.dev]
+debug = "line-tables-only"
