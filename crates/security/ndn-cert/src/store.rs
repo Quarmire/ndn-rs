@@ -1,17 +1,20 @@
 //! Durable CA state: the issued certificates a CA serves on cert-fetch, its
-//! revocation set and the one-time tokens already redeemed.
+//! revocation set, the one-time tokens already redeemed and the requests
+//! for an admin's approval.
 //! [`CaState::with_store`](crate::CaState::with_store) loads a [`CaSnapshot`]
 //! at construction and writes every new issuance / revocation through the
 //! [`CaStore`] before it takes effect, so a restarted CA keeps serving the
 //! certs it issued and keeps refusing the ones it revoked;
 //! [`TokenStore::with_store`](crate::TokenStore::with_store) does the same
-//! for token redemptions, so a redeemed invite stays spent across restarts.
+//! for token redemptions, so a redeemed invite stays spent across restarts,
+//! and [`ApprovalStore::with_store`](crate::approval::ApprovalStore::with_store)
+//! for approval records, so a pending request survives a restart.
 
 use std::path::{Path, PathBuf};
 
 use ndn_security::secure_fs;
 
-use crate::{ca::deserialize_cert, error::CertError};
+use crate::{approval::ApprovalRecord, ca::deserialize_cert, error::CertError};
 
 /// What a [`CaStore`] holds, as loaded at CA startup.
 #[derive(Debug, Default, Clone)]
@@ -46,6 +49,29 @@ pub trait CaStore: Send + Sync {
             "this CA store does not persist token redemptions".into(),
         ))
     }
+    /// The approval records (see
+    /// [`ApprovalStore::with_store`](crate::approval::ApprovalStore::with_store)).
+    /// The default refuses: a store that cannot persist them must not back
+    /// enrollment by approval, whose requests must survive a restart.
+    fn approval_records(&self) -> Result<Vec<ApprovalRecord>, CertError> {
+        Err(CertError::Storage(
+            "this CA store does not persist approval requests".into(),
+        ))
+    }
+    /// Durably record (create or replace) an approval record.
+    fn record_approval(&self, record: &ApprovalRecord) -> Result<(), CertError> {
+        let _ = record;
+        Err(CertError::Storage(
+            "this CA store does not persist approval requests".into(),
+        ))
+    }
+    /// Remove the approval record of `request_id` (expired).
+    fn remove_approval(&self, request_id: &str) -> Result<(), CertError> {
+        let _ = request_id;
+        Err(CertError::Storage(
+            "this CA store does not persist approval requests".into(),
+        ))
+    }
 }
 
 /// Directory-backed [`CaStore`]. Layout under `dir` (the forwarder uses
@@ -55,6 +81,7 @@ pub trait CaStore: Send + Sync {
 /// issued/<sha256(name-uri)>.data   signed certificate Data TLV
 /// revoked/<sha256(name-uri)>       revoked certificate name URI
 /// redeemed-tokens/<sha256(hash)>   hash of a redeemed one-time token
+/// approvals/<sha256(id)>.json      approval record (JSON)
 /// ```
 ///
 /// Entry file names hash the name (long names would overflow a file name). Each
@@ -75,7 +102,7 @@ impl FileCaStore {
     /// Open (creating if needed) a store rooted at `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, CertError> {
         let dir = dir.into();
-        for sub in ["issued", "revoked", REDEEMED_TOKENS_DIR] {
+        for sub in ["issued", "revoked", REDEEMED_TOKENS_DIR, APPROVALS_DIR] {
             secure_fs::create_private_dir_all(&dir.join(sub)).map_err(|e| io_err(&dir.join(sub), e))?;
         }
         secure_fs::repair_tree(&dir).map_err(|e| io_err(&dir, e))?;
@@ -163,9 +190,52 @@ impl CaStore for FileCaStore {
         let path = self.dir.join(REDEEMED_TOKENS_DIR).join(hex(token_hash));
         Self::write_atomic(&path, token_hash.as_bytes())
     }
+
+    fn approval_records(&self) -> Result<Vec<ApprovalRecord>, CertError> {
+        let dir = self.dir.join(APPROVALS_DIR);
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
+            let path = entry.map_err(|e| io_err(&dir, e))?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
+            match serde_json::from_slice::<ApprovalRecord>(&bytes) {
+                Ok(record) => records.push(record),
+                Err(e) => tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "CA store: skipping an approval record that does not decode"
+                ),
+            }
+        }
+        Ok(records)
+    }
+
+    fn record_approval(&self, record: &ApprovalRecord) -> Result<(), CertError> {
+        let path = self.approval_path(&record.request_id);
+        Self::write_atomic(&path, &serde_json::to_vec_pretty(record)?)
+    }
+
+    fn remove_approval(&self, request_id: &str) -> Result<(), CertError> {
+        let path = self.approval_path(request_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&path, e)),
+        }
+    }
+}
+
+impl FileCaStore {
+    fn approval_path(&self, request_id: &str) -> PathBuf {
+        self.dir
+            .join(APPROVALS_DIR)
+            .join(format!("{}.json", hex(request_id)))
+    }
 }
 
 const REDEEMED_TOKENS_DIR: &str = "redeemed-tokens";
+const APPROVALS_DIR: &str = "approvals";
 
 fn hex(s: &str) -> String {
     use sha2::Digest;

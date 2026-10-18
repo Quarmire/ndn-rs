@@ -2,8 +2,9 @@
 
 A namespace's trust context changes after nodes adopted it: a
 [revocation](./revocation.md) makes version `N+1`, so does adding or revoking
-a [recovery kit](./recovery.md), and so does a recovery (`ndn-fwd recover`,
-signed by a recovery key); later flows (CA delegation, root rotation) will too.
+a [recovery kit](./recovery.md), a [schema update](#schema-updates-ndn-fwd-schema-update)
+(`ndn-fwd schema update`), and a recovery (`ndn-fwd recover`, signed by a
+recovery key); later flows (CA delegation, root rotation) will too.
 Every node that holds the context must
 get the new version, and must never take a version the namespace root did not
 make. A node does this by **refreshing**: it asks for the newest version by
@@ -166,8 +167,9 @@ refreshing again shortly after gets the new version.
 
 ### Versions made on this device: `security/context-update`
 
-`ndn-fwd revoke` and `ndn-fwd recovery-kit create|revoke` (root device) and
-`ndn-fwd recover` (replacement device) sign the new version in the CLI — the
+`ndn-fwd revoke`, `ndn-fwd schema update` and `ndn-fwd recovery-kit
+create|revoke` (root device) and `ndn-fwd recover` (replacement device) sign
+the new version in the CLI — the
 root store, the kit, are opened there, and their passphrase or PIN never
 leaves the command — and hand it to the running daemon with
 `security/context-update` (the signed Data in `ControlParameters.ContextData`,
@@ -189,6 +191,57 @@ queued behind the first, answers what became of it. The CLI hands over only
 to the daemon that uses the PIB it read the held version from (its
 `security/identity-status` `pib_path`), so a version is never adopted by a
 daemon whose PIB stays behind.
+
+## Schema updates (`ndn-fwd schema update`)
+
+A revocation or a recovery kit carries the schema over verbatim: revoking a
+key must not change what the other devices may sign. So a namespace made by
+an earlier `ndn-fwd init` keeps the generated schema of that release (one
+made before enrollment by approval lacks the `#deny` and `#pending` rules)
+until its operator updates it on the root device:
+
+```text
+$ ndn-fwd schema update -c /etc/ndn-fwd/ndn-fwd.toml
+# ndn-fwd schema update
+namespace      = /home/bob
+trust_context  = v2 -> v3 (signed by the root /home/bob/KEY/…)
+rules_added    = 2
+  + #deny: /"home"/"bob"/_/_device/"KEY"/_/"ndncert-deny"/_ <= #admin
+  + #pending: /"home"/"bob"/"CA"/"PENDING"/_ <= #admin
+narrowed       = none (every rule of v2 is kept)
+enrollment     = admin, node by an admin's approval; member, guest by invite
+handed_over    = …
+```
+
+Version `N+1` (`ndn_cert::bump_context_schema`) carries the current
+generated schema of the namespace (`ndn_cert::namespace_schema`), is
+schema-authoritative, and carries the enrollment hint of the policy the
+namespace's CA enforces: the held version's own hint when it advertises a
+policy; for a context made before the hint named its approval roles, the
+policy the CA enforces for it — `[ca] approval_roles` /
+`approval_requires_invite` of `-c` (give the daemon's config), else the
+default. A held hint that `[ca]` contradicts is refused, as the CA's start
+refuses it. Anchors, CA endpoints, revocations and key roles are carried
+over verbatim. It is checked, signed, handed over and stored like a
+revocation (`--passphrase-file` / `--pin-file` unlock the root); with the
+schema and hint current, nothing is signed.
+
+**Never a silent narrowing.** The command compares every grant of the held
+schema — each LVS rule's data pattern with each of its signers, by pattern
+(rule names and node ids aside), and each native rule — with the new one
+(`ndn_cert::schema_change`). When one is missing, it refuses before the
+root is unlocked, listing the rules devices would lose; `--accept-narrowing`
+signs anyway and prints them as `rules_removed`. Regenerating the schema of
+a namespace made by an earlier `ndn-fwd init` only adds rules. It narrows
+when the held schema is not the generated one: a custom schema signed in
+with `ndn-trust-context`, or the key-name schema of the earliest releases
+(its rules read differently even where they grant the same).
+
+The namespace CA validates admins' decisions and pending listings under the
+version its daemon holds, so it applies the new rules as soon as the
+daemon adopts the update — no restart. Its enrollment policy does not
+change: the hint states the policy it enforces. Other nodes judge by the new
+version once they hold it (refresh, sync, or `ndn-fwd context refresh`).
 
 ## Push over the namespace's sync group
 
@@ -355,6 +408,7 @@ timeout, malformed metadata) and `no trust context is held for <ns>`.
 | Part | Where |
 |---|---|
 | Continuity check, refresh | `ndn_cert::{open_context_update, refresh_context, UpdateRefusal, RefreshError}` (`ndn-cert/src/context_update.rs`) |
+| Schema update | `ndn_cert::{bump_context_schema, schema_change, SchemaChange, SchemaBump, BumpError::Narrowing}`; CLI `ndn-fwd` `schema_cmd.rs` (`update`; test `a_schema_update_handed_over_lets_the_running_ca_take_remote_denials`); `ndn-cert/tests/approval.rs` `a_schema_update_gives_an_older_namespace_the_decision_rules` |
 | Catching up | `ndn_cert::{follow_versions, VersionSource, ContextStep, CatchUpStop, MAX_CATCH_UP_VERSIONS, MAX_CATCH_UP_TIME}`, `ContextUpdate::walked` |
 | Every version kept | `ndn_cert::{persist_context, read_stored_versions, context_version_path}` (`ndn-cert/src/context_store.rs`); served by `ndn-fwd` `context_publisher.rs` |
 | RDR fetch steps | `ndn_cert::{fetch_context_pointer, fetch_versioned_context}` |

@@ -47,6 +47,10 @@ pub enum ChallengeOutcome {
         next_state: ChallengeState,
     },
     Denied(String),
+    /// The challenge can no longer pass — what it waited on expired or is
+    /// gone — so the requester must start over. Sent with NDNCERT's
+    /// `RunOutOfTime` error code.
+    Expired(String),
 }
 
 pub trait ChallengeHandler: Send + Sync {
@@ -73,6 +77,19 @@ pub trait ChallengeHandler: Send + Sync {
     /// on a request it would refuse. Composite handlers answer for their subs.
     fn can_attest(&self, kind: &str) -> bool {
         self.challenge_type() == kind
+    }
+
+    /// ParameterKey / ParameterValue pairs the CA returns to the requester
+    /// with a [`ChallengeOutcome::Pending`] whose next state is `state` —
+    /// e.g. the request id and verification code of a `device-approval`
+    /// request, which the requester resumes in a later exchange. Default:
+    /// none.
+    fn pending_parameters(
+        &self,
+        state: &ChallengeState,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let _ = state;
+        serde_json::Map::new()
     }
 }
 

@@ -182,6 +182,9 @@ async fn threshold_round(
         ChallengeOutcome::Denied(r) => Ok(ChallengeOutcome::Denied(format!(
             "{label} sub-challenge {idx} denied: {r}"
         ))),
+        ChallengeOutcome::Expired(r) => Ok(ChallengeOutcome::Expired(format!(
+            "{label} sub-challenge {idx} expired: {r}"
+        ))),
         ChallengeOutcome::Pending {
             status_message,
             remaining_tries,
@@ -411,6 +414,9 @@ impl ChallengeHandler for AnyOf {
                 }
                 ChallengeOutcome::Denied(r) => Ok(ChallengeOutcome::Denied(format!(
                     "AnyOf sub-challenge {idx} denied: {r}"
+                ))),
+                ChallengeOutcome::Expired(r) => Ok(ChallengeOutcome::Expired(format!(
+                    "AnyOf sub-challenge {idx} expired: {r}"
                 ))),
                 ChallengeOutcome::Pending {
                     status_message,

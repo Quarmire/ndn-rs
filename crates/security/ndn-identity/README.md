@@ -14,7 +14,8 @@ renewal, and DID derivation.
 | `DeviceConfig` | Fleet provisioning configuration: namespace, CA prefix, factory credential, renewal policy |
 | `FactoryCredential` | Credential presented to the CA at first enrollment (token, voucher, etc.) |
 | `RenewalPolicy` | When to auto-renew: `WhenPercentRemaining(u8)`, `WhenExpiry(Duration)`, `Manual` |
-| `NdncertCa` / `NdncertCaBuilder` | Embedded NDNCERT CA for issuing certificates to devices; `serve_with_feed` adds the validator-checked device-approval `ApprovalFeed` |
+| `NdncertCa` / `NdncertCaBuilder` | Embedded NDNCERT CA for issuing certificates to devices; `NdncertCa::approvals(store, keyring)` adds the durable device-approval records and serves `/<prefix>/CA/APPROVAL` (admin-signed decisions) and `/<prefix>/CA/PENDING` (admin-signed listing) |
+| `approval` module | Engine-bound approval helpers: `poll_approval_via_engine` (requester polls its pending request), `fetch_pending_via_engine` (admin lists a remote CA's pending requests), `push_decision_via_engine` (admin pushes a signed approve/deny decision) |
 | `NdncertClient` / `ChallengeParams` | Consumer-backed NDNCERT client over the shared `ndn_cert::client::enroll` driver |
 | `IdentityError` | Error type covering storage, network, and crypto failures |
 

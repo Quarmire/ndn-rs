@@ -1,16 +1,18 @@
 //! [`NdncertCa`] wraps [`CaState`] with an
-//! `ndn-app::Producer` registered under `/<prefix>/CA/*`.
+//! `ndn-app::Producer` registered under `/<prefix>/CA/*`, plus — with
+//! [`NdncertCa::approvals`] — enrollment by an admin's approval
+//! (`/<prefix>/CA/APPROVAL`, `/<prefix>/CA/PENDING`; [`ndn_cert::approval`]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_cert::{
-    AcceptAllIssuance, CaConfig, CaState, CaStore, ChallengeHandler, HierarchicalPolicy,
-    IssuancePolicy, NamespacePolicy,
+    AcceptAllIssuance, ApprovalService, ApprovalStore, CaConfig, CaState, CaStore,
+    ChallengeHandler, HierarchicalPolicy, IssuancePolicy, NamespacePolicy,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{NackReason, Name, SignatureType};
-use ndn_security::{SecurityManager, Signer};
+use ndn_security::{Keyring, SecurityManager, Signer};
 use tracing::{debug, warn};
 
 use crate::{error::IdentityError, facade::Identity};
@@ -158,6 +160,7 @@ impl NdncertCaBuilder {
         Ok(NdncertCa {
             state: Arc::new(state),
             prefix,
+            approvals: None,
         })
     }
 }
@@ -165,6 +168,7 @@ impl NdncertCaBuilder {
 pub struct NdncertCa {
     state: Arc<CaState>,
     prefix: Name,
+    approvals: Option<ApprovalService>,
 }
 
 impl NdncertCa {
@@ -182,47 +186,43 @@ impl NdncertCa {
         Arc::clone(&self.state)
     }
 
-    /// Run the `/CA/*` service and a canonical (validator-checked)
-    /// [`ApprovalFeed`](crate::ApprovalFeed) concurrently, each until its
-    /// connection closes. Use this instead of [`serve`](Self::serve) when the
-    /// CA offers cross-process device-approval
-    /// ([`crate::device_approval_net`]).
-    ///
-    /// The feed's sink **must** be the same `PendingApprovalStore` the CA's
-    /// `DeviceApprovalChallenge` reads, so a networked approval flips the
-    /// request the CHALLENGE round is polling. `feed_producer` serves
-    /// `/<prefix>/CA/APPROVE-FEED` on its own face — a longer prefix than the
-    /// main `/<prefix>/CA`, so the forwarder routes feed Interests to it — and
-    /// `feed_side` is a separate consumer for the reverse pull.
-    pub async fn serve_with_feed<S>(
-        self,
-        ca_producer: ndn_app::Producer,
-        feed: crate::ApprovalFeed<S>,
-        feed_producer: ndn_app::Producer,
-        feed_side: ndn_app::Consumer,
-    ) -> Result<(), IdentityError>
-    where
-        S: crate::ApprovalSink + Clone + Send + Sync + 'static,
-    {
-        let (main_res, feed_res) =
-            tokio::join!(self.serve(ca_producer), feed.serve(feed_producer, feed_side));
-        main_res?;
-        feed_res?;
-        Ok(())
+    /// Serve enrollment by an admin's approval: decisions pushed to
+    /// `/<prefix>/CA/APPROVAL`, the pending list at `/<prefix>/CA/PENDING`
+    /// and each request's held status at `/<prefix>/CA/STATUS/<request id>`
+    /// act on `store` — the same store the CA's `device-approval` challenge
+    /// reads — and are validated under the trust contexts in `keyring` (the
+    /// node's own, holding the namespace's).
+    pub fn approvals(mut self, store: ApprovalStore, keyring: Arc<Keyring>) -> Self {
+        self.approvals = Some(ApprovalService::new(store, keyring, Arc::clone(&self.state)));
+        self
     }
 
-    /// Runs until the Producer is dropped or errors.
+    /// The approval service [`approvals`](Self::approvals) set up (shared
+    /// with the running CA): its host calls
+    /// [`ApprovalService::release_held`] when it stops, so devices waiting on
+    /// a held status ask the restarted CA instead of waiting out their
+    /// Interests.
+    pub fn approval_service(&self) -> Option<ApprovalService> {
+        self.approvals.clone()
+    }
+
+    /// Runs until the Producer is dropped or errors. A held status Interest
+    /// is answered from its own task, so holding it delays no other.
     pub async fn serve(self, producer: ndn_app::Producer) -> Result<(), IdentityError> {
         let state = self.state.clone();
         let ca_prefix = self.prefix.clone();
+        let approvals = self.approvals.clone();
 
         producer
             .serve(move |interest, responder| {
                 let state = state.clone();
                 let ca_prefix = ca_prefix.clone();
+                let approvals = approvals.clone();
                 async move {
                     let interest_name = (*interest.name).clone();
-                    let Some(reply) = handle_interest(&state, &ca_prefix, interest).await else {
+                    let Some(reply) =
+                        handle_interest(&state, &ca_prefix, approvals.as_ref(), interest).await
+                    else {
                         return;
                     };
                     let wire = match reply {
@@ -239,6 +239,35 @@ impl NdncertCa {
                         CaReply::Wire(wire) => wire,
                         CaReply::NoSuchData => {
                             responder.nack(NackReason::NoRoute).await.ok();
+                            return;
+                        }
+                        CaReply::Held {
+                            service,
+                            held,
+                            hold,
+                        } => {
+                            tokio::spawn(async move {
+                                let body = service.answer_status(&held, hold).await;
+                                let Some((signer, cert_name)) = state.response_signer() else {
+                                    warn!("NDNCERT: CA has no response signer; dropping a status answer");
+                                    return;
+                                };
+                                let wire = build_signed_response(
+                                    interest_name,
+                                    body,
+                                    signer.as_ref(),
+                                    &cert_name,
+                                )
+                                .await;
+                                responder.respond_bytes(wire).await.ok();
+                                // The slot is given back once the answer is
+                                // out (`release_held` waits for that).
+                                drop(held);
+                            });
+                            return;
+                        }
+                        CaReply::Busy => {
+                            responder.nack(NackReason::Congestion).await.ok();
                             return;
                         }
                     };
@@ -261,6 +290,16 @@ enum CaReply {
     /// `NoRoute`, so the requester moves on at once instead of waiting out
     /// the Interest lifetime.
     NoSuchData,
+    /// A request's status (`<prefix>/CA/STATUS/<request id>`), held until
+    /// the request changes or `hold` ends, then answered CA-signed.
+    Held {
+        service: ApprovalService,
+        held: ndn_cert::HeldStatus,
+        hold: Duration,
+    },
+    /// A status Interest beyond the CA's limits (per request, in all):
+    /// Nacked with `Congestion`, so the requester backs off and asks again.
+    Busy,
 }
 
 /// NDNCERT v0.3 §4.1: every CA→requester Data is signed with the CA's
@@ -288,6 +327,7 @@ async fn build_signed_response(
 async fn handle_interest(
     state: &CaState,
     ca_prefix: &Name,
+    approvals: Option<&ApprovalService>,
     interest: ndn_packet::Interest,
 ) -> Option<CaReply> {
     let name = &*interest.name;
@@ -354,6 +394,33 @@ async fn handle_interest(
         return Some(CaReply::Body(state.handle_revoke(&body).await));
     }
 
+    // Enrollment by approval: an admin device's signed decision, the
+    // pending list (answered only to an admin-signed Interest), and a
+    // request's held status.
+    if let Some(approvals) = approvals {
+        let endpoint = |e: &str| suffix.starts_with(&format!("/CA/{e}"));
+        if endpoint(ndn_cert::approval::APPROVAL_ENDPOINT) {
+            let body = interest.app_parameters().cloned().unwrap_or_default();
+            return Some(CaReply::Body(approvals.handle_decision(&body).await));
+        }
+        if endpoint(ndn_cert::approval::PENDING_ENDPOINT) {
+            return Some(CaReply::Body(approvals.handle_listing(&interest).await));
+        }
+        if let Some(request_id) = ndn_cert::approval::status_request_id(ca_prefix, name) {
+            return Some(match approvals.hold_status(&request_id) {
+                Ok(held) => CaReply::Held {
+                    service: approvals.clone(),
+                    held,
+                    hold: ndn_cert::approval::status_hold(interest.lifetime()),
+                },
+                Err(reason) => {
+                    warn!(request = %request_id, %reason, "NDNCERT: status Interest refused (Nack Congestion)");
+                    CaReply::Busy
+                }
+            });
+        }
+    }
+
     debug!(name = %name_str, "NDNCERT: no CA service or issued certificate answers this Interest; Nacking");
     Some(CaReply::NoSuchData)
 }
@@ -361,7 +428,8 @@ async fn handle_interest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingApprovalStore};
+    use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL};
+    use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 
     /// An Interest under the CA prefix that no CA service or issued
     /// certificate answers (a routed certificate fetch for a key the CA never
@@ -373,12 +441,16 @@ mod tests {
             .name("/lab/ca")
             .unwrap()
             .signing_identity(&identity)
-            .challenge(DeviceApprovalChallenge::new(PendingApprovalStore::new()))
+            .challenge(DeviceApprovalChallenge::new(ApprovalStore::new(
+                "/lab/ca".parse().unwrap(),
+                None,
+                DEFAULT_REQUEST_TTL,
+            )))
             .build()
             .unwrap();
         let interest = ndn_packet::Interest::new("/lab/ca/CA/KEY/unknown".parse().unwrap());
         assert!(matches!(
-            handle_interest(&ca.state, &ca.prefix, interest).await,
+            handle_interest(&ca.state, &ca.prefix, None, interest).await,
             Some(CaReply::NoSuchData)
         ));
     }

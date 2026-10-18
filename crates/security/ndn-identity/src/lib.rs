@@ -10,11 +10,11 @@
 //! ```
 
 pub mod adopt;
+pub mod approval;
 pub mod ca;
 pub mod context_sync;
 pub mod delegation;
 pub mod device;
-pub mod device_approval_net;
 pub mod email;
 mod engine_exchange;
 pub mod enroll;
@@ -29,14 +29,14 @@ pub mod signed_delegation;
 pub mod transition;
 
 pub use adopt::{adopt_anchor_link_via_engine, refresh_context_via_engine};
+pub use approval::{
+    fetch_pending_via_engine, poll_approval_via_engine, poll_via_engine_budget,
+    push_decision_via_engine, request_status_via_engine,
+};
 pub use invite::{enroll_via_engine_budget, enroll_with_invite_via_engine};
 pub use renewal::{RenewBefore, backoff_delay, renew_via_engine, renew_via_engine_budget};
 pub use ca::{NdncertCa, NdncertCaBuilder};
 pub use device::{DeviceConfig, FactoryCredential, RenewalPolicy};
-pub use device_approval_net::{
-    ApprovalFeed, ApprovalSink, DEFAULT_APPROVAL_TIMEOUT, PendingApproval, offer_signed_approval,
-    pull_and_validate_approval, run_approver, serve_approve_feed_validated,
-};
 pub use email::LoggingEmailSender;
 pub use enroll::{ChallengeParams, NdncertClient};
 pub use error::IdentityError;

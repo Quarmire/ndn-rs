@@ -109,11 +109,12 @@ pub fn is_cert_of(cert: &Name, key_name: &Name) -> bool {
 }
 
 /// Components ndn-rs places at the issuer-id position of Data that is *not*
-/// a certificate: an NDNCERT device approval is named
-/// `<requested key>/ndncert-approve/<request id>`, which has the certificate
+/// a certificate: an admin's NDNCERT decision on an enrollment request is
+/// named `<requested key>/ndncert-approve/<request id>` or
+/// `<requested key>/ndncert-deny/<request id>`, which has the certificate
 /// shape. A chain walk never takes such Data for a certificate of the key,
-/// so a schema rule admitting approvals cannot admit a certificate.
-pub const RESERVED_NON_CERT_ISSUERS: &[&str] = &["ndncert-approve"];
+/// so a schema rule admitting decisions cannot admit a certificate.
+pub const RESERVED_NON_CERT_ISSUERS: &[&str] = &["ndncert-approve", "ndncert-deny"];
 
 /// Whether `name` has the certificate shape but an issuer id from
 /// [`RESERVED_NON_CERT_ISSUERS`].

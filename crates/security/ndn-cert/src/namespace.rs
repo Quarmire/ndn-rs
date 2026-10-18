@@ -5,7 +5,9 @@
 //!
 //! The root device holds the namespace root and runs its issuing CA. Other
 //! devices scan a QR (or overhear an advert), adopt the context (free), and —
-//! only if they want to *produce* — enroll behind `token AND device-approval`.
+//! only if they want to *produce* — enroll: by invite, or for the roles the
+//! context's enrollment hint names, by an admin's approval
+//! ([`crate::policy::ApprovalPolicy`]).
 //! The context carries the generated namespace schema
 //! ([`crate::roles::namespace_schema`]) and makes it authoritative, so names
 //! carry roles: `/<ns>/<role>/<device>` (`docs/specs/personal-namespace.md`
@@ -29,6 +31,7 @@ use crate::context_store::{
     ContextStoreError, context_file_path, persist_context, remove_stored_context,
 };
 use crate::onboarding::anchor_fingerprint;
+use crate::policy::ApprovalPolicy;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
@@ -70,7 +73,8 @@ pub struct NamespaceInit {
     /// The self-signed namespace anchor certificate.
     pub anchor: Certificate,
     /// The published, versioned trust context (generated namespace
-    /// schema, authoritative; default `token AND device-approval` enrollment gate).
+    /// schema, authoritative; the default enrollment policy:
+    /// [`ApprovalPolicy::default`]).
     pub context: Arc<SignedTrustContext>,
     /// The context as signed NDN Data at [`SignedTrustContext::rdr_name`],
     /// signed by the root anchor — what is published and what adopters verify.
@@ -92,7 +96,7 @@ impl NamespaceInit {
 /// Initialize the namespace `namespace`: generate a signing key in `mgr`,
 /// self-sign the namespace anchor, build a context carrying the generated
 /// namespace schema ([`namespace_schema`], authoritative) with the default
-/// enrollment gate (`token AND device-approval`), sign it into Data with the
+/// enrollment policy ([`EnrollmentHint::namespace_default`]), sign it into Data with the
 /// anchor, and mint an anchor envelope committing to the anchor fingerprint.
 ///
 /// The default deployment keeps the *root* offline and runs a delegated
@@ -108,7 +112,13 @@ pub fn init_namespace(
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
     // In-memory Ed25519 signers never suspend: drive the future inline.
-    futures::executor::block_on(build_namespace(mgr, namespace, None, &[]))
+    futures::executor::block_on(build_namespace(
+        mgr,
+        namespace,
+        None,
+        &[],
+        EnrollmentHint::namespace_default(),
+    ))
 }
 
 /// Build the namespace around the root key `root_key_name(namespace)` already held
@@ -120,6 +130,7 @@ async fn build_namespace(
     namespace: &Name,
     ca_endpoint: Option<Name>,
     root_device_keys: &[Name],
+    hint: EnrollmentHint,
 ) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
@@ -129,7 +140,7 @@ async fn build_namespace(
     let schema = namespace_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
         .with_version(1)
-        .with_enrollment_hint(EnrollmentHint::namespace_default())
+        .with_enrollment_hint(hint)
         .with_schema_blobs(schema.blobs())?
         .schema_authoritative();
     if let Some(ca) = ca_endpoint {
@@ -244,12 +255,31 @@ pub enum NamespaceInitError {
 /// silently replaced: without `force` this fails with
 /// [`NamespaceInitError::AlreadyInitialized`]. A PIB holding the root of
 /// another namespace is refused even with `force`.
+///
+/// The context advertises the default enrollment policy
+/// ([`ApprovalPolicy::default`]); [`init_namespace_in_pib_with`] takes
+/// another.
 pub async fn init_namespace_in_pib(
     pib: &FilePib,
     namespace: &Name,
     device: &str,
     force: bool,
     root: &NewRootStore,
+) -> Result<PersistedNamespace, NamespaceInitError> {
+    init_namespace_in_pib_with(pib, namespace, device, force, root, &ApprovalPolicy::default())
+        .await
+}
+
+/// [`init_namespace_in_pib`] whose context advertises `approval` — which
+/// roles enroll only on an admin's approval, and whether with an invite too
+/// — the policy the namespace's CA (`[ca]`) then enforces.
+pub async fn init_namespace_in_pib_with(
+    pib: &FilePib,
+    namespace: &Name,
+    device: &str,
+    force: bool,
+    root: &NewRootStore,
+    approval: &ApprovalPolicy,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
@@ -312,6 +342,7 @@ pub async fn init_namespace_in_pib(
         namespace,
         Some(namespace.clone().append("CA")),
         &[ca_key.clone(), device_key.clone()],
+        approval.to_hint(),
     )
     .await?;
     let root_store = pending.commit(pib, namespace, &init.anchor)?;

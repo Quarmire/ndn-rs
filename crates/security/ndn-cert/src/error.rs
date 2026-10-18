@@ -8,6 +8,11 @@ pub enum CertError {
     ChallengeFailed(String),
     #[error("challenge pending: {0}")]
     ChallengePending(String),
+    /// The challenge can no longer pass — it expired, or the CA no longer
+    /// holds what it was about — so the requester must start over
+    /// (NDNCERT error code `RunOutOfTime`).
+    #[error("challenge expired: {0}")]
+    ChallengeExpired(String),
     #[error("policy denied: {0}")]
     PolicyDenied(String),
     #[error("invalid request: {0}")]

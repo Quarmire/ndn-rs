@@ -99,7 +99,9 @@ unattended. A relay never holds the root.
   version), `invite` (CA prefix + namespace + token + expected fingerprint),
   `capability`, `delegation`, `recovery`, `bag`.
 - **Enrollment** — NDNCERT 0.3 via `ndn_cert::client::enroll`; challenges
-  `token` (from an invite) and `device-approval` (admin approves).
+  `token` (from an invite) and `device-approval` (an admin approves; the
+  request waits in a durable record, the CA answers `/<ns>/CA/APPROVAL`
+  pushes and admin-signed `/<ns>/CA/PENDING` listings).
 - **Revocation** — context revocation list (authoritative, root-signed) and
   CA revocation set (immediate, CA-signed REVOKE).
 - **Recovery kit** — a separate recovery key whose anchor the context lists
@@ -119,7 +121,9 @@ express (**have**: `ndn_cert::roles::namespace_schema`, emitted by `init`).
 /<ns>/<role>/<dev>/KEY/<k>           signed by  /<ns>/CA/KEY/<k>        role ∈ {admin, member, node, guest}
 /<ns>/<role>/<dev>/<**data>          signed by  /<ns>/<role>/<dev>/KEY/<k>   (devices publish under their own name, never under their KEY subtree)
 /<ns>/CA/<**data>                    signed by  /<ns>/CA/KEY/<k>        (CA service data: INFO, NEW, …)
-<requested key>/ndncert-approve/<id> signed by  /<ns>/admin/<dev>/KEY/<k>    (only admins approve; the name is the requester's key name, which binds the approval to that request)
+<requested key>/ndncert-approve/<id> signed by  /<ns>/admin/<dev>/KEY/<k>    (only admins approve; the name is the requester's key name, which binds the approval to that request; rule #approve)
+<requested key>/ndncert-deny/<id>    signed by  /<ns>/admin/<dev>/KEY/<k>    (#deny, likewise)
+/<ns>/CA/PENDING/<p>                 signed by  /<ns>/admin/<dev>/KEY/<k>    (#pending: an admin's signed listing request)
 /<ns>/shared/<**data>                signed by  /<ns>/{admin,member}/<dev>/KEY/<k>
 ```
 
@@ -139,7 +143,11 @@ envelope still fits one QR code (≤ 2953 bytes); the fingerprint-only form
 A tool (`ndn-fwd schema show|explain <data-name> <key-name>`, **have**)
 renders the schema and answers "would this be accepted, and by which rule".
 Hand-written schemas remain possible (native rules or LVS text via
-`compile_lvs`); the generated one is the default.
+`compile_lvs`); the generated one is the default. A namespace made by an
+earlier release gets the current generated schema from `ndn-fwd schema
+update` on the root device: a root-signed version `N+1` that prints the rules
+it adds and removes and refuses to drop one without `--accept-narrowing`
+(**have**; `docs/wiki/src/reference/context-updates.md`).
 
 ## 5. Flows
 
@@ -178,10 +186,27 @@ Each flow lists steps, what is stored where, failure handling, and status
   app to persist — see
   `docs/wiki/src/reference/enrollment-by-invite.md`; adoption from a
   fingerprint-only link: `docs/wiki/src/reference/context-adoption.md`).
-- **By approval:** new device scans the anchor QR, requests enrollment with
-  `device-approval`; an admin sees the pending request (`ca list-approvals`)
-  and approves on an admin device (**have** in daemon; **gap**: approve from a
-  remote admin device, not only the CA host's mgmt socket).
+- **By approval:** new device scans the anchor QR, `ndn-fwd enroll <anchor
+  link> --role admin|node` requests enrollment with `device-approval` and
+  shows a six-digit verification code bound to its key and request; the CA
+  keeps a durable pending record (default 7 days, `[ca]
+  approval_request_ttl_days`) and the device waits on it with a held status
+  Interest (`/CA/STATUS/<id>`, which the CA answers, signed, the moment the
+  request is decided), also across restarts, until issued, denied or
+  expired. The person compares the code
+  and decides with `ndn-fwd approvals approve|deny <code>`: on the CA host as
+  the local operator; on another node as its admin key — it lists the CA's
+  `/CA/PENDING` with a signed Interest, signs a decision Data
+  (`<requested key>/ndncert-approve/<id>`, content the code, which the CA
+  checks; or `…/ndncert-deny/<id>`, content the reason) and pushes it in a
+  plain Interest to `/CA/APPROVAL` with the admin certificate chain; the
+  decision Data is the authority. If the namespace requires an invite too,
+  the device enrolls from the invite link with `--role`, and the token is
+  redeemed once when the request is opened. Decisions over `/localhop` or a
+  non-local face are refused. A namespace initialized before this release
+  gets the `#deny`/`#pending` rules with `ndn-fwd schema update` on its root
+  device, a root-signed trust-context update (**have**; see
+  `docs/wiki/src/reference/enrollment-by-approval.md`).
 - Role: the device enrolls as `/<ns>/<role>/<dev>`; issuing an admin (or
   relay) cert requires an admin approval, never a token alone; tokens
   admit members, and guests only when guest-scoped (**have**:
@@ -227,11 +252,12 @@ Gap: revoking from an admin device other than the root device (the root key
 signs the bump, so the command runs where the root key is).
 
 ### F5 Lose an admin device
-As F4: `ndn-fwd revoke /<ns>/admin/<dev>` (**have**). Approvals are given on
-the CA host's management socket (`ca approve`), not signed by a device, so
-there are no device-signed approvals to refuse yet; when remote admin approval
-(F2 gap) exists, its approvals chain through the admin key and the bump
-refuses them like any other Data. If it was the root device, continue with F8.
+As F4: `ndn-fwd revoke /<ns>/admin/<dev>` (**have**). A remote admin's
+approval or denial is a Data signed by the admin key and validated under the
+context (chain, schema, revocation) when pushed, so once the bump revokes the
+key the CA refuses its decisions like any other Data; decisions already
+recorded stay (a local operator's carry no signature). If it was the root
+device, continue with F8.
 
 ### F6 Relay compromised
 1. Root bump: revoke the relay's node key (**have**: `ndn-fwd revoke
@@ -384,7 +410,7 @@ the user's profile (see `ndn_security::secure_fs`).
 ## 7. Build order
 
 1. Generated schema + role naming in `init` and enrollment (F1, F2 roles) — **have**.
-2. `adopt` by fingerprint + `enroll` by invite (**have**) and remote admin approval (F2).
+2. `adopt` by fingerprint + `enroll` by invite + enrollment by approval, local or remote admin (F2) — **have**.
 3. `revoke` + context bump/publish + pulled updates (F4, F5) — **have**;
    `devices list` is still to build.
 4. Recovery kit formats + `recover` (F7, F8) — **have**.
@@ -395,10 +421,16 @@ the user's profile (see `ndn_security::secure_fs`).
 
 ## 8. Owner-configurable policy
 
-Admission policy is the CA's challenge configuration, chosen by the owner,
-not fixed by the design: token-only, approval-only, or token AND approval for
-members. Admin certificates always require an admin approval. Recovery kit
-formats (§F7) and root key storage (§2) are likewise the owner's choice.
+Admission policy is chosen by the owner, not fixed by the design.
+`ndn-fwd init` writes it into the context's enrollment hint from `[ca]
+approval_roles` (default admin, node; the others enroll by invite) and
+`approval_requires_invite` (such a request must also redeem one invite,
+once, when it is opened). The namespace CA enforces the hint: if those `[ca]`
+keys are set and disagree with it, the CA refuses to start and names the
+context's policy. Admin certificates always require an admin approval.
+Under `[ca.require_attestation] require_signed`, a local operator's approval
+counts only with `accept_local_operator`. Recovery kit formats (§F7) and
+root key storage (§2) are likewise the owner's choice.
 
 ## 9. Links, relays and routes vs trust and enrollment
 

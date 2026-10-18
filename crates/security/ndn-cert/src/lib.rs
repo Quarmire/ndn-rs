@@ -4,8 +4,11 @@
 //! `ApplicationParameters` / `Content`. Producer/Consumer wiring lives in
 //! `ndn-identity`.
 //!
-//! Endpoints: `/<ca>/CA/{INFO, PROBE, NEW, CHALLENGE/<req-id>, REVOKE}`.
+//! Endpoints: `/<ca>/CA/{INFO, PROBE, NEW, CHALLENGE/<req-id>, REVOKE}`, plus
+//! `/<ca>/CA/{APPROVAL, PENDING}` for enrollment by an admin's approval
+//! ([`approval`]).
 
+pub mod approval;
 pub mod attestation;
 pub mod ca;
 pub mod challenge;
@@ -49,8 +52,15 @@ pub use challenge::possession::PossessionChallenge;
 pub use challenge::token::{TokenChallenge, TokenCheck, TokenStore};
 #[cfg(feature = "yubikey-challenge")]
 pub use challenge::yubikey::YubikeyHotpChallenge;
+pub use approval::{
+    ApprovalEnrollError, ApprovalPoll, ApprovalRecord, ApprovalRefusal, ApprovalService,
+    ApprovalState, ApprovalStore, Approver, ApproverError, Decision, HeldStatus, OutgoingRequest,
+    OutgoingState, PendingRequest, RefusalKind, RequestStatus, RequestStore, fetch_pending,
+    normalize_code, poll_approval, push_decision, request_status, verification_code,
+};
+pub use challenge::device_approval::DeviceApprovalChallenge;
 pub use challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState};
-pub use client::{CaExchange, ChallengeRound, EnrollmentSession};
+pub use client::{CaExchange, ChallengeExchange, ChallengeRound, EnrollmentSession};
 pub use ecdh::{EcdhKeypair, SessionKey};
 pub use error::CertError;
 pub use context_store::{
@@ -60,13 +70,14 @@ pub use context_store::{
 };
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
-    MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, Unfetched, UpdateRefusal,
-    VersionSource, bump_context_revoking, follow_versions, key_name_of, open_context_update,
-    refresh_context, revocations_to_add,
+    MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
+    UpdateRefusal, VersionSource, bump_context_revoking, bump_context_schema, follow_versions,
+    key_name_of, open_context_update, refresh_context, revocations_to_add, schema_change,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
-    device_key_name, init_namespace, init_namespace_in_pib, root_key_name,
+    device_key_name, init_namespace, init_namespace_in_pib, init_namespace_in_pib_with,
+    root_key_name,
 };
 pub use invite::{
     INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
@@ -81,7 +92,8 @@ pub use onboarding::{
     rdr_metadata_name, rdr_prefix,
 };
 pub use policy::{
-    AcceptAllIssuance, DelegationPolicy, HierarchicalPolicy, IssuanceContext, IssuanceDecision,
+    AcceptAllIssuance, ApprovalPolicy, DelegationPolicy, HierarchicalPolicy, IssuanceContext,
+    IssuanceDecision,
     IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
     RoleTerms, SingleKeyIdentity,
 };

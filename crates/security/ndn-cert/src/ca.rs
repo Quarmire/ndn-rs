@@ -97,7 +97,11 @@ struct PendingRequest {
     cert_request: CertRequest,
     challenge_state: Option<ChallengeState>,
     challenge_type: Option<String>,
-    created_at: u64,
+    /// When this session ends (Unix seconds): the NEW → CHALLENGE window
+    /// after NEW, then the remaining time the last CHALLENGE answer
+    /// advertised. A wait that outlives sessions (an admin's approval) is
+    /// kept elsewhere ([`crate::approval::ApprovalStore`]).
+    expires_at: u64,
     session_key: SessionKey,
     request_id_bytes: [u8; 8],
     encryption_iv: [u8; 12],
@@ -210,9 +214,10 @@ impl CaState {
             .is_some_and(|own| is_other_key_of_identity(&own, key))
     }
 
-    pub fn cleanup_expired(&self, ttl_secs: u64) {
-        let cutoff = now_secs().saturating_sub(ttl_secs);
-        self.pending.retain(|_, v| v.created_at >= cutoff);
+    /// Drop the NDNCERT sessions whose own advertised time has run out.
+    pub fn cleanup_expired(&self) {
+        let now = now_secs();
+        self.pending.retain(|_, v| v.expires_at >= now);
     }
 
     /// Whether `cert_name` (a certificate or key name, canonical URI) is
@@ -661,9 +666,11 @@ impl CaState {
         resp.encode().to_vec()
     }
 
-    /// `/<ca-prefix>/CA/NEW`. NDNCERT v0.3 §3.1 — the NEW→CHALLENGE window is 60s.
+    /// `/<ca-prefix>/CA/NEW`. NDNCERT v0.3 §3.1 — the NEW→CHALLENGE window is
+    /// 60s; after that, each session lasts what its last CHALLENGE answer
+    /// advertised.
     pub async fn handle_new(&self, body: &[u8]) -> Result<Vec<u8>, CertError> {
-        self.cleanup_expired(60);
+        self.cleanup_expired();
 
         let new_req = NewRequestTlv::decode(bytes::Bytes::copy_from_slice(body))?;
 
@@ -731,7 +738,7 @@ impl CaState {
                 cert_request: req,
                 challenge_state: None,
                 challenge_type: None,
-                created_at: now_secs(),
+                expires_at: now_secs() + NEW_TO_CHALLENGE_SECS,
                 session_key,
                 request_id_bytes,
                 encryption_iv: new_encryption_iv(),
@@ -882,13 +889,15 @@ impl CaState {
                 self.pending.remove(request_id);
                 ChallengeResponseTlv {
                     status: STATUS_FAILURE,
-                    challenge_status: None,
-                    remaining_tries: None,
-                    remaining_time_secs: None,
-                    issued_cert_name: None,
                     error_code: Some(7),
                     error_info: Some(reason),
+                    ..Default::default()
                 }
+            }
+
+            ChallengeOutcome::Expired(reason) => {
+                self.pending.remove(request_id);
+                refused(ErrorCode::RunOutOfTime, reason)
             }
 
             ChallengeOutcome::Pending {
@@ -897,18 +906,21 @@ impl CaState {
                 remaining_time_secs,
                 next_state,
             } => {
+                let parameters = handler
+                    .map(|h| h.pending_parameters(&next_state))
+                    .unwrap_or_default();
                 if let Some(mut entry) = self.pending.get_mut(request_id) {
                     entry.challenge_state = Some(next_state);
                     entry.decryption_iv = dec_iv_state;
+                    entry.expires_at = now_secs() + u64::from(remaining_time_secs);
                 }
                 ChallengeResponseTlv {
                     status: STATUS_PENDING,
                     challenge_status: Some(status_message),
                     remaining_tries: Some(remaining_tries),
                     remaining_time_secs: Some(remaining_time_secs),
-                    issued_cert_name: None,
-                    error_code: None,
-                    error_info: None,
+                    parameters,
+                    ..Default::default()
                 }
             }
 
@@ -967,14 +979,11 @@ impl CaState {
                     }
                     IssuanceDecision::Deny(reason) => ChallengeResponseTlv {
                         status: STATUS_FAILURE,
-                        challenge_status: None,
-                        remaining_tries: None,
-                        remaining_time_secs: None,
-                        issued_cert_name: None,
                         // NDNCERT v0.3 has no distinct code for post-challenge
                         // policy denial; OutOfTries (7) is the closest match.
                         error_code: Some(7),
                         error_info: Some(reason),
+                        ..Default::default()
                     },
                 }
             }
@@ -1156,12 +1165,8 @@ impl CaState {
 
         Ok(ChallengeResponseTlv {
             status: STATUS_SUCCESS,
-            challenge_status: None,
-            remaining_tries: None,
-            remaining_time_secs: None,
             issued_cert_name: Some(cert_name_str),
-            error_code: None,
-            error_info: None,
+            ..Default::default()
         })
     }
 
@@ -1272,6 +1277,9 @@ async fn verify_possession(message: &[u8], signature: &[u8], public_key: &[u8]) 
     false
 }
 
+/// The NDNCERT 0.3 NEW → CHALLENGE window (§3.1), in seconds.
+const NEW_TO_CHALLENGE_SECS: u64 = 60;
+
 /// The longest chain an earlier CA's certificate is walked along to an
 /// anchor, and the most issuer certificates taken from a renewal.
 const EARLIER_CA_MAX_CHAIN: usize = 8;
@@ -1349,12 +1357,9 @@ impl Drop for InFlight<'_> {
 fn refused(code: ErrorCode, reason: String) -> ChallengeResponseTlv {
     ChallengeResponseTlv {
         status: STATUS_FAILURE,
-        challenge_status: None,
-        remaining_tries: None,
-        remaining_time_secs: None,
-        issued_cert_name: None,
         error_code: Some(code.into()),
         error_info: Some(reason),
+        ..Default::default()
     }
 }
 

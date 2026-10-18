@@ -158,6 +158,10 @@ impl UdpFace {
     /// one-shot per ICMP (`ECONNREFUSED` on alternate sends) and the socket
     /// keeps working. The engine classifies those as transient and keeps the
     /// face, so a neighbour restarting its forwarder no longer costs a route.
+    /// The send that reports such an error, though, sends nothing, and the
+    /// error is about an earlier datagram: [`send_bytes`](Transport::send_bytes)
+    /// sends that datagram once more, so it does not cost the first packet
+    /// after the neighbour is back either.
     #[cfg(unix)]
     pub async fn bind_connected(
         local_port: ConnectedPort,
@@ -310,6 +314,16 @@ impl Transport for UdpFace {
                     self.socket.send(&wire).await?;
                     Ok(())
                 }
+                // The kernel reports an ICMP error for an EARLIER datagram
+                // (the peer's port was closed while its forwarder restarted)
+                // on the next send, which then sends nothing; the report
+                // clears it. Send this datagram once more: it would otherwise
+                // be lost although the peer may be listening again. A second
+                // report means the peer is still unreachable.
+                Err(e) if is_icmp_report(&e) => {
+                    self.socket.send(&wire).await?;
+                    Ok(())
+                }
                 Err(e) => Err(e.into()),
             };
         }
@@ -331,6 +345,9 @@ impl Transport for UdpFace {
         use std::os::unix::io::AsRawFd;
         let fd = self.socket.as_raw_fd();
         let mut start = 0;
+        // As in `send_bytes`: a report of an earlier datagram's ICMP error
+        // sends nothing; try once more before treating it as an error.
+        let mut retried_report = false;
         while start < wires.len() {
             self.socket.writable().await?;
             match self.socket.try_io(tokio::io::Interest::WRITABLE, || {
@@ -340,11 +357,22 @@ impl Transport for UdpFace {
                 // Kernel accepted nothing but didn't signal WouldBlock — re-arm.
                 Ok(_) => continue,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if is_icmp_report(&e) && !retried_report => {
+                    retried_report = true;
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
         Ok(())
     }
+}
+
+/// An error a connected UDP socket reports from an ICMP message about a
+/// datagram sent before.
+fn is_icmp_report(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(e.kind(), ConnectionRefused | HostUnreachable | NetworkUnreachable)
 }
 
 impl UdpFace {
@@ -501,6 +529,32 @@ mod tests {
             shared.err().map(|e| e.kind()),
             Some(std::io::ErrorKind::AddrInUse)
         );
+    }
+
+    /// A neighbour's forwarder restarts: a datagram sent while its port was
+    /// closed draws an ICMP port-unreachable, which the kernel reports on the
+    /// face's next send. That next datagram still reaches the neighbour once
+    /// it listens again (on loopback the ICMP arrives before the first send
+    /// returns, so the report is pending when the second one is made).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_first_datagram_after_a_peer_restart_is_delivered() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        drop(peer);
+        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), peer_addr, FaceId(1))
+            .await
+            .unwrap();
+        face.send_bytes(Bytes::from_static(b"while down")).await.unwrap();
+
+        let peer = UdpSocket::bind(peer_addr).await.unwrap();
+        face.send_bytes(Bytes::from_static(b"back")).await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv(&mut buf))
+            .await
+            .expect("the datagram sent after the restart arrives")
+            .unwrap();
+        assert_eq!(&buf[..n], b"back");
     }
 
     /// A configured local IP is the one bound, not the address that routes

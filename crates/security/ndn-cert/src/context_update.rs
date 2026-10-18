@@ -5,6 +5,29 @@
 //!   anchor key of the held version — the namespace root, unlocked from its
 //!   root store ([`crate::root_store`]). Nothing else changes: anchors,
 //!   schema, CA endpoints and earlier revocations are carried over verbatim.
+//! - **Schema update** ([`bump_context_schema`], root device only): version
+//!   `N+1` carrying a new schema (for a namespace made by `ndn-fwd init`, the
+//!   current generated one, [`crate::roles::namespace_schema`]) and the
+//!   enrollment hint of the policy the namespace's CA enforces; everything
+//!   else is carried over verbatim. This is how a namespace made before a
+//!   rule existed gets it (the `#deny` and `#pending` rules of enrollment by
+//!   approval), without being initialized again. It is its own operator
+//!   action, never a side effect of another bump: a revocation or a recovery
+//!   kit must not change what devices may sign, and the operator sees which
+//!   rules a schema update adds and removes before the root signs it. A
+//!   schema update never narrows what devices may do silently
+//!   ([`schema_change`]): every grant of the held schema — an LVS rule's
+//!   data pattern with each of its signers, a native rule — must still be
+//!   granted, word for word, by the new one, or the update is refused unless
+//!   the caller consents to narrowing. Regenerating the generated schema of a
+//!   namespace made by an earlier `ndn-fwd init` only adds rules; it narrows
+//!   when the held schema is not the generated one — a custom schema signed
+//!   in with `ndn-trust-context`, or the key-name schema of the earliest
+//!   releases, whose rules read differently even where they grant the same —
+//!   and is then refused until the operator has read the rules it drops.
+//!   The new version is schema-authoritative, as the generated schema
+//!   requires (its cross-identity grants are what the hierarchy floor
+//!   forbids).
 //! - **Refresh** ([`refresh_context`], every node): ask the namespace for its
 //!   newest version by name (RDR metadata, the publication of
 //!   `docs/wiki/src/reference/trust-context-publication.md`) and, if it is
@@ -27,14 +50,16 @@
 //! See `docs/wiki/src/reference/revocation.md` and
 //! `docs/wiki/src/reference/context-updates.md`.
 
+use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
-    SignedTrustContextError, Signer, Validator,
+    Certificate, EnrollmentHint, ExpectContextError, Keyring, LvsModel, OpenContextError,
+    SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext, SignedTrustContextError, Signer,
+    Validator,
 };
 
 use crate::client::CaExchange;
@@ -63,7 +88,8 @@ pub fn key_name_of(name: &Name) -> Option<Name> {
     Some(Name::from_components(comps[..at + 2].iter().cloned()))
 }
 
-/// Why [`bump_context_revoking`] made no new version.
+/// Why [`bump_context_revoking`] or [`bump_context_schema`] made no new
+/// version.
 #[derive(Debug, thiserror::Error)]
 pub enum BumpError {
     #[error("the held context is not a valid signed trust context: {0}")]
@@ -91,6 +117,23 @@ pub enum BumpError {
     },
     #[error("context version {0} cannot be bumped")]
     VersionExhausted(u64),
+    #[error(
+        "refusing to narrow what devices of {namespace} may do: the new schema drops {} rule(s) \
+         the held version (v{version}) grants — {}. A device relying on one would be refused \
+         once its node holds the new version. If dropping them is intended (a custom schema \
+         this replaces, a rule withdrawn on purpose), sign the update with consent to narrow \
+         (`ndn-fwd schema update --accept-narrowing`); otherwise keep v{version}",
+        .removed.len(),
+        .removed.join("; ")
+    )]
+    Narrowing {
+        namespace: String,
+        version: u64,
+        /// The held schema's rules the new one no longer grants.
+        removed: Vec<String>,
+    },
+    #[error("the schema cannot be read: {0}")]
+    Schema(String),
     #[error("signing the new version: {0}")]
     Sign(#[from] SignedTrustContextError),
 }
@@ -101,7 +144,7 @@ pub struct ContextBump {
     pub context: SignedTrustContext,
     /// Its signed Data at `/<ns>/32=trust-context/v=<N+1>`.
     pub data: Data,
-    /// The revocation entries this version adds.
+    /// The revocation entries this version adds (none for a schema update).
     pub added: Vec<Name>,
 }
 
@@ -150,30 +193,14 @@ pub async fn bump_context_revoking(
     revoke: &[Name],
 ) -> Result<Option<ContextBump>, BumpError> {
     let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
-    let namespace = ctx.namespace().clone();
-
-    let is_anchor = signer.public_key().is_some_and(|pk| {
-        ctx.anchors()
-            .iter()
-            .any(|a| crate::root_store::same_public_key(&a.value().public_key, &pk))
-    });
-    if !is_anchor {
-        return Err(BumpError::NotAnAnchor {
-            key: signer.key_name().to_string(),
-            namespace: namespace.to_string(),
-            version: ctx.version(),
-        });
-    }
+    ensure_anchor(signer, &ctx)?;
 
     let added = revocations_to_add(&ctx, revoke)?;
     if added.is_empty() {
         return Ok(None);
     }
 
-    let version = ctx
-        .version()
-        .checked_add(1)
-        .ok_or(BumpError::VersionExhausted(ctx.version()))?;
+    let version = next_version(&ctx)?;
     // `held` verified above, so its Content is present and decodes.
     let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
     let mut next = SignedTrustContext::decode_content(content, version)?;
@@ -185,6 +212,206 @@ pub async fn bump_context_revoking(
         context: next,
         data,
         added,
+    }))
+}
+
+/// Refuse `signer` unless it is the key of an anchor of `ctx`: only those
+/// sign its next version (the continuity rule every node applies).
+fn ensure_anchor(signer: &dyn Signer, ctx: &SignedTrustContext) -> Result<(), BumpError> {
+    let is_anchor = signer.public_key().is_some_and(|pk| {
+        ctx.anchors()
+            .iter()
+            .any(|a| crate::root_store::same_public_key(&a.value().public_key, &pk))
+    });
+    if is_anchor {
+        return Ok(());
+    }
+    Err(BumpError::NotAnAnchor {
+        key: signer.key_name().to_string(),
+        namespace: ctx.namespace().to_string(),
+        version: ctx.version(),
+    })
+}
+
+fn next_version(ctx: &SignedTrustContext) -> Result<u64, BumpError> {
+    ctx.version()
+        .checked_add(1)
+        .ok_or(BumpError::VersionExhausted(ctx.version()))
+}
+
+// ── Schema update (root device) ────────────────────────────────────────────
+
+/// What a schema update changes, decided before the root is unlocked
+/// ([`schema_change`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaChange {
+    /// Rules the new schema grants that the held one does not.
+    pub added: Vec<String>,
+    /// Rules the held schema grants that the new one does not: what devices
+    /// would lose. Non-empty only with consent to narrowing.
+    pub removed: Vec<String>,
+    /// The held version's enrollment hint.
+    pub hint_before: Option<EnrollmentHint>,
+    /// The enrollment hint the new version carries.
+    pub hint: EnrollmentHint,
+    /// The held version is not schema-authoritative; the new one is.
+    pub becomes_authoritative: bool,
+}
+
+impl SchemaChange {
+    /// Whether the new version carries another enrollment hint.
+    pub fn changes_hint(&self) -> bool {
+        self.hint_before.as_ref() != Some(&self.hint)
+    }
+
+    /// Nothing to sign: the held version carries these rules, this hint and
+    /// the authoritative flag already.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && !self.changes_hint()
+            && !self.becomes_authoritative
+    }
+}
+
+/// A schema update signed by [`bump_context_schema`].
+#[derive(Debug)]
+pub struct SchemaBump {
+    pub bump: ContextBump,
+    pub change: SchemaChange,
+}
+
+/// Every grant of a schema, as `(comparison key, rule as shown)`: an LVS
+/// rule's data pattern with each of its signers (`#rule: <pattern> <=
+/// #signer`, compared by both patterns, not by rule names or node ids),
+/// and each native rule (`<data> => <key>`, compared in its canonical form).
+fn schema_grants(blobs: &[SchemaBlob]) -> Result<Vec<(String, String)>, BumpError> {
+    let mut grants = Vec::new();
+    for (i, blob) in blobs.iter().enumerate() {
+        match blob.format {
+            SchemaFormat::Lvs => {
+                let model = LvsModel::decode(&blob.body)
+                    .map_err(|e| BumpError::Schema(format!("schema blob {i} (LVS binary): {e}")))?;
+                for node in &model.nodes {
+                    if node.sign_constraints.is_empty() {
+                        continue;
+                    }
+                    let Some(pattern) = model.node_pattern(node.id) else {
+                        continue;
+                    };
+                    let label = model.node_label(node.id);
+                    for signer in &node.sign_constraints {
+                        let signer_label = model.node_label(*signer);
+                        let signer_pattern =
+                            model.node_pattern(*signer).unwrap_or_else(|| signer_label.clone());
+                        grants.push((
+                            format!("lvs {pattern} <= {signer_pattern}"),
+                            format!("{label}: {pattern} <= {signer_label}"),
+                        ));
+                    }
+                }
+            }
+            SchemaFormat::NativeText => {
+                let text = std::str::from_utf8(&blob.body).map_err(|_| {
+                    BumpError::Schema(format!("schema blob {i} (native rules) is not UTF-8"))
+                })?;
+                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    let rule = SchemaRule::parse(line)
+                        .map_err(|e| {
+                            BumpError::Schema(format!("schema blob {i}: rule {line:?}: {e}"))
+                        })?
+                        .to_string();
+                    grants.push((format!("native {rule}"), rule));
+                }
+            }
+        }
+    }
+    Ok(grants)
+}
+
+/// The rules of `next` not in `held`, each once, in `next`'s order.
+fn grants_missing(next: &[(String, String)], held: &[(String, String)]) -> Vec<String> {
+    let held: HashSet<&str> = held.iter().map(|(key, _)| key.as_str()).collect();
+    let mut seen = HashSet::new();
+    next.iter()
+        .filter(|(key, _)| !held.contains(key.as_str()) && seen.insert(key.as_str()))
+        .map(|(_, shown)| shown.clone())
+        .collect()
+}
+
+/// What a version after `ctx` carrying `schema` and `hint` would change:
+/// the rules it adds and removes, and whether the hint or the authoritative
+/// flag change ([`SchemaChange::is_empty`]: nothing to sign). Refused
+/// ([`BumpError::Narrowing`], listing the rules devices would lose) when a
+/// rule of `ctx` is missing from `schema`, unless `accept_narrowing`.
+/// Needs no key: a caller checks a schema update with it before unlocking
+/// the root that signs it ([`bump_context_schema`] applies the same checks).
+pub fn schema_change(
+    ctx: &SignedTrustContext,
+    schema: &[SchemaBlob],
+    hint: &EnrollmentHint,
+    accept_narrowing: bool,
+) -> Result<SchemaChange, BumpError> {
+    let held = schema_grants(&ctx.published_schemas())?;
+    let next = schema_grants(schema)?;
+    let removed = grants_missing(&held, &next);
+    if !removed.is_empty() && !accept_narrowing {
+        return Err(BumpError::Narrowing {
+            namespace: ctx.namespace().to_string(),
+            version: ctx.version(),
+            removed,
+        });
+    }
+    Ok(SchemaChange {
+        added: grants_missing(&next, &held),
+        removed,
+        hint_before: ctx.enrollment_hint().cloned(),
+        hint: hint.clone(),
+        becomes_authoritative: !ctx.schema_is_authoritative(),
+    })
+}
+
+/// Version `N+1` of the held context `held` (its signed Data, version `N`)
+/// carrying the schema blobs `schema` (their OR is the schema: at most one
+/// LVS binary, plus native rules — as
+/// [`NamespaceSchema::blobs`](crate::roles::NamespaceSchema::blobs) gives)
+/// and the enrollment hint `hint`, schema-authoritative, signed by `signer`
+/// — the key of an anchor of `held`, as for [`bump_context_revoking`].
+/// Anchors, CA endpoints, revocations and key roles are carried over
+/// verbatim. Checked as [`schema_change`] checks (a narrowing refused
+/// unless `accept_narrowing`); `Ok(None)` when `held` carries these rules
+/// and this hint already (nothing is signed). Pure: nothing is adopted,
+/// stored or published.
+pub async fn bump_context_schema(
+    signer: &dyn Signer,
+    held: &Data,
+    schema: &[SchemaBlob],
+    hint: &EnrollmentHint,
+    accept_narrowing: bool,
+) -> Result<Option<SchemaBump>, BumpError> {
+    let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
+    ensure_anchor(signer, &ctx)?;
+    let change = schema_change(&ctx, schema, hint, accept_narrowing)?;
+    if change.is_empty() {
+        return Ok(None);
+    }
+
+    let version = next_version(&ctx)?;
+    // `held` verified above, so its Content is present and decodes.
+    let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
+    let next = SignedTrustContext::decode_content(content, version)?
+        .with_schema_blobs(schema.to_vec())
+        .map_err(|e| BumpError::Schema(e.to_string()))?
+        .with_enrollment_hint(hint.clone())
+        .schema_authoritative();
+    let data = next.sign_into_data_async(signer).await?;
+    Ok(Some(SchemaBump {
+        bump: ContextBump {
+            context: next,
+            data,
+            added: Vec::new(),
+        },
+        change,
     }))
 }
 

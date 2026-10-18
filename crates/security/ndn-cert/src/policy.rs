@@ -199,13 +199,16 @@ impl IssuancePolicy for AcceptAllIssuance {
 /// leaf of `required_kind` (e.g. names under `/high-trust` must have been met
 /// with a `device-approval` challenge). Requests outside `prefix` issue
 /// normally. With `require_signed`, the matching leaf must additionally carry
-/// an independent signature (the cross-process device-approval case) — so the
-/// gate distinguishes a *signed* approval from an in-process one, which
-/// `challenge_type` alone cannot.
+/// an independent signature — an admin device's signed approval — so the
+/// gate distinguishes a *signed* approval from a local operator's, which
+/// carries none. With `accept_local_operator` as well, the CA's policy also
+/// takes a local operator's approval (`approver_kind = local-operator`
+/// evidence) in place of a signature.
 pub struct RequireAttestationKind {
     pub prefix: Name,
     pub required_kind: String,
     pub require_signed: bool,
+    pub accept_local_operator: bool,
 }
 
 impl RequireAttestationKind {
@@ -214,12 +217,34 @@ impl RequireAttestationKind {
             prefix,
             required_kind: required_kind.into(),
             require_signed: false,
+            accept_local_operator: false,
         }
     }
 
     pub fn require_signed(mut self, yes: bool) -> Self {
         self.require_signed = yes;
         self
+    }
+
+    /// Under `require_signed`, also accept a local operator's approval
+    /// (builder).
+    pub fn accept_local_operator(mut self, yes: bool) -> Self {
+        self.accept_local_operator = yes;
+        self
+    }
+
+    fn leaf_counts(&self, leaf: &crate::attestation::ChallengeAttestation) -> bool {
+        use crate::challenge::device_approval::APPROVER_KIND_EVIDENCE;
+        let by_local_operator = || {
+            leaf.evidence
+                .get(APPROVER_KIND_EVIDENCE)
+                .and_then(|v| v.as_str())
+                == Some("local-operator")
+        };
+        leaf.kind == self.required_kind
+            && (!self.require_signed
+                || leaf.signature.is_some()
+                || (self.accept_local_operator && by_local_operator()))
     }
 }
 
@@ -236,20 +261,28 @@ impl IssuancePolicy for RequireAttestationKind {
                 validity: ctx.default_validity,
             };
         }
-        let satisfied = ctx.attestation.is_some_and(|set| {
-            set.leaves.iter().any(|leaf| {
-                leaf.kind == self.required_kind
-                    && (!self.require_signed || leaf.signature.is_some())
-            })
-        });
+        let satisfied = ctx
+            .attestation
+            .is_some_and(|set| set.leaves.iter().any(|leaf| self.leaf_counts(leaf)));
         if satisfied {
             IssuanceDecision::Issue {
                 validity: ctx.default_validity,
             }
-        } else {
-            let signed = if self.require_signed { "signed " } else { "" };
+        } else if self.require_signed {
+            let local = if self.accept_local_operator {
+                " or the CA host's local operator's"
+            } else {
+                " (this CA does not count a local operator's approval, which carries no \
+                 signature)"
+            };
             IssuanceDecision::Deny(format!(
-                "names under {} require a {signed}`{}` challenge attestation",
+                "names under {} require a `{}` challenge attestation signed by an admin \
+                 device{local}: approve it from an admin device (`ndn-fwd approvals approve`)",
+                self.prefix, self.required_kind
+            ))
+        } else {
+            IssuanceDecision::Deny(format!(
+                "names under {} require a `{}` challenge attestation",
                 self.prefix, self.required_kind
             ))
         }
@@ -265,12 +298,14 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 /// keys `/<ns>/<role>/<device>/KEY/<id>…` ([`crate::roles`]), and only when
 /// the satisfied challenge is strong enough for the role:
 ///
-/// - an admin's **device approval** (`device-approval`, alone or as a leaf of
-///   a combinator such as `token AND device-approval`) admits any role;
+/// - an admin's **device approval** (`device-approval`) admits any role;
+///   the roles of [`ApprovalPolicy::roles`] (default `admin`, `node`) are
+///   admitted *only* so, and — with [`ApprovalPolicy::invite_also`] — only
+///   when an invite token was redeemed with the request as well;
 /// - an invite **token** admits a `member` when it is unscoped or scoped
 ///   inside `/<ns>/member`, and a `guest` only when scoped inside
-///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`);
-/// - `admin` and `node` certificates are never issued on a token alone;
+///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`), unless the role
+///   needs an approval;
 /// - a **renewal** (the CA's built-in [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE):
 ///   the requester proved it holds a current, unrevoked certificate this CA
 ///   — or an earlier CA of its identity — issued for the same key) admits
@@ -290,6 +325,92 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 pub struct RolePolicy {
     namespace: Name,
     terms: [RoleTerms; 4],
+    approval: ApprovalPolicy,
+}
+
+/// What enrollment needs an admin's approval for — policy in data: the
+/// namespace's trust context advertises it
+/// ([`EnrollmentHint`](ndn_security::EnrollmentHint)), and a namespace CA
+/// enforces exactly what its context advertises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPolicy {
+    /// Roles whose certificates are issued only on an admin's approval.
+    pub roles: Vec<crate::roles::Role>,
+    /// Whether a request for one of those roles must also redeem an invite
+    /// token (`token AND device-approval`).
+    pub invite_also: bool,
+}
+
+impl Default for ApprovalPolicy {
+    /// Admins and nodes by an admin's approval alone.
+    fn default() -> Self {
+        Self {
+            roles: vec![crate::roles::Role::Admin, crate::roles::Role::Node],
+            invite_also: false,
+        }
+    }
+}
+
+impl ApprovalPolicy {
+    /// What enrollment in `ctx`'s namespace needs an admin's approval for:
+    /// what its enrollment hint advertises, the default for a context made
+    /// before the hint carried it.
+    pub fn of_context(ctx: &ndn_security::SignedTrustContext) -> Self {
+        ctx.enrollment_hint()
+            .and_then(Self::from_hint)
+            .unwrap_or_default()
+    }
+
+    /// The policy a context's enrollment hint advertises; `None` for a hint
+    /// that names no approval roles (contexts made before the hint carried
+    /// them).
+    pub fn from_hint(hint: &ndn_security::EnrollmentHint) -> Option<Self> {
+        if hint.approval_roles.is_empty() {
+            return None;
+        }
+        let roles = hint
+            .approval_roles
+            .iter()
+            .filter_map(|r| r.parse().ok())
+            .collect();
+        Some(Self {
+            roles,
+            invite_also: hint.require_all,
+        })
+    }
+
+    /// The enrollment hint advertising this policy: invite tokens and
+    /// admins' approvals, both required for the approval roles when
+    /// `invite_also`.
+    pub fn to_hint(&self) -> ndn_security::EnrollmentHint {
+        ndn_security::EnrollmentHint {
+            challenges: vec!["token".into(), DEVICE_APPROVAL.into()],
+            require_all: self.invite_also,
+            approval_roles: self.roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// In words, for messages and `ndn-fwd init`: `admin, node by an
+    /// admin's approval; member, guest by invite`.
+    pub fn describe(&self) -> String {
+        let list = |roles: Vec<&str>| roles.join(", ");
+        let approved: Vec<&str> = self.roles.iter().map(|r| r.as_str()).collect();
+        let invited: Vec<&str> = crate::roles::Role::ALL
+            .iter()
+            .filter(|r| !self.roles.contains(r))
+            .map(|r| r.as_str())
+            .collect();
+        let how = if self.invite_also {
+            "by an invite AND an admin's approval"
+        } else {
+            "by an admin's approval"
+        };
+        match (approved.is_empty(), invited.is_empty()) {
+            (true, _) => format!("{} by invite (or an admin's approval)", list(invited)),
+            (false, true) => format!("{} {how}", list(approved)),
+            (false, false) => format!("{} {how}; {} by invite", list(approved), list(invited)),
+        }
+    }
 }
 
 /// What a [`RolePolicy`] grants one role.
@@ -313,7 +434,19 @@ impl RolePolicy {
         Self {
             namespace,
             terms: crate::roles::Role::ALL.map(terms),
+            approval: ApprovalPolicy::default(),
         }
+    }
+
+    /// Which roles need an admin's approval, and whether an invite too
+    /// (builder; default [`ApprovalPolicy::default`]).
+    pub fn with_approval(mut self, approval: ApprovalPolicy) -> Self {
+        self.approval = approval;
+        self
+    }
+
+    pub fn approval(&self) -> &ApprovalPolicy {
+        &self.approval
     }
 
     pub fn namespace(&self) -> &Name {
@@ -390,7 +523,23 @@ impl IssuancePolicy for RolePolicy {
         let issue = IssuanceDecision::Issue {
             validity: terms.validity.unwrap_or(ctx.default_validity),
         };
+        let needs_approval = self.approval.roles.contains(&role);
         if attested(ctx, DEVICE_APPROVAL) {
+            let invited = || {
+                satisfied(ctx, DEVICE_APPROVAL).any(|leaf| {
+                    leaf.evidence
+                        .get(crate::challenge::device_approval::INVITE_EVIDENCE)
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                })
+            };
+            if needs_approval && self.approval.invite_also && !invited() {
+                return IssuanceDecision::Deny(format!(
+                    "this CA certifies a {role} device only on an invite AND an admin's \
+                     approval, and the approved request redeemed no invite: ask again with an \
+                     invite link (`ndn-fwd enroll <invite link> --role {role}`)"
+                ));
+            }
             return issue;
         }
         if attested(ctx, crate::renewal::RENEWAL_CHALLENGE) {
@@ -402,10 +551,11 @@ impl IssuancePolicy for RolePolicy {
                  expiry; for access after that, ask for a new invite"
             ));
         }
-        if matches!(role, Role::Admin | Role::Node) {
+        if needs_approval {
             return IssuanceDecision::Deny(format!(
-                "{role} certificates require an admin's device approval \
-                 (the device-approval challenge); a token alone never issues one"
+                "{role} certificates need an admin's approval: ask with `ndn-fwd enroll <anchor \
+                 link> --role {role}` and approve the request on an admin device (`ndn-fwd \
+                 approvals approve <code>`); a token alone never issues one"
             ));
         }
         let role_scope = role_prefix(&self.namespace, role);

@@ -277,6 +277,24 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
         ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::RENEW,
     ),
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::ENROLL_STATUS,
+    ),
+    // Deciding who joins the namespace is a trust change too, and the
+    // pending requests (keys, devices, codes) stay with local operators.
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::LIST_APPROVALS,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::APPROVE,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::DENY,
+    ),
 ];
 
 /// `true` when `module/verb` changes this node's trust and must pass
@@ -389,6 +407,30 @@ pub(crate) fn authorize_trust_admin(
     };
     let (caller, set) = identify_caller(fid, engine, config);
     trust_admin_decision(&caller, &set)
+}
+
+/// Who the kernel says sent a command on `source_face`, in words, for the
+/// record of who decided an approval request: `uid 1000 (alice)`. An
+/// internally generated command (`None`) is this node's own.
+pub(crate) fn caller_label(source_face: Option<FaceId>, engine: &ForwarderEngine) -> String {
+    let Some(fid) = source_face else {
+        return "this node".to_owned();
+    };
+    #[cfg(unix)]
+    {
+        match engine.faces().get(fid).and_then(|face| face.peer_credentials()) {
+            Some(peer) => match unix_ids::user_name(peer.uid) {
+                Some(user) => format!("uid {} ({user})", peer.uid),
+                None => format!("uid {}", peer.uid),
+            },
+            None => "an unidentified caller".to_owned(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fid, engine);
+        "an unidentified caller".to_owned()
+    }
 }
 
 fn trust_admin_decision(caller: &Caller, set: &OperatorSet) -> Result<(), String> {
@@ -610,7 +652,7 @@ mod unix_ids {
         }
     }
 
-    fn user_name(uid: u32) -> Option<String> {
+    pub(super) fn user_name(uid: u32) -> Option<String> {
         let mut buf: Vec<libc::c_char> = vec![0; 1024];
         loop {
             // SAFETY: as in `lookup_group`; `pw_name` points into `buf`.

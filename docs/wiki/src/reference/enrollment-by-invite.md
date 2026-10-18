@@ -133,7 +133,7 @@ output reminds the operator to add that key to every DV neighbour's
 | token role ≠ invite role, admin/node invite | 400 | the invite was altered or minted wrongly |
 | invalid device name | 400 | the rule; choose another `--device` |
 | already holds a certificate in `/<ns>` | 409 | lists it with its validity end; `--force` with another `--device` enrolls another key, the old certificate stays valid until it expires or is revoked. A held certificate whose chain the trust context revokes (its key, its CA key or the root above, e.g. after `recover --old-root compromised`) does not count: it validates nowhere, and `enroll` lists it as unusable |
-| the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or have an admin approve the device. The token is not redeemed |
+| the CA already certified this device name to another key | 409 | the certificate holding it; choose another `--device`, revoke that certificate first, or enroll by an admin's approval ([Enrollment by approval](./enrollment-by-approval.md)). The token is not redeemed |
 | held context from another root | 403 | the two fingerprints |
 | no route / no answer | 504 | the device needs a link and a route for `/<ns>` toward a forwarder that serves it (an invite carries no host, so enrolling never creates them) |
 | invite expired (`--ttl`) | 400/403 | the expiry; ask for a new invite (refused by the CLI before anything is sent, and by the CA) |
@@ -153,7 +153,10 @@ output reminds the operator to add that key to every DV neighbour's
 | CLI | `ndn-fwd` `onboard.rs` (`run_enroll`) |
 | Mobile | `NdnEngine::enroll_with_invite(invite_uri, device, persist_password)`; the result's `adopted_context` (or `NdnError::EnrollmentFailed`'s) carries the context to persist and pass to `adopt_context` at launch |
 
-## Not yet
+## See also
 
-Enrollment by an admin's approval (asynchronous) will answer the same verb
-with a `pending` state (`EnrollOutcome` is tagged by `state` for that).
+[Enrollment by approval](./enrollment-by-approval.md): admin and node
+devices, and any role the namespace's policy reserves for an admin's
+approval, enroll with `ndn-fwd enroll <anchor link> --role <role>` (or
+`<invite link> --role <role>` when the namespace also requires an invite);
+the same verb answers `state = pending` with a verification code.

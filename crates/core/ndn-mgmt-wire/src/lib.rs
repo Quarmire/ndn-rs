@@ -222,46 +222,84 @@ impl GeneralStatus {
     }
 }
 
-/// CA pending-approval dataset TLV-TYPE codes (`/localhost/nfd/ca/list-approvals`).
+/// CA approval-request dataset TLV-TYPE codes (`/localhost/nfd/ca/list-approvals`).
 ///
 /// An ndn-rs extension (no NFD analogue), so codes sit in the application range.
 pub mod ca_tlv {
     pub const PENDING_APPROVAL: u64 = 0xCA; // nested entry
     pub const REQUEST_ID: u64 = 0xCC; // UTF-8 string
-    pub const CERT_NAME: u64 = 0xCE; // UTF-8 string
-    pub const DESCRIPTION: u64 = 0xD0; // UTF-8 string, optional
+    pub const KEY_NAME: u64 = 0xCE; // UTF-8 string (the key to certify)
+    // 0xD0 (a free-text description) is retired.
+    pub const NAMESPACE: u64 = 0xD2; // UTF-8 string (the CA prefix)
+    pub const ROLE: u64 = 0xD4; // UTF-8 string, optional
+    pub const DEVICE: u64 = 0xD6; // UTF-8 string, optional
+    pub const CODE: u64 = 0xD8; // UTF-8 string ("482 913")
+    pub const STATE: u64 = 0xDA; // UTF-8 string: pending | approved | denied
+    pub const CREATED: u64 = 0xDC; // NonNegativeInteger, Unix seconds
+    pub const EXPIRES: u64 = 0xDE; // NonNegativeInteger, Unix seconds
+    pub const APPROVER: u64 = 0xE0; // UTF-8 string, optional (who decided)
+    pub const REASON: u64 = 0xE2; // UTF-8 string, optional (a denial's reason)
 }
 
-/// One row of the CA pending-approval queue. The single source of truth for
-/// this wire shape: the native engine (`ndn-mgmt`) encodes it, every client
-/// (`ndn-ipc`, the dashboard web build, `ndn-dashboard-core`) decodes it
-/// through here rather than re-deriving the TLV codes.
+/// One request for an admin's approval, as `ca/list-approvals` lists it.
+/// The single source of truth for this wire shape: the native engine
+/// (`ndn-mgmt`) encodes it, every client (`ndn-ipc`, `ndn-dashboard-core`)
+/// decodes it through here rather than re-deriving the TLV codes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PendingApproval {
     pub request_id: String,
-    pub cert_name: String,
-    pub description: String,
+    /// The key to certify, `/<ns>/<role>/<device>/KEY/<id>`.
+    pub key_name: String,
+    /// The CA the request was made to (the namespace, for a namespace CA).
+    pub namespace: String,
+    pub role: String,
+    pub device: String,
+    /// The verification code both screens show (`482 913`).
+    pub code: String,
+    /// `pending`, `approved` or `denied`.
+    pub state: String,
+    pub created_secs: u64,
+    /// Pending: when it expires undecided; decided: until when it is kept.
+    pub expires_secs: u64,
+    /// Who decided (empty while pending).
+    pub approver: String,
+    /// A denial's reason (empty otherwise).
+    pub reason: String,
 }
 
 impl PendingApproval {
-    /// Encode a queue into the `ca/list-approvals` dataset body. `description`
-    /// is omitted when empty (decoders default it to `""`).
+    /// Encode rows into the `ca/list-approvals` dataset body. Empty optional
+    /// strings are omitted (decoders default them to `""`).
     pub fn encode_all(rows: &[PendingApproval]) -> Bytes {
         let mut w = TlvWriter::new();
         for r in rows {
             w.write_nested(ca_tlv::PENDING_APPROVAL, |inner| {
-                inner.write_tlv(ca_tlv::REQUEST_ID, r.request_id.as_bytes());
-                inner.write_tlv(ca_tlv::CERT_NAME, r.cert_name.as_bytes());
-                if !r.description.is_empty() {
-                    inner.write_tlv(ca_tlv::DESCRIPTION, r.description.as_bytes());
+                let mut text = |typ: u64, s: &str| {
+                    if !s.is_empty() {
+                        inner.write_tlv(typ, s.as_bytes());
+                    }
+                };
+                text(ca_tlv::REQUEST_ID, &r.request_id);
+                text(ca_tlv::KEY_NAME, &r.key_name);
+                text(ca_tlv::NAMESPACE, &r.namespace);
+                text(ca_tlv::ROLE, &r.role);
+                text(ca_tlv::DEVICE, &r.device);
+                text(ca_tlv::CODE, &r.code);
+                text(ca_tlv::STATE, &r.state);
+                text(ca_tlv::APPROVER, &r.approver);
+                text(ca_tlv::REASON, &r.reason);
+                for (typ, v) in [(ca_tlv::CREATED, r.created_secs), (ca_tlv::EXPIRES, r.expires_secs)]
+                {
+                    let (b, n) = nni_bytes(v);
+                    inner.write_tlv(typ, &b[..n]);
                 }
             });
         }
         w.finish()
     }
 
-    /// Decode the dataset body. Unknown top-level TLVs are skipped (evolvability);
-    /// an entry missing `request_id` or `cert_name` is dropped.
+    /// Decode the dataset body. Unknown TLVs are skipped (evolvability); an
+    /// entry missing `request_id` or `key_name` is dropped.
     pub fn decode_all(bytes: &[u8]) -> alloc::vec::Vec<PendingApproval> {
         let mut out = alloc::vec::Vec::new();
         let mut reader = TlvReader::new(Bytes::copy_from_slice(bytes));
@@ -276,15 +314,23 @@ impl PendingApproval {
             let mut inner = TlvReader::new(body);
             while !inner.is_empty() {
                 let Ok((t, v)) = inner.read_tlv() else { break };
-                let s = String::from_utf8_lossy(&v).into_owned();
+                let s = || String::from_utf8_lossy(&v).into_owned();
                 match t {
-                    ca_tlv::REQUEST_ID => row.request_id = s,
-                    ca_tlv::CERT_NAME => row.cert_name = s,
-                    ca_tlv::DESCRIPTION => row.description = s,
+                    ca_tlv::REQUEST_ID => row.request_id = s(),
+                    ca_tlv::KEY_NAME => row.key_name = s(),
+                    ca_tlv::NAMESPACE => row.namespace = s(),
+                    ca_tlv::ROLE => row.role = s(),
+                    ca_tlv::DEVICE => row.device = s(),
+                    ca_tlv::CODE => row.code = s(),
+                    ca_tlv::STATE => row.state = s(),
+                    ca_tlv::APPROVER => row.approver = s(),
+                    ca_tlv::REASON => row.reason = s(),
+                    ca_tlv::CREATED => row.created_secs = read_nni(&v).unwrap_or(0),
+                    ca_tlv::EXPIRES => row.expires_secs = read_nni(&v).unwrap_or(0),
                     _ => {}
                 }
             }
-            if !row.request_id.is_empty() && !row.cert_name.is_empty() {
+            if !row.request_id.is_empty() && !row.key_name.is_empty() {
                 out.push(row);
             }
         }
@@ -300,14 +346,24 @@ mod tests {
     fn pending_approval_round_trips() {
         let rows = alloc::vec![
             PendingApproval {
-                request_id: "req-1".into(),
-                cert_name: "/ndn/alice/KEY/k/CA/v".into(),
-                description: "Touch ID".into(),
+                request_id: "1a2b3c4d5e6f7081".into(),
+                key_name: "/home/bob/admin/phone/KEY/k".into(),
+                namespace: "/home/bob".into(),
+                role: "admin".into(),
+                device: "phone".into(),
+                code: "482 913".into(),
+                state: "pending".into(),
+                created_secs: 1_760_000_000,
+                expires_secs: 1_760_604_800,
+                ..Default::default()
             },
             PendingApproval {
-                request_id: "req-2".into(),
-                cert_name: "/ndn/bob/KEY/k/CA/v".into(),
-                description: String::new(), // omitted on the wire
+                request_id: "99aa".into(),
+                key_name: "/home/bob/node/vps/KEY/k".into(),
+                state: "denied".into(),
+                approver: "uid 1000 (bob)".into(),
+                reason: "not mine".into(),
+                ..Default::default()
             },
         ];
         let wire = PendingApproval::encode_all(&rows);
@@ -319,7 +375,7 @@ mod tests {
 
     #[test]
     fn pending_approval_drops_incomplete_entries() {
-        // An entry with only a request id (no cert name) is dropped.
+        // An entry with only a request id (no key name) is dropped.
         let mut w = TlvWriter::new();
         w.write_nested(ca_tlv::PENDING_APPROVAL, |i| {
             i.write_tlv(ca_tlv::REQUEST_ID, b"orphan");

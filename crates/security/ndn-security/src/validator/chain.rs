@@ -430,13 +430,15 @@ impl Validator {
                 });
             }
             // Data that merely shares the certificate name shape is no
-            // certificate (an NDNCERT approval `<key>/ndncert-approve/<id>`).
+            // certificate (an admin's NDNCERT decision
+            // `<key>/ndncert-approve|ndncert-deny/<id>`).
             if crate::cert_name::is_reserved_non_cert(&cert.name) {
                 return WalkOutcome::Invalid(TrustError::CertNotAuthorized {
                     cert: cert.name.to_string(),
                     issuer: current_key_name.to_string(),
-                    why: "it is an NDNCERT approval (`<key>/ndncert-approve/<id>`), not a \
-                          certificate, and never answers for a key"
+                    why: "it is an admin's NDNCERT decision (`<key>/ndncert-approve/<id>` or \
+                          `<key>/ndncert-deny/<id>`), not a certificate, and never answers for \
+                          a key"
                         .to_string(),
                 });
             }

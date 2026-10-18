@@ -1,51 +1,72 @@
-//! `/localhost/nfd/ca/list-approvals` — read-only introspection of the
-//! NDNCERT CA's pending device-approval requests. Backend is a
-//! `PendingApprovalStore`(ndn_cert::challenge::device_approval::PendingApprovalStore)
-//! via the [`ApprovalMgmtBackend`] trait.
+//! `/localhost/nfd/ca/{list-approvals,approve,deny}` — enrollment by an
+//! admin's approval, through the node's [`ApprovalMgmtBackend`]: its own
+//! CA's requests on a CA host; on an admin device also its namespaces' CAs'
+//! pending requests, decided with its admin key.
 //!
-//! List-only, like `compute`: approvals are created by the CHALLENGE flow and
-//! resolved by the approval transport, never mutated over this verb. The
-//! dataset is a concatenation of `PendingApproval` TLVs:
+//! Every verb is a trust change: it reaches this module only from a local
+//! operator on the management socket (kernel peer credentials), never over
+//! `/localhop` or another face (see `auth::TRUST_ADMIN_VERBS`). The operator
+//! the kernel attests (`uid 1000 (alice)`) is handed to the backend, which
+//! records it as the approver of a decision made on the CA host.
 //!
-//! ```text
-//! PendingApproval = PENDING-APPROVAL-TYPE TLV-LENGTH
-//!                     RequestId    ; text, the per-request nonce
-//!                     CertName     ; text, the subject awaiting approval
-//!                     [Description]; text, optional requester note
-//! ```
+//! `list-approvals` answers a dataset of `PendingApproval` rows
+//! ([`ndn_mgmt_wire::PendingApproval`]); `approve` takes the request id or
+//! verification code in `Uri`, `deny` takes `<id or code>[:<reason>]`. Both
+//! answer a sentence saying what was recorded.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use ndn_mgmt_wire::{
-    ControlParameters, ControlResponse,
+    ControlParameters, ControlResponse, PendingApproval,
     control_response::status,
     nfd_command::{module, verb},
 };
 
 use crate::module::{MgmtContext, MgmtModule};
-use crate::{ApprovalMgmtBackend, MgmtResponse, PendingApprovalInfo};
-use ndn_mgmt_wire::PendingApproval;
+use crate::{ApprovalMgmtBackend, MgmtResponse};
 
 fn handle_ca(
     verb_name: &[u8],
     params: ControlParameters,
     handler: Option<&Arc<dyn ApprovalMgmtBackend>>,
+    operator: String,
 ) -> MgmtResponse {
     let Some(handler) = handler else {
         return ControlResponse::error(
             status::NOT_FOUND,
-            "ca module not wired (no ApprovalMgmtBackend installed)",
+            "this node neither runs a CA that takes approval requests nor is an admin device \
+             of a namespace: there is nothing to approve here",
         )
         .into();
     };
+    let handler = Arc::clone(handler);
     match verb_name {
-        v if v == verb::LIST_APPROVALS => {
-            MgmtResponse::Dataset(approvals_dataset(&handler.pending()))
+        v if v == verb::LIST_APPROVALS => MgmtResponse::DeferredDataset(Box::pin(async move {
+            handler
+                .list()
+                .await
+                .map(|rows| PendingApproval::encode_all(&rows))
+                .map_err(|r| ControlResponse::error(r.status_code, r.reason))
+        })),
+        v if v == verb::APPROVE || v == verb::DENY => {
+            let Some((target, decision)) = decision_of(v == verb::APPROVE, params.uri.as_deref())
+            else {
+                return ControlResponse::error(
+                    status::BAD_PARAMS,
+                    "give the request id or the six-digit code (`ndn-fwd approvals list` shows \
+                     them) in Uri; a denial may add `:<reason>`",
+                )
+                .into();
+            };
+            MgmtResponse::Deferred(Box::pin(async move {
+                match handler.decide(target, decision, operator).await {
+                    Ok(row) => ControlResponse::ok_empty(decided(&row)),
+                    Err(r) => ControlResponse::error(r.status_code, r.reason),
+                }
+            }))
         }
-        v if v == verb::APPROVE => approve_handler(params, handler.as_ref()).into(),
-        v if v == verb::DENY => deny_handler(params, handler.as_ref()).into(),
         _ => ControlResponse::error(
             status::NOT_FOUND,
             "unknown ca verb (try `list-approvals`, `approve`, or `deny`)",
@@ -54,63 +75,41 @@ fn handle_ca(
     }
 }
 
-/// Approve a pending request. Params: `uri` carries the request id.
-/// The signed-command gate authenticates the operator; the recorded
-/// approver label is the conventional `"approved-via-mgmt"` until
-/// the v2 canonical signed-Data approval path lands.
-fn approve_handler(
-    params: ControlParameters,
-    handler: &dyn ApprovalMgmtBackend,
-) -> ControlResponse {
-    let Some(id) = params.uri.as_deref() else {
-        return ControlResponse::error(status::BAD_PARAMS, "request id required in `uri`");
-    };
-    if handler.approve(id, "approved-via-mgmt") {
-        ControlResponse::ok_empty(format!("approved {id}"))
-    } else {
-        ControlResponse::error(
-            status::NOT_FOUND,
-            format!("no pending request with id {id:?} (already resolved or never existed)"),
-        )
+/// `(target, decision)` of an approve (`<id or code>`) or deny
+/// (`<id or code>[:<reason>]`) Uri.
+fn decision_of(approve: bool, uri: Option<&str>) -> Option<(String, ndn_cert::Decision)> {
+    let raw = uri.map(str::trim).filter(|s| !s.is_empty())?;
+    if approve {
+        return Some((raw.to_owned(), ndn_cert::Decision::Approve));
     }
+    let (target, reason) = match raw.split_once(':') {
+        Some((target, reason)) => (target.trim(), reason.trim()),
+        None => (raw, ""),
+    };
+    let reason = if reason.is_empty() {
+        "no reason given".to_owned()
+    } else {
+        reason.to_owned()
+    };
+    (!target.is_empty()).then(|| (target.to_owned(), ndn_cert::Decision::Deny { reason }))
 }
 
-/// Deny a pending request. Params: `uri` carries `<request_id>:<reason>`
-/// (reason optional). Mirrors the `safebag-import` two-half hex
-/// convention so callers don't need a new TLV field.
-fn deny_handler(params: ControlParameters, handler: &dyn ApprovalMgmtBackend) -> ControlResponse {
-    let Some(raw) = params.uri.as_deref() else {
-        return ControlResponse::error(
-            status::BAD_PARAMS,
-            "request id required in `uri` (format: `<id>` or `<id>:<reason>`)",
-        );
-    };
-    let (id, reason) = match raw.split_once(':') {
-        Some((id, reason)) => (id, reason),
-        None => (raw, "denied"),
-    };
-    if handler.deny(id, reason) {
-        ControlResponse::ok_empty(format!("denied {id}"))
+/// What a decision recorded, in one sentence.
+fn decided(row: &PendingApproval) -> String {
+    let subject = if row.role.is_empty() {
+        row.key_name.clone()
     } else {
-        ControlResponse::error(
-            status::NOT_FOUND,
-            format!("no pending request with id {id:?} (already resolved or never existed)"),
-        )
-    }
-}
-
-fn approvals_dataset(rows: &[PendingApprovalInfo]) -> bytes::Bytes {
-    // Encode through the shared `ndn-mgmt-wire` codec so the engine and every
-    // client decode the same bytes by construction.
-    let wire: Vec<PendingApproval> = rows
-        .iter()
-        .map(|info| PendingApproval {
-            request_id: info.id.clone(),
-            cert_name: info.cert_name.clone(),
-            description: info.description.clone(),
-        })
-        .collect();
-    PendingApproval::encode_all(&wire)
+        format!("{} device {:?} ({})", row.role, row.device, row.key_name)
+    };
+    let outcome = if row.state == "approved" {
+        "the device's next request gets its certificate".to_owned()
+    } else {
+        format!("reason: {}; the device is told so at its next request", row.reason)
+    };
+    format!(
+        "{} request {} for {subject} at {} (code {}), recorded as decided by {}; {outcome}",
+        row.state, row.request_id, row.namespace, row.code, row.approver
+    )
 }
 
 pub(crate) struct CaModule;
@@ -127,175 +126,99 @@ impl MgmtModule for CaModule {
         params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        handle_ca(verb, params, ctx.approval_handler)
+        let operator = crate::auth::caller_label(ctx.source_face, ctx.engine);
+        handle_ca(verb, params, ctx.approval_handler, operator)
     }
 }
 
 #[cfg(test)]
 mod ca_tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
-    struct StubBackend {
-        rows: Mutex<Vec<PendingApprovalInfo>>,
-        approved: Mutex<Vec<(String, String)>>,
-        denied: Mutex<Vec<(String, String)>>,
+    /// Records what reached the backend.
+    #[derive(Default)]
+    struct Recording {
+        decided: Mutex<Vec<(String, ndn_cert::Decision, String)>>,
     }
-    impl ApprovalMgmtBackend for StubBackend {
-        fn pending(&self) -> Vec<PendingApprovalInfo> {
-            self.rows.lock().unwrap().clone()
+
+    #[async_trait]
+    impl ApprovalMgmtBackend for Recording {
+        async fn list(&self) -> Result<Vec<PendingApproval>, crate::TrustRefusal> {
+            Ok(Vec::new())
         }
-        fn approve(&self, id: &str, approver: &str) -> bool {
-            // Mirror PendingApprovalStore semantics: only flip if the
-            // request is still in the pending list.
-            let mut rows = self.rows.lock().unwrap();
-            let Some(pos) = rows.iter().position(|r| r.id == id) else {
-                return false;
-            };
-            rows.remove(pos);
-            self.approved
+        async fn decide(
+            &self,
+            target: String,
+            decision: ndn_cert::Decision,
+            operator: String,
+        ) -> Result<PendingApproval, crate::TrustRefusal> {
+            self.decided
                 .lock()
-                .unwrap()
-                .push((id.to_string(), approver.to_string()));
-            true
-        }
-        fn deny(&self, id: &str, reason: &str) -> bool {
-            let mut rows = self.rows.lock().unwrap();
-            let Some(pos) = rows.iter().position(|r| r.id == id) else {
-                return false;
-            };
-            rows.remove(pos);
-            self.denied
-                .lock()
-                .unwrap()
-                .push((id.to_string(), reason.to_string()));
-            true
+                .push((target.clone(), decision, operator.clone()));
+            Ok(PendingApproval {
+                request_id: target,
+                key_name: "/home/bob/admin/phone/KEY/k".into(),
+                state: "approved".into(),
+                approver: operator,
+                ..Default::default()
+            })
         }
     }
 
-    fn backend(rows: Vec<PendingApprovalInfo>) -> Arc<StubBackend> {
-        Arc::new(StubBackend {
-            rows: Mutex::new(rows),
-            approved: Mutex::new(Vec::new()),
-            denied: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn as_dyn(b: &Arc<StubBackend>) -> Arc<dyn ApprovalMgmtBackend> {
-        b.clone()
-    }
-
-    fn info(id: &str, cert: &str, desc: &str) -> PendingApprovalInfo {
-        PendingApprovalInfo {
-            id: id.to_string(),
-            cert_name: cert.to_string(),
-            description: desc.to_string(),
+    async fn answer(resp: MgmtResponse) -> ControlResponse {
+        match resp {
+            MgmtResponse::Control(cr) => *cr,
+            MgmtResponse::Deferred(pending) => pending.await,
+            _ => panic!("expected a control response"),
         }
     }
 
-    fn cp_uri(s: &str) -> ControlParameters {
-        ControlParameters {
-            uri: Some(s.to_string()),
+    /// The approver a decision records is the operator the kernel attested,
+    /// never a fixed label; a denial carries its reason.
+    #[tokio::test]
+    async fn decisions_carry_the_attested_operator_and_reason() {
+        let backend = Arc::new(Recording::default());
+        let dyn_backend: Arc<dyn ApprovalMgmtBackend> = backend.clone();
+        let uri = |s: &str| ControlParameters {
+            uri: Some(s.into()),
             ..Default::default()
-        }
-    }
-
-    #[test]
-    fn returns_404_when_no_backend() {
-        match handle_ca(verb::LIST_APPROVALS, ControlParameters::default(), None) {
-            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
-            _ => panic!("expected ControlResponse"),
-        }
-    }
-
-    #[test]
-    fn unknown_verb_returns_404() {
-        let h = backend(vec![]);
-        match handle_ca(b"nope", ControlParameters::default(), Some(&as_dyn(&h))) {
-            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
-            _ => panic!("expected ControlResponse"),
-        }
-    }
-
-    #[test]
-    fn list_encodes_each_pending_approval() {
-        let h = backend(vec![
-            info("req-1", "/lab/alice/devices/laptop", "laptop"),
-            info("req-2", "/lab/bob/devices/watch", ""),
-        ]);
-        let bytes = match handle_ca(
-            verb::LIST_APPROVALS,
-            ControlParameters::default(),
-            Some(&as_dyn(&h)),
-        ) {
-            MgmtResponse::Dataset(b) => b,
-            _ => panic!("expected dataset"),
         };
-        // Decode through the shared codec — proves the engine's output is
-        // round-trippable by the same decoder every client uses.
-        let rows = PendingApproval::decode_all(&bytes);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].request_id, "req-1");
-        assert_eq!(rows[0].cert_name, "/lab/alice/devices/laptop");
-        assert_eq!(rows[1].request_id, "req-2");
-        assert_eq!(rows[1].description, ""); // empty omitted on the wire
+        let op = || "uid 1000 (alice)".to_owned();
+        assert!(
+            answer(handle_ca(verb::APPROVE, uri("482 913"), Some(&dyn_backend), op()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            answer(handle_ca(verb::DENY, uri("1a2b:not mine"), Some(&dyn_backend), op()))
+                .await
+                .is_ok()
+        );
+        let decided = backend.decided.lock();
+        assert_eq!(
+            decided[0],
+            ("482 913".into(), ndn_cert::Decision::Approve, op())
+        );
+        assert_eq!(
+            decided[1],
+            (
+                "1a2b".into(),
+                ndn_cert::Decision::Deny {
+                    reason: "not mine".into()
+                },
+                op()
+            )
+        );
     }
 
-    #[test]
-    fn approve_succeeds_on_pending_request() {
-        let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        let resp = match handle_ca(verb::APPROVE, cp_uri("req-1"), Some(&as_dyn(&h))) {
-            MgmtResponse::Control(cr) => cr,
-            _ => panic!("expected ControlResponse"),
-        };
-        assert!(resp.is_ok(), "expected 2xx; got {}", resp.status_code);
-        let approved = h.approved.lock().unwrap();
-        assert_eq!(approved.len(), 1);
-        assert_eq!(approved[0].0, "req-1");
-        assert_eq!(approved[0].1, "approved-via-mgmt");
-    }
-
-    #[test]
-    fn approve_requires_request_id() {
-        let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        match handle_ca(
-            verb::APPROVE,
-            ControlParameters::default(),
-            Some(&as_dyn(&h)),
-        ) {
-            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::BAD_PARAMS),
-            _ => panic!("expected ControlResponse"),
-        }
-    }
-
-    #[test]
-    fn approve_unknown_id_returns_404() {
-        let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        match handle_ca(verb::APPROVE, cp_uri("req-missing"), Some(&as_dyn(&h))) {
-            MgmtResponse::Control(cr) => assert_eq!(cr.status_code, status::NOT_FOUND),
-            _ => panic!("expected ControlResponse"),
-        }
-    }
-
-    #[test]
-    fn deny_with_reason_records_reason() {
-        let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        match handle_ca(verb::DENY, cp_uri("req-1:not on team"), Some(&as_dyn(&h))) {
-            MgmtResponse::Control(cr) => assert!(cr.is_ok()),
-            _ => panic!("expected ControlResponse"),
-        }
-        let denied = h.denied.lock().unwrap();
-        assert_eq!(denied.len(), 1);
-        assert_eq!(denied[0].1, "not on team");
-    }
-
-    #[test]
-    fn deny_without_reason_defaults_to_denied() {
-        let h = backend(vec![info("req-1", "/lab/alice", "")]);
-        match handle_ca(verb::DENY, cp_uri("req-1"), Some(&as_dyn(&h))) {
-            MgmtResponse::Control(cr) => assert!(cr.is_ok()),
-            _ => panic!("expected ControlResponse"),
-        }
-        assert_eq!(h.denied.lock().unwrap()[0].1, "denied");
+    #[tokio::test]
+    async fn without_a_backend_or_target_nothing_is_decided() {
+        let none = handle_ca(verb::APPROVE, ControlParameters::default(), None, String::new());
+        assert_eq!(answer(none).await.status_code, status::NOT_FOUND);
+        let backend: Arc<dyn ApprovalMgmtBackend> = Arc::new(Recording::default());
+        let no_target =
+            handle_ca(verb::APPROVE, ControlParameters::default(), Some(&backend), String::new());
+        assert_eq!(answer(no_target).await.status_code, status::BAD_PARAMS);
     }
 }

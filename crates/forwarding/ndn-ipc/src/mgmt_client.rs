@@ -317,52 +317,81 @@ impl MgmtClient {
         Ok(ControlParameters::decode_all(&bytes))
     }
 
-    /// `ca/list-approvals`. Read-only introspection of the NDNCERT CA's
-    /// pending device-approval requests. Returns one tuple per pending
-    /// request: `(request_id, cert_name, description)`. Empty when no
-    /// CA is wired or no requests are pending. Powers the §5.5
-    /// dashboard approver UI.
-    pub async fn ca_list_approvals(&self) -> Result<Vec<(String, String, String)>, ForwarderError> {
-        let bytes = self.dataset_raw(module::CA, verb::LIST_APPROVALS).await?;
-        // Decode through the shared `ndn-mgmt-wire` codec; map to the historical
-        // tuple shape this method's callers expect.
-        Ok(ndn_mgmt_wire::PendingApproval::decode_all(&bytes)
-            .into_iter()
-            .map(|a| (a.request_id, a.cert_name, a.description))
-            .collect())
+    /// `ca/list-approvals`: the requests for an admin's approval this node
+    /// can decide (its CA's, or as an admin device its namespaces' CAs'
+    /// pending ones). Local operators only (trust-admin verb). On an admin
+    /// device the daemon asks the CAs over the network: the Interest lives
+    /// `timeout`, and so does the wait. A refusal (nothing to approve on this
+    /// node, a CA unreachable) is [`ForwarderError::Command`] with its reason.
+    pub async fn ca_list_approvals(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, ForwarderError> {
+        let interest_wire = InterestBuilder::new(dataset_name(module::CA, verb::LIST_APPROVALS))
+            .can_be_prefix()
+            .must_be_fresh()
+            .lifetime(timeout)
+            .build();
+        let _guard = self.recv_lock.lock().await;
+        let data_wire = self
+            .exchange_timeout(&interest_wire, timeout)
+            .await?
+            .ok_or_else(|| no_answer_within(timeout))?;
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
+        let content = data.content().map(|c| c.as_ref()).unwrap_or_default();
+        // A refusal is a ControlResponse; the dataset is PendingApproval rows.
+        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
+        {
+            let resp = ControlResponse::decode(Bytes::copy_from_slice(content))
+                .map_err(|_| ForwarderError::MalformedResponse)?;
+            return Err(ForwarderError::Command {
+                code: resp.status_code,
+                text: resp.status_text,
+            });
+        }
+        Ok(ndn_mgmt_wire::PendingApproval::decode_all(content))
     }
 
-    /// `ca/approve`. Approves a pending device-approval request by id.
-    /// Signed-command gated (SECURITY-extended-module rule); the
-    /// signer's identity authorises the approval. v1 records
-    /// `"approved-via-mgmt"` as the approver label until the v2
-    /// canonical signed-Data path lands.
-    pub async fn ca_approve(&self, request_id: &str) -> Result<ControlParameters, ForwarderError> {
+    /// `ca/approve`: approve the pending request `target` names (its request
+    /// id or its six-digit verification code). On the CA host the daemon
+    /// records the local operator as the approver; on an admin device it
+    /// signs the approval with its admin key and pushes it to the CA, so the
+    /// Interest lives `timeout`, and so does the wait. The answer's
+    /// `status_text` says what was recorded, or why nothing was.
+    pub async fn ca_approve(
+        &self,
+        target: &str,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
-            uri: Some(request_id.to_owned()),
+            uri: Some(target.to_owned()),
             ..Default::default()
         };
-        self.command(module::CA, verb::APPROVE, &params).await
+        self.deferred_command(module::CA, verb::APPROVE, &params, timeout)
+            .await
     }
 
-    /// `ca/deny`. Denies a pending request. `reason` is recorded as
-    /// the denial detail (defaults to `"denied"` if empty). Signed-
-    /// command gated like `ca_approve`.
+    /// `ca/deny`: deny the pending request `target` names, with `reason`
+    /// (told to the device; empty: "no reason given"). Decided and answered
+    /// like [`ca_approve`](Self::ca_approve).
     pub async fn ca_deny(
         &self,
-        request_id: &str,
+        target: &str,
         reason: &str,
-    ) -> Result<ControlParameters, ForwarderError> {
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
         let uri = if reason.is_empty() {
-            request_id.to_owned()
+            target.to_owned()
         } else {
-            format!("{request_id}:{reason}")
+            format!("{target}:{reason}")
         };
         let params = ControlParameters {
             uri: Some(uri),
             ..Default::default()
         };
-        self.command(module::CA, verb::DENY, &params).await
+        self.deferred_command(module::CA, verb::DENY, &params, timeout)
+            .await
     }
 
     /// `cs/config`. `Some(capacity)` sets the new bytes cap; always
@@ -701,33 +730,53 @@ impl MgmtClient {
             uri: Some(link_uri.to_owned()),
             ..Default::default()
         };
-        self.deferred_command(verb::CONTEXT_ADOPT, &params, timeout)
+        self.deferred_command(module::SECURITY, verb::CONTEXT_ADOPT, &params, timeout)
             .await
     }
 
     /// `security/enroll`: ask the daemon to enroll `identity`
-    /// (`/<ns>/<role>/<device>`) with the CA the `ndn-trust://invite` link
-    /// names — the daemon generates the key in its PIB, adopts the trust
-    /// context if needed, redeems the token and makes the certified identity
-    /// its default. `force`: enroll although this node already holds a
+    /// (`/<ns>/<role>/<device>`) with the CA `link_uri` names — an
+    /// `ndn-trust://invite` link (the token is redeemed), or an
+    /// `ndn-trust://anchor` link for a role the namespace certifies on an
+    /// admin's approval. The daemon generates the key in its PIB, adopts the
+    /// trust context if needed and, once certified, makes the identity its
+    /// default. `force`: enroll although this node already holds a
     /// certificate in the namespace. The command Interest lives `timeout`,
     /// and so does the wait. Success carries `ndn_mgmt::EnrollOutcome` as
-    /// JSON in `status_text`; a refusal's `status_text` says why and what to
-    /// do instead.
+    /// JSON in `status_text` (`enrolled`, or `pending` an admin's approval,
+    /// which the daemon then completes on its own); a refusal's
+    /// `status_text` says why and what to do instead.
     pub async fn security_enroll(
         &self,
-        invite_uri: &str,
+        link_uri: &str,
         identity: &ndn_packet::Name,
         force: bool,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
         let params = ControlParameters {
-            uri: Some(invite_uri.to_owned()),
+            uri: Some(link_uri.to_owned()),
             name: Some(identity.clone()),
             flags: force.then_some(verb::ENROLL_FORCE),
             ..Default::default()
         };
-        self.deferred_command(verb::ENROLL, &params, timeout).await
+        self.deferred_command(module::SECURITY, verb::ENROLL, &params, timeout)
+            .await
+    }
+
+    /// `security/enroll-status`: the requests for an admin's approval this
+    /// node made, oldest first, as a JSON list of `ndn_cert::OutgoingRequest`
+    /// in `status_text`.
+    pub async fn security_enroll_status(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ControlResponse, ForwarderError> {
+        self.deferred_command(
+            module::SECURITY,
+            verb::ENROLL_STATUS,
+            &ControlParameters::default(),
+            timeout,
+        )
+        .await
     }
 
     /// `security/context-refresh`: ask the daemon to check the held trust
@@ -744,7 +793,7 @@ impl MgmtClient {
             name: namespace.cloned(),
             ..Default::default()
         };
-        self.deferred_command(verb::CONTEXT_REFRESH, &params, timeout)
+        self.deferred_command(module::SECURITY, verb::CONTEXT_REFRESH, &params, timeout)
             .await
     }
 
@@ -764,7 +813,7 @@ impl MgmtClient {
             context_data: Some(context_data),
             ..Default::default()
         };
-        self.deferred_command(verb::CONTEXT_UPDATE, &params, timeout)
+        self.deferred_command(module::SECURITY, verb::CONTEXT_UPDATE, &params, timeout)
             .await
     }
 
@@ -777,14 +826,15 @@ impl MgmtClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
-        self.deferred_command(verb::RENEW, &ControlParameters::default(), timeout)
+        self.deferred_command(module::SECURITY, verb::RENEW, &ControlParameters::default(), timeout)
             .await
     }
 
-    /// A `security/<verb>` command the daemon answers only after network
+    /// A `<module>/<verb>` command the daemon answers only after network
     /// round trips: the Interest lives `timeout` and the wait is as long.
     async fn deferred_command(
         &self,
+        module_name: &[u8],
         verb: &[u8],
         params: &ControlParameters,
         timeout: std::time::Duration,
@@ -792,9 +842,9 @@ impl MgmtClient {
         // A context Data travels in ApplicationParameters (kilobytes, too
         // long for a Name component).
         let (name, app_params) = if params.context_data.is_some() {
-            (dataset_name(module::SECURITY, verb), Some(params.encode()))
+            (dataset_name(module_name, verb), Some(params.encode()))
         } else {
-            (command_name(module::SECURITY, verb, params), None)
+            (command_name(module_name, verb, params), None)
         };
         let interest_wire =
             build_signed_interest_with_lifetime(&self.signing, name, Some(timeout), app_params)
@@ -803,12 +853,7 @@ impl MgmtClient {
         let data_wire = self
             .exchange_timeout(&interest_wire, timeout)
             .await?
-            .ok_or_else(|| {
-                ForwarderError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("the daemon did not answer within {}s", timeout.as_secs()),
-                ))
-            })?;
+            .ok_or_else(|| no_answer_within(timeout))?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
         let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
@@ -1145,6 +1190,14 @@ impl MgmtClient {
         ControlResponse::decode(Bytes::copy_from_slice(content))
             .map_err(|_| ForwarderError::MalformedResponse)
     }
+}
+
+/// The error of a deferred management command the daemon left unanswered.
+fn no_answer_within(timeout: std::time::Duration) -> ForwarderError {
+    ForwarderError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("the daemon did not answer within {}s", timeout.as_secs()),
+    ))
 }
 
 fn build_dataset_interest(name: Name) -> Bytes {

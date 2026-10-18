@@ -546,7 +546,18 @@ where
     let mut fetched = Vec::new();
     for _ in 0..=MAX_FETCHES {
         match validator.validate_chain_cached(data).await {
-            (ValidationResult::Valid(_), _) => return Ok(fetched),
+            // A key of the namespace signed it. `DigestSha256` also
+            // "validates", but proves integrity, not who made it: anyone can
+            // compute it.
+            (ValidationResult::Valid(safe), _) => {
+                if matches!(safe.trust_path(), ndn_security::safe_data::TrustPath::CertChain(_)) {
+                    return Ok(fetched);
+                }
+                return Err(refused(format!(
+                    "it is not signed by a key of {namespace} (a DigestSha256 proves integrity, not \
+                     who made it)"
+                )));
+            }
             (ValidationResult::Invalid(e), _) => {
                 return Err(refused(format!(
                     "it does not chain to the root of {namespace} under its schema: {e}"

@@ -153,52 +153,92 @@ impl ContextExplanation {
     }
 }
 
-/// Which NDNCERT challenges gate enrollment under a context, and whether all
-/// are required (combinator-AND) or any one suffices.
+/// How devices enroll under a context: which NDNCERT challenges the
+/// namespace's CA offers, which roles it certifies only on an admin's
+/// approval, and whether those roles need every challenge (an invite AND an
+/// approval) or the approval alone. Other roles enroll with an invite token.
+/// Policy in data: a namespace CA enforces what its context advertises.
 ///
 /// Strings are NDNCERT challenge identifiers — `"token"`, `"pin"`, `"email"`,
-/// `"proof-of-possession"`, `"device-approval"`, `"yubikey"`. ndn-cert maps
-/// them to its handlers, keeping ndn-security free of an ndn-cert dependency.
+/// `"proof-of-possession"`, `"device-approval"`, `"yubikey"` — and role names
+/// (`"admin"`, `"node"`, …). ndn-cert maps them to its handlers and roles,
+/// keeping ndn-security free of an ndn-cert dependency.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnrollmentHint {
     pub challenges: Vec<String>,
+    /// For the roles in [`approval_roles`](Self::approval_roles): every
+    /// challenge is required (`token AND device-approval`), not the
+    /// approval alone.
     pub require_all: bool,
+    /// Roles whose certificates are issued only on an admin's approval.
+    /// Empty in contexts made before the hint carried them.
+    pub approval_roles: Vec<String>,
 }
 
+/// [`EnrollmentHint`] wire flag: every challenge is required.
+const HINT_REQUIRE_ALL: u8 = 0x01;
+/// [`EnrollmentHint`] wire flag: a `;`-separated approval-role list follows
+/// the challenge list.
+const HINT_HAS_ROLES: u8 = 0x02;
+
 impl EnrollmentHint {
-    /// The default enrollment gate `ndn-fwd init` puts on a namespace:
-    /// `token AND device-approval` — a leaked QR token alone yields no cert
-    /// without an admin tap.
+    /// The default enrollment policy `ndn-fwd init` puts on a namespace:
+    /// members and guests by invite token, admins and nodes by an admin's
+    /// approval alone.
     pub fn namespace_default() -> Self {
         Self {
             challenges: vec!["token".into(), "device-approval".into()],
-            require_all: true,
+            require_all: false,
+            approval_roles: vec!["admin".into(), "node".into()],
         }
     }
 
     fn encode(&self) -> Bytes {
-        let mut v = Vec::new();
-        v.push(self.require_all as u8);
+        let mut flags = 0u8;
+        if self.require_all {
+            flags |= HINT_REQUIRE_ALL;
+        }
+        if !self.approval_roles.is_empty() {
+            flags |= HINT_HAS_ROLES;
+        }
+        let mut v = vec![flags];
         v.extend_from_slice(self.challenges.join(",").as_bytes());
+        if !self.approval_roles.is_empty() {
+            v.push(b';');
+            v.extend_from_slice(self.approval_roles.join(",").as_bytes());
+        }
         Bytes::from(v)
     }
 
     fn decode(value: &[u8]) -> Self {
-        let require_all = value.first().copied().unwrap_or(0) != 0;
+        let flags = value.first().copied().unwrap_or(0);
         let rest = if value.is_empty() {
             &[][..]
         } else {
             &value[1..]
         };
         let s = String::from_utf8_lossy(rest);
-        let challenges = if s.is_empty() {
-            Vec::new()
+        let (challenges, roles) = if flags & HINT_HAS_ROLES != 0 {
+            s.split_once(';').unwrap_or((&s, ""))
         } else {
-            s.split(',').map(|x| x.to_string()).collect()
+            (&s[..], "")
+        };
+        let list = |text: &str| -> Vec<String> {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                text.split(',').map(|x| x.to_string()).collect()
+            }
         };
         Self {
-            challenges,
-            require_all,
+            challenges: list(challenges),
+            // Before the flags, any non-zero first byte meant "all required".
+            require_all: if flags & HINT_HAS_ROLES != 0 {
+                flags & HINT_REQUIRE_ALL != 0
+            } else {
+                flags != 0
+            },
+            approval_roles: list(roles),
         }
     }
 }
@@ -1166,8 +1206,10 @@ mod tests {
         let h = EnrollmentHint::namespace_default();
         let decoded = EnrollmentHint::decode(&h.encode());
         assert_eq!(decoded, h);
-        assert!(decoded.require_all);
+        // Admins and nodes by an admin's approval alone; members, guests by invite.
+        assert!(!decoded.require_all);
         assert_eq!(decoded.challenges, vec!["token", "device-approval"]);
+        assert_eq!(decoded.approval_roles, vec!["admin", "node"]);
     }
 
     // ── F9: source-bundle provenance hint ──────────────────────────────────

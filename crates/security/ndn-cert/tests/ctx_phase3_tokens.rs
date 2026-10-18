@@ -7,10 +7,15 @@
 use std::time::Duration;
 
 use ndn_cert::challenge::combinator::AllOf;
-use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingApprovalStore};
+use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
+use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 use ndn_cert::protocol::CertRequest;
 use ndn_cert::{ChallengeHandler, ChallengeOutcome, TokenChallenge, TokenStore};
 use ndn_packet::Name;
+
+fn approvals() -> ApprovalStore {
+    ApprovalStore::new("/home/bob".parse().unwrap(), None, DEFAULT_REQUEST_TTL)
+}
 
 fn req(name: &str) -> CertRequest {
     CertRequest {
@@ -145,12 +150,11 @@ async fn ctx05_scoped_token_enforced() {
 #[tokio::test]
 async fn ctx05b_scoped_token_under_allof_enforced() {
     use ndn_cert::challenge::combinator::AllOf;
-    use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingApprovalStore};
 
     let tokens = TokenStore::new();
     let scope: Name = "/home/bob/guests".parse().unwrap();
     tokens.add_scoped("guest-invite", None, Some(scope));
-    let approvals = PendingApprovalStore::new();
+    let approvals = approvals();
 
     let gate = AllOf::new(vec![
         Box::new(TokenChallenge::new(tokens)),
@@ -186,7 +190,7 @@ async fn ctx05b_scoped_token_under_allof_enforced() {
 async fn ctx06_approval_gate_blocks_without_admin() {
     let tokens = TokenStore::new();
     tokens.add("invite-tok");
-    let approvals = PendingApprovalStore::new();
+    let approvals = approvals();
 
     let gate = AllOf::new(vec![
         Box::new(TokenChallenge::new(tokens)),
@@ -222,7 +226,11 @@ async fn ctx06_approval_gate_blocks_without_admin() {
         1,
         "device-approval must have registered a request"
     );
-    assert!(approvals.approve(&pending[0].id));
+    assert!(
+        approvals
+            .decide_locally(&pending[0].request_id, Decision::Approve, "uid 0 (test)")
+            .is_ok()
+    );
 
     // Round 2 again: now both subs are satisfied → Approved.
     let approved = gate.verify(&pending_state, &p1).await.unwrap();

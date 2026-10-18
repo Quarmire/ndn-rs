@@ -293,6 +293,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::RENEW {
             return security_renew(ctx.trust_context_handler);
         }
+        if verb == verb::ENROLL_STATUS {
+            return security_enroll_status(ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -353,12 +356,13 @@ fn security_context_adopt(
 }
 
 /// `security/enroll`: enroll the identity in `ControlParameters.name` with the
-/// CA the `ndn-trust://invite` link in `ControlParameters.uri` names
-/// ([`verb::ENROLL_FORCE`] in `Flags`: although already enrolled). Already
-/// authorized by the trust-admin peer-credential gate (and refused over
-/// `/localhop`). Answered deferred: it
-/// takes several round trips to the CA. Success: `200` with
-/// [`crate::EnrollOutcome`] as JSON status text.
+/// CA the link in `ControlParameters.uri` names — an `ndn-trust://invite`
+/// link, or an `ndn-trust://anchor` link for a role the namespace certifies
+/// on an admin's approval ([`verb::ENROLL_FORCE`] in `Flags`: although
+/// already enrolled). Already authorized by the trust-admin peer-credential
+/// gate (and refused over `/localhop`). Answered deferred: it takes several
+/// round trips to the CA. Success: `200` with [`crate::EnrollOutcome`] as
+/// JSON status text (`enrolled`, or `pending` an admin's approval).
 fn security_enroll(
     params: ControlParameters,
     backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
@@ -371,12 +375,14 @@ fn security_enroll(
         )
         .into();
     };
-    let invite_uri = match params.uri {
+    let link_uri = match params.uri {
         Some(uri) if !uri.trim().is_empty() => uri,
         _ => {
             return ControlResponse::error(
                 status::BAD_PARAMS,
-                "enroll needs the ndn-trust://invite link in Uri",
+                "enroll needs the link in Uri: an ndn-trust://invite link, or an \
+                 ndn-trust://anchor link for a role the namespace certifies on an admin's \
+                 approval",
             )
             .into();
         }
@@ -392,7 +398,7 @@ fn security_enroll(
     let backend = Arc::clone(backend);
     MgmtResponse::Deferred(Box::pin(async move {
         let request = crate::EnrollRequest {
-            invite_uri,
+            link_uri,
             identity,
             force,
         };
@@ -435,6 +441,26 @@ fn security_renew(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> Mg
     };
     let backend = Arc::clone(backend);
     MgmtResponse::Deferred(Box::pin(async move { json_answer(backend.renew().await) }))
+}
+
+/// `security/enroll-status`: the requests for an admin's approval this node
+/// made (`ndn-fwd enroll --status`), oldest first. Already authorized by the
+/// trust-admin peer-credential gate (and refused over `/localhop`).
+/// Success: `200` with a JSON list of [`ndn_cert::OutgoingRequest`] as
+/// status text.
+fn security_enroll_status(
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node does not enroll at runtime: run `ndn-fwd enroll --status` against an \
+             ndn-fwd daemon",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(async move { json_answer(backend.enroll_status().await) }))
 }
 
 /// `security/context-refresh`: check the held trust context of the

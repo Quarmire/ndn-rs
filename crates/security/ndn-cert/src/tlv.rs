@@ -468,6 +468,7 @@ pub fn decode_challenge_plaintext(
 /// CHALLENGE response plaintext, sealed by the CA via
 /// [`crate::ecdh::SessionKey::seal_envelope`] (ref: ndncert
 /// challenge-encoder.cpp:25-46).
+#[derive(Debug, Default)]
 pub struct ChallengeResponseTlv {
     /// Per NDNCERT v0.3 §3.3.
     pub status: u8,
@@ -479,6 +480,10 @@ pub struct ChallengeResponseTlv {
     pub issued_cert_name: Option<String>,
     pub error_code: Option<u8>,
     pub error_info: Option<String>,
+    /// Challenge-specific ParameterKey / ParameterValue pairs the CA returns
+    /// with a challenge or pending status (NDNCERT 0.3 §3.3), e.g. the
+    /// request id and verification code of a `device-approval` request.
+    pub parameters: serde_json::Map<String, serde_json::Value>,
 }
 
 /// NDNCERT v0.3 status codes.
@@ -512,6 +517,7 @@ impl ChallengeResponseTlv {
         if let Some(ref ei) = self.error_info {
             w.write_tlv(TLV_ERROR_INFO, ei.as_bytes());
         }
+        w.write_raw(&encode_challenge_parameters(&self.parameters));
         w.finish()
     }
 
@@ -524,6 +530,8 @@ impl ChallengeResponseTlv {
         let mut issued_cert_name = None;
         let mut error_code = None;
         let mut error_info = None;
+        let mut parameters = serde_json::Map::new();
+        let mut pending_key: Option<String> = None;
 
         while !r.is_empty() {
             let (typ, val) = r
@@ -551,6 +559,14 @@ impl ChallengeResponseTlv {
                 TLV_ERROR_INFO => {
                     error_info = std::str::from_utf8(&val).ok().map(str::to_string);
                 }
+                TLV_PARAMETER_KEY => {
+                    pending_key = std::str::from_utf8(&val).ok().map(str::to_string);
+                }
+                TLV_PARAMETER_VALUE => {
+                    if let (Some(key), Ok(value)) = (pending_key.take(), std::str::from_utf8(&val)) {
+                        parameters.insert(key, serde_json::Value::String(value.to_string()));
+                    }
+                }
                 _ => {}
             }
         }
@@ -563,6 +579,7 @@ impl ChallengeResponseTlv {
             issued_cert_name,
             error_code,
             error_info,
+            parameters,
         })
     }
 }
@@ -775,6 +792,7 @@ mod tests {
             issued_cert_name: Some("/com/acme/alice/KEY/k1/NDNCERT/v=1".to_string()),
             error_code: None,
             error_info: None,
+            parameters: Default::default(),
         };
         let encoded = resp.encode();
         let decoded = ChallengeResponseTlv::decode(encoded).unwrap();

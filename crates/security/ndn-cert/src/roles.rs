@@ -12,6 +12,8 @@
 //! /<ns>/CA/KEY/<k>/<issuer>/<v>               signed by  the root key
 //! /<ns>/<role>/<dev>/KEY/<k>/NDNCERT/<v>      signed by  /<ns>/CA/KEY/<k>
 //! <requested device key>/ndncert-approve/<id> signed by /<ns>/admin/<dev>/KEY/<k>
+//! <requested device key>/ndncert-deny/<id>    signed by /<ns>/admin/<dev>/KEY/<k>
+//! /<ns>/CA/PENDING/<digest> (signed Interest) signed by /<ns>/admin/<dev>/KEY/<k>
 //! /<ns>/<role>/<dev>/<**data>                 signed by  /<ns>/<role>/<dev>/KEY/<k>
 //! /<ns>/CA/<**data>                           signed by  /<ns>/CA/KEY/<k>
 //! /<ns>/shared/<**data>                       signed by  /<ns>/{admin,member}/<dev>/KEY/<k>
@@ -390,11 +392,14 @@ pub fn namespace_schema(namespace: &Name) -> Result<NamespaceSchema, RoleError> 
             "#{role}: {lvs_ns}/\"{role}\"/_device/\"KEY\"/_/\"{NDNCERT_ISSUER}\"/_ <= #ca\n"
         ));
     }
-    // Enrollment approvals for any device key (whatever its role), signed by
-    // an admin device. One rule: the envelope carrying the schema must stay
-    // QR-sized.
+    // Enrollment decisions for any device key (whatever its role), signed by
+    // an admin device: approvals and denials, one rule each (the envelope
+    // carrying the schema must stay QR-sized). The CA's pending list is
+    // answered only to an Interest an admin device signed.
     lvs.push_str(&format!(
-        "#approve: {lvs_ns}/_/_device/\"KEY\"/_/\"ndncert-approve\"/_ <= #admin\n"
+        "#approve: {lvs_ns}/_/_device/\"KEY\"/_/\"ndncert-approve\"/_ <= #admin\n\
+         #deny: {lvs_ns}/_/_device/\"KEY\"/_/\"ndncert-deny\"/_ <= #admin\n\
+         #pending: {lvs_ns}/\"CA\"/\"PENDING\"/_ <= #admin\n"
     ));
 
     // Signers by key name; the validator also accepts a signer named by one

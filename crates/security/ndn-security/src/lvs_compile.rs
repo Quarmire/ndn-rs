@@ -22,9 +22,13 @@
 //! #doc:   /"ndn"/_site/"doc"/_name/"KEY"/_/_/_  <= #admin
 //! ```
 //!
-//! Each rule lowers to a chain of nodes from the shared start: a literal is a value edge
-//! (shared between rules with the same literal prefix), a variable a pattern edge (never
-//! shared). Signing relations become the data node's key-node
+//! Each rule lowers to a chain of nodes from the shared start: rules share every step of
+//! their common prefix — a literal is a value edge shared between rules with the same
+//! literal there, a variable a pattern edge shared between rules with the same variable
+//! (both anonymous, or the same name) there — so the binary is a trie and a rule costs
+//! only the steps no earlier rule took. The evaluator walks data and key names
+//! independently and emits no constraint on a variable, so sharing changes no verdict.
+//! Signing relations become the data node's key-node
 //! constraints, and each rule's terminal node carries the rule id as its rule name
 //! (so [`LvsModel::to_text`] and `explain` can say which rule matched). The result
 //! round-trips through [`LvsModel::decode`], so the evaluator and the user-function
@@ -181,21 +185,34 @@ fn lower(rules: &[Rule]) -> Result<Vec<u8>, LvsCompileError> {
     let mut next_tag: u64 = 0;
     let mut tag_symbols: Vec<(u64, String)> = Vec::new(); // named pattern vars
 
-    // Pass 1: one chain per rule from the shared start node. Literal steps are
-    // shared between rules (a trie: `/"ns"/"KEY"` and `/"ns"/"CA"` share the
-    // `"ns"` node), which keeps the binary small without changing what any name
-    // reaches; variable steps are never shared, so every pattern variable keeps
-    // its own tag.
+    // Pass 1: one chain per rule from the shared start node, as a trie: a step
+    // an earlier rule already took from the same node — the same literal, or
+    // the same variable (both anonymous, or the same name) — is shared, so
+    // `/"ns"/_/_device/"KEY"/_/"approve"` and `…/"deny"` part only at their
+    // last step. That keeps the binary small without changing what any name
+    // reaches: no constraint ties a variable's tag to anything else.
     for rule in rules {
         let mut cur = 0u64;
         for comp in &rule.pattern {
-            if let Comp::Literal(v) = comp
-                && let Some((_, dest)) = nodes[cur as usize]
+            let node = &nodes[cur as usize];
+            let taken = match comp {
+                Comp::Literal(v) => node
                     .value_edges
                     .iter()
                     .find(|(existing, _)| existing == v)
-            {
-                cur = *dest;
+                    .map(|(_, dest)| *dest),
+                Comp::Var(name) => node
+                    .pattern_edges
+                    .iter()
+                    .zip(&node.pattern_tags)
+                    .find(|(_, tag)| {
+                        let symbol = tag_symbols.iter().find(|(t, _)| t == *tag).map(|(_, s)| s);
+                        symbol == name.as_ref()
+                    })
+                    .map(|(dest, _)| *dest),
+            };
+            if let Some(dest) = taken {
+                cur = dest;
                 continue;
             }
             let dest = nodes.len() as u64;
@@ -411,5 +428,27 @@ mod tests {
         let long: ndn_packet::Name = "/a/b/c/d/e/f/g/h/i/j/k/l".parse().unwrap();
         // Just must terminate quickly without panicking; result value is unimportant here.
         let _ = model.check(&long, &long);
+    }
+
+    /// Rules that part only at their last step share the steps before it —
+    /// variables included — and every verdict stays what each rule says.
+    #[test]
+    fn rules_share_their_common_steps_without_changing_verdicts() {
+        let src = r#"
+            #admin:   /"ns"/"admin"/_device/"KEY"/_
+            #approve: /"ns"/_/_device/"KEY"/_/"approve"/_ <= #admin
+            #deny:    /"ns"/_/_device/"KEY"/_/"deny"/_ <= #admin
+        "#;
+        let model = compile(src).expect("compiles");
+        // start, ns, admin chain (4), shared request-key chain (4), two tails (2 each).
+        assert_eq!(model.nodes.len(), 1 + 1 + 4 + 4 + 2 + 2);
+        let admin = n("/ns/admin/desk/KEY/k");
+        for verb in ["approve", "deny"] {
+            let decision = n(&format!("/ns/node/relay/KEY/r/{verb}/id"));
+            assert!(model.check(&decision, &admin), "{verb}");
+            assert!(!model.check(&decision, &n("/ns/member/x/KEY/k")), "{verb} by a member");
+        }
+        assert!(!model.check(&n("/ns/node/relay/KEY/r/other/id"), &admin));
+        assert_eq!(compile(&model.to_text()).expect("recompiles").nodes.len(), model.nodes.len());
     }
 }

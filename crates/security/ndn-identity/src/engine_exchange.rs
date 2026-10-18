@@ -26,21 +26,35 @@ impl EngineExchange {
 }
 
 impl CaExchange for EngineExchange {
+    /// Waits as long as the Interest lives (its InterestLifetime, at least
+    /// the consumer's default timeout): a held Interest (a request's status)
+    /// is answered late on purpose.
     async fn express(&mut self, interest: Bytes) -> Result<Data, CertError> {
-        let name = Interest::decode(interest.clone())
+        let decoded = Interest::decode(interest.clone()).ok();
+        let name = decoded
+            .as_ref()
             .map(|i| i.name.to_string())
             .unwrap_or_default();
+        let timeout = decoded
+            .and_then(|i| i.lifetime())
+            .map_or(ndn_app::DEFAULT_TIMEOUT, |l| l.max(ndn_app::DEFAULT_TIMEOUT));
         self.consumer
-            .fetch_wire(interest, ndn_app::DEFAULT_TIMEOUT)
+            .fetch_wire(interest, timeout)
             .await
             .map_err(|e| match e {
                 AppError::Refused { reason } => CertError::Refused { name, reason },
                 AppError::Nacked {
                     reason: Some(NackReason::NoRoute),
                 } => CertError::Transport(format!("this forwarder has no route for {name}")),
+                AppError::Nacked {
+                    reason: Some(NackReason::Congestion),
+                } => CertError::Transport(format!(
+                    "{name} was Nacked (Congestion): the CA, or a forwarder on the way, takes no \
+                     more such Interests now; ask again later"
+                )),
                 AppError::Timeout => CertError::Transport(format!(
                     "no answer to {name} within {:.1} s",
-                    ndn_app::DEFAULT_TIMEOUT.as_secs_f32()
+                    timeout.as_secs_f32()
                 )),
                 e => CertError::Transport(format!("{name}: {e}")),
             })

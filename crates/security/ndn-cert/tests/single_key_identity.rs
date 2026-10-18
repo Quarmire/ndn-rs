@@ -10,7 +10,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_cert::ca::{CaConfig, CaState};
 use ndn_cert::challenge::ChallengeHandler;
-use ndn_cert::challenge::device_approval::{DeviceApprovalChallenge, PendingApprovalStore};
+use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
+use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 use ndn_cert::{
     CaExchange, CertError, HierarchicalPolicy, InviteEnrollError, InviteLink, RevokeStatus,
     RolePolicy, TokenChallenge, TokenStore, adopt_with_tofu, anchor_fingerprint, ca_key_name,
@@ -64,7 +65,7 @@ struct RootDevice {
     wire: CaWire,
     keyring: Arc<Keyring>,
     fingerprint: [u8; 32],
-    approvals: PendingApprovalStore,
+    approvals: ApprovalStore,
 }
 
 /// A namespace CA for `/home/bob` issuing by role, offering a `token` challenge
@@ -83,7 +84,7 @@ async fn root_dev(tokens: &[&str]) -> RootDevice {
     for token in tokens {
         store.add_scoped(*token, None, Some(ns().append("member")));
     }
-    let approvals = PendingApprovalStore::new();
+    let approvals = ApprovalStore::new(ns(), Some(ns()), DEFAULT_REQUEST_TTL);
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![
         Box::new(TokenChallenge::new(store)),
         Box::new(DeviceApprovalChallenge::new(approvals.clone())),
@@ -214,7 +215,9 @@ async fn revocation_or_admin_approval_lets_a_new_key_have_the_name() {
         move |round| {
             if round.round > 0 {
                 for request in approvals.pending() {
-                    approvals.approve(&request.id);
+                    approvals
+                        .decide_locally(&request.request_id, Decision::Approve, "uid 0 (test)")
+                        .unwrap();
                 }
             }
             std::future::ready(Ok(Some(serde_json::Map::new())))

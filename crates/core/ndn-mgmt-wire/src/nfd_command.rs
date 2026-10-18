@@ -33,7 +33,7 @@ pub mod module {
     pub const COMPUTE: &[u8] = b"compute";
     /// BLE peripheral listener control + status (`ndn-face` bluetooth).
     pub const BLE: &[u8] = b"ble";
-    /// NDNCERT CA introspection — read-only pending device-approvals.
+    /// Enrollment by an admin's approval: list, approve and deny requests.
     pub const CA: &[u8] = b"ca";
     /// WebTransport listener introspection — read-only TLS cert status.
     pub const WEBTRANSPORT: &[u8] = b"webtransport";
@@ -50,15 +50,18 @@ pub mod verb {
     /// Stop the BLE peripheral listener.
     pub const STOP: &[u8] = b"stop";
     pub const LIST: &[u8] = b"list";
-    /// `ca` module — list pending device-approval requests.
+    /// `ca` module — the requests for an admin's approval this node can
+    /// decide (its own CA's, or its namespaces' CAs' as an admin device).
     pub const LIST_APPROVALS: &[u8] = b"list-approvals";
-    /// `ca/approve` — approve a pending request. Signed-command gated
-    /// (SECURITY-extended-module rule); the signer's cert name is
-    /// recorded as the approver. v1 dashboard surface for the §5.5
-    /// device-approval flow.
+    /// `ca/approve` — approve the pending request whose request id or
+    /// verification code is in `ControlParameters.uri`. Authorized like a
+    /// trust change: only a local operator on the node's management socket
+    /// (never over `/localhop`), recorded as the approver on a CA host; on an
+    /// admin device the node signs the decision with its admin key and
+    /// pushes it to the namespace's CA.
     pub const APPROVE: &[u8] = b"approve";
-    /// `ca/deny` — deny a pending request with a reason. Same gating
-    /// as `approve`.
+    /// `ca/deny` — deny a pending request (`<id or code>[:<reason>]` in
+    /// `uri`). Same authorization as `approve`.
     pub const DENY: &[u8] = b"deny";
 
     pub const ADD_NEXTHOP: &[u8] = b"add-nexthop";
@@ -122,16 +125,21 @@ pub mod verb {
     /// management socket.
     pub const CONTEXT_ADOPT: &[u8] = b"context-adopt";
     /// `security/enroll` — enroll this node with the CA an `ndn-trust://invite`
-    /// link (in `ControlParameters.uri`) names: the daemon generates the key
-    /// for the identity in `ControlParameters.name` (`/<ns>/<role>/<device>`)
-    /// in its own PIB, adopts the namespace's trust context if needed, redeems
-    /// the invite's token and makes the certified identity its default.
-    /// [`ENROLL_FORCE`] in `Flags` enrolls a new key although the node already
-    /// holds a certificate in that namespace. Authorized like
-    /// [`CONTEXT_ADOPT`].
+    /// or `ndn-trust://anchor` link (in `ControlParameters.uri`) names: the
+    /// daemon generates the key for the identity in `ControlParameters.name`
+    /// (`/<ns>/<role>/<device>`) in its own PIB, adopts the namespace's trust
+    /// context if needed, and either redeems the invite's token or — for a
+    /// role the namespace certifies only on an admin's approval — opens a
+    /// request and answers `pending` with its verification code, finishing
+    /// on its own once an admin approves. [`ENROLL_FORCE`] in `Flags` enrolls
+    /// a new key although the node already holds a certificate in that
+    /// namespace. Authorized like [`CONTEXT_ADOPT`].
     pub const ENROLL: &[u8] = b"enroll";
     /// `security/enroll` flag bit: enroll although already enrolled.
     pub const ENROLL_FORCE: u64 = 1;
+    /// `security/enroll-status` — the requests for an admin's approval this
+    /// node made and where each stands. Authorized like [`CONTEXT_ADOPT`].
+    pub const ENROLL_STATUS: &[u8] = b"enroll-status";
     /// `security/context-refresh` — check the held trust context of the
     /// namespace in `ControlParameters.name` (every held one when absent) for
     /// a newer version and adopt it if the held version's root signed it.

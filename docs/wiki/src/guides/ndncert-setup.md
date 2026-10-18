@@ -108,7 +108,6 @@ The post-challenge gate. An `IssuancePolicy` impl returns:
 
 - `Accept(cert)` — sign and return the cert.
 - `Reject(reason)` — refuse, with a human-readable reason.
-- `Defer(callback)` — out-of-band hold (admin approval, etc.).
 
 Built-ins in `crates/security/ndn-cert/src/policy.rs`:
 `AcceptAllIssuance` (default), `RequireAttestationKind` (names under a
@@ -127,9 +126,13 @@ and only when the satisfied challenge fits the role:
 
 | Role | Issued on |
 |---|---|
-| `admin`, `node` | an admin's `device-approval` (alone, or a leaf of `token AND device-approval`) — never a token alone |
+| approval roles (`[ca] approval_roles`, default `admin`, `node`) | an admin's `device-approval`, plus a redeemed invite token when `approval_requires_invite` is set — never a token alone |
 | `member` | a `device-approval`, or an invite token that is unscoped or scoped inside `/<ns>/member` |
 | `guest` | a `device-approval`, or an invite token scoped inside `/<ns>/guest` |
+
+The policy is advertised in the trust context's enrollment hint, so a
+device knows before asking whether its role needs an approval (see
+[Enrollment by approval](../reference/enrollment-by-approval.md)).
 
 Other challenges (pin, email, nop) admit no role. A scoped token records its
 scope in its attestation leaf (evidence `scope`), which is how the policy tells
@@ -164,7 +167,7 @@ certified by the namespace root issues under `RolePolicy::new(/<ns>)` (combined 
 ```toml
 [ca]
 enabled  = true
-prefix   = "/home/bob"      # serves /home/bob/CA/{INFO,NEW,CHALLENGE}
+prefix   = "/home/bob"      # serves /home/bob/CA/{INFO,NEW,CHALLENGE,APPROVAL,PENDING}
 identity = "/home/bob/CA"   # signing identity loaded from the PIB
 
 [[ca.challenge]]
@@ -172,15 +175,25 @@ kind   = "token"
 tokens = ["member-<hex>", "guest-<hex>"]   # from ndn-fwd-tokens new --role …
 
 [[ca.challenge]]
-kind = "device-approval"     # approve via /localhost/nfd/ca/approve
+kind = "device-approval"     # optional here: a namespace CA offers it anyway
 ```
+
+A namespace CA offers `device-approval` even when `[[ca.challenge]]` does not
+list it (the log says so). Pending requests are kept in
+`<pib_path>/ca/approvals/` and survive restarts. Decide with `ndn-fwd
+approvals list`, `approve <id|code>`, `deny <id|code> [--reason <text>]`: on
+the CA host it decides as the local operator; on another node holding an
+admin certificate of the namespace it signs the decision with that admin key
+and pushes it to `/<prefix>/CA/APPROVAL` (listing via `/<prefix>/CA/PENDING`).
 
 Invite tokens carry their role: `ndn-fwd-tokens new --ca /home/bob --namespace
 /home/bob --role member|guest` (default `member`) mints `member-<hex>` /
 `guest-<hex>`, and the CA scopes such a token to `/<ns>/<role>`, so it cannot
 certify another role. `--role admin` (and `node`) is refused: those
-certificates need an admin's device approval, and a namespace CA refuses to start
-with an `admin-…` or `node-…` token in its config. Tokens without a role
+certificates need an admin's approval (`ndn-fwd enroll <anchor link> --role
+admin` on the device, `ndn-fwd approvals approve <code>` by an admin), and a
+namespace CA refuses to start with an `admin-…` or `node-…` token in its
+config. Tokens without a role
 prefix are scoped to `/<ns>/member`. Because every token is scoped, a request
 for a name the token cannot certify is refused before the token is spent.
 
@@ -200,9 +213,19 @@ governing it, and which rule decides (exit status 1 on deny):
 ```text
 $ ndn-fwd schema explain /home/bob/member/tablet/KEY/k1/ndncert-approve/req-1 \
       /home/bob/admin/laptop/KEY/device --pib ~/.ndn/pib
-rule           = LVS rule #approve_member: /"home"/"bob"/"member"/_device/"KEY"/_/"ndncert-approve"/_ <= #admin: /"home"/"bob"/"admin"/_device/"KEY"/_
+rule           = LVS rule #approve: /"home"/"bob"/_/_device/"KEY"/_/"ndncert-approve"/_ <= #admin: /"home"/"bob"/"admin"/_device/"KEY"/_
 verdict        = allow
 ```
+
+`#deny` (`…/"ndncert-deny"/_`) and `#pending` (`/<ns>/"CA"/"PENDING"/_`) are
+likewise signed by `#admin`.
+
+`ndn-fwd schema update [--namespace <ns>] [--accept-narrowing]` on the root
+device signs a new trust-context version carrying the current generated
+schema, so a namespace made by an earlier release gains the rules added
+since (`#deny`, `#pending`) without a re-init. It prints the rules added and
+removed, and refuses to drop a rule devices hold unless `--accept-narrowing`
+is given ([schema updates](../reference/context-updates.md#schema-updates-ndn-fwd-schema-update)).
 
 `/<prefix>/CA/REVOKE` revokes a cert this CA issued
 (`ndn_cert::client::revoke`): the request carries a signature over the cert
@@ -269,11 +292,14 @@ With it enabled, a token-challenge cert carries a single-leaf set
 naming `token`. Composite challenges record one leaf per satisfied
 sub with that sub's own evidence: `all-of` carries every sub,
 `nofm` carries the `n` that were met, and `any-of` carries the one
-that won. A cross-process `device-approval` leaf additionally
-carries the approving device's validated signer name and the
-signature value of its signed approval Data
-(`<cert>/ndncert-approve/<request-id>`, checked against the CA's
-trust schema before recording). The dashboard's trust-path inspector
+that won. A `device-approval` leaf carries `request_id`, `code`,
+`approver_kind` (`admin-key` or `local-operator`), `approved_by` and
+`invite`; for an admin key's approval it also carries the signature value
+of the signed decision Data (`<key>/ndncert-approve/<request-id>`,
+validated under the namespace's trust context before recording). A local
+operator's approval (on the CA host) carries no signature, so under
+`require_signed` it counts only with `[ca.require_attestation]
+accept_local_operator = true`. The dashboard's trust-path inspector
 renders the leaves, and `security/validate` returns them under
 `challenge_attestations`.
 

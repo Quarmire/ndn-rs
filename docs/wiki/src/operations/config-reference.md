@@ -117,7 +117,7 @@ cost = 100        # optional
 | Key | Default | Use |
 |---|---|---|
 | `serve_contexts` | `true` | Publish every trust context in `<pib_path>/contexts/` by name over RDR: `/<ns>/32=trust-context/32=metadata` names the newest stored version, `/<ns>/32=trust-context/v=<N>` returns the stored signed Data of each version held, verbatim (so nodes behind this one can follow the namespace version by version). Read at startup. See [Trust-context publication](../reference/trust-context-publication.md). |
-| `trust_admin_groups` | `[]` | Unix groups whose members are local operators on the management socket, alongside the daemon's own user and root. Only local operators may change this node's trust: the verbs in `TRUST_ADMIN_VERBS` (`ndn-mgmt/src/auth.rs`) — `security/context-adopt` (`ndn-fwd adopt`), `security/enroll` (`ndn-fwd enroll`), `security/renew` (`ndn-fwd renew`), `security/context-refresh` (`ndn-fwd context refresh`) and `security/context-update` (`ndn-fwd revoke`, `ndn-fwd recovery-kit`, `ndn-fwd recover`); everyone else is refused, and these verbs are always refused over `/localhop`. Local operators' other commands need no signature either (see [`[security.mgmt]`](#securitymgmt--who-may-manage-this-forwarder)). Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
+| `trust_admin_groups` | `[]` | Unix groups whose members are local operators on the management socket, alongside the daemon's own user and root. Only local operators may change this node's trust: the verbs in `TRUST_ADMIN_VERBS` (`ndn-mgmt/src/auth.rs`) — `security/context-adopt` (`ndn-fwd adopt`), `security/enroll` (`ndn-fwd enroll`), `security/renew` (`ndn-fwd renew`), `security/context-refresh` (`ndn-fwd context refresh`) and `security/context-update` (`ndn-fwd revoke`, `ndn-fwd schema update`, `ndn-fwd recovery-kit`, `ndn-fwd recover`); everyone else is refused, and these verbs are always refused over `/localhop`. Local operators' other commands need no signature either (see [`[security.mgmt]`](#securitymgmt--who-may-manage-this-forwarder)). Membership is checked against the caller's kernel-reported socket credentials (primary gid, the group's member list, and on Linux the caller's supplementary groups). Read at startup. |
 | `context_refresh_secs` | `300` | How often, in seconds, the daemon checks every held trust context for a newer version (RDR metadata upstream) and adopts one signed by an anchor of the held version and strictly newer — or, when a recovery installed a new root in between, follows the versions in between one by one — then stores and republishes it — how a [revocation](../reference/revocation.md) reaches this node. The first check runs as soon as the route of each namespace the node fetches has its face up, at most `min(context_refresh_secs, 30)` s after start. `0` disables the periodic check; `ndn-fwd context refresh` still works. A missed check only delays an update. The root device (whose PIB holds the root key) does not fetch its own namespace. See [Trust-context updates](../reference/context-updates.md). |
 | `context_sync` | `false` | Also join every held namespace's trust-context sync group (SVS, `/<ns>/32=trust-context/32=sync`; a namespace adopted later is joined when it is adopted). The root device (whose root store holds an anchor key of the version) puts each version it keeps into the group — a revocation, a version handed over with `security/context-update`, a recovery — and every other member fetches it at once and adopts it under the same rule as `context_refresh_secs`, then stores and republishes it the same way. Refusals are logged with their reason. The group is routed over the faces the namespace is routed over and toward the faces members' Sync Interests arrive on; a relay between the root device and a device carries it only if it runs `context_sync` too. The periodic refresh keeps running beside it. See [Trust-context updates](../reference/context-updates.md#push-over-the-namespaces-sync-group). |
 | `renew_before` | `0.333` | When the daemon renews the certificates a namespace CA issued to its keys: once the remaining validity falls below this. A number between 0 and 1 is a fraction of the lifetime; a string `"<n>d"` / `"<n>h"` / `"<n>m"` / `"<n>s"` is a fixed time before expiry (a time at least the lifetime the CA issues renews at a third of the lifetime instead, with a WARN); `0` turns the timer off (`ndn-fwd renew` still works). Failures retry with a jittered backoff (30–60 s doubling to 30–60 min; 30–60 min after a refusal) and log a WARN with the days left. See [Certificate renewal](../reference/renewal.md). |
@@ -199,13 +199,34 @@ smtp = { host = "smtp.example.com", port = 587, from = "ca@example.com", starttl
 
 `email` delivers via SMTP only with `--features smtp` (lettre); otherwise (or
 with `smtp.log_only = true`) the code is logged. `device-approval` holds each
-request until it is approved or denied over mgmt
-(`/localhost/nfd/ca/{list-approvals,approve,deny}`; `uri` = `<id>` or
-`<id>:<reason>`) or an approver device sends a signed approval to
-`/<prefix>/CA/APPROVE-FEED` that validates against the node's trust contexts;
-all three share one pending-approval store.
-`[ca.require_attestation]` (`prefix`/`kind`/`require_signed`) gates
-issuance on a challenge attestation (on a namespace CA, on top of the role layout).
+request in a durable record (`<pib_path>/ca/approvals/`) until it is approved,
+denied or expires: `ndn-fwd approvals list|approve|deny <id|code>` on the CA
+host decides as the local operator (mgmt `ca/{list-approvals,approve,deny}`,
+local socket only, never over `/localhop`); on an admin device it pushes a
+decision signed by the admin key to `/<prefix>/CA/APPROVAL`, validated under
+the namespace's trust context. See
+[Enrollment by approval](../reference/enrollment-by-approval.md).
+
+| Key | Default | Use |
+|---|---|---|
+| `approval_roles` | `["admin", "node"]` | Roles issued only on an admin's approval; the others enroll by invite. |
+| `approval_requires_invite` | `false` | An approval request must also redeem one of this CA's invite tokens. |
+| `approval_request_ttl_days` | `7` | How long a pending request waits; a decided record is kept as long again. `0` is refused. |
+
+A namespace CA enforces the policy its trust context's enrollment hint
+advertises (`ndn-fwd init` writes it from these keys, and `ndn-fwd schema
+update -c <config>` for a context made before the hint named its approval
+roles); `approval_roles` and
+`approval_requires_invite`, if set, must agree with the hint or the CA
+refuses to start (the message names the context's policy). With
+`approval_requires_invite = true` the CA needs a `token` challenge, or it
+refuses to start. A namespace CA offers `device-approval` even when
+`[[ca.challenge]]` does not list it (logged).
+`[ca.require_attestation]` (`prefix`/`kind`/`require_signed`/
+`accept_local_operator`) gates issuance on a challenge attestation (on a
+namespace CA, on top of the role layout); under `require_signed` a local
+operator's approval carries no signature and counts only with
+`accept_local_operator = true` (default `false`).
 `possession`/`yubikey` are wired in code.
 
 ## `[log]` — log filter

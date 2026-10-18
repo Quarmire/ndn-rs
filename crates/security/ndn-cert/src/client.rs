@@ -55,6 +55,8 @@ pub struct EnrollmentSession {
     validity_secs: u64,
     state: SessionState,
     issued_cert_name: Option<Name>,
+    /// The parameters of the CA's last challenge / pending response.
+    challenge_parameters: serde_json::Map<String, serde_json::Value>,
     ecdh_keypair: Option<EcdhKeypair>,
     session_key: Option<SessionKey>,
     request_id_bytes: Option<[u8; 8]>,
@@ -70,6 +72,7 @@ impl EnrollmentSession {
             validity_secs,
             state: SessionState::Init,
             issued_cert_name: None,
+            challenge_parameters: serde_json::Map::new(),
             ecdh_keypair: None,
             session_key: None,
             request_id_bytes: None,
@@ -184,6 +187,12 @@ impl EnrollmentSession {
         }
     }
 
+    /// The ParameterKey / ParameterValue pairs of the CA's last challenge or
+    /// pending response (e.g. a `device-approval` request id and code).
+    pub fn challenge_parameters(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.challenge_parameters
+    }
+
     /// ApplicationParameters for `/<ca>/CA/CHALLENGE/<request-id-bytes>`.
     /// Returns an AES-GCM envelope; plaintext is
     /// `{SelectedChallenge, ParameterKey, ParameterValue, ...}`.
@@ -239,6 +248,10 @@ impl EnrollmentSession {
                 if resp.error_code == Some(crate::protocol::ErrorCode::NameNotAllowed.into()) {
                     return Err(CertError::PolicyDenied(reason));
                 }
+                // RunOutOfTime: the challenge can no longer pass; start over.
+                if resp.error_code == Some(crate::protocol::ErrorCode::RunOutOfTime.into()) {
+                    return Err(CertError::ChallengeExpired(reason));
+                }
                 Err(CertError::ChallengeFailed(reason))
             }
             // STATUS_CHALLENGE (CA awaits requester) and STATUS_PENDING
@@ -249,6 +262,7 @@ impl EnrollmentSession {
                     SessionState::Challenging { challenge_type, .. } => challenge_type.clone(),
                     _ => String::new(),
                 };
+                self.challenge_parameters = resp.parameters;
                 self.state = SessionState::Challenging {
                     request_id,
                     challenge_type,
@@ -361,8 +375,36 @@ pub async fn run_session<E, F, Fut>(
     signer: Arc<dyn Signer>,
     validity_secs: u64,
     challenge_type: &str,
-    mut respond: F,
+    respond: F,
 ) -> Result<EnrollmentSession, CertError>
+where
+    E: CaExchange + ?Sized,
+    F: FnMut(ChallengeRound) -> Fut,
+    Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
+{
+    let (session, complete) =
+        drive(exchange, ca_prefix, signer, validity_secs, challenge_type, respond).await?;
+    if complete {
+        return Ok(session);
+    }
+    Err(CertError::ChallengePending(
+        session
+            .challenge_status_message()
+            .unwrap_or("challenge not completed")
+            .to_owned(),
+    ))
+}
+
+/// NEW, then CHALLENGE rounds while `respond` supplies parameters. Returns
+/// the session and whether it completed (`false`: `respond` stopped).
+async fn drive<E, F, Fut>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    signer: Arc<dyn Signer>,
+    validity_secs: u64,
+    challenge_type: &str,
+    mut respond: F,
+) -> Result<(EnrollmentSession, bool), CertError>
 where
     E: CaExchange + ?Sized,
     F: FnMut(ChallengeRound) -> Fut,
@@ -405,12 +447,7 @@ where
             remaining_tries: session.remaining_tries(),
         };
         let Some(params) = respond(prompt).await? else {
-            return Err(CertError::ChallengePending(
-                session
-                    .challenge_status_message()
-                    .unwrap_or("challenge not completed")
-                    .to_owned(),
-            ));
+            return Ok((session, false));
         };
         let body = session.challenge_request_body(challenge_type, params)?;
         let data = exchange
@@ -419,10 +456,59 @@ where
         session.handle_challenge_response(response_content(&data, "CHALLENGE")?)?;
 
         if session.is_complete() {
-            return Ok(session);
+            return Ok((session, true));
         }
         round += 1;
     }
+}
+
+/// The outcome of [`one_challenge_round`].
+#[derive(Debug)]
+pub enum ChallengeExchange {
+    /// The CA issued a certificate of this name.
+    Issued(Name),
+    /// The CA answered challenge / pending: its status message and the
+    /// parameters it returned.
+    Pending {
+        status: String,
+        parameters: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+/// One NDNCERT exchange — NEW, then a single CHALLENGE(`challenge_type`)
+/// round carrying `params` — for a challenge the requester resumes in a
+/// later, fresh exchange rather than in this session (e.g. waiting for an
+/// admin's `device-approval`). A refusal is an error as for [`enroll`].
+pub async fn one_challenge_round<E>(
+    exchange: &mut E,
+    ca_prefix: &Name,
+    signer: Arc<dyn Signer>,
+    validity_secs: u64,
+    challenge_type: &str,
+    params: serde_json::Map<String, serde_json::Value>,
+) -> Result<ChallengeExchange, CertError>
+where
+    E: CaExchange + ?Sized,
+{
+    let mut params = Some(params);
+    let (session, complete) = drive(exchange, ca_prefix, signer, validity_secs, challenge_type, |_| {
+        std::future::ready(Ok(params.take()))
+    })
+    .await?;
+    if complete {
+        return session
+            .issued_cert_name()
+            .cloned()
+            .map(ChallengeExchange::Issued)
+            .ok_or_else(|| CertError::InvalidRequest("no issued cert name on success".into()));
+    }
+    Ok(ChallengeExchange::Pending {
+        status: session
+            .challenge_status_message()
+            .unwrap_or_default()
+            .to_owned(),
+        parameters: session.challenge_parameters().clone(),
+    })
 }
 
 /// Fetch the certificate [`enroll`] reported as issued. The returned Data *is*
@@ -674,6 +760,7 @@ mod tests {
             issued_cert_name: None,
             error_code: None,
             error_info: None,
+            parameters: Default::default(),
         };
         let plaintext = round1_resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();
@@ -719,6 +806,7 @@ mod tests {
             issued_cert_name: Some("/com/acme/alice/KEY/v=0/CA/v=1".to_string()),
             error_code: None,
             error_info: None,
+            parameters: Default::default(),
         };
         let plaintext_bytes = plaintext_resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();
@@ -760,6 +848,7 @@ mod tests {
             issued_cert_name: Some(cert_uri.to_string()),
             error_code: None,
             error_info: None,
+            parameters: Default::default(),
         };
         let plaintext = resp.encode();
         let mut ca_iv = crate::ecdh::new_encryption_iv();

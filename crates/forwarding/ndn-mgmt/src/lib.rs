@@ -79,10 +79,16 @@ use wire::{send_dataset, send_response};
 ///   `security/context-adopt` fetching a context). The handler loop answers it
 ///   from a task of its own, so one slow command does not stall every other
 ///   management client; the command Interest's lifetime must cover it.
+/// - `DeferredDataset` — a dataset that may need network round trips (e.g.
+///   `ca/list-approvals` on an admin device asking its namespace's CA),
+///   answered like `Deferred`; a refusal is a ControlResponse instead.
 pub enum MgmtResponse {
     Control(Box<ControlResponse>),
     Dataset(bytes::Bytes),
     Deferred(std::pin::Pin<Box<dyn Future<Output = ControlResponse> + Send>>),
+    DeferredDataset(
+        std::pin::Pin<Box<dyn Future<Output = Result<bytes::Bytes, ControlResponse>> + Send>>,
+    ),
 }
 
 impl From<ControlResponse> for MgmtResponse {
@@ -356,66 +362,84 @@ pub trait BleMgmtBackend: Send + Sync {
     async fn stop(&self) -> Result<(), String>;
 }
 
-/// One pending NDNCERT device-approval request, for the `ca/list-approvals`
-/// read verb.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingApprovalInfo {
-    /// Opaque request id (the per-request nonce).
-    pub id: String,
-    /// The subject cert name awaiting approval.
-    pub cert_name: String,
-    /// Human-readable description, if the requester supplied one.
-    pub description: String,
-}
-
-/// Read-only backend for the `ca` module: lists pending device-approval
-/// requests. The spec crate owns the trait;
-/// [`ndn_cert::challenge::device_approval::PendingApprovalStore`] implements it
-/// (see the blanket impl below), so a CA wires `Some(Arc::new(store))`.
+/// Backend of the `ca` module: the requests for an admin's approval this
+/// node can decide. On a CA host that is its CA's records
+/// ([`ndn_cert::ApprovalStore`] implements it); a forwarder that is also an
+/// admin device of other namespaces adds their CAs' pending requests and
+/// decides them with its admin key. The spec crate owns the trait; the
+/// verbs reach it only from a local operator (the trust-admin
+/// peer-credential gate), never over `/localhop`.
+#[async_trait::async_trait]
 pub trait ApprovalMgmtBackend: Send + Sync {
-    fn pending(&self) -> Vec<PendingApprovalInfo>;
-    /// Mark a pending request as approved. `approver` is the validated
-    /// signer cert name from the signed mgmt-command Interest (or the
-    /// caller-supplied authority label when running unsigned). Returns
-    /// `true` when the request existed and was `Pending`.
-    ///
-    /// v1 ships mgmt-mediated approval: the signed mgmt-Interest's
-    /// command-validator already established the approver's identity,
-    /// and the SECURITY-module's extended-signed-commands rule plus
-    /// the operator-configured trust anchor / schema gate authorisation.
-    /// The canonical signed-Data-on-approval-feed path
-    /// (`ndn_identity::offer_signed_approval`) remains the v2 deepening
-    /// for cross-process cryptographic provenance.
-    fn approve(&self, id: &str, approver: &str) -> bool;
-    /// Mark a pending request as denied with a reason. Same gating
-    /// as `approve`. Returns `true` when the request existed and was
-    /// `Pending`.
-    fn deny(&self, id: &str, reason: &str) -> bool;
+    /// Every request this node can see.
+    async fn list(&self) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, TrustRefusal>;
+    /// Decide the pending request `target` names (its request id or its
+    /// verification code). `operator` is the local operator the kernel
+    /// attests (`uid 1000 (alice)`): the approver a CA host records.
+    /// Returns the request as decided.
+    async fn decide(
+        &self,
+        target: String,
+        decision: ndn_cert::Decision,
+        operator: String,
+    ) -> Result<ndn_mgmt_wire::PendingApproval, TrustRefusal>;
 }
 
-impl ApprovalMgmtBackend for ndn_cert::challenge::device_approval::PendingApprovalStore {
-    fn pending(&self) -> Vec<PendingApprovalInfo> {
-        self.pending()
-            .into_iter()
-            .map(|r| PendingApprovalInfo {
-                id: r.id,
-                cert_name: r.cert_name,
-                description: r.description,
-            })
-            .collect()
+/// The `ca/list-approvals` row of a CA's approval record.
+pub fn approval_row(record: &ndn_cert::ApprovalRecord) -> ndn_mgmt_wire::PendingApproval {
+    use ndn_cert::ApprovalState;
+    let (approver, reason) = match &record.state {
+        ApprovalState::Pending => (String::new(), String::new()),
+        ApprovalState::Approved { by, .. } => (by.describe(), String::new()),
+        ApprovalState::Denied { by, reason, .. } => (by.describe(), reason.clone()),
+    };
+    ndn_mgmt_wire::PendingApproval {
+        request_id: record.request_id.clone(),
+        key_name: record.key_name.clone(),
+        namespace: record.ca_prefix.clone(),
+        role: record.role.clone().unwrap_or_default(),
+        device: record.device.clone().unwrap_or_default(),
+        code: record.code.clone(),
+        state: record.state.as_str().to_owned(),
+        created_secs: record.created_secs,
+        expires_secs: record.expires_secs,
+        approver,
+        reason,
+    }
+}
+
+/// The status code a refused approval decision is answered with.
+pub fn approval_refusal(refusal: ndn_cert::ApprovalRefusal) -> TrustRefusal {
+    use ndn_cert::RefusalKind;
+    use ndn_mgmt_wire::control_response::status;
+    let status_code = match refusal.kind {
+        RefusalKind::NotFound => status::NOT_FOUND,
+        RefusalKind::Conflict => 409,
+        RefusalKind::Unauthorized => status::UNAUTHORIZED,
+        RefusalKind::BadRequest => status::BAD_PARAMS,
+        RefusalKind::Storage => status::SERVER_ERROR,
+    };
+    TrustRefusal {
+        status_code,
+        reason: refusal.reason,
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalMgmtBackend for ndn_cert::ApprovalStore {
+    async fn list(&self) -> Result<Vec<ndn_mgmt_wire::PendingApproval>, TrustRefusal> {
+        Ok(self.records().iter().map(approval_row).collect())
     }
 
-    fn approve(&self, id: &str, approver: &str) -> bool {
-        // The mgmt path is "trusted by signed-command auth" — the
-        // approver string came from the validated mgmt-Interest's
-        // signer cert. Record it as the approver with an empty
-        // signature (the cryptographic chain lives in the mgmt
-        // Interest, not in a separate approval Data).
-        self.approve_validated(id, approver, Vec::new())
-    }
-
-    fn deny(&self, id: &str, reason: &str) -> bool {
-        self.deny(id, reason)
+    async fn decide(
+        &self,
+        target: String,
+        decision: ndn_cert::Decision,
+        operator: String,
+    ) -> Result<ndn_mgmt_wire::PendingApproval, TrustRefusal> {
+        self.decide_locally(&target, decision, &operator)
+            .map(|record| approval_row(&record))
+            .map_err(approval_refusal)
     }
 }
 
@@ -449,10 +473,12 @@ pub struct TrustRefusal {
 }
 
 /// What `security/enroll` asks: enroll `identity` (`/<ns>/<role>/<device>`)
-/// with the CA the `ndn-trust://invite` link names.
+/// with the CA the link names — an `ndn-trust://invite` link, or an
+/// `ndn-trust://anchor` link for a role the namespace certifies on an
+/// admin's approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnrollRequest {
-    pub invite_uri: String,
+    pub link_uri: String,
     pub identity: Name,
     /// Enroll a new key although this node already holds a certificate in
     /// the namespace (the old one stays valid until revoked).
@@ -471,12 +497,35 @@ pub struct RootStoreInfo {
 
 /// The answer to `security/enroll`, JSON in the ControlResponse status text,
 /// tagged by `state`. A token enrollment completes in one exchange
-/// (`enrolled`); enrollment by an admin's approval will answer `pending`
-/// with a request to poll — the reason this is an enum.
+/// (`enrolled`); enrollment by an admin's approval answers `pending`, and
+/// the node finishes on its own once an admin approves.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum EnrollOutcome {
     Enrolled(EnrolledInfo),
+    Pending(PendingEnrollInfo),
+}
+
+/// A `security/enroll` waiting for an admin's approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingEnrollInfo {
+    /// The identity asked for, `/<ns>/<role>/<device>`.
+    pub identity: String,
+    /// The key generated for it in the node's PIB.
+    pub key: String,
+    pub namespace: String,
+    /// The CA asked.
+    pub ca: String,
+    /// The request id at the CA.
+    pub request: String,
+    /// The verification code, computed from this node's own key: an admin's
+    /// screen must show the same.
+    pub code: String,
+    /// When the request expires undecided, ISO 8601 (UTC); empty if the CA
+    /// did not say.
+    pub expires: String,
+    /// The trust context adopted on the way; `None` when it was already held.
+    pub adopted_context: Option<AdoptedContextInfo>,
 }
 
 /// A completed `security/enroll`.
@@ -671,6 +720,15 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(TrustRefusal {
             status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
             reason: "this node does not renew certificates at runtime".to_owned(),
+        })
+    }
+
+    /// The requests for an admin's approval this node made
+    /// (`security/enroll-status`), oldest first.
+    async fn enroll_status(&self) -> Result<Vec<ndn_cert::OutgoingRequest>, TrustRefusal> {
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not enroll at runtime".to_owned(),
         })
     }
 
@@ -941,9 +999,11 @@ pub async fn run_ndn_mgmt_handler(
             );
             let resp = ControlResponse::error(
                 status::UNAUTHORIZED,
-                "trust changes are accepted only on this node's local management socket; \
-                 run `ndn-fwd adopt` / `enroll` / `revoke` / `context refresh` on the node \
-                 itself",
+                "trust changes — adopting, enrolling, revoking, refreshing, and listing or \
+                 deciding approval requests — are accepted only on this node's local \
+                 management socket; run `ndn-fwd adopt` / `enroll` / `revoke` / `context \
+                 refresh` / `approvals` on the node itself (an admin device decides another \
+                 node's requests with `ndn-fwd approvals` on its own node)",
             );
             send_response(
                 &handle,
@@ -1157,6 +1217,23 @@ pub async fn run_ndn_mgmt_handler(
                 #[cfg(not(target_arch = "wasm32"))]
                 tokio::spawn(answer);
                 // No ambient multi-task runtime on wasm: answer in line.
+                #[cfg(target_arch = "wasm32")]
+                answer.await;
+            }
+            MgmtResponse::DeferredDataset(pending) => {
+                let handle = Arc::clone(&handle);
+                let name = Arc::clone(&interest.name);
+                let signer = mgmt_handles.command_response_signer.clone();
+                let answer = async move {
+                    let result = pending.await;
+                    let signer = signer.map(|s| s.current());
+                    match result {
+                        Ok(bytes) => send_dataset(&handle, &name, bytes, signer.as_deref()).await,
+                        Err(cr) => send_response(&handle, &name, &cr, signer.as_deref()).await,
+                    }
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::spawn(answer);
                 #[cfg(target_arch = "wasm32")]
                 answer.await;
             }

@@ -157,9 +157,11 @@ fn default_observability_sample() -> f64 {
     0.01
 }
 
-/// Embedded NDNCERT CA. Serves `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}` (and
-/// `/<prefix>/CA/APPROVE-FEED` with a `device-approval` challenge) plus
-/// cert-fetch for the certs it issued.
+/// Embedded NDNCERT CA. Serves `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}`
+/// plus cert-fetch for the certs it issued, and — with the
+/// `device-approval` challenge — `/<prefix>/CA/APPROVAL` (an admin device's
+/// signed decision) and `/<prefix>/CA/PENDING` (the pending requests, to an
+/// admin key).
 ///
 /// By default the CA signs with the identity `identity` loaded from the node's
 /// PIB (`[security] pib_path`): its key and its `ca/ca-cert.data` certificate
@@ -223,6 +225,28 @@ pub struct CaTomlConfig {
     /// expiry. Empty: the CA renews nothing.
     #[serde(default = "CaTomlConfig::default_renewable_roles")]
     pub renewable_roles: Vec<String>,
+    /// Roles whose certificates the CA issues only on an admin's approval
+    /// (`ndn-fwd enroll <anchor link> --role <role>`, then `ndn-fwd approvals
+    /// approve <code>` on an admin device). Policy in data: `ndn-fwd init -c
+    /// <config>` writes it into the namespace's trust context, and a
+    /// namespace CA enforces what its context advertises — it refuses to
+    /// start when this key disagrees with it. Unset: what the context says
+    /// (default `["admin", "node"]`).
+    #[serde(default)]
+    pub approval_roles: Option<Vec<String>>,
+    /// Whether a request for one of `approval_roles` must also redeem an
+    /// invite token of this CA (`token AND device-approval`), redeemed once,
+    /// when the request is made. Written into the trust context by `ndn-fwd
+    /// init -c <config>` and checked against it like `approval_roles`.
+    /// Unset: what the context says (default `false`).
+    #[serde(default)]
+    pub approval_requires_invite: Option<bool>,
+    /// How long a request for an admin's approval waits for a decision, in
+    /// days, before it expires (the device is then told to ask again); a
+    /// decision is kept as long for a device that was offline to learn it.
+    /// Default 7.
+    #[serde(default = "CaTomlConfig::default_approval_request_ttl_days")]
+    pub approval_request_ttl_days: u32,
 }
 
 /// `[ca] cert_validity_days`: one number of days for every role, or a table
@@ -368,11 +392,13 @@ impl<'de> Deserialize<'de> for CertValidityDays {
 /// need certs / secrets, so they're wired in code.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChallengeConfig {
-    /// `nop` | `token` | `pin` | `email` | `device-approval`. `device-approval`
-    /// holds each request until an operator approves it (`ca approve`/`ca
-    /// deny` over mgmt) or an approver device sends a signed approval to
-    /// `/<prefix>/CA/APPROVE-FEED` that validates against the node's trust
-    /// contexts.
+    /// `nop` | `token` | `pin` | `email` | `device-approval`.
+    /// `device-approval` holds each request durably until an admin decides
+    /// it: the CA host's local operator (`ndn-fwd approvals approve|deny`
+    /// there), or an admin device's signed decision pushed to
+    /// `/<prefix>/CA/APPROVAL` (`ndn-fwd approvals` on that device). A
+    /// namespace CA offers it even when unlisted, for the roles its trust
+    /// context certifies on approval.
     pub kind: String,
     /// `token`: one-time invite tokens.
     #[serde(default)]
@@ -429,9 +455,15 @@ pub struct RequireAttestationConfig {
     pub prefix: String,
     /// Required challenge-attestation leaf kind (e.g. `device-approval`).
     pub kind: String,
-    /// Require the matching leaf to be independently signed.
+    /// Require the matching leaf to be independently signed (an admin
+    /// device's signed approval).
     #[serde(default)]
     pub require_signed: bool,
+    /// With `require_signed`, also accept the CA host's local operator's
+    /// approval, which carries no signature (the attestation names the
+    /// operator instead).
+    #[serde(default)]
+    pub accept_local_operator: bool,
 }
 
 impl CaTomlConfig {
@@ -446,6 +478,11 @@ impl CaTomlConfig {
     /// See [`renewable_roles`](Self::renewable_roles).
     fn default_renewable_roles() -> Vec<String> {
         ["admin", "member", "node"].map(String::from).to_vec()
+    }
+    /// See [`approval_request_ttl_days`](Self::approval_request_ttl_days).
+    pub const DEFAULT_APPROVAL_REQUEST_TTL_DAYS: u32 = 7;
+    fn default_approval_request_ttl_days() -> u32 {
+        Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS
     }
 }
 
@@ -462,6 +499,9 @@ impl Default for CaTomlConfig {
             require_attestation: None,
             cert_validity_days: CertValidityDays::default(),
             renewable_roles: Self::default_renewable_roles(),
+            approval_roles: None,
+            approval_requires_invite: None,
+            approval_request_ttl_days: Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS,
         }
     }
 }
