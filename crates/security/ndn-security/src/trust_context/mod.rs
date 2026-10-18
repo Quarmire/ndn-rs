@@ -313,6 +313,10 @@ pub struct LinkPolicy {
     /// effect only when the context names a CA endpoint
     /// ([`SignedTrustContext::admits_enrollment_links`]).
     pub enrollment_links: bool,
+    /// Whether two devices linked through a relay may try a direct path
+    /// between them (NAT hole punching from the addresses each one offers),
+    /// falling back to the relay when it does not open.
+    pub direct_paths: bool,
 }
 
 impl Default for LinkPolicy {
@@ -323,6 +327,7 @@ impl Default for LinkPolicy {
             roles: Vec::new(),
             relay_roles: vec!["node".into()],
             enrollment_links: true,
+            direct_paths: true,
         }
     }
 }
@@ -330,6 +335,9 @@ impl Default for LinkPolicy {
 /// [`LinkPolicy`] wire words for `enrollment_links`.
 const ENROLLMENT_LINKS_ON: &str = "enrollment";
 const ENROLLMENT_LINKS_OFF: &str = "no-enrollment";
+/// [`LinkPolicy`] wire words for `direct_paths`.
+const DIRECT_PATHS_ON: &str = "direct";
+const DIRECT_PATHS_OFF: &str = "no-direct";
 
 impl LinkPolicy {
     /// Whether a device with `role` may link.
@@ -342,8 +350,13 @@ impl LinkPolicy {
         self.allows_link(role) && self.relay_roles.iter().any(|r| r == role)
     }
 
+    /// Whether linked devices may try a direct path instead of the relay.
+    pub fn allows_direct_paths(&self) -> bool {
+        self.direct_paths
+    }
+
     /// One line for a person: `links: any role; relays: node; enrollment
-    /// links: on`.
+    /// links: on`, plus `; direct paths: off` when they are off.
     pub fn describe(&self) -> String {
         let list = |roles: &[String], empty: &str| {
             if roles.is_empty() {
@@ -353,33 +366,45 @@ impl LinkPolicy {
             }
         };
         format!(
-            "links: {}; relays: {}; enrollment links: {}",
+            "links: {}; relays: {}; enrollment links: {}{}",
             list(&self.roles, "any role"),
             list(&self.relay_roles, "none"),
-            if self.enrollment_links { "on" } else { "off" }
+            if self.enrollment_links { "on" } else { "off" },
+            if self.direct_paths {
+                ""
+            } else {
+                "; direct paths: off"
+            }
         )
     }
 
-    /// `<roles>;<relay roles>;<enrollment|no-enrollment>`, roles
-    /// comma-separated.
+    /// `<roles>;<relay roles>;<enrollment|no-enrollment>[;no-direct]`, roles
+    /// comma-separated. The fourth field is written only when direct paths
+    /// are off, so a policy with them on encodes as before.
     fn encode(&self) -> Vec<u8> {
         format!(
-            "{};{};{}",
+            "{};{};{}{}",
             self.roles.join(","),
             self.relay_roles.join(","),
             if self.enrollment_links {
                 ENROLLMENT_LINKS_ON
             } else {
                 ENROLLMENT_LINKS_OFF
+            },
+            if self.direct_paths {
+                String::new()
+            } else {
+                format!(";{DIRECT_PATHS_OFF}")
             }
         )
         .into_bytes()
     }
 
     /// Decode the value; `None` when it is malformed (the default applies).
-    /// Fields after the third are reserved for extension and ignored, so an
-    /// older node keeps the three it knows instead of falling back to the
-    /// broader default.
+    /// The fourth field is `direct` or `no-direct`; absent or any other word
+    /// means direct paths on. Fields after the fourth are reserved for
+    /// extension and ignored, so an older node keeps the ones it knows
+    /// instead of falling back to the broader default.
     fn decode(value: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(value).ok()?;
         let mut fields = text.split(';');
@@ -396,10 +421,16 @@ impl LinkPolicy {
             Some(ENROLLMENT_LINKS_ON) | None => true,
             Some(_) => return None,
         };
+        // Unknown words are a later extension of this field: keep the default.
+        let direct_paths = match fields.next() {
+            Some(DIRECT_PATHS_OFF) => false,
+            Some(DIRECT_PATHS_ON) | Some(_) | None => true,
+        };
         Some(Self {
             roles,
             relay_roles,
             enrollment_links,
+            direct_paths,
         })
     }
 }
@@ -1457,6 +1488,7 @@ mod tests {
             roles: vec!["admin".into(), "node".into()],
             relay_roles: vec!["node".into()],
             enrollment_links: false,
+            direct_paths: false,
         };
         let ctx = SignedTrustContext::hierarchical(n("/home"))
             .with_version(3)
@@ -1713,6 +1745,7 @@ mod tests {
             roles: vec!["admin".into()],
             relay_roles: vec![],
             enrollment_links: false,
+            direct_paths: true,
         };
         let ctx = SignedTrustContext::hierarchical(n("/home")).with_link_policy(policy);
         let content = ctx.encode_content();
@@ -1758,13 +1791,28 @@ mod tests {
         }
     }
 
-    /// Fields after the third of a LinkPolicy are reserved and ignored.
+    /// The fourth field of a LinkPolicy is the direct-path word: absent or
+    /// unknown means on; fields after it are reserved and ignored.
     #[test]
-    fn link_policy_fields_after_the_third_are_ignored() {
-        let policy = LinkPolicy::decode(b"admin;node;no-enrollment;future,words").unwrap();
-        assert_eq!(policy.roles, ["admin"]);
-        assert_eq!(policy.relay_roles, ["node"]);
-        assert!(!policy.enrollment_links);
+    fn link_policy_direct_paths_field_and_later_fields() {
+        let unknown = LinkPolicy::decode(b"admin;node;no-enrollment;future,words").unwrap();
+        assert_eq!(unknown.roles, ["admin"]);
+        assert_eq!(unknown.relay_roles, ["node"]);
+        assert!(!unknown.enrollment_links);
+        assert!(unknown.allows_direct_paths(), "an unknown word keeps the default");
+
+        let absent = LinkPolicy::decode(b";node;enrollment").unwrap();
+        assert_eq!(absent, LinkPolicy::default());
+        assert_eq!(LinkPolicy::default().encode(), b";node;enrollment");
+
+        let off = LinkPolicy::decode(b";node;enrollment;no-direct;later").unwrap();
+        assert!(!off.allows_direct_paths());
+        assert_eq!(off.encode(), b";node;enrollment;no-direct");
+        assert_eq!(LinkPolicy::decode(&off.encode()).unwrap(), off);
+        assert!(off.describe().ends_with("; direct paths: off"));
+
+        let on = LinkPolicy::decode(b";node;enrollment;direct").unwrap();
+        assert_eq!(on, LinkPolicy::default());
     }
 
     /// AnchorSet (by certificate name) and Revocation entries are written in

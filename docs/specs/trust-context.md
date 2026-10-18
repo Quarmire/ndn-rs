@@ -328,20 +328,25 @@ treats every anchor alike, which is correct for a recovery anchor.
 #### 3.3.10 LinkPolicy (`0x0412`)
 
 ```
-value = roles ";" relay-roles [ ";" ( "enrollment" / "no-enrollment" ) ]   ; UTF-8
-roles = [ role *( "," role ) ]     ; empty = every device role
+value  = roles ";" relay-roles [ ";" ( "enrollment" / "no-enrollment" ) [ ";" direct ] ]   ; UTF-8
+roles  = [ role *( "," role ) ]     ; empty = every device role
+direct = "direct" / "no-direct"
 ```
 
-**Encoding.** ndn-rs always writes all three fields, and nothing after the
-third.
+**Encoding.** ndn-rs always writes the first three fields. It writes the
+fourth, `;no-direct`, only when direct paths are off, so a policy with
+direct paths on encodes exactly as before the field existed. Nothing is
+written after the fourth.
 
 **Decoding.** Split the value at `;`. A missing first or second field, a
 third field other than `enrollment` or `no-enrollment`, or invalid UTF-8
 makes the *field* invalid: the context is kept and the default policy
 applies. A missing third field means `enrollment`. Empty role names inside
-a list are dropped. Fields after the third are reserved for extension: a
-decoder MUST ignore them, and a producer MUST NOT write them until they are
-specified.
+a list are dropped. The fourth field is `no-direct` for direct paths off;
+missing, `direct`, or any other word means on (an unknown word is a later
+extension of the field, so it does not invalidate the policy). Fields after
+the fourth are reserved for extension: a decoder MUST ignore them, and a
+producer MUST NOT write them until they are specified.
 
 **Semantics.** A device's role is the component after the namespace in its
 certificate name, `/<ns>/<role>/<device>`.
@@ -350,9 +355,14 @@ certificate name, `/<ns>/<role>/<device>`.
 - It may relay iff it may link *and* `relay-roles` contains `r`.
 - A relay admits *enrollment links* iff the third field is `enrollment`
   *and* the context has at least one CaEndpoint.
+- Two devices linked through a relay may try a *direct path* between them
+  (NAT hole punching, keeping the relay when it does not open) iff the
+  fourth field is not `no-direct`. Turning direct paths off is a narrowing,
+  like removing a role (schema update, §5.3); turning them on is a widening.
 
 When the field is absent the default applies: `roles` empty,
-`relay-roles = node`, `enrollment`, which encodes as `;node;enrollment`.
+`relay-roles = node`, `enrollment`, direct paths on, which encodes as
+`;node;enrollment`.
 Admission itself is in [ndn-link.md](ndn-link.md).
 
 ### 3.4 Decoder rules
@@ -1076,6 +1086,8 @@ The metadata Data (124 octets) points at T3. Its name is
 LinkPolicy default (stated)     fd0412 10 3b6e6f64653b656e726f6c6c6d656e74          ";node;enrollment"
 LinkPolicy admin,node; ; off    fd0412 19 61646d696e2c6e6f64653b3b6e6f2d656e726f6c6c6d656e74
                                                                                      "admin,node;;no-enrollment"
+LinkPolicy default, direct off  fd0412 1a 3b6e6f64653b656e726f6c6c6d656e743b6e6f2d646972656374
+                                                                                     ";node;enrollment;no-direct"
 EnrollmentHint require_all,
   no roles                      fd0416 16 01 746f6b656e2c6465766963652d617070726f76616c
                                                                                      flags 0x01 "token,device-approval"
@@ -1212,8 +1224,9 @@ is open.
   rule: odd or `<= 31` rejects, even is skipped (§3.3.3). It is the same
   NDN evolvability rule as for the TrustContext children, and a SchemaFormat
   must be exactly one octet.
-- **Q7 LinkPolicy extra fields.** Fields after the third are reserved and
-  ignored (§3.3.10). Rejecting them would make an older node fall back to
+- **Q7 LinkPolicy extra fields.** Fields after the fourth are reserved and
+  ignored, and an unknown word in the fourth keeps direct paths on
+  (§3.3.10). Rejecting them would make an older node fall back to
   the default policy, which admits more than the stated one.
 - **Q8 Sync walk lower bound.** The sync walk starts at `H+1`, as a refresh
   does (§5.4, §9.5). An SVS update's low sequence number reflects only what
@@ -1253,7 +1266,7 @@ may move.
 - `mod.rs:61` keyword `trust-context`; `:65-92` SchemaFormat (unknown code → `Unknown`, `:85-91`); `:118-137` native-text parsing (trim, skip empty lines); `:143-161` OR of understood blobs, none understood → error, multiple LVS → error.
 - `mod.rs:204-207` hint flags; `:213-219` default hint; `:221-236` hint encode; `:238-268` hint decode (legacy rule `:260-265`).
 - `mod.rs:281-291` KeyRole codes 1/2.
-- `mod.rs:318-328` LinkPolicy default; `:331-332` words; `:336-343` allows_link/relay; `:365-377` encode; `:379-404` decode (fields after the third ignored).
+- `mod.rs:318-328` LinkPolicy default; `:331-332` words; `:336-343` allows_link/relay; `encode` (writes `;no-direct` only when off); `decode` (unknown fourth word: on; fields after the fourth ignored).
 - `mod.rs:635-637` admits_enrollment_links; `:646-652` add_anchor validity check; `:666-682` anchor_for; `:689-691` is_revoked; `:714-725` authorizes (floor + schema); `:741-753` authorizes_hop; `:771-783` authorizes_certification.
 - `mod.rs:808-861` encode_content (anchors sorted by name `:809-815`, revocations sorted `:816-817`); `:865-872` rdr_name; `:886-910` sign_into_data (KeyLocator = signer key name); `:916-931` async variant.
 - `mod.rs:942-1112` decode_content: `:947-950` outer type; `:959-966` single-valued fields at most once; `:973-979` namespace; `:980-996` AnchorSet (skip non-Data `:985-987`); `:998-1037` blob (SchemaFormat one octet, no repeats `:1006-1023`; unknown critical inner → reject `:1025-1028`; missing fields `:1033-1035`); `:1038-1041` authoritative; `:1042-1047` CaEndpoint; `:1048-1051` hint; `:1055-1058` SourceBundleHash length 32; `:1059-1064` Revocation; `:1067-1071` KeyRole; `:1074-1077` LinkPolicy; `:1079-1081` unknown critical → reject; `:1086-1090` required fields; `:1101` floor unless authoritative.

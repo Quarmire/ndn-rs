@@ -108,7 +108,12 @@ anything that is not an address and port is refused. `listen = false`
 the address it dials from this way (`bind = "192.0.2.7:0"`, port `0` lets
 the system pick the port); a dial-only socket with no `[[peer]] endpoint` to
 dial is refused. Without a quic `[[face]]`, links are dialled from an
-address and port the system picks. A daemon has at most one. Who may link
+address and port the system picks. `advertise` (default none) lists public
+`host:port` addresses that reach this socket, such as a router's port
+forward (`advertise = ["203.0.113.7:6367"]`); they are offered to linked
+devices as direct-path candidates, besides the addresses the device learns
+by itself. An entry that is not `host:port` with a non-zero port is refused.
+A daemon has at most one. Who may link
 in is decided by the devices' keys, not by this entry. See
 [QUIC links](../reference/face-transports.md#quic-links).
 
@@ -145,6 +150,7 @@ endpoint = "relay.example.net:6367"
 | `routes` | see below | Prefixes routed over this link. |
 | `persistent` | `true` | Keep the link up: redial whenever it drops, with backoff from 0.5 s to 30 s, and 60 s after the peer refused this device's key. |
 | `reliability` | `false` | NDNLPv2 reliability (retransmission of lost frames) on this link. |
+| `direct` | `true` | When this peer is reached through a relay, try a direct path to it (NAT hole punching), keeping the relay when it does not open; only when the namespace's link policy allows direct paths (`[ca] direct_paths`). `false`: always through the relay. |
 
 When `routes` is unset: a peer that validates as a `node` device (a relay)
 gets its namespace prefix `/<ns>`; any other peer that validates gets its
@@ -172,7 +178,7 @@ Validation (the daemon refuses to start, naming the entry):
 
 Older QUIC configuration is refused: `[listeners]` takes only
 `webtransport`, `webrtc` and `ble`, `[[face]] kind = "quic"` takes only
-`bind` and `listen`, and a QUIC face dialled to an address is now a
+`bind`, `listen` and `advertise`, and a QUIC face dialled to an address is now a
 `[[peer]]` with `endpoint` and the peer's `key`.
 
 ## `[discovery]` — neighbour discovery
@@ -286,6 +292,7 @@ the namespace's trust context. See
 | `link_roles` | unset (context's; default: every role) | Roles whose devices may link (`[[peer]]` QUIC links). `[]`: every role. |
 | `relay_roles` | unset (context's; default `["node"]`) | Roles a device may relay through; each must be in `link_roles` when that is not empty. |
 | `enrollment_links` | unset (context's; default `true`) | A relay of the namespace admits an unknown device on an enrollment link that carries only its enrollment (CA endpoints, trust context); effective when the namespace has a CA. |
+| `direct_paths` | unset (context's; default `true`) | Two devices of the namespace linked through a relay may try a direct path between them (NAT hole punching), keeping the relay when it does not open. Turning it off is a narrowing. |
 
 A namespace CA enforces the policy its trust context's enrollment hint
 advertises (`ndn-fwd init` writes it from these keys, and `ndn-fwd schema

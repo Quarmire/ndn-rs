@@ -155,11 +155,14 @@ sends says whether it admitted a full link or an enrollment link.
 The **link policy** is data in the trust context (field `LINK_POLICY`,
 `0x0412`): which roles may link, which may act as relays, and whether a relay
 of the namespace admits an unknown device on an enrollment link that carries
-only its enrollment (the CA endpoints, the trust context and certificates). When the
+only its enrollment (the CA endpoints, the trust context and certificates),
+and whether devices linked through a relay may try a direct path between
+them. When the
 context carries none, any device role may link, a relay must be a `node`
-device, and enrollment links are on when the namespace has a CA. `ndn-fwd
+device, enrollment links are on when the namespace has a CA, and direct
+paths are on. `ndn-fwd
 init -c <config>` writes it from `[ca] link_roles` / `relay_roles` /
-`enrollment_links` (else the default), and `ndn-fwd schema update -c
+`enrollment_links` / `direct_paths` (else the default), and `ndn-fwd schema update -c
 <config>` changes it — a narrowing only with `--accept-narrowing` (see
 [Context updates](context-updates.md)). A revocation, once this device adopts it, closes every live link
 whose certificate or issuer it revokes. Renewal keeps the key, so links
@@ -236,6 +239,7 @@ link with (full field list in the [config reference](../operations/config-refere
 kind = "quic"
 bind = "0.0.0.0:6367"        # "[::]:6367" for both families
 # listen = false             # dial only, from bind (e.g. "192.0.2.7:0")
+# advertise = ["203.0.113.7:6367"]  # port forwards offered as direct-path candidates
 
 [[peer]]
 device = "/home/node/relay"  # or key = "<64 hex>" (expected fingerprint)

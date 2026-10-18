@@ -141,7 +141,7 @@ pub enum BumpError {
          takes away what the held version (v{version}, {before}) allows — {}. A device relying \
          on it would lose its links once its node holds the new version. If that is intended, \
          sign the update with consent to narrow (`ndn-fwd schema update --accept-narrowing`); \
-         otherwise set [ca] link_roles / relay_roles / enrollment_links to the held policy or \
+         otherwise set [ca] link_roles / relay_roles / enrollment_links / direct_paths to the held policy or \
          remove them",
         .narrowed.join("; ")
     )]
@@ -310,7 +310,7 @@ impl SchemaChange {
 
 /// What devices may do under `before` and no longer under `after`: a role
 /// that could link and no longer can (every role → a list counts), a relay
-/// role removed, enrollment links turned off. Empty: `after` only widens.
+/// role removed, enrollment links or direct paths turned off. Empty: `after` only widens.
 pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
     let mut narrowed = Vec::new();
     if before.roles.is_empty() && !after.roles.is_empty() {
@@ -327,6 +327,9 @@ pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
     }
     if before.enrollment_links && !after.enrollment_links {
         narrowed.push("relays no longer admit enrollment links".to_string());
+    }
+    if before.direct_paths && !after.direct_paths {
+        narrowed.push("linked devices may no longer try direct paths".to_string());
     }
     narrowed
 }

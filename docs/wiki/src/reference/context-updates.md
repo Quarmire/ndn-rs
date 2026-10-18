@@ -226,7 +226,7 @@ policy the CA enforces for it — `[ca] approval_roles` /
 `approval_requires_invite` of `-c` (give the daemon's config), else the
 default. A held hint that `[ca]` contradicts is refused, as the CA's start
 refuses it. It carries the held link policy verbatim unless `[ca]
-link_roles` / `relay_roles` / `enrollment_links` of `-c` state another
+link_roles` / `relay_roles` / `enrollment_links` / `direct_paths` of `-c` state another
 (unset keys: the held policy's); then it states that one and prints
 `link_policy = <before> -> <after>`. Anchors, CA endpoints, revocations and
 key roles are carried over verbatim. It is checked, signed, handed over and

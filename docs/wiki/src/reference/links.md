@@ -32,8 +32,11 @@ Who may link is the namespace's **link policy**, signed in its trust context
 so every device admits links by the same rule: which roles may link, which
 may act as relays, and whether a relay admits an unknown device on an
 enrollment link that carries only its enrollment (the CA endpoints and the
-trust context) — default on when the namespace has a CA. Set it on the root
-device with `[ca] link_roles`, `relay_roles` and `enrollment_links` in
+trust context) — default on when the namespace has a CA — and whether two
+devices linked through a relay may try a direct path between them (default
+on; `[[peer]] direct = false` keeps one peer on the relay). Set it on the root
+device with `[ca] link_roles`, `relay_roles`, `enrollment_links` and
+`direct_paths` in
 `ndn-fwd init -c <config>`, or later with `ndn-fwd schema update -c
 <config>`, which refuses a narrowing unless `--accept-narrowing` (see the
 [configuration reference](../operations/config-reference.md)). Default: any
@@ -96,11 +99,52 @@ Two devices that cannot reach each other — both behind NATs, say — each link
 to the same relay. The laptop's Interests for `/home/member/phone` go to the
 relay (it routes `/home` there), and the relay sends them on over the phone's
 link. Nothing more is configured: the relay forwards between the two links.
-Hole punching (a direct path between the two NATed devices) is not done yet.
 
 To dial a device directly when it does have a reachable address, give its
 `[[peer]]` an `endpoint`. A `[[peer]]` with `relay = "/home/node/relay"` and
 no endpoint routes that device's name over the relay's link instead.
+
+## Direct paths
+
+A device reached through a relay gets a **direct path** when the networks
+allow it. Name it, with the relay it is reached through:
+
+```toml
+[[peer]]
+device = "/home/member/phone"
+relay = "/home/node/relay"
+```
+
+Nothing else: no addresses. The laptop sends a signed punch request to
+`/home/member/phone` through the relay with the addresses it may be reached
+at (its interface addresses, the address the relay sees it at, and any
+`[[face]] kind = "quic" advertise` addresses). The phone checks it the way it
+checks a link — a device of a namespace it holds, allowed to link by the link
+policy — and answers with its own. Both then send small probes from their
+link sockets to each other's addresses, which opens the NATs on both sides,
+and the device with the smaller key fingerprint dials. The phone needs no
+`[[peer]]` for the laptop, and `listen = false` does not stop it: a socket
+that does not listen accepts the punched connection, from the addresses the
+laptop signed, while the punch runs.
+
+The direct path joins the link as its second path. Its routes cost 0, so it
+carries the traffic; the relay's routes (cost 10) stay. When the direct path
+dies (8 s without an answer), its face and routes go and the relay carries the
+traffic again; the laptop punches again after 5 s, then backs off to 5
+minutes while punches fail.
+
+Some networks cannot be punched — typically both devices behind NATs that
+give each destination its own port (symmetric NATs, common on mobile
+carriers). The link stays on the relay and `ndn-ctl link list` says why
+(`direct not-possible …`). A punch the phone refuses (a key it does not let
+link, `direct = false`, a replayed request) is answered with the reason and
+causes no probe.
+
+Turn direct paths off for one peer with `[[peer]] direct = false`, or for the
+whole namespace with `[ca] direct_paths = false` on the root device and
+`ndn-fwd schema update --accept-narrowing` (it is written into the trust
+context, so every device follows it). The protocol is in
+[ndn-link.md](../../../specs/ndn-link.md) §14.
 
 ## A device outside the namespace
 
@@ -128,6 +172,64 @@ The daemon logs it at startup when its config has a QUIC listener or a
 `fingerprint=` field is the 64 hex digits other devices put in
 `[[peer]] key`. Links need the daemon's signing key, the device key it
 signs with; without one the daemon says so and starts no links.
+On a running daemon, the `key` line of [`ndn-ctl link list`](#link-status)
+shows it too.
+
+## Link status
+
+`ndn-ctl link list` shows this device's links: for each device it links
+with (or is configured to, or punched with), the paths that reach it and
+whether a direct path is up, being tried, or why not. It asks the daemon for
+the `/localhost/nfd/links/list` dataset. Run it as a local operator — the
+daemon's user, root, or a member of `[security] trust_admin_groups` — on the
+daemon's socket; anyone else is refused, with how to get access. A daemon
+with no `[[peer]]` and no `[[face]] kind = "quic"` says it runs no QUIC
+links.
+
+```text
+$ ndn-ctl link list
+key 3f0c9a…64 hex digits…
+probes-sent 40
+punches-refused 0
+link /home/node/relay
+  key 8d21e4…64 hex digits…
+  device /home/node/relay
+  path link face=5 remote=198.51.100.20:6367 rtt-ms=31.4 age-s=5400
+  direct none
+link /home/member/phone
+  key c7a05b…64 hex digits…
+  device /home/member/phone
+  path direct face=9 remote=203.0.113.5:41236 rtt-ms=12.3 age-s=90
+  path relay face=5 remote=198.51.100.20:6367 rtt-ms=31.4 age-s=5400 via=/home/node/relay
+  direct up
+```
+
+The output is one item per line, for scripts as much as for people:
+
+- `key` — this device's link key fingerprint (what other devices put in
+  `[[peer]] key`), or `-` when it links with no key yet.
+- `probes-sent`, `punches-refused` — totals since the daemon started: probe
+  datagrams sent for direct paths, and punch requests this device refused.
+- `link <label>` — one block per device, named by its `[[peer]]` label,
+  else its device name, else its key. Its `key` and `device` lines show `-`
+  until they are known.
+- `path <kind> face=<id> remote=<ip:port> rtt-ms=<ms> age-s=<s>` — one line
+  per way the device is reached now (none when it is not): `direct`, a QUIC
+  link a hole punch made; `link`, a QUIC link dialled to a configured
+  endpoint or accepted; `relay`, routes over the link to the relay named by
+  `via=`, whose face and address the line shows. `rtt-ms` is the
+  connection's round-trip estimate and `age-s` how long the path has been
+  up; `-` where nothing is known.
+- `direct <state>[ retry-in-s=<s>][ <why>]` — the device's direct path:
+
+| State | Meaning |
+|---|---|
+| `none` | No direct path is wanted: the device is not reached through a relay, or a link to it exists already. |
+| `off` | Direct paths are off, by the namespace's link policy (`[ca] direct_paths`) or by `[[peer]] direct = false`; the sentence says which. |
+| `trying` | A punch runs now. |
+| `up` | A direct path is up; traffic takes it, the relay route stays as fallback. |
+| `not-possible` | The last punch made no direct path (both NATs too strict, say); the sentence says why. Tried again in `retry-in-s`. |
+| `refused` | The last punch was refused, by the other device or by this one; the sentence says why. Tried again in `retry-in-s`. |
 
 ## When a link is refused
 

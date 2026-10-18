@@ -268,6 +268,13 @@ pub struct CaTomlConfig {
     /// CA).
     #[serde(default)]
     pub enrollment_links: Option<bool>,
+    /// Whether two devices of the namespace linked through a relay may try
+    /// a direct path between them (NAT hole punching from the addresses
+    /// each offers), keeping the relay when it does not open. Written and
+    /// checked like `link_roles`; turning it off is a narrowing. Unset:
+    /// what the context says (default on).
+    #[serde(default)]
+    pub direct_paths: Option<bool>,
     /// How long a request for an admin's approval waits for a decision, in
     /// days, before it expires (the device is then told to ask again); a
     /// decision is kept as long for a device that was offline to learn it.
@@ -531,6 +538,7 @@ impl Default for CaTomlConfig {
             link_roles: None,
             relay_roles: None,
             enrollment_links: None,
+            direct_paths: None,
             approval_request_ttl_days: Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS,
         }
     }
@@ -1173,13 +1181,22 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 (None, true) => {}
             }
         }
-        FaceConfig::Quic { bind, .. } => {
+        FaceConfig::Quic { bind, advertise, .. } => {
             bind.parse::<std::net::SocketAddr>().map_err(|_| {
                 ConfigError::Invalid(format!(
                     "[[face]] kind = \"quic\": bind must be an address and port such as \
                      \"0.0.0.0:6367\", not {bind:?}"
                 ))
             })?;
+            for addr in advertise {
+                let port = addr.rsplit_once(':').map(|(host, p)| (host, p.parse::<u16>()));
+                if !matches!(port, Some((host, Ok(p))) if p != 0 && !host.is_empty()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[[face]] kind = \"quic\": advertise entries must be the public host:port \
+                         that reaches this socket, such as \"203.0.113.7:6367\", not {addr:?}"
+                    )));
+                }
+            }
         }
         FaceConfig::Ether {
             interface,
@@ -1434,6 +1451,11 @@ pub enum FaceConfig {
         /// `[[face]]`, a device dials from an address the system picks.
         #[serde(default = "default_true")]
         listen: bool,
+        /// Public `host:port` addresses that reach this socket (port
+        /// forwards), offered to linked devices as direct-path candidates
+        /// besides the addresses the device learns by itself.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        advertise: Vec<String>,
     },
     Serial {
         path: String,
@@ -1559,6 +1581,11 @@ pub struct PeerConfig {
     /// NDNLPv2 reliability (retransmission of lost frames) on this link.
     #[serde(default)]
     pub reliability: bool,
+    /// Try a direct path to this peer when it is reached through a relay
+    /// (and the namespace's link policy allows direct paths). `false`:
+    /// always go through the relay.
+    #[serde(default = "default_true")]
+    pub direct: bool,
 }
 
 impl PeerConfig {
@@ -2625,7 +2652,7 @@ channel = 161
              [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"/home/node/relay\"\n"
         ))
         .unwrap();
-        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: true } if bind == "0.0.0.0:6367"));
+        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: true, .. } if bind == "0.0.0.0:6367"));
         assert_eq!(cfg.peers[0].endpoint, vec!["relay.example.net:6367"]);
         assert!(cfg.peers[0].persistent);
         assert_eq!(cfg.peers[1].endpoint.len(), 2);
@@ -2641,11 +2668,33 @@ channel = 161
              [[peer]]\ndevice = \"/home/node/relay\"\nendpoint = \"relay.example.net:6367\"\n",
         )
         .unwrap();
-        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false } if bind == "192.0.2.7:0"));
+        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false, .. } if bind == "192.0.2.7:0"));
         let err = ForwarderConfig::from_str("[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n")
             .err()
             .expect("a socket that neither listens nor dials is refused");
         assert!(err.to_string().contains("no [[peer]] has an endpoint"), "{err}");
+    }
+
+    #[test]
+    fn direct_paths_default_on_and_advertised_addresses_must_be_host_port() {
+        let cfg = ForwarderConfig::from_str(
+            "[[face]]\nkind = \"quic\"\nbind = \"0.0.0.0:6367\"\n\
+             advertise = [\"203.0.113.7:6367\", \"home.example.net:16367\"]\n\
+             [[peer]]\ndevice = \"/home/node/relay\"\nendpoint = \"relay.example.net:6367\"\n\
+             [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"/home/node/relay\"\ndirect = false\n",
+        )
+        .unwrap();
+        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { advertise, .. } if advertise.len() == 2));
+        assert!(cfg.peers[0].direct);
+        assert!(!cfg.peers[1].direct);
+        for bad in ["\"203.0.113.7\"", "\":6367\"", "\"h:0\""] {
+            let err = ForwarderConfig::from_str(&format!(
+                "[[face]]\nkind = \"quic\"\nbind = \"0.0.0.0:6367\"\nadvertise = [{bad}]\n"
+            ))
+            .err()
+            .expect("a malformed advertise entry is refused");
+            assert!(err.to_string().contains("advertise entries must be"), "{err}");
+        }
     }
 
     #[test]

@@ -1046,6 +1046,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         roles: vec!["admin".into(), "node".into()],
         relay_roles: vec!["node".into()],
         enrollment_links: true,
+        direct_paths: true,
     };
     let v2 = bump_context_schema(root.as_ref(), &v1, &schema, &hint, Some(&held), true)
         .await
@@ -1071,6 +1072,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         roles: vec!["admin".into(), "node".into(), "member".into()],
         relay_roles: vec!["node".into(), "admin".into()],
         enrollment_links: true,
+        direct_paths: true,
     };
     let v4 = bump_context_schema(root.as_ref(), &v3.bump.data, &schema, &other_hint, Some(&wider), false)
         .await
@@ -1084,6 +1086,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         LinkPolicy { roles: vec!["admin".into(), "node".into()], ..wider.clone() },
         LinkPolicy { relay_roles: vec!["node".into()], ..wider.clone() },
         LinkPolicy { enrollment_links: false, ..wider.clone() },
+        LinkPolicy { direct_paths: false, ..wider.clone() },
     ] {
         let refused = bump_context_schema(
             root.as_ref(),
@@ -1105,6 +1108,19 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
                 .expect("consented narrowing");
         assert_eq!(applied.bump.context.stated_link_policy(), Some(&narrower));
     }
+
+    // Direct paths off -> on widens: no consent needed.
+    let no_direct = LinkPolicy { direct_paths: false, ..wider.clone() };
+    let v5 = bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&no_direct), true)
+        .await
+        .unwrap()
+        .expect("direct paths off");
+    let v6 = bump_context_schema(root.as_ref(), &v5.bump.data, &schema, &other_hint, Some(&wider), false)
+        .await
+        .unwrap()
+        .expect("direct paths back on");
+    assert!(v6.change.link_narrowed.is_empty());
+    assert_eq!(v6.bump.context.stated_link_policy(), Some(&wider));
 }
 
 /// Nothing an unsigned NEW/CHALLENGE answer says ends a request: a denial

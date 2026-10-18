@@ -389,8 +389,12 @@ Devices dial out to a relay — a QUIC link from `[[peer]] device =
 "/<ns>/node/<relay>" endpoint = "<host:port>"`, or WebTransport from browsers
 and restrictive networks — and route `/<ns>` over that link; the relay
 forwards. Two devices behind NATs reach each other **relay-first**: each
-links to the relay, which forwards between the two links (no hole punching
-yet). Adoption and enrollment do not depend on inbound reachability, but
+links to the relay, which forwards between the two links. When the networks
+allow it, a device that names the other in a `[[peer]]` with `relay` punches
+a **direct path** to it: a signed punch through the relay, probes, and a
+QUIC path between the two that carries their traffic, with the relay as the
+fallback ([ndn-link.md](ndn-link.md) §14; off by the link policy's
+`direct_paths` or `[[peer]] direct = false`). Adoption and enrollment do not depend on inbound reachability, but
 they do need that link and route whenever the context or the CA is not on the
 local segment (§9).
 

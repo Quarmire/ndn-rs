@@ -37,6 +37,9 @@ pub mod module {
     pub const CA: &[u8] = b"ca";
     /// WebTransport listener introspection — read-only TLS cert status.
     pub const WEBTRANSPORT: &[u8] = b"webtransport";
+    /// This device's QUIC links and their paths (`ndn-link`, served by the
+    /// host daemon as an extra module) — read-only, local operators only.
+    pub const LINKS: &[u8] = b"links";
 }
 
 pub mod verb {

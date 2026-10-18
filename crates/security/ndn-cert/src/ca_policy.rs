@@ -41,6 +41,8 @@ pub struct PolicyInput {
     pub relay_roles: Option<Vec<String>>,
     /// Whether relays admit enrollment links.
     pub enrollment_links: Option<bool>,
+    /// Whether linked devices may try a direct path instead of the relay.
+    pub direct_paths: Option<bool>,
 }
 
 /// Why a CA's stated policy was refused.
@@ -80,17 +82,18 @@ impl fmt::Display for PolicyError {
             ),
             Self::LinkDisagrees { version, held } => write!(
                 f,
-                "[ca] link_roles / relay_roles / enrollment_links disagree with the namespace's trust \
+                "[ca] link_roles / relay_roles / enrollment_links / direct_paths disagree with the namespace's trust \
                  context (v{}), which states: {}. Devices admit links by the context, so the CA does \
                  not start with another policy: to change it, run `ndn-fwd schema update -c <config>` \
                  on the root device (a narrowing needs --accept-narrowing); to keep it, set \
-                 link_roles = [{}], relay_roles = [{}] and enrollment_links = {} in [ca], or remove \
-                 the keys",
+                 link_roles = [{}], relay_roles = [{}], enrollment_links = {} and direct_paths = {} \
+                 in [ca], or remove the keys",
                 version,
                 held.describe(),
                 quoted(&held.roles),
                 quoted(&held.relay_roles),
-                held.enrollment_links
+                held.enrollment_links,
+                held.direct_paths
             ),
             Self::ApprovalDisagrees {
                 version,
@@ -156,7 +159,10 @@ impl PolicyInput {
     /// no link key is set. Refuses an unknown role, and a relay role that
     /// may not link.
     pub fn link_policy(&self, base: &LinkPolicy) -> Result<Option<LinkPolicy>, PolicyError> {
-        if self.link_roles.is_none() && self.relay_roles.is_none() && self.enrollment_links.is_none()
+        if self.link_roles.is_none()
+            && self.relay_roles.is_none()
+            && self.enrollment_links.is_none()
+            && self.direct_paths.is_none()
         {
             return Ok(None);
         }
@@ -183,6 +189,7 @@ impl PolicyInput {
             roles: roles("link_roles", &self.link_roles, &base.roles)?,
             relay_roles: roles("relay_roles", &self.relay_roles, &base.relay_roles)?,
             enrollment_links: self.enrollment_links.unwrap_or(base.enrollment_links),
+            direct_paths: self.direct_paths.unwrap_or(base.direct_paths),
         };
         if let Some(role) = policy.relay_roles.iter().find(|r| !policy.allows_link(r)) {
             return Err(PolicyError::RelayMayNotLink {
@@ -317,6 +324,7 @@ pub fn same_link_policy(a: &LinkPolicy, b: &LinkPolicy) -> bool {
     set(&a.roles) == set(&b.roles)
         && set(&a.relay_roles) == set(&b.relay_roles)
         && a.enrollment_links == b.enrollment_links
+        && a.direct_paths == b.direct_paths
 }
 
 /// One challenge a CA offers, in offer order.
@@ -556,6 +564,7 @@ mod tests {
                 roles: vec!["admin".into(), "node".into()],
                 relay_roles: vec!["node".into()],
                 enrollment_links: false,
+                direct_paths: true,
             }
         );
         let (approval, new) = stated.new_namespace_policies().unwrap();
@@ -582,6 +591,7 @@ mod tests {
             roles: vec!["admin".into(), "node".into()],
             relay_roles: vec!["node".into()],
             enrollment_links: true,
+            direct_paths: true,
         };
         let b = LinkPolicy {
             roles: vec!["node".into(), "admin".into(), "node".into()],
@@ -602,6 +612,18 @@ mod tests {
             off.link_change(&a).unwrap(),
             Some(LinkPolicy {
                 enrollment_links: false,
+                ..a.clone()
+            })
+        );
+        let no_direct = PolicyInput {
+            direct_paths: Some(false),
+            ..PolicyInput::default()
+        };
+        assert!(!same_link_policy(&a, &LinkPolicy { direct_paths: false, ..a.clone() }));
+        assert_eq!(
+            no_direct.link_change(&a).unwrap(),
+            Some(LinkPolicy {
+                direct_paths: false,
                 ..a
             })
         );

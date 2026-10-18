@@ -2,10 +2,11 @@
 
 - **Status:** Draft
 - **Scope:** This spec covers the wire protocol and the admission rules of a *link*: a QUIC connection between two NDN forwarders. Each device is identified by its NDN key, which it presents in TLS 1.3 as an RFC 7250 raw public key. The spec defines:
-  - the handshake, the key fingerprint, and the link messages (LinkHello, LinkVerdict, EnrollmentLink);
+  - the handshake, the key fingerprint, and the link messages (LinkHello, LinkVerdict, EnrollmentLink, ObservedAddress);
   - how NDN packets are framed in QUIC datagrams, and the timeouts;
   - the close reason codes;
-  - admission and enrollment-link scope, routes, the duplicate-link rule, backoff and rate limits.
+  - admission and enrollment-link scope, routes, the duplicate-link rule, backoff and rate limits;
+  - direct paths: address discovery, the NDN-native punch that signals a NAT hole punch through a relay, probes, and how a punched connection joins a link as its direct path (§14).
 
   The goal is an independent implementation (NDNts, python-ndn, …) that can dial an ndn-fwd link and accept one from ndn-fwd.
 - **Design context:** [personal-namespace.md](personal-namespace.md) §9 ("QUIC links"), F6 and F11. Where the two disagree on wire detail, this spec governs.
@@ -13,7 +14,7 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 ([RFC 2119], [RFC 8174]) when, and only when, they appear in all capitals, as shown here.
 
-The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-ext) for the transport and messages, and crate `ndn-link` (ndn-ext) for admission, enrollment links, routes, redial and the duplicate-link rule. ndn-fwd is a host of `ndn-link`: it supplies the configuration, the certificates it serves and its faces and RIB. Points where the code was ambiguous or looked unintended were decided; the [Decisions](#16-decisions) say how and why. All byte-level claims are traced to code in [Appendix A](#appendix-a-code-references-non-normative).
+The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-ext) for the transport, the messages and the probes, and crate `ndn-link` (ndn-ext) for admission, enrollment links, routes, redial, the duplicate-link rule and direct paths. ndn-fwd is a host of `ndn-link`: it supplies the configuration, the certificates it serves and its faces and RIB. Points where the code was ambiguous or looked unintended were decided; the [Decisions](#17-decisions) say how and why. All byte-level claims are traced to code in [Appendix A](#appendix-a-code-references-non-normative).
 
 ---
 
@@ -29,13 +30,17 @@ The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-
 | expected fingerprint | A fingerprint the operator configured for a peer (`[[peer]] key`). A dial that has one fails unless the listener presents exactly that key. |
 | namespace | A personal namespace `/<ns>`. Its devices are named `/<ns>/<role>/<device>`, with role ∈ {`admin`, `member`, `node`, `guest`}. |
 | trust context | The signed object that defines a namespace's anchors, revocations, CA endpoints and link policy ([trust-context.md](trust-context.md)). A device *holds* a namespace when it has adopted that namespace's trust context. |
-| link policy | The trust context field (LinkPolicy, TLV 0x0412) that says which roles may link, which may relay, and whether enrollment links are admitted (§7.4). |
+| link policy | The trust context field (LinkPolicy, TLV 0x0412) that says which roles may link, which may relay, whether enrollment links are admitted, and whether direct paths are (§7.4). |
 | relay | A forwarder that other devices link to and reach each other through. For link policy purposes, a device holding a certificate whose role the link policy lets relay. |
 | enrollment link | A link admitted with a *scope*: it carries only one device's enrollment in the listed namespaces (§8). |
 | full link | A link without a scope. |
+| path | One QUIC connection of a link. A link has at most one path of each kind: the *link path* (dialled to a configured endpoint, or accepted) and the *direct path* (made by a punch, §14). |
+| direct path | A path between two devices that otherwise reach each other through a relay, made by a NAT hole punch (§14). |
+| punch | The signed Interest and Data by which two devices agree on a direct-path attempt, then probe and connect (§14). |
+| candidate | A UDP address at which a device may be reached directly: host (an interface address), reflexive (the address a linked device sees it at), advertised (configured) or mapped (port mapping) (§14.2). |
 | route | A FIB/RIB entry that sends a prefix over a link's face, with a cost (§10). |
 | enroll | Obtain a certificate `/<ns>/<role>/<device>/KEY/…` from the namespace's CA (invite or approval; see [ndncert-extensions.md](ndncert-extensions.md)). |
-| `[[peer]]` | ndn-fwd's configuration entry for a peer device. Its fields are `key` (expected fingerprint), `device` (expected device name), `endpoint`, `relay`, `routes`, `persistent` and `reliability`. Other implementations need an equivalent; only its effect on the wire is normative. |
+| `[[peer]]` | ndn-fwd's configuration entry for a peer device. Its fields are `key` (expected fingerprint), `device` (expected device name), `endpoint`, `relay`, `routes`, `persistent`, `reliability` and `direct`. Other implementations need an equivalent; only its effect on the wire is normative. |
 
 TLV notation follows the NDN Packet Format v0.3: TLV-TYPE and TLV-LENGTH are VAR-NUMBERs; `0xFD xx xx` is the 3-byte form.
 
@@ -52,8 +57,9 @@ dialer                                              listener
   |        each side decides admission (§7)             |
   | LinkVerdict (0x0452) -----------------------------> |  §5.3 (sent concurrently;
   | <----------------------------- LinkVerdict (0x0452) |       or CONNECTION_CLOSE, §6)
-  | FIN on control stream            FIN on control stream
+  | ObservedAddress (0x0458) on the control stream, both ways, at once and when it changes   §5.5
   | NDNLPv2 frames in QUIC DATAGRAM frames, both ways   |  §9
+  | FIN on control stream when the link ends            |
 ```
 
 ## 3. Transport and TLS identity
@@ -73,6 +79,8 @@ dialer                                              listener
    | `max_idle_timeout` | 30 000 ms | QUIC transport parameter |
    | Keep-alive (PING when idle) | every 10 s | keeps NAT bindings open |
    | Dial handshake timeout | 5 s | a dial with no completed handshake by then fails; QUIC ignores ICMP, so this is the only fast failure for an address where nothing listens |
+   | Direct path: `max_idle_timeout` offered by its dialer | 8 000 ms | the connection takes the smaller offer, so it applies to both sides; a dead direct path is noticed within it and its traffic falls back to the relay (§14.7). The listener of a direct path offers 8 000 ms too |
+   | Direct path: keep-alive of its dialer | every 2 s | keeps the NAT mappings of both sides open (the listener's ACKs refresh its side) |
 
 8. Cipher suites and key exchange are those of the rustls *ring* provider. Suites: `TLS_AES_256_GCM_SHA384`, `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256`. Groups: X25519, secp256r1, secp384r1. An implementation MUST support at least `TLS_AES_128_GCM_SHA256` together with X25519 or secp256r1.
 
@@ -123,14 +131,14 @@ The handshake proves one thing only: the peer holds the private half of the key 
 ### 4.1 Stream use
 
 1. After the handshake, the dialer opens the first client-initiated bidirectional stream (stream ID 0). This is the **control stream**.
-2. Each direction of the control stream carries exactly two link messages, in this order: one LinkHello, then one LinkVerdict. Each message is one complete TLV with no other framing.
-3. After it has written its LinkVerdict and read the peer's, a side finishes (FIN) its sending half. Nothing else is sent on the control stream. A receiver MUST NOT expect a FIN before the link is up, and MUST ignore any bytes after the verdict.
+2. Each direction of the control stream carries, in this order: one LinkHello, one LinkVerdict, then zero or more ObservedAddress messages (§5.5) for as long as the link is up. Each message is one complete TLV with no other framing.
+3. A side finishes (FIN) its sending half when the link ends, or earlier once it sends nothing more. A receiver MUST NOT expect a FIN before the link is up. After the verdict, a receiver reads further messages: it MUST ignore a message of an unrecognized TLV-TYPE that is even and greater than 31, and SHOULD close the link with 0x15 (Protocol) on any other unrecognized type. A side that stops reading after the verdict (an implementation before ObservedAddress) only loses those messages; its peer's writes then fail, and the peer stops sending them.
 4. NDN packets never travel on a stream (§9).
 
 ### 4.2 Reading a message
 
 1. A receiver reads the TLV-TYPE and TLV-LENGTH VAR-NUMBERs. If no complete header has arrived after 20 bytes, the message is malformed.
-2. If TLV-TYPE is not the expected message (0x0450 for the first message, 0x0452 for the second), the message is malformed.
+2. If TLV-TYPE is not the expected message (0x0450 for the first message, 0x0452 for the second, any type after the verdict, §4.1), the message is malformed.
 3. If TLV-LENGTH exceeds 65 536 (`MAX_MESSAGE`, 64 KiB, applied to the TLV-VALUE), the message is malformed.
 4. Otherwise the receiver reads exactly TLV-LENGTH more bytes. A stream that ends early is malformed. If the connection closed, the peer's close reason is reported instead.
 
@@ -138,19 +146,24 @@ A sender MUST NOT send a message whose TLV-VALUE exceeds 65 536 bytes.
 
 ## 5. Link messages
 
-All TLV-TYPEs are in the application range (types above 252, written as 3-byte VAR-NUMBERs). Inside LinkHello and LinkVerdict, a receiver MUST ignore an unrecognized TLV-TYPE that is even and greater than 31, and MUST treat any other unrecognized TLV-TYPE (odd, or in 0–31) as a malformed message. This is the rule of NDN Packet Format v0.3, where types 0–31 are always critical ([Decision 3](#16-decisions)).
+All TLV-TYPEs are in the application range (types above 252, written as 3-byte VAR-NUMBERs). Inside LinkHello and LinkVerdict, a receiver MUST ignore an unrecognized TLV-TYPE that is even and greater than 31, and MUST treat any other unrecognized TLV-TYPE (odd, or in 0–31) as a malformed message. This is the rule of NDN Packet Format v0.3, where types 0–31 are always critical ([Decision 3](#17-decisions)).
 
 ### 5.1 TLV-TYPE registry
 
 | TLV-TYPE | Name | Appears in | Value |
 |---|---|---|---|
-| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data* |
+| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data*, DirectPath? |
 | 0x0451 | LinkVersion | LinkHello | 1 byte: the protocol version, `0x01` |
 | 0x0452 | LinkVerdict | control stream, message 2 | EnrollmentLink? |
 | 0x0453 | (unassigned) | — | — |
 | 0x0454 | EnrollmentLink | LinkVerdict | Name* |
+| 0x0456 | (unassigned) | — | — |
+| 0x0458 | ObservedAddress | control stream, after the verdict | a UDP address (§5.5) |
+| 0x045A | DirectPath | LinkHello | 8 bytes: the session of the punch whose direct path this connection is (§14.6) |
 | 0x06 | Data | LinkHello | a certificate Data packet, whole |
 | 0x07 | Name | EnrollmentLink | a namespace Name |
+
+The punch messages of §14 use 0x0460–0x046C ([§14.3](#143-the-punch-interest-and-its-answer)).
 
 ### 5.2 LinkHello (0x0450)
 
@@ -158,8 +171,10 @@ All TLV-TYPEs are in the application range (types above 252, written as 3-byte V
 LinkHello      = LINK-HELLO-TYPE TLV-LENGTH
                  LinkVersion
                  *Certificate
+                 [DirectPath]
 LinkVersion    = LINK-VERSION-TYPE TLV-LENGTH(=1) %x01
 Certificate    = Data              ; NDN Certificate Format v2 Data packet
+DirectPath     = DIRECT-PATH-TYPE TLV-LENGTH(=8) 8OCTET
 ```
 
 **Sender rules**
@@ -169,6 +184,7 @@ Certificate    = Data              ; NDN Certificate Format v2 Data packet
   - The first is the sender's own certificate for the key it presented in TLS (the *leaf*).
   - The rest are the issuers the sender keeps, nearest first (the leaf's issuer, then that certificate's issuer, …).
 - A sender with no certificate for its link key (a device not enrolled anywhere, linked by expected fingerprint or on an enrollment link) sends LinkVersion only.
+- DirectPath: the dialer of a direct path MUST send the session of its punch (§14.6); a listener that punches the dialer's key now sends the session of that punch. Otherwise it is absent. ndn-rs writes it last.
 - How ndn-fwd builds the chain: it takes its newest currently valid certificate under the current key name. It then repeatedly takes the newest currently valid certificate under the key name in the previous certificate's KeyLocator (the certificate name without its last two components). It stops at a self-signed certificate (KeyLocator names the certificate's own key), at a certificate it does not keep, at a certificate already in the chain, or at **8 certificates in total**. A self-signed root that ndn-fwd keeps is therefore included as the last element.
 
 **Receiver rules**
@@ -177,6 +193,7 @@ Certificate    = Data              ; NDN Certificate Format v2 Data packet
   - LinkVersion: the value MUST be exactly one byte, the version. A value of any other length makes the hello malformed. If LinkVersion appears more than once, the last one wins.
   - Data (0x06): appended to the certificate list in order. The Data is not parsed at this stage.
   - Any other even type above 31: ignored.
+  - DirectPath (0x045A): the value MUST be exactly 8 bytes; any other length makes the hello malformed.
   - Any other type (odd, or 0–31): malformed.
 - If no version is present, the hello is malformed.
 - If the version is present and ≠ 1, the receiver MUST NOT admit the link. ndn-rs logs that the peer speaks a different version and asks the user to update the older device.
@@ -194,7 +211,7 @@ EnrollmentLink = ENROLLMENT-LINK-TYPE TLV-LENGTH
 - **Meaning.** Sending a LinkVerdict means the sender **admits** the link. A refusal is never a verdict; the refusing side closes the connection instead (§6).
 - **Without EnrollmentLink:** the sender admits a full link.
 - **With EnrollmentLink:** the sender admits the link only as an enrollment link (§8). Over it, the sender carries only the receiver's enrollment in the listed namespaces: their CA, their trust context and certificates. This lasts until the receiver links again holding a certificate.
-  - An EnrollmentLink MUST list at least one Name. An empty EnrollmentLink makes the verdict malformed ([Decision 4](#16-decisions)). A relay with no eligible namespace refuses instead (§7.3 rule 4).
+  - An EnrollmentLink MUST list at least one Name. An empty EnrollmentLink makes the verdict malformed ([Decision 4](#17-decisions)). A relay with no eligible namespace refuses instead (§7.3 rule 4).
 - **Receiver rules:**
   - Inside EnrollmentLink, every element MUST be a Name (0x07). Any other type makes the message malformed.
   - Each Name value is decoded as an NDN Name.
@@ -219,8 +236,22 @@ EnrollmentLink = ENROLLMENT-LINK-TYPE TLV-LENGTH
    - From then on it carries NDN packets (§9). A side MUST NOT send NDN datagrams before this point.
    - Datagrams that arrive before this point are buffered by the QUIC stack (ndn-rs: up to 4 MiB) and delivered once the face starts reading.
 5. **Duplicate check.** After the link is up, the duplicate-link rule (§11) may close it at once with 0x01 (Replaced).
+6. **Observed addresses.** From here on, each side tells the other the address it sees it at (§5.5).
 
 A side that receives a malformed message or an unsupported LinkVersion, or whose peer misses a `MESSAGE_DEADLINE`, does not admit the link. It closes the connection with 0x15 (Protocol) and a reason (§6.3).
+
+### 5.5 ObservedAddress (0x0458)
+
+```
+ObservedAddress = OBSERVED-ADDRESS-TYPE TLV-LENGTH UdpAddress
+UdpAddress      = 4OCTET 2OCTET     ; IPv4 address, port   (TLV-LENGTH 6)
+                / 16OCTET 2OCTET    ; IPv6 address, port   (TLV-LENGTH 18)
+```
+
+Network byte order. An IPv4-mapped IPv6 address MUST be written as IPv4. It is the address the sender sees the receiver's packets come from: the receiver's address beyond every NAT between them (its *server-reflexive* address, as STUN or QUIC address discovery would report it).
+
+- **Sender.** Once its verdict is written and the peer's read, each side SHOULD send an ObservedAddress with the peer's current address, and again whenever that address changes (the peer's NAT remapped, or the peer migrated the connection). ndn-rs sends it at once and checks for a change every 5 s (`OBSERVE_INTERVAL`).
+- **Receiver.** A value of another length makes the message malformed; ndn-rs closes the link with 0x15. The latest ObservedAddress replaces the earlier ones. A device uses the addresses its *full* links report as its reflexive candidates (§14.2); an enrollment link's report is not used (its other side is not confirmed). The report is a claim of the linked device, not a proof: a device that lies can only make the receiver offer a wrong candidate, which its punch partner then probes a few times (§14.5).
 
 ## 6. Closing a link
 
@@ -231,17 +262,19 @@ A side closes a link with a QUIC `CONNECTION_CLOSE` of type 0x1d (application). 
 | Code | Name | Sent when | Transient |
 |---|---|---|---|
 | 0x00 | Shutdown | The device is shutting down. ndn-fwd closes every link with it, then waits up to 1 s for the peer to be told. | yes |
-| 0x01 | Replaced | A newer link between the same two devices took this link's place (§11). | yes |
+| 0x01 | Replaced | A newer link between the same two devices took this link's place (§11), or another path of the same punch came up first (§14.6). | yes |
 | 0x02 | Idle | An enrollment link carried nothing for `ENROLLMENT_IDLE` (§8.4). | yes |
 | 0x03 | Enrolled | The device enrolled. It closes its enrollment link and links again holding its certificate (§8.5). | yes |
+| 0x04 | PathExpired | A connection names, in its DirectPath, a punch the closing side does not run with that key (it ended, or never began), or the listener of a direct path did not take it as one (§14.6). | yes |
 | 0x10 | Unrecognized | The key has no valid certificate in a namespace the closing side holds, no `[[peer]]` expects its fingerprint, and no enrollment link is possible. | no |
 | 0x11 | CertificateForAnotherKey | The leaf certificate in the hello certifies a different key than the one the handshake proved. | no |
 | 0x12 | Revoked | The leaf, or a sent issuer, is revoked by a held trust context. Also sent when a revocation is adopted while the link is up (§12). | no |
 | 0x13 | RoleNotAllowed | The namespace's link policy does not let the peer's role link, or does not let it relay when this side reaches others through it. | no |
 | 0x14 | NotTheExpectedDevice | The peer is valid, but not the device or key a `[[peer]]` entry expects. | no |
 | 0x15 | Protocol | A link message is malformed or carries another LinkVersion, the peer sent no link message within `MESSAGE_DEADLINE` (§6.3), a certificate in the hello does not decode, the peer does not support datagrams, or the peer misbehaved. | no |
-| 0x16 | Busy | Too many link attempts (§13), or too many enrollment links (§8.4). | yes |
+| 0x16 | Busy | Too many link attempts (§13), too many enrollment links (§8.4), or too many punches (§14.4). | yes |
 | 0x17 | NoLinkKey | This device has no usable link key. | yes¹ |
+| 0x18 | DirectPathsOff | Direct paths between the two devices are off: the link policy of the namespace the peer is identified in turns them off (§7.4), or the closing side's `[[peer]]` for it says `direct = false`. Refuses a direct path (§14.6) or a punch (§14.4). | no |
 
 ¹ ndn-rs never sends 0x17 on the wire. A device without a link key cannot complete a handshake.
 
@@ -249,7 +282,7 @@ The **Transient** column drives the dialer's backoff (§13):
 - a transient close is retried with exponential backoff;
 - a non-transient close means "refused until the trust data or the configuration changes".
 
-A received code not in this table MUST be treated as transient.
+A received code not in this table MUST be treated as transient. The same codes, and their transient column, are what a punch refusal carries (§14.4).
 
 ### 6.2 Refusal before the handshake
 
@@ -259,7 +292,7 @@ A listener over its handshake limits (§13.2) refuses an Initial with the QUIC t
 
 A side whose hello or verdict exchange fails MUST close the connection with 0x15 (Protocol) and a reason phrase that says what went wrong. Failures are a malformed message (§4.2, §5), an unsupported LinkVersion, and a missed `MESSAGE_DEADLINE` (§5.4). For a version mismatch the reason names both versions and asks the user to update the older device. A listener counts the close against the source like any refusal (§13.2).
 
-A side MUST NOT just drop the connection. A QUIC stack then closes it with application code 0x00 and an empty reason phrase, which the peer reads as Shutdown (transient) and redials at once ([Decision 1](#16-decisions)).
+A side MUST NOT just drop the connection. A QUIC stack then closes it with application code 0x00 and an empty reason phrase, which the peer reads as Shutdown (transient) and redials at once ([Decision 1](#17-decisions)).
 
 ndn-rs versions before this rule dropped the connection. A receiver therefore MUST NOT read 0x00 with an empty reason as proof of an orderly shutdown. ndn-rs treats it as transient (§13.1).
 
@@ -277,13 +310,13 @@ The rules below are those of the `ndn-link` crate, which ndn-fwd uses. An implem
 
 ### 7.1 Identifying the peer from its hello
 
-Before these steps, a side that knows a certificate of the peer's key MUST refuse with **0x12** if a held trust context revokes that certificate, whatever the hello carries. "Knows" means a certificate it serves or has cached whose public key is the peer's NDN public key; ndn-rs looks it up by the key's SHA-256 fingerprint. A revoked device that sends no certificate therefore gets no enrollment link either. A key the side knows no certificate of cannot be told from a new key, because a revoked device can always make one. For such keys the CA, which refuses to certify a revoked device again, is the backstop ([Decision 5](#16-decisions)).
+Before these steps, a side that knows a certificate of the peer's key MUST refuse with **0x12** if a held trust context revokes that certificate, whatever the hello carries. "Knows" means a certificate it serves or has cached whose public key is the peer's NDN public key; ndn-rs looks it up by the key's SHA-256 fingerprint. A revoked device that sends no certificate therefore gets no enrollment link either. A key the side knows no certificate of cannot be told from a new key, because a revoked device can always make one. For such keys the CA, which refuses to certify a revoked device again, is the backstop ([Decision 5](#17-decisions)).
 
 Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refusal: an expected fingerprint or an enrollment link may still admit the peer.
 
 1. If the hello carries no certificate: **Unknown**.
 2. Decode the leaf as a Data packet, then as a certificate. On failure, refuse with **0x15**.
-3. If the leaf's public key (normalized per §3.2) ≠ the peer's NDN public key, refuse with **0x11**. The comparison is byte by byte, so a certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2 ([Decision 12](#16-decisions)).
+3. If the leaf's public key (normalized per §3.2) ≠ the peer's NDN public key, refuse with **0x11**. The comparison is byte by byte, so a certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2 ([Decision 12](#17-decisions)).
 4. Find the held trust context whose namespace is the longest prefix of the leaf's name. If there is none: **Unknown**.
 5. If the context revokes the leaf, refuse with **0x12**. A revocation entry covers every name it is a prefix of, so revoking a key name covers all of its certificates ([trust-context.md](trust-context.md)).
 6. The leaf's name MUST be a device key name `/<ns>/<role>/<device>/KEY/<key-id>[/…]`, where:
@@ -332,17 +365,19 @@ A revoked key or issuer is refused in §7.1 before any of these rules, so it nev
 
 ### 7.4 Link policy semantics
 
-The link policy is defined in [trust-context.md](trust-context.md) (TLV 0x0412, UTF-8 `<roles>;<relay roles>;<enrollment|no-enrollment>`). It has three fields:
+The link policy is defined in [trust-context.md](trust-context.md) (TLV 0x0412, UTF-8 `<roles>;<relay roles>;<enrollment|no-enrollment>[;no-direct]`). It has four fields:
 
 - `roles`: a list of role words. Empty means every role.
 - `relay_roles`: a list of role words.
 - `enrollment_links`: a boolean.
+- `direct_paths`: a boolean (absent from the wire means true).
 
-A context that carries no link policy uses the default: `roles` = [] (any role), `relay_roles` = [`node`], `enrollment_links` = true.
+A context that carries no link policy uses the default: `roles` = [] (any role), `relay_roles` = [`node`], `enrollment_links` = true, `direct_paths` = true.
 
 - A role *may link* iff `roles` is empty or contains it.
 - A role *may relay* iff it may link and `relay_roles` contains it.
 - A context *admits enrollment links* iff `enrollment_links` is true and the context names at least one CA endpoint.
+- Devices of the namespace *may make direct paths* iff `direct_paths` is true: a device punches no peer of that namespace, and refuses its punches and direct paths with 0x18, while it is false (§14.1, §14.4, §14.6). Turning it off is a narrowing ([trust-context.md](trust-context.md) §5.3); links that are up stay up, and a direct path that is up ends at its next drop.
 
 ## 8. Enrollment links
 
@@ -429,7 +464,7 @@ Examples for `ns` = `/home`, with CA endpoint `/home/CA`:
 
    A dropped Interest first fragment, or any other dropped frame, is dropped silently.
 
-**Rate limit.** This is a token bucket per link, on received frames only. It starts full at `burst` tokens and refills continuously at `per_sec` tokens per second, up to `burst`. Every received frame that carries a network packet or a fragment of one costs one token. A frame with no Fragment (an Ack-only or idle frame, rule 2) costs nothing, so the peer's acknowledgements of the fragments this side sends cannot crowd out the peer's packets ([Decision 7](#16-decisions)). A frame that finds no token is dropped without a Nack.
+**Rate limit.** This is a token bucket per link, on received frames only. It starts full at `burst` tokens and refills continuously at `per_sec` tokens per second, up to `burst`. Every received frame that carries a network packet or a fragment of one costs one token. A frame with no Fragment (an Ack-only or idle frame, rule 2) costs nothing, so the peer's acknowledgements of the fragments this side sends cannot crowd out the peer's packets ([Decision 7](#17-decisions)). A frame that finds no token is dropped without a Nack.
 
 ### 8.4 Slots and idle close (relay side)
 
@@ -480,27 +515,27 @@ When a link is up, the admitting side installs routes over its face. These are s
 **Default routes** of the peer entry P, given the identified peer (if any), are the first of these that applies:
 
 1. P's `routes`, if configured;
-2. `/<ns>` of the identified peer, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1). This holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) falls to rule 3 ([Decision 8](#16-decisions));
+2. `/<ns>` of the identified peer, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1). This holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) falls to rule 3 ([Decision 8](#17-decisions));
 3. the identified peer's device name `/<ns>/<role>/<device>`;
 4. P's `device`, if the peer was not identified;
 5. otherwise none.
 
 For a peer reached through a relay, the default routes are computed from that peer's own entry with no identity, so they are its `routes`, else its `device`.
 
-A direct link to a peer costs 0. A route through a relay costs 10, so the direct link wins while it is up.
+A direct link to a peer costs 0. A route through a relay costs 10, so the direct link wins while it is up. A direct path (§14) gets the routes of a full link to its peer, computed the same way, on its own face; the relay's routes (cost 10) stay, so when the direct path ends its face and routes go and the relay carries the traffic again.
 
 ## 11. Duplicate-link rule
 
-Between two devices there is at most one link, keyed by the peer's fingerprint.
+Between two devices there is at most one link, keyed by the peer's fingerprint. A link has at most one path of each kind (§1): the rule below applies among paths of the same kind, so a direct path joins a link path to the same device instead of replacing it. Direct paths are always dialled by the device with the smaller fingerprint (§14.5), so two direct paths are always of the same direction and the newer stays.
 
 When a link to a fingerprint is up and another link to the same fingerprint comes up, the side compares them:
 
 - **Both sides dialed each other** (the two links have opposite directions on this side): the link **dialed by the device with the smaller fingerprint** (§3.3 order) stays. The other is closed with **0x01** (Replaced).
 - **Same direction** (the peer dialed again after losing the old link, or this side redialed): the **newer** link stays and the older is closed with **0x01**.
 
-Both sides apply the rule independently, after the link is up (§5.4 step 5). For the opposite-direction case they reach the same result. A side whose own fingerprint is unavailable treats every duplicate as same-direction ([Decision 11](#16-decisions)). The rule is `ndn_link::keeps_existing(existing direction, new direction, own fingerprint, peer fingerprint)`, which returns whether the link already in place stays.
+Both sides apply the rule independently, after the link is up (§5.4 step 5). For the opposite-direction case they reach the same result. A side whose own fingerprint is unavailable treats every duplicate as same-direction ([Decision 11](#17-decisions)). The rule is `ndn_link::keeps_existing(existing direction, new direction, own fingerprint, peer fingerprint)`, which returns whether the link already in place stays.
 
-Example with the test keys of §15: the P-256 key's fingerprint `0ca9…` is smaller than the Ed25519 key's `3475…`, so if they dial each other at once, the link the P-256 device dialed stays.
+Example with the test keys of §16: the P-256 key's fingerprint `0ca9…` is smaller than the Ed25519 key's `3475…`, so if they dial each other at once, the link the P-256 device dialed stays.
 
 ## 12. Revocation while linked
 
@@ -547,9 +582,79 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 
 - An attempt over a limit, or from a source in cooldown, is refused before its handshake (§6.2).
 - When at least half the total (32) are in flight, the listener first sends a QUIC Retry to any source whose address is not yet validated.
-- A refusal counts against the source when its handshake fails, when admission refuses it with a close code, or when its hello or verdict exchange fails (§6.3). Refusals older than the refusal window are forgotten: the count starts again at the first refusal after the window of the previous first refusal ends. It also resets when it reaches the threshold and the cooldown starts ([Decision 9](#16-decisions)).
+- A refusal counts against the source when its handshake fails, when admission refuses it with a close code, or when its hello or verdict exchange fails (§6.3). Refusals older than the refusal window are forgotten: the count starts again at the first refusal after the window of the previous first refusal ends. It also resets when it reaches the threshold and the cooldown starts ([Decision 9](#17-decisions)).
 
-## 14. Constants
+## 14. Direct paths
+
+Two devices that each reach a relay but not each other (NATs, firewalls) talk through the relay (§10). A *direct path* is a QUIC path between them made by a NAT hole punch: the punch is signalled with NDN packets through whatever routes reach the other device (normally its relay), both devices send probes from their link sockets to the other's candidate addresses, and one dials. The relay takes no part beyond forwarding the punch and reporting addresses (§5.5); no relay-specific protocol exists.
+
+### 14.1 When a device punches
+
+A device punches a peer entry P while all of these hold, and again after a direct path ends or a punch fails (§14.7):
+
+- P names a `device` (the punch is sent to that name) and a `relay` (P is reached through it), and P's `direct` is not false;
+- the link to P's relay is up, and no link path to P is up;
+- the link policy of the namespace of P's `device`, if this device holds it, has `direct_paths` (§7.4).
+
+A device answers the punches of devices without a peer entry for them (§14.4): only one side needs one.
+
+### 14.2 Candidates
+
+A candidate is a kind and a UDP address (§5.5 encoding). Kinds: 0 host (an interface address on the link socket's port; loopback and link-local skipped; a socket bound to one address offers that address), 1 reflexive (an address a full link's other side reports, §5.5, for the same socket), 2 advertised (configured, e.g. a port forward; ndn-fwd `[[face]] kind = "quic" advertise`), 3 mapped (a port-mapping protocol). A sender lists reflexive candidates first and sends at most `CANDIDATES_MAX` = 8; a receiver uses at most 8 and ignores candidates of an unknown kind. The punch uses the socket of the link to the relay, so the reflexive candidate is the NAT mapping the relay saw.
+
+### 14.3 The punch Interest and its answer
+
+Name: `<device>/32=link/32=punch/<session>` followed by a ParametersSha256DigestComponent, where `<device>` is the punched device's name and `<session>` 8 random bytes as a GenericNameComponent. The Interest MUST be an NDN signed Interest (InterestSignatureInfo with SignatureNonce and SignatureTime) signed with the sender's link key, MustBeFresh, InterestLifetime `PUNCH_ANSWER_TIMEOUT` = 4 s. Its ApplicationParameters, and the Content of the answering Data (named as the Interest, signed with the answerer's link key), are a punch message:
+
+```
+PunchMessage = PunchKey *Candidate [PunchRefusal] *Certificate
+PunchKey     = 0x0460 TLV-LENGTH SubjectPublicKeyInfo   ; the sender's link key, as in TLS (§3.2)
+Candidate    = 0x0462 TLV-LENGTH CandidateKind UdpAddress
+CandidateKind = 0x0464 TLV-LENGTH(=1) OCTET
+UdpAddress   = 0x0466 TLV-LENGTH(=6|18) 4OCTET/16OCTET 2OCTET
+PunchRefusal = 0x0468 TLV-LENGTH RefusalCode RefusalText
+RefusalCode  = 0x046A TLV-LENGTH NonNegativeInteger    ; a code of §6.1
+RefusalText  = 0x046C TLV-LENGTH *OCTET                 ; UTF-8, for a person
+Certificate  = Data                                     ; the sender's certificate, then issuers (as §5.2)
+```
+
+Exactly one PunchKey is REQUIRED. Unknown even types above 31 are skipped; any other unknown type makes the message malformed. Each side verifies the other's signature with the PunchKey and identifies the sender from the certificates exactly as from a LinkHello (§7.1, §7.3: the punched side as for a link it did not dial, the punching side as for the peer entry it dialled). An answer that does not verify, or identifies another device than P, makes no direct path.
+
+### 14.4 Answering a punch
+
+The punched device, before anything else, takes a token from a bucket over all requesters (`PUNCH_CHECKS`: burst 16, 4/s) and drops the Interest silently without one, and drops silently an Interest that is malformed or whose signature does not verify under its PunchKey. Then it refuses, with a signed answer carrying a PunchRefusal, when:
+
+- SignatureTime is more than `PUNCH_GRACE` = 120 s from its clock, or the (SignatureNonce, SignatureTime) pair was seen from that key before: 0x15;
+- the key sent more than `PUNCH_BURST` = 3 requests at once (one more per `PUNCH_REFILL` = 20 s): 0x16;
+- admission (§7) refuses the sender, or would admit it only on an enrollment link: the code of that refusal, or 0x10;
+- direct paths are off for it (§7.4, `[[peer]] direct = false`): 0x18;
+- it runs `PUNCHES_MAX` = 16 punches already: 0x16.
+
+A refused punch causes no probe and no dial. Otherwise it answers with its own candidates and certificates, and starts its side of the punch (§14.5). A refusal with a transient code (§6.1) is retried by the punching side with its backoff; a non-transient one after `DIRECT_RETRY_REFUSED`.
+
+### 14.5 Probes and the dial
+
+Once a side has sent (punched side) or verified (punching side) the answer, it:
+
+1. accepts, on that link socket, connections from the other's candidates for `PUNCH_WINDOW` = 10 s — a socket that does not listen accepts nothing else, and accepts these only while the punch runs;
+2. sends a probe from that socket to each of the other's candidates of a family the socket reaches, every `PROBE_INTERVAL` = 200 ms for `PROBE_WINDOW` = 4 s. A probe is 24 bytes: `00` ‖ ASCII `ndn-link probe` ‖ `01` ‖ the session. Probes MUST go only to candidates the other device signed. A receiver hands probes to the punch of their session (to report whether any arrived) and never to QUIC; probes of an unknown session are dropped;
+3. if its fingerprint is the smaller (§3.3), dials, `PROBE_INTERVAL` after its first probes, the other's candidates in this order, each `DIAL_STAGGER` = 250 ms after the previous: IPv6 host, IPv4 host on one of its own subnets, reflexive, advertised and mapped (other host candidates are probed but not dialled). The dial expects the other's PunchKey fingerprint (§3.4) and uses the direct-path timers (§3.1). The first admitted connection wins; the others are closed.
+
+If no direct path is admitted within `PUNCH_WINDOW`, the punch failed; its status says what was probed and whether probes from the other device arrived (none: both networks drop unsolicited UDP or map each destination to another port, e.g. symmetric NATs on both sides).
+
+### 14.6 Admitting a direct path
+
+The dialer's LinkHello carries DirectPath = the session (§5.2); the listener's carries the session of the punch it runs with the dialer's key, if any. The connection is the punch's direct path iff both name the same session. A listener that runs no punch of the named session with that key closes with 0x04; a dialer whose listener did not name the session closes with 0x04. A direct path is admitted like any link (§7) and further: it MUST be a full link (else 0x10), direct paths MUST NOT be off for the peer (else 0x18), and only the first path of a session is admitted (later ones 0x01). It is registered as the direct path of the link to that device (§11) and gets routes (§10).
+
+### 14.7 Fallback and retry
+
+A direct path ends like any link (idle timeout 8 s, close). Its face and routes go; traffic follows the relay's routes again without any action. The punching side punches again `DIRECT_RETRY_FIRST` = 5 s after a direct path ended; after a failed punch it waits 5 s, doubling to `DIRECT_RETRY_MAX` = 300 s, and `DIRECT_RETRY_REFUSED` = 600 s after a non-transient refusal; a direct path that comes up resets the doubling.
+
+### 14.8 Status
+
+ndn-rs reports per device: its paths (kind `link`, `direct` or `relay` — the relay's link face —, face, remote address, RTT, age) and the direct-path state: `none`, `off`, `trying`, `up`, `not-possible` or `refused`, with a sentence and when the next punch is due; also this device's key, the probes it sent and the punches it refused. ndn-fwd serves it as the management dataset `/localhost/nfd/links/list` (TLVs of ndn-mgmt-wire `link_status`, local operators only) and `ndn-ctl link list` prints it ([reference/links.md](../wiki/src/reference/links.md)). Presentation is not normative.
+
+## 15. Constants
 
 | Name | Value | Section |
 |---|---|---|
@@ -574,11 +679,11 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 | handshake limits | 64 / 4 per IP / 8 refusals within 60 s → 60 s | §13.2 |
 | shutdown grace | 1 s | §6.1 |
 
-## 15. Test vectors
+## 16. Test vectors
 
 All vectors were produced by running the real ndn-rs code. The hello and verdict wires come from `ndn-face-quic`'s `message.rs`; keys and fingerprints from its public `LinkKey` / `PeerKey` / `KeyFingerprint` API; certificates from `ndn_security::encode_cert_data`; LP frames from `ndn_packet::lp`. Each hello and verdict was also decoded back with the real decoder. Hex is lowercase with no separators. Line breaks inside a vector carry no meaning.
 
-### 15.1 Ed25519 link key and fingerprint
+### 16.1 Ed25519 link key and fingerprint
 
 ```
 private seed (RFC 8032)  0101010101010101010101010101010101010101010101010101010101010101
@@ -593,7 +698,7 @@ fingerprint = SHA-256(raw public key)
 
 `LinkKey::fingerprint`, `PeerKey::from_spki(spki).fingerprint` and `KeyFingerprint::of_ndn_key(raw)` all return this value.
 
-### 15.2 P-256 link key and fingerprint
+### 16.2 P-256 link key and fingerprint
 
 The key is ndn-rs `EcdsaP256Signer::from_seed([0x09; 32])`. The seed-to-key derivation is ndn-rs-specific and not part of this spec; use the SPKI below directly.
 
@@ -609,7 +714,7 @@ fingerprint = SHA-256(91-byte SPKI)
 
 Order: `0ca9…` < `3475…`, so in a mutual dial between these two keys, the P-256 device's dial stays (§11).
 
-### 15.3 Certificates used in 15.5
+### 16.3 Certificates used in 16.5
 
 Both certificates are signed by the root key `/home/KEY/0102030405060708` (Ed25519 seed `02`×32), with version 1767225600000 (`v=` = 2026-01-01T00:00:00Z in ms).
 
@@ -653,7 +758,7 @@ The same leaf as one string:
 06fd0117073f0804686f6d6508066d656d626572080570686f6e6508034b455908103131313231333134313531363137313808074e444e4345525436080000019b76daa8001414180800000000000000021908000000000036ee80152c302a300506032b65700321008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c164e1b01051c1f071d0804686f6d6508034b4559081030313032303330343035303630373038fd00fd26fd00fe0f323032363031303154303030303030fd00ff0f32303237303130315430303030303017405c22d990715a0d13c850565825fbc35afcf87aec2c8d39922f2046ee4c2004a6d286c8c4214af762cb62ff6f8d5d99b268a79d3d91221c5e469100460a539f01
 ```
 
-### 15.4 LinkHello with no certificate (9 B)
+### 16.4 LinkHello with no certificate (9 B)
 
 ```
 fd0450 05        LinkHello, length 5
@@ -661,7 +766,7 @@ fd0450 05        LinkHello, length 5
 ```
 `fd045005fd04510101`
 
-### 15.5 LinkHello with leaf and root (559 B)
+### 16.5 LinkHello with leaf and root (559 B)
 
 ```
 fd0450 fd0229    LinkHello, length 553
@@ -672,14 +777,14 @@ fd0450 fd0229    LinkHello, length 553
 
 The wire is `fd0450fd0229fd04510101` ‖ leaf ‖ root (5 + 283 + 265 = 553). A receiver whose key is the TLS key of 15.1 passes step 3 of §7.1: the leaf's Content SPKI reduces to the raw key `8a88…6f5c`.
 
-### 15.6 LinkVerdict, full link (4 B)
+### 16.6 LinkVerdict, full link (4 B)
 
 ```
 fd0452 00
 ```
 `fd045200`
 
-### 15.7 LinkVerdict, enrollment link for `/home` (16 B)
+### 16.7 LinkVerdict, enrollment link for `/home` (16 B)
 
 ```
 fd0452 0c                LinkVerdict, length 12
@@ -688,7 +793,7 @@ fd0452 0c                LinkVerdict, length 12
 ```
 `fd04520cfd04540807060804686f6d65`
 
-### 15.8 LinkVerdict, enrollment link for `/home` and `/work/lab` (29 B)
+### 16.8 LinkVerdict, enrollment link for `/home` and `/work/lab` (29 B)
 
 ```
 fd0452 19
@@ -698,11 +803,11 @@ fd0452 19
 ```
 `fd045219fd04541507060804686f6d65070b0804776f726b08036c6162`
 
-### 15.9 LinkVerdict with an empty EnrollmentLink (8 B)
+### 16.9 LinkVerdict with an empty EnrollmentLink (8 B)
 
 `fd045204fd045400`. Malformed (§5.3): a receiver closes the link with 0x15.
 
-### 15.10 Decoder behaviour
+### 16.10 Decoder behaviour
 
 These are the TLV-VALUEs given to the real decoders (the outer TLV already stripped):
 
@@ -719,7 +824,7 @@ These are the TLV-VALUEs given to the real decoders (the outer TLV already strip
 | verdict `fd0454020800` (non-Name inside EnrollmentLink) | malformed |
 | verdict `fd045400` (empty EnrollmentLink) | malformed |
 
-### 15.11 NDNLPv2 frames on a link
+### 16.11 NDNLPv2 frames on a link
 
 Interest used below, hand-encoded as input: Name `/home/CA/NEW`, Nonce `01020304`:
 `0517070f0804686f6d650802434108034e45570a0401020304`
@@ -739,7 +844,47 @@ Field breakdown of the fragment:
 - `fd0348 01 07`: TxSequence = 7
 - `50 0a …`: Fragment
 
-## 16. Decisions
+### 16.12 ObservedAddress and UDP addresses
+
+ObservedAddress for 192.0.2.7:6363: `fd045806c000020718db`. The UDP address `[2001:db8::1]:443`: `20010db800000000000000000000000101bb` (18 B). An IPv4-mapped `[::ffff:192.0.2.7]:6363` is written `c000020718db`.
+
+### 16.13 LinkHello of a direct-path dialer with no certificate, session 01…08 (21 B)
+
+```
+fd0450 11              LinkHello, length 17
+  fd0451 01 01         LinkVersion = 1
+  fd045a 08 0102030405060708   DirectPath
+```
+`fd045011fd04510101fd045a080102030405060708`
+
+### 16.14 Punch name and probe
+
+The punch of `/home/member/phone` with session 01…08, before its ParametersSha256DigestComponent:
+`072c0804686f6d6508066d656d626572080570686f6e6520046c696e6b200570756e636808080102030405060708`
+(`/home/member/phone/32=link/32=punch/%01%02%03%04%05%06%07%08`).
+
+The probe of that session (24 B): `006e646e2d6c696e6b2070726f6265010102030405060708`.
+
+### 16.15 Punch messages
+
+PunchKey is the Ed25519 key of §16.1 (`fd04602c` ‖ the 44-byte SPKI). A request with a reflexive candidate 203.0.113.9:40000 and a host candidate 192.168.1.2:6367, no certificate:
+
+```
+fd04602c302a300506032b65700321008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c
+fd04620f fd046401 01 fd046606 cb0071099c40
+fd04620f fd046401 00 fd046606 c0a8010218df
+```
+
+A refusal with code 0x18 and the text "direct paths are off":
+
+```
+fd04602c302a…6f5c (as above)
+fd04681d fd046a01 18 fd046c14 64697265637420706174687320617265206f6666
+```
+
+These are asserted by `the_spec_vectors_are_what_this_code_writes` (N/punch.rs) and `a_direct_path_session_is_eight_bytes` (Q/message.rs).
+
+## 17. Decisions
 
 These points were open when this spec was first written. Each was decided, and code and spec now agree.
 
@@ -756,7 +901,12 @@ These points were open when this spec was first written. Each was decided, and c
 11. **Duplicate rule without an own fingerprint: kept** (newer wins). A side lacks its own fingerprint only when it lost its link key mid-run, and then it cannot complete another handshake anyway. If the two sides disagree, both links close with 0x01 (transient) and the redial converges.
 12. **P-256 key comparison stays byte-exact** (§7.1 step 3). A certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2, which is how ndn-rs and ndn-cxx write it. A compressed point is refused with 0x11.
 13. **Datagrams before the verdict.** A sender MUST NOT send them (§5.4). A receiver MAY deliver ones that arrived early once it has admitted the link. ndn-rs does this, through the scope of an enrollment link. Discarding them would lose packets for no gain, since the link is admitted by then.
-14. **Location of the code** (informative). The admission rules (§7–§13) are in the `ndn-link` crate (ndn-ext/crates/faces/ndn-link), and ndn-fwd hosts it. ndn-mobile has no link implementation, so there is no second copy to diverge.
+14. **Location of the code** (informative). The admission rules (§7–§14) are in the `ndn-link` crate (ndn-ext/crates/faces/ndn-link), and ndn-fwd hosts it. ndn-mobile has no link implementation, so there is no second copy to diverge.
+15. **Signalling is NDN, not a relay protocol** (§14.3). A punch is a signed Interest to the other device's name, so any forwarder that routes the name carries it, its freshness and replay protection are those of NDN signed Interests, and its answer is signed Data the punching side validates offline like a hello. The candidate list is signed by its owner, and probes go to signed candidates only.
+16. **Reflexive address in a link message** (§5.5). quinn has no QUIC address-discovery extension, so each side tells the other what it sees on the control stream, which otherwise sat idle after the verdict. Old receivers ignore it; the stream now ends with the link.
+17. **The smaller fingerprint dials** (§14.5), the same order as the duplicate-link rule, so the two sides never race two direct paths, and a socket that does not listen still accepts the punched connection, from the signed candidates only, while the punch runs.
+18. **Short timers on direct paths** (§3.1). A direct path that dies is noticed within 8 s instead of 30 s, so traffic falls back to the relay sooner; the 2 s keep-alive also keeps port-restricted NAT mappings open. The relay link keeps the normal timers.
+19. **Refusals are signed answers** (§14.4), carrying a link close code: a refusal crosses the relay, where NDNLPv2 Nack reasons (local-refusal codes are local only) cannot say why. A request that does not verify gets no answer at all, so a stranger cannot make a device sign for it beyond the `PUNCH_CHECKS` bucket.
 
 ## Appendix A. Code references (non-normative)
 
@@ -787,7 +937,7 @@ These points were open when this spec was first written. Each was decided, and c
 | TLV-TYPEs 0x0450/0x0451/0x0452/0x0454; version 1; MAX_MESSAGE | Q/message.rs:21–32 |
 | hello encode / decode (version exactly one byte, types 0–31 and odd critical) | Q/message.rs:44–89, :150–155 |
 | verdict encode / decode (Name only in 0x0454, never empty) | Q/message.rs:101–148 |
-| decoder tests (vectors of §15.10) | Q/message.rs:284–295 |
+| decoder tests (vectors of §16.10) | Q/message.rs:284–295 |
 | close codes and transient set | Q/message.rs:173–253 |
 | hello exchange order; verdict exchange; datagram check; FIN | Q/link.rs:151–242 |
 | failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:254–280 (test: tests/link.rs:140–177) |

@@ -355,6 +355,39 @@ impl MgmtClient {
         Ok(ndn_mgmt_wire::ApprovalListing::decode(content))
     }
 
+    /// `links/list`: this device's QUIC links and the paths that reach each
+    /// linked device. Local operators only. A daemon that runs no links
+    /// answers with a refusal: [`ForwarderError::Command`] with its reason.
+    pub async fn link_list(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ndn_mgmt_wire::LinkListing, ForwarderError> {
+        let interest_wire = InterestBuilder::new(dataset_name(module::LINKS, verb::LIST))
+            .can_be_prefix()
+            .must_be_fresh()
+            .lifetime(timeout)
+            .build();
+        let _guard = self.recv_lock.lock().await;
+        let data_wire = self
+            .exchange_timeout(&interest_wire, timeout)
+            .await?
+            .ok_or_else(|| no_answer_within(timeout))?;
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
+        let content = data.content().cloned().unwrap_or_default();
+        // A refusal is a ControlResponse; the dataset is the listing.
+        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
+        {
+            let resp =
+                ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)?;
+            return Err(ForwarderError::Command {
+                code: resp.status_code,
+                text: resp.status_text,
+            });
+        }
+        ndn_mgmt_wire::LinkListing::decode(content).map_err(|_| ForwarderError::MalformedResponse)
+    }
+
     /// `ca/approve`: approve the pending request `target` names (its request
     /// id or its six-digit verification code). On the CA host the daemon
     /// records the local operator as the approver; on an admin device it

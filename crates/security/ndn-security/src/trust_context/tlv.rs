@@ -84,11 +84,11 @@ pub const SCHEMA_AUTHORITATIVE: u64 = 0x041C;
 pub const KEY_ROLE: u64 = 0x041E;
 
 /// Which devices of the namespace may link to its devices, which may be
-/// relays, and whether relays admit enrollment links — see
-/// [`LinkPolicy`](super::LinkPolicy): UTF-8 `<roles>;<relay
-/// roles>;<enrollment|no-enrollment>`, comma-separated role names, an empty
-/// role list meaning every device role (a missing third field means
-/// `enrollment`). Non-critical (even): an old node skips it and links by the
+/// relays, whether relays admit enrollment links, and whether direct paths
+/// are allowed — see [`LinkPolicy`](super::LinkPolicy): UTF-8 `<roles>;<relay
+/// roles>;<enrollment|no-enrollment>[;no-direct]`, comma-separated role
+/// names, an empty role list meaning every device role (a missing third
+/// field means `enrollment`, a missing fourth means direct paths on). Non-critical (even): an old node skips it and links by the
 /// default (any enrolled device; relays are `node` devices).
 pub const LINK_POLICY: u64 = 0x0412;
 
