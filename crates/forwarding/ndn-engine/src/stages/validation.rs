@@ -397,7 +397,9 @@ fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
             Refusal::Revoked,
             "REFUSED — certificate revoked in trust context",
         ),
-        TrustError::InvalidSignature | TrustError::InvalidKey => (
+        TrustError::InvalidSignature
+        | TrustError::InvalidKey
+        | TrustError::NotPublicKeySignature { .. } => (
             Refusal::BadSignature,
             "FAILED — forged/invalid signature",
         ),

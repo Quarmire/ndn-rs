@@ -65,6 +65,24 @@ that the digest failed. `VerifyError` has three variants:
 | `Pending` | The signing certificate chain is not yet resolved (async fetch in flight). |
 | `UnauthenticatedDigest` | The packet verified only as `DigestSha256` — integrity, not identity. |
 
+A consumer that matches `ValidationResult::Valid` directly (no `Unverified`)
+applies the same policy with `SafeData::is_authenticated()`, which is false for
+the `DigestSha256` trust path: a grant, a certificate or a reply acted on by
+who made it must require it. Signed Interests carry no trust path, so
+`validate_interest` and `validate_interest_chain` refuse a `DigestSha256`
+Interest outright; a caller content with integrity (a persistent-subscription
+request) checks the digest itself with `verify_digest`.
+
+A signer resolved through a certificate or trust anchor is verified only by a
+**public-key** signature: Ed25519, ECDSA-P256 or RSA, with a key of that
+algorithm. `verify_by_sig_type` refuses every other type with
+`TrustError::NotPublicKeySignature` — a digest (DigestSha256, DigestBlake3)
+names no signer, and a symmetric MAC (HmacWithSha256, BLAKE3-keyed) verifies
+only under a shared secret, while a certificate's key is public: a MAC keyed
+with it is a forgery anyone can make. A MAC is verified only with a configured
+shared secret: an ndn-sync `HmacKey` group key, or `HmacSha256Verifier` /
+`Blake3KeyedVerifier` handed the secret.
+
 ## The verification flow
 
 ```mermaid

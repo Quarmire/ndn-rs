@@ -177,6 +177,60 @@ impl InviteLink {
             })
         }
     }
+
+    /// The anchor link that adopts the namespace's trust context with the
+    /// expected fingerprint the invite carries; `None` when it carries none.
+    pub fn anchor_link(&self) -> Option<AnchorLink> {
+        Some(AnchorLink {
+            namespace: self.namespace.clone(),
+            expected_fingerprint: self.expected_fingerprint?,
+            min_version: None,
+            context_data: None,
+        })
+    }
+}
+
+/// The link a device enrolls with: an invite, or — for a role the namespace
+/// certifies on an admin's approval — its anchor link.
+#[derive(Debug)]
+pub enum EnrollLink {
+    /// `ndn-trust://invite`: a token of the namespace's CA.
+    Invite(InviteLink),
+    /// `ndn-trust://anchor`: the namespace and its root's expected
+    /// fingerprint, for a role it certifies on an admin's approval.
+    Anchor(AnchorLink),
+}
+
+impl EnrollLink {
+    /// Parse `uri` as an invite link, else as an anchor link. On neither,
+    /// the invite's reason (an invite is the common case).
+    pub fn parse(uri: &str) -> Result<Self, InviteEnrollError> {
+        let invite = match InviteLink::from_uri(uri) {
+            Ok(invite) => return Ok(Self::Invite(invite)),
+            Err(e) => e,
+        };
+        match AnchorLink::from_uri(uri) {
+            Ok(anchor) => Ok(Self::Anchor(anchor)),
+            Err(_) => Err(invite),
+        }
+    }
+
+    /// The namespace the link names.
+    pub fn namespace(&self) -> &Name {
+        match self {
+            Self::Invite(invite) => &invite.namespace,
+            Self::Anchor(anchor) => &anchor.namespace,
+        }
+    }
+
+    /// The fingerprint the namespace's root must have, when the link names
+    /// it (an anchor link always does; an invite when it carries one).
+    pub fn expected_fingerprint(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Invite(invite) => invite.expected_fingerprint,
+            Self::Anchor(anchor) => Some(anchor.expected_fingerprint),
+        }
+    }
 }
 
 /// A fresh key name for `identity`: `<identity>/KEY/<16 hex digits>`, the key

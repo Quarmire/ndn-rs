@@ -7,15 +7,23 @@
 //!   `renewal` challenge, proving possession of the current certificate's
 //!   key — no invite, same key.
 //! - [`RenewBefore`] says when a certificate is due; [`backoff_delay`] how
-//!   long to wait after failed attempts. Both are shared by every renewal
-//!   schedule.
+//!   long to wait after failed attempts.
+//! - [`RenewalSchedule`] is the one renewal schedule: per certificate, when
+//!   it is due, the backoff after a failed attempt (longer after a refusal),
+//!   the key just renewed not renewed again before its new certificate is
+//!   due, and which conditions to report once (an expired certificate, a
+//!   threshold longer than the lifetime). It decides; its driver renews and
+//!   logs. `ndn_namespace::renewal::spawn_periodic` (a forwarder, an app)
+//!   and [`start_renewal`] both drive it.
 //! - [`start_renewal`] runs a background task for an identity held by a
 //!   [`SecurityManager`], driving a pluggable [`CertRenewer`];
 //!   [`NdncertRenewer`] renews over a `Consumer` connection. A `None` renewer
-//!   only logs, asking the operator to re-enroll.
+//!   fails each due attempt, asking the operator to re-enroll.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -242,8 +250,21 @@ impl Drop for RenewalHandle {
 const PERCENT_POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(600);
 /// Default remaining-validity threshold (percent) that triggers renewal when a policy
 /// doesn't specify one.
-const DEFAULT_RENEW_THRESHOLD_PCT: u64 = 20;
+const DEFAULT_RENEW_THRESHOLD_PCT: u8 = 20;
 
+/// Renew the certificate `manager` holds for `key_name` (of identity
+/// `namespace`) with `renewer`, on the [`RenewalSchedule`]:
+///
+/// - `WhenPercentRemaining(p)`: due once `p`% of its lifetime is left,
+///   checked at least every 10 minutes;
+/// - `Every(d)`: due once 20% is left, checked at least every `d` (no
+///   oftener than [`RenewalSchedule::MIN_WAIT`]);
+/// - `Manual`: never.
+///
+/// The first check runs one interval after the start. A failed attempt is
+/// retried after the schedule's backoff (30–60 s, doubling up to 30–60 min;
+/// 30–60 min after the CA refused); an expired certificate is reported once,
+/// as an ERROR: the device needs a new invite.
 pub fn start_renewal(
     manager: Arc<SecurityManager>,
     key_name: Name,
@@ -251,9 +272,10 @@ pub fn start_renewal(
     policy: &RenewalPolicy,
     renewer: Option<Arc<dyn CertRenewer>>,
 ) -> RenewalHandle {
-    let check_interval = match policy {
-        RenewalPolicy::WhenPercentRemaining(_pct) => PERCENT_POLICY_CHECK_INTERVAL,
-        RenewalPolicy::Every(d) => *d,
+    let pct = |p: u8| RenewBefore::Fraction(f64::from(p) / 100.0);
+    let (before, interval) = match policy {
+        RenewalPolicy::WhenPercentRemaining(p) => (pct(*p), PERCENT_POLICY_CHECK_INTERVAL),
+        RenewalPolicy::Every(d) => (pct(DEFAULT_RENEW_THRESHOLD_PCT), *d),
         RenewalPolicy::Manual => {
             return RenewalHandle {
                 task: tokio::spawn(async {}),
@@ -261,69 +283,78 @@ pub fn start_renewal(
         }
     };
 
-    let percent = match policy {
-        RenewalPolicy::WhenPercentRemaining(p) => *p as u64,
-        _ => DEFAULT_RENEW_THRESHOLD_PCT,
-    };
-
     let task = tokio::spawn(async move {
-        let mut failures: u32 = 0;
-        // The expired certificate already reported, so it is reported once.
-        let mut reported_expired: Option<Arc<Name>> = None;
+        let mut schedule = RenewalSchedule::new(before).with_max_wait(interval);
+        let mut wait = interval;
         loop {
-            tokio::time::sleep(check_interval).await;
-
-            match renewal_due(&manager, &key_name, percent) {
-                Due::Now => reported_expired = None,
-                Due::NotYet | Due::NoCertificate => {
-                    failures = 0;
-                    continue;
-                }
-                Due::Expired(cert) => {
-                    failures = 0;
-                    if reported_expired.as_ref() != Some(&cert.name) {
-                        error!(
+            tokio::time::sleep(wait).await;
+            let held = held_certificate(&manager, &key_name);
+            schedule.begin_scan(held.as_ref().map(|cert| (&key_name, &*cert.name)));
+            if let Some(cert) = held
+                && schedule.check(&key_name, &cert, Now::current()) == Due::Now
+            {
+                info!(identity = %namespace, "certificate approaching expiry, initiating renewal");
+                let result = match &renewer {
+                    Some(r) => r
+                        .renew(&manager, &key_name, &namespace)
+                        .await
+                        .map_err(|e| (e.is_final(), e.to_string())),
+                    None => Err((
+                        false,
+                        "no CertRenewer configured; re-enroll manually or supply one".to_owned(),
+                    )),
+                };
+                match result {
+                    Ok(issued) => {
+                        info!(identity = %namespace, cert = %issued, "certificate renewed");
+                        let current = current_certificate(&manager, &key_name);
+                        schedule.renewed(&key_name, &cert, current.as_ref().unwrap_or(&cert));
+                    }
+                    Err((refused, why)) => match schedule.failed(&cert, refused, Now::current()) {
+                        Failed::Expired => error!(
                             identity = %namespace,
                             certificate = %cert.name,
                             expired_secs_ago = now_ns().saturating_sub(cert.valid_until) / 1_000_000_000,
                             "certificate expired and was not renewed in time: renewal needs a \
                              current certificate, so this device needs a new invite to enroll again"
-                        );
-                        reported_expired = Some(cert.name);
-                    }
-                    continue;
+                        ),
+                        Failed::Retry {
+                            attempts,
+                            delay,
+                            days_left,
+                        } => warn!(
+                            identity = %namespace,
+                            certificate = %cert.name,
+                            error = %why,
+                            attempts,
+                            days_left = %format!("{days_left:.1}"),
+                            retry_in_secs = delay.as_secs(),
+                            "automatic renewal failed; the certificate works until it expires"
+                        ),
+                    },
                 }
             }
-            info!(identity = %namespace, "certificate approaching expiry, initiating renewal");
-            match &renewer {
-                Some(r) => match r.renew(&manager, &key_name, &namespace).await {
-                    Ok(cert) => {
-                        failures = 0;
-                        info!(identity = %namespace, %cert, "certificate renewed");
-                    }
-                    Err(e) => {
-                        failures = failures.saturating_add(1);
-                        // Exponential backoff with jitter so a fleet that crosses the
-                        // threshold together doesn't retry against the CA in lockstep.
-                        let backoff = backoff_delay(check_interval, failures);
-                        warn!(
-                            identity = %namespace,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "automatic renewal failed; backing off before retry"
-                        );
-                        tokio::time::sleep(backoff).await;
-                    }
-                },
-                None => warn!(
-                    identity = %namespace,
-                    "no CertRenewer configured; re-enroll manually or supply one"
-                ),
-            }
+            wait = schedule.wait();
         }
     });
 
     RenewalHandle { task }
+}
+
+/// The certificate `manager` holds for `key_name`: the
+/// [current](current_certificate) one, else the newest cached under the key
+/// name (an expired one, which the schedule reports).
+fn held_certificate(manager: &SecurityManager, key_name: &Name) -> Option<Certificate> {
+    current_certificate(manager, key_name)
+        .or_else(|| manager.cert_cache().get(&Arc::new(key_name.clone())))
+}
+
+impl RenewalError {
+    /// Whether the CA refused (retrying soon cannot help) rather than the
+    /// attempt failing.
+    pub fn is_final(&self) -> bool {
+        matches!(self, Self::Renewal(e) if e.is_final())
+    }
 }
 
 /// Backoff before the next renewal attempt after `failures` consecutive failures:
@@ -356,29 +387,218 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// Whether the key's certificate is due for renewal.
-enum Due {
-    NotYet,
-    Now,
-    /// No certificate valid now; the newest cached one expired. Renewal
-    /// needs a current certificate: the device must enroll again.
-    Expired(Certificate),
-    NoCertificate,
+/// A moment on both clocks the schedule reads: the wall clock (certificate
+/// validity is in nanoseconds since the Unix epoch) and the monotonic one
+/// (backoffs).
+#[derive(Debug, Clone, Copy)]
+pub struct Now {
+    pub wall_ns: u64,
+    pub instant: Instant,
 }
 
-fn renewal_due(manager: &SecurityManager, key_name: &Name, threshold_pct: u64) -> Due {
-    let now = now_ns();
-    let Some(cert) = current_certificate(manager, key_name) else {
-        return match manager.cert_cache().get(&Arc::new(key_name.clone())) {
-            Some(cert) if cert.valid_until <= now => Due::Expired(cert),
-            _ => Due::NoCertificate,
-        };
-    };
-    let due = cert.valid_until > cert.valid_from
-        && RenewBefore::Fraction(threshold_pct as f64 / 100.0)
+impl Now {
+    pub fn current() -> Self {
+        Self {
+            wall_ns: now_ns(),
+            instant: Instant::now(),
+        }
+    }
+}
+
+/// What to do with one certificate now ([`RenewalSchedule::check`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Due {
+    /// Not due yet, or the backoff after a failed attempt runs: check again
+    /// after this.
+    Later(Duration),
+    /// It expired, and that was reported: renewal cannot help it (the
+    /// device needs a new invite).
+    Expired,
+    /// Renew it now.
+    Now,
+}
+
+/// What follows a failed attempt ([`RenewalSchedule::failed`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Failed {
+    /// The certificate expired: report it, as an ERROR. It is reported
+    /// once; the schedule does not try it again.
+    Expired,
+    /// Try again after `delay`.
+    Retry {
+        /// Consecutive failed attempts for this certificate, this one
+        /// included.
+        attempts: u32,
+        delay: Duration,
+        /// The days of validity the certificate has left.
+        days_left: f64,
+    },
+}
+
+/// The renewal schedule of a device's certificates: when each is due, and
+/// what follows an attempt. It holds no certificate and makes no exchange;
+/// its driver scans the certificates it holds, renews those this says are
+/// due, reports each outcome back, and sleeps for [`wait`](Self::wait).
+///
+/// - A certificate is due once its remaining validity falls below
+///   [`RenewBefore`]. A threshold at least the certificate's lifetime would
+///   make each one due as it is issued: it renews at a third of the
+///   lifetime, and [`first_short_lived`](Self::first_short_lived) says when
+///   to warn about it (once per key).
+/// - A key just renewed is not renewed again before the certificate that
+///   renewal issued is due, whichever certificate the store reports as the
+///   key's current one.
+/// - A failed attempt is retried after [`backoff_delay`] from
+///   [`RETRY_BASE`](Self::RETRY_BASE), doubling per consecutive failure; a
+///   refusal waits the longest backoff ([`REFUSED_BACKOFF`](Self::REFUSED_BACKOFF)).
+/// - A failed attempt on an expired certificate is reported once and not
+///   retried: renewal needs a current certificate.
+/// - A store that cannot be read is scanned again after a growing backoff
+///   ([`unreadable`](Self::unreadable)).
+#[derive(Debug)]
+pub struct RenewalSchedule {
+    before: RenewBefore,
+    max_wait: Duration,
+    /// Per certificate: consecutive failures and when to try again.
+    retry: HashMap<Name, (u32, Instant)>,
+    /// Per key: when the certificate its last renewal issued is due.
+    renewed: HashMap<Name, u64>,
+    /// Expired certificates, reported once.
+    expired: HashSet<Name>,
+    /// Keys whose certificates are shorter than the threshold, reported once.
+    short_lived: HashSet<Name>,
+    /// Consecutive scans that could not read the store.
+    unreadable: u32,
+    /// The soonest check this scan asks for.
+    next: Duration,
+}
+
+impl RenewalSchedule {
+    /// The longest a driver sleeps between scans by default.
+    pub const MAX_WAIT: Duration = Duration::from_secs(3_600);
+    /// The shortest a driver sleeps between scans.
+    pub const MIN_WAIT: Duration = Duration::from_secs(1);
+    /// Backoff base after a failed attempt.
+    pub const RETRY_BASE: Duration = Duration::from_secs(60);
+    /// Backoff exponent after a refusal: the cap (an hour).
+    pub const REFUSED_BACKOFF: u32 = 6;
+
+    pub fn new(before: RenewBefore) -> Self {
+        Self {
+            before,
+            max_wait: Self::MAX_WAIT,
+            retry: HashMap::new(),
+            renewed: HashMap::new(),
+            expired: HashSet::new(),
+            short_lived: HashSet::new(),
+            unreadable: 0,
+            next: Self::MAX_WAIT,
+        }
+    }
+
+    /// Sleep at most `max_wait` between scans (at least
+    /// [`MIN_WAIT`](Self::MIN_WAIT)).
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait.max(Self::MIN_WAIT);
+        self.next = self.max_wait;
+        self
+    }
+
+    pub fn before(&self) -> RenewBefore {
+        self.before
+    }
+
+    /// Start a scan of the certificates held now, as (key, certificate
+    /// name): what the schedule kept for any other is forgotten.
+    pub fn begin_scan<'a>(&mut self, held: impl IntoIterator<Item = (&'a Name, &'a Name)>) {
+        let (keys, certs): (HashSet<&Name>, HashSet<&Name>) = held.into_iter().unzip();
+        self.retry.retain(|cert, _| certs.contains(cert));
+        self.renewed.retain(|key, _| keys.contains(key));
+        self.unreadable = 0;
+        self.next = self.max_wait;
+    }
+
+    /// The store holding the certificates cannot be read: how long to wait
+    /// before scanning again (a growing backoff).
+    pub fn unreadable(&mut self) -> Duration {
+        self.unreadable += 1;
+        backoff_delay(Self::RETRY_BASE, self.unreadable - 1)
+    }
+
+    /// Whether `cert` of `key` is shorter than the threshold and this is
+    /// the first time that is seen for `key`: warn that it renews at a third
+    /// of its lifetime instead.
+    pub fn first_short_lived(&mut self, key: &Name, cert: &Certificate) -> bool {
+        self.before.exceeds_lifetime(cert.valid_from, cert.valid_until)
+            && self.short_lived.insert(key.clone())
+    }
+
+    /// What to do with `cert`, the current certificate of `key`, now.
+    pub fn check(&mut self, key: &Name, cert: &Certificate, now: Now) -> Due {
+        let due_at = self
+            .before
             .renew_at(cert.valid_from, cert.valid_until)
-            <= now;
-    if due { Due::Now } else { Due::NotYet }
+            .max(self.renewed.get(key).copied().unwrap_or(0));
+        if now.wall_ns < due_at {
+            return self.later(Duration::from_nanos(due_at - now.wall_ns));
+        }
+        if self.expired.contains(&*cert.name) {
+            return Due::Expired;
+        }
+        if let Some((_, at)) = self.retry.get(&*cert.name) {
+            let left = at.saturating_duration_since(now.instant);
+            if !left.is_zero() {
+                return self.later(left);
+            }
+        }
+        Due::Now
+    }
+
+    /// `previous`, the certificate of `key`, was renewed: the CA issued
+    /// `issued`.
+    pub fn renewed(&mut self, key: &Name, previous: &Certificate, issued: &Certificate) {
+        self.retry.remove(&*previous.name);
+        self.renewed.insert(
+            key.clone(),
+            self.before.renew_at(issued.valid_from, issued.valid_until),
+        );
+    }
+
+    /// An attempt to renew `cert` failed at `now`; `refused`: the CA
+    /// refused it (retrying soon cannot help).
+    pub fn failed(&mut self, cert: &Certificate, refused: bool, now: Now) -> Failed {
+        let days_left = (cert.valid_until as f64 - now.wall_ns as f64) / 86_400e9;
+        if days_left <= 0.0 {
+            self.expired.insert((*cert.name).clone());
+            return Failed::Expired;
+        }
+        let attempts = self.retry.get(&*cert.name).map_or(0, |(n, _)| *n) + 1;
+        let exponent = if refused {
+            Self::REFUSED_BACKOFF
+        } else {
+            attempts - 1
+        };
+        let delay = backoff_delay(Self::RETRY_BASE, exponent);
+        self.retry
+            .insert((*cert.name).clone(), (attempts, now.instant + delay));
+        self.next = self.next.min(delay);
+        Failed::Retry {
+            attempts,
+            delay,
+            days_left,
+        }
+    }
+
+    /// How long to sleep before the next scan: until the soonest check this
+    /// scan asked for, within [`MIN_WAIT`](Self::MIN_WAIT) and the maximum.
+    pub fn wait(&self) -> Duration {
+        self.next.clamp(Self::MIN_WAIT, self.max_wait)
+    }
+
+    fn later(&mut self, after: Duration) -> Due {
+        self.next = self.next.min(after);
+        Due::Later(after)
+    }
 }
 
 #[cfg(test)]
@@ -455,11 +675,159 @@ mod tests {
         let manager = SecurityManager::new();
         let key_name =
             Name::from_components([NameComponent::generic(bytes::Bytes::from_static(b"k"))]);
-        assert!(matches!(renewal_due(&manager, &key_name, 20), Due::NoCertificate));
+        assert!(held_certificate(&manager, &key_name).is_none());
         let mut cert = near_expiry_cert(&key_name);
         cert.valid_until = now_ns() - 1_000_000_000;
         manager.cert_cache().insert(cert);
-        assert!(matches!(renewal_due(&manager, &key_name, 20), Due::Expired(_)));
+        let held = held_certificate(&manager, &key_name).expect("the expired one is held");
+        let mut schedule = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        assert_eq!(schedule.check(&key_name, &held, Now::current()), Due::Now);
+        assert_eq!(schedule.failed(&held, false, Now::current()), Failed::Expired);
+        assert_eq!(schedule.check(&key_name, &held, Now::current()), Due::Expired);
+    }
+
+    const DAY: u64 = 86_400_000_000_000;
+
+    fn name(uri: &str) -> Name {
+        uri.parse().unwrap()
+    }
+
+    /// A certificate named `name`, valid from day `from` until day `until`.
+    fn cert(name_uri: &str, from: u64, until: u64) -> Certificate {
+        let mut c = near_expiry_cert(&name(name_uri));
+        c.valid_from = from * DAY;
+        c.valid_until = until * DAY;
+        c
+    }
+
+    fn at(day: u64, instant: Instant) -> Now {
+        Now {
+            wall_ns: day * DAY,
+            instant,
+        }
+    }
+
+    fn between(d: Duration, low: u64, high: u64) -> bool {
+        (Duration::from_secs(low)..=Duration::from_secs(high)).contains(&d)
+    }
+
+    /// A certificate is due once a third of its lifetime is left; before
+    /// that, the schedule waits until then, at most an hour per sleep.
+    #[test]
+    fn a_certificate_is_due_at_the_threshold() {
+        let key = name("/ns/member/laptop/KEY/k");
+        let c = cert("/ns/member/laptop/KEY/k/NDNCERT/v1", 0, 90);
+        let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        let t = Instant::now();
+        s.begin_scan([(&key, &*c.name)]);
+        let Due::Later(after) = s.check(&key, &c, at(10, t)) else { panic!("not due yet") };
+        assert!(after.as_nanos().abs_diff(u128::from(50 * DAY)) < 1_000_000);
+        assert_eq!(s.wait(), RenewalSchedule::MAX_WAIT);
+        assert_eq!(s.check(&key, &c, at(61, t)), Due::Now);
+    }
+
+    /// A failed attempt is retried after a doubling backoff from a minute;
+    /// a refusal after the longest; a renewal clears the backoff.
+    #[test]
+    fn a_failed_attempt_backs_off_and_a_refusal_longest() {
+        let key = name("/ns/member/laptop/KEY/k");
+        let c = cert("/ns/member/laptop/KEY/k/NDNCERT/v1", 0, 90);
+        let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        let t = Instant::now();
+        s.begin_scan([(&key, &*c.name)]);
+        let Failed::Retry { attempts: 1, delay, days_left } = s.failed(&c, false, at(80, t)) else {
+            panic!("a current certificate is retried")
+        };
+        assert!(between(delay, 30, 60), "{delay:?}");
+        assert!((days_left - 10.0).abs() < 1e-6);
+        assert_eq!(s.wait(), delay.max(RenewalSchedule::MIN_WAIT));
+        assert!(matches!(s.check(&key, &c, at(80, t)), Due::Later(left) if left <= delay));
+        assert_eq!(s.check(&key, &c, at(80, t + delay)), Due::Now);
+        let Failed::Retry { attempts: 2, delay, .. } = s.failed(&c, false, at(80, t + delay)) else {
+            panic!("retried again")
+        };
+        assert!(between(delay, 60, 120), "{delay:?}");
+        let Failed::Retry { attempts: 3, delay, .. } = s.failed(&c, true, at(80, t)) else {
+            panic!("a refusal is retried too")
+        };
+        assert!(between(delay, 1_800, 3_600), "{delay:?}");
+
+        let renewed = cert("/ns/member/laptop/KEY/k/NDNCERT/v2", 80, 170);
+        s.renewed(&key, &c, &renewed);
+        let Failed::Retry { attempts: 1, .. } = s.failed(&c, false, at(80, t)) else {
+            panic!("the renewal cleared the backoff")
+        };
+    }
+
+    /// After a renewal the key is not renewed again before the new
+    /// certificate is due, even while the store still reports the old one.
+    #[test]
+    fn a_renewed_key_waits_for_its_new_certificate() {
+        let key = name("/ns/member/laptop/KEY/k");
+        let old = cert("/ns/member/laptop/KEY/k/NDNCERT/v1", 0, 90);
+        let new = cert("/ns/member/laptop/KEY/k/NDNCERT/v2", 61, 151);
+        let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        let t = Instant::now();
+        s.begin_scan([(&key, &*old.name)]);
+        assert_eq!(s.check(&key, &old, at(61, t)), Due::Now);
+        s.renewed(&key, &old, &new);
+        s.begin_scan([(&key, &*old.name)]);
+        assert!(matches!(s.check(&key, &old, at(62, t)), Due::Later(_)));
+        assert_eq!(s.check(&key, &new, at(122, t)), Due::Now);
+        // A key no longer held is forgotten.
+        s.begin_scan(std::iter::empty());
+        assert_eq!(s.check(&key, &old, at(62, t)), Due::Now);
+    }
+
+    /// A failed attempt on an expired certificate is reported once and not
+    /// retried.
+    #[test]
+    fn an_expired_certificate_is_reported_once() {
+        let key = name("/ns/member/laptop/KEY/k");
+        let c = cert("/ns/member/laptop/KEY/k/NDNCERT/v1", 0, 90);
+        let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        let t = Instant::now();
+        s.begin_scan([(&key, &*c.name)]);
+        assert_eq!(s.check(&key, &c, at(91, t)), Due::Now);
+        assert_eq!(s.failed(&c, false, at(91, t)), Failed::Expired);
+        assert_eq!(s.check(&key, &c, at(92, t)), Due::Expired);
+        assert_eq!(s.wait(), RenewalSchedule::MAX_WAIT);
+    }
+
+    /// A threshold at least the lifetime renews at a third of it, and says
+    /// so once per key.
+    #[test]
+    fn a_threshold_longer_than_the_lifetime_is_reported_once() {
+        let key = name("/ns/member/laptop/KEY/k");
+        let c = cert("/ns/member/laptop/KEY/k/NDNCERT/v1", 0, 90);
+        let mut s = RenewalSchedule::new(RenewBefore::Remaining(Duration::from_secs(500 * 86_400)));
+        let t = Instant::now();
+        assert!(s.first_short_lived(&key, &c));
+        assert!(!s.first_short_lived(&key, &c));
+        assert!(matches!(s.check(&key, &c, at(59, t)), Due::Later(_)));
+        assert_eq!(s.check(&key, &c, at(61, t)), Due::Now);
+        let mut fraction = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        assert!(!fraction.first_short_lived(&key, &c));
+    }
+
+    /// An unreadable store is scanned again after a growing backoff, reset
+    /// by a scan that reads it.
+    #[test]
+    fn an_unreadable_store_backs_off() {
+        let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
+        assert!(between(s.unreadable(), 30, 60));
+        assert!(between(s.unreadable(), 60, 120));
+        s.begin_scan(std::iter::empty());
+        assert!(between(s.unreadable(), 30, 60));
+    }
+
+    /// The wait between scans stays within the bounds.
+    #[test]
+    fn the_wait_is_bounded() {
+        let s = RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_millis(30));
+        assert_eq!(s.wait(), RenewalSchedule::MIN_WAIT);
+        let s = RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_secs(600));
+        assert_eq!(s.wait(), Duration::from_secs(600));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

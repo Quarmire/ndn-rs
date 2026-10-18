@@ -193,8 +193,9 @@ pub(crate) async fn authorize_command(
     };
     // DigestSha256 verifies byte integrity but carries no key identity.
     // Per NFD command-authenticator.cpp, only key-backed signature types
-    // (Ed25519, ECDSA, RSA, BLAKE3) are accepted when a key validator is
-    // present. DigestSha256-only Interests are treated as unsigned here.
+    // (Ed25519, ECDSA, RSA) are accepted when a key validator is present;
+    // the validator refuses a MAC (HMAC, BLAKE3-keyed), which no public key
+    // verifies. DigestSha256-only Interests are treated as unsigned here.
     if !is_key_signed(interest) {
         return Err("command rejected: key-backed signature required \
              (DigestSha256 does not establish key identity)"
@@ -956,6 +957,47 @@ mod e01_tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A command "signed" with a symmetric MAC keyed by the operator's
+    /// *public* key (HmacWithSha256, BLAKE3-keyed; KeyLocator the operator's
+    /// key) is a forgery anyone could make: refused, as no public-key
+    /// signature.
+    #[tokio::test]
+    async fn e01_mac_keyed_with_signer_public_key_rejected() {
+        use ndn_security::cert_cache::Certificate;
+        use ndn_security::signer::{Blake3KeyedSigner, Ed25519Signer, HmacSha256Signer, Signer};
+
+        let key_name: Name = "/operators/alice/KEY/k1".parse().unwrap();
+        let pubkey = Ed25519Signer::from_seed(&[9u8; 32], key_name.clone()).public_key_bytes();
+        let validator = Validator::new(open_schema());
+        validator.cert_cache().insert(Certificate {
+            name: Arc::new(key_name.clone()),
+            public_key: bytes::Bytes::copy_from_slice(&pubkey),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
+
+        let forgers: [Box<dyn Signer>; 2] = [
+            Box::new(HmacSha256Signer::new(&pubkey, key_name.clone())),
+            Box::new(Blake3KeyedSigner::new(pubkey, key_name.clone())),
+        ];
+        for forger in forgers {
+            let cmd_name: Name = "/localhost/nfd/rib/register".parse().unwrap();
+            let wire = InterestBuilder::new(cmd_name)
+                .app_parameters(bytes::Bytes::from_static(b"params"))
+                .sign_sync(forger.sig_type(), Some(&key_name), |region| {
+                    forger.sign_sync(region).expect("MAC")
+                });
+            let interest = Interest::decode(wire).unwrap();
+            let result = authorize_command(&interest, Some(&validator), true, None).await;
+            let err = result.expect_err("a MAC keyed with a public key must not authorize");
+            assert!(err.contains("not a public-key signature"), "{err}");
+        }
     }
 
     // `/localhop/nfd/...` registration: mirrors NFD

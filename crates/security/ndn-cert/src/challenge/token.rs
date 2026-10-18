@@ -29,6 +29,7 @@ use crate::{
     error::CertError,
     policy::TOKEN_SCOPE_EVIDENCE,
     protocol::CertRequest,
+    roles::{Role, role_prefix, token_expiry, token_role},
     store::CaStore,
 };
 
@@ -57,6 +58,20 @@ pub enum TokenCheck {
     /// consumed (fail closed: an unrecorded redemption would be reusable
     /// after a restart).
     NotRecorded(String),
+}
+
+/// An invite token of a role a namespace CA certifies only on an admin's
+/// approval ([`TokenStore::add_invite_tokens`]).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[ca] token '{token}' names the {role} role, but a namespace CA never issues \
+     {role} certificates on a token alone; remove it from the config. A {role} \
+     device asks with `ndn-fwd enroll <anchor link> --role {role}` and an admin \
+     approves it (`ndn-fwd approvals approve <code>`)"
+)]
+pub struct ApprovalRoleToken {
+    pub token: String,
+    pub role: Role,
 }
 
 #[derive(Default, Clone)]
@@ -127,6 +142,48 @@ impl TokenStore {
                 scope,
             },
         );
+    }
+
+    /// Add the CA's invite `tokens`. A token naming a role (`member-…`,
+    /// `guest-…`, as `ndn-fwd-tokens new --role` mints them) is scoped to
+    /// `<namespace>/<role>`: it certifies only names under that prefix; one
+    /// minted with an expiry ([`token_expiry`]) is redeemable until then
+    /// (past: refused). Other tokens are unscoped, except on a namespace
+    /// CA (`namespace_ca`).
+    ///
+    /// On a namespace CA the issuance policy ([`RolePolicy`](crate::RolePolicy))
+    /// admits a token only for a member or a guest, after the challenge has
+    /// consumed it. So every token is scoped there: the scope check refuses a
+    /// request the policy would refuse *before* the token is spent. Unscoped
+    /// tokens are scoped to `<namespace>/member` (the only role the policy
+    /// grants them), and `admin-…` / `node-…` tokens, which could never issue
+    /// anything, are refused ([`ApprovalRoleToken`]; the tokens before it
+    /// are added).
+    pub fn add_invite_tokens(
+        &self,
+        tokens: impl IntoIterator<Item = impl AsRef<str>>,
+        namespace: &Name,
+        namespace_ca: bool,
+    ) -> Result<(), ApprovalRoleToken> {
+        for token in tokens {
+            let token = token.as_ref();
+            let role = match token_role(token) {
+                Some(role @ (Role::Admin | Role::Node)) if namespace_ca => {
+                    return Err(ApprovalRoleToken {
+                        token: token.to_string(),
+                        role,
+                    });
+                }
+                None if namespace_ca => Some(Role::Member),
+                role => role,
+            };
+            let ttl = token_expiry(token).map(|at| {
+                let now = now_ns() / 1_000_000_000;
+                Duration::from_secs(at.saturating_sub(now))
+            });
+            self.add_scoped(token, ttl, role.map(|role| role_prefix(namespace, role)));
+        }
+        Ok(())
     }
 
     fn insert(&self, token: String, meta: TokenMeta) {
@@ -290,5 +347,56 @@ impl ChallengeHandler for TokenChallenge {
                 )),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roles::token_with_expiry;
+
+    fn ns() -> Name {
+        "/home/bob".parse().unwrap()
+    }
+
+    /// On a namespace CA an admin or node token could never issue anything,
+    /// so it is refused instead of letting requests spend it.
+    #[test]
+    fn a_namespace_ca_refuses_admin_and_node_tokens() {
+        for t in ["admin-a1", "node-n1"] {
+            let err = TokenStore::new().add_invite_tokens([t], &ns(), true).unwrap_err();
+            assert_eq!(err.token, t);
+            assert!(err.to_string().contains("never issues"), "{err}");
+            assert!(TokenStore::new().add_invite_tokens([t], &ns(), false).is_ok(), "{t}");
+        }
+    }
+
+    /// A role token is scoped to its role; an untagged one is unscoped,
+    /// except on a namespace CA, where it is a member token.
+    #[test]
+    fn invite_tokens_are_scoped_by_role() {
+        let store = TokenStore::new();
+        store
+            .add_invite_tokens(["guest-g1", "invite-1"], &ns(), true)
+            .unwrap();
+        assert_eq!(store.scope_of("guest-g1"), Some("/home/bob/guest".parse().unwrap()));
+        assert_eq!(store.scope_of("invite-1"), Some("/home/bob/member".parse().unwrap()));
+        let store = TokenStore::new();
+        store
+            .add_invite_tokens(["guest-g1", "invite-1"], &ns(), false)
+            .unwrap();
+        assert_eq!(store.scope_of("guest-g1"), Some("/home/bob/guest".parse().unwrap()));
+        assert_eq!(store.scope_of("invite-1"), None);
+    }
+
+    /// A token minted with an expiry is redeemable until then, not after.
+    #[test]
+    fn invite_tokens_carry_their_expiry() {
+        let past = token_with_expiry("member-m1", 1);
+        let future = token_with_expiry("member-m2", u64::from(u32::MAX));
+        let store = TokenStore::new();
+        store.add_invite_tokens([&past, &future], &ns(), true).unwrap();
+        assert!(!store.is_live(&past));
+        assert!(store.is_live(&future));
     }
 }

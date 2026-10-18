@@ -34,6 +34,17 @@ pub enum TrustError {
     KeyStore(String),
     #[error("unsupported signature type: {name} (code {code})")]
     UnsupportedSignatureType { code: u64, name: String },
+    /// A signature type that no public key verifies, where a signer's public
+    /// key (a certificate's or trust anchor's) was to verify it: a digest
+    /// (DigestSha256, DigestBlake3) names no signer and anyone can compute
+    /// it; a symmetric MAC (HmacWithSha256, BLAKE3-keyed) verifies only under
+    /// a shared secret, and a public key is no secret — anyone holding it
+    /// could compute the MAC.
+    #[error(
+        "{sig_type} is not a public-key signature, so the signer's public key cannot verify it: \
+         {why}"
+    )]
+    NotPublicKeySignature { sig_type: String, why: &'static str },
     #[error("certificate revoked in trust context: {name}")]
     Revoked { name: String },
     /// A trust context arrived for a namespace the validator expects one for

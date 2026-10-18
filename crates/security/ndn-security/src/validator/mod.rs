@@ -15,7 +15,7 @@ use crate::cert_fetcher::CertFetcher;
 use crate::keyring::Keyring;
 use crate::trust_context::SignedTrustContext;
 use crate::trust_schema::SchemaRule;
-use crate::verifier::verify_by_sig_type;
+use crate::verifier::{DIGEST_NO_SIGNER, not_public_key, verify_by_sig_type, verify_digest};
 use crate::{CertCache, SafeData, TrustError, TrustSchema, VerifyOutcome};
 
 /// Structured trace returned by [`Validator::trace`].
@@ -383,15 +383,10 @@ impl Validator {
         };
 
         // DigestSha256 carries no KeyLocator; verify sig_value ==
-        // SHA256(region). Trust is established at a higher layer.
+        // SHA256(region). Integrity only: labelled `TrustPath::DigestSha256`
+        // for the consumer to decide (it authenticates no signer).
         if sig_info.sig_type == ndn_packet::SignatureType::DigestSha256 {
-            return match verify_by_sig_type(
-                sig_info.sig_type,
-                data.signed_region(),
-                data.sig_value(),
-                &[],
-            )
-            .await
+            return match verify_digest(sig_info.sig_type, data.signed_region(), data.sig_value())
             {
                 Ok(VerifyOutcome::Valid) => {
                     // Re-decode of already-validated bytes is infallible; treat the
@@ -480,7 +475,12 @@ impl Validator {
     /// The signed region is `Interest::signed_region()` (Name without the
     /// trailing PSDC ‖ ApplicationParameters ‖ InterestSignatureInfo);
     /// `sig_value` is `InterestSignatureValue` (TLV-TYPE 0x2E). Trust
-    /// establishment matches the Data path.
+    /// establishment matches the Data path. `Valid` means a key the trust
+    /// schema accepts signed it: a `DigestSha256` Interest names no signer
+    /// and is `Invalid` ([`TrustError::NotPublicKeySignature`]) — the outcome
+    /// carries no trust path to tell integrity from authentication, so a
+    /// caller content with integrity checks the digest itself
+    /// ([`verify_digest`](crate::verify_digest)).
     pub async fn validate_interest(&self, interest: &Interest) -> InterestValidationOutcome {
         let Some(sig_info) = interest.sig_info() else {
             return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
@@ -493,14 +493,10 @@ impl Validator {
         };
 
         if sig_info.sig_type == ndn_packet::SignatureType::DigestSha256 {
-            return match verify_by_sig_type(sig_info.sig_type, &signed_region, sig_value, &[]).await
-            {
-                Ok(VerifyOutcome::Valid) => InterestValidationOutcome::Valid,
-                Ok(VerifyOutcome::Invalid) => {
-                    InterestValidationOutcome::Invalid(TrustError::InvalidSignature)
-                }
-                Err(e) => InterestValidationOutcome::Invalid(e),
-            };
+            return InterestValidationOutcome::Invalid(not_public_key(
+                "DigestSha256 (0)",
+                DIGEST_NO_SIGNER,
+            ));
         }
 
         let key_name: std::sync::Arc<Name> = match &sig_info.key_locator {
@@ -960,16 +956,18 @@ mod tests {
         w.finish()
     }
 
-    /// HMAC-SHA-256 dispatches via `verify_by_sig_type`.
+    /// A certificate's key is public, so a symmetric MAC (HMAC-SHA-256 = 4,
+    /// BLAKE3-keyed = 7) keyed with it proves nothing — anyone could compute
+    /// it: refused as no public-key signature, never verified.
     #[tokio::test]
-    async fn c02_hmac_signed_data_validates_through_dispatch() {
+    async fn c02_mac_keyed_with_a_certificate_key_is_refused() {
         let key_bytes = [0x42u8; 32];
-        let key_name = name1("hmac-key");
-        let signer = crate::signer::HmacSha256Signer::new(&key_bytes, key_name.clone());
-        let data_bytes = make_signed_data_with_sig_type(&signer, 4, "data", "hmac-key").await;
-        let data = Data::decode(data_bytes).unwrap();
+        let key_name = name1("mac-key");
+        let hmac = crate::signer::HmacSha256Signer::new(&key_bytes, key_name.clone());
+        let blake3 = crate::signer::Blake3KeyedSigner::new(key_bytes, key_name.clone());
 
-        let cert = Certificate {
+        let validator = Validator::new(open_schema("data", "mac-key"));
+        validator.cert_cache().insert(Certificate {
             name: Arc::new(key_name),
             public_key: Bytes::copy_from_slice(&key_bytes),
             valid_from: 0,
@@ -977,14 +975,16 @@ mod tests {
             issuer: None,
             signed_region: None,
             sig_value: None,
-            sig_type: ndn_packet::SignatureType::SignatureHmacWithSha256,
-        };
-        let validator = Validator::new(open_schema("data", "hmac-key"));
-        validator.cert_cache().insert(cert);
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        });
 
-        match validator.validate(&data).await {
-            ValidationResult::Valid(_) => {}
-            other => panic!("HMAC dispatch failed; expected Valid, got: {other:?}"),
+        for (signer, code) in [(&hmac as &dyn Signer, 4u8), (&blake3, 7)] {
+            let data_bytes = make_signed_data_with_sig_type(signer, code, "data", "mac-key").await;
+            let data = Data::decode(data_bytes).unwrap();
+            match validator.validate(&data).await {
+                ValidationResult::Invalid(TrustError::NotPublicKeySignature { .. }) => {}
+                other => panic!("sig type {code}: a MAC must be refused, got: {other:?}"),
+            }
         }
     }
 

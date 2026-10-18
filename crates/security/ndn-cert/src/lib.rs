@@ -11,11 +11,13 @@
 pub mod approval;
 pub mod attestation;
 pub mod ca;
+pub mod ca_policy;
 pub mod challenge;
 pub mod client;
 pub mod context_store;
 pub mod context_update;
 pub mod ecdh;
+pub mod enroll_target;
 pub mod error;
 pub mod invite;
 pub mod issuers;
@@ -24,8 +26,11 @@ pub mod onboarding;
 pub mod policy;
 pub mod protocol;
 pub mod recovery;
+pub mod report;
 pub mod renewal;
+pub mod revocation;
 pub mod roles;
+pub mod root_device;
 pub mod root_store;
 pub mod store;
 pub mod tlv;
@@ -39,6 +44,8 @@ pub use root_store::{
     NewRootStore, RootSecret, RootStore, RootStoreError, RootStoreKind, RootUnlockKind,
     SlotGuard, os_keychain_reachable, read_root_secret, read_secret,
 };
+pub use root_device::{RootDevice, RootDeviceError, held_context, kit_namespace, root_device};
+pub use revocation::{RevocationError, RevocationPlan, keys_to_revoke, plan_revocation};
 pub use recovery::{
     FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError, RecoveryPlan, RecoverySeed,
     RecoveryVersion, YubikeyKit, add_recovery_anchor, kit_anchor, recover_namespace_in_pib,
@@ -49,7 +56,7 @@ pub use challenge::email::{EmailChallenge, EmailSender};
 pub use challenge::nop::NopChallenge;
 pub use challenge::pin::PinChallenge;
 pub use challenge::possession::PossessionChallenge;
-pub use challenge::token::{TokenChallenge, TokenCheck, TokenStore};
+pub use challenge::token::{ApprovalRoleToken, TokenChallenge, TokenCheck, TokenStore};
 #[cfg(feature = "yubikey-challenge")]
 pub use challenge::yubikey::YubikeyHotpChallenge;
 pub use approval::{
@@ -81,9 +88,9 @@ pub use namespace::{
     root_key_name,
 };
 pub use invite::{
-    INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure, InviteEnrollment,
-    InviteLink, IssuedCertificate, IssuedCheckError, check_chain, enroll_with_invite,
-    ensure_invite_context, new_device_key_name,
+    EnrollLink, INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure,
+    InviteEnrollment, InviteLink, IssuedCertificate, IssuedCheckError, check_chain,
+    enroll_with_invite, ensure_invite_context, new_device_key_name,
 };
 pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL,
@@ -92,8 +99,14 @@ pub use onboarding::{
     fetch_context, fetch_context_pointer, fetch_versioned_context, open_signed_context,
     rdr_metadata_name, rdr_prefix,
 };
+pub use ca_policy::{
+    ChallengeOrder, ChallengeSlot, PolicyError, PolicyInput, SchemaPlanError, SchemaUpdatePlan,
+    challenge_order, plan_schema_update, same_link_policy,
+};
+pub use enroll_target::{EnrollTarget, EnrollTargetError};
 pub use policy::{
-    AcceptAllIssuance, ApprovalPolicy, DelegationPolicy, HierarchicalPolicy, IssuanceContext,
+    AcceptAllIssuance, AllIssuance, ApprovalPolicy, DelegationPolicy, HierarchicalPolicy,
+    IssuanceContext,
     IssuanceDecision,
     IssuancePolicy, NamespacePolicy, PolicyDecision, RequireAttestationKind, RolePolicy,
     RoleTerms, SingleKeyIdentity,

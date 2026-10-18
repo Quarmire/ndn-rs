@@ -7,7 +7,7 @@ use ndn_packet::{Data, Interest, KeyLocator, Name, SignatureType};
 use crate::cert_cache::Certificate;
 use crate::cert_name::{is_cert_name, is_cert_of, is_reserved_non_cert, key_name_of};
 use crate::safe_data::TrustPath;
-use crate::verifier::verify_by_sig_type;
+use crate::verifier::{DIGEST_NO_SIGNER, not_public_key, verify_by_sig_type};
 use crate::{SafeData, TrustError, VerifyOutcome};
 
 use super::{
@@ -191,15 +191,12 @@ impl Validator {
             return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
         };
 
+        // A digest names no signer: no chain to walk, nothing authenticated.
         if sig_info.sig_type == SignatureType::DigestSha256 {
-            return match verify_by_sig_type(sig_info.sig_type, &signed_region, sig_value, &[]).await
-            {
-                Ok(VerifyOutcome::Valid) => InterestValidationOutcome::Valid,
-                Ok(VerifyOutcome::Invalid) => {
-                    InterestValidationOutcome::Invalid(TrustError::InvalidSignature)
-                }
-                Err(e) => InterestValidationOutcome::Invalid(e),
-            };
+            return InterestValidationOutcome::Invalid(not_public_key(
+                "DigestSha256 (0)",
+                DIGEST_NO_SIGNER,
+            ));
         }
 
         let first_key: Arc<Name> = match &sig_info.key_locator {
@@ -1659,5 +1656,156 @@ mod tests {
             "got {result:?}"
         );
         assert!(missing.is_none());
+    }
+
+    /// Symmetric signers keyed with `public_key` (anyone holds it), each
+    /// naming `key_name` in its KeyLocator.
+    fn mac_forgers(public_key: [u8; 32], key_name: &Name) -> Vec<Box<dyn Signer>> {
+        vec![
+            Box::new(crate::signer::HmacSha256Signer::new(&public_key, key_name.clone())),
+            Box::new(crate::signer::Blake3KeyedSigner::new(public_key, key_name.clone())),
+        ]
+    }
+
+    #[track_caller]
+    fn assert_mac_refused(result: &ValidationResult) {
+        assert!(
+            matches!(result, ValidationResult::Invalid(TrustError::NotPublicKeySignature { .. })),
+            "a MAC keyed with a public key must be refused as no public-key signature: {result:?}"
+        );
+    }
+
+    /// A MAC keyed with a signer's public key is a forgery anyone can make.
+    /// The chain walk refuses it at every hop: Data "signed" so by a trust
+    /// anchor, by a certified key, and a certificate "issued" so by the
+    /// anchor (the Data under it genuinely signed). Genuine chains validate.
+    #[tokio::test]
+    async fn chain_walk_refuses_a_mac_keyed_with_a_public_key() {
+        let anchor = Ed25519Signer::from_seed(&[40u8; 32], n("/lab/KEY/root"));
+        let member = Ed25519Signer::from_seed(&[41u8; 32], n("/lab/m/KEY/k1"));
+        let validator = Validator::new(wildcard_schema());
+        validator.add_trust_anchor(anchor_cert(
+            anchor.key_name().clone(),
+            anchor.public_key_bytes(),
+        ));
+        // The single-hop `validate` resolves the anchor's key from the cache.
+        validator.cert_cache().insert(anchor_cert(
+            anchor.key_name().clone(),
+            anchor.public_key_bytes(),
+        ));
+        let member_cert = make_cert_data_packet(
+            &n("/lab/m/KEY/k1/root/v=1"),
+            &member.public_key_bytes(),
+            &anchor,
+        )
+        .await;
+        validator
+            .cert_cache()
+            .insert(Certificate::decode(&Data::decode(member_cert).unwrap()).unwrap());
+
+        let mac_signed = |signer: &dyn Signer, name: &str| {
+            let wire = ndn_packet::encode::DataBuilder::new(n(name), b"forged").sign_sync(
+                signer.sig_type(),
+                Some(signer.key_name()),
+                |region| signer.sign_sync(region).unwrap(),
+            );
+            Data::decode(wire).unwrap()
+        };
+        for forger in mac_forgers(anchor.public_key_bytes(), anchor.key_name()) {
+            let data = mac_signed(forger.as_ref(), "/lab/by-anchor");
+            assert_mac_refused(&validator.validate_chain(&data).await);
+            assert_mac_refused(&validator.validate(&data).await);
+        }
+        for forger in mac_forgers(member.public_key_bytes(), member.key_name()) {
+            let data = mac_signed(forger.as_ref(), "/lab/m/by-member");
+            assert_mac_refused(&validator.validate_chain(&data).await);
+            assert_mac_refused(&validator.validate(&data).await);
+        }
+
+        // A certificate "issued" with a MAC keyed with the anchor's public key.
+        let intruder = Ed25519Signer::from_seed(&[42u8; 32], n("/lab/x/KEY/k1"));
+        for forger in mac_forgers(anchor.public_key_bytes(), anchor.key_name()) {
+            let forged_cert = crate::manager::encode_cert_data(
+                &n("/lab/x/KEY/k1/root/v=1"),
+                &intruder.public_key_bytes(),
+                forger.as_ref(),
+                0,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
+            let validator = Validator::new(wildcard_schema());
+            validator.add_trust_anchor(anchor_cert(
+                anchor.key_name().clone(),
+                anchor.public_key_bytes(),
+            ));
+            validator
+                .cert_cache()
+                .insert(Certificate::decode(&Data::decode(forged_cert.clone()).unwrap()).unwrap());
+            let data = data_signed_by("/lab/x/photo", &intruder);
+            assert_mac_refused(&validator.validate_chain(&data).await);
+            assert_mac_refused(&validator.validate_chain(&Data::decode(forged_cert).unwrap()).await);
+        }
+
+        let genuine = data_signed_by("/lab/m/photo", &member);
+        assert!(matches!(
+            validator.validate_chain(&genuine).await,
+            ValidationResult::Valid(_)
+        ));
+    }
+
+    /// A signed Interest "signed" with a MAC keyed with the signer's public
+    /// key, or with only a DigestSha256 (no signer at all), is refused by
+    /// both Interest paths; a genuinely signed one validates.
+    #[tokio::test]
+    async fn interest_validation_refuses_a_mac_or_a_digest() {
+        use ndn_packet::Interest;
+        use ndn_packet::encode::InterestBuilder;
+
+        let anchor = Ed25519Signer::from_seed(&[43u8; 32], n("/lab/KEY/root"));
+        let validator = Validator::new(wildcard_schema());
+        validator.add_trust_anchor(anchor_cert(
+            anchor.key_name().clone(),
+            anchor.public_key_bytes(),
+        ));
+        validator.cert_cache().insert(anchor_cert(
+            anchor.key_name().clone(),
+            anchor.public_key_bytes(),
+        ));
+        let refused = |outcome: crate::InterestValidationOutcome| {
+            matches!(
+                outcome,
+                crate::InterestValidationOutcome::Invalid(TrustError::NotPublicKeySignature { .. })
+            )
+        };
+
+        for forger in mac_forgers(anchor.public_key_bytes(), anchor.key_name()) {
+            let wire = InterestBuilder::new(n("/lab/cmd"))
+                .app_parameters(Bytes::from_static(b"p"))
+                .sign_sync(forger.sig_type(), Some(forger.key_name()), |region| {
+                    forger.sign_sync(region).unwrap()
+                });
+            let interest = Interest::decode(wire).unwrap();
+            assert!(refused(validator.validate_interest_chain(&interest).await));
+            assert!(refused(validator.validate_interest(&interest).await));
+        }
+
+        let digest = InterestBuilder::new(n("/lab/cmd"))
+            .app_parameters(Bytes::from_static(b"p"))
+            .sign_digest_sha256();
+        let interest = Interest::decode(digest).unwrap();
+        assert!(refused(validator.validate_interest_chain(&interest).await));
+        assert!(refused(validator.validate_interest(&interest).await));
+
+        let wire = make_signed_interest(&anchor, anchor.key_name(), "/lab/cmd").await;
+        let interest = Interest::decode(wire).unwrap();
+        assert!(matches!(
+            validator.validate_interest_chain(&interest).await,
+            crate::InterestValidationOutcome::Valid
+        ));
+        assert!(matches!(
+            validator.validate_interest(&interest).await,
+            crate::InterestValidationOutcome::Valid
+        ));
     }
 }

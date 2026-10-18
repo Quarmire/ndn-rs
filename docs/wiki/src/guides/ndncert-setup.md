@@ -245,9 +245,10 @@ Run as a system service via the docker-compose stack — see
 
 A holder of `cert-N` proves possession of its key to obtain
 `cert-N+1`. The background renewal task watches a cert's remaining
-validity and re-runs enrollment before expiry; see
-`crates/security/ndn-identity/src/renewal.rs` (`start_renewal` +
-`NdncertRenewer`).
+validity and renews it before expiry on the one renewal schedule,
+`RenewalSchedule`; see `crates/security/ndn-identity/src/renewal.rs`
+(`start_renewal` + `NdncertRenewer`) and, for a device taking part in a
+namespace, `crates/security/ndn-namespace/src/renewal.rs`.
 
 ## Challenge attestations
 

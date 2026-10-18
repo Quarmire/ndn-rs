@@ -352,7 +352,7 @@ impl PitCheckStage {
         }
 
         let state = if let Some(v) = &self.validator {
-            match v.validate_interest(interest).await {
+            match subscription_validation(v, interest).await {
                 InterestValidationOutcome::Valid => {
                     let now = ctx.arrival;
                     let reap_at = now + (sub_req.max_lifetime_secs as u64) * 1_000_000_000;
@@ -394,6 +394,31 @@ impl PitCheckStage {
         _ctx: &PacketContext,
     ) -> Result<Option<PersistentState>, Action> {
         Ok(None)
+    }
+}
+
+/// The validation a persistent subscription needs: an intact request, not a
+/// signer — a `DigestSha256` one (as `ndn-app` sends) is `Valid` on its digest,
+/// which [`Validator::validate_interest`] never accepts (a digest names no
+/// signer); any other must validate.
+#[cfg(not(target_arch = "wasm32"))]
+async fn subscription_validation(
+    validator: &Validator,
+    interest: &ndn_packet::Interest,
+) -> InterestValidationOutcome {
+    let digest = ndn_packet::SignatureType::DigestSha256;
+    if interest.sig_info().map(|s| s.sig_type) != Some(digest) {
+        return validator.validate_interest(interest).await;
+    }
+    let (Some(region), Some(sig_value)) = (interest.signed_region(), interest.sig_value()) else {
+        return InterestValidationOutcome::Invalid(ndn_security::TrustError::InvalidSignature);
+    };
+    match ndn_security::verify_digest(digest, &region, sig_value) {
+        Ok(ndn_security::VerifyOutcome::Valid) => InterestValidationOutcome::Valid,
+        Ok(ndn_security::VerifyOutcome::Invalid) => {
+            InterestValidationOutcome::Invalid(ndn_security::TrustError::InvalidSignature)
+        }
+        Err(e) => InterestValidationOutcome::Invalid(e),
     }
 }
 

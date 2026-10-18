@@ -1135,6 +1135,59 @@ impl CaState {
         outcome
     }
 
+    /// Follow `ctx`, a version of a trust context the device running this
+    /// CA holds now: when this is the CA of its namespace (identity
+    /// `<ns>/CA`), stop serving every certificate it issued that `ctx`
+    /// revokes, and record that in the store. Idempotent: certificates
+    /// revoked already are skipped, so following the same version again
+    /// changes nothing. `None` when this is not the CA of `ctx`'s namespace.
+    pub fn follow_context(&self, ctx: &ndn_security::SignedTrustContext) -> Option<CaRevocation> {
+        let ca_identity = ctx.namespace().clone().append("CA");
+        let key = self.signing_key_name()?;
+        if !(key.has_prefix(&ca_identity) && key.len() == ca_identity.len() + 2) {
+            return None;
+        }
+        let mut followed = CaRevocation::default();
+        for revoked in ctx.revocations() {
+            let out = self.revoke_issued_under(revoked);
+            followed.revoked.extend(out.revoked);
+            if followed.not_persisted.is_none() {
+                followed.not_persisted = out.not_persisted;
+            }
+        }
+        if !followed.revoked.is_empty() {
+            tracing::info!(
+                target: "ca",
+                namespace = %ctx.namespace(),
+                version = ctx.version(),
+                revoked = ?followed.revoked.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "the trust context revokes certificates this CA issued: no longer served, and \
+                 their device names are free for a new key"
+            );
+        }
+        if let Some(e) = &followed.not_persisted {
+            tracing::warn!(
+                target: "ca",
+                namespace = %ctx.namespace(),
+                version = ctx.version(),
+                error = %e,
+                "could not record a revocation in the CA store: it holds for this run, and the CA \
+                 follows the stored trust context again at the next start"
+            );
+        }
+        Some(followed)
+    }
+
+    /// Follow every trust context `keyring` holds ([`Self::follow_context`]):
+    /// at the CA's start, for versions adopted while it did not run — one
+    /// stored for the next start by a CLI that found no daemon, or a
+    /// revocation its store could not record.
+    pub fn follow_held(&self, keyring: &Keyring) {
+        for ctx in keyring.contexts() {
+            self.follow_context(&ctx);
+        }
+    }
+
     /// Mint, persist and serve the certificate for an approved request. It is
     /// named `<key>/NDNCERT/<version>` (NDN Certificate Format v2), so every
     /// certificate of a key — a renewal's included — has a name of its own and

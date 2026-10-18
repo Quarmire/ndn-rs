@@ -20,6 +20,7 @@ pub mod capability;
 pub mod cert_cache;
 pub mod cert_fetcher;
 pub mod cert_name;
+pub mod cert_set;
 pub mod confidentiality;
 #[cfg(feature = "custodian")]
 #[cfg_attr(docsrs, doc(cfg(feature = "custodian")))]
@@ -62,6 +63,7 @@ pub use active_signer::ActiveSigner;
 pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn, FetchMiss};
+pub use cert_set::CertSet;
 pub use confidentiality::{ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck};
 pub use error::TrustError;
 pub use keychain::{KeyAlgorithm, KeyChain};
@@ -98,7 +100,7 @@ pub use validator::{
 };
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
-    ed25519_verify_batch, verify_by_sig_type,
+    ed25519_verify_batch, verify_by_sig_type, verify_digest,
 };
 #[cfg(feature = "yubikey-piv")]
 pub use yubikey::{

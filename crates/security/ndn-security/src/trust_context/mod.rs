@@ -1536,4 +1536,40 @@ mod tests {
             Err(SignedTrustContextError::Sign(_))
         ));
     }
+
+    /// A context "signed" with a MAC keyed with its anchor's public key
+    /// (KeyLocator the anchor) — anyone can make one, e.g. to drop a
+    /// revocation or add an anchor — never opens; the anchor's real
+    /// signature does.
+    #[tokio::test]
+    async fn a_context_maced_with_its_anchor_public_key_does_not_open() {
+        use crate::signer::{Blake3KeyedSigner, Ed25519Signer, HmacSha256Signer, Signer};
+
+        let key = n("/home/bob/KEY/root");
+        let root = Ed25519Signer::from_seed(&[5u8; 32], key.clone());
+        let pk = root.public_key_bytes();
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
+        let anchor_wire =
+            crate::manager::encode_cert_data(&n("/home/bob/KEY/root/self/v=1"), &pk, &root, 0, u64::MAX)
+                .await
+                .unwrap();
+        let anchor = Certificate::decode(&Data::decode(anchor_wire).unwrap()).unwrap();
+        assert!(ctx.add_anchor(anchor));
+
+        let forgers: [Box<dyn Signer>; 2] = [
+            Box::new(HmacSha256Signer::new(&pk, key.clone())),
+            Box::new(Blake3KeyedSigner::new(pk, key.clone())),
+        ];
+        for forger in forgers {
+            let data = ctx.sign_into_data(forger.as_ref()).expect("MAC into data");
+            let opened = SignedTrustContext::open_signed(&data).await;
+            assert!(
+                matches!(opened, Err(OpenContextError::UnsupportedSignature(_))),
+                "a context MACed with its anchor's public key must not open: {opened:?}"
+            );
+        }
+        let data = ctx.sign_into_data(&root).unwrap();
+        let (_, anchor) = SignedTrustContext::open_signed(&data).await.unwrap();
+        assert!(anchor.name.has_prefix(&key), "{}", anchor.name);
+    }
 }

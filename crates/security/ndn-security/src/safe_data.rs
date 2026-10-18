@@ -55,6 +55,15 @@ impl SafeData {
         &self.trust_path
     }
 
+    /// Whether validation established who produced the Data — every trust
+    /// path but [`TrustPath::DigestSha256`], which proves integrity only:
+    /// anyone can compute a digest. A consumer acting on the producer's
+    /// identity or authority (a grant, a certificate, a reply it trusts)
+    /// MUST require this.
+    pub fn is_authenticated(&self) -> bool {
+        !matches!(self.trust_path, TrustPath::DigestSha256)
+    }
+
     pub fn verified_at(&self) -> u64 {
         self.verified_at
     }

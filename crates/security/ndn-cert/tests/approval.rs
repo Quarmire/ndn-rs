@@ -845,6 +845,60 @@ async fn only_an_admin_key_lists_pending_requests() {
     assert_eq!(record.code, code);
 }
 
+/// An admin's certificate key is public: a decision or a pending listing
+/// "signed" with a symmetric MAC keyed by it (HmacWithSha256, BLAKE3-keyed;
+/// KeyLocator the admin's key) is a forgery anyone could make. The CA
+/// refuses both — the MAC is no public-key signature — and nothing changes.
+#[tokio::test]
+async fn a_mac_keyed_with_an_admin_public_key_neither_decides_nor_lists() {
+    use ndn_security::{Blake3KeyedSigner, HmacSha256Signer};
+
+    let rd = RootDevice::new().await;
+    let ca = rd.start_ca(DEFAULT_REQUEST_TTL);
+    let admin = device(&rd, &ca, "admin", "laptop", 1).await;
+    let (id, _) = request(&rd, &ca, &key("node", "vps", 2)).await;
+    let record = ca.approvals.get(&id).unwrap();
+
+    let admin_cert =
+        Certificate::decode(&Data::decode(admin.chain[0].clone()).unwrap()).unwrap();
+    let public = admin_cert.public_key.clone();
+    let raw: [u8; 32] = ndn_security::spki::unwrap_ed25519(&public)
+        .unwrap_or_else(|| public.as_ref().try_into().expect("an Ed25519 key"));
+    let admin_key = admin.key.key_name().clone();
+    let forgers: [Arc<dyn Signer>; 3] = [
+        Arc::new(HmacSha256Signer::new(&public, admin_key.clone())),
+        Arc::new(HmacSha256Signer::new(&raw, admin_key.clone())),
+        Arc::new(Blake3KeyedSigner::new(raw, admin_key)),
+    ];
+    for key in forgers {
+        let forger = Device {
+            key,
+            chain: admin.chain.clone(),
+        };
+        for result in [
+            push(&rd, &ca, &record, &Decision::Approve, &forger).await.map(|_| ()),
+            listing(&rd, &ca, &forger).await.map(|_| ()),
+        ] {
+            match result {
+                Err(ApproverError::Refused(refusal)) => {
+                    assert_eq!(refusal.kind, RefusalKind::Unauthorized, "{refusal:?}");
+                    assert!(
+                        refusal.reason.contains("not a public-key signature"),
+                        "refused for the MAC: {}",
+                        refusal.reason
+                    );
+                }
+                other => panic!("a MAC keyed with the admin's public key was accepted: {other:?}"),
+            }
+        }
+        assert!(ca.approvals.get(&id).unwrap().is_pending());
+    }
+
+    // The admin's real signature still decides.
+    let decided = push(&rd, &ca, &record, &Decision::Approve, &admin).await.unwrap();
+    assert!(matches!(decided.state, ApprovalState::Approved { .. }));
+}
+
 /// The generated schema `ndn-fwd init` wrote before admins could deny or
 /// list requests remotely — today's without the `#deny` and `#pending`
 /// rules, as that generator produced it — and the hint of that time (an

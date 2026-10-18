@@ -148,7 +148,12 @@ impl Consumer {
     ) -> Result<SafeData, AppError> {
         let data = self.pull_reflexive(forward, suffix, timeout).await?;
         match validator.validate(&data).await {
-            ValidationResult::Valid(safe) => Ok(*safe),
+            ValidationResult::Valid(safe) if safe.is_authenticated() => Ok(*safe),
+            ValidationResult::Valid(_) => Err(AppError::Protocol(
+                "the reply is not signed by a key (a DigestSha256 proves integrity, not who \
+                 made it)"
+                    .into(),
+            )),
             ValidationResult::Invalid(e) => Err(AppError::Protocol(e.to_string())),
             ValidationResult::Pending => {
                 Err(AppError::Protocol("certificate chain not resolved".into()))

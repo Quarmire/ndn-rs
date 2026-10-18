@@ -1,0 +1,37 @@
+[package]
+name = "ndn-namespace"
+description = "Taking part in personal NDN namespaces: keeping trust contexts current, enrolling, approving, renewing, publishing and syncing — the library any forwarder or app links"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+classification = "spec"
+
+[dependencies]
+ndn-packet    = { workspace = true, features = ["std"] }
+ndn-security  = { workspace = true, features = ["custodian"] }
+ndn-cert      = { workspace = true }
+ndn-identity  = { workspace = true }
+ndn-app       = { workspace = true }
+ndn-engine    = { workspace = true }
+ndn-face      = { workspace = true }
+ndn-transport = { workspace = true }
+ndn-store     = { workspace = true }
+ndn-sync      = { workspace = true }
+ndn-strategy  = { workspace = true }
+ndn-mgmt-wire = { workspace = true }
+bytes         = { workspace = true, features = ["std"] }
+tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util    = { workspace = true }
+tracing       = { workspace = true }
+async-trait   = { workspace = true }
+
+[dev-dependencies]
+tokio         = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+tempfile      = "3"
+parking_lot   = { workspace = true }
+
+[lints]
+workspace = true

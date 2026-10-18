@@ -90,8 +90,9 @@ from `<ns>/CA` find it there.
 | Issuer certificates a node keeps: `keep_issuer_certs`, `stored_issuer_certs` | `ndn-cert/src/issuers.rs` |
 | CA side: built-in `renewal` challenge (`CaState::verify_renewal`, `accept_earlier_ca_certificates`); issued cert name in the CHALLENGE response | `ndn-cert/src/ca.rs`; `ChallengeResponseTlv::issued_cert_name` in `ndn-cert/src/tlv.rs` |
 | Per-role lifetime and renewability: `RolePolicy::with_validity` / `with_renewable`, `RoleTerms` | `ndn-cert/src/policy.rs` |
-| Engine binding `renew_via_engine`, schedule `RenewBefore`, `backoff_delay`; `NdncertRenewer` for `start_renewal` | `ndn-identity/src/renewal.rs` |
-| Daemon: `security/renew` verb and renewal timer | `ndn-fwd/binaries/ndn-fwd/src/renewal.rs` |
+| Engine binding `renew_via_engine`, due time `RenewBefore`, `backoff_delay`, the one schedule `RenewalSchedule` (driven by both timers below); `start_renewal` + `NdncertRenewer` for a `SecurityManager`-held identity | `ndn-identity/src/renewal.rs` |
+| Library: `renew_now`, renewal timer `spawn_periodic` over a `Participant` and a `KeyVault` | `ndn-namespace/src/renewal.rs` |
+| Daemon: `security/renew` verb and `[security] renew_before` (glue over the library, PIB as the vault) | `ndn-fwd/binaries/ndn-fwd/src/renewal.rs` |
 | CA config → `RolePolicy` | `ndn-fwd/binaries/ndn-fwd/src/ca.rs` (`role_policy`) |
 | Config: `CertValidityDays`, `renewable_roles`, `RenewBeforeConfig` | `ndn-config/src/config.rs` |
 | Mobile: `NdnEngine::renew_certificate`, `certificate_validity` | `ndn-mobile/crates/ndn-boltffi/src/{engine,identity_core}.rs` |
@@ -130,7 +131,10 @@ those are renewed once a third of their lifetime is left, and a WARN says so
 once. A failed attempt is retried after a jittered backoff (30–60 s,
 doubling up to 30–60 min; 30–60 min after a refusal) and logged as a WARN
 with `days_left`; a PIB the daemon cannot read is logged as a WARN and
-retried likewise; an expired certificate is reported once, as an ERROR.
+retried likewise; an expired certificate is reported once, as an ERROR. This
+schedule (`ndn_identity::renewal::RenewalSchedule`) is the only one:
+`ndn_identity::start_renewal` follows it too, with its policy's threshold and
+check interval.
 
 ```sh
 ndn-fwd renew -c device.toml      # renew now

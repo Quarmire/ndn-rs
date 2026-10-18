@@ -20,6 +20,9 @@ NDNCERT — NDN Certificate Management Protocol. Implements automated certificat
 | `ChallengeRequest` / `ChallengeResponse` | CHALLENGE phase messages |
 | `EcdhKeypair` / `SessionKey` | ECDH key agreement for channel encryption (Phase 1C) |
 | `NamespacePolicy` / `HierarchicalPolicy` | CA issuance policy — controls which names a CA may certify |
+| `AllIssuance` | Conjunction of issuance policies at the shortest validity |
+| `PolicyInput` / `ca_policy` | A namespace CA's stated approval and link policy reconciled with its trust context; challenge offer order (`challenge_order`); schema update plan (`plan_schema_update`) |
+| `EnrollTarget` | The namespace and identity a device asks for when enrolling with an invite or anchor link |
 | `CertError` | Unified error type |
 
 ## Usage

@@ -114,7 +114,10 @@ once at the Ethernet boundary (it does **not** re-frame at the transport).
 A QUIC link joins two devices — two `ndn-fwd` daemons — across networks: a
 laptop to a home server, a phone to a relay on a VPS. For the person using
 them this is "link my devices" or "use my relay"; the steps are on
-[Linking devices](./links.md). This section is the reference.
+[Linking devices](./links.md). This section is the reference. The transport
+is `ndn-face-quic`; the admission rules below, the routes, redial and the
+one-link-per-pair rule are the `ndn-link` library (`ndn-ext/crates/faces/ndn-link/`),
+which `ndn-fwd` and any other host link through.
 
 **Identity is the device's NDN key.** Both ends run TLS 1.3 with raw public
 keys (RFC 7250): the key each side presents *is* its NDN device key (Ed25519

@@ -195,6 +195,38 @@ impl IssuancePolicy for AcceptAllIssuance {
     }
 }
 
+/// Issues only when every policy issues, at the shortest validity offered;
+/// an identity is held to one key when any policy holds it so, and renewal
+/// is offered when any policy offers it.
+pub struct AllIssuance(Vec<Box<dyn IssuancePolicy>>);
+
+impl AllIssuance {
+    pub fn new(policies: Vec<Box<dyn IssuancePolicy>>) -> Self {
+        Self(policies)
+    }
+}
+
+impl IssuancePolicy for AllIssuance {
+    fn decide(&self, ctx: &IssuanceContext<'_>) -> IssuanceDecision {
+        let mut validity = ctx.max_validity;
+        for policy in &self.0 {
+            match policy.decide(ctx) {
+                IssuanceDecision::Issue { validity: v } => validity = validity.min(v),
+                deny @ IssuanceDecision::Deny(_) => return deny,
+            }
+        }
+        IssuanceDecision::Issue { validity }
+    }
+
+    fn single_key_identity(&self, key_name: &Name) -> Option<SingleKeyIdentity> {
+        self.0.iter().find_map(|p| p.single_key_identity(key_name))
+    }
+
+    fn offers_renewal(&self) -> bool {
+        self.0.iter().any(|p| p.offers_renewal())
+    }
+}
+
 /// Under `prefix`, require the satisfied challenge's attestation to carry a
 /// leaf of `required_kind` (e.g. names under `/high-trust` must have been met
 /// with a `device-approval` challenge). Requests outside `prefix` issue
@@ -702,6 +734,35 @@ mod issuance_tests {
                 validity: Duration::from_secs(7 * 86_400),
             }
         }
+    }
+
+    /// All policies must issue; the shortest validity wins; the first
+    /// denial is the answer.
+    #[test]
+    fn all_issuance_is_the_conjunction_at_the_shortest_validity() {
+        let ca = "/registry/CA".parse::<Name>().unwrap();
+        let both = AllIssuance::new(vec![
+            Box::new(AcceptAllIssuance),
+            Box::new(RegistryIssuance {
+                allowed_zone: "/registry/zone-a".parse().unwrap(),
+            }),
+        ]);
+        let r = req("/registry/zone-a/device/x");
+        assert!(matches!(
+            both.decide(&ctx(&r, "token", &ca)),
+            IssuanceDecision::Issue { validity } if validity == Duration::from_secs(86_400)
+        ));
+        let outside = req("/registry/zone-b/device/x");
+        assert!(matches!(
+            both.decide(&ctx(&outside, "token", &ca)),
+            IssuanceDecision::Deny(r) if r.contains("outside registry zone")
+        ));
+        assert!(!both.offers_renewal());
+        let none = AllIssuance::new(Vec::new());
+        assert!(matches!(
+            none.decide(&ctx(&r, "pin", &ca)),
+            IssuanceDecision::Issue { validity } if validity == Duration::from_secs(7 * 86_400)
+        ));
     }
 
     #[test]

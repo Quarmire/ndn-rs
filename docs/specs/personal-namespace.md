@@ -4,6 +4,16 @@ Status: **draft for review**. Scope: how an owner creates, grows, repairs and
 shares a personal NDN namespace. Every flow is defined headless (CLI + mobile
 FFI) first; the TUI is a thin skin over the same calls.
 
+This document is the design. The bytes on the wire are specified normatively
+in separate specs (index: [README.md](README.md)):
+[ndn-link.md](ndn-link.md) (QUIC links, §9),
+[trust-context.md](trust-context.md) (the trust context, §3, §4),
+[ndncert-extensions.md](ndncert-extensions.md) (approval, renewal, invites; F2, F10),
+[trust-envelope.md](trust-envelope.md) (`ndn-trust://` envelopes),
+[recovery-kit.md](recovery-kit.md) (F7, F8) and
+[local-refusal.md](local-refusal.md) (NackReason 170–176).
+Where this document and a spec disagree on wire detail, the spec governs.
+
 There is no "network" to "join". A device **adopts** the namespace's trust
 context (it accepts Data under `/<ns>` signed by keys chaining to the
 namespace root, under the namespace's schema) and, to produce, **enrolls**

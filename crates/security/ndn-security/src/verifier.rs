@@ -23,11 +23,23 @@ pub trait Verifier: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>>;
 }
 
-/// Dispatch signature verification against the algorithm declared in the
-/// packet's `SignatureInfo`. Returns `Ok(Valid)` / `Ok(Invalid)` for
-/// handled algorithms, `Err(InvalidKey)` / `Err(InvalidSignature)` for
-/// malformed inputs, and `Err(UnsupportedSignatureType)` for unknown
-/// codes. All NDN Packet Format v0.3 codes plus BLAKE3 (6, 7) are wired.
+/// Verify a **public-key** signature of `sig_type` over `region` under the
+/// signer's `public_key` (a certificate's or trust anchor's key): Ed25519
+/// (a DER SubjectPublicKeyInfo or the raw 32-byte key), ECDSA-P256 or RSA
+/// (DER SubjectPublicKeyInfo). Returns `Ok(Valid)` / `Ok(Invalid)`;
+/// `Err(InvalidKey)` when `public_key` is not a key of the signature's
+/// algorithm (e.g. an Ed25519 key for an ECDSA signature) and
+/// `Err(InvalidSignature)` for a malformed signature.
+///
+/// Every other type is refused with
+/// [`TrustError::NotPublicKeySignature`], never verified: a digest
+/// (DigestSha256, DigestBlake3) names no signer — anyone can compute it —
+/// and a symmetric MAC (HmacWithSha256, BLAKE3-keyed) verifies only under a
+/// shared secret, while a public key is known to anyone, who could then
+/// compute the MAC for any content. Check a digest with [`verify_digest`];
+/// verify a MAC with its shared secret ([`HmacSha256Verifier`],
+/// [`Blake3KeyedVerifier`]). Unknown codes are
+/// `Err(UnsupportedSignatureType)`.
 pub async fn verify_by_sig_type(
     sig_type: SignatureType,
     region: &[u8],
@@ -35,11 +47,6 @@ pub async fn verify_by_sig_type(
     public_key: &[u8],
 ) -> Result<VerifyOutcome, TrustError> {
     match sig_type {
-        SignatureType::DigestSha256 => {
-            DigestSha256Verifier
-                .verify(region, sig_value, public_key)
-                .await
-        }
         SignatureType::SignatureEd25519 => {
             // Certificate Format v2 stores the public key as a 44-byte
             // DER SubjectPublicKeyInfo envelope; `Ed25519Verifier` wants
@@ -54,11 +61,6 @@ pub async fn verify_by_sig_type(
             };
             Ed25519Verifier.verify(region, sig_value, &raw).await
         }
-        SignatureType::SignatureHmacWithSha256 => {
-            HmacSha256Verifier
-                .verify(region, sig_value, public_key)
-                .await
-        }
         SignatureType::SignatureSha256WithRsa => {
             RsaSha256Verifier
                 .verify(region, sig_value, public_key)
@@ -69,21 +71,65 @@ pub async fn verify_by_sig_type(
                 .verify(region, sig_value, public_key)
                 .await
         }
+        SignatureType::DigestSha256 => Err(not_public_key("DigestSha256 (0)", DIGEST_NO_SIGNER)),
         SignatureType::Other(c) if c == SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN => {
-            Blake3DigestVerifier
-                .verify(region, sig_value, public_key)
-                .await
+            Err(not_public_key("DigestBlake3 (6)", DIGEST_NO_SIGNER))
+        }
+        SignatureType::SignatureHmacWithSha256 => {
+            Err(not_public_key("HmacWithSha256 (4)", SYMMETRIC_MAC))
         }
         SignatureType::Other(c) if c == SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED => {
-            Blake3KeyedVerifier
-                .verify(region, sig_value, public_key)
-                .await
+            Err(not_public_key("SignatureBlake3Keyed (7)", SYMMETRIC_MAC))
         }
         SignatureType::Other(c) => Err(TrustError::UnsupportedSignatureType {
             code: c,
             name: format!("Other({c})"),
         }),
     }
+}
+
+pub(crate) const DIGEST_NO_SIGNER: &str = "a digest names no signer, and anyone can compute it";
+
+const SYMMETRIC_MAC: &str = "it is a symmetric MAC, verifiable only with the secret key shared \
+                             with its signer; a public key is no secret, and anyone holding it \
+                             could compute the MAC for any content";
+
+pub(crate) fn not_public_key(sig_type: &str, why: &'static str) -> TrustError {
+    TrustError::NotPublicKeySignature {
+        sig_type: sig_type.to_string(),
+        why,
+    }
+}
+
+/// Check a **digest** "signature" (DigestSha256, DigestBlake3): `sig_value`
+/// must be the digest of `region`. Integrity only — a digest names no signer
+/// and anyone can compute it, so it authenticates nothing. Any other
+/// `sig_type` is `Err(UnsupportedSignatureType)`.
+pub fn verify_digest(
+    sig_type: SignatureType,
+    region: &[u8],
+    sig_value: &[u8],
+) -> Result<VerifyOutcome, TrustError> {
+    let valid = match sig_type {
+        SignatureType::DigestSha256 => {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(region).as_slice() == sig_value
+        }
+        SignatureType::Other(c) if c == SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN => {
+            crate::signer::blake3_hash_auto(region).as_bytes().as_slice() == sig_value
+        }
+        other => {
+            return Err(TrustError::UnsupportedSignatureType {
+                code: other.code(),
+                name: format!("{other:?} is no digest"),
+            });
+        }
+    };
+    Ok(if valid {
+        VerifyOutcome::Valid
+    } else {
+        VerifyOutcome::Invalid
+    })
 }
 
 /// SHA-256 digest verifier — `sig_value` must equal `SHA-256(region)`.
@@ -109,8 +155,10 @@ impl Verifier for DigestSha256Verifier {
     }
 }
 
-/// HMAC-SHA-256 verifier; `public_key` is the shared HMAC key.
-/// Constant-time tag comparison is delegated to ring.
+/// HMAC-SHA-256 verifier. The `public_key` argument of [`Verifier::verify`]
+/// carries the **shared secret** HMAC key — never a public key, which anyone
+/// holds (see [`verify_by_sig_type`]). Constant-time tag comparison is
+/// delegated to ring.
 pub struct HmacSha256Verifier;
 
 impl Verifier for HmacSha256Verifier {
@@ -253,7 +301,9 @@ impl Verifier for Blake3DigestVerifier {
 }
 
 /// BLAKE3 keyed verifier — `sig_value` must equal `BLAKE3_keyed(region)`.
-/// `public_key` is the 32-byte BLAKE3 key. Same large-input dispatch as
+/// The `public_key` argument of [`Verifier::verify`] carries the 32-byte
+/// **shared secret** BLAKE3 key — never a public key, which anyone holds
+/// (see [`verify_by_sig_type`]). Same large-input dispatch as
 /// [`Blake3DigestVerifier`].
 pub struct Blake3KeyedVerifier;
 
@@ -560,5 +610,100 @@ mod tests {
             .verify(b"data", &[0u8; 64], b"not-a-der-key")
             .await;
         assert!(matches!(result, Err(TrustError::InvalidKey)));
+    }
+
+    /// A MAC computed with the signer's public key as the MAC key, or a bare
+    /// digest, is refused — never `Valid` — by the public-key dispatch: anyone
+    /// holding the public key (everyone) could make it.
+    #[tokio::test]
+    async fn mac_and_digest_types_are_refused_for_a_public_key() {
+        use crate::signer::{Blake3KeyedSigner, HmacSha256Signer, Signer as _};
+        use ndn_packet::Name;
+
+        let (_, pk) = keypair(&[7u8; 32]);
+        let spki = crate::spki::wrap_ed25519(&pk);
+        let region = b"forged region";
+        let key_name: Name = "/k".parse().unwrap();
+        for public_key in [&pk[..], &spki[..]] {
+            let hmac = HmacSha256Signer::new(public_key, key_name.clone())
+                .sign_sync(region)
+                .unwrap();
+            let mut blake3_key = [0u8; 32];
+            blake3_key.copy_from_slice(&public_key[public_key.len() - 32..]);
+            let keyed = Blake3KeyedSigner::new(blake3_key, key_name.clone())
+                .sign_sync(region)
+                .unwrap();
+            let sha = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(region).to_vec()
+            };
+            let blake3 = blake3::hash(region).as_bytes().to_vec();
+            for (sig_type, sig) in [
+                (SignatureType::SignatureHmacWithSha256, &hmac[..]),
+                (SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED), &keyed[..]),
+                (SignatureType::DigestSha256, &sha[..]),
+                (SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN), &blake3[..]),
+            ] {
+                let outcome = verify_by_sig_type(sig_type, region, sig, public_key).await;
+                assert!(
+                    matches!(outcome, Err(TrustError::NotPublicKeySignature { .. })),
+                    "{sig_type:?} under a public key must be refused: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// A key of another algorithm than the signature's is refused as
+    /// `InvalidKey`: an Ed25519 key for ECDSA or RSA, a P-256 key for
+    /// Ed25519 or RSA.
+    #[tokio::test]
+    async fn a_key_of_another_algorithm_is_refused() {
+        use p256_ecdsa::pkcs8::EncodePublicKey;
+
+        let (sk, pk) = keypair(&[8u8; 32]);
+        let region = b"region";
+        let ed_sig = sk.sign(region).to_bytes();
+        let ed_spki = crate::spki::wrap_ed25519(&pk);
+        let (_, p256) = ecdsa_keypair();
+        let p256_spki = p256.to_public_key_der().unwrap();
+
+        for (sig_type, key) in [
+            (SignatureType::SignatureSha256WithEcdsa, &ed_spki[..]),
+            (SignatureType::SignatureSha256WithRsa, &ed_spki[..]),
+            (SignatureType::SignatureSha256WithEcdsa, &pk[..]),
+            (SignatureType::SignatureEd25519, p256_spki.as_bytes()),
+            (SignatureType::SignatureSha256WithRsa, p256_spki.as_bytes()),
+        ] {
+            let outcome = verify_by_sig_type(sig_type, region, &ed_sig, key).await;
+            assert!(
+                matches!(outcome, Err(TrustError::InvalidKey)),
+                "{sig_type:?} with a key of another algorithm: {outcome:?}"
+            );
+        }
+        // The matching key verifies, raw or in its SPKI envelope.
+        for key in [&pk[..], &ed_spki[..]] {
+            let outcome = verify_by_sig_type(SignatureType::SignatureEd25519, region, &ed_sig, key)
+                .await
+                .unwrap();
+            assert_eq!(outcome, VerifyOutcome::Valid);
+        }
+    }
+
+    #[test]
+    fn verify_digest_checks_digests_only() {
+        use sha2::{Digest, Sha256};
+        let region = b"region";
+        let sha = Sha256::digest(region);
+        let blake3 = blake3::hash(region);
+        let ok = |sig_type, sig: &[u8]| verify_digest(sig_type, region, sig).unwrap();
+        assert_eq!(ok(SignatureType::DigestSha256, &sha), VerifyOutcome::Valid);
+        assert_eq!(ok(SignatureType::DigestSha256, &[0u8; 32]), VerifyOutcome::Invalid);
+        let plain = SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN);
+        assert_eq!(ok(plain, blake3.as_bytes()), VerifyOutcome::Valid);
+        assert_eq!(ok(plain, &sha), VerifyOutcome::Invalid);
+        assert!(matches!(
+            verify_digest(SignatureType::SignatureHmacWithSha256, region, &sha),
+            Err(TrustError::UnsupportedSignatureType { .. })
+        ));
     }
 }
