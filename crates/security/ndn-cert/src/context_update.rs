@@ -381,6 +381,18 @@ fn schema_grants(blobs: &[SchemaBlob]) -> Result<Vec<(String, String)>, BumpErro
                     grants.push((format!("native {rule}"), rule));
                 }
             }
+            // Kept verbatim, not understood here: dropping it is a narrowing
+            // for the nodes that do understand it.
+            SchemaFormat::Unknown(code) => {
+                let body: String = blob.body.iter().map(|b| format!("{b:02x}")).collect();
+                grants.push((
+                    format!("format {code} {body}"),
+                    format!(
+                        "schema blob {i} in format {code} ({} bytes, not understood here)",
+                        blob.body.len()
+                    ),
+                ));
+            }
         }
     }
     Ok(grants)
@@ -719,16 +731,19 @@ pub struct ContextUpdate {
 }
 
 /// Open `data` as an update of the held context `held`: a self-consistent
-/// signed context ([`SignedTrustContext::open_signed`]) of the same namespace,
-/// strictly newer, and signed by a key that is an anchor of `held` — the
-/// continuity rule: an update is authorized by the version it replaces. A
-/// new version may list other anchors (a root rotation is signed by the old
-/// root), but those are trusted only once it is adopted.
+/// signed context whose signing anchor is valid now
+/// ([`SignedTrustContext::open_received`]) of the same namespace, strictly
+/// newer, and signed by a key that is an anchor of `held` — the continuity
+/// rule: an update is authorized by the version it replaces. A new version
+/// may list other anchors (a root rotation is signed by the old root), but
+/// those are trusted only once it is adopted. The held anchor is matched by
+/// public key only, not by its certificate's validity, so a root whose held
+/// certificate expired still signs a version re-issuing it.
 pub async fn open_context_update(
     held: &SignedTrustContext,
     data: &Data,
 ) -> Result<(SignedTrustContext, Certificate), UpdateRefusal> {
-    let (ctx, signer) = SignedTrustContext::open_signed(data).await?;
+    let (ctx, signer) = SignedTrustContext::open_received(data).await?;
     if ctx.namespace() != held.namespace() {
         return Err(UpdateRefusal::OtherNamespace {
             expected: held.namespace().to_string(),

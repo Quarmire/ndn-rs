@@ -13,7 +13,7 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 ([RFC 2119], [RFC 8174]) when, and only when, they appear in all capitals, as shown here.
 
-The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-ext) for the transport and messages, and crate `ndn-link` (ndn-ext) for admission, enrollment links, routes, redial and the duplicate-link rule. ndn-fwd is a host of `ndn-link`: it supplies the configuration, the certificates it serves and its faces and RIB. Where the code is ambiguous or looks unintended, this spec says what the code does and lists the point under [Open questions](#16-open-questions). All byte-level claims are traced to code in [Appendix A](#appendix-a-code-references-non-normative).
+The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-ext) for the transport and messages, and crate `ndn-link` (ndn-ext) for admission, enrollment links, routes, redial and the duplicate-link rule. ndn-fwd is a host of `ndn-link`: it supplies the configuration, the certificates it serves and its faces and RIB. Points where the code was ambiguous or looked unintended were decided; the [Decisions](#16-decisions) say how and why. All byte-level claims are traced to code in [Appendix A](#appendix-a-code-references-non-normative).
 
 ---
 
@@ -138,7 +138,7 @@ A sender MUST NOT send a message whose TLV-VALUE exceeds 65 536 bytes.
 
 ## 5. Link messages
 
-All TLV-TYPEs are in the application range (types above 252, written as 3-byte VAR-NUMBERs). Inside LinkHello and LinkVerdict, a receiver MUST ignore an unrecognized TLV-TYPE that is even and MUST treat an unrecognized TLV-TYPE that is odd as a malformed message. This even/odd test applies to every TLV-TYPE, including 0–31 (see [Open question 3](#16-open-questions)).
+All TLV-TYPEs are in the application range (types above 252, written as 3-byte VAR-NUMBERs). Inside LinkHello and LinkVerdict, a receiver MUST ignore an unrecognized TLV-TYPE that is even and greater than 31, and MUST treat any other unrecognized TLV-TYPE (odd, or in 0–31) as a malformed message. This is the rule of NDN Packet Format v0.3, where types 0–31 are always critical ([Decision 3](#16-decisions)).
 
 ### 5.1 TLV-TYPE registry
 
@@ -174,10 +174,10 @@ Certificate    = Data              ; NDN Certificate Format v2 Data packet
 **Receiver rules**
 
 - Elements are processed in order:
-  - LinkVersion: the version is the first byte of the value. An empty value counts as absent, and extra bytes are ignored. If LinkVersion appears more than once, the last one wins.
+  - LinkVersion: the value MUST be exactly one byte, the version. A value of any other length makes the hello malformed. If LinkVersion appears more than once, the last one wins.
   - Data (0x06): appended to the certificate list in order. The Data is not parsed at this stage.
-  - Any other even type: ignored.
-  - Any other odd type: malformed.
+  - Any other even type above 31: ignored.
+  - Any other type (odd, or 0–31): malformed.
 - If no version is present, the hello is malformed.
 - If the version is present and ≠ 1, the receiver MUST NOT admit the link. ndn-rs logs that the peer speaks a different version and asks the user to update the older device.
 - A receiver uses the leaf and at most the **first 8** issuer certificates (`MAX_CHAIN` = 8) and ignores the rest.
@@ -194,7 +194,7 @@ EnrollmentLink = ENROLLMENT-LINK-TYPE TLV-LENGTH
 - **Meaning.** Sending a LinkVerdict means the sender **admits** the link. A refusal is never a verdict; the refusing side closes the connection instead (§6).
 - **Without EnrollmentLink:** the sender admits a full link.
 - **With EnrollmentLink:** the sender admits the link only as an enrollment link (§8). Over it, the sender carries only the receiver's enrollment in the listed namespaces: their CA, their trust context and certificates. This lasts until the receiver links again holding a certificate.
-  - An empty EnrollmentLink decodes as an enrollment link for no namespace. ndn-fwd never sends one: a relay with no eligible namespace refuses instead.
+  - An EnrollmentLink MUST list at least one Name. An empty EnrollmentLink makes the verdict malformed ([Decision 4](#16-decisions)). A relay with no eligible namespace refuses instead (§7.3 rule 4).
 - **Receiver rules:**
   - Inside EnrollmentLink, every element MUST be a Name (0x07). Any other type makes the message malformed.
   - Each Name value is decoded as an NDN Name.
@@ -220,7 +220,7 @@ EnrollmentLink = ENROLLMENT-LINK-TYPE TLV-LENGTH
    - Datagrams that arrive before this point are buffered by the QUIC stack (ndn-rs: up to 4 MiB) and delivered once the face starts reading.
 5. **Duplicate check.** After the link is up, the duplicate-link rule (§11) may close it at once with 0x01 (Replaced).
 
-A malformed message or a missed deadline means the link is not admitted (see §6.3 for how ndn-fwd closes it).
+A side that receives a malformed message or an unsupported LinkVersion, or whose peer misses a `MESSAGE_DEADLINE`, does not admit the link. It closes the connection with 0x15 (Protocol) and a reason (§6.3).
 
 ## 6. Closing a link
 
@@ -239,7 +239,7 @@ A side closes a link with a QUIC `CONNECTION_CLOSE` of type 0x1d (application). 
 | 0x12 | Revoked | The leaf, or a sent issuer, is revoked by a held trust context. Also sent when a revocation is adopted while the link is up (§12). | no |
 | 0x13 | RoleNotAllowed | The namespace's link policy does not let the peer's role link, or does not let it relay when this side reaches others through it. | no |
 | 0x14 | NotTheExpectedDevice | The peer is valid, but not the device or key a `[[peer]]` entry expects. | no |
-| 0x15 | Protocol | A certificate in the hello does not decode, the peer does not support datagrams, or the peer misbehaved. | no |
+| 0x15 | Protocol | A link message is malformed or carries another LinkVersion, the peer sent no link message within `MESSAGE_DEADLINE` (§6.3), a certificate in the hello does not decode, the peer does not support datagrams, or the peer misbehaved. | no |
 | 0x16 | Busy | Too many link attempts (§13), or too many enrollment links (§8.4). | yes |
 | 0x17 | NoLinkKey | This device has no usable link key. | yes¹ |
 
@@ -255,11 +255,13 @@ A received code not in this table MUST be treated as transient.
 
 A listener over its handshake limits (§13.2) refuses an Initial with the QUIC transport error `CONNECTION_REFUSED` (0x02). Dialers SHOULD treat this like application code 0x16 (Busy). ndn-rs does.
 
-### 6.3 Implicit close
+### 6.3 Failed exchange
 
-ndn-fwd closes some links without an explicit reason. If a link fails in the hello or verdict exchange (a malformed message, an unsupported LinkVersion, or a missed `MESSAGE_DEADLINE`), ndn-fwd drops the connection. QUIC then closes it with application code **0x00 and an empty reason phrase**.
+A side whose hello or verdict exchange fails MUST close the connection with 0x15 (Protocol) and a reason phrase that says what went wrong. Failures are a malformed message (§4.2, §5), an unsupported LinkVersion, and a missed `MESSAGE_DEADLINE` (§5.4). For a version mismatch the reason names both versions and asks the user to update the older device. A listener counts the close against the source like any refusal (§13.2).
 
-A receiver therefore MUST NOT read 0x00 with an empty reason as proof of an orderly shutdown. New implementations SHOULD close such links with 0x15 (Protocol) and a reason ([Open question 1](#16-open-questions)).
+A side MUST NOT just drop the connection. A QUIC stack then closes it with application code 0x00 and an empty reason phrase, which the peer reads as Shutdown (transient) and redials at once ([Decision 1](#16-decisions)).
+
+ndn-rs versions before this rule dropped the connection. A receiver therefore MUST NOT read 0x00 with an empty reason as proof of an orderly shutdown. ndn-rs treats it as transient (§13.1).
 
 ## 7. Admission
 
@@ -275,11 +277,13 @@ The rules below are those of the `ndn-link` crate, which ndn-fwd uses. An implem
 
 ### 7.1 Identifying the peer from its hello
 
+Before these steps, a side that knows a certificate of the peer's key MUST refuse with **0x12** if a held trust context revokes that certificate, whatever the hello carries. "Knows" means a certificate it serves or has cached whose public key is the peer's NDN public key; ndn-rs looks it up by the key's SHA-256 fingerprint. A revoked device that sends no certificate therefore gets no enrollment link either. A key the side knows no certificate of cannot be told from a new key, because a revoked device can always make one. For such keys the CA, which refuses to certify a revoked device again, is the backstop ([Decision 5](#16-decisions)).
+
 Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refusal: an expected fingerprint or an enrollment link may still admit the peer.
 
 1. If the hello carries no certificate: **Unknown**.
 2. Decode the leaf as a Data packet, then as a certificate. On failure, refuse with **0x15**.
-3. If the leaf's public key (normalized per §3.2) ≠ the peer's NDN public key, refuse with **0x11**. The comparison is byte by byte.
+3. If the leaf's public key (normalized per §3.2) ≠ the peer's NDN public key, refuse with **0x11**. The comparison is byte by byte, so a certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2 ([Decision 12](#16-decisions)).
 4. Find the held trust context whose namespace is the longest prefix of the leaf's name. If there is none: **Unknown**.
 5. If the context revokes the leaf, refuse with **0x12**. A revocation entry covers every name it is a prefix of, so revoking a key name covers all of its certificates ([trust-context.md](trust-context.md)).
 6. The leaf's name MUST be a device key name `/<ns>/<role>/<device>/KEY/<key-id>[/…]`, where:
@@ -324,7 +328,7 @@ Rules are evaluated in order. The first that applies decides.
    - Otherwise refuse **0x10**.
 5. Otherwise admit a **full link**. This covers a peer identified in a namespace, and a key-expected peer whether identified or not.
 
-A revoked key or issuer is refused in §7.1 before any of these rules, so it never reaches an enrollment link through them. See [Open question 5](#16-open-questions) for a peer that sends no certificate.
+A revoked key or issuer is refused in §7.1 before any of these rules, so it never reaches an enrollment link through them. This includes a peer that sends no certificate, when the side knows a revoked certificate of its key (§7.1).
 
 ### 7.4 Link policy semantics
 
@@ -425,7 +429,7 @@ Examples for `ns` = `/home`, with CA endpoint `/home/CA`:
 
    A dropped Interest first fragment, or any other dropped frame, is dropped silently.
 
-**Rate limit.** This is a token bucket per link, on received frames only. It starts full at `burst` tokens and refills continuously at `per_sec` tokens per second, up to `burst`. Every received frame costs one token, Ack-only frames included. A frame that finds no token is dropped without a Nack.
+**Rate limit.** This is a token bucket per link, on received frames only. It starts full at `burst` tokens and refills continuously at `per_sec` tokens per second, up to `burst`. Every received frame that carries a network packet or a fragment of one costs one token. A frame with no Fragment (an Ack-only or idle frame, rule 2) costs nothing, so the peer's acknowledgements of the fragments this side sends cannot crowd out the peer's packets ([Decision 7](#16-decisions)). A frame that finds no token is dropped without a Nack.
 
 ### 8.4 Slots and idle close (relay side)
 
@@ -476,7 +480,7 @@ When a link is up, the admitting side installs routes over its face. These are s
 **Default routes** of the peer entry P, given the identified peer (if any), are the first of these that applies:
 
 1. P's `routes`, if configured;
-2. `/<ns>` of the identified peer, if it is a `node` device and a peer entry exists. This holds whether the link was dialed or accepted;
+2. `/<ns>` of the identified peer, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1). This holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) falls to rule 3 ([Decision 8](#16-decisions));
 3. the identified peer's device name `/<ns>/<role>/<device>`;
 4. P's `device`, if the peer was not identified;
 5. otherwise none.
@@ -494,7 +498,7 @@ When a link to a fingerprint is up and another link to the same fingerprint come
 - **Both sides dialed each other** (the two links have opposite directions on this side): the link **dialed by the device with the smaller fingerprint** (§3.3 order) stays. The other is closed with **0x01** (Replaced).
 - **Same direction** (the peer dialed again after losing the old link, or this side redialed): the **newer** link stays and the older is closed with **0x01**.
 
-Both sides apply the rule independently, after the link is up (§5.4 step 5). For the opposite-direction case they reach the same result. A side whose own fingerprint is unavailable treats every duplicate as same-direction ([Open question 11](#16-open-questions)). The rule is `ndn_link::keeps_existing(existing direction, new direction, own fingerprint, peer fingerprint)`, which returns whether the link already in place stays.
+Both sides apply the rule independently, after the link is up (§5.4 step 5). For the opposite-direction case they reach the same result. A side whose own fingerprint is unavailable treats every duplicate as same-direction ([Decision 11](#16-decisions)). The rule is `ndn_link::keeps_existing(existing direction, new direction, own fingerprint, peer fingerprint)`, which returns whether the link already in place stays.
 
 Example with the test keys of §15: the P-256 key's fingerprint `0ca9…` is smaller than the Ed25519 key's `3475…`, so if they dial each other at once, the link the P-256 device dialed stays.
 
@@ -521,13 +525,13 @@ A link admitted only by expected fingerprint (no identity) is not affected. It e
 
 - A non-persistent peer is not redialed after its link ends or a dial fails. The exception is the one redial after 0x03 (§8.5).
 - A failure is **non-transient** if any of these holds:
-  - the peer closed with a non-transient code (§6.1);
-  - this side refused with one;
+  - the peer closed with a non-transient code (§6.1), including 0x15 after a failed exchange (§6.3);
+  - this side refused with one, including 0x15 after the peer's malformed message or unsupported LinkVersion;
   - the handshake failed on an unexpected key (§3.4);
   - TLS configuration failed;
   - there is no local link key.
 
-  Every other failure is **transient**: connect and handshake timeouts, an unreachable address, a missed `MESSAGE_DEADLINE`, a malformed message, the transport-level refusal of §6.2, or an unknown or 0x00 code.
+  Every other failure is **transient**: connect and handshake timeouts, an unreachable address, a `MESSAGE_DEADLINE` the peer missed (this side closes with 0x15, but the peer may only be slow), the transport-level refusal of §6.2, or an unknown or 0x00 code.
 
 ### 13.2 Inbound handshake limits
 
@@ -537,12 +541,13 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 |---|---|
 | in flight in total | 64 |
 | in flight per source IP | 4 |
-| refusals of one source IP before a cooldown | 8 |
+| refusals of one source IP within the refusal window before a cooldown | 8 |
+| refusal window | 60 s |
 | cooldown | 60 s |
 
 - An attempt over a limit, or from a source in cooldown, is refused before its handshake (§6.2).
 - When at least half the total (32) are in flight, the listener first sends a QUIC Retry to any source whose address is not yet validated.
-- A refusal counts against the source when its handshake fails or when admission refuses it with a close code. The count resets when it reaches the cooldown threshold ([Open question 9](#16-open-questions)).
+- A refusal counts against the source when its handshake fails, when admission refuses it with a close code, or when its hello or verdict exchange fails (§6.3). Refusals older than the refusal window are forgotten: the count starts again at the first refusal after the window of the previous first refusal ends. It also resets when it reaches the threshold and the cooldown starts ([Decision 9](#16-decisions)).
 
 ## 14. Constants
 
@@ -566,7 +571,7 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 | `DATAGRAM_FLOOR` | 1100 bytes | §9 |
 | fragment overhead reserve | 50 bytes | §9 |
 | `max_datagram_frame_size` advertised | 65 535 | §3.1 |
-| handshake limits | 64 / 4 per IP / 8 refusals → 60 s | §13.2 |
+| handshake limits | 64 / 4 per IP / 8 refusals within 60 s → 60 s | §13.2 |
 | shutdown grace | 1 s | §6.1 |
 
 ## 15. Test vectors
@@ -695,7 +700,7 @@ fd0452 19
 
 ### 15.9 LinkVerdict with an empty EnrollmentLink (8 B)
 
-`fd045204fd045400`. It decodes as an enrollment link for no namespace; ndn-fwd never sends it (§5.3).
+`fd045204fd045400`. Malformed (§5.3): a receiver closes the link with 0x15.
 
 ### 15.10 Decoder behaviour
 
@@ -704,13 +709,15 @@ These are the TLV-VALUEs given to the real decoders (the outer TLV already strip
 | Message value (hex) | Result |
 |---|---|
 | hello `0600` (Data, no LinkVersion) | malformed: no protocol version |
-| hello `fd045100` (empty LinkVersion) | malformed: no protocol version |
-| hello `fd04510102` (version 2) | refused: different version |
-| hello `fd0451020100` (2-byte version value, first byte 1) | accepted, 0 certificates |
+| hello `fd045100` (empty LinkVersion) | malformed: LinkVersion is not one byte |
+| hello `fd04510102` (version 2) | refused: different version (closed with 0x15, §6.3) |
+| hello `fd0451020100` (2-byte version value) | malformed: LinkVersion is not one byte |
+| hello `fd045101010a00` (unknown even 0x0A, in 0–31) | malformed: unknown critical field |
 | hello `fd04510101fd045600` (unknown even 0x0456) | accepted, 0 certificates |
 | hello `fd04510101fd045700` (unknown odd 0x0457) | malformed: unknown critical field |
 | verdict `fd045700` | malformed: unknown critical field |
 | verdict `fd0454020800` (non-Name inside EnrollmentLink) | malformed |
+| verdict `fd045400` (empty EnrollmentLink) | malformed |
 
 ### 15.11 NDNLPv2 frames on a link
 
@@ -732,32 +739,24 @@ Field breakdown of the fragment:
 - `fd0348 01 07`: TxSequence = 7
 - `50 0a …`: Fragment
 
-## 16. Open questions
+## 16. Decisions
 
-1. **Protocol errors close as 0x00.**
-   - Code: `ndn_link`'s `establish` propagates hello and verdict errors with `?`. These are a malformed message, an unsupported LinkVersion, and a missed `MESSAGE_DEADLINE`. Propagating drops the connection, and quinn then closes it with code 0 and an empty reason (§6.3).
-   - Effect: the peer sees "Shutdown" (transient) instead of 0x15 (Protocol), and keeps redialing every ≤ 30 s. The text "update the older of the two" is only logged locally.
-   - Question: should these close explicitly with 0x15 and a reason, and should a version mismatch become non-transient?
-2. **Chain length asymmetry.** The sender (`chain_of`) sends at most 8 certificates in total (leaf + 7 issuers). The receiver uses the leaf + 8 issuers. Should `MAX_CHAIN` mean the same thing on both sides?
-3. **TLV criticality.**
-   - Code: the hello and verdict decoders treat every unknown even TLV-TYPE as non-critical. NDN Packet Format v0.3 treats types 0–31 as always critical.
-   - Code: LinkVersion uses only the first byte of its value.
-   - Question: should the decoders follow the 0–31 rule?
-   - Question: is the version policy (ALPN `ndn-link/1` *and* LinkVersion 1) meant to evolve through one of the two only?
-4. **Empty EnrollmentLink.** It is accepted and means "enrollment link for no namespace". Should it be malformed?
-5. **Revoked keys and enrollment links.**
-   - [personal-namespace.md](personal-namespace.md) §9 says "A revoked key gets no enrollment link".
-   - Code: revocations are names, so a relay can detect a revoked key only from the certificate the peer sends. A device whose key is revoked can send a hello with no certificate and is admitted on an enrollment link by §7.3 rule 4, if the relay has a slot.
-   - Question: is the CA's refusal the intended backstop, or should the design statement change?
-6. **CA endpoints outside the namespace.** `in_enrollment` requires every carried name to be under `ns` before it tests the CA endpoints. A trust context that names a CA endpoint outside `/<ns>` therefore cannot be reached over an enrollment link. Is such a context valid?
-7. **Rate limit counts Ack-only frames.** The enrollment-link bucket charges every received frame, including NDNLPv2 Ack-only frames. On the relay side (burst 32, 4/s), the device's Acks for a fragmented answer can drain the bucket. The relay then drops Interests and its fragments are retransmitted needlessly. Should link-only frames be exempt?
-8. **Namespace route for inbound `node` peers.** The `ndn-link` crate documentation and the `routes_for` comment say the namespace route is installed for "a relay (a `node` device this device dials)". `routes_for` installs it for any identified `node` peer that has a peer entry, including one matched on an inbound link (§10 rule 2). Which is intended?
-9. **Handshake refusal count never decays.** A source's refusals accumulate with no time window until they reach 8, and only then trigger the 60 s cooldown. Should the count expire?
-10. **Idle detection.** Only the relay closes idle enrollment links. Ack-only frames and QUIC keep-alives do not count as activity. Is a device-side idle close wanted?
-11. **Duplicate rule without an own fingerprint.** If a side cannot read its own fingerprint at registration, it treats a duplicate as same-direction (newer wins). This can disagree with the peer. Should it refuse instead?
-12. **P-256 key comparison is byte-exact.** A certificate whose `Content` encodes the same P-256 key differently (for example a compressed point) is refused with 0x11. Should keys be compared after canonicalization?
-13. **Datagrams before the verdict.** No code stops a peer from sending NDN datagrams before the verdicts. ndn-rs only buffers them. This spec makes such early sending a MUST NOT (§5.4). Should a receiver also discard them?
-14. **Location of the code.** The admission rules (§7–§13) moved from the ndn-fwd binary into the `ndn-link` crate (ndn-ext/crates/faces/ndn-link); ndn-fwd now only hosts it. ndn-mobile has no link implementation, so there is no second copy to diverge.
+These points were open when this spec was first written. Each was decided, and code and spec now agree.
+
+1. **Failed exchanges close with 0x15** (§6.3). Earlier, a malformed message, an unsupported LinkVersion or a missed `MESSAGE_DEADLINE` dropped the connection, and quinn closed it with code 0 and an empty reason. The peer read that as Shutdown (transient) and redialed every ≤ 30 s forever, and the "update the older of the two" text was only logged locally. Now the side that detects the failure closes with 0x15 and the reason, and a listener counts it against the source. A version mismatch is non-transient on both sides: the peer backs off `BACKOFF_REFUSED`, because only a software update on one side changes the outcome. A missed deadline stays transient for the side that waited, since the peer may only be slow.
+2. **Chain length: kept as is.** The sender sends at most 8 certificates in total (leaf + 7 issuers). The receiver accepts the leaf + up to 8 issuers. Accepting one more than is sent costs nothing and interoperates both ways. No wire change.
+3. **TLV criticality follows NDN** (§5). Types 0–31 are critical, as in NDN Packet Format v0.3, and LinkVersion is exactly one byte. Version policy: the ALPN `ndn-link/1` names the transport framing (control stream and datagrams) and changes only for a protocol that cannot share this handshake. LinkVersion versions the link messages, and a peer of another version is refused with 0x15 naming both versions. No implementation sent either of the newly malformed forms.
+4. **An empty EnrollmentLink is malformed** (§5.3). It meant "an enrollment link for no namespace", which carries nothing. No sender produces it: a relay with no eligible namespace refuses with 0x10.
+5. **A known revoked key gets no enrollment link** (§7.1). A side refuses with 0x12 any key it knows a revoked certificate of, whatever the hello carries; `ndn-link` asks the host (`LinkTrust::known_certificate_of_key`), and ndn-fwd looks the key up in the validator's certificate cache. A key the side knows no certificate of cannot be told from a new one, and a revoked device can always make a new key. For those keys the CA, which refuses to certify a revoked device again, remains the backstop. The design statement in [personal-namespace.md](personal-namespace.md) §9 holds for every key a relay can tie to a revoked certificate.
+6. **CA endpoints outside the namespace: kept.** A trust context that names a CA endpoint outside `/<ns>` is valid, but an enrollment link does not carry that endpoint: a relay forwards only names under the namespace for a device it does not know. Root devices put CA endpoints under the namespace; ndn-rs uses `/<ns>/CA`.
+7. **Ack-only frames are free** (§8.3). The enrollment-link bucket now charges only frames that carry a network packet or a fragment of one. Before, a device's acknowledgements of a fragmented answer drained the relay's bucket (burst 32, 4/s), so the relay dropped the device's Interests and retransmitted its fragments needlessly.
+8. **The namespace route goes to a `node` this side dials** (§10 rule 2), whichever side's dial the link came from. This is what the `ndn-link` documentation said. A node that only links in gets its device route. Keying on "this side dials that peer", and not on the link's direction, keeps the routes the same when the duplicate-link rule keeps the other side's dial.
+9. **The refusal count decays** (§13.2). Refusals count within a 60 s window (`HandshakeLimits::refusal_window`). Before, a source's refusals added up with no time limit, so 8 refusals spread over days still triggered the cooldown.
+10. **No device-side idle close.** The relay's idle close frees scarce enrollment slots. A device has no slots to free, and it must keep its link while it waits for an approval.
+11. **Duplicate rule without an own fingerprint: kept** (newer wins). A side lacks its own fingerprint only when it lost its link key mid-run, and then it cannot complete another handshake anyway. If the two sides disagree, both links close with 0x01 (transient) and the redial converges.
+12. **P-256 key comparison stays byte-exact** (§7.1 step 3). A certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2, which is how ndn-rs and ndn-cxx write it. A compressed point is refused with 0x11.
+13. **Datagrams before the verdict.** A sender MUST NOT send them (§5.4). A receiver MAY deliver ones that arrived early once it has admitted the link. ndn-rs does this, through the scope of an enrollment link. Discarding them would lose packets for no gain, since the link is admitted by then.
+14. **Location of the code** (informative). The admission rules (§7–§13) are in the `ndn-link` crate (ndn-ext/crates/faces/ndn-link), and ndn-fwd hosts it. ndn-mobile has no link implementation, so there is no second copy to diverge.
 
 ## Appendix A. Code references (non-normative)
 
@@ -766,16 +765,16 @@ Field breakdown of the fragment:
 | Claim | Location |
 |---|---|
 | ALPN `ndn-link/1`; internal server name `ndn-link` | Q/endpoint.rs:20, :24 |
-| TLS 1.3 only; ALPN set; SNI off; resumption off (dialer) | Q/endpoint.rs:322, :331–334 |
-| TLS 1.3 only; ALPN; no session storage, 0 tickets, 0 early data (listener) | Q/endpoint.rs:395, :399–404 |
-| keep-alive 10 s, idle 30 s, dial handshake 5 s | Q/endpoint.rs:46–48, :377–381 |
-| 1 bidi stream, 0 uni streams, 4 MiB datagram buffers | Q/endpoint.rs:382–385 |
+| TLS 1.3 only; ALPN set; SNI off; resumption off (dialer) | Q/endpoint.rs:344, :353–356 |
+| TLS 1.3 only; ALPN; no session storage, 0 tickets, 0 early data (listener) | Q/endpoint.rs:417, :421–426 |
+| keep-alive 10 s, idle 30 s, dial handshake 5 s | Q/endpoint.rs:46–48, :398–401 |
+| 1 bidi stream, 0 uni streams, 4 MiB datagram buffers | Q/endpoint.rs:404–407 |
 | `max_datagram_frame_size` = min(buffer, 65535) | quinn-proto 0.11.16 src/transport_parameters.rs:170–172 |
-| handshake limits 64 / 4 / 8 / 60 s; refusal count and reset | Q/endpoint.rs:70–79, :103–118 |
-| Retry when busy (in_flight × 2 ≥ max); refuse over limits | Q/endpoint.rs:169–171, :271–296 |
+| handshake limits 64 / 4 / 8 / 60 s, refusal window 60 s; refusal count, decay and reset | Q/endpoint.rs:59–84, :108–162 (test :459–484) |
+| Retry when busy (in_flight × 2 ≥ max); refuse over limits | Q/endpoint.rs:191–193, :293–318 |
 | CONNECTION_REFUSED → Busy | Q/link.rs:74–83 |
-| stateless-reset key derived from the device key (local) | Q/endpoint.rs:419–434 |
-| endpoint close with code + text, 1 s grace | Q/endpoint.rs:309–313; N/links.rs:102–114 |
+| stateless-reset key derived from the device key (local) | Q/endpoint.rs:441–456 |
+| endpoint close with code + text, 1 s grace | Q/endpoint.rs:331–335; N/links.rs:102–114 |
 | Ed25519 SPKI prefix (12 B), P-256 SPKI prefix (26 B), `04` check | Q/key.rs:18–26, :103–122 |
 | NDN public key form (raw Ed25519 / P-256 SPKI) | Q/key.rs:133–141 |
 | fingerprint = SHA-256(NDN public key); hex text; parse; `Ord` | Q/key.rs:55–85 |
@@ -786,16 +785,18 @@ Field breakdown of the fragment:
 | listener checks key type only | Q/verify.rs:131–138 |
 | certificate Content: Ed25519 SPKI unwrapped to raw, else as is | ndn-rs/crates/security/ndn-security/src/cert_cache.rs:31–38; …/spki.rs:30–58 |
 | TLV-TYPEs 0x0450/0x0451/0x0452/0x0454; version 1; MAX_MESSAGE | Q/message.rs:21–32 |
-| hello encode / decode (version first byte, even skip, odd error) | Q/message.rs:44–81 |
-| verdict encode / decode (Name only in 0x0454) | Q/message.rs:93–138 |
-| close codes and transient set | Q/message.rs:156–236 |
-| hello exchange order; verdict exchange; datagram check; FIN | Q/link.rs:151–237 |
-| message read: 20-byte header, expected type, MAX_MESSAGE | Q/link.rs:259–305 |
+| hello encode / decode (version exactly one byte, types 0–31 and odd critical) | Q/message.rs:44–89, :150–155 |
+| verdict encode / decode (Name only in 0x0454, never empty) | Q/message.rs:101–148 |
+| decoder tests (vectors of §15.10) | Q/message.rs:284–295 |
+| close codes and transient set | Q/message.rs:173–253 |
+| hello exchange order; verdict exchange; datagram check; FIN | Q/link.rs:151–242 |
+| failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:254–280 (test: tests/link.rs:140–177) |
+| message read and write: 20-byte header, expected type, MAX_MESSAGE, peer's close reason | Q/link.rs:282–338 |
 | close mapping and `is_transient` of errors | Q/link.rs:66–101 |
-| implicit close on drop = code 0, empty reason | quinn 0.11.12 src/connection.rs:946–961, :1254–1257 (lockfile pins quinn 0.11.9; same code at :928–939, :1241–1243) |
-| DATAGRAM_FLOOR 1100; send_mtu; TooLarge dropped | Q/link.rs:24, :383–395, :422–424 |
-| scoped face send / receive, Nack paths | Q/link.rs:426–461 |
-| scope: frame classification, fragments, rate bucket, Nack | Q/scope.rs:28–35, :142–240, :242–244, :272–332 |
+| a dropped connection closes with code 0 and an empty reason (what §6.3 forbids) | quinn 0.11.12 src/connection.rs:946–961, :1254–1257 (lockfile pins quinn 0.11.9; same code at :928–939, :1241–1243) |
+| DATAGRAM_FLOOR 1100; send_mtu; TooLarge dropped | Q/link.rs:24, :456–459, :422–424 |
+| scoped face send / receive, Nack paths | Q/link.rs:460–495 |
+| scope: frame classification, fragments, rate bucket (Ack-only frames free), Nack | Q/scope.rs:28–35, :141–243, :245–247, :274–335 |
 | LP wrap / fragment / reliable / Nack / Ack encoders | ndn-rs/crates/core/ndn-packet/src/lp/encode.rs:7–92 |
 | fragment if len + 4 > mtu; plain LP wrap otherwise | ndn-rs/crates/core/ndn-transport/src/link_service/mod.rs:364–428 |
 | fragments always carry TxSequence (not gated) | …/link_service/features/reliability.rs:140–156; …/link_service/mod.rs:287–313 |
@@ -804,28 +805,29 @@ Field breakdown of the fragment:
 | NackReason NoRoute = 150 | ndn-rs/crates/core/ndn-packet/src/nack.rs:29, :40 |
 | constants MESSAGE_DEADLINE … ENROLLMENT_ANSWERS (`ndn_link::policy`) | N/policy.rs:10–42 |
 | MAX_STATUS_HOLD = 60 s | ndn-rs/crates/security/ndn-cert/src/approval.rs:104 |
-| LinkTransportConfig::default used by ndn-fwd | F/links.rs:169 |
+| LinkTransportConfig::default used by ndn-fwd | F/links.rs:175 |
 | hello = own certificate chain | N/links.rs:166–169; F/links.rs:76–78; F/own_certs.rs:218–250 |
-| known certificates for offline validation (served, then engine cache) | F/links.rs:80–86; N/host.rs:25–31 |
+| known certificates for offline validation (served, then engine cache); certificate of a key by fingerprint | F/links.rs:80–92; N/host.rs:26–38 |
 | own certificate / own role / namespace_of | N/admission.rs:93–121 |
 | enrollment eligibility | N/admission.rs:125–159 |
 | enrollment slots 32 / 4 per source, Busy | N/slots.rs:34–71 |
-| admission → verdict + scope (directions, filter, rates) | N/admission.rs:308–355 |
-| relink on key switch, 0x03 | N/links.rs:119–123, :491–493; N/table.rs:139–176; F/links.rs:212–225 |
-| identify steps 1–11 | N/admission.rs:162–264 |
-| offline validation, depth 8, no fetch | N/admission.rs:267–284 |
+| admission → verdict + scope (directions, filter, rates) | N/admission.rs:340–385 |
+| relink on key switch, 0x03 | N/links.rs:119–123, :496–498; N/table.rs:139–176; F/links.rs:218–231 |
+| known revoked key refused 0x12 before the hello is read | N/admission.rs:162–165, :295–315 (test :802–857) |
+| identify steps 1–11 | N/admission.rs:166–271 |
+| offline validation, depth 8, no fetch | N/admission.rs:274–293 |
 | peer entry lookup (first by key or device); is_relay | N/peer.rs:42–56, :63–68 |
-| decision rules 7.3 | N/admission.rs:288–305, :367–499 |
-| routes and VIA_RELAY_COST | N/routes.rs:16–51 |
-| route origin static, CHILD_INHERIT | F/links.rs:105–122 |
-| establish: hello, decide, slot, admit, reliability choice, register, routes, idle close | N/links.rs:164–302 |
+| decision rules 7.3 | N/admission.rs:320–336, :399–530 |
+| routes and VIA_RELAY_COST; namespace route only for a node this side dials | N/routes.rs:11–51; N/links.rs:247–252 |
+| route origin static, CHILD_INHERIT | F/links.rs:111–128 |
+| establish: hello, decide, slot, admit, reliability choice, register, routes, idle close | N/links.rs:164–307 |
 | duplicate-link rule `keeps_existing`; register | N/table.rs:24–35, :89–115 (test :206) |
 | revocation closes links | N/links.rs:85–89; N/table.rs:179–200 |
-| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s) / persistence | N/links.rs:430–488; N/policy.rs:48–80 |
-| dial over path candidates and resolved addresses | N/links.rs:360–393; N/host.rs:60–84 |
+| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s) / persistence | N/links.rs:435–493; N/policy.rs:48–80 |
+| dial over path candidates and resolved addresses | N/links.rs:365–398; N/host.rs:66–90 |
 | `[[peer]]` → PeerSpec | F/links.rs:30–58 |
-| `in_enrollment` / `is_key_or_certificate_name` | N/admission.rs:507–528 |
-| name filter test cases | N/admission.rs:552–585 |
+| `in_enrollment` / `is_key_or_certificate_name` | N/admission.rs:539–560 |
+| name filter test cases | N/admission.rs:584–617 |
 | LinkPolicy fields, default, allows_link / allows_relay | ndn-rs/crates/security/ndn-security/src/trust_context/mod.rs:278–318 |
 | link_policy default; admits_enrollment_links; is_revoked prefix | …/trust_context/mod.rs:596–598, :606–608, :660–662 |
 | `trust-context` keyword; rdr_prefix | …/trust_context/mod.rs:55; ndn-rs/crates/security/ndn-cert/src/onboarding.rs:57–63 |

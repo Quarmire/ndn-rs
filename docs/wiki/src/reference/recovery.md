@@ -62,7 +62,9 @@ A YubiKey kit's token is chosen with `--kit-yubikey-serial` /
 a key replaces whatever the slot held, for good, so the kit is refused on the
 root's own token (one lost token would lose both) and in a slot that already
 holds a key — or whose firmware cannot tell (older than 5.2.3) — unless
-`--replace-slot` says that key is not needed (`ndn_cert::SlotGuard`).
+`--replace-slot` says that key is not needed (`ndn_cert::SlotGuard`). A token
+with firmware older than 5.3 is refused outright: opening the kit later reads
+its key from the slot's PIV metadata, which needs 5.3.
 
 The CLI makes the key, the root signs `N+1`, and the CLI hands it to the
 running daemon that uses the same PIB (`security/context-update`), which
@@ -77,7 +79,8 @@ start; any other socket error is a refusal that names it.
 The outcome is the daemon's answer, never a timeout. A request it does not
 answer in time (another change of the namespace may run there) is made again
 with the same version; the daemon answers `200` for a version it already took
-and stores byte for byte, so the answer always says what became of it. Only
+and stores byte for byte, so the answer always says what became of it. After
+10 waits of 30 s without an answer the outcome is reported as not known. Only
 a refusal undoes anything: a file kit is written before the root signs and
 removed if the daemon refuses the version, so there is never an anchor
 without its kit; when no answer says what happened, the kit is kept and

@@ -186,6 +186,14 @@ impl Interest {
         compute_interest_signed_region(&self.raw).ok().flatten()
     }
 
+    /// The part of the Interest its `ParametersSha256DigestComponent`
+    /// covers, as on the wire: the `ApplicationParameters` element and every
+    /// element after it (`InterestSignatureInfo`, `InterestSignatureValue`).
+    /// `None` when the Interest carries no `ApplicationParameters`.
+    pub fn parameters_portion(&self) -> Option<Bytes> {
+        decode_parameters_portion(&self.raw).ok().flatten()
+    }
+
     /// The full on-wire Interest bytes (empty for an unencoded [`Interest::new`]).
     pub fn raw(&self) -> &Bytes {
         &self.raw
@@ -363,6 +371,23 @@ fn decode_app_params(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
         let (typ, val) = inner.read_tlv()?;
         if typ == tlv_type::APP_PARAMETERS {
             return Ok(Some(val));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_parameters_portion(raw: &Bytes) -> Result<Option<Bytes>, PacketError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = TlvReader::new(raw.clone());
+    let (_, value) = reader.read_tlv()?;
+    let mut inner = TlvReader::new(value.clone());
+    while !inner.is_empty() {
+        let start = inner.position();
+        let (typ, _) = inner.read_tlv()?;
+        if typ == tlv_type::APP_PARAMETERS {
+            return Ok(Some(value.slice(start..)));
         }
     }
     Ok(None)

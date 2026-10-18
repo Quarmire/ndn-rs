@@ -59,14 +59,6 @@ pub enum KeyAlgorithm {
 
 const DEFAULT_CERT_VALIDITY_MS: u64 = 365 * 24 * 3600 * 1_000;
 
-/// 8 random bytes formatted as 16 lowercase hex chars; populates the
-/// `<key-id>` slot of the key name.
-fn ephemeral_keyid() -> String {
-    let mut bytes = [0u8; 8];
-    let _ = getrandom::getrandom(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 impl KeyChain {
     /// Ephemeral in-memory identity with a fresh Ed25519 key
     /// `<name>/KEY/<key-id>`, self-signed with a 365-day certificate
@@ -94,16 +86,10 @@ impl KeyChain {
             .map_err(|_| TrustError::KeyStore(format!("invalid NDN name: {}", name.as_ref())))?;
 
         // NDN Certificate Format v2: the key is `<name>/KEY/<key-id>` (a
-        // random key id); `issue_self_signed` names its certificate
-        // `<key>/self/<version>`.
+        // random key id; a failing RNG is an error); `issue_self_signed`
+        // names its certificate `<key>/self/<version>`.
         let mgr = SecurityManager::new();
-        let keyid = ephemeral_keyid();
-        let key_name = name
-            .clone()
-            .append("KEY")
-            .append_component(ndn_packet::NameComponent::generic(
-                bytes::Bytes::copy_from_slice(keyid.as_bytes()),
-            ));
+        let key_name = crate::cert_name::new_key_name(&name)?;
         match algo {
             crate::KeyAlgorithm::Ed25519 => {
                 mgr.generate_ed25519(key_name.clone())?;

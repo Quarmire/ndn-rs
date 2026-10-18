@@ -108,7 +108,7 @@ impl ChallengeHandler for EmailChallenge {
 
             match phase {
                 "awaiting_email" => {
-                    let otp = generate_otp();
+                    let otp = generate_otp()?;
                     sender.send(&email, &otp).await.map_err(|e| {
                         CertError::InvalidRequest(format!("email send failed: {e}"))
                     })?;
@@ -198,11 +198,11 @@ impl ChallengeHandler for EmailChallenge {
     }
 }
 
-fn generate_otp() -> String {
+fn generate_otp() -> Result<String, CertError> {
     let mut buf = [0u8; 4];
-    let _ = getrandom::getrandom(&mut buf);
+    crate::ecdh::fill_random(&mut buf)?;
     let n = u32::from_be_bytes(buf) % 1_000_000;
-    format!("{n:06}")
+    Ok(format!("{n:06}"))
 }
 
 fn sha256_hex(input: &str) -> String {

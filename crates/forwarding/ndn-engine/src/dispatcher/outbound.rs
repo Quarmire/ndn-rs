@@ -61,19 +61,39 @@ impl PacketDispatcher {
                 continue;
             }
             debug!(target: t::SECURITY, face=%d.face, name=%d.name, refusal=%refusal, "telling a local downstream its Data was refused");
-            let intent = EgressIntent {
-                headers: LpHeaders {
-                    pit_token: d.lp_pit_token.clone(),
-                    ..Default::default()
-                },
-                nack: Some(ndn_packet::NackReason::Refused(refusal)),
-            };
-            if let Some(state) = self.face_states.get(&d.face) {
-                state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
-            }
-            let interest = ndn_packet::Nack::interest_wire(&d.name, &d.selector, d.nonce);
-            self.enqueue_send(d.face, interest, intent).await;
+            self.nack_downstream(
+                d.face,
+                ndn_packet::Nack::interest_wire(&d.name, &d.selector, d.nonce, d.parameters.as_ref()),
+                d.lp_pit_token.clone(),
+                ndn_packet::NackReason::Refused(refusal),
+            )
+            .await;
         }
+    }
+
+    /// Send a Nack with `reason` to one downstream: `interest` is that
+    /// downstream's own Interest (rebuilt from its PIT in-record), and its
+    /// NDNLPv2 PitToken is echoed, so a consumer matching replies by
+    /// either finds its pending Interest.
+    pub(super) async fn nack_downstream(
+        &self,
+        face: FaceId,
+        interest: Bytes,
+        pit_token: Option<Bytes>,
+        reason: ndn_packet::NackReason,
+    ) {
+        let intent = EgressIntent {
+            headers: LpHeaders {
+                pit_token,
+                ..Default::default()
+            },
+            nack: Some(reason),
+        };
+        // NFD NOutNacks.
+        if let Some(state) = self.face_states.get(&face) {
+            state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
+        }
+        self.enqueue_send(face, interest, intent).await;
     }
 
     /// Classify an outbound packet into a [`TrafficClass`](crate::egress::TrafficClass).

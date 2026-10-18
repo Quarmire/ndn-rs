@@ -67,8 +67,8 @@ An envelope is unsigned. A consumer gets authenticity from two sources:
 Every signed object an envelope carries inline (the context Data, a certificate, a delegation)
 is verified by the consumer. The envelope layer never verifies it.
 
-The same TLV bytes are used in every carriage: base64url in a URI or QR code, raw bytes in a
-binary file. The kind in a URI is only a routing hint. The `Kind` TLV is authoritative.
+The same TLV bytes are used in every carriage: base64url in a URI, QR code or file. The kind
+in a URI is a routing hint that MUST match the `Kind` TLV (§5.2); the TLV is authoritative.
 
 ## 3. Kinds
 
@@ -156,6 +156,9 @@ Further producer rules:
   envelopes; use ContextData.
 - **capability.** A producer MUST omit Nonce when the nonce is empty. A decoded capability
   without Nonce has an empty nonce. ScopePattern elements keep their order.
+  - A request MUST carry a Nonce of 16 bytes (`CAPABILITY_NONCE_LEN`) from a
+    cryptographically secure RNG, fresh for every request.
+  - A grant SHOULD carry the Nonce of the request it answers.
 - **No other fields.** A producer MUST NOT emit fields not listed for the kind, and MUST NOT
   emit a field twice, ScopePattern excepted.
 
@@ -168,9 +171,12 @@ Further producer rules:
     length 0 and lengths above 8.
 - **NDN name string (CaPrefix, IdentityNamespace, KeyName, Namespace).** The UTF-8 NDN URI
   form of a Name, for example `/home/bob`. The envelope layer only requires valid UTF-8.
-  Consumers parse the string as an NDN URI (§7).
-  - Producers SHOULD emit the canonical URI form: generic components unescaped where
-    URI-unreserved, typed components in their `<type>=<value>` form.
+  Consumers parse the string as an NDN URI (§7) and compare Names, never strings.
+  - A producer MUST emit the canonical URI form: the string ndn-rs `Name` displays for the
+    parsed Name, so that parsing and displaying it again gives the same string. Generic
+    components are percent-escaped except URI-unreserved bytes; typed components use their
+    `<type>=<value>` form. Equal Names then give byte-identical envelopes. Parsers do not
+    check the form.
   - A namespace that a consumer validates (invite, §7.2) MUST consist only of
     GenericNameComponents whose bytes are ASCII letters, digits, `-`, `_`, `.` and `~`.
 - **UTF-8 string (Token, ScopePattern).** UTF-8 bytes, no terminator. A parser MUST reject
@@ -195,7 +201,10 @@ Further producer rules:
   The envelope layer treats all of these as opaque.
 - **PrincipalPubkey.** The principal's public key bytes as returned by the signer, opaque here.
 - **Grant.** The granting operator's certificate as NDN Data wire.
-- **Nonce.** Opaque bytes chosen by the requester. This spec sets no length.
+- **Nonce.** Opaque bytes chosen by the requester: 16 fresh random bytes in a request (§4.3).
+- **TtlSecs, capability.** A lifetime in seconds, counted from when the consumer decodes the
+  envelope. The envelope carries no issuance time. The consumer MUST treat it as a ceiling: it
+  does not act on the capability, or keep what it granted, past that time.
 
 ## 5. Text forms and carriage
 
@@ -219,7 +228,7 @@ trust-uri     = "ndn-trust://" kind-token "/" payload
 mirror-url    = "https://" domain "/t/" kind-token "#" payload
 kind-token    = "anchor" / "invite" / "delegation" / "recovery" / "bag" / "capability"
 payload       = b64url                         ; base64url(Envelope TLV), §5.1
-domain        = 1*( ALPHA / DIGIT / "-" / "." ) ; host chosen by the issuer; not validated
+domain        = 1*( ALPHA / DIGIT / "-" / "." ) [ ":" 1*DIGIT ] ; issuer's host, optional port
 b64url        = *( 4b64 ) [ b64 b64-tail2 / 2b64 b64-tail3 ]
 b64           = ALPHA / DIGIT / "-" / "_"
 b64-tail2     = "A" / "Q" / "g" / "w"
@@ -230,35 +239,41 @@ b64-tail3     = "A" / "E" / "I" / "M" / "Q" / "U" / "Y" / "c" / "g" / "k" / "o" 
 A producer MUST set `kind-token` to the token of the envelope's Kind (§3). Its output MUST
 match `trust-uri` or `mirror-url` exactly, with no surrounding whitespace.
 
-Accepted forms. A parser compatible with ndn-rs MUST accept everything below. The reference
-parser accepts exactly this set, quirks included (§10):
+Accepted forms. A parser MUST accept exactly the forms below:
 
 ```abnf
 envelope-text = *ws ( p-trust-uri / p-mirror / p-legacy ) *ws
-p-trust-uri   = "ndn-trust://" p-kind "/" *ws payload *ws
-p-kind        = *( %x00-2E / %x30-10FFFF )      ; anything without "/", may be empty;
-                                                ; NOT checked against the Kind TLV
-p-mirror      = ( "https://" / "http://" ) p-before "#" *ws payload *ws
-p-before      = *( %x00-22 / %x24-10FFFF )      ; no "#"; the whole text MUST contain "/t/"
-p-legacy      = "ndn-ctx:1:" version ":" *ws payload *ws
-version       = [ "+" ] 1*DIGIT                 ; decimal u64
+p-trust-uri   = "ndn-trust://" kind-token "/" *ws payload *ws
+p-mirror      = "https://" p-domain "/t/" kind-token "#" *ws payload *ws
+p-domain      = 1*( %x00-22 / %x24-2E / %x30-3E / %x40-10FFFF ) ; no "/", "?" or "#"
+p-legacy      = "ndn-ctx:1:" 1*DIGIT ":" *ws payload *ws         ; DIGIT run is a u64
 ws            = <Unicode White_Space>
 ```
 
-The prefixes `ndn-trust://`, `https://`, `http://` and `ndn-ctx:1:` are matched
+In `p-trust-uri` and `p-mirror`, `kind-token` MUST be the token of the decoded Kind (§3).
+The prefixes `ndn-trust://`, `https://` and `ndn-ctx:1:` and the kind token are matched
 case-sensitively. A parser processes the text as follows:
 
 1. Strip leading and trailing whitespace from the whole text.
-2. If the text starts with `ndn-ctx:1:`, it is the legacy form (§5.5).
-3. Otherwise, if it starts with `ndn-trust://`, the payload is everything after the first
-   `/` that follows the prefix. No `/` there gives MalformedUri.
-4. Otherwise, if it starts with `https://` or `http://` and contains `/t/` anywhere, the
-   payload is everything after the first `#`. No `#` gives MalformedUri.
-5. Anything else gives UnknownScheme.
+2. If the text starts with `ndn-ctx:1:`, it is the legacy form (§5.5). A version that is not
+   one or more ASCII digits fitting a u64 gives MalformedUri.
+3. Otherwise, if it starts with `ndn-trust://`, the kind token is everything up to the first
+   `/` after the prefix and the payload is everything after that `/`. No `/` there gives
+   MalformedUri.
+4. Otherwise, if it starts with `https://`:
+   - split off the fragment at the first `#`, then split the rest at its first `/` into
+     domain and path;
+   - if the path is not `t/<token>` with a token free of `/` and `?`, the text is not a
+     trust link: UnknownScheme;
+   - an empty domain, a domain containing `?`, or no `#` gives MalformedUri;
+   - the fragment is the payload.
+5. Anything else, `http://` included, gives UnknownScheme.
 6. Strip whitespace from the payload, base64url-decode it (§5.1, failure gives BadBase64) and
    decode the TLV (§6).
+7. If the kind token differs from the token of the decoded Kind, the result is
+   KindMismatch.
 
-A query string or a second `#` stays part of the payload and therefore fails base64url.
+A query string or a second `#` in the payload fails base64url.
 
 ### 5.3 URI form
 
@@ -277,7 +292,9 @@ never sent to the web server and never appears in HTTP access logs. A web page a
 - `ndn-fwd-tokens new --domain <d>` emits this form for invites.
 - `ndn-fwd init` prints an `anchor_url` with domain `ndn.local`.
 
-A producer MUST NOT move the payload into the path or query.
+A producer MUST NOT move the payload into the path or query. `<domain>` is a host name,
+optionally with `:port`. The mirror has no other path: the parser refuses anything but
+`/t/<kind>` (§5.2).
 
 ### 5.5 Legacy form (parse-only)
 
@@ -296,40 +313,55 @@ The QR content is the exact octets of a `trust-uri` or `mirror-url`. There is no
 wrapping, BOM, ECI or line break.
 
 Producer rules:
-- **Error correction.** A producer SHOULD use level **M**, which is what every ndn-rs renderer
-  uses.
-- **Version and mode.** A producer SHOULD pick the smallest version (1–40) that fits, and MAY
-  use any segment mode. ndn-rs uses optimal segmentation: base64url has lowercase letters, so
-  this is byte mode, with numeric segments where digit runs pay off.
+- **Error correction.** A producer MUST use level **M**.
+- **Version and mode.** A producer MUST encode the text as one byte-mode segment, and SHOULD
+  pick the smallest version (1–40) that holds it. Byte mode makes the size limit independent
+  of the text. ndn-rs renders through `ndn_trust_envelope::qr::encode`.
 - **Quiet zone.** A producer MUST keep a quiet zone of at least 4 modules.
-- **Size limit.** A producer MUST NOT emit an envelope that does not fit one QR symbol at its
-  chosen error-correction level. Structured Append (multi-symbol) is not used.
-- **Large envelopes.** For an `anchor` too large for one symbol, the producer SHOULD switch to
-  the fingerprint-only form (Namespace + AnchorFingerprint + Version, no ContextData). The
-  consumer then fetches the context by name.
+- **Size limit.** A producer MUST NOT render a text longer than **2331 bytes**
+  (`qr::MAX_TEXT_LEN`), the byte-mode capacity of a version-40 symbol at level M.
+  Structured Append (multi-symbol) is not used.
+- **Large anchors.** If the `trust-uri` of an `anchor` exceeds the limit, the producer MUST
+  render the by-reference form instead (`TrustEnvelope::qr_uri`):
+  - the same Namespace, AnchorFingerprint and Version;
+  - no ContextData and no Wire.
+
+  The consumer then fetches the context by name. That needs a link and a route to a node
+  that serves the context ([ndn-link.md](ndn-link.md)). Other kinds have no fallback: the
+  producer refuses to render them.
 
 Parser rules: a parser MUST accept any version, error-correction level and mode a standard
 decoder produces.
 
-Capacity of one version-40 symbol in byte mode (ISO/IEC 18004), and the largest `trust-uri`
-measured to fit with the reference renderer:
+Byte capacity of one version-40 symbol (ISO/IEC 18004):
 
-| EC level | Byte capacity | Largest URI measured |
+| EC level | Byte capacity | Used by ndn-rs |
 |---|---|---|
-| L | 2953 | 2949 |
-| M | 2331 | 2327 |
-| Q | 1663 | 1661 |
-| H | 1273 | not measured |
+| L | 2953 | no |
+| M | 2331 | yes: the size limit |
+| Q | 1663 | no |
+| H | 1273 | no |
 
-Measurements used the `qrcode` 0.14.1 crate, `recovery` envelopes with a pseudo-random payload,
-and kind token `recovery`. They grow in steps of 4 characters, which is why each largest URI
-sits slightly below the capacity.
+In byte mode every text up to the capacity fits. The test
+`qr::tests::limit_matches_the_renderer` checks this at M with the `qrcode` 0.14.1 crate:
+2331 bytes fit and 2332 bytes do not.
 
-Typical sizes from §8:
-- a fingerprint-only anchor for `/home/bob` is 125 characters (version 8 at M);
-- an invite carrying an expected fingerprint is 230 characters (version 11 at M);
-- an inline anchor with a real signed context is usually 1–3 KB. Check its size against the
-  table.
+Why M:
+- A QR is scanned off a screen or paper. M recovers about 15 % of the codewords, L about 7 %.
+- Parsers accept any level, so the choice does not affect interoperability.
+- L would hold an inline anchor only for the shortest namespaces (below), so the by-reference
+  fallback is needed at either level.
+
+Typical sizes:
+- a fingerprint-only anchor for `/home/bob` is 125 characters (version 8);
+- an invite carrying an expected fingerprint is 230 characters (version 11);
+- an inline anchor carries the whole signed context:
+  - The context `ndn-fwd init` makes for `/home/bob` was 1977 bytes, measured on a stored
+    `contexts/*.tc` file (2026-10-16).
+  - That gives a 2066-byte envelope and a 2774-character `trust-uri`: above the M limit, so
+    the QR carries the by-reference form. It is just under the L capacity.
+  - The namespace occurs about 21 times in that context. Each further byte of namespace adds
+    about 28 characters, so `/com/example/users/alice-smith` exceeds even L.
 
 ### 5.7 File and paste
 
@@ -339,9 +371,9 @@ Typical sizes from §8:
   - `ndn_cert::FileKit::read` parses it.
   A producer MUST write files that carry a secret (an invite token, a SafeBag) readable by
   the owner only.
-- **Binary file `.ndntrust`.** The raw Envelope TLV bytes (§4), with no base64. This form is
-  documented in the codec, but no producer or consumer in this repository reads or writes it
-  (§10, Q11).
+- **Files are text only.** No binary file form is defined. A file holds one `trust-uri` (or
+  `mirror-url`). Earlier codec docs mentioned a raw-TLV `.ndntrust` file, which nothing read
+  or wrote.
 - **Paste / clipboard / deep link.** The `trust-uri` or `mirror-url` text, parsed as in §5.2.
   Surrounding whitespace is ignored.
 - **NFC.** The `trust-uri` text. The NDEF record type is not specified (§10, Q13).
@@ -349,29 +381,36 @@ Typical sizes from §8:
 ## 6. Decoding and validation
 
 A parser MUST behave as follows. The error names are the reference implementation's. A parser
-MAY report them differently but MUST accept and refuse the same inputs. Behaviours marked
-*[lenient]* are what the reference does today and are listed as open questions (§10).
-Independent parsers MUST accept everything the reference accepts. Producers MUST NOT rely on
-any lenient behaviour.
+MAY report them differently but MUST accept and refuse the same inputs.
+
+**Evolvability rule.** A parser applies the NDN rule (NDN Packet Format v0.3, TLV-TYPE
+evolvability) to every element it does not recognize in its place:
+- A TLV-TYPE is **critical** if it is ≤ 31 or odd.
+- An unrecognized critical element makes the envelope invalid: UnknownCritical(type).
+- An unrecognized non-critical element is skipped, without looking at its value.
+
+A later format can therefore add optional fields with even types and required fields with odd
+types.
 
 ### 6.1 Outer element
 
 1. Read one TLV from the start of the buffer. An empty or truncated buffer, or a malformed
    VAR-NUMBER, gives Truncated.
 2. If its type is not `0x0470`, the result is BadTag(type).
-3. *[lenient]* Bytes after the Envelope element are ignored.
+3. Bytes after the Envelope element give Malformed("bytes after the envelope").
 
 ### 6.2 Envelope children
 
 1. Read the children in any order. Any malformed child gives Truncated.
-2. FormatVersion and Kind are the first byte of their value.
-   - An empty value counts as absent.
-   - *[lenient]* Bytes after the first are ignored.
-3. A repeated child replaces the earlier one (last wins).
-4. *[lenient]* Children of any other type are ignored, whatever their critical bit.
+2. FormatVersion and Kind MUST have a 1-byte value, else Malformed("format version length") or
+   Malformed("kind length").
+3. A second FormatVersion, Kind or Body gives Malformed("repeated field").
+4. Any other child is unrecognized (evolvability rule).
 5. Then, in this order:
    - FormatVersion absent: MissingField("format version").
-   - FormatVersion ≠ `1`: UnsupportedVersion.
+   - FormatVersion ≠ `1`: UnsupportedVersion. This comes before the next check, so a newer
+     format is refused as such and not by one of its new children.
+   - An unrecognized critical child: UnknownCritical(type).
    - Kind absent: MissingField("kind").
    - Kind not in 1–6: UnknownKind.
    - Body absent: MissingField("body").
@@ -380,23 +419,20 @@ any lenient behaviour.
 
 The body is decoded in two passes.
 
-**Pass 1** reads every body field in wire order, whatever the Kind. Any malformed field
-gives Truncated. Each known field is validated as it is read, and the first failure is
-returned:
+**Pass 1** reads every body field in wire order. Any malformed field gives Truncated. A field
+that the Kind defines (§4.3) is validated as it is read, and the first failure is returned:
 - Version, TtlSecs: 1–8 bytes, else Malformed("u64 field length").
 - CaPrefix, IdentityNamespace, Token, KeyName, Namespace, ScopePattern: valid UTF-8, else
   Malformed("non-utf8 string field").
 - AnchorFingerprint: exactly 32 bytes, else Malformed("anchor fingerprint length").
-- Direction: first byte. An empty value counts as absent; *[lenient]* extra bytes are
-  ignored.
+- Direction: exactly 1 byte, else Malformed("capability direction length").
+- A second occurrence of any field but ScopePattern: Malformed("repeated field").
+  ScopePattern accumulates in order.
 
-Further pass-1 rules:
-- *[lenient]* Fields that do not belong to the Kind are validated in the same way and then
-  dropped. For example, a 31-byte AnchorFingerprint inside a `delegation` is an error, while
-  a Token inside an `anchor` is silently ignored.
-- ScopePattern accumulates in order. For every other field the last occurrence wins
-  *[lenient]*.
-- *[lenient]* Unknown types are ignored, whatever their critical bit.
+A field that the Kind does not define is unrecognized, whether its type is unassigned or
+defined for another kind (evolvability rule). For example:
+- a Token (`0x0485`, odd) inside an `anchor` is refused;
+- a 31-byte AnchorFingerprint (`0x048E`, even) inside a `delegation` is skipped.
 
 **Pass 2** checks the per-kind requirements:
 
@@ -474,11 +510,18 @@ interoperating with ndn-rs flows.
      made.
 
   Details are in [recovery-kit.md](recovery-kit.md).
+- **Mobile** (`NdnTrust::parse`) keeps KeyName, the SafeBag, Namespace and AnchorFingerprint.
+  A bag with Namespace is a file recovery kit, not an identity. Mobile `load_identity`
+  refuses a SafeBag whose key is a namespace recovery key: its key name is
+  `<ns>/KEY/r<hex>`, derived from the certificate's own public key.
 
 ### 7.4 `capability`, `delegation`, `recovery`
 
 The envelope layer adds no checks for these kinds:
-- `capability`: the Grant certificate is decoded and its key learned by the bearer.
+- `capability`: the Grant certificate is decoded and its key learned by the bearer. TtlSecs
+  counts from decoding (§4.4). The envelope has no issuance time, so a captured request can
+  be replayed. A granting device SHOULD refuse a request whose Nonce it already granted
+  within TtlSecs.
 - `delegation`: the signed delegation is verified against PrincipalPubkey.
 - `recovery`: the bundle is consumed by the restore flow.
 
@@ -490,8 +533,8 @@ Generated by encoding the stated values with `ndn-trust-envelope` and checking t
 `decode(encode(v)) == v` and `from_uri(to_uri(v)) == v` (Appendix B). Opaque payloads are
 short placeholders, not real Data or SafeBags.
 
-In every vector, `FP` is the 32 bytes `00 01 02 … 1f`. The QR column gives the version chosen
-by the reference renderer at EC level M and at level L.
+In every vector, `FP` is the 32 bytes `00 01 02 … 1f`. The QR column gives the version in byte
+mode at EC level M (what the reference renderer uses) and, for comparison, at level L.
 
 ### 8.1 Annotated: `anchor`, fingerprint only
 
@@ -647,11 +690,13 @@ means the decode succeeds.
 |---|---|
 | `fd047032fd04710101fd04720101fd047324` B | accept: anchor, fingerprint only |
 | same, FormatVersion `02` | UnsupportedVersion(2) |
-| same, FormatVersion value `0100` | accept *[lenient]* |
-| same, FormatVersion value empty (`fd047100`) | MissingField("format version") |
+| same, FormatVersion value `0100` or empty (`fd047100`) | Malformed("format version length") |
 | same, Kind `00` / `07` | UnknownKind |
+| same, Kind value `0100` | Malformed("kind length") |
+| same, Kind written twice | Malformed("repeated field") |
 | `fd047032fd047324` B `fd04720101fd04710101` (children reversed) | accept |
-| B followed by `aabb` after the Envelope | accept *[lenient]* |
+| B followed by `aabb` after the Envelope | Malformed("bytes after the envelope") |
+| unknown Envelope child `fd0476` / `fd0477` | accept (skipped) / UnknownCritical(0x477) |
 | `fd04710101` (outer type `0x0471`) | BadTag(0x471) |
 | empty input | Truncated |
 | AnchorFingerprint of 31 or 33 bytes | Malformed("anchor fingerprint length") |
@@ -660,24 +705,29 @@ means the decode succeeds.
 | Version of 0 or 9 bytes | Malformed("u64 field length") |
 | Version `05` (1 byte) | accept, version 5 |
 | Namespace `ff` | Malformed("non-utf8 string field") |
-| unknown field `fd0490` or `fd0491` in Body | accept *[lenient]* |
-| Namespace `/a` then `/b` | accept, namespace `/b` *[lenient]* |
+| unknown field `fd0490` in Body | accept (skipped) |
+| unknown field `fd0491` in Body | UnknownCritical(0x491) |
+| Token `fd0485` in an anchor body | UnknownCritical(0x485) |
+| Namespace `/a` then `/b` | Malformed("repeated field") |
 | capability Direction `02` | Malformed("capability direction") |
-| capability Direction value `0105` | accept, grant *[lenient]* |
+| capability Direction value `0105` | Malformed("capability direction length") |
 | invite with empty Token | accept at the envelope layer (refused by §7.2) |
 | recovery with empty Wire | accept |
-| `ndn-trust://anchor/` + base64url(§8.7 bytes) | accept as **recovery** (kind token not checked) |
-| `ndn-trust:///` + same payload | accept |
+| `ndn-trust://anchor/` + base64url(§8.7 bytes) | KindMismatch |
+| `ndn-trust:///` + same payload | KindMismatch |
 | `"  \n" + §8.7 URI + " \t\n"` | accept |
 | §8.7 payload with an inner space, `==` padding, or `?x=1` appended | BadBase64 |
 | `ndn-trust://recovery/+w` | BadBase64 |
 | `ndn-trust://recovery/BB` (non-canonical trailing bits) | BadBase64 |
 | `NDN-TRUST://recovery/…` | UnknownScheme |
-| `http://x/t/recovery#` + payload | accept |
-| `https://x/recovery#` + payload | UnknownScheme |
+| `https://x/t/recovery#` + payload | accept |
+| `https://x:8443/t/recovery#` + payload | accept |
+| `http://x/t/recovery#` + payload | UnknownScheme |
+| `https://x/recovery#` + payload, `https://x/a/t/recovery#` + payload | UnknownScheme |
 | `https://x/t/recovery` | MalformedUri |
 | `ndn-trust://anchor` | MalformedUri |
-| `ndn-ctx:1:+42:Y3R4` | accept, version 42 |
+| `ndn-ctx:1:42:Y3R4` | accept, version 42 |
+| `ndn-ctx:1:+42:Y3R4` | MalformedUri |
 
 ## 9. Security considerations
 
@@ -692,49 +742,70 @@ means the decode succeeds.
   by name (§7.1). A fingerprint-only anchor without Version accepts any version signed by the
   expected anchor.
 - **Unsigned legacy context.** It is never adopted by default (§5.5, §7.1).
+- **Capability replay.** A capability carries no issuance time. A captured request can be
+  shown again; the fresh Nonce lets a granting device notice (§7.4).
+- **Kind token.** A URI whose token disagrees with its Kind is refused (§5.2), so a link
+  cannot be routed to one flow while carrying another kind.
 
 ## 10. Open questions
 
-- **Q1. Trailing bytes after the Envelope element.** They are accepted and ignored (§6.1).
-  Should a parser reject them?
-- **Q2. Unknown children and body fields.** They are ignored whatever the NDN critical bit
-  (§6.2, §6.3). Should an unknown type that is critical under NDN rules (odd, ≥ 32) be
-  rejected, so that future required fields can be added safely?
-- **Q3. Extra bytes after the first.** For FormatVersion, Kind and Direction they are
-  ignored. Should their length be required to be exactly 1?
-- **Q4. Duplicates.** Fields other than ScopePattern take the last occurrence. Reject
-  duplicates instead?
-- **Q5. Fields of another kind** are validated (and can fail decoding) but are otherwise
-  ignored (§6.3). Should a parser skip them unvalidated, or reject them?
-- **Q6. URI kind token.** It is not checked against the Kind TLV; an empty token is
-  accepted. Should a mismatch be refused?
 - **Q7. u64 fields.** They are emitted as 8 bytes, not as NDN NonNegativeInteger (1/2/4/8
   minimal), and decoded from any 1–8 bytes. Should the format switch to NonNegativeInteger
-  in a FormatVersion 2?
-- **Q8. Mirror detection.** It accepts `http://` and finds `/t/` anywhere in the string,
-  fragment included (§5.2). Should it be limited to `https://` with `/t/<kind>` as the path?
-- **Q9. Legacy version.** It accepts a leading `+`, because Rust `u64::from_str` does.
-- **Q10. Mobile `bag`.** The ndn-mobile parser (`NdnTrust::parse`) drops Namespace and
-  AnchorFingerprint from `bag`, so a mobile host cannot learn a file kit's namespace or
-  expected fingerprint. ndn-cert `FileKit::read` keeps them. Which behaviour is intended for
-  mobile recovery?
-- **Q11. `.ndntrust` binary files.** The crate documents raw-TLV `.ndntrust` files, but the
-  only file the tree writes (the recovery kit) is the text URI. Keep the binary form,
-  or define files as text only?
-- **Q12. QR error-correction level.** All renderers use M (2331-byte limit). The namespace
-  test asserts an inline anchor fits L (2953). Which level is normative? See the bug report
-  below.
+  in a FormatVersion 2? **Recommendation:** yes, in FormatVersion 2 only: emit
+  NonNegativeInteger and refuse lengths other than 1, 2, 4 and 8. FormatVersion 1 parsers
+  already accept those lengths, but new output changes the canonical bytes and the §8
+  vectors.
 - **Q13. NFC and OS integration.** The NFC NDEF record type is not specified in this tree,
   and neither is the OS deep-link registration (`ndn-trust` scheme handler, universal-link
-  association for `/t/`).
+  association for `/t/`). **Recommendation:** one NFC Forum URI record (TNF well-known, type
+  `U`, identifier code `00`, the `trust-uri` text). Register the `ndn-trust` scheme, and an
+  associated-domains / App Links entry for paths `/t/*` on the issuer's mirror domain.
 - **Q14. Delegation and recovery payloads.** The formats of the `delegation` Wire
   (`SignedDelegation`), PrincipalPubkey (raw key, which algorithm?) and the `recovery` bundle
-  are not specified by any spec in this set.
-- **Q15. Capability timing and nonce.** TtlSecs has no reference time in the envelope (the
-  envelope has no issuance time). The nonce has no minimum length or uniqueness rule, and
-  `ndn-pair-kiosk` uses a constant nonce.
-- **Q16. Name strings.** No canonical-form requirement is enforced. Two producers can emit
-  different strings for the same Name, so their envelopes are not byte-identical.
+  are not specified by any spec in this set. **Recommendation:** specify them, with an
+  algorithm tag for PrincipalPubkey, in a spec of the mobile delegation and restore flows,
+  and reference it from §4.4.
+
+### Decisions
+
+- **Q1 Trailing bytes.** Refused (§6.1). No producer emits them, and ignoring them let a
+  damaged or altered file pass.
+- **Q2 Unknown types.** NDN evolvability rule: critical types (≤ 31 or odd) refused, others
+  skipped (§6). A later format can add required fields safely. Every producer emits only
+  registry types.
+- **Q3 One-byte fields.** FormatVersion, Kind and Direction must be exactly 1 byte (§6.2,
+  §6.3). Producers always emit 1 byte, and extra bytes had no meaning.
+- **Q4 Duplicates.** A repeated field other than ScopePattern is refused (§6.3). With last
+  wins, a reviewer of the bytes could see one value while the parser used another. No
+  producer repeats a field.
+- **Q5 Fields of another kind.** Treated as unrecognized: critical refused, non-critical
+  skipped unread (§6.3). One rule covers unknown and foreign fields. No producer emits them.
+- **Q6 URI kind token.** It must equal the token of the Kind TLV, else KindMismatch (§5.2).
+  A host routes on the token before decoding, so a mismatch steers the wrong flow. Every
+  producer derives the token from the Kind.
+- **Q8 Mirror detection.** `https://` only, path exactly `/t/<kind>`, payload in the
+  fragment (§5.2). `ndn-fwd-tokens` and `ndn-fwd init` emit only this form, and `http://`
+  would load the page carrying a bearer secret in clear.
+- **Q9 Legacy version.** One or more ASCII digits; a leading `+` is refused (§5.2). Nothing
+  emits the legacy form.
+- **Q10 Mobile `bag`.** Mobile keeps Namespace and AnchorFingerprint, and `load_identity`
+  refuses a namespace recovery key's SafeBag (§7.3). A host needs the kit's namespace and
+  expected fingerprint to recover, and a recovery key loaded as the operator identity would
+  sign as a device.
+- **Q11 Binary files.** Files carry the text form only (§5.7). Nothing read or wrote
+  `.ndntrust`, and one file form keeps files and pastes identical.
+- **Q12 QR level.** Level M, byte mode, limit 2331 bytes (`qr::MAX_TEXT_LEN`). An inline anchor
+  above the limit is rendered by reference (§5.6). Every renderer already used M, M survives
+  damage better, and even L cannot hold an inline anchor for longer namespaces. The
+  namespace test now checks against the shared limit, not L's.
+- **Q15 Capability timing and nonce.** TtlSecs counts from decoding by the consumer. A request
+  carries 16 fresh random bytes of Nonce, which a grant echoes, and a granting device should
+  refuse a nonce it already granted (§4.3, §4.4, §7.4). An issuance time would need a format
+  change; the nonce is the replay guard. `ndn-pair-kiosk` now draws a fresh nonce.
+- **Q16 Name strings.** Producers emit the canonical URI form; parsers do not check it, and
+  consumers compare parsed Names (§4.4). Equal values give byte-identical envelopes without a
+  Name codec in the envelope layer. `ndn-fwd-tokens` (`--ca`) and `ndn-pair-kiosk` now
+  canonicalize their input.
 
 ## Appendix A. Code references (non-normative)
 
@@ -742,21 +813,25 @@ Paths are relative to the workspace root. Code in `ndn-fwd` may move to library 
 
 | Claim | Location |
 |---|---|
-| Kinds, directions, carriage list | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:4-40` |
-| TLV type numbers 0x0470–0x048F | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:48-68` |
-| Fingerprint length 32, FORMAT_VERSION 1, scheme and legacy tags | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:70-77` |
-| Kind codes 1–6, unknown-kind error, kind tokens | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:96-131` |
-| Direction codes 0/1 | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:142-156` |
-| Envelope order FormatVersion, Kind, Body | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:249-257` |
-| Body field order per kind; 8-byte u64; empty nonce omitted | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:259-341` |
-| Outer decode, BadTag, children order-free, first byte, ignore unknown, error order | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:344-372` |
-| Body decode (pass 1), fingerprint length, last-wins, ScopePattern push | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:374-418` |
-| Per-kind requirements (pass 2) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:420-463` |
-| `to_uri`, `to_https_url` | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:465-482` |
-| `from_uri`: trim, legacy, scheme split, mirror rule, base64 | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:487-520` |
-| UTF-8 and u64 (1–8 bytes) rules | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:523-534` |
-| Error set | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:536-557` |
-| base64 engine `URL_SAFE_NO_PAD`, crate 0.22.1 | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:42-43`; `ndn-rs/Cargo.toml:181`; `ndn-rs/Cargo.lock:136-137` |
+| Kinds, directions, carriage list, decoding rules summary | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:4-51` |
+| TLV type numbers 0x0470–0x048F | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:61-81` |
+| Fingerprint length 32, FORMAT_VERSION 1, `CAPABILITY_NONCE_LEN` 16, scheme, mirror and legacy tags | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:83-95` |
+| Kind codes 1–6, unknown-kind error, kind tokens, fields per kind | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:114-181` |
+| Direction codes 0/1 | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:192-206` |
+| Envelope order FormatVersion, Kind, Body | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:297-307` |
+| Body field order per kind; 8-byte u64; empty nonce omitted | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:309-391` |
+| Outer decode: BadTag, trailing bytes, one-byte and repeated children, critical rule, error order | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:393-434` |
+| Body decode (pass 1): fields per kind, critical rule, repeated fields, fingerprint and Direction length, ScopePattern push | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:436-490` |
+| Per-kind requirements (pass 2) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:492-535` |
+| `to_uri`, `to_https_url` | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:537-554` |
+| `qr_uri`: inline anchor falls back to by-reference | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:556-584` |
+| `from_uri`: trim, legacy digits, scheme split, mirror rule, base64, kind-token check | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:586-646` |
+| Critical rule, repeated field, one-byte value | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:648-669` |
+| UTF-8 and u64 (1–8 bytes) rules | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:671-682` |
+| Error set (incl. UnknownCritical, KindMismatch) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:684-709` |
+| Decoding-rule tests (trailing bytes, critical rule, one-byte, repeated, kind token, mirror, legacy) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:911-1124` |
+| QR: level M, limit 2331, byte-mode `encode`; limit/renderer and fallback tests | `ndn-rs/crates/security/ndn-trust-envelope/src/qr.rs:12-32,59-122` |
+| base64 engine `URL_SAFE_NO_PAD`, crate 0.22.1 | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:53-54`; `ndn-rs/Cargo.toml:181`; `ndn-rs/Cargo.lock:136-137` |
 | VAR-NUMBER minimal decode | `ndn-rs/crates/core/ndn-tlv/src/lib.rs:24-61` |
 | TLV-TYPE range, length bound | `ndn-rs/crates/core/ndn-tlv/src/reader.rs:47-107` |
 | Minimal VAR-NUMBER encode | `ndn-rs/crates/core/ndn-tlv/src/writer.rs:33-66` |
@@ -765,20 +840,21 @@ Paths are relative to the workspace root. Code in `ndn-fwd` may move to library 
 | Anchor consumer checks | `ndn-rs/crates/security/ndn-cert/src/onboarding.rs:237-298` |
 | Invite consumer checks | `ndn-rs/crates/security/ndn-cert/src/invite.rs:85-152` |
 | Token role / `-until` expiry; namespace component rule | `ndn-rs/crates/security/ndn-cert/src/roles.rs:91-93,204-232,303-340` |
-| File kit: URI text, reading and checks | `ndn-rs/crates/security/ndn-cert/src/recovery.rs:396-492` |
+| File kit: URI text, reading and checks | `ndn-rs/crates/security/ndn-cert/src/recovery.rs:400-513` |
 | File kit written as `<uri>\n`, 0600 | `ndn-fwd/binaries/ndn-fwd/src/recovery_kit.rs:484-485` |
 | Namespace init emits inline signed anchor | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:159-165` |
-| QR capacity test (asserts ≤ 2953, EC L) | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:589-592` |
-| `ndn-fwd init` prints `anchor_uri`, `anchor_url` (ndn.local), `anchor_uri_fp` | `ndn-fwd/binaries/ndn-fwd/src/onboard.rs:474-491` |
-| Invite emission, TtlSecs = remaining token life, mirror via `--domain` | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:215-229` |
-| QR rendering (QrCode::new, ASCII 2×1, SVG ≥256 px, 0600) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:257-283` |
-| Context authoring: signed vs unsigned legacy anchor | `ndn-fwd/binaries/ndn-trust-context/src/lib.rs:103-148`; `ndn-fwd/binaries/ndn-trust-context/src/main.rs:142-188` |
-| QR rendering in `ndn-trust-context` | `ndn-fwd/binaries/ndn-trust-context/src/main.rs:258-276` |
-| Dev emitter, QR via QrCode::new | `ndn-rs/crates/security/ndn-trust-envelope/examples/emit.rs:48-58` |
-| `qrcode` defaults: `new` = EC M, auto version, quiet zone 4 | `qrcode-0.14.1/src/lib.rs:75-76,92-94,250` (cargo registry) |
-| Mobile parser and Bag field drop | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:27-30,80-147` |
-| Mobile builders (delegation, recovery, capability) | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:37-77` |
-| Capability request with constant nonce | `ndn-fwd/binaries/tooling/ndn-pair-kiosk/src/main.rs:72-80` |
+| Init anchor link has a QR form within the shared limit (inline or by reference) | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:589-611` |
+| `ndn-fwd init` prints `anchor_uri`, `anchor_url` (ndn.local), `anchor_uri_fp`, QR hint by size | `ndn-fwd/binaries/ndn-fwd/src/onboard.rs:472-497` |
+| Invite emission, canonical `--ca`, TtlSecs = remaining token life, mirror via `--domain` | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:214-233` |
+| QR rendering (`qr::encode`, ASCII 2×1, SVG ≥256 px, 0600) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:261-287` |
+| Context authoring: signed vs unsigned legacy anchor; QR via `qr_uri` | `ndn-fwd/binaries/ndn-trust-context/src/lib.rs:103-148`; `ndn-fwd/binaries/ndn-trust-context/src/main.rs:142-206` |
+| QR rendering in `ndn-trust-context` | `ndn-fwd/binaries/ndn-trust-context/src/main.rs:274-298` |
+| Dev emitter, QR via `qr::encode` | `ndn-rs/crates/security/ndn-trust-envelope/examples/emit.rs:47-58` |
+| `qrcode` byte mode and terminator, `with_bits`, quiet zone 4 | `qrcode-0.14.1/src/bits.rs:495-501,720-748`; `qrcode-0.14.1/src/lib.rs:149-158,250` (cargo registry) |
+| Mobile parser; Bag keeps Namespace and AnchorFingerprint | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:28-31,83-157,159-203`; `ndn-mobile/crates/ndn-boltffi/src/types.rs:419-431` |
+| Mobile `load_identity` refuses a namespace recovery key | `ndn-mobile/crates/ndn-boltffi/src/identity_core.rs:568-586,602-609`; test `ndn-mobile/crates/ndn-boltffi/src/engine.rs:2250-2282` |
+| Mobile builders (delegation, recovery, capability) | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:38-80` |
+| Capability request with a fresh 16-byte nonce, canonical namespace | `ndn-fwd/binaries/tooling/ndn-pair-kiosk/src/main.rs:65-83,209-229` |
 | Mgmt verbs take the link in `ControlParameters.Uri` | `ndn-rs/crates/core/ndn-mgmt-wire/src/nfd_command.rs:121-131`; `ndn-rs/crates/forwarding/ndn-mgmt/src/modules/security.rs:318-387` |
 
 ## Appendix B. Vector provenance (non-normative)
@@ -789,6 +865,9 @@ The vectors in §8 were produced on 2026-10-18 by a temporary example in the
 - asserted both round trips;
 - fed the hand-built inputs of §8.12 to `TrustEnvelope::decode` / `from_uri`;
 - rendered every URI with `qrcode::QrCode::new` (EC M) and `with_error_correction_level(L)`
-  to report versions;
-- searched for the largest `recovery` URI with a pseudo-random payload that fits each EC level
-  (§5.6).
+  to report versions.
+
+The §8.12 results were then revised by hand for the stricter decoding rules (§10, Decisions
+Q1–Q6, Q8, Q9). The unit tests in `ndn-trust-envelope` (`src/lib.rs`, `src/qr.rs`) cover
+each revised row. QR versions in §8 match the byte-mode capacities at M and L, which is
+how the renderer now encodes (§5.6); `qr::tests::vector_versions` checks §8.1 and §8.4.

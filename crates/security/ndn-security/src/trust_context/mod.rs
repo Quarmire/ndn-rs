@@ -32,7 +32,7 @@ pub enum SignedTrustContextError {
     Truncated(&'static str),
     #[error("missing required field: {0}")]
     MissingField(&'static str),
-    #[error("unsupported schema format: {0}")]
+    #[error("no schema blob in a format this node understands (format code {0})")]
     UnsupportedSchemaFormat(u8),
     #[error("malformed anchor certificate: {0}")]
     BadAnchor(String),
@@ -48,6 +48,12 @@ pub enum SignedTrustContextError {
     Sign(String),
     #[error("more than one LVS schema blob (a context carries at most one)")]
     MultipleLvsSchemas,
+    #[error("{0} appears more than once (a context carries at most one)")]
+    DuplicateField(&'static str),
+    #[error("unknown critical TLV-TYPE {0:#06x}")]
+    UnknownCritical(u64),
+    #[error("malformed {0}")]
+    BadField(&'static str),
 }
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
@@ -61,6 +67,11 @@ pub enum SchemaFormat {
     NativeText,
     /// Stock LightVerSec binary — the portable, published form.
     Lvs,
+    /// A format code this node does not understand. The blob authorizes
+    /// nothing here (the schema is the OR of the blobs understood, so fewer
+    /// blobs authorize less, never more) and is re-emitted verbatim; a
+    /// context none of whose blobs is understood is refused.
+    Unknown(u8),
 }
 
 impl SchemaFormat {
@@ -68,13 +79,14 @@ impl SchemaFormat {
         match self {
             SchemaFormat::NativeText => tlv::SCHEMA_FORMAT_NATIVE,
             SchemaFormat::Lvs => tlv::SCHEMA_FORMAT_LVS,
+            SchemaFormat::Unknown(c) => c,
         }
     }
-    fn from_code(c: u8) -> Result<Self, SignedTrustContextError> {
+    fn from_code(c: u8) -> Self {
         match c {
-            tlv::SCHEMA_FORMAT_NATIVE => Ok(SchemaFormat::NativeText),
-            tlv::SCHEMA_FORMAT_LVS => Ok(SchemaFormat::Lvs),
-            other => Err(SignedTrustContextError::UnsupportedSchemaFormat(other)),
+            tlv::SCHEMA_FORMAT_NATIVE => SchemaFormat::NativeText,
+            tlv::SCHEMA_FORMAT_LVS => SchemaFormat::Lvs,
+            other => SchemaFormat::Unknown(other),
         }
     }
 }
@@ -105,6 +117,7 @@ impl SchemaBlob {
     /// Build the runtime [`TrustSchema`] this blob describes.
     fn to_schema(&self) -> Result<TrustSchema, SignedTrustContextError> {
         match self.format {
+            SchemaFormat::Unknown(c) => Err(SignedTrustContextError::UnsupportedSchemaFormat(c)),
             SchemaFormat::Lvs => Ok(TrustSchema::from_lvs_binary(&self.body)?),
             SchemaFormat::NativeText => {
                 let mut schema = TrustSchema::new();
@@ -124,15 +137,27 @@ impl SchemaBlob {
     }
 }
 
-/// The runtime schema for a set of blobs: their OR.
+/// The runtime schema for a set of blobs: the OR of those in a format this
+/// node understands. Blobs in an unknown format are skipped (they can only
+/// add grants); a non-empty set with none understood is refused.
 fn schema_of(blobs: &[SchemaBlob]) -> Result<TrustSchema, SignedTrustContextError> {
     let mut schema = TrustSchema::new();
+    let mut unknown = None;
+    let mut understood = false;
     for blob in blobs {
+        if let SchemaFormat::Unknown(c) = blob.format {
+            unknown.get_or_insert(c);
+            continue;
+        }
+        understood = true;
         if !schema.merge(blob.to_schema()?) {
             return Err(SignedTrustContextError::MultipleLvsSchemas);
         }
     }
-    Ok(schema)
+    match unknown {
+        Some(c) if !understood => Err(SignedTrustContextError::UnsupportedSchemaFormat(c)),
+        _ => Ok(schema),
+    }
 }
 
 /// What [`SignedTrustContext::explain`] found for a `(data, key)` pair.
@@ -351,6 +376,10 @@ impl LinkPolicy {
         .into_bytes()
     }
 
+    /// Decode the value; `None` when it is malformed (the default applies).
+    /// Fields after the third are reserved for extension and ignored, so an
+    /// older node keeps the three it knows instead of falling back to the
+    /// broader default.
     fn decode(value: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(value).ok()?;
         let mut fields = text.split(';');
@@ -773,19 +802,27 @@ impl SignedTrustContext {
     /// Encode this context as the `Content` of its NDN object: a single
     /// `SignedTrustContext` (`0x0410`) TLV. The version lives in the *name* (RDR),
     /// not here. Anchors with no retained wire (test-only structs) are
-    /// skipped.
+    /// skipped. Anchors (by certificate name) and Revocation entries are
+    /// written in canonical NDN name order, so the same context always
+    /// encodes to the same bytes.
     pub fn encode_content(&self) -> Bytes {
         let blobs = self.schema_blobs_or_derive();
+        let mut anchors: Vec<(Arc<Name>, Bytes)> = self
+            .anchors
+            .iter()
+            .filter_map(|r| Some((Arc::clone(r.key()), r.value().data_wire()?)))
+            .collect();
+        anchors.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut revocations: Vec<&Name> = self.revocations.iter().collect();
+        revocations.sort();
         let mut w = TlvWriter::new();
         w.write_nested(tlv::TRUST_CONTEXT, |w| {
             // namespace — a plain Name (0x07), no dedicated code.
             w.write_raw(&self.namespace.encode_to_tlv());
             // AnchorSet — concatenated Data (0x06) certs.
             w.write_nested(tlv::ANCHOR_SET, |w| {
-                for r in self.anchors.iter() {
-                    if let Some(wire) = r.value().data_wire() {
-                        w.write_raw(&wire);
-                    }
+                for (_, wire) in &anchors {
+                    w.write_raw(wire);
                 }
             });
             // TrustSchemaBlob(s) — format + body; their OR is the schema.
@@ -804,7 +841,7 @@ impl SignedTrustContext {
             if let Some(hint) = &self.enrollment_hint {
                 w.write_tlv(tlv::ENROLLMENT_HINT, &hint.encode());
             }
-            for rev in &self.revocations {
+            for rev in revocations {
                 w.write_tlv(tlv::REVOCATION, &rev.encode_to_tlv());
             }
             // SourceBundleHash — non-critical provenance hint (F9).
@@ -897,6 +934,11 @@ impl SignedTrustContext {
     /// `version` must be supplied by the caller (it lives in the RDR name).
     /// Decoded contexts keep the hierarchical floor (N1) unless they carry
     /// [`tlv::SCHEMA_AUTHORITATIVE`].
+    ///
+    /// A single-valued field (Name, AnchorSet, SchemaAuthoritative,
+    /// EnrollmentHint, SourceBundleHash, LinkPolicy; SchemaFormat and
+    /// SchemaBody inside a blob) that appears twice rejects the context: no
+    /// producer emits one twice, and which one counts would be a guess.
     pub fn decode_content(content: &[u8], version: u64) -> Result<Self, SignedTrustContextError> {
         let (t, value, _rest) = read_tlv(content)?;
         if t != tlv::TRUST_CONTEXT {
@@ -914,18 +956,29 @@ impl SignedTrustContext {
         let mut key_roles: Vec<(KeyRole, Name)> = Vec::new();
         let mut link_policy: Option<LinkPolicy> = None;
 
+        let mut seen: Vec<u64> = Vec::new();
+        let mut once = |t: u64, field: &'static str| {
+            if seen.contains(&t) {
+                return Err(SignedTrustContextError::DuplicateField(field));
+            }
+            seen.push(t);
+            Ok(())
+        };
+
         let mut cur = value;
         while !cur.is_empty() {
             let (ft, fval, rest) = read_tlv(cur)?;
             cur = rest;
             match ft {
                 ndn_packet::tlv_type::NAME => {
+                    once(ft, "Name")?;
                     namespace = Some(
                         Name::decode(Bytes::copy_from_slice(fval))
                             .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
                 tlv::ANCHOR_SET => {
+                    once(ft, "AnchorSet")?;
                     let mut acur = fval;
                     while !acur.is_empty() {
                         let (at, aval, arest) = read_tlv(acur)?;
@@ -951,11 +1004,28 @@ impl SignedTrustContext {
                         scur = srest;
                         match st {
                             tlv::SCHEMA_FORMAT => {
-                                format = Some(SchemaFormat::from_code(
-                                    sval.first().copied().unwrap_or(0),
-                                )?);
+                                let [code] = sval else {
+                                    return Err(SignedTrustContextError::BadField(
+                                        "SchemaFormat (one octet)",
+                                    ));
+                                };
+                                if format.replace(SchemaFormat::from_code(*code)).is_some() {
+                                    return Err(SignedTrustContextError::DuplicateField(
+                                        "SchemaFormat",
+                                    ));
+                                }
                             }
-                            tlv::SCHEMA_BODY => body = Some(Bytes::copy_from_slice(sval)),
+                            tlv::SCHEMA_BODY => {
+                                if body.replace(Bytes::copy_from_slice(sval)).is_some() {
+                                    return Err(SignedTrustContextError::DuplicateField(
+                                        "SchemaBody",
+                                    ));
+                                }
+                            }
+                            // Same evolvability rule as the outer fields.
+                            other if is_critical(other) => {
+                                return Err(SignedTrustContextError::UnknownCritical(other));
+                            }
                             _ => {}
                         }
                     }
@@ -965,22 +1035,26 @@ impl SignedTrustContext {
                         body: body.ok_or(SignedTrustContextError::MissingField("SchemaBody"))?,
                     });
                 }
-                tlv::SCHEMA_AUTHORITATIVE => schema_authoritative = true,
+                tlv::SCHEMA_AUTHORITATIVE => {
+                    once(ft, "SchemaAuthoritative")?;
+                    schema_authoritative = true;
+                }
                 tlv::CA_ENDPOINT => {
                     ca_endpoints.push(
                         Name::decode_from_tlv(Bytes::copy_from_slice(fval))
                             .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
-                tlv::ENROLLMENT_HINT => enrollment_hint = Some(EnrollmentHint::decode(fval)),
+                tlv::ENROLLMENT_HINT => {
+                    once(ft, "EnrollmentHint")?;
+                    enrollment_hint = Some(EnrollmentHint::decode(fval));
+                }
                 // Non-critical provenance hint (F9): a 32-byte SHA-256 digest.
-                // A malformed length fails the guard and falls through to the
-                // non-critical skip arm below — tolerate, don't reject; it is a
-                // hint, not a rule.
-                tlv::SOURCE_BUNDLE_HASH if fval.len() == 32 => {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(fval);
-                    source_bundle_hash = Some(h);
+                // A malformed length is ignored — a hint, not a rule — but
+                // still counts as the one SourceBundleHash.
+                tlv::SOURCE_BUNDLE_HASH => {
+                    once(ft, "SourceBundleHash")?;
+                    source_bundle_hash = <[u8; 32]>::try_from(fval).ok();
                 }
                 tlv::REVOCATION => {
                     revocations.push(
@@ -997,12 +1071,13 @@ impl SignedTrustContext {
                 }
                 // A malformed policy is a field lost (the default applies),
                 // not a rejected context (non-critical).
-                tlv::LINK_POLICY => link_policy = LinkPolicy::decode(fval),
+                tlv::LINK_POLICY => {
+                    once(ft, "LinkPolicy")?;
+                    link_policy = LinkPolicy::decode(fval);
+                }
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
-                    return Err(SignedTrustContextError::Truncated(
-                        "unknown critical sub-TLV",
-                    ));
+                    return Err(SignedTrustContextError::UnknownCritical(other));
                 }
                 _ => {}
             }
@@ -1098,6 +1173,11 @@ pub enum OpenContextError {
     UnsupportedSignature(u64),
     #[error("context signature does not verify under anchor {0}")]
     BadSignature(String),
+    #[error(
+        "context signer {0} is outside its certificate's ValidityPeriod now (expired, or not \
+         yet valid: check this device's clock)"
+    )]
+    SignerNotValid(String),
 }
 
 impl SignedTrustContext {
@@ -1153,6 +1233,24 @@ impl SignedTrustContext {
             Ok(crate::VerifyOutcome::Valid) => Ok((ctx, anchor)),
             _ => Err(OpenContextError::BadSignature(anchor.name.to_string())),
         }
+    }
+
+    /// [`open_signed`](Self::open_signed) for a context received from
+    /// elsewhere — a first adoption, or an update and each version a
+    /// catch-up walk goes through: its signing anchor must also be valid now
+    /// (its ValidityPeriod), as a chain walk requires of an anchor it
+    /// terminates at. Only the signing anchor of the version received is
+    /// checked: the continuity rule matches the held version's anchors by
+    /// public key, so a root whose held certificate expired signs the next
+    /// version listing a re-issued certificate of the same key. A node's own
+    /// stored copy is opened with [`open_signed`](Self::open_signed), so an
+    /// expired anchor never stops a root device from making that version.
+    pub async fn open_received(data: &Data) -> Result<(Self, Certificate), OpenContextError> {
+        let (ctx, anchor) = Self::open_signed(data).await?;
+        if !anchor.is_valid_now() {
+            return Err(OpenContextError::SignerNotValid(anchor.name.to_string()));
+        }
+        Ok((ctx, anchor))
     }
 }
 
@@ -1222,10 +1320,12 @@ fn read_tlv(input: &[u8]) -> Result<(u64, &[u8], &[u8]), SignedTrustContextError
 
 /// Recover the signing identity from a key/cert name by dropping a trailing
 /// `KEY/<keyid>/...` tail. `/home/bob/alice/KEY/k1/self/v=0` → `/home/bob/alice`.
-/// Names without a `KEY` component are returned unchanged.
+/// Only the GenericNameComponent `KEY` counts (as in
+/// [`is_cert_name`](crate::cert_name::is_cert_name)); names without one are
+/// returned unchanged.
 pub(crate) fn key_identity(key_name: &Name) -> Name {
     let comps = key_name.components();
-    match comps.iter().position(|c| c.value.as_ref() == b"KEY") {
+    match comps.iter().position(crate::cert_name::is_key_component) {
         Some(pos) => Name::from_components(comps[..pos].iter().cloned()),
         None => key_name.clone(),
     }
@@ -1571,5 +1671,280 @@ mod tests {
         let data = ctx.sign_into_data(&root).unwrap();
         let (_, anchor) = SignedTrustContext::open_signed(&data).await.unwrap();
         assert!(anchor.name.has_prefix(&key), "{}", anchor.name);
+    }
+
+    // ── decoder rules (spec trust-context.md §3.4, Decisions) ──────────────
+
+    fn tlv_bytes(t: u64, v: &[u8]) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_tlv(t, v);
+        w.finish()
+    }
+
+    /// `content` with the complete TLVs `extra` appended inside TrustContext.
+    fn with_fields(content: &[u8], extra: &[Bytes]) -> Bytes {
+        let (_, value, _) = read_tlv(content).unwrap();
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::TRUST_CONTEXT, |w| {
+            w.write_raw(value);
+            for field in extra {
+                w.write_raw(field);
+            }
+        });
+        w.finish()
+    }
+
+    fn blob(sub: &[Bytes]) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::TRUST_SCHEMA_BLOB, |w| {
+            for s in sub {
+                w.write_raw(s);
+            }
+        });
+        w.finish()
+    }
+
+    /// A later malformed LinkPolicy used to reset an earlier valid one to
+    /// the (broader) default. A second copy of any single-valued field now
+    /// rejects the context; one malformed LinkPolicy alone is a field lost.
+    #[test]
+    fn a_repeated_single_valued_field_rejects_the_context() {
+        let policy = LinkPolicy {
+            roles: vec!["admin".into()],
+            relay_roles: vec![],
+            enrollment_links: false,
+        };
+        let ctx = SignedTrustContext::hierarchical(n("/home")).with_link_policy(policy);
+        let content = ctx.encode_content();
+        let malformed_policy = tlv_bytes(tlv::LINK_POLICY, b"no separators");
+        let twice = with_fields(&content, &[malformed_policy.clone()]);
+        assert!(matches!(
+            SignedTrustContext::decode_content(&twice, 1),
+            Err(SignedTrustContextError::DuplicateField("LinkPolicy"))
+        ));
+
+        let bare = SignedTrustContext::hierarchical(n("/home")).encode_content();
+        let lost = SignedTrustContext::decode_content(&with_fields(&bare, &[malformed_policy]), 1)
+            .unwrap();
+        assert_eq!(lost.stated_link_policy(), None);
+
+        for (extra, field) in [
+            (n("/other").encode_to_tlv(), "Name"),
+            (tlv_bytes(tlv::ANCHOR_SET, &[]), "AnchorSet"),
+        ] {
+            assert!(
+                matches!(
+                    SignedTrustContext::decode_content(&with_fields(&bare, &[extra]), 1),
+                    Err(SignedTrustContextError::DuplicateField(f)) if f == field
+                ),
+                "{field}"
+            );
+        }
+        for (t, v, field) in [
+            (tlv::ENROLLMENT_HINT, &b"\x00token"[..], "EnrollmentHint"),
+            (tlv::SOURCE_BUNDLE_HASH, &[0u8; 3][..], "SourceBundleHash"),
+            (tlv::SCHEMA_AUTHORITATIVE, &[][..], "SchemaAuthoritative"),
+        ] {
+            let once = with_fields(&bare, &[tlv_bytes(t, v)]);
+            assert!(SignedTrustContext::decode_content(&once, 1).is_ok(), "{field} once");
+            let twice = with_fields(&bare, &[tlv_bytes(t, v), tlv_bytes(t, v)]);
+            assert!(
+                matches!(
+                    SignedTrustContext::decode_content(&twice, 1),
+                    Err(SignedTrustContextError::DuplicateField(f)) if f == field
+                ),
+                "{field} twice"
+            );
+        }
+    }
+
+    /// Fields after the third of a LinkPolicy are reserved and ignored.
+    #[test]
+    fn link_policy_fields_after_the_third_are_ignored() {
+        let policy = LinkPolicy::decode(b"admin;node;no-enrollment;future,words").unwrap();
+        assert_eq!(policy.roles, ["admin"]);
+        assert_eq!(policy.relay_roles, ["node"]);
+        assert!(!policy.enrollment_links);
+    }
+
+    /// AnchorSet (by certificate name) and Revocation entries are written in
+    /// canonical name order whatever order they were added in.
+    #[tokio::test]
+    async fn anchors_and_revocations_encode_in_canonical_order() {
+        use crate::signer::Ed25519Signer;
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n("/home/bob/member/z/KEY/k"))
+            .with_revocation(n("/home/bob/guest/a/KEY/k"))
+            .with_revocation(n("/home/bob/member/b/KEY/k"));
+        for (i, id) in ["d", "a", "c", "b"].into_iter().enumerate() {
+            let key = n(&format!("/home/bob/KEY/{id}"));
+            let signer = Ed25519Signer::from_seed(&[i as u8 + 1; 32], key.clone());
+            let cert_name = key.append("self").append_version(1);
+            let wire = crate::manager::encode_cert_data(
+                &cert_name,
+                &signer.public_key_bytes(),
+                &signer,
+                0,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
+            assert!(ctx.add_anchor(Certificate::decode(&Data::decode(wire).unwrap()).unwrap()));
+        }
+        let content = ctx.encode_content();
+        assert_eq!(content, ctx.encode_content());
+
+        let (_, value, _) = read_tlv(&content).unwrap();
+        let (mut cur, mut anchor_names) = (value, Vec::new());
+        while !cur.is_empty() {
+            let (t, v, rest) = read_tlv(cur).unwrap();
+            cur = rest;
+            let mut a = v;
+            while t == tlv::ANCHOR_SET && !a.is_empty() {
+                let (_, data, more) = read_tlv(a).unwrap();
+                a = more;
+                let mut dw = TlvWriter::new();
+                dw.write_tlv(ndn_packet::tlv_type::DATA, data);
+                anchor_names.push(Name::clone(&Data::decode(dw.finish()).unwrap().name));
+            }
+        }
+        let mut sorted = anchor_names.clone();
+        sorted.sort();
+        assert_eq!(anchor_names.len(), 4);
+        assert_eq!(anchor_names, sorted);
+
+        let decoded = SignedTrustContext::decode_content(&content, 1).unwrap();
+        assert_eq!(
+            decoded.revocations(),
+            [
+                n("/home/bob/guest/a/KEY/k"),
+                n("/home/bob/member/b/KEY/k"),
+                n("/home/bob/member/z/KEY/k"),
+            ]
+        );
+    }
+
+    /// A blob in an unknown format authorizes nothing and is kept (and
+    /// re-emitted); a context with no blob this node understands is refused.
+    #[test]
+    fn an_unknown_schema_format_is_skipped_unless_nothing_is_understood() {
+        let native = SchemaBlob::native_text("/home/a/<**d> => /home/a/KEY/<k>");
+        let ctx = SignedTrustContext::hierarchical(n("/home"))
+            .with_schema_blob(native)
+            .unwrap();
+        let unknown = blob(&[
+            tlv_bytes(tlv::SCHEMA_FORMAT, &[9]),
+            tlv_bytes(tlv::SCHEMA_BODY, b"/<**d> => /<**k>"),
+        ]);
+        let content = with_fields(&ctx.encode_content(), &[unknown.clone()]);
+        let decoded = SignedTrustContext::decode_content(&content, 1).unwrap();
+        let formats: Vec<_> = decoded.published_schemas().iter().map(|b| b.format).collect();
+        assert_eq!(formats, [SchemaFormat::NativeText, SchemaFormat::Unknown(9)]);
+        assert!(decoded.authorizes(&n("/home/a/x"), &n("/home/a/KEY/k")));
+        assert!(!decoded.authorizes(&n("/home/b/x"), &n("/home/b/KEY/k")));
+        let again = SignedTrustContext::decode_content(&decoded.encode_content(), 1).unwrap();
+        assert_eq!(again.published_schemas()[1].format, SchemaFormat::Unknown(9));
+
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::TRUST_CONTEXT, |w| {
+            w.write_raw(&n("/home").encode_to_tlv());
+            w.write_tlv(tlv::ANCHOR_SET, &[]);
+            w.write_raw(&unknown);
+        });
+        assert!(matches!(
+            SignedTrustContext::decode_content(&w.finish(), 1),
+            Err(SignedTrustContextError::UnsupportedSchemaFormat(9))
+        ));
+    }
+
+    /// Inside a TrustSchemaBlob: an unknown critical (odd) sub-TLV rejects,
+    /// an unknown even one is skipped, SchemaFormat is exactly one octet and
+    /// neither SchemaFormat nor SchemaBody may repeat.
+    #[test]
+    fn schema_blob_sub_tlvs_follow_the_critical_bit_rule() {
+        let bare = {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv::TRUST_CONTEXT, |w| {
+                w.write_raw(&n("/home").encode_to_tlv());
+                w.write_tlv(tlv::ANCHOR_SET, &[]);
+            });
+            w.finish()
+        };
+        let format = tlv_bytes(tlv::SCHEMA_FORMAT, &[tlv::SCHEMA_FORMAT_NATIVE]);
+        let body = tlv_bytes(tlv::SCHEMA_BODY, b"/home/<**d> => /home/KEY/<k>");
+        let decode = |sub: &[Bytes]| SignedTrustContext::decode_content(&with_fields(&bare, &[blob(sub)]), 1);
+
+        assert!(decode(&[format.clone(), body.clone()]).is_ok());
+        assert!(decode(&[format.clone(), tlv_bytes(0x0420, b"x"), body.clone()]).is_ok());
+        assert!(matches!(
+            decode(&[format.clone(), tlv_bytes(0x0421, b"x"), body.clone()]),
+            Err(SignedTrustContextError::UnknownCritical(0x0421))
+        ));
+        assert!(matches!(
+            decode(&[tlv_bytes(tlv::SCHEMA_FORMAT, &[1, 1]), body.clone()]),
+            Err(SignedTrustContextError::BadField(_))
+        ));
+        assert!(matches!(
+            decode(&[tlv_bytes(tlv::SCHEMA_FORMAT, &[]), body.clone()]),
+            Err(SignedTrustContextError::BadField(_))
+        ));
+        assert!(matches!(
+            decode(&[format.clone(), format.clone(), body.clone()]),
+            Err(SignedTrustContextError::DuplicateField("SchemaFormat"))
+        ));
+        assert!(matches!(
+            decode(&[format, body.clone(), body]),
+            Err(SignedTrustContextError::DuplicateField("SchemaBody"))
+        ));
+    }
+
+    /// A context received from elsewhere is refused when its signing anchor
+    /// is outside its ValidityPeriod; the holder's own copy still opens.
+    #[tokio::test]
+    async fn a_context_signed_by_an_expired_anchor_is_not_received() {
+        use crate::signer::Ed25519Signer;
+        let root = Ed25519Signer::from_seed(&[6u8; 32], n("/home/bob/KEY/root"));
+        let pk = root.public_key_bytes();
+        let signer = &root;
+        let cert = |until: u64| async move {
+            let wire = crate::manager::encode_cert_data(
+                &n("/home/bob/KEY/root/self/v=1"),
+                &pk,
+                signer,
+                0,
+                until,
+            )
+            .await
+            .unwrap();
+            Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+        };
+
+        let expired = cert(1).await;
+        assert!(!expired.is_valid_now());
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
+        // `add_anchor` refuses an invalid certificate; a decoded context
+        // keeps whatever its producer listed.
+        ctx.anchors().insert(Arc::clone(&expired.name), expired);
+        let data = ctx.sign_into_data(&root).unwrap();
+        assert!(SignedTrustContext::open_signed(&data).await.is_ok());
+        assert!(matches!(
+            SignedTrustContext::open_received(&data).await,
+            Err(OpenContextError::SignerNotValid(_))
+        ));
+
+        let valid = SignedTrustContext::hierarchical(n("/home/bob")).with_version(3);
+        assert!(valid.add_anchor(cert(u64::MAX).await));
+        let data = valid.sign_into_data(&root).unwrap();
+        assert!(SignedTrustContext::open_received(&data).await.is_ok());
+    }
+
+    /// Only the GenericNameComponent `KEY` ends a signer's identity.
+    #[test]
+    fn key_identity_ignores_a_typed_key_component() {
+        let typed = n("/home/bob").append_component(ndn_packet::NameComponent::keyword(
+            Bytes::from_static(b"KEY"),
+        ));
+        let key = typed.clone().append("k1");
+        assert_eq!(key_identity(&key), key);
     }
 }

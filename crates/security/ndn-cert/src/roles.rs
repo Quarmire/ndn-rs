@@ -52,7 +52,8 @@
 //! purpose) and the schema is checked on every certificate hop, so a key is
 //! only as good as its issuer's right to certify it.
 //!
-//! The schema travels in the anchor envelope, which must fit one QR code: the
+//! The schema travels in the anchor envelope, which is kept small so it fits
+//! one QR code for short namespaces (a larger one is shown by reference): the
 //! approval rule therefore covers every role's request with one pattern.
 
 use std::fmt;
@@ -329,14 +330,33 @@ pub fn token_with_expiry(token: &str, expires_at_secs: u64) -> String {
     format!("{token}{TOKEN_EXPIRY_MARK}{expires_at_secs}")
 }
 
-/// The expiry (Unix seconds) a token carries ([`token_with_expiry`]), if
-/// any. A token without one does not expire.
-pub fn token_expiry(token: &str) -> Option<u64> {
-    let (_, secs) = token.rsplit_once(TOKEN_EXPIRY_MARK)?;
-    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+/// The expiry (Unix seconds) a token carries ([`token_with_expiry`]):
+/// `Ok(None)` for a token without one, which does not expire. A `-until`
+/// suffix that is not a decimal u64 (empty, non-digits, overflow) is an
+/// error: such a token is refused, never read as non-expiring.
+pub fn token_expiry(token: &str) -> Result<Option<u64>, MalformedTokenExpiry> {
+    let Some((_, secs)) = token.rsplit_once(TOKEN_EXPIRY_MARK) else {
+        return Ok(None);
+    };
+    if !secs.is_empty()
+        && secs.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(at) = secs.parse()
+    {
+        return Ok(Some(at));
     }
-    secs.parse().ok()
+    Err(MalformedTokenExpiry(secs.to_string()))
+}
+
+/// A token's `-until` suffix is not a number of Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the token's expiry `-until{0}` is not a number of Unix seconds")]
+pub struct MalformedTokenExpiry(pub String);
+
+/// Whether a token expiring at `expires_at` has expired at `now` (same
+/// unit). A token is valid while `now < expires_at`, on the CA and on the
+/// invitee alike.
+pub fn token_expired(expires_at: u64, now: u64) -> bool {
+    now >= expires_at
 }
 
 /// The generated namespace schema for one namespace (see the module
@@ -431,6 +451,30 @@ mod tests {
 
     fn n(s: &str) -> Name {
         s.parse().unwrap()
+    }
+
+    /// A malformed `-until` suffix is refused, never read as "no expiry".
+    #[test]
+    fn malformed_token_expiry_fails_closed() {
+        assert_eq!(token_expiry("member-ab"), Ok(None));
+        assert_eq!(token_expiry(&token_with_expiry("member-ab", 1700000000)), Ok(Some(1700000000)));
+        for bad in [
+            "member-ab-until",
+            "member-ab-untilsoon",
+            "member-ab-until12x",
+            "member-ab-until+12",
+            "member-ab-until99999999999999999999",
+        ] {
+            assert!(token_expiry(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// One boundary everywhere: valid while `now < until`.
+    #[test]
+    fn a_token_expires_at_its_until() {
+        assert!(!token_expired(100, 99));
+        assert!(token_expired(100, 100));
+        assert!(token_expired(100, 101));
     }
 
     #[test]

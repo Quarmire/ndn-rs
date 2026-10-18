@@ -93,13 +93,21 @@ impl Keyring {
     /// Anti-rollback: a context is accepted only if its `version` is **≥** the
     /// version currently held for the same namespace (a strictly older version
     /// is refused, so an attacker cannot serve a stale context to re-introduce
-    /// a weakened schema or a revoked anchor). Returns `true` if adopted.
+    /// a weakened schema or a revoked anchor). An *equal* version is accepted
+    /// only when it encodes to the same content as the held one, and then
+    /// changes nothing (re-adopting what is held); a differing context under
+    /// the held version number — a fork — is refused. Returns `true` if
+    /// adopted or already held.
     pub fn adopt(&self, ctx: Arc<SignedTrustContext>) -> bool {
         let ns = ctx.namespace().clone();
         let revoked = match self.contexts.entry(ns) {
             dashmap::mapref::entry::Entry::Occupied(mut held) => {
                 if ctx.version() < held.get().version() {
                     return false;
+                }
+                if ctx.version() == held.get().version() {
+                    return Arc::ptr_eq(held.get(), &ctx)
+                        || held.get().encode_content() == ctx.encode_content();
                 }
                 let revoked = newly_revoked(Some(held.get().as_ref()), &ctx);
                 held.insert(Arc::clone(&ctx));
@@ -394,5 +402,21 @@ mod tests {
         .unwrap();
         assert_eq!(*heard.lock().unwrap(), [(2, vec![k1], 1), (3, vec![k2], 2)]);
         assert_eq!(kr.revocation_epoch(), 2, "v4 revoked nothing new");
+    }
+
+    /// An equal version is a no-op when it is the same content, and a fork
+    /// (refused, the held one stays) when it differs.
+    #[test]
+    fn an_equal_version_is_adopted_only_when_identical() {
+        let kr = keyring();
+        let base = || SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
+        let held = Arc::new(base());
+        assert!(kr.adopt(Arc::clone(&held)));
+        assert!(kr.adopt(Arc::new(base())), "the same content again");
+        assert!(Arc::ptr_eq(&kr.contexts().pop().unwrap(), &held), "nothing replaced");
+        let fork = Arc::new(base().with_revocation(n("/home/bob/member/x/KEY/k")));
+        assert!(!kr.adopt(fork), "a differing v2 is a fork");
+        assert!(!kr.contexts().pop().unwrap().is_revoked(&n("/home/bob/member/x/KEY/k")));
+        assert_eq!(kr.revocation_epoch(), 0);
     }
 }

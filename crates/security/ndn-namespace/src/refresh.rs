@@ -89,12 +89,10 @@ pub async fn refresh_contexts(
 ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
     let held = p.keyring().contexts();
     let targets = match namespace {
-        Some(ns) => vec![held.into_iter().find(|c| *c.namespace() == ns).ok_or_else(|| {
-            refusal(
-                status::NOT_FOUND,
-                format!("this node holds no trust context for {ns}; adopt it first (`ndn-fwd adopt`)"),
-            )
-        })?],
+        Some(ns) => vec![held
+            .into_iter()
+            .find(|c| *c.namespace() == ns)
+            .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&ns)))?],
         None => held,
     };
     // No lock across the fetches (a catch-up walk may take many round
@@ -358,6 +356,7 @@ mod tests {
             own_certs: None,
             sync: None,
             ca: None,
+            words: Default::default(),
         });
 
         let results = refresh_contexts(&admin, Some(ns.clone())).await.unwrap();
@@ -412,6 +411,7 @@ mod tests {
             own_certs: None,
             sync: None,
             ca: None,
+            words: Default::default(),
         });
 
         let results = refresh_contexts(&admin, Some(ns.clone())).await.unwrap();
@@ -473,6 +473,7 @@ mod tests {
             own_certs: None,
             sync: None,
             ca: None,
+            words: Default::default(),
         }));
         let cancel = CancellationToken::new();
         spawn_periodic(Arc::clone(&admin), Duration::from_secs(3600), cancel.clone());

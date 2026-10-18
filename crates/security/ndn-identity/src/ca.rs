@@ -11,7 +11,7 @@ use ndn_cert::{
     ChallengeHandler, HierarchicalPolicy, IssuancePolicy, NamespacePolicy,
 };
 use ndn_packet::encode::DataBuilder;
-use ndn_packet::{NackReason, Name, SignatureType};
+use ndn_packet::{NackReason, Name, NameComponent, SignatureType};
 use ndn_security::{Keyring, SecurityManager, Signer};
 use tracing::{debug, warn};
 
@@ -331,87 +331,95 @@ async fn handle_interest(
     interest: ndn_packet::Interest,
 ) -> Option<CaReply> {
     let name = &*interest.name;
-    let name_str = name.to_string();
-    let ca_prefix_str = ca_prefix.to_string();
 
-    debug!(name = %name_str, "NDNCERT: received Interest");
+    debug!(%name, "NDNCERT: received Interest");
 
     // Cert-fetch: ship the pre-signed Data wire verbatim. A CanBePrefix
     // Interest for a key name gets the newest valid certificate of the key.
     if let Some(wire) = state.cert_for_interest(name, interest.selectors().can_be_prefix) {
-        debug!(name = %name_str, "NDNCERT: serving issued cert");
+        debug!(%name, "NDNCERT: serving issued cert");
         return Some(CaReply::Wire(bytes::Bytes::from(wire)));
     }
 
-    let suffix = name_str.strip_prefix(&ca_prefix_str).unwrap_or(&name_str);
+    // `<ca>/CA/<endpoint>/…`: the endpoint is the one component after `CA`,
+    // matched exactly (so `<ca>/CA/APPROVALX` reaches nothing).
+    let Some((endpoint, tail)) = ca_endpoint(ca_prefix, name) else {
+        debug!(%name, "NDNCERT: not a CA endpoint; Nacking");
+        return Some(CaReply::NoSuchData);
+    };
 
-    if suffix == "/CA/INFO" || suffix.ends_with("/CA/INFO") {
-        return Some(CaReply::Body(state.handle_info()));
-    }
-
-    if suffix.contains("/CA/NEW") {
-        let body = interest.app_parameters().cloned().unwrap_or_default();
-        match state.handle_new(&body).await {
-            Ok(resp) => return Some(CaReply::Body(resp)),
-            Err(e) => {
-                warn!(error = %e, "NDNCERT NEW failed");
-                return None;
-            }
+    match endpoint {
+        // INFO may name a version and segment of the CA profile.
+        b"INFO" => return Some(CaReply::Body(state.handle_info())),
+        // A failed NEW or CHALLENGE is answered, as in NDNCERT v0.3, with an
+        // unencrypted ErrorCode + ErrorInfo, never left to time out.
+        b"NEW" => {
+            let answer = if only_params_digest(tail) {
+                let body = interest.app_parameters().cloned().unwrap_or_default();
+                state.handle_new(&body).await
+            } else {
+                Err(bad_interest_format("NEW"))
+            };
+            return Some(CaReply::Body(answer_or_failure(answer, "NEW")));
         }
-    }
-
-    if suffix.contains("/CA/CHALLENGE/") {
-        // NDN Packet Format §3.4: a signed Interest with
-        // ApplicationParameters carries `ParametersSha256Digest` (0x02)
-        // as the last name component, so request-id sits at index N-2.
-        const PARAMETERS_SHA256: u64 = 0x02;
-        let comps = name.components();
-        let request_id_comp = match comps.last() {
-            Some(last) if last.typ == PARAMETERS_SHA256 => comps.get(comps.len() - 2)?,
-            Some(last) => last,
-            None => return None,
-        };
-        let request_id_hex: String = request_id_comp
-            .value
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-
-        let body = interest.app_parameters().cloned().unwrap_or_default();
-        match state.handle_challenge(&request_id_hex, &body).await {
-            Ok(resp) => return Some(CaReply::Body(resp)),
-            Err(e) => {
-                warn!(error = %e, "NDNCERT CHALLENGE failed");
-                return None;
+        // `<ca>/CA/CHALLENGE/<request id>`, then the
+        // ParametersSha256DigestComponent of a signed Interest.
+        b"CHALLENGE" => {
+            // The request id is a GenericNameComponent: a lone digest
+            // component is not one.
+            let request_id = match tail {
+                [request_id] => Some(request_id),
+                [request_id, digest] if digest.typ == PARAMETERS_SHA256 => Some(request_id),
+                _ => None,
             }
+            .filter(|id| id.typ == ndn_packet::tlv_type::NAME_COMPONENT);
+            let answer = match request_id {
+                Some(request_id) => {
+                    let request_id_hex: String = request_id
+                        .value
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    let body = interest.app_parameters().cloned().unwrap_or_default();
+                    state.handle_challenge(&request_id_hex, &body).await
+                }
+                None => Err(bad_interest_format("CHALLENGE")),
+            };
+            return Some(CaReply::Body(answer_or_failure(answer, "CHALLENGE")));
         }
-    }
-
-    // NDNCERT 0.3 `<ca-prefix>/CA/REVOKE/...`: the possession-proof request
-    // rides in ApplicationParameters; the outcome is a status, never an error.
-    if suffix.contains("/CA/REVOKE") {
-        let body = interest.app_parameters().cloned().unwrap_or_default();
-        return Some(CaReply::Body(state.handle_revoke(&body).await));
+        // NDNCERT 0.3 `<ca-prefix>/CA/REVOKE`: the possession-proof request
+        // rides in ApplicationParameters; the outcome is a status, never an
+        // error.
+        b"REVOKE" if only_params_digest(tail) => {
+            let body = interest.app_parameters().cloned().unwrap_or_default();
+            return Some(CaReply::Body(state.handle_revoke(&body).await));
+        }
+        _ => {}
     }
 
     // Enrollment by approval: an admin device's signed decision, the
     // pending list (answered only to an admin-signed Interest), and a
     // request's held status.
     if let Some(approvals) = approvals {
-        let endpoint = |e: &str| suffix.starts_with(&format!("/CA/{e}"));
-        if endpoint(ndn_cert::approval::APPROVAL_ENDPOINT) {
+        let is = |e: &str| endpoint == e.as_bytes() && only_params_digest(tail);
+        if is(ndn_cert::approval::APPROVAL_ENDPOINT) {
             let body = interest.app_parameters().cloned().unwrap_or_default();
             return Some(CaReply::Body(approvals.handle_decision(&body).await));
         }
-        if endpoint(ndn_cert::approval::PENDING_ENDPOINT) {
+        if is(ndn_cert::approval::PENDING_ENDPOINT) {
             return Some(CaReply::Body(approvals.handle_listing(&interest).await));
         }
         if let Some(request_id) = ndn_cert::approval::status_request_id(ca_prefix, name) {
+            let hold = ndn_cert::approval::status_hold(interest.lifetime());
+            // A check asked to be answered at once takes no held slot.
+            if hold.is_zero() {
+                return Some(CaReply::Body(approvals.status_now(&request_id)));
+            }
             return Some(match approvals.hold_status(&request_id) {
                 Ok(held) => CaReply::Held {
                     service: approvals.clone(),
                     held,
-                    hold: ndn_cert::approval::status_hold(interest.lifetime()),
+                    hold,
                 },
                 Err(reason) => {
                     warn!(request = %request_id, %reason, "NDNCERT: status Interest refused (Nack Congestion)");
@@ -421,8 +429,52 @@ async fn handle_interest(
         }
     }
 
-    debug!(name = %name_str, "NDNCERT: no CA service or issued certificate answers this Interest; Nacking");
+    debug!(%name, "NDNCERT: no CA service or issued certificate answers this Interest; Nacking");
     Some(CaReply::NoSuchData)
+}
+
+/// NDN Packet Format §3.4: a signed Interest with ApplicationParameters
+/// ends with a `ParametersSha256DigestComponent`.
+const PARAMETERS_SHA256: u64 = ndn_packet::tlv_type::PARAMETERS_SHA256;
+
+/// The endpoint `name` addresses — the component after `<ca>/CA` — and the
+/// components after it. `None` unless `name` is `<ca>/CA/<endpoint>[/…]`
+/// with `CA` and the endpoint GenericNameComponents.
+fn ca_endpoint<'a>(ca_prefix: &Name, name: &'a Name) -> Option<(&'a [u8], &'a [NameComponent])> {
+    const GENERIC: u64 = ndn_packet::tlv_type::NAME_COMPONENT;
+    if !name.has_prefix(ca_prefix) {
+        return None;
+    }
+    let [ca, endpoint, tail @ ..] = name.components().get(ca_prefix.len()..)? else {
+        return None;
+    };
+    (ca.typ == GENERIC && ca.value.as_ref() == b"CA" && endpoint.typ == GENERIC)
+        .then_some((endpoint.value.as_ref(), tail))
+}
+
+/// Nothing follows the endpoint but, for a signed Interest, its
+/// ParametersSha256DigestComponent.
+fn only_params_digest(tail: &[NameComponent]) -> bool {
+    match tail {
+        [] => true,
+        [digest] => digest.typ == PARAMETERS_SHA256,
+        _ => false,
+    }
+}
+
+fn bad_interest_format(step: &str) -> ndn_cert::CertError {
+    ndn_cert::CertError::CaFailure {
+        code: ndn_cert::ErrorCode::BadInterestFormat.into(),
+        info: format!("the {step} Interest name is not <ca>/CA/{step} in NDNCERT form"),
+    }
+}
+
+/// The CA's answer to a NEW or CHALLENGE, or its failure answer.
+fn answer_or_failure(answer: Result<Vec<u8>, ndn_cert::CertError>, step: &str) -> Vec<u8> {
+    answer.unwrap_or_else(|e| {
+        warn!(error = %e, "NDNCERT {step} failed; answering ErrorCode {}", e.ndncert_error_code());
+        ndn_cert::tlv::ErrorTlv::from_error(&e).encode().to_vec()
+    })
 }
 
 #[cfg(test)]
@@ -453,5 +505,139 @@ mod tests {
             handle_interest(&ca.state, &ca.prefix, None, interest).await,
             Some(CaReply::NoSuchData)
         ));
+    }
+
+    fn lab_ca() -> (Identity, NdncertCa) {
+        let identity = Identity::ephemeral("/lab/ca").unwrap();
+        let store = || ApprovalStore::new("/lab/ca".parse().unwrap(), None, DEFAULT_REQUEST_TTL);
+        let ca = NdncertCa::builder()
+            .name("/lab/ca")
+            .unwrap()
+            .signing_identity(&identity)
+            .challenge(DeviceApprovalChallenge::new(store()))
+            .build()
+            .unwrap()
+            .approvals(store(), Arc::new(Keyring::new()));
+        (identity, ca)
+    }
+
+    async fn ask(ca: &NdncertCa, name: &str, body: Vec<u8>) -> Option<CaReply> {
+        let wire = ndn_packet::encode::InterestBuilder::new(name.parse::<Name>().unwrap())
+            .app_parameters(body)
+            .build();
+        let interest = ndn_packet::Interest::decode(wire).unwrap();
+        let approvals = ca.approval_service();
+        handle_interest(&ca.state, &ca.prefix, approvals.as_ref(), interest).await
+    }
+
+    fn failure(reply: Option<CaReply>) -> ndn_cert::tlv::ErrorTlv {
+        let Some(CaReply::Body(body)) = reply else {
+            panic!("expected an answer Data");
+        };
+        ndn_cert::tlv::ErrorTlv::decode_if_error(&body)
+            .unwrap()
+            .expect("a failure answer (ErrorCode + ErrorInfo)")
+    }
+
+    /// A NEW for a name the CA's policy refuses is answered with ErrorCode
+    /// NameNotAllowed (not left to time out), and the requester reads it as
+    /// a refusal of the name.
+    #[tokio::test]
+    async fn a_new_for_a_refused_name_answers_name_not_allowed() {
+        let (_identity, ca) = lab_ca();
+        let key: Name = "/elsewhere/alice/KEY/k1".parse().unwrap();
+        let signer = Arc::new(ndn_security::Ed25519Signer::from_seed(&[7u8; 32], key.clone()));
+        let mut session = ndn_cert::EnrollmentSession::new(key, signer, 3600);
+        let body = session.new_request_body().await.unwrap();
+        let answer = failure(ask(&ca, "/lab/ca/CA/NEW", body).await);
+        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::NameNotAllowed));
+        assert!(answer.info.contains("/elsewhere/alice"), "{}", answer.info);
+        assert!(matches!(
+            session.handle_new_response(&answer.encode()),
+            Err(ndn_cert::CertError::PolicyDenied(_))
+        ));
+    }
+
+    /// A malformed NEW and a CHALLENGE for an unknown request are answered
+    /// with their v0.3 ErrorCodes.
+    #[tokio::test]
+    async fn malformed_new_and_unknown_challenge_are_answered() {
+        let (_identity, ca) = lab_ca();
+        let answer = failure(ask(&ca, "/lab/ca/CA/NEW", vec![0x01, 0x05, 0x00]).await);
+        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::BadParameterFormat));
+        let answer = failure(
+            ask(&ca, "/lab/ca/CA/CHALLENGE/%01%02%03%04%05%06%07%08", vec![0x01]).await,
+        );
+        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::InvalidParameters));
+        // No request id component.
+        let answer = failure(ask(&ca, "/lab/ca/CA/CHALLENGE", vec![0x01]).await);
+        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::BadInterestFormat));
+    }
+
+    /// Endpoints are the exact component after `<ca>/CA`: a longer
+    /// component, or `CA` deeper in the name, reaches no handler.
+    #[tokio::test]
+    async fn endpoints_match_exact_components() {
+        let (_identity, ca) = lab_ca();
+        for name in [
+            "/lab/ca/CA/APPROVALX",
+            "/lab/ca/CA/PENDINGX",
+            "/lab/ca/CA/NEWX",
+            "/lab/ca/CA/CHALLENGEX/%01",
+            "/lab/ca/CA/REVOKEX",
+            "/lab/ca/x/CA/NEW",
+            "/lab/ca/CA/APPROVAL/extra",
+        ] {
+            assert!(
+                matches!(ask(&ca, name, vec![0x01]).await, Some(CaReply::NoSuchData)),
+                "{name} must reach no handler"
+            );
+        }
+        // The exact endpoint still reaches its handler.
+        assert!(matches!(
+            ask(&ca, "/lab/ca/CA/APPROVAL", vec![0x01]).await,
+            Some(CaReply::Body(_))
+        ));
+    }
+
+    /// A status check asked to be answered at once takes no held slot: it
+    /// is answered even while the request's held slots are all taken, when
+    /// a held status Interest is refused.
+    #[tokio::test]
+    async fn an_immediate_status_check_takes_no_held_slot() {
+        let (_identity, ca) = lab_ca();
+        let approvals = ca.approval_service().unwrap();
+        let _held: Vec<_> = (0..ndn_cert::approval::MAX_HELD_PER_REQUEST)
+            .map(|_| approvals.hold_status("0123456789abcdef").unwrap())
+            .collect();
+        let status = |lifetime: Duration| {
+            let wire = ndn_packet::encode::InterestBuilder::new(
+                "/lab/ca/CA/STATUS/0123456789abcdef".parse::<Name>().unwrap(),
+            )
+            .must_be_fresh()
+            .lifetime(lifetime)
+            .build();
+            ndn_packet::Interest::decode(wire).unwrap()
+        };
+        let now = handle_interest(
+            &ca.state,
+            &ca.prefix,
+            Some(&approvals),
+            status(ndn_cert::approval::STATUS_ANSWER_MARGIN),
+        )
+        .await;
+        let Some(CaReply::Body(body)) = now else {
+            panic!("an immediate check is answered");
+        };
+        let answer: ndn_cert::approval::RequestStatus = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(answer, ndn_cert::approval::RequestStatus::Expired { .. }));
+        let held = handle_interest(
+            &ca.state,
+            &ca.prefix,
+            Some(&approvals),
+            status(ndn_cert::approval::STATUS_LIFETIME),
+        )
+        .await;
+        assert!(matches!(held, Some(CaReply::Busy)));
     }
 }

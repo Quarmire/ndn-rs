@@ -85,7 +85,10 @@ pub enum Refusal {
     Chain,
     /// A certificate on the chain is revoked in the governing trust context.
     Revoked,
-    /// The signature does not verify: forged, or altered in transit.
+    /// The signature does not verify: forged, or altered in transit; or the
+    /// Data names no usable signing key (no SignatureInfo, no KeyLocator, a
+    /// KeyDigest this forwarder has no certificate of). Retrying cannot
+    /// change any of these.
     BadSignature,
     /// The trust schema or trust context does not authorize the signer for
     /// the name.
@@ -96,11 +99,10 @@ pub enum Refusal {
     /// failed that expectation (a foreign fingerprint, or an update not
     /// signed by an anchor of the held version).
     Context,
-    /// The Data cannot be verified now: it names no signing key (no
-    /// KeyLocator), or every source the forwarder asked for its signing
-    /// certificate — the routes and the face that delivered the Data —
-    /// answered that none is to be had there (NoRoute) or refused what it
-    /// served. Not final ([`is_final`](Refusal::is_final)).
+    /// The Data cannot be verified now: every source the forwarder asked for
+    /// its signing certificate — the routes and the face that delivered the
+    /// Data — answered that none is to be had there (NoRoute) or refused
+    /// what it served. Not final ([`is_final`](Refusal::is_final)).
     Unverifiable,
 }
 
@@ -190,7 +192,7 @@ impl Refusal {
             }
             Refusal::Unverifiable => {
                 "retry later: the signing certificate could not be fetched (if it never can, the \
-                 publisher has no certificate, or signed without a KeyLocator)"
+                 publisher has no certificate)"
             }
         }
     }
@@ -260,10 +262,18 @@ impl Nack {
     }
 
     /// The Interest a Nack to one downstream carries, rebuilt from what the
-    /// forwarder kept of it (name, selectors, nonce) once the Interest itself
-    /// is gone: a consumer matches the Nack to its pending Interest by name
-    /// and selectors (ndn-cxx's `Face`, `ndn-app`).
-    pub fn interest_wire(name: &Name, selector: &Selector, nonce: u32) -> Bytes {
+    /// forwarder kept of it (name, selectors, nonce, and for a parameterized
+    /// Interest its [`parameters_portion`](Interest::parameters_portion))
+    /// once the Interest itself is gone: a consumer matches the Nack to its
+    /// pending Interest by name and selectors (ndn-cxx's `Face`, `ndn-app`),
+    /// and a name ending in a `ParametersSha256DigestComponent` comes with
+    /// the parameters that digest covers, so a strict decoder accepts it.
+    pub fn interest_wire(
+        name: &Name,
+        selector: &Selector,
+        nonce: u32,
+        parameters: Option<&Bytes>,
+    ) -> Bytes {
         let mut w = ndn_tlv::TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_raw(&name.encode_to_tlv());
@@ -274,6 +284,9 @@ impl Nack {
                 w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
             }
             w.write_tlv(tlv_type::NONCE, &nonce.to_be_bytes());
+            if let Some(parameters) = parameters {
+                w.write_raw(parameters);
+            }
         });
         w.finish()
     }
@@ -340,6 +353,40 @@ mod tests {
         for r in Refusal::ALL {
             assert_eq!(r.is_final(), r != Refusal::Unverifiable, "{r}");
         }
+    }
+
+    /// The Interest a refusal encloses for a parameterized downstream keeps
+    /// the parameters its ParametersSha256DigestComponent covers, so the
+    /// name and the parameters stay consistent for a strict decoder.
+    #[test]
+    fn a_rebuilt_parameterized_interest_keeps_its_parameters() {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"ca");
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, &[7u8; 32]);
+            });
+            w.write_tlv(tlv_type::CAN_BE_PREFIX, &[]);
+            w.write_tlv(tlv_type::NONCE, &[1, 2, 3, 4]);
+            w.write_tlv(tlv_type::INTEREST_LIFETIME, &[0x0F, 0xA0]);
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"params");
+            w.write_tlv(tlv_type::INTEREST_SIGNATURE_INFO, &[0x1B, 0x01, 0x00]);
+            w.write_tlv(tlv_type::INTEREST_SIGNATURE_VALUE, &[0u8; 32]);
+        });
+        let original = Interest::decode(w.finish()).unwrap();
+        let portion = original.parameters_portion().expect("parameterized");
+
+        let wire = Nack::interest_wire(&original.name, original.selectors(), 0x0102_0304, Some(&portion));
+        let rebuilt = Interest::decode(wire).unwrap();
+        assert_eq!(rebuilt.name, original.name);
+        assert_eq!(rebuilt.selectors(), original.selectors());
+        assert_eq!(rebuilt.app_parameters(), original.app_parameters());
+        assert_eq!(rebuilt.parameters_portion(), Some(portion), "the digest covers the same bytes");
+        assert!(rebuilt.sig_value().is_some());
+
+        let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"x"))]);
+        let unparameterized = Interest::decode(encode_interest(&name, None)).unwrap();
+        assert_eq!(unparameterized.parameters_portion(), None);
     }
 
     #[test]

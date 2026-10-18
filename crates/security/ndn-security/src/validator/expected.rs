@@ -267,7 +267,7 @@ impl Validator {
                 reason,
             }))
         };
-        let (context, anchor) = match SignedTrustContext::open_signed(data).await {
+        let (context, anchor) = match SignedTrustContext::open_received(data).await {
             Ok(opened) => opened,
             Err(e) => return refused(e.to_string()),
         };

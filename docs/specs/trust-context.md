@@ -24,10 +24,9 @@ document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174)
 when, and only when, they appear in all capitals, as shown here.
 
 Every byte-level statement below is taken from the ndn-rs code at the time of
-writing. Appendix A gives the file and line for each one. Where the code is
-ambiguous, or the ndn-fwd and ndn-mobile copies differ, this document states
-what the library and ndn-fwd do and lists the point under §12 "Open
-questions".
+writing. Appendix A gives the file and line for each one. Points where the
+code was ambiguous, or where the ndn-fwd and ndn-mobile copies differed, are
+recorded with the decision taken under §12 "Decisions".
 
 ## 1. Terminology
 
@@ -55,7 +54,9 @@ NonNegativeInteger. Every other literal component is a
 as `keyword=x`.
 
 "NonNegativeInteger" means the NDN encoding: big-endian in 1, 2, 4 or 8
-octets. ndn-rs always writes the shortest of these forms (canonical form).
+octets. ndn-rs always writes the shortest of these forms (canonical form). A
+decoder MUST reject any other length (empty, 3, 5–7, or more than 8 octets):
+such a component is not a version or segment number, never a truncated one.
 
 ## 2. Overview
 
@@ -134,11 +135,16 @@ LinkPolicy     = 0x0412 TLV-LENGTH *OCTET        ; UTF-8
 ```
 
 A producer MUST emit the fields in the order above. ndn-rs always emits
-`AnchorSet`, even when it is empty. Within a repeatable field, ndn-rs emits
-CaEndpoint, Revocation and KeyRole entries in the order they were added. A
-new version made from an earlier one carries the earlier entries first and
-appends new ones (Test vector T7). Anchor order inside AnchorSet is not
-defined (§12, Q1). TLV-LENGTH uses the shortest NDN VAR-NUMBER form.
+`AnchorSet`, even when it is empty. Inside AnchorSet, a producer MUST write
+the certificates in NDN canonical order of their names, and it MUST write
+Revocation entries in NDN canonical order of their Names (component by
+component: TLV-TYPE, then TLV-LENGTH, then the octets; a prefix sorts
+first). So the same context always encodes to the same bytes, whatever
+order its anchors and revocations were added in. CaEndpoint and KeyRole
+entries are emitted in the order they were added: a new version made from
+an earlier one carries the earlier entries first and appends new ones. A
+decoder MUST NOT depend on the order of entries within a field, and accepts
+any. TLV-LENGTH uses the shortest NDN VAR-NUMBER form.
 
 The Content of a context Data MUST be exactly one TrustContext TLV. ndn-rs
 ignores bytes after it.
@@ -162,8 +168,10 @@ ndn-rs reads these parts of each certificate:
 
 - **Name** — `…/KEY/<key-id>/<issuer-id>/<version>`. An anchor's *key name*
   is its certificate name without the last two components. A name whose
-  fourth-last component has value `KEY` is a certificate name; any other
-  name is used unchanged as a key name.
+  fourth-last component is the GenericNameComponent `KEY` (TLV-TYPE `0x08`,
+  value `KEY`) is a certificate name; a component of another TLV-TYPE with
+  value `KEY` (e.g. `32=KEY`) does not count. Any other name is used
+  unchanged as a key name.
 - **Public key** — the certificate Content. If the Content is the 44-octet
   Ed25519 SPKI (`302a300506032b6570032100` ‖ 32-octet key), the public key is
   the 32 raw octets. Otherwise it is the Content verbatim, e.g. the DER SPKI
@@ -175,21 +183,28 @@ defined above. For Ed25519 that is SHA-256 over the 32 raw octets, not over
 the SPKI. The fingerprint does not change when a certificate for the same key
 is re-issued.
 
-Anchors match by key (§6.2). A decoder does not check anchor validity
-periods (§12, Q4). ndn-rs producers add an anchor only when it is valid at
-the time of encoding. ndn-rs makes root anchors self-signed, with NotAfter
-derived from `u64::MAX` ns (`25540721T233433`) and name
-`/<ns>/KEY/root/self/v=<ms>`. The anchor format of a recovery kit is in
+Anchors match by key (§6.2). Decoding keeps every anchor whatever its
+ValidityPeriod; a consumer checks the validity of the anchor that *signed*
+a context it receives (§4.3). ndn-rs producers add an anchor only when it
+is valid at the time of encoding. ndn-rs makes root anchors self-signed,
+with NotAfter derived from `u64::MAX` ns (`25540721T233433`) and name
+`/<ns>/KEY/root/self/v=<ms>`; recovery anchors and the root a recovery
+installs get the same NotAfter. The anchor format of a recovery kit is in
 [recovery-kit.md](recovery-kit.md).
 
 #### 3.3.3 TrustSchemaBlob (`0x0413`), SchemaFormat (`0x0415`), SchemaBody (`0x0417`)
 
 Each blob carries exactly one SchemaFormat and one SchemaBody. A decoder:
 
-- MUST reject a blob that lacks either sub-TLV;
-- MUST reject a SchemaFormat whose first octet is not `1` or `2`. An empty
-  SchemaFormat reads as `0` and is rejected;
-- ignores any other sub-TLV inside a blob, whatever its parity (§12, Q6);
+- MUST reject a blob that lacks either sub-TLV, or carries either twice;
+- MUST reject a SchemaFormat whose length is not 1 octet;
+- treats a format code other than `1` or `2` as *unknown*: the blob is not
+  understood. It MUST NOT contribute to the runtime schema, and a producer
+  that makes a new version from this one MUST re-emit it unchanged. A
+  decoder MUST reject the context when none of its blobs is understood;
+- MUST reject an unknown critical sub-TLV inside a blob (TLV-TYPE `<= 31`
+  or odd) and MUST skip an unknown non-critical (even) one, as for the
+  children of TrustContext (§3.4);
 - MUST reject a TrustContext with no blob at all.
 
 - **Format 2, LightVerSec binary.** This is the portable form, the binary
@@ -208,13 +223,15 @@ Each blob carries exactly one SchemaFormat and one SchemaBody. A decoder:
   A rule admits a `(data name, key name)` pair if both patterns match with
   consistent captures.
 
-The runtime schema is the logical OR of all blobs. A context MUST NOT carry
-more than one format-2 blob, and a decoder MUST reject a context that does.
-The namespace context `ndn-fwd init` generates carries one LVS blob and one
-native-text blob. The native blob holds the rules LVS cannot express (see
-the `init_namespace` structure under §11). A node that understands only some
-blobs authorizes less, never more. However, ndn-rs rejects an unknown
-*format code*, so it does not skip a blob it cannot read (§12, Q5).
+The runtime schema is the logical OR of all understood blobs. A context MUST
+NOT carry more than one format-2 blob, and a decoder MUST reject a context
+that does. The namespace context `ndn-fwd init` generates carries one LVS
+blob and one native-text blob. The native blob holds the rules LVS cannot
+express (see the `init_namespace` structure under §11). A node that
+understands only some blobs authorizes less, never more, which is why a
+blob in an unknown format is skipped rather than refused: format `1` is
+ndn-rs-specific, and an implementation without the native-text grammar
+still validates by the LVS blob.
 
 #### 3.3.4 SchemaAuthoritative (`0x041C`)
 
@@ -315,13 +332,16 @@ value = roles ";" relay-roles [ ";" ( "enrollment" / "no-enrollment" ) ]   ; UTF
 roles = [ role *( "," role ) ]     ; empty = every device role
 ```
 
-**Encoding.** ndn-rs always writes all three fields.
+**Encoding.** ndn-rs always writes all three fields, and nothing after the
+third.
 
 **Decoding.** Split the value at `;`. A missing first or second field, a
 third field other than `enrollment` or `no-enrollment`, or invalid UTF-8
 makes the *field* invalid: the context is kept and the default policy
 applies. A missing third field means `enrollment`. Empty role names inside
-a list are dropped. Fields after the third are ignored (§12, Q7).
+a list are dropped. Fields after the third are reserved for extension: a
+decoder MUST ignore them, and a producer MUST NOT write them until they are
+specified.
 
 **Semantics.** A device's role is the component after the namespace in its
 certificate name, `/<ns>/<role>/<device>`.
@@ -341,16 +361,17 @@ A decoder:
 
 1. MUST reject Content whose first TLV is not `0x0410`, or any truncated
    TLV.
-2. Processes the TrustContext children in order. A later Name, EnrollmentHint,
-   SourceBundleHash or LinkPolicy overwrites an earlier one, so a later
-   *invalid* LinkPolicy resets the policy to the default. CaEndpoint,
-   Revocation, KeyRole and TrustSchemaBlob accumulate. AnchorSet
-   accumulates across repeated AnchorSets.
+2. MUST reject a TrustContext in which Name, AnchorSet, SchemaAuthoritative,
+   EnrollmentHint, SourceBundleHash or LinkPolicy appears more than once,
+   whether or not the copies are well formed. CaEndpoint, Revocation,
+   KeyRole and TrustSchemaBlob are repeatable and accumulate.
 3. MUST reject an unknown critical child type (`<= 31` or odd), and MUST
    skip an unknown non-critical one (even). A KeyRole or SourceBundleHash
-   that fails its length check is skipped as non-critical.
+   that fails its length check is skipped as non-critical (it still counts
+   as the one SourceBundleHash for rule 2).
 4. MUST reject the context when the namespace is missing, no
-   TrustSchemaBlob is present, or the schema does not import (LVS error,
+   TrustSchemaBlob is present, no blob is in a format the decoder
+   understands (§3.3.3), or the schema does not import (LVS error,
    native-text parse error, more than one LVS blob).
 
 ## 4. The context Data
@@ -367,11 +388,13 @@ A decoder:
 - `v=<N>` is a VersionNameComponent; `N` is the version, a NonNegativeInteger.
 
 The version lives only in the name; the Content carries no version field. A
-consumer MUST take the version from the last name component. It MUST then
-check that the Data name is byte-for-byte equal to the name rebuilt from the
-decoded namespace and that version, written with the canonical (shortest)
-NonNegativeInteger. A context Data whose version component is not in
-canonical form is therefore rejected. Producers MUST use canonical form.
+consumer MUST take the version from the last name component; a component
+whose value is not 1, 2, 4 or 8 octets is not a version (§1), and the name is
+not a context name. It MUST then check that the Data name is byte-for-byte
+equal to the name rebuilt from the decoded namespace and that version,
+written with the canonical (shortest) NonNegativeInteger. A context Data
+whose version component is not in canonical form is therefore rejected.
+Producers MUST use canonical form.
 
 The first version a namespace gets from `ndn-fwd init` is `1`. Every new
 version is the previous one plus one; ndn-rs refuses to bump past
@@ -412,6 +435,20 @@ anchors signed. Whether that anchor is trusted is decided by §4.4 for a
 first adoption, and by §5.2 for an update. A version MUST therefore list,
 among its anchors, the key that signs it.
 
+**Validity of the signer.** A node MUST refuse a context Data it *receives*
+— on first adoption (§4.4), as an update (§5.2), and at each step of a walk
+(§5.4) — when the anchor that signed it is outside its ValidityPeriod at
+verification time (NotBefore after now, or NotAfter before now), as it
+refuses a chain that ends at such an anchor. The anchor checked is the one
+listed in the received version itself. A node opening its *own stored copy*
+of a version, for example the root device making the next version, does not
+check it. So an expired anchor never stops a namespace: its key signs a new
+version that lists a re-issued certificate of the same key, and §5.2 rule 4
+matches the held version's anchor by public key, not by its certificate's
+validity. ndn-rs gives every anchor it makes NotAfter `25540721T233433`
+(§3.3.2), so in practice only a device clock set before the anchor's
+NotBefore makes this check fail.
+
 ndn-rs signs:
 
 - version 1 with the namespace root key `/<ns>/KEY/root`;
@@ -428,7 +465,8 @@ anything is signed.
 A node that holds no context for `<ns>` MUST adopt a context Data only if
 all of these hold:
 
-- it is self-consistent (§4.3);
+- it is self-consistent (§4.3), and the anchor that signed it is valid now
+  (§4.3);
 - its namespace equals the namespace the out-of-band link named;
 - the anchor that signed it has the **expected fingerprint** from that link
   (§3.3.2);
@@ -447,7 +485,10 @@ A node MUST NOT replace its held version with a lower one. ndn-rs applies
 two rules:
 
 - **Adoption from a link** (§4.4) replaces the held context iff the offered
-  version is ≥ the held version. An equal version replaces it (§12, Q3).
+  version is greater than the held version. An offered version *equal* to
+  the held one is accepted only when its content encodes identically to the
+  held context's (§3.2), and then changes nothing. A different context under
+  the held version number is a fork, and a node MUST refuse it.
 - **Update** (§5.2) replaces it iff the offered version is *strictly*
   greater. ndn-rs also requires that the held context is still the exact
   one the update was checked against, a compare-and-swap. If another
@@ -462,7 +503,8 @@ the node SHOULD purge cached Data signed by the newly revoked keys.
 A node holding version `N` (context `H`) MUST accept a context Data `D` as an
 update only if all of these hold:
 
-1. `D` is self-consistent (§4.3), and its signer anchor is `A`;
+1. `D` is self-consistent (§4.3), its signer anchor is `A`, and `A` is valid
+   now (§4.3);
 2. the namespace of `D` equals the namespace of `H`;
 3. the version of `D` is greater than `N`;
 4. some anchor of `H` has a public key byte-equal to `A`'s public key (§3.3.2).
@@ -470,7 +512,9 @@ update only if all of these hold:
 So version `N+1` is authorized by version `N`. A version may add anchors,
 for a root rotation or a new recovery anchor, but those anchors carry trust
 only once that version is adopted. Rule 4 compares public keys, not names: a
-re-issued certificate of the same key satisfies it.
+re-issued certificate of the same key satisfies it. Rule 4 does not check
+the validity of the matching anchor of `H` either, so a root whose held
+certificate has expired still authorizes the version that re-issues it.
 
 ### 5.3 Root hand-over (informative summary)
 
@@ -507,8 +551,9 @@ versions in between. In a refresh, a forwarder refusal of `D` triggers the
 walk as well. The walk applies only if `M > N + 1`; otherwise `D` is
 refused.
 
-- **Positions:** `N+1 … M` for a refresh; `max(low_seq, N+1) … M` for a sync
-  update (§12, Q8).
+- **Positions:** `N+1 … M`, for a refresh and for a sync update alike. A
+  sync update's low sequence number is not a lower bound: it says what the
+  member last heard, not which versions exist.
 - **Bound:** if the number of positions exceeds **128**
   (`MAX_CATCH_UP_VERSIONS`), the walk is refused before anything is fetched.
 - **Deadline:** no fetch starts after **40 s** (`MAX_CATCH_UP_TIME`). The
@@ -575,7 +620,8 @@ these hold:
 
 - *Hierarchy floor*, only when SchemaAuthoritative is absent: the identity of
   `K` is a prefix of `D`. The identity is `K` truncated before the first
-  component whose value is `KEY`.
+  GenericNameComponent `KEY` (§3.3.2); a typed component with value `KEY`
+  does not end it.
 - *Schema*: some rule of the runtime schema admits `(D, K)`.
 
 ndn-rs also tries the equivalent key forms. The pair is authorized if any
@@ -620,7 +666,9 @@ and the bare prefix. Matching is on the Interest name only:
 
 - the metadata answer requires the name to equal the metadata name exactly;
 - a versioned answer requires exactly one component after the prefix,
-  decoded as a VersionNameComponent.
+  decoded as a VersionNameComponent *in canonical form*. The same version
+  number in another width (e.g. `v=1` as `36 02 00 01`) is Nacked, because
+  the stored Data's name would differ from the Interest's.
 
 The Nack makes a walk past a version this node never held move on at once.
 
@@ -717,15 +765,20 @@ version `v > max(N, a)` (§9.7). Then the outcome is **Behind** instead:
 the answer is stale, and nothing changes. A bare sequence number never
 counts as verified.
 
-**Outcomes.** ndn-fwd reports:
+**Outcomes.** ndn-fwd and ndn-boltffi (mobile) run the same library
+refresh (ndn-namespace) and report:
 
 - **Source**: the node holds the root key;
 - **Current**, **UpstreamOlder**, **Updated**, **Behind**;
 - **Unreachable**: no answer to the metadata Interest;
 - **Failed**: everything else.
 
-ndn-boltffi reports only `current`, `upstream-older`, `updated` and
-`failed`, and maps Unreachable to `failed` (§12, Q9).
+ndn-boltffi reports them as lowercase strings (`source`, `current`,
+`upstream-older`, `updated`, `behind`, `unreachable`, `failed`). It never
+reports `source`, because the app holds no root key, nor `behind`, because
+it joins no sync group. Like ndn-fwd it evicts cached metadata before asking
+(§7.3). It publishes nothing, so it hands the host only the newest version
+to persist and does not keep the walked versions.
 
 **Schedule (ndn-fwd).** Refresh every `[security] context_refresh_secs`
 seconds; the default is **300**, and `0` means never. The first check runs
@@ -822,8 +875,8 @@ version `H < high`:
    - Not a Data, or not a context name → drop.
    - A namespace not held → drop. A group never yields a first adoption.
 2. Check §5.2 against the held context. If rule 4 fails, walk (§5.4) over
-   `max(low, H+1) … high`, using `P/seg=<n>` as the source. The walk is not
-   tried when `max(low, H+1) ≥ high`.
+   `H+1 … high`, using `P/seg=<n>` as the source. The walk is not tried
+   when `H+1 ≥ high`.
 3. Adopt the newest under §5.1 and keep it like a refreshed version: walked
    versions, then the newest.
 
@@ -832,7 +885,8 @@ version changed meanwhile, ndn-rs retries the announcement:
 
 - after 1 s, doubling up to 60 s between tries;
 - while the announcement is newer than the held version;
-- merging the ranges of later announcements from the same member.
+- keeping the highest sequence number of later announcements from the same
+  member.
 
 A member none of whose announcements ever passed §5.2 is tried at most
 **6** times, and at most **8** such members wait at once. A refused
@@ -1045,7 +1099,7 @@ That is, namespace `/h`, an empty native blob, then:
 - `fd0498 01 78`: an unknown even type, skipped.
 
 Replacing the last child with `fd0499 01 78`, an unknown *odd* type, makes
-the decoder reject the context ("unknown critical sub-TLV").
+the decoder reject the context ("unknown critical TLV-TYPE 0x0499").
 
 ### T6 Sync group (namespace `/home/bob`)
 
@@ -1071,7 +1125,9 @@ The group Data for T3 is 727 octets: `06 fd02d3`, the name above, then
 `/home/bob/32=trust-context/v=2` (662 octets). `open_context_update(v1, v2)`
 passes, with signer anchor `/home/bob/KEY/root/self/v=1`. Its content
 (526 octets) differs from T2 in only two places: the outer length
-(`fd0208`), and an extra Revocation that follows the first one:
+(`fd0208`), and an extra Revocation, written *before* the existing one
+because Revocation entries are in canonical name order (§3.2; `guest`
+sorts before `member`, being shorter):
 
 ```
 fd041821071f0804686f6d650803626f62080567756573740802747608034b455908026b32
@@ -1118,60 +1174,72 @@ Two parts were copied from ndn-fwd, because the originals are private there:
 The program was deleted after the run. An independent Python SHA-256 check
 confirmed the fingerprint and the metadata DigestSha256 value.
 
-## 12. Open questions
+## 12. Decisions
 
-- **Q1 Anchor order.** `encode_content` iterates the anchor map in hash-map
-  order, so for more than one anchor the AnchorSet order is unspecified and
-  can change between encodings of the same context. Decoders do not depend
-  on the order. Should a canonical order (e.g. by certificate name) be
-  fixed, so that a re-encoded version is reproducible?
-- **Q2 Duplicates.** A later Name, EnrollmentHint or LinkPolicy overwrites
-  an earlier one. A later *invalid* LinkPolicy resets the policy to the
-  default, even after a valid one. Should duplicates of single-valued
-  fields reject the context?
-- **Q3 Equal-version re-adoption.** `Keyring::adopt`, the link path,
-  accepts a context with a version *equal* to the held one and replaces the
-  held one, even if its content differs (a fork signed by the root).
-  Updates require strictly newer. Is the equality intended?
-- **Q4 Anchor validity.** `open_signed` and the continuity check do not
-  look at the signing anchor's ValidityPeriod. `decode_content` keeps
-  expired anchors; only `add_anchor` at production time refuses them. Must
-  a consumer refuse a context signed by an expired anchor?
-- **Q5 Unknown SchemaFormat.** A blob whose format code is unknown rejects
-  the whole context, although the module notes say a node keeping fewer
-  blobs "authorizes less, never more". Should an unknown format code
-  instead be skipped when another blob is understood? This matters for
-  implementations without the ndn-rs native-text grammar: format `1` is
-  ndn-rs-specific.
-- **Q6 Unknown sub-TLVs inside TrustSchemaBlob** are ignored whatever their
-  parity. Should odd (critical) ones reject the context?
-- **Q7 LinkPolicy extra fields.** Text after a third `;` is ignored.
-  Reserve it for extension, or reject?
-- **Q8 Sync walk lower bound.** The sync walk starts at
-  `max(low_seq, H+1)`, not `H+1`. If an earlier announcement of the same
-  member was dropped, for example refused, the positions below `low_seq`
-  are not walked, and the update falls back to the pull refresh. Intended?
-- **Q9 ndn-fwd and ndn-boltffi differ.** The mobile copy
-  (`identity_core.rs::refresh_contexts`) calls the same library refresh,
-  but:
-  - it has no Source, Behind or Unreachable outcomes;
-  - it returns only the newest version to the host, so walked versions are
-    neither kept nor served;
-  - it publishes nothing, so §7.3 does not apply;
-  - [INFERENCE] it does not evict cached metadata before a refresh, so a
-    pointer cached within the last 1 s can make a refresh report Current.
-- **Q10 Pattern grammar.** The doc comment of `NamePattern` says `<**v>`
-  captures "one or more" components, but `matches` accepts zero. This
-  document specifies the code (zero or more).
-- **Q11 Version decoding.** `NameComponent::as_version` accepts any length
-  and silently drops high-order octets past 8. Verification still fails,
-  because the name is rebuilt in canonical form. However, the publisher's
-  `answer` maps such an Interest to a held version, and returns a Data
-  whose name differs from the Interest's.
-- **Q12 KEY detection.** `key_identity` and `is_cert_name` compare only the
-  component *value* `KEY`, not its TLV-TYPE. Implementations should match,
-  or the floor and anchor matching will differ for names containing a
-  non-generic component with value `KEY`.
+These points were ambiguous in the code or differed between copies. Each is
+now decided, and the code and the sections above agree with it. No question
+is open.
+
+- **Q1 Anchor and revocation order.** A producer writes AnchorSet in
+  canonical order of the certificate names and Revocation entries in
+  canonical name order (§3.2); decoders accept any order. The anchor map
+  and the recovery procedure's revocation list have no stable order, so
+  without this the same version re-encoded to different bytes. Order is
+  not semantic, so no decoder changes.
+- **Q2 Duplicates.** A second Name, AnchorSet, SchemaAuthoritative,
+  EnrollmentHint, SourceBundleHash or LinkPolicy rejects the context, and so
+  does a second SchemaFormat or SchemaBody in a blob (§3.3.3, §3.4). No
+  producer emits one twice, and "the later one wins" let a later malformed
+  LinkPolicy reset a valid one to the broader default.
+- **Q3 Equal-version re-adoption.** An equal version from a link is a no-op
+  when it encodes identically to the held context, and refused as a fork
+  otherwise (§5.1). Re-scanning the same link stays harmless, while a
+  second, different context under the same number cannot silently replace
+  the held one.
+- **Q4 Anchor validity.** A received context is refused when its signing
+  anchor is outside its ValidityPeriod now; a node's own stored copy is
+  not checked, and §5.2 rule 4 matches the held anchor by key only (§4.3).
+  This is the rule a chain walk already applies to anchors. It cannot brick
+  a namespace: an expired root certificate is replaced by signing the next
+  version with a re-issued certificate of the same key. ndn-rs anchors
+  never expire before 2554.
+- **Q5 Unknown SchemaFormat.** A blob in an unknown format is skipped and
+  re-emitted verbatim; a context with no understood blob is refused
+  (§3.3.3). Fewer blobs only authorize less, and format `1` is
+  ndn-rs-specific, so refusing would lock out implementations that only read
+  LVS.
+- **Q6 Unknown sub-TLVs inside TrustSchemaBlob** follow the critical-bit
+  rule: odd or `<= 31` rejects, even is skipped (§3.3.3). It is the same
+  NDN evolvability rule as for the TrustContext children, and a SchemaFormat
+  must be exactly one octet.
+- **Q7 LinkPolicy extra fields.** Fields after the third are reserved and
+  ignored (§3.3.10). Rejecting them would make an older node fall back to
+  the default policy, which admits more than the stated one.
+- **Q8 Sync walk lower bound.** The sync walk starts at `H+1`, as a refresh
+  does (§5.4, §9.5). An SVS update's low sequence number reflects only what
+  this member last heard: with a lower bound of `max(low, H+1)`, a dropped
+  earlier announcement made the walk skip the version that links `H` to
+  the newest.
+- **Q9 ndn-fwd and ndn-boltffi.** Both now run the library refresh
+  (`ndn_namespace::refresh::refresh_contexts`). That refresh reports every
+  outcome and evicts cached metadata before asking for any node, publisher
+  or not, so the earlier mobile differences are gone. The rest is by
+  design (§8.2): the app holds no root key, joins no sync group, publishes
+  nothing, and hands the host only the newest version.
+- **Q10 Pattern grammar.** `<**v>` matches zero or more components and binds
+  nothing (§3.3.3); the `NamePattern` documentation now says so. The
+  generated namespace schema depends on zero: `/<ns>/<role>/<dev>/<!KEY>/<**data>`
+  must admit a one-component data name.
+- **Q11 Version decoding.** A NonNegativeInteger of any length other than 1,
+  2, 4 or 8 octets does not decode (§1), so `as_version` and its siblings
+  return nothing for it instead of dropping octets. The publisher answers a
+  versioned Interest only when its version component is canonical (§7.1),
+  so a Data is never returned under a name that differs from the
+  Interest's.
+- **Q12 KEY detection.** Only the GenericNameComponent `KEY` (TLV-TYPE 8)
+  marks a key or certificate name, in `is_cert_name` and in the floor's
+  identity (§3.3.2, §6.4). ndn-cxx's `Certificate::isValidName` compares it
+  this way, and a typed `32=KEY` component is not a certificate marker.
 
 ## Appendix A. Code references (non-normative)
 
@@ -1181,36 +1249,37 @@ may move.
 
 **TLV registry and codec** — `ndn-rs/crates/security/ndn-security/src/trust_context/`
 
-- `tlv.rs:29` TrustContext 0x0410; `:32` AnchorSet 0x0411; `:38` TrustSchemaBlob 0x0413; `:42` CaEndpoint 0x0414; `:45` SchemaFormat 0x0415; `:48` SchemaBody 0x0417; `:51` EnrollmentHint 0x0416; `:54` Revocation 0x0418; `:61` SourceBundleHash 0x041A; `:71` SchemaAuthoritative 0x041C; `:81` KeyRole 0x041E; `:90` LinkPolicy 0x0412; `:93-95` format codes 1/2; `:3-25` provisional block and parity.
-- `mod.rs:55` keyword `trust-context`; `:73-79` format code decode (unknown → error); `:106-124` native-text parsing (trim, skip empty lines); `:128-136` OR of blobs, multiple LVS → error.
-- `mod.rs:179-182` hint flags; `:188-194` default hint; `:196-211` hint encode; `:213-243` hint decode (legacy rule `:235-240`).
-- `mod.rs:256-266` KeyRole codes 1/2.
-- `mod.rs:293-303` LinkPolicy default; `:306-307` words; `:311-318` allows_link/relay; `:340-352` encode; `:354-375` decode.
-- `mod.rs:606-608` admits_enrollment_links; `:617-623` add_anchor validity check; `:637-653` anchor_for; `:660-662` is_revoked; `:685-696` authorizes (floor + schema); `:712-724` authorizes_hop; `:742-754` authorizes_certification.
-- `mod.rs:777-824` encode_content (order; anchor map iteration `:785`); `:828-835` rdr_name; `:849-873` sign_into_data (KeyLocator = signer key name); `:879-894` async variant.
-- `mod.rs:900-1037` decode_content: `:901-904` outer type; `:922-927` namespace; `:928-944` AnchorSet (skip non-Data `:933-935`); `:945-967` blob (inner unknown ignored `:959`; missing fields `:963-965`); `:968` authoritative; `:969-974` CaEndpoint; `:975` hint; `:980-984` SourceBundleHash length 32; `:985-990` Revocation; `:993-997` KeyRole; `:1000` LinkPolicy; `:1002-1006` unknown critical → reject; `:1011-1015` required fields; `:1026` floor unless authoritative.
-- `mod.rs:1041-1053` derived native blob; `:1060-1063` anchor_fingerprint; `:1067-1081` context_namespace_of; `:1113-1156` open_signed (name equality `:1123`, signer must be own anchor `:1133-1135`, public-key sig types `:1139-1144`); `:1204-1206` is_critical; `:1209-1221` read_tlv (trailing bytes ignored); `:1226-1232` key_identity.
+- `tlv.rs:29` TrustContext 0x0410; `:32` AnchorSet 0x0411; `:38` TrustSchemaBlob 0x0413; `:42` CaEndpoint 0x0414; `:48` SchemaFormat 0x0415 (unknown code not understood, `:44-47`); `:51` SchemaBody 0x0417; `:54` EnrollmentHint 0x0416; `:57` Revocation 0x0418; `:64` SourceBundleHash 0x041A; `:74` SchemaAuthoritative 0x041C; `:84` KeyRole 0x041E; `:93` LinkPolicy 0x0412; `:96-98` format codes 1/2; `:3-25` provisional block and parity.
+- `mod.rs:61` keyword `trust-context`; `:65-92` SchemaFormat (unknown code → `Unknown`, `:85-91`); `:118-137` native-text parsing (trim, skip empty lines); `:143-161` OR of understood blobs, none understood → error, multiple LVS → error.
+- `mod.rs:204-207` hint flags; `:213-219` default hint; `:221-236` hint encode; `:238-268` hint decode (legacy rule `:260-265`).
+- `mod.rs:281-291` KeyRole codes 1/2.
+- `mod.rs:318-328` LinkPolicy default; `:331-332` words; `:336-343` allows_link/relay; `:365-377` encode; `:379-404` decode (fields after the third ignored).
+- `mod.rs:635-637` admits_enrollment_links; `:646-652` add_anchor validity check; `:666-682` anchor_for; `:689-691` is_revoked; `:714-725` authorizes (floor + schema); `:741-753` authorizes_hop; `:771-783` authorizes_certification.
+- `mod.rs:808-861` encode_content (anchors sorted by name `:809-815`, revocations sorted `:816-817`); `:865-872` rdr_name; `:886-910` sign_into_data (KeyLocator = signer key name); `:916-931` async variant.
+- `mod.rs:942-1112` decode_content: `:947-950` outer type; `:959-966` single-valued fields at most once; `:973-979` namespace; `:980-996` AnchorSet (skip non-Data `:985-987`); `:998-1037` blob (SchemaFormat one octet, no repeats `:1006-1023`; unknown critical inner → reject `:1025-1028`; missing fields `:1033-1035`); `:1038-1041` authoritative; `:1042-1047` CaEndpoint; `:1048-1051` hint; `:1055-1058` SourceBundleHash length 32; `:1059-1064` Revocation; `:1067-1071` KeyRole; `:1074-1077` LinkPolicy; `:1079-1081` unknown critical → reject; `:1086-1090` required fields; `:1101` floor unless authoritative.
+- `mod.rs:1116-1128` derived native blob; `:1135-1138` anchor_fingerprint; `:1142-1156` context_namespace_of; `:1193-1236` open_signed (name equality `:1203`, signer must be own anchor `:1212-1215`, public-key sig types `:1219-1224`); `:1238-1254` open_received (signer valid now `:1250`); `:1302-1304` is_critical; `:1307-1319` read_tlv (trailing bytes ignored); `:1321-1332` key_identity (generic `KEY` only).
 
 **Supporting library code**
 
-- `ndn-rs/crates/security/ndn-security/src/keyring.rs:97-116` adopt (≥); `:123-135` adopt_update (>); `:145-163` adopt_update_from (CAS); `:240-253` context_for (longest prefix).
+- `ndn-rs/crates/security/ndn-security/src/keyring.rs:101-124` adopt (> replaces; = only when identical, `:108-111`); `:131-143` adopt_update (>); `:153-171` adopt_update_from (CAS); `:248-261` context_for (longest prefix).
 - `ndn-rs/crates/security/ndn-security/src/cert_cache.rs:31-37` public key from Content (Ed25519 SPKI unwrapped).
 - `ndn-rs/crates/security/ndn-security/src/spki.rs:31-33` Ed25519 SPKI prefix.
-- `ndn-rs/crates/security/ndn-security/src/cert_name.rs:43-57` is_cert_name, key_name_of; `:74-80` cert_name.
+- `ndn-rs/crates/security/ndn-security/src/cert_name.rs:39-41` is_key_component (GenericNameComponent `KEY`); `:46-49` is_cert_name; `:54-60` key_name_of; `:77-83` cert_name.
 - `ndn-rs/crates/security/ndn-security/src/manager.rs:514-594` certificate encoding (8-octet MetaInfo integers, ValidityPeriod).
-- `ndn-rs/crates/security/ndn-security/src/trust_schema.rs:39-91` pattern grammar; `:121-123` MultiCapture matches zero or more; `:146-163` rule parse/check.
+- `ndn-rs/crates/security/ndn-security/src/trust_schema.rs:41-93` pattern grammar; `:123-125` MultiCapture matches zero or more, binds nothing; `:147-165` rule parse/check.
+- `ndn-rs/crates/security/ndn-security/src/validator/expected.rs:270` forwarder expectation opens with open_received.
 - `ndn-rs/crates/core/ndn-packet/src/signature.rs:36-40` signature type codes.
 - `ndn-rs/crates/core/ndn-packet/src/encode/data.rs:411-416` `build` = DigestSha256; `:535-588` sign_sync (MetaInfo only if set).
 - `ndn-rs/crates/core/ndn-packet/src/lib.rs:105-108` SEGMENT 0x32, KEYWORD 0x20, VERSION 0x36.
-- `ndn-rs/crates/core/ndn-foundation-types/src/name.rs:99-111` keyword/version components; `:124-136` as_segment/as_version; `:149-163` NNI encode (shortest) / decode (any length).
+- `ndn-rs/crates/core/ndn-foundation-types/src/name.rs:99-111` keyword/version components; `:123-158` as_segment/as_version/… (NNI widths only); `:161-169` NNI encode (shortest); `:175-184` NNI decode (1, 2, 4 or 8 octets, else none).
 - `ndn-rs/crates/app/ndn-app/src/rdr.rs:83-107` MetaData encode (Name only when other fields absent).
 - `ndn-rs/crates/app/ndn-app/src/consumer.rs:196` DEFAULT_TIMEOUT 4.5 s; `ndn-rs/crates/security/ndn-identity/src/engine_exchange.rs:38-40` wait = max(lifetime, default).
 - `ndn-rs/crates/core/ndn-packet/src/encode/interest.rs:194,236` InterestLifetime defaults to 4000 ms; `:199-210,240-241` ApplicationParameters + ParametersSha256Digest component.
 
 **ndn-cert**
 
-- `ndn-rs/crates/security/ndn-cert/src/onboarding.rs:41` `metadata`; `:52` CONTEXT_EXPECTATION_TTL 30 s; `:57-69` rdr_prefix, rdr_metadata_name; `:184-200` authenticate (namespace, expected fingerprint); `:289-297` minimum version; `:350-404` adopt_anchor_link; `:509-515` fetch_context; `:521-550` pointer fetch (CanBePrefix, MustBeFresh, prefix check); `:554-575` exact fetch, name check; `:580-612` context_pointer confinement.
-- `ndn-rs/crates/security/ndn-cert/src/context_update.rs:83-93` key_name_of; `:178-200` revocations_to_add; `:211-237` bump_context_revoking; `:241-255` ensure_anchor; `:257-261` next_version; `:510` MAX_CATCH_UP_VERSIONS 128; `:519` MAX_CATCH_UP_TIME 40 s; `:727-756` open_context_update (public-key equality `:749`); `:783-811` fetch_update; `:830-843` ByName source; `:869-938` follow_versions; `:964-1091` refresh_context (pointer compare `:1005-1013`, walk condition `:1042-1043`, CAS `:1067-1076`).
+- `ndn-rs/crates/security/ndn-cert/src/onboarding.rs:41` `metadata`; `:52` CONTEXT_EXPECTATION_TTL 30 s; `:57-69` rdr_prefix, rdr_metadata_name; `:195-211` authenticate (open_received, namespace, expected fingerprint); `:300-308` minimum version; `:361-415` adopt_anchor_link; `:454-470` adopt_arc_into (Rollback vs Fork); `:524-530` fetch_context; `:595` context_pointer confinement.
+- `ndn-rs/crates/security/ndn-cert/src/context_update.rs:83-93` key_name_of; `:178-200` revocations_to_add; `:211-237` bump_context_revoking; `:241-255` ensure_anchor; `:257-261` next_version; `:345-398` schema_grants (unknown-format blob `:386-395`); `:522` MAX_CATCH_UP_VERSIONS 128; `:531` MAX_CATCH_UP_TIME 40 s; `:742-771` open_context_update (open_received `:746`, public-key equality `:764`); `:798-826` fetch_update; `:841-858` ByName source; `:884-953` follow_versions; `:979-1106` refresh_context (pointer compare `:1020-1028`, walk condition `:1057-1058`, CAS `:1082-1091`).
 - `ndn-rs/crates/security/ndn-cert/src/namespace.rs:55-57` root key name; `:60-62` CA key name; `:137-156` build_namespace (version 1, hint, link policy, blobs, authoritative, CA endpoint, root-device KeyRoles).
 - `ndn-rs/crates/security/ndn-cert/src/recovery.rs:740-756` add recovery anchor; `:762-790` remove; `:800-806` reissue; `:921-988` recovery_version.
 - `ndn-rs/crates/security/ndn-cert/src/context_store.rs:5-8` on-disk layout (newest + every version).
@@ -1218,7 +1287,12 @@ may move.
 **ndn-identity**
 
 - `ndn-rs/crates/security/ndn-identity/src/adopt.rs:51-59` refresh_context_via_engine.
-- `ndn-rs/crates/security/ndn-identity/src/context_sync.rs:144-148` group_prefix; `:155-162` group_data (seg=version, DigestSha256); `:250-368` check_and_adopt (fetch `:256`, walk lower bound `:297-300`); `:387-409` GroupVersions; `:422-430` Retry 1 s/60 s; `:436` UNPROVEN_TRIES 6; `:440` UNPROVEN_PENDING 8; `:473-588` run (range merge `:501-505`); `:606-692` obtain.
+- `ndn-rs/crates/security/ndn-identity/src/context_sync.rs:144-148` group_prefix; `:155-162` group_data (seg=version, DigestSha256); `:252-372` check_and_adopt (fetch `:258`, walk from `H+1` `:301-304`); `:377-413` GroupVersions; `:421-434` Retry 1 s/60 s; `:440` UNPROVEN_TRIES 6; `:444` UNPROVEN_PENDING 8; `:477-592` run (highest sequence kept `:506`); `:609-` obtain.
+
+**ndn-namespace**
+
+- `ndn-rs/crates/security/ndn-namespace/src/publish/contexts.rs:199-217` answer (canonical version component only, `:210-214`).
+- `ndn-rs/crates/security/ndn-namespace/src/refresh.rs:86` refresh_contexts (used by ndn-fwd and ndn-boltffi); `:133` cached metadata evicted before every refresh.
 
 **ndn-sync**
 
@@ -1236,4 +1310,4 @@ may move.
 
 **ndn-mobile**
 
-- `ndn-mobile/crates/ndn-boltffi/src/identity_core.rs:215-304` refresh_contexts (four states; only newest returned `:297`).
+- `ndn-mobile/crates/ndn-boltffi/src/identity_core.rs:213-260` refresh_contexts (the library refresh; every outcome mapped `:241-249`; only the newest returned to the host `:232-239`).

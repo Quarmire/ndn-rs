@@ -223,11 +223,11 @@ waiting out the Interest lifetime:
 |---|---|---|
 | 170 | `chain` | chain rejected otherwise (too deep, a cycle, unsupported signature type, key store error) |
 | 171 | `revoked` | a certificate on the chain is revoked in the governing trust context |
-| 172 | `bad-signature` | the signature does not verify: forged, or altered in transit |
+| 172 | `bad-signature` | the signature does not verify (forged, or altered in transit), or the Data names no usable signing key (a KeyDigest locator no cached certificate answers; a Data without a KeyLocator does not decode) |
 | 173 | `schema` | the trust schema/context does not authorize the signer for the name |
 | 174 | `untrusted-root` | the chain ends at a self-signed certificate that is no trust anchor |
 | 175 | `context` | a trust context being adopted/updated failed the expectation |
-| 176 | `unverifiable` | the Data names no signing key (no KeyLocator), or every source asked for its signing certificate had none or served one this forwarder refused (see [Missing certificates](#missing-certificates)). **Refused for now**, not final |
+| 176 | `unverifiable` | every source asked for the signing certificate had none or served one this forwarder refused (see [Missing certificates](#missing-certificates)). **Refused for now**, not final |
 
 (`ndn_packet::Refusal`, `NackReason::Refused`; ndn-rs-private codes, beside
 `NotYet` = 160.) Rules:
@@ -248,7 +248,9 @@ waiting out the Interest lifetime:
   (anyone could forge "revoked"): it is relayed as `NoRoute` and the strategy
   treats it as `NoRoute` (that upstream has nothing usable; another may). A
   refusal from a local upstream (a forwarder on this host) is relayed as a
-  refusal to local downstreams only.
+  refusal to local downstreams and as `NoRoute` to non-local ones. Every
+  relayed Nack, like a refusal, carries each downstream's own Interest
+  (its nonce, selectors and parameters) and echoes its PitToken.
 - **Why a Nack:** NackReason is NDNLPv2's field for "why this Interest is not
   satisfied", and a receiver that does not know a reason code must treat it
   as a Nack without reason, not drop it — so an NFD/ndn-cxx app on a local

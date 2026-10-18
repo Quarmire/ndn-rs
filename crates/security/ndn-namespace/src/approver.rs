@@ -156,7 +156,7 @@ pub async fn list(
 ) -> Result<Listing, TrustRefusal> {
     let creds = credentials()?;
     if local.is_none() && creds.is_empty() {
-        return Err(nothing_here());
+        return Err(nothing_here(p));
     }
     let local = local.map(|store| store.records());
     let mut remote = Vec::with_capacity(creds.len());
@@ -198,7 +198,7 @@ pub async fn decide(
     if creds.is_empty() {
         return Err(match local_miss {
             Some(miss) => miss.into(),
-            None => nothing_here(),
+            None => nothing_here(p),
         });
     }
     // The namespaces this device administers: ask each CA what is pending.
@@ -217,15 +217,13 @@ pub async fn decide(
     let (cred, record) = match found.len() {
         1 => found.remove(0),
         0 => {
-            let mut reason = format!(
-                "no pending request shows {target:?} at {}: check the code on the new \
-                 device against `ndn-fwd approvals list` (a request that expired or was \
-                 decided is not pending)",
+            let mut reason = p.words().no_pending_request(
+                target,
                 if local.is_some() {
                     "this node's CA or at the CAs of the namespaces it administers"
                 } else {
                     "the CAs of the namespaces this node administers"
-                }
+                },
             );
             let mut code = status::NOT_FOUND;
             if let Some(first) = failed.first() {
@@ -275,15 +273,8 @@ pub async fn decide(
 }
 
 /// Nothing to approve on this device, and how to change that.
-fn nothing_here() -> TrustRefusal {
-    refusal(
-        status::NOT_FOUND,
-        "this node neither runs a CA that takes approval requests nor holds a current admin \
-         certificate of a namespace whose CA runs elsewhere: there is nothing to approve \
-         here. Run `ndn-fwd approvals` on the namespace's root device (its CA host) or on \
-         an admin device; a device becomes one with `ndn-fwd enroll <anchor link> --role \
-         admin`, approved by an admin",
-    )
+fn nothing_here(p: &Participant) -> TrustRefusal {
+    refusal(status::NOT_FOUND, p.words().nothing_to_approve())
 }
 
 /// The pending requests at `cred`'s CA.

@@ -119,7 +119,7 @@ fn device_keyring(root_dev: &RootDevice) -> Arc<Keyring> {
 }
 
 fn device_key(invite: &InviteLink, device: &str) -> Arc<dyn Signer> {
-    let key = new_device_key_name(&invite.device_identity(device).unwrap());
+    let key = new_device_key_name(&invite.device_identity(device).unwrap()).unwrap();
     Arc::new(Ed25519Signer::from_seed(&DEVICE_SEED, key))
 }
 
@@ -263,6 +263,32 @@ fn an_expired_invite_is_refused() {
     let link = InviteLink::from_uri(&invite("/home/bob/member", &later, [1; 32])).unwrap();
     assert_eq!(link.expires_at_secs, Some(u64::from(u32::MAX)));
     assert_eq!(link.role, ndn_cert::roles::Role::Member);
+}
+
+/// An invite whose token reaches its `-until` second is expired (valid only
+/// while now < until, as on the CA); one whose `-until` is not a number is
+/// refused, never read as non-expiring.
+#[test]
+fn an_invite_expires_at_its_until_and_a_malformed_expiry_is_refused() {
+    use ndn_cert::roles::token_with_expiry;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let at_now = invite("/home/bob/member", &token_with_expiry("member-aa", now), [1; 32]);
+    assert!(matches!(
+        InviteLink::from_uri(&at_now),
+        Err(InviteEnrollError::TokenExpired { .. })
+    ));
+    for token in ["member-aa-untilsoon", "member-aa-until99999999999999999999"] {
+        assert!(
+            matches!(
+                InviteLink::from_uri(&invite("/home/bob/member", token, [1; 32])),
+                Err(InviteEnrollError::InviteField { field: "token", .. })
+            ),
+            "{token}"
+        );
+    }
 }
 
 /// Malformed or misdirected invites are refused with a reason, never a

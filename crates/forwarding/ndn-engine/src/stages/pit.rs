@@ -5,7 +5,7 @@ use tracing::trace;
 use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DownstreamInterest, DropReason, PacketContext};
 use ndn_store::{
-    DeadNonceList, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
+    DeadNonceList, InRecord, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
     PitKeyDiscriminator, PitToken,
 };
 use ndn_transport::FaceId;
@@ -123,6 +123,13 @@ impl PitCheckStage {
             PitToken::from_name_hash_keyed(name_hash, interest.forwarding_hint(), discriminator);
         ctx.pit_token = Some(token);
         let in_selector = interest.selectors().clone();
+        // Kept per in-record for the Interest a Nack to this downstream
+        // encloses (see `InRecord::parameters`).
+        let parameters = interest
+            .app_parameters()
+            .is_some()
+            .then(|| interest.parameters_portion())
+            .flatten();
 
         if let Some(dnl) = self.dead_nonce_list.as_ref() {
             let fp = NonceFingerprint::new(name_hash, nonce);
@@ -218,6 +225,7 @@ impl PitCheckStage {
                     ctx.lp_pit_token.clone(),
                     in_selector.clone(),
                     persistent.clone(),
+                    parameters.clone(),
                 );
                 // Extend entry deadline to cover the longest live in-record.
                 if let Some(ref ps) = persistent
@@ -293,6 +301,7 @@ impl PitCheckStage {
                     ctx.lp_pit_token.clone(),
                     in_selector.clone(),
                     persistent.clone(),
+                    parameters.clone(),
                 );
                 (entry, CheckResult::Inserted)
             },
@@ -421,16 +430,6 @@ async fn subscription_validation(
         Err(e) => InterestValidationOutcome::Invalid(e),
     }
 }
-
-/// A CanBePrefix in-record drained during the prefix-walk: (face id, LP PIT
-/// token to echo, trace ids for fan-out instrumentation, selectors + nonce
-/// for a refusal Nack).
-type DrainedInRecord = (
-    u64,
-    Option<bytes::Bytes>,
-    Vec<ndn_packet::lp::TraceId>,
-    (ndn_packet::Selector, u32),
-);
 
 enum PersistentMatchResult {
     /// Persistent entry: faces collected, per-subscriber counter decremented.
@@ -700,44 +699,30 @@ impl PitMatchStage {
             // exact-match subscribers (who want Data named exactly at the
             // prefix) pending — removing the whole entry would silently starve
             // them. Reap the entry only once it is empty.
-            let record = interests.is_some();
             let drained = self.pit.with_entry_mut(token, |entry| {
-                let mut taken: SmallVec<[DrainedInRecord; 4]> = SmallVec::new();
+                let mut taken: SmallVec<[InRecord; 4]> = SmallVec::new();
                 let mut i = 0;
                 while i < entry.in_records.len() {
                     if entry.in_records[i].selector.can_be_prefix {
-                        let r = entry.in_records.swap_remove(i);
-                        taken.push((
-                            r.face_id,
-                            r.lp_pit_token,
-                            r.trace_ids.iter().copied().collect(),
-                            (r.selector, r.nonce),
-                        ));
+                        taken.push(entry.in_records.swap_remove(i));
                     } else {
                         i += 1;
                     }
                 }
-                let name = record.then(|| Arc::clone(&entry.name));
-                (taken, entry.in_records.is_empty(), name)
+                (taken, entry.in_records.is_empty(), Arc::clone(&entry.name))
             });
             if let Some((taken, now_empty, entry_name)) = drained {
-                for (face_id, lp_token, trace_ids, (selector, nonce)) in taken {
-                    if seen.contains(&face_id) {
+                for r in taken {
+                    if let Some(list) = interests.as_deref_mut() {
+                        record_downstream(list, &entry_name, &r);
+                    }
+                    if seen.contains(&r.face_id) {
                         continue;
                     }
-                    seen.push(face_id);
-                    faces.push(FaceId(face_id));
-                    if let (Some(list), Some(name)) = (interests.as_deref_mut(), &entry_name) {
-                        list.push(DownstreamInterest {
-                            face: FaceId(face_id),
-                            lp_pit_token: lp_token.clone(),
-                            name: Arc::clone(name),
-                            selector,
-                            nonce,
-                        });
-                    }
-                    tokens.push(lp_token);
-                    fan_out.push((face_id, trace_ids));
+                    seen.push(r.face_id);
+                    faces.push(FaceId(r.face_id));
+                    tokens.push(r.lp_pit_token);
+                    fan_out.push((r.face_id, r.trace_ids.into_iter().collect()));
                 }
                 if now_empty && let Some((_, entry)) = self.pit.remove(token) {
                     insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
@@ -749,6 +734,9 @@ impl PitMatchStage {
         if let Some((_, entry)) = self.pit.remove(token) {
             insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
             for r in entry.in_records.iter() {
+                if let Some(list) = interests.as_deref_mut() {
+                    record_downstream(list, &entry.name, r);
+                }
                 if seen.contains(&r.face_id) {
                     continue;
                 }
@@ -756,18 +744,29 @@ impl PitMatchStage {
                 faces.push(FaceId(r.face_id));
                 tokens.push(r.lp_pit_token.clone());
                 fan_out.push((r.face_id, r.trace_ids.iter().copied().collect()));
-                if let Some(list) = interests.as_deref_mut() {
-                    list.push(DownstreamInterest {
-                        face: FaceId(r.face_id),
-                        lp_pit_token: r.lp_pit_token.clone(),
-                        name: Arc::clone(&entry.name),
-                        selector: r.selector.clone(),
-                        nonce: r.nonce,
-                    });
-                }
             }
         }
     }
+}
+
+/// Record the Interest of in-record `r` (of the entry named `name`) for a
+/// refusal to its face. One Data goes once to each face, but a refusal
+/// answers one pending Interest: a face whose exact and CanBePrefix
+/// Interests the same Data consumed gets a refusal for each name (one per
+/// face and name: a face's repeated Interest under one name needs one).
+fn record_downstream(list: &mut SmallVec<[DownstreamInterest; 1]>, name: &Arc<ndn_packet::Name>, r: &InRecord) {
+    let face = FaceId(r.face_id);
+    if list.iter().any(|d| d.face == face && d.name == *name) {
+        return;
+    }
+    list.push(DownstreamInterest {
+        face,
+        lp_pit_token: r.lp_pit_token.clone(),
+        name: Arc::clone(name),
+        selector: r.selector.clone(),
+        nonce: r.nonce,
+        parameters: r.parameters.clone(),
+    });
 }
 
 pub(crate) fn insert_dead_nonces(dnl: &Option<Arc<DeadNonceList>>, entry: &PitEntry, now: u64) {

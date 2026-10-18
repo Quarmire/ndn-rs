@@ -14,9 +14,12 @@ ndn-tlv   = { workspace = true }
 bytes     = { workspace = true, features = ["std"] }
 base64    = { workspace = true }
 thiserror = { workspace = true }
+# `qr`: the one QR renderer configuration (level M, byte mode). No default
+# features: no image dependency.
+qrcode    = { version = "0.14", default-features = false }
 
 [dev-dependencies]
-# only for the `emit` helper's `qr` mode (renders a payload SVG for testing)
+# the `emit` helper's `qr` mode writes an SVG
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [lints]

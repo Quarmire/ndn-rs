@@ -46,6 +46,11 @@ pub enum SafeBagError {
     Pkcs8(String),
     #[error("Ed25519 PKCS#8 conversion: {0}")]
     Ed25519(String),
+    /// The bag's key derivation asks for more work than a reader spends
+    /// ([`MAX_PBKDF2_ITERATIONS`], [`MAX_SCRYPT_WORK`]): refused before
+    /// any of it is done.
+    #[error("the key is sealed with a key derivation too costly to open: {0}")]
+    KdfTooCostly(String),
     #[cfg(feature = "ndnsec-compat")]
     #[error("key conversion error: {0}")]
     KeyConversion(String),
@@ -55,6 +60,46 @@ pub enum SafeBagError {
     #[cfg(feature = "ndnsec-compat")]
     #[error("unsupported algorithm in SafeBag: {0}")]
     UnsupportedAlgorithm(String),
+}
+
+/// The most PBKDF2 iterations a SafeBag is opened with. Bags are sealed
+/// with 600 000; a crafted bag asking for billions would make opening it
+/// take hours.
+pub const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
+
+/// The most scrypt work a SafeBag is opened with, as `128 · N · r · p`
+/// bytes (1 GiB): `N = 2^20, r = 8, p = 1` and anything cheaper.
+pub const MAX_SCRYPT_WORK: u64 = 1 << 30;
+
+/// Refuse a PBES2 key derivation above [`MAX_PBKDF2_ITERATIONS`] or
+/// [`MAX_SCRYPT_WORK`], before deriving anything.
+fn check_kdf_cost(scheme: &pkcs8::pkcs5::EncryptionScheme<'_>) -> Result<(), SafeBagError> {
+    let Some(pbes2) = scheme.pbes2() else {
+        return Ok(());
+    };
+    if let Some(pbkdf2) = pbes2
+        .kdf
+        .pbkdf2()
+        .filter(|p| p.iteration_count > MAX_PBKDF2_ITERATIONS)
+    {
+        return Err(SafeBagError::KdfTooCostly(format!(
+            "{} PBKDF2 iterations (at most {MAX_PBKDF2_ITERATIONS})",
+            pbkdf2.iteration_count
+        )));
+    }
+    if let Some(scrypt) = pbes2.kdf.scrypt() {
+        let work = 128u128
+            * u128::from(scrypt.cost_parameter)
+            * u128::from(scrypt.block_size)
+            * u128::from(scrypt.parallelization);
+        if work > u128::from(MAX_SCRYPT_WORK) {
+            return Err(SafeBagError::KdfTooCostly(format!(
+                "scrypt N={} r={} p={} (at most {MAX_SCRYPT_WORK} bytes of work)",
+                scrypt.cost_parameter, scrypt.block_size, scrypt.parallelization
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A decoded SafeBag: the certificate Data wire bytes plus the
@@ -151,12 +196,25 @@ impl SafeBag {
         })
     }
 
+    fn encrypted_key_info(&self) -> Result<pkcs8::EncryptedPrivateKeyInfo<'_>, SafeBagError> {
+        pkcs8::EncryptedPrivateKeyInfo::try_from(&self.encrypted_key[..])
+            .map_err(|e| SafeBagError::Pkcs8(format!("parse EncryptedPrivateKeyInfo: {e}")))
+    }
+
+    /// Refuse a key derivation costlier than [`MAX_PBKDF2_ITERATIONS`] /
+    /// [`MAX_SCRYPT_WORK`] ([`SafeBagError::KdfTooCostly`]) without a
+    /// password, so a reader can refuse the bag before asking for one.
+    pub fn check_kdf_cost(&self) -> Result<(), SafeBagError> {
+        check_kdf_cost(&self.encrypted_key_info()?.encryption_algorithm)
+    }
+
     /// Returns the unencrypted PKCS#8 `PrivateKeyInfo` DER; the caller
     /// dispatches on the algorithm OID or uses [`Self::decrypt_ed25519_seed`].
+    /// A key derivation costlier than [`MAX_PBKDF2_ITERATIONS`] /
+    /// [`MAX_SCRYPT_WORK`] is refused ([`SafeBagError::KdfTooCostly`]).
     pub fn decrypt_pkcs8(&self, password: &[u8]) -> Result<Vec<u8>, SafeBagError> {
-        use pkcs8::EncryptedPrivateKeyInfo;
-        let epki = EncryptedPrivateKeyInfo::try_from(&self.encrypted_key[..])
-            .map_err(|e| SafeBagError::Pkcs8(format!("parse EncryptedPrivateKeyInfo: {e}")))?;
+        let epki = self.encrypted_key_info()?;
+        check_kdf_cost(&epki.encryption_algorithm)?;
         let decrypted = epki
             .decrypt(password)
             .map_err(|e| SafeBagError::Pkcs8(format!("decrypt: {e}")))?;
@@ -196,13 +254,18 @@ impl SafeBag {
     }
 }
 
+/// The Ed25519 key with `seed` as a PKCS#8 v1 `PrivateKeyInfo` (RFC 8410,
+/// 48 bytes, no public key): the form every reader accepts — BoringSSL
+/// (Chrome's WebCrypto) refuses v2. [`pkcs8_to_ed25519_seed`] reads v1 and
+/// v2.
 pub fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Result<Vec<u8>, SafeBagError> {
-    use ed25519_dalek::SigningKey;
-    use ed25519_dalek::pkcs8::EncodePrivateKey;
-    let sk = SigningKey::from_bytes(seed);
-    let doc = sk
-        .to_pkcs8_der()
-        .map_err(|e| SafeBagError::Ed25519(format!("to_pkcs8_der: {e}")))?;
+    use ed25519_dalek::pkcs8::{EncodePrivateKey, KeypairBytes};
+    let doc = KeypairBytes {
+        secret_key: *seed,
+        public_key: None,
+    }
+    .to_pkcs8_der()
+    .map_err(|e| SafeBagError::Ed25519(format!("to_pkcs8_der: {e}")))?;
     Ok(doc.as_bytes().to_vec())
 }
 
@@ -321,6 +384,87 @@ mod tests {
         let pkcs8 = ed25519_seed_to_pkcs8(&seed).expect("encode");
         let recovered = pkcs8_to_ed25519_seed(&pkcs8).expect("decode");
         assert_eq!(seed, recovered);
+    }
+
+    #[test]
+    fn ed25519_seed_pkcs8_is_v1_and_v2_still_opens() {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        let seed = [0x42u8; 32];
+        let pkcs8 = ed25519_seed_to_pkcs8(&seed).expect("encode");
+        // RFC 8410 v1: version 0, id-Ed25519, CurvePrivateKey; no public key.
+        let mut v1 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        v1.extend_from_slice(&seed);
+        assert_eq!(pkcs8, v1);
+        let v2 = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .to_pkcs8_der()
+            .unwrap();
+        assert_eq!(v2.as_bytes()[4], 0x01, "dalek writes v2");
+        assert_eq!(pkcs8_to_ed25519_seed(v2.as_bytes()).unwrap(), seed);
+    }
+
+    /// A bag sealed with `params` (its encrypted data is never reached).
+    fn sealed_with(params: pkcs8::pkcs5::pbes2::Parameters<'_>) -> SafeBag {
+        use pkcs8::der::Encode;
+        let epki = pkcs8::EncryptedPrivateKeyInfo {
+            encryption_algorithm: params.into(),
+            encrypted_data: &[0u8; 64],
+        };
+        SafeBag {
+            certificate: fake_cert(b"c"),
+            encrypted_key: Bytes::from(epki.to_der().unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_bag_asking_for_too_costly_a_key_derivation_is_refused_before_deriving() {
+        use pkcs8::pkcs5::pbes2::{
+            EncryptionScheme, Parameters, Pbkdf2Params, Pbkdf2Prf, ScryptParams,
+        };
+        let (salt, iv) = ([1u8; 16], [2u8; 16]);
+        let pbkdf2 = |iteration_count| Parameters {
+            kdf: Pbkdf2Params {
+                salt: &salt,
+                iteration_count,
+                key_length: None,
+                prf: Pbkdf2Prf::HmacWithSha256,
+            }
+            .into(),
+            encryption: EncryptionScheme::Aes256Cbc { iv: &iv },
+        };
+        for iterations in [MAX_PBKDF2_ITERATIONS + 1, u32::MAX] {
+            let bag = sealed_with(pbkdf2(iterations));
+            match bag.decrypt_pkcs8(b"pw") {
+                Err(SafeBagError::KdfTooCostly(why)) => {
+                    assert!(why.contains(&iterations.to_string()), "{why}")
+                }
+                other => panic!("expected KdfTooCostly, got {other:?}"),
+            }
+        }
+        assert!(sealed_with(pbkdf2(MAX_PBKDF2_ITERATIONS)).check_kdf_cost().is_ok());
+
+        let scrypt = |log_n: u32| Parameters {
+            kdf: ScryptParams {
+                salt: &salt,
+                cost_parameter: 1u64 << log_n,
+                block_size: 8,
+                parallelization: 1,
+                key_length: None,
+            }
+            .into(),
+            encryption: EncryptionScheme::Aes256Cbc { iv: &iv },
+        };
+        assert!(matches!(
+            sealed_with(scrypt(21)).decrypt_pkcs8(b"pw"),
+            Err(SafeBagError::KdfTooCostly(_))
+        ));
+        assert!(sealed_with(scrypt(20)).check_kdf_cost().is_ok());
+        assert!(matches!(
+            sealed_with(scrypt(21)).check_kdf_cost(),
+            Err(SafeBagError::KdfTooCostly(_))
+        ));
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::{
     error::CertError,
     policy::TOKEN_SCOPE_EVIDENCE,
     protocol::CertRequest,
-    roles::{Role, role_prefix, token_expiry, token_role},
+    roles::{Role, role_prefix, token_expired, token_expiry, token_role},
     store::CaStore,
 };
 
@@ -101,6 +101,13 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a token expiring at `expires_at_ns` (`None`: never) is still
+/// redeemable at `now_ns`: while `now < expiry`
+/// ([`token_expired`], the invitee's rule too).
+fn live_at(expires_at_ns: Option<u64>, now_ns: u64) -> bool {
+    expires_at_ns.is_none_or(|exp| !token_expired(exp, now_ns))
+}
+
 impl TokenStore {
     pub fn new() -> Self {
         Self::default()
@@ -147,9 +154,10 @@ impl TokenStore {
     /// Add the CA's invite `tokens`. A token naming a role (`member-…`,
     /// `guest-…`, as `ndn-fwd-tokens new --role` mints them) is scoped to
     /// `<namespace>/<role>`: it certifies only names under that prefix; one
-    /// minted with an expiry ([`token_expiry`]) is redeemable until then
-    /// (past: refused). Other tokens are unscoped, except on a namespace
-    /// CA (`namespace_ca`).
+    /// minted with an expiry ([`token_expiry`]) is redeemable while the time
+    /// is before it (from that second on: refused), and one whose expiry is
+    /// malformed is not added (refused, never read as non-expiring). Other
+    /// tokens are unscoped, except on a namespace CA (`namespace_ca`).
     ///
     /// On a namespace CA the issuance policy ([`RolePolicy`](crate::RolePolicy))
     /// admits a token only for a member or a guest, after the challenge has
@@ -177,11 +185,22 @@ impl TokenStore {
                 None if namespace_ca => Some(Role::Member),
                 role => role,
             };
-            let ttl = token_expiry(token).map(|at| {
-                let now = now_ns() / 1_000_000_000;
-                Duration::from_secs(at.saturating_sub(now))
-            });
-            self.add_scoped(token, ttl, role.map(|role| role_prefix(namespace, role)));
+            // The `-until` second itself, not a TTL from now: the invitee
+            // reads the same instant.
+            let expires_at_ns = match token_expiry(token) {
+                Ok(at) => at.map(|at| at.saturating_mul(1_000_000_000)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "token challenge: refusing an invite token");
+                    continue;
+                }
+            };
+            self.insert(
+                token.to_string(),
+                TokenMeta {
+                    expires_at_ns,
+                    scope: role.map(|role| role_prefix(namespace, role)),
+                },
+            );
         }
         Ok(())
     }
@@ -209,7 +228,7 @@ impl TokenStore {
     pub fn is_live(&self, token: &str) -> bool {
         self.tokens
             .get(token)
-            .is_some_and(|m| m.expires_at_ns.is_none_or(|exp| now_ns() <= exp))
+            .is_some_and(|m| live_at(m.expires_at_ns, now_ns()))
     }
 
     /// Single-use consume enforcing TTL and (if set) that `request_name` is
@@ -228,9 +247,7 @@ impl TokenStore {
         let Some(meta) = self.tokens.get(token).map(|r| r.value().clone()) else {
             return TokenCheck::NotFound;
         };
-        if let Some(exp) = meta.expires_at_ns
-            && now_ns() > exp
-        {
+        if !live_at(meta.expires_at_ns, now_ns()) {
             self.tokens.remove(token);
             return TokenCheck::Expired;
         }
@@ -389,7 +406,7 @@ mod tests {
         assert_eq!(store.scope_of("invite-1"), None);
     }
 
-    /// A token minted with an expiry is redeemable until then, not after.
+    /// A token minted with an expiry is redeemable before then, not after.
     #[test]
     fn invite_tokens_carry_their_expiry() {
         let past = token_with_expiry("member-m1", 1);
@@ -398,5 +415,41 @@ mod tests {
         store.add_invite_tokens([&past, &future], &ns(), true).unwrap();
         assert!(!store.is_live(&past));
         assert!(store.is_live(&future));
+    }
+
+    /// The CA redeems while `now < until`: at the `-until` second itself the
+    /// token is expired, as the invitee reads it.
+    #[test]
+    fn a_token_is_redeemable_only_before_its_until() {
+        let until_ns: u64 = 1_700_000_000 * 1_000_000_000;
+        assert!(live_at(Some(until_ns), until_ns - 1));
+        assert!(!live_at(Some(until_ns), until_ns));
+        assert!(!live_at(Some(until_ns), until_ns + 1));
+        assert!(live_at(None, u64::MAX));
+        // Loaded from the token, the expiry is the `-until` second exactly.
+        let now_secs = now_ns() / 1_000_000_000;
+        let at_now = token_with_expiry("member-m3", now_secs);
+        let store = TokenStore::new();
+        store.add_invite_tokens([&at_now], &ns(), true).unwrap();
+        assert!(!store.is_live(&at_now));
+        assert_eq!(store.redeem(&at_now), TokenCheck::Expired);
+    }
+
+    /// A token whose `-until` is not a number is refused, not loaded as a
+    /// token that never expires.
+    #[test]
+    fn a_token_with_a_malformed_expiry_is_refused() {
+        let store = TokenStore::new();
+        store
+            .add_invite_tokens(
+                ["member-m4-untilsoon", "member-m5-until99999999999999999999", "member-m6"],
+                &ns(),
+                true,
+            )
+            .unwrap();
+        assert!(!store.is_live("member-m4-untilsoon"));
+        assert!(!store.is_live("member-m5-until99999999999999999999"));
+        assert!(store.is_live("member-m6"));
+        assert_eq!(store.redeem("member-m4-untilsoon"), TokenCheck::NotFound);
     }
 }

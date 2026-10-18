@@ -539,22 +539,26 @@ impl ChallengeResponseTlv {
                 .map_err(|e| CertError::InvalidRequest(format!("TLV parse error: {e}")))?;
             match typ {
                 TLV_STATUS => {
-                    status = val.first().copied();
+                    status = Some(nni_u8(&val, "Status")?);
                 }
                 TLV_CHALLENGE_STATUS => {
                     challenge_status = std::str::from_utf8(&val).ok().map(str::to_string);
                 }
+                // NonNegativeIntegers of any valid width (1, 2, 4 or 8
+                // octets); a value wider than the field saturates.
                 TLV_REMAINING_TRIES => {
-                    remaining_tries = val.first().copied();
+                    let tries = nni(&val, "RemainingTries")?;
+                    remaining_tries = Some(u8::try_from(tries).unwrap_or(u8::MAX));
                 }
-                TLV_REMAINING_TIME if val.len() >= 4 => {
-                    remaining_time_secs = Some(u32::from_be_bytes(val[..4].try_into().unwrap()));
+                TLV_REMAINING_TIME => {
+                    let secs = nni(&val, "RemainingTime")?;
+                    remaining_time_secs = Some(u32::try_from(secs).unwrap_or(u32::MAX));
                 }
                 TLV_ISSUED_CERT_NAME => {
                     issued_cert_name = decode_name_value(&val).ok();
                 }
                 TLV_ERROR_CODE => {
-                    error_code = val.first().copied();
+                    error_code = Some(nni_u8(&val, "ErrorCode")?);
                 }
                 TLV_ERROR_INFO => {
                     error_info = std::str::from_utf8(&val).ok().map(str::to_string);
@@ -581,6 +585,74 @@ impl ChallengeResponseTlv {
             error_info,
             parameters,
         })
+    }
+}
+
+/// A NonNegativeInteger field (NDN packet format v0.3: 1, 2, 4 or 8
+/// octets, big-endian); any other width is malformed.
+fn nni(val: &[u8], field: &str) -> Result<u64, CertError> {
+    ndn_packet::decode_nni(val).map_err(|_| {
+        CertError::InvalidRequest(format!(
+            "{field} is not a NonNegativeInteger ({} octets)",
+            val.len()
+        ))
+    })
+}
+
+/// A NonNegativeInteger field whose values all fit one octet.
+fn nni_u8(val: &[u8], field: &str) -> Result<u8, CertError> {
+    let v = nni(val, field)?;
+    u8::try_from(v).map_err(|_| CertError::InvalidRequest(format!("{field} {v} out of range")))
+}
+
+/// The Content of a CA's failure answer to NEW or CHALLENGE (NDNCERT v0.3
+/// `ErrorEncoder`): exactly one `ErrorCode (0xAB)` and one `ErrorInfo
+/// (0xAD)`, unencrypted, with no Status, so a v0.3 requester reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorTlv {
+    pub code: u8,
+    pub info: String,
+}
+
+impl ErrorTlv {
+    /// The failure answer a CA sends for a NEW or CHALLENGE that failed
+    /// with `e`.
+    pub fn from_error(e: &CertError) -> Self {
+        Self {
+            code: e.ndncert_error_code(),
+            info: e.ndncert_error_info(),
+        }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_tlv(TLV_ERROR_CODE, &[self.code]);
+        w.write_tlv(TLV_ERROR_INFO, self.info.as_bytes());
+        w.finish()
+    }
+
+    /// `Some` when `content` is a failure answer (it holds an ErrorCode at
+    /// the top level), `None` for any other answer. A NEW answer
+    /// (`EcdhPub`, `Salt`, …) and a CHALLENGE envelope (`IV`, `AuthTag`,
+    /// `EncryptedPayload`) never carry one.
+    pub fn decode_if_error(content: &[u8]) -> Result<Option<Self>, CertError> {
+        let mut r = TlvReader::new(Bytes::copy_from_slice(content));
+        let mut code = None;
+        let mut info = None;
+        while !r.is_empty() {
+            let (typ, val) = r
+                .read_tlv()
+                .map_err(|e| CertError::InvalidRequest(format!("TLV parse error: {e}")))?;
+            match typ {
+                TLV_ERROR_CODE => code = Some(nni_u8(&val, "ErrorCode")?),
+                TLV_ERROR_INFO => info = Some(String::from_utf8_lossy(&val).into_owned()),
+                _ => {}
+            }
+        }
+        Ok(code.map(|code| Self {
+            code,
+            info: info.unwrap_or_default(),
+        }))
     }
 }
 
@@ -835,5 +907,77 @@ mod tests {
             recovered.get("code").and_then(|v| v.as_str()),
             Some("ABC123")
         );
+    }
+
+    /// A pending CHALLENGE answer whose RemainingTries and RemainingTime use
+    /// the given widths.
+    fn pending_with(tries: &[u8], time: &[u8]) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_tlv(TLV_STATUS, &[STATUS_PENDING]);
+        w.write_tlv(TLV_REMAINING_TRIES, tries);
+        w.write_tlv(TLV_REMAINING_TIME, time);
+        w.finish()
+    }
+
+    /// RemainingTries and RemainingTime are NonNegativeIntegers: every valid
+    /// width (1, 2, 4, 8 octets) decodes to its value, not to its first
+    /// octets.
+    #[test]
+    fn remaining_tries_and_time_decode_every_nni_width() {
+        let cases: [(&[u8], &[u8], u8, u32); 4] = [
+            (&[3], &[60], 3, 60),
+            (&[0, 3], &[0x01, 0x2C], 3, 300),
+            (&[0, 0, 0, 3], &[0, 0, 0x0E, 0x10], 3, 3600),
+            (&[0, 0, 0, 0, 0, 0, 0, 3], &[0, 0, 0, 0, 0, 0x01, 0x51, 0x80], 3, 86400),
+        ];
+        for (tries, time, want_tries, want_time) in cases {
+            let decoded = ChallengeResponseTlv::decode(pending_with(tries, time)).unwrap();
+            assert_eq!(decoded.remaining_tries, Some(want_tries), "tries {tries:?}");
+            assert_eq!(decoded.remaining_time_secs, Some(want_time), "time {time:?}");
+        }
+        // Wider than the field: saturates instead of wrapping.
+        let decoded =
+            ChallengeResponseTlv::decode(pending_with(&[0x01, 0x00], &[1, 0, 0, 0, 0, 0, 0, 0]))
+                .unwrap();
+        assert_eq!(decoded.remaining_tries, Some(u8::MAX));
+        assert_eq!(decoded.remaining_time_secs, Some(u32::MAX));
+    }
+
+    #[test]
+    fn remaining_time_of_invalid_width_is_refused() {
+        assert!(ChallengeResponseTlv::decode(pending_with(&[3], &[0, 0, 60])).is_err());
+        assert!(ChallengeResponseTlv::decode(pending_with(&[3], &[0, 0, 0, 0, 60])).is_err());
+        assert!(ChallengeResponseTlv::decode(pending_with(&[0, 0, 3], &[60])).is_err());
+        assert!(ChallengeResponseTlv::decode(pending_with(&[], &[60])).is_err());
+    }
+
+    /// The failure answer is v0.3's ErrorCode + ErrorInfo, and is told apart
+    /// from a NEW answer and a CHALLENGE envelope.
+    #[test]
+    fn error_content_roundtrips_and_is_told_apart() {
+        // The spec's vector (ndncert-extensions.md §17 V4).
+        let err = ErrorTlv {
+            code: crate::protocol::ErrorCode::NameNotAllowed.into(),
+            info: "no".into(),
+        };
+        let wire = err.encode();
+        assert_eq!(&wire[..], &[0xAB, 0x01, 0x05, 0xAD, 0x02, b'n', b'o']);
+        assert_eq!(ErrorTlv::decode_if_error(&wire).unwrap(), Some(err));
+
+        let new_answer = NewResponseTlv {
+            ecdh_pub: Bytes::from(vec![0x04u8; 65]),
+            salt: [0xABu8; 32],
+            request_id: [0x01u8; 8],
+            challenges: vec!["possession".to_string()],
+        }
+        .encode();
+        assert_eq!(ErrorTlv::decode_if_error(&new_answer).unwrap(), None);
+        let envelope = ChallengeRequestTlv {
+            iv: [0x11u8; 12],
+            auth_tag: [0x22u8; 16],
+            encrypted_payload: Bytes::from_static(b"ciphertext"),
+        }
+        .encode();
+        assert_eq!(ErrorTlv::decode_if_error(&envelope).unwrap(), None);
     }
 }

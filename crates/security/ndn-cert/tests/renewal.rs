@@ -122,7 +122,7 @@ async fn enroll(ns: &Namespace, role: &str, token: &str, device: &str, seed: u8)
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();
-    let key_name = new_device_key_name(&invite.device_identity(device).unwrap());
+    let key_name = new_device_key_name(&invite.device_identity(device).unwrap()).unwrap();
     let key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[seed; 32], key_name));
     let enrolled = enroll_with_invite(&keyring, None, &mut CaWire(Arc::clone(&ns.ca)), &invite, Arc::clone(&key))
         .await

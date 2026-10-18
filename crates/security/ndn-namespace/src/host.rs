@@ -15,6 +15,8 @@ use ndn_cert::{RequestStore, RootStore};
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, FilePib, SignedTrustContext, Signer};
 
+use crate::HostWords;
+
 /// One stored trust-context version, read back and re-verified, or why it
 /// could not be.
 pub struct StoredContext {
@@ -55,17 +57,27 @@ pub trait ContextStore: Send + Sync {
 
 /// A [`ContextStore`] beside a PIB: `<pib>/contexts/`
 /// ([`ndn_cert::context_store`]) and the PIB's root store
-/// ([`ndn_cert::RootStore`]).
+/// ([`ndn_cert::RootStore`]). Its location is worded with the host's
+/// [`HostWords::key_storage_dir`] ([`PibContextStore::with_words`]).
 #[derive(Debug, Clone)]
 pub struct PibContextStore {
     root: PathBuf,
+    /// What the host calls the directory, as something to fix.
+    called: String,
 }
 
 impl PibContextStore {
     pub fn new(pib_root: impl Into<PathBuf>) -> Self {
         Self {
             root: pib_root.into(),
+            called: HostWords::default().key_storage_dir,
         }
+    }
+
+    /// The store with its location worded in the host's `words`.
+    pub fn with_words(mut self, words: &HostWords) -> Self {
+        self.called = words.key_storage_dir.clone();
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -86,7 +98,7 @@ fn stored(
 
 impl ContextStore for PibContextStore {
     fn location(&self) -> String {
-        format!("the PIB directory ({})", self.root.display())
+        format!("{} ({})", self.called, self.root.display())
     }
 
     fn persist(&self, ctx: &SignedTrustContext, data: &Data) -> Result<String, String> {

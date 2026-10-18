@@ -64,8 +64,8 @@ use bytes::Bytes;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::{
-    CertCache, Certificate, InterestValidationOutcome, Keyring, Signer, ValidationResult,
-    Validator, secure_fs,
+    CertCache, Certificate, InterestValidationOutcome, Keyring, ReplayCheck, ReplayGuard, Signer,
+    ValidationResult, Validator, secure_fs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +116,16 @@ pub const MAX_PENDING: usize = MAX_HELD_STATUS / MAX_HELD_PER_REQUEST;
 /// identity, e.g. one role of a namespace), so one flood cannot take the
 /// whole [`MAX_PENDING`] budget.
 pub const MAX_PENDING_PER_PREFIX: usize = 32;
+/// How far the SignatureTime of a `<ca>/CA/PENDING` Interest may be from
+/// the CA's clock (the NDN signed-Interest grace period, ndn-cxx's
+/// default). Beyond it the Interest is refused as replayed or stale.
+pub const LISTING_SIG_TIME_GRACE: Duration = Duration::from_secs(120);
+/// Listing Interests the CA remembers per admin key (SignatureNonce,
+/// SignatureTime), and admin keys it remembers: bounded, and filled only
+/// by Interests whose signature verified. An admin lists far fewer than
+/// this many times within one [`LISTING_SIG_TIME_GRACE`].
+const LISTING_REPLAY_PER_KEY: usize = 64;
+const LISTING_REPLAY_KEYS: usize = 256;
 
 /// Consumes a new request's one-time invite (see
 /// [`ApprovalStore::open_request`]); `Err` says why and what to do.
@@ -573,8 +583,13 @@ impl ApprovalStore {
                  them (`ndn-fwd approvals list`), then ask again"
             )));
         }
+        let request_id = new_request_id().map_err(|e| {
+            OpenRefusal::Refused(format!(
+                "the CA could not draw a random request id ({e}); nothing is pending and any \
+                 invite was not used: ask again later"
+            ))
+        })?;
         let redeem = invite().map_err(OpenRefusal::Refused)?;
-        let request_id = new_request_id();
         let device = self
             .inner
             .namespace
@@ -778,14 +793,16 @@ impl ApprovalStore {
     /// Authorize a `<ca>/CA/PENDING` listing: `interest` must be signed by a
     /// current admin key of the namespace (validated as
     /// [`apply_signed`](Self::apply_signed) validates a decision; its
-    /// ApplicationParameters carry certificates of the signer's chain).
-    /// Returns the signer's key name.
+    /// ApplicationParameters carry certificates of the signer's chain), and
+    /// fresh by the NDN signed-Interest rule ([`check_listing_fresh`]),
+    /// recorded in `replay`. Returns the signer's key name.
     pub async fn authorize_listing(
         &self,
         interest: &Interest,
         keyring: &Arc<Keyring>,
         trusted: &[Certificate],
         is_revoked: impl Fn(&Name) -> bool,
+        replay: &ReplayGuard,
     ) -> Result<Name, ApprovalRefusal> {
         let unauthorized = |why: String| refuse(RefusalKind::Unauthorized, why);
         let signer = interest
@@ -821,7 +838,50 @@ impl ApprovalStore {
         if is_revoked(&key) {
             return Err(unauthorized(format!("{key} is revoked at this CA")));
         }
+        // Only now that the signature verified, so nothing unverified
+        // fills the record.
+        check_listing_fresh(interest, replay, now_ms())?;
         Ok(key)
+    }
+}
+
+/// The NDN signed-Interest rule for a PENDING Interest whose signature
+/// verified: it carries SignatureTime and SignatureNonce, its SignatureTime
+/// is within [`LISTING_SIG_TIME_GRACE`] of `now_ms`, and the same key did
+/// not send the same (SignatureNonce, SignatureTime) before (`replay`
+/// records them). Older replays fall outside the window.
+pub fn check_listing_fresh(
+    interest: &Interest,
+    replay: &ReplayGuard,
+    now_ms: u64,
+) -> Result<(), ApprovalRefusal> {
+    let unauthorized = |why: String| refuse(RefusalKind::Unauthorized, why);
+    let Some((sig, time)) = interest
+        .sig_info()
+        .filter(|sig| sig.sig_nonce.is_some())
+        .and_then(|sig| sig.sig_time.map(|time| (sig, time)))
+    else {
+        return Err(unauthorized(
+            "the PENDING Interest lacks SignatureTime or SignatureNonce; sign it as an NDN \
+             signed Interest with both"
+                .into(),
+        ));
+    };
+    let grace_ms = LISTING_SIG_TIME_GRACE.as_millis() as u64;
+    if now_ms.abs_diff(time) > grace_ms {
+        return Err(unauthorized(format!(
+            "the PENDING Interest was signed at {time} ms, more than {} s from this CA's clock \
+             ({now_ms} ms): it is replayed, or the signer's clock is off",
+            LISTING_SIG_TIME_GRACE.as_secs()
+        )));
+    }
+    match replay.check(sig) {
+        ReplayCheck::Fresh => Ok(()),
+        ReplayCheck::Replay | ReplayCheck::NoAntiReplayFields => Err(unauthorized(
+            "the PENDING Interest repeats an earlier one of its key (same SignatureNonce and \
+             SignatureTime): a replay; sign a new Interest"
+                .into(),
+        )),
     }
 }
 
@@ -1136,6 +1196,8 @@ pub struct ApprovalService {
     ca: Arc<crate::CaState>,
     /// The status Interests held now (shared by clones).
     holds: Arc<Holds>,
+    /// The PENDING Interests seen per admin key (shared by clones).
+    listings: Arc<ReplayGuard>,
 }
 
 /// The CA's answer to a pushed decision (JSON content).
@@ -1164,6 +1226,11 @@ impl ApprovalService {
             keyring,
             ca,
             holds: Arc::default(),
+            listings: Arc::new(ReplayGuard::with_capacities(
+                LISTING_REPLAY_PER_KEY,
+                LISTING_REPLAY_KEYS,
+                false,
+            )),
         }
     }
 
@@ -1199,9 +1266,13 @@ impl ApprovalService {
         let ca = Arc::clone(&self.ca);
         let answer = match self
             .store
-            .authorize_listing(interest, &self.keyring, &self.trusted(), |k| {
-                ca.is_revoked(&k.to_string())
-            })
+            .authorize_listing(
+                interest,
+                &self.keyring,
+                &self.trusted(),
+                |k| ca.is_revoked(&k.to_string()),
+                &self.listings,
+            )
             .await
         {
             Ok(_) => ListingAnswer::Listed {
@@ -1213,6 +1284,14 @@ impl ApprovalService {
             }
         };
         serde_json::to_vec(&answer).unwrap_or_default()
+    }
+
+    /// `<ca>/CA/STATUS/<request id>` asked to be answered at once (a hold
+    /// of zero, [`status_hold`]): the request's state now. It takes no held
+    /// slot, so a requester's checks never crowd out the status Interests
+    /// held for that request.
+    pub fn status_now(&self, request_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&self.store.status(request_id)).unwrap_or_default()
     }
 
     /// Take a slot to hold a status Interest for `request_id`; refused (the
@@ -1988,10 +2067,19 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn new_request_id() -> String {
+/// 8 random bytes as hex. A failing system RNG is an error, never an id of
+/// zeros that the next failure would repeat.
+fn new_request_id() -> Result<String, CertError> {
     let mut bytes = [0u8; 8];
-    let _ = getrandom::getrandom(&mut bytes);
-    hex(&bytes)
+    crate::ecdh::fill_random(&mut bytes)?;
+    Ok(hex(&bytes))
+}
+
+fn now_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub(crate) fn now_secs() -> u64 {

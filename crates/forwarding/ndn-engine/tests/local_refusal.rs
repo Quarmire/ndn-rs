@@ -203,7 +203,8 @@ async fn a_remote_refusal_is_relayed_as_no_route() {
 }
 
 /// A refusal from a forwarder on this host (a local upstream) reaches the
-/// local downstream as a refusal; the non-local one gets nothing.
+/// local downstream as a refusal; the non-local one learns only that this
+/// path has nothing (NoRoute), as from a non-local upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_refusal_is_relayed_to_local_downstreams_only() {
     let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
@@ -212,8 +213,118 @@ async fn a_local_refusal_is_relayed_to_local_downstreams_only() {
     upstream_refuses(&rig).await;
     let got = recv_timeout(&rig.local, 500).await.expect("the local app hears back");
     assert_eq!(refusal_of(&got), Some(Refusal::Revoked));
-    assert!(recv_timeout(&rig.remote, 300).await.is_none());
+    let got = recv_timeout(&rig.remote, 500).await.expect("the remote downstream hears back");
+    assert_eq!(nack_reason(&got), Some(NackReason::NoRoute));
     rig.shutdown.shutdown().await;
+}
+
+/// The enclosed Interest of a Nack, decoded.
+fn enclosed(wire: &Bytes) -> ndn_packet::Interest {
+    let lp = LpPacket::decode(wire.clone()).expect("an LP-framed Nack");
+    ndn_packet::Interest::decode(lp.fragment.expect("a Fragment")).expect("an Interest")
+}
+
+/// A relayed Nack is built for each downstream, as a refusal this node
+/// makes is: it encloses that downstream's own Interest (its nonce, its
+/// parameters) and echoes its PitToken, so a consumer matching replies by
+/// PitToken, or a strict decoder checking the ParametersSha256Digest, still
+/// finds its pending Interest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_nack_carries_each_downstreams_own_interest_and_pit_token() {
+    use ndn_packet::lp::{LpHeaders, encode_lp_with_headers};
+
+    let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+    let member = Ed25519Signer::from_seed(&[2; 32], n("/t/m/KEY/k"));
+    let (local_face, local) = InProcFace::new(FaceId(LOCAL), 64);
+    let (remote_face, remote) = InProcFace::new_kind(FaceId(REMOTE), 64, FaceKind::Tcp);
+    let (up_face, upstream) = InProcFace::new(FaceId(UPSTREAM), 64);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .validator(Arc::new(validator(&root, &member, false).await))
+        .face(local_face)
+        .face(remote_face)
+        .face(up_face)
+        .build()
+        .await
+        .expect("engine build");
+    engine.fib().add_nexthop(&n("/t"), FaceId(UPSTREAM), 0);
+
+    let interest = || {
+        InterestBuilder::new(n("/t/m/CA/NEW"))
+            .app_parameters(b"request".to_vec())
+            .lifetime(Duration::from_secs(4))
+            .build()
+    };
+    let (mine, theirs) = (interest(), interest());
+    let token = Bytes::from_static(&[0xCA, 0xFE, 0x00, 0x01]);
+    let headers = LpHeaders {
+        pit_token: Some(token.clone()),
+        ..Default::default()
+    };
+    local.send(encode_lp_with_headers(&mine, &headers)).await.expect("send Interest");
+    let forwarded = recv_timeout(&upstream, 500).await.expect("the Interest reaches the upstream");
+    remote.send(theirs.clone()).await.expect("send Interest");
+    assert!(recv_timeout(&upstream, 200).await.is_none(), "the second Interest is aggregated");
+    let forwarded = match LpPacket::decode(forwarded.clone()) {
+        Ok(lp) => lp.fragment.expect("LP-framed Interest"),
+        Err(_) => forwarded,
+    };
+    upstream
+        .send(encode_lp_nack(NackReason::Refused(Refusal::Revoked), &forwarded))
+        .await
+        .expect("send Nack");
+
+    for (h, sent, pit_token, reason) in [
+        (&local, &mine, Some(token), NackReason::Refused(Refusal::Revoked)),
+        (&remote, &theirs, None, NackReason::NoRoute),
+    ] {
+        let got = recv_timeout(h, 500).await.expect("the downstream hears back");
+        let lp = LpPacket::decode(got.clone()).unwrap();
+        assert_eq!(lp.nack.and_then(|n| n.reason), Some(reason));
+        assert_eq!(lp.pit_token, pit_token, "the downstream's PitToken comes back");
+        let sent = ndn_packet::Interest::decode(sent.clone()).unwrap();
+        let back = enclosed(&got);
+        assert_eq!(back.name, sent.name);
+        assert_eq!(back.nonce(), sent.nonce(), "its own nonce, not the forwarded one");
+        assert_eq!(back.parameters_portion(), sent.parameters_portion(), "its parameters");
+    }
+    shutdown.shutdown().await;
+}
+
+/// One Data consumes a face's exact Interest and its CanBePrefix Interest
+/// at a shorter prefix: each pending Interest gets its refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_pending_interest_of_a_face_gets_its_refusal() {
+    let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+    let member = Ed25519Signer::from_seed(&[2; 32], n("/t/m/KEY/k"));
+    let (local_face, local) = InProcFace::new(FaceId(LOCAL), 64);
+    let (up_face, upstream) = InProcFace::new_kind(FaceId(UPSTREAM), 64, FaceKind::Tcp);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .validator(Arc::new(validator(&root, &member, true).await))
+        .face(local_face)
+        .face(up_face)
+        .build()
+        .await
+        .expect("engine build");
+    engine.fib().add_nexthop(&n("/t"), FaceId(UPSTREAM), 0);
+    let exact = InterestBuilder::new(n("/t/m/doc")).lifetime(Duration::from_secs(4)).build();
+    let prefix = InterestBuilder::new(n("/t/m"))
+        .can_be_prefix()
+        .lifetime(Duration::from_secs(4))
+        .build();
+    for i in [exact, prefix] {
+        local.send(i).await.expect("send Interest");
+        recv_timeout(&upstream, 500).await.expect("the Interest reaches the upstream");
+    }
+    upstream.send(signed_data("/t/m/doc", &member)).await.expect("send Data");
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let got = recv_timeout(&local, 500).await.expect("a refusal for each Interest");
+        assert_eq!(refusal_of(&got), Some(Refusal::Revoked));
+        names.push(enclosed(&got).name.to_string());
+    }
+    names.sort();
+    assert_eq!(names, ["/t/m", "/t/m/doc"]);
+    shutdown.shutdown().await;
 }
 
 /// The local downstream gets the refusal at once; the remote one nothing.

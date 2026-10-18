@@ -12,7 +12,7 @@
   ([trust-context.md](trust-context.md)), the `ndn-trust://` container
   ([trust-envelope.md](trust-envelope.md)), and the identity-level "recovery
   bundle" (`ndn-trust://recovery/…`, envelope kind 4) used by ndn-mobile.
-  That bundle is a separate mechanism; see Open question 7.
+  That bundle is a separate mechanism; see §9, Q7.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
@@ -174,8 +174,9 @@ A file kit is a text file whose content, ignoring leading and trailing
 whitespace, is one `ndn-trust://bag/<base64url>` URI
 ([trust-envelope.md](trust-envelope.md)). ndn-rs writes the URI followed
 by `\n`, in a file readable by the owner only. When reading, ndn-rs also
-accepts the `https://<domain>/t/bag#<base64url>` mirror form. It does not
-accept the raw `.ndntrust` TLV file form.
+accepts exactly the `https://<domain>/t/bag#<base64url>` mirror form
+(`http://` and other paths are refused). No binary file form exists
+([trust-envelope.md](trust-envelope.md) §5.7).
 
 #### 4.2.1 Envelope
 
@@ -196,14 +197,30 @@ TrustEnvelope (0x0470) {
 ```
 
 - The encoder writes fields in the order shown. Decoders MUST accept any
-  order and MUST ignore unknown fields.
+  order and decode the envelope as
+  [trust-envelope.md](trust-envelope.md) specifies. ndn-rs refuses a URI
+  kind that differs from the TLV `Kind`, a repeated field, an unknown
+  critical type and trailing bytes; it ignores unknown non-critical
+  fields.
 - `Namespace` is what makes a bag a recovery kit. ndn-rs refuses a bag
   without it as "not a recovery kit".
 - `AnchorFingerprint` is the expected fingerprint of the namespace **when
   the kit was made**: the fingerprint of the anchor whose public key is the
   root store's. ndn-rs always writes it when the root's anchor is found in
   the held context. During recovery it is used only when the device holds
-  no context (§6.2, row "not held").
+  no context (§6.2, row "not held"), and only as an expected fingerprint:
+  it MUST match the anchor that signed the version adopted, as for any
+  anchor link ([trust-envelope.md](trust-envelope.md)). A reader MUST NOT
+  accept it because it matches a listed anchor or the signer of an older
+  version.
+- After a version that changes the root (a recovery's `N+2`, §6.5), the
+  field is stale. Adoption by it then fails, and the operator adopts the
+  namespace with a current anchor link first (ndn-fwd says so). The kit
+  itself still recovers a device that holds the context. The field is
+  outside the sealed key, so an implementation MAY rewrite it with the
+  current expected fingerprint without the passphrase. ndn-rs has no
+  command for that; `recovery-kit create` makes a kit with the current
+  one.
 
 #### 4.2.2 SafeBag
 
@@ -229,21 +246,33 @@ SafeBag (0x80) {
 | encryptionScheme | aes256-CBC `2.16.840.1.101.3.4.1.42`, IV = 16 random bytes |
 | encryptedData | AES-256-CBC with PKCS#7 padding over the PKCS#8 below |
 
-The plaintext is the Ed25519 private key as a PKCS#8 **v2**
-OneAsymmetricKey (RFC 5958 / RFC 8410), 83 bytes:
+The plaintext is the Ed25519 private key as a PKCS#8 **v1**
+PrivateKeyInfo (RFC 8410 §7), 48 bytes:
 
 ```
-30 51  02 01 01                          ; version 1 (v2)
+30 2e  02 01 00                          ; version 0 (v1)
        30 05 06 03 2b 65 70              ; id-Ed25519
        04 22 04 20 <32-byte secret key>  ; CurvePrivateKey
-       81 21 00 <32-byte public key>     ; [1] publicKey
 ```
 
-**Password**: the passphrase octets exactly as given. The ndn-fwd CLI
-passes the UTF-8 bytes of the text with no Unicode normalization. From
-the terminal it strips the trailing CR/LF. From `--kit-passphrase-file`
-it takes the first line and strips a trailing `\r`. It also reads
-`NDN_KIT_PASSPHRASE` verbatim. An empty passphrase MUST be refused.
+Encoders MUST emit v1: BoringSSL, and so Chrome's WebCrypto, refuses a
+PrivateKeyInfo whose version is not 0. Decoders MUST accept v1 and the
+RFC 5958 v2 OneAsymmetricKey (version 1, with `[1] publicKey`). With v2,
+the public key MUST match the secret key; ndn-rs (ed25519-dalek) refuses
+it otherwise. ndn-rs wrote v2 (83 bytes) before 2026-10-18; those kits
+still open (§8.4).
+
+**Password**: the passphrase in Unicode Normalization Form C (NFC), as
+UTF-8 octets, as in the RFC 8265 OpaqueString profile. An encoder MUST
+normalize a UTF-8 passphrase to NFC before sealing. A reader MUST first try
+the octets as given. If they fail and are UTF-8 not in NFC, it MUST then
+try their NFC form. Kits sealed before this rule (ndn-rs before
+2026-10-18) used the octets as given, and the first try still opens them.
+Octets that are not UTF-8 are used as given. The ndn-fwd CLI passes the
+UTF-8 bytes of the text. From the terminal it strips the trailing CR/LF.
+From `--kit-passphrase-file` it takes the first line and strips a trailing
+`\r`. It also reads `NDN_KIT_PASSPHRASE` verbatim. An empty passphrase
+MUST be refused.
 
 Encoders MUST use the parameters above. Decoders MUST accept them. ndn-rs
 also opens other PBES2 parameter sets:
@@ -251,8 +280,14 @@ also opens other PBES2 parameter sets:
 - PBKDF2 with HMAC-SHA-224/256/384/512, or scrypt;
 - AES-128/192/256-CBC.
 
-It refuses hmacWithSHA1 (pkcs5 0.7.1 without `sha1-insecure`). Its PKCS#8
-decoder accepts both v1 and v2 [INFERENCE: ed25519-dalek `from_pkcs8_der`].
+It refuses hmacWithSHA1 (pkcs5 0.7.1 without `sha1-insecure`).
+
+**Cost cap.** A reader MUST refuse a kit whose PBKDF2 `iterationCount` is
+above 10 000 000, before asking for the passphrase: a crafted kit could
+otherwise take hours to open. ndn-rs applies this cap to every SafeBag it
+decrypts (`MAX_PBKDF2_ITERATIONS`). It also refuses scrypt whose
+`128 · N · r · p` exceeds 2^30 bytes (`MAX_SCRYPT_WORK`; `N = 2^20, r = 8,
+p = 1` passes).
 
 #### 4.2.3 Reading and opening a file kit
 
@@ -267,11 +302,14 @@ passphrase:
    last two components) equals `KeyName`, **and**
    `recovery_key_name(Namespace, cert.public_key)` equals `KeyName`.
 
+5. Refuse the kit if its key derivation is above the cost cap (§4.2.2).
+
 To open the kit:
 
-5. Decrypt `EncryptedKey` with the passphrase and decode an Ed25519 key
-   from the PKCS#8. If either step fails, report a wrong passphrase.
-6. Refuse the kit unless the decrypted key's public key equals the
+6. Decrypt `EncryptedKey` with the passphrase (as given, then its NFC
+   form, §4.2.2) and decode an Ed25519 key from the PKCS#8. If no try
+   gives a key, report a wrong passphrase.
+7. Refuse the kit unless the decrypted key's public key equals the
    certificate's public key, comparing in canonical form (§3.1).
 
 ndn-rs does not verify the certificate's self-signature when reading a
@@ -291,6 +329,7 @@ another implementation, plug in the token. Nothing is exported.
 | Touch policy | `always` (default), `cached` or `never`, as the owner chooses |
 | Management key | generation authenticates with the factory-default PIV management key |
 | Public key | after generation, the SPKI built from the returned point (§3.1). When opening later, the slot's public key comes from PIV GET METADATA (firmware 5.3 or later) |
+| Firmware | 5.3 or later. Creation MUST be refused on older firmware, before anything is generated: such a kit could never be opened, because reading its key back needs GET METADATA |
 | Signature | ECDSA over SHA-256 of the signed region, DER-encoded, SignatureType 3 |
 | Name | `recovery_key_name(<ns>, SPKI)` (§3.2) |
 
@@ -451,7 +490,9 @@ refused.
 8. For each old root key, old root-device key and removed kit, add a
    `Revocation` for the key name, unless it is already revoked. Refuse the
    whole recovery if such a name is a prefix of a remaining anchor's
-   certificate name.
+   certificate name. Revocation entries are encoded in canonical name
+   order ([trust-context.md](trust-context.md) §3.2), so the order in which
+   they are added does not matter.
 
 Then:
 
@@ -510,9 +551,12 @@ the version. The operator is told how to find the outcome later.
 **Idempotent retry.** The adopter MUST answer *taken* (ndn-fwd: `200`) for
 a version it already adopted and stores byte for byte. A requester that
 gets no answer within its wait (ndn-fwd: 30 s) MUST send the **same bytes**
-again, never a re-signed version. ndn-fwd:
+again, never a re-signed version. A requester MUST bound these resends, and
+the outcome when it stops is *unknown*. ndn-fwd:
 
-- retries timeouts without limit;
+- ends with *unknown* after 10 waits without an answer in all
+  (`HAND_OVER_WAITS`, about five minutes), and sends nothing after the
+  last;
 - ends with *unknown* after 2 consecutive other transport failures once a
   request was sent.
 
@@ -568,9 +612,11 @@ public key = 7d2cb63ef6edcc26ff3024e8c99fb1f845a863e575cb1a9966ae9194e0985439
 SHA-256(pk)= b2e88ab584a63a2c7aed693647da49dd06f747f31b3b26fb3e3ee5e12bb220be   (= expected fingerprint of its anchor)
 key name   = /home/bob/KEY/rb2e88ab584a63a2c
 Name TLV   = 07230804686f6d650803626f6208034b455908117262326538386162353834613633613263
-PKCS#8     = 3051020101300506032b65700422042068a79eaca2324873eacc50cb9c6eca8cc68ea5d9
+PKCS#8     = 302e020100300506032b65700422042068a79eaca2324873eacc50cb9c6eca8cc68ea5d9
+             36f98787c60c7ebc74e6ce7c                                          (v1, §4.2.2)
+PKCS#8 v2  = 3051020101300506032b65700422042068a79eaca2324873eacc50cb9c6eca8cc68ea5d9
              36f98787c60c7ebc74e6ce7c8121007d2cb63ef6edcc26ff3024e8c99fb1f845a863e5
-             75cb1a9966ae9194e0985439
+             75cb1a9966ae9194e0985439                                          (as ndn-rs wrote before 2026-10-18)
 ```
 
 The same name results when the public key is given as its 44-byte SPKI
@@ -672,9 +718,10 @@ EncryptedPrivateKeyInfo:
         20edb9cc04cdc0ddd3e43bfd80e1379daccec1b8031b67dcdd6276148fa6ca9c
 ```
 
-Decrypting it with the passphrase yields the PKCS#8 of §8.2. The kit then
-opens as `/home/bob/KEY/rb2e88ab584a63a2c`. Opening with the passphrase
-`wrong` fails with "the kit passphrase does not open …".
+Decrypting it with the passphrase yields the PKCS#8 **v2** of §8.2: the
+kit was made before encoders switched to v1, and a reader MUST open it.
+The kit then opens as `/home/bob/KEY/rb2e88ab584a63a2c`. Opening with the
+passphrase `wrong` fails with "the kit passphrase does not open …".
 
 ### 8.5 Provenance
 
@@ -694,85 +741,107 @@ The program asserted that `RecoverySeed` agrees with
 `Ed25519Signer::from_seed(entropy)`, and that the words round-trip.
 
 The structural annotations in §8.4 and the KeyRole line in §8.2 were
-written by hand from the program's hex output.
+written by hand from the program's hex output. The v1 PKCS#8 line in §8.2
+was assembled by hand from §4.2.2: the v2 line with its version byte set to
+0, its `[1] publicKey` removed and its length fixed. ndn-rs's encoder now
+writes exactly that layout (`ed25519_seed_pkcs8_is_v1_and_v2_still_opens`,
+for another seed).
 
 ## 9. Open questions
 
-1. **Stale expected fingerprint in file kits.** `AnchorFingerprint` is the
-   root's when the kit was made. After a root rotation or a recovery
-   (`N+2`), an older file kit's fingerprint no longer matches the newest
-   version's signer. Adoption by that fingerprint (§6.2, "not held") then
-   fails. Should kits be re-sealed, or should adoption accept a fingerprint
-   of any version in the chain?
-2. **Passphrase normalization.** The kit passphrase is used as raw UTF-8
-   octets with no Unicode normalization (§4.2.2). Two implementations that
-   take the same non-ASCII passphrase with different normalization (NFC vs
-   NFD input methods) will not open each other's kits. Should NFKC (or
-   ASCII-only) be required?
-3. **No upper bound on PBKDF2 iterations when opening.** ndn-rs passes the
-   kit's `iterationCount` (any u32) to the KDF. A crafted kit can make
-   opening very slow. Should readers refuse iterations above a cap (e.g.
-   10 000 000)?
-4. **PKCS#8 version.** ndn-rs emits PKCS#8 v2 (with the public key). Some
-   stacks (older WebCrypto, some OpenSSL builds) accept only v1 for Ed25519.
-   Should encoders emit v1 for compatibility?
-5. **YubiKey firmware below 5.3.** `YubikeyKit::generate` gets the public
-   key from the generate response, but opening a kit later
-   (`YubikeyKit::signer` / `public_key`) reads it from PIV metadata, which
-   needs firmware 5.3 or later. On older firmware, a kit can be created
-   (with `--replace-slot`, since slot state is unknown there) that `check`
-   and `recover` cannot open. Should creation refuse such tokens, or write a
-   PIV certificate object to the slot so the key can be found without
-   metadata?
-6. **Unbounded resend on timeouts.** `hand_over` resends the same version
-   on every 30 s timeout without a limit (§7). A wedged adopter keeps the
-   CLI waiting forever. Should there be an overall deadline that ends as
-   *unknown*?
-7. **ndn-mobile.** ndn-boltffi has no namespace recovery-kit implementation.
-   Its `Bag` mapping keeps only `key_name` and `safebag`, dropping
-   `namespace` and `fingerprint`. A file kit given to the mobile app is
-   therefore treated as an identity SafeBag for `load_identity`, not as a
-   recovery kit. Its "recovery" (`make_recoverable` / `restore_identity`,
-   envelope kind 4) is a different, identity-level mechanism with an
-   Ed25519 seed but no BIP39 and no context versions. Should mobile
-   implement this spec, and should a `bag` with `Namespace` be refused by
-   `load_identity`?
-8. **Revocation order.** Under `compromised`, the order of the old root keys
-   follows the iteration order of the anchor map, so the order of new
-   `Revocation` entries in `N+1` is not specified. Revocations are a set
-   semantically. Should the encoding sort them, for reproducible bytes?
+7. **ndn-mobile namespace recovery.** ndn-boltffi has no namespace
+   recovery-kit implementation. Its "recovery" (`make_recoverable` /
+   `restore_identity`, envelope kind 4) is a different, identity-level
+   mechanism with an Ed25519 seed but no BIP39 and no context versions.
+   Should mobile implement this spec (check a kit, recover on a phone as the
+   replacement device)? **Recommendation:** yes, through the same
+   `ndn_cert::recovery` / `ndn_namespace::admin` code ndn-fwd uses (words
+   and file kits first; YubiKey kits once the app reaches PIV over NFC or
+   USB), keeping the kind 4 identity bundle a separate mechanism. Until
+   then mobile refuses kits (decision Q7 below).
+
+### Decisions
+
+- **Q1 Stale expected fingerprint in file kits.** Adoption by a kit's
+  `AnchorFingerprint` matches only the anchor that signed the version
+  adopted, never a listed anchor or the signer of an older version. A stale
+  fingerprint makes adoption fail, and the operator adopts with a current
+  anchor link first. Implementations MAY rewrite the field without the
+  passphrase (§4.2.1). Reason: after a `compromised` recovery, the old
+  root's holder can sign a fork. Accepting the old fingerprint at any point
+  of a chain would let it hand a fresh device its own chain, and a listed
+  anchor proves nothing because anyone can list one.
+- **Q2 Passphrase normalization.** Encoders seal with the NFC form of a
+  UTF-8 passphrase. Readers try the octets as given, then their NFC form
+  (§4.2.2). Reason: NFC is the RFC 8265 password normalization, and it
+  keeps the meaning of the text (NFKC would fold distinct characters).
+  Trying the octets as given first keeps every kit made before this rule
+  opening with the same input.
+- **Q3 PBKDF2 iteration cap.** Readers refuse `iterationCount` above
+  10 000 000 before asking for the passphrase. ndn-rs also caps scrypt at
+  `128 · N · r · p ≤ 2^30` (§4.2.2), for every SafeBag it opens. Reason:
+  kits are sealed with 600 000, and a crafted kit must not tie a reader up
+  for hours.
+- **Q4 PKCS#8 version.** Encoders emit v1; decoders accept v1 and v2
+  (§4.2.2). Reason: BoringSSL (Chrome's WebCrypto) parses only version 0,
+  while OpenSSL and ed25519-dalek read both. ndn-rs reads both, so kits made
+  before still open.
+- **Q5 YubiKey firmware below 5.3.** Creation refuses such a token before
+  anything is generated, with an error that says why (§4.3). Reason: the
+  kit could never be opened. Writing a PIV certificate object instead
+  would add a second way to find the key that other implementations would
+  also have to support.
+- **Q6 Unbounded resend on timeouts.** A requester bounds its resends, and
+  the hand-over ends as *unknown* (§7). ndn-fwd stops after 10 waits of
+  30 s. Reason: a wedged adopter must not hold the CLI forever. *Unknown*
+  keeps the undo rule safe, and ndn-fwd already tells the operator how to
+  find the outcome.
+- **Q7 A file kit given to mobile.** ndn-boltffi keeps a bag's `Namespace`
+  and `AnchorFingerprint`. Its `load_identity` refuses a recovery key's
+  SafeBag, recognized by a key name derived from the certificate's public
+  key (§3.2). The refusal says to use the kit to recover its namespace.
+  Reason: a namespace recovery key is root-equivalent and must not become
+  a device identity. Whether mobile implements recovery stays open (Q7
+  above).
+- **Q8 Revocation order.** Producers write `AnchorSet` entries by
+  certificate name and `Revocation` entries in canonical NDN name order,
+  and decoders accept any order ([trust-context.md](trust-context.md) §3.2,
+  Decision Q1). Reason: revocations are a set, and a canonical order gives
+  the same content the same bytes, which byte-for-byte hand-over checks
+  and test vectors rely on.
 
 ## Appendix A. Code references (non-normative)
 
-Paths are relative to the workspace root. Code in `ndn-fwd/binaries/ndn-fwd/src/` may move into library crates (planned `ndn-namespace`); the lines below are as read on 2026-10-18.
+Paths are relative to the workspace root. Code in `ndn-fwd/binaries/ndn-fwd/src/` may move into library crates (planned `ndn-namespace`); the lines below are as read on 2026-10-18 (rows for the files touched by the §9 decisions re-read after those changes).
 
 | Claim | Location |
 |---|---|
 | Kit formats, env vars `NDN_KIT_PASSPHRASE`/`NDN_KIT_WORDS`/`NDN_KIT_PIN`, default slot `9d`, 24 words | `ndn-rs/crates/security/ndn-cert/src/recovery.rs:18-31,79-91` |
-| Canonical public key (strip Ed25519 SPKI) | `recovery.rs:273-279`; SPKI prefix `ndn-rs/crates/security/ndn-security/src/spki.rs:24-60` |
-| `recovery_key_name` (SHA-256, first 8 bytes, lowercase hex, `r` prefix) | `recovery.rs:267-269,283-289` |
+| Canonical public key (strip Ed25519 SPKI) | `recovery.rs:279-285`; SPKI prefix `ndn-rs/crates/security/ndn-security/src/spki.rs:24-60` |
+| `recovery_key_name` (SHA-256, first 8 bytes, lowercase hex, `r` prefix) | `recovery.rs:273-275,289-295` |
 | `Name::append` makes GenericNameComponents | `ndn-rs/crates/core/ndn-foundation-types/src/name.rs:317-321` |
-| Words parsing: whitespace split, lowercase, count 24, English, checksum, entropy = seed | `recovery.rs:308-350` |
-| Words emission | `recovery.rs:353-362`; CLI display `ndn-fwd/binaries/ndn-fwd/src/recovery_kit.rs:563-576` |
-| Seed → Ed25519 (`SigningKey::from_bytes`), named by its public key | `recovery.rs:366-370`; `ndn-rs/crates/security/ndn-security/src/signer.rs:62-65` |
-| PKCS#8 from seed (ed25519-dalek `to_pkcs8_der`) | `recovery.rs:372-376`; `ndn-rs/crates/security/ndn-security/src/safebag.rs:199-207` |
-| Anchor certificate: `<key>/self/<v>`, validity `u64::MAX` | `recovery.rs:382-392`; `ndn-rs/crates/security/ndn-security/src/manager.rs:162-213` |
+| Words parsing: whitespace split, lowercase, count 24, English, checksum, entropy = seed | `recovery.rs:314-356` |
+| Words emission | `recovery.rs:359-368`; CLI display `ndn-fwd/binaries/ndn-fwd/src/recovery_kit.rs:503-513` |
+| Seed → Ed25519 (`SigningKey::from_bytes`), named by its public key | `recovery.rs:372-376`; `ndn-rs/crates/security/ndn-security/src/signer.rs:62-65` |
+| PKCS#8 v1 from seed (`KeypairBytes` without public key); v1 and v2 read, v2 public key checked | `recovery.rs:378-382`; `ndn-rs/crates/security/ndn-security/src/safebag.rs:255-276`; test `safebag.rs` `ed25519_seed_pkcs8_is_v1_and_v2_still_opens` |
+| Anchor certificate: `<key>/self/<v>`, validity `u64::MAX` | `recovery.rs:388-398`; `ndn-rs/crates/security/ndn-security/src/manager.rs:162-213` |
 | Certificate wire (ContentType 2, Freshness 3600000, SPKI content, ValidityPeriod) | `manager.rs:505-594`; cert name/version `ndn-rs/crates/security/ndn-security/src/cert_name.rs:27-34,74-103` |
 | Certificate decode unwraps Ed25519 SPKI | `ndn-rs/crates/security/ndn-security/src/cert_cache.rs:31-61` |
 | Expected fingerprint = SHA-256(cert.public_key) | `ndn-rs/crates/security/ndn-security/src/trust_context/mod.rs:1060-1063` |
 | P-256 SPKI 91-byte prefix | `signer.rs:147-165` |
-| File kit sealing (empty passphrase refused; Bag fields) | `recovery.rs:400-423` |
-| File kit read checks (Namespace required, name/cert/key match) | `recovery.rs:442-492` |
-| File kit open (wrong passphrase; key matches cert) | `recovery.rs:495-513`; `signer.rs:69-72` |
+| File kit sealing (empty passphrase refused; NFC passphrase; Bag fields) | `recovery.rs:402-444` |
+| File kit read checks (Namespace required, name/cert/key match, KDF cost cap before the passphrase) | `recovery.rs:461-516`; test `recovery.rs` `a_file_kit_asking_for_too_many_iterations_is_refused_before_its_passphrase` |
+| File kit open (as given then NFC; wrong passphrase; key matches cert) | `recovery.rs:518-539`; `signer.rs:69-72`; test `recovery.rs` `a_file_kit_opens_with_its_passphrase_in_either_unicode_normalization` |
 | Envelope TLV numbers, format version 1, kind 5, body order, unknown fields ignored, base64url no pad | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:42-76,89-130,218-229,249-257,311-325,344-372,374-463,465-520` |
-| SafeBag TLV 0x80/0x81 | `safebag.rs:7-12,36-37,73-122` |
-| PBES2: PBKDF2-HMAC-SHA256, 600000 iterations, 16-byte salt, AES-256-CBC, 16-byte IV | `safebag.rs:124-152` |
-| PBES2 accepted on decrypt (no SHA-1) | `safebag.rs:156-164`; `pkcs5-0.7.1/src/pbes2/encryption.rs:83-89,113-140` (crate registry) |
+| SafeBag TLV 0x80/0x81 | `safebag.rs:7-12,36-37,116-165` |
+| PBES2: PBKDF2-HMAC-SHA256, 600000 iterations, 16-byte salt, AES-256-CBC, 16-byte IV | `safebag.rs:167-195` |
+| PBES2 accepted on decrypt (no SHA-1); cost cap 10 000 000 PBKDF2 iterations / scrypt 2^30 | `safebag.rs:49-53,65-101,197-220`; `pkcs5-0.7.1/src/pbes2/encryption.rs:83-89,113-140` (crate registry); test `safebag.rs` `a_bag_asking_for_too_costly_a_key_derivation_is_refused_before_deriving` |
 | Passphrase bytes, first line of file, trailing CR/LF trimmed, empty refused | `ndn-rs/crates/security/ndn-cert/src/root_store.rs:1424-1466,1494-1503` |
-| CLI writes kit + `\n`, owner-only, no overwrite | `recovery_kit.rs:423-434,475-487` |
-| YubiKey kit: P-256, PIN policy always, touch default, slots | `recovery.rs:518-616`; `recovery_kit.rs:69-82`; `ndn-rs/crates/security/ndn-security/src/yubikey.rs:17-18,75-93,145-165,278-294,375-419` |
-| YubiKey signature: SHA-256 digest, ECDSA P-256, SignatureType 3 | `yubikey.rs:431-466` |
-| Slot guard (not on root's token, occupied slot refused unless replace) | `ndn-rs/crates/security/ndn-cert/src/root_store.rs:224-267`; `recovery_kit.rs:450-461`; `ndn-fwd/binaries/ndn-fwd/src/recover.rs:237-243` |
+| CLI writes kit + `\n`, owner-only, no overwrite | `recovery_kit.rs:361-370,412-429` |
+| YubiKey kit: P-256, PIN policy always, touch default, slots | `recovery.rs:541-660`; `recovery_kit.rs:74-87`; `ndn-rs/crates/security/ndn-security/src/yubikey.rs:17-18,75-93,145-165,286-302,383-427` |
+| YubiKey kit refused below firmware 5.3 | `recovery.rs:260-265,557-572,601`; `yubikey.rs:258-276`; test `recovery.rs` `a_yubikey_kit_is_refused_on_firmware_before_5_3` |
+| YubiKey signature: SHA-256 digest, ECDSA P-256, SignatureType 3 | `yubikey.rs:439-474` |
+| Slot guard (not on root's token, occupied slot refused unless replace) | `ndn-rs/crates/security/ndn-cert/src/root_store.rs:224-267`; `recovery_kit.rs:390-397`; `ndn-fwd/binaries/ndn-fwd/src/recover.rs:218-221` |
 | KeyRole codes 1/2, names, TLV 0x041E value = role byte ‖ Name | `trust_context/mod.rs:249-267,991-997`; `ndn-rs/crates/security/ndn-security/src/trust_context/tlv.rs:73-81` |
 | Revocation TLV 0x0418 | `tlv.rs:53-54`; `trust_context/mod.rs:807-809` |
 | `add_anchor` requires validity now | `trust_context/mod.rs:617-623` |
@@ -781,18 +850,19 @@ Paths are relative to the workspace root. Code in `ndn-fwd/binaries/ndn-fwd/src/
 | RDR name `<ns>/32=trust-context/v=<N>` | `trust_context/mod.rs:55,827-835` |
 | Continuity rule | `ndn-rs/crates/security/ndn-cert/src/context_update.rs:721-756` |
 | Version walk, 128 max | `context_update.rs:510,845-880` |
-| Kit ↔ anchor match by public key, role required | `recovery.rs:654-684`; `root_store.rs:381-393` |
-| Add / remove / reissue | `recovery.rs:688-806` |
-| Recovery version rules (`destroyed`/`compromised`, kept kits, revocations, `CoversAnchor`) | `recovery.rs:808-988` |
-| Unrecorded root-device keys → `<ns>/CA/KEY/ca` | `recovery.rs:957-961`; `ndn-rs/crates/security/ndn-cert/src/namespace.rs:59-62` |
-| Recovery in PIB: preconditions, fresh keys, CA (`NA`) / device (`NDNCERT`) certs, N+1 then N+2, undo | `recovery.rs:1026-1226`; `cert_name.rs:59-69` |
-| Root-device check | `recovery_kit.rs:194-217`; `root_store.rs:620-624` |
-| Hand-over outcomes, 30 s wait, 2 failures, resend same bytes, keep for next start, same-PIB check | `recovery_kit.rs:37-41,219-347,372-396` |
+| Kit ↔ anchor match by public key, role required | `recovery.rs:697-727`; `root_store.rs:381-393` |
+| Add / remove / reissue | `recovery.rs:731-849` |
+| Recovery version rules (`destroyed`/`compromised`, kept kits, revocations, `CoversAnchor`) | `recovery.rs:851-1031` |
+| Revocation and AnchorSet encoded in canonical order | `trust_context/mod.rs:802-850` |
+| Unrecorded root-device keys → `<ns>/CA/KEY/ca` | `recovery.rs:1000-1004`; `ndn-rs/crates/security/ndn-cert/src/namespace.rs:59-62` |
+| Recovery in PIB: preconditions, fresh keys, CA (`NA`) / device (`NDNCERT`) certs, N+1 then N+2, undo | `recovery.rs:1069-1269`; `cert_name.rs:59-69` |
+| Root-device check | `recovery_kit.rs:174-187`; `root_store.rs:620-624` |
+| Hand-over outcomes, 30 s wait, 10 waits / 2 failures → unknown, resend same bytes, keep for next start, same-PIB check | `ndn-rs/crates/security/ndn-namespace/src/admin.rs:61-70,174-179,213-221,240-318`; `recovery_kit.rs:40-46,191-338`; test `admin.rs` `a_device_that_never_answers_leaves_it_unknown_after_the_last_wait` |
 | Daemon `context-update`: idempotent 200 on stored copy, 403 refusal, 409 changed meanwhile | `ndn-fwd/binaries/ndn-fwd/src/context_refresh.rs:335-480` |
-| Create order (file before sign, removal on refusal, keep on unknown) | `recovery_kit.rs:418-609` |
-| Revoke | `recovery_kit.rs:690-754` |
-| Check | `recovery_kit.rs:659-688` |
+| Create order (file before sign, removal on refusal, keep on unknown) | `recovery_kit.rs:356-546` |
+| Revoke | `recovery_kit.rs:627-690` |
+| Check | `recovery_kit.rs:596-625` |
 | Anti-fork table, 60 s fetch, adopt by kit fingerprint | `recover.rs:58-164` |
 | RefreshState meanings | `ndn-rs/crates/forwarding/ndn-mgmt/src/lib.rs:596-621`; producers `context_refresh.rs:132-283` |
-| Recover CLI: `--old-root` required, root store refused, stored = newest, self-consistency, kit anchor, kept kits, N+1/N+2 hand-over, link only after N+2 | `recover.rs:166-400` |
-| ndn-mobile Bag mapping drops namespace/fingerprint; identity-level recovery | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:131-134`; `ndn-mobile/crates/ndn-boltffi/src/identity_core.rs:1438-1456,1601-1654` |
+| Recover CLI: `--old-root` required, root store refused, stored = newest, self-consistency, kit anchor, kept kits, N+1/N+2 hand-over, link only after N+2 | `recover.rs:166-407` |
+| ndn-mobile Bag keeps namespace/fingerprint; `load_identity` refuses a recovery key; identity-level recovery | `ndn-mobile/crates/ndn-boltffi/src/trust.rs:136-145,165-200`; `ndn-mobile/crates/ndn-boltffi/src/identity_core.rs:573-610,1561-1660`; test `ndn-mobile/crates/ndn-boltffi/src/engine.rs` `load_identity_refuses_a_namespace_recovery_kit` |

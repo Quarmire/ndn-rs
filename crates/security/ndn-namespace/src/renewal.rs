@@ -213,20 +213,12 @@ pub async fn renew_now(
     vault: &dyn KeyVault,
 ) -> Result<Vec<RenewalInfo>, TrustRefusal> {
     let _one_at_a_time = p.renewing.lock().await;
-    let held = held_certificates(p, vault).map_err(|why| {
-        refusal(
-            status::SERVER_ERROR,
-            format!("{why}: nothing was renewed. Make the PIB readable by this daemon, then renew again"),
-        )
-    })?;
+    let held = held_certificates(p, vault)
+        .map_err(|why| refusal(status::SERVER_ERROR, p.words().renewal_unreadable(why)))?;
     if held.is_empty() {
         return Err(refusal(
             status::NOT_FOUND,
-            format!(
-                "this node holds no certificate a namespace CA issued to it in {}: nothing to \
-                 renew. Enroll first (`ndn-fwd enroll <invite>`)",
-                vault.location()
-            ),
+            p.words().nothing_to_renew(&vault.location()),
         ));
     }
     let mut out = Vec::with_capacity(held.len());
@@ -268,8 +260,8 @@ pub fn spawn_periodic(
                         target: "security",
                         error = %why,
                         retry_in_secs = wait.as_secs(),
-                        "no certificate is renewed while the PIB cannot be read; they expire unless \
-                         it becomes readable"
+                        "{}",
+                        p.words().renewal_waits_for_storage()
                     );
                     continue;
                 }
@@ -283,8 +275,8 @@ pub fn spawn_periodic(
                         certificate = %h.cert.name,
                         validity_days = (h.cert.valid_until.saturating_sub(h.cert.valid_from)) / 86_400_000_000_000,
                         renew_before = ?before,
-                        "[security] renew_before is at least the lifetime of the certificates this \
-                         CA issues; renewing them once a third of their lifetime is left instead"
+                        "{}",
+                        p.words().renew_before_too_long()
                     );
                 }
                 if schedule.check(&h.key, &h.cert, Now::current()) != Due::Now {

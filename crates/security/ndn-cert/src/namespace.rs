@@ -586,10 +586,29 @@ mod tests {
 
         // The signed context is stored, names the CA, and re-loads verified.
         assert_eq!(out.init.context.ca_endpoints(), &[n("/home/bob/CA")]);
-        // The inline envelope still fits one QR code (version 40, byte mode,
-        // low error correction: 2953 bytes) for a typical namespace.
-        let uri = out.init.envelope.to_uri();
-        assert!(uri.len() <= 2953, "anchor envelope is {} bytes", uri.len());
+        // The anchor link fits one QR code as the renderers draw it
+        // (`ndn_trust_envelope::qr`): inline when the context fits, else by
+        // reference (namespace, expected fingerprint, version).
+        let inline = out.init.envelope.to_uri();
+        let shown = out.init.envelope.qr_uri().expect("the anchor link has a QR form");
+        assert!(ndn_trust_envelope::qr::encode(&shown).is_ok(), "{} bytes", shown.len());
+        if inline.len() <= ndn_trust_envelope::qr::MAX_TEXT_LEN {
+            assert_eq!(shown, inline);
+        } else {
+            let TrustEnvelope::Anchor {
+                namespace,
+                fingerprint,
+                version,
+                context_data: None,
+                context_content: None,
+            } = TrustEnvelope::from_uri(&shown).unwrap()
+            else {
+                panic!("an inline link too large for a QR is shown by reference");
+            };
+            assert_eq!(namespace.as_deref(), Some("/home/bob"));
+            assert_eq!(fingerprint, Some(anchor_fingerprint(&out.init.anchor)));
+            assert_eq!(version, Some(1));
+        }
         let keyring = ndn_security::Keyring::new();
         let loaded = crate::context_store::load_persisted_contexts(dir.path(), &keyring).unwrap();
         assert_eq!(loaded.len(), 1);

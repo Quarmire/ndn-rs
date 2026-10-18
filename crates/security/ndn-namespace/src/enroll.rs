@@ -47,7 +47,7 @@ use ndn_mgmt_wire::control_response::status;
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, SignedTrustContext, Signer};
 
-use crate::{KeyVault, Participant, hex, iso, now_secs, refusal};
+use crate::{HostWords, KeyVault, Participant, hex, iso, now_secs, refusal};
 
 /// The status code an invite enrollment's refusal is reported with.
 pub fn invite_status(e: &InviteEnrollError) -> u64 {
@@ -214,11 +214,9 @@ async fn check_context(p: &Participant, namespace: &Name) -> Option<ContextRefre
     {
         Ok(Ok(mut results)) => results.pop(),
         Ok(Err(e)) => Some(not_checked(e.reason)),
-        Err(_) => Some(not_checked(format!(
-            "no newer version was confirmed within {}s (following several versions takes \
-             longer); `ndn-fwd context refresh {namespace}` completes the check",
-            budget.as_secs()
-        ))),
+        Err(_) => Some(not_checked(
+            p.words().context_check_timed_out(budget.as_secs(), namespace),
+        )),
     }
 }
 
@@ -292,8 +290,12 @@ pub fn request_store(vault: &dyn KeyVault) -> Result<RequestStore, TrustRefusal>
 
 /// End the device's pending requests the CA never answered before they
 /// expired ([`RequestStore::expire_overdue`]) and delete their keys, so a
-/// new request may go out.
-pub fn expire_overdue(vault: &dyn KeyVault, store: &RequestStore) -> Result<(), TrustRefusal> {
+/// new request may go out. `words`: the host's, for the log line.
+pub fn expire_overdue(
+    vault: &dyn KeyVault,
+    store: &RequestStore,
+    words: &HostWords,
+) -> Result<(), TrustRefusal> {
     let ended = store.expire_overdue().map_err(|e| {
         refusal(status::SERVER_ERROR, format!("cannot update this node's request records: {e}"))
     })?;
@@ -301,24 +303,16 @@ pub fn expire_overdue(vault: &dyn KeyVault, store: &RequestStore) -> Result<(), 
         if let Ok(key) = r.key_name.parse::<Name>() {
             discard(vault, &key);
         }
-        tracing::warn!(target: "security", request = %r.request_id, key = %r.key_name, "the CA never answered before the request expired; it ended here and its key was deleted: ask again (`ndn-fwd enroll`)");
+        tracing::warn!(target: "security", request = %r.request_id, key = %r.key_name, "{}", words.request_expired_unanswered());
     }
     Ok(())
 }
 
-/// Parse the link `ndn-fwd enroll` was given: an invite, or an anchor link.
-pub fn parse_link(uri: &str) -> Result<EnrollLink, TrustRefusal> {
-    EnrollLink::parse(uri).map_err(|e| {
-        refusal(
-            status::BAD_PARAMS,
-            format!(
-                "the link is neither an invite nor an anchor link ({e}): give an \
-                 ndn-trust://invite link (`ndn-fwd-tokens new` prints one) or, for a role the \
-                 namespace certifies on an admin's approval, its ndn-trust://anchor link \
-                 (`ndn-fwd init` prints it as anchor_uri)"
-            ),
-        )
-    })
+/// Parse the link an enrollment was given: an invite, or an anchor link.
+/// `words`: the host's, for the refusal.
+pub fn parse_link(uri: &str, words: &HostWords) -> Result<EnrollLink, TrustRefusal> {
+    EnrollLink::parse(uri)
+        .map_err(|e| refusal(status::BAD_PARAMS, words.not_an_enroll_link(e)))
 }
 
 /// Hold the trust context of the namespace `link` names: adopt it (and keep
@@ -408,23 +402,13 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
         (EnrollLink::Invite(invite), false) => {
             return Err(refusal(
                 status::BAD_PARAMS,
-                format!(
-                    "the invite admits a {} device, not a {role} device; {namespace} certifies \
-                     {role} devices by invite: ask for a {role} invite (`ndn-fwd-tokens new \
-                     --role {role}`)",
-                    invite.role
-                ),
+                p.words().invite_for_another_role(namespace, &invite.role, role),
             ));
         }
         (EnrollLink::Anchor(_), false) => {
             return Err(refusal(
                 status::BAD_PARAMS,
-                format!(
-                    "{namespace} certifies {role} devices by invite, not on an admin's approval \
-                     ({}): ask an admin for an invite (`ndn-fwd-tokens new --role {role}` on the \
-                     root device) and run `ndn-fwd enroll <invite link>`",
-                    policy.describe(),
-                ),
+                p.words().role_by_invite(namespace, role, policy.describe()),
             ));
         }
     }
@@ -433,11 +417,7 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
         (EnrollLink::Anchor(_), true) => {
             return Err(refusal(
                 status::BAD_PARAMS,
-                format!(
-                    "{namespace} certifies a {role} device only on an invite AND an admin's \
-                     approval: ask an admin for an invite and run `ndn-fwd enroll <invite link> \
-                     --role {role}`"
-                ),
+                p.words().role_by_invite_and_approval(namespace, role),
             ));
         }
         _ => None,
@@ -465,7 +445,7 @@ pub async fn enroll(
             "another enrollment is running on this node; wait for it to finish",
         ));
     };
-    let link = parse_link(&request.link_uri)?;
+    let link = parse_link(&request.link_uri, p.words())?;
     let namespace = link.namespace().clone();
     let identity = request.identity.clone();
     let Some(device) = parse_device_identity(&namespace, &identity) else {
@@ -502,14 +482,10 @@ pub async fn enroll(
         let still_valid: Vec<String> = held.iter().map(Certified::still_valid).collect();
         return Err(refusal(
             409,
-            format!(
-                "this node already holds a certificate in {namespace}: {}{}. To enroll another \
-                 key anyway, run again with --force and another --device name (the CA certifies \
-                 a new key for a device name it already certified only once that certificate \
-                 is revoked or an admin approves the new key); the certificate this node holds \
-                 stays valid until it expires or is revoked",
-                still_valid.join(", "),
-                context_check.as_ref().map(judged_on_held).unwrap_or_default()
+            p.words().already_certified(
+                &namespace,
+                &still_valid.join(", "),
+                &context_check.as_ref().map(judged_on_held).unwrap_or_default(),
             ),
         ));
     }
@@ -550,7 +526,12 @@ fn generate_key(
     vault: &dyn KeyVault,
     identity: &Name,
 ) -> Result<(Name, Arc<dyn Signer>), TrustRefusal> {
-    let key = new_device_key_name(identity);
+    let key = new_device_key_name(identity).map_err(|e| {
+        refusal(
+            status::SERVER_ERROR,
+            format!("cannot name the device key (the system RNG failed): {e}"),
+        )
+    })?;
     let signer = vault.generate(&key).map_err(|e| {
         refusal(
             status::SERVER_ERROR,
@@ -610,7 +591,7 @@ pub async fn enroll_by_invite(
         signer,
         &issued,
         enrolling,
-        "The token is spent: fix the PIB directory and ask for a new invite",
+        &p.words().invite_spent(),
     )
     .await
     .map(EnrollOutcome::Enrolled)
@@ -652,7 +633,7 @@ pub async fn enroll_by_approval(
 ) -> Result<EnrollOutcome, TrustRefusal> {
     let requests = request_store(vault)?;
     let identity = enrolling.identity.to_string();
-    let outstanding = expire_overdue(vault, &requests).and_then(|()| {
+    let outstanding = expire_overdue(vault, &requests, p.words()).and_then(|()| {
         requests.outstanding(&identity).map_err(|e| {
             refusal(status::SERVER_ERROR, format!("cannot read this node's request records: {e}"))
         })
@@ -703,14 +684,11 @@ pub async fn enroll_by_approval(
                 discard(vault, &key);
                 return Err(refusal(
                     status::SERVER_ERROR,
-                    format!(
-                        "the CA holds request {} (code {}), but this node could not record it \
-                         ({e}), so it would never finish it: the key was deleted. Fix the PIB \
-                         directory ({}) and ask again; an admin can deny request {}",
-                        record.request_id,
-                        record.code,
-                        vault.location(),
-                        record.request_id
+                    p.words().request_not_recorded(
+                        &record.request_id,
+                        &record.code,
+                        e,
+                        &vault.location(),
                     ),
                 ));
             }
@@ -735,8 +713,7 @@ pub async fn enroll_by_approval(
             signer,
             &issued,
             enrolling,
-            "The approval is used: fix the PIB directory, ask again (`ndn-fwd enroll`) and have \
-             an admin approve the new request",
+            &p.words().approval_used(),
         )
         .await
         .map(EnrollOutcome::Enrolled),
@@ -837,7 +814,8 @@ pub async fn install(
         certificate = %issued.cert.name,
         issuer = ?issued.issuer.as_ref().map(Name::to_string),
         signing_now = activation.signing_now,
-        "enrolled; the PIB's default identity is now this one"
+        "{}",
+        p.words().enrolled()
     );
     Ok(EnrolledInfo {
         identity: identity.to_string(),
@@ -863,10 +841,13 @@ pub async fn install(
 }
 
 /// The device's requests for an admin's approval, oldest first (overdue
-/// ones ended first).
-pub fn enroll_status(vault: &dyn KeyVault) -> Result<Vec<OutgoingRequest>, TrustRefusal> {
+/// ones ended first). `words`: the host's, for the log line.
+pub fn enroll_status(
+    vault: &dyn KeyVault,
+    words: &HostWords,
+) -> Result<Vec<OutgoingRequest>, TrustRefusal> {
     let store = request_store(vault)?;
-    expire_overdue(vault, &store)?;
+    expire_overdue(vault, &store, words)?;
     store
         .list()
         .map_err(|e| refusal(status::SERVER_ERROR, format!("cannot read this node's request records: {e}")))

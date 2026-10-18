@@ -450,7 +450,7 @@ impl SecurityManager {
             return Ok((mgr, false));
         }
 
-        let key_name = crate::cert_name::new_key_name(identity);
+        let key_name = crate::cert_name::new_key_name(identity)?;
         // ECDSA-P256 so the identity is verifiable by ndn-cxx tooling,
         // which doesn't support Ed25519. Ed25519 stays available via
         // explicit `pib.generate_ed25519` for ndn-rs-only deployments.

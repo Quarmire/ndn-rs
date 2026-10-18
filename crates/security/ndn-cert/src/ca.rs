@@ -725,8 +725,8 @@ impl CaState {
 
         let ca_kp = EcdhKeypair::generate();
         let ca_pub_bytes = ca_kp.public_key_bytes();
-        let salt = EcdhKeypair::random_salt();
-        let request_id_bytes = generate_request_id_bytes();
+        let salt = EcdhKeypair::random_salt()?;
+        let request_id_bytes = generate_request_id_bytes()?;
 
         let session_key = ca_kp.derive_session_key(&new_req.ecdh_pub, &salt, &request_id_bytes)?;
 
@@ -741,7 +741,7 @@ impl CaState {
                 expires_at: now_secs() + NEW_TO_CHALLENGE_SECS,
                 session_key,
                 request_id_bytes,
-                encryption_iv: new_encryption_iv(),
+                encryption_iv: new_encryption_iv()?,
                 decryption_iv: None,
             },
         );
@@ -794,9 +794,10 @@ impl CaState {
         if let Some(ref locked_type) = existing_type
             && locked_type != &challenge_type
         {
-            return Err(CertError::InvalidRequest(format!(
-                "challenge type locked to '{locked_type}' for this request"
-            )));
+            return Err(CertError::CaFailure {
+                code: ErrorCode::InvalidParameters.into(),
+                info: format!("challenge type locked to '{locked_type}' for this request"),
+            });
         }
 
         // The CA's built-in renewal, when its issuance policy renews; any
@@ -811,10 +812,9 @@ impl CaState {
                     .challenges
                     .iter()
                     .find(|h| h.challenge_type() == challenge_type)
-                    .ok_or_else(|| {
-                        CertError::InvalidRequest(format!(
-                            "unsupported challenge type: {challenge_type}"
-                        ))
+                    .ok_or_else(|| CertError::CaFailure {
+                        code: ErrorCode::InvalidParameters.into(),
+                        info: format!("unsupported challenge type: {challenge_type}"),
                     })?,
             )
         };
@@ -1378,10 +1378,10 @@ fn is_other_key_of_identity(own: &ndn_packet::Name, key: &ndn_packet::Name) -> b
         && mine[n - 1] != theirs[n - 1]
 }
 
-fn generate_request_id_bytes() -> [u8; 8] {
+fn generate_request_id_bytes() -> Result<[u8; 8], CertError> {
     let mut bytes = [0u8; 8];
-    let _ = getrandom::getrandom(&mut bytes);
-    bytes
+    crate::ecdh::fill_random(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// What [`CaState::revoke_issued_under`] revoked.

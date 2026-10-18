@@ -56,6 +56,9 @@ keyring      = { version = "3.6", optional = true, features = ["apple-native", "
 # BIP39 English words, whose checksum catches a mistyped word; `zeroize`
 # wipes the `Mnemonic` (which encodes the whole seed) when it is dropped.
 bip39        = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+# A file kit's passphrase is sealed in Unicode NFC, so the same text typed
+# through an input method that produces NFD still opens it.
+unicode-normalization = "0.1"
 
 # Root store: reading a passphrase / PIN from the terminal without echo.
 [target.'cfg(unix)'.dependencies]

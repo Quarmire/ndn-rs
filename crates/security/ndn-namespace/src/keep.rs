@@ -275,11 +275,11 @@ pub fn keep_update(
 
 /// Whether a version this device keeps is published ([`keep`] publishes
 /// only with a publisher), worded for a detail.
-pub(crate) fn publication(p: &Participant) -> &'static str {
+pub(crate) fn publication(p: &Participant) -> String {
     if p.publisher().is_some() {
-        " and published"
+        " and published".into()
     } else {
-        "; not published: [security] serve_contexts = false, so no node fetches it from this one"
+        p.words().not_published()
     }
 }
 
@@ -305,15 +305,9 @@ pub async fn apply_update(p: &Participant, wire: Bytes) -> Result<ContextRefresh
         )
     })?;
     let _one_change = p.context_change.lock().await;
-    let held = p.held_context(&namespace).ok_or_else(|| {
-        refusal(
-            status::NOT_FOUND,
-            format!(
-                "this node holds no trust context for {namespace}; adopt it first (`ndn-fwd \
-                 adopt`)"
-            ),
-        )
-    })?;
+    let held = p
+        .held_context(&namespace)
+        .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&namespace)))?;
     if let Some((version, location)) = stored_copy(p, &held, &data) {
         return Ok(ContextRefreshInfo {
             namespace: namespace.to_string(),

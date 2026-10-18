@@ -19,7 +19,6 @@ pub struct ValidationStats {
     pub valid: AtomicU64,
     pub invalid: AtomicU64,
     pub pending: AtomicU64,
-    pub dropped_no_key: AtomicU64,
     pub dropped_timeout: AtomicU64,
 }
 
@@ -278,8 +277,8 @@ impl ValidationStage {
             .instrument(span.clone())
             .await;
         span.record("elapsed_us", started.elapsed().as_micros() as u64);
-        match result {
-            ValidationResult::Valid(_safe) => {
+        match (result, missing) {
+            (ValidationResult::Valid(_safe), _) => {
                 span.record("outcome", "valid");
                 self.stats.valid.fetch_add(1, Ordering::Relaxed);
                 trace!(target: t::SECURITY, name=%name, "validation: valid");
@@ -287,29 +286,25 @@ impl ValidationStage {
                 ctx.revocation_epoch = Some(epoch);
                 Action::Satisfy(ctx)
             }
-            ValidationResult::Pending => {
-                if let Some(cert_name) = missing {
-                    span.record("outcome", "pending");
-                    span.record("reason", "awaiting-cert");
-                    self.stats.pending.fetch_add(1, Ordering::Relaxed);
-                    debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, awaiting certificate (queued)");
+            (ValidationResult::Pending, Some(cert_name)) => {
+                span.record("outcome", "pending");
+                span.record("reason", "awaiting-cert");
+                self.stats.pending.fetch_add(1, Ordering::Relaxed);
+                debug!(target: t::SECURITY, name=%name, cert=%cert_name, "validation: pending, awaiting certificate (queued)");
 
-                    self.request_cert(validator, &cert_name, ctx.face_id);
+                self.request_cert(validator, &cert_name, ctx.face_id);
 
-                    let now = self.runtime.now();
-                    let mut pending = self.pending.lock().await;
-                    let deadline = pending.deadline_from(now);
-                    pending.push(ctx, cert_name, deadline);
-                    Action::Drop(DropReason::ValidationPending)
-                } else {
-                    span.record("outcome", "dropped");
-                    span.record("reason", Refusal::Unverifiable.as_str());
-                    self.stats.dropped_no_key.fetch_add(1, Ordering::Relaxed);
-                    warn!(target: t::SECURITY, name=%name, "validation: DROPPED — unverifiable (no key locator)");
-                    Action::Refuse(ctx, Refusal::Unverifiable)
-                }
+                let now = self.runtime.now();
+                let mut pending = self.pending.lock().await;
+                let deadline = pending.deadline_from(now);
+                pending.push(ctx, cert_name, deadline);
+                Action::Drop(DropReason::ValidationPending)
             }
-            ValidationResult::Invalid(e) => {
+            // `validate_chain_cached` names the missing certificate of every
+            // pending walk, so this never happens; were it to, the Data has
+            // no verdict, and Data without a verdict is refused to nobody.
+            (ValidationResult::Pending, None) => Action::Drop(DropReason::ValidationFailed),
+            (ValidationResult::Invalid(e), _) => {
                 let (refusal, what) = invalid_reason(&e);
                 span.record("outcome", "invalid");
                 span.record("reason", refusal.as_str());
@@ -454,6 +449,41 @@ mod tests {
             matches!(action, Action::Refuse(_, Refusal::BadSignature)),
             "/localhost Data must go through validation instead of bypassing it"
         );
+    }
+
+    /// A Data whose signature names no usable signing key — here a
+    /// KeyDigest locator no cached certificate answers (a Data with no
+    /// KeyLocator at all does not even decode) — can never be verified: it
+    /// is refused `bad-signature` (172), a final verdict, never
+    /// `unverifiable` (176), which would have consumers retry it.
+    #[tokio::test]
+    async fn data_naming_no_usable_signing_key_is_refused_bad_signature() {
+        use ndn_packet::tlv_type as tt;
+
+        let validator = Arc::new(Validator::new(TrustSchema::accept_all()));
+        let validation = ValidationStage::new(
+            Some(validator),
+            PendingQueueConfig::default(),
+            ndn_runtime::default_runtime(),
+        );
+        let mut w = ndn_tlv::TlvWriter::new();
+        w.write_nested(tt::DATA, |w| {
+            w.write_nested(tt::NAME, |w| w.write_tlv(tt::NAME_COMPONENT, b"doc"));
+            w.write_tlv(tt::CONTENT, b"x");
+            w.write_nested(tt::SIGNATURE_INFO, |w| {
+                w.write_tlv(tt::SIGNATURE_TYPE, &[5]);
+                w.write_nested(tt::KEY_LOCATOR, |w| w.write_tlv(tt::KEY_DIGEST, &[9u8; 32]));
+            });
+            w.write_tlv(tt::SIGNATURE_VALUE, &[0u8; 64]);
+        });
+        let wire = w.finish();
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(1), 0);
+        ctx.name = Some(Arc::clone(&data.name));
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+
+        let action = validation.process(ctx).await;
+        assert!(matches!(action, Action::Refuse(_, Refusal::BadSignature)));
     }
 
     use ndn_packet::Name;

@@ -74,13 +74,14 @@ Fragment   = 0x50 TLV-LENGTH Interest
   bare TLV (Unix sockets, in-process app faces). A bare `0x0320` TLV outside an LpPacket is
   not a Nack. ndn-rs rejects it on decode.
 - When the downstream's Interest arrived with an NDNLPv2 PitToken, the sender MUST echo it
-  unchanged in the refusal.
+  unchanged in the refusal. This holds for a refusal it relays too (§5).
 
 A receiver:
 
 - MUST accept any other NDNLPv2 header a peer adds, as NDNLPv2 specifies.
-- MUST read NackReason as a NonNegativeInteger. It SHOULD accept the 1-, 2-, 4- and 8-byte
-  encodings: test vector V10 is a 2-byte encoding of 171, and ndn-rs decodes it as `revoked`.
+- MUST read NackReason as a NonNegativeInteger: 1, 2, 4 or 8 octets. Test vector V10 is a
+  2-byte encoding of 171, and ndn-rs decodes it as `revoked`. An LpPacket whose NackReason has
+  any other length (V12) is malformed and is dropped, as NFD drops it.
 - MUST treat a Nack element with no NackReason as a Nack without reason. That is not a refusal.
 - MUST use only the first NackReason inside a Nack. This is what ndn-rs does.
 
@@ -96,18 +97,19 @@ exactly:
 | 2 | CanBePrefix (`0x21`, empty) | present iff the downstream's Interest had it |
 | 3 | MustBeFresh (`0x12`, empty) | present iff the downstream's Interest had it |
 | 4 | Nonce (`0x0A`, 4 bytes) | the nonce the downstream sent |
+| 5 | ApplicationParameters (`0x24`) and every element after it (InterestSignatureInfo `0x2C`, InterestSignatureValue `0x2E`) | present iff the downstream's Interest had ApplicationParameters: those elements byte for byte as received |
 
-InterestLifetime, HopLimit, ForwardingHint, ApplicationParameters and the Interest signature
-elements are left out.
+InterestLifetime, HopLimit and ForwardingHint are left out. Because element 5 is copied
+unchanged, a name that ends in a ParametersSha256DigestComponent still matches the parameters
+the Nack carries, and a decoder that checks the digest accepts the enclosed Interest
+([Decision 3](#8-decisions)).
 
 A receiver MUST match a refusal to its pending Interest by the enclosed Interest's Name, with
-CanBePrefix taken into account, or by PitToken. A receiver MUST NOT require the other
-elements of its original Interest to be present. A receiver SHOULD NOT reject the enclosed
-Interest because its Name ends in a ParametersSha256DigestComponent with no
-ApplicationParameters present (see §8, item 3).
+CanBePrefix taken into account, or by PitToken. A receiver MUST NOT require the left-out
+elements of its original Interest to be present.
 
-A refusal relayed by a second forwarder (§5) carries the Interest that forwarder received in
-the upstream's Nack instead.
+A refusal relayed by a second forwarder (§5) is rebuilt the same way, from that forwarder's
+own state for each of its downstreams.
 
 ## 3. Codes
 
@@ -166,12 +168,15 @@ one of three ways: valid, invalid with an error, or pending on a missing certifi
 | Valid | none: the Data is forwarded and may be cached |
 | Revoked | 171 |
 | Signature does not verify; invalid key encoding | 172 |
-| No SignatureInfo; no KeyLocator on a non-DigestSha256 signature; a KeyDigest KeyLocator whose certificate is not cached | 172 (see §8, item 1) |
+| No SignatureInfo; a KeyDigest KeyLocator whose certificate is not cached; no KeyLocator on a signature type that does not require one at decode | 172 ([Decision 1](#8-decisions)) |
 | Schema mismatch; certificate not authorized by its issuer | 173 |
 | Chain ends at a self-signed certificate that is not an anchor | 174 |
 | Trust context at an expected name fails the adoption or update expectation | 175 |
 | Any other chain error (too deep, cycle, unsupported signature type, key store, certificate not found) | 170 |
 | Pending: the signing (or an issuer) certificate is not cached | none yet; see below |
+
+A Data whose signature type requires a KeyLocator (Ed25519, ECDSA, RSA, HMAC, keyed BLAKE3) and
+has none does not decode. It is dropped before validation and gets no refusal.
 
 A pending Data is parked, and the forwarder fetches the missing certificate in the background.
 The fetch is routed by the FIB and is also sent directly out of the face the Data arrived on.
@@ -206,9 +211,11 @@ When the forwarder refuses a Data:
    forwarded: the exact-name entry, the parameters- or implicit-digest-stripped entry, and
    CanBePrefix entries at shorter prefixes. Their nonces enter the Dead Nonce List. Persistent
    (subscription) in-records are not consumed and get no refusal.
-3. For each matched downstream face (deduplicated by face, first match wins):
+3. For each pending Interest the Data consumed (one per downstream face and Interest name: a
+   face whose exact Interest and CanBePrefix Interest at a shorter prefix were both consumed
+   counts twice):
    - **Local face**: the forwarder MUST send one refusal Nack (§2), enclosing that
-     downstream's own Interest (§2.2) and echoing its PitToken.
+     Interest (§2.2) and echoing its PitToken.
    - **Non-local face**: the forwarder MUST NOT send anything. To the network, a refused
      Data looks the same as a dropped one, so a remote peer cannot probe the forwarder's
      trust state.
@@ -242,17 +249,19 @@ A forwarder that receives a Nack carrying `170`–`176` from an upstream handles
 3. If the strategy decides to Nack, the forwarder removes the PIT entry and chooses the reason
    to relay:
    - **The refusal came from a local upstream** (a forwarder on this host): the refusal code
-     is kept. It MUST be sent only to local downstreams. Non-local downstreams MUST get
-     nothing.
+     is kept for local downstreams. Each non-local downstream MUST get **NoRoute (150)**
+     instead: to the network the path has nothing usable, as in the next case
+     ([Decision 6](#8-decisions)).
    - **The refusal came from a non-local upstream**: the code is an unverified claim. Anyone
      could forge "revoked". The forwarder MUST relay it as **NoRoute (150)**, to every
      point-to-point downstream, local and non-local alike.
-4. A relayed Nack encloses the Interest from the upstream Nack's Fragment, unchanged. ndn-rs
-   does not attach the downstream's PitToken to a relayed Nack (see §8, item 4).
+4. A relayed Nack is built per downstream face, like an originated refusal: it encloses that
+   downstream's own Interest rebuilt from its PIT in-record (§2.2: its name, selectors, nonce
+   and parameters) and echoes its PitToken ([Decision 4](#8-decisions)).
 
 A consumer MUST NOT treat a refusal code received over a non-local face as a refusal. It MUST
-treat it as NoRoute. A conforming forwarder never sends one there (§4.3), so if one arrives,
-the code is unverified.
+treat it as NoRoute. A conforming forwarder never sends one there (§4.3, §5), so if one
+arrives, the code is unverified.
 
 ## 6. Consumer behaviour
 
@@ -356,7 +365,8 @@ LpPacket:
 ```
 
 **V9: the same Interest relayed as NoRoute (150).** This is what a downstream receives when a
-non-local upstream sent a refusal (§5):
+non-local upstream sent a refusal, and what a non-local downstream receives when a local
+upstream did (§5):
 
 ```text
 6425FD032005FD03210196501A051807100804686F6D650803626F620803646F630A0401020304
@@ -372,76 +382,92 @@ decodes it as `Refused(Revoked)`. A sender MUST NOT produce it.
 **V11: range bounds.** NackReason 169 decodes as `Other(169)` and 177 as `Other(177)`.
 Neither is a refusal.
 
+**V12: malformed NackReason.** NackReason 171 in a 3-byte encoding (`0000AB`). A
+NonNegativeInteger has 1, 2, 4 or 8 octets, so `LpPacket::decode` rejects the packet.
+
+```text
+6427FD032007FD0321030000AB501A051807100804686F6D650803626F620803646F630A0401020304
+```
+
 ### Provenance
 
 - V1–V11 come from a throwaway example built against `ndn-packet` (feature `std`):
   `cargo run -p ndn-packet --features std --example specvec_refusal`, run on 2026-10-18
   against the working tree, after which the file was deleted.
   - The enclosed Interests were built with `Nack::interest_wire`, the function the forwarder
-    uses in `refuse`.
+    uses in `refuse` and when it relays a Nack. None of them is parameterized, so they did not
+    change when that function started copying ApplicationParameters (§2.2).
   - The Nacks were built with `encode_lp_nack` (V1–V7, V9) and `encode_lp_nack_with_pit_token`
     (V8). The engine's `frame_with_intent` calls these to frame a Nack.
   - Every vector was decoded back with `LpPacket::decode` / `Nack::decode`, and the program
     asserted the code, the token, the name, the PitToken and the selectors.
   - V10 was hand-built with `TlvWriter` and decoded with `LpPacket::decode`.
+- V12 was derived from V10 by hand. The accepted and rejected NackReason lengths are tested
+  in `ndn-packet/src/lp/decode.rs` (`nack_reason_is_a_nonnegative_integer`).
 - Behavioural coverage in the repository: `ndn-engine/tests/local_refusal.rs`.
   - `a_remote_refusal_is_relayed_as_no_route`
   - `a_local_refusal_is_relayed_to_local_downstreams_only`
+  - `a_relayed_nack_carries_each_downstreams_own_interest_and_pit_token`
+  - `each_pending_interest_of_a_face_gets_its_refusal`
   - `revoked_data_is_refused_to_the_local_consumer_only`
   - `forged_data_is_refused_to_the_local_consumer_only`
   - `pending_data_is_refused_to_nobody`
   - `data_whose_certificate_is_absent_is_refused_unverifiable`
-  - Code and token round-trips are in `ndn-packet/src/nack.rs` tests.
+  - `ndn-engine/src/stages/validation.rs`: `data_naming_no_usable_signing_key_is_refused_bad_signature`
+  - Code and token round-trips, and the parameterized enclosed Interest
+    (`a_rebuilt_parameterized_interest_keeps_its_parameters`), are in `ndn-packet/src/nack.rs`
+    tests.
 
-## 8. Open questions
+## 8. Decisions
 
-1. **Missing KeyLocator gives 172, but the documentation says 176.**
-   - `Refusal::Unverifiable`'s doc comment and the wiki table say a Data that "names no
-     signing key (no KeyLocator)" is refused `unverifiable`.
-   - In the code, `validate_chain_inner` returns `Invalid(InvalidSignature)` for a missing
-     KeyLocator, a missing SignatureInfo, and an uncached KeyDigest locator. That error maps
-     to **172 `bad-signature`**.
-   - The `Pending`-with-no-missing-certificate branch in the validation stage that would
-     produce 176 cannot be reached: `validate_chain_cached` returns a missing name iff the
-     result is `Pending`.
-   - This spec states what the code does (172). One of the two needs to change. If 176 is
-     intended, it would be refused for now although retrying can never help.
-2. **Should 176 be final when retrying cannot help?** This only matters if item 1 is resolved
-   towards 176.
-3. **The enclosed Interest is rebuilt and loses elements.**
-   - `Nack::interest_wire` keeps the PIT entry's full name. For a parameterized Interest that
-     name includes the ParametersSha256DigestComponent, but ApplicationParameters is left out.
-   - A strict decoder that enforces "a PSDC requires ApplicationParameters" could drop the
-     Nack. ndn-rs and ndn-cxx (according to ndn-rs's own decoder comments) accept it. Whether
-     NDNts and python-ndn accept it is [INFERENCE: unverified].
-   - Options: drop the PSDC from the name, or keep the full Interest per in-record.
-4. **Relayed Nacks are built differently from originated refusals.**
-   - A relayed Nack (§5) does not echo the downstream's PitToken.
-   - It also carries the Interest from the upstream Nack instead of each downstream's own
-     Interest (own nonce).
-   - `refuse` does both correctly. A downstream that matches replies only by PitToken cannot
-     match a relayed refusal or NoRoute.
-5. **Only the first pending Interest per face is answered.**
-   - Downstreams are deduplicated by face.
-   - If one Data consumes two in-records of the same local face, for example an exact
-     Interest and a CanBePrefix Interest at a shorter prefix, only the first gets a refusal.
-     The other times out.
-6. **Non-local downstreams get nothing when the refusal came from a local upstream.**
-   - The PIT entry is removed, so a non-local downstream waits out its Interest lifetime.
-   - This matches "a refused Data is a dropped one".
-   - It differs from the non-local-upstream case, where every downstream gets NoRoute. The
-     brief for this spec said "relayed to non-local faces as NoRoute". The code does that
-     only when the refusal came from a non-local upstream.
-7. **Range registration.** 170–176 (and 160) are unregistered. Another stack could assign
-   these numbers differently. Whether to request an NDNLPv2 registry entry is open.
-8. **Leniency in decoding NackReason.**
-   - ndn-rs decodes a NackReason of any length, folding bytes big-endian.
-   - A zero-length value decodes as code 0. A value longer than 8 bytes silently loses its
-     high bytes.
-   - NDN requires NonNegativeInteger lengths of 1, 2, 4 or 8.
-9. **Silent drops.** A Data that times out or is evicted from the pending queue gets no
-   refusal, so the consumer sees a timeout. The queue limits (4 s, 256 entries, 4 MiB) are
-   compiled-in defaults (`PendingQueueConfig::default()`) and cannot be configured.
+These points were open when this spec was first written. Each was decided, and code and spec
+now agree.
+
+1. **A Data that names no usable signing key is refused 172, which is final.** This covers
+   no SignatureInfo, an uncached KeyDigest locator, and no KeyLocator on a signature type
+   that decodes without one. Retrying can never help, so 176 (refused for now) would have
+   had consumers retry in vain. `Refusal::Unverifiable`'s documentation, its next step and
+   the wiki table said 176 and were corrected. The validation stage's unreachable 176 branch
+   (a pending verdict naming no missing certificate) is gone: such a Data would have no
+   verdict, so it is dropped with no refusal (§4.2).
+2. **176 stays non-final.** It now means only "every source answered that the certificate is
+   not there", which can change.
+3. **The enclosed Interest keeps its parameters** (§2.2). The PIT in-record keeps the
+   downstream's ApplicationParameters and the elements after it (a slice of the received
+   packet, held only for parameterized Interests until the entry is consumed). The rebuilt
+   Interest carries them byte for byte. Dropping the ParametersSha256DigestComponent from the
+   name instead would break name matching in ndn-cxx and ndn-app. Copying the parameters
+   keeps the name and keeps the digest valid, so the result is also what NFD sends, since NFD
+   encloses the stored Interest.
+4. **Relayed Nacks are built per downstream** (§5 step 4). Each downstream gets its own
+   Interest (nonce, selectors, parameters) and its PitToken back. Before, every downstream got
+   the upstream's Interest and no PitToken, so a consumer that matches replies by PitToken
+   could not match a relayed refusal or NoRoute.
+5. **Every pending Interest gets its refusal** (§4.3). Downstream Interests are recorded per
+   face and Interest name, not once per face. Before, when one Data consumed a face's exact
+   Interest and its CanBePrefix Interest at a shorter prefix, the second timed out. The Data
+   fan-out itself is still once per face.
+6. **Non-local downstreams get NoRoute when a local upstream refused** (§5). This is the same
+   as the non-local-upstream case and matches the brief ("relayed to non-local faces as
+   NoRoute"). A non-local consumer fails fast, and it learns only that this path has nothing,
+   which any NoRoute says. The forwarder's own refusal (§4.3) still sends nothing to
+   non-local faces, so the forwarder's own trust verdicts cannot be probed.
+7. **NackReason is a strict NonNegativeInteger** (§2.1, V12). 1, 2, 4 or 8 octets; any other
+   length makes the LpPacket malformed, as in NFD. Before, any length was folded big-endian,
+   so a zero-length value read as code 0 and a 9-byte value silently lost its high byte.
+8. **Silent drops stay silent** (§4.2). A Data with no verdict (pending, timed out, evicted)
+   MUST NOT be refused, because a certificate may still appear. The queue limits (4 s, 256
+   entries, 4 MiB) remain compiled-in defaults (`PendingQueueConfig::default()`). No
+   deployment has needed other values, and they bound memory that a remote peer can fill.
+
+## 9. Open questions
+
+1. **Range registration.** 170–176 (and 160) are unregistered NDNLPv2 NackReason values, and
+   another stack could assign them differently. Requesting registry entries is the owner's
+   policy call. Recommendation: request a block (for example 170–179 as "local refusal",
+   with 160 NotYet) on the NDNLPv2 wiki page before a second implementation ships. Until
+   then, keep the codes on local faces only, as this spec requires, so a collision can reach
+   only a host that runs ndn-rs.
 
 ## Appendix A. Code references (non-normative)
 
@@ -455,19 +481,19 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | `NackReason` enum, codes 50/100/150/160 | `ndn-rs/crates/core/ndn-packet/src/nack.rs:12-44` |
 | `is_registered` excludes NotYet and refusals | `ndn-rs/crates/core/ndn-packet/src/nack.rs:48-53` |
 | `refusal()` | `ndn-rs/crates/core/ndn-packet/src/nack.rs:56-61` |
-| `Refusal` variants and meanings | `ndn-rs/crates/core/ndn-packet/src/nack.rs:64-105` |
-| Codes 170–176 | `ndn-rs/crates/core/ndn-packet/src/nack.rs:119-129` |
-| `from_code`, unknown codes become `Other` | `ndn-rs/crates/core/ndn-packet/src/nack.rs:36-44`, `131-133` |
-| Tokens | `ndn-rs/crates/core/ndn-packet/src/nack.rs:137-152` |
-| `is_final` (only Unverifiable is not final) | `ndn-rs/crates/core/ndn-packet/src/nack.rs:159-161` |
-| `next_step` texts | `ndn-rs/crates/core/ndn-packet/src/nack.rs:164-196` |
-| Rebuilt enclosed Interest (Name, CanBePrefix, MustBeFresh, Nonce) | `ndn-rs/crates/core/ndn-packet/src/nack.rs:266-279` |
-| Round-trip tests (169/177 are `Other`) | `ndn-rs/crates/core/ndn-packet/src/nack.rs:323-343` |
+| `Refusal` variants and meanings | `ndn-rs/crates/core/ndn-packet/src/nack.rs:64-107` |
+| Codes 170–176 | `ndn-rs/crates/core/ndn-packet/src/nack.rs:121-131` |
+| `from_code`, unknown codes become `Other` | `ndn-rs/crates/core/ndn-packet/src/nack.rs:36-44`, `133-135` |
+| Tokens | `ndn-rs/crates/core/ndn-packet/src/nack.rs:139-154` |
+| `is_final` (only Unverifiable is not final) | `ndn-rs/crates/core/ndn-packet/src/nack.rs:161-163` |
+| `next_step` texts | `ndn-rs/crates/core/ndn-packet/src/nack.rs:166-198` |
+| Rebuilt enclosed Interest (Name, CanBePrefix, MustBeFresh, Nonce, parameters portion) | `ndn-rs/crates/core/ndn-packet/src/nack.rs:264-292`; `Interest::parameters_portion`: `ndn-rs/crates/core/ndn-packet/src/interest.rs:189-195`, `379-394` |
+| Round-trip tests (169/177 are `Other`); parameterized enclosed Interest | `ndn-rs/crates/core/ndn-packet/src/nack.rs:337-347`, `356-390` |
 | TLV types: Nack 0x0320, NackReason 0x0321, LpPacket 0x64, Fragment 0x50, PitToken 0x62 | `ndn-rs/crates/core/ndn-packet/src/lib.rs:128-129`, `143-148` |
 | LP Nack encoder, header order | `ndn-rs/crates/core/ndn-packet/src/lp/encode.rs:7-33` |
 | Shortest-form NNI | `ndn-rs/crates/core/ndn-packet/src/lp/mod.rs:46-57` |
-| Nack header decode (empty means no reason, first NackReason wins, any length) | `ndn-rs/crates/core/ndn-packet/src/lp/decode.rs:233-249` |
-| `Nack::decode` rejects a bare 0x0320 and requires a Fragment | `ndn-rs/crates/core/ndn-packet/src/nack.rs:239-260`, `396-428` |
+| Nack header decode (empty means no reason, first NackReason wins, NonNegativeInteger of 1/2/4/8 octets) | `ndn-rs/crates/core/ndn-packet/src/lp/decode.rs:233-249` (test `456-473`); `decode_nni`: `ndn-rs/crates/core/ndn-packet/src/lib.rs:73-95` |
+| `Nack::decode` rejects a bare 0x0320 and requires a Fragment | `ndn-rs/crates/core/ndn-packet/src/nack.rs:241-262`, `431-475` |
 
 **Forwarder: emitting a refusal**
 
@@ -476,23 +502,24 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | Egress framing: a Nack is always LP-framed, PitToken echoed | `ndn-rs/crates/forwarding/ndn-engine/src/engine.rs:95-101`, `115-125` |
 | `is_local_face` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:44-48` |
 | `nacks_allowed_on_face` (point-to-point only) | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:38-40` |
-| `refuse`: local downstreams only, own Interest, PitToken | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:57-77` |
-| `Action::Refuse` dispatched to `refuse` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:240` |
+| `refuse`: local downstreams only, own Interest, PitToken; `nack_downstream` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:57-97` |
+| `Action::Refuse` dispatched to `refuse` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:260` |
 | Refused Data is never cached or forwarded | `ndn-rs/crates/forwarding/ndn-engine/src/pipeline/action.rs:40-43` |
-| Which Data is validated (non-local, or `require_data_validation`); downstream recording | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:574-641` |
+| Which Data is validated (non-local, or `require_data_validation`); downstream recording | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:583-650` |
 | `require_local_validation` config | `ndn-rs/crates/platform/ndn-config/src/config.rs:1346-1350`; `ndn-rs/crates/forwarding/ndn-engine/src/builder.rs:86`, `100`; `ndn-rs/crates/forwarding/ndn-engine/src/engine.rs:634-636`; `ndn-fwd/binaries/ndn-fwd/src/main.rs:553` |
-| PIT match records downstreams (exact, digest-stripped, CanBePrefix) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:480-558` |
-| In-records consumed, deduplicated by face, nonces into the Dead Nonce List | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:679-745` |
-| `out_interests` / `DownstreamInterest`; persistent in-records excluded | `ndn-rs/crates/forwarding/ndn-engine/src/pipeline/context.rs:36-45`, `80-83` |
-| Pending queue defaults (256, 4 MiB, 4 s) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:64-72` |
-| Pending queue eviction and timeout | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:91-125` |
-| Ready check, then known-absent check, gives 176 | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:127-153` |
-| Inline verdicts | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:281-319` |
-| Re-validation after parking | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:323-388` |
-| `invalid_reason` (TrustError to Refusal) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:394-418` |
-| 100 ms drain tick | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:714-735` |
+| PIT match records downstreams (exact, digest-stripped, CanBePrefix) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:463-602` |
+| In-records consumed (Data fan-out deduplicated by face; refusals recorded per face and Interest name), nonces into the Dead Nonce List | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:695-770` |
+| Parameters portion kept per in-record | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:126-132`; `ndn-rs/crates/forwarding/ndn-store/src/pit.rs:187-193`, `268-293` |
+| `out_interests` / `DownstreamInterest`; persistent in-records excluded | `ndn-rs/crates/forwarding/ndn-engine/src/pipeline/context.rs:36-45`, `76-92` |
+| Pending queue defaults (256, 4 MiB, 4 s) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:63-71` |
+| Pending queue eviction and timeout | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:90-124` |
+| Ready check, then known-absent check, gives 176 | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:126-152` |
+| Inline verdicts (a pending walk without a missing name is dropped, never refused) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:280-315` |
+| Re-validation after parking | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:318-383` |
+| `invalid_reason` (TrustError to Refusal) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/validation.rs:389-415` |
+| 100 ms drain tick | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:723-744` |
 | `TrustError` variants | `ndn-rs/crates/security/ndn-security/src/error.rs:4-43` |
-| No SigInfo, no KeyLocator, or uncached KeyDigest gives `InvalidSignature`; DigestSha256 handling | `ndn-rs/crates/security/ndn-security/src/validator/chain.rs:97-130` |
+| No SigInfo, no KeyLocator, or uncached KeyDigest gives `InvalidSignature`; DigestSha256 handling | `ndn-rs/crates/security/ndn-security/src/validator/chain.rs:97-130`; KeyLocator required at decode for types 1, 3, 4, 5, 7: `ndn-rs/crates/core/ndn-packet/src/signature.rs:153-170` |
 | `Pending` iff a missing name; a refused certificate is remembered | `ndn-rs/crates/security/ndn-security/src/validator/chain.rs:62-76`, `158-172` |
 | Expected-context refusal (175) | `ndn-rs/crates/security/ndn-security/src/validator/expected.rs:247-288` |
 | `FetchMiss` (Absent = NoRoute, Refused), combining sources | `ndn-rs/crates/security/ndn-security/src/cert_fetcher.rs:50-79` |
@@ -511,7 +538,7 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | Ingress Nack checks (point-to-point, PIT entry exists) | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:366-383` |
 | Strategy sees a refusal or unknown code as NoRoute | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:457-468` |
 | Failover sends no Nack | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:476-506` |
-| Relay: kept only from a local upstream, else NoRoute; refusal to local downstreams only; no PitToken | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:508-541` |
+| Relay: kept only from a local upstream for local downstreams, else NoRoute; each downstream's own Interest and PitToken | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:508-550` |
 
 **Consumers**
 

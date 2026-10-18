@@ -184,6 +184,13 @@ pub struct InRecord {
     /// Trace IDs observed on this in-record's Interest; emitted as one span
     /// per aggregated consumer on Data fan-out.
     pub trace_ids: SmallVec<[TraceId; 1]>,
+    /// The downstream's `ApplicationParameters` and the elements after it
+    /// (`Interest::parameters_portion`), for a parameterized Interest: a
+    /// Nack to this downstream encloses its Interest rebuilt with them, so
+    /// the name's `ParametersSha256DigestComponent` still covers what the
+    /// Nack carries. A slice of the received packet, held until the entry
+    /// is consumed.
+    pub parameters: Option<bytes::Bytes>,
 }
 
 /// NFD `RetxSuppressionExponential` defaults
@@ -255,12 +262,14 @@ impl PitEntry {
         lp_pit_token: Option<bytes::Bytes>,
         selector: Selector,
     ) {
-        self.add_in_record_with_persistent(face_id, nonce, expires_at, lp_pit_token, selector, None)
+        self.add_in_record_with_persistent(face_id, nonce, expires_at, lp_pit_token, selector, None, None)
     }
 
-    /// Add an in-record with optional persistent state. When `persistent` is
+    /// Add an in-record with optional persistent state and the Interest's
+    /// parameters portion ([`InRecord::parameters`]). When `persistent` is
     /// `Some`, the entry survives until every persistent in-record exhausts
     /// its credit or the reaper fires.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_in_record_with_persistent(
         &mut self,
         face_id: u64,
@@ -269,6 +278,7 @@ impl PitEntry {
         lp_pit_token: Option<bytes::Bytes>,
         selector: Selector,
         persistent: Option<PersistentState>,
+        parameters: Option<bytes::Bytes>,
     ) {
         self.add_in_record_inner(
             face_id,
@@ -278,6 +288,7 @@ impl PitEntry {
             selector,
             persistent,
             SmallVec::new(),
+            parameters,
         )
     }
 
@@ -302,6 +313,7 @@ impl PitEntry {
             selector,
             persistent,
             trace_ids,
+            None,
         )
     }
 
@@ -315,6 +327,7 @@ impl PitEntry {
         selector: Selector,
         persistent: Option<PersistentState>,
         trace_ids: SmallVec<[TraceId; 1]>,
+        parameters: Option<bytes::Bytes>,
     ) {
         self.in_records.push(InRecord {
             face_id,
@@ -324,6 +337,7 @@ impl PitEntry {
             selector,
             persistent,
             trace_ids,
+            parameters,
         });
         if !self.nonces_seen.contains(&nonce) {
             self.nonces_seen.push(nonce);

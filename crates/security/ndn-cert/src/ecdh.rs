@@ -40,18 +40,35 @@ impl EcdhKeypair {
         EncodedPoint::from(&pub_key).as_bytes().to_vec()
     }
 
-    pub fn random_salt() -> [u8; 32] {
+    pub fn random_salt() -> Result<[u8; 32], CertError> {
         let mut salt = [0u8; 32];
-        let _ = getrandom::getrandom(&mut salt);
-        salt
+        fill_random(&mut salt)?;
+        Ok(salt)
     }
 }
 
 /// `[8 random bytes][4 zero counter bytes]`.
-pub fn new_encryption_iv() -> [u8; 12] {
+pub fn new_encryption_iv() -> Result<[u8; 12], CertError> {
     let mut iv = [0u8; 12];
-    let _ = getrandom::getrandom(&mut iv[..8]);
-    iv
+    fill_random(&mut iv[..8])?;
+    Ok(iv)
+}
+
+/// Fill `buf` from the system RNG. Its failure is an error: a zero salt,
+/// IV or request id would repeat on the next failure.
+pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), CertError> {
+    fill_from(buf, getrandom::getrandom)
+}
+
+fn fill_from(
+    buf: &mut [u8],
+    rng: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<(), CertError> {
+    rng(buf).map_err(|e| {
+        CertError::Security(ndn_security::TrustError::KeyStore(format!(
+            "system RNG failed: {e}"
+        )))
+    })
 }
 
 /// Advance counter by `ceil(payload_len / 16)`.
@@ -325,14 +342,26 @@ mod tests {
 
     #[test]
     fn new_encryption_iv_is_structured() {
-        let iv = new_encryption_iv();
+        let iv = new_encryption_iv().unwrap();
         assert_eq!(iv.len(), 12);
         assert_eq!(&iv[8..12], &[0u8; 4]);
     }
 
+    /// A failing system RNG is an error for every salt, IV and request id
+    /// drawn through [`fill_random`], never a buffer of zeros.
+    #[test]
+    fn a_failing_rng_is_an_error_not_zeros() {
+        let mut buf = [0u8; 8];
+        assert!(matches!(
+            fill_from(&mut buf, |_| Err(getrandom::Error::UNSUPPORTED)),
+            Err(CertError::Security(_))
+        ));
+        assert!(fill_random(&mut buf).is_ok());
+    }
+
     #[test]
     fn advance_iv_counter_increments_by_ceil_blocks() {
-        let mut iv = new_encryption_iv();
+        let mut iv = new_encryption_iv().unwrap();
         let prefix = iv[..8].to_vec();
         advance_iv_counter(&mut iv, 16);
         assert_eq!(u32::from_be_bytes(iv[8..12].try_into().unwrap()), 1);
@@ -347,7 +376,7 @@ mod tests {
         let plaintext = b"hello NDNCERT challenge";
         let aad = &[0xABu8; 8];
 
-        let mut iv_state = new_encryption_iv();
+        let mut iv_state = new_encryption_iv().unwrap();
         let envelope = key.seal_envelope(plaintext, aad, &mut iv_state).unwrap();
 
         let counter_after = u32::from_be_bytes(iv_state[8..12].try_into().unwrap());
@@ -363,7 +392,7 @@ mod tests {
     fn seal_multiple_rounds_monotonic_counter() {
         let key = SessionKey { key: [0x11u8; 16] };
         let aad = &[0x22u8; 8];
-        let mut iv_state = new_encryption_iv();
+        let mut iv_state = new_encryption_iv().unwrap();
         let prefix = iv_state[..8].to_vec();
 
         key.seal_envelope(b"first round payload", aad, &mut iv_state)

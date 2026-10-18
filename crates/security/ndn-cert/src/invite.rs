@@ -49,7 +49,8 @@ use crate::client::CaExchange;
 use crate::error::CertError;
 use crate::onboarding::{AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint};
 use crate::roles::{
-    Role, RoleError, token_expiry, token_role, validate_device_name, validate_namespace,
+    Role, RoleError, token_expired, token_expiry, token_role, validate_device_name,
+    validate_namespace,
 };
 
 /// What an `ndn-trust://invite` link asks a device to do: enroll a key under
@@ -121,13 +122,15 @@ impl InviteLink {
             return Err(bad("token", token));
         }
         let token_admits = token_role(token).unwrap_or(Role::Member);
-        let expires_at_secs = token_expiry(token);
+        // A malformed `-until` is refused (fail closed), never read as a
+        // token without expiry.
+        let expires_at_secs = token_expiry(token).map_err(|_| bad("token", token))?;
         if let Some(at) = expires_at_secs {
             let now = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if now >= at {
+            if token_expired(at, now) {
                 return Err(InviteEnrollError::TokenExpired {
                     expired_at: iso_secs(at),
                 });
@@ -235,8 +238,8 @@ impl EnrollLink {
 
 /// A fresh key name for `identity`: `<identity>/KEY/<16 hex digits>`, the key
 /// id random so a re-enrollment never collides with an earlier key
-/// ([`ndn_security::cert_name::new_key_name`]).
-pub fn new_device_key_name(identity: &Name) -> Name {
+/// ([`ndn_security::cert_name::new_key_name`]; a failing RNG is an error).
+pub fn new_device_key_name(identity: &Name) -> Result<Name, ndn_security::TrustError> {
     ndn_security::cert_name::new_key_name(identity)
 }
 
@@ -308,7 +311,7 @@ pub enum InviteEnrollError {
         "could not reach the CA {ca_prefix}/CA ({detail}): this device needs a face and a route \
          for {namespace} toward a forwarder that serves it (`ndn-ctl face create \
          udp4://<host>:6363`, then `ndn-ctl route add {namespace} <face-id>`), then enroll \
-         again. A CA that refuses a request outright also leaves it unanswered"
+         again"
     )]
     CaUnreachable {
         ca_prefix: String,

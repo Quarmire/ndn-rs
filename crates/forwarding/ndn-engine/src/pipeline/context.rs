@@ -86,6 +86,9 @@ pub struct DownstreamInterest {
     pub name: Arc<Name>,
     pub selector: ndn_packet::Selector,
     pub nonce: u32,
+    /// The Interest's parameters portion, when it is parameterized
+    /// (`ndn_store::InRecord::parameters`).
+    pub parameters: Option<Bytes>,
 }
 
 impl PacketContext {

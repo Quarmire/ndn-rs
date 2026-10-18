@@ -238,10 +238,9 @@ fn decode_nack_header(value: Bytes) -> Result<NackHeader, crate::PacketError> {
     while !reader.is_empty() {
         let (t, v) = reader.read_tlv()?;
         if t == tlv_type::NACK_REASON {
-            let mut code = 0u64;
-            for &b in v.iter() {
-                code = (code << 8) | b as u64;
-            }
+            // A NonNegativeInteger: 1, 2, 4 or 8 octets, else the packet is
+            // malformed (as in NFD), never a reason folded from stray bytes.
+            let code = crate::decode_nni(&v)?;
             return Ok(NackHeader::new(Some(NackReason::from_code(code))));
         }
     }
@@ -452,6 +451,25 @@ mod tests {
             header.reason, None,
             "absent NackReason must not be represented as Other(0)"
         );
+    }
+
+    #[test]
+    fn nack_reason_is_a_nonnegative_integer() {
+        let nack_with = |reason: &[u8]| {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv_type::LP_PACKET, |w| {
+                w.write_nested(tlv_type::NACK, |w| w.write_tlv(tlv_type::NACK_REASON, reason));
+                w.write_tlv(tlv_type::LP_FRAGMENT, &fixture_interest_wire());
+            });
+            LpPacket::decode(w.finish())
+        };
+        for ok in [&[0xAB][..], &[0x00, 0xAB], &[0, 0, 0, 0xAB], &[0, 0, 0, 0, 0, 0, 0, 0xAB]] {
+            let reason = nack_with(ok).unwrap().nack.unwrap().reason;
+            assert_eq!(reason, Some(NackReason::from_code(171)), "{ok:02x?}");
+        }
+        for bad in [&[][..], &[0, 0xAB, 0], &[0; 9]] {
+            assert!(nack_with(bad).is_err(), "a {}-octet NackReason", bad.len());
+        }
     }
 
     #[test]

@@ -33,8 +33,11 @@ pub const NDNCERT_ISSUER: &str = "NDNCERT";
 /// Issuer id when none is chosen (ndn-cxx `MakeCertificateOptions` default).
 pub const DEFAULT_ISSUER: &str = "NA";
 
-fn is_key_component(c: &NameComponent) -> bool {
-    c.value.as_ref() == KEY_COMPONENT.as_bytes()
+/// Whether `c` is the GenericNameComponent `KEY` (TLV-TYPE 8, value `KEY`),
+/// as ndn-cxx compares it: a typed component that happens to hold the bytes
+/// `KEY` (e.g. `32=KEY`) is not.
+pub(crate) fn is_key_component(c: &NameComponent) -> bool {
+    c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == KEY_COMPONENT.as_bytes()
 }
 
 /// Whether `name` has the certificate shape `…/KEY/<key-id>/<issuer-id>/<version>`
@@ -58,14 +61,14 @@ pub fn key_name_of(name: &Name) -> Name {
 
 /// A fresh key name for `identity`: `<identity>/KEY/<16 hex digits>`, the
 /// key id 8 random bytes (ndn-cxx's default `KeyIdType::RANDOM`), so a new
-/// key never collides with an earlier one. The system RNG failing leaves the
-/// id zero; the name is still valid and a collision is refused by the
-/// caller's key store.
-pub fn new_key_name(identity: &Name) -> Name {
+/// key never collides with an earlier one. A failing system RNG is an
+/// error, never a zero key id that the next failure would repeat.
+pub fn new_key_name(identity: &Name) -> Result<Name, crate::TrustError> {
     let mut id = [0u8; 8];
-    let _ = getrandom::getrandom(&mut id);
+    getrandom::getrandom(&mut id)
+        .map_err(|e| crate::TrustError::KeyStore(format!("rng failure: {e}")))?;
     let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
-    identity.clone().append(KEY_COMPONENT).append(hex.as_str())
+    Ok(identity.clone().append(KEY_COMPONENT).append(hex.as_str()))
 }
 
 /// The name of a certificate of `key_name` issued by `issuer_id` at
@@ -154,5 +157,17 @@ mod tests {
         let a = next_version();
         let b = next_version();
         assert!(b > a);
+    }
+
+    /// Only the GenericNameComponent `KEY` marks a key or certificate name.
+    #[test]
+    fn only_a_generic_key_component_counts() {
+        let keyword_key = n("/home/bob/x").append_component(NameComponent::keyword(
+            Bytes::from_static(b"KEY"),
+        ));
+        let cert = keyword_key.clone().append("k1").append("self").append_version(1);
+        assert!(!is_cert_name(&cert));
+        assert_eq!(key_name_of(&cert), cert);
+        assert!(is_cert_name(&n("/home/bob/x/KEY/k1/self/v=1")));
     }
 }

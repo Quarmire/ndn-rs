@@ -236,6 +236,7 @@ fn p256_spki(point: &[u8]) -> Bytes {
 pub struct YubikeyPiv {
     yk: SharedKey,
     serial: u32,
+    firmware: [u8; 3],
 }
 
 impl YubikeyPiv {
@@ -256,15 +257,22 @@ impl YubikeyPiv {
 
     fn from_device(yk: YubiKey) -> Self {
         let serial = yk.serial().0;
+        let version = yk.version();
         Self {
             yk: Arc::new(Mutex::new(yk)),
             serial,
+            firmware: [version.major, version.minor, version.patch],
         }
     }
 
     /// The token's serial number.
     pub fn serial(&self) -> u32 {
         self.serial
+    }
+
+    /// The token's PIV firmware version, `[major, minor, patch]`.
+    pub fn firmware(&self) -> [u8; 3] {
+        self.firmware
     }
 
     /// Verify the PIV PIN.

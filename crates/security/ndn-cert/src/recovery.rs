@@ -257,6 +257,12 @@ pub enum RecoveryError {
     Init(#[from] NamespaceInitError),
     #[error("YubiKey: {0}")]
     Yubikey(String),
+    #[error(
+        "this YubiKey's firmware is {firmware}: a recovery kit made on it could never be opened, \
+         as reading its key back needs the PIV slot metadata of firmware 5.3 or later. Use a \
+         YubiKey with firmware 5.3 or later, or a words or file kit; nothing was generated"
+    )]
+    KitFirmwareTooOld { firmware: String },
     #[error("I/O on {path}: {source}")]
     Io {
         path: PathBuf,
@@ -393,10 +399,21 @@ pub async fn recovery_anchor(signer: Arc<dyn Signer>) -> Result<Certificate, Rec
 
 // ── File kits ──────────────────────────────────────────────────────────────
 
+/// The NFC form of a UTF-8 kit passphrase, when it differs from the bytes
+/// given: a file kit is sealed with it, so the same text typed through an
+/// input method that produces another normalization still opens the kit.
+/// `None` for a passphrase already in NFC or not UTF-8 (used as given).
+fn nfc_passphrase(passphrase: &[u8]) -> Option<Zeroizing<String>> {
+    use unicode_normalization::{UnicodeNormalization, is_nfc};
+    let text = std::str::from_utf8(passphrase).ok()?;
+    (!is_nfc(text)).then(|| Zeroizing::new(text.nfc().collect()))
+}
+
 /// A file kit's content: the `ndn-trust://bag` URI of an envelope carrying
 /// the recovery key's SafeBag — its anchor certificate and the key sealed
-/// with `passphrase` — plus the namespace and its expected fingerprint
-/// (`fingerprint`: the root's, when the kit was made).
+/// with `passphrase` (in Unicode NFC when it is UTF-8) — plus the
+/// namespace and its expected fingerprint (`fingerprint`: the root's, when
+/// the kit was made).
 pub fn seal_file_kit(
     seed: &RecoverySeed,
     anchor: &Certificate,
@@ -411,7 +428,11 @@ pub fn seal_file_kit(
         .data_wire()
         .ok_or_else(|| TrustError::KeyStore("the recovery anchor has no signed wire".into()))?;
     let pkcs8 = seed.pkcs8()?;
-    let bag = SafeBag::encrypt(wire, &pkcs8, passphrase.expose())
+    let nfc = nfc_passphrase(passphrase.expose());
+    let password = nfc
+        .as_ref()
+        .map_or(passphrase.expose(), |nfc| nfc.as_bytes());
+    let bag = SafeBag::encrypt(wire, &pkcs8, password)
         .map_err(|e| TrustError::KeyStore(e.to_string()))?;
     Ok(TrustEnvelope::Bag {
         key_name: anchor.key_name().to_string(),
@@ -481,6 +502,9 @@ impl FileKit {
                 anchor.name
             )));
         }
+        // Before any passphrase is asked for: a crafted kit asking for
+        // billions of PBKDF2 iterations would take hours to open.
+        bag.check_kdf_cost().map_err(|e| not_a_kit(e.to_string()))?;
         Ok(FileKit {
             path: path.to_path_buf(),
             namespace,
@@ -491,18 +515,19 @@ impl FileKit {
         })
     }
 
-    /// Unseal the recovery key with the kit passphrase.
+    /// Unseal the recovery key with the kit passphrase: as given, then (a
+    /// kit is sealed with it) its Unicode NFC form.
     pub fn open(&self, passphrase: &RootSecret) -> Result<Ed25519Signer, RecoveryError> {
-        let wrong = || RecoveryError::WrongKitPassphrase {
-            path: self.path.display().to_string(),
-        };
-        let pkcs8 = Zeroizing::new(
-            self.bag
-                .decrypt_pkcs8(passphrase.expose())
-                .map_err(|_| wrong())?,
-        );
-        let signer =
-            Ed25519Signer::from_pkcs8_der(&pkcs8, self.key_name.clone()).map_err(|_| wrong())?;
+        let nfc = nfc_passphrase(passphrase.expose());
+        let signer = std::iter::once(passphrase.expose())
+            .chain(nfc.as_ref().map(|nfc| nfc.as_bytes()))
+            .find_map(|password| {
+                let pkcs8 = Zeroizing::new(self.bag.decrypt_pkcs8(password).ok()?);
+                Ed25519Signer::from_pkcs8_der(&pkcs8, self.key_name.clone()).ok()
+            })
+            .ok_or_else(|| RecoveryError::WrongKitPassphrase {
+                path: self.path.display().to_string(),
+            })?;
         if !same_public_key(&signer.public_key_bytes(), &self.public_key) {
             return Err(RecoveryError::NotAKit {
                 path: self.path.display().to_string(),
@@ -527,6 +552,23 @@ pub struct YubikeyKit {
     pub slot: String,
     /// `always` (default), `cached`, `never`.
     pub touch_policy: String,
+}
+
+/// The oldest YubiKey firmware a kit is made on: opening a kit reads the
+/// slot's public key from its PIV metadata (GET METADATA), which firmware
+/// 5.3 introduced.
+pub const KIT_MIN_FIRMWARE: [u8; 3] = [5, 3, 0];
+
+/// Refuse a token whose `firmware` ([major, minor, patch]) is older than
+/// [`KIT_MIN_FIRMWARE`]: a kit generated there could never be opened.
+pub fn check_kit_firmware(firmware: [u8; 3]) -> Result<(), RecoveryError> {
+    if firmware < KIT_MIN_FIRMWARE {
+        let [major, minor, patch] = firmware;
+        return Err(RecoveryError::KitFirmwareTooOld {
+            firmware: format!("{major}.{minor}.{patch}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "yubikey-piv")]
@@ -556,6 +598,7 @@ impl YubikeyKit {
     ) -> Result<(Arc<dyn Signer>, u32), RecoveryError> {
         use ndn_security::{YubikeyPinPolicy, YubikeyTouchPolicy};
         let (token, slot) = self.token()?;
+        check_kit_firmware(token.firmware())?;
         crate::root_store::check_generation_target(&token, slot, guard).await?;
         let touch: YubikeyTouchPolicy =
             self.touch_policy.parse().map_err(RecoveryError::Yubikey)?;
@@ -1130,9 +1173,9 @@ pub async fn recover_namespace_in_pib(
         }
     }
     let device_identity = device_identity(&namespace, Role::Admin, device)?;
-    let root_key = new_key_name(&namespace);
-    let ca_key = new_key_name(&namespace.clone().append("CA"));
-    let device_key = new_key_name(&device_identity);
+    let root_key = new_key_name(&namespace)?;
+    let ca_key = new_key_name(&namespace.clone().append("CA"))?;
+    let device_key = new_key_name(&device_identity)?;
 
     let built: Result<_, RecoveryError> = async {
         let pending = PendingRoot::create(pib, &root_key, root).await?;
@@ -1221,6 +1264,146 @@ pub async fn recover_namespace_in_pib(
         Err(e) => {
             remove_recovered(pib, None, &[root_key, ca_key, device_key]);
             Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_yubikey_kit_is_refused_on_firmware_before_5_3() {
+        for old in [[4, 3, 7], [5, 1, 2], [5, 2, 7]] {
+            let refused = check_kit_firmware(old).unwrap_err();
+            let [major, minor, patch] = old;
+            let text = refused.to_string();
+            assert!(text.contains(&format!("firmware is {major}.{minor}.{patch}")), "{text}");
+            assert!(text.contains("could never be opened"), "{text}");
+        }
+        for new in [[5, 3, 0], [5, 4, 3], [5, 7, 1], [6, 0, 0]] {
+            assert!(check_kit_firmware(new).is_ok(), "{new:?}");
+        }
+    }
+
+    async fn kit_anchor_of(seed: &RecoverySeed) -> Certificate {
+        recovery_anchor(Arc::new(seed.signer(&"/home/bob".parse().unwrap())))
+            .await
+            .unwrap()
+    }
+
+    /// Write a kit file carrying `bag` for `anchor`.
+    fn write_kit(dir: &Path, file: &str, anchor: &Certificate, bag: &SafeBag) -> PathBuf {
+        let uri = TrustEnvelope::Bag {
+            key_name: anchor.key_name().to_string(),
+            safebag: bag.encode(),
+            namespace: Some("/home/bob".into()),
+            fingerprint: None,
+        }
+        .to_uri();
+        let path = dir.join(file);
+        std::fs::write(&path, uri).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_file_kit_opens_with_its_passphrase_in_either_unicode_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = RecoverySeed::generate().unwrap();
+        let anchor = kit_anchor_of(&seed).await;
+        let nfc = RootSecret::new("caf\u{e9} cr\u{e8}me".as_bytes().to_vec());
+        let nfd = RootSecret::new("cafe\u{301} cre\u{300}me".as_bytes().to_vec());
+        let public_key = seed.signer(&Name::root()).public_key_bytes();
+
+        // Sealed from NFD input: sealed in NFC, opens with either.
+        let uri = seal_file_kit(&seed, &anchor, &"/home/bob".parse().unwrap(), None, &nfd)
+            .unwrap();
+        let path = dir.path().join("new.kit");
+        std::fs::write(&path, uri).unwrap();
+        let kit = FileKit::read(&path).unwrap();
+        for passphrase in [&nfc, &nfd] {
+            assert_eq!(kit.open(passphrase).unwrap().public_key_bytes(), public_key);
+        }
+        assert!(matches!(
+            kit.open(&RootSecret::new(b"cafe creme".to_vec())),
+            Err(RecoveryError::WrongKitPassphrase { .. })
+        ));
+
+        // A kit sealed before with the NFD bytes as given still opens with them.
+        let wire = anchor.data_wire().unwrap();
+        let raw = SafeBag::encrypt(wire, &seed.pkcs8().unwrap(), nfd.expose()).unwrap();
+        let kit = FileKit::read(&write_kit(dir.path(), "old.kit", &anchor, &raw)).unwrap();
+        assert_eq!(kit.open(&nfd).unwrap().public_key_bytes(), public_key);
+    }
+
+    /// An EncryptedPrivateKeyInfo (PBES2, PBKDF2-HMAC-SHA256, AES-256-CBC)
+    /// whose iterationCount INTEGER holds `iterations`.
+    fn sealed_key_with_iterations(iterations: &[u8]) -> Vec<u8> {
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if content.len() >= 0x80 {
+                out.push(0x81);
+            }
+            out.push(content.len() as u8);
+            out.extend_from_slice(content);
+            out
+        }
+        let oid = |bytes: &[u8]| tlv(0x06, bytes);
+        let prf = tlv(
+            0x30,
+            &[oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09]), vec![0x05, 0x00]].concat(),
+        );
+        let pbkdf2 = tlv(
+            0x30,
+            &[
+                oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c]),
+                tlv(0x30, &[tlv(0x04, &[1; 16]), tlv(0x02, iterations), prf].concat()),
+            ]
+            .concat(),
+        );
+        let aes = tlv(
+            0x30,
+            &[
+                oid(&[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a]),
+                tlv(0x04, &[2; 16]),
+            ]
+            .concat(),
+        );
+        let pbes2 = tlv(
+            0x30,
+            &[
+                oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d]),
+                tlv(0x30, &[pbkdf2, aes].concat()),
+            ]
+            .concat(),
+        );
+        tlv(0x30, &[pbes2, tlv(0x04, &[0; 16])].concat())
+    }
+
+    #[tokio::test]
+    async fn a_file_kit_asking_for_too_many_iterations_is_refused_before_its_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = RecoverySeed::generate().unwrap();
+        let anchor = kit_anchor_of(&seed).await;
+        let bag = |iterations: &[u8]| SafeBag {
+            certificate: anchor.data_wire().unwrap(),
+            encrypted_key: sealed_key_with_iterations(iterations).into(),
+        };
+        // 600 000, as kits are sealed: read (the key itself is junk).
+        let usual = bag(&[0x09, 0x27, 0xc0]);
+        assert!(FileKit::read(&write_kit(dir.path(), "usual.kit", &anchor, &usual)).is_ok());
+        // 10 000 001 and u32::MAX: refused when read.
+        for (file, iterations) in [
+            ("over.kit", &[0x00, 0x98, 0x96, 0x81][..]),
+            ("max.kit", &[0x00, 0xff, 0xff, 0xff, 0xff][..]),
+        ] {
+            let path = write_kit(dir.path(), file, &anchor, &bag(iterations));
+            match FileKit::read(&path) {
+                Err(RecoveryError::NotAKit { reason, .. }) => {
+                    assert!(reason.contains("too costly"), "{reason}")
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
         }
     }
 }

@@ -46,8 +46,8 @@ fn main() {
         }
         // Render a URI as a scannable QR SVG (testing the mobile scanner).
         Some("qr") if args.len() == 3 => {
-            use qrcode::QrCode;
-            let code = QrCode::new(args[1].as_bytes()).unwrap_or_else(|e| die(&format!("qr: {e}")));
+            let code = ndn_trust_envelope::qr::encode(&args[1])
+                .unwrap_or_else(|e| die(&format!("qr: {e}")));
             let svg = code
                 .render::<qrcode::render::svg::Color<'_>>()
                 .min_dimensions(420, 420)

@@ -146,9 +146,11 @@ in-tree compiler does not lower nor the evaluator check. Signers are key names
 `NDNCERT` from the CA, `NA` for the CA's cert from the root). The context is
 *schema-authoritative*: no hierarchy floor (approvals and `shared` are
 cross-identity by design) and the schema is checked on every certificate hop,
-so a device cannot self-issue keys. For a short namespace the inline anchor
-envelope still fits one QR code (≤ 2953 bytes); the fingerprint-only form
-(`anchor_uri_fp`, ~125 bytes) always does (**have**, F2).
+so a device cannot self-issue keys. The inline anchor envelope carries the whole
+context (about 2.8 KB for `/home/bob`), more than one QR code holds at level M
+(2331 bytes). A QR therefore carries the fingerprint-only form (`anchor_uri_fp`,
+~125 bytes) and the inline form travels as a link ([trust-envelope.md](trust-envelope.md)
+§5.6; **have**, F2).
 
 A tool (`ndn-fwd schema show|explain <data-name> <key-name>`, **have**)
 renders the schema and answers "would this be accepted, and by which rule".

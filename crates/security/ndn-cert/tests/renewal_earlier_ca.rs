@@ -147,7 +147,7 @@ async fn later(earlier: &Earlier, revoke: &[Name]) -> Later {
         .issue_self_signed_async(&root_key, root_pub, u64::MAX)
         .await
         .unwrap();
-    let ca_key = ndn_security::cert_name::new_key_name(&ns().append("CA"));
+    let ca_key = ndn_security::cert_name::new_key_name(&ns().append("CA")).unwrap();
     mgr.generate_ed25519(ca_key.clone()).unwrap();
     let ca_pub = mgr.get_signer_sync(&ca_key).unwrap().public_key().unwrap();
     mgr.certify(&ca_key, ca_pub, &root_key, 3_650 * DAY_MS)
@@ -193,7 +193,7 @@ async fn enroll(earlier: &Earlier) -> Device {
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();
-    let key_name = new_device_key_name(&invite.device_identity("phone").unwrap());
+    let key_name = new_device_key_name(&invite.device_identity("phone").unwrap()).unwrap();
     let key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[1; 32], key_name));
     let enrolled = enroll_with_invite(
         &keyring,
@@ -290,7 +290,7 @@ async fn certified_device(
     device: &str,
     seed: u8,
 ) -> (Arc<dyn Signer>, Data) {
-    let key_name = new_device_key_name(&ns().append("member").append(device));
+    let key_name = new_device_key_name(&ns().append("member").append(device)).unwrap();
     let key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[seed; 32], key_name.clone()));
     let cert = mgr
         .certify(&key_name, key.public_key().unwrap(), issuer_key, 30 * DAY_MS)

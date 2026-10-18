@@ -171,7 +171,7 @@ pub async fn wait_for_decision(
             }
         };
         if request.overdue(crate::now_secs()) {
-            if let Err(e) = expire_overdue(vault, &store) {
+            if let Err(e) = expire_overdue(vault, &store, p.words()) {
                 tracing::warn!(target: "security", key = %key_name, error = %e.reason, "a request past its expiry could not be ended here");
             }
             return match current(vault, key_name) {
@@ -184,9 +184,7 @@ pub async fn wait_for_decision(
             (request.namespace.parse::<Name>(), request.ca_prefix.parse::<Name>())
         else {
             request.state = OutgoingState::Failed {
-                reason: "the request record names no valid namespace or CA; ask again \
-                         (`ndn-fwd enroll`)"
-                    .into(),
+                reason: p.words().request_names_no_ca(),
             };
             record(&store, &request);
             return Waited::Ended(request);
@@ -348,9 +346,7 @@ async fn issue(
     );
     let (Ok(namespace), Ok(ca_prefix), Ok(identity), Ok(key)) = parsed else {
         request.state = OutgoingState::Failed {
-            reason: "the request record names no valid namespace, CA, identity or key; ask \
-                     again (`ndn-fwd enroll`)"
-                .into(),
+            reason: p.words().request_names_no_key(),
         };
         record(store, &request);
         return Issue::Ended(request);
@@ -360,10 +356,7 @@ async fn issue(
         Err(KeyUnavailable::Unreadable(why)) => return Issue::Retry(why),
         Err(KeyUnavailable::Gone(why)) => {
             request.state = OutgoingState::Failed {
-                reason: format!(
-                    "the key {key} of this request is {why}; nothing can be certified for it: \
-                     ask again (`ndn-fwd enroll`)"
-                ),
+                reason: p.words().request_key_gone(&key, why),
             };
             record(store, &request);
             return Issue::Ended(request);
@@ -397,8 +390,7 @@ async fn issue(
                 signer,
                 &issued,
                 enrolling,
-                "The approval is used: fix the PIB directory, ask again (`ndn-fwd enroll`) and \
-                 have an admin approve the new request",
+                &p.words().approval_used(),
             )
             .await
             {

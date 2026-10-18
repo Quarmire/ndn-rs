@@ -52,11 +52,11 @@
 //!
 //! When the newest version is not signed by an anchor of the held one — a
 //! recovery kit installed a new root in a version this node missed — the
-//! publisher's earlier sequence numbers (each the version it republished)
-//! are fetched oldest first and followed one by one, each under the
-//! continuity rule from the one before ([`ndn_cert::follow_versions`], the
-//! same walk as the pull refresh); the newest is adopted only if the walk
-//! reaches it.
+//! publisher's sequence numbers from the one after the held version (each
+//! the version it republished) are fetched oldest first and followed one by
+//! one, each under the continuity rule from the one before
+//! ([`ndn_cert::follow_versions`], the same walk as the pull refresh); the
+//! newest is adopted only if the walk reaches it.
 //!
 //! # Keeping what was adopted
 //!
@@ -228,10 +228,12 @@ pub struct Processed {
 /// Fetch, check, and adopt the context advertised by one [`SyncUpdate`].
 /// The highest sequence is fetched first: a trust context fully supersedes
 /// its predecessor, so when the newest is signed by an anchor of the held
-/// version nothing else is needed. When it is not, the sequence numbers in
-/// between (from the first one newer than the held version) are followed
-/// oldest first ([`follow_versions`]), fetching for [`MAX_CATCH_UP_TIME`] at
-/// most, as a refresh does. The newest is adopted only if it passes
+/// version nothing else is needed. When it is not, every sequence number
+/// from the one after the held version up to it is followed oldest first
+/// ([`follow_versions`]) — not only those from the update's low end, which
+/// says only what this member last heard, not which versions exist —
+/// fetching for [`MAX_CATCH_UP_TIME`] at most, as a refresh does. The newest
+/// is adopted only if it passes
 /// [`open_context_update`] against the held version of its namespace —
 /// directly or through that walk — and [`Keyring::adopt_update_from`] (that
 /// version still held, strictly newer, atomic); see the module docs.
@@ -292,9 +294,11 @@ async fn check_and_adopt(
             Vec::new(),
         ),
         Err(refusal @ UpdateRefusal::NotSignedByHeldAnchor { .. }) => {
-            // The sequence numbers are the versions republished: start at
-            // the first one newer than the held version.
-            let first = update.low_seq.max(held.version() + 1);
+            // The sequence numbers are the versions republished: walk every
+            // one newer than the held version, as a refresh does. An
+            // earlier announcement of this member that was dropped or
+            // refused may have carried the version that links them.
+            let first = held.version() + 1;
             if first >= update.high_seq {
                 return ContextSyncOutcome::Refused(refusal);
             }
@@ -499,7 +503,6 @@ pub async fn run(
                 // the start again; the tries it already cost still count.
                 let mut tries = 0;
                 if let Some(earlier) = pending.remove(&update.name) {
-                    update.low_seq = update.low_seq.min(earlier.update.low_seq);
                     update.high_seq = update.high_seq.max(earlier.update.high_seq);
                     tries = earlier.tries;
                 }
@@ -828,9 +831,13 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(9, &forged.version(9, &["/home/bob/admin/desk/KEY/device"]));
 
+        // The walk from the held version finds no version linking the two
+        // (positions 2..8 are not published), so the update stays refused.
         match process_update(&update_at(9), &fetcher, &keyring).await.outcome {
-            ContextSyncOutcome::Refused(UpdateRefusal::NotSignedByHeldAnchor {
-                held: 1, ..
+            ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
+                held: 1,
+                offered: 9,
+                ..
             }) => {}
             other => panic!("forged update not refused: {other:?}"),
         }
@@ -983,6 +990,57 @@ mod tests {
                 assert_eq!(walked, vec![v3.data.raw()]);
             }
             other => panic!("the recovery was not followed: {other:?}"),
+        }
+        assert_eq!(held_version(&keyring), 4);
+    }
+
+    /// The walk starts after the held version, not at the update's low end:
+    /// a node holding v1 whose announcements of v2 and v3 were lost hears
+    /// only `[4, 4]`, and still follows v2 (a recovery anchor added) and v3
+    /// (the recovery) to the re-issued v4.
+    #[tokio::test]
+    async fn the_walk_starts_after_the_held_version_not_at_the_low_end() {
+        let root = Root::new();
+        let ns = n("/home/bob");
+        let keyring = node_holding(&root);
+        let root_signer = root.mgr.get_signer_sync(&root.init.anchor_key).unwrap();
+        let seed = ndn_cert::RecoverySeed::generate().unwrap();
+        let recovery: Arc<dyn Signer> = Arc::new(seed.signer(&ns));
+        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery)).await.unwrap();
+        let v2 = ndn_cert::add_recovery_anchor(root_signer.as_ref(), &root.init.context_data, &kit)
+            .await
+            .unwrap();
+        let new_root_mgr = SecurityManager::new();
+        let new_root_key = n("/home/bob/KEY/root2");
+        new_root_mgr.generate_ed25519(new_root_key.clone()).unwrap();
+        let new_root = new_root_mgr.get_signer_sync(&new_root_key).unwrap();
+        let new_anchor = new_root_mgr
+            .issue_self_signed_async(&new_root_key, new_root.public_key().unwrap(), u64::MAX)
+            .await
+            .unwrap();
+        let plan = ndn_cert::RecoveryPlan {
+            new_root: &new_anchor,
+            new_root_device_keys: &[],
+            old_root: ndn_cert::OldRoot::Destroyed,
+            kept_kits: &[],
+        };
+        let v3 = ndn_cert::recovery_version(recovery.as_ref(), &v2.data, &plan)
+            .await
+            .unwrap()
+            .bump;
+        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data).await.unwrap();
+        let fetcher = MapFetcher::new();
+        for (seq, data) in [(2, &v2.data), (3, &v3.data), (4, &v4.data)] {
+            fetcher.publish(seq, data);
+        }
+
+        match process_update(&update_at(4), &fetcher, &keyring).await.outcome {
+            ContextSyncOutcome::Adopted(adopted) => {
+                assert_eq!((adopted.previous, adopted.context.version()), (1, 4));
+                let walked: Vec<_> = adopted.walked.iter().map(|s| s.data.raw()).collect();
+                assert_eq!(walked, vec![v2.data.raw(), v3.data.raw()]);
+            }
+            other => panic!("the versions below the low end were not walked: {other:?}"),
         }
         assert_eq!(held_version(&keyring), 4);
     }

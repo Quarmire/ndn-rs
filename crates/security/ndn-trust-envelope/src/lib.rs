@@ -31,19 +31,32 @@
 //! ## Carriage
 //!
 //! ```text
-//! ndn-trust://<kind>/<base64url(TLV)>        QR / NFC / clipboard / deep-link
+//! ndn-trust://<kind>/<base64url(TLV)>        QR / NFC / clipboard / deep-link / file
 //! https://<domain>/t/<kind>#<base64url(TLV)> universal-link mirror (payload in the fragment)
-//! <file>.ndntrust                            raw TLV — file / share-sheet
 //! ndn-ctx:1:<ver>:<b64url>                    legacy inline-anchor form, parse-only
 //! ```
 //!
-//! The `<kind>` in a URI is a routing hint; the TLV is authoritative.
+//! A file carries the text form (one URI). The `<kind>` in a URI must name the
+//! kind of the TLV it carries; the TLV is authoritative. [`qr`] holds the QR
+//! parameters every producer renders with, and [`TrustEnvelope::qr_uri`] the
+//! URI to show as a QR code.
+//!
+//! ## Decoding rules
+//!
+//! The decoder is strict where a lenient reading could hide a forged or
+//! damaged envelope: no bytes after the envelope, one-byte FormatVersion /
+//! Kind / Direction, no repeated field (ScopePattern excepted), and the NDN
+//! evolvability rule for anything it does not recognize in its place
+//! (an unknown child, or a field another kind uses): ignored when its type
+//! is non-critical (even and above 31), refused when it is critical.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 use thiserror::Error;
+
+pub mod qr;
 
 // ── TLV codes (fresh range, clear of SignedTrustContext's 0x0410–0x041F) ─────
 const T_ENVELOPE: u64 = 0x0470;
@@ -73,7 +86,12 @@ pub const ANCHOR_FINGERPRINT_LEN: usize = 32;
 /// The envelope format version this crate emits and accepts.
 pub const FORMAT_VERSION: u8 = 1;
 
+/// Length of the nonce a capability request carries: fresh random bytes per
+/// request (trust-envelope.md §4.4). Producers draw it from the system RNG.
+pub const CAPABILITY_NONCE_LEN: usize = 16;
+
 const SCHEME: &str = "ndn-trust://";
+const MIRROR_SCHEME: &str = "https://";
 const LEGACY_ANCHOR_TAG: &str = "ndn-ctx:1:";
 
 /// What kind of authority transfer an envelope carries.
@@ -126,6 +144,38 @@ impl TrustKind {
             TrustKind::Recovery => "recovery",
             TrustKind::Bag => "bag",
             TrustKind::Capability => "capability",
+        }
+    }
+
+    /// The body fields this kind defines (any order on the wire). Any other
+    /// field is unrecognized here and falls under the evolvability rule.
+    fn body_fields(self) -> &'static [u64] {
+        match self {
+            TrustKind::Anchor => &[
+                T_NAMESPACE,
+                T_ANCHOR_FINGERPRINT,
+                T_U64_VERSION,
+                T_CONTEXT_DATA,
+                T_WIRE,
+            ],
+            TrustKind::Invite => &[
+                T_CA_PREFIX,
+                T_ID_NAMESPACE,
+                T_TOKEN,
+                T_TTL_SECS,
+                T_ANCHOR_FINGERPRINT,
+            ],
+            TrustKind::Delegation => &[T_WIRE, T_PRINCIPAL_PUBKEY],
+            TrustKind::Recovery => &[T_WIRE],
+            TrustKind::Bag => &[T_KEY_NAME, T_WIRE, T_NAMESPACE, T_ANCHOR_FINGERPRINT],
+            TrustKind::Capability => &[
+                T_DIRECTION,
+                T_NAMESPACE,
+                T_SCOPE_PATTERN,
+                T_TTL_SECS,
+                T_NONCE,
+                T_GRANT,
+            ],
         }
     }
 }
@@ -244,8 +294,8 @@ impl TrustEnvelope {
         }
     }
 
-    /// Encode to the canonical TLV container (the `.ndntrust` file form, and the
-    /// bytes base64url'd into a URI).
+    /// Encode to the canonical TLV container (the bytes base64url'd into a
+    /// URI).
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(T_ENVELOPE, |w| {
@@ -340,31 +390,43 @@ impl TrustEnvelope {
         }
     }
 
-    /// Decode the canonical TLV container.
+    /// Decode the TLV container (trust-envelope.md §6).
     pub fn decode(wire: &[u8]) -> Result<Self, EnvelopeError> {
         let mut outer = TlvReader::new(Bytes::copy_from_slice(wire));
         let (typ, body) = outer.read_tlv().map_err(|_| EnvelopeError::Truncated)?;
         if typ != T_ENVELOPE {
             return Err(EnvelopeError::BadTag(typ));
         }
+        if !outer.is_empty() {
+            return Err(EnvelopeError::Malformed("bytes after the envelope"));
+        }
 
         let mut fmt: Option<u8> = None;
         let mut kind: Option<u8> = None;
         let mut body_bytes: Option<Bytes> = None;
+        // Reported after the format version, so a newer format is refused as
+        // such rather than by one of its new children.
+        let mut unknown_critical: Option<u64> = None;
         let mut inner = TlvReader::new(body);
         while !inner.is_empty() {
             let (t, v) = inner.read_tlv().map_err(|_| EnvelopeError::Truncated)?;
             match t {
-                T_FORMAT_VERSION => fmt = v.first().copied(),
-                T_KIND => kind = v.first().copied(),
-                T_BODY => body_bytes = Some(v),
-                _ => {} // forward-compatible: ignore unknown fields
+                T_FORMAT_VERSION => set_once(&mut fmt, one_byte(&v, "format version length")?)?,
+                T_KIND => set_once(&mut kind, one_byte(&v, "kind length")?)?,
+                T_BODY => set_once(&mut body_bytes, v)?,
+                t if is_critical(t) => {
+                    unknown_critical.get_or_insert(t);
+                }
+                _ => {} // non-critical: ignored (evolvability)
             }
         }
 
         let fmt = fmt.ok_or(EnvelopeError::MissingField("format version"))?;
         if fmt != FORMAT_VERSION {
             return Err(EnvelopeError::UnsupportedVersion(fmt));
+        }
+        if let Some(t) = unknown_critical {
+            return Err(EnvelopeError::UnknownCritical(t));
         }
         let kind = TrustKind::from_code(kind.ok_or(EnvelopeError::MissingField("kind"))?)?;
         let body = body_bytes.ok_or(EnvelopeError::MissingField("body"))?;
@@ -388,32 +450,42 @@ impl TrustEnvelope {
         let mut fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]> = None;
         let mut context_data: Option<Bytes> = None;
 
+        let fields = kind.body_fields();
         let mut r = TlvReader::new(body);
         while !r.is_empty() {
             let (t, v) = r.read_tlv().map_err(|_| EnvelopeError::Truncated)?;
-            match t {
-                T_U64_VERSION => version = Some(read_u64(&v)?),
-                T_WIRE => wire = Some(v),
-                T_CONTEXT_DATA => context_data = Some(v),
-                T_CA_PREFIX => ca_prefix = Some(read_str(&v)?),
-                T_ID_NAMESPACE => id_namespace = Some(read_str(&v)?),
-                T_TOKEN => token = Some(read_str(&v)?),
-                T_TTL_SECS => ttl_secs = Some(read_u64(&v)?),
-                T_PRINCIPAL_PUBKEY => principal_pubkey = Some(v),
-                T_KEY_NAME => key_name = Some(read_str(&v)?),
-                T_NAMESPACE => namespace = Some(read_str(&v)?),
-                T_SCOPE_PATTERN => scope_patterns.push(read_str(&v)?),
-                T_NONCE => nonce = Some(v),
-                T_GRANT => grant = Some(v),
-                T_DIRECTION => direction = v.first().copied(),
-                T_ANCHOR_FINGERPRINT => {
-                    fingerprint = Some(
-                        v.as_ref()
-                            .try_into()
-                            .map_err(|_| EnvelopeError::Malformed("anchor fingerprint length"))?,
-                    )
+            if !fields.contains(&t) {
+                // Unknown here (a future field, or one another kind uses):
+                // skipped unread if non-critical, refused if critical.
+                if is_critical(t) {
+                    return Err(EnvelopeError::UnknownCritical(t));
                 }
-                _ => {} // forward-compatible: ignore unknown fields
+                continue;
+            }
+            match t {
+                T_U64_VERSION => set_once(&mut version, read_u64(&v)?)?,
+                T_WIRE => set_once(&mut wire, v)?,
+                T_CONTEXT_DATA => set_once(&mut context_data, v)?,
+                T_CA_PREFIX => set_once(&mut ca_prefix, read_str(&v)?)?,
+                T_ID_NAMESPACE => set_once(&mut id_namespace, read_str(&v)?)?,
+                T_TOKEN => set_once(&mut token, read_str(&v)?)?,
+                T_TTL_SECS => set_once(&mut ttl_secs, read_u64(&v)?)?,
+                T_PRINCIPAL_PUBKEY => set_once(&mut principal_pubkey, v)?,
+                T_KEY_NAME => set_once(&mut key_name, read_str(&v)?)?,
+                T_NAMESPACE => set_once(&mut namespace, read_str(&v)?)?,
+                T_SCOPE_PATTERN => scope_patterns.push(read_str(&v)?),
+                T_NONCE => set_once(&mut nonce, v)?,
+                T_GRANT => set_once(&mut grant, v)?,
+                T_DIRECTION => {
+                    set_once(&mut direction, one_byte(&v, "capability direction length")?)?
+                }
+                T_ANCHOR_FINGERPRINT => set_once(
+                    &mut fingerprint,
+                    v.as_ref()
+                        .try_into()
+                        .map_err(|_| EnvelopeError::Malformed("anchor fingerprint length"))?,
+                )?,
+                _ => unreachable!("every type in body_fields() has an arm"),
             }
         }
 
@@ -475,20 +547,55 @@ impl TrustEnvelope {
     /// The payload rides in the fragment, so it never reaches the web server.
     pub fn to_https_url(&self, domain: &str) -> String {
         format!(
-            "https://{domain}/t/{}#{}",
+            "{MIRROR_SCHEME}{domain}/t/{}#{}",
             self.kind().as_str(),
             B64.encode(self.encode())
         )
     }
 
-    /// Parse any supported carriage: the `ndn-trust://` scheme, the `https://…#`
-    /// universal-link mirror, or the legacy `ndn-ctx:1:` inline-anchor form
-    /// (parse-only; nothing emits it any more).
+    /// The URI to show as one QR code ([`qr::encode`]): [`to_uri`](Self::to_uri)
+    /// when it fits [`qr::MAX_TEXT_LEN`]; for an inline anchor that does not,
+    /// the same anchor by reference (namespace, expected fingerprint and
+    /// version, no context: the adopting device fetches the context by name).
+    /// `None` when neither fits.
+    pub fn qr_uri(&self) -> Option<String> {
+        let uri = self.to_uri();
+        if uri.len() <= qr::MAX_TEXT_LEN {
+            return Some(uri);
+        }
+        let TrustEnvelope::Anchor {
+            namespace: Some(namespace),
+            fingerprint: Some(fingerprint),
+            version,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let by_reference = TrustEnvelope::Anchor {
+            namespace: Some(namespace.clone()),
+            fingerprint: Some(*fingerprint),
+            version: *version,
+            context_data: None,
+            context_content: None,
+        }
+        .to_uri();
+        (by_reference.len() <= qr::MAX_TEXT_LEN).then_some(by_reference)
+    }
+
+    /// Parse any supported carriage: the `ndn-trust://<kind>/` scheme, the
+    /// `https://<domain>/t/<kind>#` universal-link mirror, or the legacy
+    /// `ndn-ctx:1:` inline-anchor form (parse-only; nothing emits it any
+    /// more). The `<kind>` must be the kind of the TLV the URI carries.
     pub fn from_uri(s: &str) -> Result<Self, EnvelopeError> {
         let s = s.trim();
 
         if let Some(rest) = s.strip_prefix(LEGACY_ANCHOR_TAG) {
             let (ver, b64) = rest.split_once(':').ok_or(EnvelopeError::MalformedUri)?;
+            // Decimal digits only (`u64::from_str` alone would take a `+`).
+            if ver.is_empty() || !ver.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(EnvelopeError::MalformedUri);
+            }
             let version = ver.parse().map_err(|_| EnvelopeError::MalformedUri)?;
             let content = B64
                 .decode(b64.trim())
@@ -502,13 +609,24 @@ impl TrustEnvelope {
             });
         }
 
-        let b64 = if let Some(rest) = s.strip_prefix(SCHEME) {
-            // <kind>/<b64> — the kind is a hint; the TLV is authoritative.
-            rest.split_once('/')
-                .map(|(_, b)| b)
-                .ok_or(EnvelopeError::MalformedUri)?
-        } else if (s.starts_with("https://") || s.starts_with("http://")) && s.contains("/t/") {
-            s.split_once('#').ok_or(EnvelopeError::MalformedUri)?.1
+        let (token, b64) = if let Some(rest) = s.strip_prefix(SCHEME) {
+            // <kind>/<b64>
+            rest.split_once('/').ok_or(EnvelopeError::MalformedUri)?
+        } else if let Some(rest) = s.strip_prefix(MIRROR_SCHEME) {
+            // <domain>/t/<kind>#<b64>: an https URL with another path is not a
+            // trust link at all.
+            let (url, fragment) = match rest.split_once('#') {
+                Some((url, fragment)) => (url, Some(fragment)),
+                None => (rest, None),
+            };
+            let (domain, path) = url.split_once('/').unwrap_or((url, ""));
+            let Some(token) = path.strip_prefix("t/").filter(|t| !t.contains(['/', '?'])) else {
+                return Err(EnvelopeError::UnknownScheme);
+            };
+            if domain.is_empty() || domain.contains('?') {
+                return Err(EnvelopeError::MalformedUri);
+            }
+            (token, fragment.ok_or(EnvelopeError::MalformedUri)?)
         } else {
             return Err(EnvelopeError::UnknownScheme);
         };
@@ -516,7 +634,37 @@ impl TrustEnvelope {
         let wire = B64
             .decode(b64.trim())
             .map_err(|_| EnvelopeError::BadBase64)?;
-        Self::decode(&wire)
+        let envelope = Self::decode(&wire)?;
+        if token != envelope.kind().as_str() {
+            return Err(EnvelopeError::KindMismatch {
+                uri: token.to_owned(),
+                envelope: envelope.kind().as_str(),
+            });
+        }
+        Ok(envelope)
+    }
+}
+
+/// The NDN evolvability rule (Packet Format v0.3, TLV-TYPE): an unrecognized
+/// type is critical when it is 31 or below, or odd.
+fn is_critical(t: u64) -> bool {
+    t <= 31 || t % 2 == 1
+}
+
+/// Store a field read once; a second occurrence is refused.
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), EnvelopeError> {
+    if slot.is_some() {
+        return Err(EnvelopeError::Malformed("repeated field"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// A one-byte field value; any other length is refused.
+fn one_byte(v: &[u8], what: &'static str) -> Result<u8, EnvelopeError> {
+    match v {
+        [b] => Ok(*b),
+        _ => Err(EnvelopeError::Malformed(what)),
     }
 }
 
@@ -554,6 +702,10 @@ pub enum EnvelopeError {
     MissingField(&'static str),
     #[error("malformed field: {0}")]
     Malformed(&'static str),
+    #[error("unrecognized critical TLV type {0:#x}")]
+    UnknownCritical(u64),
+    #[error("the link says it is a {uri:?} link, but it carries a {envelope} envelope")]
+    KindMismatch { uri: String, envelope: &'static str },
 }
 
 #[cfg(test)]
@@ -579,7 +731,7 @@ mod tests {
         };
         assert_eq!(e.kind(), TrustKind::Anchor);
         round_trip(&e);
-        // By reference (namespace + fingerprint pin), and both forms at once.
+        // By reference (namespace + expected fingerprint), and both forms at once.
         round_trip(&TrustEnvelope::Anchor {
             namespace: Some("/home/bob".into()),
             fingerprint: Some([0xAB; ANCHOR_FINGERPRINT_LEN]),
@@ -754,5 +906,220 @@ mod tests {
             TrustEnvelope::from_uri("ndn-trust://invite/!!!not-base64!!!"),
             Err(EnvelopeError::BadBase64)
         );
+    }
+
+    /// An envelope from hand-written children.
+    fn raw(children: impl FnOnce(&mut TlvWriter)) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(T_ENVELOPE, children);
+        w.finish()
+    }
+
+    /// A fingerprint-only anchor whose body also carries `extra`.
+    fn anchor_with(extra: impl FnOnce(&mut TlvWriter)) -> Bytes {
+        raw(|w| {
+            w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+            w.write_tlv(T_KIND, &[TrustKind::Anchor.code()]);
+            w.write_nested(T_BODY, |w| {
+                w.write_tlv(T_ANCHOR_FINGERPRINT, &[1; ANCHOR_FINGERPRINT_LEN]);
+                extra(w);
+            });
+        })
+    }
+
+    fn recovery_uri(token: &str) -> String {
+        let wire = TrustEnvelope::Recovery {
+            bundle: Bytes::from_static(b"\xb0\x0b"),
+        }
+        .encode();
+        format!("ndn-trust://{token}/{}", B64.encode(wire))
+    }
+
+    #[test]
+    fn bytes_after_the_envelope_are_refused() {
+        let mut wire = anchor_with(|_| {}).to_vec();
+        assert!(TrustEnvelope::decode(&wire).is_ok());
+        wire.extend_from_slice(&[0xaa, 0xbb]);
+        assert_eq!(
+            TrustEnvelope::decode(&wire),
+            Err(EnvelopeError::Malformed("bytes after the envelope"))
+        );
+    }
+
+    /// Unknown types follow the NDN critical rule, in the envelope and in the
+    /// body, and a field of another kind counts as unknown.
+    #[test]
+    fn unknown_types_follow_the_critical_rule() {
+        assert!(TrustEnvelope::decode(&anchor_with(|w| w.write_tlv(0x0490, b"x"))).is_ok());
+        assert_eq!(
+            TrustEnvelope::decode(&anchor_with(|w| w.write_tlv(0x0491, b"x"))),
+            Err(EnvelopeError::UnknownCritical(0x0491))
+        );
+        // Token (0x0485, odd) belongs to invites: critical inside an anchor.
+        assert_eq!(
+            TrustEnvelope::decode(&anchor_with(|w| w.write_tlv(T_TOKEN, b"t"))),
+            Err(EnvelopeError::UnknownCritical(T_TOKEN))
+        );
+        // Envelope children.
+        let child = |t: u64| {
+            raw(|w| {
+                w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+                w.write_tlv(T_KIND, &[TrustKind::Recovery.code()]);
+                w.write_tlv(t, b"x");
+                w.write_nested(T_BODY, |w| w.write_tlv(T_WIRE, b"b"));
+            })
+        };
+        assert!(TrustEnvelope::decode(&child(0x0476)).is_ok());
+        assert_eq!(
+            TrustEnvelope::decode(&child(0x0477)),
+            Err(EnvelopeError::UnknownCritical(0x0477))
+        );
+        assert_eq!(
+            TrustEnvelope::decode(&child(0x07)),
+            Err(EnvelopeError::UnknownCritical(0x07))
+        );
+        // A non-critical field of another kind is skipped unread: a 31-byte
+        // AnchorFingerprint (0x048E) inside a delegation.
+        let delegation = raw(|w| {
+            w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+            w.write_tlv(T_KIND, &[TrustKind::Delegation.code()]);
+            w.write_nested(T_BODY, |w| {
+                w.write_tlv(T_WIRE, b"d");
+                w.write_tlv(T_PRINCIPAL_PUBKEY, b"k");
+                w.write_tlv(T_ANCHOR_FINGERPRINT, &[0; 31]);
+            });
+        });
+        assert!(TrustEnvelope::decode(&delegation).is_ok());
+    }
+
+    /// A newer format is refused as such, whatever its new children.
+    #[test]
+    fn newer_format_is_refused_before_its_children() {
+        let wire = raw(|w| {
+            w.write_tlv(T_FORMAT_VERSION, &[2]);
+            w.write_tlv(T_KIND, &[TrustKind::Anchor.code()]);
+            w.write_tlv(0x0479, b"new");
+        });
+        assert_eq!(
+            TrustEnvelope::decode(&wire),
+            Err(EnvelopeError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
+    fn one_byte_fields_must_be_one_byte() {
+        for (value, error) in [
+            (&[1u8, 0][..], "format version length"),
+            (&[][..], "format version length"),
+        ] {
+            let wire = raw(|w| {
+                w.write_tlv(T_FORMAT_VERSION, value);
+                w.write_tlv(T_KIND, &[TrustKind::Recovery.code()]);
+                w.write_nested(T_BODY, |w| w.write_tlv(T_WIRE, b"b"));
+            });
+            assert_eq!(TrustEnvelope::decode(&wire), Err(EnvelopeError::Malformed(error)));
+        }
+        let wire = raw(|w| {
+            w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+            w.write_tlv(T_KIND, &[TrustKind::Recovery.code(), 0]);
+            w.write_nested(T_BODY, |w| w.write_tlv(T_WIRE, b"b"));
+        });
+        assert_eq!(
+            TrustEnvelope::decode(&wire),
+            Err(EnvelopeError::Malformed("kind length"))
+        );
+        let capability = |direction: &[u8]| {
+            raw(|w| {
+                w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+                w.write_tlv(T_KIND, &[TrustKind::Capability.code()]);
+                w.write_nested(T_BODY, |w| {
+                    w.write_tlv(T_DIRECTION, direction);
+                    w.write_tlv(T_NAMESPACE, b"/work");
+                    w.write_tlv(T_TTL_SECS, &300u64.to_be_bytes());
+                });
+            })
+        };
+        assert!(TrustEnvelope::decode(&capability(&[1])).is_ok());
+        assert_eq!(
+            TrustEnvelope::decode(&capability(&[1, 5])),
+            Err(EnvelopeError::Malformed("capability direction length"))
+        );
+    }
+
+    #[test]
+    fn repeated_fields_are_refused_except_scope_patterns() {
+        let twice = anchor_with(|w| {
+            w.write_tlv(T_NAMESPACE, b"/a");
+            w.write_tlv(T_NAMESPACE, b"/b");
+        });
+        assert_eq!(
+            TrustEnvelope::decode(&twice),
+            Err(EnvelopeError::Malformed("repeated field"))
+        );
+        let kind_twice = raw(|w| {
+            w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
+            w.write_tlv(T_KIND, &[TrustKind::Recovery.code()]);
+            w.write_tlv(T_KIND, &[TrustKind::Recovery.code()]);
+            w.write_nested(T_BODY, |w| w.write_tlv(T_WIRE, b"b"));
+        });
+        assert_eq!(
+            TrustEnvelope::decode(&kind_twice),
+            Err(EnvelopeError::Malformed("repeated field"))
+        );
+        let c = Capability {
+            direction: CapDirection::Request,
+            namespace: "/work/acme".into(),
+            scope_patterns: vec!["/work/acme/a".into(), "/work/acme/b".into()],
+            ttl_secs: 60,
+            nonce: Bytes::from_static(&[3; CAPABILITY_NONCE_LEN]),
+            grant: None,
+        };
+        round_trip(&TrustEnvelope::Capability(c));
+    }
+
+    #[test]
+    fn uri_kind_must_match_the_envelope() {
+        assert!(TrustEnvelope::from_uri(&recovery_uri("recovery")).is_ok());
+        for token in ["anchor", "", "Recovery"] {
+            assert_eq!(
+                TrustEnvelope::from_uri(&recovery_uri(token)),
+                Err(EnvelopeError::KindMismatch {
+                    uri: token.into(),
+                    envelope: "recovery",
+                }),
+                "{token:?}"
+            );
+        }
+        let payload = recovery_uri("recovery").rsplit('/').next().unwrap().to_owned();
+        assert!(matches!(
+            TrustEnvelope::from_uri(&format!("https://x.example/t/bag#{payload}")),
+            Err(EnvelopeError::KindMismatch { .. })
+        ));
+    }
+
+    /// The mirror is `https://<domain>/t/<kind>#<payload>`, nothing looser.
+    #[test]
+    fn mirror_is_https_with_the_t_kind_path() {
+        let payload = recovery_uri("recovery").rsplit('/').next().unwrap().to_owned();
+        let ok = |s: String| assert!(TrustEnvelope::from_uri(&s).is_ok(), "{s}");
+        ok(format!("https://join.example/t/recovery#{payload}"));
+        ok(format!("https://join.example:8443/t/recovery#{payload}"));
+        let err = |s: String, e: EnvelopeError| assert_eq!(TrustEnvelope::from_uri(&s), Err(e), "{s}");
+        err(format!("http://x/t/recovery#{payload}"), EnvelopeError::UnknownScheme);
+        err(format!("https://x/recovery#{payload}"), EnvelopeError::UnknownScheme);
+        err(format!("https://x/a/t/recovery#{payload}"), EnvelopeError::UnknownScheme);
+        err(format!("https://x/t/recovery/y#{payload}"), EnvelopeError::UnknownScheme);
+        err(format!("https://x/t/recovery?q=1#{payload}"), EnvelopeError::UnknownScheme);
+        err(format!("https://x/y#/t/recovery{payload}"), EnvelopeError::UnknownScheme);
+        err("https://x/t/recovery".into(), EnvelopeError::MalformedUri);
+        err(format!("https:///t/recovery#{payload}"), EnvelopeError::MalformedUri);
+    }
+
+    #[test]
+    fn legacy_version_is_decimal_digits_only() {
+        assert!(TrustEnvelope::from_uri("ndn-ctx:1:42:Y3R4").is_ok());
+        for bad in ["ndn-ctx:1:+42:Y3R4", "ndn-ctx:1::Y3R4", "ndn-ctx:1:-1:Y3R4", "ndn-ctx:1: 42:Y3R4"] {
+            assert_eq!(TrustEnvelope::from_uri(bad), Err(EnvelopeError::MalformedUri), "{bad}");
+        }
     }
 }

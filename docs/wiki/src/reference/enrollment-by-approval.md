@@ -243,10 +243,14 @@ their next refresh. See
 
 ## Anchor QR size
 
-The anchor envelope for `/home/bob` is 2831 bytes, within the 2953-byte
-single-QR limit; each extra namespace character costs about 33 bytes, so
-namespaces up to 12 characters fit inline. Longer namespaces use the
-fingerprint-only link form (`anchor_uri_fp`).
+The anchor link with the context inline is about 2.8 KB for `/home/bob`
+(2831 bytes measured), and each extra namespace character adds about 30 more.
+One QR code holds at most 2331 bytes at the error-correction level every
+ndn-rs renderer uses (M), so a QR of the anchor link carries the
+fingerprint-only form (`anchor_uri_fp`): `ndn-trust-context build --qr`
+switches to it on its own, and `ndn-fwd init` says which line to show. Share
+the inline form (`anchor_uri`, `anchor_url`) as a link. See
+[trust-envelope.md](../../../specs/trust-envelope.md) §5.6.
 
 ## In an app (ndn-mobile)
 

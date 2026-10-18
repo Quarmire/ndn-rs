@@ -39,7 +39,15 @@
 //!   ([`PibContextStore`] keeps them beside a PIB);
 //! - optionally a running [`publish::PublishedContexts`] and
 //!   [`publish::OwnCertificates`] (serving by name), a [`sync::ContextSync`],
-//!   and the namespace CA's [`ndn_cert::CaState`] when the device runs one.
+//!   and the namespace CA's [`ndn_cert::CaState`] when the device runs one;
+//! - its [`HostWords`]: how the person at the device does what a refusal or
+//!   a log line asks of them, in the host's own terms — its commands or app
+//!   actions, its configuration, where it keeps keys. The library quotes
+//!   them and names no host itself; [`HostWords::default`] is neutral. A
+//!   forwarder supplies its CLI (`` `ndn-fwd enroll` ``, `[security]
+//!   renew_before`, "the PIB directory"), an app its own actions. Each
+//!   message that quotes them is a [`HostWords`] method, so a host can test
+//!   how its words read.
 //!
 //! and passes a [`KeyVault`] — where device keys and certificates are kept,
 //! and how the running device switches to a new key — to each operation
@@ -62,6 +70,7 @@ pub mod publish;
 pub mod refresh;
 pub mod renewal;
 pub mod sync;
+mod words;
 
 use std::sync::Arc;
 
@@ -76,6 +85,7 @@ pub use ndn_cert::report::{
     AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
     PendingEnrollInfo, RefreshState, RenewalInfo, RenewalState, TrustRefusal,
 };
+pub use words::HostWords;
 
 /// What a [`Participant`] is built from: see the [crate docs](crate).
 pub struct ParticipantParts {
@@ -93,6 +103,9 @@ pub struct ParticipantParts {
     /// The namespace CA this device runs: it follows every version of its
     /// namespace's trust context this device keeps.
     pub ca: Option<Arc<CaState>>,
+    /// How the person at the device does what a refusal or a log line asks
+    /// of them, in the host's terms.
+    pub words: HostWords,
 }
 
 /// A device taking part in personal namespaces: the engine and keyring it
@@ -106,6 +119,7 @@ pub struct Participant {
     own_certs: Option<Arc<publish::OwnCertificates>>,
     sync: Option<sync::ContextSync>,
     ca: Option<Arc<CaState>>,
+    words: HostWords,
     /// One enrollment at a time.
     pub(crate) enrolling: tokio::sync::Mutex<()>,
     /// Held while a context is stored and published, so of two concurrent
@@ -137,6 +151,7 @@ impl Participant {
             own_certs,
             sync,
             ca,
+            words,
         } = parts;
         Self {
             engine,
@@ -146,6 +161,7 @@ impl Participant {
             own_certs,
             sync,
             ca,
+            words,
             enrolling: tokio::sync::Mutex::new(()),
             keeping: std::sync::Mutex::new(()),
             context_change: tokio::sync::Mutex::new(()),
@@ -181,6 +197,11 @@ impl Participant {
 
     pub fn ca(&self) -> Option<&Arc<CaState>> {
         self.ca.as_ref()
+    }
+
+    /// The host's words, quoted in refusals and logs.
+    pub fn words(&self) -> &HostWords {
+        &self.words
     }
 
     /// The trust context this device holds for `namespace`.

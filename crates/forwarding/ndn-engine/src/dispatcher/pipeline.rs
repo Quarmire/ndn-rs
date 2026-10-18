@@ -508,34 +508,43 @@ impl PacketDispatcher {
             }
             ForwardingAction::Nack(_reason) => {
                 if let Some((_, entry)) = self.strategy.pit.remove(&token) {
-                    let interest_wire = nack.interest.raw().clone();
                     // Only a local upstream (a forwarder on this host) may
                     // say it refused the Data; from anyone else a refusal is
                     // an unverified claim, passed on as NoRoute.
-                    let packet_reason = match nack.reason {
-                        Some(r) if r.refusal().is_none() || self.is_local_face(ctx.face_id) => r,
+                    let from_local = self.is_local_face(ctx.face_id);
+                    let upstream_reason = match nack.reason {
+                        Some(r) if r.refusal().is_none() || from_local => r,
                         _ => ndn_packet::NackReason::NoRoute,
                     };
-                    for face_id_raw in entry.in_record_faces() {
-                        let face_id = FaceId(face_id_raw);
+                    let mut told: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+                    for r in &entry.in_records {
+                        let face_id = FaceId(r.face_id);
+                        if told.contains(&r.face_id) {
+                            continue;
+                        }
+                        told.push(r.face_id);
                         if !self.nacks_allowed_on_face(face_id) {
                             debug!(target: t::FWD_STRATEGY, face=%face_id, "nack propagation suppressed on multi-access/ad-hoc in-record face");
                             continue;
                         }
                         // A refusal is told to local downstreams only (see
-                        // `refuse`); a non-local one gets nothing.
-                        if packet_reason.refusal().is_some() && !self.is_local_face(face_id) {
-                            continue;
-                        }
-                        let intent = crate::engine::EgressIntent {
-                            nack: Some(packet_reason),
-                            ..Default::default()
+                        // `refuse`); a non-local one learns that this path
+                        // has nothing usable, as from any other upstream.
+                        let reason = if upstream_reason.refusal().is_some() && !self.is_local_face(face_id) {
+                            ndn_packet::NackReason::NoRoute
+                        } else {
+                            upstream_reason
                         };
-                        // NFD NOutNacks.
-                        if let Some(state) = self.face_states.get(&face_id) {
-                            state.counters.out_nacks.fetch_add(1, Ordering::Relaxed);
-                        }
-                        self.enqueue_send(face_id, interest_wire.clone(), intent)
+                        // Each downstream gets its own Interest (its nonce,
+                        // selectors and parameters) and its PitToken back,
+                        // as a refusal this node makes does.
+                        let interest = ndn_packet::Nack::interest_wire(
+                            &entry.name,
+                            &r.selector,
+                            r.nonce,
+                            r.parameters.as_ref(),
+                        );
+                        self.nack_downstream(face_id, interest, r.lp_pit_token.clone(), reason)
                             .await;
                     }
                 }

@@ -98,24 +98,40 @@ path is local to the CA and has no wire format.
    `<RequestId>` component is a GenericNameComponent holding the 8 raw
    bytes. Because a CHALLENGE Interest carries ApplicationParameters, its
    last component is the ParametersSha256DigestComponent.
-2. Each NEW and CHALLENGE Interest is a signed Interest (NDN packet format
+2. **Endpoint dispatch.** A CA MUST select the endpoint by the exact
+   GenericNameComponent that follows `<ca>` / `CA` (itself a
+   GenericNameComponent), never by a substring or prefix of the URI, and
+   MUST check what follows it:
+
+   | Endpoint | After the endpoint component |
+   |---|---|
+   | `INFO` | anything (version, segment) |
+   | `NEW`, `REVOKE`, `PENDING`, `APPROVAL` | nothing, or only the ParametersSha256DigestComponent |
+   | `CHALLENGE` | the RequestId, then optionally the ParametersSha256DigestComponent |
+   | `STATUS` | the request id, and nothing after it (§8.1) |
+
+   A `NEW` or `CHALLENGE` name with anything else after the endpoint is
+   answered with ErrorCode 1 (§3.5). Any other name under `<ca>` that
+   matches no endpoint, such as `<ca>/CA/APPROVALX` or
+   `<ca>/CA/APPROVAL/x`, is not an endpoint (§3.5, last paragraph).
+3. Each NEW and CHALLENGE Interest is a signed Interest (NDN packet format
    v0.3), signed by the key being certified. The KeyLocator names that key.
    The cert request in NEW is self-signed and named
    `<key>/cert-request/v=<ms>`.
-3. A requester SHOULD send a cert request whose ValidityPeriod is empty
+4. A requester SHOULD send a cert request whose ValidityPeriod is empty
    (`NotBefore` equal to `NotAfter`). The CA then applies its policy
    lifetime. If the window is non-empty, the CA issues
    `min(requested, policy, max_validity)`.
-4. A CA keeps a session from NEW for 60 s. After a CHALLENGE that answers
+5. A CA keeps a session from NEW for 60 s. After a CHALLENGE that answers
    status 2, it keeps the session for the RemainingTime it advertised. At
    every NEW it drops expired sessions.
-5. A CA built on ndn-rs signs every NEW, CHALLENGE, STATUS, PENDING and
-   APPROVAL answer with its CA key. The KeyLocator is the CA certificate
-   name, and the answer has no FreshnessPeriod. The ndn-rs requester does
-   **not** validate the NEW and CHALLENGE answers, so it never treats them
-   as final (§6.6). It MUST validate STATUS, PENDING and APPROVAL answers
-   (§8–§10).
-6. The CA names an issued certificate `<key>/NDNCERT/v=<version>` (issuer
+6. A CA built on ndn-rs signs every NEW, CHALLENGE, STATUS, PENDING and
+   APPROVAL answer with its CA key, failure answers (§3.5) included. The
+   KeyLocator is the CA certificate name, and the answer has no
+   FreshnessPeriod. The ndn-rs requester does **not** validate the NEW and
+   CHALLENGE answers, so it never treats them as final (§6.6). It MUST
+   validate STATUS, PENDING and APPROVAL answers (§8–§10).
+7. The CA names an issued certificate `<key>/NDNCERT/v=<version>` (issuer
    component `NDNCERT`, VersionNameComponent). Every certificate of a key,
    renewals included, therefore has its own name. A requester SHOULD fetch
    it with a ForwardingHint of `<ca>`.
@@ -126,7 +142,8 @@ The CA uses status `2` for every challenge that waits for more: another
 round, or an admin's decision. It never sends status `1`. A requester MUST
 treat `1` and `2` alike: the session needs another round.
 
-Failure is status `4` with these ErrorCodes:
+Failure after the session is open is status `4` in the encrypted CHALLENGE
+response, with these ErrorCodes:
 
 | Cause | ErrorCode |
 |---|---|
@@ -134,9 +151,13 @@ Failure is status `4` with these ErrorCodes:
 | approval request expired or gone (`device-approval`) | 8 (OutOfTime) |
 | another request for the same single-key identity is being certified, or the identity is held by another key | 5 (NameNotAllowed) |
 
-A requester MUST read ErrorCode 8 as "expired" and every other failure as
-"denied". ErrorInfo is human-readable text with what to do. It has no
-grammar.
+A NEW or CHALLENGE the CA cannot process gets the unencrypted failure
+answer of §3.5 instead. Either way, a requester MUST read ErrorCode 8 as
+"expired" and ErrorCode 5 as a refusal of the requested name. ndn-rs reads
+7 as "denied" and the request-format codes (1–4, 6, 9) as a refusal of the
+request that keeps its code; it reads any other value as "denied". None of
+these answers is final (§6.6). ErrorInfo is human-readable text with what
+to do. It has no grammar.
 
 ### 3.3 Challenge parameters
 
@@ -145,13 +166,19 @@ grammar.
   keys and values are UTF-8. ndn-rs emits the pairs sorted by key in byte
   order. A receiver MUST accept any order. Elements of any other type are
   ignored.
-- **CHALLENGE response plaintext**: `Status (0x9B, 1 octet)`, then
-  `ChallengeStatus (0xA3)`, `RemainingTries (0xA5, 1 octet)`,
-  `RemainingTime (0xA7, 4 octets big-endian)`, `IssuedCertName (0xA9,
-  containing a Name TLV)`, `ErrorCode (0xAB, 1 octet)`, `ErrorInfo (0xAD)`,
-  each when present, then the response parameters as ParameterKey /
-  ParameterValue pairs. Response parameters are an ndn-rs addition: the CA
-  returns them with status 2.
+- **CHALLENGE response plaintext**: `Status (0x9B)`, then
+  `ChallengeStatus (0xA3)`, `RemainingTries (0xA5)`, `RemainingTime
+  (0xA7)`, `IssuedCertName (0xA9, containing a Name TLV)`, `ErrorCode
+  (0xAB)`, `ErrorInfo (0xAD)`, each when present, then the response
+  parameters as ParameterKey / ParameterValue pairs. Response parameters
+  are an ndn-rs addition: the CA returns them with status 2.
+- Status, RemainingTries, RemainingTime and ErrorCode are
+  NonNegativeIntegers (NDN packet format v0.3: 1, 2, 4 or 8 octets,
+  big-endian). ndn-rs writes Status, RemainingTries and ErrorCode in 1
+  octet and RemainingTime in 4. A reader MUST accept every valid width and
+  MUST refuse the response when one of them has another width. ndn-rs
+  saturates a RemainingTries above 255 to 255 and a RemainingTime above
+  2³² − 1 s to 2³² − 1, and refuses a Status or ErrorCode above 255.
 - A parameter value that is not a JSON string on the producer side (for
   example `issuers`, §11.2) is written as its compact JSON text.
 
@@ -161,16 +188,36 @@ The NEW response lists the CA's configured challenges in configuration
 order. A namespace CA whose context advertises approval roles also offers
 `device-approval` when it is not configured (§4.2). The CA appends
 `renewal` when its issuance policy renews any role. A requester MUST select
-only an offered challenge. A CHALLENGE whose SelectedChallenge differs from
-the first one of the session is not answered (§3.5).
+only an offered challenge. A CHALLENGE whose SelectedChallenge was not
+offered, or differs from the first one of the session, is answered with
+ErrorCode 4 (§3.5).
 
-### 3.5 Unanswered requests
+### 3.5 Failure answers
 
-A CA built on ndn-rs sends **no** Data for a NEW or CHALLENGE it cannot
-process: a malformed body, a policy-refused name, an unknown or expired
-session, an unoffered or changed challenge type, or a handler error. The
-requester sees only a timeout (Open question 3). An Interest under `<ca>`
-that nothing answers gets a Nack `NoRoute`.
+A CA MUST answer a NEW or CHALLENGE that it cannot process with a Data
+whose Content is exactly one `ErrorCode (0xAB)` followed by one `ErrorInfo
+(0xAD, UTF-8)`: unencrypted, with no Status, as NDNCERT v0.3 does (the
+v0.3 requester reads only those two elements and refuses any other
+critical one). The Data is named and signed as every answer (§3.1 item 6).
+ndn-rs uses these ErrorCodes:
+
+| Cause | ErrorCode |
+|---|---|
+| NEW or CHALLENGE name not of the form of §3.1 item 2 | 1 (BadInterestFormat) |
+| malformed NEW body, cert request, ECDH key, CHALLENGE envelope or plaintext; a handler's malformed-request error | 2 (BadParameterFormat) |
+| unknown or expired NDNCERT session; unoffered or changed challenge type; a failure of the CA itself (storage, signing, RNG) | 4 (InvalidParameters) |
+| the CA's namespace policy refuses the key name in NEW | 5 (NameNotAllowed) |
+| a challenge handler's denial or expiry raised as an error | 7 or 8 |
+
+For a failure of the CA itself, ErrorInfo says only to ask again later; the
+CA logs the detail. A requester MUST look for a top-level ErrorCode in
+every NEW and CHALLENGE answer before decoding it otherwise (a NEW answer
+and a CHALLENGE envelope never carry one), and read it as in §3.2. The
+ndn-rs requester thus reports a policy refusal of the name in NEW as "name
+refused".
+
+An Interest under `<ca>` that nothing answers (no endpoint, §3.1 item 2,
+and no issued certificate) gets a Nack `NoRoute`.
 
 ### 3.6 URI form
 
@@ -272,14 +319,18 @@ A reader derives:
   exactly one of the four role names and the right part is non-empty, that
   is the role. Otherwise the token has no role.
 - **Expiry**: split the token at its **last** occurrence of `-until`. If
-  the right part is non-empty, all ASCII digits, and parses as a u64, that
-  is the expiry. Otherwise the token does not expire. See Open question 6.
+  there is none, the token does not expire. If the right part is
+  non-empty, all ASCII digits, and fits a u64, that is the expiry.
+  Otherwise the expiry is **malformed** and the reader MUST refuse the
+  token: it is never read as a token that does not expire.
+- **Validity**: a token with an expiry is valid while `now < expiry`, in
+  Unix seconds; at the expiry second it has expired. The CA and the
+  invitee apply the same boundary.
 
 The whole string, suffix included, is the token. A CA MUST match it
 byte-exactly.
 
-Producers MUST NOT emit a `secret` that contains `-until` followed only by
-digits.
+Producers MUST NOT emit a `secret` that contains `-until`.
 
 ### 5.2 CA rules
 
@@ -288,8 +339,9 @@ digits.
    `member-…` or `guest-…` token to `<ns>/<role>`. A CA that is not a
    namespace CA scopes role tokens the same way and leaves other tokens
    unscoped.
-2. A token with an expiry is redeemable while the CA clock is at or before
-   the expiry (Open question 5).
+2. A token with an expiry is redeemable while the CA clock is before the
+   expiry (§5.1). A CA MUST NOT load a token whose expiry is malformed;
+   ndn-rs skips it with a warning, so it is never redeemable.
 3. A token is single-use. The CA removes it atomically on redemption. If
    the CA has durable storage, it records the redemption before approving.
    A recorded token is never accepted again, even if it is still
@@ -312,10 +364,11 @@ digits.
 
 ### 5.4 Invitee checks
 
-Before sending anything, an invitee MUST refuse an invite whose token
-expiry is at or before its own clock. It MUST also refuse an invite whose
-token role differs from the invite's identity namespace role. A token with
-no role counts as `member`.
+Before sending anything, an invitee MUST refuse an invite whose token has
+expired by its own clock (§5.1: at or after the expiry second) or whose
+expiry is malformed. It MUST also refuse an invite whose token role
+differs from the invite's identity namespace role. A token with no role
+counts as `member`.
 
 ## 6. The `device-approval` challenge
 
@@ -364,7 +417,10 @@ pending, approved (by whom, when) or denied (by whom, when, reason). The
 JSON form is in §11.3.
 
 - The request id is 8 random bytes in lowercase hex. It MUST be unique
-  among the CA's records.
+  among the CA's records. The bytes MUST come from a working RNG: a CA
+  whose RNG fails refuses to open the request (§6.3) and never falls back
+  to a fixed id. The same holds for the NDNCERT request id, salt and IV,
+  and for new key ids.
 - A pending record expires `ttl` after it is created. `ttl` is policy (in
   ndn-fwd, `[ca] approval_request_ttl_days`, default 7, never 0).
 - When a request is decided, its `expires` becomes `decision time + ttl`:
@@ -387,7 +443,8 @@ these cases:
   under `/ns/role`;
 - `require_all` applies and `token` is missing or not live (unknown,
   redeemed or expired). The token's scope is not checked here: the admin's
-  approval decides the role.
+  approval decides the role;
+- the CA cannot draw a random request id (§6.2). The invite is not spent.
 
 When an invite is required, the CA MUST record the request durably
 **before** it redeems the token. If the redemption then fails, it MUST
@@ -395,7 +452,7 @@ remove the record. A storage failure therefore never spends the invite.
 
 ### 6.4 Approved: issuance
 
-The approved poll goes through §3.1 item 6 and §4.4. The CA does not
+The approved poll goes through §3.1 item 7 and §4.4. The CA does not
 re-check the decision Data at issuance; it trusts its record.
 
 ### 6.5 Who decides
@@ -409,7 +466,7 @@ re-check the decision Data at issuance; it trusts its record.
 ### 6.6 What may end a request on the requester
 
 The requester MUST NOT delete its key or end a request because of a NEW or
-CHALLENGE answer. Those answers are not validated (§3.1 item 5): a denial,
+CHALLENGE answer. Those answers are not validated (§3.1 item 6): a denial,
 an expiry, a refusal or an unreadable answer is not final. Only a STATUS
 answer validated under §8.3 saying `denied` or `expired` ends a request.
 Two other events also end it: the requester's own key fails to sign, and
@@ -464,9 +521,15 @@ code   = decimal(n / 1000, 3 digits, zero-padded) || " " || decimal(n mod 1000, 
 - The CA answers as soon as the record is no longer pending (decided,
   expired or pruned), when the hold ends, or at once when the CA stops. At
   each of those points the answer carries the record's state at that time.
+- **Immediate checks.** A STATUS Interest whose hold is 0 (lifetime at
+  most `STATUS_ANSWER_MARGIN`) is answered at once with the record's state
+  and takes no held slot. A CA does not rate-limit them per request: each
+  costs one signature, as does the answer for an unknown request id, which
+  no per-request limit can bound; Interest rate limits belong to the
+  forwarder.
 - **Limits.** The CA holds at most `MAX_HELD_PER_REQUEST` = 4 status
   Interests per request and `MAX_HELD_STATUS` = 1024 in total. Beyond
-  that, it answers with Nack `Congestion`.
+  that, it answers a held one with Nack `Congestion`.
 - A CA that serves no approvals answers with Nack `NoRoute`.
 - **Answer Data.** Its name equals the Interest name. Content is the
   `RequestStatus` JSON of §11.1. It has no FreshnessPeriod and is signed by
@@ -492,8 +555,10 @@ Otherwise it MUST ignore the answer and ask again.
 - The name is `<ca>/CA/PENDING`, followed by the
   ParametersSha256DigestComponent.
 - MustBeFresh. It MUST be a signed Interest (NDN packet format v0.3) signed
-  by an admin key. ndn-rs includes SignatureNonce (8 octets) and
-  SignatureTime.
+  by an admin key, with SignatureNonce and SignatureTime. ndn-rs writes an
+  8-octet SignatureNonce and the SignatureTime in milliseconds. An
+  approver MUST sign every listing Interest afresh: a retransmitted wire is
+  refused as a replay (§9.2).
 - The KeyLocator names the admin key, or one of its certificates.
 - ApplicationParameters: the concatenated Data wires of the admin's
   certificate chain. The admin certificate comes first, then each issuer
@@ -508,6 +573,21 @@ every hop. The schema rule `#pending: <ns>/"CA"/"PENDING"/_ <= #admin` must
 admit the Interest name. Neither the trust context nor the CA may revoke
 the signer's key.
 
+Then the CA applies the NDN signed-Interest freshness rule. All of these
+must hold, else the answer is `refused`, kind `unauthorized`:
+
+1. SignatureTime and SignatureNonce are present;
+2. SignatureTime is within `LISTING_SIG_TIME_GRACE` = 120 s of the CA's
+   clock, either way;
+3. the CA has not seen the same (SignatureNonce, SignatureTime) from the
+   same KeyLocator before.
+
+The CA records the pair only for an Interest whose chain verified. ndn-rs
+remembers 64 pairs per signer key and 256 signer keys, least recently used
+first out, in memory. A captured listing Interest can therefore be
+replayed only within the window, and only to a CA that restarted, or that
+evicted the pair, since it answered it.
+
 - **Answer Data.** Named as the Interest, with no FreshnessPeriod, signed
   by the CA key. Content is a `ListingAnswer` (§11.2):
   - `listed`: the pending, unexpired records, oldest first (by
@@ -515,8 +595,8 @@ the signer's key.
   - `refused`: kind `unauthorized`, with a reason.
 - The approver MUST validate the answer to the namespace root before it
   uses it.
-- Clients MUST NOT rely on SignatureTime or SignatureNonce being checked
-  (Open question 4).
+- `listed` reveals the same records to every admin key that asks within
+  the rules above (Decision Q9: only live pending records).
 
 ## 10. Decisions and `<ca>/CA/APPROVAL`
 
@@ -654,7 +734,7 @@ evidence. A leaf for `local-operator` claims no signature.
 | NEW / CHALLENGE Data | CA key | not validated by ndn-rs requester | — |
 | STATUS Interest | unsigned | — | — |
 | STATUS Data | CA key | requester (§8.3) | CA key under `<ns>/CA/KEY/<k>` per schema |
-| PENDING Interest | admin key | CA (§9.2) | `#admin` key, current, unrevoked |
+| PENDING Interest | admin key | CA (§9.2), freshness included | `#admin` key, current, unrevoked |
 | PENDING Data | CA key | approver | CA key |
 | APPROVAL Interest | unsigned | — | — |
 | decision Data (in APPROVAL) | admin key | CA (§10.3) | `#admin` key, current, unrevoked |
@@ -676,6 +756,8 @@ evidence. A leaf for `local-operator` claims no signature.
 | `MAX_HELD_STATUS` | 1024 | CA |
 | `MAX_PENDING` | 256 | CA |
 | `MAX_PENDING_PER_PREFIX` | 32 | CA |
+| `LISTING_SIG_TIME_GRACE` (PENDING SignatureTime window) | 120 s | CA |
+| PENDING replay record | 64 pairs per signer key, 256 keys | CA (ndn-rs) |
 | certificates taken from a PENDING/APPROVAL push | 6; chain depth 8 | CA |
 | `OUTGOING_EXPIRY_GRACE` | 86400 s | requester |
 | retry pause | 1 s doubling to 60 s | requester |
@@ -686,7 +768,9 @@ evidence. A leaf for `local-operator` claims no signature.
    `token` if required. The CA answers pending; the requester MUST check the
    code (§7). The requester SHOULD then keep `(namespace, ca prefix,
    identity, key name, request id, code, expires)` durably. The pending
-   answer is final for this step.
+   answer is final for this step. A failure answer (§3.5) to the poll is
+   read as in §3.2 and is not final: for example a refused name asks for
+   another device name.
 2. **Wait.** Keep one STATUS Interest outstanding (§8), with lifetime
    `STATUS_LIFETIME`.
    - When it answers `pending`, update `expires` and send the next one.
@@ -796,7 +880,11 @@ certificate's name.
   can never end a request (§6.6). A forged pending answer can at worst
   delay the requester. A forged code is caught by §7.
 - **PENDING** reveals key names, device names and codes to admin keys
-  only. A captured listing Interest can be replayed (Open question 4).
+  only. A captured listing Interest is refused when replayed (§9.2), except
+  within 120 s of its signing by a CA that has since forgotten it.
+- **Failure answers** (§3.5) are unencrypted and not validated by the
+  requester. A forged one can at worst make the requester ask again, as a
+  forged pending answer can.
 - **Request flooding** is bounded by `MAX_PENDING` and
   `MAX_PENDING_PER_PREFIX`. Held STATUS Interests are bounded by the hold
   limits.
@@ -870,8 +958,8 @@ between `cert_name` and `issuers`):
 | `friend-abc` | none | none |
 | `Member-abc` | none | none |
 | `abcdef` | none | none |
-| `member-ab-until` | member | none |
-| `member-ab-until12x` | member | none |
+| `member-ab-until` | member | malformed: refused |
+| `member-ab-until12x` | member | malformed: refused |
 | `member-ab-until1-until2` | member | 2 |
 | `ab-until99` | none | 99 |
 
@@ -886,6 +974,8 @@ between `cert_name` and `issuers`):
   `9b0102a30777616974696e67a50101a7040000003c8504636f6465870732373620303033850765787069726573870a31373630363034383030850772657175657374871038663361356337653962316432663430`.
 - Denied (`no`): `9b0104ab0107ad026e6f`.
 - Expired (`gone`): `9b0104ab0108ad04676f6e65`.
+- Unencrypted failure answer (§3.5), ErrorCode 5, ErrorInfo `no`:
+  `ab0105ad026e6f`.
 
 ### V5 Names (CA prefix `/home/bob`)
 
@@ -953,41 +1043,63 @@ reference Ed25519:
 
 The same program probed a live `CaState` + `ApprovalService` for Bug 1.
 
+The failure answer of V4 and the two malformed rows of V3 were written
+from the TLV and grammar rules by hand; the unit tests
+`error_content_roundtrips_and_is_told_apart` (`ndn-cert/tlv.rs`) and
+`malformed_token_expiry_fails_closed` (`ndn-cert/roles.rs`) check them.
+
 ## 18. Open questions
 
 1. **Code input uses the URI form of the CA prefix.** A stack whose URI
    printer differs (uppercase vs lowercase `%XX`, `8=` prefixes, typed
    components) computes another code. A `v2` could hash the Name TLV
-   instead. Until then, the URI form is pinned by §3.6.
-2. **Deadline-bounded checks.** A requester that waits with a deadline
-   sends STATUS lifetimes down to `STATUS_ANSWER_MARGIN`, which the CA
-   answers at once. Each one still takes a held-STATUS slot until it is
-   answered, and nothing else limits their rate. Should a CA rate-limit
-   immediate checks per request?
-3. **No error Data for refused NEW and CHALLENGE (§3.5).** Should the CA
-   answer with status 4 / ErrorCode 1, 2 or 5 as NDNCERT v0.3 does? Today
-   a policy refusal of the name in NEW reaches the requester only as a
-   timeout, so its "name refused" message is unreachable.
-4. **PENDING freshness.** The CA does not check SignatureTime or
-   SignatureNonce, so a captured listing Interest can be replayed while the
-   admin certificate is valid. Should it apply the signed-Interest
-   timestamp rule?
-5. **Expiry boundary.** An invitee refuses at `now >= until`, but the CA
-   redeems while `now <= until`. Pick one.
-6. **Malformed expiry fails open.** `-until` followed by non-digits, or a
-   value that overflows u64, makes the token non-expiring. Should a reader
-   refuse such a token instead?
-7. **Endpoint dispatch by URI substring.** The ndn-rs producer matches
-   `/CA/NEW` with `contains`, and `/CA/APPROVAL` and `/CA/PENDING` with a
-   prefix test on the URI suffix. So, for example, `<ca>/CA/APPROVALX`
-   reaches the decision handler. Should the CA match exact components?
-8. **CHALLENGE response integer widths.** ndn-rs reads RemainingTime only
-   when it is at least 4 octets (the first 4), and RemainingTries as the
-   first octet. NDNCERT v0.3 allows any NonNegativeInteger width, so a CA
-   that sends a 1-, 2- or 8-octet value is misread (§19, item 4).
-9. **Decided record listing.** The CA host's local listing shows every
-   record, decided ones included. The remote PENDING listing shows only
-   live pending ones. Is that intended?
+   instead. Until then, the URI form is fixed by §3.6.
+   **Recommendation:** keep `v1` (URI form, §3.6) as the only code input
+   now; changing it changes every code shown, so a `v2` input
+   (`ndncert-approval-code/v2`, hashing the Name TLV of `C`) needs a
+   CHALLENGE response parameter that names the version and a transition
+   in which requester and approver both show the version they used. Do it
+   only when a second stack prints URIs differently.
+
+### Decisions
+
+- **Q2 Deadline-bounded checks.** A STATUS Interest with a hold of 0 is
+  answered at once and takes no held slot; there is no per-request rate
+  limit (§8.2). Each answer costs one signature, the same as the answer
+  for an unknown request id, which no per-request limit can bound, and
+  immediate checks no longer crowd out the held ones of the same request.
+- **Q3 Failure answers for NEW and CHALLENGE.** The CA answers them with
+  the unencrypted v0.3 ErrorCode + ErrorInfo Content (§3.5), and the
+  requester reads it (§3.2), so a policy refusal of the name reaches the
+  requester as "name refused". This is the v0.3 wire format, so v0.3
+  requesters read it too.
+- **Q4 PENDING freshness.** The CA applies the NDN signed-Interest rule to
+  PENDING (§9.2): SignatureTime within 120 s and a bounded record of
+  (SignatureNonce, SignatureTime) per signer key. A captured listing can
+  no longer be replayed for as long as the admin certificate is valid.
+  The record keeps no strict SignatureTime order, so two listings signed
+  in one millisecond are both accepted.
+- **Q5 Expiry boundary.** A token is valid while `now < until`, on the CA
+  and on the invitee (§5.1). The invitee already refused at `now >=
+  until`; the CA now refuses at the expiry second instead of one second
+  later, and reads the `-until` second itself rather than a TTL counted
+  from when it loaded the token.
+- **Q6 Malformed expiry.** A `-until` suffix that is not a decimal u64 is
+  refused, by the CA (the token is not loaded) and by the invitee (the
+  invite is refused). Failing closed costs nothing: no producer emits
+  such a token.
+- **Q7 Endpoint dispatch.** The CA matches the exact component after
+  `<ca>/CA` and checks the components after it (§3.1 item 2).
+  `<ca>/CA/APPROVALX` reaches no handler.
+- **Q8 Integer widths.** Status, RemainingTries, RemainingTime and
+  ErrorCode decode as NonNegativeIntegers of 1, 2, 4 or 8 octets; any
+  other width refuses the response (§3.3). This is the NDN packet
+  format's rule, so ndn-rs reads any v0.3 CA.
+- **Q9 Decided record listing.** Intended. The CA host's local listing
+  (its operator, on the host) shows every record, decided ones included,
+  as the record of who decided what. The remote PENDING listing serves
+  deciding, so it shows only live pending records and reveals no decided
+  history to other admin devices (§9.2).
 
 ## 19. Known deviations in ndn-rs (informative)
 
@@ -1000,16 +1112,6 @@ implementation follows the normative text and SHOULD NOT copy them.
    Data or a PENDING Interest MAC'd with an admin's public key was
    accepted. `verify_by_sig_type` now refuses MAC and digest types for a
    public-key signer.
-2. **Random ids on RNG failure.** The approval request id, the NDNCERT
-   request id and new key ids ignore a `getrandom` failure and fall back to
-   zero bytes, which gives `0000000000000000`. Two approval requests opened
-   that way share an id, and the second replaces the first in the CA's
-   table.
-3. **Silent NEW and CHALLENGE failures** (§3.5, Open question 3).
-4. **Width-dependent decode of RemainingTime and RemainingTries**
-   (Open question 8). This affects ndn-rs as a requester of other CAs.
-5. **Token expiry fails open on a malformed suffix** (Open question 6).
-6. **Endpoint dispatch by URI substring** (Open question 7).
 
 ## Appendix A. Code references (non-normative)
 
@@ -1018,36 +1120,36 @@ Paths are relative to the workspace root. `ndn-cert` =
 
 | Claim | Code |
 |---|---|
-| Endpoint, component and parameter constants; timing; limits; `POLL_SESSION_SECS`; `DEFAULT_REQUEST_TTL` | `ndn-cert/approval.rs:77-148` |
-| Per-prefix pending group | `ndn-cert/approval.rs:124-129` |
-| ApprovalRecord, ApprovalState, Approver JSON | `ndn-cert/approval.rs:150-228` |
-| Verification code, normalization | `ndn-cert/approval.rs:244-271` |
-| RefusalKind names | `ndn-cert/approval.rs:280-302` |
-| Status of unknown / expired record | `ndn-cert/approval.rs:421-450` |
-| Listing order, pending filter, prune rule | `ndn-cert/approval.rs:452-500` |
-| Opening / resuming a record; limits; invite redeemed after durable save | `ndn-cert/approval.rs:508-618` |
-| Decision recording, final, expiry reset, wake STATUS | `ndn-cert/approval.rs:639-698` |
-| Decision check order, evidence base64url | `ndn-cert/approval.rs:710-776` |
-| PENDING authorization | `ndn-cert/approval.rs:783-825` |
-| RequestStatus JSON | `ndn-cert/approval.rs:859-876` |
-| STATUS name, parse (n+3 components), hold | `ndn-cert/approval.rs:902-932` |
-| Code / id lookup | `ndn-cert/approval.rs:998-1031` |
-| Decision name parse | `ndn-cert/approval.rs:1034-1047` |
-| Walk validator, 6 supplied certs, depth 8 | `ndn-cert/approval.rs:1051-1072` |
-| Admin Data validation, revocation | `ndn-cert/approval.rs:1074-1110` |
-| Answer JSON enums; handlers; held-STATUS limits | `ndn-cert/approval.rs:1141-1245` |
-| Answer when decided / deadline / stopping | `ndn-cert/approval.rs:1253-1306` |
-| Decision Data construction | `ndn-cert/approval.rs:1310-1343` |
-| Approver checks CA answer chain | `ndn-cert/approval.rs:1375-1400` |
-| PENDING Interest (signed, MustBeFresh, chain params) | `ndn-cert/approval.rs:1411-1438` |
-| APPROVAL Interest (unsigned, MustBeFresh) | `ndn-cert/approval.rs:1444-1473` |
-| CA prefix from context | `ndn-cert/approval.rs:1486-1499` |
-| Admin chain building, ≤ 6 | `ndn-cert/approval.rs:1507-1536` |
-| Unsigned answers never final | `ndn-cert/approval.rs:1601-1611` |
-| Poll: params, code check, expires | `ndn-cert/approval.rs:1638-1715` |
-| STATUS Interest and answer checks | `ndn-cert/approval.rs:1728-1782` |
-| Outgoing grace 86400 s, overdue | `ndn-cert/approval.rs:1803-1818` |
-| Request id = 8 random bytes hex | `ndn-cert/approval.rs:1991-1995` |
+| Endpoint, component and parameter constants; timing; limits; `LISTING_SIG_TIME_GRACE`, replay record; `POLL_SESSION_SECS`; `DEFAULT_REQUEST_TTL` | `ndn-cert/approval.rs:77-158` |
+| Per-prefix pending group | `ndn-cert/approval.rs:134-139` |
+| ApprovalRecord, ApprovalState, Approver JSON | `ndn-cert/approval.rs:160-238` |
+| Verification code, normalization | `ndn-cert/approval.rs:254-281` |
+| RefusalKind names | `ndn-cert/approval.rs:290-312` |
+| Status of unknown / expired record | `ndn-cert/approval.rs:431-460` |
+| Listing order, pending filter, prune rule | `ndn-cert/approval.rs:462-510` |
+| Opening / resuming a record; limits; request id drawn before the invite; invite redeemed after durable save | `ndn-cert/approval.rs:518-633` |
+| Decision recording, final, expiry reset, wake STATUS | `ndn-cert/approval.rs:654-713` |
+| Decision check order, evidence base64url | `ndn-cert/approval.rs:725-791` |
+| PENDING authorization, then freshness (`check_listing_fresh`) | `ndn-cert/approval.rs:799-886` |
+| RequestStatus JSON | `ndn-cert/approval.rs:919-936` |
+| STATUS name, parse (n+3 components), hold | `ndn-cert/approval.rs:962-992` |
+| Code / id lookup | `ndn-cert/approval.rs:1058-1091` |
+| Decision name parse | `ndn-cert/approval.rs:1094-1107` |
+| Walk validator, 6 supplied certs, depth 8 | `ndn-cert/approval.rs:1111-1132` |
+| Admin Data validation, revocation | `ndn-cert/approval.rs:1134-1170` |
+| Answer JSON enums; handlers; PENDING replay record; immediate STATUS (`status_now`); held-STATUS limits | `ndn-cert/approval.rs:1203-1324` |
+| Answer when decided / deadline / stopping | `ndn-cert/approval.rs:1332-1385` |
+| Decision Data construction | `ndn-cert/approval.rs:1389-1422` |
+| Approver checks CA answer chain | `ndn-cert/approval.rs:1454-1479` |
+| PENDING Interest (signed, MustBeFresh, chain params) | `ndn-cert/approval.rs:1490-1517` |
+| APPROVAL Interest (unsigned, MustBeFresh) | `ndn-cert/approval.rs:1523-1552` |
+| CA prefix from context | `ndn-cert/approval.rs:1565-1578` |
+| Admin chain building, ≤ 6 | `ndn-cert/approval.rs:1586-1615` |
+| Unsigned answers never final; `PolicyDenied` → name refused | `ndn-cert/approval.rs:1680-1706` |
+| Poll: params, code check, expires | `ndn-cert/approval.rs:1717-1794` |
+| STATUS Interest and answer checks | `ndn-cert/approval.rs:1807-1861` |
+| Outgoing grace 86400 s, overdue | `ndn-cert/approval.rs:1882-1897` |
+| Request id = 8 random bytes hex, RNG failure an error | `ndn-cert/approval.rs:2070-2076` |
 | `device-approval` handler: params, record → response, pending parameters, attestation | `ndn-cert/challenge/device_approval.rs:26-231` |
 | Invite needed beside approval (live check, redeem later) | `ndn-cert/challenge/device_approval.rs:72-112` |
 | Renewal constants and proof message | `ndn-cert/renewal.rs:66-95` |
@@ -1059,41 +1161,43 @@ Paths are relative to the workspace root. `ndn-cert` =
 | `issuers` parsing, ≤ 8 | `ndn-cert/ca.rs:1338-1366` |
 | Offered challenges incl. `renewal` | `ndn-cert/ca.rs:291-305` |
 | Session cleanup; 60 s window | `ndn-cert/ca.rs:217-221,669-756,1333-1334` |
-| CHALLENGE handling, status/error mapping | `ndn-cert/ca.rs:760-1003` |
+| CHALLENGE handling, status/error mapping, unoffered or changed type → ErrorCode 4 | `ndn-cert/ca.rs:760-1003` |
 | `refused()` helper | `ndn-cert/ca.rs:1410-1416` |
 | Issued name `<key>/NDNCERT/v=` | `ndn-cert/ca.rs:1195-1224,1265-1276` |
-| NDNCERT request id random bytes | `ndn-cert/ca.rs:1381-1385` |
+| NDNCERT request id random bytes, RNG failure an error | `ndn-cert/ca.rs:1381-1385` |
 | Response signer KeyLocator = CA cert name | `ndn-cert/ca.rs:612-617` |
-| TLV numbers, parameter codec, plaintext, response encode / decode, status codes | `ndn-cert/tlv.rs:44-121,420-585` |
+| TLV numbers, parameter codec, plaintext, response encode / decode, status codes | `ndn-cert/tlv.rs:44-121,420-589` |
+| NonNegativeInteger fields (1, 2, 4, 8 octets); failure answer `ErrorTlv` | `ndn-cert/tlv.rs:541-562,591-657` |
 | ErrorCode values | `ndn-cert/protocol.rs:76-86` |
-| Requester: cert request, request id hex, status handling | `ndn-cert/client.rs:91-151,228-290` |
-| Requester: run / one round / challenge name | `ndn-cert/client.rs:400-512` |
-| Certificate fetch with ForwardingHint | `ndn-cert/client.rs:530-545` |
-| Responses not validated | `ndn-cert/client.rs:618-621` |
-| Producer dispatch, unanswered errors, Nacks, held STATUS | `ndn-rs/crates/security/ndn-identity/src/ca.rs:211-426` |
-| Token grammar | `ndn-cert/roles.rs:303-340` |
+| CertError → ErrorCode / ErrorInfo (CA); ErrorCode → CertError (requester) | `ndn-cert/error.rs:46-126` (`ndncert_error_code`, `ndncert_error_info`, `from_ca_failure`) |
+| Salt, IV and ids from the RNG (`fill_random`) | `ndn-cert/ecdh.rs:43-72` |
+| Requester: cert request, request id hex, failure answers, status handling | `ndn-cert/client.rs:91-153,229-293` |
+| Requester: run / one round / challenge name | `ndn-cert/client.rs:396-508` |
+| Certificate fetch with ForwardingHint | `ndn-cert/client.rs:526-541` |
+| Responses not validated; failure answer read (`refuse_if_failure`) | `ndn-cert/client.rs:614-634` |
+| Producer dispatch by exact component, failure answers, Nacks, held and immediate STATUS | `ndn-rs/crates/security/ndn-identity/src/ca.rs:327-475` (`handle_interest`, `ca_endpoint`, `only_params_digest`, `answer_or_failure`) |
+| Token grammar, malformed expiry, `now < until` | `ndn-cert/roles.rs:303-359` (`token_expiry`, `MalformedTokenExpiry`, `token_expired`) |
 | Device-key parse, role names | `ndn-cert/roles.rs:67-101,259-301` |
-| Schema rules `#approve`, `#deny`, `#pending` | `ndn-cert/roles.rs:395-403` |
-| TokenStore: redemption hash, live, consume, scope | `ndn-cert/challenge/token.rs:88,209,227` (`token_hash`, `is_live`, `check_and_consume`) |
-| `token` challenge | `ndn-cert/challenge/token.rs:279` (`impl ChallengeHandler for TokenChallenge`) |
-| CA token loading rules (role scope, untagged → member, admin/node refused, `-until` → TTL) | `ndn-cert/challenge/token.rs:162-187` (`TokenStore::add_invite_tokens`) |
+| Schema rules `#approve`, `#deny`, `#pending` | `ndn-cert/roles.rs:414-422` |
+| TokenStore: redemption hash, live, consume, scope | `ndn-cert/challenge/token.rs:88,107,228,246` (`token_hash`, `live_at`, `is_live`, `check_and_consume`) |
+| `token` challenge | `ndn-cert/challenge/token.rs:296` (`impl ChallengeHandler for TokenChallenge`) |
+| CA token loading rules (role scope, untagged → member, admin/node refused, `-until` second as expiry, malformed refused) | `ndn-cert/challenge/token.rs:170-206` (`TokenStore::add_invite_tokens`) |
 | ApprovalPolicy, hint mapping, RolePolicy issuance | `ndn-cert/policy.rs:368,399,536` (`ApprovalPolicy`, `from_hint`, `impl IssuancePolicy for RolePolicy`) |
 | CA enforces the advertised approval policy | `ndn-cert/ca_policy.rs:274-300` (`ApprovalPolicy::reconcile`) |
-| Invite checks (expiry `now >= until`, role) | `ndn-cert/invite.rs:89-152` (`InviteLink::from_envelope`) |
+| Invite checks (expiry `token_expired`, malformed refused, role) | `ndn-cert/invite.rs:90-155` (`InviteLink::from_envelope`) |
 | Token minting (16 bytes hex, `-until`) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:140-142,184-187,247-255` |
 | CA: TTL ≠ 0, namespace CA, policy from context | `ndn-fwd/binaries/ndn-fwd/src/ca.rs:99-201` |
 | CA: challenge set, implied `device-approval`, invite requirement | `ndn-fwd/binaries/ndn-fwd/src/ca.rs:597-695` |
-| Requester routing table, CA prefix choice | `ndn-rs/crates/security/ndn-namespace/src/enroll.rs:401-450` (`route`) |
-| Opening and recording a request | `ndn-rs/crates/security/ndn-namespace/src/enroll.rs:645-754` (`enroll_by_approval`) |
-| Status wait, retry 1→60 s, probing, deadline lifetimes (ndn-fwd and ndn-mobile) | `ndn-rs/crates/security/ndn-namespace/src/approval_wait.rs:44-45,137-294` (`wait_for_decision`) |
-| Issue on approval | `ndn-rs/crates/security/ndn-namespace/src/approval_wait.rs:336-435` |
-| Approver: admin credential selection, listing, local-first decide, remote push | `ndn-rs/crates/security/ndn-namespace/src/approver.rs:72-146,152-275` |
+| Requester routing table, CA prefix choice | `ndn-rs/crates/security/ndn-namespace/src/enroll.rs:395-430` (`route`) |
+| Opening and recording a request | `ndn-rs/crates/security/ndn-namespace/src/enroll.rs:626-731` (`enroll_by_approval`) |
+| Status wait, retry 1→60 s, probing, deadline lifetimes (ndn-fwd and ndn-mobile) | `ndn-rs/crates/security/ndn-namespace/src/approval_wait.rs:44-45,137-292` (`wait_for_decision`) |
+| Issue on approval | `ndn-rs/crates/security/ndn-namespace/src/approval_wait.rs:334-427` |
+| Approver: admin credential selection, listing, local-first decide, remote push | `ndn-rs/crates/security/ndn-namespace/src/approver.rs:72-146,152-273` |
 | URI form | `ndn-rs/crates/core/ndn-foundation-types/src/name.rs:539-638` |
 | Public-key bytes (SPKI unwrap) | `ndn-rs/crates/security/ndn-security/src/cert_cache.rs:34-37`; `ndn-rs/crates/security/ndn-security/src/spki.rs:31-60` |
 | Cert-request Content is SPKI | `ndn-rs/crates/security/ndn-security/src/manager.rs:556-565` |
 | Signed Interest SignatureNonce / SignatureTime | `ndn-rs/crates/core/ndn-packet/src/encode/interest.rs:388-405` |
 | Signature dispatch (public-key types only; MAC and digest types refused) | `ndn-rs/crates/security/ndn-security/src/verifier.rs:26-102` |
 | Interest chain validation | `ndn-rs/crates/security/ndn-security/src/validator/chain.rs:183-232` |
-| Random ids fall back to zero bytes on `getrandom` failure | `ndn-cert/approval.rs:1991-1995`; `ndn-cert/ca.rs:1381-1385`; `ndn-rs/crates/security/ndn-security/src/cert_name.rs:64-69` |
-| Endpoint dispatch by URI substring | `ndn-rs/crates/security/ndn-identity/src/ca.rs:346-409` |
-| Local listing shows all records, remote only pending | `ndn-rs/crates/security/ndn-namespace/src/approver.rs:161`; `ndn-cert/approval.rs:1207-1209` |
+| New key ids from the RNG, failure an error | `ndn-rs/crates/security/ndn-security/src/cert_name.rs:62-72` (`new_key_name`) |
+| Local listing shows all records, remote only pending (Decision Q9) | `ndn-rs/crates/security/ndn-namespace/src/approver.rs:161`; `ndn-cert/approval.rs:1278-1280` |

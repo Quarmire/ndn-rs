@@ -41,7 +41,10 @@ pub const TRUST_SCHEMA_BLOB: u64 = 0x0413;
 /// connectivity/future-join hint.
 pub const CA_ENDPOINT: u64 = 0x0414;
 
-/// `{1 = native-text, 2 = lvs-binary}` schema encoding. Critical.
+/// `{1 = native-text, 2 = lvs-binary}` schema encoding, exactly one octet.
+/// Critical. Another code makes its blob not understood: it authorizes
+/// nothing and is re-emitted verbatim ([`SchemaFormat::Unknown`](super::SchemaFormat::Unknown));
+/// a context with no understood blob is refused.
 pub const SCHEMA_FORMAT: u64 = 0x0415;
 
 /// Schema bytes interpreted per [`SCHEMA_FORMAT`]. Critical.

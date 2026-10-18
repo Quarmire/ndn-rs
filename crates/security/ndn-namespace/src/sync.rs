@@ -682,6 +682,7 @@ mod tests {
             own_certs: None,
             sync: Some(sync),
             ca: None,
+            words: Default::default(),
         }));
         groups.spawn(Arc::clone(&admin), cancel.child_token());
         admin
@@ -1139,6 +1140,7 @@ mod tests {
             own_certs: None,
             sync: Some(sync),
             ca: None,
+            words: Default::default(),
         });
 
         let results = crate::refresh::refresh_contexts(&admin, Some(ns.clone()))

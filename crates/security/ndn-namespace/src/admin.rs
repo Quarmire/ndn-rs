@@ -13,8 +13,9 @@
 //! hand-over that gets no answer in time (the device may be busy with
 //! another change of the namespace) is made again with **the same
 //! version**, which the device answers once that version is decided: taken
-//! (also when it took it already) or refused. [`HAND_OVER_FAILURES`]
-//! transport failures in a row end it as [`NotTaken::Unknown`]. Only
+//! (also when it took it already) or refused. [`HAND_OVER_WAITS`] waits
+//! without an answer, or [`HAND_OVER_FAILURES`] transport failures in a
+//! row, end it as [`NotTaken::Unknown`]. Only
 //! [`NotTaken::Refused`] — nothing was handed over, or the device answered
 //! that it did not take it — lets the caller undo what it made for the
 //! version (a kit file, the keys of a recovered root); after
@@ -55,11 +56,18 @@ use ndn_cert::ContextBump;
 use ndn_cert::report::{ContextRefreshInfo, RefreshState};
 use ndn_packet::{Data, Name};
 
+use crate::HostWords;
 use crate::host::ContextStore;
 
 /// How many transport failures in a row, other than a wait without an
 /// answer, end a hand-over as [`NotTaken::Unknown`].
 pub const HAND_OVER_FAILURES: usize = 2;
+
+/// How many waits without an answer, in all, end a hand-over as
+/// [`NotTaken::Unknown`] ([`HandOverError::Unanswered`]): a wedged device
+/// must not keep the caller waiting forever (`ndn-fwd` waits 30 s each, so
+/// about five minutes).
+pub const HAND_OVER_WAITS: usize = 10;
 
 /// Why a version handed to the running device ([`hand_over`]) was not
 /// taken.
@@ -163,6 +171,12 @@ pub enum HandOverError {
         version: u64,
         failure: String,
     },
+    /// Handed over [`HAND_OVER_WAITS`] times, never answered.
+    Unanswered {
+        peer: String,
+        version: u64,
+        waits: usize,
+    },
     /// No device runs, and the version could not be kept for its next start.
     NotStored(String),
 }
@@ -196,6 +210,15 @@ impl fmt::Display for HandOverError {
                 f,
                 "handing v{version} to {peer} failed without an answer ({failure})"
             ),
+            HandOverError::Unanswered {
+                peer,
+                version,
+                waits,
+            } => write!(
+                f,
+                "{peer} never answered on v{version}, handed to it {waits} times: whether it \
+                 adopts that version is not known (it may still)"
+            ),
             HandOverError::NotStored(why) => f.write_str(why),
         }
     }
@@ -225,6 +248,7 @@ where
     let version = bump.context.version();
     let mut sent = false;
     let mut failures = 0;
+    let mut waits = 0;
     loop {
         let failure = match sink.hand_over(&bump.data).await {
             Ok(info) => return Ok(HandedOver::Taken(info)),
@@ -261,8 +285,19 @@ where
             }
             Err(SinkError::NoAnswer) => {
                 sent = true;
-                sink.no_answer_yet(version);
                 failures = 0;
+                waits += 1;
+                if waits >= HAND_OVER_WAITS {
+                    return Err(NotTaken::Unknown(
+                        HandOverError::Unanswered {
+                            peer: sink.peer(),
+                            version,
+                            waits,
+                        }
+                        .into(),
+                    ));
+                }
+                sink.no_answer_yet(version);
                 continue;
             }
             Err(SinkError::Failed(e)) => e,
@@ -321,13 +356,19 @@ pub enum NewestRefusal {
         detail: String,
     },
     /// Nothing answered: whether the held version is the newest is unknown.
+    /// `recover_from_held`: the host's [`HostWords::recover_from_held`].
     Unreachable {
         namespace: Name,
         held_version: u64,
         detail: String,
+        recover_from_held: String,
     },
     /// The device holds the namespace root: nothing to recover.
-    Source { namespace: Name },
+    /// `root_key_status`: the host's [`HostWords::root_key_status`].
+    Source {
+        namespace: Name,
+        root_key_status: String,
+    },
     /// The newest version could not be fetched.
     Failed {
         namespace: Name,
@@ -335,8 +376,12 @@ pub enum NewestRefusal {
         detail: String,
     },
     /// The device holds no version, and there is no expected fingerprint to
-    /// adopt one with.
-    NotHeld { namespace: Name },
+    /// adopt one with. `adopt_anchor_link`: the host's
+    /// [`HostWords::adopt_anchor_link`].
+    NotHeld {
+        namespace: Name,
+        adopt_anchor_link: String,
+    },
 }
 
 impl fmt::Display for NewestRefusal {
@@ -355,18 +400,22 @@ impl fmt::Display for NewestRefusal {
                 namespace,
                 held_version,
                 detail,
+                recover_from_held,
             } => write!(
                 f,
                 "{detail}. Recovering from the held v{held_version} without knowing it is the \
                  newest could fork the namespace: give this device a face and a route toward a \
                  relay or member that holds it, then retry. If no other node holding {namespace} \
                  exists or can be reached, and you know no version newer than v{held_version} \
-                 was made, retry with --from-held"
+                 was made, {recover_from_held}"
             ),
-            NewestRefusal::Source { namespace } => write!(
+            NewestRefusal::Source {
+                namespace,
+                root_key_status,
+            } => write!(
                 f,
-                "this device holds the root of {namespace} (`ndn-fwd root-key status`): it is the \
-                 root device, nothing to recover"
+                "this device holds the root of {namespace} ({root_key_status}): it is the root \
+                 device, nothing to recover"
             ),
             NewestRefusal::Failed {
                 namespace,
@@ -379,12 +428,14 @@ impl fmt::Display for NewestRefusal {
                  namespace: make sure this device reaches the namespace (a face and a route \
                  toward a relay or member that holds it), then retry"
             ),
-            NewestRefusal::NotHeld { namespace } => write!(
+            NewestRefusal::NotHeld {
+                namespace,
+                adopt_anchor_link,
+            } => write!(
                 f,
                 "this device's daemon holds no trust context for {namespace}. Adopt it first \
-                 with the namespace's anchor link (`ndn-fwd adopt <ndn-trust://anchor/…>`, the \
-                 link `ndn-fwd init` printed), so the version recovered from is authenticated, \
-                 then retry"
+                 with the namespace's anchor link ({adopt_anchor_link}), so the version recovered \
+                 from is authenticated, then retry"
             ),
         }
     }
@@ -412,11 +463,12 @@ pub trait NewestSource: Send + Sync {
 /// The anti-fork decision on a refresh of the held version of `namespace`:
 /// a recovery starts from the newest version only. `from_held`: the
 /// operator vouches that no version newer than the held one exists, for
-/// when nothing answers.
+/// when nothing answers. `words`: the host's, for the refusal.
 pub fn newest_of(
     namespace: &Name,
     refresh: &ContextRefreshInfo,
     from_held: bool,
+    words: &HostWords,
 ) -> Result<Newest, NewestRefusal> {
     let refused = |detail: &str| (namespace.clone(), refresh.held_version, detail.to_string());
     match refresh.state {
@@ -442,10 +494,12 @@ pub fn newest_of(
                 namespace,
                 held_version,
                 detail,
+                recover_from_held: words.recover_from_held.clone(),
             })
         }
         RefreshState::Source => Err(NewestRefusal::Source {
             namespace: namespace.clone(),
+            root_key_status: words.root_key_status.clone(),
         }),
         RefreshState::Failed => {
             let (namespace, held_version, detail) = refused(&refresh.detail);
@@ -461,21 +515,24 @@ pub fn newest_of(
 /// Make the running device hold the newest version of `namespace`, fetched
 /// by name ([`newest_of`]); a device holding none adopts it only with the
 /// namespace's expected fingerprint `kit_fingerprint` (a file kit's).
+/// `words`: the host's, for the refusals.
 pub async fn fetch_newest<S>(
     source: &S,
     namespace: &Name,
     kit_fingerprint: Option<[u8; 32]>,
     from_held: bool,
+    words: &HostWords,
 ) -> Result<Newest, S::Error>
 where
     S: NewestSource + ?Sized,
 {
     if let Some(refresh) = source.refresh(namespace).await? {
-        return Ok(newest_of(namespace, &refresh, from_held)?);
+        return Ok(newest_of(namespace, &refresh, from_held, words)?);
     }
     let Some(fingerprint) = kit_fingerprint else {
         return Err(NewestRefusal::NotHeld {
             namespace: namespace.clone(),
+            adopt_anchor_link: words.adopt_anchor_link.clone(),
         }
         .into());
     };
@@ -657,6 +714,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_device_that_never_answers_leaves_it_unknown_after_the_last_wait() {
+        // A failure in between does not restart the count of waits.
+        let mut answers = vec![Err(SinkError::NoAnswer), failed()];
+        answers.extend((1..HAND_OVER_WAITS).map(|_| Err(SinkError::NoAnswer)));
+        let (out, device) = run(answers).await;
+        let Err(NotTaken::Unknown(e)) = out else {
+            panic!("unknown")
+        };
+        assert_eq!(
+            e.0,
+            format!(
+                "the device never answered on v1, handed to it {HAND_OVER_WAITS} times: whether \
+                 it adopts that version is not known (it may still)"
+            )
+        );
+        let sent = device.sent.lock();
+        assert_eq!(sent.len(), HAND_OVER_WAITS + 1, "no hand-over after the last wait");
+        assert!(sent.iter().all(|wire| wire == &sent[0]), "the same version");
+        assert_eq!(device.waits.load(Ordering::SeqCst), HAND_OVER_WAITS - 1);
+    }
+
+    #[tokio::test]
     async fn refused_only_when_nothing_was_handed_over_or_the_device_says_so() {
         let not_reached = || Err(SinkError::NotReached(Error("another PIB".into())));
         let refused = || {
@@ -764,7 +843,8 @@ mod tests {
     #[test]
     fn a_recovery_starts_from_the_newest_version_only() {
         let ns: Name = "/home/bob".parse().unwrap();
-        let newest = |state, from_held| newest_of(&ns, &refreshed(state), from_held);
+        let words = crate::HostWords::default();
+        let newest = |state, from_held| newest_of(&ns, &refreshed(state), from_held, &words);
         for state in [
             RefreshState::Updated,
             RefreshState::Current,
@@ -805,10 +885,11 @@ mod tests {
             refresh: None,
             adopted: Mutex::new(None),
         };
-        let refused = fetch_newest(&source, &ns, None, true).await.unwrap_err();
+        let words = crate::HostWords::default();
+        let refused = fetch_newest(&source, &ns, None, true, &words).await.unwrap_err();
         assert!(refused.0.contains("holds no trust context for /home/bob"));
         assert!(source.adopted.lock().is_none());
-        let newest = fetch_newest(&source, &ns, Some([9; 32]), false)
+        let newest = fetch_newest(&source, &ns, Some([9; 32]), false, &words)
             .await
             .unwrap();
         assert_eq!((newest.version, newest.confirmed), (7, true));
@@ -819,7 +900,7 @@ mod tests {
             adopted: Mutex::new(None),
         };
         assert_eq!(
-            fetch_newest(&held, &ns, Some([9; 32]), false)
+            fetch_newest(&held, &ns, Some([9; 32]), false, &words)
                 .await
                 .unwrap()
                 .version,

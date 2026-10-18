@@ -24,7 +24,9 @@ pub enum PatternComponent {
     Literal(NameComponent),
     /// Binds one component to a named variable.
     Capture(Arc<str>),
-    /// Binds one or more trailing components to a named variable.
+    /// Matches every remaining component — zero or more — and binds
+    /// nothing (the name is only a label). Must be last. Zero lets
+    /// `/x/<id>/<!KEY>/<**data>` admit `/x/a/notes` as well as deeper names.
     MultiCapture(Arc<str>),
     /// Matches exactly one component that is **not** this literal (binds
     /// nothing). Lets a rule cover "anything under `/x/<id>` except its
@@ -37,9 +39,9 @@ pub enum PatternComponent {
 /// `/sensor/<node>/KEY/<id>`" where `<node>` must match in both patterns.
 ///
 /// Text format: `/`-separated components; `/literal` is a literal,
-/// `/<var>` captures one component, `/<**var>` captures all remaining
-/// components (must be last), `/<!literal>` matches one component other than
-/// `literal`.
+/// `/<var>` captures one component, `/<**var>` matches all remaining
+/// components, zero or more, binding nothing (must be last), `/<!literal>`
+/// matches one component other than `literal`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamePattern(pub Vec<PatternComponent>);
 
@@ -623,6 +625,25 @@ mod tests {
         let p = NamePattern::parse("/org/<**rest>").unwrap();
         assert_eq!(p.0.len(), 2);
         assert!(matches!(&p.0[1], PatternComponent::MultiCapture(v) if v.as_ref() == "rest"));
+    }
+
+    /// `<**v>` matches zero or more trailing components and binds nothing:
+    /// the generated namespace schema's `/<dev>/<!KEY>/<**data>` relies on
+    /// zero for a one-component data name.
+    #[test]
+    fn multi_capture_matches_zero_or_more_and_binds_nothing() {
+        let p = NamePattern::parse("/org/<**rest>").unwrap();
+        for name in ["/org", "/org/a", "/org/a/b/c"] {
+            let mut b = HashMap::new();
+            assert!(p.matches(&name.parse().unwrap(), &mut b), "{name}");
+            assert!(b.is_empty(), "{name} bound {b:?}");
+        }
+        assert!(!p.matches(&"/other".parse().unwrap(), &mut HashMap::new()));
+        let rule = SchemaRule::parse("/x/<dev>/<!KEY>/<**data> => /x/<dev>/KEY/<k>").unwrap();
+        let key = "/x/a/KEY/k1".parse().unwrap();
+        assert!(rule.check(&"/x/a/notes".parse().unwrap(), &key));
+        assert!(rule.check(&"/x/a/notes/2026/v1".parse().unwrap(), &key));
+        assert!(!rule.check(&"/x/a".parse().unwrap(), &key));
     }
 
     #[test]

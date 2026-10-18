@@ -177,7 +177,7 @@ fn key(role: &str, device: &str, seed: u8) -> Arc<dyn Signer> {
     let identity = ns().append(role).append(device);
     Arc::new(Ed25519Signer::from_seed(
         &[seed; 32],
-        new_device_key_name(&identity),
+        new_device_key_name(&identity).unwrap(),
     ))
 }
 

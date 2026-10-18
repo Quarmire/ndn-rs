@@ -100,8 +100,18 @@ pub enum AdoptError {
     UnsupportedSignature(u64),
     #[error("context signature does not verify under anchor {0}")]
     BadSignature(String),
+    #[error(
+        "context signer {0} is outside its certificate's ValidityPeriod now (expired, or not \
+         yet valid: check this device's clock); ask the namespace's owner for a current version"
+    )]
+    SignerNotValid(String),
     #[error("refused: context version {offered} is older than the held version {held}")]
     Rollback { offered: u64, held: u64 },
+    #[error(
+        "refused: this context is version {0}, the version held, but its content differs from \
+         the held one (a fork); only a newer version replaces it"
+    )]
+    Fork(u64),
     #[error(
         "refused: the fetched context is version {offered}, older than version {required} \
          named by the invite/QR (an outdated or replayed context); retry once the namespace \
@@ -162,6 +172,7 @@ impl From<OpenContextError> for AdoptError {
             OpenContextError::SignerNotAnchor(s) => Self::SignerNotAnchor(s),
             OpenContextError::UnsupportedSignature(t) => Self::UnsupportedSignature(t),
             OpenContextError::BadSignature(a) => Self::BadSignature(a),
+            OpenContextError::SignerNotValid(a) => Self::SignerNotValid(a),
         }
     }
 }
@@ -178,15 +189,15 @@ pub fn open_signed_context(data: &Data) -> Result<(SignedTrustContext, Certifica
     ))?)
 }
 
-/// [`SignedTrustContext::open_signed`] plus the out-of-band checks: the
-/// context roots `namespace` and its signing anchor has
+/// [`SignedTrustContext::open_received`] plus the out-of-band checks: the
+/// context roots `namespace`, its signing anchor is valid now and has
 /// `expected_fingerprint`. Adopts nothing.
 async fn authenticate(
     context_data: &Data,
     namespace: &Name,
     expected_fingerprint: &[u8; 32],
 ) -> Result<SignedTrustContext, AdoptError> {
-    let (ctx, signer) = SignedTrustContext::open_signed(context_data).await?;
+    let (ctx, signer) = SignedTrustContext::open_received(context_data).await?;
     if ctx.namespace() != namespace {
         return Err(AdoptError::NamespaceMismatch {
             expected: namespace.to_string(),
@@ -445,13 +456,17 @@ fn adopt_arc_into(
     ctx: Arc<SignedTrustContext>,
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
     if keyring.adopt(Arc::clone(&ctx)) {
-        Ok(ctx)
-    } else {
-        Err(AdoptError::Rollback {
-            offered: ctx.version(),
-            held: keyring.version_of(ctx.namespace()).unwrap_or_default(),
-        })
+        return Ok(ctx);
     }
+    let held = keyring.version_of(ctx.namespace()).unwrap_or_default();
+    Err(if held == ctx.version() {
+        AdoptError::Fork(held)
+    } else {
+        AdoptError::Rollback {
+            offered: ctx.version(),
+            held,
+        }
+    })
 }
 
 /// TLV type of the Name inside RDR metadata Content.

@@ -162,3 +162,39 @@ async fn failed_save_keeps_invite() {
     assert!(working.get(&id).unwrap().invite);
     assert!(!tokens.is_live("invite-token"));
 }
+
+/// A PENDING Interest is answered once: replayed (same SignatureNonce and
+/// SignatureTime from the same key), or signed outside the grace window,
+/// it is refused as unauthorized.
+#[tokio::test]
+async fn a_replayed_or_stale_pending_interest_is_refused() {
+    use ndn_cert::approval::{LISTING_SIG_TIME_GRACE, check_listing_fresh};
+    use ndn_packet::Interest;
+    use ndn_packet::encode::InterestBuilder;
+    use ndn_security::{Ed25519Signer, ReplayGuard, Signer};
+
+    let key: Name = "/home/bob/admin/laptop/KEY/k".parse().unwrap();
+    let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[3; 32], key.clone()));
+    let sign = Arc::clone(&signer);
+    let wire = InterestBuilder::new("/home/bob/CA/PENDING".parse::<Name>().unwrap())
+        .must_be_fresh()
+        .app_parameters(Vec::new())
+        .sign_fallible(signer.sig_type(), Some(&key), |region| {
+            let region = region.to_vec();
+            async move { sign.sign(&region).await }
+        })
+        .await
+        .unwrap();
+    let interest = Interest::decode(wire).unwrap();
+    let signed_at = interest.sig_info().unwrap().sig_time.unwrap();
+
+    let seen = ReplayGuard::new(64, false);
+    assert!(check_listing_fresh(&interest, &seen, signed_at).is_ok());
+    let replayed = check_listing_fresh(&interest, &seen, signed_at + 1_000).unwrap_err();
+    assert_eq!(replayed.kind, RefusalKind::Unauthorized);
+    // Past the window it is refused even by a CA that never saw it (one
+    // that restarted since).
+    let late = signed_at + LISTING_SIG_TIME_GRACE.as_millis() as u64 + 1;
+    let stale = check_listing_fresh(&interest, &ReplayGuard::new(64, false), late).unwrap_err();
+    assert_eq!(stale.kind, RefusalKind::Unauthorized);
+}

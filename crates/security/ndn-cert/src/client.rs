@@ -125,6 +125,7 @@ impl EnrollmentSession {
     }
 
     pub fn handle_new_response(&mut self, body: &[u8]) -> Result<(), CertError> {
+        refuse_if_failure(body)?;
         let resp = NewResponseTlv::decode(bytes::Bytes::copy_from_slice(body))?;
 
         if resp.challenges.is_empty() {
@@ -143,7 +144,7 @@ impl EnrollmentSession {
 
         self.session_key = Some(session_key);
         self.request_id_bytes = Some(resp.request_id);
-        self.encryption_iv = Some(new_encryption_iv());
+        self.encryption_iv = Some(new_encryption_iv()?);
         self.state = SessionState::AwaitingChallenge {
             request_id: request_id_hex,
             challenges: resp.challenges,
@@ -234,6 +235,7 @@ impl EnrollmentSession {
             CertError::InvalidRequest("no session key — call handle_new_response first".into())
         })?;
 
+        refuse_if_failure(body)?;
         let plaintext =
             session_key.open_envelope(body, &request_id_bytes, &mut self.decryption_iv)?;
 
@@ -244,15 +246,9 @@ impl EnrollmentSession {
                     .error_info
                     .unwrap_or_else(|| "challenge denied".to_string());
                 // NameNotAllowed: the CA refuses the name itself, whatever
-                // the challenge proves.
-                if resp.error_code == Some(crate::protocol::ErrorCode::NameNotAllowed.into()) {
-                    return Err(CertError::PolicyDenied(reason));
-                }
-                // RunOutOfTime: the challenge can no longer pass; start over.
-                if resp.error_code == Some(crate::protocol::ErrorCode::RunOutOfTime.into()) {
-                    return Err(CertError::ChallengeExpired(reason));
-                }
-                Err(CertError::ChallengeFailed(reason))
+                // the challenge proves; RunOutOfTime: the challenge can no
+                // longer pass, start over.
+                Err(CertError::from_ca_failure(resp.error_code, reason))
             }
             // STATUS_CHALLENGE (CA awaits requester) and STATUS_PENDING
             // (CA busy with async work) both require another round.
@@ -621,6 +617,22 @@ fn response_content<'a>(data: &'a Data, step: &str) -> Result<&'a [u8], CertErro
         .ok_or_else(|| CertError::InvalidRequest(format!("{step} response has no content")))
 }
 
+/// A CA failure answer to NEW or CHALLENGE (NDNCERT v0.3: unencrypted
+/// ErrorCode + ErrorInfo) as the error it states.
+fn refuse_if_failure(content: &[u8]) -> Result<(), CertError> {
+    match crate::tlv::ErrorTlv::decode_if_error(content)? {
+        Some(failure) => Err(CertError::from_ca_failure(
+            Some(failure.code),
+            if failure.info.is_empty() {
+                "the CA refused the request".to_string()
+            } else {
+                failure.info
+            },
+        )),
+        None => Ok(()),
+    }
+}
+
 fn now_ns() -> u64 {
     // `web_time` shims `std::time` on wasm32 (reads `Date.now()`); native
     // targets re-export `std::time` unchanged.
@@ -763,7 +775,7 @@ mod tests {
             parameters: Default::default(),
         };
         let plaintext = round1_resp.encode();
-        let mut ca_iv = crate::ecdh::new_encryption_iv();
+        let mut ca_iv = crate::ecdh::new_encryption_iv().unwrap();
         let encrypted = test_key
             .seal_envelope(&plaintext, &request_id_bytes, &mut ca_iv)
             .unwrap();
@@ -809,7 +821,7 @@ mod tests {
             parameters: Default::default(),
         };
         let plaintext_bytes = plaintext_resp.encode();
-        let mut ca_iv = crate::ecdh::new_encryption_iv();
+        let mut ca_iv = crate::ecdh::new_encryption_iv().unwrap();
         let encrypted = test_key
             .seal_envelope(&plaintext_bytes, &request_id_bytes, &mut ca_iv)
             .unwrap();
@@ -851,7 +863,7 @@ mod tests {
             parameters: Default::default(),
         };
         let plaintext = resp.encode();
-        let mut ca_iv = crate::ecdh::new_encryption_iv();
+        let mut ca_iv = crate::ecdh::new_encryption_iv().unwrap();
         let encrypted = test_key
             .seal_envelope(&plaintext, &request_id_bytes, &mut ca_iv)
             .unwrap();

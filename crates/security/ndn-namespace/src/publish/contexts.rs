@@ -201,11 +201,17 @@ fn answer<'a>(contexts: &'a [Published], name: &Name) -> Option<&'a Bytes> {
         if *name == c.metadata_name {
             return Some(&c.metadata);
         }
-        // Exactly `<ns>/32=trust-context/v=<N>`.
+        // Exactly `<ns>/32=trust-context/v=<N>`, the version in canonical
+        // (shortest) form: the stored Data's name, never a different
+        // encoding of the same number.
         if name.len() != c.prefix.len() + 1 || !name.has_prefix(&c.prefix) {
             return None;
         }
-        let version = name.components().last()?.as_version()?;
+        let last = name.components().last()?;
+        let version = last.as_version()?;
+        if *last != ndn_packet::NameComponent::version(version) {
+            return None;
+        }
         c.versions.get(&version)
     })
 }
@@ -499,6 +505,25 @@ mod tests {
         }
     }
 
+    /// A version component in a non-canonical width (`v=1` as `00 01`) names
+    /// no stored Data: answering it would return a Data whose name differs
+    /// from the Interest's.
+    #[test]
+    fn a_non_canonical_version_is_not_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let bob = stored(dir.path(), "/home/bob");
+        let contexts = published(dir.path());
+        let canonical = bob.context.rdr_name();
+        assert_eq!(answer(&contexts, &canonical), Some(bob.context_data.raw()));
+        let prefix = ndn_cert::rdr_prefix(bob.context.namespace());
+        let padded = prefix.append_component(ndn_packet::NameComponent::new(
+            ndn_packet::tlv_type::VERSION,
+            Bytes::from_static(&[0, 1]),
+        ));
+        assert_eq!(padded.components().last().unwrap().as_version(), Some(1));
+        assert_eq!(answer(&contexts, &padded), None);
+    }
+
     #[test]
     fn damaged_store_file_is_not_published() {
         let dir = tempfile::tempdir().unwrap();
@@ -692,6 +717,7 @@ mod tests {
             own_certs: None,
             sync: None,
             ca: None,
+            words: Default::default(),
         });
 
         let results = crate::refresh::refresh_contexts(&device, Some(ns.clone()))

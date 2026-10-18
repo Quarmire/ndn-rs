@@ -90,29 +90,41 @@ impl NameComponent {
         Self::new(tlv_type::SEQUENCE_NUM, encode_nonneg_integer(seq))
     }
 
-    /// The segment number, or `None` if this is not a `SegmentNameComponent`.
+    /// The segment number, or `None` if this is not a `SegmentNameComponent`
+    /// or its value is not a NonNegativeInteger (1, 2, 4 or 8 octets).
     pub fn as_segment(&self) -> Option<u64> {
-        (self.typ == tlv_type::SEGMENT).then(|| decode_nonnegative_integer(&self.value))
+        self.nonneg_integer_of(tlv_type::SEGMENT)
     }
 
-    /// The byte offset, or `None` if this is not a `ByteOffsetNameComponent`.
+    /// The byte offset, or `None` if this is not a `ByteOffsetNameComponent`
+    /// or its value is not a NonNegativeInteger.
     pub fn as_byte_offset(&self) -> Option<u64> {
-        (self.typ == tlv_type::BYTE_OFFSET).then(|| decode_nonnegative_integer(&self.value))
+        self.nonneg_integer_of(tlv_type::BYTE_OFFSET)
     }
 
-    /// The version, or `None` if this is not a `VersionNameComponent`.
+    /// The version, or `None` if this is not a `VersionNameComponent` or its
+    /// value is not a NonNegativeInteger.
     pub fn as_version(&self) -> Option<u64> {
-        (self.typ == tlv_type::VERSION).then(|| decode_nonnegative_integer(&self.value))
+        self.nonneg_integer_of(tlv_type::VERSION)
     }
 
-    /// The timestamp, or `None` if this is not a `TimestampNameComponent`.
+    /// The timestamp, or `None` if this is not a `TimestampNameComponent` or
+    /// its value is not a NonNegativeInteger.
     pub fn as_timestamp(&self) -> Option<u64> {
-        (self.typ == tlv_type::TIMESTAMP).then(|| decode_nonnegative_integer(&self.value))
+        self.nonneg_integer_of(tlv_type::TIMESTAMP)
     }
 
-    /// The sequence number, or `None` if this is not a `SequenceNumNameComponent`.
+    /// The sequence number, or `None` if this is not a
+    /// `SequenceNumNameComponent` or its value is not a NonNegativeInteger.
     pub fn as_sequence_num(&self) -> Option<u64> {
-        (self.typ == tlv_type::SEQUENCE_NUM).then(|| decode_nonnegative_integer(&self.value))
+        self.nonneg_integer_of(tlv_type::SEQUENCE_NUM)
+    }
+
+    fn nonneg_integer_of(&self, typ: u64) -> Option<u64> {
+        if self.typ != typ {
+            return None;
+        }
+        decode_nonnegative_integer(&self.value)
     }
 }
 
@@ -126,22 +138,26 @@ fn encode_nonneg_integer(v: u64) -> Bytes {
     })
 }
 
-fn decode_nonnegative_integer(bytes: &[u8]) -> u64 {
-    let mut val: u64 = 0;
-    for &b in bytes {
-        val = (val << 8) | u64::from(b);
+/// Decode an NDN NonNegativeInteger: big-endian in exactly 1, 2, 4 or 8
+/// octets (NDN Packet Format v0.3 §1.2). Any other width — empty, 3, 5–7, or
+/// more than 8 octets — is `None`, never a truncated or zero value. A
+/// non-minimal width (e.g. `00 01`) is accepted, as ndn-cxx does.
+fn decode_nonnegative_integer(bytes: &[u8]) -> Option<u64> {
+    if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
+        return None;
     }
-    val
+    Some(
+        bytes
+            .iter()
+            .fold(0u64, |val, &b| (val << 8) | u64::from(b)),
+    )
 }
 
 /// Decode a value as a *canonical* NonNegativeInteger: 1/2/4/8 octets in the
 /// spec's minimal width. Returns `None` for any other byte string, so callers
 /// can preserve malformed values verbatim instead of silently rewriting them.
 fn canonical_nonneg_integer(bytes: &[u8]) -> Option<u64> {
-    if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
-        return None;
-    }
-    let v = decode_nonnegative_integer(bytes);
+    let v = decode_nonnegative_integer(bytes)?;
     (encode_nonneg_integer(v).as_ref() == bytes).then_some(v)
 }
 
@@ -567,5 +583,38 @@ mod implicit_digest_tests {
         let dlast = decoded.components().last().unwrap();
         assert_eq!(dlast.typ, tlv_type::IMPLICIT_SHA256);
         assert_eq!(dlast.value.as_ref(), &digest[..]);
+    }
+}
+
+#[cfg(test)]
+mod nonneg_integer_tests {
+    use super::*;
+
+    fn version_component(value: &[u8]) -> NameComponent {
+        NameComponent::new(tlv_type::VERSION, Bytes::copy_from_slice(value))
+    }
+
+    #[test]
+    fn only_ndn_widths_decode() {
+        assert_eq!(version_component(&[7]).as_version(), Some(7));
+        assert_eq!(version_component(&[0, 7]).as_version(), Some(7));
+        assert_eq!(version_component(&[0, 0, 1, 0]).as_version(), Some(256));
+        assert_eq!(
+            version_component(&[0xFF; 8]).as_version(),
+            Some(u64::MAX)
+        );
+        for len in [0usize, 3, 5, 6, 7, 9, 16] {
+            let c = version_component(&[1u8; 16][..len]);
+            assert_eq!(c.as_version(), None, "{len} octets");
+            let seg = NameComponent::new(tlv_type::SEGMENT, c.value.clone());
+            assert_eq!(seg.as_segment(), None, "{len} octets");
+        }
+    }
+
+    #[test]
+    fn more_than_eight_octets_never_drop_high_octets() {
+        // 9 octets whose low 8 read as 1: must not decode as version 1.
+        let c = version_component(&[1, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(c.as_version(), None);
     }
 }
