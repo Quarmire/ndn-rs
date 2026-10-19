@@ -8,10 +8,11 @@ use bytes::Bytes;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::lp::encode_lp_nack;
 use ndn_packet::{NackReason, Name};
-use ndn_security::{SignWith, Signer};
+use ndn_security::SignWith;
 
 use crate::AppError;
 use crate::connection::Connection;
+use crate::signing::DataSigner;
 
 /// Single-use: call exactly one of [`Self::respond`],
 /// [`Self::respond_bytes`], or [`Self::nack`]. Dropping silently
@@ -21,16 +22,17 @@ pub struct Responder {
     /// Needed to encode a valid Nack reply (NDNLPv2 §5.2).
     interest_wire: Bytes,
     /// Set when the `Producer`(crate::Producer) was configured with
-    /// [`with_signer`](crate::Producer::with_signer); makes [`respond`](Self::respond)
-    /// sign instead of emitting a bare digest.
-    signer: Option<Arc<dyn Signer>>,
+    /// [`with_signer`](crate::Producer::with_signer) or
+    /// [`with_signers`](crate::Producer::with_signers); makes
+    /// [`respond`](Self::respond) sign instead of emitting a bare digest.
+    signer: Option<DataSigner>,
 }
 
 impl Responder {
     pub(crate) fn new(
         conn: Arc<dyn Connection>,
         interest_wire: Bytes,
-        signer: Option<Arc<dyn Signer>>,
+        signer: Option<DataSigner>,
     ) -> Self {
         Self {
             conn,
@@ -44,16 +46,24 @@ impl Responder {
     }
 
     /// Build and send a `Data` for `name` + `content`. If the producer was
-    /// configured with a signer, the reply is **signed** with the producer's
-    /// identity; otherwise it carries a `DigestSha256` (integrity, not
-    /// authorship). For full control over the wire (custom signing, pre-built
-    /// packets) use [`respond_bytes`](Self::respond_bytes).
+    /// configured with a signer, the reply is **signed**: with that signer,
+    /// or — for [`with_signers`](crate::Producer::with_signers) — with the
+    /// key the device's identities choose for `name`; when none may sign
+    /// `name` nothing is sent and the error says why
+    /// ([`AppError::Signing`]). Without a signer the reply carries a
+    /// `DigestSha256` (integrity, not authorship). For full control over the
+    /// wire (custom signing, pre-built packets) use
+    /// [`respond_bytes`](Self::respond_bytes).
     pub async fn respond(self, name: Name, content: impl Into<Bytes>) -> Result<(), AppError> {
         let content = content.into();
+        let signer = match &self.signer {
+            Some(signing) => Some(signing.signer_for(&name)?),
+            None => None,
+        };
         let builder = DataBuilder::new(name, &content);
-        let wire = match &self.signer {
+        let wire = match signer {
             Some(signer) => builder
-                .sign_with_sync(&**signer)
+                .sign_with_sync(&*signer)
                 .map_err(|e| AppError::Protocol(e.to_string()))?,
             None => builder.build(),
         };

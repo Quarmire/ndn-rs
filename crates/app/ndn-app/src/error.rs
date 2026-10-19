@@ -61,6 +61,13 @@ pub enum AppError {
     /// re-dial) or build the pattern type directly from `Node::connection`.
     #[error("unsupported on this handle: {0}")]
     Unsupported(String),
+    /// The Data was not sent: no key of this device may sign its name. The
+    /// error says which trusted prefix and what to do — the device only
+    /// follows it (enroll in it to publish), or no identity covers the name
+    /// (sign with an explicit key). Never signed with another prefix's key,
+    /// never sent unsigned instead.
+    #[error("data not sent: {0}")]
+    Signing(#[source] ndn_security::TrustError),
 }
 
 impl AppError {

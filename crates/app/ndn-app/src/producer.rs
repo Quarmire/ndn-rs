@@ -15,13 +15,14 @@ use ndn_ipc::{ChunkedProducer, ForwarderClient};
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};
-use ndn_security::Signer;
+use ndn_security::{SecurityManager, Signer};
 
 use crate::AppError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
 use crate::connection::{Connection, InProcConnection};
 use crate::responder::Responder;
+use crate::signing::DataSigner;
 
 /// Default RDR segment size when the caller passes `chunk_size == 0`. Mirrors
 /// `ndn_ipc::NDN_DEFAULT_SEGMENT_SIZE`; redefined here so the wasm build (which
@@ -72,7 +73,7 @@ pub struct PublishOptions {
 pub struct Producer {
     conn: Arc<dyn Connection>,
     prefix: Name,
-    signer: Option<Arc<dyn Signer>>,
+    signer: Option<DataSigner>,
 }
 
 impl Producer {
@@ -93,7 +94,19 @@ impl Producer {
     /// bare `DigestSha256`. Without it the producer is unsigned-by-default
     /// (integrity only) — fine for forwarding tests, not for authentic content.
     pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
-        self.signer = Some(signer);
+        self.signer = Some(DataSigner::Fixed(signer));
+        self
+    }
+
+    /// Sign each reply with the key `identities` chooses by the Data's name
+    /// ([`SecurityManager::signer_for`]): a device taking part in several
+    /// trusted prefixes signs each prefix's Data with its key in that prefix.
+    /// A Data no key of the device may sign (a prefix the device only
+    /// follows, a name no identity covers) is not sent:
+    /// [`Responder::respond`](crate::Responder::respond) and the object
+    /// publishers answer [`AppError::Signing`] with why and what to do.
+    pub fn with_signers(mut self, identities: Arc<SecurityManager>) -> Self {
+        self.signer = Some(DataSigner::ByName(identities));
         self
     }
 
@@ -292,7 +305,13 @@ impl Producer {
     /// matching/build/sign lives in [`PreparedObject::answer_interest`], so this
     /// and the demultiplexed serve path stay in lockstep.
     async fn serve_object(&self, prepared: crate::rdr::PreparedObject) -> Result<(), AppError> {
-        let signer = self.signer.as_deref();
+        // One signer for the whole object: its metadata and segments share
+        // the object name's prefix, so the name chooses it once.
+        let signer = match &self.signer {
+            Some(signing) => Some(signing.signer_for(&prepared.object_name)?),
+            None => None,
+        };
+        let signer = signer.as_deref();
         loop {
             let raw = match self.conn.recv().await {
                 Some(b) => b,
@@ -357,14 +376,14 @@ type RouteHandler = Arc<dyn Fn(Interest, Responder) -> RouteFut + Send + Sync>;
 pub struct Router {
     conn: Arc<dyn Connection>,
     prefix: Name,
-    signer: Option<Arc<dyn Signer>>,
+    signer: Option<DataSigner>,
     /// `(full route name = prefix + suffix, handler)`.
     routes: Vec<(Name, RouteHandler)>,
     fallback: Option<RouteHandler>,
 }
 
 impl Router {
-    fn new(conn: Arc<dyn Connection>, prefix: Name, signer: Option<Arc<dyn Signer>>) -> Self {
+    fn new(conn: Arc<dyn Connection>, prefix: Name, signer: Option<DataSigner>) -> Self {
         Self {
             conn,
             prefix,
@@ -447,8 +466,8 @@ fn append_components(prefix: &Name, suffix: &Name) -> Name {
 mod router_tests {
     use super::*;
     use ndn_packet::encode::InterestBuilder;
+    use parking_lot::Mutex;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     /// A connection that replays a fixed Interest queue then closes, and
     /// records nothing on send (handlers record via their own state).
@@ -462,7 +481,7 @@ mod router_tests {
             Ok(())
         }
         async fn recv(&self) -> Option<Bytes> {
-            self.q.lock().unwrap().pop_front()
+            self.q.lock().pop_front()
         }
         async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
             Ok(())
@@ -487,7 +506,7 @@ mod router_tests {
             move |i: Interest, _r: Responder| {
                 let hits = Arc::clone(&hits);
                 async move {
-                    hits.lock().unwrap().push(format!("{label}:{}", i.name));
+                    hits.lock().push(format!("{label}:{}", i.name));
                 }
             }
         };
@@ -509,7 +528,7 @@ mod router_tests {
             .await
             .unwrap();
 
-        let hits = hits.lock().unwrap().clone();
+        let hits = hits.lock().clone();
         assert_eq!(
             hits,
             vec![
@@ -519,5 +538,79 @@ mod router_tests {
                 "fallback:/app/unmatched".to_string(),
             ]
         );
+    }
+
+    /// A connection that replays an Interest queue and records every wire
+    /// sent.
+    struct RecordingConn {
+        q: Mutex<VecDeque<Bytes>>,
+        sent: Mutex<Vec<Bytes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for RecordingConn {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            self.sent.lock().push(wire);
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.q.lock().pop_front()
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// A producer signing by name signs /a's Data with the /a key and /c's
+    /// with the /c key, and sends nothing for /b, a prefix the device only
+    /// follows — the refusal says so.
+    #[tokio::test]
+    async fn producer_signs_each_prefix_with_its_own_key() {
+        let n = |s: &str| -> Name { s.parse().unwrap() };
+        let mgr = Arc::new(SecurityManager::new());
+        let a_key = n("/a/member/x/KEY/k1");
+        let c_key = n("/c/member/x/KEY/k2");
+        mgr.generate_ed25519(a_key.clone()).unwrap();
+        mgr.generate_ed25519(c_key.clone()).unwrap();
+        mgr.keyring().adopt(Arc::new(
+            ndn_security::SignedTrustContext::hierarchical(n("/b")).with_version(1),
+        ));
+        let conn = Arc::new(RecordingConn {
+            q: Mutex::new(VecDeque::from(vec![
+                InterestBuilder::new(n("/a/member/x/d")).build(),
+                InterestBuilder::new(n("/c/member/x/d")).build(),
+                InterestBuilder::new(n("/b/x/d")).build(),
+            ])),
+            sent: Mutex::new(Vec::new()),
+        });
+        let refusals: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&refusals);
+        Producer::new(conn.clone(), n("/"))
+            .with_signers(mgr)
+            .serve(move |i: Interest, r: Responder| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if let Err(e) = r.respond((*i.name).clone(), "x").await {
+                        assert!(matches!(e, AppError::Signing(_)), "{e}");
+                        seen.lock().push(e.to_string());
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        let locators: Vec<Name> = conn
+            .sent
+            .lock()
+            .iter()
+            .map(|w| {
+                let data = ndn_packet::Data::decode(w.clone()).unwrap();
+                (*data.sig_info().unwrap().key_locator_name().unwrap()).clone()
+            })
+            .collect();
+        assert_eq!(locators, vec![a_key, c_key]);
+        let refusals = refusals.lock().clone();
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("follows /b"), "{}", refusals[0]);
     }
 }
