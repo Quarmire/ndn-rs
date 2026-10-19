@@ -39,7 +39,7 @@
 //!   ([`PibContextStore`] keeps them beside a PIB);
 //! - optionally a running [`publish::PublishedContexts`] and
 //!   [`publish::OwnCertificates`] (serving by name), a [`sync::ContextSync`],
-//!   and the namespace CA's [`ndn_cert::CaState`] when the device runs one;
+//!   and the [`ndn_cert::CaState`] of each namespace CA the device runs;
 //! - its [`HostWords`]: how the person at the device does what a refusal or
 //!   a log line asks of them, in the host's own terms — its commands or app
 //!   actions, its configuration, where it keeps keys. The library quotes
@@ -66,6 +66,7 @@ pub mod approver;
 pub mod enroll;
 pub mod host;
 pub mod keep;
+pub mod membership;
 pub mod publish;
 pub mod refresh;
 pub mod renewal;
@@ -83,7 +84,8 @@ pub use host::{
 };
 pub use ndn_cert::report::{
     AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
-    PendingEnrollInfo, RefreshState, RenewalInfo, RenewalState, TrustRefusal,
+    MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation, PendingEnrollInfo,
+    RefreshState, RenewalInfo, RenewalState, TrustRefusal,
 };
 pub use words::HostWords;
 
@@ -100,9 +102,10 @@ pub struct ParticipantParts {
     pub own_certs: Option<Arc<publish::OwnCertificates>>,
     /// The namespaces' sync groups: every version kept is handed to them.
     pub sync: Option<sync::ContextSync>,
-    /// The namespace CA this device runs: it follows every version of its
+    /// The namespace CAs this device runs (one per namespace whose root it
+    /// holds and serves a CA of): each follows every version of its
     /// namespace's trust context this device keeps.
-    pub ca: Option<Arc<CaState>>,
+    pub cas: Vec<Arc<CaState>>,
     /// How the person at the device does what a refusal or a log line asks
     /// of them, in the host's terms.
     pub words: HostWords,
@@ -118,10 +121,22 @@ pub struct Participant {
     publisher: Option<publish::PublishedContexts>,
     own_certs: Option<Arc<publish::OwnCertificates>>,
     sync: Option<sync::ContextSync>,
-    ca: Option<Arc<CaState>>,
+    cas: Vec<Arc<CaState>>,
     words: HostWords,
-    /// One enrollment at a time.
-    pub(crate) enrolling: tokio::sync::Mutex<()>,
+    /// One enrollment at a time per namespace: enrolling in one namespace
+    /// (or an approval in it landing) never waits on, nor changes, another.
+    enroll_locks: parking_lot::Mutex<std::collections::HashMap<ndn_packet::Name, EnrollLock>>,
+    /// Held while an installed identity is recorded as the vault's default
+    /// and handed to the host, so of two installs in different namespaces
+    /// only the first of a device without an identity becomes its node
+    /// identity.
+    pub(crate) installing: parking_lot::Mutex<()>,
+    /// Membership changes, as they happen ([`membership_events`](Self::membership_events)).
+    membership_events: tokio::sync::broadcast::Sender<MembershipEvent>,
+    /// What the device last saw of each namespace it holds, to tell an
+    /// adoption, a revocation of its certificate and a root change apart.
+    pub(crate) seen:
+        parking_lot::Mutex<std::collections::HashMap<ndn_packet::Name, membership::Seen>>,
     /// Held while a context is stored and published, so of two concurrent
     /// adoptions of one namespace the store and the publisher end up with
     /// the version the keyring holds, never an older one.
@@ -150,19 +165,22 @@ impl Participant {
             publisher,
             own_certs,
             sync,
-            ca,
+            cas,
             words,
         } = parts;
         Self {
             engine,
-            keyring,
+            keyring: Arc::clone(&keyring),
             store,
             publisher,
             own_certs,
             sync,
-            ca,
+            cas,
             words,
-            enrolling: tokio::sync::Mutex::new(()),
+            enroll_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            installing: parking_lot::Mutex::new(()),
+            membership_events: tokio::sync::broadcast::channel(MEMBERSHIP_EVENTS_CAP).0,
+            seen: parking_lot::Mutex::new(membership::seen_now(&keyring)),
             keeping: std::sync::Mutex::new(()),
             context_change: tokio::sync::Mutex::new(()),
             renewing: tokio::sync::Mutex::new(()),
@@ -195,8 +213,14 @@ impl Participant {
         self.sync.as_ref()
     }
 
-    pub fn ca(&self) -> Option<&Arc<CaState>> {
-        self.ca.as_ref()
+    /// The CA this device runs for `namespace` (identity `<namespace>/CA`).
+    pub fn ca_for(&self, namespace: &ndn_packet::Name) -> Option<&Arc<CaState>> {
+        self.cas.iter().find(|ca| ca.is_ca_of(namespace))
+    }
+
+    /// Every CA this device runs.
+    pub fn cas(&self) -> &[Arc<CaState>] {
+        &self.cas
     }
 
     /// The host's words, quoted in refusals and logs.
@@ -211,7 +235,46 @@ impl Participant {
             .into_iter()
             .find(|c| c.namespace() == namespace)
     }
+
+    /// The enrollment lock of `namespace`: one enrollment at a time in it.
+    pub(crate) fn enroll_lock(&self, namespace: &ndn_packet::Name) -> EnrollLock {
+        Arc::clone(
+            self.enroll_locks
+                .lock()
+                .entry(namespace.clone())
+                .or_default(),
+        )
+    }
+
+    /// A receiver of every [`MembershipEvent`] from now on: the device
+    /// adopted a namespace, enrolled or renewed in one, a version revokes
+    /// one of its certificates, or a namespace's root changed. A receiver
+    /// that falls more than a few hundred events behind loses the oldest
+    /// (`RecvError::Lagged`); [`membership::memberships`] is the state.
+    pub fn membership_events(&self) -> tokio::sync::broadcast::Receiver<MembershipEvent> {
+        self.membership_events.subscribe()
+    }
+
+    /// Publish `event` to the [`membership_events`](Self::membership_events)
+    /// receivers (none: dropped).
+    pub(crate) fn publish_membership(&self, event: MembershipEvent) {
+        tracing::info!(
+            target: "security",
+            namespace = %event.namespace,
+            relation = %event.relation,
+            change = ?event.change,
+            "{}",
+            event.detail
+        );
+        let _ = self.membership_events.send(event);
+    }
 }
+
+/// One namespace's enrollment lock ([`Participant::enroll_lock`]).
+pub(crate) type EnrollLock = Arc<tokio::sync::Mutex<()>>;
+
+/// How many membership events a slow receiver may fall behind.
+const MEMBERSHIP_EVENTS_CAP: usize = 256;
 
 /// A [`TrustRefusal`] with `status_code` and `reason`.
 pub fn refusal(status_code: u64, reason: impl Into<String>) -> TrustRefusal {

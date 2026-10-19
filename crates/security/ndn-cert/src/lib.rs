@@ -22,6 +22,7 @@ pub mod error;
 pub mod invite;
 pub mod issuers;
 pub mod namespace;
+pub mod node_identity;
 pub mod onboarding;
 pub mod policy;
 pub mod protocol;
@@ -80,10 +81,11 @@ pub use invite::{
     enroll_with_invite, ensure_invite_context, new_device_key_name,
 };
 pub use namespace::{
-    NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
-    device_key_name, init_namespace, init_namespace_in_pib, init_namespace_in_pib_with,
-    root_key_name,
+    NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_dir, ca_dir_of,
+    ca_key_name, device_key_name, init_namespace, init_namespace_in_pib,
+    init_namespace_in_pib_with, root_key_name,
 };
+pub use node_identity::{NodeIdentity, NodeIdentitySource, choose_node_identity};
 pub use onboarding::{
     AdoptError, AdvertConfig, AnchorAdvert, AnchorLink, CONTEXT_EXPECTATION_TTL, FetchContextError,
     LinkAdoption, adopt_anchor_envelope, adopt_anchor_link, adopt_unsigned_legacy_with_tofu,
@@ -110,9 +112,11 @@ pub use renewal::{
 };
 pub use revocation::{RevocationError, RevocationPlan, keys_to_revoke, plan_revocation};
 pub use roles::{NamespaceSchema, Role, RoleError, namespace_schema};
-pub use root_device::{RootDevice, RootDeviceError, held_context, kit_namespace, root_device};
+pub use root_device::{
+    RootDevice, RootDeviceError, held_context, kit_namespace, root_device, root_device_covering,
+};
 pub use root_store::{
     NewRootStore, RootSecret, RootStore, RootStoreError, RootStoreKind, RootUnlockKind, SlotGuard,
-    os_keychain_reachable, read_root_secret, read_secret,
+    os_keychain_reachable, read_root_secret, read_secret, root_store_dir,
 };
 pub use store::{CaSnapshot, CaStore, FileCaStore};

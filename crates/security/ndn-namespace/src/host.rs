@@ -56,9 +56,10 @@ pub trait ContextStore: Send + Sync {
 }
 
 /// A [`ContextStore`] beside a PIB: `<pib>/contexts/`
-/// ([`ndn_cert::context_store`]) and the PIB's root store
-/// ([`ndn_cert::RootStore`]). Its location is worded with the host's
-/// [`HostWords::key_storage_dir`] ([`PibContextStore::with_words`]).
+/// ([`ndn_cert::context_store`]) and the PIB's root stores, one per
+/// namespace whose root it holds ([`ndn_cert::RootStore::open_all`]). Its
+/// location is worded with the host's [`HostWords::key_storage_dir`]
+/// ([`PibContextStore::with_words`]).
 #[derive(Debug, Clone)]
 pub struct PibContextStore {
     root: PathBuf,
@@ -132,10 +133,7 @@ impl ContextStore for PibContextStore {
         let Ok(pib) = FilePib::open(&self.root) else {
             return false;
         };
-        RootStore::open(&pib)
-            .ok()
-            .flatten()
-            .is_some_and(|store| store.holds_anchor_of(ctx))
+        RootStore::any_holds_anchor_of(&pib, ctx).unwrap_or(false)
     }
 }
 
@@ -157,11 +155,16 @@ impl std::fmt::Display for KeyUnavailable {
 }
 
 /// What a newly installed identity changes on the running device, as its
-/// host decides ([`KeyVault::activate`]).
+/// host decides ([`KeyVault::activate`]). Per namespace: the device's
+/// identities in other namespaces are never touched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Activation {
-    /// Whether the device signs with the new key from now on.
+    /// Whether the device signs the namespace's Data with the new key from
+    /// now on.
     pub signing_now: bool,
+    /// Whether the new identity became the node identity (the device had no
+    /// persistent identity before).
+    pub node_identity: bool,
     /// What changes only at the next start, and why (empty: nothing).
     pub at_next_start: Vec<String>,
 }
@@ -176,9 +179,18 @@ pub trait KeyVault: Send + Sync {
     /// Where the keys are, for messages (a PIB path, a storage directory).
     fn location(&self) -> String;
 
-    /// The identity the device loads by default, if any. Err: the vault
-    /// cannot be opened (why).
+    /// The identity the device loads by default — its node identity, when
+    /// its configuration names none — if any. Err: the vault cannot be
+    /// opened (why).
     fn default_identity(&self) -> Result<Option<Name>, String>;
+
+    /// The node identity the running device signs its own traffic as
+    /// (management, discovery, links), if it has a persistent one. A host
+    /// whose configuration can name another than the vault's default
+    /// overrides this.
+    fn node_identity(&self) -> Option<Name> {
+        self.default_identity().ok().flatten()
+    }
 
     /// The records of the device's requests for an admin's approval
     /// ([`ndn_cert::RequestStore`]), kept beside the keys they were made
@@ -206,8 +218,10 @@ pub trait KeyVault: Send + Sync {
     /// `key`, beside the certificates kept for it before.
     fn store_certificate(&self, key: &Name, cert: &Data) -> Result<(), String>;
 
-    /// Make `identity` the one the device loads by default (the last step
-    /// of an enrollment).
+    /// Make `identity` the one the device loads by default: its node
+    /// identity. An enrollment calls it only when the vault has no default
+    /// identity (the device's first identity); otherwise only an operator
+    /// changes it.
     fn make_default(&self, identity: &Name) -> Result<(), String>;
 
     /// Keep the issuer certificates of a certificate's chain: they are
@@ -227,7 +241,16 @@ pub trait KeyVault: Send + Sync {
     /// if one is kept.
     fn issued_certificate(&self, key: &Name) -> Result<Option<Bytes>, String>;
 
-    /// Switch the running device to `key` of `identity` (its `signer`) as
-    /// the host allows, once its certificate is installed.
-    fn activate(&self, identity: &Name, key: &Name, signer: Arc<dyn Signer>) -> Activation;
+    /// Have the running device sign `identity`'s Data with `key` (its
+    /// `signer`) from now on, beside its other identities, as the host
+    /// allows, once its certificate is installed — and, when
+    /// `first_identity` (the vault had no default identity before this
+    /// enrollment), sign the device's own traffic as it too.
+    fn activate(
+        &self,
+        identity: &Name,
+        key: &Name,
+        signer: Arc<dyn Signer>,
+        first_identity: bool,
+    ) -> Activation;
 }

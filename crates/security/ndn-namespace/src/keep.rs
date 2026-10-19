@@ -115,7 +115,12 @@ pub fn keep(p: &Participant, ctx: &SignedTrustContext, data: &Data) -> Result<Ke
             ),
         ));
     }
-    let ca = p.ca().and_then(|ca| ca.follow_context(ctx));
+    let ca = p
+        .ca_for(ctx.namespace())
+        .and_then(|ca| ca.follow_context(ctx));
+    // The version holds for this run whether or not it is stored: what it
+    // changes about the device's membership is published now.
+    crate::membership::kept(p, ctx);
     Ok(Kept {
         stored: store_and_publish(p, ctx, data),
         ca,
