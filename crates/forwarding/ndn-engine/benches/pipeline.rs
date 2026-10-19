@@ -191,6 +191,7 @@ fn bench_pit_check(c: &mut Criterion) {
             let pit = Arc::new(Pit::new());
             let stage = PitCheckStage {
                 pit,
+                face_table: Arc::new(FaceTable::new()),
                 dead_nonce_list: None,
                 validator: None,
                 replay_guard: None,
@@ -209,6 +210,7 @@ fn bench_pit_check(c: &mut Criterion) {
         let pit = Arc::new(Pit::new());
         let stage = PitCheckStage {
             pit: Arc::clone(&pit),
+            face_table: Arc::new(FaceTable::new()),
             dead_nonce_list: None,
             validator: None,
             replay_guard: None,
@@ -344,6 +346,9 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
+            // Bench Data carries no validation outcome; admit it so the
+            // insert path is what gets measured.
+            admit_unverified: true,
         };
         let wire = data_wire(4);
         // Pre-insert once so every bench call is a Replaced (not Inserted) operation.
@@ -373,6 +378,7 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
+            admit_unverified: true,
         };
 
         b.iter(|| {
@@ -406,11 +412,10 @@ fn bench_validation_stage(c: &mut Criterion) {
     let key_name: Name = "/bench/KEY".parse().unwrap();
     let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
     let pub_key_bytes = signer.public_key_bytes();
-    let data_wire_signed = DataBuilder::new("/bench/data", b"payload").sign_sync(
-        SignatureType::SignatureEd25519,
-        Some(&key_name),
-        |region| signer.sign_sync(region).unwrap(),
-    );
+    let data_wire_signed = DataBuilder::new(ndn_packet::name!("/bench/data"), b"payload")
+        .sign_sync(SignatureType::SignatureEd25519, Some(&key_name), |region| {
+            signer.sign_sync(region).unwrap()
+        });
 
     let mut group = c.benchmark_group("validation_stage");
 
@@ -498,6 +503,7 @@ fn bench_interest_pipeline(c: &mut Criterion) {
             };
             let pit_check = PitCheckStage {
                 pit: Arc::clone(&pit),
+                face_table: Arc::new(FaceTable::new()),
                 dead_nonce_list: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 validator: None,
@@ -612,6 +618,7 @@ fn bench_data_pipeline(c: &mut Criterion) {
                 let cs_insert = CsInsertStage {
                     cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
                     admission: Arc::new(ndn_store::AdmitAllPolicy),
+                    admit_unverified: true,
                 };
 
                 b.iter(|| {
