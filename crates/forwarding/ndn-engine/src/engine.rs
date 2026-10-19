@@ -1155,9 +1155,7 @@ pub(crate) async fn run_face_sender(
     let mut next_tick = runtime.unix_nanos().saturating_add(tick_nanos);
     let mut tick_count: u32 = 0;
     loop {
-        let until = std::time::Duration::from_nanos(
-            next_tick.saturating_sub(runtime.unix_nanos()),
-        );
+        let until = std::time::Duration::from_nanos(next_tick.saturating_sub(runtime.unix_nanos()));
         let retx_sleep = runtime.sleep(until);
         tokio::select! {
             biased;            _ = cancel.cancelled() => break,
@@ -1241,7 +1239,7 @@ pub(crate) async fn run_face_sender(
                 tick_count = tick_count.wrapping_add(1);
                 if let Some(feature) = lp_reliability_feature.as_ref() {
                     // Retransmissions keep the original 50 ms cadence.
-                    if tick_count % RETX_TICKS == 0 {
+                    if tick_count.is_multiple_of(RETX_TICKS) {
                         for wire in feature.take_retransmissions() {
                             if let Err(e) = face.send_bytes(wire).await
                                 && handle_send_error(e)

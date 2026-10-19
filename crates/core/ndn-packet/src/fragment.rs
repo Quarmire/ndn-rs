@@ -163,11 +163,10 @@ impl ReassemblyBuffer {
                     .iter()
                     .min_by_key(|(_, v)| v.created)
                     .map(|(k, _)| *k)
+                && let Some(dropped) = self.pending.remove(&oldest_key)
             {
-                if let Some(dropped) = self.pending.remove(&oldest_key) {
-                    self.stats.groups_evicted += 1;
-                    self.stats.fragments_wasted += dropped.received as u64;
-                }
+                self.stats.groups_evicted += 1;
+                self.stats.fragments_wasted += dropped.received as u64;
             }
         }
         let entry = self.pending.entry(key).or_insert_with(|| Pending {
