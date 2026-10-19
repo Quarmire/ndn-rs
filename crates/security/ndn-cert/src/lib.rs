@@ -79,8 +79,8 @@ pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
     UpdateRefusal, VersionSource, bump_context_revoking, bump_context_schema, follow_versions,
-    key_name_of, link_narrowing, open_context_update, refresh_context, revocations_to_add,
-    schema_change,
+    key_name_of, link_narrowing, open_context_update, refresh_context, relay_narrowing,
+    revocations_to_add, schema_change,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_key_name,
@@ -100,8 +100,8 @@ pub use onboarding::{
     rdr_metadata_name, rdr_prefix,
 };
 pub use ca_policy::{
-    ChallengeOrder, ChallengeSlot, PolicyError, PolicyInput, SchemaPlanError, SchemaUpdatePlan,
-    challenge_order, plan_schema_update, same_link_policy,
+    ChallengeOrder, ChallengeSlot, NamespacePolicies, PolicyError, PolicyInput, SchemaPlanError,
+    SchemaUpdatePlan, challenge_order, plan_schema_update, same_link_policy,
 };
 pub use enroll_target::{EnrollTarget, EnrollTargetError};
 pub use policy::{

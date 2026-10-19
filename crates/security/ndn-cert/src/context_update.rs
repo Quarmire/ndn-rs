@@ -61,9 +61,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy, LvsModel, OpenContextError,
-    SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext, SignedTrustContextError, Signer,
-    Validator,
+    AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy, LvsModel,
+    OpenContextError, SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext,
+    SignedTrustContextError, Signer, Validator,
 };
 
 use crate::client::CaExchange;
@@ -141,8 +141,8 @@ pub enum BumpError {
          takes away what the held version (v{version}, {before}) allows — {}. A device relying \
          on it would lose its links once its node holds the new version. If that is intended, \
          sign the update with consent to narrow (`ndn-fwd schema update --accept-narrowing`); \
-         otherwise set [ca] link_roles / relay_roles / enrollment_links / direct_paths to the held policy or \
-         remove them",
+         otherwise set [ca] link_roles / relay_roles / enrollment_links / direct_paths / \
+         direct_pairs to the held policy or remove them",
         .narrowed.join("; ")
     )]
     LinkNarrowing {
@@ -152,6 +152,20 @@ pub enum BumpError {
         after: String,
         /// What devices could do under the held policy and no longer can.
         narrowed: Vec<String>,
+    },
+    #[error(
+        "refusing to narrow the relays {namespace} advertises: the new version drops what the \
+         held version (v{version}) advertises — {}. A device using that relay would lose it \
+         once it holds the new version. If that is intended, sign the update with consent to \
+         narrow (`ndn-fwd schema update --accept-narrowing`); otherwise keep the held relays as \
+         [[ca.relay]] entries, or remove every [[ca.relay]] entry to carry them",
+        .dropped.join("; ")
+    )]
+    RelayNarrowing {
+        namespace: String,
+        version: u64,
+        /// The relays of the held version the new one no longer advertises.
+        dropped: Vec<String>,
     },
     #[error("the schema cannot be read: {0}")]
     Schema(String),
@@ -284,6 +298,13 @@ pub struct SchemaChange {
     /// What devices could do under `link_before` and no longer can under
     /// `link`. Non-empty only with consent to narrowing.
     pub link_narrowed: Vec<String>,
+    /// The relays the held version advertises.
+    pub relays_before: Vec<AdvertisedRelay>,
+    /// The relays the new version advertises.
+    pub relays: Vec<AdvertisedRelay>,
+    /// The relays of `relays_before` the new version drops
+    /// ([`relay_narrowing`]). Non-empty only with consent to narrowing.
+    pub relays_dropped: Vec<String>,
 }
 
 impl SchemaChange {
@@ -297,20 +318,27 @@ impl SchemaChange {
         self.link_before != self.link
     }
 
+    /// Whether the new version advertises other relays.
+    pub fn changes_relays(&self) -> bool {
+        !same_relays(&self.relays_before, &self.relays)
+    }
+
     /// Nothing to sign: the held version carries these rules, this hint,
-    /// this link policy and the authoritative flag already.
+    /// this link policy, these relays and the authoritative flag already.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.removed.is_empty()
             && !self.changes_hint()
             && !self.changes_link()
+            && !self.changes_relays()
             && !self.becomes_authoritative
     }
 }
 
 /// What devices may do under `before` and no longer under `after`: a role
 /// that could link and no longer can (every role → a list counts), a relay
-/// role removed, enrollment links or direct paths turned off. Empty: `after` only widens.
+/// role removed, enrollment links or direct paths turned off, a pair of
+/// roles that may no longer make direct paths. Empty: `after` only widens.
 pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
     let mut narrowed = Vec::new();
     if before.roles.is_empty() && !after.roles.is_empty() {
@@ -330,8 +358,47 @@ pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
     }
     if before.direct_paths && !after.direct_paths {
         narrowed.push("linked devices may no longer try direct paths".to_string());
+    } else if before.direct_paths {
+        for (a, b) in before
+            .canonical_direct_pairs()
+            .iter()
+            .filter(|(a, b)| !after.allows_direct_path(a, b))
+        {
+            narrowed.push(if a == b {
+                format!("two {a} devices may no longer make a direct path with each other")
+            } else {
+                format!("{a} and {b} devices may no longer make direct paths with each other")
+            });
+        }
     }
     narrowed
+}
+
+/// The relays of `before` that `after` no longer advertises: one whose
+/// device `after` does not list, or lists only with another expected
+/// fingerprint. Empty: `after` only adds relays or moves them to other
+/// endpoints or preferences.
+pub fn relay_narrowing(before: &[AdvertisedRelay], after: &[AdvertisedRelay]) -> Vec<String> {
+    before
+        .iter()
+        .filter(|b| {
+            !after
+                .iter()
+                .any(|a| a.device == b.device && (a.key.is_none() || a.key == b.key))
+        })
+        .map(|b| {
+            if after.iter().any(|a| a.device == b.device) {
+                format!("{} is advertised with another expected fingerprint", b.device)
+            } else {
+                format!("{} is no longer advertised as a relay", b.device)
+            }
+        })
+        .collect()
+}
+
+/// Whether two relay lists advertise the same relays, in any order.
+pub(crate) fn same_relays(a: &[AdvertisedRelay], b: &[AdvertisedRelay]) -> bool {
+    a.len() == b.len() && a.iter().all(|r| b.contains(r)) && b.iter().all(|r| a.contains(r))
 }
 
 /// A schema update signed by [`bump_context_schema`].
@@ -411,14 +478,16 @@ fn grants_missing(next: &[(String, String)], held: &[(String, String)]) -> Vec<S
         .collect()
 }
 
-/// What a version after `ctx` carrying `schema`, `hint` and the link policy
-/// `link` (`None`: the held one, carried verbatim) would change: the rules
-/// it adds and removes, and whether the hint, the link policy or the
-/// authoritative flag change ([`SchemaChange::is_empty`]: nothing to sign).
-/// Refused unless `accept_narrowing` when a rule of `ctx` is missing from
-/// `schema` ([`BumpError::Narrowing`], listing the rules devices would
-/// lose) or `link` takes away what the held policy allows
-/// ([`BumpError::LinkNarrowing`], [`link_narrowing`]). Needs no key: a
+/// What a version after `ctx` carrying `schema`, `hint`, the link policy
+/// `link` and the relays `relays` (`None`: the held ones, carried verbatim)
+/// would change: the rules it adds and removes, and whether the hint, the
+/// link policy, the relays or the authoritative flag change
+/// ([`SchemaChange::is_empty`]: nothing to sign). Refused unless
+/// `accept_narrowing` when a rule of `ctx` is missing from `schema`
+/// ([`BumpError::Narrowing`], listing the rules devices would lose), `link`
+/// takes away what the held policy allows ([`BumpError::LinkNarrowing`],
+/// [`link_narrowing`]) or `relays` drops a held relay
+/// ([`BumpError::RelayNarrowing`], [`relay_narrowing`]). Needs no key: a
 /// caller checks a schema update with it before unlocking the root that
 /// signs it ([`bump_context_schema`] applies the same checks).
 pub fn schema_change(
@@ -426,6 +495,7 @@ pub fn schema_change(
     schema: &[SchemaBlob],
     hint: &EnrollmentHint,
     link: Option<&LinkPolicy>,
+    relays: Option<&[AdvertisedRelay]>,
     accept_narrowing: bool,
 ) -> Result<SchemaChange, BumpError> {
     let held = schema_grants(&ctx.published_schemas())?;
@@ -450,6 +520,16 @@ pub fn schema_change(
             narrowed: link_narrowed,
         });
     }
+    let relays_before = ctx.relays().to_vec();
+    let relays = relays.map_or_else(|| relays_before.clone(), <[AdvertisedRelay]>::to_vec);
+    let relays_dropped = relay_narrowing(&relays_before, &relays);
+    if !relays_dropped.is_empty() && !accept_narrowing {
+        return Err(BumpError::RelayNarrowing {
+            namespace: ctx.namespace().to_string(),
+            version: ctx.version(),
+            dropped: relays_dropped,
+        });
+    }
     Ok(SchemaChange {
         added: grants_missing(&next, &held),
         removed,
@@ -459,6 +539,9 @@ pub fn schema_change(
         link_before,
         link,
         link_narrowed,
+        relays_before,
+        relays,
+        relays_dropped,
     })
 }
 
@@ -468,24 +551,26 @@ pub fn schema_change(
 /// [`NamespaceSchema::blobs`](crate::roles::NamespaceSchema::blobs) gives)
 /// and the enrollment hint `hint`, schema-authoritative, signed by `signer`
 /// — the key of an anchor of `held`, as for [`bump_context_revoking`].
-/// It states the link policy `link` when that differs from the held one;
-/// otherwise (and with `link` `None`) the held link policy is carried over
-/// verbatim, like anchors, CA endpoints, revocations and key roles. Checked
-/// as [`schema_change`] checks (a narrowing of the schema or the link
-/// policy refused unless `accept_narrowing`); `Ok(None)` when `held`
-/// carries these rules, this hint and this link policy already (nothing is
-/// signed). Pure: nothing is adopted, stored or published.
+/// It states the link policy `link` and advertises the relays `relays`
+/// when they differ from the held ones; otherwise (and with `None`) the
+/// held ones are carried over verbatim, like anchors, CA endpoints,
+/// revocations and key roles. Checked as [`schema_change`] checks (a
+/// narrowing of the schema, the link policy or the relays refused unless
+/// `accept_narrowing`); `Ok(None)` when `held` carries these rules, this
+/// hint, this link policy and these relays already (nothing is signed).
+/// Pure: nothing is adopted, stored or published.
 pub async fn bump_context_schema(
     signer: &dyn Signer,
     held: &Data,
     schema: &[SchemaBlob],
     hint: &EnrollmentHint,
     link: Option<&LinkPolicy>,
+    relays: Option<&[AdvertisedRelay]>,
     accept_narrowing: bool,
 ) -> Result<Option<SchemaBump>, BumpError> {
     let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
     ensure_anchor(signer, &ctx)?;
-    let change = schema_change(&ctx, schema, hint, link, accept_narrowing)?;
+    let change = schema_change(&ctx, schema, hint, link, relays, accept_narrowing)?;
     if change.is_empty() {
         return Ok(None);
     }
@@ -500,6 +585,9 @@ pub async fn bump_context_schema(
         .schema_authoritative();
     if change.changes_link() {
         next = next.with_link_policy(change.link.clone());
+    }
+    if change.changes_relays() {
+        next = next.with_relays(change.relays.clone());
     }
     let data = next.sign_into_data_async(signer).await?;
     Ok(Some(SchemaBump {

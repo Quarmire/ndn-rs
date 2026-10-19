@@ -388,6 +388,37 @@ impl MgmtClient {
         ndn_mgmt_wire::LinkListing::decode(content).map_err(|_| ForwarderError::MalformedResponse)
     }
 
+    /// `links/connect`: link now to the configured device labelled `label`
+    /// (as `link list` shows it), whatever its mode. The answer's
+    /// `status_text` says what was done, or why nothing was.
+    pub async fn link_connect(&self, label: &str) -> Result<ControlResponse, ForwarderError> {
+        let params = ndn_mgmt_wire::link_command(label, None);
+        self.send_interest(command_name(module::LINKS, verb::CONNECT, &params))
+            .await
+    }
+
+    /// `links/disconnect`: close the link labelled `label` and keep it closed
+    /// until connected again or its mode is set. Answered like
+    /// [`link_connect`](Self::link_connect).
+    pub async fn link_disconnect(&self, label: &str) -> Result<ControlResponse, ForwarderError> {
+        let params = ndn_mgmt_wire::link_command(label, None);
+        self.send_interest(command_name(module::LINKS, verb::DISCONNECT, &params))
+            .await
+    }
+
+    /// `links/mode`: set the mode of the link labelled `label` until the
+    /// daemon restarts (the config's mode applies again then). Answered like
+    /// [`link_connect`](Self::link_connect).
+    pub async fn link_mode(
+        &self,
+        label: &str,
+        mode: ndn_mgmt_wire::LinkModeArg,
+    ) -> Result<ControlResponse, ForwarderError> {
+        let params = ndn_mgmt_wire::link_command(label, Some(mode));
+        self.send_interest(command_name(module::LINKS, verb::MODE, &params))
+            .await
+    }
+
     /// `ca/approve`: approve the pending request `target` names (its request
     /// id or its six-digit verification code). On the CA host the daemon
     /// records the local operator as the approver; on an admin device it

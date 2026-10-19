@@ -106,8 +106,9 @@ and UDP port (`"0.0.0.0:6367"`; `"[::]:6367"` takes both IPv4 and IPv6);
 anything that is not an address and port is refused. `listen = false`
 (default `true`) makes it dial-only: it accepts no links, and a device picks
 the address it dials from this way (`bind = "192.0.2.7:0"`, port `0` lets
-the system pick the port); a dial-only socket with no `[[peer]] endpoint` to
-dial is refused. Without a quic `[[face]]`, links are dialled from an
+the system pick the port); a dial-only socket with nothing to dial (no
+`[[peer]] endpoint`, no `[[relay]]` and `[relays] namespace = false`) is
+refused. Without a quic `[[face]]`, links are dialled from an
 address and port the system picks. `advertise` (default none) lists public
 `host:port` addresses that reach this socket, such as a router's port
 forward (`advertise = ["203.0.113.7:6367"]`); they are offered to linked
@@ -146,11 +147,15 @@ endpoint = "relay.example.net:6367"
 | `device` | (none) | The peer's device name `/<namespace>/<role>/<device>` (at least three components). The link is admitted when the peer's certificate validates in a namespace this device holds and names this device. |
 | `key` | (none) | Expected fingerprint of the peer's key: 64 hex digits, the SHA-256 of its public key, as the peer's daemon logs it at startup (`this device's link key`, `fingerprint=…`). For a device of another namespace, or one not enrolled or adopted yet. With `device` too, the key must match and a certificate that validates must name that device. |
 | `endpoint` | (none) | Where to dial it: `"host:port"`, or a list tried in order. None: this device does not dial it — it is reached through `relay`, or it links in. |
-| `relay` | (none) | The `device` or `key` of another `[[peer]]`: reach this peer through that peer's link. This peer's routes are installed on the relay's link at cost 10 (a direct link costs 0). |
+| `relay` | (none) | The `device` or `key` of another `[[peer]]` or of a `[[relay]]`: reach this peer through that link. This peer's routes are installed on the relay's link at cost 10 (a direct link costs 0). |
 | `routes` | see below | Prefixes routed over this link. |
 | `persistent` | `true` | Keep the link up: redial whenever it drops, with backoff from 0.5 s to 30 s, and 60 s after the peer refused this device's key. |
 | `reliability` | `false` | NDNLPv2 reliability (retransmission of lost frames) on this link. |
 | `direct` | `true` | When this peer is reached through a relay, try a direct path to it (NAT hole punching), keeping the relay when it does not open; only when the namespace's link policy allows direct paths (`[ca] direct_paths`). `false`: always through the relay. |
+| `mode` | `"always"` | When the link is up: `always`, `on-demand` or `off` — see [Link modes](#link-modes). |
+| `idle_secs` | `60` | With `mode = "on-demand"`: close the link after this many seconds without traffic (10–86400). |
+| `hold` | `false` | Ask this peer, when it is a relay, to hold Interests for this device while its link is asleep and deliver them when it is back (the relay must offer it: `[relay_service] hold`). |
+| `wake_token` | (none) | Opaque token (UTF-8, 1–1024 bytes, such as a platform push token) registered with this peer, when it is a relay, so its `wake_command` can wake this device. Redacted from `config get`. |
 
 When `routes` is unset: a peer that validates as a `node` device (a relay)
 gets its namespace prefix `/<ns>`; any other peer that validates gets its
@@ -171,15 +176,147 @@ Validation (the daemon refuses to start, naming the entry):
   components;
 - each `endpoint` is `host:port` with a non-zero port;
 - each of `routes` is an NDN name starting with `/`;
-- `relay` names another `[[peer]]` (its `device` or `key`), and that peer has
-  an `endpoint`;
-- no two entries name the same device or key;
+- `relay` names another `[[peer]]` (its `device` or `key`) that has an
+  `endpoint`, or a `[[relay]]`;
+- no two entries name the same device or key, and no `[[relay]]` names the
+  same device or key as a `[[peer]]`;
+- with `mode = "on-demand"`, `idle_secs` is 10–86400; `wake_token` is
+  1–1024 bytes;
 - unknown keys are refused.
 
 Older QUIC configuration is refused: `[listeners]` takes only
 `webtransport`, `webrtc` and `ble`, `[[face]] kind = "quic"` takes only
 `bind`, `listen` and `advertise`, and a QUIC face dialled to an address is now a
 `[[peer]]` with `endpoint` and the peer's `key`.
+
+### Link modes
+
+Each `[[peer]]`, each `[[relay]]` and the namespace's relays (`[relays]
+mode`) have a mode. It trades reachability against battery and data:
+
+| Mode | What it does | Battery and data |
+|---|---|---|
+| `always` (default) | Linked all the time; redialled when it drops. | A keep-alive every `[links] keep_alive_secs` (default 10 s) keeps NAT bindings — and the radio — awake: the device can be reached at any time, at the cost of a small, steady stream of packets that keeps a phone's radio from sleeping. |
+| `on-demand` | Closed until there is traffic for it (an Interest that would go out over its routes, or the host says it is active); closed again after `idle_secs` without traffic. | No traffic at all while closed. The first Interest waits for the handshake (about one round trip plus the QUIC handshake). While it is closed, Interests *to* this device reach it only if the relay holds them for it (`hold`) or wakes it (`wake_token`), and only if the relay offers that. |
+| `off` | Configured but closed until asked (`ndn-ctl link connect <label>`). | Nothing at all until asked. |
+
+`ndn-ctl link mode <label> <always|on-demand[:idle_secs]|off>` changes a
+link's mode until the daemon restarts; `ndn-ctl link disconnect <label>`
+closes a link until it is connected again or its mode is set.
+
+## `[relays]` — which relays this device uses
+
+A relay forwards between devices that cannot reach each other directly. A
+device uses the relays its namespace advertises in its trust context (signed
+by the root device, so every member learns them) and the relays added with
+`[[relay]]`. It links to the preferred one(s) and fails over to the next
+when one is lost.
+
+```toml
+[relays]
+count = 1
+namespace = true
+mode = "always"
+```
+
+| Key | Default | Use |
+|---|---|---|
+| `count` | `1` | Relays linked at once, preferred first (1–8); the others stand by and take over when one is lost. Each linked relay costs its keep-alives. |
+| `namespace` | `true` | Use the relays the namespace advertises. `false` with no `[[relay]]`: no relays (LAN and `[[peer]]` links only). |
+| `mode` | `"always"` | [Link mode](#link-modes) of the namespace's relays. |
+| `idle_secs` | `60` | With `mode = "on-demand"`: idle close in seconds (10–86400). |
+| `hold` | `false` | Ask the namespace's relays to hold Interests for this device while it is asleep. |
+
+## `[[relay]]` — relays the user adds
+
+Repeated table: an own server, a community relay or a hosted service,
+identified by its key and dialled at its endpoints.
+
+```toml
+[[relay]]
+key = "9f2c…"            # 64 hex digits
+endpoint = ["relay.example.net:6367"]
+preference = 0
+```
+
+| Key | Default | Use |
+|---|---|---|
+| `key` | (none) | Expected fingerprint of the relay's key (64 hex digits). Required unless `device` is a device of a namespace this device holds. |
+| `device` | (none) | The relay's device name `/<namespace>/node/<device>`. |
+| `endpoint` | (required) | Where to dial it: `"host:port"`, or a list tried in order. |
+| `preference` | `0` | Lower is preferred; on a tie, user relays come before the namespace's. |
+| `mode`, `idle_secs`, `hold`, `wake_token` | as `[[peer]]` | Same meaning as on a `[[peer]]`. |
+
+Refused: an entry with neither `key` nor `device`, without `endpoint`, with
+a malformed `key`, `device` or `endpoint`, two entries naming the same
+device, and an entry naming the same device or key as a `[[peer]]` (one
+device is one link: keep the `[[relay]]`, moving the peer's options to it,
+or the `[[peer]]`).
+
+**Privacy of a relay of another namespace.** A community or hosted relay
+cannot read or forge your data — every Data packet is signed, and
+encrypted content stays encrypted — but it sees the names it forwards and
+which devices talk to which, and when. Use a relay you run, or your
+namespace's own, when names or traffic patterns are sensitive.
+
+## `[relay_service]` — serving as a relay
+
+What this device does as a relay for other devices.
+
+```toml
+[relay_service]
+serve = "listed"
+roots = ["4b1d…"]        # root key fingerprints of the served namespaces
+hold = true
+wake_command = ["/usr/local/bin/ndn-wake", "--push"]
+```
+
+| Key | Default | Use |
+|---|---|---|
+| `serve` | `"own"` | `own`: devices of the namespaces this device holds a certificate in. `listed`: those, plus the namespaces whose root key fingerprint is in `roots`. `open`: any namespace whose certificate chain validates to its root, within the quotas. Devices named by a `[[peer]]` or `[[relay]]` are admitted whatever this says. |
+| `roots` | `[]` | With `serve = "listed"` (required, and only there): root key fingerprints (64 hex digits). |
+| `links_total` | `256` | Quota: links from devices of other namespaces, in total. |
+| `links_per_namespace` | `32` (at most `links_total`) | Quota: links per other namespace. |
+| `interests_per_key` | `100` | Quota: Interests per second from one device (burst twice that). |
+| `interests_per_namespace` | `400` | Quota: Interests per second from one other namespace (burst twice that). |
+| `hold` | `false` | Hold Interests for sleeping devices that ask, and deliver them when they are back. |
+| `hold_per_device` | `64` | Most Interests held for one device (at least 1). |
+| `hold_total` | `4096` | Most Interests held in total (at least `hold_per_device`). |
+| `hold_secs` | `60` | Longest an Interest is held (1–3600), never past its lifetime. |
+| `asleep_secs` | `86400` | How long a device that went asleep counts as asleep (60–604800); after that it is treated as gone. |
+| `wake_command` | (none) | Program and arguments run once per wake of a sleeping device that registered a wake token. |
+
+The quotas are always in force for `open`; for `listed` only when one of
+them is set (the unset ones take their defaults); with `own` they are
+refused (it serves no other namespace).
+
+`wake_command` is run without a shell, with these environment variables:
+
+| Variable | Value |
+|---|---|
+| `NDN_WAKE_TOKEN` | The device's wake token, hex. |
+| `NDN_WAKE_DEVICE` | The device's name, or empty when it is known only by key. |
+| `NDN_WAKE_KEY` | The device's key fingerprint, 64 hex digits. |
+| `NDN_WAKE_HELD` | How many Interests are held for it. |
+
+It runs in the background; one that has not exited after 10 s is killed.
+Its output goes to the daemon's log. The library defines this interface
+only — the command does the vendor-specific part (a push service, a
+webhook, …).
+
+## `[links]` — link timing
+
+| Key | Default | Use |
+|---|---|---|
+| `keep_alive_secs` | `10` | Seconds between keep-alives on an idle link (2–60). Shorter costs battery and data; longer than the NAT's binding lifetime (often 30–120 s) and the device cannot be reached. |
+| `idle_timeout_secs` | `30` | Seconds of silence after which a link counts as lost: at least 3 × `keep_alive_secs` (so two lost keep-alives do not drop it), at most 600. |
+
+## `[direct]` — direct paths by membership
+
+| Key | Default | Use |
+|---|---|---|
+| `membership` | `true` | Try direct paths with devices of this device's namespace met at a common relay, without a `[[peer]]` entry, where the trust context's role matrix allows them (default: admin, member and node devices, not guests). |
+| `max_paths` | `8` | Most direct paths kept at once (1–64). |
 
 ## `[discovery]` — neighbour discovery
 
@@ -293,6 +430,32 @@ the namespace's trust context. See
 | `relay_roles` | unset (context's; default `["node"]`) | Roles a device may relay through; each must be in `link_roles` when that is not empty. |
 | `enrollment_links` | unset (context's; default `true`) | A relay of the namespace admits an unknown device on an enrollment link that carries only its enrollment (CA endpoints, trust context); effective when the namespace has a CA. |
 | `direct_paths` | unset (context's; default `true`) | Two devices of the namespace linked through a relay may try a direct path between them (NAT hole punching), keeping the relay when it does not open. Turning it off is a narrowing. |
+| `direct_pairs` | unset (context's; default: every pair of `admin`, `member`, `node`; `guest` none) | Which role pairs may make direct paths, `"<role>:<role>"` unordered (`"member:member"`: two members); roles `admin`, `member`, `node`, `guest`. `[]`: no pair. Removing a pair is a narrowing. |
+| `[[ca.relay]]` | unset (context's; default none) | Relays the namespace advertises in its trust context, so every member learns them without local configuration (each device decides whether to use them, `[relays] namespace`). `relay = []` in `[ca]`: none. Every device that holds the context sees their endpoints. |
+
+`[[ca.relay]]` entry:
+
+| Key | Default | Use |
+|---|---|---|
+| `device` | (required) | The relay's device name, normally `/<namespace>/node/<device>`. |
+| `key` | unset | Its expected fingerprint, 64 hex digits (the link key its `ndn-fwd` prints). Required when `device` is not a device of the namespace (a community or hosted relay). |
+| `endpoint` | (required) | `host:port`, or a list tried in order. |
+| `preference` | `0` | Lower is preferred. |
+
+```toml
+[ca]
+direct_pairs = ["admin:member", "member:member"]   # nodes always through the relay
+
+[[ca.relay]]
+device = "/home/bob/node/vps"
+endpoint = ["vps.example.net:6367", "203.0.113.7:6367"]
+
+[[ca.relay]]
+device = "/club/node/relay"
+key = "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c"
+endpoint = "relay.club.example.org:6367"
+preference = 10
+```
 
 A namespace CA enforces the policy its trust context's enrollment hint
 advertises (`ndn-fwd init` writes it from these keys, and `ndn-fwd schema
@@ -303,14 +466,19 @@ refuses to start (the message names the context's policy). With
 `approval_requires_invite = true` the CA needs a `token` challenge, or it
 refuses to start. A namespace CA offers `device-approval` even when
 `[[ca.challenge]]` does not list it (logged).
-The link keys are the trust context's link policy, never the CA's own:
+The link keys are the trust context's link policy, never the CA's own, and
+`[[ca.relay]]` are the relays it advertises:
 `ndn-fwd init -c <config>` writes them (unset keys: the default) and prints
-`link_policy = …`; `ndn-fwd schema update -c <config>` changes them (unset
-keys: what the context says), refusing a narrowing — a role that could link
-no longer can, `[]` turned into a list, a relay role removed, enrollment
-links turned off — unless `--accept-narrowing`. A namespace CA whose link
-keys disagree with its context refuses to start, naming the context's policy.
-Unknown roles, and a relay role that may not link, are refused.
+`link_policy = …` and the relays; `ndn-fwd schema update -c <config>` changes
+them (unset keys: what the context says), refusing a narrowing — a role
+that could link no longer can, `[]` turned into a list, a relay role
+removed, enrollment links turned off, a direct pair removed, an advertised
+relay dropped or given another `key` — unless `--accept-narrowing`. Adding
+a relay, or changing its endpoints or preference, is not a narrowing. A
+namespace CA whose link keys or relays disagree with its context refuses to
+start, naming what the context states. Unknown roles, a relay role that may
+not link, a relay without an endpoint, and a relay outside the namespace
+without `key` are refused.
 `[ca.require_attestation]` (`prefix`/`kind`/`require_signed`/
 `accept_local_operator`) gates issuance on a challenge attestation (on a
 namespace CA, on top of the role layout); under `require_signed` a local

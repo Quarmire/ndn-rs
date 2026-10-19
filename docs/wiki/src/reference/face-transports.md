@@ -157,12 +157,13 @@ The **link policy** is data in the trust context (field `LINK_POLICY`,
 of the namespace admits an unknown device on an enrollment link that carries
 only its enrollment (the CA endpoints, the trust context and certificates),
 and whether devices linked through a relay may try a direct path between
-them. When the
+them, and between which roles. When the
 context carries none, any device role may link, a relay must be a `node`
 device, enrollment links are on when the namespace has a CA, and direct
-paths are on. `ndn-fwd
+paths are on between admin, member and node devices (guests: none). `ndn-fwd
 init -c <config>` writes it from `[ca] link_roles` / `relay_roles` /
-`enrollment_links` / `direct_paths` (else the default), and `ndn-fwd schema update -c
+`enrollment_links` / `direct_paths` / `direct_pairs` (else the default), and
+`ndn-fwd schema update -c
 <config>` changes it — a narrowing only with `--accept-narrowing` (see
 [Context updates](context-updates.md)). A revocation, once this device adopts it, closes every live link
 whose certificate or issuer it revokes. Renewal keeps the key, so links

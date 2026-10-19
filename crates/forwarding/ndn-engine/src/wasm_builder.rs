@@ -205,6 +205,7 @@ impl WasmEngineBuilder {
         let reflexive = Arc::new(crate::reflexive::ReflexiveTable::new(
             crate::reflexive::ReflexiveConfig::default(),
         ));
+        let transit = Arc::new(crate::transit::TransitPrefixes::default());
 
         {
             let rib_clone = Arc::clone(&rib);
@@ -289,6 +290,7 @@ impl WasmEngineBuilder {
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),
             reflexive: Arc::clone(&reflexive),
+            transit: Arc::clone(&transit),
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
@@ -342,7 +344,8 @@ impl WasmEngineBuilder {
                 validator.clone(),
                 Default::default(),
                 Arc::clone(&runtime),
-            ),
+            )
+            .with_transit(Arc::clone(&transit)),
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: Arc::new(ndn_store::DefaultAdmissionPolicy),

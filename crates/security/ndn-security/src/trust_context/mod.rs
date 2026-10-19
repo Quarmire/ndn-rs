@@ -294,10 +294,11 @@ impl KeyRole {
 
 /// Which devices of a namespace may link to its devices, by the role in
 /// their certificate's name (`/<ns>/<role>/<device>`), which roles may act
-/// as a relay for other devices, and whether a relay admits enrollment
-/// links ([`tlv::LINK_POLICY`]). Policy in data: signed with the context, so
-/// every device of the namespace admits links by the same rule, and carried
-/// to every version made from it. A context without one has the default
+/// as a relay for other devices, whether a relay admits enrollment links,
+/// and which pairs of roles may make direct paths ([`tlv::LINK_POLICY`]).
+/// Policy in data: signed with the context, so every device of the
+/// namespace admits links by the same rule, and carried to every version
+/// made from it. A context without one has the default
 /// ([`LinkPolicy::default`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkPolicy {
@@ -317,17 +318,24 @@ pub struct LinkPolicy {
     /// between them (NAT hole punching from the addresses each one offers),
     /// falling back to the relay when it does not open.
     pub direct_paths: bool,
+    /// Unordered pairs of roles whose devices may make a direct path with
+    /// each other when `direct_paths` is on: `(a, b)` also allows `(b, a)`,
+    /// `(r, r)` two devices of role `r`. Default:
+    /// [`default_direct_pairs`](Self::default_direct_pairs).
+    pub direct_pairs: Vec<(String, String)>,
 }
 
 impl Default for LinkPolicy {
     /// Any enrolled device of the namespace may link; relays are `node`
-    /// devices; relays admit enrollment links.
+    /// devices; relays admit enrollment links; admins, members and nodes
+    /// may make direct paths with each other, guests with nobody.
     fn default() -> Self {
         Self {
             roles: Vec::new(),
             relay_roles: vec!["node".into()],
             enrollment_links: true,
             direct_paths: true,
+            direct_pairs: Self::default_direct_pairs(),
         }
     }
 }
@@ -338,6 +346,8 @@ const ENROLLMENT_LINKS_OFF: &str = "no-enrollment";
 /// [`LinkPolicy`] wire words for `direct_paths`.
 const DIRECT_PATHS_ON: &str = "direct";
 const DIRECT_PATHS_OFF: &str = "no-direct";
+/// The roles whose devices make direct paths with each other by default.
+const DEFAULT_DIRECT_ROLES: [&str; 3] = ["admin", "member", "node"];
 
 impl LinkPolicy {
     /// Whether a device with `role` may link.
@@ -350,13 +360,61 @@ impl LinkPolicy {
         self.allows_link(role) && self.relay_roles.iter().any(|r| r == role)
     }
 
-    /// Whether linked devices may try a direct path instead of the relay.
+    /// Whether linked devices may try a direct path instead of the relay
+    /// at all; [`allows_direct_path`](Self::allows_direct_path) says between
+    /// which roles.
     pub fn allows_direct_paths(&self) -> bool {
         self.direct_paths
     }
 
+    /// Whether a device with role `a` and one with role `b` may make a
+    /// direct path with each other: direct paths are on and `{a, b}` is one
+    /// of [`direct_pairs`](Self::direct_pairs).
+    pub fn allows_direct_path(&self, a: &str, b: &str) -> bool {
+        self.direct_paths
+            && self
+                .direct_pairs
+                .iter()
+                .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+    }
+
+    /// Every pair of `admin`, `member` and `node` (each role with itself
+    /// too); `guest` in none. In canonical form
+    /// ([`canonical_direct_pairs`](Self::canonical_direct_pairs)).
+    pub fn default_direct_pairs() -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        for (i, a) in DEFAULT_DIRECT_ROLES.iter().enumerate() {
+            for b in &DEFAULT_DIRECT_ROLES[i..] {
+                pairs.push((a.to_string(), b.to_string()));
+            }
+        }
+        pairs
+    }
+
+    /// [`direct_pairs`](Self::direct_pairs) as a set: each pair's roles in
+    /// order, the pairs sorted, duplicates dropped. Two policies allow the
+    /// same direct paths iff these are equal.
+    pub fn canonical_direct_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = self
+            .direct_pairs
+            .iter()
+            .map(|(a, b)| {
+                if a <= b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                }
+            })
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
     /// One line for a person: `links: any role; relays: node; enrollment
-    /// links: on`, plus `; direct paths: off` when they are off.
+    /// links: on`, plus `; direct paths: off` when they are off, or `;
+    /// direct paths: admin:member, …` when they are on between other role
+    /// pairs than the default.
     pub fn describe(&self) -> String {
         let list = |roles: &[String], empty: &str| {
             if roles.is_empty() {
@@ -365,25 +423,33 @@ impl LinkPolicy {
                 roles.join(", ")
             }
         };
+        let pairs = self.canonical_direct_pairs();
+        let direct = if !self.direct_paths {
+            "; direct paths: off".to_string()
+        } else if pairs == Self::default_direct_pairs() {
+            String::new()
+        } else if pairs.is_empty() {
+            "; direct paths: no role pair".to_string()
+        } else {
+            format!("; direct paths: {}", pairs_text(&pairs, ", "))
+        };
         format!(
-            "links: {}; relays: {}; enrollment links: {}{}",
+            "links: {}; relays: {}; enrollment links: {}{direct}",
             list(&self.roles, "any role"),
             list(&self.relay_roles, "none"),
             if self.enrollment_links { "on" } else { "off" },
-            if self.direct_paths {
-                ""
-            } else {
-                "; direct paths: off"
-            }
         )
     }
 
-    /// `<roles>;<relay roles>;<enrollment|no-enrollment>[;no-direct]`, roles
-    /// comma-separated. The fourth field is written only when direct paths
-    /// are off, so a policy with them on encodes as before.
+    /// `<roles>;<relay roles>;<enrollment|no-enrollment>[;<direct|no-direct>
+    /// [;<pairs>]]`, roles comma-separated, pairs `a:b` comma-separated in
+    /// canonical order. The fifth field is written only when the pairs are
+    /// not the default (and then the fourth explicitly); otherwise the
+    /// fourth only when direct paths are off. So a policy that states
+    /// nothing new encodes as before either field existed.
     fn encode(&self) -> Vec<u8> {
-        format!(
-            "{};{};{}{}",
+        let mut text = format!(
+            "{};{};{}",
             self.roles.join(","),
             self.relay_roles.join(","),
             if self.enrollment_links {
@@ -391,20 +457,28 @@ impl LinkPolicy {
             } else {
                 ENROLLMENT_LINKS_OFF
             },
-            if self.direct_paths {
-                String::new()
-            } else {
-                format!(";{DIRECT_PATHS_OFF}")
-            }
-        )
-        .into_bytes()
+        );
+        let direct = if self.direct_paths {
+            DIRECT_PATHS_ON
+        } else {
+            DIRECT_PATHS_OFF
+        };
+        let pairs = self.canonical_direct_pairs();
+        if pairs != Self::default_direct_pairs() {
+            text = format!("{text};{direct};{}", pairs_text(&pairs, ","));
+        } else if !self.direct_paths {
+            text = format!("{text};{direct}");
+        }
+        text.into_bytes()
     }
 
     /// Decode the value; `None` when it is malformed (the default applies).
     /// The fourth field is `direct` or `no-direct`; absent or any other word
-    /// means direct paths on. Fields after the fourth are reserved for
-    /// extension and ignored, so an older node keeps the ones it knows
-    /// instead of falling back to the broader default.
+    /// means direct paths on. The fifth lists the role pairs; absent, or
+    /// not a list of `a:b` (a later form of the field), means the default
+    /// pairs. Fields after the fifth are reserved for extension and
+    /// ignored, so an older node keeps the ones it knows instead of
+    /// falling back to the broader default.
     fn decode(value: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(value).ok()?;
         let mut fields = text.split(';');
@@ -426,12 +500,162 @@ impl LinkPolicy {
             Some(DIRECT_PATHS_OFF) => false,
             Some(DIRECT_PATHS_ON) | Some(_) | None => true,
         };
-        Some(Self {
+        let direct_pairs = fields
+            .next()
+            .and_then(parse_pairs)
+            .unwrap_or_else(Self::default_direct_pairs);
+        let mut policy = Self {
             roles,
             relay_roles,
             enrollment_links,
             direct_paths,
+            direct_pairs,
+        };
+        policy.direct_pairs = policy.canonical_direct_pairs();
+        Some(policy)
+    }
+}
+
+/// `a:b` per pair, joined by `sep`.
+fn pairs_text(pairs: &[(String, String)], sep: &str) -> String {
+    pairs
+        .iter()
+        .map(|(a, b)| format!("{a}:{b}"))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The LinkPolicy pair list `a:b,c:d` (empty: no pair); `None` when an
+/// entry is not `<role>:<role>`.
+fn parse_pairs(field: &str) -> Option<Vec<(String, String)>> {
+    field
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (a, b) = p.split_once(':')?;
+            (!a.is_empty() && !b.is_empty() && !b.contains(':'))
+                .then(|| (a.to_string(), b.to_string()))
         })
+        .collect()
+}
+
+/// A relay the namespace advertises ([`tlv::ADVERTISED_RELAY`]). Signed
+/// with the context, so every member learns it without local
+/// configuration; each device decides whether it uses namespace relays.
+/// Every device that holds the context sees its endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvertisedRelay {
+    /// The relay's device name, normally `/<ns>/node/<device>`.
+    pub device: Name,
+    /// The relay's expected fingerprint: SHA-256 of its public key as its
+    /// certificate carries it. Required when `device` is not under the
+    /// namespace (a device of the namespace is admitted by its certificate).
+    pub key: Option<[u8; 32]>,
+    /// Where to dial it, `host:port`, in the order a device tries them (at
+    /// least one).
+    pub endpoints: Vec<String>,
+    /// Lower is preferred.
+    pub preference: u32,
+}
+
+impl AdvertisedRelay {
+    /// The canonical order: by preference, then device, key, endpoints.
+    fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.preference, &self.device, &self.key, &self.endpoints).cmp(&(
+            other.preference,
+            &other.device,
+            &other.key,
+            &other.endpoints,
+        ))
+    }
+
+    /// The [`tlv::ADVERTISED_RELAY`] value: device Name, then
+    /// [`tlv::RELAY_KEY`], each [`tlv::RELAY_ENDPOINT`], [`tlv::RELAY_PREFERENCE`].
+    fn encode(&self) -> Vec<u8> {
+        let mut w = TlvWriter::new();
+        w.write_raw(&self.device.encode_to_tlv());
+        if let Some(key) = &self.key {
+            w.write_tlv(tlv::RELAY_KEY, key);
+        }
+        for endpoint in &self.endpoints {
+            w.write_tlv(tlv::RELAY_ENDPOINT, endpoint.as_bytes());
+        }
+        w.write_tlv(tlv::RELAY_PREFERENCE, &nni(u64::from(self.preference)));
+        w.finish().to_vec()
+    }
+
+    /// Decode the value; `None` when it is malformed: no device Name, or a
+    /// second one, a key that is not 32 octets or a second key, no
+    /// endpoint or an empty / non-UTF-8 one, a preference that is not a
+    /// NonNegativeInteger of at most 32 bits or a second one, an unknown
+    /// critical sub-TLV. Unknown non-critical sub-TLVs are skipped. A
+    /// missing preference is 0.
+    fn decode(value: &[u8]) -> Option<Self> {
+        let mut device = None;
+        let mut key = None;
+        let mut endpoints = Vec::new();
+        let mut preference = None;
+        let mut cur = value;
+        while !cur.is_empty() {
+            let (t, v, rest) = read_tlv(cur).ok()?;
+            cur = rest;
+            match t {
+                ndn_packet::tlv_type::NAME if device.is_none() => {
+                    device = Some(Name::decode(Bytes::copy_from_slice(v)).ok()?);
+                }
+                tlv::RELAY_KEY if key.is_none() => key = Some(<[u8; 32]>::try_from(v).ok()?),
+                tlv::RELAY_ENDPOINT => {
+                    let endpoint = std::str::from_utf8(v).ok().filter(|e| !e.is_empty())?;
+                    endpoints.push(endpoint.to_string());
+                }
+                tlv::RELAY_PREFERENCE if preference.is_none() => {
+                    let p = ndn_packet::decode_nni(v).ok()?;
+                    preference = Some(u32::try_from(p).ok()?);
+                }
+                ndn_packet::tlv_type::NAME | tlv::RELAY_KEY | tlv::RELAY_PREFERENCE => return None,
+                other if is_critical(other) => return None,
+                _ => {}
+            }
+        }
+        if endpoints.is_empty() {
+            return None;
+        }
+        Some(Self {
+            device: device?,
+            key,
+            endpoints,
+            preference: preference.unwrap_or(0),
+        })
+    }
+}
+
+impl std::fmt::Display for AdvertisedRelay {
+    /// `<device> [key <64 hex>] at <endpoint>, … (preference <n>)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.device)?;
+        if let Some(key) = &self.key {
+            f.write_str(" key ")?;
+            for b in key {
+                write!(f, "{b:02x}")?;
+            }
+        }
+        write!(
+            f,
+            " at {} (preference {})",
+            self.endpoints.join(", "),
+            self.preference
+        )
+    }
+}
+
+/// NDN NonNegativeInteger: 1, 2, 4 or 8 big-endian octets by magnitude.
+fn nni(v: u64) -> Vec<u8> {
+    let b = v.to_be_bytes();
+    match v {
+        0..=0xFF => b[7..].to_vec(),
+        0x100..=0xFFFF => b[6..].to_vec(),
+        0x1_0000..=0xFFFF_FFFF => b[4..].to_vec(),
+        _ => b.to_vec(),
     }
 }
 
@@ -477,6 +701,9 @@ pub struct SignedTrustContext {
     key_roles: Vec<(KeyRole, Name)>,
     /// Which devices may link ([`tlv::LINK_POLICY`]); `None` is the default.
     link_policy: Option<LinkPolicy>,
+    /// Relays the namespace advertises ([`tlv::ADVERTISED_RELAY`]), in
+    /// canonical order (preference, then device).
+    relays: Vec<AdvertisedRelay>,
 }
 
 impl SignedTrustContext {
@@ -495,6 +722,7 @@ impl SignedTrustContext {
             source_bundle_hash: None,
             key_roles: Vec::new(),
             link_policy: None,
+            relays: Vec::new(),
         }
     }
 
@@ -604,6 +832,16 @@ impl SignedTrustContext {
         self.link_policy = Some(policy);
         self
     }
+    /// Set the relays the namespace advertises (replacing any), kept and
+    /// encoded in canonical order — by preference, then device — so the
+    /// same set encodes identically. The caller checks each entry (an
+    /// endpoint, a `key` for a device outside the namespace): a decoder
+    /// drops an entry without them.
+    pub fn with_relays(mut self, mut relays: Vec<AdvertisedRelay>) -> Self {
+        relays.sort_by(AdvertisedRelay::canonical_cmp);
+        self.relays = relays;
+        self
+    }
 
     // ── accessors ───────────────────────────────────────────────────────────
 
@@ -660,6 +898,10 @@ impl SignedTrustContext {
     /// [`link_policy`](Self::link_policy) is the default).
     pub fn stated_link_policy(&self) -> Option<&LinkPolicy> {
         self.link_policy.as_ref()
+    }
+    /// The relays the namespace advertises, in canonical order.
+    pub fn relays(&self) -> &[AdvertisedRelay] {
+        &self.relays
     }
     /// Whether a relay of this namespace admits enrollment links: its link
     /// policy allows them and the context names a CA endpoint to enroll at.
@@ -887,6 +1129,10 @@ impl SignedTrustContext {
             if let Some(policy) = &self.link_policy {
                 w.write_tlv(tlv::LINK_POLICY, &policy.encode());
             }
+            // AdvertisedRelay entries, in canonical order (`with_relays`).
+            for relay in &self.relays {
+                w.write_tlv(tlv::ADVERTISED_RELAY, &relay.encode());
+            }
         });
         w.finish()
     }
@@ -986,6 +1232,7 @@ impl SignedTrustContext {
         let mut source_bundle_hash: Option<[u8; 32]> = None;
         let mut key_roles: Vec<(KeyRole, Name)> = Vec::new();
         let mut link_policy: Option<LinkPolicy> = None;
+        let mut relays: Vec<AdvertisedRelay> = Vec::new();
 
         let mut seen: Vec<u64> = Vec::new();
         let mut once = |t: u64, field: &'static str| {
@@ -1106,6 +1353,9 @@ impl SignedTrustContext {
                     once(ft, "LinkPolicy")?;
                     link_policy = LinkPolicy::decode(fval);
                 }
+                // A malformed entry is a relay lost, not a rejected context
+                // (non-critical).
+                tlv::ADVERTISED_RELAY => relays.extend(AdvertisedRelay::decode(fval)),
                 // Unknown critical sub-TLV → reject; unknown non-critical → skip.
                 other if is_critical(other) => {
                     return Err(SignedTrustContextError::UnknownCritical(other));
@@ -1115,6 +1365,10 @@ impl SignedTrustContext {
         }
 
         let namespace = namespace.ok_or(SignedTrustContextError::MissingField("namespace"))?;
+        // A relay outside the namespace is admitted only by its expected
+        // fingerprint: an entry without one cannot be used, so it is dropped.
+        relays.retain(|r| r.key.is_some() || r.device.has_prefix(&namespace));
+        relays.sort_by(AdvertisedRelay::canonical_cmp);
         if schema_blobs.is_empty() {
             return Err(SignedTrustContextError::MissingField("TrustSchemaBlob"));
         }
@@ -1139,6 +1393,7 @@ impl SignedTrustContext {
             source_bundle_hash,
             key_roles,
             link_policy,
+            relays,
         })
     }
 
@@ -1489,6 +1744,7 @@ mod tests {
             relay_roles: vec!["node".into()],
             enrollment_links: false,
             direct_paths: false,
+            direct_pairs: LinkPolicy::default_direct_pairs(),
         };
         let ctx = SignedTrustContext::hierarchical(n("/home"))
             .with_version(3)
@@ -1746,6 +2002,7 @@ mod tests {
             relay_roles: vec![],
             enrollment_links: false,
             direct_paths: true,
+            direct_pairs: LinkPolicy::default_direct_pairs(),
         };
         let ctx = SignedTrustContext::hierarchical(n("/home")).with_link_policy(policy);
         let content = ctx.encode_content();
@@ -1792,7 +2049,8 @@ mod tests {
     }
 
     /// The fourth field of a LinkPolicy is the direct-path word: absent or
-    /// unknown means on; fields after it are reserved and ignored.
+    /// unknown means on. The fifth lists the role pairs: absent or not a
+    /// pair list means the default pairs; fields after it are ignored.
     #[test]
     fn link_policy_direct_paths_field_and_later_fields() {
         let unknown = LinkPolicy::decode(b"admin;node;no-enrollment;future,words").unwrap();
@@ -1807,12 +2065,183 @@ mod tests {
 
         let off = LinkPolicy::decode(b";node;enrollment;no-direct;later").unwrap();
         assert!(!off.allows_direct_paths());
+        assert_eq!(off.direct_pairs, LinkPolicy::default_direct_pairs());
         assert_eq!(off.encode(), b";node;enrollment;no-direct");
         assert_eq!(LinkPolicy::decode(&off.encode()).unwrap(), off);
         assert!(off.describe().ends_with("; direct paths: off"));
 
         let on = LinkPolicy::decode(b";node;enrollment;direct").unwrap();
         assert_eq!(on, LinkPolicy::default());
+    }
+
+    /// The direct-path role matrix: default pairs (no guest) when the fifth
+    /// field is absent, so an encoding made before the field decodes as it
+    /// did; the default writes nothing new; other pairs round-trip in
+    /// canonical order, after an explicit fourth field.
+    #[test]
+    fn link_policy_direct_pairs_round_trip_and_default_is_unchanged() {
+        let default = LinkPolicy::default();
+        for (a, b) in [("admin", "member"), ("member", "member"), ("node", "admin")] {
+            assert!(default.allows_direct_path(a, b), "{a}-{b} by default");
+        }
+        for other in ["admin", "member", "node", "guest"] {
+            assert!(!default.allows_direct_path("guest", other), "guest-{other}");
+        }
+        // Four fields (an encoding from before the matrix): default pairs.
+        let old = LinkPolicy::decode(b"admin,member;node;no-enrollment;direct").unwrap();
+        assert_eq!(old.direct_pairs, LinkPolicy::default_direct_pairs());
+        assert_eq!(old.encode(), b"admin,member;node;no-enrollment");
+        // Stating the default pairs, in any order, writes nothing new.
+        let mut reordered = LinkPolicy::default_direct_pairs();
+        reordered.reverse();
+        reordered.push(("member".into(), "admin".into()));
+        let stated = LinkPolicy {
+            direct_pairs: reordered,
+            ..LinkPolicy::default()
+        };
+        assert_eq!(stated.encode(), b";node;enrollment");
+        assert_eq!(stated.describe(), LinkPolicy::default().describe());
+
+        let members = LinkPolicy {
+            direct_pairs: vec![("member".into(), "member".into())],
+            ..LinkPolicy::default()
+        };
+        assert_eq!(members.encode(), b";node;enrollment;direct;member:member");
+        assert_eq!(LinkPolicy::decode(&members.encode()).unwrap(), members);
+        assert!(members.allows_direct_path("member", "member"));
+        assert!(!members.allows_direct_path("admin", "member"));
+        assert!(members.describe().ends_with("; direct paths: member:member"));
+
+        let with_guest = LinkPolicy {
+            direct_pairs: vec![("member".into(), "guest".into()), ("node".into(), "admin".into())],
+            direct_paths: false,
+            ..LinkPolicy::default()
+        };
+        assert_eq!(with_guest.encode(), b";node;enrollment;no-direct;admin:node,guest:member");
+        let decoded = LinkPolicy::decode(&with_guest.encode()).unwrap();
+        assert_eq!(decoded.direct_pairs, with_guest.canonical_direct_pairs());
+        assert!(!decoded.allows_direct_path("guest", "member"), "direct paths are off");
+
+        let none = LinkPolicy {
+            direct_pairs: Vec::new(),
+            ..LinkPolicy::default()
+        };
+        assert_eq!(none.encode(), b";node;enrollment;direct;");
+        assert_eq!(LinkPolicy::decode(&none.encode()).unwrap(), none);
+        assert!(none.describe().ends_with("; direct paths: no role pair"));
+    }
+
+    fn relay(device: &str, key: Option<[u8; 32]>, endpoints: &[&str], preference: u32) -> AdvertisedRelay {
+        AdvertisedRelay {
+            device: n(device),
+            key,
+            endpoints: endpoints.iter().map(|e| e.to_string()).collect(),
+            preference,
+        }
+    }
+
+    /// Advertised relays survive a re-encode (so every version made from a
+    /// context carries them) and encode in canonical order whatever order
+    /// they were set in; the TLV is non-critical.
+    #[test]
+    fn advertised_relays_round_trip_in_canonical_order() {
+        let far = relay("/club/node/r", Some([7; 32]), &["club.example.org:6367"], 5);
+        let near = relay("/home/node/b", None, &["b.example.net:6367", "192.0.2.1:6367"], 0);
+        let tie = relay("/home/node/a", None, &["a.example.net:6367"], 0);
+        let ctx = SignedTrustContext::hierarchical(n("/home"))
+            .with_version(2)
+            .with_relays(vec![far.clone(), near.clone(), tie.clone()]);
+        assert_eq!(ctx.relays(), [tie.clone(), near.clone(), far.clone()]);
+        let decoded = SignedTrustContext::decode_content(&ctx.encode_content(), 2).unwrap();
+        assert_eq!(decoded.relays(), ctx.relays());
+        let again = SignedTrustContext::hierarchical(n("/home"))
+            .with_version(2)
+            .with_relays(vec![near, tie, far]);
+        assert_eq!(again.encode_content(), ctx.encode_content());
+        assert_eq!(tlv::ADVERTISED_RELAY % 2, 0, "an old node must be able to skip it");
+        let bare = SignedTrustContext::hierarchical(n("/home")).with_version(1);
+        assert!(SignedTrustContext::decode_content(&bare.encode_content(), 1).unwrap().relays().is_empty());
+    }
+
+    /// A malformed relay entry is dropped, not the context; an unknown
+    /// non-critical sub-TLV is skipped.
+    #[test]
+    fn a_malformed_relay_entry_is_skipped() {
+        let name = |s: &str| n(s).encode_to_tlv().to_vec();
+        let endpoint = tlv_bytes(tlv::RELAY_ENDPOINT, b"r.example.net:6367").to_vec();
+        let entry = |parts: &[&[u8]]| tlv_bytes(tlv::ADVERTISED_RELAY, &parts.concat());
+        let ok = entry(&[&name("/h/node/ok"), &endpoint, &tlv_bytes(0x0428, b"x")]);
+        let malformed = [
+            entry(&[&name("/h/node/a")]),                                   // no endpoint
+            entry(&[&name("/h/node/b"), &endpoint, &tlv_bytes(0x0429, b"x")]), // unknown critical
+            entry(&[&name("/h/node/c"), &tlv_bytes(tlv::RELAY_KEY, &[1; 31]), &endpoint]),
+            entry(&[&name("/h/node/d"), &tlv_bytes(tlv::RELAY_ENDPOINT, b"")]),
+            entry(&[&name("/h/node/e"), &endpoint, &tlv_bytes(tlv::RELAY_PREFERENCE, &[1; 5])]),
+            entry(&[&name("/h/node/f"), &name("/h/node/g"), &endpoint]),
+            entry(&[&endpoint]),                                            // no device
+            entry(&[&name("/other/node/r"), &endpoint]),                    // outside, no key
+        ];
+        let mut body = n("/h").encode_to_tlv().to_vec();
+        body.extend_from_slice(&tlv_bytes(
+            tlv::TRUST_SCHEMA_BLOB,
+            &[
+                tlv_bytes(tlv::SCHEMA_FORMAT, &[tlv::SCHEMA_FORMAT_NATIVE]),
+                tlv_bytes(tlv::SCHEMA_BODY, b""),
+            ]
+            .concat(),
+        ));
+        for e in malformed.iter().chain([&ok]) {
+            body.extend_from_slice(e);
+        }
+        let ctx = SignedTrustContext::decode_content(&tlv_bytes(tlv::TRUST_CONTEXT, &body), 1)
+            .expect("a malformed relay does not reject the context");
+        assert_eq!(ctx.relays(), [relay("/h/node/ok", None, &["r.example.net:6367"], 0)]);
+    }
+
+    /// The LinkPolicy and AdvertisedRelay vectors of trust-context.md §11 T5.
+    #[test]
+    fn spec_vectors_t5_direct_pairs_and_relays() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut w = TlvWriter::new();
+        let members = LinkPolicy {
+            direct_pairs: vec![("member".into(), "member".into())],
+            ..LinkPolicy::default()
+        };
+        w.write_tlv(tlv::LINK_POLICY, &members.encode());
+        assert_eq!(
+            hex(&w.finish()),
+            "fd0412253b6e6f64653b656e726f6c6c6d656e743b6469726563743b6d656d6265723a6d656d626572"
+        );
+        let mut w = TlvWriter::new();
+        let none = LinkPolicy {
+            direct_pairs: Vec::new(),
+            ..LinkPolicy::default()
+        };
+        w.write_tlv(tlv::LINK_POLICY, &none.encode());
+        assert_eq!(hex(&w.finish()), "fd0412183b6e6f64653b656e726f6c6c6d656e743b6469726563743b");
+
+        let fingerprint: [u8; 32] = [
+            0x56, 0x47, 0x5a, 0xa7, 0x54, 0x63, 0x47, 0x4c, 0x02, 0x85, 0xdf, 0x5d, 0xbf, 0x2b,
+            0xca, 0xb7, 0x3d, 0xa6, 0x51, 0x35, 0x88, 0x39, 0xe9, 0xb7, 0x74, 0x81, 0xb2, 0xea,
+            0xb1, 0x07, 0x70, 0x8c,
+        ];
+        let r1 = relay("/home/bob/node/relay", Some(fingerprint), &["relay.example.net:6367"], 0);
+        let r2 = relay("/home/bob/node/r2", None, &["192.0.2.7:6367", "[2001:db8::7]:6367"], 300);
+        let mut w = TlvWriter::new();
+        w.write_tlv(tlv::ADVERTISED_RELAY, &r1.encode());
+        assert_eq!(
+            hex(&w.finish()),
+            "fd04205d07180804686f6d650803626f6208046e6f6465080572656c6179fd0422205647\
+             5aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708cfd04241672656c\
+             61792e6578616d706c652e6e65743a36333637fd04260100"
+        );
+        let mut w = TlvWriter::new();
+        w.write_tlv(tlv::ADVERTISED_RELAY, &r2.encode());
+        assert_eq!(
+            hex(&w.finish()),
+            "fd04204507150804686f6d650803626f6208046e6f646508027232fd04240e3139322e30\
+             2e322e373a36333637fd0424125b323030313a6462383a3a375d3a36333637fd042602012c"
+        );
     }
 
     /// AnchorSet (by certificate name) and Revocation entries are written in

@@ -25,7 +25,9 @@ use ndn_cert::{
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{Ed25519Signer, FilePib, Keyring, LinkPolicy, SecurityManager, Signer};
+use ndn_security::{
+    AdvertisedRelay, Ed25519Signer, FilePib, Keyring, LinkPolicy, SecurityManager, Signer,
+};
 use ndn_cert::{
     ApprovalPolicy, BumpError, RootStore, bump_context_schema, namespace_schema,
     open_context_update, read_stored_context,
@@ -973,7 +975,7 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
 
     // The namespace as an earlier `ndn-fwd init` left it.
     let (old_schema, old_hint) = old_generated_schema();
-    let old = bump_context_schema(root.as_ref(), &v1, &old_schema, &old_hint, None, true)
+    let old = bump_context_schema(root.as_ref(), &v1, &old_schema, &old_hint, None, None, true)
         .await
         .unwrap()
         .unwrap();
@@ -992,7 +994,7 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
 
     let current = namespace_schema(&ns()).unwrap().blobs();
     let hint = ApprovalPolicy::default().to_hint();
-    let update = bump_context_schema(root.as_ref(), &old.bump.data, &current, &hint, None, false)
+    let update = bump_context_schema(root.as_ref(), &old.bump.data, &current, &hint, None, None, false)
         .await
         .unwrap()
         .expect("the old schema lacks rules");
@@ -1014,9 +1016,10 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
     assert!(produces(&rd, &phone, &member).await);
 
     let again =
-        bump_context_schema(root.as_ref(), &update.bump.data, &current, &hint, None, false).await;
+        bump_context_schema(root.as_ref(), &update.bump.data, &current, &hint, None, None, false)
+            .await;
     assert!(matches!(again, Ok(None)), "nothing to sign: {again:?}");
-    match bump_context_schema(root.as_ref(), &update.bump.data, &old_schema, &hint, None, false)
+    match bump_context_schema(root.as_ref(), &update.bump.data, &old_schema, &hint, None, None, false)
         .await
     {
         Err(BumpError::Narrowing { removed, .. }) => {
@@ -1028,8 +1031,9 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
     }
 }
 
-/// A schema update carries the held link policy unchanged unless `[ca]`
-/// states another; a widening applies as is, a narrowing only with consent.
+/// A schema update carries the held link policy and relays unchanged unless
+/// `[ca]` states others; a widening applies as is, a narrowing only with
+/// consent.
 #[tokio::test]
 async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
     let rd = RootDevice::new().await;
@@ -1047,8 +1051,9 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         relay_roles: vec!["node".into()],
         enrollment_links: true,
         direct_paths: true,
+        direct_pairs: LinkPolicy::default_direct_pairs(),
     };
-    let v2 = bump_context_schema(root.as_ref(), &v1, &schema, &hint, Some(&held), true)
+    let v2 = bump_context_schema(root.as_ref(), &v1, &schema, &hint, Some(&held), None, true)
         .await
         .unwrap()
         .expect("another link policy");
@@ -1060,7 +1065,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         ..ApprovalPolicy::default()
     }
     .to_hint();
-    let v3 = bump_context_schema(root.as_ref(), &v2.bump.data, &schema, &other_hint, None, false)
+    let v3 = bump_context_schema(root.as_ref(), &v2.bump.data, &schema, &other_hint, None, None, false)
         .await
         .unwrap()
         .expect("another hint");
@@ -1073,8 +1078,9 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         relay_roles: vec!["node".into(), "admin".into()],
         enrollment_links: true,
         direct_paths: true,
+        direct_pairs: LinkPolicy::default_direct_pairs(),
     };
-    let v4 = bump_context_schema(root.as_ref(), &v3.bump.data, &schema, &other_hint, Some(&wider), false)
+    let v4 = bump_context_schema(root.as_ref(), &v3.bump.data, &schema, &other_hint, Some(&wider), None, false)
         .await
         .unwrap()
         .expect("a wider link policy");
@@ -1082,11 +1088,14 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
     assert_eq!(v4.bump.context.stated_link_policy(), Some(&wider));
 
     // Each narrowing is refused without consent and applies with it.
+    let mut fewer_pairs = LinkPolicy::default_direct_pairs();
+    fewer_pairs.retain(|(a, b)| !(a == "node" && b == "node"));
     for narrower in [
         LinkPolicy { roles: vec!["admin".into(), "node".into()], ..wider.clone() },
         LinkPolicy { relay_roles: vec!["node".into()], ..wider.clone() },
         LinkPolicy { enrollment_links: false, ..wider.clone() },
         LinkPolicy { direct_paths: false, ..wider.clone() },
+        LinkPolicy { direct_pairs: fewer_pairs, ..wider.clone() },
     ] {
         let refused = bump_context_schema(
             root.as_ref(),
@@ -1094,6 +1103,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
             &schema,
             &other_hint,
             Some(&narrower),
+            None,
             false,
         )
         .await;
@@ -1102,7 +1112,7 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
             "{refused:?}"
         );
         let applied =
-            bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&narrower), true)
+            bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&narrower), None, true)
                 .await
                 .unwrap()
                 .expect("consented narrowing");
@@ -1111,16 +1121,51 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
 
     // Direct paths off -> on widens: no consent needed.
     let no_direct = LinkPolicy { direct_paths: false, ..wider.clone() };
-    let v5 = bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&no_direct), true)
+    let v5 = bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&no_direct), None, true)
         .await
         .unwrap()
         .expect("direct paths off");
-    let v6 = bump_context_schema(root.as_ref(), &v5.bump.data, &schema, &other_hint, Some(&wider), false)
+    let v6 = bump_context_schema(root.as_ref(), &v5.bump.data, &schema, &other_hint, Some(&wider), None, false)
         .await
         .unwrap()
         .expect("direct paths back on");
     assert!(v6.change.link_narrowed.is_empty());
     assert_eq!(v6.bump.context.stated_link_policy(), Some(&wider));
+
+    // Advertising a relay widens; the next version carries it; dropping it
+    // needs consent.
+    let relay = AdvertisedRelay {
+        device: "/home/bob/node/vps".parse().unwrap(),
+        key: None,
+        endpoints: vec!["vps.example.net:6367".into()],
+        preference: 0,
+    };
+    let v7 = bump_context_schema(
+        root.as_ref(),
+        &v6.bump.data,
+        &schema,
+        &other_hint,
+        None,
+        Some(&[relay.clone()]),
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("a relay added");
+    assert_eq!(v7.bump.context.relays(), [relay.clone()]);
+    let v8 = bump_context_schema(root.as_ref(), &v7.bump.data, &schema, &hint, None, None, false)
+        .await
+        .unwrap()
+        .expect("another hint");
+    assert_eq!(v8.bump.context.relays(), [relay], "carried to the next version");
+    let refused =
+        bump_context_schema(root.as_ref(), &v8.bump.data, &schema, &hint, None, Some(&[]), false).await;
+    assert!(matches!(&refused, Err(BumpError::RelayNarrowing { dropped, .. }) if dropped.len() == 1), "{refused:?}");
+    let v9 = bump_context_schema(root.as_ref(), &v8.bump.data, &schema, &hint, None, Some(&[]), true)
+        .await
+        .unwrap()
+        .expect("consented narrowing");
+    assert!(v9.bump.context.relays().is_empty());
 }
 
 /// Nothing an unsigned NEW/CHALLENGE answer says ends a request: a denial

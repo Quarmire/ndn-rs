@@ -38,7 +38,8 @@ pub mod module {
     /// WebTransport listener introspection — read-only TLS cert status.
     pub const WEBTRANSPORT: &[u8] = b"webtransport";
     /// This device's QUIC links and their paths (`ndn-link`, served by the
-    /// host daemon as an extra module) — read-only, local operators only.
+    /// host daemon as an extra module), local operators only: `list`, and
+    /// the link commands `connect`, `disconnect` and `mode`.
     pub const LINKS: &[u8] = b"links";
 }
 
@@ -66,6 +67,16 @@ pub mod verb {
     /// `ca/deny` — deny a pending request (`<id or code>[:<reason>]` in
     /// `uri`). Same authorization as `approve`.
     pub const DENY: &[u8] = b"deny";
+    /// `links/connect` — link now to the configured device whose label is in
+    /// `ControlParameters.uri`, whatever its mode, until it is disconnected.
+    pub const CONNECT: &[u8] = b"connect";
+    /// `links/disconnect` — stop asking for the link labelled in `uri`: an
+    /// `off` link closes now, an `on-demand` one once idle; an `always` link
+    /// stays up.
+    pub const DISCONNECT: &[u8] = b"disconnect";
+    /// `links/mode` — set the mode of the link labelled in `uri` to the
+    /// [`LinkModeArg`](crate::LinkModeArg) in `local_uri`, until restart.
+    pub const MODE: &[u8] = b"mode";
 
     pub const ADD_NEXTHOP: &[u8] = b"add-nexthop";
     pub const REMOVE_NEXTHOP: &[u8] = b"remove-nexthop";

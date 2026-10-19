@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use ndn_packet::{Data, Name};
 use ndn_security::{
-    Certificate, EnrollmentHint, FilePib, KeyRole, LinkPolicy, PibError, SecurityManager, SignedTrustContext,
-    SignedTrustContextError, TrustError,
+    AdvertisedRelay, Certificate, EnrollmentHint, FilePib, KeyRole, LinkPolicy, PibError,
+    SecurityManager, SignedTrustContext, SignedTrustContextError, TrustError,
 };
 use ndn_trust_envelope::TrustEnvelope;
 
@@ -31,7 +31,7 @@ use crate::context_store::{
     ContextStoreError, context_file_path, persist_context, remove_stored_context,
 };
 use crate::onboarding::anchor_fingerprint;
-use crate::policy::ApprovalPolicy;
+use crate::ca_policy::NamespacePolicies;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
@@ -74,7 +74,7 @@ pub struct NamespaceInit {
     pub anchor: Certificate,
     /// The published, versioned trust context (generated namespace
     /// schema, authoritative; the default enrollment policy:
-    /// [`ApprovalPolicy::default`]).
+    /// [`ApprovalPolicy::default`](crate::policy::ApprovalPolicy::default)).
     pub context: Arc<SignedTrustContext>,
     /// The context as signed NDN Data at [`SignedTrustContext::rdr_name`],
     /// signed by the root anchor — what is published and what adopters verify.
@@ -119,13 +119,15 @@ pub fn init_namespace(
         &[],
         EnrollmentHint::namespace_default(),
         LinkPolicy::default(),
+        Vec::new(),
     ))
 }
 
 /// Build the namespace around the root key `root_key_name(namespace)` already held
 /// by `mgr` (in memory or a hardware signer registered with it). The
 /// `root_device_keys` (the CA and admin keys that will live beside the root)
-/// get the [`KeyRole::ROOT_DEVICE`] role in the context.
+/// get the [`KeyRole::ROOT_DEVICE`] role in the context, which advertises
+/// `relays`.
 async fn build_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
@@ -133,6 +135,7 @@ async fn build_namespace(
     root_device_keys: &[Name],
     hint: EnrollmentHint,
     link: LinkPolicy,
+    relays: Vec<AdvertisedRelay>,
 ) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
@@ -144,6 +147,7 @@ async fn build_namespace(
         .with_version(1)
         .with_enrollment_hint(hint)
         .with_link_policy(link)
+        .with_relays(relays)
         .with_schema_blobs(schema.blobs())?
         .schema_authoritative();
     if let Some(ca) = ca_endpoint {
@@ -260,8 +264,9 @@ pub enum NamespaceInitError {
 /// another namespace is refused even with `force`.
 ///
 /// The context advertises the default enrollment policy
-/// ([`ApprovalPolicy::default`]) and states the default link policy
-/// ([`LinkPolicy::default`]); [`init_namespace_in_pib_with`] takes others.
+/// ([`ApprovalPolicy::default`](crate::policy::ApprovalPolicy::default)), states the default link policy
+/// ([`LinkPolicy::default`]) and advertises no relay;
+/// [`init_namespace_in_pib_with`] takes others.
 pub async fn init_namespace_in_pib(
     pib: &FilePib,
     namespace: &Name,
@@ -275,25 +280,23 @@ pub async fn init_namespace_in_pib(
         device,
         force,
         root,
-        &ApprovalPolicy::default(),
-        &LinkPolicy::default(),
+        &NamespacePolicies::default(),
     )
     .await
 }
 
-/// [`init_namespace_in_pib`] whose context advertises `approval` — which
-/// roles enroll only on an admin's approval, and whether with an invite too
-/// — the policy the namespace's CA (`[ca]`) then enforces, and states
-/// `link`: which devices may link and relay, and whether relays admit
-/// enrollment links.
+/// [`init_namespace_in_pib`] whose context advertises `policies`: which
+/// roles enroll only on an admin's approval, and whether with an invite
+/// too — the policy the namespace's CA (`[ca]`) then enforces; which
+/// devices may link, relay and make direct paths (stated); and the relays
+/// every member learns.
 pub async fn init_namespace_in_pib_with(
     pib: &FilePib,
     namespace: &Name,
     device: &str,
     force: bool,
     root: &NewRootStore,
-    approval: &ApprovalPolicy,
-    link: &LinkPolicy,
+    policies: &NamespacePolicies,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
@@ -356,8 +359,9 @@ pub async fn init_namespace_in_pib_with(
         namespace,
         Some(namespace.clone().append("CA")),
         &[ca_key.clone(), device_key.clone()],
-        approval.to_hint(),
-        link.clone(),
+        policies.approval.to_hint(),
+        policies.link.clone(),
+        policies.relays.clone(),
     )
     .await?;
     let root_store = pending.commit(pib, namespace, &init.anchor)?;

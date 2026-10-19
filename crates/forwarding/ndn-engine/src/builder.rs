@@ -522,6 +522,7 @@ impl EngineBuilder {
         let mut tasks = TaskTracker::new(Arc::clone(&runtime));
 
         let reflexive = Arc::new(crate::reflexive::ReflexiveTable::new(self.config.reflexive));
+        let transit = Arc::new(crate::transit::TransitPrefixes::default());
 
         // Must outlive the expiry task, which credits `NUnsatisfiedInterests`
         // on the in-faces of timed-out PIT entries.
@@ -688,6 +689,7 @@ impl EngineBuilder {
             discovery: Arc::clone(&discovery),
             neighbors: Arc::clone(&neighbors),
             reflexive: Arc::clone(&reflexive),
+            transit: Arc::clone(&transit),
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
@@ -780,7 +782,8 @@ impl EngineBuilder {
                 validator,
                 crate::stages::validation::PendingQueueConfig::default(),
                 Arc::clone(&runtime),
-            ),
+            )
+            .with_transit(Arc::clone(&transit)),
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
                 admission: self

@@ -33,7 +33,10 @@ pub mod nfd_dataset;
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;
 pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
-pub use link_status::{LinkEntry, LinkListing, LinkPathEntry};
+pub use link_status::{
+    LinkAsleepEntry, LinkEntry, LinkListing, LinkModeArg, LinkPathEntry, LinkRelayEntry,
+    link_command, parse_link_command,
+};
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
 pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
 

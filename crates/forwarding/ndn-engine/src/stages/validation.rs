@@ -179,6 +179,8 @@ pub struct ValidationStage {
     pending: Arc<Mutex<PendingQueue>>,
     pub runtime: Arc<dyn Runtime>,
     stats: Arc<ValidationStats>,
+    /// Namespaces carried in transit, unvalidated (see [`crate::transit`]).
+    transit: Arc<crate::transit::TransitPrefixes>,
 }
 
 impl ValidationStage {
@@ -192,7 +194,14 @@ impl ValidationStage {
             pending: Arc::new(Mutex::new(PendingQueue::new(&config))),
             runtime,
             stats: Arc::new(ValidationStats::default()),
+            transit: Arc::default(),
         }
+    }
+
+    /// Carry the namespaces in `transit` unvalidated.
+    pub fn with_transit(mut self, transit: Arc<crate::transit::TransitPrefixes>) -> Self {
+        self.transit = transit;
+        self
     }
 
     pub fn disabled() -> Self {
@@ -203,6 +212,7 @@ impl ValidationStage {
             )),
             runtime: ndn_runtime::default_runtime(),
             stats: Arc::new(ValidationStats::default()),
+            transit: Arc::default(),
         }
     }
 
@@ -246,6 +256,17 @@ impl ValidationStage {
             DecodedPacket::Data(d) => d,
             _ => return Action::Satisfy(ctx),
         };
+
+        // A namespace in transit (served for devices of a namespace this
+        // forwarder does not hold) is forwarded unvalidated: `verified`
+        // stays false, so it is never cached; its consumers validate it. A
+        // namespace held here is validated whatever the transit marks say.
+        if self.transit.covers(&data.name)
+            && validator.keyring().context_for(&data.name).namespace().is_empty()
+        {
+            trace!(target: t::SECURITY, name=%data.name, "validation: in transit (a served namespace not held here), forwarded unvalidated");
+            return Action::Satisfy(ctx);
+        }
 
         // The `validate` span: inputs (name / signature type / signing key) and the
         // verdict + reason + latency. Zero-cost without a subscriber; under the

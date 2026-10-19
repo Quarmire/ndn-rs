@@ -23,6 +23,10 @@ use crate::trust_context::SignedTrustContext;
 /// See [`Keyring::on_revocation`].
 type RevocationListener = Arc<dyn Fn(&Arc<SignedTrustContext>, &[Name]) + Send + Sync>;
 
+/// Called once a context (a new namespace, or a newer version) is adopted.
+/// See [`Keyring::on_adoption`].
+type AdoptionListener = Arc<dyn Fn(&Arc<SignedTrustContext>) + Send + Sync>;
+
 /// A node's set of adopted trust contexts plus an ambient fallback context.
 ///
 /// The `ambient` context (namespace `/`) backs the flat-anchor / single-schema
@@ -33,6 +37,7 @@ pub struct Keyring {
     contexts: DashMap<Name, Arc<SignedTrustContext>>,
     ambient: Arc<SignedTrustContext>,
     revocation_listeners: RwLock<Vec<RevocationListener>>,
+    adoption_listeners: RwLock<Vec<AdoptionListener>>,
     /// Bumped each time an adopted version newly revokes names; see
     /// [`revocation_epoch`](Keyring::revocation_epoch).
     revocation_epoch: AtomicU64,
@@ -68,6 +73,7 @@ impl Keyring {
             contexts: DashMap::new(),
             ambient,
             revocation_listeners: RwLock::new(Vec::new()),
+            adoption_listeners: RwLock::new(Vec::new()),
             revocation_epoch: AtomicU64::new(0),
         }
     }
@@ -120,6 +126,7 @@ impl Keyring {
             }
         };
         self.notify_revoked(&ctx, &revoked);
+        self.notify_adopted(&ctx);
         true
     }
 
@@ -139,6 +146,7 @@ impl Keyring {
             }
         };
         self.notify_revoked(&ctx, &revoked);
+        self.notify_adopted(&ctx);
         Ok(())
     }
 
@@ -167,6 +175,7 @@ impl Keyring {
             }
         };
         self.notify_revoked(&ctx, &revoked);
+        self.notify_adopted(&ctx);
         Ok(())
     }
 
@@ -186,6 +195,30 @@ impl Keyring {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Arc::new(listener));
+    }
+
+    /// Run `listener` whenever this keyring adopts a context of a namespace
+    /// it did not hold, or a newer version of one it holds (re-adopting the
+    /// held version runs nothing) — e.g. so a host learns what a new version
+    /// says (its relays, its link policy). It runs synchronously on the
+    /// adopting thread after the context is in force and after the
+    /// revocation listeners, so it should only schedule work.
+    pub fn on_adoption(&self, listener: impl Fn(&Arc<SignedTrustContext>) + Send + Sync + 'static) {
+        self.adoption_listeners
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::new(listener));
+    }
+
+    fn notify_adopted(&self, ctx: &Arc<SignedTrustContext>) {
+        let listeners = self
+            .adoption_listeners
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for listener in listeners {
+            listener(ctx);
+        }
     }
 
     /// How many adoptions so far newly revoked names. Read it before

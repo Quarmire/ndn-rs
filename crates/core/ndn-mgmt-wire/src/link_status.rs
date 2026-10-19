@@ -9,14 +9,16 @@ use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::{DecodeError, nni_bytes, read_nni};
+use crate::{ControlParameters, DecodeError, nni_bytes, read_nni};
 
 /// `links/list` TLV-TYPE codes.
 ///
 /// An ndn-rs extension (no NFD analogue) in the application range
-/// 0x04A0–0x04BF, clear of the trust context (0x0410–0x041F), the link
-/// messages (0x0450–0x046F) and the trust envelope (0x0470–0x049F). All
+/// 0x04A0–0x04DF, clear of the trust context (0x0410–0x042F), the link
+/// messages (0x0440–0x046F) and the trust envelope (0x0470–0x049F). All
 /// codes are even (non-critical): a decoder skips the ones it does not know.
+/// A code's meaning depends on the entry it sits in (`KEY`, `HELD` and
+/// `WAKES` appear at the top level and nested).
 pub mod link_tlv {
     /// 32 bytes, a link key fingerprint: at the top level this device's, in
     /// a [`LINK`] the linked device's.
@@ -52,6 +54,42 @@ pub mod link_tlv {
     pub const DIRECT_TEXT: u64 = 0x04BC;
     /// NonNegativeInteger, seconds, optional: when the next punch is due.
     pub const RETRY_IN_SECS: u64 = 0x04BE;
+    /// UTF-8 string in a [`LINK`], optional: `always`, `on-demand` or `off`.
+    pub const MODE: u64 = 0x04C0;
+    /// NonNegativeInteger, seconds, in a [`LINK`] with mode `on-demand`:
+    /// the idle close.
+    pub const IDLE_SECS: u64 = 0x04C2;
+    /// Nested in a [`LINK`], optional: the link is to a relay this device uses.
+    pub const RELAY: u64 = 0x04C4;
+    /// UTF-8 string in a [`RELAY`]: `user` or `namespace:<namespace>`.
+    pub const RELAY_SOURCE: u64 = 0x04C6;
+    /// NonNegativeInteger in a [`RELAY`]: lower is preferred.
+    pub const PREFERENCE: u64 = 0x04C8;
+    /// UTF-8 string in a [`RELAY`]: `linked`, `trying`, `down`, `standby`
+    /// or `off`.
+    pub const RELAY_STATE: u64 = 0x04CA;
+    /// UTF-8 string in a [`RELAY`], optional: why, and what to do if
+    /// anything.
+    pub const RELAY_TEXT: u64 = 0x04CC;
+    /// Nested in a [`LINK`], optional (relay side): the device is asleep here.
+    pub const ASLEEP: u64 = 0x04CE;
+    /// NonNegativeInteger, seconds, in an [`ASLEEP`]: how long it has been.
+    pub const SINCE_SECS: u64 = 0x04D0;
+    /// NonNegativeInteger: Interests held — in an [`ASLEEP`] for that device,
+    /// at the top level for all.
+    pub const HELD: u64 = 0x04D2;
+    /// Empty, in an [`ASLEEP`]: the device asked for its Interests to be held.
+    pub const HOLD: u64 = 0x04D4;
+    /// Empty, in an [`ASLEEP`]: the device registered a wake token.
+    pub const WAKE: u64 = 0x04D6;
+    /// NonNegativeInteger: wakes sent — in an [`ASLEEP`] to that device, at
+    /// the top level to all.
+    pub const WAKES: u64 = 0x04D8;
+    /// UTF-8 string in a [`LINK`], optional: why a configured device is not
+    /// linked now.
+    pub const DOWN: u64 = 0x04DA;
+    /// UTF-8 string, top level, optional: this device's relay serving policy.
+    pub const SERVE: u64 = 0x04DC;
 }
 
 /// The `links/list` answer.
@@ -64,6 +102,12 @@ pub struct LinkListing {
     /// Punch requests this device refused, in total.
     pub punches_refused: u64,
     pub links: Vec<LinkEntry>,
+    /// This device's relay serving policy, one line (empty: not reported).
+    pub serve: String,
+    /// Interests this device holds for sleeping devices now, in total.
+    pub held_total: u64,
+    /// Wakes this device has sent, in total.
+    pub wakes_sent: u64,
 }
 
 /// One device this device links with (or is configured to, or punched with).
@@ -83,6 +127,109 @@ pub struct LinkEntry {
     pub direct_text: String,
     /// When the next punch is due.
     pub retry_in_secs: Option<u64>,
+    /// `always`, `on-demand` or `off`, for a configured link.
+    pub mode: Option<String>,
+    /// With mode `on-demand`: the idle close, in seconds.
+    pub idle_secs: Option<u64>,
+    /// Set when the device is a relay this device uses.
+    pub relay: Option<LinkRelayEntry>,
+    /// Set (relay side) when the device is asleep here.
+    pub asleep: Option<LinkAsleepEntry>,
+    /// Why a configured device is not linked now.
+    pub down: Option<String>,
+}
+
+/// A relay this device uses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkRelayEntry {
+    /// `user` or `namespace:<namespace>`.
+    pub source: String,
+    /// Lower is preferred.
+    pub preference: u64,
+    /// `linked`, `trying`, `down`, `standby` or `off`.
+    pub state: String,
+    /// Why, for a person (empty when there is nothing to say).
+    pub text: String,
+}
+
+/// A device asleep at this relay.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkAsleepEntry {
+    /// How long it has been asleep.
+    pub since_secs: u64,
+    /// Interests held for it now.
+    pub held: u64,
+    /// It asked for its Interests to be held.
+    pub hold: bool,
+    /// It registered a wake token.
+    pub wake: bool,
+    /// Wakes sent to it.
+    pub wakes: u64,
+}
+
+/// A link mode as `links/mode` carries it (in `ControlParameters.local_uri`,
+/// the link's label in `uri`) and `ndn-ctl link mode` takes it: `always`,
+/// `on-demand`, `on-demand:<idle seconds>` or `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkModeArg {
+    Always,
+    /// `idle_secs = None`: keep the link's current (or configured) idle close.
+    OnDemand { idle_secs: Option<u64> },
+    Off,
+}
+
+impl core::str::FromStr for LinkModeArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "always" => Ok(Self::Always),
+            "on-demand" => Ok(Self::OnDemand { idle_secs: None }),
+            "off" => Ok(Self::Off),
+            _ => match s.strip_prefix("on-demand:").map(str::parse::<u64>) {
+                Some(Ok(secs)) => Ok(Self::OnDemand { idle_secs: Some(secs) }),
+                _ => Err(alloc::format!(
+                    "{s:?} is not a link mode: use always, on-demand, on-demand:<idle seconds> \
+                     (e.g. on-demand:60) or off"
+                )),
+            },
+        }
+    }
+}
+
+impl core::fmt::Display for LinkModeArg {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Always => f.write_str("always"),
+            Self::OnDemand { idle_secs: None } => f.write_str("on-demand"),
+            Self::OnDemand { idle_secs: Some(s) } => write!(f, "on-demand:{s}"),
+            Self::Off => f.write_str("off"),
+        }
+    }
+}
+
+/// The parameters of a `links/connect`, `links/disconnect` or (with `mode`)
+/// `links/mode` command for the link labelled `label`.
+pub fn link_command(label: &str, mode: Option<LinkModeArg>) -> ControlParameters {
+    ControlParameters {
+        uri: Some(label.into()),
+        local_uri: mode.map(|m| alloc::string::ToString::to_string(&m)),
+        ..Default::default()
+    }
+}
+
+/// The label (and, if carried, the mode) of a links command; the error says
+/// what is missing.
+pub fn parse_link_command(
+    params: &ControlParameters,
+) -> Result<(String, Option<LinkModeArg>), String> {
+    let label = params
+        .uri
+        .clone()
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| String::from("name the link (its label in `ndn-ctl link list`) in Uri"))?;
+    let mode = params.local_uri.as_deref().map(str::parse).transpose()?;
+    Ok((label, mode))
 }
 
 /// One path to a device.
@@ -146,6 +293,9 @@ impl LinkListing {
         for link in &self.links {
             w.write_nested(link_tlv::LINK, |w| link.encode_into(w));
         }
+        write_text(&mut w, link_tlv::SERVE, &self.serve);
+        write_nni(&mut w, link_tlv::HELD, self.held_total);
+        write_nni(&mut w, link_tlv::WAKES, self.wakes_sent);
         w.finish()
     }
 
@@ -160,6 +310,9 @@ impl LinkListing {
                 link_tlv::PROBES_SENT => out.probes_sent = nni(&v)?,
                 link_tlv::PUNCHES_REFUSED => out.punches_refused = nni(&v)?,
                 link_tlv::LINK => out.links.push(LinkEntry::decode(v)?),
+                link_tlv::SERVE => out.serve = text(&v)?,
+                link_tlv::HELD => out.held_total = nni(&v)?,
+                link_tlv::WAKES => out.wakes_sent = nni(&v)?,
                 _ => {}
             }
         }
@@ -188,6 +341,21 @@ impl LinkEntry {
         if let Some(s) = self.retry_in_secs {
             write_nni(w, link_tlv::RETRY_IN_SECS, s);
         }
+        if let Some(mode) = &self.mode {
+            w.write_tlv(link_tlv::MODE, mode.as_bytes());
+        }
+        if let Some(s) = self.idle_secs {
+            write_nni(w, link_tlv::IDLE_SECS, s);
+        }
+        if let Some(relay) = &self.relay {
+            w.write_nested(link_tlv::RELAY, |w| relay.encode_into(w));
+        }
+        if let Some(asleep) = &self.asleep {
+            w.write_nested(link_tlv::ASLEEP, |w| asleep.encode_into(w));
+        }
+        if let Some(down) = &self.down {
+            w.write_tlv(link_tlv::DOWN, down.as_bytes());
+        }
     }
 
     fn decode(bytes: Bytes) -> Result<LinkEntry, DecodeError> {
@@ -211,6 +379,11 @@ impl LinkEntry {
                 }
                 link_tlv::DIRECT_TEXT => out.direct_text = text(&v)?,
                 link_tlv::RETRY_IN_SECS => out.retry_in_secs = Some(nni(&v)?),
+                link_tlv::MODE => out.mode = Some(text(&v)?),
+                link_tlv::IDLE_SECS => out.idle_secs = Some(nni(&v)?),
+                link_tlv::RELAY => out.relay = Some(LinkRelayEntry::decode(v)?),
+                link_tlv::ASLEEP => out.asleep = Some(LinkAsleepEntry::decode(v)?),
+                link_tlv::DOWN => out.down = Some(text(&v)?),
                 _ => {}
             }
         }
@@ -219,6 +392,73 @@ impl LinkEntry {
         }
         if !state {
             return Err(DecodeError::MissingField(link_tlv::DIRECT_STATE));
+        }
+        Ok(out)
+    }
+}
+
+impl LinkRelayEntry {
+    fn encode_into(&self, w: &mut TlvWriter) {
+        w.write_tlv(link_tlv::RELAY_SOURCE, self.source.as_bytes());
+        write_nni(w, link_tlv::PREFERENCE, self.preference);
+        w.write_tlv(link_tlv::RELAY_STATE, self.state.as_bytes());
+        write_text(w, link_tlv::RELAY_TEXT, &self.text);
+    }
+
+    fn decode(bytes: Bytes) -> Result<LinkRelayEntry, DecodeError> {
+        let mut out = LinkRelayEntry::default();
+        let (mut source, mut state) = (false, false);
+        for tlv in tlvs(bytes) {
+            let (typ, v) = tlv?;
+            match typ {
+                link_tlv::RELAY_SOURCE => {
+                    out.source = text(&v)?;
+                    source = true;
+                }
+                link_tlv::PREFERENCE => out.preference = nni(&v)?,
+                link_tlv::RELAY_STATE => {
+                    out.state = text(&v)?;
+                    state = true;
+                }
+                link_tlv::RELAY_TEXT => out.text = text(&v)?,
+                _ => {}
+            }
+        }
+        if !source {
+            return Err(DecodeError::MissingField(link_tlv::RELAY_SOURCE));
+        }
+        if !state {
+            return Err(DecodeError::MissingField(link_tlv::RELAY_STATE));
+        }
+        Ok(out)
+    }
+}
+
+impl LinkAsleepEntry {
+    fn encode_into(&self, w: &mut TlvWriter) {
+        write_nni(w, link_tlv::SINCE_SECS, self.since_secs);
+        write_nni(w, link_tlv::HELD, self.held);
+        if self.hold {
+            w.write_tlv(link_tlv::HOLD, &[]);
+        }
+        if self.wake {
+            w.write_tlv(link_tlv::WAKE, &[]);
+        }
+        write_nni(w, link_tlv::WAKES, self.wakes);
+    }
+
+    fn decode(bytes: Bytes) -> Result<LinkAsleepEntry, DecodeError> {
+        let mut out = LinkAsleepEntry::default();
+        for tlv in tlvs(bytes) {
+            let (typ, v) = tlv?;
+            match typ {
+                link_tlv::SINCE_SECS => out.since_secs = nni(&v)?,
+                link_tlv::HELD => out.held = nni(&v)?,
+                link_tlv::HOLD => out.hold = true,
+                link_tlv::WAKE => out.wake = true,
+                link_tlv::WAKES => out.wakes = nni(&v)?,
+                _ => {}
+            }
         }
         Ok(out)
     }
@@ -308,15 +548,42 @@ mod tests {
                     direct_state: "up".into(),
                     direct_text: String::new(),
                     retry_in_secs: None,
+                    mode: Some("on-demand".into()),
+                    idle_secs: Some(60),
+                    relay: None,
+                    asleep: Some(LinkAsleepEntry {
+                        since_secs: 300,
+                        held: 4,
+                        hold: true,
+                        wake: true,
+                        wakes: 2,
+                    }),
+                    down: None,
                 },
                 LinkEntry {
                     label: "laptop".into(),
                     direct_state: "not-possible".into(),
                     direct_text: "no probe came back".into(),
                     retry_in_secs: Some(20),
+                    down: Some("off: links when asked".into()),
+                    ..Default::default()
+                },
+                LinkEntry {
+                    label: "/home/node/vps".into(),
+                    direct_state: "none".into(),
+                    mode: Some("always".into()),
+                    relay: Some(LinkRelayEntry {
+                        source: "namespace:/home".into(),
+                        preference: 0,
+                        state: "standby".into(),
+                        text: "a preferred relay is linked".into(),
+                    }),
                     ..Default::default()
                 },
             ],
+            serve: "listed: 2 namespaces, quotas 256 links".into(),
+            held_total: 4,
+            wakes_sent: 2,
         };
         assert_eq!(LinkListing::decode(listing.encode()).unwrap(), listing);
         assert_eq!(
@@ -335,5 +602,22 @@ mod tests {
             LinkListing::decode(w.finish()),
             Err(DecodeError::MissingField(link_tlv::LABEL))
         );
+    }
+
+    #[test]
+    fn link_commands_carry_label_and_mode() {
+        for mode in [
+            LinkModeArg::Always,
+            LinkModeArg::OnDemand { idle_secs: None },
+            LinkModeArg::OnDemand { idle_secs: Some(120) },
+            LinkModeArg::Off,
+        ] {
+            let params = ControlParameters::decode(link_command("vps", Some(mode)).encode()).unwrap();
+            assert_eq!(parse_link_command(&params), Ok(("vps".into(), Some(mode))));
+        }
+        let params = link_command("vps", None);
+        assert_eq!(parse_link_command(&params), Ok(("vps".into(), None)));
+        assert!("sometimes".parse::<LinkModeArg>().unwrap_err().contains("on-demand:<idle seconds>"));
+        assert!(parse_link_command(&ControlParameters::default()).is_err());
     }
 }

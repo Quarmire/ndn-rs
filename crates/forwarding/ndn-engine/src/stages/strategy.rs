@@ -112,8 +112,16 @@ impl NetworkRegionTable {
 /// Measured consequence on the fleet: 12 wire copies per Interest against NFD's
 /// 9 — the 3 extra being exactly the returns to the originator — which put 35%
 /// more packets on a shared medium and cost ~30% of video throughput.
+///
+/// `None` for a QUIC link face: a link is one connection to one device,
+/// identified by its key, and devices behind one NAT (or on one host) share
+/// an address — a relay must forward between them.
 fn peer_host(face_table: &ndn_transport::FaceTable, face_id: ndn_transport::FaceId) -> Option<String> {
-    let uri = face_table.get(face_id)?.remote_uri()?;
+    let face = face_table.get(face_id)?;
+    if face.kind() == ndn_transport::FaceKind::Quic {
+        return None;
+    }
+    let uri = face.remote_uri()?;
     // strip scheme
     Some(host_of_remote_uri(&uri).to_string())
 }

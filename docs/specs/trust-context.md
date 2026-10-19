@@ -3,7 +3,7 @@
 - **Status:** Draft
 - **Scope:** the signed trust context of a namespace as ndn-rs encodes,
   signs, verifies, adopts, publishes, refreshes and synchronizes it. This
-  covers the TLV registry `0x0410–0x041E` and every value encoding, the name
+  covers the TLV registry `0x0410–0x041E` and `0x0420–0x0426` and every value encoding, the name
   and signature of a context Data, the continuity rule between versions, the
   catch-up walk, RDR publication, the refresh state machine and the
   context-sync group. An independent implementation (NDNts, python-ndn, …)
@@ -97,15 +97,21 @@ evolvability rule: a type is *critical* iff `type <= 31` or `type` is odd.
 | `0x041A` | SourceBundleHash | no | in TrustContext | 0..1 | 32 octets |
 | `0x041C` | SchemaAuthoritative | no | in TrustContext | 0..1 | empty (flag) |
 | `0x041E` | KeyRole | no | in TrustContext | 0..n | 1 role octet + a complete Name TLV |
+| `0x0420` | AdvertisedRelay | no | in TrustContext | 0..n | a complete Name TLV + the sub-TLVs below (§3.3.11) |
+| `0x0422` | RelayKey | no | in AdvertisedRelay | 0..1 | 32 octets |
+| `0x0424` | RelayEndpoint | no | in AdvertisedRelay | 1..n | UTF-8 `host:port` |
+| `0x0426` | RelayPreference | no | in AdvertisedRelay | 0..1 | NonNegativeInteger, at most `2^32-1` |
 
-`0x0419`, `0x041B`, `0x041D` and `0x041F` are unassigned. `0x0403–0x040F` is
-left free below the block. The block is provisional and has not been
-submitted to the NDN TLV registry.
+`0x0419`, `0x041B`, `0x041D` and `0x041F` are unassigned. Every even number
+of `0x0410–0x041F` being taken, the block continues at `0x0420–0x042F`;
+its numbers other than those above are unassigned. `0x0403–0x040F` is left
+free below the block. The block is provisional and has not been submitted
+to the NDN TLV registry.
 
 The value encodings differ in one place that implementers must notice. The
 namespace Name is written *directly* as a `0x07` child of TrustContext. The
-values of CaEndpoint, Revocation and KeyRole *contain* a full `0x07` Name TLV,
-header included.
+values of CaEndpoint, Revocation, KeyRole and AdvertisedRelay *contain* a
+full `0x07` Name TLV, header included.
 
 ### 3.2 Structure and producer order
 
@@ -121,6 +127,7 @@ TrustContext   = 0x0410 TLV-LENGTH
                    [SourceBundleHash]
                    *KeyRole
                    [LinkPolicy]
+                   *AdvertisedRelay
 AnchorSet      = 0x0411 TLV-LENGTH *Data         ; each a certificate, 0x06
 TrustSchemaBlob= 0x0413 TLV-LENGTH SchemaFormat SchemaBody
 SchemaFormat   = 0x0415 1 (%x01 / %x02)
@@ -132,6 +139,10 @@ Revocation     = 0x0418 TLV-LENGTH Name
 SourceBundleHash = 0x041A 32 32OCTET
 KeyRole        = 0x041E TLV-LENGTH RoleCode Name
 LinkPolicy     = 0x0412 TLV-LENGTH *OCTET        ; UTF-8
+AdvertisedRelay = 0x0420 TLV-LENGTH Name [RelayKey] 1*RelayEndpoint [RelayPreference]
+RelayKey       = 0x0422 32 32OCTET
+RelayEndpoint  = 0x0424 TLV-LENGTH 1*OCTET       ; UTF-8 host:port
+RelayPreference = 0x0426 TLV-LENGTH NonNegativeInteger
 ```
 
 A producer MUST emit the fields in the order above. ndn-rs always emits
@@ -140,7 +151,11 @@ the certificates in NDN canonical order of their names, and it MUST write
 Revocation entries in NDN canonical order of their Names (component by
 component: TLV-TYPE, then TLV-LENGTH, then the octets; a prefix sorts
 first). So the same context always encodes to the same bytes, whatever
-order its anchors and revocations were added in. CaEndpoint and KeyRole
+order its anchors and revocations were added in. AdvertisedRelay entries
+are written in canonical order too: by RelayPreference, then by device
+Name in canonical order, then entries without a RelayKey before those with
+one (RelayKey octets compared), then the endpoint lists compared entry by
+entry (UTF-8 octets). CaEndpoint and KeyRole
 entries are emitted in the order they were added: a new version made from
 an earlier one carries the earlier entries first and appends new ones. A
 decoder MUST NOT depend on the order of entries within a field, and accepts
@@ -328,15 +343,21 @@ treats every anchor alike, which is correct for a recovery anchor.
 #### 3.3.10 LinkPolicy (`0x0412`)
 
 ```
-value  = roles ";" relay-roles [ ";" ( "enrollment" / "no-enrollment" ) [ ";" direct ] ]   ; UTF-8
+value  = roles ";" relay-roles [ ";" ( "enrollment" / "no-enrollment" ) [ ";" direct [ ";" pairs ] ] ]   ; UTF-8
 roles  = [ role *( "," role ) ]     ; empty = every device role
 direct = "direct" / "no-direct"
+pairs  = [ pair *( "," pair ) ]     ; empty = no pair
+pair   = role ":" role              ; unordered
 ```
 
-**Encoding.** ndn-rs always writes the first three fields. It writes the
-fourth, `;no-direct`, only when direct paths are off, so a policy with
-direct paths on encodes exactly as before the field existed. Nothing is
-written after the fourth.
+**Encoding.** ndn-rs always writes the first three fields. When the direct
+pairs are the default ones (below), it writes the fourth, `;no-direct`,
+only when direct paths are off, and nothing after it: a policy that does
+not change the pairs encodes exactly as before the fourth and fifth fields
+existed. When the pairs are not the default, it writes the fourth field
+explicitly (`direct` or `no-direct`) and the fifth: the pairs in canonical
+form, each pair's two roles in octet order, the pairs sorted (first role,
+then second) without duplicates. Nothing is written after the fifth.
 
 **Decoding.** Split the value at `;`. A missing first or second field, a
 third field other than `enrollment` or `no-enrollment`, or invalid UTF-8
@@ -344,9 +365,13 @@ makes the *field* invalid: the context is kept and the default policy
 applies. A missing third field means `enrollment`. Empty role names inside
 a list are dropped. The fourth field is `no-direct` for direct paths off;
 missing, `direct`, or any other word means on (an unknown word is a later
-extension of the field, so it does not invalidate the policy). Fields after
-the fourth are reserved for extension: a decoder MUST ignore them, and a
-producer MUST NOT write them until they are specified.
+extension of the field, so it does not invalidate the policy). The fifth
+field lists the direct pairs; empty entries are dropped. A missing fifth
+field means the default pairs, and so does a fifth field with an entry
+that is not `role:role` (no `:`, more than one, or an empty role): it is a
+later form of the field, not an invalid policy. Fields after the fifth are
+reserved for extension: a decoder MUST ignore them, and a producer MUST NOT
+write them until they are specified.
 
 **Semantics.** A device's role is the component after the namespace in its
 certificate name, `/<ns>/<role>/<device>`.
@@ -355,15 +380,87 @@ certificate name, `/<ns>/<role>/<device>`.
 - It may relay iff it may link *and* `relay-roles` contains `r`.
 - A relay admits *enrollment links* iff the third field is `enrollment`
   *and* the context has at least one CaEndpoint.
-- Two devices linked through a relay may try a *direct path* between them
-  (NAT hole punching, keeping the relay when it does not open) iff the
-  fourth field is not `no-direct`. Turning direct paths off is a narrowing,
-  like removing a role (schema update, §5.3); turning them on is a widening.
+- A device with role `a` and one with role `b`, linked through a relay, may
+  try a *direct path* between them (NAT hole punching, keeping the relay
+  when it does not open) iff the fourth field is not `no-direct` *and*
+  `{a, b}` is one of the pairs (`a:b` or `b:a`; `r:r` for two devices of
+  role `r`). A device MUST NOT offer its addresses for, nor accept, a direct
+  path the policy does not allow: its addresses go only to devices the
+  policy allows. Turning direct paths off, or removing a pair, is a
+  narrowing, like removing a role (schema update, §5.3); turning them on or
+  adding a pair is a widening.
+
+The default pairs are every pair of `admin`, `member` and `node`, each role
+with itself too, and none with `guest`:
+`admin:admin,admin:member,admin:node,member:member,member:node,node:node`.
 
 When the field is absent the default applies: `roles` empty,
-`relay-roles = node`, `enrollment`, direct paths on, which encodes as
-`;node;enrollment`.
+`relay-roles = node`, `enrollment`, direct paths on between the default
+pairs, which encodes as `;node;enrollment`.
 Admission itself is in [ndn-link.md](ndn-link.md).
+
+**Older nodes.** A node built before the fifth field reads the first four
+and ignores the rest, as this section required of it. It therefore reads
+direct paths as on for *every* pair of roles, guests included, whenever the
+fourth field is `direct`. That is accepted, for three reasons. A direct path
+needs both ends, and a node that reads the fifth field neither offers its
+addresses for nor accepts a path the pairs exclude, so only two older nodes
+can open one against the matrix. Older ndn-rs builds try a direct path only
+toward a peer configured to be reached through a relay (`[[peer]] relay`),
+never by membership, so only pairs an operator configured are exposed. And a
+direct path changes the route, not authorization: every packet is still
+validated by the context's schema. What an older node does not enforce is
+the privacy part: it may send its addresses to, and accept a path from, a
+device of an excluded role. An operator who needs an excluded pair kept off
+older nodes too sets direct paths off (fourth field `no-direct`, which older
+nodes honour) until every device runs a build that reads the fifth field.
+
+#### 3.3.11 AdvertisedRelay (`0x0420`)
+
+```
+value = Name [RelayKey] 1*RelayEndpoint [RelayPreference]
+```
+
+A relay the namespace advertises: every device that holds the context
+learns it without local configuration. Repeatable, one entry per relay.
+
+- **Name** (a complete `0x07` TLV): the relay's device name, normally
+  `/<ns>/node/<device>`.
+- **RelayKey** (`0x0422`, 32 octets): the relay's expected fingerprint, the
+  SHA-256 of its public key as its certificate carries it. REQUIRED when the
+  device is not under the namespace (a community or hosted relay), which a
+  device can admit only by its key; OPTIONAL for a device of the namespace,
+  which is admitted by its certificate (and by that key only, when given).
+- **RelayEndpoint** (`0x0424`, UTF-8, non-empty): `host:port`, in the order
+  a device tries them.
+- **RelayPreference** (`0x0426`, NonNegativeInteger of at most 32 bits):
+  lower is preferred. ndn-rs always writes it; a missing one means `0`.
+
+**Encoding.** Children in the order above, entries in canonical order
+(§3.2), at most one entry per device.
+
+**Decoding.** An entry is dropped, and the context kept, when: it has no
+Name or two; a RelayKey is not 32 octets, or appears twice; it has no
+RelayEndpoint, or one that is empty or not UTF-8; a RelayPreference is not
+a NonNegativeInteger (1, 2, 4 or 8 octets) or exceeds `2^32-1`, or appears
+twice; it has an unknown critical child (`<= 31` or odd); its device is not
+under the namespace and it has no RelayKey. An unknown non-critical child
+(even) is skipped.
+
+**Semantics.** The context only advertises. Each device decides whether it
+uses the namespace's relays, how many at once and in which link mode
+([ndn-link.md](ndn-link.md)); a relay of the namespace must still hold a
+role the LinkPolicy lets relay. Dropping an entry — no entry for its device
+any more, or one naming another RelayKey — is a narrowing (§5.3): a device
+using that relay loses it. Adding an entry, or changing an entry's
+endpoints or preference, is not. A node that does not know the TLV skips it
+(even type) and uses only the relays configured on it.
+
+**Privacy.** The endpoints are visible to every member, and to anyone who
+fetches the context: it is published unencrypted by name (§7). Advertise
+only endpoints that may be public. A relay sees the names of the packets it
+forwards (their content is signed, and encrypted where the application
+encrypts it); see [ndn-link.md](ndn-link.md).
 
 ### 3.4 Decoder rules
 
@@ -374,11 +471,13 @@ A decoder:
 2. MUST reject a TrustContext in which Name, AnchorSet, SchemaAuthoritative,
    EnrollmentHint, SourceBundleHash or LinkPolicy appears more than once,
    whether or not the copies are well formed. CaEndpoint, Revocation,
-   KeyRole and TrustSchemaBlob are repeatable and accumulate.
+   KeyRole, AdvertisedRelay and TrustSchemaBlob are repeatable and
+   accumulate.
 3. MUST reject an unknown critical child type (`<= 31` or odd), and MUST
    skip an unknown non-critical one (even). A KeyRole or SourceBundleHash
    that fails its length check is skipped as non-critical (it still counts
-   as the one SourceBundleHash for rule 2).
+   as the one SourceBundleHash for rule 2), and so is a malformed
+   AdvertisedRelay (§3.3.11).
 4. MUST reject the context when the namespace is missing, no
    TrustSchemaBlob is present, no blob is in a format the decoder
    understands (§3.3.3), or the schema does not import (LVS error,
@@ -534,9 +633,11 @@ procedures are specified in [recovery-kit.md](recovery-kit.md).
 - **Revocation bump (F4–F6):** `N+1` is `N` plus new Revocation entries,
   signed by an anchor of `N`. Everything else is carried over verbatim.
 - **Schema update:** `N+1` carries new blobs, the EnrollmentHint, the
-  SchemaAuthoritative flag, and optionally a new LinkPolicy. It is signed by
-  an anchor of `N`. ndn-rs refuses a narrowing unless the operator consents,
-  but that is a producer-side check only.
+  SchemaAuthoritative flag, and optionally a new LinkPolicy or new
+  AdvertisedRelay entries (otherwise both are carried verbatim). It is
+  signed by an anchor of `N`. ndn-rs refuses a narrowing — a rule, a link
+  permission, a direct pair or an advertised relay dropped — unless the
+  operator consents, but that is a producer-side check only.
 - **Recovery anchor added or removed (F7):**
   - When a recovery key is added, `N+1` gains the new anchor and a KeyRole
     `1` entry, signed by the root.
@@ -939,6 +1040,10 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   retry such a walk from sync.
 - A recovery anchor is root-equivalent. A compromise recovery therefore
   removes every recovery anchor the operator does not vouch for (§5.3).
+- AdvertisedRelay endpoints are public: the context is served unencrypted
+  to anyone who asks by name, so they are visible beyond the namespace's
+  members (§3.3.11). Direct-path addresses are never in the context; they
+  go only to devices the LinkPolicy's pairs allow (§3.3.10).
 
 ## 11. Test vectors
 
@@ -1088,6 +1193,10 @@ LinkPolicy admin,node; ; off    fd0412 19 61646d696e2c6e6f64653b3b6e6f2d656e726f
                                                                                      "admin,node;;no-enrollment"
 LinkPolicy default, direct off  fd0412 1a 3b6e6f64653b656e726f6c6c6d656e743b6e6f2d646972656374
                                                                                      ";node;enrollment;no-direct"
+LinkPolicy default pairs but    fd0412 25 3b6e6f64653b656e726f6c6c6d656e743b6469726563743b6d656d6265723a6d656d626572
+  member:member only                                                                 ";node;enrollment;direct;member:member"
+LinkPolicy no direct pair       fd0412 18 3b6e6f64653b656e726f6c6c6d656e743b6469726563743b
+                                                                                     ";node;enrollment;direct;"
 EnrollmentHint require_all,
   no roles                      fd0416 16 01 746f6b656e2c6465766963652d617070726f76616c
                                                                                      flags 0x01 "token,device-approval"
@@ -1112,6 +1221,39 @@ That is, namespace `/h`, an empty native blob, then:
 
 Replacing the last child with `fd0499 01 78`, an unknown *odd* type, makes
 the decoder reject the context ("unknown critical TLV-TYPE 0x0499").
+
+AdvertisedRelay `/home/bob/node/relay`, RelayKey = the fingerprint above,
+endpoint `relay.example.net:6367`, preference 0 (97 octets):
+
+```
+fd04205d07180804686f6d650803626f6208046e6f6465080572656c6179fd04
+222056475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107
+708cfd04241672656c61792e6578616d706c652e6e65743a36333637fd042601
+00
+
+fd0420 5d                          AdvertisedRelay, length 93
+  0718 0804686f6d65…080572656c6179 Name /home/bob/node/relay
+  fd0422 20 56475aa7…b107708c      RelayKey
+  fd0424 16 72656c61…36333637      RelayEndpoint "relay.example.net:6367"
+  fd0426 01 00                     RelayPreference 0
+```
+
+AdvertisedRelay `/home/bob/node/r2`, no RelayKey, endpoints
+`192.0.2.7:6367` then `[2001:db8::7]:6367`, preference 300 (73 octets):
+
+```
+fd04204507150804686f6d650803626f6208046e6f646508027232fd04240e31
+39322e302e322e373a36333637fd0424125b323030313a6462383a3a375d3a36
+333637fd042602012c
+```
+
+In a TrustContext the first entry precedes the second (preference 0 before
+300). These encodings are asserted by
+`trust_context::tests::spec_vectors_t5_direct_pairs_and_relays`; the
+decoding rules of §3.3.11 (malformed entries dropped, unknown even child
+skipped, a device outside the namespace without RelayKey dropped) by
+`a_malformed_relay_entry_is_skipped`, both in
+`ndn-security/src/trust_context/mod.rs`.
 
 ### T6 Sync group (namespace `/home/bob`)
 
@@ -1253,6 +1395,19 @@ is open.
   marks a key or certificate name, in `is_cert_name` and in the floor's
   identity (§3.3.2, §6.4). ndn-cxx's `Certificate::isValidName` compares it
   this way, and a typed `32=KEY` component is not a certificate marker.
+- **Q13 LinkPolicy direct pairs.** The role matrix is a fifth LinkPolicy
+  field rather than a new TLV, written only when it is not the default, so
+  every existing encoding is unchanged and decodes to the default pairs.
+  An older node ignores the field and reads direct paths as on for every
+  pair; §3.3.10 says why that is accepted and how to keep an excluded pair
+  off older nodes (`no-direct`). A malformed fifth field means the default
+  pairs, as an unknown fourth word means on (Q7).
+- **Q14 AdvertisedRelay numbering and validity.** Every even number of
+  `0x0410–0x041F` was taken, so the relay TLV opens `0x0420–0x042F`; its
+  children use the same block, even (skippable). An entry that cannot be
+  used — no endpoint, or a device outside the namespace with no RelayKey —
+  is dropped by the decoder rather than kept for the device to discover;
+  the producer (`ndn-fwd`) refuses to write one.
 
 ## Appendix A. Code references (non-normative)
 
@@ -1262,11 +1417,12 @@ may move.
 
 **TLV registry and codec** — `ndn-rs/crates/security/ndn-security/src/trust_context/`
 
-- `tlv.rs:29` TrustContext 0x0410; `:32` AnchorSet 0x0411; `:38` TrustSchemaBlob 0x0413; `:42` CaEndpoint 0x0414; `:48` SchemaFormat 0x0415 (unknown code not understood, `:44-47`); `:51` SchemaBody 0x0417; `:54` EnrollmentHint 0x0416; `:57` Revocation 0x0418; `:64` SourceBundleHash 0x041A; `:74` SchemaAuthoritative 0x041C; `:84` KeyRole 0x041E; `:93` LinkPolicy 0x0412; `:96-98` format codes 1/2; `:3-25` provisional block and parity.
+- `tlv.rs:29` TrustContext 0x0410; `:32` AnchorSet 0x0411; `:38` TrustSchemaBlob 0x0413; `:42` CaEndpoint 0x0414; `:48` SchemaFormat 0x0415 (unknown code not understood, `:44-47`); `:51` SchemaBody 0x0417; `:54` EnrollmentHint 0x0416; `:57` Revocation 0x0418; `:64` SourceBundleHash 0x041A; `:74` SchemaAuthoritative 0x041C; `:87` KeyRole 0x041E; `:98` LinkPolicy 0x0412; `:105` AdvertisedRelay 0x0420; `:110` RelayKey 0x0422; `:114` RelayEndpoint 0x0424; `:118` RelayPreference 0x0426; format codes 1/2 after them; `:3-28` provisional blocks and parity.
 - `mod.rs:61` keyword `trust-context`; `:65-92` SchemaFormat (unknown code → `Unknown`, `:85-91`); `:118-137` native-text parsing (trim, skip empty lines); `:143-161` OR of understood blobs, none understood → error, multiple LVS → error.
 - `mod.rs:204-207` hint flags; `:213-219` default hint; `:221-236` hint encode; `:238-268` hint decode (legacy rule `:260-265`).
 - `mod.rs:281-291` KeyRole codes 1/2.
-- `mod.rs:318-328` LinkPolicy default; `:331-332` words; `:336-343` allows_link/relay; `encode` (writes `;no-direct` only when off); `decode` (unknown fourth word: on; fields after the fourth ignored).
+- `mod.rs:304-341` LinkPolicy and its default; `:373` allows_direct_path; `:384` default_direct_pairs; `:397` canonical_direct_pairs; `:450` encode (fourth field only when off, unless the pairs are not the default: then fourth and fifth); `:482` decode (unknown fourth word: on; missing or malformed fifth: default pairs; fields after the fifth ignored); `:530` parse_pairs.
+- `mod.rs:547` AdvertisedRelay; `:563` canonical order; `:574` encode; `:593` decode (malformed entry → `None`); `:840` with_relays (sorted); `:903` relays; encode_content writes the entries after LinkPolicy (`:1134`); decode_content drops malformed entries (`:1358`) and entries outside the namespace without a key (`:1370`).
 - `mod.rs:635-637` admits_enrollment_links; `:646-652` add_anchor validity check; `:666-682` anchor_for; `:689-691` is_revoked; `:714-725` authorizes (floor + schema); `:741-753` authorizes_hop; `:771-783` authorizes_certification.
 - `mod.rs:808-861` encode_content (anchors sorted by name `:809-815`, revocations sorted `:816-817`); `:865-872` rdr_name; `:886-910` sign_into_data (KeyLocator = signer key name); `:916-931` async variant.
 - `mod.rs:942-1112` decode_content: `:947-950` outer type; `:959-966` single-valued fields at most once; `:973-979` namespace; `:980-996` AnchorSet (skip non-Data `:985-987`); `:998-1037` blob (SchemaFormat one octet, no repeats `:1006-1023`; unknown critical inner → reject `:1025-1028`; missing fields `:1033-1035`); `:1038-1041` authoritative; `:1042-1047` CaEndpoint; `:1048-1051` hint; `:1055-1058` SourceBundleHash length 32; `:1059-1064` Revocation; `:1067-1071` KeyRole; `:1074-1077` LinkPolicy; `:1079-1081` unknown critical → reject; `:1086-1090` required fields; `:1101` floor unless authoritative.

@@ -2,8 +2,10 @@
 //!
 //! Provisional block `0x0410–0x041F` in the app-defined range (`>= 0x0400`),
 //! above `ndn-packet`'s `REFLEXIVE_NAME = 0x0402` with `0x0403–0x040F` as
-//! headroom. Not LP (`0x500`), not management (`0xD0`), not NDNCERT
-//! (`0x81–0xAF`). Flagged for a future NDN TLV-registry submission.
+//! headroom, continued in `0x0420–0x042F` once every even number of the
+//! first block was taken ([`ADVERTISED_RELAY`] and its sub-TLVs). Not LP
+//! (`0x500`), not management (`0xD0`), not NDNCERT (`0x81–0xAF`). Flagged
+//! for a future NDN TLV-registry submission.
 //!
 //! # Criticality parity
 //!
@@ -17,8 +19,9 @@
 //!   [`SCHEMA_FORMAT`], [`SCHEMA_BODY`]. Without the anchors or schema a
 //!   context is meaningless, so a node that can't parse them must reject it.
 //! - Additive → **even**: [`CA_ENDPOINT`], [`ENROLLMENT_HINT`],
-//!   [`REVOCATION`], [`KEY_ROLE`]. An old node skips an unknown one and still
-//!   validates with the anchors + schema it does understand.
+//!   [`REVOCATION`], [`KEY_ROLE`], [`LINK_POLICY`], [`ADVERTISED_RELAY`]. An
+//!   old node skips an unknown one and still validates with the anchors +
+//!   schema it does understand.
 //!
 //! (The design note's draft had the parity inverted for the must-understand
 //! fields; renumbered here per the note's own "verify criticality parity"
@@ -84,13 +87,35 @@ pub const SCHEMA_AUTHORITATIVE: u64 = 0x041C;
 pub const KEY_ROLE: u64 = 0x041E;
 
 /// Which devices of the namespace may link to its devices, which may be
-/// relays, whether relays admit enrollment links, and whether direct paths
-/// are allowed — see [`LinkPolicy`](super::LinkPolicy): UTF-8 `<roles>;<relay
-/// roles>;<enrollment|no-enrollment>[;no-direct]`, comma-separated role
-/// names, an empty role list meaning every device role (a missing third
-/// field means `enrollment`, a missing fourth means direct paths on). Non-critical (even): an old node skips it and links by the
+/// relays, whether relays admit enrollment links, whether direct paths are
+/// allowed and between which roles — see [`LinkPolicy`](super::LinkPolicy):
+/// UTF-8 `<roles>;<relay roles>;<enrollment|no-enrollment>[;<direct|no-direct>
+/// [;<direct pairs>]]`, comma-separated role names, an empty role list
+/// meaning every device role (a missing third field means `enrollment`, a
+/// missing fourth means direct paths on, a missing fifth the default role
+/// pairs). Non-critical (even): an old node skips it and links by the
 /// default (any enrolled device; relays are `node` devices).
 pub const LINK_POLICY: u64 = 0x0412;
+
+/// A relay the namespace advertises, repeatable — see
+/// [`AdvertisedRelay`](super::AdvertisedRelay). Non-critical (even): an old
+/// node skips it, and a device that does not use namespace relays ignores
+/// it. Its value is the sub-TLVs below plus the relay's device `Name`
+/// (`0x07`); a malformed entry is skipped, not the context.
+pub const ADVERTISED_RELAY: u64 = 0x0420;
+
+/// In [`ADVERTISED_RELAY`]: the relay's expected fingerprint, 32 octets
+/// (SHA-256 of its public key as its certificate carries it). Optional
+/// for a device of the namespace, required otherwise.
+pub const RELAY_KEY: u64 = 0x0422;
+
+/// In [`ADVERTISED_RELAY`]: one endpoint, UTF-8 `host:port`, repeatable, in
+/// the order a device tries them (at least one).
+pub const RELAY_ENDPOINT: u64 = 0x0424;
+
+/// In [`ADVERTISED_RELAY`]: preference, a NonNegativeInteger (lower is
+/// preferred).
+pub const RELAY_PREFERENCE: u64 = 0x0426;
 
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;

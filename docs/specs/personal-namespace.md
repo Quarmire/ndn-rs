@@ -501,14 +501,18 @@ Consequences:
   key is one a `[[peer]] key` expects — for another namespace or before
   enrollment. Otherwise it is closed with a reason saying what to do.
 - **Link policy lives in the trust context** (`LINK_POLICY`): which roles
-  may link, which may relay, and whether a relay admits an unknown device on
+  may link, which may relay, whether a relay admits an unknown device on
   an enrollment link that carries only its enrollment (CA endpoints, trust
-  context). Default: any device role may link; a relay must be a `node`
-  device; enrollment links on when the namespace has a CA. `ndn-fwd init -c
-  <config>` states it from `[ca] link_roles` / `relay_roles` /
-  `enrollment_links` (else the default); `ndn-fwd schema update -c <config>`
+  context), and which role pairs may make direct paths. Default: any device
+  role may link; a relay must be a `node` device; enrollment links on when
+  the namespace has a CA; direct paths between admin, member and node
+  devices, none for guests. `ndn-fwd init -c <config>` states it from `[ca]
+  link_roles` / `relay_roles` / `enrollment_links` / `direct_paths` /
+  `direct_pairs` (else the default); `ndn-fwd schema update -c <config>`
   changes it, refusing a narrowing without `--accept-narrowing`; a namespace
-  CA whose `[ca]` link keys disagree with the context refuses to start.
+  CA whose `[ca]` link keys disagree with the context refuses to start. The
+  relays the namespace advertises (`[[ca.relay]]`, trust-context.md
+  §3.3.11) are written and checked the same way.
 - **Enrolling across networks: enrollment links.** A relay of the namespace
   (it holds a certificate of a role the link policy lets relay) admits a
   device whose key it does not know on an enrollment link when the policy

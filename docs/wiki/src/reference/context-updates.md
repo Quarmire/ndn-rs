@@ -226,12 +226,15 @@ policy the CA enforces for it — `[ca] approval_roles` /
 `approval_requires_invite` of `-c` (give the daemon's config), else the
 default. A held hint that `[ca]` contradicts is refused, as the CA's start
 refuses it. It carries the held link policy verbatim unless `[ca]
-link_roles` / `relay_roles` / `enrollment_links` / `direct_paths` of `-c` state another
-(unset keys: the held policy's); then it states that one and prints
-`link_policy = <before> -> <after>`. Anchors, CA endpoints, revocations and
-key roles are carried over verbatim. It is checked, signed, handed over and
-stored like a revocation (`--passphrase-file` / `--pin-file` unlock the
-root); with the schema, hint and link policy current, nothing is signed.
+link_roles` / `relay_roles` / `enrollment_links` / `direct_paths` /
+`direct_pairs` of `-c` state another (unset keys: the held policy's); then
+it states that one and prints `link_policy = <before> -> <after>`. Likewise
+it carries the held advertised relays unless `[[ca.relay]]` entries (or
+`relay = []`) state others, then prints `relays_before` and `relays`.
+Anchors, CA endpoints, revocations and key roles are carried over verbatim.
+It is checked, signed, handed over and stored like a revocation
+(`--passphrase-file` / `--pin-file` unlock the root); with the schema, hint,
+link policy and relays current, nothing is signed.
 
 **Never a silent narrowing.** The command compares every grant of the held
 schema — each LVS rule's data pattern with each of its signers, by pattern
@@ -245,10 +248,14 @@ with `ndn-trust-context`, or the key-name schema of the earliest releases
 (its rules read differently even where they grant the same).
 
 The link policy is held to the same rule: a role that could link and no
-longer can (including every role → a list), a relay role removed, or
-enrollment links turned off is a narrowing — refused before the root is
-unlocked, naming what devices would lose; `--accept-narrowing` signs it and
-prints it as `link_narrowed`. A widening applies without it.
+longer can (including every role → a list), a relay role removed,
+enrollment links or direct paths turned off, or a direct-path role pair
+removed is a narrowing — refused before the root is unlocked, naming what
+devices would lose; `--accept-narrowing` signs it and prints it as
+`link_narrowed`. So are the advertised relays: dropping one, or giving it
+another expected fingerprint, is refused the same way and printed as
+`relays_dropped` with consent. A widening — a pair added, a relay added or
+moved to other endpoints or another preference — applies without it.
 
 The namespace CA validates admins' decisions and pending listings under the
 version its daemon holds, so it applies the new rules as soon as the

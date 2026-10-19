@@ -12,12 +12,14 @@ use ndn_mgmt::{CaInfo, MgmtConfig};
 
 /// Key names (case-insensitive, exact match) whose values are secrets and must
 /// be redacted from `config/get` (audit CFG-1). Covers CA invite tokens +
-/// enrolment PINs, SMTP/TURN credentials, and the ACME DNS-provider API token
-/// carried in the opaque `params` blob.
+/// enrolment PINs, SMTP/TURN credentials, link wake tokens (platform push
+/// tokens), and the ACME DNS-provider API token carried in the opaque
+/// `params` blob.
 const SECRET_KEYS: &[&str] = &[
     "password",
     "token",
     "tokens",
+    "wake_token",
     "pin",
     "credential",
     "username",

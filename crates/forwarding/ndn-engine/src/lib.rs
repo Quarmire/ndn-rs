@@ -43,6 +43,7 @@ pub mod routing;
 pub mod signals_driver;
 pub mod stages;
 pub mod traceroute;
+pub mod transit;
 pub mod unsolicited;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_builder;
@@ -86,4 +87,5 @@ pub use pipeline::{
 };
 pub use rate_limit_hook::{Decision, PacketKind, RateLimitHook, SharedRateLimitHook};
 pub use reflexive::{ReflexiveConfig, ReflexiveStatus, ReflexiveTable};
+pub use transit::TransitPrefixes;
 pub use unsolicited::UnsolicitedDataPolicy;

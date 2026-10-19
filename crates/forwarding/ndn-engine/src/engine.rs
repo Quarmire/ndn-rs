@@ -303,6 +303,9 @@ pub struct EngineInner {
     /// Reflexive-forwarding reverse routes (temporary, reverse-path routes
     /// installed from `REFLEXIVE_NAME` Interests).
     pub reflexive: Arc<crate::reflexive::ReflexiveTable>,
+    /// Namespaces whose Data is forwarded without validation (served for
+    /// devices of a namespace this forwarder does not hold).
+    pub transit: Arc<crate::transit::TransitPrefixes>,
     /// `OnceLock` breaks the `EngineInner -> Arc<ctx> -> Weak<EngineInner>` cycle.
     pub(crate) discovery_ctx: OnceLock<Arc<EngineDiscoveryContext>>,
     pub(crate) runtime: Arc<dyn Runtime>,
@@ -408,6 +411,12 @@ impl ForwarderEngine {
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn reflexive(&self) -> Arc<crate::reflexive::ReflexiveTable> {
         Arc::clone(&self.inner.reflexive)
+    }
+
+    /// Namespaces carried in transit: their Data is forwarded unvalidated
+    /// and never cached (see [`crate::transit`]).
+    pub fn transit(&self) -> Arc<crate::transit::TransitPrefixes> {
+        Arc::clone(&self.inner.transit)
     }
 
     /// Pre-PIT replay guard. `Some` for production-shaped engines; `None`

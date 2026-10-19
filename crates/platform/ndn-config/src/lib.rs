@@ -27,13 +27,14 @@ pub use ndn_mgmt_wire::{
 pub use ndn_mgmt_wire::{control_parameters, control_response, nfd_command, nfd_dataset};
 
 pub use config::{
-    AcmeTomlConfig, CertSourceConfig, CertValidityDays, ChallengeConfig, CsConfig, CaTomlConfig,
-    DiscoveryTomlConfig, EngineConfig, FaceConfig, FaceKind, ForwarderConfig, ListenersConfig,
-    LoggingConfig, ManagementConfig, MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig,
-    ObservabilityTomlConfig, PeerConfig, RadioDeviceConfig, ReflexiveTomlConfig,
-    RenewBeforeConfig, RequireAttestationConfig, RouteConfig, RoutingTomlConfig, SecurityConfig,
-    SelfSignedDevConfig, SmtpConfig, TrustRuleConfig, WebRtcListenerConfig,
-    WebTransportListenerConfig, WtIceServers, WtTurnServer,
+    AcmeTomlConfig, CaRelayConfig, CertSourceConfig, CertValidityDays, ChallengeConfig, CsConfig, CaTomlConfig,
+    DirectConfig, DiscoveryTomlConfig, EngineConfig, FaceConfig, FaceKind, ForwarderConfig,
+    LinkModeConfig, LinksConfig, ListenersConfig, LoggingConfig, ManagementConfig,
+    MgmtSecurityConfig, NlsrNeighborConfig, NlsrTomlConfig, ObservabilityTomlConfig, PeerConfig,
+    QuotasConfig, RadioDeviceConfig, ReflexiveTomlConfig, RelayConfig, RelayServiceConfig,
+    RelaysConfig, RenewBeforeConfig, RequireAttestationConfig, RouteConfig, RoutingTomlConfig,
+    SecurityConfig, SelfSignedDevConfig, ServeConfig, SmtpConfig, TrustRuleConfig,
+    WebRtcListenerConfig, WebTransportListenerConfig, WtIceServers, WtTurnServer,
 };
 pub use error::ConfigError;
 pub use notifications::NotificationStream;

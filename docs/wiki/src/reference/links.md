@@ -34,13 +34,16 @@ may act as relays, and whether a relay admits an unknown device on an
 enrollment link that carries only its enrollment (the CA endpoints and the
 trust context) — default on when the namespace has a CA — and whether two
 devices linked through a relay may try a direct path between them (default
-on; `[[peer]] direct = false` keeps one peer on the relay). Set it on the root
-device with `[ca] link_roles`, `relay_roles`, `enrollment_links` and
-`direct_paths` in
+on; `[[peer]] direct = false` keeps one peer on the relay), and for which
+role pairs (default: every pair of `admin`, `member` and `node`; guests
+none). The trust context also lists the relays the namespace advertises.
+Set it on the root device with `[ca] link_roles`, `relay_roles`,
+`enrollment_links`, `direct_paths`, `direct_pairs` and `[[ca.relay]]` in
 `ndn-fwd init -c <config>`, or later with `ndn-fwd schema update -c
-<config>`, which refuses a narrowing unless `--accept-narrowing` (see the
+<config>`, which refuses a narrowing (a role pair or an advertised relay
+removed, among others) unless `--accept-narrowing` (see the
 [configuration reference](../operations/config-reference.md)). Default: any
-role may link, relays are `node` devices.
+role may link, relays are `node` devices, no relays are advertised.
 
 On each device, link to the relay:
 
@@ -104,6 +107,45 @@ To dial a device directly when it does have a reachable address, give its
 `[[peer]]` an `endpoint`. A `[[peer]]` with `relay = "/home/node/relay"` and
 no endpoint routes that device's name over the relay's link instead.
 
+## Relays and link modes
+
+Which relays a device uses is the deployer's and the user's choice:
+
+- **the namespace's relays** — the root device lists them in the trust
+  context, so every member learns them, signed; used unless `[relays]
+  namespace = false`;
+- **relays you add** — `[[relay]]` with the relay's `key` (expected
+  fingerprint) and `endpoint`: your own server, a community relay, a hosted
+  service;
+- **none** — `namespace = false` and no `[[relay]]`: LAN and `[[peer]]` links
+  only.
+
+The device links to its preferred relay (`[relays] count` of them), routes
+through each by preference, and fails over to the next when one is lost: at
+once when the relay says it is shutting down, otherwise once a redial of it
+fails (it may only be restarting). A
+relay of another namespace admits devices by its serving policy
+(`[relay_service] serve`). It cannot read or forge your data — everything is
+signed — but it sees the names it forwards and which devices talk to which.
+
+Each link has a mode: `always` (keep-alives keep NAT bindings and the radio
+awake; reachable at any time), `on-demand` (no traffic while closed; the
+first Interest waits for a handshake; closed after `idle_secs` idle) or
+`off` (closed until `ndn-ctl link connect`). While a device's link is
+asleep, its relay can hold Interests for it (`hold`) and wake it through a
+deployer's `wake_command` (`wake_token`), if the relay offers that. Keys,
+defaults, bounds and trade-offs:
+[Config reference](../operations/config-reference.md#link-modes).
+
+```text
+$ ndn-ctl link mode /home/node/relay on-demand:120
+$ ndn-ctl link disconnect /home/node/relay
+$ ndn-ctl link connect /home/node/relay
+```
+
+A mode set this way lasts until the daemon restarts. A command that cannot
+be done says why and exits non-zero.
+
 ## Direct paths
 
 A device reached through a relay gets a **direct path** when the networks
@@ -132,6 +174,16 @@ carries the traffic; the relay's routes (cost 10) stay. When the direct path
 dies (8 s without an answer), its face and routes go and the relay carries the
 traffic again; the laptop punches again after 5 s, then backs off to 5
 minutes while punches fail.
+
+When a device's network changes (the app calls `network_changed`, say on a
+move from Wi-Fi to cellular), it closes its direct paths and punches each of
+those devices again at once from its new address, through the relay. The
+other device's old path closes when that punch reaches it. A QUIC
+connection cannot follow the side that accepted it to a new address, so
+without this the other device would keep sending into a dead path until its
+8 s timeout. Behind a NAT, the relay may not have reported the device's new
+outside address yet (it checks every 5 s); that punch can then fail, and the
+next one, 5 s later, uses the new address.
 
 Some networks cannot be punched — typically both devices behind NATs that
 give each destination its own port (symmetric NATs, common on mobile
@@ -182,8 +234,9 @@ with (or is configured to, or punched with), the paths that reach it and
 whether a direct path is up, being tried, or why not. It asks the daemon for
 the `/localhost/nfd/links/list` dataset. Run it as a local operator — the
 daemon's user, root, or a member of `[security] trust_admin_groups` — on the
-daemon's socket; anyone else is refused, with how to get access. A daemon
-with no `[[peer]]` and no `[[face]] kind = "quic"` says it runs no QUIC
+daemon's socket; anyone else is refused, with how to get access. Links run
+whenever the device has a key (its namespace's relays need no config); a
+daemon without one (`[security] profile = "disabled"`) says it runs no QUIC
 links.
 
 ```text
@@ -191,9 +244,14 @@ $ ndn-ctl link list
 key 3f0c9a…64 hex digits…
 probes-sent 40
 punches-refused 0
+serve own
+held-total 0
+wakes-sent 0
 link /home/node/relay
   key 8d21e4…64 hex digits…
   device /home/node/relay
+  mode always
+  relay linked source=namespace:/home preference=0
   path link face=5 remote=198.51.100.20:6367 rtt-ms=31.4 age-s=5400
   direct none
 link /home/member/phone
@@ -210,9 +268,21 @@ The output is one item per line, for scripts as much as for people:
   `[[peer]] key`), or `-` when it links with no key yet.
 - `probes-sent`, `punches-refused` — totals since the daemon started: probe
   datagrams sent for direct paths, and punch requests this device refused.
+- `serve <policy>` — this device's relay serving policy (when it reports
+  one); `held-total`, `wakes-sent` — Interests it holds now for sleeping
+  devices, and wakes it has sent since it started.
 - `link <label>` — one block per device, named by its `[[peer]]` label,
   else its device name, else its key. Its `key` and `device` lines show `-`
   until they are known.
+- `mode <always|on-demand|off>[ idle-s=<s>]` — a configured link's mode.
+- `relay <state> source=<user|namespace:<ns>> preference=<n>[ <why>]` — the
+  device is a relay this device uses: `linked`, `trying`, `down`, `standby`
+  (a preferred relay is linked) or `off`.
+- `asleep since-s=<s> held=<n> hold=<yes|no> wake=<yes|no> wakes=<n>` — on a
+  relay: the device is asleep here, with the Interests held for it, whether
+  it asked for holding and registered a wake token, and the wakes sent.
+- `down <why>` — why a configured device is not linked now (closed after
+  idle, off, dial failed and when it retries).
 - `path <kind> face=<id> remote=<ip:port> rtt-ms=<ms> age-s=<s>` — one line
   per way the device is reached now (none when it is not): `direct`, a QUIC
   link a hole punch made; `link`, a QUIC link dialled to a configured
@@ -230,6 +300,37 @@ The output is one item per line, for scripts as much as for people:
 | `up` | A direct path is up; traffic takes it, the relay route stays as fallback. |
 | `not-possible` | The last punch made no direct path (both NATs too strict, say); the sentence says why. Tried again in `retry-in-s`. |
 | `refused` | The last punch was refused, by the other device or by this one; the sentence says why. Tried again in `retry-in-s`. |
+
+## In an app (ndn-boltffi)
+
+An Android or iOS app that embeds the engine (`ndn-boltffi`'s `NdnEngine`)
+hosts links with the same library as the daemon — the same admission,
+relays, modes, held Interests, wake tokens and direct paths. What the
+daemon reads from its config, the app passes in calls:
+
+| Daemon | App (`NdnEngine`) |
+|---|---|
+| `[[face]] kind = "quic"` (`bind`, `listen`) | `start_links(NdnLinksConfig { socket_fd, bind, listen, … })` — `socket_fd`: a UDP socket the platform bound to the network to use (Android `Network.bindSocket`) |
+| `[relays]` (`count`, `namespace`, `mode`, `hold`) | `NdnLinksConfig.relay_count`, `use_namespace_relays`, `namespace_relay_mode`, `namespace_relay_hold` |
+| `[links]` (`keep_alive_secs`, `idle_timeout_secs`) | `NdnLinksConfig.keep_alive_secs`, `idle_timeout_secs` (same bounds) |
+| `[[relay]]` | `add_relay(NdnRelay { label, key, device, endpoints, preference, mode, hold, routes })`, `remove_relay(label)` |
+| `mode` / `idle_secs` | `set_link_mode(label, NdnLinkMode::{Always, OnDemand { idle_secs }, Off})`; `connect_link` / `disconnect_link` |
+| `wake_token` | `set_wake_token(label, token)` (a platform push token; `None` withdraws it) |
+| — | `set_app_active(bool)` from the app's lifecycle: on-demand links link while active and close idle in the background |
+| — | `network_changed(socket_fd)` on a network change (Wi-Fi ↔ cellular): links move to the new socket, dropped ones are dialled again, direct paths punched again now |
+| `ndn-ctl link list` | `link_status()` |
+| the daemon's key | the loaded identity: `start_links` refuses without one, or with an enclave key that signs only asynchronously (a TLS handshake signs at once); an identity installed later (an enrollment) is presented by the next link, and enrollment links become full links by themselves |
+
+Persist the issuer chain an enrollment or renewal returns
+(`NdnEnrolledIdentity.issuers`) and pass it as `NdnLinksConfig.issuers`: a
+link hello carries it.
+
+What each mode costs: `Always` keeps the link and wakes the radio for every
+keep-alive (default every 10 s) — reachable at once, the most battery and
+data. `OnDemand` costs nothing while closed; the phone is reachable while
+the app is active or has something to send, and otherwise only through the
+relay holding Interests (`hold`) and waking it (`set_wake_token`, if the
+relay's operator runs a notifier). `Off` costs nothing until the app asks.
 
 ## When a link is refused
 

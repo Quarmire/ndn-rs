@@ -21,6 +21,28 @@ pub struct ForwarderConfig {
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
 
+    /// Which relays this device links to and how (`[relays]`). See
+    /// [`RelaysConfig`].
+    #[serde(default)]
+    pub relays: RelaysConfig,
+
+    /// Relays the user adds: own server, community relay, hosted service
+    /// (`[[relay]]`). See [`RelayConfig`].
+    #[serde(default, rename = "relay")]
+    pub user_relays: Vec<RelayConfig>,
+
+    /// What this device does as a relay for others (`[relay_service]`).
+    #[serde(default)]
+    pub relay_service: RelayServiceConfig,
+
+    /// Keep-alive and idle timeout of every link (`[links]`).
+    #[serde(default)]
+    pub links: LinksConfig,
+
+    /// Direct paths with members met at a common relay (`[direct]`).
+    #[serde(default)]
+    pub direct: DirectConfig,
+
     /// Boot-time strategy choices. Strategy selection is otherwise only
     /// reachable over the management socket, so a forwarder restart silently
     /// reverts every prefix to the default strategy while `[[route]]` entries
@@ -275,12 +297,48 @@ pub struct CaTomlConfig {
     /// what the context says (default on).
     #[serde(default)]
     pub direct_paths: Option<bool>,
+    /// Which pairs of roles may make direct paths with each other, each
+    /// `"<role>:<role>"` (unordered; `"member:member"` for two members),
+    /// roles `admin`, `member`, `node` or `guest`. Written and checked like
+    /// `link_roles`; removing a pair is a narrowing. Empty list: no pair.
+    /// Unset: what the context says (default: every pair of admin, member
+    /// and node; guests none).
+    #[serde(default)]
+    pub direct_pairs: Option<Vec<String>>,
+    /// `[[ca.relay]]`: the relays the namespace advertises in its trust
+    /// context, so every member learns them without local configuration
+    /// (each device decides whether to use them). Their endpoints are
+    /// visible to every device that holds the context. Written by `ndn-fwd
+    /// init -c <config>` and `ndn-fwd schema update -c <config>` (dropping
+    /// one, or changing its `key`, is a narrowing); a namespace CA refuses to
+    /// start when they disagree with the context. `relay = []`: none.
+    /// Unset: what the context says (default none).
+    #[serde(default, rename = "relay", skip_serializing_if = "Option::is_none")]
+    pub relays: Option<Vec<CaRelayConfig>>,
     /// How long a request for an admin's approval waits for a decision, in
     /// days, before it expires (the device is then told to ask again); a
     /// decision is kept as long for a device that was offline to learn it.
     /// Default 7.
     #[serde(default = "CaTomlConfig::default_approval_request_ttl_days")]
     pub approval_request_ttl_days: u32,
+}
+
+/// One `[[ca.relay]]` entry: a relay the namespace advertises.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaRelayConfig {
+    /// The relay's device name, normally `/<namespace>/node/<device>`.
+    pub device: String,
+    /// Its expected fingerprint: 64 hex digits (the link key its `ndn-fwd`
+    /// prints). Required when `device` is not a device of the namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Where devices dial it: `host:port`, or a list tried in order.
+    #[serde(deserialize_with = "one_or_many")]
+    pub endpoint: Vec<String>,
+    /// Lower is preferred. Default 0.
+    #[serde(default)]
+    pub preference: u32,
 }
 
 /// `[ca] cert_validity_days`: one number of days for every role, or a table
@@ -518,6 +576,64 @@ impl CaTomlConfig {
     fn default_approval_request_ttl_days() -> u32 {
         Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS
     }
+
+    /// Checks `direct_pairs` and each `[[ca.relay]]` entry on their own;
+    /// whether a relay outside the namespace has its `key` is checked when
+    /// the namespace is known (init, schema update, CA start).
+    fn validate(&self) -> Result<(), ConfigError> {
+        for pair in self.direct_pairs.iter().flatten() {
+            let roles = pair.split_once(':');
+            if !roles.is_some_and(|(a, b)| {
+                CertValidityDays::ROLES.contains(&a) && CertValidityDays::ROLES.contains(&b)
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "[ca] direct_pairs: {pair:?} is not a pair of roles: write \"<role>:<role>\" \
+                     with roles {}, such as \"member:member\"",
+                    CertValidityDays::ROLES.join(", ")
+                )));
+            }
+        }
+        let relays = self.relays.as_deref().unwrap_or_default();
+        for (i, relay) in relays.iter().enumerate() {
+            let invalid = |why: String| {
+                ConfigError::Invalid(format!("[[ca.relay]] {}: {why}", relay.device))
+            };
+            let parsed = relay.device.parse::<ndn_packet::Name>().ok();
+            if !relay.device.starts_with('/') || parsed.is_none_or(|n| n.len() < 3) {
+                return Err(ConfigError::Invalid(format!(
+                    "[[ca.relay]] #{}: device must be a device name /<namespace>/<role>/<device>, \
+                     not {:?}",
+                    i + 1,
+                    relay.device
+                )));
+            }
+            if let Some(key) = &relay.key
+                && (key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(invalid(format!(
+                    "key must be the 64 hex digits of the relay's fingerprint, not {key:?}"
+                )));
+            }
+            if relay.endpoint.is_empty() {
+                return Err(invalid(
+                    "no endpoint, so no device could reach it: set endpoint = \"host:port\"".into(),
+                ));
+            }
+            for endpoint in &relay.endpoint {
+                let port = endpoint.rsplit_once(':').map(|(_, p)| p.parse::<u16>());
+                if !matches!(port, Some(Ok(p)) if p != 0) {
+                    return Err(invalid(format!(
+                        "endpoint must be host:port, such as \"relay.example.net:6367\", not \
+                         {endpoint:?}"
+                    )));
+                }
+            }
+            if relays[..i].iter().any(|r| r.device == relay.device) {
+                return Err(invalid("listed twice; merge the two entries".into()));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for CaTomlConfig {
@@ -539,6 +655,8 @@ impl Default for CaTomlConfig {
             relay_roles: None,
             enrollment_links: None,
             direct_paths: None,
+            direct_pairs: None,
+            relays: None,
             approval_request_ttl_days: Self::DEFAULT_APPROVAL_REQUEST_TTL_DAYS,
         }
     }
@@ -1034,15 +1152,26 @@ impl ForwarderConfig {
                 quic_sockets.len()
             )));
         }
-        if quic_sockets == [false] && !self.peers.iter().any(|p| !p.endpoint.is_empty()) {
+        if quic_sockets == [false]
+            && !self.peers.iter().any(|p| !p.endpoint.is_empty())
+            && self.user_relays.is_empty()
+            && !self.relays.namespace
+        {
             return Err(ConfigError::Invalid(
-                "[[face]] kind = \"quic\" with listen = false only dials, and no [[peer]] has an \
-                 endpoint to dial: give a [[peer]] an endpoint, or set listen = true to accept \
-                 links"
+                "[[face]] kind = \"quic\" with listen = false only dials, and nothing is there to \
+                 dial: no [[peer]] has an endpoint, no [[relay]] is configured and [relays] \
+                 namespace = false; give a [[peer]] an endpoint, add a [[relay]], set [relays] \
+                 namespace = true, or set listen = true to accept links"
                     .into(),
             ));
         }
-        validate_peers(&self.peers)?;
+        validate_peers(&self.peers, &self.user_relays)?;
+        validate_relays(&self.user_relays, &self.peers)?;
+        self.relays.validate()?;
+        self.relay_service.validate()?;
+        self.links.validate()?;
+        self.direct.validate()?;
+        self.ca.validate()?;
 
         if self.engine.cs_capacity_mb > 65536 {
             return Err(ConfigError::Invalid(format!(
@@ -1586,6 +1715,23 @@ pub struct PeerConfig {
     /// always go through the relay.
     #[serde(default = "default_true")]
     pub direct: bool,
+    /// When the link is up: `always`, `on-demand` or `off`. See
+    /// [`LinkModeConfig`].
+    #[serde(default)]
+    pub mode: LinkModeConfig,
+    /// With `mode = "on-demand"`: close the link after this many seconds
+    /// without traffic (10..=86400).
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
+    /// Ask this peer (a relay) to hold Interests for this device while its
+    /// link is asleep, and deliver them when it is back.
+    #[serde(default)]
+    pub hold: bool,
+    /// Opaque token (UTF-8, at most 1024 bytes) registered with this peer
+    /// (a relay) to wake this device when Interests arrive while it is
+    /// asleep, e.g. a platform push token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_token: Option<String>,
 }
 
 impl PeerConfig {
@@ -1627,7 +1773,7 @@ where
     })
 }
 
-fn validate_peers(peers: &[PeerConfig]) -> Result<(), ConfigError> {
+fn validate_peers(peers: &[PeerConfig], relays: &[RelayConfig]) -> Result<(), ConfigError> {
     let invalid = |peer: &PeerConfig, why: String| {
         ConfigError::Invalid(format!("[[peer]] {}: {why}", peer.label()))
     };
@@ -1639,32 +1785,10 @@ fn validate_peers(peers: &[PeerConfig]) -> Result<(), ConfigError> {
                 i + 1
             )));
         }
-        if let Some(key) = &peer.key
-            && (key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            return Err(invalid(
-                peer,
-                format!("key must be the 64 hex digits of the device's fingerprint, not {key:?}"),
-            ));
-        }
-        if let Some(device) = &peer.device {
-            let parsed = device.parse::<ndn_packet::Name>().ok();
-            if !device.starts_with('/') || parsed.is_none_or(|n| n.len() < 3) {
-                return Err(invalid(
-                    peer,
-                    format!("device must be a device name /<namespace>/<role>/<device>, not {device:?}"),
-                ));
-            }
-        }
-        for endpoint in &peer.endpoint {
-            let port = endpoint.rsplit_once(':').map(|(_, p)| p.parse::<u16>());
-            if !matches!(port, Some(Ok(p)) if p != 0) {
-                return Err(invalid(
-                    peer,
-                    format!("endpoint must be host:port, such as \"relay.example.net:6367\", not {endpoint:?}"),
-                ));
-            }
-        }
+        check_identity(peer.key.as_deref(), peer.device.as_deref())
+            .and_then(|()| check_endpoints(&peer.endpoint))
+            .and_then(|()| check_mode(peer.mode, peer.idle_secs, peer.wake_token.as_deref()))
+            .map_err(|why| invalid(peer, why))?;
         for route in peer.routes.iter().flatten() {
             if route.parse::<ndn_packet::Name>().is_err() || !route.starts_with('/') {
                 return Err(invalid(peer, format!("route {route:?} is not an NDN name")));
@@ -1679,19 +1803,22 @@ fn validate_peers(peers: &[PeerConfig]) -> Result<(), ConfigError> {
                     ));
                 }
                 Some(_) => {}
+                None if relays.iter().any(|r| r.is_named(relay)) => {}
                 None => {
                     return Err(invalid(
                         peer,
-                        format!("relay {relay:?} is not the device or key of another [[peer]]"),
+                        format!(
+                            "relay {relay:?} is not the device or key of another [[peer]] or of a \
+                             [[relay]]; add it as one of those, or fix the reference"
+                        ),
                     ));
                 }
             }
         }
-        if let Some(other) = peers[..i].iter().find(|p| {
-            (p.device.is_some() && p.device == peer.device)
-                || (p.key.is_some()
-                    && peer.key.as_deref().is_some_and(|k| p.is_named(k)))
-        }) {
+        if let Some(other) = peers[..i]
+            .iter()
+            .find(|p| same_device(p.key.as_deref(), p.device.as_deref(), peer.key.as_deref(), peer.device.as_deref()))
+        {
             return Err(invalid(
                 peer,
                 format!("names the same device as [[peer]] {}; merge the two", other.label()),
@@ -1699,6 +1826,564 @@ fn validate_peers(peers: &[PeerConfig]) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// `[[relay]]` entries: each identified, reachable, and distinct from every
+/// other `[[relay]]` and `[[peer]]` (one device is one link).
+fn validate_relays(relays: &[RelayConfig], peers: &[PeerConfig]) -> Result<(), ConfigError> {
+    for (i, relay) in relays.iter().enumerate() {
+        let invalid = |why: String| ConfigError::Invalid(format!("[[relay]] {}: {why}", relay.label()));
+        if relay.key.is_none() && relay.device.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "[[relay]] #{}: give the relay's expected fingerprint (key = \"<64 hex digits>\"); \
+                 device = \"/<namespace>/node/<device>\" alone is enough only for a relay of a \
+                 namespace this device holds",
+                i + 1
+            )));
+        }
+        if relay.endpoint.is_empty() {
+            return Err(invalid(
+                "has no endpoint, so this device cannot reach it: add endpoint = \"host:port\" \
+                 (or a list tried in order)"
+                    .into(),
+            ));
+        }
+        check_identity(relay.key.as_deref(), relay.device.as_deref())
+            .and_then(|()| check_endpoints(&relay.endpoint))
+            .and_then(|()| check_mode(relay.mode, relay.idle_secs, relay.wake_token.as_deref()))
+            .map_err(invalid)?;
+        let same = |key: Option<&str>, device: Option<&str>| {
+            same_device(key, device, relay.key.as_deref(), relay.device.as_deref())
+        };
+        if let Some(other) = relays[..i].iter().find(|r| same(r.key.as_deref(), r.device.as_deref())) {
+            return Err(invalid(format!(
+                "names the same device as [[relay]] {}; merge the two",
+                other.label()
+            )));
+        }
+        if let Some(peer) = peers.iter().find(|p| same(p.key.as_deref(), p.device.as_deref())) {
+            return Err(invalid(format!(
+                "names the same device as [[peer]] {}: one device is one link; keep the \
+                 [[relay]] (and move that peer's routes and options to it) or the [[peer]], not both",
+                peer.label()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether two (key, device) identifications name the same device.
+fn same_device(a_key: Option<&str>, a_device: Option<&str>, b_key: Option<&str>, b_device: Option<&str>) -> bool {
+    (a_device.is_some() && a_device == b_device)
+        || a_key.zip(b_key).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn check_identity(key: Option<&str>, device: Option<&str>) -> Result<(), String> {
+    if let Some(key) = key
+        && !is_fingerprint(key)
+    {
+        return Err(format!(
+            "key must be the 64 hex digits of the device's fingerprint, not {key:?}"
+        ));
+    }
+    if let Some(device) = device {
+        let parsed = device.parse::<ndn_packet::Name>().ok();
+        if !device.starts_with('/') || parsed.is_none_or(|n| n.len() < 3) {
+            return Err(format!(
+                "device must be a device name /<namespace>/<role>/<device>, not {device:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_fingerprint(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn check_endpoints(endpoints: &[String]) -> Result<(), String> {
+    for endpoint in endpoints {
+        let port = endpoint.rsplit_once(':').map(|(_, p)| p.parse::<u16>());
+        if !matches!(port, Some(Ok(p)) if p != 0) {
+            return Err(format!(
+                "endpoint must be host:port, such as \"relay.example.net:6367\", not {endpoint:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_mode(mode: LinkModeConfig, idle_secs: u64, wake_token: Option<&str>) -> Result<(), String> {
+    if mode == LinkModeConfig::OnDemand && !IDLE_SECS.contains(&idle_secs) {
+        return Err(format!(
+            "idle_secs = {idle_secs} is outside {}..={}: below that an on-demand link closes \
+             between the packets of one exchange, above it stays open for a day; pick a value in range",
+            IDLE_SECS.start(),
+            IDLE_SECS.end()
+        ));
+    }
+    if let Some(token) = wake_token
+        && !(1..=MAX_WAKE_TOKEN).contains(&token.len())
+    {
+        return Err(format!(
+            "wake_token is {} bytes; a relay keeps 1..={MAX_WAKE_TOKEN} bytes: remove the key \
+             to register none, or shorten the token",
+            token.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Bounds of an on-demand link's idle close, in seconds.
+const IDLE_SECS: std::ops::RangeInclusive<u64> = 10..=86_400;
+/// Longest wake token a relay keeps, in bytes.
+const MAX_WAKE_TOKEN: usize = 1024;
+
+fn default_idle_secs() -> u64 {
+    60
+}
+
+/// When a link is up.
+///
+/// - `always`: linked all the time; a keep-alive every
+///   `[links] keep_alive_secs` keeps NAT bindings — and the radio — awake.
+/// - `on-demand`: closed until there is traffic for it (or the host says it
+///   is active); closed again after `idle_secs` without traffic. The first
+///   Interest waits for the handshake.
+/// - `off`: configured but closed until asked (`ndn-ctl link connect`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkModeConfig {
+    #[default]
+    Always,
+    OnDemand,
+    Off,
+}
+
+/// `[relays]`: how this device uses relays.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelaysConfig {
+    /// Relays linked at once, preferred first (1..=8); the rest stand by
+    /// and take over when one is lost.
+    #[serde(default = "default_relay_count")]
+    pub count: usize,
+    /// Use the relays the namespace advertises in its trust context.
+    #[serde(default = "default_true")]
+    pub namespace: bool,
+    /// Link mode of the namespace's relays.
+    #[serde(default)]
+    pub mode: LinkModeConfig,
+    /// With `mode = "on-demand"`: idle close, in seconds (10..=86400).
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
+    /// Ask the namespace's relays to hold Interests while this device is
+    /// asleep.
+    #[serde(default)]
+    pub hold: bool,
+}
+
+fn default_relay_count() -> usize {
+    1
+}
+
+impl Default for RelaysConfig {
+    fn default() -> Self {
+        Self {
+            count: default_relay_count(),
+            namespace: true,
+            mode: LinkModeConfig::default(),
+            idle_secs: default_idle_secs(),
+            hold: false,
+        }
+    }
+}
+
+impl RelaysConfig {
+    /// Most relays linked at once.
+    pub const MAX_COUNT: usize = 8;
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |why: String| ConfigError::Invalid(format!("[relays] {why}"));
+        if !(1..=Self::MAX_COUNT).contains(&self.count) {
+            return Err(invalid(format!(
+                "count = {} is outside 1..={}: at least one relay is linked when any is known \
+                 (set namespace = false and add no [[relay]] for none), and more than {} only \
+                 costs keep-alives",
+                self.count,
+                Self::MAX_COUNT,
+                Self::MAX_COUNT
+            )));
+        }
+        check_mode(self.mode, self.idle_secs, None).map_err(invalid)
+    }
+}
+
+/// One `[[relay]]`: a relay the user adds (own server, community relay,
+/// hosted service), identified by its key and dialled at its endpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Expected fingerprint of the relay's key (64 hex digits). Required
+    /// unless `device` is a device of a namespace this device holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The relay's device name, `/<namespace>/node/<device>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Where to dial it: `host:port`, or a list tried in order.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub endpoint: Vec<String>,
+    /// Lower is preferred; on a tie user relays come before the
+    /// namespace's.
+    #[serde(default)]
+    pub preference: u32,
+    /// Link mode; see [`LinkModeConfig`].
+    #[serde(default)]
+    pub mode: LinkModeConfig,
+    /// With `mode = "on-demand"`: idle close, in seconds (10..=86400).
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
+    /// Ask this relay to hold Interests while this device is asleep.
+    #[serde(default)]
+    pub hold: bool,
+    /// Opaque wake token (UTF-8, at most 1024 bytes) registered with this
+    /// relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_token: Option<String>,
+}
+
+impl RelayConfig {
+    /// How the config refers to this relay in messages and in `[[peer]] relay`.
+    pub fn label(&self) -> String {
+        self.device
+            .clone()
+            .or_else(|| self.key.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `reference` (a `[[peer]] relay` value) names this relay.
+    pub fn is_named(&self, reference: &str) -> bool {
+        self.device.as_deref() == Some(reference)
+            || self
+                .key
+                .as_deref()
+                .is_some_and(|k| k.eq_ignore_ascii_case(reference))
+    }
+}
+
+/// Which namespaces a relay serves (`[relay_service] serve`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServeConfig {
+    /// Devices of namespaces this device holds a certificate in.
+    #[default]
+    Own,
+    /// Those, plus namespaces whose root key fingerprint is in `roots`.
+    Listed,
+    /// Any namespace whose certificate chain validates to its root, within
+    /// the quotas.
+    Open,
+}
+
+/// Per-relay quotas for devices of other namespaces (rates per second,
+/// burst twice that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotasConfig {
+    pub links_total: usize,
+    pub links_per_namespace: usize,
+    pub interests_per_key: u32,
+    pub interests_per_namespace: u32,
+}
+
+impl Default for QuotasConfig {
+    fn default() -> Self {
+        Self {
+            links_total: 256,
+            links_per_namespace: 32,
+            interests_per_key: 100,
+            interests_per_namespace: 400,
+        }
+    }
+}
+
+/// `[relay_service]`: what this device does as a relay for others.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayServiceConfig {
+    /// `own` (default), `listed` or `open`; see [`ServeConfig`].
+    #[serde(default)]
+    pub serve: ServeConfig,
+    /// With `serve = "listed"`: root key fingerprints (64 hex digits) of the
+    /// namespaces served besides this device's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
+    /// Quotas: always in force for `open` (defaults 256, 32, 100, 400);
+    /// for `listed` only when one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_per_namespace: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interests_per_key: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interests_per_namespace: Option<u32>,
+    /// Hold Interests for sleeping devices that ask (within the bounds
+    /// below).
+    #[serde(default)]
+    pub hold: bool,
+    #[serde(default = "default_hold_per_device")]
+    pub hold_per_device: usize,
+    #[serde(default = "default_hold_total")]
+    pub hold_total: usize,
+    /// Longest an Interest is held, in seconds (never past its lifetime).
+    #[serde(default = "default_hold_secs")]
+    pub hold_secs: u64,
+    /// How long a device that went asleep counts as asleep (held for,
+    /// woken), in seconds.
+    #[serde(default = "default_asleep_secs")]
+    pub asleep_secs: u64,
+    /// Program (and arguments) run once per wake, with env
+    /// `NDN_WAKE_TOKEN` (hex), `NDN_WAKE_DEVICE` (name, or empty),
+    /// `NDN_WAKE_KEY` (fingerprint hex), `NDN_WAKE_HELD` (count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_command: Option<Vec<String>>,
+}
+
+fn default_hold_per_device() -> usize {
+    64
+}
+fn default_hold_total() -> usize {
+    4096
+}
+fn default_hold_secs() -> u64 {
+    60
+}
+fn default_asleep_secs() -> u64 {
+    86_400
+}
+
+impl Default for RelayServiceConfig {
+    fn default() -> Self {
+        Self {
+            serve: ServeConfig::default(),
+            roots: Vec::new(),
+            links_total: None,
+            links_per_namespace: None,
+            interests_per_key: None,
+            interests_per_namespace: None,
+            hold: false,
+            hold_per_device: default_hold_per_device(),
+            hold_total: default_hold_total(),
+            hold_secs: default_hold_secs(),
+            asleep_secs: default_asleep_secs(),
+            wake_command: None,
+        }
+    }
+}
+
+impl RelayServiceConfig {
+    fn any_quota(&self) -> bool {
+        self.links_total.is_some()
+            || self.links_per_namespace.is_some()
+            || self.interests_per_key.is_some()
+            || self.interests_per_namespace.is_some()
+    }
+
+    /// The quotas in force: `open` always, `listed` when any is set (unset
+    /// ones take the default), `own` never.
+    pub fn quotas(&self) -> Option<QuotasConfig> {
+        let on = match self.serve {
+            ServeConfig::Own => false,
+            ServeConfig::Listed => self.any_quota(),
+            ServeConfig::Open => true,
+        };
+        on.then(|| {
+            let d = QuotasConfig::default();
+            let links_total = self.links_total.unwrap_or(d.links_total);
+            QuotasConfig {
+                links_total,
+                // An unset share never exceeds a smaller total that was set.
+                links_per_namespace: self
+                    .links_per_namespace
+                    .unwrap_or(d.links_per_namespace.min(links_total)),
+                interests_per_key: self.interests_per_key.unwrap_or(d.interests_per_key),
+                interests_per_namespace: self
+                    .interests_per_namespace
+                    .unwrap_or(d.interests_per_namespace),
+            }
+        })
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |why: String| ConfigError::Invalid(format!("[relay_service] {why}"));
+        match self.serve {
+            ServeConfig::Listed if self.roots.is_empty() => {
+                return Err(invalid(
+                    "serve = \"listed\" serves the namespaces in roots, and roots is empty: list \
+                     their root key fingerprints, or use serve = \"own\""
+                        .into(),
+                ));
+            }
+            ServeConfig::Own | ServeConfig::Open if !self.roots.is_empty() => {
+                return Err(invalid(
+                    "roots is used only with serve = \"listed\" (\"own\" serves this device's \
+                     namespaces, \"open\" every namespace): set serve = \"listed\" or remove roots"
+                        .into(),
+                ));
+            }
+            ServeConfig::Own if self.any_quota() => {
+                return Err(invalid(
+                    "quotas limit devices of other namespaces, and serve = \"own\" serves none: \
+                     remove them, or set serve = \"listed\" or \"open\""
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        if let Some(root) = self.roots.iter().find(|r| !is_fingerprint(r)) {
+            return Err(invalid(format!(
+                "roots entries must be the 64 hex digits of a namespace's root key fingerprint, \
+                 not {root:?}"
+            )));
+        }
+        if let Some(q) = self.quotas() {
+            if q.links_total == 0 || q.links_per_namespace == 0 || q.links_per_namespace > q.links_total {
+                return Err(invalid(format!(
+                    "links_per_namespace = {} with links_total = {}: both must be at least 1 and \
+                     one namespace cannot have more links than the total",
+                    q.links_per_namespace, q.links_total
+                )));
+            }
+            if q.interests_per_key == 0 || q.interests_per_namespace == 0 {
+                return Err(invalid(
+                    "interests_per_key and interests_per_namespace must be at least 1 Interest \
+                     per second: 0 would admit links that can send nothing; to serve no other \
+                     namespace use serve = \"own\""
+                        .into(),
+                ));
+            }
+        }
+        if self.hold_per_device == 0 || self.hold_total < self.hold_per_device {
+            return Err(invalid(format!(
+                "hold_per_device = {} with hold_total = {}: a device needs room for at least one \
+                 Interest, and the total must fit one device's share",
+                self.hold_per_device, self.hold_total
+            )));
+        }
+        if !(1..=3600).contains(&self.hold_secs) {
+            return Err(invalid(format!(
+                "hold_secs = {} is outside 1..=3600: an Interest is never held past its lifetime, \
+                 and Interests live far less than an hour",
+                self.hold_secs
+            )));
+        }
+        if !(60..=604_800).contains(&self.asleep_secs) {
+            return Err(invalid(format!(
+                "asleep_secs = {} is outside 60..=604800 (one minute to one week): a device asleep \
+                 longer is treated as gone",
+                self.asleep_secs
+            )));
+        }
+        if let Some(command) = &self.wake_command
+            && command.first().is_none_or(|program| program.trim().is_empty())
+        {
+            return Err(invalid(
+                "wake_command must start with the program to run, as in wake_command = \
+                 [\"/usr/local/bin/notify\", \"arg\"]; remove the key to wake no one"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `[links]`: timing of every link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinksConfig {
+    /// Seconds between keep-alives on an idle link (2..=60).
+    #[serde(default = "default_keep_alive_secs")]
+    pub keep_alive_secs: u64,
+    /// Seconds of silence after which a link counts as lost
+    /// (≥ 3 × keep_alive_secs, ≤ 600).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_keep_alive_secs() -> u64 {
+    10
+}
+fn default_idle_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for LinksConfig {
+    fn default() -> Self {
+        Self {
+            keep_alive_secs: default_keep_alive_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
+}
+
+impl LinksConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let k = self.keep_alive_secs;
+        let t = self.idle_timeout_secs;
+        if !(2..=60).contains(&k) {
+            return Err(ConfigError::Invalid(format!(
+                "[links] keep_alive_secs = {k} is outside 2..=60: faster wastes battery and data, \
+                 slower lets NAT bindings (often 30–120 s) expire so the peer can no longer reach \
+                 this device"
+            )));
+        }
+        if t < 3 * k || t > 600 {
+            return Err(ConfigError::Invalid(format!(
+                "[links] idle_timeout_secs = {t} must be at least 3 × keep_alive_secs ({}) so \
+                 two lost keep-alives do not drop the link, and at most 600 so a dead link is \
+                 noticed",
+                3 * k
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `[direct]`: direct paths made by membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectConfig {
+    /// Try direct paths with devices of this device's namespace met at a
+    /// common relay, where the trust context's role matrix allows them.
+    #[serde(default = "default_true")]
+    pub membership: bool,
+    /// Most direct paths kept at once (1..=64).
+    #[serde(default = "default_max_paths")]
+    pub max_paths: usize,
+}
+
+fn default_max_paths() -> usize {
+    8
+}
+
+impl Default for DirectConfig {
+    fn default() -> Self {
+        Self { membership: true, max_paths: default_max_paths() }
+    }
+}
+
+impl DirectConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=64).contains(&self.max_paths) {
+            return Err(ConfigError::Invalid(format!(
+                "[direct] max_paths = {} is outside 1..=64: each path costs keep-alives; for no \
+                 direct paths by membership set membership = false",
+                self.max_paths
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Automatic multicast face creation and OS interface hotplug.
@@ -2669,10 +3354,53 @@ channel = 161
         )
         .unwrap();
         assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false, .. } if bind == "192.0.2.7:0"));
-        let err = ForwarderConfig::from_str("[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n")
-            .err()
-            .expect("a socket that neither listens nor dials is refused");
+        let err = ForwarderConfig::from_str(
+            "[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n\
+             [relays]\nnamespace = false\n",
+        )
+        .err()
+        .expect("a socket that neither listens nor dials is refused");
         assert!(err.to_string().contains("no [[peer]] has an endpoint"), "{err}");
+        // The namespace's relays (on by default) are something to dial.
+        assert!(
+            ForwarderConfig::from_str("[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n")
+                .is_ok()
+        );
+    }
+
+    /// `[[ca.relay]]` and `direct_pairs` parse, unset stays unset (the
+    /// context's), `relay = []` states none, and a bad entry is refused.
+    #[test]
+    fn ca_relays_and_direct_pairs_are_checked() {
+        let cfg = ForwarderConfig::from_str(&format!(
+            "[ca]\ndirect_pairs = [\"member:member\", \"admin:member\"]\n\
+             [[ca.relay]]\ndevice = \"/home/node/vps\"\nendpoint = \"vps.example.net:6367\"\n\
+             [[ca.relay]]\ndevice = \"/club/node/r\"\nkey = \"{}\"\n\
+             endpoint = [\"club.example.org:6367\", \"192.0.2.9:6367\"]\npreference = 2\n",
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        let relays = cfg.ca.relays.as_deref().unwrap();
+        assert_eq!(relays.len(), 2);
+        assert_eq!((relays[1].endpoint.len(), relays[1].preference), (2, 2));
+        assert_eq!(ForwarderConfig::from_str("").unwrap().ca.relays, None);
+        assert_eq!(ForwarderConfig::from_str("[ca]\nrelay = []\n").unwrap().ca.relays, Some(Vec::new()));
+        for (bad, why) in [
+            ("[ca]\ndirect_pairs = [\"member\"]\n", "is not a pair of roles"),
+            ("[ca]\ndirect_pairs = [\"member:robot\"]\n", "is not a pair of roles"),
+            ("[[ca.relay]]\ndevice = \"vps\"\nendpoint = \"v:1\"\n", "device must be a device name"),
+            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nkey = \"ab\"\nendpoint = \"v:1\"\n", "key must be"),
+            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = []\n", "no endpoint"),
+            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"v\"\n", "endpoint must be host:port"),
+            (
+                "[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"v:1\"\n\
+                 [[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"w:1\"\n",
+                "listed twice",
+            ),
+        ] {
+            let err = ForwarderConfig::from_str(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -2714,6 +3442,70 @@ channel = 161
             "[[face]]\nkind = \"quic\"\nremote = \"quic://h:1\"\n",
         ] {
             assert!(ForwarderConfig::from_str(bad).is_err(), "accepted: {bad}");
+        }
+    }
+
+    #[test]
+    fn relays_link_modes_and_relay_service_parse() {
+        let fp = "ab".repeat(32);
+        let root = "cd".repeat(32);
+        let cfg = ForwarderConfig::from_str(&format!(
+            "[relays]\ncount = 2\nnamespace = true\nmode = \"on-demand\"\nidle_secs = 120\nhold = true\n\
+             [[relay]]\nkey = \"{fp}\"\nendpoint = \"relay.example.net:6367\"\npreference = 5\n\
+             mode = \"off\"\nwake_token = \"push-token\"\n\
+             [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"{fp}\"\nmode = \"on-demand\"\n\
+             idle_secs = 30\nhold = true\n\
+             [relay_service]\nserve = \"listed\"\nroots = [\"{root}\"]\nlinks_total = 10\n\
+             hold = true\nhold_secs = 30\nwake_command = [\"/usr/bin/notify\", \"-q\"]\n\
+             [links]\nkeep_alive_secs = 20\nidle_timeout_secs = 60\n\
+             [direct]\nmembership = false\nmax_paths = 2\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.relays.count, 2);
+        assert_eq!(cfg.relays.mode, LinkModeConfig::OnDemand);
+        assert!(cfg.relays.hold);
+        let relay = &cfg.user_relays[0];
+        assert_eq!((relay.preference, relay.mode), (5, LinkModeConfig::Off));
+        assert_eq!(relay.wake_token.as_deref(), Some("push-token"));
+        assert_eq!(cfg.peers[0].mode, LinkModeConfig::OnDemand);
+        assert_eq!(cfg.peers[0].idle_secs, 30);
+        assert_eq!(cfg.relay_service.serve, ServeConfig::Listed);
+        let quotas = cfg.relay_service.quotas().expect("a set quota turns listed quotas on");
+        assert_eq!((quotas.links_total, quotas.links_per_namespace), (10, 10));
+        assert_eq!(cfg.links.idle_timeout_secs, 60);
+        assert_eq!(cfg.direct, DirectConfig { membership: false, max_paths: 2 });
+
+        let cfg = ForwarderConfig::default();
+        assert!(cfg.relays.namespace && cfg.direct.membership);
+        assert_eq!(cfg.relay_service.quotas(), None);
+        let open: ForwarderConfig = "[relay_service]\nserve = \"open\"\n".parse().unwrap();
+        assert_eq!(open.relay_service.quotas(), Some(QuotasConfig::default()));
+    }
+
+    #[test]
+    fn reach_options_out_of_bounds_are_refused_with_the_reason() {
+        let fp = "ab".repeat(32);
+        let twice = format!("[[relay]]\nkey = \"{fp}\"\nendpoint = \"h:1\"\n[[peer]]\nkey = \"{fp}\"\n");
+        let roots_unlisted = format!("[relay_service]\nroots = [\"{fp}\"]\n");
+        for (bad, why) in [
+            ("[relays]\ncount = 9\n", "count = 9"),
+            ("[relays]\nmode = \"on-demand\"\nidle_secs = 5\n", "idle_secs = 5"),
+            ("[relays]\nmode = \"sometimes\"\n", "sometimes"),
+            ("[relays]\nnope = 1\n", "nope"),
+            ("[[relay]]\ndevice = \"/home/node/r\"\n", "has no endpoint"),
+            ("[[relay]]\nendpoint = \"h:1\"\n", "expected fingerprint"),
+            ("[[relay]]\nkey = \"abc\"\nendpoint = \"h:1\"\n", "64 hex digits"),
+            (twice.as_str(), "one device is one link"),
+            ("[[peer]]\ndevice = \"/home/node/r\"\nwake_token = \"\"\n", "wake_token"),
+            ("[relay_service]\nserve = \"listed\"\n", "roots is empty"),
+            (roots_unlisted.as_str(), "only with serve = \"listed\""),
+            ("[relay_service]\nwake_command = [\"\"]\n", "start with the program"),
+            ("[links]\nkeep_alive_secs = 90\n", "NAT bindings"),
+            ("[links]\nkeep_alive_secs = 10\nidle_timeout_secs = 20\n", "3 × keep_alive_secs"),
+            ("[direct]\nmax_paths = 0\n", "max_paths = 0"),
+        ] {
+            let err = ForwarderConfig::from_str(bad).err().unwrap_or_else(|| panic!("accepted: {bad}"));
+            assert!(err.to_string().contains(why), "{bad}: {err}");
         }
     }
 }
