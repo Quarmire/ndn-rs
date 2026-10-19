@@ -359,7 +359,7 @@ binding transcript = "ndn-link/1 membership" %x00     ; 22 bytes: 21 ASCII bytes
 
 ### 6.1 Close reason codes
 
-A side closes a link with a QUIC `CONNECTION_CLOSE` of type 0x1d (application). Its Error Code is one of the codes below, and its Reason Phrase is a UTF-8 sentence for the person reading the other side's log. That sentence SHOULD say what to do. It is not machine-readable.
+A side closes a link with a QUIC `CONNECTION_CLOSE` of type 0x1d (application). Its Error Code is one of the codes below, and its Reason Phrase is a UTF-8 sentence for the person reading the other side's log. That sentence SHOULD say what to do, in terms of no particular host (ndn-rs sends the neutral sentence of its refusal's detail, §14.10). It is not machine-readable.
 
 | Code | Name | Sent when | Transient |
 |---|---|---|---|
@@ -863,7 +863,9 @@ A device has at most `max_paths` direct paths up at once (`DirectOptions::max_pa
 
 ### 14.10 Status and link commands
 
-ndn-rs reports per device (`Links::report`): its paths (kind `link`, `direct` or `relay` — the relay's link face —, face, remote address, RTT, age) and the direct-path state: `none`, `off`, `trying`, `up`, `not-possible` or `refused`, with a sentence and when the next punch is due; for a configured device, its link mode and, when it is not linked, why; for a relay this device uses, its source, preference and state (`linked`, `trying`, `down`, `standby` or `off`, §15.6) with a sentence; on a relay, for a device asleep here, how long, the Interests held for it, whether it asked to be held for and to be woken, and the wakes sent (§17). For the device itself: its key, the probes it sent, the punches it refused, its serving policy in one line (§15.2), the Interests it holds for sleeping devices, and the wakes it sent.
+ndn-rs reports per device (`Links::report`): its paths (kind `link`, `direct` or `relay` — the relay's link face —, face, remote address, RTT, age) and the direct-path state: `none`, `off`, `trying`, `up`, `not-possible` or `refused`, with a detail and when the next punch is due; for a configured device, its link mode and, when it is not linked, why (a detail); for a relay this device uses, its source, preference and state (`linked`, `trying`, `down`, `standby` or `off`, §15.6) with a detail; on a relay, for a device asleep here, how long, the Interests held for it, whether it asked to be held for and to be woken, and the wakes sent (§17). For the device itself: its key, the probes it sent, the punches it refused, its serving policy (a detail, §15.2), the Interests it holds for sleeping devices, and the wakes it sent.
+
+Whatever the report says in words is a **detail** (`LinkDetail`, ndn-mgmt-wire): a stable code (`link_code`, catalogued with its parameters in [mgmt-trust.md, "Links"](mgmt-trust.md#links)), named parameters, a neutral default sentence and the details that sentence quotes (its causes, each cause's sentence verbatim in its parent's, in order). The library takes no host's words: its sentences name no host command or configuration key. A client words the codes it knows (`LinkDetail::render`; `LinkWords` gives a client's sentence for the six codes whose neutral sentence stands in for a host's peer entries, certificate renewal and expected keys) and shows the neutral sentence, its known causes worded in place, for the others. The sentence of a refusal is also the Reason Phrase this side closes with (§6.1), and the text of a punch refusal (§14.4): the other device gets the neutral sentence.
 
 ndn-fwd serves this as the management dataset `/localhost/nfd/links/list` (local operators only), and `ndn-ctl link list` prints it ([reference/links.md](../wiki/src/reference/links.md)). Its TLVs are those of ndn-mgmt-wire `link_status` (`link_tlv`), all even and so skippable by an older decoder: 0x04A0–0x04BE for keys, paths and direct-path state, and
 
@@ -875,15 +877,22 @@ ndn-fwd serves this as the management dataset `/localhost/nfd/links/list` (local
 | 0x04C6 | source | relay | `user` or `namespace:<namespace>` |
 | 0x04C8 | preference | relay | NonNegativeInteger, lower preferred |
 | 0x04CA | state | relay | `linked`, `trying`, `down`, `standby` or `off` |
-| 0x04CC | text | relay | why, and what to do if anything |
 | 0x04CE | asleep | LINK (relay side) | nested: the device is asleep here |
 | 0x04D0 | since_secs | asleep | NonNegativeInteger (s) |
 | 0x04D2 | held | asleep; top level | NonNegativeInteger: Interests held for that device; top level: `held_total`, for all |
 | 0x04D4 | hold | asleep | empty: it asked for its Interests to be held |
 | 0x04D6 | wake | asleep | empty: it registered a wake token |
 | 0x04D8 | wakes | asleep; top level | NonNegativeInteger: wakes sent to that device; top level: `wakes_sent`, to all |
-| 0x04DA | down | LINK | why a configured device is not linked now |
-| 0x04DC | serve | top level | this device's serving policy, one line |
+| 0x04E0 | code | detail | UTF-8: the detail's code |
+| 0x04E2 | param | detail | nested, one per parameter: name (0x04E4), value (0x04E6), both UTF-8 |
+| 0x04E8 | text | detail | UTF-8: the neutral sentence |
+| 0x04EA | cause | detail | nested detail, one per cause, in the order their sentences appear |
+| 0x04EC | direct | LINK | nested detail: why the direct path is in its state, and what to do if anything |
+| 0x04EE | detail | relay | nested detail: why the relay is in its state |
+| 0x04F0 | down | LINK | nested detail: why a configured device is not linked now |
+| 0x04F2 | serve | top level | nested detail: this device's serving policy |
+
+A detail without a code is malformed. 0x04BC, 0x04CC, 0x04DA and 0x04DC carried sentences before details replaced them; they are retired and not reused.
 
 Strings are UTF-8. The link commands, also for local operators only, name a configured link by its label (as `link list` shows it) in `ControlParameters` Uri, and change only the running daemon:
 
@@ -891,7 +900,7 @@ Strings are UTF-8. The link commands, also for local operators only, name a conf
 - `/localhost/nfd/links/disconnect` — `Links::disconnect`: the link is no longer asked for; an `off` link closes now, an `on-demand` link once idle, an `always` link stays (set its mode to `off` to close it);
 - `/localhost/nfd/links/mode` — `Links::set_mode`: the mode in `ControlParameters` LocalUri, `always`, `on-demand`, `on-demand:<idle seconds>` (10–86 400; without seconds the link's current idle time, else 60 s) or `off`.
 
-A device that linked in without a peer entry has no mode and cannot be named by these commands. Presentation is not normative.
+A device that linked in without a peer entry has no mode and cannot be named by these commands. A command answers its detail as JSON in the ControlResponse status text (codes `linking`, `link-released`, `link-mode-set`); a refusal is a structured refusal (the `links` codes of [mgmt-trust.md](mgmt-trust.md#links)). Presentation is not normative.
 
 ## 15. Relays
 
@@ -1574,8 +1583,8 @@ These points were open when this spec was first written. Each was decided, and c
 | direct paths off over every identity / role pair (`pair_off`), bound (`direct_full`), member tie-breaker (`member_turn`), traffic record, member answer check, Busy at the bound | N/direct.rs:185, :347, :376–441, :679–724 |
 | after a network change: direct paths closed (0x01) and punched again from the new address, the loop going on from that punch; a punch from a key with a direct path up closes that path (0x01); a path replaced or punched again ends with no retry wait | N/control.rs:237; N/direct.rs:922–1062; N/table.rs:320–353 (test ndn-link/tests/direct.rs) |
 | status: mode, relay, asleep, down, serve, held_total, wakes_sent | N/status.rs; N/links.rs:254 |
-| `links/list` TLVs 0x04A0–0x04DC; `LinkModeArg` | ndn-rs/crates/core/ndn-mgmt-wire/src/link_status.rs:22–93, :97–168, :174 |
-| `links/connect`, `links/disconnect`, `links/mode` | ndn-rs/crates/core/ndn-mgmt-wire/src/nfd_command.rs:70–79; F/links_mgmt.rs:38–157 |
+| `links/list` TLVs 0x04A0–0x04F2; `link_code`, `LinkDetail`, `LinkWords`; `LinkModeArg` | ndn-rs/crates/core/ndn-mgmt-wire/src/link_status.rs:30, :120, :406, :536, :713 |
+| `links/connect`, `links/disconnect`, `links/mode` | ndn-rs/crates/core/ndn-mgmt-wire/src/nfd_command.rs:70–79; F/links_mgmt.rs:67–230 |
 | `[[peer]]` / `[[relay]]` → PeerSpec; `[relay_service]` → RelayService and the wake command; `[links]` → `bounded`; `[relays]`, `[direct]` | F/links.rs:61–152, :153–281, :401, :466–476 |
 | `[[peer]]`, `[relays]`, `[[relay]]`, `[relay_service]`, `[links]`, `[direct]` fields and bounds | ndn-rs/crates/platform/ndn-config/src/config.rs:1684, :1966, :2026, :2113, :2304, :2356 |
 | `in_enrollment` / `is_key_or_certificate_name`; name filter test cases | N/admission.rs:1059–1080, test `an_enrollment_link_carries_only_the_enrollment` |
