@@ -37,7 +37,10 @@ impl TransitPrefixes {
 
     /// One reason less; the last one takes `prefix` out of transit.
     pub fn remove(&self, prefix: &Name) {
-        let mut prefixes = self.prefixes.write().unwrap_or_else(PoisonError::into_inner);
+        let mut prefixes = self
+            .prefixes
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(count) = prefixes.get_mut(prefix) {
             *count -= 1;
             if *count == 0 {

@@ -148,7 +148,12 @@ impl Validator {
         expected_fingerprint: [u8; 32],
         ttl: Duration,
     ) -> Result<ContextExpectation<'_>, ExpectContextError> {
-        self.register_expectation(namespace, vec![expected_fingerprint], Purpose::Adoption, ttl)
+        self.register_expectation(
+            namespace,
+            vec![expected_fingerprint],
+            Purpose::Adoption,
+            ttl,
+        )
     }
 
     /// Expect an **update** of the held context `held`: while the guard
@@ -262,10 +267,12 @@ impl Validator {
         };
         let refused = |reason: String| {
             self.record(&namespace, |o| o.refused = Some(reason.clone()));
-            Some(ValidationResult::Invalid(TrustError::ExpectedContextRefused {
-                namespace: namespace.to_string(),
-                reason,
-            }))
+            Some(ValidationResult::Invalid(
+                TrustError::ExpectedContextRefused {
+                    namespace: namespace.to_string(),
+                    reason,
+                },
+            ))
         };
         let (context, anchor) = match SignedTrustContext::open_received(data).await {
             Ok(opened) => opened,
@@ -317,7 +324,9 @@ mod tests {
     fn a_guard_never_withdraws_a_newer_expectation() {
         let v = Validator::new(TrustSchema::new());
         let ns: Name = "/home/bob".parse().unwrap();
-        let old = v.expect_context(ns.clone(), [1; 32], Duration::ZERO).unwrap();
+        let old = v
+            .expect_context(ns.clone(), [1; 32], Duration::ZERO)
+            .unwrap();
         let new = v
             .expect_context(ns.clone(), [2; 32], Duration::from_secs(30))
             .expect("the old one expired");
@@ -327,6 +336,9 @@ mod tests {
             Err(ExpectContextError::AlreadyExpected(_))
         ));
         drop(new);
-        assert!(v.expect_context(ns, [3; 32], Duration::from_secs(30)).is_ok());
+        assert!(
+            v.expect_context(ns, [3; 32], Duration::from_secs(30))
+                .is_ok()
+        );
     }
 }

@@ -159,7 +159,9 @@ impl FromStr for YubikeyTouchPolicy {
             "never" => Ok(YubikeyTouchPolicy::Never),
             "always" => Ok(YubikeyTouchPolicy::Always),
             "cached" => Ok(YubikeyTouchPolicy::Cached),
-            _ => Err(format!("unknown touch policy {s:?} (never, always, cached)")),
+            _ => Err(format!(
+                "unknown touch policy {s:?} (never, always, cached)"
+            )),
         }
     }
 }
@@ -294,7 +296,10 @@ impl YubikeyPiv {
                 ))
             })?;
             let spki = meta.public.ok_or_else(|| {
-                TrustError::KeyStore(format!("slot {} of the YubiKey holds no key", slot.as_str()))
+                TrustError::KeyStore(format!(
+                    "slot {} of the YubiKey holds no key",
+                    slot.as_str()
+                ))
             })?;
             Ok(p256_spki(spki.subject_public_key.raw_bytes()))
         })
@@ -397,7 +402,10 @@ impl YubikeyPiv {
             )
             .await?;
         let spki = p256_spki(&point);
-        Ok((self.signer_with(key_name, slot, spki.clone(), Some(pin)), spki))
+        Ok((
+            self.signer_with(key_name, slot, spki.clone(), Some(pin)),
+            spki,
+        ))
     }
 
     async fn generate_on_device(
@@ -419,8 +427,9 @@ impl YubikeyPiv {
                      a PIN-protected one only behind its `untested` feature)"
                 ))
             })?;
-            let spki = piv::generate(yk, slot_id, AlgorithmId::EccP256, pin_policy, touch_policy)
-                .map_err(|e| TrustError::KeyStore(format!("YubiKey generate failed: {e}")))?;
+            let spki =
+                piv::generate(yk, slot_id, AlgorithmId::EccP256, pin_policy, touch_policy)
+                    .map_err(|e| TrustError::KeyStore(format!("YubiKey generate failed: {e}")))?;
             Ok(Bytes::copy_from_slice(spki.subject_public_key.raw_bytes()))
         })
         .await

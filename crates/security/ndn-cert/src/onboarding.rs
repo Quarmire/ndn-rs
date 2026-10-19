@@ -65,7 +65,8 @@ pub fn rdr_prefix(namespace: &Name) -> Name {
 /// The RDR metadata name: `/<namespace>/32=trust-context/32=metadata`. The
 /// versioned context itself is named by [`SignedTrustContext::rdr_name`].
 pub fn rdr_metadata_name(namespace: &Name) -> Name {
-    rdr_prefix(namespace).append_component(NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD)))
+    rdr_prefix(namespace)
+        .append_component(NameComponent::keyword(Bytes::from_static(METADATA_KEYWORD)))
 }
 
 /// Why a trust context was not adopted. Every message says what is wrong and,
@@ -80,9 +81,7 @@ pub enum AdoptError {
     MissingContent,
     #[error("malformed trust context: {0}")]
     Malformed(#[from] SignedTrustContextError),
-    #[error(
-        "context namespace {found} does not match the namespace {expected} from the invite/QR"
-    )]
+    #[error("context namespace {found} does not match the namespace {expected} from the invite/QR")]
     NamespaceMismatch { expected: String, found: String },
     #[error("context Data carries no KeyLocator naming its signer")]
     MissingKeyLocator,
@@ -184,9 +183,9 @@ impl From<OpenContextError> for AdoptError {
 /// [`adopt_with_tofu`] compares it with the expected fingerprint.
 pub fn open_signed_context(data: &Data) -> Result<(SignedTrustContext, Certificate), AdoptError> {
     // The verifiers never suspend; drive the future inline.
-    Ok(futures::executor::block_on(SignedTrustContext::open_signed(
-        data,
-    ))?)
+    Ok(futures::executor::block_on(
+        SignedTrustContext::open_signed(data),
+    )?)
 }
 
 /// [`SignedTrustContext::open_received`] plus the out-of-band checks: the
@@ -223,11 +222,8 @@ pub fn adopt_with_tofu(
     expected_fingerprint: &[u8; 32],
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
     // The verifiers never suspend; drive the future inline.
-    let ctx = futures::executor::block_on(authenticate(
-        context_data,
-        namespace,
-        expected_fingerprint,
-    ))?;
+    let ctx =
+        futures::executor::block_on(authenticate(context_data, namespace, expected_fingerprint))?;
     adopt_into(keyring, ctx)
 }
 
@@ -607,8 +603,7 @@ pub fn context_pointer(namespace: &Name, content: &Bytes) -> Result<Name, FetchC
             break;
         }
     }
-    let pointer =
-        pointer.ok_or_else(|| FetchContextError::MetadataMalformed("no Name".into()))?;
+    let pointer = pointer.ok_or_else(|| FetchContextError::MetadataMalformed("no Name".into()))?;
     let prefix = rdr_prefix(namespace);
     let is_context = pointer.len() == prefix.len() + 1
         && pointer.has_prefix(&prefix)
@@ -725,7 +720,10 @@ mod tests {
     }
 
     impl CaExchange for FakeNet {
-        fn express(&mut self, interest: Bytes) -> impl Future<Output = Result<Data, CertError>> + Send {
+        fn express(
+            &mut self,
+            interest: Bytes,
+        ) -> impl Future<Output = Result<Data, CertError>> + Send {
             let interest = ndn_packet::Interest::decode(interest).expect("well-formed Interest");
             let reply = self
                 .replies
@@ -780,12 +778,12 @@ mod tests {
         let ns = n("/home/bob");
         let eve = root_dev("/home/eve");
         let foreign_pointers = [
-            eve.context.rdr_name(),                     // another namespace's context
-            n("/home/bob/32=trust-context"),            // no version
-            n("/home/bob/32=trust-context/v=1/extra"),  // deeper than a context
-            n("/home/bob/32=trust-context/seg=1"),      // not a version component
-            n("/home/bob/KEY/root"),                    // outside the context prefix
-            n("/home/bob/x/32=trust-context/v=1"),      // a sub-namespace's context
+            eve.context.rdr_name(),                    // another namespace's context
+            n("/home/bob/32=trust-context"),           // no version
+            n("/home/bob/32=trust-context/v=1/extra"), // deeper than a context
+            n("/home/bob/32=trust-context/seg=1"),     // not a version component
+            n("/home/bob/KEY/root"),                   // outside the context prefix
+            n("/home/bob/x/32=trust-context/v=1"),     // a sub-namespace's context
         ];
         // Invariant: a pointer outside `<ns>/32=trust-context/v=<N>` is refused
         // and never fetched; malformed content is refused without a panic.
@@ -797,10 +795,10 @@ mod tests {
         }
 
         let malformed: [&[u8]; 4] = [
-            &[],                             // no Name at all
-            &[0x07, 0x05, 0x08],             // truncated Name TLV
-            &[0x07, 0x02, 0x00, 0x00],       // Name holding a type-0 component
-            &[0xfd],                         // not TLV
+            &[],                       // no Name at all
+            &[0x07, 0x05, 0x08],       // truncated Name TLV
+            &[0x07, 0x02, 0x00, 0x00], // Name holding a type-0 component
+            &[0xfd],                   // not TLV
         ];
         for content in malformed {
             let mut net = FakeNet::new(vec![metadata(&ns, content)]);
@@ -812,10 +810,16 @@ mod tests {
         // A metadata reply named outside the metadata name.
         let mut net = FakeNet::new(vec![(
             rdr_metadata_name(&ns),
-            data(n("/home/bob/other"), &eve.context.rdr_name().encode_to_tlv()),
+            data(
+                n("/home/bob/other"),
+                &eve.context.rdr_name().encode_to_tlv(),
+            ),
         )]);
         let res = futures::executor::block_on(fetch_context(&mut net, &ns));
-        assert!(res.is_err(), "a metadata reply under another name must be refused");
+        assert!(
+            res.is_err(),
+            "a metadata reply under another name must be refused"
+        );
         assert_eq!(net.sent.len(), 1);
 
         // No metadata at all.
@@ -835,7 +839,10 @@ mod tests {
             (versioned, eve.context_data.raw().clone()),
         ]);
         let res = futures::executor::block_on(fetch_context(&mut net, &ns));
-        assert!(res.is_err(), "a context under another name must never be returned");
+        assert!(
+            res.is_err(),
+            "a context under another name must never be returned"
+        );
     }
 
     /// A forger serving its own context under the right name gets through the
@@ -853,8 +860,13 @@ mod tests {
         let fetched = futures::executor::block_on(fetch_context(&mut net, &ns)).unwrap();
         let keyring = Keyring::new();
         assert!(
-            adopt_with_tofu(&keyring, &fetched, &ns, &anchor_fingerprint(&genuine.anchor))
-                .is_err()
+            adopt_with_tofu(
+                &keyring,
+                &fetched,
+                &ns,
+                &anchor_fingerprint(&genuine.anchor)
+            )
+            .is_err()
         );
         assert!(keyring.is_empty(), "a forged context must not be adopted");
     }
@@ -892,9 +904,14 @@ mod tests {
 
         let fp = anchor_fingerprint(&genuine.anchor);
         {
-            let expectation = v.expect_context(ns.clone(), fp, Duration::from_secs(30)).unwrap();
+            let expectation = v
+                .expect_context(ns.clone(), fp, Duration::from_secs(30))
+                .unwrap();
             // A second adoption of the same namespace cannot overwrite it.
-            assert!(v.expect_context(ns.clone(), [0; 32], Duration::from_secs(30)).is_err());
+            assert!(
+                v.expect_context(ns.clone(), [0; 32], Duration::from_secs(30))
+                    .is_err()
+            );
             assert!(matches!(
                 verdict(&v, &forged.context_data),
                 ndn_security::ValidationResult::Invalid(_)
@@ -914,12 +931,18 @@ mod tests {
             ));
             let outcome = expectation.finish();
             let admitted = outcome.admitted.expect("admitted result kept");
-            assert!(outcome.refused.is_some(), "the forged context's refusal is kept");
+            assert!(
+                outcome.refused.is_some(),
+                "the forged context's refusal is kept"
+            );
             assert_eq!(admitted.wire, *genuine.context_data.raw());
         }
         // Withdrawn: exactly as before any expectation.
         assert!(same_kind(&verdict(&v, &genuine.context_data), &before));
-        assert!(same_kind(&verdict(&v, &forged.context_data), &forged_before));
+        assert!(same_kind(
+            &verdict(&v, &forged.context_data),
+            &forged_before
+        ));
 
         // An expired expectation admits nothing.
         let _expired = v.expect_context(ns.clone(), fp, Duration::ZERO).unwrap();
@@ -938,7 +961,9 @@ mod tests {
             let data = self.net.express(interest).await?;
             match self.forwarder.validate_chain_cached(&data).await.0 {
                 ndn_security::ValidationResult::Valid(_) => Ok(data),
-                other => Err(CertError::Transport(format!("dropped by the forwarder: {other:?}"))),
+                other => Err(CertError::Transport(format!(
+                    "dropped by the forwarder: {other:?}"
+                ))),
             }
         }
     }
@@ -1010,7 +1035,10 @@ mod tests {
             &mut through_forwarder,
             &link("/home/bob", fp, None),
         ));
-        assert!(matches!(res, Err(AdoptError::WrongContext { .. })), "{res:?}");
+        assert!(
+            matches!(res, Err(AdoptError::WrongContext { .. })),
+            "{res:?}"
+        );
 
         let mut direct = serving(&forged);
         let res = futures::executor::block_on(adopt_anchor_link(
@@ -1019,7 +1047,10 @@ mod tests {
             &mut direct,
             &link("/home/bob", fp, None),
         ));
-        assert!(matches!(res, Err(AdoptError::FingerprintMismatch(_))), "{res:?}");
+        assert!(
+            matches!(res, Err(AdoptError::FingerprintMismatch(_))),
+            "{res:?}"
+        );
 
         let inline = AnchorLink {
             context_data: Some(decode(forged.context_data.raw())),
@@ -1051,7 +1082,13 @@ mod tests {
                 &link("/home/bob", fp, Some(2)),
             ));
             assert!(
-                matches!(res, Err(AdoptError::Downgrade { offered: 1, required: 2 })),
+                matches!(
+                    res,
+                    Err(AdoptError::Downgrade {
+                        offered: 1,
+                        required: 2
+                    })
+                ),
                 "{res:?}"
             );
         }

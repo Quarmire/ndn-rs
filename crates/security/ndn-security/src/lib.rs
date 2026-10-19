@@ -12,10 +12,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 
-pub mod active_signer;
 #[cfg(feature = "abe")]
 #[cfg_attr(docsrs, doc(cfg(feature = "abe")))]
 pub mod abe;
+pub mod active_signer;
 pub mod capability;
 pub mod cert_cache;
 pub mod cert_fetcher;
@@ -84,9 +84,9 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    AdvertisedRelay, ContextExplanation, EnrollmentHint, KeyRole, LinkPolicy, OpenContextError, SchemaBlob,
-    SchemaFormat, SignedTrustContext, SignedTrustContextError, SigningPair, anchor_fingerprint,
-    context_namespace_of, dryrun_orphans,
+    AdvertisedRelay, ContextExplanation, EnrollmentHint, KeyRole, LinkPolicy, OpenContextError,
+    SchemaBlob, SchemaFormat, SignedTrustContext, SignedTrustContextError, SigningPair,
+    anchor_fingerprint, context_namespace_of, dryrun_orphans,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaMatch, SchemaRule,
@@ -95,8 +95,7 @@ pub use trust_schema::{
 pub use unverified::{Unverified, VerifyError};
 pub use validator::{
     AdmittedContext, ContextExpectation, ExpectContextError, ExpectationOutcome,
-    InterestValidationOutcome,
-    ValidationResult, Validator,
+    InterestValidationOutcome, ValidationResult, Validator,
 };
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,

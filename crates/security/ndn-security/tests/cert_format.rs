@@ -71,7 +71,9 @@ async fn issue_cert_data(
 #[test]
 fn c07_keychain_ephemeral_cert_name_has_four_trailing_components() {
     let kc = KeyChain::ephemeral("/test/alice").expect("ephemeral must succeed");
-    let cert_name = kc.cert_name().expect("ephemeral identity has a certificate");
+    let cert_name = kc
+        .cert_name()
+        .expect("ephemeral identity has a certificate");
     let comps = cert_name.components();
     let n = comps.len();
 

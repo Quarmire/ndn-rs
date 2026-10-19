@@ -446,9 +446,15 @@ mod tests {
         for verb in ["approve", "deny"] {
             let decision = n(&format!("/ns/node/relay/KEY/r/{verb}/id"));
             assert!(model.check(&decision, &admin), "{verb}");
-            assert!(!model.check(&decision, &n("/ns/member/x/KEY/k")), "{verb} by a member");
+            assert!(
+                !model.check(&decision, &n("/ns/member/x/KEY/k")),
+                "{verb} by a member"
+            );
         }
         assert!(!model.check(&n("/ns/node/relay/KEY/r/other/id"), &admin));
-        assert_eq!(compile(&model.to_text()).expect("recompiles").nodes.len(), model.nodes.len());
+        assert_eq!(
+            compile(&model.to_text()).expect("recompiles").nodes.len(),
+            model.nodes.len()
+        );
     }
 }

@@ -446,10 +446,18 @@ mod tests {
         let held = Arc::new(base());
         assert!(kr.adopt(Arc::clone(&held)));
         assert!(kr.adopt(Arc::new(base())), "the same content again");
-        assert!(Arc::ptr_eq(&kr.contexts().pop().unwrap(), &held), "nothing replaced");
+        assert!(
+            Arc::ptr_eq(&kr.contexts().pop().unwrap(), &held),
+            "nothing replaced"
+        );
         let fork = Arc::new(base().with_revocation(n("/home/bob/member/x/KEY/k")));
         assert!(!kr.adopt(fork), "a differing v2 is a fork");
-        assert!(!kr.contexts().pop().unwrap().is_revoked(&n("/home/bob/member/x/KEY/k")));
+        assert!(
+            !kr.contexts()
+                .pop()
+                .unwrap()
+                .is_revoked(&n("/home/bob/member/x/KEY/k"))
+        );
         assert_eq!(kr.revocation_epoch(), 0);
     }
 }

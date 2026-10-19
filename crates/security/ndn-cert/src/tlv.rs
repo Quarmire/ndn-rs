@@ -567,7 +567,8 @@ impl ChallengeResponseTlv {
                     pending_key = std::str::from_utf8(&val).ok().map(str::to_string);
                 }
                 TLV_PARAMETER_VALUE => {
-                    if let (Some(key), Ok(value)) = (pending_key.take(), std::str::from_utf8(&val)) {
+                    if let (Some(key), Ok(value)) = (pending_key.take(), std::str::from_utf8(&val))
+                    {
                         parameters.insert(key, serde_json::Value::String(value.to_string()));
                     }
                 }
@@ -928,12 +929,21 @@ mod tests {
             (&[3], &[60], 3, 60),
             (&[0, 3], &[0x01, 0x2C], 3, 300),
             (&[0, 0, 0, 3], &[0, 0, 0x0E, 0x10], 3, 3600),
-            (&[0, 0, 0, 0, 0, 0, 0, 3], &[0, 0, 0, 0, 0, 0x01, 0x51, 0x80], 3, 86400),
+            (
+                &[0, 0, 0, 0, 0, 0, 0, 3],
+                &[0, 0, 0, 0, 0, 0x01, 0x51, 0x80],
+                3,
+                86400,
+            ),
         ];
         for (tries, time, want_tries, want_time) in cases {
             let decoded = ChallengeResponseTlv::decode(pending_with(tries, time)).unwrap();
             assert_eq!(decoded.remaining_tries, Some(want_tries), "tries {tries:?}");
-            assert_eq!(decoded.remaining_time_secs, Some(want_time), "time {time:?}");
+            assert_eq!(
+                decoded.remaining_time_secs,
+                Some(want_time),
+                "time {time:?}"
+            );
         }
         // Wider than the field: saturates instead of wrapping.
         let decoded =

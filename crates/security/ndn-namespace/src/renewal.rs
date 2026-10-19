@@ -75,7 +75,10 @@ fn held_certificates(p: &Participant, vault: &dyn KeyVault) -> Result<Vec<Held>,
         .collect();
     let mut held = Vec::new();
     for key in vault.keys()? {
-        if !namespaces.iter().any(|ns| parse_device_key(ns, &key).is_some()) {
+        if !namespaces
+            .iter()
+            .any(|ns| parse_device_key(ns, &key).is_some())
+        {
             continue;
         }
         let Some(wire) = vault.issued_certificate(&key)? else {
@@ -83,7 +86,11 @@ fn held_certificates(p: &Participant, vault: &dyn KeyVault) -> Result<Vec<Held>,
         };
         let decoded = Data::decode(wire)
             .map_err(|e| e.to_string())
-            .and_then(|data| Certificate::decode(&data).map(|cert| (data, cert)).map_err(|e| e.to_string()));
+            .and_then(|data| {
+                Certificate::decode(&data)
+                    .map(|cert| (data, cert))
+                    .map_err(|e| e.to_string())
+            });
         let (data, cert) = match decoded {
             Ok(decoded) => decoded,
             Err(e) => {
@@ -112,7 +119,10 @@ async fn renew_one(
     held: &Held,
 ) -> Result<Certificate, (RenewalState, String)> {
     let failed = |why: String| (RenewalState::Failed, why);
-    if p.keyring().context_for(&held.cert.name).is_revoked(&held.cert.name) {
+    if p.keyring()
+        .context_for(&held.cert.name)
+        .is_revoked(&held.cert.name)
+    {
         return Err((
             RenewalState::Refused,
             format!(

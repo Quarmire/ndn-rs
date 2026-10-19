@@ -284,13 +284,14 @@ impl FilePib {
         let Some(dir) = self.existing_key_dir(key_name) else {
             return Ok(Vec::new());
         };
-        let mut entries: Vec<(Certificate, Option<Bytes>)> = stored_cert_files(&dir.join(CERTS_DIR))
-            .into_iter()
-            .filter_map(|(path, cert)| {
-                let wire = std::fs::read(path).ok()?;
-                Some((cert, Some(Bytes::from(wire))))
-            })
-            .collect();
+        let mut entries: Vec<(Certificate, Option<Bytes>)> =
+            stored_cert_files(&dir.join(CERTS_DIR))
+                .into_iter()
+                .filter_map(|(path, cert)| {
+                    let wire = std::fs::read(path).ok()?;
+                    Some((cert, Some(Bytes::from(wire))))
+                })
+                .collect();
         // Legacy: the issued certificate earlier releases kept beside the key.
         if let Ok(wire) = std::fs::read(dir.join(LEGACY_CERT_DATA))
             && let Some(cert) = decode_cert_wire(&wire)
@@ -423,7 +424,11 @@ impl FilePib {
     /// (`cert_data`, the signed Certificate v2 Data) as one more certificate
     /// of the key (see [`store_cert`](Self::store_cert)). The key must already
     /// be in the PIB and the certificate must be one of its certificates.
-    pub fn store_issued_cert(&self, key_name: &Name, cert_data: &[u8]) -> Result<Certificate, PibError> {
+    pub fn store_issued_cert(
+        &self,
+        key_name: &Name,
+        cert_data: &[u8],
+    ) -> Result<Certificate, PibError> {
         let dir = self
             .existing_key_dir(key_name)
             .ok_or_else(|| PibError::KeyNotFound(name_to_uri(key_name)))?;
@@ -473,7 +478,10 @@ impl FilePib {
         if self.identity_keys(identity)?.is_empty() {
             return Err(PibError::KeyNotFound(name_to_uri(identity)));
         }
-        secure_fs::write_private(&self.root.join(DEFAULT_IDENTITY_FILE), name_to_uri(identity))?;
+        secure_fs::write_private(
+            &self.root.join(DEFAULT_IDENTITY_FILE),
+            name_to_uri(identity),
+        )?;
         Ok(())
     }
 
@@ -624,7 +632,11 @@ fn stored_cert_files(dir: &Path) -> Vec<(PathBuf, Certificate)> {
 fn newest<T>(entries: impl IntoIterator<Item = (Certificate, T)>) -> Option<(Certificate, T)> {
     let now = crate::validator::now_ns();
     entries.into_iter().max_by(|(a, _), (b, _)| {
-        (a.is_valid_at(now), a.valid_from, &a.name).cmp(&(b.is_valid_at(now), b.valid_from, &b.name))
+        (a.is_valid_at(now), a.valid_from, &a.name).cmp(&(
+            b.is_valid_at(now),
+            b.valid_from,
+            &b.name,
+        ))
     })
 }
 
@@ -879,7 +891,9 @@ mod tests {
         let (dir, pib) = tmp_pib();
         pib.generate_ed25519(&key_name("a")).unwrap();
         let keydir = pib.existing_key_dir(&key_name("a")).unwrap();
-        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
         set(&keydir.join("private.pkcs8.der"), 0o644);
         set(&keydir, 0o755);
         set(&dir.path().join("keys"), 0o755);
@@ -1161,7 +1175,8 @@ mod tests {
             .unwrap();
         pib.store_cert(&expired, &cert(&expired, now - 3 * hour, now - hour))
             .unwrap();
-        pib.store_cert(&other, &cert(&other, now, now + hour)).unwrap();
+        pib.store_cert(&other, &cert(&other, now, now + hour))
+            .unwrap();
 
         assert_eq!(
             pib.identity_keys(&id).unwrap(),
@@ -1191,10 +1206,14 @@ mod tests {
         ));
         assert_eq!(pib.get_default_identity().unwrap(), None);
 
-        pib.generate_ed25519(&n("/home/bob/member/phone/KEY/a")).unwrap();
-        pib.generate_ed25519(&n("/home/bob/guest/phone/KEY/b")).unwrap();
-        pib.set_default_identity(&n("/home/bob/member/phone")).unwrap();
-        pib.set_default_identity(&n("/home/bob/guest/phone")).unwrap();
+        pib.generate_ed25519(&n("/home/bob/member/phone/KEY/a"))
+            .unwrap();
+        pib.generate_ed25519(&n("/home/bob/guest/phone/KEY/b"))
+            .unwrap();
+        pib.set_default_identity(&n("/home/bob/member/phone"))
+            .unwrap();
+        pib.set_default_identity(&n("/home/bob/guest/phone"))
+            .unwrap();
         let reopened = FilePib::open(dir.path()).unwrap();
         assert_eq!(
             reopened.get_default_identity().unwrap(),
@@ -1244,13 +1263,25 @@ mod tests {
         let hour = 3_600_000_000_000u64;
         let issue = |name: &str, from: u64, until: u64| {
             futures::executor::block_on(crate::manager::encode_cert_data(
-                &n(name), &pk, &signer, from, until,
+                &n(name),
+                &pk,
+                &signer,
+                from,
+                until,
             ))
             .unwrap()
         };
         let now = now_ns();
-        let old = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=1", now - 2 * hour, now + hour);
-        let new = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=2", now - hour, now + 2 * hour);
+        let old = issue(
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=1",
+            now - 2 * hour,
+            now + hour,
+        );
+        let new = issue(
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=2",
+            now - hour,
+            now + 2 * hour,
+        );
         pib.store_issued_cert(&key, &old).unwrap();
         pib.store_issued_cert(&key, &new).unwrap();
 
@@ -1262,12 +1293,29 @@ mod tests {
         );
         assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(new));
 
-        let expired = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=0", now - 3 * hour, now - hour);
+        let expired = issue(
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=0",
+            now - 3 * hour,
+            now - hour,
+        );
         pib.store_issued_cert(&key, &expired).unwrap();
-        let third = issue("/home/bob/member/phone/KEY/a/NDNCERT/v=3", now, now + 3 * hour);
+        let third = issue(
+            "/home/bob/member/phone/KEY/a/NDNCERT/v=3",
+            now,
+            now + 3 * hour,
+        );
         pib.store_issued_cert(&key, &third).unwrap();
-        let names: Vec<String> = pib.certs(&key).unwrap().iter().map(|c| c.name.to_string()).collect();
-        assert_eq!(names.len(), 3, "the expired certificate is dropped: {names:?}");
+        let names: Vec<String> = pib
+            .certs(&key)
+            .unwrap()
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect();
+        assert_eq!(
+            names.len(),
+            3,
+            "the expired certificate is dropped: {names:?}"
+        );
         assert!(!names.iter().any(|n| n.ends_with("v=0")));
     }
 
@@ -1284,21 +1332,39 @@ mod tests {
         let now = now_ns();
         let hour = 3_600_000_000_000u64;
         let legacy = futures::executor::block_on(crate::manager::encode_cert_data(
-            &key, &pk, &signer, now - hour, now + hour,
+            &key,
+            &pk,
+            &signer,
+            now - hour,
+            now + hour,
         ))
         .unwrap();
         let dir = pib.existing_key_dir(&key).unwrap();
         std::fs::write(dir.join("cert.data"), &legacy).unwrap();
-        std::fs::write(dir.join("cert.ndnc"), encode_cert(&decode_cert_wire(&legacy).unwrap()))
-            .unwrap();
+        std::fs::write(
+            dir.join("cert.ndnc"),
+            encode_cert(&decode_cert_wire(&legacy).unwrap()),
+        )
+        .unwrap();
 
         let cert = pib.get_cert(&key).unwrap();
-        assert_eq!(*cert.name, key, "the legacy certificate is named after its key");
-        assert_eq!(pib.certs(&key).unwrap().len(), 1, "summary and Data are one certificate");
+        assert_eq!(
+            *cert.name, key,
+            "the legacy certificate is named after its key"
+        );
+        assert_eq!(
+            pib.certs(&key).unwrap().len(),
+            1,
+            "summary and Data are one certificate"
+        );
         assert_eq!(pib.get_issued_cert(&key).unwrap(), Some(legacy.clone()));
 
         let renewed = futures::executor::block_on(crate::manager::encode_cert_data(
-            &n("/home/bob/member/phone/KEY/a/NDNCERT/v=5"), &pk, &signer, now, now + 2 * hour,
+            &n("/home/bob/member/phone/KEY/a/NDNCERT/v=5"),
+            &pk,
+            &signer,
+            now,
+            now + 2 * hour,
         ))
         .unwrap();
         pib.store_issued_cert(&key, &renewed).unwrap();
@@ -1306,7 +1372,10 @@ mod tests {
             pib.get_cert(&key).unwrap().name.to_string(),
             "/home/bob/member/phone/KEY/a/NDNCERT/v=5"
         );
-        assert_eq!(std::fs::read(dir.join("cert.data")).unwrap(), legacy.to_vec());
+        assert_eq!(
+            std::fs::read(dir.join("cert.data")).unwrap(),
+            legacy.to_vec()
+        );
         assert_eq!(pib.valid_cert_wires(&key).unwrap().len(), 2);
     }
 }

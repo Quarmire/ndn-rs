@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
 use ndn_cert::ca::{CaConfig, CaState};
 use ndn_cert::challenge::ChallengeHandler;
-use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
 use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 use ndn_cert::{
     CaExchange, CertError, HierarchicalPolicy, InviteEnrollError, InviteLink, RevokeStatus,
@@ -77,9 +77,14 @@ async fn root_dev(tokens: &[&str]) -> RootDevice {
     let ca_key = ca_key_name(&ns());
     mgr.generate_ed25519(ca_key.clone()).unwrap();
     let ca_pub = mgr.get_signer_sync(&ca_key).unwrap().public_key().unwrap();
-    mgr.certify(&ca_key, ca_pub, &root_dev.anchor_key, 3_650 * 86_400 * 1_000)
-        .await
-        .unwrap();
+    mgr.certify(
+        &ca_key,
+        ca_pub,
+        &root_dev.anchor_key,
+        3_650 * 86_400 * 1_000,
+    )
+    .await
+    .unwrap();
     let store = TokenStore::new();
     for token in tokens {
         store.add_scoped(*token, None, Some(ns().append("member")));
@@ -182,7 +187,10 @@ async fn a_token_never_certifies_a_second_key_for_a_device_name() {
         (key("laptop", 3), "member-3")
     };
     assert!(
-        matches!(if a.is_ok() { &b } else { &a }, Err(InviteEnrollError::NameRefused(_))),
+        matches!(
+            if a.is_ok() { &b } else { &a },
+            Err(InviteEnrollError::NameRefused(_))
+        ),
         "the race loser is refused by name: {a:?} / {b:?}"
     );
     enroll(&root_dev, loser_token, key("desk", 6))
@@ -201,7 +209,9 @@ async fn a_token_never_certifies_a_second_key_for_a_device_name() {
 async fn revocation_or_admin_approval_lets_a_new_key_have_the_name() {
     let root_dev = root_dev(&["member-1", "member-2", "member-3"]).await;
     let old = key("phone", 1);
-    let cert = enroll(&root_dev, "member-1", Arc::clone(&old)).await.unwrap();
+    let cert = enroll(&root_dev, "member-1", Arc::clone(&old))
+        .await
+        .unwrap();
 
     // An admin approves a new key for the held name.
     let approved = key("phone", 2);
@@ -233,9 +243,10 @@ async fn revocation_or_admin_approval_lets_a_new_key_have_the_name() {
         "{taken:?}"
     );
     for (cert_name, holder) in [(cert.name.as_ref().clone(), old), (approved_cert, approved)] {
-        let revoked = ndn_cert::client::revoke(&mut root_dev.wire.clone(), &ns(), &cert_name, holder)
-            .await
-            .unwrap();
+        let revoked =
+            ndn_cert::client::revoke(&mut root_dev.wire.clone(), &ns(), &cert_name, holder)
+                .await
+                .unwrap();
         assert_eq!(revoked, RevokeStatus::Revoked);
     }
     enroll(&root_dev, "member-3", key("phone", 3))

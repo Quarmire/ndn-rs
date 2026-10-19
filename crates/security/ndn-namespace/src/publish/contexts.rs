@@ -246,9 +246,8 @@ impl ContextPublisher {
         tokio::spawn(async move {
             let served = producer
                 .serve(|interest, responder| {
-                    let snapshot: Snapshot = Arc::clone(
-                        &list.read().unwrap_or_else(|poisoned| poisoned.into_inner()),
-                    );
+                    let snapshot: Snapshot =
+                        Arc::clone(&list.read().unwrap_or_else(|poisoned| poisoned.into_inner()));
                     async move {
                         let sent = match answer(&snapshot, &interest.name) {
                             Some(wire) => responder.respond_bytes(wire.clone()).await,
@@ -325,7 +324,10 @@ impl PublishedContexts {
         let newest_changed = {
             // Swapped under `bypassed` so a bypass ending meanwhile sees the
             // namespace and routes it back here.
-            let mut list = self.list.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut list = self
+                .list
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let before = list.iter().find(|c| c.prefix == prefix).map(|c| c.newest);
             *list = Arc::new(with_version(&list, ctx, data));
             // A namespace new to the publisher may still have a pointer
@@ -358,7 +360,9 @@ impl PublishedContexts {
     }
 
     fn lock_bypassed(&self) -> std::sync::MutexGuard<'_, HashMap<Name, usize>> {
-        self.bypassed.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.bypassed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -434,7 +438,10 @@ impl Drop for PublisherBypass {
             return;
         }
         bypassed.remove(&self.prefix);
-        let list = p.list.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let list = p
+            .list
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if list.iter().any(|c| c.prefix == self.prefix) {
             p.engine.fib().add_nexthop(&self.prefix, p.face_id, 0);
         }
@@ -460,7 +467,8 @@ mod tests {
     }
 
     fn stored(dir: &Path, ns: &str) -> ndn_cert::NamespaceInit {
-        let root_dev = ndn_cert::init_namespace(&ndn_security::SecurityManager::new(), &n(ns)).unwrap();
+        let root_dev =
+            ndn_cert::init_namespace(&ndn_security::SecurityManager::new(), &n(ns)).unwrap();
         ndn_cert::persist_context(dir, &root_dev.context, &root_dev.context_data).unwrap();
         root_dev
     }
@@ -482,8 +490,8 @@ mod tests {
             );
             // Metadata → RDR Name-only content pointing at exactly that name,
             // under this namespace (what `fetch_context` accepts).
-            let wire = answer(&contexts, &ndn_cert::rdr_metadata_name(ns))
-                .expect("metadata served");
+            let wire =
+                answer(&contexts, &ndn_cert::rdr_metadata_name(ns)).expect("metadata served");
             let meta = Data::decode(wire.clone()).unwrap();
             assert!(meta.name.has_prefix(&ndn_cert::rdr_metadata_name(ns)));
             let content = meta.content().unwrap();
@@ -576,13 +584,18 @@ mod tests {
         assert_eq!(answer(&added, &v3.0.rdr_name()), Some(v3.1.raw()));
         assert_eq!(newest_named(&added), v3.0.rdr_name());
         let again = with_version(&added, &v1.0, &v1.1);
-        assert_eq!(newest_named(&again), v3.0.rdr_name(), "an older version never moves it back");
+        assert_eq!(
+            newest_named(&again),
+            v3.0.rdr_name(),
+            "an older version never moves it back"
+        );
         for (ctx, data) in [&v1, &v2, &v3] {
             assert_eq!(answer(&again, &ctx.rdr_name()), Some(data.raw()));
         }
 
-        let alice = ndn_cert::init_namespace(&ndn_security::SecurityManager::new(), &n("/home/alice"))
-            .unwrap();
+        let alice =
+            ndn_cert::init_namespace(&ndn_security::SecurityManager::new(), &n("/home/alice"))
+                .unwrap();
         let both = with_version(&again, &alice.context, &alice.context_data);
         assert_eq!(both.len(), 2);
         assert_eq!(
@@ -602,11 +615,12 @@ mod tests {
         stored(dir.path(), "/home/bob");
         let (face, publisher) = prepare(&PibContextStore::new(dir.path()), FACE);
         let publisher_face = publisher.face_id;
-        let (engine, shutdown) = ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
-            .face(face)
-            .build()
-            .await
-            .unwrap();
+        let (engine, shutdown) =
+            ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
+                .face(face)
+                .build()
+                .await
+                .unwrap();
         let published = publisher.spawn(&engine);
         let upstream = FaceId(4242);
         engine.fib().add_nexthop(&n("/home/bob"), upstream, 0);
@@ -643,11 +657,12 @@ mod tests {
         let (v1, v2) = (version(1), version(2));
         ndn_cert::persist_context(dir.path(), &v1.0, &v1.1).unwrap();
         let (face, publisher) = prepare(&PibContextStore::new(dir.path()), FACE);
-        let (engine, shutdown) = ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
-            .face(face)
-            .build()
-            .await
-            .unwrap();
+        let (engine, shutdown) =
+            ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
+                .face(face)
+                .build()
+                .await
+                .unwrap();
         let published = publisher.spawn(&engine);
         let cs = engine.cs();
         let cache = |wire: Bytes| {
@@ -669,7 +684,11 @@ mod tests {
 
         cache(metadata_data(&ns, &v2.0.rdr_name(), 2)).await;
         published.publish(&v1.0, &v1.1);
-        assert_eq!(cs.len(), 2, "an older version leaves the newest pointer cached");
+        assert_eq!(
+            cs.len(),
+            2,
+            "an older version leaves the newest pointer cached"
+        );
         shutdown.shutdown().await;
     }
 
@@ -691,13 +710,14 @@ mod tests {
         let (v1, v2) = (version(1), version(2));
         ndn_cert::persist_context(upstream.path(), &v2.0, &v2.1).unwrap();
         let (face, publisher) = prepare(&PibContextStore::new(upstream.path()), FACE);
-        let (engine, shutdown) = ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
-            .security_profile(ndn_security::SecurityProfile::Disabled)
-            .security(Arc::new(ndn_security::SecurityManager::new()))
-            .face(face)
-            .build()
-            .await
-            .unwrap();
+        let (engine, shutdown) =
+            ndn_engine::EngineBuilder::new(ndn_engine::EngineConfig::default())
+                .security_profile(ndn_security::SecurityProfile::Disabled)
+                .security(Arc::new(ndn_security::SecurityManager::new()))
+                .face(face)
+                .build()
+                .await
+                .unwrap();
         let _serving = publisher.spawn(&engine);
         let ns = n("/home/bob");
         let stale = metadata_data(&ns, &v1.0.rdr_name(), 1);
@@ -723,7 +743,12 @@ mod tests {
         let results = crate::refresh::refresh_contexts(&device, Some(ns.clone()))
             .await
             .unwrap();
-        assert_eq!(results[0].state, crate::RefreshState::Updated, "{}", results[0].detail);
+        assert_eq!(
+            results[0].state,
+            crate::RefreshState::Updated,
+            "{}",
+            results[0].detail
+        );
         assert_eq!(device.keyring().version_of(&ns), Some(2));
         shutdown.shutdown().await;
     }

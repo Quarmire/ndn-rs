@@ -80,7 +80,10 @@ pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> F
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
             let wire = cert_interest(name).build();
-            consumer.fetch_wire(wire, CERT_FETCH_TIMEOUT).await.map_err(miss)
+            consumer
+                .fetch_wire(wire, CERT_FETCH_TIMEOUT)
+                .await
+                .map_err(miss)
         })
     })
 }
@@ -112,7 +115,10 @@ pub fn engine_direct_fetch_fn(
             if routed_there {
                 return Err(FetchMiss::NotAsked);
             }
-            consumer.fetch_with_on(face, cert_interest(name)).await.map_err(miss)
+            consumer
+                .fetch_with_on(face, cert_interest(name))
+                .await
+                .map_err(miss)
         })
     })
 }
@@ -125,8 +131,12 @@ pub fn engine_cert_fetcher(
     cancel: CancellationToken,
 ) -> Arc<CertFetcher> {
     Arc::new(
-        CertFetcher::new(cache, engine_fetch_fn(engine, cancel.clone()), CERT_FETCH_TIMEOUT)
-            .with_direct_fetch(engine_direct_fetch_fn(engine, cancel)),
+        CertFetcher::new(
+            cache,
+            engine_fetch_fn(engine, cancel.clone()),
+            CERT_FETCH_TIMEOUT,
+        )
+        .with_direct_fetch(engine_direct_fetch_fn(engine, cancel)),
     )
 }
 

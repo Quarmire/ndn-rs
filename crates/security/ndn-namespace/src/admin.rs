@@ -730,7 +730,11 @@ mod tests {
             )
         );
         let sent = device.sent.lock();
-        assert_eq!(sent.len(), HAND_OVER_WAITS + 1, "no hand-over after the last wait");
+        assert_eq!(
+            sent.len(),
+            HAND_OVER_WAITS + 1,
+            "no hand-over after the last wait"
+        );
         assert!(sent.iter().all(|wire| wire == &sent[0]), "the same version");
         assert_eq!(device.waits.load(Ordering::SeqCst), HAND_OVER_WAITS - 1);
     }
@@ -886,7 +890,9 @@ mod tests {
             adopted: Mutex::new(None),
         };
         let words = crate::HostWords::default();
-        let refused = fetch_newest(&source, &ns, None, true, &words).await.unwrap_err();
+        let refused = fetch_newest(&source, &ns, None, true, &words)
+            .await
+            .unwrap_err();
         assert!(refused.0.contains("holds no trust context for /home/bob"));
         assert!(source.adopted.lock().is_none());
         let newest = fetch_newest(&source, &ns, Some([9; 32]), false, &words)

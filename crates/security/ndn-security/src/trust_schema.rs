@@ -503,7 +503,11 @@ mod tests {
         for (data, key, allowed) in cases {
             let (data, key) = (n(data), n(key));
             assert_eq!(schema.allows(&data, &key), allowed, "{data} by {key}");
-            assert_eq!(schema.explain(&data, &key).is_some(), allowed, "{data} by {key}");
+            assert_eq!(
+                schema.explain(&data, &key).is_some(),
+                allowed,
+                "{data} by {key}"
+            );
         }
         let native = schema.explain(&n("/b/1"), &n("/b/KEY/k")).unwrap();
         assert!(matches!(native, SchemaMatch::Native { index: 1, .. }));
@@ -516,7 +520,11 @@ mod tests {
         )
         .unwrap();
         assert!(!schema.merge(again));
-        assert_eq!(schema.rules().len(), 2, "a refused merge leaves the schema unchanged");
+        assert_eq!(
+            schema.rules().len(),
+            2,
+            "a refused merge leaves the schema unchanged"
+        );
     }
 
     #[test]

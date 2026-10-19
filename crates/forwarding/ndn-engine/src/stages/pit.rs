@@ -754,7 +754,11 @@ impl PitMatchStage {
 /// answers one pending Interest: a face whose exact and CanBePrefix
 /// Interests the same Data consumed gets a refusal for each name (one per
 /// face and name: a face's repeated Interest under one name needs one).
-fn record_downstream(list: &mut SmallVec<[DownstreamInterest; 1]>, name: &Arc<ndn_packet::Name>, r: &InRecord) {
+fn record_downstream(
+    list: &mut SmallVec<[DownstreamInterest; 1]>,
+    name: &Arc<ndn_packet::Name>,
+    r: &InRecord,
+) {
     let face = FaceId(r.face_id);
     if list.iter().any(|d| d.face == face && d.name == *name) {
         return;

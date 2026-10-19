@@ -770,7 +770,11 @@ mod tests {
 
         // `<subject key>/<issuer-id>/<version>`, found by the key name.
         assert!(cert.name.len() == subj_name.len() + 2 && cert.name.has_prefix(&subj_name));
-        assert!(cert.name.components()[subj_name.len() + 1].as_version().is_some());
+        assert!(
+            cert.name.components()[subj_name.len() + 1]
+                .as_version()
+                .is_some()
+        );
         assert_eq!(cert.public_key, subj_pk);
         assert!(cert.valid_until > cert.valid_from);
 
@@ -787,11 +791,25 @@ mod tests {
         mgr.generate_ed25519(ca.clone()).unwrap();
         let pk = Bytes::from_static(&[3; 32]);
         let first = mgr
-            .certify_as(&dev, pk.clone(), &ca, 60_000, crate::cert_name::NDNCERT_ISSUER, None)
+            .certify_as(
+                &dev,
+                pk.clone(),
+                &ca,
+                60_000,
+                crate::cert_name::NDNCERT_ISSUER,
+                None,
+            )
             .await
             .unwrap();
         let second = mgr
-            .certify_as(&dev, pk, &ca, 60_000, crate::cert_name::NDNCERT_ISSUER, None)
+            .certify_as(
+                &dev,
+                pk,
+                &ca,
+                60_000,
+                crate::cert_name::NDNCERT_ISSUER,
+                None,
+            )
             .await
             .unwrap();
         assert_ne!(first.name, second.name);
@@ -799,7 +817,10 @@ mod tests {
             assert_eq!(cert.key_name(), dev);
             assert_eq!(cert.name.components()[dev.len()].value.as_ref(), b"NDNCERT");
         }
-        assert_eq!(mgr.cert_cache().get(&Arc::new(dev)).unwrap().name, second.name);
+        assert_eq!(
+            mgr.cert_cache().get(&Arc::new(dev)).unwrap().name,
+            second.name
+        );
     }
 
     #[tokio::test]
@@ -849,10 +870,17 @@ mod tests {
         let (first, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert!(generated);
         let (key, pk) = identity_signer(&first, &identity);
-        assert!(is_key_of(&key, &identity) && key.len() == identity.len() + 2, "{key}");
+        assert!(
+            is_key_of(&key, &identity) && key.len() == identity.len() + 2,
+            "{key}"
+        );
         // Its self-signed anchor is a cert-v2 certificate of the key.
         let anchor = first.trust_anchor(&key).expect("self anchor");
-        assert!(crate::cert_name::is_cert_name(&anchor.name), "{}", anchor.name);
+        assert!(
+            crate::cert_name::is_cert_name(&anchor.name),
+            "{}",
+            anchor.name
+        );
         assert_eq!(anchor.key_name(), key);
         assert_eq!(
             anchor.name.components()[key.len()].value.as_ref(),
@@ -863,7 +891,10 @@ mod tests {
         // Simulated restart: fresh managers over the same directory.
         let (again, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert!(!generated);
-        assert_eq!(identity_signer(&again, &identity), (key.clone(), pk.clone()));
+        assert_eq!(
+            identity_signer(&again, &identity),
+            (key.clone(), pk.clone())
+        );
 
         let pib = crate::pib::FilePib::open(&pib_path).unwrap();
         let loaded = SecurityManager::from_pib(&pib, &identity).unwrap();
@@ -883,7 +914,10 @@ mod tests {
         let (a, _) = SecurityManager::auto_init(&alice, &pib_path).unwrap();
         let alice_key = identity_signer(&a, &alice);
         let (c, generated) = SecurityManager::auto_init(&carol, &pib_path).unwrap();
-        assert!(generated, "carol has no key yet; alice's must not be reused");
+        assert!(
+            generated,
+            "carol has no key yet; alice's must not be reused"
+        );
         let carol_key = identity_signer(&c, &carol);
         assert_ne!(alice_key.0, carol_key.0);
 
@@ -935,7 +969,10 @@ mod tests {
             pib.add_trust_anchor(&legacy_key, &cert).unwrap();
 
             let mgr = SecurityManager::from_pib(&pib, &identity).unwrap();
-            assert_eq!(identity_signer(&mgr, &identity), (legacy_key.clone(), pk.clone()));
+            assert_eq!(
+                identity_signer(&mgr, &identity),
+                (legacy_key.clone(), pk.clone())
+            );
 
             let (mgr, generated) = SecurityManager::auto_init(&identity, dir.path()).unwrap();
             assert!(!generated, "legacy key must be reused, not replaced");
@@ -968,7 +1005,8 @@ mod tests {
         }
         assert_eq!(mgr.identity_key_name(&n("/home")), None);
         assert_eq!(
-            mgr.identity_key_for(&n("/home/bob/CA/issued/x")).map(|(_, k)| k),
+            mgr.identity_key_for(&n("/home/bob/CA/issued/x"))
+                .map(|(_, k)| k),
             Some(n("/home/bob/CA/KEY/ca"))
         );
     }

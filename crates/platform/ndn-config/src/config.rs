@@ -595,9 +595,8 @@ impl CaTomlConfig {
         }
         let relays = self.relays.as_deref().unwrap_or_default();
         for (i, relay) in relays.iter().enumerate() {
-            let invalid = |why: String| {
-                ConfigError::Invalid(format!("[[ca.relay]] {}: {why}", relay.device))
-            };
+            let invalid =
+                |why: String| ConfigError::Invalid(format!("[[ca.relay]] {}: {why}", relay.device));
             let parsed = relay.device.parse::<ndn_packet::Name>().ok();
             if !relay.device.starts_with('/') || parsed.is_none_or(|n| n.len() < 3) {
                 return Err(ConfigError::Invalid(format!(
@@ -1310,7 +1309,9 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 (None, true) => {}
             }
         }
-        FaceConfig::Quic { bind, advertise, .. } => {
+        FaceConfig::Quic {
+            bind, advertise, ..
+        } => {
             bind.parse::<std::net::SocketAddr>().map_err(|_| {
                 ConfigError::Invalid(format!(
                     "[[face]] kind = \"quic\": bind must be an address and port such as \
@@ -1318,7 +1319,9 @@ fn validate_face_config(face: &FaceConfig) -> Result<(), ConfigError> {
                 ))
             })?;
             for addr in advertise {
-                let port = addr.rsplit_once(':').map(|(host, p)| (host, p.parse::<u16>()));
+                let port = addr
+                    .rsplit_once(':')
+                    .map(|(host, p)| (host, p.parse::<u16>()));
                 if !matches!(port, Some((host, Ok(p))) if p != 0 && !host.is_empty()) {
                     return Err(ConfigError::Invalid(format!(
                         "[[face]] kind = \"quic\": advertise entries must be the public host:port \
@@ -1795,7 +1798,10 @@ fn validate_peers(peers: &[PeerConfig], relays: &[RelayConfig]) -> Result<(), Co
             }
         }
         if let Some(relay) = &peer.relay {
-            match peers.iter().find(|p| !std::ptr::eq(*p, peer) && p.is_named(relay)) {
+            match peers
+                .iter()
+                .find(|p| !std::ptr::eq(*p, peer) && p.is_named(relay))
+            {
                 Some(r) if r.endpoint.is_empty() => {
                     return Err(invalid(
                         peer,
@@ -1815,13 +1821,20 @@ fn validate_peers(peers: &[PeerConfig], relays: &[RelayConfig]) -> Result<(), Co
                 }
             }
         }
-        if let Some(other) = peers[..i]
-            .iter()
-            .find(|p| same_device(p.key.as_deref(), p.device.as_deref(), peer.key.as_deref(), peer.device.as_deref()))
-        {
+        if let Some(other) = peers[..i].iter().find(|p| {
+            same_device(
+                p.key.as_deref(),
+                p.device.as_deref(),
+                peer.key.as_deref(),
+                peer.device.as_deref(),
+            )
+        }) {
             return Err(invalid(
                 peer,
-                format!("names the same device as [[peer]] {}; merge the two", other.label()),
+                format!(
+                    "names the same device as [[peer]] {}; merge the two",
+                    other.label()
+                ),
             ));
         }
     }
@@ -1832,7 +1845,8 @@ fn validate_peers(peers: &[PeerConfig], relays: &[RelayConfig]) -> Result<(), Co
 /// other `[[relay]]` and `[[peer]]` (one device is one link).
 fn validate_relays(relays: &[RelayConfig], peers: &[PeerConfig]) -> Result<(), ConfigError> {
     for (i, relay) in relays.iter().enumerate() {
-        let invalid = |why: String| ConfigError::Invalid(format!("[[relay]] {}: {why}", relay.label()));
+        let invalid =
+            |why: String| ConfigError::Invalid(format!("[[relay]] {}: {why}", relay.label()));
         if relay.key.is_none() && relay.device.is_none() {
             return Err(ConfigError::Invalid(format!(
                 "[[relay]] #{}: give the relay's expected fingerprint (key = \"<64 hex digits>\"); \
@@ -1855,13 +1869,19 @@ fn validate_relays(relays: &[RelayConfig], peers: &[PeerConfig]) -> Result<(), C
         let same = |key: Option<&str>, device: Option<&str>| {
             same_device(key, device, relay.key.as_deref(), relay.device.as_deref())
         };
-        if let Some(other) = relays[..i].iter().find(|r| same(r.key.as_deref(), r.device.as_deref())) {
+        if let Some(other) = relays[..i]
+            .iter()
+            .find(|r| same(r.key.as_deref(), r.device.as_deref()))
+        {
             return Err(invalid(format!(
                 "names the same device as [[relay]] {}; merge the two",
                 other.label()
             )));
         }
-        if let Some(peer) = peers.iter().find(|p| same(p.key.as_deref(), p.device.as_deref())) {
+        if let Some(peer) = peers
+            .iter()
+            .find(|p| same(p.key.as_deref(), p.device.as_deref()))
+        {
             return Err(invalid(format!(
                 "names the same device as [[peer]] {}: one device is one link; keep the \
                  [[relay]] (and move that peer's routes and options to it) or the [[peer]], not both",
@@ -1873,9 +1893,16 @@ fn validate_relays(relays: &[RelayConfig], peers: &[PeerConfig]) -> Result<(), C
 }
 
 /// Whether two (key, device) identifications name the same device.
-fn same_device(a_key: Option<&str>, a_device: Option<&str>, b_key: Option<&str>, b_device: Option<&str>) -> bool {
+fn same_device(
+    a_key: Option<&str>,
+    a_device: Option<&str>,
+    b_key: Option<&str>,
+    b_device: Option<&str>,
+) -> bool {
     (a_device.is_some() && a_device == b_device)
-        || a_key.zip(b_key).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        || a_key
+            .zip(b_key)
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 fn check_identity(key: Option<&str>, device: Option<&str>) -> Result<(), String> {
@@ -1913,7 +1940,11 @@ fn check_endpoints(endpoints: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_mode(mode: LinkModeConfig, idle_secs: u64, wake_token: Option<&str>) -> Result<(), String> {
+fn check_mode(
+    mode: LinkModeConfig,
+    idle_secs: u64,
+    wake_token: Option<&str>,
+) -> Result<(), String> {
     if mode == LinkModeConfig::OnDemand && !IDLE_SECS.contains(&idle_secs) {
         return Err(format!(
             "idle_secs = {idle_secs} is outside {}..={}: below that an on-demand link closes \
@@ -2248,7 +2279,10 @@ impl RelayServiceConfig {
             )));
         }
         if let Some(q) = self.quotas() {
-            if q.links_total == 0 || q.links_per_namespace == 0 || q.links_per_namespace > q.links_total {
+            if q.links_total == 0
+                || q.links_per_namespace == 0
+                || q.links_per_namespace > q.links_total
+            {
                 return Err(invalid(format!(
                     "links_per_namespace = {} with links_total = {}: both must be at least 1 and \
                      one namespace cannot have more links than the total",
@@ -2286,7 +2320,9 @@ impl RelayServiceConfig {
             )));
         }
         if let Some(command) = &self.wake_command
-            && command.first().is_none_or(|program| program.trim().is_empty())
+            && command
+                .first()
+                .is_none_or(|program| program.trim().is_empty())
         {
             return Err(invalid(
                 "wake_command must start with the program to run, as in wake_command = \
@@ -2369,7 +2405,10 @@ fn default_max_paths() -> usize {
 
 impl Default for DirectConfig {
     fn default() -> Self {
-        Self { membership: true, max_paths: default_max_paths() }
+        Self {
+            membership: true,
+            max_paths: default_max_paths(),
+        }
     }
 }
 
@@ -2949,7 +2988,10 @@ mod tests {
 
     #[test]
     fn legacy_demo_ca_section_is_refused_with_rename_hint() {
-        for src in ["[demo_ca]\nenabled = true\n", "[[demo_ca.challenge]]\nkind = \"nop\"\n"] {
+        for src in [
+            "[demo_ca]\nenabled = true\n",
+            "[[demo_ca.challenge]]\nkind = \"nop\"\n",
+        ] {
             let err = src.parse::<ForwarderConfig>().unwrap_err().to_string();
             assert!(err.contains("renamed to `[ca]`"), "{err}");
         }
@@ -2974,7 +3016,10 @@ mod tests {
         let days = cfg.ca.cert_validity_days;
         assert_eq!(days.for_role("member"), 1);
         assert_eq!(days.for_role("guest"), 7);
-        assert_eq!(days.for_role("admin"), CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS);
+        assert_eq!(
+            days.for_role("admin"),
+            CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS
+        );
         assert_eq!(days.max_days(), CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS);
         let again: ForwarderConfig = cfg.to_toml_string().unwrap().parse().unwrap();
         assert_eq!(again.ca.cert_validity_days, days);
@@ -2985,8 +3030,16 @@ mod tests {
         assert_eq!(cfg.ca.cert_validity_days.for_role("member"), 10);
         assert_eq!(cfg.ca.cert_validity_days.max_days(), 20);
 
-        assert!("[ca.cert_validity_days]\nfriend = 7\n".parse::<ForwarderConfig>().is_err());
-        assert!("[ca]\ncert_validity_days = -1\n".parse::<ForwarderConfig>().is_err());
+        assert!(
+            "[ca.cert_validity_days]\nfriend = 7\n"
+                .parse::<ForwarderConfig>()
+                .is_err()
+        );
+        assert!(
+            "[ca]\ncert_validity_days = -1\n"
+                .parse::<ForwarderConfig>()
+                .is_err()
+        );
         let cfg: ForwarderConfig = "[ca]\n".parse().unwrap();
         assert_eq!(cfg.ca.renewable_roles, ["admin", "member", "node"]);
     }
@@ -3337,7 +3390,9 @@ channel = 161
              [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"/home/node/relay\"\n"
         ))
         .unwrap();
-        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: true, .. } if bind == "0.0.0.0:6367"));
+        assert!(
+            matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: true, .. } if bind == "0.0.0.0:6367")
+        );
         assert_eq!(cfg.peers[0].endpoint, vec!["relay.example.net:6367"]);
         assert!(cfg.peers[0].persistent);
         assert_eq!(cfg.peers[1].endpoint.len(), 2);
@@ -3353,17 +3408,24 @@ channel = 161
              [[peer]]\ndevice = \"/home/node/relay\"\nendpoint = \"relay.example.net:6367\"\n",
         )
         .unwrap();
-        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false, .. } if bind == "192.0.2.7:0"));
+        assert!(
+            matches!(&cfg.faces[0], FaceConfig::Quic { bind, listen: false, .. } if bind == "192.0.2.7:0")
+        );
         let err = ForwarderConfig::from_str(
             "[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n\
              [relays]\nnamespace = false\n",
         )
         .expect_err("a socket that neither listens nor dials is refused");
-        assert!(err.to_string().contains("no [[peer]] has an endpoint"), "{err}");
+        assert!(
+            err.to_string().contains("no [[peer]] has an endpoint"),
+            "{err}"
+        );
         // The namespace's relays (on by default) are something to dial.
         assert!(
-            ForwarderConfig::from_str("[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n")
-                .is_ok()
+            ForwarderConfig::from_str(
+                "[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n"
+            )
+            .is_ok()
         );
     }
 
@@ -3383,14 +3445,38 @@ channel = 161
         assert_eq!(relays.len(), 2);
         assert_eq!((relays[1].endpoint.len(), relays[1].preference), (2, 2));
         assert_eq!(ForwarderConfig::from_str("").unwrap().ca.relays, None);
-        assert_eq!(ForwarderConfig::from_str("[ca]\nrelay = []\n").unwrap().ca.relays, Some(Vec::new()));
+        assert_eq!(
+            ForwarderConfig::from_str("[ca]\nrelay = []\n")
+                .unwrap()
+                .ca
+                .relays,
+            Some(Vec::new())
+        );
         for (bad, why) in [
-            ("[ca]\ndirect_pairs = [\"member\"]\n", "is not a pair of roles"),
-            ("[ca]\ndirect_pairs = [\"member:robot\"]\n", "is not a pair of roles"),
-            ("[[ca.relay]]\ndevice = \"vps\"\nendpoint = \"v:1\"\n", "device must be a device name"),
-            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nkey = \"ab\"\nendpoint = \"v:1\"\n", "key must be"),
-            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = []\n", "no endpoint"),
-            ("[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"v\"\n", "endpoint must be host:port"),
+            (
+                "[ca]\ndirect_pairs = [\"member\"]\n",
+                "is not a pair of roles",
+            ),
+            (
+                "[ca]\ndirect_pairs = [\"member:robot\"]\n",
+                "is not a pair of roles",
+            ),
+            (
+                "[[ca.relay]]\ndevice = \"vps\"\nendpoint = \"v:1\"\n",
+                "device must be a device name",
+            ),
+            (
+                "[[ca.relay]]\ndevice = \"/h/node/v\"\nkey = \"ab\"\nendpoint = \"v:1\"\n",
+                "key must be",
+            ),
+            (
+                "[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = []\n",
+                "no endpoint",
+            ),
+            (
+                "[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"v\"\n",
+                "endpoint must be host:port",
+            ),
             (
                 "[[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"v:1\"\n\
                  [[ca.relay]]\ndevice = \"/h/node/v\"\nendpoint = \"w:1\"\n",
@@ -3411,7 +3497,9 @@ channel = 161
              [[peer]]\ndevice = \"/home/member/phone\"\nrelay = \"/home/node/relay\"\ndirect = false\n",
         )
         .unwrap();
-        assert!(matches!(&cfg.faces[0], FaceConfig::Quic { advertise, .. } if advertise.len() == 2));
+        assert!(
+            matches!(&cfg.faces[0], FaceConfig::Quic { advertise, .. } if advertise.len() == 2)
+        );
         assert!(cfg.peers[0].direct);
         assert!(!cfg.peers[1].direct);
         for bad in ["\"203.0.113.7\"", "\":6367\"", "\"h:0\""] {
@@ -3419,7 +3507,10 @@ channel = 161
                 "[[face]]\nkind = \"quic\"\nbind = \"0.0.0.0:6367\"\nadvertise = [{bad}]\n"
             ))
             .expect_err("a malformed advertise entry is refused");
-            assert!(err.to_string().contains("advertise entries must be"), "{err}");
+            assert!(
+                err.to_string().contains("advertise entries must be"),
+                "{err}"
+            );
         }
     }
 
@@ -3468,10 +3559,19 @@ channel = 161
         assert_eq!(cfg.peers[0].mode, LinkModeConfig::OnDemand);
         assert_eq!(cfg.peers[0].idle_secs, 30);
         assert_eq!(cfg.relay_service.serve, ServeConfig::Listed);
-        let quotas = cfg.relay_service.quotas().expect("a set quota turns listed quotas on");
+        let quotas = cfg
+            .relay_service
+            .quotas()
+            .expect("a set quota turns listed quotas on");
         assert_eq!((quotas.links_total, quotas.links_per_namespace), (10, 10));
         assert_eq!(cfg.links.idle_timeout_secs, 60);
-        assert_eq!(cfg.direct, DirectConfig { membership: false, max_paths: 2 });
+        assert_eq!(
+            cfg.direct,
+            DirectConfig {
+                membership: false,
+                max_paths: 2
+            }
+        );
 
         let cfg = ForwarderConfig::default();
         assert!(cfg.relays.namespace && cfg.direct.membership);
@@ -3483,26 +3583,44 @@ channel = 161
     #[test]
     fn reach_options_out_of_bounds_are_refused_with_the_reason() {
         let fp = "ab".repeat(32);
-        let twice = format!("[[relay]]\nkey = \"{fp}\"\nendpoint = \"h:1\"\n[[peer]]\nkey = \"{fp}\"\n");
+        let twice =
+            format!("[[relay]]\nkey = \"{fp}\"\nendpoint = \"h:1\"\n[[peer]]\nkey = \"{fp}\"\n");
         let roots_unlisted = format!("[relay_service]\nroots = [\"{fp}\"]\n");
         for (bad, why) in [
             ("[relays]\ncount = 9\n", "count = 9"),
-            ("[relays]\nmode = \"on-demand\"\nidle_secs = 5\n", "idle_secs = 5"),
+            (
+                "[relays]\nmode = \"on-demand\"\nidle_secs = 5\n",
+                "idle_secs = 5",
+            ),
             ("[relays]\nmode = \"sometimes\"\n", "sometimes"),
             ("[relays]\nnope = 1\n", "nope"),
             ("[[relay]]\ndevice = \"/home/node/r\"\n", "has no endpoint"),
             ("[[relay]]\nendpoint = \"h:1\"\n", "expected fingerprint"),
-            ("[[relay]]\nkey = \"abc\"\nendpoint = \"h:1\"\n", "64 hex digits"),
+            (
+                "[[relay]]\nkey = \"abc\"\nendpoint = \"h:1\"\n",
+                "64 hex digits",
+            ),
             (twice.as_str(), "one device is one link"),
-            ("[[peer]]\ndevice = \"/home/node/r\"\nwake_token = \"\"\n", "wake_token"),
+            (
+                "[[peer]]\ndevice = \"/home/node/r\"\nwake_token = \"\"\n",
+                "wake_token",
+            ),
             ("[relay_service]\nserve = \"listed\"\n", "roots is empty"),
             (roots_unlisted.as_str(), "only with serve = \"listed\""),
-            ("[relay_service]\nwake_command = [\"\"]\n", "start with the program"),
+            (
+                "[relay_service]\nwake_command = [\"\"]\n",
+                "start with the program",
+            ),
             ("[links]\nkeep_alive_secs = 90\n", "NAT bindings"),
-            ("[links]\nkeep_alive_secs = 10\nidle_timeout_secs = 20\n", "3 × keep_alive_secs"),
+            (
+                "[links]\nkeep_alive_secs = 10\nidle_timeout_secs = 20\n",
+                "3 × keep_alive_secs",
+            ),
             ("[direct]\nmax_paths = 0\n", "max_paths = 0"),
         ] {
-            let err = ForwarderConfig::from_str(bad).err().unwrap_or_else(|| panic!("accepted: {bad}"));
+            let err = ForwarderConfig::from_str(bad)
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {bad}"));
             assert!(err.to_string().contains(why), "{bad}: {err}");
         }
     }

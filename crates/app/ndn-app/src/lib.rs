@@ -71,15 +71,15 @@ pub use app_face::OutboundRequest;
 pub use connection::{Connection, InProcConnection, LpInfo};
 // IpcConnection talks to an external `ndn-fwd` over a Unix socket (ndn-ipc).
 #[cfg(not(target_arch = "wasm32"))]
+pub use cert_fetch::{
+    CERT_FETCH_TIMEOUT, engine_cert_fetcher, engine_direct_fetch_fn, engine_fetch_fn,
+    install_engine_cert_fetcher,
+};
+#[cfg(not(target_arch = "wasm32"))]
 pub use connection::IpcConnection;
 pub use consumer::{
     CongestionStrategy, Consumer, DEFAULT_INTEREST_LIFETIME, DEFAULT_TIMEOUT, SubscribeOptions,
     Subscription, VerifiedConsumer,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use cert_fetch::{
-    CERT_FETCH_TIMEOUT, engine_cert_fetcher, engine_direct_fetch_fn, engine_fetch_fn,
-    install_engine_cert_fetcher,
 };
 pub use demux::{DemuxConnection, Replies, Reply, ServeGuard};
 pub use engine_ext::EngineAppExt;

@@ -352,8 +352,7 @@ fn classify_caller(
     let Some(peer) = peer else {
         return Caller::Unidentified;
     };
-    if peer.uid == daemon_uid || peer.uid == 0 || (!groups.is_empty() && in_allowed_group(&peer))
-    {
+    if peer.uid == daemon_uid || peer.uid == 0 || (!groups.is_empty() && in_allowed_group(&peer)) {
         Caller::Operator
     } else {
         Caller::OtherUser { uid: peer.uid }
@@ -419,7 +418,11 @@ pub(crate) fn caller_label(source_face: Option<FaceId>, engine: &ForwarderEngine
     };
     #[cfg(unix)]
     {
-        match engine.faces().get(fid).and_then(|face| face.peer_credentials()) {
+        match engine
+            .faces()
+            .get(fid)
+            .and_then(|face| face.peer_credentials())
+        {
             Some(peer) => match unix_ids::user_name(peer.uid) {
                 Some(user) => format!("uid {} ({user})", peer.uid),
                 None => format!("uid {}", peer.uid),
@@ -592,9 +595,7 @@ mod unix_ids {
                 return true;
             }
             if !group.members.is_empty()
-                && let Some(user) = user
-                    .get_or_insert_with(|| user_name(peer.uid))
-                    .as_deref()
+                && let Some(user) = user.get_or_insert_with(|| user_name(peer.uid)).as_deref()
                 && group.members.iter().any(|m| m == user)
             {
                 return true;
@@ -691,7 +692,10 @@ mod unix_ids {
             status
                 .lines()
                 .find_map(|l| l.strip_prefix(key))
-                .map(|rest| rest.split_whitespace().filter_map(|t| t.parse::<u32>().ok()))
+                .map(|rest| {
+                    rest.split_whitespace()
+                        .filter_map(|t| t.parse::<u32>().ok())
+                })
         };
         if field("Uid:").and_then(|mut ids| ids.nth(1)) != Some(uid) {
             return Vec::new();
@@ -791,8 +795,14 @@ mod trust_admin_tests {
     #[test]
     fn local_operator_commands_need_no_signature() {
         for has_validator in [false, true] {
-            assert_eq!(command(peer(DAEMON, 5), false, has_validator), CommandAuth::LocalOperator);
-            assert_eq!(command(peer(0, 0), false, has_validator), CommandAuth::LocalOperator);
+            assert_eq!(
+                command(peer(DAEMON, 5), false, has_validator),
+                CommandAuth::LocalOperator
+            );
+            assert_eq!(
+                command(peer(0, 0), false, has_validator),
+                CommandAuth::LocalOperator
+            );
         }
     }
 
@@ -801,7 +811,10 @@ mod trust_admin_tests {
     #[test]
     fn local_operator_key_signature_is_still_verified() {
         assert_eq!(command(peer(DAEMON, 5), true, true), CommandAuth::Signature);
-        assert!(matches!(command(peer(DAEMON, 5), true, false), CommandAuth::Refused(_)));
+        assert!(matches!(
+            command(peer(DAEMON, 5), true, false),
+            CommandAuth::Refused(_)
+        ));
     }
 
     /// Another local user's unsigned command is refused; a key-signed one goes
@@ -814,8 +827,14 @@ mod trust_admin_tests {
                 CommandAuth::Refused(_)
             ));
         }
-        assert!(matches!(command(peer(1000, 1000), true, false), CommandAuth::Refused(_)));
-        assert_eq!(command(peer(1000, 1000), true, true), CommandAuth::Signature);
+        assert!(matches!(
+            command(peer(1000, 1000), true, false),
+            CommandAuth::Refused(_)
+        ));
+        assert_eq!(
+            command(peer(1000, 1000), true, true),
+            CommandAuth::Signature
+        );
     }
 
     /// A face without peer credentials (every non-local face) is never

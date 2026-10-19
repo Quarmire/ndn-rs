@@ -942,7 +942,9 @@ fn resolve_security_profile(
                      anchors, or profile = \"accept-signed\"."
                 );
             }
-            Some(Arc::new(Validator::new(TrustSchema::accept_all()).accept_signed()))
+            Some(Arc::new(
+                Validator::new(TrustSchema::accept_all()).accept_signed(),
+            ))
         }
 
         (SecurityProfile::AcceptSigned, Some(mgr)) => {
@@ -952,13 +954,8 @@ fn resolve_security_profile(
                 .ambient()
                 .set_schema(TrustSchema::accept_all());
             Some(Arc::new(
-                Validator::with_keyring(
-                    Arc::clone(mgr.keyring()),
-                    mgr.cert_cache_arc(),
-                    None,
-                    1,
-                )
-                .accept_signed(),
+                Validator::with_keyring(Arc::clone(mgr.keyring()), mgr.cert_cache_arc(), None, 1)
+                    .accept_signed(),
             ))
         }
 
@@ -1089,7 +1086,9 @@ mod tests {
             .unwrap();
         let wired = engine.security().expect("engine keeps the manager");
         assert!(Arc::ptr_eq(&wired, &mgr));
-        let signer = wired.get_signer_sync(kc.key_name()).expect("signer survives");
+        let signer = wired
+            .get_signer_sync(kc.key_name())
+            .expect("signer survives");
         assert_eq!(signer.public_key(), kc.signer().unwrap().public_key());
         handle.shutdown().await;
     }

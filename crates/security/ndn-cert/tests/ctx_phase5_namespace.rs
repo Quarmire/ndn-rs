@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use ndn_cert::{
-    TokenStore, ValidityMode, adopt_anchor_envelope, adopt_envelope_into_store,
-    adopt_with_tofu, init_namespace, init_namespace_in_pib, load_persisted_contexts,
+    TokenStore, ValidityMode, adopt_anchor_envelope, adopt_envelope_into_store, adopt_with_tofu,
+    init_namespace, init_namespace_in_pib, load_persisted_contexts,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
@@ -95,11 +95,10 @@ fn ctx16_namespace_init_roundtrips_through_tofu() {
 /// Sign `name` with `key_name` held by `mgr`.
 fn signed(mgr: &SecurityManager, key_name: &Name, name: &str) -> Data {
     let signer = mgr.get_signer_sync(key_name).unwrap();
-    let wire = DataBuilder::new(n(name), b"payload").sign_sync(
-        signer.sig_type(),
-        Some(key_name),
-        |r| signer.sign_sync(r).unwrap_or_default(),
-    );
+    let wire =
+        DataBuilder::new(n(name), b"payload").sign_sync(signer.sig_type(), Some(key_name), |r| {
+            signer.sign_sync(r).unwrap_or_default()
+        });
     Data::decode(wire).unwrap()
 }
 
@@ -115,10 +114,15 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     let ns = n("/home/bob");
 
     let root_pib = FilePib::new(root_dir.path()).unwrap();
-    let root_dev =
-        init_namespace_in_pib(&root_pib, &ns, "laptop", false, &ndn_cert::NewRootStore::File)
-            .await
-            .unwrap();
+    let root_dev = init_namespace_in_pib(
+        &root_pib,
+        &ns,
+        "laptop",
+        false,
+        &ndn_cert::NewRootStore::File,
+    )
+    .await
+    .unwrap();
     let uri = root_dev.init.envelope.to_uri();
 
     // The adopting node only ever sees the scanned URI.
@@ -130,10 +134,17 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     // The CA cert as published (signed by the root), and Data signed by a
     // member whose cert the CA (loaded back from the root device's PIB) issued.
     let root_mgr = SecurityManager::new();
-    root_mgr.register_signer(root_dev.ca_key.clone(), root_pib.get_signer(&root_dev.ca_key).unwrap());
+    root_mgr.register_signer(
+        root_dev.ca_key.clone(),
+        root_pib.get_signer(&root_dev.ca_key).unwrap(),
+    );
     let member = n("/home/bob/member/phone/KEY/k1");
     root_mgr.generate_ed25519(member.clone()).unwrap();
-    let member_pk = root_mgr.get_signer_sync(&member).unwrap().public_key().unwrap();
+    let member_pk = root_mgr
+        .get_signer_sync(&member)
+        .unwrap()
+        .public_key()
+        .unwrap();
     // As the CA issues it: `<key>/NDNCERT/<version>`.
     let member_cert = root_mgr
         .certify_as(
@@ -146,8 +157,10 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
         )
         .await
         .unwrap();
-    let ca_cert = Data::decode(bytes::Bytes::from(std::fs::read(&root_dev.ca_cert_path).unwrap()))
-        .unwrap();
+    let ca_cert = Data::decode(bytes::Bytes::from(
+        std::fs::read(&root_dev.ca_cert_path).unwrap(),
+    ))
+    .unwrap();
     let by_member = signed(&root_mgr, &member, "/home/bob/member/phone/msg");
 
     // "Restart": a brand-new validator whose keyring is filled from disk.
@@ -158,8 +171,14 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
     assert!(loaded[0].1.is_ok(), "{:?}", loaded[0].1.as_ref().err());
     v.cert_cache().insert(member_cert);
     v.cert_cache().insert(root_dev.ca_cert.clone());
-    assert!(matches!(v.validate_chain(&ca_cert).await, ValidationResult::Valid(_)));
-    assert!(matches!(v.validate_chain(&by_member).await, ValidationResult::Valid(_)));
+    assert!(matches!(
+        v.validate_chain(&ca_cert).await,
+        ValidationResult::Valid(_)
+    ));
+    assert!(matches!(
+        v.validate_chain(&by_member).await,
+        ValidationResult::Valid(_)
+    ));
 
     // Re-adopting the same envelope keeps working (same version, idempotent).
     adopt_envelope_into_store(node_dir.path(), &envelope).unwrap();

@@ -99,9 +99,11 @@ mod tests {
             Data::decode(ndn_packet::encode::DataBuilder::new(other, b"").sign_digest_sha256())
                 .unwrap();
 
-        let written =
-            keep_issuer_certs(dir.path(), &[Data::decode(wire.clone()).unwrap(), not_a_cert])
-                .unwrap();
+        let written = keep_issuer_certs(
+            dir.path(),
+            &[Data::decode(wire.clone()).unwrap(), not_a_cert],
+        )
+        .unwrap();
         assert_eq!(written.len(), 1);
         assert_eq!(stored_issuer_certs(dir.path()), vec![wire]);
         #[cfg(unix)]

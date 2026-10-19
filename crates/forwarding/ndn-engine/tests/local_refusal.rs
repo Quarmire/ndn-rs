@@ -42,11 +42,7 @@ async fn recv_timeout(h: &InProcHandle, ms: u64) -> Option<Bytes> {
 
 /// The refusal a reply carries, `None` for anything else.
 fn refusal_of(wire: &Bytes) -> Option<Refusal> {
-    LpPacket::decode(wire.clone())
-        .ok()?
-        .nack?
-        .reason?
-        .refusal()
+    LpPacket::decode(wire.clone()).ok()?.nack?.reason?.refusal()
 }
 
 fn anchor_cert(signer: &Ed25519Signer) -> Certificate {
@@ -196,7 +192,9 @@ async fn a_remote_refusal_is_relayed_as_no_route() {
     let rig = rig(validator(&root, &member, false).await, "/t/m/doc").await;
     upstream_refuses(&rig).await;
     for h in [&rig.local, &rig.remote] {
-        let got = recv_timeout(h, 500).await.expect("the downstream hears back");
+        let got = recv_timeout(h, 500)
+            .await
+            .expect("the downstream hears back");
         assert_eq!(nack_reason(&got), Some(NackReason::NoRoute));
     }
     rig.shutdown.shutdown().await;
@@ -211,9 +209,13 @@ async fn a_local_refusal_is_relayed_to_local_downstreams_only() {
     let member = Ed25519Signer::from_seed(&[2; 32], n("/t/m/KEY/k"));
     let rig = rig_with(validator(&root, &member, false).await, "/t/m/doc", true).await;
     upstream_refuses(&rig).await;
-    let got = recv_timeout(&rig.local, 500).await.expect("the local app hears back");
+    let got = recv_timeout(&rig.local, 500)
+        .await
+        .expect("the local app hears back");
     assert_eq!(refusal_of(&got), Some(Refusal::Revoked));
-    let got = recv_timeout(&rig.remote, 500).await.expect("the remote downstream hears back");
+    let got = recv_timeout(&rig.remote, 500)
+        .await
+        .expect("the remote downstream hears back");
     assert_eq!(nack_reason(&got), Some(NackReason::NoRoute));
     rig.shutdown.shutdown().await;
 }
@@ -260,32 +262,61 @@ async fn a_relayed_nack_carries_each_downstreams_own_interest_and_pit_token() {
         pit_token: Some(token.clone()),
         ..Default::default()
     };
-    local.send(encode_lp_with_headers(&mine, &headers)).await.expect("send Interest");
-    let forwarded = recv_timeout(&upstream, 500).await.expect("the Interest reaches the upstream");
+    local
+        .send(encode_lp_with_headers(&mine, &headers))
+        .await
+        .expect("send Interest");
+    let forwarded = recv_timeout(&upstream, 500)
+        .await
+        .expect("the Interest reaches the upstream");
     remote.send(theirs.clone()).await.expect("send Interest");
-    assert!(recv_timeout(&upstream, 200).await.is_none(), "the second Interest is aggregated");
+    assert!(
+        recv_timeout(&upstream, 200).await.is_none(),
+        "the second Interest is aggregated"
+    );
     let forwarded = match LpPacket::decode(forwarded.clone()) {
         Ok(lp) => lp.fragment.expect("LP-framed Interest"),
         Err(_) => forwarded,
     };
     upstream
-        .send(encode_lp_nack(NackReason::Refused(Refusal::Revoked), &forwarded))
+        .send(encode_lp_nack(
+            NackReason::Refused(Refusal::Revoked),
+            &forwarded,
+        ))
         .await
         .expect("send Nack");
 
     for (h, sent, pit_token, reason) in [
-        (&local, &mine, Some(token), NackReason::Refused(Refusal::Revoked)),
+        (
+            &local,
+            &mine,
+            Some(token),
+            NackReason::Refused(Refusal::Revoked),
+        ),
         (&remote, &theirs, None, NackReason::NoRoute),
     ] {
-        let got = recv_timeout(h, 500).await.expect("the downstream hears back");
+        let got = recv_timeout(h, 500)
+            .await
+            .expect("the downstream hears back");
         let lp = LpPacket::decode(got.clone()).unwrap();
         assert_eq!(lp.nack.and_then(|n| n.reason), Some(reason));
-        assert_eq!(lp.pit_token, pit_token, "the downstream's PitToken comes back");
+        assert_eq!(
+            lp.pit_token, pit_token,
+            "the downstream's PitToken comes back"
+        );
         let sent = ndn_packet::Interest::decode(sent.clone()).unwrap();
         let back = enclosed(&got);
         assert_eq!(back.name, sent.name);
-        assert_eq!(back.nonce(), sent.nonce(), "its own nonce, not the forwarded one");
-        assert_eq!(back.parameters_portion(), sent.parameters_portion(), "its parameters");
+        assert_eq!(
+            back.nonce(),
+            sent.nonce(),
+            "its own nonce, not the forwarded one"
+        );
+        assert_eq!(
+            back.parameters_portion(),
+            sent.parameters_portion(),
+            "its parameters"
+        );
     }
     shutdown.shutdown().await;
 }
@@ -306,19 +337,28 @@ async fn each_pending_interest_of_a_face_gets_its_refusal() {
         .await
         .expect("engine build");
     engine.fib().add_nexthop(&n("/t"), FaceId(UPSTREAM), 0);
-    let exact = InterestBuilder::new(n("/t/m/doc")).lifetime(Duration::from_secs(4)).build();
+    let exact = InterestBuilder::new(n("/t/m/doc"))
+        .lifetime(Duration::from_secs(4))
+        .build();
     let prefix = InterestBuilder::new(n("/t/m"))
         .can_be_prefix()
         .lifetime(Duration::from_secs(4))
         .build();
     for i in [exact, prefix] {
         local.send(i).await.expect("send Interest");
-        recv_timeout(&upstream, 500).await.expect("the Interest reaches the upstream");
+        recv_timeout(&upstream, 500)
+            .await
+            .expect("the Interest reaches the upstream");
     }
-    upstream.send(signed_data("/t/m/doc", &member)).await.expect("send Data");
+    upstream
+        .send(signed_data("/t/m/doc", &member))
+        .await
+        .expect("send Data");
     let mut names = Vec::new();
     for _ in 0..2 {
-        let got = recv_timeout(&local, 500).await.expect("a refusal for each Interest");
+        let got = recv_timeout(&local, 500)
+            .await
+            .expect("a refusal for each Interest");
         assert_eq!(refusal_of(&got), Some(Refusal::Revoked));
         names.push(enclosed(&got).name.to_string());
     }
@@ -330,7 +370,9 @@ async fn each_pending_interest_of_a_face_gets_its_refusal() {
 /// The local downstream gets the refusal at once; the remote one nothing.
 async fn assert_refused_locally_only(rig: Rig, data: Bytes, want: Refusal) {
     rig.upstream.send(data).await.expect("send Data");
-    let got = recv_timeout(&rig.local, 500).await.expect("the local app hears back");
+    let got = recv_timeout(&rig.local, 500)
+        .await
+        .expect("the local app hears back");
     assert_eq!(refusal_of(&got), Some(want));
     assert!(
         recv_timeout(&rig.remote, 300).await.is_none(),

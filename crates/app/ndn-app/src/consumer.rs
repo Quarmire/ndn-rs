@@ -424,10 +424,13 @@ impl Consumer {
 
         self.conn.send(wire).await?;
 
-        crate::rt::timeout(timeout, replies.answer(&interest.name, can_be_prefix, false))
-            .await
-            .map_err(|_| AppError::Timeout)?
-            .map(|(data, _)| data)
+        crate::rt::timeout(
+            timeout,
+            replies.answer(&interest.name, can_be_prefix, false),
+        )
+        .await
+        .map_err(|_| AppError::Timeout)?
+        .map(|(data, _)| data)
     }
 
     /// Like [`fetch`](Self::fetch) but also returns the received Data's
@@ -665,9 +668,9 @@ impl Consumer {
         let meta = self
             .fetch_metadata(&name, validator.clone(), forwarding_hint)
             .await?;
-        let last_seg = meta
-            .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
+        let last_seg = meta.last_segment().ok_or_else(|| {
+            AppError::Protocol("metadata FinalBlockID missing or unparseable".into())
+        })?;
 
         // In-memory reassembly: the sink stashes each segment into `chunks`,
         // joined in order once the window completes.
@@ -760,9 +763,9 @@ impl Consumer {
         let meta = self
             .fetch_metadata(&name, validator.clone(), forwarding_hint)
             .await?;
-        let last_seg = meta
-            .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
+        let last_seg = meta.last_segment().ok_or_else(|| {
+            AppError::Protocol("metadata FinalBlockID missing or unparseable".into())
+        })?;
         self.fetch_segments_windowed(
             &meta.versioned_name,
             last_seg,
@@ -842,9 +845,9 @@ impl Consumer {
         let meta = self
             .fetch_metadata(&name, Some(validator.clone()), forwarding_hint)
             .await?;
-        let last_seg = meta
-            .last_segment()
-            .ok_or_else(|| AppError::Protocol("metadata FinalBlockID missing or unparseable".into()))?;
+        let last_seg = meta.last_segment().ok_or_else(|| {
+            AppError::Protocol("metadata FinalBlockID missing or unparseable".into())
+        })?;
         let seg_size = meta.segment_size.unwrap_or(8192);
         self.fetch_segments_windowed(
             &meta.versioned_name,
@@ -2099,7 +2102,12 @@ mod fetch_pairing_tests {
             .await
             .expect_err("a revocation is final");
         assert!(
-            matches!(err, AppError::Refused { reason: ndn_packet::Refusal::Revoked }),
+            matches!(
+                err,
+                AppError::Refused {
+                    reason: ndn_packet::Refusal::Revoked
+                }
+            ),
             "got {err:?}"
         );
 
@@ -2135,7 +2143,12 @@ mod fetch_pairing_tests {
             .await
             .expect_err("refused on every attempt");
         assert!(
-            matches!(err, AppError::Refused { reason: ndn_packet::Refusal::Unverifiable }),
+            matches!(
+                err,
+                AppError::Refused {
+                    reason: ndn_packet::Refusal::Unverifiable
+                }
+            ),
             "got {err:?}"
         );
     }

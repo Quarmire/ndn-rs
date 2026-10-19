@@ -27,11 +27,11 @@ use ndn_security::{
 use ndn_trust_envelope::TrustEnvelope;
 
 use crate::ca::serialize_cert;
+use crate::ca_policy::NamespacePolicies;
 use crate::context_store::{
     ContextStoreError, context_file_path, persist_context, remove_stored_context,
 };
 use crate::onboarding::anchor_fingerprint;
-use crate::ca_policy::NamespacePolicies;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
@@ -140,7 +140,9 @@ async fn build_namespace(
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
     let pk = signer.public_key().unwrap_or_default();
-    let anchor = mgr.issue_self_signed_async(&anchor_key, pk, u64::MAX).await?;
+    let anchor = mgr
+        .issue_self_signed_async(&anchor_key, pk, u64::MAX)
+        .await?;
 
     let schema = namespace_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
@@ -316,7 +318,10 @@ pub async fn init_namespace_in_pib_with(
         .into());
     }
     let existing = if let Some(held) = &held_root {
-        Some(format!("root key {anchor_key} ({} root store)", held.kind()))
+        Some(format!(
+            "root key {anchor_key} ({} root store)",
+            held.kind()
+        ))
     } else if pib.has_private_key(&anchor_key) {
         Some(format!("root key {anchor_key}"))
     } else if pib.has_private_key(&ca_key) {
@@ -494,7 +499,10 @@ mod tests {
         let schemas = init.context.published_schemas();
         assert_eq!(schemas.len(), 2);
         assert_eq!(schemas[0].format, ndn_security::SchemaFormat::Lvs);
-        assert_eq!(schemas[0].body.as_ref(), namespace_schema(&n("/home/bob")).unwrap().lvs_binary);
+        assert_eq!(
+            schemas[0].body.as_ref(),
+            namespace_schema(&n("/home/bob")).unwrap().lvs_binary
+        );
         // The root certifies the CA (judged by the root's certificate name).
         assert!(ndn_security::cert_name::is_cert_name(&init.anchor.name));
         assert!(init.context.authorizes_hop(
@@ -502,7 +510,11 @@ mod tests {
             &init.anchor_key,
             Some(&init.anchor.name)
         ));
-        assert!(!init.context.authorizes(&n("/home/bob/anything"), &init.anchor_key));
+        assert!(
+            !init
+                .context
+                .authorizes(&n("/home/bob/anything"), &init.anchor_key)
+        );
         assert_eq!(
             init.context.enrollment_hint(),
             Some(&EnrollmentHint::namespace_default())
@@ -568,7 +580,10 @@ mod tests {
         // Root key + cert + anchor are in the PIB.
         let root = root_key_name(&ns);
         assert_eq!(root_public_key(&pib, &ns), out.init.anchor.public_key);
-        assert_eq!(pib.get_cert(&root).unwrap().public_key, out.init.anchor.public_key);
+        assert_eq!(
+            pib.get_cert(&root).unwrap().public_key,
+            out.init.anchor.public_key
+        );
         assert!(pib.list_anchors().unwrap().contains(&root));
 
         // CA identity: key in the PIB, cert issued (and signed) by the root.
@@ -594,8 +609,16 @@ mod tests {
         // (`ndn_trust_envelope::qr`): inline when the context fits, else by
         // reference (namespace, expected fingerprint, version).
         let inline = out.init.envelope.to_uri();
-        let shown = out.init.envelope.qr_uri().expect("the anchor link has a QR form");
-        assert!(ndn_trust_envelope::qr::encode(&shown).is_ok(), "{} bytes", shown.len());
+        let shown = out
+            .init
+            .envelope
+            .qr_uri()
+            .expect("the anchor link has a QR form");
+        assert!(
+            ndn_trust_envelope::qr::encode(&shown).is_ok(),
+            "{} bytes",
+            shown.len()
+        );
         if inline.len() <= ndn_trust_envelope::qr::MAX_TEXT_LEN {
             assert_eq!(shown, inline);
         } else {
@@ -639,8 +662,13 @@ mod tests {
         // The persisted signed cert is signed by the CA key.
         let wire = std::fs::read(&out.device_cert_path).unwrap();
         let data = Data::decode(bytes::Bytes::from(wire)).unwrap();
-        assert!(data.name.has_prefix(&out.device_key) && data.name.len() == out.device_key.len() + 2);
-        assert_eq!(data.name.components()[out.device_key.len()].value.as_ref(), b"NDNCERT");
+        assert!(
+            data.name.has_prefix(&out.device_key) && data.name.len() == out.device_key.len() + 2
+        );
+        assert_eq!(
+            data.name.components()[out.device_key.len()].value.as_ref(),
+            b"NDNCERT"
+        );
         let outcome = futures::executor::block_on(ndn_security::verifier::verify_by_sig_type(
             data.sig_info().unwrap().sig_type,
             data.signed_region(),
@@ -675,12 +703,18 @@ mod tests {
                 .err()
                 .expect("invalid device name must be refused");
             assert!(
-                matches!(err, NamespaceInitError::Role(RoleError::InvalidDevice { .. })),
+                matches!(
+                    err,
+                    NamespaceInitError::Role(RoleError::InvalidDevice { .. })
+                ),
                 "{bad:?}: {err}"
             );
         }
         let err = init_in_pib(&pib, &n("/"), "laptop", false).err().unwrap();
-        assert!(matches!(err, NamespaceInitError::Role(RoleError::InvalidNamespace { .. })));
+        assert!(matches!(
+            err,
+            NamespaceInitError::Role(RoleError::InvalidNamespace { .. })
+        ));
         assert!(pib.list_keys().unwrap().is_empty(), "nothing written");
     }
 
@@ -695,7 +729,10 @@ mod tests {
         let err = init_in_pib(&pib, &ns, "laptop", false)
             .err()
             .expect("re-init must fail");
-        assert!(matches!(err, NamespaceInitError::AlreadyInitialized { .. }), "{err}");
+        assert!(
+            matches!(err, NamespaceInitError::AlreadyInitialized { .. }),
+            "{err}"
+        );
         assert_eq!(root_public_key(&pib, &ns), root_before, "root untouched");
 
         // With force a fresh root replaces it (and the stored context follows).
@@ -710,7 +747,11 @@ mod tests {
         let loaded = crate::context_store::load_persisted_contexts(dir.path(), &keyring).unwrap();
         assert_eq!(loaded.len(), 1);
         let ctx = loaded[0].1.as_ref().unwrap();
-        let fps: Vec<_> = ctx.anchors().iter().map(|r| anchor_fingerprint(r.value())).collect();
+        let fps: Vec<_> = ctx
+            .anchors()
+            .iter()
+            .map(|r| anchor_fingerprint(r.value()))
+            .collect();
         assert_eq!(fps, vec![anchor_fingerprint(&second.init.anchor)]);
     }
 
@@ -751,7 +792,10 @@ mod tests {
         v.cert_cache().insert(out.device_cert.clone());
 
         let mgr = SecurityManager::new();
-        mgr.register_signer(out.device_key.clone(), pib.get_signer(&out.device_key).unwrap());
+        mgr.register_signer(
+            out.device_key.clone(),
+            pib.get_signer(&out.device_key).unwrap(),
+        );
         mgr.register_signer(out.ca_key.clone(), pib.get_signer(&out.ca_key).unwrap());
         // A member enrolled through the CA.
         let member = n("/home/bob/member/phone/KEY/k1");
@@ -761,7 +805,11 @@ mod tests {
             .certify_as(&member, pk, &out.ca_key, 3_600_000, "NDNCERT", None)
             .await
             .unwrap();
-        assert!(ndn_security::cert_name::is_cert_name(&cert.name), "{}", cert.name);
+        assert!(
+            ndn_security::cert_name::is_cert_name(&cert.name),
+            "{}",
+            cert.name
+        );
         v.cert_cache().insert(cert);
         // The member self-issues an "admin" key.
         let forged = n("/home/bob/admin/phone/KEY/k1");

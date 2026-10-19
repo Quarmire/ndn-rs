@@ -262,7 +262,15 @@ impl PitEntry {
         lp_pit_token: Option<bytes::Bytes>,
         selector: Selector,
     ) {
-        self.add_in_record_with_persistent(face_id, nonce, expires_at, lp_pit_token, selector, None, None)
+        self.add_in_record_with_persistent(
+            face_id,
+            nonce,
+            expires_at,
+            lp_pit_token,
+            selector,
+            None,
+            None,
+        )
     }
 
     /// Add an in-record with optional persistent state and the Interest's

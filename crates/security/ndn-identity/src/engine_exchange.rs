@@ -37,7 +37,9 @@ impl CaExchange for EngineExchange {
             .unwrap_or_default();
         let timeout = decoded
             .and_then(|i| i.lifetime())
-            .map_or(ndn_app::DEFAULT_TIMEOUT, |l| l.max(ndn_app::DEFAULT_TIMEOUT));
+            .map_or(ndn_app::DEFAULT_TIMEOUT, |l| {
+                l.max(ndn_app::DEFAULT_TIMEOUT)
+            });
         self.consumer
             .fetch_wire(interest, timeout)
             .await

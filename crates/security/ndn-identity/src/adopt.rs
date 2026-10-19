@@ -63,6 +63,8 @@ struct NoNetwork;
 
 impl CaExchange for NoNetwork {
     async fn express(&mut self, _interest: Bytes) -> Result<Data, CertError> {
-        Err(CertError::Transport("inline adoption does not fetch".into()))
+        Err(CertError::Transport(
+            "inline adoption does not fetch".into(),
+        ))
     }
 }

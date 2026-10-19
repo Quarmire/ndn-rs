@@ -77,8 +77,16 @@ async fn a_sealed_root_never_touches_the_disk_in_plaintext() {
         .decrypt_ed25519_seed(b"correct horse battery staple")
         .unwrap();
     for (path, body) in files(dir.path()) {
-        assert!(!contains(&body, &seed), "{} holds the root seed", path.display());
-        assert!(!contains(&body, &pkcs8), "{} holds the root PKCS#8", path.display());
+        assert!(
+            !contains(&body, &seed),
+            "{} holds the root seed",
+            path.display()
+        );
+        assert!(
+            !contains(&body, &pkcs8),
+            "{} holds the root PKCS#8",
+            path.display()
+        );
     }
     // The CA and admin device keys stay in the FilePib (unattended use).
     assert!(pib.has_private_key(&out.ca_key));
@@ -183,14 +191,29 @@ async fn moving_a_file_root_seals_it_without_losing_it() {
         );
     }
     // A sealed-file target without a passphrase is refused.
-    assert!(store.move_to(&pib, RootStoreKind::SealedFile, None, None).await.is_err());
+    assert!(
+        store
+            .move_to(&pib, RootStoreKind::SealedFile, None, None)
+            .await
+            .is_err()
+    );
     if ndn_cert::os_keychain_reachable().is_err() {
-        assert!(store.move_to(&pib, RootStoreKind::OsKeyring, None, None).await.is_err());
+        assert!(
+            store
+                .move_to(&pib, RootStoreKind::OsKeyring, None, None)
+                .await
+                .is_err()
+        );
     }
     assert_eq!(files(dir.path()), before, "a refused move changes nothing");
 
     let moved = store
-        .move_to(&pib, RootStoreKind::SealedFile, None, Some(&secret("sealed now")))
+        .move_to(
+            &pib,
+            RootStoreKind::SealedFile,
+            None,
+            Some(&secret("sealed now")),
+        )
         .await
         .unwrap();
     assert_eq!(moved.kind(), RootStoreKind::SealedFile);
@@ -202,10 +225,14 @@ async fn moving_a_file_root_seals_it_without_losing_it() {
     // Same key: it signs the next version of the context it anchors.
     let signer = reopened.signer(Some(&secret("sealed now"))).await.unwrap();
     assert!(
-        bump_context_revoking(signer.as_ref(), &out.init.context_data, std::slice::from_ref(&out.device_key))
-            .await
-            .unwrap()
-            .is_some()
+        bump_context_revoking(
+            signer.as_ref(),
+            &out.init.context_data,
+            std::slice::from_ref(&out.device_key)
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
     // A key that is no anchor does not.
     let device = pib.get_signer(&out.device_key).unwrap();

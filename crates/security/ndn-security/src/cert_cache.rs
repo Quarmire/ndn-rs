@@ -272,7 +272,8 @@ impl CertCache {
             if let Some(mut names) = self.by_key.get_mut(&key_name) {
                 names.retain(|cn| *cn != cert.name);
             }
-            self.by_key.remove_if(&key_name, |_, names| names.is_empty());
+            self.by_key
+                .remove_if(&key_name, |_, names| names.is_empty());
             if !self.by_key.contains_key(&key_name) {
                 let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
                 self.by_digest.remove_if(&digest, |_, k| *k == key_name);
@@ -289,7 +290,9 @@ fn key_candidates(name: &Name) -> Vec<Name> {
     let mut keys = vec![crate::cert_name::key_name_of(name)];
     let comps = name.components();
     if comps.len() >= 3 && comps[comps.len() - 3].value.as_ref() == b"KEY" {
-        keys.push(Name::from_components(comps[..comps.len() - 1].iter().cloned()));
+        keys.push(Name::from_components(
+            comps[..comps.len() - 1].iter().cloned(),
+        ));
     }
     keys
 }
@@ -301,7 +304,8 @@ fn key_candidates(name: &Name) -> Vec<Name> {
 /// published under `/home/bob/eve` — so the key a signature is checked with
 /// is always the key the hierarchy floor and the schema judged.
 pub(crate) fn resolves_to(locator: &Name, cert: &Name) -> bool {
-    cert.has_prefix(locator) && key_candidates(locator).contains(&crate::cert_name::key_name_of(cert))
+    cert.has_prefix(locator)
+        && key_candidates(locator).contains(&crate::cert_name::key_name_of(cert))
 }
 
 impl Default for CertCache {
@@ -462,7 +466,11 @@ mod tests {
         assert!(cache.remove(&name).is_some());
         assert!(cache.get(&name).is_none());
         use sha2::{Digest, Sha256};
-        assert!(cache.get_by_key_digest(Sha256::digest(&pk).as_slice()).is_none());
+        assert!(
+            cache
+                .get_by_key_digest(Sha256::digest(&pk).as_slice())
+                .is_none()
+        );
         assert!(cache.remove(&name).is_none(), "second remove finds nothing");
     }
 
@@ -547,7 +555,10 @@ mod tests {
         let exact: Arc<Name> = Arc::new("/a/KEY/k/NDNCERT/v=2".parse().unwrap());
         assert_eq!(cache.get(&exact).unwrap().name, exact);
         let issuer: Arc<Name> = Arc::new("/a/KEY/k/NDNCERT".parse().unwrap());
-        assert_eq!(cache.get(&issuer).unwrap().name.to_string(), "/a/KEY/k/NDNCERT/v=3");
+        assert_eq!(
+            cache.get(&issuer).unwrap().name.to_string(),
+            "/a/KEY/k/NDNCERT/v=3"
+        );
         assert_eq!(cache.all(&key).len(), 4);
 
         // An expired certificate alone: `get` still reports it, `get_valid` does not.
@@ -558,7 +569,11 @@ mod tests {
         // Removing the key evicts every certificate of it, and only those.
         assert!(cache.remove(&key).is_some());
         assert!(cache.get(&key).is_none());
-        assert!(cache.get(&Arc::new("/a/KEY/other".parse().unwrap())).is_some());
+        assert!(
+            cache
+                .get(&Arc::new("/a/KEY/other".parse().unwrap()))
+                .is_some()
+        );
     }
 
     /// A KeyLocator resolves only to certificates of its own key: never to
@@ -572,7 +587,10 @@ mod tests {
 
         for locator in ["/home/bob", "/home", "/home/bob/eve", "/a/KEY/k", "/a/KEY"] {
             let locator: Arc<Name> = Arc::new(locator.parse().unwrap());
-            assert!(cache.get(&locator).is_none(), "{locator} resolved to a foreign certificate");
+            assert!(
+                cache.get(&locator).is_none(),
+                "{locator} resolved to a foreign certificate"
+            );
             assert!(cache.all(&locator).is_empty());
             assert!(!resolves_to(&locator, &"/home/bob/eve/p".parse().unwrap()));
         }

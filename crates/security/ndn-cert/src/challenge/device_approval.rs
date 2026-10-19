@@ -54,7 +54,12 @@ impl DeviceApprovalChallenge {
     /// also redeem one of `tokens` — an invite of this CA, whatever role it
     /// names: the admin's approval decides the role. The token is redeemed
     /// once, when the request is opened, and recorded with it.
-    pub fn requiring_invite(mut self, namespace: Name, roles: Vec<Role>, tokens: TokenStore) -> Self {
+    pub fn requiring_invite(
+        mut self,
+        namespace: Name,
+        roles: Vec<Role>,
+        tokens: TokenStore,
+    ) -> Self {
         self.invite = Some(InviteRequirement {
             namespace,
             roles,

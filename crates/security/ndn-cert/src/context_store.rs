@@ -184,8 +184,7 @@ pub fn load_persisted_contexts(
 /// (byte-identical Data, never re-signed).
 pub fn read_stored_contexts(
     pib_root: &Path,
-) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError>
-{
+) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError> {
     let dir = pib_root.join(CONTEXTS_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -229,8 +228,7 @@ pub fn read_stored_context(
 pub fn read_stored_versions(
     pib_root: &Path,
     namespace: &Name,
-) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError>
-{
+) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError> {
     let dir = context_versions_dir(pib_root, namespace);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -271,10 +269,7 @@ fn read_verified(path: &Path) -> Result<(SignedTrustContext, Data), ContextStore
     Ok((ctx, data))
 }
 
-fn read_one(
-    pib_root: &Path,
-    path: &Path,
-) -> Result<(SignedTrustContext, Data), ContextStoreError> {
+fn read_one(pib_root: &Path, path: &Path) -> Result<(SignedTrustContext, Data), ContextStoreError> {
     let (ctx, data) = read_verified(path)?;
     // Check the file is stored under its own namespace *before* anyone
     // trusts or publishes it, so a context copied over another namespace's
@@ -363,7 +358,8 @@ mod tests {
     fn stored_context_reads_back_byte_identical_and_damage_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let ns: Name = "/home/bob".parse().unwrap();
-        let root_dev = crate::namespace::init_namespace(&ndn_security::SecurityManager::new(), &ns).unwrap();
+        let root_dev =
+            crate::namespace::init_namespace(&ndn_security::SecurityManager::new(), &ns).unwrap();
         let path = persist_context(dir.path(), &root_dev.context, &root_dev.context_data).unwrap();
 
         let stored = read_stored_contexts(dir.path()).unwrap();
@@ -383,7 +379,10 @@ mod tests {
         ));
         std::fs::write(&path, &wire[..wire.len() / 2]).unwrap();
         let stored = read_stored_contexts(dir.path()).unwrap();
-        assert!(matches!(stored[0].1, Err(ContextStoreError::BadData { .. })));
+        assert!(matches!(
+            stored[0].1,
+            Err(ContextStoreError::BadData { .. })
+        ));
     }
 
     /// Every version stored is kept by version, for nodes behind this one;

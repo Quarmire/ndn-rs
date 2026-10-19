@@ -458,12 +458,19 @@ mod tests {
         let nack_with = |reason: &[u8]| {
             let mut w = TlvWriter::new();
             w.write_nested(tlv_type::LP_PACKET, |w| {
-                w.write_nested(tlv_type::NACK, |w| w.write_tlv(tlv_type::NACK_REASON, reason));
+                w.write_nested(tlv_type::NACK, |w| {
+                    w.write_tlv(tlv_type::NACK_REASON, reason)
+                });
                 w.write_tlv(tlv_type::LP_FRAGMENT, &fixture_interest_wire());
             });
             LpPacket::decode(w.finish())
         };
-        for ok in [&[0xAB][..], &[0x00, 0xAB], &[0, 0, 0, 0xAB], &[0, 0, 0, 0, 0, 0, 0, 0xAB]] {
+        for ok in [
+            &[0xAB][..],
+            &[0x00, 0xAB],
+            &[0, 0, 0, 0xAB],
+            &[0, 0, 0, 0, 0, 0, 0, 0xAB],
+        ] {
             let reason = nack_with(ok).unwrap().nack.unwrap().reason;
             assert_eq!(reason, Some(NackReason::from_code(171)), "{ok:02x?}");
         }

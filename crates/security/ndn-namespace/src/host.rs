@@ -86,11 +86,12 @@ impl PibContextStore {
 }
 
 /// One stored context file as [`ndn_cert::read_stored_contexts`] reads it.
-type StoredRead = (PathBuf, Result<(SignedTrustContext, Data), ndn_cert::ContextStoreError>);
+type StoredRead = (
+    PathBuf,
+    Result<(SignedTrustContext, Data), ndn_cert::ContextStoreError>,
+);
 
-fn stored(
-    list: Vec<StoredRead>,
-) -> Vec<StoredContext> {
+fn stored(list: Vec<StoredRead>) -> Vec<StoredContext> {
     list.into_iter()
         .map(|(path, read)| StoredContext {
             location: path.display().to_string(),

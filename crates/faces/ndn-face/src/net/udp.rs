@@ -372,7 +372,10 @@ impl Transport for UdpFace {
 /// datagram sent before.
 fn is_icmp_report(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
-    matches!(e.kind(), ConnectionRefused | HostUnreachable | NetworkUnreachable)
+    matches!(
+        e.kind(),
+        ConnectionRefused | HostUnreachable | NetworkUnreachable
+    )
 }
 
 impl UdpFace {
@@ -512,9 +515,10 @@ mod tests {
     async fn exclusive_port_is_never_shared() {
         let hub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let hub_addr = hub.local_addr().unwrap();
-        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), hub_addr, FaceId(1))
-            .await
-            .unwrap();
+        let face =
+            UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), hub_addr, FaceId(1))
+                .await
+                .unwrap();
         let local = face.socket.local_addr().unwrap();
 
         let again =
@@ -542,10 +546,13 @@ mod tests {
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer_addr = peer.local_addr().unwrap();
         drop(peer);
-        let face = UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), peer_addr, FaceId(1))
+        let face =
+            UdpFace::bind_connected(ConnectedPort::Exclusive(any_ip(0)), peer_addr, FaceId(1))
+                .await
+                .unwrap();
+        face.send_bytes(Bytes::from_static(b"while down"))
             .await
             .unwrap();
-        face.send_bytes(Bytes::from_static(b"while down")).await.unwrap();
 
         let peer = UdpSocket::bind(peer_addr).await.unwrap();
         face.send_bytes(Bytes::from_static(b"back")).await.unwrap();
@@ -566,8 +573,13 @@ mod tests {
         let hub_addr = hub.local_addr().unwrap();
         // All of 127/8 is local on Linux; the route to the hub is 127.0.0.1.
         let configured: SocketAddr = "127.0.0.2:0".parse().unwrap();
-        for port in [ConnectedPort::Exclusive(configured), ConnectedPort::Listener(configured)] {
-            let face = UdpFace::bind_connected(port, hub_addr, FaceId(1)).await.unwrap();
+        for port in [
+            ConnectedPort::Exclusive(configured),
+            ConnectedPort::Listener(configured),
+        ] {
+            let face = UdpFace::bind_connected(port, hub_addr, FaceId(1))
+                .await
+                .unwrap();
             assert_eq!(face.socket.local_addr().unwrap().ip(), configured.ip());
         }
         let other_family = UdpFace::bind_connected(

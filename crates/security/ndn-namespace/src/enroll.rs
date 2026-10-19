@@ -39,7 +39,7 @@ use ndn_cert::report::{
 };
 use ndn_cert::roles::{Role, parse_device_identity, parse_device_key};
 use ndn_cert::{
-    ApprovalEnrollError, ApprovalPoll, ApprovalPolicy, EnrollLink, InviteEnrollError, InviteLink,
+    ApprovalEnrollError, ApprovalPolicy, ApprovalPoll, EnrollLink, InviteEnrollError, InviteLink,
     IssuedCertificate, OutgoingRequest, OutgoingState, RequestStore, anchor_fingerprint,
     new_device_key_name,
 };
@@ -123,7 +123,11 @@ impl Certified {
 
     /// `<key> (revoked: <name>)` when the trust context revokes its chain.
     fn unusable(&self) -> Option<String> {
-        Some(format!("{} (revoked: {})", self.key, self.revoked.as_ref()?))
+        Some(format!(
+            "{} (revoked: {})",
+            self.key,
+            self.revoked.as_ref()?
+        ))
     }
 }
 
@@ -215,7 +219,8 @@ async fn check_context(p: &Participant, namespace: &Name) -> Option<ContextRefre
         Ok(Ok(mut results)) => results.pop(),
         Ok(Err(e)) => Some(not_checked(e.reason)),
         Err(_) => Some(not_checked(
-            p.words().context_check_timed_out(budget.as_secs(), namespace),
+            p.words()
+                .context_check_timed_out(budget.as_secs(), namespace),
         )),
     }
 }
@@ -297,7 +302,10 @@ pub fn expire_overdue(
     words: &HostWords,
 ) -> Result<(), TrustRefusal> {
     let ended = store.expire_overdue().map_err(|e| {
-        refusal(status::SERVER_ERROR, format!("cannot update this node's request records: {e}"))
+        refusal(
+            status::SERVER_ERROR,
+            format!("cannot update this node's request records: {e}"),
+        )
     })?;
     for r in ended {
         if let Ok(key) = r.key_name.parse::<Name>() {
@@ -311,8 +319,7 @@ pub fn expire_overdue(
 /// Parse the link an enrollment was given: an invite, or an anchor link.
 /// `words`: the host's, for the refusal.
 pub fn parse_link(uri: &str, words: &HostWords) -> Result<EnrollLink, TrustRefusal> {
-    EnrollLink::parse(uri)
-        .map_err(|e| refusal(status::BAD_PARAMS, words.not_an_enroll_link(e)))
+    EnrollLink::parse(uri).map_err(|e| refusal(status::BAD_PARAMS, words.not_an_enroll_link(e)))
 }
 
 /// Hold the trust context of the namespace `link` names: adopt it (and keep
@@ -387,7 +394,10 @@ pub enum Route {
     Invite,
     /// Ask the CA at `ca_prefix` for an admin's approval, with the invite's
     /// `token` when the namespace requires one beside the approval.
-    Approval { ca_prefix: Name, token: Option<String> },
+    Approval {
+        ca_prefix: Name,
+        token: Option<String>,
+    },
 }
 
 /// How `role` is certified in `link`'s namespace, as its held trust
@@ -402,7 +412,8 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
         (EnrollLink::Invite(invite), false) => {
             return Err(refusal(
                 status::BAD_PARAMS,
-                p.words().invite_for_another_role(namespace, invite.role, role),
+                p.words()
+                    .invite_for_another_role(namespace, invite.role, role),
             ));
         }
         (EnrollLink::Anchor(_), false) => {
@@ -485,7 +496,10 @@ pub async fn enroll(
             p.words().already_certified(
                 &namespace,
                 &still_valid.join(", "),
-                &context_check.as_ref().map(judged_on_held).unwrap_or_default(),
+                &context_check
+                    .as_ref()
+                    .map(judged_on_held)
+                    .unwrap_or_default(),
             ),
         ));
     }
@@ -504,7 +518,9 @@ pub async fn enroll(
         (Route::Approval { ca_prefix, token }, _) => {
             enroll_by_approval(p, vault, &ca_prefix, device.role, token, enrolling).await
         }
-        (Route::Invite, EnrollLink::Anchor(_)) => unreachable!("an anchor link never routes by invite"),
+        (Route::Invite, EnrollLink::Anchor(_)) => {
+            unreachable!("an anchor link never routes by invite")
+        }
     }
 }
 
@@ -535,7 +551,10 @@ fn generate_key(
     let signer = vault.generate(&key).map_err(|e| {
         refusal(
             status::SERVER_ERROR,
-            format!("cannot generate the device key in {}: {e}", vault.location()),
+            format!(
+                "cannot generate the device key in {}: {e}",
+                vault.location()
+            ),
         )
     })?;
     Ok((key, signer))
@@ -635,7 +654,10 @@ pub async fn enroll_by_approval(
     let identity = enrolling.identity.to_string();
     let outstanding = expire_overdue(vault, &requests, p.words()).and_then(|()| {
         requests.outstanding(&identity).map_err(|e| {
-            refusal(status::SERVER_ERROR, format!("cannot read this node's request records: {e}"))
+            refusal(
+                status::SERVER_ERROR,
+                format!("cannot read this node's request records: {e}"),
+            )
         })
     })?;
     if let Some(outstanding) = outstanding {
@@ -827,7 +849,10 @@ pub async fn install(
             .map(Name::to_string)
             .unwrap_or_default(),
         valid_until: iso(issued.cert.valid_until),
-        validity_secs: issued.cert.valid_until.saturating_sub(issued.cert.valid_from)
+        validity_secs: issued
+            .cert
+            .valid_until
+            .saturating_sub(issued.cert.valid_from)
             / 1_000_000_000,
         adopted_context,
         pib: vault.location(),
@@ -848,7 +873,10 @@ pub fn enroll_status(
 ) -> Result<Vec<OutgoingRequest>, TrustRefusal> {
     let store = request_store(vault)?;
     expire_overdue(vault, &store, words)?;
-    store
-        .list()
-        .map_err(|e| refusal(status::SERVER_ERROR, format!("cannot read this node's request records: {e}")))
+    store.list().map_err(|e| {
+        refusal(
+            status::SERVER_ERROR,
+            format!("cannot read this node's request records: {e}"),
+        )
+    })
 }

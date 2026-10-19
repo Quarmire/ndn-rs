@@ -281,7 +281,11 @@ impl ContentStore for LruCs {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut evicted = 0;
         for (name, data) in victims {
-            if inner.cache.peek(name.as_ref()).is_none_or(|e| e.data != data) {
+            if inner
+                .cache
+                .peek(name.as_ref())
+                .is_none_or(|e| e.data != data)
+            {
                 continue;
             }
             inner.cache.pop(name.as_ref());
@@ -838,7 +842,10 @@ mod tests {
     }
 
     async fn epoch_of(cs: &LruCs, name: &str) -> Option<u64> {
-        cs.get(&interest(&[name]), 0).await.unwrap().revocation_epoch
+        cs.get(&interest(&[name]), 0)
+            .await
+            .unwrap()
+            .revocation_epoch
     }
 
     #[tokio::test]

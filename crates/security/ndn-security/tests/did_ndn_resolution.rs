@@ -54,25 +54,28 @@ fn fixture_fetcher(expected: Name, cert: Certificate) -> Arc<CertFetcher> {
             // populates the cache directly below and the FetchFn never
             // actually fires. This closure is here in case the cache
             // misses unexpectedly.
-            cell.lock().unwrap().take().map(|c| {
-                // Produce a wire that re-decodes to our Certificate.
-                // The simplest path is to use the cert's own
-                // signed_region + sig_value if present; otherwise
-                // panic loudly so the test author sees what's wrong.
-                let signed = c.signed_region.expect("test cert needs signed_region");
-                let sig = c.sig_value.expect("test cert needs sig_value");
-                let mut buf = bytes::BytesMut::new();
-                use ndn_tlv::TlvWriter;
-                let mut w = TlvWriter::new();
-                w.write_nested(ndn_packet::tlv_type::DATA, |w| {
-                    w.write_raw(&signed);
-                    w.write_tlv(ndn_packet::tlv_type::SIGNATURE_VALUE, &sig);
-                });
-                let wire = w.finish();
-                buf.extend_from_slice(&wire);
-                ndn_packet::Data::decode(buf.freeze()).expect("test wire decodes")
-            })
-            .ok_or(ndn_security::FetchMiss::Unanswered)
+            cell.lock()
+                .unwrap()
+                .take()
+                .map(|c| {
+                    // Produce a wire that re-decodes to our Certificate.
+                    // The simplest path is to use the cert's own
+                    // signed_region + sig_value if present; otherwise
+                    // panic loudly so the test author sees what's wrong.
+                    let signed = c.signed_region.expect("test cert needs signed_region");
+                    let sig = c.sig_value.expect("test cert needs sig_value");
+                    let mut buf = bytes::BytesMut::new();
+                    use ndn_tlv::TlvWriter;
+                    let mut w = TlvWriter::new();
+                    w.write_nested(ndn_packet::tlv_type::DATA, |w| {
+                        w.write_raw(&signed);
+                        w.write_tlv(ndn_packet::tlv_type::SIGNATURE_VALUE, &sig);
+                    });
+                    let wire = w.finish();
+                    buf.extend_from_slice(&wire);
+                    ndn_packet::Data::decode(buf.freeze()).expect("test wire decodes")
+                })
+                .ok_or(ndn_security::FetchMiss::Unanswered)
         })
     });
     let fetcher = Arc::new(CertFetcher::new(

@@ -97,7 +97,15 @@ pub async fn fetch_pending_via_engine(
     admin_chain: &[Bytes],
 ) -> Result<Vec<ApprovalRecord>, ApproverError> {
     let mut exchange = EngineExchange::new(engine);
-    ndn_cert::fetch_pending(&mut exchange, keyring, namespace, ca_prefix, admin, admin_chain).await
+    ndn_cert::fetch_pending(
+        &mut exchange,
+        keyring,
+        namespace,
+        ca_prefix,
+        admin,
+        admin_chain,
+    )
+    .await
 }
 
 /// Decide `record` as the admin key `admin`, through `engine`: see

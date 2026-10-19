@@ -86,7 +86,10 @@ async fn second_pending_request_for_key_is_refused() {
     assert!(why.contains(&id), "{why}");
     assert_eq!(store.pending().len(), 1);
     // The first requester still resumes its own request.
-    assert_eq!(pending_id(&ask(&ch, key, b"victim", Default::default()).await), id);
+    assert_eq!(
+        pending_id(&ask(&ch, key, b"victim", Default::default()).await),
+        id
+    );
 }
 
 #[tokio::test]
@@ -149,7 +152,10 @@ async fn failed_save_keeps_invite() {
     let why = denied(ask(&ch, key, b"pk", params.clone()).await);
     assert!(why.contains("ask again"), "{why}");
     assert!(failing.pending().is_empty());
-    assert!(tokens.is_live("invite-token"), "the failed request spent the invite");
+    assert!(
+        tokens.is_live("invite-token"),
+        "the failed request spent the invite"
+    );
 
     // Once storage works the same invite opens the request, and only then is spent.
     let working = ApprovalStore::new(ns(), Some(ns()), TTL);

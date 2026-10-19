@@ -307,5 +307,8 @@ fn ctx17_schema_roundtrips_as_stock_lvs() {
         "LVS binary must round-trip byte-for-byte"
     );
     assert_eq!(back.namespace(), &n("/a/blog"));
-    assert_eq!(back.enrollment_hint(), Some(&EnrollmentHint::namespace_default()));
+    assert_eq!(
+        back.enrollment_hint(),
+        Some(&EnrollmentHint::namespace_default())
+    );
 }

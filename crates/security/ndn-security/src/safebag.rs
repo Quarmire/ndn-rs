@@ -443,7 +443,11 @@ mod tests {
                 other => panic!("expected KdfTooCostly, got {other:?}"),
             }
         }
-        assert!(sealed_with(pbkdf2(MAX_PBKDF2_ITERATIONS)).check_kdf_cost().is_ok());
+        assert!(
+            sealed_with(pbkdf2(MAX_PBKDF2_ITERATIONS))
+                .check_kdf_cost()
+                .is_ok()
+        );
 
         let scrypt = |log_n: u32| Parameters {
             kdf: ScryptParams {

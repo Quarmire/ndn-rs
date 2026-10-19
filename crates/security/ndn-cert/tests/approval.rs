@@ -23,14 +23,14 @@ use ndn_cert::{
     ca_key_name, fetch_pending, init_namespace_in_pib, new_device_key_name, poll_approval,
     push_decision, request_status, verification_code,
 };
+use ndn_cert::{
+    ApprovalPolicy, BumpError, RootStore, bump_context_schema, namespace_schema,
+    open_context_update, read_stored_context,
+};
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
 use ndn_security::{
     AdvertisedRelay, Ed25519Signer, FilePib, Keyring, LinkPolicy, SecurityManager, Signer,
-};
-use ndn_cert::{
-    ApprovalPolicy, BumpError, RootStore, bump_context_schema, namespace_schema,
-    open_context_update, read_stored_context,
 };
 use ndn_security::{
     Certificate, EnrollmentHint, SchemaBlob, ValidationResult, Validator, compile_lvs_to_binary,
@@ -133,8 +133,13 @@ impl RootDevice {
         mgr.cert_cache().insert(out.ca_cert.clone());
         let context = Data::decode(out.init.context_data.raw().clone()).unwrap();
         let keyring = Arc::new(Keyring::new());
-        adopt_with_tofu(&keyring, &context, &ns(), &anchor_fingerprint(&out.init.anchor))
-            .unwrap();
+        adopt_with_tofu(
+            &keyring,
+            &context,
+            &ns(),
+            &anchor_fingerprint(&out.init.anchor),
+        )
+        .unwrap();
         Self {
             mgr: Arc::new(mgr),
             keyring,
@@ -206,7 +211,10 @@ async fn poll(
 async fn request(rd: &RootDevice, ca: &CaWire, key: &Arc<dyn Signer>) -> (String, String) {
     match poll(rd, ca, key, None).await {
         Ok(ApprovalPoll::Pending(p)) => (p.request_id, p.code),
-        other => panic!("expected a pending request for {}: {other:?}", key.key_name()),
+        other => panic!(
+            "expected a pending request for {}: {other:?}",
+            key.key_name()
+        ),
     }
 }
 
@@ -266,7 +274,15 @@ async fn listing(
     ca: &CaWire,
     by: &Device,
 ) -> Result<Vec<ApprovalRecord>, ApproverError> {
-    fetch_pending(&mut ca.clone(), &rd.keyring, &ns(), &ns(), &by.key, &by.chain).await
+    fetch_pending(
+        &mut ca.clone(),
+        &rd.keyring,
+        &ns(),
+        &ns(),
+        &by.key,
+        &by.chain,
+    )
+    .await
 }
 
 #[track_caller]
@@ -300,7 +316,11 @@ async fn a_pending_request_survives_restarts_of_the_ca_and_the_requester() {
         .unwrap();
 
     let cert = issued(&rd, &ca, &requester, &request_id).await;
-    assert!(cert.cert.name.has_prefix(requester.key_name()), "{}", cert.cert.name);
+    assert!(
+        cert.cert.name.has_prefix(requester.key_name()),
+        "{}",
+        cert.cert.name
+    );
     assert!(
         cert.issuers
             .iter()
@@ -332,7 +352,10 @@ async fn only_a_current_admin_key_decides_a_request_remotely() {
         chain: Vec::new(),
     };
     let forged = Device {
-        key: Arc::new(Ed25519Signer::from_seed(&[6; 32], admin.key.key_name().clone())),
+        key: Arc::new(Ed25519Signer::from_seed(
+            &[6; 32],
+            admin.key.key_name().clone(),
+        )),
         chain: admin.chain.clone(),
     };
 
@@ -363,7 +386,12 @@ async fn only_a_current_admin_key_decides_a_request_remotely() {
         ..record.clone()
     };
     let wrong_code = ApprovalRecord {
-        code: if record.code == "000 000" { "111 111" } else { "000 000" }.into(),
+        code: if record.code == "000 000" {
+            "111 111"
+        } else {
+            "000 000"
+        }
+        .into(),
         ..record.clone()
     };
     for (mismatched, kind) in [
@@ -372,12 +400,17 @@ async fn only_a_current_admin_key_decides_a_request_remotely() {
         (unknown, RefusalKind::NotFound),
         (wrong_code, RefusalKind::BadRequest),
     ] {
-        assert_refused(push(&rd, &ca, &mismatched, &Decision::Approve, &admin).await, kind);
+        assert_refused(
+            push(&rd, &ca, &mismatched, &Decision::Approve, &admin).await,
+            kind,
+        );
         still_pending();
         assert!(ca.approvals.get(&other_id).unwrap().is_pending());
     }
 
-    let decided = push(&rd, &ca, &record, &Decision::Approve, &admin).await.unwrap();
+    let decided = push(&rd, &ca, &record, &Decision::Approve, &admin)
+        .await
+        .unwrap();
     assert!(matches!(decided.state, ApprovalState::Approved { .. }));
 }
 
@@ -394,7 +427,10 @@ async fn the_issued_certificate_attests_who_approved_it() {
         set.leaves[0].clone()
     };
     let evidence = |leaf: &ndn_cert::ChallengeAttestation, k: &str| {
-        leaf.evidence.get(k).and_then(|v| v.as_str()).map(str::to_owned)
+        leaf.evidence
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
     };
 
     let local = key("admin", "laptop", 1);
@@ -409,8 +445,14 @@ async fn the_issued_certificate_attests_who_approved_it() {
     assert!(matches!(&record.state, ApprovalState::Approved { by, .. } if *by == who));
     let cert = issued(&rd, &ca, &local, &id).await;
     let operator = leaf(&cert);
-    assert_eq!(evidence(&operator, "approver_kind").as_deref(), Some("local-operator"));
-    assert_eq!(evidence(&operator, "approved_by").as_deref(), Some("uid 1000 (alice)"));
+    assert_eq!(
+        evidence(&operator, "approver_kind").as_deref(),
+        Some("local-operator")
+    );
+    assert_eq!(
+        evidence(&operator, "approved_by").as_deref(),
+        Some("uid 1000 (alice)")
+    );
     assert_eq!(operator.signature, None);
 
     let admin = Device {
@@ -419,18 +461,30 @@ async fn the_issued_certificate_attests_who_approved_it() {
     };
     let remote = key("node", "vps", 2);
     let (id, _) = request(&rd, &ca, &remote).await;
-    let record = push(&rd, &ca, &ca.approvals.get(&id).unwrap(), &Decision::Approve, &admin)
-        .await
-        .unwrap();
+    let record = push(
+        &rd,
+        &ca,
+        &ca.approvals.get(&id).unwrap(),
+        &Decision::Approve,
+        &admin,
+    )
+    .await
+    .unwrap();
     let ApprovalState::Approved {
-        by: Approver::AdminKey { key, evidence: signed },
+        by: Approver::AdminKey {
+            key,
+            evidence: signed,
+        },
         ..
     } = record.state
     else {
         panic!("{record:?}");
     };
     let attested = leaf(&issued(&rd, &ca, &remote, &id).await);
-    assert_eq!(evidence(&attested, "approver_kind").as_deref(), Some("admin-key"));
+    assert_eq!(
+        evidence(&attested, "approver_kind").as_deref(),
+        Some("admin-key")
+    );
     assert_eq!(evidence(&attested, "approved_by"), Some(key));
     assert_eq!(attested.signature, Some(signed));
 }
@@ -485,7 +539,16 @@ async fn status(
     lifetime: Duration,
 ) -> Result<RequestStatus, ApprovalEnrollError> {
     let key_name = key.key_name().to_string();
-    request_status(&mut ca.clone(), &rd.keyring, &ns(), &ns(), id, &key_name, lifetime).await
+    request_status(
+        &mut ca.clone(),
+        &rd.keyring,
+        &ns(),
+        &ns(),
+        id,
+        &key_name,
+        lifetime,
+    )
+    .await
 }
 
 /// A status Interest held for a pending request is answered the moment an
@@ -505,16 +568,25 @@ async fn a_held_status_is_answered_when_the_decision_is_recorded() {
 
     let denied = key("node", "vps", 1);
     let (id, _) = request(&rd, &ca, &denied).await;
-    let now = tokio::time::timeout(at_once, status(&rd, &ca, &id, &denied, STATUS_ANSWER_MARGIN))
-        .await
-        .expect("a check-now status is answered at once");
+    let now = tokio::time::timeout(
+        at_once,
+        status(&rd, &ca, &id, &denied, STATUS_ANSWER_MARGIN),
+    )
+    .await
+    .expect("a check-now status is answered at once");
     assert!(matches!(now, Ok(RequestStatus::Pending { .. })), "{now:?}");
 
     let held = waiting(&id, &denied);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!held.is_finished(), "held while the request is pending");
     ca.approvals
-        .decide_locally(&id, Decision::Deny { reason: "not my relay".into() }, "uid 1000 (alice)")
+        .decide_locally(
+            &id,
+            Decision::Deny {
+                reason: "not my relay".into(),
+            },
+            "uid 1000 (alice)",
+        )
         .unwrap();
     let answer = tokio::time::timeout(at_once, held)
         .await
@@ -530,7 +602,10 @@ async fn a_held_status_is_answered_when_the_decision_is_recorded() {
     let again = tokio::time::timeout(at_once, status(&rd, &ca, &id, &denied, STATUS_LIFETIME))
         .await
         .expect("a decided request is answered at once");
-    assert!(matches!(again, Ok(RequestStatus::Denied { .. })), "{again:?}");
+    assert!(
+        matches!(again, Ok(RequestStatus::Denied { .. })),
+        "{again:?}"
+    );
 
     let approved = key("admin", "tablet", 2);
     let (id, _) = request(&rd, &ca, &approved).await;
@@ -544,12 +619,21 @@ async fn a_held_status_is_answered_when_the_decision_is_recorded() {
         .await
         .expect("answered when the decision is recorded")
         .unwrap();
-    assert!(matches!(answer, Ok(RequestStatus::Approved { .. })), "{answer:?}");
+    assert!(
+        matches!(answer, Ok(RequestStatus::Approved { .. })),
+        "{answer:?}"
+    );
     issued(&rd, &ca, &approved, &id).await;
 
     let unknown = tokio::time::timeout(
         at_once,
-        status(&rd, &ca, "00000000000000ff", &key("node", "pi", 3), STATUS_LIFETIME),
+        status(
+            &rd,
+            &ca,
+            "00000000000000ff",
+            &key("node", "pi", 3),
+            STATUS_LIFETIME,
+        ),
     )
     .await
     .expect("an unknown request is answered at once");
@@ -588,12 +672,18 @@ async fn the_ca_holds_a_bounded_number_of_status_interests() {
     assert!(refused.contains("limit per request"), "{refused}");
     drop(per_request);
     let mut all: Vec<_> = (0..MAX_HELD_STATUS)
-        .map(|i| ca.service.hold_status(&format!("{:016x}", i / MAX_HELD_PER_REQUEST)).unwrap())
+        .map(|i| {
+            ca.service
+                .hold_status(&format!("{:016x}", i / MAX_HELD_PER_REQUEST))
+                .unwrap()
+        })
         .collect();
     let refused = ca.service.hold_status("b").map(drop).unwrap_err();
     assert!(refused.contains("its limit"), "{refused}");
     all.pop();
-    ca.service.hold_status("b").expect("a slot given back is usable again");
+    ca.service
+        .hold_status("b")
+        .expect("a slot given back is usable again");
 }
 
 /// A CA that stops answers the status Interests it holds at once (pending,
@@ -606,23 +696,37 @@ async fn a_stopping_ca_answers_the_status_it_holds() {
     let requester = key("node", "vps", 1);
     let (id, _) = request(&rd, &ca, &requester).await;
     let held = {
-        let (rd, ca, id, key) = (Arc::clone(&rd), ca.clone(), id.clone(), Arc::clone(&requester));
+        let (rd, ca, id, key) = (
+            Arc::clone(&rd),
+            ca.clone(),
+            id.clone(),
+            Arc::clone(&requester),
+        );
         tokio::spawn(async move { status(&rd, &ca, &id, &key, STATUS_LIFETIME).await })
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!held.is_finished(), "held while the request is pending");
-    tokio::time::timeout(Duration::from_secs(1), ca.service.release_held(Duration::from_secs(1)))
-        .await
-        .expect("released at once");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        ca.service.release_held(Duration::from_secs(1)),
+    )
+    .await
+    .expect("released at once");
     let answer = held.await.unwrap();
-    assert!(matches!(answer, Ok(RequestStatus::Pending { .. })), "{answer:?}");
+    assert!(
+        matches!(answer, Ok(RequestStatus::Pending { .. })),
+        "{answer:?}"
+    );
     let later = tokio::time::timeout(
         Duration::from_secs(1),
         status(&rd, &ca, &id, &requester, STATUS_LIFETIME),
     )
     .await
     .expect("a stopping CA holds nothing");
-    assert!(matches!(later, Ok(RequestStatus::Pending { .. })), "{later:?}");
+    assert!(
+        matches!(later, Ok(RequestStatus::Pending { .. })),
+        "{later:?}"
+    );
 }
 
 /// Answers to a status Interest, as a neighbour may forge them; anything
@@ -636,7 +740,12 @@ struct Forger {
 impl CaExchange for Forger {
     async fn express(&mut self, interest_wire: Bytes) -> Result<Data, CertError> {
         let interest = Interest::decode(interest_wire.clone()).unwrap();
-        if interest.name.components().iter().any(|c| c.value.as_ref() == b"STATUS") {
+        if interest
+            .name
+            .components()
+            .iter()
+            .any(|c| c.value.as_ref() == b"STATUS")
+        {
             return Ok(Data::decode(self.forged.clone()).unwrap());
         }
         self.ca.express(interest_wire).await
@@ -684,7 +793,10 @@ async fn a_forged_or_unsigned_denial_is_not_acted_on() {
         .raw()
         .clone();
     let other_request = ca
-        .ca_signed(name.clone(), &denial("00000000000000ff", &requester.key_name().to_string()))
+        .ca_signed(
+            name.clone(),
+            &denial("00000000000000ff", &requester.key_name().to_string()),
+        )
         .await
         .unwrap()
         .raw()
@@ -777,14 +889,26 @@ async fn an_expired_request_is_neither_listed_nor_decided_and_is_pruned() {
 
     let ca = rd.start_ca(DEFAULT_REQUEST_TTL);
     let kept = stored();
-    assert!(!kept.contains(&stale_id), "pending one TTL past its expiry: pruned");
-    assert!(!kept.contains(&denied_id), "a decision past its keep time: pruned");
-    assert!(kept.contains(&late_id), "kept to tell the requester it expired");
+    assert!(
+        !kept.contains(&stale_id),
+        "pending one TTL past its expiry: pruned"
+    );
+    assert!(
+        !kept.contains(&denied_id),
+        "a decision past its keep time: pruned"
+    );
+    assert!(
+        kept.contains(&late_id),
+        "kept to tell the requester it expired"
+    );
     assert!(kept.contains(&current_id));
 
     let listed = listing(&rd, &ca, &admin).await.unwrap();
     assert!(listed.iter().all(|r| r.request_id != late_id), "{listed:?}");
-    assert!(listed.iter().any(|r| r.request_id == current_id), "{listed:?}");
+    assert!(
+        listed.iter().any(|r| r.request_id == current_id),
+        "{listed:?}"
+    );
     let local = ca
         .approvals
         .decide_locally(&late_code, Decision::Approve, "uid 0 (setup)")
@@ -794,7 +918,10 @@ async fn an_expired_request_is_neither_listed_nor_decided_and_is_pruned() {
         push(&rd, &ca, &approved_late, &Decision::Approve, &admin).await,
         RefusalKind::Conflict,
     );
-    assert!(ca.approvals.get(&late_id).unwrap().is_pending(), "nothing changed");
+    assert!(
+        ca.approvals.get(&late_id).unwrap().is_pending(),
+        "nothing changed"
+    );
 
     let expired = poll(&rd, &ca, &late, Some(&late_id)).await;
     assert!(
@@ -861,8 +988,7 @@ async fn a_mac_keyed_with_an_admin_public_key_neither_decides_nor_lists() {
     let (id, _) = request(&rd, &ca, &key("node", "vps", 2)).await;
     let record = ca.approvals.get(&id).unwrap();
 
-    let admin_cert =
-        Certificate::decode(&Data::decode(admin.chain[0].clone()).unwrap()).unwrap();
+    let admin_cert = Certificate::decode(&Data::decode(admin.chain[0].clone()).unwrap()).unwrap();
     let public = admin_cert.public_key.clone();
     let raw: [u8; 32] = ndn_security::spki::unwrap_ed25519(&public)
         .unwrap_or_else(|| public.as_ref().try_into().expect("an Ed25519 key"));
@@ -878,7 +1004,9 @@ async fn a_mac_keyed_with_an_admin_public_key_neither_decides_nor_lists() {
             chain: admin.chain.clone(),
         };
         for result in [
-            push(&rd, &ca, &record, &Decision::Approve, &forger).await.map(|_| ()),
+            push(&rd, &ca, &record, &Decision::Approve, &forger)
+                .await
+                .map(|_| ()),
             listing(&rd, &ca, &forger).await.map(|_| ()),
         ] {
             match result {
@@ -897,7 +1025,9 @@ async fn a_mac_keyed_with_an_admin_public_key_neither_decides_nor_lists() {
     }
 
     // The admin's real signature still decides.
-    let decided = push(&rd, &ca, &record, &Decision::Approve, &admin).await.unwrap();
+    let decided = push(&rd, &ca, &record, &Decision::Approve, &admin)
+        .await
+        .unwrap();
     assert!(matches!(decided.state, ApprovalState::Approved { .. }));
 }
 
@@ -937,7 +1067,9 @@ async fn adopt_update(rd: &RootDevice, data: &Data) {
 /// under the keyring's context, its chain walked to the root.
 async fn produces(rd: &RootDevice, identity: &Name, by: &Device) -> bool {
     let cert = Data::decode(by.chain[0].clone()).unwrap();
-    rd.mgr.cert_cache().insert(Certificate::decode(&cert).unwrap());
+    rd.mgr
+        .cert_cache()
+        .insert(Certificate::decode(&cert).unwrap());
     let key = Arc::clone(&by.key);
     let wire = DataBuilder::new(identity.clone().append("notes").append("1"), b"hello")
         .sign_fallible(by.key.sig_type(), Some(cert.name.as_ref()), move |region| {
@@ -949,7 +1081,10 @@ async fn produces(rd: &RootDevice, identity: &Name, by: &Device) -> bool {
     let validator =
         Validator::with_keyring(Arc::clone(&rd.keyring), rd.mgr.cert_cache_arc(), None, 4);
     let data = Data::decode(wire).unwrap();
-    matches!(validator.validate_chain_cached(&data).await.0, ValidationResult::Valid(_))
+    matches!(
+        validator.validate_chain_cached(&data).await.0,
+        ValidationResult::Valid(_)
+    )
 }
 
 /// A namespace held with the old generated schema refuses an admin's remote
@@ -994,16 +1129,37 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
 
     let current = namespace_schema(&ns()).unwrap().blobs();
     let hint = ApprovalPolicy::default().to_hint();
-    let update = bump_context_schema(root.as_ref(), &old.bump.data, &current, &hint, None, None, false)
-        .await
-        .unwrap()
-        .expect("the old schema lacks rules");
+    let update = bump_context_schema(
+        root.as_ref(),
+        &old.bump.data,
+        &current,
+        &hint,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("the old schema lacks rules");
     let change = &update.change;
     assert_eq!(change.added.len(), 2, "{:?}", change.added);
-    assert!(change.added.iter().any(|r| r.starts_with("#deny:") && r.contains("ndncert-deny")));
-    assert!(change.added.iter().any(|r| r.starts_with("#pending:") && r.contains("PENDING")));
+    assert!(
+        change
+            .added
+            .iter()
+            .any(|r| r.starts_with("#deny:") && r.contains("ndncert-deny"))
+    );
+    assert!(
+        change
+            .added
+            .iter()
+            .any(|r| r.starts_with("#pending:") && r.contains("PENDING"))
+    );
     assert!(change.removed.is_empty());
-    assert_eq!(update.bump.context.version(), old.bump.context.version() + 1);
+    assert_eq!(
+        update.bump.context.version(),
+        old.bump.context.version() + 1
+    );
     assert_eq!(update.bump.context.enrollment_hint(), Some(&hint));
     adopt_update(&rd, &update.bump.data).await;
 
@@ -1012,15 +1168,33 @@ async fn a_schema_update_gives_an_older_namespace_the_decision_rules() {
     let denied = push(&rd, &ca, &ca.approvals.get(&id).unwrap(), &deny, &admin)
         .await
         .unwrap();
-    assert!(matches!(denied.state, ApprovalState::Denied { .. }), "{denied:?}");
+    assert!(
+        matches!(denied.state, ApprovalState::Denied { .. }),
+        "{denied:?}"
+    );
     assert!(produces(&rd, &phone, &member).await);
 
-    let again =
-        bump_context_schema(root.as_ref(), &update.bump.data, &current, &hint, None, None, false)
-            .await;
+    let again = bump_context_schema(
+        root.as_ref(),
+        &update.bump.data,
+        &current,
+        &hint,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert!(matches!(again, Ok(None)), "nothing to sign: {again:?}");
-    match bump_context_schema(root.as_ref(), &update.bump.data, &old_schema, &hint, None, None, false)
-        .await
+    match bump_context_schema(
+        root.as_ref(),
+        &update.bump.data,
+        &old_schema,
+        &hint,
+        None,
+        None,
+        false,
+    )
+    .await
     {
         Err(BumpError::Narrowing { removed, .. }) => {
             assert_eq!(removed.len(), 2, "{removed:?}");
@@ -1065,10 +1239,18 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         ..ApprovalPolicy::default()
     }
     .to_hint();
-    let v3 = bump_context_schema(root.as_ref(), &v2.bump.data, &schema, &other_hint, None, None, false)
-        .await
-        .unwrap()
-        .expect("another hint");
+    let v3 = bump_context_schema(
+        root.as_ref(),
+        &v2.bump.data,
+        &schema,
+        &other_hint,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("another hint");
     assert!(!v3.change.changes_link());
     assert_eq!(v3.bump.context.stated_link_policy(), Some(&held));
 
@@ -1080,10 +1262,18 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         direct_paths: true,
         direct_pairs: LinkPolicy::default_direct_pairs(),
     };
-    let v4 = bump_context_schema(root.as_ref(), &v3.bump.data, &schema, &other_hint, Some(&wider), None, false)
-        .await
-        .unwrap()
-        .expect("a wider link policy");
+    let v4 = bump_context_schema(
+        root.as_ref(),
+        &v3.bump.data,
+        &schema,
+        &other_hint,
+        Some(&wider),
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("a wider link policy");
     assert!(v4.change.link_narrowed.is_empty());
     assert_eq!(v4.bump.context.stated_link_policy(), Some(&wider));
 
@@ -1091,11 +1281,26 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
     let mut fewer_pairs = LinkPolicy::default_direct_pairs();
     fewer_pairs.retain(|(a, b)| !(a == "node" && b == "node"));
     for narrower in [
-        LinkPolicy { roles: vec!["admin".into(), "node".into()], ..wider.clone() },
-        LinkPolicy { relay_roles: vec!["node".into()], ..wider.clone() },
-        LinkPolicy { enrollment_links: false, ..wider.clone() },
-        LinkPolicy { direct_paths: false, ..wider.clone() },
-        LinkPolicy { direct_pairs: fewer_pairs, ..wider.clone() },
+        LinkPolicy {
+            roles: vec!["admin".into(), "node".into()],
+            ..wider.clone()
+        },
+        LinkPolicy {
+            relay_roles: vec!["node".into()],
+            ..wider.clone()
+        },
+        LinkPolicy {
+            enrollment_links: false,
+            ..wider.clone()
+        },
+        LinkPolicy {
+            direct_paths: false,
+            ..wider.clone()
+        },
+        LinkPolicy {
+            direct_pairs: fewer_pairs,
+            ..wider.clone()
+        },
     ] {
         let refused = bump_context_schema(
             root.as_ref(),
@@ -1111,24 +1316,50 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
             matches!(&refused, Err(BumpError::LinkNarrowing { narrowed, .. }) if narrowed.len() == 1),
             "{refused:?}"
         );
-        let applied =
-            bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&narrower), None, true)
-                .await
-                .unwrap()
-                .expect("consented narrowing");
+        let applied = bump_context_schema(
+            root.as_ref(),
+            &v4.bump.data,
+            &schema,
+            &other_hint,
+            Some(&narrower),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("consented narrowing");
         assert_eq!(applied.bump.context.stated_link_policy(), Some(&narrower));
     }
 
     // Direct paths off -> on widens: no consent needed.
-    let no_direct = LinkPolicy { direct_paths: false, ..wider.clone() };
-    let v5 = bump_context_schema(root.as_ref(), &v4.bump.data, &schema, &other_hint, Some(&no_direct), None, true)
-        .await
-        .unwrap()
-        .expect("direct paths off");
-    let v6 = bump_context_schema(root.as_ref(), &v5.bump.data, &schema, &other_hint, Some(&wider), None, false)
-        .await
-        .unwrap()
-        .expect("direct paths back on");
+    let no_direct = LinkPolicy {
+        direct_paths: false,
+        ..wider.clone()
+    };
+    let v5 = bump_context_schema(
+        root.as_ref(),
+        &v4.bump.data,
+        &schema,
+        &other_hint,
+        Some(&no_direct),
+        None,
+        true,
+    )
+    .await
+    .unwrap()
+    .expect("direct paths off");
+    let v6 = bump_context_schema(
+        root.as_ref(),
+        &v5.bump.data,
+        &schema,
+        &other_hint,
+        Some(&wider),
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("direct paths back on");
     assert!(v6.change.link_narrowed.is_empty());
     assert_eq!(v6.bump.context.stated_link_policy(), Some(&wider));
 
@@ -1153,18 +1384,49 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
     .unwrap()
     .expect("a relay added");
     assert_eq!(v7.bump.context.relays(), std::slice::from_ref(&relay));
-    let v8 = bump_context_schema(root.as_ref(), &v7.bump.data, &schema, &hint, None, None, false)
-        .await
-        .unwrap()
-        .expect("another hint");
-    assert_eq!(v8.bump.context.relays(), [relay], "carried to the next version");
-    let refused =
-        bump_context_schema(root.as_ref(), &v8.bump.data, &schema, &hint, None, Some(&[]), false).await;
-    assert!(matches!(&refused, Err(BumpError::RelayNarrowing { dropped, .. }) if dropped.len() == 1), "{refused:?}");
-    let v9 = bump_context_schema(root.as_ref(), &v8.bump.data, &schema, &hint, None, Some(&[]), true)
-        .await
-        .unwrap()
-        .expect("consented narrowing");
+    let v8 = bump_context_schema(
+        root.as_ref(),
+        &v7.bump.data,
+        &schema,
+        &hint,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("another hint");
+    assert_eq!(
+        v8.bump.context.relays(),
+        [relay],
+        "carried to the next version"
+    );
+    let refused = bump_context_schema(
+        root.as_ref(),
+        &v8.bump.data,
+        &schema,
+        &hint,
+        None,
+        Some(&[]),
+        false,
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(BumpError::RelayNarrowing { dropped, .. }) if dropped.len() == 1),
+        "{refused:?}"
+    );
+    let v9 = bump_context_schema(
+        root.as_ref(),
+        &v8.bump.data,
+        &schema,
+        &hint,
+        None,
+        Some(&[]),
+        true,
+    )
+    .await
+    .unwrap()
+    .expect("consented narrowing");
     assert!(v9.bump.context.relays().is_empty());
 }
 
@@ -1199,7 +1461,10 @@ fn expired_outgoing_request_ends_locally() {
     use ndn_cert::approval::{OUTGOING_EXPIRY_GRACE, OutgoingRequest, OutgoingState, RequestStore};
     let dir = tempfile::tempdir().unwrap();
     let store = RequestStore::open(dir.path().join("requests")).unwrap();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let request = |device: &str, expires_secs| OutgoingRequest {
         namespace: "/home/bob".into(),
         ca_prefix: "/home/bob".into(),
@@ -1222,7 +1487,10 @@ fn expired_outgoing_request_ends_locally() {
     assert_eq!(ended.len(), 1);
     match &ended[0].state {
         OutgoingState::Expired { reason } => {
-            assert!(reason.contains("never answered") && reason.contains("ask again"), "{reason}")
+            assert!(
+                reason.contains("never answered") && reason.contains("ask again"),
+                "{reason}"
+            )
         }
         other => panic!("{other:?}"),
     }

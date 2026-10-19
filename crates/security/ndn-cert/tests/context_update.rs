@@ -126,10 +126,11 @@ fn node_holding(root: &PersistedNamespace) -> (Arc<Keyring>, Validator) {
 /// Data the root device's admin device `/home/bob/admin/desk` produces.
 fn device_data(pib: &FilePib, root: &PersistedNamespace, suffix: &str) -> Data {
     let signer = pib.get_signer(&root.device_key).unwrap();
-    let wire = DataBuilder::new(root.device_identity.clone().append(suffix), b"photo")
-        .sign_sync(signer.sig_type(), Some(signer.key_name()), |region| {
-            signer.sign_sync(region).unwrap()
-        });
+    let wire = DataBuilder::new(root.device_identity.clone().append(suffix), b"photo").sign_sync(
+        signer.sig_type(),
+        Some(signer.key_name()),
+        |region| signer.sign_sync(region).unwrap(),
+    );
     Data::decode(wire).unwrap()
 }
 
@@ -148,14 +149,21 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
     ));
 
     // The root device revokes the device's key: v2, signed by the root.
-    let bump = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
-        .await
-        .unwrap()
-        .expect("a new version");
+    let bump = bump(
+        &pib,
+        &root.init.context_data,
+        std::slice::from_ref(&root.device_key),
+    )
+    .await
+    .unwrap()
+    .expect("a new version");
     assert_eq!(bump.context.version(), 2);
     assert_eq!(bump.added, std::slice::from_ref(&root.device_key));
     // Everything else is carried over.
-    assert_eq!(bump.context.ca_endpoints(), root.init.context.ca_endpoints());
+    assert_eq!(
+        bump.context.ca_endpoints(),
+        root.init.context.ca_endpoints()
+    );
     assert_eq!(bump.context.anchors().len(), 1);
 
     // The relay refreshes through its own validating forwarder.
@@ -163,16 +171,24 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
         upstream: Upstream::serving(&bump.data),
         forwarder: &relay_validator,
     };
-    let refreshed =
-        refresh_context(&relay, Some(&relay_validator), &mut upstream, &n("/home/bob"))
-            .await
-            .unwrap();
+    let refreshed = refresh_context(
+        &relay,
+        Some(&relay_validator),
+        &mut upstream,
+        &n("/home/bob"),
+    )
+    .await
+    .unwrap();
     let ContextRefresh::Updated(update) = refreshed else {
         panic!("expected an update: {refreshed:?}");
     };
     assert_eq!((update.previous, update.context.version()), (1, 2));
     assert_eq!(update.revoked, std::slice::from_ref(&root.device_key));
-    assert_eq!(update.data.raw(), bump.data.raw(), "kept verbatim to store and republish");
+    assert_eq!(
+        update.data.raw(),
+        bump.data.raw(),
+        "kept verbatim to store and republish"
+    );
     assert_eq!(relay.version_of(&n("/home/bob")), Some(2));
 
     // Old and new Data of the revoked key are refused now; nothing else is.
@@ -191,10 +207,14 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
         upstream: Upstream::serving(&update.data),
         forwarder: &device_validator,
     };
-    let refreshed =
-        refresh_context(&device, Some(&device_validator), &mut from_relay, &n("/home/bob"))
-            .await
-            .unwrap();
+    let refreshed = refresh_context(
+        &device,
+        Some(&device_validator),
+        &mut from_relay,
+        &n("/home/bob"),
+    )
+    .await
+    .unwrap();
     assert!(matches!(refreshed, ContextRefresh::Updated(_)));
     assert!(!matches!(
         validate(&device_validator, &device_data(&pib, &root, "later")),
@@ -224,13 +244,22 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
         upstream: Upstream::serving(&forged_v2.data),
         forwarder: &relay_validator,
     };
-    let res = refresh_context(&relay, Some(&relay_validator), &mut upstream, &n("/home/bob")).await;
+    let res = refresh_context(
+        &relay,
+        Some(&relay_validator),
+        &mut upstream,
+        &n("/home/bob"),
+    )
+    .await;
     match res {
         Err(RefreshError::Refused {
             refusal: UpdateRefusal::DroppedByForwarder(reason),
             held: 1,
             ..
-        }) => assert!(reason.contains("not an anchor of the held version"), "{reason}"),
+        }) => assert!(
+            reason.contains("not an anchor of the held version"),
+            "{reason}"
+        ),
         other => panic!("forged update not refused at the forwarder: {other:?}"),
     }
     assert_eq!(relay.version_of(&n("/home/bob")), Some(1));
@@ -261,10 +290,14 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
 async fn a_lower_or_equal_version_never_replaces_the_held_one() {
     let dir = tempfile::tempdir().unwrap();
     let (pib, root) = root_device(dir.path());
-    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
-        .await
-        .unwrap()
-        .unwrap();
+    let v2 = bump(
+        &pib,
+        &root.init.context_data,
+        std::slice::from_ref(&root.device_key),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let (relay, _) = node_holding(&root);
     let ns = n("/home/bob");
     let mut serving_v2 = Upstream::serving(&v2.data);
@@ -278,7 +311,13 @@ async fn a_lower_or_equal_version_never_replaces_the_held_one() {
     let mut serving_v1 = Upstream::serving(&root.init.context_data);
     let res = refresh_context(&relay, None, &mut serving_v1, &ns).await;
     assert!(
-        matches!(res, Ok(ContextRefresh::UpstreamOlder { held: 2, offered: 1 })),
+        matches!(
+            res,
+            Ok(ContextRefresh::UpstreamOlder {
+                held: 2,
+                offered: 1
+            })
+        ),
         "{res:?}"
     );
     assert_eq!(serving_v1.sent, [rdr_metadata_name(&ns)]);
@@ -307,10 +346,14 @@ async fn a_failed_refresh_never_drops_a_good_context() {
     let (pib, root) = root_device(dir.path());
     let (relay, validator) = node_holding(&root);
     let ns = n("/home/bob");
-    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
-        .await
-        .unwrap()
-        .unwrap();
+    let v2 = bump(
+        &pib,
+        &root.init.context_data,
+        std::slice::from_ref(&root.device_key),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     // Nothing answers: the namespace could not be asked at all.
     let mut silent = Upstream {
@@ -318,7 +361,10 @@ async fn a_failed_refresh_never_drops_a_good_context() {
         sent: Vec::new(),
     };
     let res = refresh_context(&relay, Some(&validator), &mut silent, &ns).await;
-    assert!(matches!(res, Err(RefreshError::NoAnswer { held: 1, .. })), "{res:?}");
+    assert!(
+        matches!(res, Err(RefreshError::NoAnswer { held: 1, .. })),
+        "{res:?}"
+    );
     // The metadata announces v2, the context itself never arrives: something
     // answered, so this is not "nothing answered".
     let mut half = Upstream::serving(&v2.data);
@@ -340,7 +386,13 @@ async fn a_failed_refresh_never_drops_a_good_context() {
         ValidationResult::Valid(_)
     ));
     // Not held at all: refused, nothing adopted.
-    let res = refresh_context(&relay, None, &mut Upstream::serving(&v2.data), &n("/home/eve")).await;
+    let res = refresh_context(
+        &relay,
+        None,
+        &mut Upstream::serving(&v2.data),
+        &n("/home/eve"),
+    )
+    .await;
     assert!(matches!(res, Err(RefreshError::NotHeld(_))), "{res:?}");
 }
 
@@ -357,14 +409,24 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
     // root under the same name — does not sign this namespace.
     let device = pib.get_signer(&root.device_key).unwrap();
     assert!(matches!(
-        bump_context_revoking(device.as_ref(), held, std::slice::from_ref(&root.device_key)).await,
+        bump_context_revoking(
+            device.as_ref(),
+            held,
+            std::slice::from_ref(&root.device_key)
+        )
+        .await,
         Err(BumpError::NotAnAnchor { .. })
     ));
     let (forged_pib, _) = root_device(other_dir.path().join("forged").as_path());
     let forged = RootStore::open(&forged_pib).unwrap().unwrap();
     let forged = forged.signer(None).await.unwrap();
     assert!(matches!(
-        bump_context_revoking(forged.as_ref(), held, std::slice::from_ref(&root.device_key)).await,
+        bump_context_revoking(
+            forged.as_ref(),
+            held,
+            std::slice::from_ref(&root.device_key)
+        )
+        .await,
         Err(BumpError::NotAnAnchor { .. })
     ));
 
@@ -428,12 +490,19 @@ impl CaExchange for RefusingVersion {
 async fn a_version_refused_for_now_is_fetched_again_later() {
     let dir = tempfile::tempdir().unwrap();
     let (pib, root) = root_device(dir.path());
-    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
-        .await
-        .unwrap()
-        .expect("a new version");
+    let v2 = bump(
+        &pib,
+        &root.init.context_data,
+        std::slice::from_ref(&root.device_key),
+    )
+    .await
+    .unwrap()
+    .expect("a new version");
     let (relay, _) = node_holding(&root);
-    for reason in [ndn_packet::Refusal::Unverifiable, ndn_packet::Refusal::Revoked] {
+    for reason in [
+        ndn_packet::Refusal::Unverifiable,
+        ndn_packet::Refusal::Revoked,
+    ] {
         let mut upstream = RefusingVersion {
             upstream: Upstream::serving(&v2.data),
             versioned: (*v2.data.name).clone(),

@@ -18,8 +18,7 @@ use bytes::Bytes;
 use ndn_packet::{Interest, Name};
 
 use crate::cs_keycodec::{
-    HEADER_LEN, StoredStamp, decode_stale_at, decode_value, encode_value, key_to_name,
-    name_to_key,
+    HEADER_LEN, StoredStamp, decode_stale_at, decode_value, encode_value, key_to_name, name_to_key,
 };
 use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
 
@@ -718,7 +717,10 @@ mod tests {
     }
 
     async fn epoch_of(cs: &FjallCs, name: &str) -> Option<u64> {
-        cs.get(&interest(&[name]), 0).await.unwrap().revocation_epoch
+        cs.get(&interest(&[name]), 0)
+            .await
+            .unwrap()
+            .revocation_epoch
     }
 
     /// Keyring epochs restart at 0, so a stamp read back by a later open must

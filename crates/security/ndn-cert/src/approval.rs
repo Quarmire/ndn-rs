@@ -135,7 +135,9 @@ pub(crate) type Redeem<'r> = Box<dyn FnOnce() -> Result<(), String> + 'r>;
 /// key's identity (`/ns/role/device/KEY/x` → `/ns/role`).
 fn pending_group(key_uri: &str) -> &str {
     let identity = key_uri.rsplit_once("/KEY/").map_or(key_uri, |(id, _)| id);
-    identity.rsplit_once('/').map_or(identity, |(parent, _)| parent)
+    identity
+        .rsplit_once('/')
+        .map_or(identity, |(parent, _)| parent)
 }
 /// The challenge type of enrollment by approval.
 pub const DEVICE_APPROVAL: &str = "device-approval";
@@ -193,8 +195,15 @@ pub struct ApprovalRecord {
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ApprovalState {
     Pending,
-    Approved { by: Approver, at_secs: u64 },
-    Denied { by: Approver, at_secs: u64, reason: String },
+    Approved {
+        by: Approver,
+        at_secs: u64,
+    },
+    Denied {
+        by: Approver,
+        at_secs: u64,
+        reason: String,
+    },
 }
 
 impl ApprovalState {
@@ -539,7 +548,10 @@ impl ApprovalStore {
             }
             if record.is_pending() && now > record.expires_secs {
                 self.forget(&mut records, id);
-                return Err(OpenRefusal::Expired(expired_reason(id, record.expires_secs)));
+                return Err(OpenRefusal::Expired(expired_reason(
+                    id,
+                    record.expires_secs,
+                )));
             }
             return Ok(record);
         }
@@ -574,7 +586,10 @@ impl ApprovalStore {
             )));
         }
         let group = pending_group(&key_uri);
-        if live.iter().filter(|r| pending_group(&r.key_name) == group).count()
+        if live
+            .iter()
+            .filter(|r| pending_group(&r.key_name) == group)
+            .count()
             >= MAX_PENDING_PER_PREFIX
         {
             return Err(OpenRefusal::Refused(format!(
@@ -926,13 +941,19 @@ pub enum RequestStatus {
     },
     /// The next NEW → CHALLENGE exchange ([`poll_approval`]) issues the
     /// certificate.
-    Approved { request_id: String, key_name: String },
+    Approved {
+        request_id: String,
+        key_name: String,
+    },
     Denied {
         request_id: String,
         key_name: String,
         reason: String,
     },
-    Expired { request_id: String, reason: String },
+    Expired {
+        request_id: String,
+        reason: String,
+    },
 }
 
 impl RequestStatus {
@@ -976,7 +997,11 @@ pub fn status_request_id(ca_prefix: &Name, name: &Name) -> Option<String> {
         return None;
     }
     (comps[n].value.as_ref() == b"CA" && comps[n + 1].value.as_ref() == STATUS_ENDPOINT.as_bytes())
-        .then(|| std::str::from_utf8(&comps[n + 2].value).ok().map(str::to_owned))
+        .then(|| {
+            std::str::from_utf8(&comps[n + 2].value)
+                .ok()
+                .map(str::to_owned)
+        })
         .flatten()
 }
 
@@ -1103,7 +1128,11 @@ fn parse_decision_name(name: &Name) -> Option<(Name, &'static str, String)> {
         _ => return None,
     };
     let id = std::str::from_utf8(&comps[n - 1].value).ok()?.to_owned();
-    Some((Name::from_components(comps[..n - 2].iter().cloned()), kind, id))
+    Some((
+        Name::from_components(comps[..n - 2].iter().cloned()),
+        kind,
+        id,
+    ))
 }
 
 /// A validator over `keyring` whose chain walk may use only `trusted` and
@@ -1156,7 +1185,9 @@ async fn validate_admin_data(
             return Err(unauthorized(format!(
                 "the decision's chain needs {}, which did not come with it; push the signer's \
                  certificate chain with the decision",
-                missing.map(|m| m.to_string()).unwrap_or_else(|| signer.to_string())
+                missing
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| signer.to_string())
             )));
         }
     }
@@ -1318,7 +1349,9 @@ impl ApprovalService {
             ));
         }
         counts.total += 1;
-        counts.per_request.insert(request_id.to_owned(), for_request + 1);
+        counts
+            .per_request
+            .insert(request_id.to_owned(), for_request + 1);
         Ok(HeldStatus {
             request_id: request_id.to_owned(),
             holds: Arc::clone(&self.holds),
@@ -1608,7 +1641,12 @@ pub fn admin_chain(cert_data: &Data, cert: &Certificate, kept: &[Bytes]) -> Vec<
         };
         chain.push((*wire).clone());
         // A self-signed issuer ends the chain.
-        if next.issuer.as_deref().map(ndn_security::cert_name::key_name_of) == Some(issuer_key) {
+        if next
+            .issuer
+            .as_deref()
+            .map(ndn_security::cert_name::key_name_of)
+            == Some(issuer_key)
+        {
             break;
         }
         issuer = next.issuer.clone();
@@ -1701,7 +1739,9 @@ impl ApprovalEnrollError {
             },
             CertError::Refused { name, reason } => Self::CaUnreachable {
                 ca_prefix: ca_prefix.to_string(),
-                detail: format!("this node's forwarder refused the Data answering {name} ({reason})"),
+                detail: format!(
+                    "this node's forwarder refused the Data answering {name} ({reason})"
+                ),
             },
             CertError::PolicyDenied(reason) => Self::NameRefused(reason),
             CertError::Security(e) => Self::Signing(e.to_string()),
@@ -1752,7 +1792,12 @@ where
     let cert_name = match outcome {
         Ok(ChallengeExchange::Issued(name)) => name,
         Ok(ChallengeExchange::Pending { parameters, status }) => {
-            let param = |k: &str| parameters.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+            let param = |k: &str| {
+                parameters
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            };
             let request_id = param(REQUEST_PARAM).ok_or_else(|| {
                 ApprovalEnrollError::CaRefused(format!(
                     "the CA answered pending without naming the request ({status})"
@@ -1786,11 +1831,17 @@ where
         .await
         .map_err(|e| ApprovalEnrollError::from_cert(e, ca_prefix))?;
     let checked = |e: crate::invite::IssuedCheckError| match e {
-        crate::invite::IssuedCheckError::Refused(why) => ApprovalEnrollError::IssuedCertificate(why),
+        crate::invite::IssuedCheckError::Refused(why) => {
+            ApprovalEnrollError::IssuedCertificate(why)
+        }
         crate::invite::IssuedCheckError::Signing(e) => ApprovalEnrollError::Signing(e),
-        crate::invite::IssuedCheckError::Exchange(e) => ApprovalEnrollError::from_cert(e, ca_prefix),
+        crate::invite::IssuedCheckError::Exchange(e) => {
+            ApprovalEnrollError::from_cert(e, ca_prefix)
+        }
     };
-    let mut issued = check_issued(&data, device_key.as_ref()).await.map_err(checked)?;
+    let mut issued = check_issued(&data, device_key.as_ref())
+        .await
+        .map_err(checked)?;
     issued.issuers = check_chain(&data, keyring, exchange, namespace)
         .await
         .map_err(checked)?;
@@ -1834,12 +1885,17 @@ where
         .map_err(|e| ApprovalEnrollError::from_cert(e, ca_prefix))?;
     let untrusted = ApprovalEnrollError::UntrustedAnswer;
     if *data.name != name {
-        return Err(untrusted(format!("the answer is named {}, not {name}", data.name)));
+        return Err(untrusted(format!(
+            "the answer is named {}, not {name}",
+            data.name
+        )));
     }
     check_chain(&data, keyring, exchange, namespace)
         .await
         .map_err(|e| match e {
-            crate::invite::IssuedCheckError::Exchange(e) => ApprovalEnrollError::from_cert(e, ca_prefix),
+            crate::invite::IssuedCheckError::Exchange(e) => {
+                ApprovalEnrollError::from_cert(e, ca_prefix)
+            }
             crate::invite::IssuedCheckError::Refused(why)
             | crate::invite::IssuedCheckError::Signing(why) => {
                 untrusted(format!("the answer to {name} is not the CA's: {why}"))
@@ -1896,7 +1952,10 @@ impl OutgoingRequest {
     pub fn overdue(&self, now: u64) -> bool {
         self.state == OutgoingState::Pending
             && self.expires_secs != 0
-            && now > self.expires_secs.saturating_add(OUTGOING_EXPIRY_GRACE.as_secs())
+            && now
+                > self
+                    .expires_secs
+                    .saturating_add(OUTGOING_EXPIRY_GRACE.as_secs())
     }
 }
 
@@ -1905,12 +1964,20 @@ impl OutgoingRequest {
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum OutgoingState {
     Pending,
-    Issued { certificate: String },
-    Denied { reason: String },
-    Expired { reason: String },
+    Issued {
+        certificate: String,
+    },
+    Denied {
+        reason: String,
+    },
+    Expired {
+        reason: String,
+    },
     /// Approved, but the certificate could not be kept; `reason` says why
     /// and what to do.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 impl OutgoingState {
@@ -1953,7 +2020,8 @@ impl RequestStore {
     }
 
     fn path(&self, key_name: &str) -> PathBuf {
-        self.dir.join(format!("{}.json", hex(&sha256(key_name.as_bytes()))))
+        self.dir
+            .join(format!("{}.json", hex(&sha256(key_name.as_bytes()))))
     }
 
     pub fn save(&self, request: &OutgoingRequest) -> Result<(), CertError> {
@@ -1999,10 +2067,9 @@ impl RequestStore {
     /// go out ([`expire_overdue`](Self::expire_overdue) ends it).
     pub fn outstanding(&self, identity: &str) -> Result<Option<OutgoingRequest>, CertError> {
         let now = now_secs();
-        Ok(self
-            .list()?
-            .into_iter()
-            .find(|r| r.identity == identity && r.state == OutgoingState::Pending && !r.overdue(now)))
+        Ok(self.list()?.into_iter().find(|r| {
+            r.identity == identity && r.state == OutgoingState::Pending && !r.overdue(now)
+        }))
     }
 
     /// End every [overdue](OutgoingRequest::overdue) pending request as
@@ -2028,7 +2095,8 @@ impl RequestStore {
     }
 
     fn key_path(&self, key_name: &str) -> PathBuf {
-        self.dir.join(format!("{}.key", hex(&sha256(key_name.as_bytes()))))
+        self.dir
+            .join(format!("{}.key", hex(&sha256(key_name.as_bytes()))))
     }
 
     /// Keep the request's key `key_name` beside its record, `sealed` by the

@@ -1011,7 +1011,12 @@ impl SignedTrustContext {
     /// KeyLocator names it, as its resolved certificate, or as its key; for a
     /// certificate `signed`, the certificate's own name or its key name. Every
     /// form names the same key, so no form grants authority another one lacks.
-    pub fn authorizes_hop(&self, signed: &Name, locator: &Name, signer_cert: Option<&Name>) -> bool {
+    pub fn authorizes_hop(
+        &self,
+        signed: &Name,
+        locator: &Name,
+        signer_cert: Option<&Name>,
+    ) -> bool {
         if self.authorizes(signed, locator) {
             return true;
         }
@@ -1431,9 +1436,7 @@ pub fn context_namespace_of(name: &Name) -> Option<Name> {
         return None;
     };
     version.as_version()?;
-    if *keyword
-        != ndn_packet::NameComponent::keyword(Bytes::from_static(TRUST_CONTEXT_KEYWORD))
-    {
+    if *keyword != ndn_packet::NameComponent::keyword(Bytes::from_static(TRUST_CONTEXT_KEYWORD)) {
         return None;
     }
     Some(Name::from_components(
@@ -1664,7 +1667,10 @@ mod tests {
         )
         .unwrap();
         let native = "/home/bob/shared/<**d> => /home/bob/admin/<dev>/KEY/<**k>";
-        let blobs = vec![SchemaBlob::lvs(lvs.clone()), SchemaBlob::native_text(native)];
+        let blobs = vec![
+            SchemaBlob::lvs(lvs.clone()),
+            SchemaBlob::native_text(native),
+        ];
         let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
             .with_schema_blobs(blobs.clone())
             .unwrap()
@@ -1704,14 +1710,18 @@ mod tests {
         assert!(back.enforces_hierarchy());
         assert!(!back.authorizes(&n("/home/bob/shared/notes"), &admin));
         assert_eq!(
-            back.explain(&n("/home/bob/shared/notes"), &admin).hierarchy_floor,
+            back.explain(&n("/home/bob/shared/notes"), &admin)
+                .hierarchy_floor,
             Some(false)
         );
 
         // Two LVS blobs are refused.
         let two = SignedTrustContext::hierarchical(n("/home/bob"))
             .with_schema_blobs(vec![SchemaBlob::lvs(lvs.clone()), SchemaBlob::lvs(lvs)]);
-        assert!(matches!(two, Err(SignedTrustContextError::MultipleLvsSchemas)));
+        assert!(matches!(
+            two,
+            Err(SignedTrustContextError::MultipleLvsSchemas)
+        ));
     }
 
     #[test]
@@ -1755,21 +1765,38 @@ mod tests {
         assert_eq!(decoded.stated_link_policy(), Some(&policy));
         assert!(!decoded.link_policy().allows_link("member"));
         assert!(decoded.link_policy().allows_relay("node"));
-        assert!(!decoded.admits_enrollment_links(), "the policy turned them off");
+        assert!(
+            !decoded.admits_enrollment_links(),
+            "the policy turned them off"
+        );
 
         let bare = SignedTrustContext::hierarchical(n("/home")).with_version(1);
         let decoded = SignedTrustContext::decode_content(&bare.encode_content(), 1).unwrap();
         let default = decoded.link_policy();
         assert_eq!(decoded.stated_link_policy(), None);
-        assert!(["admin", "member", "node", "guest"].iter().all(|r| default.allows_link(r)));
+        assert!(
+            ["admin", "member", "node", "guest"]
+                .iter()
+                .all(|r| default.allows_link(r))
+        );
         assert!(default.allows_relay("node") && !default.allows_relay("member"));
         assert!(default.enrollment_links);
-        assert!(!decoded.admits_enrollment_links(), "no CA endpoint to enroll at");
+        assert!(
+            !decoded.admits_enrollment_links(),
+            "no CA endpoint to enroll at"
+        );
         let with_ca = SignedTrustContext::hierarchical(n("/home"))
             .with_version(1)
             .with_ca_endpoint(n("/home/CA"));
-        assert!(with_ca.admits_enrollment_links(), "default on for a namespace with a CA");
-        assert_eq!(tlv::LINK_POLICY % 2, 0, "an old node must be able to skip it");
+        assert!(
+            with_ca.admits_enrollment_links(),
+            "default on for a namespace with a CA"
+        );
+        assert_eq!(
+            tlv::LINK_POLICY % 2,
+            0,
+            "an old node must be able to skip it"
+        );
     }
 
     // ── F9: source-bundle provenance hint ──────────────────────────────────
@@ -1808,14 +1835,19 @@ mod tests {
     fn key_roles_roundtrip_and_are_non_critical() {
         let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
             .with_version(3)
-            .with_key_role(KeyRole::RECOVERY_ANCHOR, n("/home/bob/KEY/r0011223344556677"))
+            .with_key_role(
+                KeyRole::RECOVERY_ANCHOR,
+                n("/home/bob/KEY/r0011223344556677"),
+            )
             .with_key_role(KeyRole::ROOT_DEVICE, n("/home/bob/CA/KEY/ca"))
             .with_key_role(KeyRole(9), n("/home/bob/x/KEY/k"));
         let decoded = SignedTrustContext::decode_content(&ctx.encode_content(), 3).unwrap();
         assert_eq!(decoded.key_roles(), ctx.key_roles());
         assert!(decoded.has_key_role(&n("/home/bob/CA/KEY/ca"), KeyRole::ROOT_DEVICE));
         assert_eq!(
-            decoded.keys_with_role(KeyRole::RECOVERY_ANCHOR).collect::<Vec<_>>(),
+            decoded
+                .keys_with_role(KeyRole::RECOVERY_ANCHOR)
+                .collect::<Vec<_>>(),
             [&n("/home/bob/KEY/r0011223344556677")]
         );
         assert_eq!(tlv::KEY_ROLE % 2, 0);
@@ -1937,10 +1969,15 @@ mod tests {
         let root = Ed25519Signer::from_seed(&[5u8; 32], key.clone());
         let pk = root.public_key_bytes();
         let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
-        let anchor_wire =
-            crate::manager::encode_cert_data(&n("/home/bob/KEY/root/self/v=1"), &pk, &root, 0, u64::MAX)
-                .await
-                .unwrap();
+        let anchor_wire = crate::manager::encode_cert_data(
+            &n("/home/bob/KEY/root/self/v=1"),
+            &pk,
+            &root,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
         let anchor = Certificate::decode(&Data::decode(anchor_wire).unwrap()).unwrap();
         assert!(ctx.add_anchor(anchor));
 
@@ -2036,7 +2073,10 @@ mod tests {
             (tlv::SCHEMA_AUTHORITATIVE, &[][..], "SchemaAuthoritative"),
         ] {
             let once = with_fields(&bare, &[tlv_bytes(t, v)]);
-            assert!(SignedTrustContext::decode_content(&once, 1).is_ok(), "{field} once");
+            assert!(
+                SignedTrustContext::decode_content(&once, 1).is_ok(),
+                "{field} once"
+            );
             let twice = with_fields(&bare, &[tlv_bytes(t, v), tlv_bytes(t, v)]);
             assert!(
                 matches!(
@@ -2057,7 +2097,10 @@ mod tests {
         assert_eq!(unknown.roles, ["admin"]);
         assert_eq!(unknown.relay_roles, ["node"]);
         assert!(!unknown.enrollment_links);
-        assert!(unknown.allows_direct_paths(), "an unknown word keeps the default");
+        assert!(
+            unknown.allows_direct_paths(),
+            "an unknown word keeps the default"
+        );
 
         let absent = LinkPolicy::decode(b";node;enrollment").unwrap();
         assert_eq!(absent, LinkPolicy::default());
@@ -2110,17 +2153,30 @@ mod tests {
         assert_eq!(LinkPolicy::decode(&members.encode()).unwrap(), members);
         assert!(members.allows_direct_path("member", "member"));
         assert!(!members.allows_direct_path("admin", "member"));
-        assert!(members.describe().ends_with("; direct paths: member:member"));
+        assert!(
+            members
+                .describe()
+                .ends_with("; direct paths: member:member")
+        );
 
         let with_guest = LinkPolicy {
-            direct_pairs: vec![("member".into(), "guest".into()), ("node".into(), "admin".into())],
+            direct_pairs: vec![
+                ("member".into(), "guest".into()),
+                ("node".into(), "admin".into()),
+            ],
             direct_paths: false,
             ..LinkPolicy::default()
         };
-        assert_eq!(with_guest.encode(), b";node;enrollment;no-direct;admin:node,guest:member");
+        assert_eq!(
+            with_guest.encode(),
+            b";node;enrollment;no-direct;admin:node,guest:member"
+        );
         let decoded = LinkPolicy::decode(&with_guest.encode()).unwrap();
         assert_eq!(decoded.direct_pairs, with_guest.canonical_direct_pairs());
-        assert!(!decoded.allows_direct_path("guest", "member"), "direct paths are off");
+        assert!(
+            !decoded.allows_direct_path("guest", "member"),
+            "direct paths are off"
+        );
 
         let none = LinkPolicy {
             direct_pairs: Vec::new(),
@@ -2131,7 +2187,12 @@ mod tests {
         assert!(none.describe().ends_with("; direct paths: no role pair"));
     }
 
-    fn relay(device: &str, key: Option<[u8; 32]>, endpoints: &[&str], preference: u32) -> AdvertisedRelay {
+    fn relay(
+        device: &str,
+        key: Option<[u8; 32]>,
+        endpoints: &[&str],
+        preference: u32,
+    ) -> AdvertisedRelay {
         AdvertisedRelay {
             device: n(device),
             key,
@@ -2146,7 +2207,12 @@ mod tests {
     #[test]
     fn advertised_relays_round_trip_in_canonical_order() {
         let far = relay("/club/node/r", Some([7; 32]), &["club.example.org:6367"], 5);
-        let near = relay("/home/node/b", None, &["b.example.net:6367", "192.0.2.1:6367"], 0);
+        let near = relay(
+            "/home/node/b",
+            None,
+            &["b.example.net:6367", "192.0.2.1:6367"],
+            0,
+        );
         let tie = relay("/home/node/a", None, &["a.example.net:6367"], 0);
         let ctx = SignedTrustContext::hierarchical(n("/home"))
             .with_version(2)
@@ -2158,9 +2224,18 @@ mod tests {
             .with_version(2)
             .with_relays(vec![near, tie, far]);
         assert_eq!(again.encode_content(), ctx.encode_content());
-        assert_eq!(tlv::ADVERTISED_RELAY % 2, 0, "an old node must be able to skip it");
+        assert_eq!(
+            tlv::ADVERTISED_RELAY % 2,
+            0,
+            "an old node must be able to skip it"
+        );
         let bare = SignedTrustContext::hierarchical(n("/home")).with_version(1);
-        assert!(SignedTrustContext::decode_content(&bare.encode_content(), 1).unwrap().relays().is_empty());
+        assert!(
+            SignedTrustContext::decode_content(&bare.encode_content(), 1)
+                .unwrap()
+                .relays()
+                .is_empty()
+        );
     }
 
     /// A malformed relay entry is dropped, not the context; an unknown
@@ -2172,14 +2247,22 @@ mod tests {
         let entry = |parts: &[&[u8]]| tlv_bytes(tlv::ADVERTISED_RELAY, &parts.concat());
         let ok = entry(&[&name("/h/node/ok"), &endpoint, &tlv_bytes(0x0428, b"x")]);
         let malformed = [
-            entry(&[&name("/h/node/a")]),                                   // no endpoint
+            entry(&[&name("/h/node/a")]), // no endpoint
             entry(&[&name("/h/node/b"), &endpoint, &tlv_bytes(0x0429, b"x")]), // unknown critical
-            entry(&[&name("/h/node/c"), &tlv_bytes(tlv::RELAY_KEY, &[1; 31]), &endpoint]),
+            entry(&[
+                &name("/h/node/c"),
+                &tlv_bytes(tlv::RELAY_KEY, &[1; 31]),
+                &endpoint,
+            ]),
             entry(&[&name("/h/node/d"), &tlv_bytes(tlv::RELAY_ENDPOINT, b"")]),
-            entry(&[&name("/h/node/e"), &endpoint, &tlv_bytes(tlv::RELAY_PREFERENCE, &[1; 5])]),
+            entry(&[
+                &name("/h/node/e"),
+                &endpoint,
+                &tlv_bytes(tlv::RELAY_PREFERENCE, &[1; 5]),
+            ]),
             entry(&[&name("/h/node/f"), &name("/h/node/g"), &endpoint]),
-            entry(&[&endpoint]),                                            // no device
-            entry(&[&name("/other/node/r"), &endpoint]),                    // outside, no key
+            entry(&[&endpoint]),                         // no device
+            entry(&[&name("/other/node/r"), &endpoint]), // outside, no key
         ];
         let mut body = n("/h").encode_to_tlv().to_vec();
         body.extend_from_slice(&tlv_bytes(
@@ -2195,7 +2278,10 @@ mod tests {
         }
         let ctx = SignedTrustContext::decode_content(&tlv_bytes(tlv::TRUST_CONTEXT, &body), 1)
             .expect("a malformed relay does not reject the context");
-        assert_eq!(ctx.relays(), [relay("/h/node/ok", None, &["r.example.net:6367"], 0)]);
+        assert_eq!(
+            ctx.relays(),
+            [relay("/h/node/ok", None, &["r.example.net:6367"], 0)]
+        );
     }
 
     /// The LinkPolicy and AdvertisedRelay vectors of trust-context.md §11 T5.
@@ -2218,15 +2304,28 @@ mod tests {
             ..LinkPolicy::default()
         };
         w.write_tlv(tlv::LINK_POLICY, &none.encode());
-        assert_eq!(hex(&w.finish()), "fd0412183b6e6f64653b656e726f6c6c6d656e743b6469726563743b");
+        assert_eq!(
+            hex(&w.finish()),
+            "fd0412183b6e6f64653b656e726f6c6c6d656e743b6469726563743b"
+        );
 
         let fingerprint: [u8; 32] = [
             0x56, 0x47, 0x5a, 0xa7, 0x54, 0x63, 0x47, 0x4c, 0x02, 0x85, 0xdf, 0x5d, 0xbf, 0x2b,
             0xca, 0xb7, 0x3d, 0xa6, 0x51, 0x35, 0x88, 0x39, 0xe9, 0xb7, 0x74, 0x81, 0xb2, 0xea,
             0xb1, 0x07, 0x70, 0x8c,
         ];
-        let r1 = relay("/home/bob/node/relay", Some(fingerprint), &["relay.example.net:6367"], 0);
-        let r2 = relay("/home/bob/node/r2", None, &["192.0.2.7:6367", "[2001:db8::7]:6367"], 300);
+        let r1 = relay(
+            "/home/bob/node/relay",
+            Some(fingerprint),
+            &["relay.example.net:6367"],
+            0,
+        );
+        let r2 = relay(
+            "/home/bob/node/r2",
+            None,
+            &["192.0.2.7:6367", "[2001:db8::7]:6367"],
+            300,
+        );
         let mut w = TlvWriter::new();
         w.write_tlv(tlv::ADVERTISED_RELAY, &r1.encode());
         assert_eq!(
@@ -2315,12 +2414,22 @@ mod tests {
         ]);
         let content = with_fields(&ctx.encode_content(), std::slice::from_ref(&unknown));
         let decoded = SignedTrustContext::decode_content(&content, 1).unwrap();
-        let formats: Vec<_> = decoded.published_schemas().iter().map(|b| b.format).collect();
-        assert_eq!(formats, [SchemaFormat::NativeText, SchemaFormat::Unknown(9)]);
+        let formats: Vec<_> = decoded
+            .published_schemas()
+            .iter()
+            .map(|b| b.format)
+            .collect();
+        assert_eq!(
+            formats,
+            [SchemaFormat::NativeText, SchemaFormat::Unknown(9)]
+        );
         assert!(decoded.authorizes(&n("/home/a/x"), &n("/home/a/KEY/k")));
         assert!(!decoded.authorizes(&n("/home/b/x"), &n("/home/b/KEY/k")));
         let again = SignedTrustContext::decode_content(&decoded.encode_content(), 1).unwrap();
-        assert_eq!(again.published_schemas()[1].format, SchemaFormat::Unknown(9));
+        assert_eq!(
+            again.published_schemas()[1].format,
+            SchemaFormat::Unknown(9)
+        );
 
         let mut w = TlvWriter::new();
         w.write_nested(tlv::TRUST_CONTEXT, |w| {
@@ -2349,7 +2458,9 @@ mod tests {
         };
         let format = tlv_bytes(tlv::SCHEMA_FORMAT, &[tlv::SCHEMA_FORMAT_NATIVE]);
         let body = tlv_bytes(tlv::SCHEMA_BODY, b"/home/<**d> => /home/KEY/<k>");
-        let decode = |sub: &[Bytes]| SignedTrustContext::decode_content(&with_fields(&bare, &[blob(sub)]), 1);
+        let decode = |sub: &[Bytes]| {
+            SignedTrustContext::decode_content(&with_fields(&bare, &[blob(sub)]), 1)
+        };
 
         assert!(decode(&[format.clone(), body.clone()]).is_ok());
         assert!(decode(&[format.clone(), tlv_bytes(0x0420, b"x"), body.clone()]).is_ok());

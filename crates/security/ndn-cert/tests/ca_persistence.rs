@@ -30,12 +30,22 @@ fn ca_key() -> Name {
 /// with a certificate issued by the root.
 async fn root_manager() -> (Arc<SecurityManager>, Certificate) {
     let mgr = SecurityManager::new();
-    mgr.generate_ed25519_from_seed(root_key(), &ROOT_SEED).unwrap();
-    let root_pub = mgr.get_signer_sync(&root_key()).unwrap().public_key().unwrap();
-    mgr.issue_self_signed(&root_key(), root_pub, u64::MAX).unwrap();
+    mgr.generate_ed25519_from_seed(root_key(), &ROOT_SEED)
+        .unwrap();
+    let root_pub = mgr
+        .get_signer_sync(&root_key())
+        .unwrap()
+        .public_key()
+        .unwrap();
+    mgr.issue_self_signed(&root_key(), root_pub, u64::MAX)
+        .unwrap();
 
     mgr.generate_ed25519_from_seed(ca_key(), &CA_SEED).unwrap();
-    let ca_pub = mgr.get_signer_sync(&ca_key()).unwrap().public_key().unwrap();
+    let ca_pub = mgr
+        .get_signer_sync(&ca_key())
+        .unwrap()
+        .public_key()
+        .unwrap();
     let ca_cert = mgr
         .certify(&ca_key(), ca_pub, &root_key(), 3_650 * 86_400 * 1_000)
         .await
@@ -70,7 +80,11 @@ impl CaExchange for CaWire {
         let body = if verb(b"NEW").is_some() {
             self.0.handle_new(&params()).await?
         } else if let Some(i) = verb(b"CHALLENGE") {
-            let rid: String = comps[i + 1].value.iter().map(|b| format!("{b:02x}")).collect();
+            let rid: String = comps[i + 1]
+                .value
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             self.0.handle_challenge(&rid, &params()).await?
         } else {
             let wire = self
@@ -164,7 +178,10 @@ async fn restarted_ca_serves_old_certs_and_chains_to_same_root() {
 
     let second = enroll(&ca, "phone", 0x55).await;
     for (issued, ca_cert) in [(&first, &ca_cert_1), (&second, &ca_cert_2)] {
-        assert!(signed_by(issued, ca_cert).await, "issued cert signed by the CA key");
+        assert!(
+            signed_by(issued, ca_cert).await,
+            "issued cert signed by the CA key"
+        );
     }
     // Both CA certs are the same key certified by the same root.
     assert_eq!(ca_cert_1.public_key, ca_cert_2.public_key);

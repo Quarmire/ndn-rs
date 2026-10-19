@@ -769,7 +769,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(context_data.as_deref(), Some(&b"\x06\x03abc"[..]));
-        assert_eq!(context_content, None, "signed Data is not decoded as legacy content");
+        assert_eq!(
+            context_content, None,
+            "signed Data is not decoded as legacy content"
+        );
     }
 
     #[test]
@@ -1017,7 +1020,10 @@ mod tests {
                 w.write_tlv(T_KIND, &[TrustKind::Recovery.code()]);
                 w.write_nested(T_BODY, |w| w.write_tlv(T_WIRE, b"b"));
             });
-            assert_eq!(TrustEnvelope::decode(&wire), Err(EnvelopeError::Malformed(error)));
+            assert_eq!(
+                TrustEnvelope::decode(&wire),
+                Err(EnvelopeError::Malformed(error))
+            );
         }
         let wire = raw(|w| {
             w.write_tlv(T_FORMAT_VERSION, &[FORMAT_VERSION]);
@@ -1090,7 +1096,11 @@ mod tests {
                 "{token:?}"
             );
         }
-        let payload = recovery_uri("recovery").rsplit('/').next().unwrap().to_owned();
+        let payload = recovery_uri("recovery")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
         assert!(matches!(
             TrustEnvelope::from_uri(&format!("https://x.example/t/bag#{payload}")),
             Err(EnvelopeError::KindMismatch { .. })
@@ -1100,26 +1110,61 @@ mod tests {
     /// The mirror is `https://<domain>/t/<kind>#<payload>`, nothing looser.
     #[test]
     fn mirror_is_https_with_the_t_kind_path() {
-        let payload = recovery_uri("recovery").rsplit('/').next().unwrap().to_owned();
+        let payload = recovery_uri("recovery")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
         let ok = |s: String| assert!(TrustEnvelope::from_uri(&s).is_ok(), "{s}");
         ok(format!("https://join.example/t/recovery#{payload}"));
         ok(format!("https://join.example:8443/t/recovery#{payload}"));
-        let err = |s: String, e: EnvelopeError| assert_eq!(TrustEnvelope::from_uri(&s), Err(e), "{s}");
-        err(format!("http://x/t/recovery#{payload}"), EnvelopeError::UnknownScheme);
-        err(format!("https://x/recovery#{payload}"), EnvelopeError::UnknownScheme);
-        err(format!("https://x/a/t/recovery#{payload}"), EnvelopeError::UnknownScheme);
-        err(format!("https://x/t/recovery/y#{payload}"), EnvelopeError::UnknownScheme);
-        err(format!("https://x/t/recovery?q=1#{payload}"), EnvelopeError::UnknownScheme);
-        err(format!("https://x/y#/t/recovery{payload}"), EnvelopeError::UnknownScheme);
+        let err =
+            |s: String, e: EnvelopeError| assert_eq!(TrustEnvelope::from_uri(&s), Err(e), "{s}");
+        err(
+            format!("http://x/t/recovery#{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
+        err(
+            format!("https://x/recovery#{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
+        err(
+            format!("https://x/a/t/recovery#{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
+        err(
+            format!("https://x/t/recovery/y#{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
+        err(
+            format!("https://x/t/recovery?q=1#{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
+        err(
+            format!("https://x/y#/t/recovery{payload}"),
+            EnvelopeError::UnknownScheme,
+        );
         err("https://x/t/recovery".into(), EnvelopeError::MalformedUri);
-        err(format!("https:///t/recovery#{payload}"), EnvelopeError::MalformedUri);
+        err(
+            format!("https:///t/recovery#{payload}"),
+            EnvelopeError::MalformedUri,
+        );
     }
 
     #[test]
     fn legacy_version_is_decimal_digits_only() {
         assert!(TrustEnvelope::from_uri("ndn-ctx:1:42:Y3R4").is_ok());
-        for bad in ["ndn-ctx:1:+42:Y3R4", "ndn-ctx:1::Y3R4", "ndn-ctx:1:-1:Y3R4", "ndn-ctx:1: 42:Y3R4"] {
-            assert_eq!(TrustEnvelope::from_uri(bad), Err(EnvelopeError::MalformedUri), "{bad}");
+        for bad in [
+            "ndn-ctx:1:+42:Y3R4",
+            "ndn-ctx:1::Y3R4",
+            "ndn-ctx:1:-1:Y3R4",
+            "ndn-ctx:1: 42:Y3R4",
+        ] {
+            assert_eq!(
+                TrustEnvelope::from_uri(bad),
+                Err(EnvelopeError::MalformedUri),
+                "{bad}"
+            );
         }
     }
 }

@@ -619,7 +619,11 @@ mod tests {
             ..MetaData::default()
         };
         let wire = m.encode();
-        assert_eq!(wire, versioned.encode_to_tlv(), "content is exactly the Name TLV");
+        assert_eq!(
+            wire,
+            versioned.encode_to_tlv(),
+            "content is exactly the Name TLV"
+        );
         let m2 = MetaData::decode(wire).unwrap();
         assert_eq!(m2.versioned_name, versioned);
         assert_eq!(m2.final_block_id, None);

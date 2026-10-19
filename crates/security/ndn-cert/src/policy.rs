@@ -899,14 +899,29 @@ mod issuance_tests {
         let token = AttestationSet::single(token_leaf(None));
         let both = AttestationSet::new(
             crate::attestation::Combinator::AllOf,
-            vec![token_leaf(None), ChallengeAttestation::of_kind("device-approval")],
+            vec![
+                token_leaf(None),
+                ChallengeAttestation::of_kind("device-approval"),
+            ],
         );
         for who in ["/home/bob/admin/desk/KEY/k1", "/home/bob/node/vps/KEY/k1"] {
-            assert!(!issued(&policy, who, "token", Some(&token)), "{who} by token");
-            assert!(issued(&policy, who, "device-approval", Some(&approval)), "{who}");
-            assert!(issued(&policy, who, "all-of", Some(&both)), "{who} by token+approval");
+            assert!(
+                !issued(&policy, who, "token", Some(&token)),
+                "{who} by token"
+            );
+            assert!(
+                issued(&policy, who, "device-approval", Some(&approval)),
+                "{who}"
+            );
+            assert!(
+                issued(&policy, who, "all-of", Some(&both)),
+                "{who} by token+approval"
+            );
             // A single-challenge leaf the CA did not run is not believed.
-            assert!(!issued(&policy, who, "token", Some(&approval)), "{who}: forged leaf");
+            assert!(
+                !issued(&policy, who, "token", Some(&approval)),
+                "{who}: forged leaf"
+            );
             // Approval-less composites do not qualify either.
             let tokens_only = AttestationSet::new(
                 crate::attestation::Combinator::AllOf,

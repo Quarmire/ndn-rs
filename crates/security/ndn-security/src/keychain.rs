@@ -801,19 +801,21 @@ mod tests {
         let kc = KeyChain::open_or_create(dir.path(), "/legacy/node").unwrap();
         assert_eq!(kc.key_name(), &legacy, "legacy key reused, not replaced");
         let wire = kc
-            .sign_data(DataBuilder::new(ndn_packet::name!("/legacy/node/d"), b"body"))
+            .sign_data(DataBuilder::new(
+                ndn_packet::name!("/legacy/node/d"),
+                b"body",
+            ))
             .unwrap();
         let data = Data::decode(wire).unwrap();
         let locator = data.sig_info().unwrap().key_locator.as_ref().unwrap();
         let locator = Arc::new(locator.as_name().unwrap().clone());
         let cert = kc.cert_cache().get(&locator).expect("KeyLocator resolves");
-        assert_eq!(crate::cert_name::key_name_of(&cert.name), crate::cert_name::key_name_of(&legacy));
         assert_eq!(
-            Ed25519Verifier.verify_sync(
-                data.signed_region(),
-                data.sig_value(),
-                &raw_pk,
-            ),
+            crate::cert_name::key_name_of(&cert.name),
+            crate::cert_name::key_name_of(&legacy)
+        );
+        assert_eq!(
+            Ed25519Verifier.verify_sync(data.signed_region(), data.sig_value(), &raw_pk,),
             VerifyOutcome::Valid
         );
     }

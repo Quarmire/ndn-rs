@@ -229,7 +229,11 @@ impl CertFetcher {
         let failed = self.failed.get(&key).map(|e| *e.value());
         if let Some(failed) = failed {
             if tokio::time::Instant::now() < failed.retry_at {
-                let why = if failed.absent { "known absent" } else { "recently failed" };
+                let why = if failed.absent {
+                    "known absent"
+                } else {
+                    "recently failed"
+                };
                 return Err(TrustError::CertNotFound {
                     name: format!("{why}: {cert_name}"),
                 });
@@ -246,12 +250,11 @@ impl CertFetcher {
                     Ok(Some(cert)) => Ok(cert),
                     // Closed before we subscribed in time: the leader may still
                     // have succeeded (it caches before publishing).
-                    _ => self
-                        .cert_cache
-                        .get_valid(cert_name)
-                        .ok_or_else(|| TrustError::CertNotFound {
+                    _ => self.cert_cache.get_valid(cert_name).ok_or_else(|| {
+                        TrustError::CertNotFound {
                             name: cert_name.to_string(),
-                        }),
+                        }
+                    }),
                 };
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -290,7 +293,11 @@ impl CertFetcher {
         result.map_err(|miss| miss.error)
     }
 
-    async fn do_fetch(&self, cert_name: &Arc<Name>, face: Option<u64>) -> Result<Certificate, Miss> {
+    async fn do_fetch(
+        &self,
+        cert_name: &Arc<Name>,
+        face: Option<u64>,
+    ) -> Result<Certificate, Miss> {
         let name = cert_name.as_ref().clone();
         let routed = (self.fetch_fn)(name.clone());
         let answer = async {
@@ -660,7 +667,11 @@ mod tests {
         for _ in 0..50 {
             assert!(fetcher.fetch(&name).await.is_err());
         }
-        assert_eq!(count.load(Ordering::Relaxed), 1, "one Interest per backoff window");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "one Interest per backoff window"
+        );
         // A different name is unaffected.
         assert!(fetcher.fetch(&make_cert_name("other")).await.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 2);
@@ -669,30 +680,28 @@ mod tests {
     #[tokio::test]
     async fn failed_fetch_is_retried_after_backoff() {
         let (fetch_fn, count) = counting_miss_fetch_fn();
-        let fetcher = CertFetcher::new(
-            Arc::new(CertCache::new()),
-            fetch_fn,
-            Duration::from_secs(1),
-        )
-        .with_negative_ttl(Duration::from_millis(30));
+        let fetcher =
+            CertFetcher::new(Arc::new(CertCache::new()), fetch_fn, Duration::from_secs(1))
+                .with_negative_ttl(Duration::from_millis(30));
         let name = make_cert_name("later");
         assert!(fetcher.fetch(&name).await.is_err());
         assert!(fetcher.fetch(&name).await.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 1);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(fetcher.fetch(&name).await.is_err());
-        assert_eq!(count.load(Ordering::Relaxed), 2, "backoff expired → refetch");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "backoff expired → refetch"
+        );
     }
 
     #[tokio::test]
     async fn zero_negative_ttl_disables_backoff() {
         let (fetch_fn, count) = counting_miss_fetch_fn();
-        let fetcher = CertFetcher::new(
-            Arc::new(CertCache::new()),
-            fetch_fn,
-            Duration::from_secs(1),
-        )
-        .with_negative_ttl(Duration::ZERO);
+        let fetcher =
+            CertFetcher::new(Arc::new(CertCache::new()), fetch_fn, Duration::from_secs(1))
+                .with_negative_ttl(Duration::ZERO);
         let name = make_cert_name("nocache");
         for _ in 0..3 {
             assert!(fetcher.fetch(&name).await.is_err());
@@ -711,7 +720,11 @@ mod tests {
         let routed: FetchFn = Arc::new(|_| Box::pin(std::future::pending()));
         let asked = Arc::new(std::sync::OnceLock::new());
         let count = Arc::new(AtomicUsize::new(0));
-        let (cn, log, n) = (Arc::clone(&cert_name), Arc::clone(&asked), Arc::clone(&count));
+        let (cn, log, n) = (
+            Arc::clone(&cert_name),
+            Arc::clone(&asked),
+            Arc::clone(&count),
+        );
         let started = tokio::time::Instant::now();
         let direct: DirectFetchFn = Arc::new(move |_, face| {
             n.fetch_add(1, Ordering::Relaxed);
@@ -754,7 +767,11 @@ mod tests {
 
         let unrouted = make_cert_name("unrouted");
         assert!(fetcher.fetch(&unrouted).await.is_err());
-        assert_eq!(direct_count.load(Ordering::Relaxed), 0, "no face named, none asked");
+        assert_eq!(
+            direct_count.load(Ordering::Relaxed),
+            0,
+            "no face named, none asked"
+        );
     }
 
     /// A refusal of what the routes served is a miss for the routes only:
@@ -806,11 +823,17 @@ mod tests {
                 Box::pin(async move { Ok(data) })
             });
             let fetcher = CertFetcher::new(Arc::clone(&cache), fetch_fn, Duration::from_secs(1));
-            assert!(fetcher.fetch(&asked).await.is_err(), "{asked} accepted a foreign answer");
+            assert!(
+                fetcher.fetch(&asked).await.is_err(),
+                "{asked} accepted a foreign answer"
+            );
             assert!(cache.get(&asked).is_none());
         }
         // A certificate of the key, and a legacy key-named one, do answer.
-        for (asked, answered) in [("/a/KEY/k", "/a/KEY/k/NDNCERT/v=1"), ("/a/KEY/k", "/a/KEY/k")] {
+        for (asked, answered) in [
+            ("/a/KEY/k", "/a/KEY/k/NDNCERT/v=1"),
+            ("/a/KEY/k", "/a/KEY/k"),
+        ] {
             let asked: Arc<Name> = Arc::new(asked.parse().unwrap());
             let answered: Name = answered.parse().unwrap();
             let fetch_fn: FetchFn = Arc::new(move |_| {
@@ -900,10 +923,16 @@ mod tests {
             .with_negative_ttl(Duration::from_millis(100))
             .with_direct_fetch(direct_answering(FetchMiss::Absent));
 
-        assert!(!fetcher.known_absent(&name, Some(9)), "not before it was asked");
+        assert!(
+            !fetcher.known_absent(&name, Some(9)),
+            "not before it was asked"
+        );
         assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
         assert!(fetcher.known_absent(&name, Some(9)));
-        assert!(!fetcher.known_absent(&name, Some(4)), "only for the face asked");
+        assert!(
+            !fetcher.known_absent(&name, Some(4)),
+            "only for the face asked"
+        );
         assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
         assert_eq!(count.load(Ordering::Relaxed), 1, "backed off as before");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -941,19 +970,29 @@ mod tests {
         ];
         for (routed, direct, absent) in cases {
             let (routed_fn, _) = answering(routed);
-            let fetcher =
-                CertFetcher::new(Arc::new(CertCache::new()), routed_fn, Duration::from_secs(1))
-                    .with_direct_fetch(direct_answering(direct));
+            let fetcher = CertFetcher::new(
+                Arc::new(CertCache::new()),
+                routed_fn,
+                Duration::from_secs(1),
+            )
+            .with_direct_fetch(direct_answering(direct));
             assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
-            assert_eq!(fetcher.known_absent(&name, Some(9)), absent, "{routed:?} + {direct:?}");
+            assert_eq!(
+                fetcher.known_absent(&name, Some(9)),
+                absent,
+                "{routed:?} + {direct:?}"
+            );
         }
 
         // The routes say none, the neighbour never answers: the fetch times
         // out, and nothing is known.
         let (routed, _) = answering(FetchMiss::Absent);
-        let fetcher =
-            CertFetcher::new(Arc::new(CertCache::new()), routed, Duration::from_millis(200))
-                .with_direct_fetch(Arc::new(|_, _| Box::pin(std::future::pending())));
+        let fetcher = CertFetcher::new(
+            Arc::new(CertCache::new()),
+            routed,
+            Duration::from_millis(200),
+        )
+        .with_direct_fetch(Arc::new(|_, _| Box::pin(std::future::pending())));
         assert!(fetcher.fetch_from(&name, Some(9)).await.is_err());
         assert!(!fetcher.known_absent(&name, Some(9)));
 

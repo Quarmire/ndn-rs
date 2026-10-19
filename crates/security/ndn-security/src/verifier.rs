@@ -116,7 +116,10 @@ pub fn verify_digest(
             Sha256::digest(region).as_slice() == sig_value
         }
         SignatureType::Other(c) if c == SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN => {
-            crate::signer::blake3_hash_auto(region).as_bytes().as_slice() == sig_value
+            crate::signer::blake3_hash_auto(region)
+                .as_bytes()
+                .as_slice()
+                == sig_value
         }
         other => {
             return Err(TrustError::UnsupportedSignatureType {
@@ -640,9 +643,15 @@ mod tests {
             let blake3 = blake3::hash(region).as_bytes().to_vec();
             for (sig_type, sig) in [
                 (SignatureType::SignatureHmacWithSha256, &hmac[..]),
-                (SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED), &keyed[..]),
+                (
+                    SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_KEYED),
+                    &keyed[..],
+                ),
                 (SignatureType::DigestSha256, &sha[..]),
-                (SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN), &blake3[..]),
+                (
+                    SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN),
+                    &blake3[..],
+                ),
             ] {
                 let outcome = verify_by_sig_type(sig_type, region, sig, public_key).await;
                 assert!(
@@ -697,7 +706,10 @@ mod tests {
         let blake3 = blake3::hash(region);
         let ok = |sig_type, sig: &[u8]| verify_digest(sig_type, region, sig).unwrap();
         assert_eq!(ok(SignatureType::DigestSha256, &sha), VerifyOutcome::Valid);
-        assert_eq!(ok(SignatureType::DigestSha256, &[0u8; 32]), VerifyOutcome::Invalid);
+        assert_eq!(
+            ok(SignatureType::DigestSha256, &[0u8; 32]),
+            VerifyOutcome::Invalid
+        );
         let plain = SignatureType::Other(SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN);
         assert_eq!(ok(plain, blake3.as_bytes()), VerifyOutcome::Valid);
         assert_eq!(ok(plain, &sha), VerifyOutcome::Invalid);

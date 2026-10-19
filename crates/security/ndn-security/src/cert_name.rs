@@ -147,9 +147,15 @@ mod tests {
         assert_eq!(key_name_of(&key), key);
         assert!(is_cert_of(&cert, &key));
         assert!(is_cert_of(&key, &key));
-        assert!(!is_cert_of(&n("/home/bob/member/phone/KEY/k2/NDNCERT/v=7"), &key));
+        assert!(!is_cert_of(
+            &n("/home/bob/member/phone/KEY/k2/NDNCERT/v=7"),
+            &key
+        ));
         // A certificate-shaped key name is reduced to its key first.
-        assert_eq!(cert_name(&cert, SELF_ISSUER, 9), n("/home/bob/member/phone/KEY/k1/self/v=9"));
+        assert_eq!(
+            cert_name(&cert, SELF_ISSUER, 9),
+            n("/home/bob/member/phone/KEY/k1/self/v=9")
+        );
     }
 
     #[test]
@@ -162,10 +168,13 @@ mod tests {
     /// Only the GenericNameComponent `KEY` marks a key or certificate name.
     #[test]
     fn only_a_generic_key_component_counts() {
-        let keyword_key = n("/home/bob/x").append_component(NameComponent::keyword(
-            Bytes::from_static(b"KEY"),
-        ));
-        let cert = keyword_key.clone().append("k1").append("self").append_version(1);
+        let keyword_key =
+            n("/home/bob/x").append_component(NameComponent::keyword(Bytes::from_static(b"KEY")));
+        let cert = keyword_key
+            .clone()
+            .append("k1")
+            .append("self")
+            .append_version(1);
         assert!(!is_cert_name(&cert));
         assert_eq!(key_name_of(&cert), cert);
         assert!(is_cert_name(&n("/home/bob/x/KEY/k1/self/v=1")));

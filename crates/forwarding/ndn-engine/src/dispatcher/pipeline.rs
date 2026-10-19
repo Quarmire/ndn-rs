@@ -529,7 +529,9 @@ impl PacketDispatcher {
                         // A refusal is told to local downstreams only (see
                         // `refuse`); a non-local one learns that this path
                         // has nothing usable, as from any other upstream.
-                        let reason = if upstream_reason.refusal().is_some() && !self.is_local_face(face_id) {
+                        let reason = if upstream_reason.refusal().is_some()
+                            && !self.is_local_face(face_id)
+                        {
                             ndn_packet::NackReason::NoRoute
                         } else {
                             upstream_reason

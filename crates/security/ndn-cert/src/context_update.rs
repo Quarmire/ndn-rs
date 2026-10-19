@@ -61,8 +61,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy, LvsModel,
-    OpenContextError, SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext,
+    AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy,
+    LvsModel, OpenContextError, SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext,
     SignedTrustContextError, Signer, Validator,
 };
 
@@ -189,7 +189,10 @@ pub struct ContextBump {
 /// ([`key_name_of`]) under the namespace, or is the key of one of its anchors.
 /// Needs no key: a caller checks a revocation with it before unlocking the
 /// root that signs it ([`bump_context_revoking`] applies the same checks).
-pub fn revocations_to_add(ctx: &SignedTrustContext, revoke: &[Name]) -> Result<Vec<Name>, BumpError> {
+pub fn revocations_to_add(
+    ctx: &SignedTrustContext,
+    revoke: &[Name],
+) -> Result<Vec<Name>, BumpError> {
     let namespace = ctx.namespace();
     let mut added = Vec::new();
     for name in revoke {
@@ -350,7 +353,11 @@ pub fn link_narrowing(before: &LinkPolicy, after: &LinkPolicy) -> Vec<String> {
     for role in before.roles.iter().filter(|r| !after.allows_link(r)) {
         narrowed.push(format!("{role} devices may no longer link"));
     }
-    for role in before.relay_roles.iter().filter(|r| !after.relay_roles.contains(r)) {
+    for role in before
+        .relay_roles
+        .iter()
+        .filter(|r| !after.relay_roles.contains(r))
+    {
         narrowed.push(format!("{role} devices may no longer relay"));
     }
     if before.enrollment_links && !after.enrollment_links {
@@ -388,7 +395,10 @@ pub fn relay_narrowing(before: &[AdvertisedRelay], after: &[AdvertisedRelay]) ->
         })
         .map(|b| {
             if after.iter().any(|a| a.device == b.device) {
-                format!("{} is advertised with another expected fingerprint", b.device)
+                format!(
+                    "{} is advertised with another expected fingerprint",
+                    b.device
+                )
             } else {
                 format!("{} is no longer advertised as a relay", b.device)
             }
@@ -429,8 +439,9 @@ fn schema_grants(blobs: &[SchemaBlob]) -> Result<Vec<(String, String)>, BumpErro
                     let label = model.node_label(node.id);
                     for signer in &node.sign_constraints {
                         let signer_label = model.node_label(*signer);
-                        let signer_pattern =
-                            model.node_pattern(*signer).unwrap_or_else(|| signer_label.clone());
+                        let signer_pattern = model
+                            .node_pattern(*signer)
+                            .unwrap_or_else(|| signer_label.clone());
                         grants.push((
                             format!("lvs {pattern} <= {signer_pattern}"),
                             format!("{label}: {pattern} <= {signer_label}"),
@@ -1094,16 +1105,17 @@ where
         refusal,
     };
 
-    let pointer = fetch_context_pointer(exchange, namespace)
-        .await
-        .map_err(|source| match source {
-            FetchContextError::Transport { .. } => RefreshError::NoAnswer {
-                namespace: namespace.to_string(),
-                held: held.version(),
-                source,
-            },
-            source => fetch_failed(source),
-        })?;
+    let pointer =
+        fetch_context_pointer(exchange, namespace)
+            .await
+            .map_err(|source| match source {
+                FetchContextError::Transport { .. } => RefreshError::NoAnswer {
+                    namespace: namespace.to_string(),
+                    held: held.version(),
+                    source,
+                },
+                source => fetch_failed(source),
+            })?;
     // `fetch_context_pointer` confines the pointer to `<ns>/32=trust-context/v=<N>`.
     let offered = pointer
         .components()

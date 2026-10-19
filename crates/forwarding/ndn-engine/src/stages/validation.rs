@@ -262,7 +262,11 @@ impl ValidationStage {
         // stays false, so it is never cached; its consumers validate it. A
         // namespace held here is validated whatever the transit marks say.
         if self.transit.covers(&data.name)
-            && validator.keyring().context_for(&data.name).namespace().is_empty()
+            && validator
+                .keyring()
+                .context_for(&data.name)
+                .namespace()
+                .is_empty()
         {
             trace!(target: t::SECURITY, name=%data.name, "validation: in transit (a served namespace not held here), forwarded unvalidated");
             return Action::Satisfy(ctx);
@@ -415,10 +419,9 @@ fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
         ),
         TrustError::InvalidSignature
         | TrustError::InvalidKey
-        | TrustError::NotPublicKeySignature { .. } => (
-            Refusal::BadSignature,
-            "FAILED — forged/invalid signature",
-        ),
+        | TrustError::NotPublicKeySignature { .. } => {
+            (Refusal::BadSignature, "FAILED — forged/invalid signature")
+        }
         TrustError::SchemaMismatch | TrustError::CertNotAuthorized { .. } => (
             Refusal::Schema,
             "REFUSED — not authorized by the trust schema",
@@ -621,7 +624,10 @@ mod tests {
         let action = stage
             .process(ctx_for(signed_data("/t/leaf/photo", &leaf)))
             .await;
-        assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
+        assert!(matches!(
+            action,
+            Action::Drop(DropReason::ValidationPending)
+        ));
 
         wait_cached(&validator, leaf.key_name()).await;
         assert!(
@@ -660,7 +666,10 @@ mod tests {
             let action = stage
                 .process(ctx_for(signed_data(&format!("/t/ghost/{i}"), &ghost)))
                 .await;
-            assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
+            assert!(matches!(
+                action,
+                Action::Drop(DropReason::ValidationPending)
+            ));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(stage.drain_pending().await.is_empty(), "nothing ready yet");
@@ -674,7 +683,10 @@ mod tests {
                 .all(|a| matches!(a, Action::Drop(DropReason::ValidationTimeout)))
         );
         assert_eq!(stage.stats().dropped_timeout.load(Ordering::Relaxed), 20);
-        assert!(stage.drain_pending().await.is_empty(), "no retry after drop");
+        assert!(
+            stage.drain_pending().await.is_empty(),
+            "no retry after drop"
+        );
         assert_eq!(
             fetches.load(Ordering::Relaxed),
             1,
@@ -701,7 +713,10 @@ mod tests {
         let action = stage
             .process(ctx_for(signed_data("/t/ghost/doc", &ghost)))
             .await;
-        assert!(matches!(action, Action::Drop(DropReason::ValidationPending)));
+        assert!(matches!(
+            action,
+            Action::Drop(DropReason::ValidationPending)
+        ));
         let mut actions = Vec::new();
         for _ in 0..200 {
             actions = stage.drain_pending().await;
@@ -711,7 +726,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
-            matches!(actions.as_slice(), [Action::Refuse(_, Refusal::Unverifiable)]),
+            matches!(
+                actions.as_slice(),
+                [Action::Refuse(_, Refusal::Unverifiable)]
+            ),
             "the Data is refused unverifiable, well before its deadline"
         );
         assert_eq!(stage.stats().invalid.load(Ordering::Relaxed), 1);

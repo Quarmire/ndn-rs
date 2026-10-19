@@ -503,7 +503,9 @@ impl RootStore {
         if let Some(bag) = &store.safebag
             && (bag.contains('/') || bag.contains('\\') || bag.starts_with('.'))
         {
-            return Err(bad(format!("safebag {bag:?} must be a file name in {ROOT_STORE_DIR}/")));
+            return Err(bad(format!(
+                "safebag {bag:?} must be a file name in {ROOT_STORE_DIR}/"
+            )));
         }
         Ok(store)
     }
@@ -727,7 +729,10 @@ impl RootStore {
     }
 
     /// The plaintext PKCS#8 of a software root (to move it).
-    fn export_pkcs8(&self, secret: Option<&RootSecret>) -> Result<Zeroizing<Vec<u8>>, RootStoreError> {
+    fn export_pkcs8(
+        &self,
+        secret: Option<&RootSecret>,
+    ) -> Result<Zeroizing<Vec<u8>>, RootStoreError> {
         let bag_pkcs8 = |passphrase: &[u8]| -> Result<Zeroizing<Vec<u8>>, RootStoreError> {
             let path = self.safebag_path().unwrap_or_default();
             let wire = std::fs::read(&path).map_err(io_err(&path))?;
@@ -873,9 +878,7 @@ impl RootStore {
         };
 
         // The new store must sign as the root before anything else changes.
-        let check = moved
-            .signer(new_passphrase)
-            .await;
+        let check = moved.signer(new_passphrase).await;
         let verified = match check {
             Ok(signer) => verify_signs(signer.as_ref(), &self.public_key).await,
             Err(e) => Err(e),
@@ -952,8 +955,9 @@ impl RootStore {
 /// Sign a fresh challenge with `signer` and verify it under `public_key`.
 async fn verify_signs(signer: &dyn Signer, public_key: &[u8]) -> Result<(), RootStoreError> {
     let mut challenge = [0u8; 32];
-    getrandom::getrandom(&mut challenge)
-        .map_err(|_| RootStoreError::Trust(TrustError::KeyStore("system RNG unavailable".into())))?;
+    getrandom::getrandom(&mut challenge).map_err(|_| {
+        RootStoreError::Trust(TrustError::KeyStore("system RNG unavailable".into()))
+    })?;
     let sig = signer.sign(&challenge).await?;
     let outcome =
         ndn_security::verify_by_sig_type(signer.sig_type(), &challenge, &sig, public_key).await?;
@@ -1156,7 +1160,10 @@ impl PendingRoot {
                         let secret = keychain::new_sealing_secret()?;
                         keychain::set(&entry, &secret)?;
                         store.keychain = Some(entry);
-                        (KEYCHAIN_SAFEBAG_FILE, RootSecret::new(secret.as_bytes().to_vec()))
+                        (
+                            KEYCHAIN_SAFEBAG_FILE,
+                            RootSecret::new(secret.as_bytes().to_vec()),
+                        )
                     }
                     _ => (
                         SEALED_SAFEBAG_FILE,
@@ -1265,8 +1272,8 @@ mod keychain {
         }
 
         pub(in super::super) fn probe() -> Result<(), RootStoreError> {
-            let probe = keyring::Entry::new(KEYCHAIN_SERVICE, "reachability probe")
-                .map_err(unavailable)?;
+            let probe =
+                keyring::Entry::new(KEYCHAIN_SERVICE, "reachability probe").map_err(unavailable)?;
             match probe.get_password() {
                 Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(e) => Err(unavailable(e)),
@@ -1378,7 +1385,10 @@ mod keychain {
         imp::set(e, secret)
     }
 
-    pub(super) fn get(e: &KeychainEntry, safebag: &Path) -> Result<Zeroizing<String>, RootStoreError> {
+    pub(super) fn get(
+        e: &KeychainEntry,
+        safebag: &Path,
+    ) -> Result<Zeroizing<String>, RootStoreError> {
         imp::get(e, safebag)
     }
 
@@ -1521,7 +1531,10 @@ mod tests {
     fn kinds_parse_and_name_their_unlock() {
         for kind in RootStoreKind::ALL {
             assert_eq!(kind.as_str().parse::<RootStoreKind>(), Ok(kind));
-            assert_eq!(kind.unlock().as_str().parse::<RootUnlockKind>(), Ok(kind.unlock()));
+            assert_eq!(
+                kind.unlock().as_str().parse::<RootUnlockKind>(),
+                Ok(kind.unlock())
+            );
         }
         assert!("tpm".parse::<RootStoreKind>().is_err());
     }

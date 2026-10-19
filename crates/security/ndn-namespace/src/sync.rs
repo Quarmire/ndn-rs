@@ -172,14 +172,23 @@ pub fn prepare(member: NameComponent, store: Arc<dyn ContextStore>) -> (ContextS
 /// hex) of the machine's id (else its host name), a zero byte, and the
 /// canonical path of the directory the device keeps its keys in.
 pub fn member_id(pib_root: &Path) -> NameComponent {
-    let machine = ["/etc/machine-id", "/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
+    let machine = [
+        "/etc/machine-id",
+        "/proc/sys/kernel/hostname",
+        "/etc/hostname",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+    .unwrap_or_default();
     let pib = std::fs::canonicalize(pib_root).unwrap_or_else(|_| pib_root.to_path_buf());
     // FNV-1a, 64 bits.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let bytes = machine.trim().as_bytes().iter().chain(&[0]).chain(pib.as_os_str().as_encoded_bytes());
+    let bytes = machine
+        .trim()
+        .as_bytes()
+        .iter()
+        .chain(&[0])
+        .chain(pib.as_os_str().as_encoded_bytes());
     for b in bytes {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -220,13 +229,24 @@ impl Groups {
             group.serve_stored(admin.store(), &namespace);
             joined.insert(namespace, group);
         }
-        let namespaces: Vec<Name> = fetched.iter().map(|held| held.namespace().clone()).collect();
+        let namespaces: Vec<Name> = fetched
+            .iter()
+            .map(|held| held.namespace().clone())
+            .collect();
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = faces_up(admin.engine(), &namespaces, self.svs.sync_interval) => {}
         }
         for namespace in namespaces {
-            let group = Group::join(&admin, &self.member, &namespace, 0, &self.svs, self.retry, &cancel);
+            let group = Group::join(
+                &admin,
+                &self.member,
+                &namespace,
+                0,
+                &self.svs,
+                self.retry,
+                &cancel,
+            );
             joined.insert(namespace, group);
         }
         loop {
@@ -238,7 +258,15 @@ impl Groups {
                 },
             };
             let group = joined.entry(kept.namespace.clone()).or_insert_with(|| {
-                Group::join(&admin, &self.member, &kept.namespace, 0, &self.svs, self.retry, &cancel)
+                Group::join(
+                    &admin,
+                    &self.member,
+                    &kept.namespace,
+                    0,
+                    &self.svs,
+                    self.retry,
+                    &cancel,
+                )
             });
             if kept.root {
                 group.put(&kept).await;
@@ -312,7 +340,13 @@ impl Group {
             },
         );
         let publish = handle.tx.clone();
-        pump(routes, Arc::new(sync_face), out_rx, in_tx, cancel.child_token());
+        pump(
+            routes,
+            Arc::new(sync_face),
+            out_rx,
+            in_tx,
+            cancel.child_token(),
+        );
 
         let fetcher: Arc<dyn ContextFetcher> = Arc::new(EngineFetcher(tokio::sync::Mutex::new(
             engine.app_consumer(cancel.child_token()),
@@ -331,9 +365,12 @@ impl Group {
             },
             move |found: &group::VerifiedVersion| {
                 let Some(verified) = &verified else { return };
-                let mut verified =
-                    verified.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let newest = verified.entry(group_namespace.clone()).or_insert((0, Name::root()));
+                let mut verified = verified
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let newest = verified
+                    .entry(group_namespace.clone())
+                    .or_insert((0, Name::root()));
                 if found.version > newest.0 {
                     *newest = (found.version, found.served_by.clone());
                 }
@@ -706,7 +743,10 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| {
-            panic!("v{version} did not arrive over sync; holds {:?}", keyring.version_of(ns))
+            panic!(
+                "v{version} did not arrive over sync; holds {:?}",
+                keyring.version_of(ns)
+            )
         });
     }
 
@@ -719,11 +759,21 @@ mod tests {
         let (root_dev, device) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let ns: Name = "/home/bob".parse().unwrap();
         let pib = FilePib::new(root_dev.path()).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
-        let root_signer = RootStore::open(&pib).unwrap().unwrap().signer(None).await.unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
+        let root_signer = RootStore::open(&pib)
+            .unwrap()
+            .unwrap()
+            .signer(None)
+            .await
+            .unwrap();
         let v1 = &init.init.context_data;
         // The version after `base` revoking `revoked`, signed by the root key.
         let next = |base: &Data, revoked: &str| {
@@ -745,16 +795,25 @@ mod tests {
         ndn_cert::load_persisted_contexts(root_dev.path(), &root_keyring).unwrap();
         let root = node(&root_engine, root_keyring, root_dev.path(), &cancel);
         let dev_keyring = Keyring::new();
-        ndn_cert::adopt_with_tofu(&dev_keyring, v1, &ns, &ndn_cert::anchor_fingerprint(&init.init.anchor))
-            .unwrap();
+        ndn_cert::adopt_with_tofu(
+            &dev_keyring,
+            v1,
+            &ns,
+            &ndn_cert::anchor_fingerprint(&init.init.anchor),
+        )
+        .unwrap();
         let dev = node(&dev_engine, dev_keyring, device.path(), &cancel);
 
         // The root device revokes a key (the version `ndn-fwd revoke` hands
         // its daemon).
         let v2 = next(v1, "/home/bob/member/phone/KEY/k1").await;
-        crate::keep::apply_update(&root, v2.raw().clone()).await.unwrap();
+        crate::keep::apply_update(&root, v2.raw().clone())
+            .await
+            .unwrap();
         holds(dev.keyring(), &ns, 2).await;
-        let (_, stored) = ndn_cert::read_stored_context(device.path(), &ns).unwrap().unwrap();
+        let (_, stored) = ndn_cert::read_stored_context(device.path(), &ns)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.raw(), v2.raw());
 
         // Another member announces v3, signed by a stranger listing itself
@@ -764,10 +823,19 @@ mod tests {
             "/home/bob/KEY/stranger".parse().unwrap(),
         ));
         let forged = SignedTrustContext::decode_content(v1.content().unwrap(), 3).unwrap();
-        forged.add_anchor(ndn_cert::recovery_anchor(Arc::clone(&stranger)).await.unwrap());
-        let forged = forged.sign_into_data_async(stranger.as_ref()).await.unwrap();
+        forged.add_anchor(
+            ndn_cert::recovery_anchor(Arc::clone(&stranger))
+                .await
+                .unwrap(),
+        );
+        let forged = forged
+            .sign_into_data_async(stranger.as_ref())
+            .await
+            .unwrap();
         let prefix = group::group_prefix(&ns);
-        let rogue = prefix.clone().append_component(NameComponent::generic(Bytes::from_static(b"rogue")));
+        let rogue = prefix
+            .clone()
+            .append_component(NameComponent::generic(Bytes::from_static(b"rogue")));
         let (serve_id, serve_face) = local_face(&root_engine, &cancel);
         root_engine.fib().add_nexthop(&rogue, serve_id, 0);
         let fetched = Arc::new(tokio::sync::Notify::new());
@@ -804,7 +872,11 @@ mod tests {
                 let _ = sync_face.send(pkt).await;
             }
         });
-        rogue_handle.tx.send((rogue.clone().append_segment(3), None)).await.unwrap();
+        rogue_handle
+            .tx
+            .send((rogue.clone().append_segment(3), None))
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(20), fetched.notified())
             .await
             .expect("the device never fetched the forged version");
@@ -812,9 +884,13 @@ mod tests {
         // Fetched and checked before the root device's v3 is announced: had
         // it been adopted, the root's v3 would be refused as not newer.
         let v3 = next(&v2, "/home/bob/member/tablet/KEY/k2").await;
-        crate::keep::apply_update(&root, v3.raw().clone()).await.unwrap();
+        crate::keep::apply_update(&root, v3.raw().clone())
+            .await
+            .unwrap();
         holds(dev.keyring(), &ns, 3).await;
-        let (_, stored) = ndn_cert::read_stored_context(device.path(), &ns).unwrap().unwrap();
+        let (_, stored) = ndn_cert::read_stored_context(device.path(), &ns)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.raw(), v3.raw());
 
         cancel.cancel();
@@ -836,10 +912,15 @@ mod tests {
         let (root_dev, relay) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let ns: Name = "/home/bob".parse().unwrap();
         let pib = FilePib::new(root_dev.path()).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
 
         let cancel = CancellationToken::new();
         let (engine, down) = engine().await;
@@ -898,7 +979,9 @@ mod tests {
         engine.fib().add_nexthop(&ns, up2, 10);
         let (_, member) = non_local_face(&engine);
         let sync = ndn_packet::encode::InterestBuilder::new(
-            prefix.clone().append_version(quick().dialect.sync_version()),
+            prefix
+                .clone()
+                .append_version(quick().dialect.sync_version()),
         )
         .build();
         member.send(sync).await.unwrap();
@@ -923,10 +1006,15 @@ mod tests {
         let (root_dev, device) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let ns: Name = "/home/bob".parse().unwrap();
         let pib = FilePib::new(root_dev.path()).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
         let hourly = SvsConfig {
             sync_interval: Duration::from_secs(3600),
             ..quick()
@@ -936,7 +1024,13 @@ mod tests {
         let ((root_engine, root_down), (dev_engine, dev_down)) = (engine().await, engine().await);
         let root_keyring = Keyring::new();
         ndn_cert::load_persisted_contexts(root_dev.path(), &root_keyring).unwrap();
-        let _root = node_with(&root_engine, root_keyring, root_dev.path(), &cancel, hourly.clone());
+        let _root = node_with(
+            &root_engine,
+            root_keyring,
+            root_dev.path(),
+            &cancel,
+            hourly.clone(),
+        );
 
         // The link: the root device's end is up; the device's end is routed
         // but not up yet.
@@ -958,7 +1052,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         dev_engine.add_face(face, cancel.child_token());
         let (root_end, dev_end) = (Arc::new(root_end), Arc::new(dev_end));
-        for (from, to) in [(Arc::clone(&root_end), Arc::clone(&dev_end)), (dev_end, root_end)] {
+        for (from, to) in [
+            (Arc::clone(&root_end), Arc::clone(&dev_end)),
+            (dev_end, root_end),
+        ] {
             tokio::spawn(async move {
                 while let Some(pkt) = from.recv().await {
                     if to.send(pkt).await.is_err() {
@@ -1005,10 +1102,15 @@ mod tests {
         let (root_dev, tab) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let ns: Name = "/home/bob".parse().unwrap();
         let pib = FilePib::new(root_dev.path()).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
 
         let cancel = CancellationToken::new();
         let (engine, down) = engine().await;
@@ -1057,7 +1159,9 @@ mod tests {
         let from_relay = ndn_packet::encode::InterestBuilder::new(wanted.clone())
             .lifetime(Duration::from_secs(4))
             .build();
-        let fetcher = EngineFetcher(tokio::sync::Mutex::new(engine.app_consumer(cancel.child_token())));
+        let fetcher = EngineFetcher(tokio::sync::Mutex::new(
+            engine.app_consumer(cancel.child_token()),
+        ));
         relay.send(from_relay).await.unwrap();
         let fetch = {
             let wanted = wanted.clone();
@@ -1084,7 +1188,10 @@ mod tests {
         );
         let data = group::group_data(&publisher, &init.init.context_data).unwrap();
         relay.send(data).await.unwrap();
-        let content = fetch.await.unwrap().expect("the device's fetch was not answered");
+        let content = fetch
+            .await
+            .unwrap()
+            .expect("the device's fetch was not answered");
         assert_eq!(&content, init.init.context_data.raw());
 
         cancel.cancel();
@@ -1109,10 +1216,8 @@ mod tests {
         .await
         .unwrap();
         ndn_cert::persist_context(upstream, &init.init.context, &init.init.context_data).unwrap();
-        let (face, publisher) = crate::publish::prepare(
-            &PibContextStore::new(upstream),
-            FaceId(0xFFFF_0005),
-        );
+        let (face, publisher) =
+            crate::publish::prepare(&PibContextStore::new(upstream), FaceId(0xFFFF_0005));
         let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
             .security_profile(ndn_security::SecurityProfile::Disabled)
             .security(Arc::new(SecurityManager::new()))
@@ -1122,9 +1227,13 @@ mod tests {
             .unwrap();
         let _serving = publisher.spawn(&engine);
         let keyring = Keyring::new();
-        assert!(keyring.adopt(Arc::new(
-            ndn_cert::open_signed_context(&init.init.context_data).unwrap().0
-        )));
+        assert!(
+            keyring.adopt(Arc::new(
+                ndn_cert::open_signed_context(&init.init.context_data)
+                    .unwrap()
+                    .0
+            ))
+        );
         let store: Arc<dyn ContextStore> = Arc::new(PibContextStore::new(device));
         let (sync, _groups) = prepare(member_id(device), Arc::clone(&store));
         let member: Name = "/home/bob/member/tab".parse().unwrap();
@@ -1146,8 +1255,17 @@ mod tests {
         let results = crate::refresh::refresh_contexts(&admin, Some(ns.clone()))
             .await
             .unwrap();
-        assert_eq!(results[0].state, crate::RefreshState::Behind, "{}", results[0].detail);
-        assert!(results[0].detail.contains(&member.to_string()), "{}", results[0].detail);
+        assert_eq!(
+            results[0].state,
+            crate::RefreshState::Behind,
+            "{}",
+            results[0].detail
+        );
+        assert!(
+            results[0].detail.contains(&member.to_string()),
+            "{}",
+            results[0].detail
+        );
         assert_eq!(admin.keyring().version_of(&ns), Some(1));
         shutdown.shutdown().await;
     }

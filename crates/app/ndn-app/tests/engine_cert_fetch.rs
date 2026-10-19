@@ -154,8 +154,16 @@ async fn data_signed_by_uncached_intermediate_validates_after_cert_fetch() {
     let cert_interests = spawn_producer(producer, true).await;
 
     let got = fetch(&mut consumer, "/home/phone/photo/1", Duration::from_secs(3)).await;
-    assert_eq!(got.as_deref(), Some(&b"photo"[..]), "Data must validate after cert fetch");
-    assert_eq!(cert_interests.load(Ordering::SeqCst), 1, "one fetch for the cert");
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"photo"[..]),
+        "Data must validate after cert fetch"
+    );
+    assert_eq!(
+        cert_interests.load(Ordering::SeqCst),
+        1,
+        "one fetch for the cert"
+    );
 
     // The cert is now cached: the next Data validates inline, no new fetch.
     let got = fetch(&mut consumer, "/home/phone/photo/2", Duration::from_secs(1)).await;
@@ -175,16 +183,29 @@ async fn data_signed_by_uncached_intermediate_validates_after_cert_fetch() {
 async fn the_face_that_delivered_the_data_serves_its_issuer_chain() {
     let (engine, shutdown, mut consumer, producer) = engine_trusting_root().await;
     let cancel = CancellationToken::new();
-    assert!(ndn_app::install_engine_cert_fetcher(&engine, cancel.child_token()));
+    assert!(ndn_app::install_engine_cert_fetcher(
+        &engine,
+        cancel.child_token()
+    ));
     let silent_id = engine.faces().alloc_id();
     let (silent, silent_handle) = InProcFace::new(silent_id, 64);
     engine.add_face(silent, cancel.child_token());
-    engine.fib().add_nexthop(&n("/home/phone/KEY"), silent_id, 0);
+    engine
+        .fib()
+        .add_nexthop(&n("/home/phone/KEY"), silent_id, 0);
     let cert_interests = spawn_producer(producer, true).await;
 
     let got = fetch(&mut consumer, "/home/phone/photo/1", Duration::from_secs(3)).await;
-    assert_eq!(got.as_deref(), Some(&b"photo"[..]), "Data must validate through its own face");
-    assert_eq!(cert_interests.load(Ordering::SeqCst), 1, "the producer was asked once");
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"photo"[..]),
+        "Data must validate through its own face"
+    );
+    assert_eq!(
+        cert_interests.load(Ordering::SeqCst),
+        1,
+        "the producer was asked once"
+    );
     drop(silent_handle);
 
     cancel.cancel();
@@ -198,7 +219,12 @@ async fn without_engine_fetcher_uncached_intermediate_is_dropped() {
     let (_engine, shutdown, mut consumer, producer) = engine_trusting_root().await;
     let cert_interests = spawn_producer(producer, true).await;
 
-    let got = fetch(&mut consumer, "/home/phone/photo/1", Duration::from_millis(500)).await;
+    let got = fetch(
+        &mut consumer,
+        "/home/phone/photo/1",
+        Duration::from_millis(500),
+    )
+    .await;
     assert!(got.is_none(), "unverifiable Data must not be delivered");
     assert_eq!(cert_interests.load(Ordering::SeqCst), 0);
 
@@ -214,7 +240,10 @@ async fn without_engine_fetcher_uncached_intermediate_is_dropped() {
 async fn a_cert_answered_no_route_refuses_data_without_retry_storm() {
     let (engine, shutdown, mut consumer, producer) = engine_trusting_root().await;
     let cancel = CancellationToken::new();
-    assert!(ndn_app::install_engine_cert_fetcher(&engine, cancel.child_token()));
+    assert!(ndn_app::install_engine_cert_fetcher(
+        &engine,
+        cancel.child_token()
+    ));
     let cert_interests = spawn_producer(producer, false).await;
 
     for i in 0..4 {
@@ -290,7 +319,10 @@ async fn engine_with_self_signed_producer(
     engine.set_require_data_validation(PRODUCER, true);
     engine.fib().add_nexthop(&n("/home"), PRODUCER, 0);
     let cancel = CancellationToken::new();
-    assert!(ndn_app::install_engine_cert_fetcher(&engine, cancel.child_token()));
+    assert!(ndn_app::install_engine_cert_fetcher(
+        &engine,
+        cancel.child_token()
+    ));
 
     let stranger = Arc::new(stranger());
     let cert_wire = encode_cert_data(
@@ -317,7 +349,10 @@ async fn engine_with_self_signed_producer(
                         counter.fetch_add(1, Ordering::SeqCst);
                         responder.respond_bytes(cert_wire).await.ok();
                     } else {
-                        responder.respond_bytes(sign_data(name, &stranger)).await.ok();
+                        responder
+                            .respond_bytes(sign_data(name, &stranger))
+                            .await
+                            .ok();
                     }
                 }
             })
@@ -343,12 +378,26 @@ async fn accept_signed_accepts_data_from_a_fetchable_self_signed_key() {
     let (_engine, shutdown, mut consumer, cancel, cert_interests) =
         engine_with_self_signed_producer(SecurityProfile::AcceptSigned).await;
 
-    let got = fetch(&mut consumer, "/home/stranger/photo/1", Duration::from_secs(3)).await;
-    assert_eq!(got.as_deref(), Some(&b"photo"[..]), "validly signed Data must arrive");
+    let got = fetch(
+        &mut consumer,
+        "/home/stranger/photo/1",
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"photo"[..]),
+        "validly signed Data must arrive"
+    );
     assert_eq!(cert_interests.load(Ordering::SeqCst), 1);
 
     // The certificate is cached: the next Data validates inline.
-    let got = fetch(&mut consumer, "/home/stranger/photo/2", Duration::from_secs(1)).await;
+    let got = fetch(
+        &mut consumer,
+        "/home/stranger/photo/2",
+        Duration::from_secs(1),
+    )
+    .await;
     assert_eq!(got.as_deref(), Some(&b"photo"[..]));
     assert_eq!(cert_interests.load(Ordering::SeqCst), 1);
 
@@ -388,8 +437,15 @@ async fn anchored_profile_refuses_unknown_self_signed_chain_promptly() {
         }
         let got;
         (consumer, got) = consumer_task.await.unwrap();
-        assert!(got.is_none(), "Data under an untrusted self-signed root must not be delivered");
-        assert_eq!(cert_interests.load(Ordering::SeqCst), 1, "one certificate fetch");
+        assert!(
+            got.is_none(),
+            "Data under an untrusted self-signed root must not be delivered"
+        );
+        assert_eq!(
+            cert_interests.load(Ordering::SeqCst),
+            1,
+            "one certificate fetch"
+        );
     }
 
     cancel.cancel();

@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use ndn_cert::challenge::combinator::AllOf;
 use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
+use ndn_cert::challenge::combinator::AllOf;
 use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 use ndn_cert::protocol::CertRequest;
 use ndn_cert::{ChallengeHandler, ChallengeOutcome, TokenChallenge, TokenStore};
@@ -63,8 +63,8 @@ async fn ctx03_redeemed_token_reuse_rejected() {
 /// only a hash of it lands on disk.
 #[tokio::test]
 async fn ctx03_redeemed_token_stays_spent_across_restart() {
-    use std::sync::Arc;
     use ndn_cert::{CaStore, FileCaStore};
+    use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
     let open = || -> Arc<dyn CaStore> { Arc::new(FileCaStore::open(dir.path()).unwrap()) };
@@ -72,7 +72,9 @@ async fn ctx03_redeemed_token_stays_spent_across_restart() {
     let store = TokenStore::with_store(open()).unwrap();
     store.add_many(["one-shot", "spare"]);
     let ch = TokenChallenge::new(store);
-    assert!(is_approved(&verify_token(&ch, "/home/bob/alice", "one-shot").await));
+    assert!(is_approved(
+        &verify_token(&ch, "/home/bob/alice", "one-shot").await
+    ));
     drop(ch);
 
     // Restart: same config tokens, same store directory.
@@ -85,11 +87,17 @@ async fn ctx03_redeemed_token_stays_spent_across_restart() {
         matches!(replay, ChallengeOutcome::Denied(_)),
         "redeemed token must be refused after restart"
     );
-    assert!(is_approved(&verify_token(&ch, "/home/bob/bob", "spare").await));
+    assert!(is_approved(
+        &verify_token(&ch, "/home/bob/bob", "spare").await
+    ));
 
     let hashes = open().redeemed_tokens().unwrap();
     assert_eq!(hashes.len(), 2);
-    assert!(hashes.iter().all(|h| !h.contains("one-shot") && !h.contains("spare")));
+    assert!(
+        hashes
+            .iter()
+            .all(|h| !h.contains("one-shot") && !h.contains("spare"))
+    );
 }
 
 /// CTX.04 (TTL): a token past its TTL is rejected.

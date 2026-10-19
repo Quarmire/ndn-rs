@@ -89,7 +89,11 @@ mod tests {
                 AppError::Refused { reason } if reason == r
             ));
         }
-        for reason in [None, Some(NackReason::NoRoute), Some(NackReason::Other(999))] {
+        for reason in [
+            None,
+            Some(NackReason::NoRoute),
+            Some(NackReason::Other(999)),
+        ] {
             assert!(matches!(
                 AppError::from_nack(reason),
                 AppError::Nacked { reason: got } if got == reason

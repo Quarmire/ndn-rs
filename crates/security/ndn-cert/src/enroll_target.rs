@@ -66,11 +66,7 @@ impl EnrollTarget {
     /// What enrolling `device` with the link `uri` asks for, as `role`
     /// when given: an invite's own role (its device identity) unless
     /// another role is given; an anchor link needs the role.
-    pub fn of_link(
-        uri: &str,
-        role: Option<Role>,
-        device: &str,
-    ) -> Result<Self, EnrollTargetError> {
+    pub fn of_link(uri: &str, role: Option<Role>, device: &str) -> Result<Self, EnrollTargetError> {
         if let Ok(invite) = InviteLink::from_uri(uri) {
             let identity = match role {
                 Some(role) if role != invite.role => {
@@ -151,8 +147,14 @@ mod tests {
     #[test]
     fn an_anchor_link_needs_a_role() {
         let err = EnrollTarget::of_link(&anchor(), None, "vps").unwrap_err();
-        assert!(err.to_string().starts_with("an anchor link names no role"), "{err}");
-        assert!(err.to_string().contains("a role /home/bob certifies"), "{err}");
+        assert!(
+            err.to_string().starts_with("an anchor link names no role"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("a role /home/bob certifies"),
+            "{err}"
+        );
         let node = EnrollTarget::of_link(&anchor(), Some(Role::Node), "vps").unwrap();
         assert_eq!(node.identity, name("/home/bob/node/vps"));
         assert!(matches!(

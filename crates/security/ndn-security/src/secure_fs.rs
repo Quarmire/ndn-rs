@@ -60,7 +60,10 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> 
 /// renamed over `path`. `mode` must not grant group/other access.
 pub fn write_private_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     debug_assert_eq!(mode & 0o077, 0, "secret file mode must be owner-only");
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -106,7 +109,12 @@ pub fn write_private_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::R
 pub fn shred_file(path: &Path) -> io::Result<()> {
     let len = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return Err(io::Error::other(format!("{} is not a file", path.display()))),
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "{} is not a file",
+                path.display()
+            )));
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
@@ -169,7 +177,11 @@ fn tighten_for(path: &Path, meta: &std::fs::Metadata, euid: u32) -> io::Result<O
     if mode & 0o077 == 0 {
         return Ok(None);
     }
-    let owner = if meta.is_dir() { PRIVATE_DIR_MODE } else { mode & 0o700 };
+    let owner = if meta.is_dir() {
+        PRIVATE_DIR_MODE
+    } else {
+        mode & 0o700
+    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(owner))?;
     Ok(Some(mode))
 }

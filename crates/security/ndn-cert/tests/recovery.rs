@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::{
-    AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, FileKit,
-    MAX_CATCH_UP_VERSIONS, NewRootStore, OldRoot, PersistedNamespace, RecoveryError,
-    RecoverySeed, RefreshError, RootSecret, RootStore, UpdateRefusal, add_recovery_anchor,
-    anchor_fingerprint, bump_context_revoking, init_namespace_in_pib, open_context_update,
-    rdr_metadata_name, read_stored_context, recover_namespace_in_pib, recovery_anchor,
-    recovery_version, refresh_context, remove_recovery_anchor, seal_file_kit,
+    AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, FileKit, MAX_CATCH_UP_VERSIONS,
+    NewRootStore, OldRoot, PersistedNamespace, RecoveryError, RecoverySeed, RefreshError,
+    RootSecret, RootStore, UpdateRefusal, add_recovery_anchor, anchor_fingerprint,
+    bump_context_revoking, init_namespace_in_pib, open_context_update, rdr_metadata_name,
+    read_stored_context, recover_namespace_in_pib, recovery_anchor, recovery_version,
+    refresh_context, remove_recovery_anchor, seal_file_kit,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
@@ -571,7 +571,13 @@ impl CaExchange for Upstream {
         let meta_name = rdr_metadata_name(&n("/home/bob"));
         if *interest.name == meta_name {
             let newest = Data::decode(self.versions.last().unwrap().clone()).unwrap();
-            let version = newest.name.components().last().unwrap().as_version().unwrap();
+            let version = newest
+                .name
+                .components()
+                .last()
+                .unwrap()
+                .as_version()
+                .unwrap();
             let wire = DataBuilder::new(
                 meta_name.append_version(version).append_segment(0),
                 &newest.name.encode_to_tlv(),
@@ -643,14 +649,21 @@ async fn a_node_offline_across_a_recovery_catches_up_version_by_version() {
 
     let node = holding(&with_kit);
     let mut upstream = Upstream::serving(&[&with_kit, n1, n2, &n3]);
-    let Ok(ContextRefresh::Updated(update)) = refresh_context(&node, None, &mut upstream, &ns).await
+    let Ok(ContextRefresh::Updated(update)) =
+        refresh_context(&node, None, &mut upstream, &ns).await
     else {
         panic!("the node did not follow the recovery");
     };
     let walked: Vec<u64> = update.walked.iter().map(|s| s.context.version()).collect();
     assert_eq!(walked, [v + 1, v + 2]);
-    assert_eq!(update.walked[0].signer.key_name(), recovered.version.recovery_key);
-    assert_eq!(update.walked[1].signer.key_name(), recovered.anchor.key_name());
+    assert_eq!(
+        update.walked[0].signer.key_name(),
+        recovered.version.recovery_key
+    );
+    assert_eq!(
+        update.walked[1].signer.key_name(),
+        recovered.anchor.key_name()
+    );
     assert_eq!((update.previous, update.context.version()), (v, v + 3));
     assert_eq!(node.version_of(&ns), Some(v + 3));
     assert!(node.contexts()[0].is_revoked(&revoked));
@@ -667,11 +680,16 @@ async fn a_node_offline_across_a_recovery_catches_up_version_by_version() {
     assert_eq!(node.version_of(&ns), Some(v + 3));
 
     // A forged N+1: a stranger signs N's content, listing itself.
-    let stranger: Arc<dyn Signer> =
-        Arc::new(Ed25519Signer::from_seed(&[7; 32], n("/home/bob/KEY/stranger")));
+    let stranger: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(
+        &[7; 32],
+        n("/home/bob/KEY/stranger"),
+    ));
     let forged = SignedTrustContext::decode_content(with_kit.content().unwrap(), v + 1).unwrap();
     forged.add_anchor(recovery_anchor(Arc::clone(&stranger)).await.unwrap());
-    let forged = forged.sign_into_data_async(stranger.as_ref()).await.unwrap();
+    let forged = forged
+        .sign_into_data_async(stranger.as_ref())
+        .await
+        .unwrap();
     let node = holding(&with_kit);
     let mut upstream = Upstream::serving(&[&with_kit, &forged, n2, &n3]);
     match refresh_context(&node, None, &mut upstream, &ns).await {
@@ -731,7 +749,10 @@ async fn a_node_offline_across_a_recovery_catches_up_version_by_version() {
         ),
         "{res:?}"
     );
-    assert_eq!(upstream.asked, [rdr_metadata_name(&ns), (*far.name).clone()]);
+    assert_eq!(
+        upstream.asked,
+        [rdr_metadata_name(&ns), (*far.name).clone()]
+    );
     assert_eq!(node.version_of(&ns), Some(v));
 }
 
@@ -751,8 +772,14 @@ async fn after_a_recovery_the_root_fingerprint_adopts_a_fresh_device() {
     let n1 = &recovered.version.bump.data;
     let n2 = &recovered.root_version.data;
     assert_eq!(open(n2).version(), open(n1).version() + 1);
-    for key in [&recovered.anchor.key_name(), &recovered.version.recovery_key] {
-        assert!(open(n2).is_anchor(key), "{key} is an anchor of N+2 as of N+1");
+    for key in [
+        &recovered.anchor.key_name(),
+        &recovered.version.recovery_key,
+    ] {
+        assert!(
+            open(n2).is_anchor(key),
+            "{key} is an anchor of N+2 as of N+1"
+        );
     }
     let link = AnchorLink {
         namespace: ns.clone(),

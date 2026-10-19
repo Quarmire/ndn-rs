@@ -17,12 +17,12 @@ use crate::{
     challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState},
     ecdh::{EcdhKeypair, SessionKey, new_encryption_iv},
     error::CertError,
-    store::CaStore,
     policy::{
         AcceptAllIssuance, IssuanceContext, IssuanceDecision, IssuancePolicy, NamespacePolicy,
         PolicyDecision, SingleKeyIdentity, attested,
     },
     protocol::{CertRequest, ErrorCode},
+    store::CaStore,
     tlv::{
         CaProfileTlv, ChallengeResponseTlv, NewRequestTlv, NewResponseTlv, ProbeResponseTlv,
         REVOKE_STATUS_NOT_FOUND, REVOKE_STATUS_REVOKED, REVOKE_STATUS_UNAUTHORIZED,
@@ -320,7 +320,9 @@ impl CaState {
         req: &CertRequest,
         params: &serde_json::Map<String, serde_json::Value>,
     ) -> ChallengeOutcome {
-        use crate::renewal::{CERT_NAME_PARAM, PROOF_PARAM, RENEWAL_CHALLENGE, renewal_proof_message};
+        use crate::renewal::{
+            CERT_NAME_PARAM, PROOF_PARAM, RENEWAL_CHALLENGE, renewal_proof_message,
+        };
         let deny = ChallengeOutcome::Denied;
         let param = |key: &str| params.get(key).and_then(|v| v.as_str());
         let (Some(cert_uri), Some(proof)) = (param(CERT_NAME_PARAM), param(PROOF_PARAM)) else {
@@ -335,7 +337,9 @@ impl CaState {
         ) else {
             return deny(format!("{cert_uri:?} or {:?} is not an NDN name", req.name));
         };
-        let own = self.ca_certificate().is_some_and(|ca| *ca.name == cert_name);
+        let own = self
+            .ca_certificate()
+            .is_some_and(|ca| *ca.name == cert_name);
         let canonical = cert_name.to_string();
         // A certificate this CA issued: neither its own nor an earlier CA's
         // it serves.
@@ -368,7 +372,11 @@ impl CaState {
                  the same key; a new key needs a new invite or an admin's approval"
             ));
         }
-        if self.issued_under(&key_name).iter().any(|(_, revoked)| *revoked) {
+        if self
+            .issued_under(&key_name)
+            .iter()
+            .any(|(_, revoked)| *revoked)
+        {
             return deny(format!(
                 "{key_name} is revoked at this CA, and a revoked key is never renewed: enroll a \
                  new key with a new invite"
@@ -458,8 +466,14 @@ impl CaState {
                 cert.name
             ));
         }
-        let issuer = cert.issuer.as_deref().map(ndn_security::cert_name::key_name_of);
-        if !issuer.as_ref().is_some_and(|key| self.is_earlier_ca_key(key)) {
+        let issuer = cert
+            .issuer
+            .as_deref()
+            .map(ndn_security::cert_name::key_name_of);
+        if !issuer
+            .as_ref()
+            .is_some_and(|key| self.is_earlier_ca_key(key))
+        {
             return Err(format!(
                 "{cert_name} is not a certificate this CA issued, nor one an earlier CA of its \
                  identity issued (its issuer is {}): it renews only those; enroll with an invite \
@@ -560,7 +574,11 @@ impl CaState {
         self.served_certs
             .iter()
             .filter(|e| !self.is_revoked(e.key()))
-            .filter(|e| e.key().parse::<ndn_packet::Name>().is_ok_and(|n| n.has_prefix(prefix)))
+            .filter(|e| {
+                e.key()
+                    .parse::<ndn_packet::Name>()
+                    .is_ok_and(|n| n.has_prefix(prefix))
+            })
             .filter_map(|e| Some((deserialize_cert(e.value())?, e.value().clone())))
             .filter(|(cert, _)| cert.is_valid_now())
             .max_by(|(a, _), (b, _)| (a.valid_from, &a.name).cmp(&(b.valid_from, &b.name)))
@@ -571,7 +589,11 @@ impl CaState {
     /// `can_be_prefix`, [`served_cert_under`](Self::served_cert_under) (a key
     /// name finds the key's newest valid certificate); without, exactly the
     /// certificate `name` ([`get_served_cert`](Self::get_served_cert)).
-    pub fn cert_for_interest(&self, name: &ndn_packet::Name, can_be_prefix: bool) -> Option<Vec<u8>> {
+    pub fn cert_for_interest(
+        &self,
+        name: &ndn_packet::Name,
+        can_be_prefix: bool,
+    ) -> Option<Vec<u8>> {
         if can_be_prefix {
             self.served_cert_under(name)
         } else {
@@ -1080,7 +1102,11 @@ impl CaState {
     /// from now on, and no longer holding its identity under a single-key
     /// rule. Applied in memory even if the store write fails — the CA must
     /// refuse the cert now; the error says a restart would forget it.
-    fn mark_revoked(&self, cert_uri: String, cert_name: &ndn_packet::Name) -> Result<(), CertError> {
+    fn mark_revoked(
+        &self,
+        cert_uri: String,
+        cert_name: &ndn_packet::Name,
+    ) -> Result<(), CertError> {
         let persisted = match &self.store {
             Some(store) if !self.revoked.contains(&cert_uri) => store.record_revoked(&cert_uri),
             _ => Ok(()),

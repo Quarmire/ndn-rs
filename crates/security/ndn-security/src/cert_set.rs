@@ -91,8 +91,11 @@ impl CertSet {
             .iter()
             .filter(|(held, _)| held.has_prefix(name))
             .max_by(|(a, x), (b, y)| {
-                (x.cert.is_valid_at(now), x.cert.valid_from, *a)
-                    .cmp(&(y.cert.is_valid_at(now), y.cert.valid_from, *b))
+                (x.cert.is_valid_at(now), x.cert.valid_from, *a).cmp(&(
+                    y.cert.is_valid_at(now),
+                    y.cert.valid_from,
+                    *b,
+                ))
             })
             .map(|(_, held)| held.wire.clone())
     }
@@ -100,7 +103,8 @@ impl CertSet {
     /// The newest certificate valid now under `name` (a key name or a
     /// certificate name).
     pub fn newest_valid(&self, name: &Name) -> Option<&Certificate> {
-        self.newest_valid_held(name, now_ns()).map(|held| &held.cert)
+        self.newest_valid_held(name, now_ns())
+            .map(|held| &held.cert)
     }
 
     fn newest_valid_held(&self, name: &Name, now: u64) -> Option<&Held> {

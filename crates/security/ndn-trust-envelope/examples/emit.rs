@@ -56,11 +56,9 @@ fn main() {
             eprintln!("wrote QR to {}", args[2]);
             return;
         }
-        _ => die(
-            "usage: emit (bag <safebag-file> <key-name> | \
+        _ => die("usage: emit (bag <safebag-file> <key-name> | \
              anchor <namespace> <fingerprint-hex> <signed-context-data-file> | \
-             invite <ca-prefix> <identity> <token> [ttl-secs] | decode <uri>)",
-        ),
+             invite <ca-prefix> <identity> <token> [ttl-secs] | decode <uri>)"),
     };
     println!("{}", env.to_uri());
 }

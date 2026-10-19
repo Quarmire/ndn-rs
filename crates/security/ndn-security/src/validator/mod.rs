@@ -386,8 +386,7 @@ impl Validator {
         // SHA256(region). Integrity only: labelled `TrustPath::DigestSha256`
         // for the consumer to decide (it authenticates no signer).
         if sig_info.sig_type == ndn_packet::SignatureType::DigestSha256 {
-            return match verify_digest(sig_info.sig_type, data.signed_region(), data.sig_value())
-            {
+            return match verify_digest(sig_info.sig_type, data.signed_region(), data.sig_value()) {
                 Ok(VerifyOutcome::Valid) => {
                     // Re-decode of already-validated bytes is infallible; treat the
                     // impossible failure as invalid rather than panicking in the
@@ -430,7 +429,11 @@ impl Validator {
             .cert_cache
             .get(&key_name)
             .or_else(|| own_certificate(data, &key_name));
-        if !ctx.authorizes_hop(&data.name, &key_name, cert.as_ref().map(|c| c.name.as_ref())) {
+        if !ctx.authorizes_hop(
+            &data.name,
+            &key_name,
+            cert.as_ref().map(|c| c.name.as_ref()),
+        ) {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
         // A revoked key (or certificate) signs nothing, cached or not.
@@ -516,7 +519,11 @@ impl Validator {
 
         let ctx = self.keyring.context_for(&interest.name);
         let cert = self.cert_cache.get(&key_name);
-        if !ctx.authorizes_hop(&interest.name, &key_name, cert.as_ref().map(|c| c.name.as_ref())) {
+        if !ctx.authorizes_hop(
+            &interest.name,
+            &key_name,
+            cert.as_ref().map(|c| c.name.as_ref()),
+        ) {
             return InterestValidationOutcome::Invalid(TrustError::SchemaMismatch);
         }
         if let Some(revoked) = revoked_signer(&ctx, &key_name, cert.as_ref()) {
@@ -560,7 +567,9 @@ fn revoked_signer(
     std::iter::once(key_name)
         .chain(cert.map(|c| c.name.as_ref()))
         .find(|n| ctx.is_revoked(n))
-        .map(|n| TrustError::Revoked { name: n.to_string() })
+        .map(|n| TrustError::Revoked {
+            name: n.to_string(),
+        })
 }
 
 /// The certificate a **self-signed** certificate Data carries for its own

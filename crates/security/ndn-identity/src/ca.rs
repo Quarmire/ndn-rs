@@ -193,7 +193,11 @@ impl NdncertCa {
     /// reads — and are validated under the trust contexts in `keyring` (the
     /// node's own, holding the namespace's).
     pub fn approvals(mut self, store: ApprovalStore, keyring: Arc<Keyring>) -> Self {
-        self.approvals = Some(ApprovalService::new(store, keyring, Arc::clone(&self.state)));
+        self.approvals = Some(ApprovalService::new(
+            store,
+            keyring,
+            Arc::clone(&self.state),
+        ));
         self
     }
 
@@ -546,7 +550,10 @@ mod tests {
     async fn a_new_for_a_refused_name_answers_name_not_allowed() {
         let (_identity, ca) = lab_ca();
         let key: Name = "/elsewhere/alice/KEY/k1".parse().unwrap();
-        let signer = Arc::new(ndn_security::Ed25519Signer::from_seed(&[7u8; 32], key.clone()));
+        let signer = Arc::new(ndn_security::Ed25519Signer::from_seed(
+            &[7u8; 32],
+            key.clone(),
+        ));
         let mut session = ndn_cert::EnrollmentSession::new(key, signer, 3600);
         let body = session.new_request_body().await.unwrap();
         let answer = failure(ask(&ca, "/lab/ca/CA/NEW", body).await);
@@ -564,14 +571,28 @@ mod tests {
     async fn malformed_new_and_unknown_challenge_are_answered() {
         let (_identity, ca) = lab_ca();
         let answer = failure(ask(&ca, "/lab/ca/CA/NEW", vec![0x01, 0x05, 0x00]).await);
-        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::BadParameterFormat));
-        let answer = failure(
-            ask(&ca, "/lab/ca/CA/CHALLENGE/%01%02%03%04%05%06%07%08", vec![0x01]).await,
+        assert_eq!(
+            answer.code,
+            u8::from(ndn_cert::ErrorCode::BadParameterFormat)
         );
-        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::InvalidParameters));
+        let answer = failure(
+            ask(
+                &ca,
+                "/lab/ca/CA/CHALLENGE/%01%02%03%04%05%06%07%08",
+                vec![0x01],
+            )
+            .await,
+        );
+        assert_eq!(
+            answer.code,
+            u8::from(ndn_cert::ErrorCode::InvalidParameters)
+        );
         // No request id component.
         let answer = failure(ask(&ca, "/lab/ca/CA/CHALLENGE", vec![0x01]).await);
-        assert_eq!(answer.code, u8::from(ndn_cert::ErrorCode::BadInterestFormat));
+        assert_eq!(
+            answer.code,
+            u8::from(ndn_cert::ErrorCode::BadInterestFormat)
+        );
     }
 
     /// Endpoints are the exact component after `<ca>/CA`: a longer
@@ -612,7 +633,9 @@ mod tests {
             .collect();
         let status = |lifetime: Duration| {
             let wire = ndn_packet::encode::InterestBuilder::new(
-                "/lab/ca/CA/STATUS/0123456789abcdef".parse::<Name>().unwrap(),
+                "/lab/ca/CA/STATUS/0123456789abcdef"
+                    .parse::<Name>()
+                    .unwrap(),
             )
             .must_be_fresh()
             .lifetime(lifetime)
@@ -630,7 +653,10 @@ mod tests {
             panic!("an immediate check is answered");
         };
         let answer: ndn_cert::approval::RequestStatus = serde_json::from_slice(&body).unwrap();
-        assert!(matches!(answer, ndn_cert::approval::RequestStatus::Expired { .. }));
+        assert!(matches!(
+            answer,
+            ndn_cert::approval::RequestStatus::Expired { .. }
+        ));
         let held = handle_interest(
             &ca.state,
             &ca.prefix,

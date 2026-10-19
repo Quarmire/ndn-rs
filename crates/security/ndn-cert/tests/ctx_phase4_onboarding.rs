@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use ndn_cert::{
-    AdoptError, AdvertConfig, AnchorAdvert, adopt_anchor_envelope,
-    adopt_unsigned_legacy_with_tofu, adopt_with_tofu, anchor_fingerprint,
+    AdoptError, AdvertConfig, AnchorAdvert, adopt_anchor_envelope, adopt_unsigned_legacy_with_tofu,
+    adopt_with_tofu, anchor_fingerprint,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name, SignatureType};
@@ -208,7 +208,11 @@ fn tampered_context_keeping_the_anchor_is_refused() {
 
     let weakened = SignedTrustContext::accept_all(bob.clone()).with_version(1);
     weakened.add_anchor(root_dev.anchor.clone());
-    assert_ne!(weakened.encode_content(), root_dev.published, "schema really changed");
+    assert_ne!(
+        weakened.encode_content(),
+        root_dev.published,
+        "schema really changed"
+    );
 
     // (a) the genuine signature replayed over the weakened content…
     let genuine_sig = root_dev.published_data.sig_value().to_vec();
@@ -243,7 +247,12 @@ fn wrong_fingerprint_or_namespace_is_refused() {
     let root_dev = build_namespace("/home/bob");
     let keyring = Keyring::new();
     assert!(matches!(
-        adopt_with_tofu(&keyring, &root_dev.published_data, &n("/home/bob"), &[0u8; 32]),
+        adopt_with_tofu(
+            &keyring,
+            &root_dev.published_data,
+            &n("/home/bob"),
+            &[0u8; 32]
+        ),
         Err(AdoptError::FingerprintMismatch(_))
     ));
     assert!(matches!(

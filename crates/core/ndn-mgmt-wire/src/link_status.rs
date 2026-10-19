@@ -174,7 +174,9 @@ pub struct LinkAsleepEntry {
 pub enum LinkModeArg {
     Always,
     /// `idle_secs = None`: keep the link's current (or configured) idle close.
-    OnDemand { idle_secs: Option<u64> },
+    OnDemand {
+        idle_secs: Option<u64>,
+    },
     Off,
 }
 
@@ -187,7 +189,9 @@ impl core::str::FromStr for LinkModeArg {
             "on-demand" => Ok(Self::OnDemand { idle_secs: None }),
             "off" => Ok(Self::Off),
             _ => match s.strip_prefix("on-demand:").map(str::parse::<u64>) {
-                Some(Ok(secs)) => Ok(Self::OnDemand { idle_secs: Some(secs) }),
+                Some(Ok(secs)) => Ok(Self::OnDemand {
+                    idle_secs: Some(secs),
+                }),
                 _ => Err(alloc::format!(
                     "{s:?} is not a link mode: use always, on-demand, on-demand:<idle seconds> \
                      (e.g. on-demand:60) or off"
@@ -609,15 +613,23 @@ mod tests {
         for mode in [
             LinkModeArg::Always,
             LinkModeArg::OnDemand { idle_secs: None },
-            LinkModeArg::OnDemand { idle_secs: Some(120) },
+            LinkModeArg::OnDemand {
+                idle_secs: Some(120),
+            },
             LinkModeArg::Off,
         ] {
-            let params = ControlParameters::decode(link_command("vps", Some(mode)).encode()).unwrap();
+            let params =
+                ControlParameters::decode(link_command("vps", Some(mode)).encode()).unwrap();
             assert_eq!(parse_link_command(&params), Ok(("vps".into(), Some(mode))));
         }
         let params = link_command("vps", None);
         assert_eq!(parse_link_command(&params), Ok(("vps".into(), None)));
-        assert!("sometimes".parse::<LinkModeArg>().unwrap_err().contains("on-demand:<idle seconds>"));
+        assert!(
+            "sometimes"
+                .parse::<LinkModeArg>()
+                .unwrap_err()
+                .contains("on-demand:<idle seconds>")
+        );
         assert!(parse_link_command(&ControlParameters::default()).is_err());
     }
 }

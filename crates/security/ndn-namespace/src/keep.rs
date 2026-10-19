@@ -295,13 +295,19 @@ pub(crate) fn publication(p: &Participant) -> String {
 /// answer can hand the same version over again and learn the outcome (the
 /// second request waits for the first). Any other answer means it was not
 /// adopted.
-pub async fn apply_update(p: &Participant, wire: Bytes) -> Result<ContextRefreshInfo, TrustRefusal> {
+pub async fn apply_update(
+    p: &Participant,
+    wire: Bytes,
+) -> Result<ContextRefreshInfo, TrustRefusal> {
     let data = Data::decode(wire)
         .map_err(|e| refusal(status::BAD_PARAMS, format!("not a Data packet: {e}")))?;
     let namespace = ndn_security::context_namespace_of(&data.name).ok_or_else(|| {
         refusal(
             status::BAD_PARAMS,
-            format!("{} is not a trust-context name (<ns>/32=trust-context/v=<N>)", data.name),
+            format!(
+                "{} is not a trust-context name (<ns>/32=trust-context/v=<N>)",
+                data.name
+            ),
         )
     })?;
     let _one_change = p.context_change.lock().await;

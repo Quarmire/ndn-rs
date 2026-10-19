@@ -143,7 +143,10 @@ async fn a_nack_reaches_only_the_fetch_it_answers() {
     fwd.nack(&refused_interest);
     // Give the Nack time to be (mis)routed before the Data exists.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!served.is_finished(), "the Nack must not end the other fetch");
+    assert!(
+        !served.is_finished(),
+        "the Nack must not end the other fetch"
+    );
     fwd.data(&name("/served"), "ok");
 
     assert!(matches!(

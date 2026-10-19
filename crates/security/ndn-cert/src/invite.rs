@@ -50,7 +50,9 @@ use ndn_trust_envelope::TrustEnvelope;
 
 use crate::client::CaExchange;
 use crate::error::CertError;
-use crate::onboarding::{AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint};
+use crate::onboarding::{
+    AdoptError, AnchorLink, LinkAdoption, adopt_anchor_link, anchor_fingerprint,
+};
 use crate::roles::{
     Role, RoleError, token_expired, token_expiry, token_role, validate_device_name,
     validate_namespace,
@@ -120,7 +122,8 @@ impl InviteLink {
             }
             _ => return Err(InviteEnrollError::InviteRole(identity_namespace.clone())),
         };
-        validate_namespace(&namespace).map_err(|_| bad("identity namespace", identity_namespace))?;
+        validate_namespace(&namespace)
+            .map_err(|_| bad("identity namespace", identity_namespace))?;
         if token.is_empty() {
             return Err(bad("token", token));
         }
@@ -277,7 +280,10 @@ pub enum InviteEnrollError {
     #[error("{0}; choose another device name (--device)")]
     Device(RoleError),
     #[error("key {key} is not a device key under {identity_prefix} (<device>/KEY/<id>)")]
-    KeyOutsideInvite { key: String, identity_prefix: String },
+    KeyOutsideInvite {
+        key: String,
+        identity_prefix: String,
+    },
     #[error(
         "this node holds no trust context for {namespace}, and the invite carries no root \
          fingerprint to check one against: ask for an invite minted with --anchor-fp, or adopt \
@@ -612,7 +618,10 @@ where
             // "validates", but proves integrity, not who made it: anyone can
             // compute it.
             (ValidationResult::Valid(safe), _) => {
-                if matches!(safe.trust_path(), ndn_security::safe_data::TrustPath::CertChain(_)) {
+                if matches!(
+                    safe.trust_path(),
+                    ndn_security::safe_data::TrustPath::CertChain(_)
+                ) {
                     return Ok(fetched);
                 }
                 return Err(refused(format!(
@@ -638,7 +647,9 @@ where
                     .await
                     .map_err(IssuedCheckError::Exchange)?;
                 let cert = Certificate::decode(&reply).map_err(|e| {
-                    refused(format!("its issuer certificate {missing} is malformed: {e}"))
+                    refused(format!(
+                        "its issuer certificate {missing} is malformed: {e}"
+                    ))
                 })?;
                 validator.cert_cache().insert(cert);
                 fetched.push(reply);

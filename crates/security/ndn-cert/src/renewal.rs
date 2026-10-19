@@ -102,9 +102,9 @@ pub fn renewal_proof_message(request_id_hex: &str, cert_name: &Name) -> Vec<u8> 
 pub fn issuing_ca_prefix(cert: &Certificate) -> Option<Name> {
     let issuer = cert.issuer.as_deref()?;
     let comps = issuer.components();
-    let key = comps
-        .iter()
-        .position(|c| c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY")?;
+    let key = comps.iter().position(|c| {
+        c.typ == ndn_packet::tlv_type::NAME_COMPONENT && c.value.as_ref() == b"KEY"
+    })?;
     let ca = comps.get(key.checked_sub(1)?)?;
     (ca.typ == ndn_packet::tlv_type::NAME_COMPONENT && ca.value.as_ref() == b"CA" && key >= 2)
         .then(|| Name::from_components(comps[..key - 1].iter().cloned()))
@@ -401,7 +401,10 @@ mod tests {
     #[test]
     fn issuing_ca_is_the_issuer_minus_ca_key() {
         let prefix = |issuer| issuing_ca_prefix(&cert_issued_by(issuer));
-        assert_eq!(prefix("/home/bob/CA/KEY/k1"), Some("/home/bob".parse().unwrap()));
+        assert_eq!(
+            prefix("/home/bob/CA/KEY/k1"),
+            Some("/home/bob".parse().unwrap())
+        );
         assert_eq!(
             prefix("/home/bob/CA/KEY/k1/root/v=1"),
             Some("/home/bob".parse().unwrap())
@@ -415,8 +418,14 @@ mod tests {
     fn the_proof_binds_the_exchange_and_the_certificate() {
         let a: Name = "/home/bob/member/phone/KEY/k/i/v1".parse().unwrap();
         let b: Name = "/home/bob/member/phone/KEY/k/i/v2".parse().unwrap();
-        assert_ne!(renewal_proof_message("00", &a), renewal_proof_message("01", &a));
-        assert_ne!(renewal_proof_message("00", &a), renewal_proof_message("00", &b));
+        assert_ne!(
+            renewal_proof_message("00", &a),
+            renewal_proof_message("01", &a)
+        );
+        assert_ne!(
+            renewal_proof_message("00", &a),
+            renewal_proof_message("00", &b)
+        );
     }
 
     /// A CA answer this node's forwarder refused for now (`unverifiable`)

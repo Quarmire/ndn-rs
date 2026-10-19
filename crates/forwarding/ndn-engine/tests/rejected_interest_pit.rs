@@ -64,7 +64,10 @@ async fn an_interest_nacked_for_no_route_leaves_no_pit_entry_behind() {
         .build();
     handle_b.send(from_b).await.expect("inject on B");
     let back = recv_timeout(&handle_b).await.expect("an answer on B");
-    assert!(is_nack(&back), "an Interest with no eligible nexthop is Nacked back");
+    assert!(
+        is_nack(&back),
+        "an Interest with no eligible nexthop is Nacked back"
+    );
 
     // Within that Interest's lifetime, the same name from A must reach B.
     let from_a = InterestBuilder::new(name.clone())

@@ -67,9 +67,15 @@ pub struct NamespacePolicies {
 #[derive(Debug)]
 pub enum PolicyError {
     /// `key` names a role that does not exist.
-    UnknownRole { key: &'static str, reason: RoleError },
+    UnknownRole {
+        key: &'static str,
+        reason: RoleError,
+    },
     /// A relay role that may not link, so none could relay.
-    RelayMayNotLink { role: String, link_roles: Vec<String> },
+    RelayMayNotLink {
+        role: String,
+        link_roles: Vec<String>,
+    },
     /// The stated link policy is not the one the context `version` states.
     LinkDisagrees { version: u64, held: LinkPolicy },
     /// A `direct_pairs` entry is not `<role>:<role>`.
@@ -95,7 +101,11 @@ pub enum PolicyError {
 }
 
 fn quoted(roles: &[String]) -> String {
-    roles.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>().join(", ")
+    roles
+        .iter()
+        .map(|r| format!("{r:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Relays one per `; `, or `none`.
@@ -103,7 +113,11 @@ fn relay_list(relays: &[AdvertisedRelay]) -> String {
     if relays.is_empty() {
         return "none".to_string();
     }
-    relays.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    relays
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl fmt::Display for PolicyError {
@@ -212,17 +226,20 @@ impl PolicyInput {
             Some(roles) => roles
                 .iter()
                 .map(|r| {
-                    r.parse::<Role>().map_err(|reason| PolicyError::UnknownRole {
-                        key: "approval_roles",
-                        reason,
-                    })
+                    r.parse::<Role>()
+                        .map_err(|reason| PolicyError::UnknownRole {
+                            key: "approval_roles",
+                            reason,
+                        })
                 })
                 .collect::<Result<Vec<Role>, _>>()?,
             None => defaults.roles,
         };
         Ok(Some(ApprovalPolicy {
             roles,
-            invite_also: self.approval_requires_invite.unwrap_or(defaults.invite_also),
+            invite_also: self
+                .approval_requires_invite
+                .unwrap_or(defaults.invite_also),
         }))
     }
 
@@ -266,9 +283,12 @@ impl PolicyInput {
             Some(pairs) => pairs
                 .iter()
                 .map(|entry| {
-                    let (a, b) = entry.split_once(':').ok_or_else(|| PolicyError::BadDirectPair {
-                        entry: entry.clone(),
-                    })?;
+                    let (a, b) =
+                        entry
+                            .split_once(':')
+                            .ok_or_else(|| PolicyError::BadDirectPair {
+                                entry: entry.clone(),
+                            })?;
                     Ok((role("direct_pairs", a)?, role("direct_pairs", b)?))
                 })
                 .collect::<Result<Vec<_>, PolicyError>>()?,
@@ -319,10 +339,15 @@ impl PolicyInput {
 
     /// The policies a new namespace's first trust context advertises: the
     /// stated ones, the default for what is not stated (no relays).
-    pub fn new_namespace_policies(&self, namespace: &Name) -> Result<NamespacePolicies, PolicyError> {
+    pub fn new_namespace_policies(
+        &self,
+        namespace: &Name,
+    ) -> Result<NamespacePolicies, PolicyError> {
         Ok(NamespacePolicies {
             approval: self.approval_policy()?.unwrap_or_default(),
-            link: self.link_policy(&LinkPolicy::default())?.unwrap_or_default(),
+            link: self
+                .link_policy(&LinkPolicy::default())?
+                .unwrap_or_default(),
             relays: self.advertised_relays(namespace)?.unwrap_or_default(),
         })
     }
@@ -603,7 +628,9 @@ pub fn plan_schema_update(
     let link = stated
         .link_change(&held.link_policy())
         .map_err(SchemaPlanError::Policy)?;
-    let relays = stated.relays_change(held).map_err(SchemaPlanError::Policy)?;
+    let relays = stated
+        .relays_change(held)
+        .map_err(SchemaPlanError::Policy)?;
     let change = schema_change(
         held,
         &schema,
@@ -650,7 +677,11 @@ mod tests {
             ..PolicyInput::default()
         };
         let err = unknown.approval_policy().unwrap_err();
-        assert!(err.to_string().starts_with("[ca] approval_roles: unknown role"), "{err}");
+        assert!(
+            err.to_string()
+                .starts_with("[ca] approval_roles: unknown role"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -689,8 +720,14 @@ mod tests {
         for stated in [&admins_only, &invite] {
             let err = ApprovalPolicy::reconcile(stated, Some((3, advertised.clone()))).unwrap_err();
             let msg = err.to_string();
-            assert!(msg.contains("disagree with the namespace's trust context (v3)"), "{msg}");
-            assert!(msg.contains("approval_roles = [\"admin\", \"node\"]"), "{msg}");
+            assert!(
+                msg.contains("disagree with the namespace's trust context (v3)"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("approval_roles = [\"admin\", \"node\"]"),
+                "{msg}"
+            );
         }
         assert!(advertised.clone().roles.len() == 2 && !advertised.needs_invite());
         assert!(
@@ -711,7 +748,12 @@ mod tests {
 
     #[test]
     fn the_stated_link_policy_takes_unset_keys_from_its_base() {
-        assert_eq!(PolicyInput::default().link_policy(&LinkPolicy::default()).unwrap(), None);
+        assert_eq!(
+            PolicyInput::default()
+                .link_policy(&LinkPolicy::default())
+                .unwrap(),
+            None
+        );
         let stated = PolicyInput {
             link_roles: roles(&["admin", "node", "admin"]),
             enrollment_links: Some(false),
@@ -745,13 +787,19 @@ mod tests {
             ..PolicyInput::default()
         };
         let err = relay.link_policy(&LinkPolicy::default()).unwrap_err();
-        assert!(matches!(err, PolicyError::RelayMayNotLink { .. }), "a relay that may not link");
+        assert!(
+            matches!(err, PolicyError::RelayMayNotLink { .. }),
+            "a relay that may not link"
+        );
         let unknown = PolicyInput {
             link_roles: roles(&["robot"]),
             ..PolicyInput::default()
         };
         let err = unknown.link_policy(&LinkPolicy::default()).unwrap_err();
-        assert!(err.to_string().starts_with("[ca] link_roles: unknown role"), "{err}");
+        assert!(
+            err.to_string().starts_with("[ca] link_roles: unknown role"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -772,12 +820,22 @@ mod tests {
             link_roles: roles(&["node", "admin"]),
             ..PolicyInput::default()
         };
-        assert_eq!(restated.link_change(&a).unwrap(), None, "the same policy is no change");
+        assert_eq!(
+            restated.link_change(&a).unwrap(),
+            None,
+            "the same policy is no change"
+        );
         let off = PolicyInput {
             enrollment_links: Some(false),
             ..PolicyInput::default()
         };
-        assert!(!same_link_policy(&a, &LinkPolicy { enrollment_links: false, ..a.clone() }));
+        assert!(!same_link_policy(
+            &a,
+            &LinkPolicy {
+                enrollment_links: false,
+                ..a.clone()
+            }
+        ));
         assert_eq!(
             off.link_change(&a).unwrap(),
             Some(LinkPolicy {
@@ -789,7 +847,13 @@ mod tests {
             direct_paths: Some(false),
             ..PolicyInput::default()
         };
-        assert!(!same_link_policy(&a, &LinkPolicy { direct_paths: false, ..a.clone() }));
+        assert!(!same_link_policy(
+            &a,
+            &LinkPolicy {
+                direct_paths: false,
+                ..a.clone()
+            }
+        ));
         assert_eq!(
             no_direct.link_change(&a).unwrap(),
             Some(LinkPolicy {
@@ -808,18 +872,29 @@ mod tests {
         let link = stated.link_policy(&LinkPolicy::default()).unwrap().unwrap();
         assert_eq!(
             link.direct_pairs,
-            [("admin".into(), "member".into()), ("member".into(), "member".into())]
+            [
+                ("admin".into(), "member".into()),
+                ("member".into(), "member".into())
+            ]
         );
         assert!(!same_link_policy(&link, &LinkPolicy::default()));
         let restated = PolicyInput {
             direct_pairs: roles(&[
-                "node:node", "member:node", "member:member", "admin:node", "admin:member", "admin:admin",
+                "node:node",
+                "member:node",
+                "member:member",
+                "admin:node",
+                "admin:member",
+                "admin:admin",
             ]),
             ..PolicyInput::default()
         };
         assert_eq!(restated.link_change(&LinkPolicy::default()).unwrap(), None);
         for (bad, start) in [
-            ("member", "[ca] direct_pairs: \"member\" is not a pair of roles"),
+            (
+                "member",
+                "[ca] direct_pairs: \"member\" is not a pair of roles",
+            ),
             ("member:robot", "[ca] direct_pairs: unknown role"),
         ] {
             let err = PolicyInput {
@@ -832,7 +907,12 @@ mod tests {
         }
     }
 
-    fn relay(device: &str, key: Option<[u8; 32]>, endpoint: &str, preference: u32) -> AdvertisedRelay {
+    fn relay(
+        device: &str,
+        key: Option<[u8; 32]>,
+        endpoint: &str,
+        preference: u32,
+    ) -> AdvertisedRelay {
         AdvertisedRelay {
             device: device.parse().unwrap(),
             key,
@@ -853,7 +933,10 @@ mod tests {
         let foreign = relay("/club/node/r", None, "club.example.org:6367", 1);
         for (relays, start) in [
             (vec![no_endpoint], "[ca] relay /home/node/r has no endpoint"),
-            (vec![foreign.clone()], "[ca] relay /club/node/r is not a device of /home"),
+            (
+                vec![foreign.clone()],
+                "[ca] relay /club/node/r is not a device of /home",
+            ),
         ] {
             let err = PolicyInput {
                 relays: Some(relays),
@@ -872,16 +955,24 @@ mod tests {
             ..PolicyInput::default()
         };
         let ctx = SignedTrustContext::hierarchical(ns.clone()).with_relays(vec![own, keyed]);
-        stated.check_relays(&ctx).expect("the same relays, in another order");
+        stated
+            .check_relays(&ctx)
+            .expect("the same relays, in another order");
         assert_eq!(stated.relays_change(&ctx).unwrap(), None);
-        PolicyInput::default().check_relays(&ctx).expect("unset: the context's");
+        PolicyInput::default()
+            .check_relays(&ctx)
+            .expect("unset: the context's");
         let none = PolicyInput {
             relays: Some(Vec::new()),
             ..PolicyInput::default()
         };
         let err = none.enforced_policy(Some(&ctx)).unwrap_err();
         assert!(matches!(err, PolicyError::RelaysDisagree { .. }), "{err}");
-        assert!(err.to_string().contains("which advertises: /home/node/r at"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("which advertises: /home/node/r at"),
+            "{err}"
+        );
     }
 
     /// Removing a direct pair or dropping an advertised relay narrows (a
@@ -907,7 +998,10 @@ mod tests {
         match plan_schema_update(&held, &fewer_pairs, false) {
             Err(SchemaPlanError::Change(BumpError::LinkNarrowing { narrowed, .. })) => {
                 assert!(
-                    narrowed.contains(&"admin and member devices may no longer make direct paths with each other".to_string()),
+                    narrowed.contains(
+                        &"admin and member devices may no longer make direct paths with each other"
+                            .to_string()
+                    ),
                     "{narrowed:?}"
                 );
                 assert_eq!(narrowed.len(), 4, "{narrowed:?}");
@@ -918,7 +1012,12 @@ mod tests {
         assert_eq!(plan.change.link_narrowed.len(), 4);
         let more_pairs = PolicyInput {
             direct_pairs: roles(&[
-                "node:node", "member:node", "member:member", "admin:node", "admin:member", "admin:admin",
+                "node:node",
+                "member:node",
+                "member:member",
+                "admin:node",
+                "admin:member",
+                "admin:admin",
                 "guest:member",
             ]),
             ..PolicyInput::default()
@@ -954,7 +1053,10 @@ mod tests {
         assert!(plan.change.changes_relays() && plan.change.relays_dropped.is_empty());
 
         let pinned = PolicyInput {
-            relays: Some(vec![AdvertisedRelay { key: Some([1; 32]), ..r }]),
+            relays: Some(vec![AdvertisedRelay {
+                key: Some([1; 32]),
+                ..r
+            }]),
             ..PolicyInput::default()
         };
         assert!(matches!(
@@ -967,10 +1069,20 @@ mod tests {
     fn token_and_device_approval_are_one_challenge_each_where_first_listed() {
         use ChallengeSlot::*;
         let order = challenge_order(
-            ["pin", "token", "device-approval", "token", "email", "device-approval"],
+            [
+                "pin",
+                "token",
+                "device-approval",
+                "token",
+                "email",
+                "device-approval",
+            ],
             None,
         );
-        assert_eq!(order.slots, [Configured(0), Token, DeviceApproval, Configured(4)]);
+        assert_eq!(
+            order.slots,
+            [Configured(0), Token, DeviceApproval, Configured(4)]
+        );
         assert!(!order.approval_unlisted);
     }
 

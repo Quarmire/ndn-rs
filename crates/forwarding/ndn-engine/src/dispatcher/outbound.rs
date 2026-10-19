@@ -63,7 +63,12 @@ impl PacketDispatcher {
             debug!(target: t::SECURITY, face=%d.face, name=%d.name, refusal=%refusal, "telling a local downstream its Data was refused");
             self.nack_downstream(
                 d.face,
-                ndn_packet::Nack::interest_wire(&d.name, &d.selector, d.nonce, d.parameters.as_ref()),
+                ndn_packet::Nack::interest_wire(
+                    &d.name,
+                    &d.selector,
+                    d.nonce,
+                    d.parameters.as_ref(),
+                ),
                 d.lp_pit_token.clone(),
                 ndn_packet::NackReason::Refused(refusal),
             )

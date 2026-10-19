@@ -376,12 +376,21 @@ mod tests {
         let original = Interest::decode(w.finish()).unwrap();
         let portion = original.parameters_portion().expect("parameterized");
 
-        let wire = Nack::interest_wire(&original.name, original.selectors(), 0x0102_0304, Some(&portion));
+        let wire = Nack::interest_wire(
+            &original.name,
+            original.selectors(),
+            0x0102_0304,
+            Some(&portion),
+        );
         let rebuilt = Interest::decode(wire).unwrap();
         assert_eq!(rebuilt.name, original.name);
         assert_eq!(rebuilt.selectors(), original.selectors());
         assert_eq!(rebuilt.app_parameters(), original.app_parameters());
-        assert_eq!(rebuilt.parameters_portion(), Some(portion), "the digest covers the same bytes");
+        assert_eq!(
+            rebuilt.parameters_portion(),
+            Some(portion),
+            "the digest covers the same bytes"
+        );
         assert!(rebuilt.sig_value().is_some());
 
         let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"x"))]);

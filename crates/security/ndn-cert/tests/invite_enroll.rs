@@ -12,8 +12,8 @@ use ndn_cert::ca::{CaConfig, CaState};
 use ndn_cert::challenge::ChallengeHandler;
 use ndn_cert::{
     CaExchange, CertError, HierarchicalPolicy, InviteEnrollError, InviteLink, TokenChallenge,
-    TokenStore, adopt_with_tofu, anchor_fingerprint, ca_key_name, enroll_with_invite, init_namespace,
-    new_device_key_name,
+    TokenStore, adopt_with_tofu, anchor_fingerprint, ca_key_name, enroll_with_invite,
+    init_namespace, new_device_key_name,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
@@ -45,7 +45,11 @@ impl CaExchange for CaWire {
         let body = if verb(b"NEW").is_some() {
             self.ca.handle_new(&params()).await?
         } else if let Some(i) = verb(b"CHALLENGE") {
-            let rid: String = comps[i + 1].value.iter().map(|b| format!("{b:02x}")).collect();
+            let rid: String = comps[i + 1]
+                .value
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             self.ca.handle_challenge(&rid, &params()).await?
         } else {
             let wire = self
@@ -74,15 +78,19 @@ async fn root_dev(tokens: &[(&str, &str)]) -> RootDevice {
     let ca_key = ca_key_name(&ns());
     mgr.generate_ed25519(ca_key.clone()).unwrap();
     let ca_pub = mgr.get_signer_sync(&ca_key).unwrap().public_key().unwrap();
-    mgr.certify(&ca_key, ca_pub, &root_dev.anchor_key, 3_650 * 86_400 * 1_000)
-        .await
-        .unwrap();
+    mgr.certify(
+        &ca_key,
+        ca_pub,
+        &root_dev.anchor_key,
+        3_650 * 86_400 * 1_000,
+    )
+    .await
+    .unwrap();
     let store = TokenStore::new();
     for (token, role) in tokens {
         store.add_scoped(*token, None, Some(ns().append(*role)));
     }
-    let challenges: Vec<Box<dyn ChallengeHandler>> =
-        vec![Box::new(TokenChallenge::new(store))];
+    let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(TokenChallenge::new(store))];
     let config = CaConfig::new(
         ns(),
         "namespace CA".to_string(),
@@ -158,7 +166,10 @@ async fn member_invite_certifies_the_device_key_and_keeps_it_private() {
     let uri = invite("/home/bob/member", "member-aa", root_dev.fingerprint);
     let (result, sent) = run(&root_dev, &keyring, &uri, "phone").await;
     let cert = result.expect("member token enrolls a member key");
-    assert!(cert.name.has_prefix(&"/home/bob/member/phone/KEY".parse().unwrap()));
+    assert!(
+        cert.name
+            .has_prefix(&"/home/bob/member/phone/KEY".parse().unwrap())
+    );
     assert_eq!(cert.issuer.as_deref(), Some(&ca_key_name(&ns())));
 
     let pkcs8 = ndn_security::safebag::ed25519_seed_to_pkcs8(&DEVICE_SEED).unwrap();
@@ -200,9 +211,15 @@ async fn a_token_certifies_only_its_role() {
     let uri = invite("/home/bob/guest", "guest-gg", root_dev.fingerprint);
     let (result, _) = run(&root_dev, &keyring, &uri, "friend").await;
     let cert = result.expect("guest token enrolls a guest key");
-    assert!(cert.name.has_prefix(&"/home/bob/guest/friend".parse().unwrap()));
+    assert!(
+        cert.name
+            .has_prefix(&"/home/bob/guest/friend".parse().unwrap())
+    );
     let (again, _) = run(&root_dev, &keyring, &uri, "friend2").await;
-    assert!(matches!(again, Err(InviteEnrollError::TokenRefused(_))), "{again:?}");
+    assert!(
+        matches!(again, Err(InviteEnrollError::TokenRefused(_))),
+        "{again:?}"
+    );
 }
 
 /// A held context signed by another root than the invite expects is refused
@@ -214,7 +231,10 @@ async fn other_root_or_foreign_key_is_refused_before_contacting_the_ca() {
     let keyring = device_keyring(&root_dev);
     let uri = invite("/home/bob/member", "member-aa", [7; 32]);
     let (result, sent) = run(&root_dev, &keyring, &uri, "phone").await;
-    assert!(matches!(result, Err(InviteEnrollError::DifferentRoot { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(InviteEnrollError::DifferentRoot { .. })),
+        "{result:?}"
+    );
     assert!(sent.is_empty());
 
     let uri = invite("/home/bob/member", "member-aa", root_dev.fingerprint);
@@ -246,7 +266,10 @@ async fn the_ca_policy_decides_the_certificate_lifetime() {
     let (result, _) = run(&root_dev, &keyring, &uri, "phone").await;
     let cert = result.expect("enrolls");
     let secs = (cert.valid_until - cert.valid_from) / 1_000_000_000;
-    assert!((86_400 - 60..=86_400 + 60).contains(&secs), "lifetime {secs}s");
+    assert!(
+        (86_400 - 60..=86_400 + 60).contains(&secs),
+        "lifetime {secs}s"
+    );
 }
 
 /// A token carrying an expiry is refused once it has passed, before
@@ -254,7 +277,11 @@ async fn the_ca_policy_decides_the_certificate_lifetime() {
 #[test]
 fn an_expired_invite_is_refused() {
     use ndn_cert::roles::token_with_expiry;
-    let expired = invite("/home/bob/member", &token_with_expiry("member-aa", 1), [1; 32]);
+    let expired = invite(
+        "/home/bob/member",
+        &token_with_expiry("member-aa", 1),
+        [1; 32],
+    );
     assert!(matches!(
         InviteLink::from_uri(&expired),
         Err(InviteEnrollError::TokenExpired { .. })
@@ -275,7 +302,11 @@ fn an_invite_expires_at_its_until_and_a_malformed_expiry_is_refused() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let at_now = invite("/home/bob/member", &token_with_expiry("member-aa", now), [1; 32]);
+    let at_now = invite(
+        "/home/bob/member",
+        &token_with_expiry("member-aa", now),
+        [1; 32],
+    );
     assert!(matches!(
         InviteLink::from_uri(&at_now),
         Err(InviteEnrollError::TokenExpired { .. })
@@ -340,6 +371,9 @@ fn malformed_invites_are_refused_without_panicking() {
     let ok = InviteLink::from_uri(&env("/home/bob", "/home/bob/member", "member-aa")).unwrap();
     assert_eq!(ok.namespace, ns());
     for device in ["", "KEY", "member", "a/b", "-x", &"x".repeat(64)] {
-        assert!(ok.device_identity(device).is_err(), "accepted device {device:?}");
+        assert!(
+            ok.device_identity(device).is_err(),
+            "accepted device {device:?}"
+        );
     }
 }

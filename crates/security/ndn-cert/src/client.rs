@@ -355,8 +355,15 @@ where
     F: FnMut(ChallengeRound) -> Fut,
     Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
 {
-    let session = run_session(exchange, ca_prefix, signer, validity_secs, challenge_type, respond)
-        .await?;
+    let session = run_session(
+        exchange,
+        ca_prefix,
+        signer,
+        validity_secs,
+        challenge_type,
+        respond,
+    )
+    .await?;
     session
         .issued_cert_name()
         .cloned()
@@ -378,8 +385,15 @@ where
     F: FnMut(ChallengeRound) -> Fut,
     Fut: Future<Output = Result<Option<serde_json::Map<String, serde_json::Value>>, CertError>>,
 {
-    let (session, complete) =
-        drive(exchange, ca_prefix, signer, validity_secs, challenge_type, respond).await?;
+    let (session, complete) = drive(
+        exchange,
+        ca_prefix,
+        signer,
+        validity_secs,
+        challenge_type,
+        respond,
+    )
+    .await?;
     if complete {
         return Ok(session);
     }
@@ -415,7 +429,11 @@ where
         .await?;
     session.handle_new_response(response_content(&new_data, "NEW")?)?;
 
-    if !session.offered_challenges().iter().any(|c| c == challenge_type) {
+    if !session
+        .offered_challenges()
+        .iter()
+        .any(|c| c == challenge_type)
+    {
         return Err(CertError::InvalidRequest(format!(
             "CA did not offer the '{challenge_type}' challenge; offered: {:?}",
             session.offered_challenges()
@@ -447,7 +465,11 @@ where
         };
         let body = session.challenge_request_body(challenge_type, params)?;
         let data = exchange
-            .express(session.signed_interest(challenge_name.clone(), body).await?)
+            .express(
+                session
+                    .signed_interest(challenge_name.clone(), body)
+                    .await?,
+            )
             .await?;
         session.handle_challenge_response(response_content(&data, "CHALLENGE")?)?;
 
@@ -487,9 +509,14 @@ where
     E: CaExchange + ?Sized,
 {
     let mut params = Some(params);
-    let (session, complete) = drive(exchange, ca_prefix, signer, validity_secs, challenge_type, |_| {
-        std::future::ready(Ok(params.take()))
-    })
+    let (session, complete) = drive(
+        exchange,
+        ca_prefix,
+        signer,
+        validity_secs,
+        challenge_type,
+        |_| std::future::ready(Ok(params.take())),
+    )
     .await?;
     if complete {
         return session
@@ -571,9 +598,8 @@ where
     let data = exchange
         .express(signed_command(name, body, &signer, &key_locator).await?)
         .await?;
-    let resp = RevokeResponseTlv::decode(Bytes::copy_from_slice(response_content(
-        &data, "REVOKE",
-    )?))?;
+    let resp =
+        RevokeResponseTlv::decode(Bytes::copy_from_slice(response_content(&data, "REVOKE")?))?;
     match resp.status {
         REVOKE_STATUS_REVOKED => Ok(RevokeStatus::Revoked),
         REVOKE_STATUS_NOT_FOUND => Ok(RevokeStatus::NotFound),

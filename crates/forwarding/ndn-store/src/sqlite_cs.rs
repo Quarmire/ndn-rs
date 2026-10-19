@@ -732,7 +732,10 @@ mod tests {
     }
 
     async fn epoch_of(cs: &SqliteCs, name: &str) -> Option<u64> {
-        cs.get(&interest(&[name]), 0).await.unwrap().revocation_epoch
+        cs.get(&interest(&[name]), 0)
+            .await
+            .unwrap()
+            .revocation_epoch
     }
 
     /// Keyring epochs restart at 0, so a stamp read back by a later open must

@@ -222,7 +222,9 @@ fn cached_issuers(manager: &SecurityManager, cert: &Certificate) -> Vec<Data> {
     let mut issuers: Vec<Data> = Vec::new();
     let mut locator = cert.issuer.clone();
     while let Some(key) = locator.take() {
-        let Some(issuer) = manager.cert_cache().get_valid(&key) else { break };
+        let Some(issuer) = manager.cert_cache().get_valid(&key) else {
+            break;
+        };
         let Some(data) = issuer.data_wire().and_then(|wire| Data::decode(wire).ok()) else {
             break;
         };
@@ -529,7 +531,8 @@ impl RenewalSchedule {
     /// the first time that is seen for `key`: warn that it renews at a third
     /// of its lifetime instead.
     pub fn first_short_lived(&mut self, key: &Name, cert: &Certificate) -> bool {
-        self.before.exceeds_lifetime(cert.valid_from, cert.valid_until)
+        self.before
+            .exceeds_lifetime(cert.valid_from, cert.valid_until)
             && self.short_lived.insert(key.clone())
     }
 
@@ -682,8 +685,14 @@ mod tests {
         let held = held_certificate(&manager, &key_name).expect("the expired one is held");
         let mut schedule = RenewalSchedule::new(RenewBefore::ONE_THIRD);
         assert_eq!(schedule.check(&key_name, &held, Now::current()), Due::Now);
-        assert_eq!(schedule.failed(&held, false, Now::current()), Failed::Expired);
-        assert_eq!(schedule.check(&key_name, &held, Now::current()), Due::Expired);
+        assert_eq!(
+            schedule.failed(&held, false, Now::current()),
+            Failed::Expired
+        );
+        assert_eq!(
+            schedule.check(&key_name, &held, Now::current()),
+            Due::Expired
+        );
     }
 
     const DAY: u64 = 86_400_000_000_000;
@@ -720,7 +729,9 @@ mod tests {
         let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
         let t = Instant::now();
         s.begin_scan([(&key, &*c.name)]);
-        let Due::Later(after) = s.check(&key, &c, at(10, t)) else { panic!("not due yet") };
+        let Due::Later(after) = s.check(&key, &c, at(10, t)) else {
+            panic!("not due yet")
+        };
         assert!(after.as_nanos().abs_diff(u128::from(50 * DAY)) < 1_000_000);
         assert_eq!(s.wait(), RenewalSchedule::MAX_WAIT);
         assert_eq!(s.check(&key, &c, at(61, t)), Due::Now);
@@ -735,7 +746,12 @@ mod tests {
         let mut s = RenewalSchedule::new(RenewBefore::ONE_THIRD);
         let t = Instant::now();
         s.begin_scan([(&key, &*c.name)]);
-        let Failed::Retry { attempts: 1, delay, days_left } = s.failed(&c, false, at(80, t)) else {
+        let Failed::Retry {
+            attempts: 1,
+            delay,
+            days_left,
+        } = s.failed(&c, false, at(80, t))
+        else {
             panic!("a current certificate is retried")
         };
         assert!(between(delay, 30, 60), "{delay:?}");
@@ -743,11 +759,17 @@ mod tests {
         assert_eq!(s.wait(), delay.max(RenewalSchedule::MIN_WAIT));
         assert!(matches!(s.check(&key, &c, at(80, t)), Due::Later(left) if left <= delay));
         assert_eq!(s.check(&key, &c, at(80, t + delay)), Due::Now);
-        let Failed::Retry { attempts: 2, delay, .. } = s.failed(&c, false, at(80, t + delay)) else {
+        let Failed::Retry {
+            attempts: 2, delay, ..
+        } = s.failed(&c, false, at(80, t + delay))
+        else {
             panic!("retried again")
         };
         assert!(between(delay, 60, 120), "{delay:?}");
-        let Failed::Retry { attempts: 3, delay, .. } = s.failed(&c, true, at(80, t)) else {
+        let Failed::Retry {
+            attempts: 3, delay, ..
+        } = s.failed(&c, true, at(80, t))
+        else {
             panic!("a refusal is retried too")
         };
         assert!(between(delay, 1_800, 3_600), "{delay:?}");
@@ -824,9 +846,11 @@ mod tests {
     /// The wait between scans stays within the bounds.
     #[test]
     fn the_wait_is_bounded() {
-        let s = RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_millis(30));
+        let s =
+            RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_millis(30));
         assert_eq!(s.wait(), RenewalSchedule::MIN_WAIT);
-        let s = RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_secs(600));
+        let s =
+            RenewalSchedule::new(RenewBefore::ONE_THIRD).with_max_wait(Duration::from_secs(600));
         assert_eq!(s.wait(), Duration::from_secs(600));
     }
 

@@ -414,9 +414,7 @@ fn security_enroll(
 }
 
 /// The JSON answer of a deferred trust-admin verb.
-fn json_answer<T: serde::Serialize>(
-    result: Result<T, crate::TrustRefusal>,
-) -> ControlResponse {
+fn json_answer<T: serde::Serialize>(result: Result<T, crate::TrustRefusal>) -> ControlResponse {
     match result {
         Ok(info) => match serde_json::to_string(&info) {
             Ok(json) => ControlResponse::ok_empty(json),
@@ -449,9 +447,7 @@ fn security_renew(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> Mg
 /// trust-admin peer-credential gate (and refused over `/localhop`).
 /// Success: `200` with a JSON list of [`ndn_cert::OutgoingRequest`] as
 /// status text.
-fn security_enroll_status(
-    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
-) -> MgmtResponse {
+fn security_enroll_status(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> MgmtResponse {
     let Some(backend) = backend else {
         return ControlResponse::error(
             status::NOT_FOUND,
@@ -461,7 +457,9 @@ fn security_enroll_status(
         .into();
     };
     let backend = Arc::clone(backend);
-    MgmtResponse::Deferred(Box::pin(async move { json_answer(backend.enroll_status().await) }))
+    MgmtResponse::Deferred(Box::pin(async move {
+        json_answer(backend.enroll_status().await)
+    }))
 }
 
 /// `security/context-refresh`: check the held trust context of the
@@ -788,19 +786,28 @@ mod security_v1_handler_tests {
                 name: Some(identity.clone()),
                 ..Default::default()
             };
-            assert_eq!(refused(security_enroll(params, Some(&backend))), status::BAD_PARAMS);
+            assert_eq!(
+                refused(security_enroll(params, Some(&backend))),
+                status::BAD_PARAMS
+            );
         }
         let no_identity = ControlParameters {
             uri: Some("ndn-trust://invite/x".into()),
             ..Default::default()
         };
-        assert_eq!(refused(security_enroll(no_identity, Some(&backend))), status::BAD_PARAMS);
+        assert_eq!(
+            refused(security_enroll(no_identity, Some(&backend))),
+            status::BAD_PARAMS
+        );
 
         let params = ControlParameters {
             uri: Some("ndn-trust://anchor/x".into()),
             ..Default::default()
         };
-        assert_eq!(refused(security_context_adopt(params, None)), status::NOT_FOUND);
+        assert_eq!(
+            refused(security_context_adopt(params, None)),
+            status::NOT_FOUND
+        );
         let params = ControlParameters {
             uri: Some("ndn-trust://invite/x".into()),
             name: Some(identity),

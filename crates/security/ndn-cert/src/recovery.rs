@@ -1236,7 +1236,15 @@ pub async fn recover_namespace_in_pib(
                 .map_err(io(&path))?;
             paths.push(path);
         }
-        Ok((version, root_version, root_store, anchor, ca_cert, device_cert, paths))
+        Ok((
+            version,
+            root_version,
+            root_store,
+            anchor,
+            ca_cert,
+            device_cert,
+            paths,
+        ))
     }
     .await;
 
@@ -1278,7 +1286,10 @@ mod tests {
             let refused = check_kit_firmware(old).unwrap_err();
             let [major, minor, patch] = old;
             let text = refused.to_string();
-            assert!(text.contains(&format!("firmware is {major}.{minor}.{patch}")), "{text}");
+            assert!(
+                text.contains(&format!("firmware is {major}.{minor}.{patch}")),
+                "{text}"
+            );
             assert!(text.contains("could never be opened"), "{text}");
         }
         for new in [[5, 3, 0], [5, 4, 3], [5, 7, 1], [6, 0, 0]] {
@@ -1316,8 +1327,7 @@ mod tests {
         let public_key = seed.signer(&Name::root()).public_key_bytes();
 
         // Sealed from NFD input: sealed in NFC, opens with either.
-        let uri = seal_file_kit(&seed, &anchor, &"/home/bob".parse().unwrap(), None, &nfd)
-            .unwrap();
+        let uri = seal_file_kit(&seed, &anchor, &"/home/bob".parse().unwrap(), None, &nfd).unwrap();
         let path = dir.path().join("new.kit");
         std::fs::write(&path, uri).unwrap();
         let kit = FileKit::read(&path).unwrap();
@@ -1351,13 +1361,20 @@ mod tests {
         let oid = |bytes: &[u8]| tlv(0x06, bytes);
         let prf = tlv(
             0x30,
-            &[oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09]), vec![0x05, 0x00]].concat(),
+            &[
+                oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x09]),
+                vec![0x05, 0x00],
+            ]
+            .concat(),
         );
         let pbkdf2 = tlv(
             0x30,
             &[
                 oid(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c]),
-                tlv(0x30, &[tlv(0x04, &[1; 16]), tlv(0x02, iterations), prf].concat()),
+                tlv(
+                    0x30,
+                    &[tlv(0x04, &[1; 16]), tlv(0x02, iterations), prf].concat(),
+                ),
             ]
             .concat(),
         );

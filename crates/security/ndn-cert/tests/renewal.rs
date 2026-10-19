@@ -42,7 +42,11 @@ impl CaExchange for CaWire {
         let body = if verb(b"NEW").is_some() {
             self.0.handle_new(&params()).await?
         } else if let Some(i) = verb(b"CHALLENGE") {
-            let rid: String = comps[i + 1].value.iter().map(|b| format!("{b:02x}")).collect();
+            let rid: String = comps[i + 1]
+                .value
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             self.0.handle_challenge(&rid, &params()).await?
         } else {
             let wire = self
@@ -74,7 +78,11 @@ async fn namespace(policy: impl FnOnce(Name) -> Box<dyn ndn_cert::IssuancePolicy
         .await
         .unwrap();
     let store = TokenStore::new();
-    for (token, role) in [("member-aa", "member"), ("member-bb", "member"), ("guest-gg", "guest")] {
+    for (token, role) in [
+        ("member-aa", "member"),
+        ("member-bb", "member"),
+        ("guest-gg", "guest"),
+    ] {
         store.add_scoped(token, None, Some(ns().append(role)));
     }
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(TokenChallenge::new(store))];
@@ -124,10 +132,16 @@ async fn enroll(ns: &Namespace, role: &str, token: &str, device: &str, seed: u8)
     let invite = InviteLink::from_uri(&uri).unwrap();
     let key_name = new_device_key_name(&invite.device_identity(device).unwrap()).unwrap();
     let key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[seed; 32], key_name));
-    let enrolled = enroll_with_invite(&keyring, None, &mut CaWire(Arc::clone(&ns.ca)), &invite, Arc::clone(&key))
-        .await
-        .map_err(|f| f.error)
-        .expect("the token enrolls the device");
+    let enrolled = enroll_with_invite(
+        &keyring,
+        None,
+        &mut CaWire(Arc::clone(&ns.ca)),
+        &invite,
+        Arc::clone(&key),
+    )
+    .await
+    .map_err(|f| f.error)
+    .expect("the token enrolls the device");
     Device {
         keyring,
         key,
@@ -135,7 +149,10 @@ async fn enroll(ns: &Namespace, role: &str, token: &str, device: &str, seed: u8)
     }
 }
 
-async fn renew(ns: &Namespace, device: &Device) -> Result<ndn_cert::IssuedCertificate, RenewalError> {
+async fn renew(
+    ns: &Namespace,
+    device: &Device,
+) -> Result<ndn_cert::IssuedCertificate, RenewalError> {
     renew_certificate(
         &device.keyring,
         &mut CaWire(Arc::clone(&ns.ca)),
@@ -156,7 +173,11 @@ fn cert_of(data: &Data) -> ndn_security::Certificate {
 
 /// The CA's verdict on a renewal request sent as-is (no client-side
 /// checks): `signer` signs the request and the proof for `cert_name`.
-async fn raw_renewal(ns: &Namespace, signer: Arc<dyn Signer>, cert_name: &Name) -> Result<Name, CertError> {
+async fn raw_renewal(
+    ns: &Namespace,
+    signer: Arc<dyn Signer>,
+    cert_name: &Name,
+) -> Result<Name, CertError> {
     let proof_key = Arc::clone(&signer);
     let cert_name = cert_name.clone();
     ndn_cert::client::enroll(
@@ -201,10 +222,18 @@ async fn a_valid_device_renews_without_a_token_and_keeps_its_key() {
     // Validity periods are stored to the second.
     std::thread::sleep(Duration::from_millis(1_100));
 
-    let renewed = renew(&ns, &device).await.expect("a current member certificate renews");
-    assert!(renewed.cert.name.has_prefix(device.key.key_name()), "for the same key name");
+    let renewed = renew(&ns, &device)
+        .await
+        .expect("a current member certificate renews");
+    assert!(
+        renewed.cert.name.has_prefix(device.key.key_name()),
+        "for the same key name"
+    );
     assert_eq!(renewed.cert.public_key, old.public_key, "for the same key");
-    assert!(renewed.cert.valid_until > old.valid_until, "a new certificate, valid for longer");
+    assert!(
+        renewed.cert.valid_until > old.valid_until,
+        "a new certificate, valid for longer"
+    );
     assert_eq!(renewed.issuer.as_ref(), Some(&ca_key_name(&self::ns())));
     assert!((30 * 86_400 - 60..=30 * 86_400 + 60).contains(&lifetime_secs(&renewed.cert)));
 
@@ -213,7 +242,9 @@ async fn a_valid_device_renews_without_a_token_and_keeps_its_key() {
         cert: renewed.data,
         ..device
     };
-    renew(&ns, &again).await.expect("a renewed certificate renews again");
+    renew(&ns, &again)
+        .await
+        .expect("a renewed certificate renews again");
 }
 
 /// Each role's certificates last what the policy sets for that role.
@@ -224,8 +255,14 @@ async fn per_role_lifetimes_are_honoured() {
     let guest = enroll(&ns, "guest", "guest-gg", "friend", 2).await;
     let member_secs = lifetime_secs(&cert_of(&member.cert));
     let guest_secs = lifetime_secs(&cert_of(&guest.cert));
-    assert!((30 * 86_400 - 60..=30 * 86_400 + 60).contains(&member_secs), "{member_secs}");
-    assert!((7 * 86_400 - 60..=7 * 86_400 + 60).contains(&guest_secs), "{guest_secs}");
+    assert!(
+        (30 * 86_400 - 60..=30 * 86_400 + 60).contains(&member_secs),
+        "{member_secs}"
+    );
+    assert!(
+        (7 * 86_400 - 60..=7 * 86_400 + 60).contains(&guest_secs),
+        "{guest_secs}"
+    );
 }
 
 /// A guest is not renewable by default, so guest access ends at expiry; a
@@ -235,11 +272,16 @@ async fn a_guest_cannot_renew_by_default() {
     let ns = namespace(role_policy).await;
     let guest = enroll(&ns, "guest", "guest-gg", "friend", 2).await;
     let refused = renew(&ns, &guest).await;
-    assert!(matches!(refused, Err(RenewalError::Refused { .. })), "{refused:?}");
+    assert!(
+        matches!(refused, Err(RenewalError::Refused { .. })),
+        "{refused:?}"
+    );
 
     let ns = namespace(|ns| Box::new(RolePolicy::new(ns).with_renewable(Role::Guest, true))).await;
     let guest = enroll(&ns, "guest", "guest-gg", "friend", 2).await;
-    renew(&ns, &guest).await.expect("a policy may make guests renewable");
+    renew(&ns, &guest)
+        .await
+        .expect("a policy may make guests renewable");
 }
 
 /// A key the CA revoked is never renewed, whichever certificate of it the
@@ -248,18 +290,26 @@ async fn a_guest_cannot_renew_by_default() {
 async fn a_revoked_key_cannot_renew() {
     let ns = namespace(role_policy).await;
     let device = enroll(&ns, "member", "member-aa", "phone", 1).await;
-    let renewed = renew(&ns, &device).await.expect("renews before the revocation");
+    let renewed = renew(&ns, &device)
+        .await
+        .expect("renews before the revocation");
     let revoked = ns.ca.revoke_issued_under(device.key.key_name());
     assert!(!revoked.revoked.is_empty());
 
-    for cert in [Data::decode(device.cert.raw().clone()).unwrap(), renewed.data] {
+    for cert in [
+        Data::decode(device.cert.raw().clone()).unwrap(),
+        renewed.data,
+    ] {
         let presenting = Device {
             keyring: Arc::clone(&device.keyring),
             key: Arc::clone(&device.key),
             cert,
         };
         let refused = renew(&ns, &presenting).await;
-        assert!(matches!(refused, Err(RenewalError::Refused { .. })), "{refused:?}");
+        assert!(
+            matches!(refused, Err(RenewalError::Refused { .. })),
+            "{refused:?}"
+        );
     }
 }
 
@@ -275,11 +325,17 @@ async fn an_expired_certificate_cannot_renew() {
     std::thread::sleep(Duration::from_millis(3_100));
 
     let refused = renew(&ns, &device).await;
-    assert!(matches!(refused, Err(RenewalError::Expired { .. })), "{refused:?}");
+    assert!(
+        matches!(refused, Err(RenewalError::Expired { .. })),
+        "{refused:?}"
+    );
 
     let cert_name = (*cert_of(&device.cert).name).clone();
     let at_ca = raw_renewal(&ns, Arc::clone(&device.key), &cert_name).await;
-    assert!(matches!(at_ca, Err(CertError::ChallengeFailed(_))), "{at_ca:?}");
+    assert!(
+        matches!(at_ca, Err(CertError::ChallengeFailed(_))),
+        "{at_ca:?}"
+    );
 }
 
 /// Renewal proves possession of the certified key: another key cannot renew
@@ -311,5 +367,8 @@ async fn a_ca_that_does_not_renew_refuses() {
     let device = enroll(&renewing, "member", "member-aa", "phone", 1).await;
     let plain = namespace(|_| Box::new(ndn_cert::AcceptAllIssuance)).await;
     let refused = renew(&plain, &device).await;
-    assert!(matches!(refused, Err(RenewalError::Refused { .. })), "{refused:?}");
+    assert!(
+        matches!(refused, Err(RenewalError::Refused { .. })),
+        "{refused:?}"
+    );
 }

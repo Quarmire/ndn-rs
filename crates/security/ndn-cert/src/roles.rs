@@ -457,7 +457,10 @@ mod tests {
     #[test]
     fn malformed_token_expiry_fails_closed() {
         assert_eq!(token_expiry("member-ab"), Ok(None));
-        assert_eq!(token_expiry(&token_with_expiry("member-ab", 1700000000)), Ok(Some(1700000000)));
+        assert_eq!(
+            token_expiry(&token_with_expiry("member-ab", 1700000000)),
+            Ok(Some(1700000000))
+        );
         for bad in [
             "member-ab-until",
             "member-ab-untilsoon",
@@ -645,7 +648,10 @@ mod tests {
         let cert = cert_of(&key);
         let by_key = ctx.authorizes_hop(&data, &key, Some(&cert));
         let by_cert = ctx.authorizes_hop(&data, &cert, Some(&cert));
-        assert_eq!(by_key, by_cert, "{data} by {key}: the KeyLocator form changed the verdict");
+        assert_eq!(
+            by_key, by_cert,
+            "{data} by {key}: the KeyLocator form changed the verdict"
+        );
         by_key
     }
 
@@ -692,13 +698,21 @@ mod tests {
         // The certificate hops, as LVS (python-ndn, NDNts) reads them: the
         // published LVS alone admits them with certificate-name signers.
         let lvs = SignedTrustContext::hierarchical(n("/home/bob"))
-            .with_schema_blob(SchemaBlob::lvs(namespace_schema(&n("/home/bob")).unwrap().lvs_binary))
+            .with_schema_blob(SchemaBlob::lvs(
+                namespace_schema(&n("/home/bob")).unwrap().lvs_binary,
+            ))
             .unwrap()
             .schema_authoritative();
         for (data, key) in [
             ("/home/bob/CA/KEY/ca/NA/v=1", "/home/bob/KEY/root/self/v=1"),
-            ("/home/bob/member/phone/KEY/k1/NDNCERT/v=2", "/home/bob/CA/KEY/ca/NA/v=1"),
-            ("/home/bob/32=trust-context/v=3", "/home/bob/KEY/root/self/v=1"),
+            (
+                "/home/bob/member/phone/KEY/k1/NDNCERT/v=2",
+                "/home/bob/CA/KEY/ca/NA/v=1",
+            ),
+            (
+                "/home/bob/32=trust-context/v=3",
+                "/home/bob/KEY/root/self/v=1",
+            ),
         ] {
             assert!(lvs.authorizes(&n(data), &n(key)), "LVS: {data} by {key}");
         }
@@ -758,7 +772,10 @@ mod tests {
                 "/home/bob/member/phone/KEY/k1",
             ),
             ("/home/bob/member/phone/KEY/k1", "/home/bob/KEY/root"),
-            ("/home/bob/member/phone/KEY/k1/NDNCERT/v=1", "/home/bob/KEY/root"),
+            (
+                "/home/bob/member/phone/KEY/k1/NDNCERT/v=1",
+                "/home/bob/KEY/root",
+            ),
             (
                 "/home/bob/admin/laptop/KEY/k1",
                 "/home/bob/admin/desk/KEY/k1",
@@ -796,7 +813,9 @@ mod tests {
              #ca: {ns}/\"CA\"/\"KEY\"/_ <= #root\n"
         );
         for role in Role::ALL {
-            lvs.push_str(&format!("#{role}: {ns}/\"{role}\"/_device/\"KEY\"/_ <= #ca\n"));
+            lvs.push_str(&format!(
+                "#{role}: {ns}/\"{role}\"/_device/\"KEY\"/_ <= #ca\n"
+            ));
             lvs.push_str(&format!(
                 "#approve_{role}: {ns}/\"{role}\"/_device/\"KEY\"/_/\"ndncert-approve\"/_ <= #admin\n"
             ));

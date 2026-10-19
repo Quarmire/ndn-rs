@@ -176,11 +176,7 @@ fn decode_nonnegative_integer(bytes: &[u8]) -> Option<u64> {
     if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
         return None;
     }
-    Some(
-        bytes
-            .iter()
-            .fold(0u64, |val, &b| (val << 8) | u64::from(b)),
-    )
+    Some(bytes.iter().fold(0u64, |val, &b| (val << 8) | u64::from(b)))
 }
 
 /// Decode a value as a *canonical* NonNegativeInteger: 1/2/4/8 octets in the
@@ -771,10 +767,7 @@ mod nonneg_integer_tests {
         assert_eq!(version_component(&[7]).as_version(), Some(7));
         assert_eq!(version_component(&[0, 7]).as_version(), Some(7));
         assert_eq!(version_component(&[0, 0, 1, 0]).as_version(), Some(256));
-        assert_eq!(
-            version_component(&[0xFF; 8]).as_version(),
-            Some(u64::MAX)
-        );
+        assert_eq!(version_component(&[0xFF; 8]).as_version(), Some(u64::MAX));
         for len in [0usize, 3, 5, 6, 7, 9, 16] {
             let c = version_component(&[1u8; 16][..len]);
             assert_eq!(c.as_version(), None, "{len} octets");

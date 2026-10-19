@@ -307,8 +307,10 @@ impl ApprovalListing {
                 text(ca_tlv::STATE, &r.state);
                 text(ca_tlv::APPROVER, &r.approver);
                 text(ca_tlv::REASON, &r.reason);
-                for (typ, v) in [(ca_tlv::CREATED, r.created_secs), (ca_tlv::EXPIRES, r.expires_secs)]
-                {
+                for (typ, v) in [
+                    (ca_tlv::CREATED, r.created_secs),
+                    (ca_tlv::EXPIRES, r.expires_secs),
+                ] {
                     let (b, n) = nni_bytes(v);
                     inner.write_tlv(typ, &b[..n]);
                 }
@@ -394,7 +396,9 @@ mod tests {
         ];
         let listing = ApprovalListing {
             rows,
-            notes: alloc::vec!["/home/carol: unreachable (no answer); its requests are not shown".into()],
+            notes: alloc::vec![
+                "/home/carol: unreachable (no answer); its requests are not shown".into()
+            ],
         };
         let wire = listing.encode();
         assert_eq!(ApprovalListing::decode(&wire), listing);

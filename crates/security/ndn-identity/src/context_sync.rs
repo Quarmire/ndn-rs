@@ -130,7 +130,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_cert::{
-    ContextStep, ContextUpdate, MAX_CATCH_UP_TIME, UpdateRefusal, Unfetched, VersionSource,
+    ContextStep, ContextUpdate, MAX_CATCH_UP_TIME, Unfetched, UpdateRefusal, VersionSource,
     follow_versions, open_context_update,
 };
 use ndn_packet::{Data, Name, NameComponent};
@@ -142,9 +142,8 @@ use tokio_util::sync::CancellationToken;
 /// The name of `namespace`'s context-sync group:
 /// `/<ns>/32=trust-context/32=sync`.
 pub fn group_prefix(namespace: &Name) -> Name {
-    ndn_cert::rdr_prefix(namespace).append_component(NameComponent::keyword(Bytes::from_static(
-        b"sync",
-    )))
+    ndn_cert::rdr_prefix(namespace)
+        .append_component(NameComponent::keyword(Bytes::from_static(b"sync")))
 }
 
 /// The group Data a member named `publisher` (`<group>/<member>`) publishes
@@ -156,8 +155,11 @@ pub fn group_data(publisher: &Name, context: &Data) -> Option<Bytes> {
     context_namespace_of(&context.name)?;
     let version = context.name.components().last()?.as_version()?;
     Some(
-        ndn_packet::encode::DataBuilder::new(publisher.clone().append_segment(version), context.raw())
-            .build(),
+        ndn_packet::encode::DataBuilder::new(
+            publisher.clone().append_segment(version),
+            context.raw(),
+        )
+        .build(),
     )
 }
 
@@ -403,12 +405,18 @@ impl VersionSource for GroupVersions<'_> {
             )));
         }
         let name = self.group.clone().append_segment(position);
-        let content = self.fetcher.fetch_content(name.clone()).await.map_err(|e| match e {
-            ContextFetchError::Missing(reason) => {
-                Unfetched::Missing(format!("{name} could not be fetched: {reason}"))
-            }
-            ContextFetchError::Refused(reason) => Unfetched::Dropped(format!("{name}: {reason}")),
-        })?;
+        let content = self
+            .fetcher
+            .fetch_content(name.clone())
+            .await
+            .map_err(|e| match e {
+                ContextFetchError::Missing(reason) => {
+                    Unfetched::Missing(format!("{name} could not be fetched: {reason}"))
+                }
+                ContextFetchError::Refused(reason) => {
+                    Unfetched::Dropped(format!("{name}: {reason}"))
+                }
+            })?;
         Data::decode(content)
             .map_err(|e| Unfetched::Missing(format!("{name} carries no Data packet: {e}")))
     }
@@ -800,7 +808,10 @@ mod tests {
         let v2 = root.version(2, &[revoked]);
         fetcher.publish(2, &v2);
 
-        match process_update(&update_at(2), &fetcher, &keyring).await.outcome {
+        match process_update(&update_at(2), &fetcher, &keyring)
+            .await
+            .outcome
+        {
             ContextSyncOutcome::Adopted(adopted) => {
                 assert_eq!((adopted.previous, adopted.context.version()), (1, 2));
                 assert_eq!(adopted.revoked, vec![n(revoked)]);
@@ -835,7 +846,10 @@ mod tests {
 
         // The walk from the held version finds no version linking the two
         // (positions 2..8 are not published), so the update stays refused.
-        match process_update(&update_at(9), &fetcher, &keyring).await.outcome {
+        match process_update(&update_at(9), &fetcher, &keyring)
+            .await
+            .outcome
+        {
             ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
                 held: 1,
                 offered: 9,
@@ -848,7 +862,9 @@ mod tests {
         // Bare Content (the old wire) is unauthenticated and never adopted.
         fetcher.publish_raw(10, root.init.context.encode_content());
         assert!(matches!(
-            process_update(&update_at(10), &fetcher, &keyring).await.outcome,
+            process_update(&update_at(10), &fetcher, &keyring)
+                .await
+                .outcome,
             ContextSyncOutcome::DecodeFailed
         ));
         // Neither is a genuine context whose signature no longer verifies.
@@ -858,7 +874,9 @@ mod tests {
         wire[last] ^= 0xff;
         fetcher.publish_raw(11, Bytes::from(wire));
         assert!(matches!(
-            process_update(&update_at(11), &fetcher, &keyring).await.outcome,
+            process_update(&update_at(11), &fetcher, &keyring)
+                .await
+                .outcome,
             ContextSyncOutcome::Refused(UpdateRefusal::Unauthentic(_))
         ));
         assert_eq!(held_version(&keyring), 1, "the held version stays");
@@ -879,7 +897,9 @@ mod tests {
         fetcher.publish(3, &root.version(3, &[]));
         for seq in [6, 3] {
             assert!(matches!(
-                process_update(&update_at(seq), &fetcher, &keyring).await.outcome,
+                process_update(&update_at(seq), &fetcher, &keyring)
+                    .await
+                    .outcome,
                 ContextSyncOutcome::Refused(UpdateRefusal::NotNewer { held: 5, .. })
             ));
         }
@@ -895,7 +915,9 @@ mod tests {
         let fetcher = MapFetcher::new();
         fetcher.publish(2, &root.version(2, &[]));
         assert!(matches!(
-            process_update(&update_at(2), &fetcher, &keyring).await.outcome,
+            process_update(&update_at(2), &fetcher, &keyring)
+                .await
+                .outcome,
             ContextSyncOutcome::NotHeld { .. }
         ));
         assert!(keyring.is_empty());
@@ -906,12 +928,16 @@ mod tests {
         let keyring = Keyring::new();
         let fetcher = MapFetcher::new();
         assert!(matches!(
-            process_update(&update_at(1), &fetcher, &keyring).await.outcome,
+            process_update(&update_at(1), &fetcher, &keyring)
+                .await
+                .outcome,
             ContextSyncOutcome::FetchFailed { .. }
         ));
         fetcher.publish_raw(1, Bytes::from_static(b"not a trust context"));
         assert!(matches!(
-            process_update(&update_at(1), &fetcher, &keyring).await.outcome,
+            process_update(&update_at(1), &fetcher, &keyring)
+                .await
+                .outcome,
             ContextSyncOutcome::DecodeFailed
         ));
     }
@@ -928,7 +954,9 @@ mod tests {
         let root_signer = root.mgr.get_signer_sync(&root.init.anchor_key).unwrap();
         let seed = ndn_cert::RecoverySeed::generate().unwrap();
         let recovery: Arc<dyn Signer> = Arc::new(seed.signer(&ns));
-        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery)).await.unwrap();
+        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery))
+            .await
+            .unwrap();
         let v2 = ndn_cert::add_recovery_anchor(root_signer.as_ref(), &root.init.context_data, &kit)
             .await
             .unwrap();
@@ -958,20 +986,37 @@ mod tests {
             .await
             .unwrap()
             .bump;
-        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data).await.unwrap();
+        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data)
+            .await
+            .unwrap();
         let missed = SyncUpdate {
             low_seq: 3,
             ..update_at(4)
         };
 
-        let stranger: Arc<dyn Signer> =
-            Arc::new(Ed25519Signer::from_seed(&[7; 32], n("/home/bob/KEY/stranger")));
+        let stranger: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(
+            &[7; 32],
+            n("/home/bob/KEY/stranger"),
+        ));
         let forged = SignedTrustContext::decode_content(v2.data.content().unwrap(), 3).unwrap();
-        forged.add_anchor(ndn_cert::recovery_anchor(Arc::clone(&stranger)).await.unwrap());
+        forged.add_anchor(
+            ndn_cert::recovery_anchor(Arc::clone(&stranger))
+                .await
+                .unwrap(),
+        );
         let forged_group = MapFetcher::new();
-        forged_group.publish(3, &forged.sign_into_data_async(stranger.as_ref()).await.unwrap());
+        forged_group.publish(
+            3,
+            &forged
+                .sign_into_data_async(stranger.as_ref())
+                .await
+                .unwrap(),
+        );
         forged_group.publish(4, &v4.data);
-        match process_update(&missed, &forged_group, &keyring).await.outcome {
+        match process_update(&missed, &forged_group, &keyring)
+            .await
+            .outcome
+        {
             ContextSyncOutcome::Refused(UpdateRefusal::CatchUp {
                 stop: CatchUpStop::Refused { version: 3, .. },
                 ..
@@ -1008,7 +1053,9 @@ mod tests {
         let root_signer = root.mgr.get_signer_sync(&root.init.anchor_key).unwrap();
         let seed = ndn_cert::RecoverySeed::generate().unwrap();
         let recovery: Arc<dyn Signer> = Arc::new(seed.signer(&ns));
-        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery)).await.unwrap();
+        let kit = ndn_cert::recovery_anchor(Arc::clone(&recovery))
+            .await
+            .unwrap();
         let v2 = ndn_cert::add_recovery_anchor(root_signer.as_ref(), &root.init.context_data, &kit)
             .await
             .unwrap();
@@ -1030,13 +1077,18 @@ mod tests {
             .await
             .unwrap()
             .bump;
-        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data).await.unwrap();
+        let v4 = ndn_cert::reissue_version(new_root.as_ref(), &v3.data)
+            .await
+            .unwrap();
         let fetcher = MapFetcher::new();
         for (seq, data) in [(2, &v2.data), (3, &v3.data), (4, &v4.data)] {
             fetcher.publish(seq, data);
         }
 
-        match process_update(&update_at(4), &fetcher, &keyring).await.outcome {
+        match process_update(&update_at(4), &fetcher, &keyring)
+            .await
+            .outcome
+        {
             ContextSyncOutcome::Adopted(adopted) => {
                 assert_eq!((adopted.previous, adopted.context.version()), (1, 4));
                 let walked: Vec<_> = adopted.walked.iter().map(|s| s.data.raw()).collect();
@@ -1150,14 +1202,23 @@ mod tests {
         let root = Root::new();
         let keyring = Arc::new(node_holding(&root));
         let fetcher = Flaky::new(3);
-        fetcher.group.publish(2, &root.version(2, &["/home/bob/member/phone/KEY/k1"]));
+        fetcher
+            .group
+            .publish(2, &root.version(2, &["/home/bob/member/phone/KEY/k1"]));
         let kept = Arc::default();
         let cancel = CancellationToken::new();
         let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
 
         updates.send(update_at(2)).await.unwrap();
-        until("the lost version was never fetched again", || held_version(&keyring) == 2).await;
-        assert_eq!(fetcher.fetches(&n(GROUP).append_segment(2)), 4, "three lost, then obtained");
+        until("the lost version was never fetched again", || {
+            held_version(&keyring) == 2
+        })
+        .await;
+        assert_eq!(
+            fetcher.fetches(&n(GROUP).append_segment(2)),
+            4,
+            "three lost, then obtained"
+        );
         assert_eq!(kept.load(std::sync::atomic::Ordering::SeqCst), 1);
         cancel.cancel();
     }
@@ -1172,10 +1233,10 @@ mod tests {
         // Nothing is published under GROUP: that publisher is unreachable.
         let fetcher = Flaky::new(0);
         let other = n("/home/bob/_sync/v1/devices/device-b");
-        fetcher
-            .group
-            .0
-            .insert(other.clone().append_segment(2).to_string(), root.version(2, &[]).raw().clone());
+        fetcher.group.0.insert(
+            other.clone().append_segment(2).to_string(),
+            root.version(2, &[]).raw().clone(),
+        );
         let kept = Arc::default();
         let cancel = CancellationToken::new();
         let (updates, _) = subscribe(&keyring, &fetcher, &kept, &cancel);
@@ -1187,9 +1248,15 @@ mod tests {
         let tries = fetcher.fetches(&unreachable);
         // 20, 40, then 80 ms apart: at most 8 in the first 500 ms (fewer
         // on a slow machine, never more).
-        assert!(tries >= 2, "the lost version was not fetched again: {tries}");
+        assert!(
+            tries >= 2,
+            "the lost version was not fetched again: {tries}"
+        );
         let elapsed = started.elapsed().as_millis();
-        assert!(tries <= 8 + (elapsed.saturating_sub(500) / 80) as usize, "{tries} fetches in {elapsed} ms");
+        assert!(
+            tries <= 8 + (elapsed.saturating_sub(500) / 80) as usize,
+            "{tries} fetches in {elapsed} ms"
+        );
 
         updates
             .send(SyncUpdate {
@@ -1199,13 +1266,18 @@ mod tests {
             })
             .await
             .unwrap();
-        until("the version announced by the other member was not adopted", || {
-            held_version(&keyring) == 2
-        })
+        until(
+            "the version announced by the other member was not adopted",
+            || held_version(&keyring) == 2,
+        )
         .await;
         let tries = fetcher.fetches(&unreachable);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(fetcher.fetches(&unreachable), tries, "retried after v2 was held");
+        assert_eq!(
+            fetcher.fetches(&unreachable),
+            tries,
+            "retried after v2 was held"
+        );
 
         // A v3 another root signed is refused, and not fetched again.
         let forged = Root::new().version(3, &[]);
@@ -1237,9 +1309,10 @@ mod tests {
     impl Flaky {
         /// Serve `context` as member `name`'s group Data at `seq`.
         fn serve(&self, name: &str, seq: u64, context: &Data) {
-            self.group
-                .0
-                .insert(member(name).append_segment(seq).to_string(), context.raw().clone());
+            self.group.0.insert(
+                member(name).append_segment(seq).to_string(),
+                context.raw().clone(),
+            );
         }
     }
 
@@ -1261,14 +1334,21 @@ mod tests {
         // A made-up member announcing v1000 and serving nothing, and one
         // serving a v9 another root signed.
         fetcher.serve("forger", 9, &Root::new().version(9, &[]));
-        updates.send(update_from("ghost", 1000, 1000)).await.unwrap();
+        updates
+            .send(update_from("ghost", 1000, 1000))
+            .await
+            .unwrap();
         updates.send(update_from("forger", 1, 9)).await.unwrap();
         until("the announcements were not tried", || {
             fetcher.fetches(&member("ghost").append_segment(1000)) >= UNPROVEN_TRIES as usize
                 && fetcher.fetches(&member("forger").append_segment(8)) == 1
         })
         .await;
-        assert_eq!(drain(&mut verified), vec![], "an unverified version counted");
+        assert_eq!(
+            drain(&mut verified),
+            vec![],
+            "an unverified version counted"
+        );
         assert_eq!(held_version(&keyring), 1);
 
         fetcher.serve("device-b", 2, &root.version(2, &[]));
@@ -1302,7 +1382,11 @@ mod tests {
             served_by: member("device-c"),
         };
         assert_eq!(seen, vec![v3]);
-        assert_eq!(held_version(&keyring), 2, "nothing adopted from a stopped walk");
+        assert_eq!(
+            held_version(&keyring),
+            2,
+            "nothing adopted from a stopped walk"
+        );
         cancel.cancel();
     }
 
@@ -1354,7 +1438,10 @@ mod tests {
                 ..
             })
         ));
-        assert!(counting.fetches.is_empty(), "fetched past the walk's deadline");
+        assert!(
+            counting.fetches.is_empty(),
+            "fetched past the walk's deadline"
+        );
     }
 
     /// Member names are made up at will: a member that never served a
@@ -1372,7 +1459,10 @@ mod tests {
 
         let ghosts = 20;
         for i in 0..ghosts {
-            updates.send(update_from(&format!("ghost-{i}"), 5, 5)).await.unwrap();
+            updates
+                .send(update_from(&format!("ghost-{i}"), 5, 5))
+                .await
+                .unwrap();
         }
         let total = || fetcher.fetches.iter().map(|e| *e.value()).sum::<usize>();
         // Under QUICK the last retry is due 300 ms after the first try.
@@ -1384,7 +1474,10 @@ mod tests {
         assert!(settled <= bound, "{settled} fetches, more than {bound}");
         for i in 0..ghosts {
             let fetches = fetcher.fetches(&member(&format!("ghost-{i}")).append_segment(5));
-            assert!(fetches <= UNPROVEN_TRIES as usize, "ghost-{i} fetched {fetches} times");
+            assert!(
+                fetches <= UNPROVEN_TRIES as usize,
+                "ghost-{i} fetched {fetches} times"
+            );
         }
         cancel.cancel();
     }

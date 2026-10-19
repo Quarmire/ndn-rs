@@ -179,7 +179,11 @@ async fn localhop_trust_admin_verbs_never_run() {
         ..Default::default()
     };
     let cr = send_localhop(&app_handle, &signer, &key_name, b"context-adopt", &adopt).await;
-    assert_eq!(cr.status_code, 403, "localhop context-adopt: {:?}", cr.status_text);
+    assert_eq!(
+        cr.status_code, 403,
+        "localhop context-adopt: {:?}",
+        cr.status_text
+    );
 
     let enroll = ControlParameters {
         uri: Some("ndn-trust://invite?ns=/home/member".into()),
@@ -194,11 +198,26 @@ async fn localhop_trust_admin_verbs_never_run() {
         ..Default::default()
     };
     let cr = send_localhop(&app_handle, &signer, &key_name, b"context-update", &update).await;
-    assert_eq!(cr.status_code, 403, "localhop context-update: {:?}", cr.status_text);
+    assert_eq!(
+        cr.status_code, 403,
+        "localhop context-update: {:?}",
+        cr.status_text
+    );
 
     let refresh = ControlParameters::default();
-    let cr = send_localhop(&app_handle, &signer, &key_name, b"context-refresh", &refresh).await;
-    assert_eq!(cr.status_code, 403, "localhop context-refresh: {:?}", cr.status_text);
+    let cr = send_localhop(
+        &app_handle,
+        &signer,
+        &key_name,
+        b"context-refresh",
+        &refresh,
+    )
+    .await;
+    assert_eq!(
+        cr.status_code, 403,
+        "localhop context-refresh: {:?}",
+        cr.status_text
+    );
 
     assert_eq!(
         backend.calls.load(Ordering::SeqCst),

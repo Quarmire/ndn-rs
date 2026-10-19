@@ -61,7 +61,11 @@ impl CaExchange for Net {
         let body = if verb(b"NEW").is_some() {
             self.ca.handle_new(&params()).await?
         } else if let Some(i) = verb(b"CHALLENGE") {
-            let rid: String = comps[i + 1].value.iter().map(|b| format!("{b:02x}")).collect();
+            let rid: String = comps[i + 1]
+                .value
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             self.ca.handle_challenge(&rid, &params()).await?
         } else {
             let can_be_prefix = interest.selectors().can_be_prefix;
@@ -142,7 +146,11 @@ async fn later(earlier: &Earlier, revoke: &[Name]) -> Later {
     let mgr = Arc::new(SecurityManager::new());
     let root_key = ns().append("KEY").append("root2");
     mgr.generate_ed25519(root_key.clone()).unwrap();
-    let root_pub = mgr.get_signer_sync(&root_key).unwrap().public_key().unwrap();
+    let root_pub = mgr
+        .get_signer_sync(&root_key)
+        .unwrap()
+        .public_key()
+        .unwrap();
     let anchor = mgr
         .issue_self_signed_async(&root_key, root_pub, u64::MAX)
         .await
@@ -205,7 +213,12 @@ async fn enroll(earlier: &Earlier) -> Device {
     .await
     .map_err(|f| f.error)
     .expect("the token enrolls the device");
-    let issuers = enrolled.issued.issuers.iter().map(|d| d.raw().clone()).collect();
+    let issuers = enrolled
+        .issued
+        .issuers
+        .iter()
+        .map(|d| d.raw().clone())
+        .collect();
     Device {
         keyring,
         key,
@@ -221,7 +234,10 @@ async fn renew_keeping(
     device: &Device,
     kept: &[Bytes],
 ) -> Result<ndn_cert::IssuedCertificate, RenewalError> {
-    let kept: Vec<Data> = kept.iter().map(|w| Data::decode(w.clone()).unwrap()).collect();
+    let kept: Vec<Data> = kept
+        .iter()
+        .map(|w| Data::decode(w.clone()).unwrap())
+        .collect();
     renew_certificate(
         &device.keyring,
         &mut Net::to(&later.ca),
@@ -232,7 +248,10 @@ async fn renew_keeping(
     .await
 }
 
-async fn renew(later: &Later, device: &Device) -> Result<ndn_cert::IssuedCertificate, RenewalError> {
+async fn renew(
+    later: &Later,
+    device: &Device,
+) -> Result<ndn_cert::IssuedCertificate, RenewalError> {
     renew_keeping(later, device, &device.issuers).await
 }
 
@@ -293,7 +312,12 @@ async fn certified_device(
     let key_name = new_device_key_name(&ns().append("member").append(device)).unwrap();
     let key: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(&[seed; 32], key_name.clone()));
     let cert = mgr
-        .certify(&key_name, key.public_key().unwrap(), issuer_key, 30 * DAY_MS)
+        .certify(
+            &key_name,
+            key.public_key().unwrap(),
+            issuer_key,
+            30 * DAY_MS,
+        )
         .await
         .unwrap();
     (key, Data::decode(cert.data_wire().unwrap()).unwrap())
@@ -313,8 +337,15 @@ async fn a_device_renews_an_earlier_ca_certificate_at_the_later_ca() {
         .iter()
         .map(|w| (*Data::decode(w.clone()).unwrap().name).clone())
         .collect();
-    assert_eq!(kept.len(), 1, "the issuer chain short of the anchor: {kept:?}");
-    assert!(ndn_security::cert_name::is_cert_of(&kept[0], &earlier_ca_key));
+    assert_eq!(
+        kept.len(),
+        1,
+        "the issuer chain short of the anchor: {kept:?}"
+    );
+    assert!(ndn_security::cert_name::is_cert_of(
+        &kept[0],
+        &earlier_ca_key
+    ));
 
     let later = later(&earlier, &[]).await;
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
@@ -325,9 +356,16 @@ async fn a_device_renews_an_earlier_ca_certificate_at_the_later_ca() {
         .await
         .expect("a current certificate of the earlier CA renews at the later CA");
     let old = ndn_security::Certificate::decode(&device.cert).unwrap();
-    assert!(renewed.cert.name.has_prefix(device.key.key_name()), "for the same key name");
+    assert!(
+        renewed.cert.name.has_prefix(device.key.key_name()),
+        "for the same key name"
+    );
     assert_eq!(renewed.cert.public_key, old.public_key, "for the same key");
-    assert_eq!(renewed.issuer.as_ref(), Some(&later.ca_key), "by the later CA");
+    assert_eq!(
+        renewed.issuer.as_ref(),
+        Some(&later.ca_key),
+        "by the later CA"
+    );
 
     let served = later
         .ca
@@ -356,14 +394,21 @@ async fn only_the_kept_issuer_chain_renews_once_nobody_serves_the_earlier_ca() {
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
 
     let refused = renew_keeping(&later, &device, &[]).await;
-    assert!(matches!(refused, Err(RenewalError::Refused { .. })), "{refused:?}");
+    assert!(
+        matches!(refused, Err(RenewalError::Refused { .. })),
+        "{refused:?}"
+    );
     assert!(later.ca.issued_under(&ns()).is_empty(), "nothing issued");
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
 
     let renewed = renew(&later, &device)
         .await
         .expect("the kept issuer chain renews the earlier CA's certificate");
-    assert_eq!(renewed.issuer.as_ref(), Some(&later.ca_key), "by the later CA");
+    assert_eq!(
+        renewed.issuer.as_ref(),
+        Some(&later.ca_key),
+        "by the later CA"
+    );
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_some());
 }
 
@@ -378,7 +423,10 @@ async fn a_revoked_earlier_ca_is_refused() {
 
     // The device still holds v1: it sends its chain as before.
     let refused = renew(&later, &device).await;
-    assert!(matches!(refused, Err(RenewalError::Refused { .. })), "{refused:?}");
+    assert!(
+        matches!(refused, Err(RenewalError::Refused { .. })),
+        "{refused:?}"
+    );
     assert!(later.ca.issued_under(&ns()).is_empty(), "nothing issued");
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
 }
@@ -401,14 +449,22 @@ async fn an_issuer_outside_the_ca_or_off_the_chain_is_refused() {
     let mgr = SecurityManager::new();
     let fake_root = ns().append("KEY").append("fake");
     mgr.generate_ed25519(fake_root.clone()).unwrap();
-    let fake_pub = mgr.get_signer_sync(&fake_root).unwrap().public_key().unwrap();
+    let fake_pub = mgr
+        .get_signer_sync(&fake_root)
+        .unwrap()
+        .public_key()
+        .unwrap();
     let fake_anchor = mgr
         .issue_self_signed_async(&fake_root, fake_pub, u64::MAX)
         .await
         .unwrap();
     let rogue_ca = ns().append("CA").append("KEY").append("rogue");
     mgr.generate_ed25519(rogue_ca.clone()).unwrap();
-    let rogue_pub = mgr.get_signer_sync(&rogue_ca).unwrap().public_key().unwrap();
+    let rogue_pub = mgr
+        .get_signer_sync(&rogue_ca)
+        .unwrap()
+        .public_key()
+        .unwrap();
     let rogue_cert = mgr
         .certify(&rogue_ca, rogue_pub, &fake_root, 3_650 * DAY_MS)
         .await

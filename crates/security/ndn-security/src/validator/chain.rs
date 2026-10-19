@@ -295,7 +295,11 @@ impl Validator {
                          the context's CA ({cas}) certifying a name under {ns}; have the key \
                          certified by the namespace CA (enroll the device)",
                         ns = ctx.namespace(),
-                        cas = if cas.is_empty() { "none named".to_string() } else { cas.join(", ") },
+                        cas = if cas.is_empty() {
+                            "none named".to_string()
+                        } else {
+                            cas.join(", ")
+                        },
                     ),
                 }))
             }
@@ -911,8 +915,8 @@ mod tests {
         assert!(matches!(result, ValidationResult::Pending));
         assert_eq!(missing.as_deref(), Some(&name1("key")));
 
-        let key_cert = Data::decode(make_cert_data_packet(&name1("key"), &key_pk, &mid_signer).await)
-            .unwrap();
+        let key_cert =
+            Data::decode(make_cert_data_packet(&name1("key"), &key_pk, &mid_signer).await).unwrap();
         validator
             .cert_cache()
             .insert(Certificate::decode(&key_cert).unwrap());
@@ -920,7 +924,11 @@ mod tests {
         assert!(matches!(result, ValidationResult::Pending));
         assert_eq!(missing.as_deref(), Some(&name1("mid")));
 
-        assert_eq!(fetches.load(Ordering::Relaxed), 0, "cached walk must not fetch");
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            0,
+            "cached walk must not fetch"
+        );
     }
 
     /// A self-signed certificate carries its own verifying key, so validating it
@@ -1463,7 +1471,8 @@ mod tests {
         let by_ca = key("/home/bob/member/alice/KEY/y", 85);
         let by_anchor = key("/home/bob/member/alice/KEY/z", 86);
 
-        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_ca_endpoint(n("/home/bob/CA"));
+        let ctx =
+            SignedTrustContext::hierarchical(n("/home/bob")).with_ca_endpoint(n("/home/bob/CA"));
         assert!(ctx.add_anchor(anchor(&root)));
         assert!(ctx.add_anchor(anchor(&outside_anchor)));
         let validator = Validator::new(TrustSchema::hierarchical());
@@ -1483,7 +1492,10 @@ mod tests {
         }
 
         let doc = "/home/bob/member/alice/doc";
-        match validator.validate_chain(&data_signed_by(doc, &forged)).await {
+        match validator
+            .validate_chain(&data_signed_by(doc, &forged))
+            .await
+        {
             ValidationResult::Invalid(TrustError::CertNotAuthorized { cert, issuer, .. }) => {
                 assert!(n(&cert).has_prefix(forged.key_name()));
                 assert_eq!(n(&issuer), *eve.key_name());
@@ -1492,7 +1504,10 @@ mod tests {
         }
         for signer in [&by_ca, &by_anchor] {
             let result = validator.validate_chain(&data_signed_by(doc, signer)).await;
-            assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+            assert!(
+                matches!(result, ValidationResult::Valid(_)),
+                "got {result:?}"
+            );
         }
     }
 
@@ -1581,10 +1596,7 @@ mod tests {
     }
 
     /// Attach a fetcher answering every fetch with `served`; counts fetches.
-    fn serve_on_fetch(
-        validator: &Validator,
-        served: Bytes,
-    ) -> Arc<std::sync::atomic::AtomicUsize> {
+    fn serve_on_fetch(validator: &Validator, served: Bytes) -> Arc<std::sync::atomic::AtomicUsize> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let fetches = Arc::new(AtomicUsize::new(0));
         let f = Arc::clone(&fetches);
@@ -1617,16 +1629,26 @@ mod tests {
 
         let cert = Data::decode(cert_wire).unwrap();
         let (result, missing) = validator.validate_chain_cached(&cert).await;
-        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+        assert!(
+            matches!(result, ValidationResult::Valid(_)),
+            "got {result:?}"
+        );
         assert!(missing.is_none());
-        assert_eq!(fetch_count(&fetches), 0, "a self-signed cert is its own signer");
+        assert_eq!(
+            fetch_count(&fetches),
+            0,
+            "a self-signed cert is its own signer"
+        );
 
         let data = data_signed_by("/lab/eph/photo", &signer);
         let (result, missing) = validator.validate_chain_cached(&data).await;
         assert!(matches!(result, ValidationResult::Pending));
         assert_eq!(missing.as_deref(), Some(signer.key_name()));
         let result = validator.validate_chain(&data).await;
-        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+        assert!(
+            matches!(result, ValidationResult::Valid(_)),
+            "got {result:?}"
+        );
         assert_eq!(fetch_count(&fetches), 1);
 
         // A signature the certificate's key did not make still fails.
@@ -1663,7 +1685,10 @@ mod tests {
         let data = data_signed_by("/lab/eph/photo", &signer);
         let (result, missing) = validator.validate_chain_cached(&data).await;
         assert!(
-            matches!(result, ValidationResult::Invalid(TrustError::UntrustedSelfSigned { .. })),
+            matches!(
+                result,
+                ValidationResult::Invalid(TrustError::UntrustedSelfSigned { .. })
+            ),
             "got {result:?}"
         );
         assert!(missing.is_none());
@@ -1671,7 +1696,10 @@ mod tests {
         let (impostor, _) = self_signed_key(43).await;
         let other = data_signed_by("/lab/eph/photo", &impostor);
         let (result, missing) = validator.validate_chain_cached(&other).await;
-        assert!(matches!(result, ValidationResult::Pending), "got {result:?}");
+        assert!(
+            matches!(result, ValidationResult::Pending),
+            "got {result:?}"
+        );
         assert_eq!(missing.as_deref(), Some(signer.key_name()));
         assert_eq!(fetch_count(&fetches), 0);
     }
@@ -1700,7 +1728,10 @@ mod tests {
         let validator = Validator::new(wildcard_schema());
         assert!(validator.add_trust_anchor(Certificate::decode(&cert).unwrap()));
         let (result, _) = validator.validate_chain_cached(&cert).await;
-        assert!(matches!(result, ValidationResult::Valid(_)), "got {result:?}");
+        assert!(
+            matches!(result, ValidationResult::Valid(_)),
+            "got {result:?}"
+        );
     }
 
     /// A certificate refused for its chain (its issuer is revoked) answers
@@ -1746,19 +1777,28 @@ mod tests {
 
         let data = data_signed_by("/lab/m/photo", &member);
         let (result, _) = validator.validate_chain_cached(&data).await;
-        assert!(matches!(result, ValidationResult::Pending), "got {result:?}");
+        assert!(
+            matches!(result, ValidationResult::Pending),
+            "got {result:?}"
+        );
 
         let (result, _) = validator
             .validate_chain_cached(&Data::decode(member_cert).unwrap())
             .await;
         assert!(
-            matches!(result, ValidationResult::Invalid(TrustError::Revoked { .. })),
+            matches!(
+                result,
+                ValidationResult::Invalid(TrustError::Revoked { .. })
+            ),
             "got {result:?}"
         );
         assert!(validator.can_resolve(member.key_name()));
         let (result, missing) = validator.validate_chain_cached(&data).await;
         assert!(
-            matches!(result, ValidationResult::Invalid(TrustError::Revoked { .. })),
+            matches!(
+                result,
+                ValidationResult::Invalid(TrustError::Revoked { .. })
+            ),
             "got {result:?}"
         );
         assert!(missing.is_none());
@@ -1768,15 +1808,24 @@ mod tests {
     /// naming `key_name` in its KeyLocator.
     fn mac_forgers(public_key: [u8; 32], key_name: &Name) -> Vec<Box<dyn Signer>> {
         vec![
-            Box::new(crate::signer::HmacSha256Signer::new(&public_key, key_name.clone())),
-            Box::new(crate::signer::Blake3KeyedSigner::new(public_key, key_name.clone())),
+            Box::new(crate::signer::HmacSha256Signer::new(
+                &public_key,
+                key_name.clone(),
+            )),
+            Box::new(crate::signer::Blake3KeyedSigner::new(
+                public_key,
+                key_name.clone(),
+            )),
         ]
     }
 
     #[track_caller]
     fn assert_mac_refused(result: &ValidationResult) {
         assert!(
-            matches!(result, ValidationResult::Invalid(TrustError::NotPublicKeySignature { .. })),
+            matches!(
+                result,
+                ValidationResult::Invalid(TrustError::NotPublicKeySignature { .. })
+            ),
             "a MAC keyed with a public key must be refused as no public-key signature: {result:?}"
         );
     }
@@ -1850,7 +1899,11 @@ mod tests {
                 .insert(Certificate::decode(&Data::decode(forged_cert.clone()).unwrap()).unwrap());
             let data = data_signed_by("/lab/x/photo", &intruder);
             assert_mac_refused(&validator.validate_chain(&data).await);
-            assert_mac_refused(&validator.validate_chain(&Data::decode(forged_cert).unwrap()).await);
+            assert_mac_refused(
+                &validator
+                    .validate_chain(&Data::decode(forged_cert).unwrap())
+                    .await,
+            );
         }
 
         let genuine = data_signed_by("/lab/m/photo", &member);

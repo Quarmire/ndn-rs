@@ -73,7 +73,10 @@ pub async fn faces_up(engine: &ForwarderEngine, namespaces: &[Name], within: Dur
     let deadline = tokio::time::Instant::now() + within;
     let has_face = |ns: &Name| {
         engine.fib().lpm(ns).is_some_and(|entry| {
-            entry.nexthops.iter().any(|hop| engine.faces().get(hop.face_id).is_some())
+            entry
+                .nexthops
+                .iter()
+                .any(|hop| engine.faces().get(hop.face_id).is_some())
         })
     };
     while !namespaces.iter().all(has_face) && tokio::time::Instant::now() < deadline {
@@ -89,10 +92,11 @@ pub async fn refresh_contexts(
 ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
     let held = p.keyring().contexts();
     let targets = match namespace {
-        Some(ns) => vec![held
-            .into_iter()
-            .find(|c| *c.namespace() == ns)
-            .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&ns)))?],
+        Some(ns) => vec![
+            held.into_iter()
+                .find(|c| *c.namespace() == ns)
+                .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&ns)))?,
+        ],
         None => held,
     };
     // No lock across the fetches (a catch-up walk may take many round
@@ -304,18 +308,34 @@ mod tests {
         use ndn_security::{Keyring, SecurityManager};
 
         let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
-        let (root_dev, replacement, upstream, device) =
-            (dirs[0].path(), dirs[1].path(), dirs[2].path(), dirs[3].path());
+        let (root_dev, replacement, upstream, device) = (
+            dirs[0].path(),
+            dirs[1].path(),
+            dirs[2].path(),
+            dirs[3].path(),
+        );
         let ns: Name = "/home/bob".parse().unwrap();
 
         let pib = FilePib::new(root_dev).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
-        let root = RootStore::open(&pib).unwrap().unwrap().signer(None).await.unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
+        let root = RootStore::open(&pib)
+            .unwrap()
+            .unwrap()
+            .signer(None)
+            .await
+            .unwrap();
         let seed = ndn_cert::RecoverySeed::generate().unwrap();
-        let kit = ndn_cert::recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
+        let kit = ndn_cert::recovery_anchor(Arc::new(seed.signer(&ns)))
+            .await
+            .unwrap();
         let v2 = ndn_cert::add_recovery_anchor(root.as_ref(), &init.init.context_data, &kit)
             .await
             .unwrap();
@@ -360,7 +380,12 @@ mod tests {
         });
 
         let results = refresh_contexts(&admin, Some(ns.clone())).await.unwrap();
-        assert_eq!(results[0].state, RefreshState::Updated, "{}", results[0].detail);
+        assert_eq!(
+            results[0].state,
+            RefreshState::Updated,
+            "{}",
+            results[0].detail
+        );
         assert_eq!((results[0].held_version, results[0].version), (2, 4));
         assert_eq!(admin.keyring().version_of(&ns), Some(4));
         let (newest, _) = ndn_cert::read_stored_context(device, &ns).unwrap().unwrap();
@@ -401,7 +426,9 @@ mod tests {
             .await
             .unwrap();
         let keyring = Arc::new(Keyring::new());
-        let held = ndn_cert::open_signed_context(&init.init.context_data).unwrap().0;
+        let held = ndn_cert::open_signed_context(&init.init.context_data)
+            .unwrap()
+            .0;
         assert!(keyring.adopt(Arc::new(held)));
         let admin = Participant::new(ParticipantParts {
             engine,
@@ -415,7 +442,12 @@ mod tests {
         });
 
         let results = refresh_contexts(&admin, Some(ns.clone())).await.unwrap();
-        assert_eq!(results[0].state, RefreshState::Unreachable, "{}", results[0].detail);
+        assert_eq!(
+            results[0].state,
+            RefreshState::Unreachable,
+            "{}",
+            results[0].detail
+        );
         assert_eq!((results[0].held_version, results[0].version), (1, 1));
         assert_eq!(admin.keyring().version_of(&ns), Some(1));
         shutdown.shutdown().await;
@@ -435,13 +467,25 @@ mod tests {
         let (root_dev, upstream, device) = (dirs[0].path(), dirs[1].path(), dirs[2].path());
         let ns: Name = "/home/bob".parse().unwrap();
         let pib = FilePib::new(root_dev).unwrap();
-        let init =
-            ndn_cert::init_namespace_in_pib(&pib, &ns, "desk", false, &ndn_cert::NewRootStore::File)
-                .await
-                .unwrap();
-        let root = RootStore::open(&pib).unwrap().unwrap().signer(None).await.unwrap();
+        let init = ndn_cert::init_namespace_in_pib(
+            &pib,
+            &ns,
+            "desk",
+            false,
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
+        let root = RootStore::open(&pib)
+            .unwrap()
+            .unwrap()
+            .signer(None)
+            .await
+            .unwrap();
         let seed = ndn_cert::RecoverySeed::generate().unwrap();
-        let kit = ndn_cert::recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
+        let kit = ndn_cert::recovery_anchor(Arc::new(seed.signer(&ns)))
+            .await
+            .unwrap();
         let v2 = ndn_cert::add_recovery_anchor(root.as_ref(), &init.init.context_data, &kit)
             .await
             .unwrap();
@@ -463,7 +507,9 @@ mod tests {
         let late = engine.faces().alloc_id();
         engine.fib().add_nexthop(&ns, late, 10);
         let keyring = Arc::new(Keyring::new());
-        let held = ndn_cert::open_signed_context(&init.init.context_data).unwrap().0;
+        let held = ndn_cert::open_signed_context(&init.init.context_data)
+            .unwrap()
+            .0;
         assert!(keyring.adopt(Arc::new(held)));
         let admin = Arc::new(Participant::new(ParticipantParts {
             engine: engine.clone(),
@@ -476,10 +522,18 @@ mod tests {
             words: Default::default(),
         }));
         let cancel = CancellationToken::new();
-        spawn_periodic(Arc::clone(&admin), Duration::from_secs(3600), cancel.clone());
+        spawn_periodic(
+            Arc::clone(&admin),
+            Duration::from_secs(3600),
+            cancel.clone(),
+        );
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(admin.keyring().version_of(&ns), Some(1), "checked before the face was up");
+        assert_eq!(
+            admin.keyring().version_of(&ns),
+            Some(1),
+            "checked before the face was up"
+        );
         let (face, _handle) = InProcFace::new(late, 16);
         engine.add_face(face, cancel.child_token());
         let adopted = tokio::time::timeout(Duration::from_secs(3), async {

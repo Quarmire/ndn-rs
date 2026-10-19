@@ -105,7 +105,10 @@ fn decided(row: &PendingApproval) -> String {
     let outcome = if row.state == "approved" {
         "the device's next request gets its certificate".to_owned()
     } else {
-        format!("reason: {}; the device is told so at its next request", row.reason)
+        format!(
+            "reason: {}; the device is told so at its next request",
+            row.reason
+        )
     };
     format!(
         "{} request {} for {subject} at {} (code {}), recorded as decided by {}; {outcome}",
@@ -188,14 +191,24 @@ mod ca_tests {
         };
         let op = || "uid 1000 (alice)".to_owned();
         assert!(
-            answer(handle_ca(verb::APPROVE, uri("482 913"), Some(&dyn_backend), op()))
-                .await
-                .is_ok()
+            answer(handle_ca(
+                verb::APPROVE,
+                uri("482 913"),
+                Some(&dyn_backend),
+                op()
+            ))
+            .await
+            .is_ok()
         );
         assert!(
-            answer(handle_ca(verb::DENY, uri("1a2b:not mine"), Some(&dyn_backend), op()))
-                .await
-                .is_ok()
+            answer(handle_ca(
+                verb::DENY,
+                uri("1a2b:not mine"),
+                Some(&dyn_backend),
+                op()
+            ))
+            .await
+            .is_ok()
         );
         let decided = backend.decided.lock();
         assert_eq!(
@@ -216,11 +229,20 @@ mod ca_tests {
 
     #[tokio::test]
     async fn without_a_backend_or_target_nothing_is_decided() {
-        let none = handle_ca(verb::APPROVE, ControlParameters::default(), None, String::new());
+        let none = handle_ca(
+            verb::APPROVE,
+            ControlParameters::default(),
+            None,
+            String::new(),
+        );
         assert_eq!(answer(none).await.status_code, status::NOT_FOUND);
         let backend: Arc<dyn ApprovalMgmtBackend> = Arc::new(Recording::default());
-        let no_target =
-            handle_ca(verb::APPROVE, ControlParameters::default(), Some(&backend), String::new());
+        let no_target = handle_ca(
+            verb::APPROVE,
+            ControlParameters::default(),
+            Some(&backend),
+            String::new(),
+        );
         assert_eq!(answer(no_target).await.status_code, status::BAD_PARAMS);
     }
 }

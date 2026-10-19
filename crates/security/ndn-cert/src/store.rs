@@ -103,7 +103,8 @@ impl FileCaStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, CertError> {
         let dir = dir.into();
         for sub in ["issued", "revoked", REDEEMED_TOKENS_DIR, APPROVALS_DIR] {
-            secure_fs::create_private_dir_all(&dir.join(sub)).map_err(|e| io_err(&dir.join(sub), e))?;
+            secure_fs::create_private_dir_all(&dir.join(sub))
+                .map_err(|e| io_err(&dir.join(sub), e))?;
         }
         secure_fs::repair_tree(&dir).map_err(|e| io_err(&dir, e))?;
         Ok(Self { dir })

@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use ndn_cert::approval::{
     STATUS_ANSWER_MARGIN, STATUS_LIFETIME, STATUS_PROBE_LIFETIME, status_hold,
 };
-use ndn_cert::{ApprovalEnrollError, ApprovalPoll, OutgoingRequest, OutgoingState, RequestStatus, RequestStore};
+use ndn_cert::{
+    ApprovalEnrollError, ApprovalPoll, OutgoingRequest, OutgoingState, RequestStatus, RequestStore,
+};
 use ndn_packet::Name;
 use ndn_security::Signer;
 use tokio_util::sync::CancellationToken;
@@ -68,20 +70,24 @@ pub enum Waited {
 /// each pending record is waited on by its own task ([`wait_for_decision`]
 /// without a deadline) — at start (a request made before a restart
 /// resumes) and as soon as an enrollment records a new one.
-pub fn spawn_status_watch(p: Arc<Participant>, vault: Arc<dyn KeyVault>, cancel: CancellationToken) {
+pub fn spawn_status_watch(
+    p: Arc<Participant>,
+    vault: Arc<dyn KeyVault>,
+    cancel: CancellationToken,
+) {
     tokio::spawn(async move {
         // Per request key: its watch task.
         let mut watching: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
             watching.retain(|_, task| !task.is_finished());
-            let listed = request_store(vault.as_ref()).and_then(|store| {
-                store
-                    .list()
-                    .map_err(|e| crate::refusal(500, e.to_string()))
-            });
+            let listed = request_store(vault.as_ref())
+                .and_then(|store| store.list().map_err(|e| crate::refusal(500, e.to_string())));
             let read_again = match listed {
                 Ok(list) => {
-                    for request in list.into_iter().filter(|r| r.state == OutgoingState::Pending) {
+                    for request in list
+                        .into_iter()
+                        .filter(|r| r.state == OutgoingState::Pending)
+                    {
                         if let std::collections::hash_map::Entry::Vacant(slot) =
                             watching.entry(request.key_name)
                         {
@@ -182,16 +188,21 @@ pub async fn wait_for_decision(
             };
         }
         let id = request.request_id.clone();
-        let (Ok(namespace), Ok(ca_prefix)) =
-            (request.namespace.parse::<Name>(), request.ca_prefix.parse::<Name>())
-        else {
+        let (Ok(namespace), Ok(ca_prefix)) = (
+            request.namespace.parse::<Name>(),
+            request.ca_prefix.parse::<Name>(),
+        ) else {
             request.state = OutgoingState::Failed {
                 reason: p.words().request_names_no_ca(),
             };
             record(&store, &request);
             return Waited::Ended(request);
         };
-        let longest = if probing { STATUS_PROBE_LIFETIME } else { STATUS_LIFETIME };
+        let longest = if probing {
+            STATUS_PROBE_LIFETIME
+        } else {
+            STATUS_LIFETIME
+        };
         let lifetime = match until {
             Some(deadline) => deadline
                 .saturating_duration_since(Instant::now())
@@ -222,7 +233,7 @@ pub async fn wait_for_decision(
                 if expires_secs != request.expires_secs && expires_secs != 0 {
                     request.expires_secs = expires_secs;
                     record(&store, &request);
-                            }
+                }
                 // The CA answers pending shortly before the Interest
                 // expires. An earlier answer is followed by a pause,
                 // growing while they keep coming early, and short
@@ -236,22 +247,36 @@ pub async fn wait_for_decision(
                     None
                 }
             }
-            Ok(RequestStatus::Approved { .. }) => match issue(p, vault, &store, request.clone()).await {
-                Issue::Ended(request) => return Waited::Ended(request),
-                // The status said approved, the exchange says pending (the
-                // CA was replaced in between): wait, never loop fast.
-                Issue::Pending => Some(retry),
-                Issue::Retry(why) => {
-                    tracing::warn!(target: "security", request = %id, error = %why, "approved, but the certificate is not kept yet; the key and the request are kept, asking again in {}s", retry.as_secs());
-                    not_reached = Some(why);
-                    Some(retry)
+            Ok(RequestStatus::Approved { .. }) => {
+                match issue(p, vault, &store, request.clone()).await {
+                    Issue::Ended(request) => return Waited::Ended(request),
+                    // The status said approved, the exchange says pending (the
+                    // CA was replaced in between): wait, never loop fast.
+                    Issue::Pending => Some(retry),
+                    Issue::Retry(why) => {
+                        tracing::warn!(target: "security", request = %id, error = %why, "approved, but the certificate is not kept yet; the key and the request are kept, asking again in {}s", retry.as_secs());
+                        not_reached = Some(why);
+                        Some(retry)
+                    }
                 }
-            },
+            }
             Ok(RequestStatus::Denied { reason, .. }) => {
-                return Waited::Ended(end(vault, &store, request, |reason| OutgoingState::Denied { reason }, &reason));
+                return Waited::Ended(end(
+                    vault,
+                    &store,
+                    request,
+                    |reason| OutgoingState::Denied { reason },
+                    &reason,
+                ));
             }
             Ok(RequestStatus::Expired { reason, .. }) => {
-                return Waited::Ended(end(vault, &store, request, |reason| OutgoingState::Expired { reason }, &reason));
+                return Waited::Ended(end(
+                    vault,
+                    &store,
+                    request,
+                    |reason| OutgoingState::Expired { reason },
+                    &reason,
+                ));
             }
             Err(e @ ApprovalEnrollError::UntrustedAnswer(_)) => {
                 tracing::warn!(target: "security", request = %id, error = %e, "asking again in {}s", retry.as_secs());

@@ -346,10 +346,12 @@ impl ChallengeHandler for TokenChallenge {
             match check {
                 TokenCheck::Ok => Ok(ChallengeOutcome::Approved {
                     attestation: scope.map(|scope| {
-                        AttestationSet::single(ChallengeAttestation::of_kind("token").with_evidence(
-                            TOKEN_SCOPE_EVIDENCE,
-                            serde_json::Value::String(scope.to_string()),
-                        ))
+                        AttestationSet::single(
+                            ChallengeAttestation::of_kind("token").with_evidence(
+                                TOKEN_SCOPE_EVIDENCE,
+                                serde_json::Value::String(scope.to_string()),
+                            ),
+                        )
                     }),
                 }),
                 TokenCheck::Expired => Ok(ChallengeOutcome::Denied("token expired".to_string())),
@@ -381,10 +383,17 @@ mod tests {
     #[test]
     fn a_namespace_ca_refuses_admin_and_node_tokens() {
         for t in ["admin-a1", "node-n1"] {
-            let err = TokenStore::new().add_invite_tokens([t], &ns(), true).unwrap_err();
+            let err = TokenStore::new()
+                .add_invite_tokens([t], &ns(), true)
+                .unwrap_err();
             assert_eq!(err.token, t);
             assert!(err.to_string().contains("never issues"), "{err}");
-            assert!(TokenStore::new().add_invite_tokens([t], &ns(), false).is_ok(), "{t}");
+            assert!(
+                TokenStore::new()
+                    .add_invite_tokens([t], &ns(), false)
+                    .is_ok(),
+                "{t}"
+            );
         }
     }
 
@@ -396,13 +405,22 @@ mod tests {
         store
             .add_invite_tokens(["guest-g1", "invite-1"], &ns(), true)
             .unwrap();
-        assert_eq!(store.scope_of("guest-g1"), Some("/home/bob/guest".parse().unwrap()));
-        assert_eq!(store.scope_of("invite-1"), Some("/home/bob/member".parse().unwrap()));
+        assert_eq!(
+            store.scope_of("guest-g1"),
+            Some("/home/bob/guest".parse().unwrap())
+        );
+        assert_eq!(
+            store.scope_of("invite-1"),
+            Some("/home/bob/member".parse().unwrap())
+        );
         let store = TokenStore::new();
         store
             .add_invite_tokens(["guest-g1", "invite-1"], &ns(), false)
             .unwrap();
-        assert_eq!(store.scope_of("guest-g1"), Some("/home/bob/guest".parse().unwrap()));
+        assert_eq!(
+            store.scope_of("guest-g1"),
+            Some("/home/bob/guest".parse().unwrap())
+        );
         assert_eq!(store.scope_of("invite-1"), None);
     }
 
@@ -412,7 +430,9 @@ mod tests {
         let past = token_with_expiry("member-m1", 1);
         let future = token_with_expiry("member-m2", u64::from(u32::MAX));
         let store = TokenStore::new();
-        store.add_invite_tokens([&past, &future], &ns(), true).unwrap();
+        store
+            .add_invite_tokens([&past, &future], &ns(), true)
+            .unwrap();
         assert!(!store.is_live(&past));
         assert!(store.is_live(&future));
     }
@@ -442,7 +462,11 @@ mod tests {
         let store = TokenStore::new();
         store
             .add_invite_tokens(
-                ["member-m4-untilsoon", "member-m5-until99999999999999999999", "member-m6"],
+                [
+                    "member-m4-untilsoon",
+                    "member-m5-until99999999999999999999",
+                    "member-m6",
+                ],
                 &ns(),
                 true,
             )

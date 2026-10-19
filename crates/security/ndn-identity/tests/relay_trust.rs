@@ -103,12 +103,20 @@ impl Namespace {
 
     fn device_cert(&self) -> (Name, Bytes) {
         let name = (*self.ns.device_cert.name).clone();
-        (name, std::fs::read(&self.ns.device_cert_path).unwrap().into())
+        (
+            name,
+            std::fs::read(&self.ns.device_cert_path).unwrap().into(),
+        )
     }
 
     /// `/home/bob/admin/desk/data/<suffix>`, signed by the device's key.
     fn device_data(&self, suffix: &str) -> (Name, Bytes) {
-        let name = self.ns.device_identity.clone().append("data").append(suffix);
+        let name = self
+            .ns
+            .device_identity
+            .clone()
+            .append("data")
+            .append(suffix);
         let signer = self.pib.get_signer(&self.ns.device_key).unwrap();
         let wire = DataBuilder::new(name.clone(), b"photo")
             .freshness(Duration::from_secs(600))
@@ -154,7 +162,10 @@ async fn relay(ns: &Namespace, device_route: Name, photos: &[&str]) -> Relay {
         5,
     ));
     let (relay, relay_sd) = build(SecurityProfile::Custom(validator)).await;
-    assert!(ndn_app::install_engine_cert_fetcher(&relay, cancel.child_token()));
+    assert!(ndn_app::install_engine_cert_fetcher(
+        &relay,
+        cancel.child_token()
+    ));
     let (root, root_sd) = build(SecurityProfile::Disabled).await;
     let (device, device_sd) = build(SecurityProfile::Disabled).await;
 
@@ -244,14 +255,21 @@ async fn a_relay_never_serves_cached_data_of_a_key_revoked_by_an_update() {
     let (photo1, _) = ns.device_data("1");
     let (photo2, _) = ns.device_data("2");
     for photo in [&photo1, &photo2] {
-        assert!(relay.fetch(photo).await.is_some(), "valid before revocation");
+        assert!(
+            relay.fetch(photo).await.is_some(),
+            "valid before revocation"
+        );
         assert!(relay.cached(photo).await);
     }
     let (cert_name, _) = ns.device_cert();
     assert!(relay.cached(&cert_name).await);
     let hits = relay.cs_hits();
     assert_eq!(relay.fetch(&photo1).await.as_deref(), Some(&b"photo"[..]));
-    assert_eq!(relay.cs_hits(), hits + 1, "the repeat is answered from the CS");
+    assert_eq!(
+        relay.cs_hits(),
+        hits + 1,
+        "the repeat is answered from the CS"
+    );
 
     let root = ndn_cert::RootStore::open(&ns.pib).unwrap().unwrap();
     let root = root.signer(None).await.unwrap();
@@ -266,11 +284,21 @@ async fn a_relay_never_serves_cached_data_of_a_key_revoked_by_an_update() {
     relay.keyring.adopt_update(Arc::new(bump.context)).unwrap();
 
     for photo in [&photo1, &photo2] {
-        assert!(!relay.cached(photo).await, "evicted when the update was adopted");
+        assert!(
+            !relay.cached(photo).await,
+            "evicted when the update was adopted"
+        );
     }
-    assert!(!relay.cached(&cert_name).await, "the revoked key's certificate too");
+    assert!(
+        !relay.cached(&cert_name).await,
+        "the revoked key's certificate too"
+    );
     let hits = relay.cs_hits();
-    assert_eq!(relay.fetch(&photo1).await, None, "refused when fetched again");
+    assert_eq!(
+        relay.fetch(&photo1).await,
+        None,
+        "refused when fetched again"
+    );
     assert_eq!(relay.cs_hits(), hits, "not answered from the CS");
     relay.stop().await;
 }

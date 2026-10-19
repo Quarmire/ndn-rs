@@ -892,8 +892,13 @@ impl MgmtClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<ControlResponse, ForwarderError> {
-        self.deferred_command(module::SECURITY, verb::RENEW, &ControlParameters::default(), timeout)
-            .await
+        self.deferred_command(
+            module::SECURITY,
+            verb::RENEW,
+            &ControlParameters::default(),
+            timeout,
+        )
+        .await
     }
 
     /// A `<module>/<verb>` command the daemon answers only after network
