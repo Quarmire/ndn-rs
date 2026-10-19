@@ -44,6 +44,13 @@ pub enum TrustError {
     NoTrustAnchors { namespace: String },
     #[error("key store error: {0}")]
     KeyStore(String),
+    /// No identity this device holds may sign `name`. `why` names the
+    /// trusted prefix and what to do: the device only follows the prefix
+    /// covering `name` (verify only; enroll in it to publish), or no identity
+    /// of the device covers `name` at all. Never answered with another
+    /// prefix's key or a default key instead.
+    #[error("cannot sign {name}: {why}")]
+    NoSigningIdentity { name: String, why: String },
     #[error("unsupported signature type: {name} (code {code})")]
     UnsupportedSignatureType { code: u64, name: String },
     /// A signature type that no public key verifies, where a signer's public

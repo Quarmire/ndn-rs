@@ -72,7 +72,9 @@ pub use lvs::{LvsError, LvsModel, LvsUserFn, UserFnRegistry};
 pub use lvs_compile::{
     LvsCompileError, compile as compile_lvs, compile_to_binary as compile_lvs_to_binary,
 };
-pub use manager::{SecurityManager, encode_cert_data, encode_cert_data_with_description};
+pub use manager::{
+    SecurityManager, SigningIdentity, encode_cert_data, encode_cert_data_with_description,
+};
 pub use pib::{FilePib, PibError};
 pub use profile::SecurityProfile;
 pub use replay_guard::{KeyFingerprint, ReplayCheck, ReplayGuard};

@@ -219,16 +219,15 @@ impl KeyChain {
             }
             SignerSelection::HmacKey(key_name) => Ok(Some(self.mgr.get_signer_sync(key_name)?)),
             SignerSelection::Suggested { for_name } => {
-                // Until LVS rule evaluation is wired: the registered identity
-                // with the longest name covering `for_name` signs. A name no
-                // identity covers is an error, never another identity's key.
-                match self.mgr.identity_key_for(for_name) {
-                    Some((identity, _)) if identity == self.name => Ok(Some(self.signer()?)),
-                    Some((_, key_name)) => Ok(Some(self.mgr.get_signer_sync(&key_name)?)),
-                    None => Err(TrustError::KeyStore(format!(
-                        "SignerSelection::Suggested: no identity held by this keychain \
-                         covers {for_name}"
-                    ))),
+                // Until LVS rule evaluation is wired: the identity the
+                // manager's signing set chooses by name
+                // (`SecurityManager::signing_identity_for`). A name no
+                // identity may sign is an error, never another prefix's key.
+                let chosen = self.mgr.signing_identity_for(for_name)?;
+                if chosen.identity == self.name {
+                    Ok(Some(self.signer()?))
+                } else {
+                    Ok(Some(chosen.signer))
                 }
             }
         }
@@ -737,7 +736,7 @@ mod tests {
         let builder = DataBuilder::new(foreign.clone(), b"body");
         let err = kc.sign_packet(builder, &SigningInfo::suggested(foreign));
         assert!(
-            matches!(err, Err(TrustError::KeyStore(_))),
+            matches!(err, Err(TrustError::NoSigningIdentity { .. })),
             "uncovered name must error; got {err:?}"
         );
     }

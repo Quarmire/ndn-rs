@@ -32,9 +32,15 @@ pub enum SignerSelection {
     HmacKey(Name),
     /// `DigestSha256` — integrity only, no key.
     Digest,
-    /// Let an LVS rule choose the signer for the packet name. Until full
-    /// LVS-rule evaluation lands, the held identity with the longest name
-    /// covering `for_name` signs; no covering identity is an error.
+    /// Let the packet name choose the signer. Until full LVS-rule
+    /// evaluation lands, the identity
+    /// [`SecurityManager::signing_identity_for`] chooses signs: the device's
+    /// identity in the trusted prefix governing `for_name`, else the held
+    /// identity with the longest name covering it; none is an error that
+    /// says why ([`TrustError::NoSigningIdentity`]).
+    ///
+    /// [`SecurityManager::signing_identity_for`]: crate::SecurityManager::signing_identity_for
+    /// [`TrustError::NoSigningIdentity`]: crate::TrustError::NoSigningIdentity
     Suggested { for_name: Name },
 }
 
