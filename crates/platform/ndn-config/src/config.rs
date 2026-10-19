@@ -2059,8 +2059,10 @@ pub enum LinkModeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelaysConfig {
-    /// Relays linked at once, preferred first (1..=8); the rest stand by
-    /// and take over when one is lost.
+    /// Relays linked at once for each trusted prefix the device is a member
+    /// of, preferred first (1..=8); the rest stand by and take over when one
+    /// is lost. A `[[relay]]` counts for every prefix, a relay a namespace
+    /// advertises for each prefix that advertises it.
     #[serde(default = "default_relay_count")]
     pub count: usize,
     /// Use the relays the namespace advertises in its trust context.
