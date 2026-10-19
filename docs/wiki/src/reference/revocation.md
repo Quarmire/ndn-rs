@@ -67,7 +67,8 @@ context revokes.
 
 - a device identity, e.g. `/home/bob/member/phone`: every key the namespace
   CA issued a certificate for to exactly that identity, read from the CA
-  store in the PIB (`<pib_path>/ca/issued/`);
+  store in the PIB (`issued/` in the CA's directory, `<pib_path>/ca/<hex of the
+  trusted prefix>/`; `<pib_path>/ca/` for the one CA of an older PIB);
 - a key name, e.g. `/home/bob/member/phone/KEY/eba4f4f2af5d697b`, also for a
   key this CA did not certify;
 - a certificate name: reduced to its key name.
@@ -113,7 +114,7 @@ Whenever the daemon keeps a version of a context — handed over by a CLI,
 fetched by a refresh, adopted by link — and the node runs the CA of that
 namespace (`[ca]` with identity `<ns>/CA`), the CA follows the version
 (`TrustAdmin::keep` → `revoke::ca_follow`): every certificate it issued under
-a name the version revokes is recorded in `<pib_path>/ca/revoked/` (kept
+a name the version revokes is recorded in `revoked/` of the CA's directory (kept
 across restarts) and dropped from its certificate cache
 (`CaState::revoke_issued_under`): no longer served, that key is never
 certified again, and the device name is free for a new key. When the CA
@@ -233,7 +234,7 @@ made from a context the daemon no longer holds: run `revoke` again), or when
 the context changed meanwhile (`409`). A refusal changes nothing — neither
 the context nor the CA.
 
-When the CA cannot record a revocation in `<pib_path>/ca/revoked/`, the
+When the CA cannot record a revocation in `revoked/` of its directory, the
 daemon's answer says so: the CA stops serving the certificate for this run,
 and follows the stored context again when it next starts.
 

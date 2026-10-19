@@ -98,7 +98,7 @@ request id.
 ## Across restarts
 
 Both sides keep durable records. The CA keeps each request in
-`<pib>/ca/approvals/` until it is decided or expires (default 7 days, `[ca]
+`approvals/` of its directory (`<pib>/ca/<hex of the trusted prefix>/`) until it is decided or expires (default 7 days, `[ca]
 approval_request_ttl_days`). The device keeps its outgoing request in
 `<pib>/requests/` and waits on it until issued, denied or expired — after a
 restart too: its daemon reads `<pib>/requests/` at start.

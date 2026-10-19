@@ -160,7 +160,10 @@ trust context carrying the generated role schema, and prints the
 `[security]` lines (`identity`, `pib_path`) that make the forwarder load the
 device identity. The CA loads its identity, so the certs it issues chain to
 the same root across restarts, and it persists issued certs, revocations and
-redeemed tokens (hashed) under `<pib_path>/ca/`. A PIB-backed `/<ns>/CA`
+redeemed tokens (hashed) in its own directory, `<pib_path>/ca/<hex of the
+trusted prefix>/` (`<pib_path>/ca/` for the one CA of an older PIB). A device
+that is the root of several trusted prefixes runs one CA each: one `[[ca]]`
+table per CA instead of `[ca]`. A PIB-backed `/<ns>/CA`
 certified by the namespace root issues under `RolePolicy::new(/<ns>)` (combined with
 `require_attestation` when that is set too):
 
@@ -180,7 +183,7 @@ kind = "device-approval"     # optional here: a namespace CA offers it anyway
 
 A namespace CA offers `device-approval` even when `[[ca.challenge]]` does not
 list it (the log says so). Pending requests are kept in
-`<pib_path>/ca/approvals/` and survive restarts. Decide with `ndn-fwd
+`approvals/` of the CA's directory and survive restarts. Decide with `ndn-fwd
 approvals list`, `approve <id|code>`, `deny <id|code> [--reason <text>]`: on
 the CA host it decides as the local operator; on another node holding an
 admin certificate of the namespace it signs the decision with that admin key

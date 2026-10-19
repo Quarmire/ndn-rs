@@ -245,12 +245,15 @@ recovery) is what every adopter trusts, and it
 signs rarely — the anchor, the CA's certificate, each new trust-context
 version (a revocation). So `ndn-fwd init` puts it in a **root store**,
 not with the keys the daemon uses unattended, and records the store in
-`<pib>/root/store.toml` (`ndn_cert::root_store`):
+`<pib>/root/<hex of the trusted prefix>/store.toml`, its SafeBag beside it
+(`ndn_cert::root_store`; an older PIB's one root stays in `<pib>/root/`). A
+device can hold the roots of several trusted prefixes, one store each; root
+commands then name one with `--namespace <prefix>`:
 
 | `--root-store` | Private key | A root operation needs |
 |---|---|---|
-| `os-keyring` (default when reachable) | SafeBag `root/root-keychain.safebag`, sealed by a random 32-byte secret in the OS keychain (Secret Service, macOS Keychain, Windows Credential Manager; `keyring` crate) | nothing beyond the user's login |
-| `sealed-file` | SafeBag `root/root.safebag` under your passphrase (PBES2, 600 000 PBKDF2 rounds) | the passphrase |
+| `os-keyring` (default when reachable) | SafeBag `root-keychain.safebag` in the store's directory, sealed by a random 32-byte secret in the OS keychain (Secret Service, macOS Keychain, Windows Credential Manager; `keyring` crate) | nothing beyond the user's login |
+| `sealed-file` | SafeBag `root.safebag` in the store's directory under your passphrase (PBES2, 600 000 PBKDF2 rounds) | the passphrase |
 | `yubikey-piv` | generated on a YubiKey PIV slot (P-256, never exportable; PIN policy `always`) | the PIN, and a touch per the recorded touch policy |
 | `file` | plaintext in the FilePib, file modes only | nothing — the daemon warns at startup |
 

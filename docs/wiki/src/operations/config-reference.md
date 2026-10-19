@@ -381,7 +381,7 @@ also mints the root device's admin identity `/<ns>/admin/<device>` (default devi
 name: the host name, lowercased, first label, disallowed characters as `-`;
 `KEY`, `CA` and the role words are refused; key
 `/<ns>/admin/<device>/KEY/device`, cert issued by the CA, signed copy at
-`<pib_path>/ca/device-cert.data`), stores the root-signed trust context
+the CA's directory as `device-cert.data`), stores the root-signed trust context
 carrying the generated role schema (`ndn-fwd schema show`), and prints the
 `[security]` lines that load the device identity
 (`identity = "/<ns>/admin/<device>"`, `pib_path = "<pib>"`); without them the
@@ -389,8 +389,10 @@ forwarder falls back to an ephemeral key. Init never edits config files.
 
 The root key itself goes to the root store chosen with `init --root-store`
 (`os-keyring` by default when an OS keychain is reachable, else refused with
-advice; `sealed-file`, `yubikey-piv`, `file`), recorded in
-`<pib_path>/root/store.toml` — no config key selects it; see
+advice; `sealed-file`, `yubikey-piv`, `file`), recorded per trusted prefix in
+`<pib_path>/root/<hex of the prefix>/store.toml` (an older PIB's one root:
+`<pib_path>/root/store.toml`). One PIB can hold the roots of several trusted
+prefixes; root commands then take `--namespace <prefix>` — no config key selects it; see
 [root custody](../concepts/identity-and-keys.md#root-custody-where-a-namespace-root-key-lives).
 The daemon reports it in `security/identity-status` (`root_store=`,
 `root_key=`; shown by `ndn-ctl status`) and warns at startup when it is
@@ -422,7 +424,7 @@ smtp = { host = "smtp.example.com", port = 587, from = "ca@example.com", starttl
 
 `email` delivers via SMTP only with `--features smtp` (lettre); otherwise (or
 with `smtp.log_only = true`) the code is logged. `device-approval` holds each
-request in a durable record (`<pib_path>/ca/approvals/`) until it is approved,
+request in a durable record (`approvals/` of the CA's directory) until it is approved,
 denied or expires: `ndn-fwd approvals list|approve|deny <id|code>` on the CA
 host decides as the local operator (mgmt `ca/{list-approvals,approve,deny}`,
 local socket only, never over `/localhop`); on an admin device it pushes a

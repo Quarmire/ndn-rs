@@ -262,7 +262,7 @@ certificate name) (**have**; see `docs/wiki/src/reference/revocation.md`):
 2. CA, following the signed version: whenever a node running the namespace
    CA keeps a version (handed over, refreshed, adopted) and when the CA
    starts, the CA marks every certificate it issued that the version revokes
-   (`<pib>/ca/revoked/`): no longer served, the key is never certified
+   (`revoked/` in the CA's directory, `<pib>/ca/<hex>/`): no longer served, the key is never certified
    again, the device name is free to enroll with a new key. The CA acts on
    the signed version only, never on a separate request.
 Gap: revoking from an admin device other than the root device (the root key
