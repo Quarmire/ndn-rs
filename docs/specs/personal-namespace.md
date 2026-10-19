@@ -191,11 +191,12 @@ Each flow lists steps, what is stored where, failure handling, and status
   <invite> [--device <name>]` = adopt the trust context by namespace +
   expected fingerprint if not held (no version floor: an invite names none),
   generate the device key in the daemon's PIB, enroll with the token, check
-  the issued certificate's chain to the root, store it and make the identity
-  the PIB's default (loaded at start unless `[security] identity` names
-  another), and switch the running daemon's signer for its management
-  responses and discovery records (DV with `static`/`lvs` trust keeps its
-  startup key until a restart) (**have**:
+  the issued certificate's chain to the root, store it and **add** the
+  identity to those the device signs as: Data under the namespace is signed
+  with the new key from the next packet on, the device's identities in other
+  trusted prefixes and its node identity stay as they were (only a device's
+  first identity becomes the PIB's default and node identity; DV with
+  `static`/`lvs` trust keeps its startup key until a restart) (**have**:
   `ndn_cert::enroll_with_invite`, `ndn_identity::enroll_with_invite_via_engine`,
   `security/enroll` gated like `security/context-adopt` by the management
   socket's peer credentials and never accepted over `/localhop`, mobile
@@ -237,6 +238,35 @@ Each flow lists steps, what is stored where, failure handling, and status
 - Lifetime: certificates from the namespace CA last their role's `[ca]
   cert_validity_days` (default 90; e.g. `guest = 7`); a device's request names
   no lifetime, so the CA's setting decides. Devices renew before expiry (F10).
+- Several trusted prefixes at once (**have**): a device holds a key and
+  certificate in each namespace it is a member of. Data or a signed
+  Interest with no explicit key is signed by the identity its name chooses
+  (`SecurityManager::signer_for`): the device's identity in the namespace
+  whose held trust context governs the name — never that namespace's root
+  or CA key, never another namespace's key; a name in a namespace the device
+  only follows, or one nothing covers, is refused with which prefix and
+  what to do (enroll in it, or name a key). Every PIB identity with a
+  currently valid certificate is loaded at start. Enrollments in different
+  namespaces run independently (one at a time per namespace); a late
+  approval in one changes nothing about another.
+- Node identity (**have**): the device's own packets (management
+  responses, discovery records, links, DV routing) are signed as its node
+  identity, chosen from durable data — `[security] identity`, else the PIB's
+  default identity, else its device identity in a namespace whose root it
+  holds, else the first enrolled, else an ephemeral key — logged at start
+  and reported by `security/identity-status` (`node_identity_source=`, one
+  `signing_identity=` per identity it signs Data as). An operator changes it
+  with `[security] identity` or `ndn-fwd node-identity <identity>` (the PIB
+  default; applies at the next start).
+- Membership (**have**): per held namespace the device is *following*
+  (adopted, verify only), *member* (a valid, unrevoked device certificate;
+  with its role) or *owner* (holds the root key). `security/memberships`
+  answers a JSON list of `{namespace, version, relation, role, identity,
+  key, valid_until, node_identity, root_fingerprint}`; each change (adopted,
+  enrolled, renewed, revoked, root-changed) is published as JSON
+  `{namespace, relation, change, detail}` at
+  `/localhost/nfd/security/notifications`; `ndn-ctl status` prints them as
+  "trusted prefixes".
 
 ### F3 Delegate the CA to a relay
 1. The relay generates `/<ns>/CA` key locally; produces a cert request.

@@ -52,9 +52,10 @@ followed by hints for the admin (`ndn-fwd approvals list`, `ndn-fwd
 approvals approve <code>`). Asking again while the request is pending
 answers the same request; no second key is made. Once issued, the
 certificate is installed exactly as after an
-[invite enrollment](./enrollment-by-invite.md) (stored, default identity,
-issuer chain kept and served, live signer switch unless `[security]
-identity` is set).
+[invite enrollment](./enrollment-by-invite.md) (stored, the identity added
+to those the node signs as — its other trusted prefixes and its node
+identity unchanged, so an approval landing late in one prefix changes
+nothing about another — issuer chain kept and served).
 
 `enroll` refuses, saying what to do:
 

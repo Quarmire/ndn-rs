@@ -69,11 +69,11 @@ key without an invite, if the CA renews the role — see
 | 5 | daemon → root device or relay | context not held: RDR metadata + context fetch; the forwarder admits only the expected context |
 | 6 | daemon → CA | `/<ns>/CA/NEW` and `/<ns>/CA/CHALLENGE/<id>` signed Interests (device key), token challenge; replies signed by `/<ns>/CA/KEY/…`, validated by the device's forwarder under the adopted context |
 | 7 | daemon → CA | fetches the issued certificate by the name the CA reports in the CHALLENGE response (`<key>/NDNCERT/v=<ms>`, NDN Certificate Format v2), and the CA's certificate; checks the certificate certifies the device key, is valid now, and chains to the root under the context's schema |
-| 8 | daemon | stores the certificate (signed Data, as issued) under the key's `certs/`, then sets the PIB's default identity — the last step |
-| 9 | daemon | switches the signer of its management responses and discovery records to the new key; the key also enters the engine's key store |
+| 8 | daemon | stores the certificate (signed Data, as issued) under the key's `certs/`; only a node without an identity yet records it as the PIB's default identity |
+| 9 | daemon | adds the key to the engine's key store: Data under `/<ns>` is signed with it from the next packet on, the node's other trusted prefixes keep their keys; a node that ran on its ephemeral key also signs its management responses and discovery records with it |
 
-A failure at any step after 4 deletes the new key; the default identity and
-the signer stay as they were. A context adopted in step 5 is kept (it passed
+A failure at any step after 4 deletes the new key; the node's identities
+and its signer stay as they were. A context adopted in step 5 is kept (it passed
 the fingerprint check on its own); the refusal says so, or why storing it
 failed. Once the CA has issued (step 7–8) the token is spent: a failure to
 store the certificate says so; a failure to store the adopted context keeps
@@ -103,25 +103,36 @@ before retrying.
 <pib>/issuers/<hash>.data             issuer certificates of the device's chain (sent with a renewal)
 ```
 
-The config file is never edited. At start the daemon loads `[security]
-identity` if set, else the PIB's default identity, else an ephemeral key.
-With `[security] identity` set, enrolling stores and selects the identity in
-the PIB but the configured one keeps signing; the answer says so.
+The config file is never edited. At start the daemon loads every PIB
+identity with a currently valid certificate, and signs its own packets as
+its node identity: `[security] identity` if set, else the PIB's default
+identity, else its identity in a namespace whose root it holds, else the
+first enrolled, else an ephemeral key (logged, and reported by
+`security/identity-status` as `node_identity_source=`). Enrolling in a
+second trusted prefix adds an identity and never changes the node identity;
+`ndn-fwd node-identity <identity>` does (from the next start).
 
-## Live signer switch
+## Signing by name, and the node signer
+
+Data a producer on the node publishes is signed with the key its name
+chooses (`SecurityManager::signer_for`, `Producer::with_signers`,
+`ndn-put --pib` without `--identity`): the node's identity in the trusted
+prefix covering it. A prefix the node only follows is refused with what to
+do. `ndn-ctl status` lists the trusted prefixes and how the node takes part
+in each (`security/memberships`).
 
 Management responses and discovery records sign through one shared
-`ndn_security::ActiveSigner`: the current signer behind an atomic swap
-(`ndn-fwd` `active_identity.rs` holds it). Each packet takes one snapshot and
-uses it for both its KeyLocator and its signature, so a packet always names
-the key that signed it, and every switch applies from the next packet on
-(`ndn-ctl status` shows `signing: identity=… key=…`). There is no limit on
-how many times a run switches.
+`ndn_security::ActiveSigner`, the node signer (`ndn-fwd`
+`active_identity.rs`). Each packet takes one snapshot and uses it for both
+its KeyLocator and its signature, so a packet always names the key that
+signed it (`ndn-ctl status` shows `signing: identity=… key=…`). It changes
+only for a node's first identity, or at the next start after
+`ndn-fwd node-identity`.
 
 DV routing with `[routing.dv.trust] mode = "static"` or `"lvs"` keeps signing
 with the key the node started with: its neighbours accept only the keys in
-their `trusted_keys`, so switching would silently cut the node off from
-routing. It signs with the enrolled key after the next start; the enroll
+their `trusted_keys`, so a new node key would silently cut the node off from
+routing. It signs with the new node key after the next start; the enroll
 output reminds the operator to add that key to every DV neighbour's
 `trusted_keys` first.
 
