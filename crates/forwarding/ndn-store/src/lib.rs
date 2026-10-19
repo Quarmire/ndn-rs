@@ -11,14 +11,18 @@
 #![allow(missing_docs)]
 
 pub mod content_store;
+#[cfg(test)]
+mod cs_conformance;
 // Shared key/value codec for the disk-backed stores (fjall + sqlite).
 #[cfg(any(feature = "fjall", feature = "sqlite-cs", test))]
 pub(crate) mod cs_keycodec;
 pub mod dead_nonce_list;
 pub mod fib;
+// Freshest-descendant CanBePrefix index behind `LruCs`.
 #[cfg(any(feature = "fjall", test))]
 #[cfg_attr(docsrs, doc(cfg(feature = "fjall")))]
 pub mod fjall_cs;
+mod fresh_index;
 pub mod lru_cs;
 pub mod observable_cs;
 pub mod pit;

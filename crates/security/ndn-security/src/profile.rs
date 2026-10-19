@@ -14,12 +14,12 @@ pub enum SecurityProfile {
     /// - `TrustSchema::hierarchical()` (data and key share first component)
     /// - Shared `CertCache` from the `SecurityManager`
     /// - Trust anchors from the `SecurityManager`
-    /// - `CertFetcher` for missing certificates
+    /// - `CertFetcher` for missing certificates (the engine fetches them
+    ///   through its own faces)
     ///
-    /// **When no `SecurityManager` is set**, the engine falls back to
-    /// `AcceptSigned` behaviour: each Data packet's signature is verified
-    /// cryptographically but namespace hierarchy is not enforced. This keeps
-    /// security on by default even without a configured trust anchor.
+    /// **When no `SecurityManager` is set** there are no trust anchors: the
+    /// chain walk still runs, so DigestSha256 Data validates but key-signed
+    /// Data fails closed. It never degrades to signature-only checking.
     ///
     /// Use [`Disabled`](Self::Disabled) to explicitly turn off all validation.
     Default,

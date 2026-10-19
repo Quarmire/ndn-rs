@@ -202,11 +202,11 @@ pub struct FaceStatus {
     /// Frames resent early by ack ordering (TLV `N_LP_FAST_RETX`).
     pub n_lp_fast_retx: Option<u64>,
     /// Inbound frames dropped as duplicates (TLV `N_LP_DUPLICATE_FRAMES`).
-    /// Read together with
-    /// `n_lp_fast_retx`: retransmits that show up here as duplicates were
-    /// not repairing loss, they were wasting airtime.
+    /// Read together with `n_lp_fast_retx`: retransmits that show up here as
+    /// duplicates were not repairing loss, they were wasting airtime.
     pub n_lp_duplicate_frames: Option<u64>,
-    /// Acks sent (TLV `N_LP_ACKS_SENT`).
+    /// Ack entries handed to the wire (TLV `N_LP_ACKS_SENT`); compare with the
+    /// peer's `n_lp_acks_received` for the ack delivery ratio.
     pub n_lp_acks_sent: Option<u64>,
     /// Fragments rejected by the reassembler AFTER being Acked.
     pub n_reasm_fragments_rejected: Option<u64>,

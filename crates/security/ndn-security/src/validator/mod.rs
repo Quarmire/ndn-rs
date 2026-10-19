@@ -424,8 +424,12 @@ impl Validator {
 
         // The signer as its KeyLocator names it, as the certificate that
         // resolves to, or as its key (`SignedTrustContext::authorizes_hop`).
+        // A self-signed certificate Data carries its own verifying key.
         let ctx = self.keyring.context_for(&data.name);
-        let cert = self.cert_cache.get(&key_name);
+        let cert = self
+            .cert_cache
+            .get(&key_name)
+            .or_else(|| own_certificate(data, &key_name));
         if !ctx.authorizes_hop(&data.name, &key_name, cert.as_ref().map(|c| c.name.as_ref())) {
             return ValidationResult::Invalid(TrustError::SchemaMismatch);
         }
@@ -557,6 +561,25 @@ fn revoked_signer(
         .chain(cert.map(|c| c.name.as_ref()))
         .find(|n| ctx.is_revoked(n))
         .map(|n| TrustError::Revoked { name: n.to_string() })
+}
+
+/// The certificate a **self-signed** certificate Data carries for its own
+/// signature: its KeyLocator resolves to the packet itself (it names the
+/// certificate or its key) and its Content is the verifying key. Resolving
+/// that key through the cert cache or a fetch would wait on the very packet
+/// being validated -- a forwarder that fetched a root certificate while
+/// resolving a chain parked it in its pending queue behind its own fetch until
+/// both timed out. Trust in the key is a separate question: the chain walk
+/// still rejects a self-signed certificate that is not an anchor (it signs
+/// itself: a cycle).
+pub(super) fn own_certificate(data: &Data, key_name: &Name) -> Option<Certificate> {
+    let is_cert = data
+        .meta_info()
+        .is_some_and(|m| m.content_type == ndn_packet::meta_info::ContentType::Key);
+    if !is_cert || !crate::cert_cache::resolves_to(key_name, &data.name) {
+        return None;
+    }
+    Certificate::decode(data).ok()
 }
 
 pub(crate) fn now_ns() -> u64 {

@@ -28,8 +28,10 @@ impl CsLookupStage {
         };
 
         // The Serve gate lives inside the CS (`get` returns None when disabled),
-        // mirroring NFD's Cs::findImpl.
-        if let Some(entry) = self.cs.get_erased(interest).await {
+        // mirroring NFD's Cs::findImpl. Freshness is judged at the Interest's
+        // arrival — the runtime clock `CsInsertStage` stamps `stale_at` on — so
+        // FreshnessPeriod expires in virtual time under a simulated runtime.
+        if let Some(entry) = self.cs.get_erased(interest, ctx.arrival).await {
             // Data judged before the latest revoking trust-context update is
             // checked against the revocations held now. One atomic load
             // while the epoch has not moved since the entry was stamped.
@@ -146,6 +148,9 @@ mod tests {
     use crate::pipeline::DecodedPacket;
     use crate::stages::validation::{PendingQueueConfig, ValidationStage};
 
+    /// Lookup time; the direct CS lookups here do not ask for MustBeFresh.
+    const NOW: u64 = 1_000_000_000;
+
     fn make_ctx_with_freshness(name: &str, verified: bool) -> PacketContext {
         let n: Name = name.parse().unwrap();
         let wire = DataBuilder::new(n.clone(), b"x")
@@ -235,6 +240,55 @@ mod tests {
         );
     }
 
+    /// End to end through both CS stages: a Data with FreshnessPeriod 1 s that
+    /// arrives at runtime time T satisfies a MustBeFresh Interest arriving at
+    /// T + 999 ms and not one at T + 1 s. Both stamps are `ctx.arrival` (the
+    /// runtime clock), so under a virtual runtime the cache ages in virtual
+    /// time — T here is a virtual-epoch instant nowhere near the wall clock.
+    #[tokio::test]
+    async fn cached_data_ages_on_the_runtime_clock() {
+        const T: u64 = 5_000_000_000;
+        let name = ndn_packet::name!("/test/fresh/virtual");
+        let wire = DataBuilder::new(name.clone(), b"x")
+            .freshness(std::time::Duration::from_secs(1))
+            .sign_sync(SignatureType::DigestSha256, None, |_| {
+                Bytes::from_static(&[0u8; 32])
+            });
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut data_ctx = PacketContext::new(wire, FaceId(0), T);
+        data_ctx.name = Some(Arc::clone(&data.name));
+        data_ctx.packet = DecodedPacket::Data(Box::new(data));
+        data_ctx.verified = true;
+
+        let (insert, cs) = make_insert_stage();
+        insert.process(data_ctx).await;
+        let lookup = CsLookupStage {
+            cs: cs as Arc<dyn ndn_store::ErasedContentStore>,
+            validator: None,
+        };
+        let fresh_interest_at = |arrival: u64| {
+            let wire = InterestBuilder::new(name.clone()).must_be_fresh().build();
+            let mut ctx = interest_ctx(wire);
+            ctx.arrival = arrival;
+            ctx
+        };
+
+        assert!(
+            matches!(
+                lookup.process(fresh_interest_at(T + 999_000_000)).await,
+                Action::Satisfy(_)
+            ),
+            "still fresh 999 ms after arrival"
+        );
+        assert!(
+            matches!(
+                lookup.process(fresh_interest_at(T + 1_000_000_000)).await,
+                Action::Continue(_)
+            ),
+            "stale once FreshnessPeriod has elapsed on the runtime clock"
+        );
+    }
+
     /// A validator RAN and rejected this Data, so it must not be cached.
     /// `validation_not_configured` stays false, which is what separates this
     /// from the "no validator at all" case below.
@@ -246,7 +300,7 @@ mod tests {
 
         let name: Name = "/test/d12/unverified".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_none(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_none(),
             "CS must not admit Data a validator rejected (D.12)"
         );
     }
@@ -269,7 +323,7 @@ mod tests {
 
         let name: Name = "/test/cs/unvalidated-default".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_none(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_none(),
             "fail-secure is the DEFAULT: no opt-in, no caching of unvalidated Data"
         );
     }
@@ -284,7 +338,7 @@ mod tests {
 
         let name: Name = "/test/cs/unvalidated-optin".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_some(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_some(),
             "with admit_unverified the CS caches Data no validator ever checked"
         );
     }
@@ -300,7 +354,7 @@ mod tests {
 
         let name: Name = "/test/cs/rejected".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_none(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_none(),
             "admit_unverified must never cache Data a validator rejected"
         );
     }
@@ -313,7 +367,7 @@ mod tests {
 
         let name: Name = "/test/d12/verified".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_some(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_some(),
             "CS must admit Data with ctx.verified=true"
         );
     }
@@ -443,7 +497,7 @@ mod tests {
 
         let name: Name = "/test/d12/network-novalidator".parse().unwrap();
         assert!(
-            cs.get_erased(&Interest::new(name)).await.is_none(),
+            cs.get_erased(&Interest::new(name), NOW).await.is_none(),
             "unverified Data must NOT enter the CS (D.12 fail-secure)"
         );
     }

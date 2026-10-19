@@ -63,6 +63,13 @@ impl ReliabilityFeature {
         self.state.lock().unwrap().set_mtu(mtu);
     }
 
+    /// Time source for RTO, RTT and the duplicate window. See
+    /// `LpReliability::set_clock`; the engine passes its runtime when the face
+    /// is wired.
+    pub fn set_clock(&self, clock: Arc<dyn ndn_runtime::Now>) {
+        self.state.lock().unwrap().set_clock(clock);
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }
@@ -155,9 +162,10 @@ impl ReliabilityFeature {
         s.on_send(payload)
     }
 
-    /// Standalone Ack frame for received reliable frames not yet piggybacked,
-    /// pumped on the retx tick alongside [`Self::take_retransmissions`]. `None`
-    /// when there is nothing to Ack.
+    /// Standalone Ack frame for received reliable frames that no outgoing
+    /// frame has piggybacked yet, pumped on the engine's 5 ms idle-Ack tick
+    /// (NFD's `idleAckTimerPeriod`). Carries as many pending Acks as fit in
+    /// the MTU; call until `None` to drain them all.
     ///
     /// NOT gated on `is_enabled`: see [`Self::on_ingress`]. Acking is a
     /// receiver-side duty owed to whoever sent us a TxSequence, independent of

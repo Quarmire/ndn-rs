@@ -197,7 +197,7 @@ impl Relay {
 
     async fn cached(&self, name: &Name) -> bool {
         let interest = Interest::decode(InterestBuilder::new(name.clone()).build()).unwrap();
-        self.engine.cs().get_erased(&interest).await.is_some()
+        self.engine.cs().get_erased(&interest, 0).await.is_some()
     }
 
     fn cs_hits(&self) -> u64 {

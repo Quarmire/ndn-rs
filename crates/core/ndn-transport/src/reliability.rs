@@ -2,14 +2,32 @@
 //! wire-ready packets and callers handle I/O.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_runtime::Now;
 use web_time::Instant;
 
 use ndn_packet::fragment::FRAG_OVERHEAD;
 use ndn_packet::lp::{encode_lp_acks, encode_lp_reliable, extract_acks};
 
 const MAX_PIGGYBACKED_ACKS: usize = 16;
+/// LpPacket TLV header of a standalone Ack packet: 1-byte type (0x64) plus a
+/// length of up to 3 bytes (any MTU this crate frames to is < 65536).
+const ACK_PACKET_OVERHEAD: usize = 4;
+
+/// Encoded size of one Ack TLV: 3-byte type (0x0344), 1-byte length, and the
+/// minimal NonNegativeInteger (`encode_lp_acks`/`encode_lp_reliable`).
+fn ack_tlv_len(tx_seq: u64) -> usize {
+    let value = match tx_seq {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    };
+    4 + value
+}
+
 const DEFAULT_MAX_RETRIES: u8 = 1;
 /// Cap retransmits per tick so retx bursts don't starve new packets.
 const MAX_RETX_PER_TICK: usize = 8;
@@ -31,6 +49,21 @@ const QUIC_INITIAL_RTO_US: u64 = 333_000;
 const QUIC_MIN_RTO_US: u64 = 1_000;
 const QUIC_MAX_RTO_US: u64 = 4_000_000;
 const QUIC_GRANULARITY_US: u64 = 1_000;
+
+/// The system clock: what [`LpReliability`] and the congestion-marking feature
+/// read until the engine wires the face to its runtime (`set_clock`).
+/// Production runtimes read this same clock, so there the swap changes nothing.
+struct WallClock;
+
+impl Now for WallClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub(crate) fn wall_clock() -> Arc<dyn Now> {
+    Arc::new(WallClock)
+}
 
 /// RTO computation strategy.
 ///
@@ -123,6 +156,16 @@ struct UnackedEntry {
     /// `SEQ_NUM_LOSS_THRESHOLD` the frame is declared lost immediately rather
     /// than waiting out its RTO (NFD's `UnackedFrag::nGreaterSeqAcks`).
     n_greater_seq_acks: u32,
+    /// Lowest TxSequence whose Ack counts toward `n_greater_seq_acks`: the
+    /// first TxSequence assigned AFTER this copy went out.
+    ///
+    /// Retransmission reuses the frame's TxSequence (see [`LpReliability::on_receive`]),
+    /// so without this floor the Acks for every frame sent between the
+    /// original and the retransmission -- still in flight when the
+    /// retransmission leaves -- would count against the new copy and condemn
+    /// it again before it could possibly have been acked. NFD gets the same
+    /// effect by re-stamping a fresh TxSequence on each retransmission.
+    evidence_floor: u64,
 }
 
 /// Per-face NDNLPv2 reliability state.
@@ -171,8 +214,9 @@ pub struct LpReliability {
     /// were Acked or retried to exhaustion — silent, unrecoverable loss.
     unacked_evictions: u64,
     /// TxSequences seen recently, for duplicate-frame suppression, with the
-    /// time each was first seen. Aged out after one RTO — long enough to
-    /// cover a retransmission, short enough to stay small.
+    /// time each was last seen. Aged out after two RTOs (see `on_receive`) —
+    /// long enough to cover the peer's retransmission, short enough to stay
+    /// small.
     recent_recv: HashMap<u64, Instant>,
     /// `recent_recv` keys in arrival order, so ageing is O(expired).
     recent_recv_order: VecDeque<u64>,
@@ -187,6 +231,14 @@ pub struct LpReliability {
     acks_sent: u64,
     /// Ack entries extracted from inbound frames.
     acks_received: u64,
+    /// Time source for send stamps, RTT samples, RTO expiry and the duplicate
+    /// window. The engine wires every face to its `Runtime` clock (see
+    /// [`Self::set_clock`]). Read from the host clock instead, a simulated link
+    /// sampled RTTs of host scheduling rather than of the modelled link, and
+    /// retransmission and give-up depended on how fast the simulator ran:
+    /// the engine's retx tick fires on virtual time, but "has this frame's RTO
+    /// elapsed?" was answered in wall time.
+    clock: Arc<dyn Now>,
 }
 
 fn initial_rto_for(strategy: &RtoStrategy) -> u64 {
@@ -228,6 +280,7 @@ impl LpReliability {
             duplicate_frames: 0,
             acks_sent: 0,
             acks_received: 0,
+            clock: wall_clock(),
         }
     }
 
@@ -242,6 +295,21 @@ impl LpReliability {
         self.rto_strategy = config.rto_strategy;
     }
 
+    /// Read time from `clock` from now on (the engine passes its runtime).
+    /// Stamps already taken on the previous clock mean nothing on the new one,
+    /// so they are re-taken as "now": nothing ages across the switch.
+    pub fn set_clock(&mut self, clock: Arc<dyn Now>) {
+        let now = clock.now();
+        for entry in self.unacked.values_mut() {
+            entry.first_sent = now;
+            entry.last_sent = now;
+        }
+        for seen in self.recent_recv.values_mut() {
+            *seen = now;
+        }
+        self.clock = clock;
+    }
+
     pub fn config(&self) -> ReliabilityConfig {
         ReliabilityConfig {
             rto_strategy: self.rto_strategy.clone(),
@@ -253,26 +321,30 @@ impl LpReliability {
 
     /// Fragment if needed, assign TxSequences, piggyback pending Acks,
     /// buffer for retransmit. Returns wire-ready LpPackets.
+    ///
+    /// Acks ride the LAST frame, in whatever room the payload leaves under the
+    /// MTU, as NFD's `LpReliability::piggyback` does: they never cost an extra
+    /// fragment. Reserving room for them up front instead (as this did) splits
+    /// a near-MTU packet in two whenever Acks are pending -- which, now that
+    /// Acks wait for an outgoing frame instead of being flushed on receipt, is
+    /// most of the time. Acks that do not fit stay queued for the next frame
+    /// or the idle-Ack flush.
     pub fn on_send(&mut self, pkt: &[u8]) -> Vec<Bytes> {
-        let now = Instant::now();
+        let now = self.clock.now();
 
-        let acks: Vec<u64> = self
-            .pending_acks
-            .drain(..self.pending_acks.len().min(MAX_PIGGYBACKED_ACKS))
-            .collect();
-        self.acks_sent += acks.len() as u64;
-
-        let ack_overhead = acks.len() * 10;
-        let payload_cap = self
-            .mtu
-            .saturating_sub(FRAG_OVERHEAD)
-            .saturating_sub(ack_overhead);
-
+        let payload_cap = self.mtu.saturating_sub(FRAG_OVERHEAD);
         if payload_cap == 0 {
             return vec![];
         }
 
         let frag_count = pkt.len().div_ceil(payload_cap);
+        let last_chunk = pkt.len() - payload_cap * frag_count.saturating_sub(1);
+        let acks = if frag_count == 0 {
+            Vec::new()
+        } else {
+            self.drain_acks(payload_cap - last_chunk, MAX_PIGGYBACKED_ACKS)
+        };
+
         // Reserve a CONSECUTIVE block: NDNLPv2 Sequence increments per
         // fragment, and the receiver recovers the group key as
         // `Sequence - FragIndex` (see the engine's decode stage, and NFD's
@@ -297,7 +369,7 @@ impl LpReliability {
                 None
             };
 
-            let frag_acks = if i == 0 { &acks[..] } else { &[] };
+            let frag_acks = if i + 1 == frag_count { &acks[..] } else { &[] };
             let wire = encode_lp_reliable(chunk, tx_seq, frag_info, frag_acks);
 
             while self.unacked.len() >= self.max_unacked {
@@ -316,6 +388,7 @@ impl LpReliability {
                     retx_count: 0,
                     is_retx: false,
                     n_greater_seq_acks: 0,
+                    evidence_floor: tx_seq + 1,
                 },
             );
 
@@ -368,11 +441,22 @@ impl LpReliability {
         if let Some(seq) = tx_seq {
             self.pending_acks.push_back(seq);
 
-            let now = Instant::now();
-            let rto = std::time::Duration::from_micros(self.rto_us);
+            let now = self.clock.now();
+            // Two RTOs, not one. The peer resends a frame whose Ack it lost one of
+            // ITS RTOs after that copy left, on its next retransmit-pump tick (up
+            // to 50 ms later), so with both ends at the same RTO (a ~ms link pins
+            // both at the 200 ms floor) the copy lands just past a one-RTO window.
+            // Measured on the sim fleet: 65 of 93 RTO-driven duplicates slipped
+            // past it into reassembly and the PIT, and `duplicate_frames` read
+            // under half the true count. NFD (`LpReliability::
+            // processIncomingPacket`) keys its window on Sequence and ages it by
+            // its own RTO estimate too, but tests for the duplicate BEFORE ageing
+            // and resends on a per-frame RTO timer, so it misses a copy only when
+            // other traffic arrived in between.
+            let window = 2 * std::time::Duration::from_micros(self.rto_us);
             while let Some(&front) = self.recent_recv_order.front() {
                 match self.recent_recv.get(&front) {
-                    Some(&seen) if now.duration_since(seen) > rto => {
+                    Some(&seen) if now.duration_since(seen) > window => {
                         self.recent_recv.remove(&front);
                         self.recent_recv_order.pop_front();
                     }
@@ -387,7 +471,7 @@ impl LpReliability {
             }
         }
 
-        let now = Instant::now();
+        let now = self.clock.now();
         for ack_seq in acks {
             // Fast retransmit, mirroring NFD's findLostLpPackets(): every frame
             // still unacked BELOW the acked TxSequence has had a later frame
@@ -402,28 +486,16 @@ impl LpReliability {
             // sees it directly as a stall.
             //
             // Only frames below the ack are eligible: `unacked` is ordered by
-            // TxSequence, so that is the range below `ack_seq`.
-            // A frame is only EVIDENCE of loss once it has had a fair chance
-            // to be acked. One network packet fragments into several LP frames
-            // sent back-to-back, so acks for its siblings arrive within
-            // microseconds of each other and in no guaranteed order. Counting
-            // those against a frame declares it lost while it is still in
-            // flight, and the "repair" is pure waste: it spends airtime on a
-            // medium that is already the binding constraint, which makes the
-            // congestion it is reacting to worse.
-            //
-            // Measured on the fleet at heavy video load: the GCS received 9023
-            // duplicate frames from iuas-01 against 13968 Data in the same
-            // window, i.e. roughly HALF of all fast retransmits were spurious
-            // and ~13% of fragments were transmitted twice for nothing.
-            //
-            // So require a frame to have been outstanding for at least one
-            // smoothed RTT before ack ordering may condemn it. Genuine loss is
-            // still caught -- the frame simply waits one RTT longer than the
-            // sibling acks that used to convict it instantly. Before the first
-            // RTT sample srtt is 0 and this is a no-op, matching the old
-            // behaviour on a cold face.
+            // TxSequence, so that is the range below `ack_seq`. And only an ack
+            // for a frame sent AFTER the entry's latest copy is evidence --
+            // see `UnackedEntry::evidence_floor`. Counting the in-flight acks
+            // of earlier frames against a retransmission turned one loss into
+            // `max_retries` back-to-back resends, all but the first spurious,
+            // and then a give-up for a frame the peer had received.
             for (&seq, entry) in self.unacked.range_mut(..ack_seq) {
+                if ack_seq < entry.evidence_floor {
+                    continue;
+                }
                 entry.n_greater_seq_acks += 1;
                 if entry.n_greater_seq_acks == SEQ_NUM_LOSS_THRESHOLD {
                     self.fast_retx_candidates.push(seq);
@@ -443,17 +515,18 @@ impl LpReliability {
 
     /// Wires for frames that ack ordering has declared lost, ready to send now.
     ///
-    /// Kept separate from [`Self::check_retransmit`] so the caller can flush
-    /// these on the receive path -- the same place it flushes Acks -- instead of
-    /// waiting for the next retransmit tick. Retransmitting reuses the frame's
-    /// TxSequence (see [`Self::on_receive`] on why this port keys duplicate
-    /// suppression on TxSequence where NFD re-stamps it), so Karn's check still
-    /// excludes these from RTT sampling via `is_retx`.
+    /// Kept separate from [`Self::check_retransmit`] so the caller can send
+    /// these from the receive path, where the Acks revealing the loss arrive,
+    /// instead of waiting for the next retransmit tick. Retransmitting reuses
+    /// the frame's TxSequence (see [`Self::on_receive`] on why this port keys
+    /// duplicate suppression on TxSequence where NFD re-stamps it), so Karn's
+    /// check still excludes these from RTT sampling via `is_retx`.
     pub fn take_fast_retransmits(&mut self) -> Vec<Bytes> {
         if self.fast_retx_candidates.is_empty() {
             return Vec::new();
         }
-        let now = Instant::now();
+        let now = self.clock.now();
+        let next_tx_seq = self.next_tx_seq;
         let candidates = std::mem::take(&mut self.fast_retx_candidates);
         let mut wires = Vec::with_capacity(candidates.len());
         for seq in candidates {
@@ -466,6 +539,7 @@ impl LpReliability {
                     entry.retx_count += 1;
                     entry.is_retx = true;
                     entry.n_greater_seq_acks = 0;
+                    entry.evidence_floor = next_tx_seq;
                     wires.push(entry.wire.clone());
                     self.fast_retx += 1;
                     false
@@ -505,7 +579,7 @@ impl LpReliability {
 
     /// Returns wire packets due for retransmission.
     pub fn check_retransmit(&mut self) -> Vec<Bytes> {
-        let now = Instant::now();
+        let now = self.clock.now();
         let rto = std::time::Duration::from_micros(self.rto_us);
         let mut retx = Vec::new();
         let mut expired = Vec::new();
@@ -525,12 +599,15 @@ impl LpReliability {
             self.rto_expirations += 1;
         }
 
+        let next_tx_seq = self.next_tx_seq;
         let mut wires = Vec::with_capacity(retx.len().min(self.max_retx_per_tick));
         for seq in retx.into_iter().take(self.max_retx_per_tick) {
             if let Some(entry) = self.unacked.get_mut(&seq) {
                 entry.last_sent = now;
                 entry.retx_count += 1;
                 entry.is_retx = true;
+                entry.n_greater_seq_acks = 0;
+                entry.evidence_floor = next_tx_seq;
                 wires.push(entry.wire.clone());
             }
         }
@@ -538,13 +615,39 @@ impl LpReliability {
         wires
     }
 
+    /// One standalone Ack packet carrying as many pending Acks as fit in the
+    /// MTU; `None` when none are pending. Anything that does not fit stays
+    /// queued, so the idle-Ack pump calls this until it returns `None`.
     pub fn flush_acks(&mut self) -> Option<Bytes> {
         if self.pending_acks.is_empty() {
             return None;
         }
-        let acks: Vec<u64> = self.pending_acks.drain(..).collect();
-        self.acks_sent += acks.len() as u64;
+        let room = self.mtu.saturating_sub(ACK_PACKET_OVERHEAD);
+        let mut acks = self.drain_acks(room, usize::MAX);
+        if acks.is_empty() {
+            // An MTU too small for even one Ack: send one anyway rather than
+            // leave the peer retransmitting forever.
+            acks.extend(self.pending_acks.pop_front());
+            self.acks_sent += 1;
+        }
         Some(encode_lp_acks(&acks))
+    }
+
+    /// Dequeue pending Acks, oldest first, whose encoded Ack TLVs fit in
+    /// `room` bytes, at most `max` of them.
+    fn drain_acks(&mut self, room: usize, max: usize) -> Vec<u64> {
+        let mut used = 0;
+        let mut n = 0;
+        for &ack in &self.pending_acks {
+            let len = ack_tlv_len(ack);
+            if n == max || used + len > room {
+                break;
+            }
+            used += len;
+            n += 1;
+        }
+        self.acks_sent += n as u64;
+        self.pending_acks.drain(..n).collect()
     }
 
     pub fn unacked_count(&self) -> usize {
@@ -650,6 +753,11 @@ mod tests {
 
     fn small_packet() -> Vec<u8> {
         vec![0x05, 0x03, 0xAA, 0xBB, 0xCC]
+    }
+
+    /// A peer's reliable frame with the given TxSequence.
+    fn reliable_frame(tx_seq: u64) -> Bytes {
+        encode_lp_reliable(&small_packet(), tx_seq, None, &[])
     }
 
     #[test]
@@ -775,6 +883,80 @@ mod tests {
         assert_eq!(rel.unacked_count(), 2, "frames 0 and 4 remain unacked");
     }
 
+    /// Sends 16 frames, loses frame 0, and delivers 1..=15 with each Ack
+    /// returned on its own. Returns the fast retransmissions the sender emitted
+    /// while those Acks -- all for frames sent BEFORE any retransmission --
+    /// were arriving.
+    fn lose_frame_zero_with_a_window_in_flight(
+        tx: &mut LpReliability,
+        rx: &mut LpReliability,
+    ) -> Vec<Bytes> {
+        let sent: Vec<Bytes> = (0..16)
+            .map(|_| tx.on_send(&small_packet())[0].clone())
+            .collect();
+        let mut repairs = Vec::new();
+        for wire in &sent[1..] {
+            rx.on_receive(wire);
+            tx.on_receive(&rx.flush_acks().unwrap());
+            repairs.extend(tx.take_fast_retransmits());
+        }
+        repairs
+    }
+
+    /// One loss costs exactly one retransmission, however many Acks for
+    /// earlier frames are still in flight when it leaves.
+    ///
+    /// Retransmission reuses the TxSequence, so every in-flight Ack for frames
+    /// 4..=15 is for a HIGHER TxSequence than the resent copy. Counting those
+    /// re-condemned the copy every third Ack: one loss became `max_retries`
+    /// resends, the peer dropped all but the first as duplicates, and the
+    /// sender then gave up on a frame the peer had received.
+    #[test]
+    fn a_retransmission_is_not_condemned_by_acks_for_earlier_frames() {
+        let mut tx = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let mut rx = LpReliability::new(1400);
+
+        let repairs = lose_frame_zero_with_a_window_in_flight(&mut tx, &mut rx);
+        let seqs: Vec<Option<u64>> = repairs.iter().map(|w| extract_acks(w).0).collect();
+        assert_eq!(seqs, vec![Some(0)], "frame 0 is resent exactly once");
+
+        assert!(!rx.on_receive(&repairs[0]), "the copy is not a duplicate");
+        tx.on_receive(&rx.flush_acks().unwrap());
+        assert_eq!(rx.duplicate_frames(), 0);
+        assert_eq!(
+            tx.rto_expirations(),
+            0,
+            "a delivered frame is never given up"
+        );
+        assert_eq!(tx.unacked_count(), 0);
+    }
+
+    /// The evidence floor only discounts Acks for frames sent BEFORE the copy:
+    /// a retransmission that is itself lost is still repaired by ack ordering
+    /// once frames sent after it are acked.
+    #[test]
+    fn a_lost_retransmission_is_repaired_by_acks_for_later_frames() {
+        let mut tx = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let mut rx = LpReliability::new(1400);
+
+        let repairs = lose_frame_zero_with_a_window_in_flight(&mut tx, &mut rx);
+        assert_eq!(repairs.len(), 1);
+
+        // The copy is lost too; three frames sent after it get through.
+        for _ in 0..3 {
+            let wire = tx.on_send(&small_packet())[0].clone();
+            rx.on_receive(&wire);
+        }
+        tx.on_receive(&rx.flush_acks().unwrap());
+
+        let again: Vec<Option<u64>> = tx
+            .take_fast_retransmits()
+            .iter()
+            .map(|w| extract_acks(w).0)
+            .collect();
+        assert_eq!(again, vec![Some(0)]);
+    }
+
     /// Under a backlog, `check_retransmit` repairs the OLDEST losses first.
     ///
     /// `max_retx_per_tick` caps how many frames a tick may resend, so when more
@@ -867,6 +1049,90 @@ mod tests {
         assert_eq!(acks[0], 0);
     }
 
+    /// Piggybacked Acks fill only the room the payload leaves: they never push
+    /// a frame past the MTU and never split a packet into an extra fragment.
+    ///
+    /// Acks now wait for an outgoing frame instead of leaving on receipt, so
+    /// they are pending on most sends. Reserving a fixed 10 B per Ack up front
+    /// split every near-MTU packet in two whenever any were queued, and
+    /// under-reserved for the 12 B an 8-byte TxSequence (e.g. NFD's random
+    /// initial one) encodes to.
+    #[test]
+    fn pending_acks_never_cost_an_extra_fragment_or_overrun_the_mtu() {
+        const MTU: usize = 1452;
+        let big_seq = |i: u64| (1u64 << 40) + i; // 8-byte NNI: the largest Ack TLV
+
+        // A packet that exactly fills one frame: no room, Acks stay queued.
+        let mut rel = LpReliability::new(MTU);
+        for i in 0..MAX_PIGGYBACKED_ACKS as u64 {
+            rel.on_receive(&reliable_frame(big_seq(i)));
+        }
+        let full = vec![0xAB; MTU - FRAG_OVERHEAD];
+        let wires = rel.on_send(&full);
+        assert_eq!(
+            wires.len(),
+            1,
+            "pending Acks must not fragment a fitting packet"
+        );
+        assert!(wires[0].len() <= MTU);
+        assert!(extract_acks(&wires[0]).1.is_empty(), "no room, no Acks");
+        assert_eq!(rel.acks_pending(), MAX_PIGGYBACKED_ACKS);
+
+        // A packet leaving room for some: those that fit ride, the frame still fits.
+        let partial = vec![0xAB; MTU - FRAG_OVERHEAD - 5 * ack_tlv_len(big_seq(0))];
+        let wires = rel.on_send(&partial);
+        assert_eq!(wires.len(), 1);
+        assert!(wires[0].len() <= MTU, "{} > MTU", wires[0].len());
+        assert_eq!(extract_acks(&wires[0]).1.len(), 5);
+
+        // A multi-fragment packet: the Acks ride its short last fragment.
+        let big = vec![0xAB; 3 * (MTU - FRAG_OVERHEAD) + 100];
+        let wires = rel.on_send(&big);
+        assert_eq!(wires.len(), 4);
+        for w in &wires {
+            assert!(w.len() <= MTU, "{} > MTU", w.len());
+        }
+        let carried: Vec<usize> = wires.iter().map(|w| extract_acks(w).1.len()).collect();
+        assert_eq!(carried, vec![0, 0, 0, MAX_PIGGYBACKED_ACKS - 5]);
+        assert_eq!(rel.acks_pending(), 0);
+        assert_eq!(rel.acks_sent(), MAX_PIGGYBACKED_ACKS as u64);
+    }
+
+    /// The idle-Ack flush packs every pending Ack into as few packets as the
+    /// MTU allows -- one, at any realistic 5 ms backlog -- and never overruns it.
+    #[test]
+    fn flush_acks_packs_pending_acks_into_mtu_sized_packets() {
+        const MTU: usize = 1452;
+        let mut rel = LpReliability::new(MTU);
+        for seq in 0..10 {
+            rel.on_receive(&reliable_frame(seq));
+        }
+        let one = rel.flush_acks().expect("Acks pending");
+        assert_eq!(
+            extract_acks(&one).1.as_slice(),
+            &(0..10).collect::<Vec<_>>()[..]
+        );
+        assert!(rel.flush_acks().is_none(), "one packet carried them all");
+
+        // A backlog larger than one MTU splits, losing nothing.
+        for seq in 0..1000u64 {
+            rel.on_receive(&reliable_frame((1 << 40) + seq));
+        }
+        let mut packets = 0;
+        let mut acked = 0;
+        while let Some(p) = rel.flush_acks() {
+            assert!(p.len() <= MTU, "{} > MTU", p.len());
+            acked += extract_acks(&p).1.len();
+            packets += 1;
+        }
+        assert_eq!(acked, 1000);
+        assert_eq!(
+            packets,
+            1000usize.div_ceil((MTU - ACK_PACKET_OVERHEAD) / 12)
+        );
+        assert_eq!(rel.acks_sent(), 1010);
+    }
+
     #[test]
     fn quic_strategy_lower_initial_rto() {
         let cfg = ReliabilityConfig {
@@ -957,10 +1223,10 @@ mod tests {
     /// `wifi()` deliberately still selects RFC6298. Quic was tried on the
     /// fleet (3ae75e41) and had to be reverted: its ~4.5 ms RTO undercut the
     /// Ack delay of the day, so the sender retransmitted before an Ack was
-    /// physically possible. Acking on receipt removes that floor, but the
-    /// estimator must be shown to actually converge on hardware before the
-    /// profile switches. This test pins the MEASURED difference so the
-    /// motivation survives the deferral.
+    /// physically possible. Acks now wait at most the 5 ms idle-Ack tick (or
+    /// ride an outgoing frame), and the estimator must be shown to converge
+    /// over that delay on hardware before the profile switches. This test pins
+    /// the MEASURED difference so the motivation survives the deferral.
     #[test]
     fn rfc6298_pins_at_its_floor_on_a_mesh_rtt_where_quic_tracks_the_link() {
         const MESH_RTT_US: f64 = 1_500.0; // ~1.5 ms, measured on the fleet
@@ -1009,6 +1275,66 @@ mod tests {
             rel.on_send(&small_packet());
         }
         assert!(rel.unacked_count() <= MAX_UNACKED);
+    }
+
+    /// A clock that moves only when told to.
+    struct ManualClock {
+        base: Instant,
+        offset_us: std::sync::atomic::AtomicU64,
+    }
+
+    impl ManualClock {
+        fn advance_ms(&self, ms: u64) {
+            self.offset_us
+                .fetch_add(ms * 1_000, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Now for ManualClock {
+        fn now(&self) -> Instant {
+            self.base
+                + std::time::Duration::from_micros(
+                    self.offset_us.load(std::sync::atomic::Ordering::Relaxed),
+                )
+        }
+    }
+
+    /// RTO expiry, retransmission and give-up follow the injected clock alone:
+    /// the clock jumps, no wall time passes, and the frame is resent exactly
+    /// when its RTO has elapsed on that clock — which is what lets a simulated
+    /// link retransmit on virtual time instead of on how fast the host ran.
+    #[test]
+    fn rto_expiry_follows_the_injected_clock() {
+        let clock = Arc::new(ManualClock {
+            base: Instant::now(),
+            offset_us: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 200_000 },
+                max_retries: 1,
+                ..Default::default()
+            },
+        );
+        rel.set_clock(Arc::clone(&clock) as Arc<dyn Now>);
+        rel.on_send(&small_packet());
+
+        clock.advance_ms(199);
+        assert!(rel.check_retransmit().is_empty(), "RTO not yet elapsed");
+        clock.advance_ms(1);
+        assert_eq!(rel.check_retransmit().len(), 1, "resent once RTO elapses");
+        assert!(
+            rel.check_retransmit().is_empty(),
+            "the resend restarts its RTO"
+        );
+        clock.advance_ms(200);
+        assert!(
+            rel.check_retransmit().is_empty(),
+            "retries exhausted: give up"
+        );
+        assert_eq!(rel.rto_expirations(), 1);
+        assert_eq!(rel.unacked_count(), 0);
     }
 }
 
@@ -1070,7 +1396,49 @@ mod duplicate_suppression_tests {
         assert_eq!(rel.duplicate_frames(), 0);
     }
 
-    /// The dedup window is bounded: entries age out after one RTO, so a long
+    /// The peer resends a frame whose Ack it lost one of its RTOs later, on its
+    /// next retransmit tick — so the copy lands a little MORE than one RTO after
+    /// the original. It must still be caught: with both ends at the 200 ms RTO
+    /// floor, a one-RTO window let it through to reassembly and the PIT as new.
+    #[test]
+    fn a_retransmission_one_peer_rto_later_is_still_a_duplicate() {
+        struct StepClock {
+            base: Instant,
+            offset_ms: std::sync::atomic::AtomicU64,
+        }
+        impl Now for StepClock {
+            fn now(&self) -> Instant {
+                self.base
+                    + std::time::Duration::from_millis(
+                        self.offset_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+            }
+        }
+        let clock = Arc::new(StepClock {
+            base: Instant::now(),
+            offset_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 200_000 },
+                ..Default::default()
+            },
+        );
+        rel.set_clock(Arc::clone(&clock) as Arc<dyn Now>);
+
+        assert!(!rel.on_receive(&reliable_frame(9)));
+        // Peer RTO (200 ms, same as ours) plus one 50 ms retransmit-pump tick.
+        clock
+            .offset_ms
+            .store(250, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            rel.on_receive(&reliable_frame(9)),
+            "the peer's RTO retransmission must be recognised as a duplicate"
+        );
+    }
+
+    /// The dedup window is bounded: entries age out after two RTOs, so a long
     /// flow cannot grow it without limit.
     #[test]
     fn dedup_window_ages_out_and_stays_bounded() {

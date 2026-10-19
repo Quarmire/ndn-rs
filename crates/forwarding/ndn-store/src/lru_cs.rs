@@ -8,9 +8,8 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::{
-    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult, NameTrie,
-};
+use crate::fresh_index::FreshIndex;
+use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult};
 
 /// In-memory LRU content store, bounded by total byte capacity. `get()` skips
 /// the Mutex via an atomic empty check so cache-cold paths are lock-free.
@@ -30,7 +29,8 @@ pub struct LruCs {
 
 struct LruInner {
     cache: LruCache<Arc<Name>, CsEntry>,
-    prefix_index: NameTrie<Arc<Name>>,
+    /// CanBePrefix index; answers "freshest descendant" in one walk.
+    prefix_index: FreshIndex,
     current_bytes: usize,
 }
 
@@ -45,7 +45,7 @@ impl LruCs {
         Self {
             inner: Mutex::new(LruInner {
                 cache: LruCache::unbounded(),
-                prefix_index: NameTrie::new(),
+                prefix_index: FreshIndex::new(),
                 current_bytes: 0,
             }),
             capacity_bytes: AtomicUsize::new(capacity_bytes),
@@ -65,7 +65,7 @@ impl LruCs {
 
     /// The cache lookup itself, returning the matching entry (if any). Hit/miss accounting lives in
     /// [`get`](ContentStore::get) so every non-satisfying path is counted uniformly.
-    fn lookup(&self, interest: &Interest) -> Option<CsEntry> {
+    fn lookup(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
         // NFD cs/config Serve gate (Cs::findImpl): don't satisfy from cache
         // when serving is disabled.
         if !self.serve.load(Ordering::Relaxed) {
@@ -97,13 +97,16 @@ impl LruCs {
             let data_name = Name::from_components(comps[..comps.len() - 1].iter().cloned());
             inner.cache.get(&data_name)?.clone()
         } else if interest.selectors().can_be_prefix {
-            let data_name = inner.prefix_index.first_descendant(&interest.name)?;
+            // The FRESHEST descendant, not an arbitrary one (see `FreshIndex`):
+            // if even it is stale, every descendant is, and MustBeFresh
+            // misses below.
+            let data_name = Arc::clone(inner.prefix_index.freshest(&interest.name)?.0);
             inner.cache.get(data_name.as_ref())?.clone()
         } else {
             inner.cache.get(interest.name.as_ref())?.clone()
         };
 
-        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns()) {
+        if interest.selectors().must_be_fresh && !entry.is_fresh(now_ns) {
             return None;
         }
         Some(entry)
@@ -111,10 +114,10 @@ impl LruCs {
 }
 
 impl ContentStore for LruCs {
-    async fn get(&self, interest: &Interest) -> Option<CsEntry> {
+    async fn get(&self, interest: &Interest, now_ns: u64) -> Option<CsEntry> {
         // Count a hit whenever we satisfy from cache, a miss on every non-satisfying path
         // (serve-disabled, empty, digest mismatch, stale, absent) — mirrors NFD nCsHits/nCsMisses.
-        let result = self.lookup(interest);
+        let result = self.lookup(interest, now_ns);
         if result.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -160,9 +163,9 @@ impl ContentStore for LruCs {
         inner.cache.put(name.clone(), entry);
         inner.current_bytes += entry_bytes;
 
-        if !was_present {
-            inner.prefix_index.insert(name.as_ref(), Arc::clone(&name));
-        }
+        // Always, not only for new names: a replacement carries a new
+        // `stale_at`, and the index ranks by it.
+        inner.prefix_index.insert(Arc::clone(&name), meta.stale_at);
 
         if !was_present {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
@@ -241,21 +244,16 @@ impl ContentStore for LruCs {
 
     async fn evict_prefix(&self, prefix: &Name, limit: Option<usize>) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let names: Vec<Arc<Name>> = inner.prefix_index.descendants(prefix);
-        let max = limit.unwrap_or(usize::MAX);
-        let mut evicted = 0;
-        for name in names {
-            if evicted >= max {
-                break;
-            }
+        let names = inner
+            .prefix_index
+            .remove_prefix(prefix, limit.unwrap_or(usize::MAX));
+        for name in &names {
             if let Some(entry) = inner.cache.pop(name.as_ref()) {
                 inner.current_bytes = inner.current_bytes.saturating_sub(entry.data.len());
-                inner.prefix_index.remove(name.as_ref());
                 self.entry_count.fetch_sub(1, Ordering::Relaxed);
-                evicted += 1;
             }
         }
-        evicted
+        names.len()
     }
 
     async fn evict_matching(&self, prefix: &Name, matches: &CsEntryFilter) -> usize {
@@ -305,19 +303,14 @@ impl ContentStore for LruCs {
     }
 }
 
-fn now_ns() -> u64 {
-    use web_time::SystemTime;
-    use web_time::UNIX_EPOCH;
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndn_packet::{Interest, Name, NameComponent};
+
+    /// Lookup time for entries stamped always-fresh (`u64::MAX`) or already
+    /// stale (`0`); any instant strictly between the two.
+    const NOW: u64 = 1_000_000_000;
 
     fn arc_name(components: &[&str]) -> Arc<Name> {
         Arc::new(Name::from_components(components.iter().map(|s| {
@@ -394,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn get_miss_returns_none() {
         let cs = LruCs::new(65536);
-        assert!(cs.get(&interest(&["a"])).await.is_none());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -403,7 +396,7 @@ mod tests {
         let name = arc_name(&["a", "b"]);
         cs.insert(Bytes::from_static(b"data"), name.clone(), meta_fresh())
             .await;
-        let entry = cs.get(&interest(&["a", "b"])).await.unwrap();
+        let entry = cs.get(&interest(&["a", "b"]), NOW).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"data");
     }
 
@@ -411,7 +404,7 @@ mod tests {
     async fn stats_track_hits_misses_and_inserts() {
         let cs = LruCs::new(65536);
         // A cold lookup is a miss.
-        assert!(cs.get(&interest(&["a", "b"])).await.is_none());
+        assert!(cs.get(&interest(&["a", "b"]), NOW).await.is_none());
         cs.insert(
             Bytes::from_static(b"data"),
             arc_name(&["a", "b"]),
@@ -419,8 +412,8 @@ mod tests {
         )
         .await;
         // Two satisfying lookups.
-        assert!(cs.get(&interest(&["a", "b"])).await.is_some());
-        assert!(cs.get(&interest(&["a", "b"])).await.is_some());
+        assert!(cs.get(&interest(&["a", "b"]), NOW).await.is_some());
+        assert!(cs.get(&interest(&["a", "b"]), NOW).await.is_some());
         let s = cs.stats();
         assert_eq!(s.inserts, 1, "one admitted Data");
         assert_eq!(s.hits, 2, "two satisfying lookups");
@@ -446,7 +439,7 @@ mod tests {
             .insert(Bytes::from_static(b"new"), name.clone(), meta_fresh())
             .await;
         assert_eq!(r, InsertResult::Replaced);
-        let entry = cs.get(&interest(&["a"])).await.unwrap();
+        let entry = cs.get(&interest(&["a"]), NOW).await.unwrap();
         assert_eq!(entry.data.as_ref(), b"new");
     }
 
@@ -455,7 +448,7 @@ mod tests {
         let cs = LruCs::new(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
-        assert!(cs.get(&interest_fresh(&["a"])).await.is_none());
+        assert!(cs.get(&interest_fresh(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -463,7 +456,7 @@ mod tests {
         let cs = LruCs::new(65536);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
             .await;
-        assert!(cs.get(&interest_fresh(&["a"])).await.is_some());
+        assert!(cs.get(&interest_fresh(&["a"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -472,7 +465,7 @@ mod tests {
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_stale())
             .await;
         // Without MustBeFresh the stale entry is still returned.
-        assert!(cs.get(&interest(&["a"])).await.is_some());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -486,15 +479,65 @@ mod tests {
         .await;
 
         assert!(
-            cs.get(&interest_can_be_prefix_fresh(&["a", "b"]))
+            cs.get(&interest_can_be_prefix_fresh(&["a", "b"]), NOW)
                 .await
                 .is_none(),
             "CanBePrefix selects the descendant, then MustBeFresh must reject it when stale"
         );
         assert!(
-            cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_some(),
+            cs.get(&interest_can_be_prefix(&["a", "b"]), NOW)
+                .await
+                .is_some(),
             "the same stale descendant may satisfy a non-MustBeFresh Interest"
         );
+    }
+
+    /// FreshnessPeriod must expire on the CALLER's clock. The engine stamps
+    /// `stale_at` from its runtime (virtual time under a simulator) and asks at
+    /// the Interest's arrival on the same runtime; a store that consults the
+    /// system clock instead reads every virtual-epoch entry as long stale (or,
+    /// with a future epoch, never stale), so a simulated "latest telemetry"
+    /// fetch (CanBePrefix + MustBeFresh) was answered wrongly. No wall time
+    /// passes in this test: only the lookup instant moves.
+    #[tokio::test]
+    async fn freshness_expires_on_the_callers_clock() {
+        const FRESHNESS_NS: u64 = 1_000_000_000; // FreshnessPeriod = 1 s
+        let arrival = 5_000_000_000; // 5 s into a virtual run, epoch 0
+        let cs = LruCs::new(65536);
+        cs.insert(
+            Bytes::from_static(b"v7"),
+            arc_name(&["telemetry", "v7"]),
+            CsMeta {
+                stale_at: arrival + FRESHNESS_NS,
+                revocation_epoch: None,
+            },
+        )
+        .await;
+        let latest = interest_can_be_prefix_fresh(&["telemetry"]);
+
+        assert!(cs.get(&latest, arrival).await.is_some(), "fresh at arrival");
+        assert!(
+            cs.get(&latest, arrival + FRESHNESS_NS - 1).await.is_some(),
+            "fresh until the last nanosecond of FreshnessPeriod"
+        );
+        assert!(
+            cs.get(&latest, arrival + FRESHNESS_NS).await.is_none(),
+            "stale once FreshnessPeriod has elapsed on the caller's clock"
+        );
+        assert!(
+            cs.get(
+                &interest_can_be_prefix(&["telemetry"]),
+                arrival + FRESHNESS_NS
+            )
+            .await
+            .is_some(),
+            "stale Data stays cached for Interests without MustBeFresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_fresh_version_answers_latest() {
+        crate::cs_conformance::only_the_fresh_version_answers_latest(&LruCs::new(1 << 20)).await;
     }
 
     #[tokio::test]
@@ -506,7 +549,7 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        let entry = cs.get(&interest_can_be_prefix(&["a", "b"])).await;
+        let entry = cs.get(&interest_can_be_prefix(&["a", "b"]), NOW).await;
         assert!(entry.is_some());
     }
 
@@ -519,7 +562,11 @@ mod tests {
             meta_fresh(),
         )
         .await;
-        assert!(cs.get(&interest_can_be_prefix(&["a", "b"])).await.is_none());
+        assert!(
+            cs.get(&interest_can_be_prefix(&["a", "b"]), NOW)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -530,7 +577,7 @@ mod tests {
             .await;
         let removed = cs.evict(&name).await;
         assert!(removed);
-        assert!(cs.get(&interest(&["a"])).await.is_none());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -550,7 +597,7 @@ mod tests {
         .await;
         cs.evict(&arc_name(&["a", "b"])).await;
         // CanBePrefix should also miss now.
-        assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
+        assert!(cs.get(&interest_can_be_prefix(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -565,18 +612,18 @@ mod tests {
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
             .await;
         assert!(
-            cs.get(&interest(&["a"])).await.is_some(),
+            cs.get(&interest(&["a"]), NOW).await.is_some(),
             "served by default"
         );
 
         cs.set_serve(false);
         assert!(
-            cs.get(&interest(&["a"])).await.is_none(),
+            cs.get(&interest(&["a"]), NOW).await.is_none(),
             "serve disabled → cache not consulted"
         );
         cs.set_serve(true);
         assert!(
-            cs.get(&interest(&["a"])).await.is_some(),
+            cs.get(&interest(&["a"]), NOW).await.is_some(),
             "serve re-enabled"
         );
     }
@@ -592,13 +639,16 @@ mod tests {
             matches!(r, InsertResult::Skipped),
             "admit off → not inserted"
         );
-        assert!(cs.get(&interest(&["a"])).await.is_none(), "nothing cached");
+        assert!(
+            cs.get(&interest(&["a"]), NOW).await.is_none(),
+            "nothing cached"
+        );
 
         cs.set_admit(true);
         cs.insert(Bytes::from_static(b"x"), arc_name(&["a"]), meta_fresh())
             .await;
         assert!(
-            cs.get(&interest(&["a"])).await.is_some(),
+            cs.get(&interest(&["a"]), NOW).await.is_some(),
             "admit on → cached"
         );
     }
@@ -614,9 +664,9 @@ mod tests {
         // Third insert evicts /a (LRU).
         cs.insert(Bytes::from(vec![0u8; 10]), arc_name(&["c"]), meta_fresh())
             .await;
-        assert!(cs.get(&interest(&["a"])).await.is_none());
-        assert!(cs.get(&interest(&["b"])).await.is_some());
-        assert!(cs.get(&interest(&["c"])).await.is_some());
+        assert!(cs.get(&interest(&["a"]), NOW).await.is_none());
+        assert!(cs.get(&interest(&["b"]), NOW).await.is_some());
+        assert!(cs.get(&interest(&["c"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -636,7 +686,7 @@ mod tests {
         });
         let interest_name = Name::from_components(comps);
         let i = Interest::new(interest_name);
-        let entry = cs.get(&i).await.expect("implicit digest hit");
+        let entry = cs.get(&i, NOW).await.expect("implicit digest hit");
         assert_eq!(entry.data.as_ref(), b"wire-format-data");
     }
 
@@ -653,7 +703,7 @@ mod tests {
             value: Bytes::from_static(&[0u8; 32]),
         });
         let i = Interest::new(Name::from_components(comps));
-        assert!(cs.get(&i).await.is_none());
+        assert!(cs.get(&i, NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -679,7 +729,7 @@ mod tests {
         )
         .await;
         // CanBePrefix for /a should now miss (evicted entry removed from index).
-        assert!(cs.get(&interest_can_be_prefix(&["a"])).await.is_none());
+        assert!(cs.get(&interest_can_be_prefix(&["a"]), NOW).await.is_none());
     }
 
     #[tokio::test]
@@ -709,7 +759,7 @@ mod tests {
         assert_eq!(cs.capacity().max_bytes, 50);
         assert_eq!(cs.len(), 1);
         // The more recently used entry (/b) survives.
-        assert!(cs.get(&interest(&["b"])).await.is_some());
+        assert!(cs.get(&interest(&["b"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -748,7 +798,7 @@ mod tests {
         assert_eq!(evicted, 2);
         assert_eq!(cs.len(), 1);
         // /x/y should still be there.
-        assert!(cs.get(&interest(&["x", "y"])).await.is_some());
+        assert!(cs.get(&interest(&["x", "y"]), NOW).await.is_some());
     }
 
     #[tokio::test]
@@ -788,7 +838,7 @@ mod tests {
     }
 
     async fn epoch_of(cs: &LruCs, name: &str) -> Option<u64> {
-        cs.get(&interest(&[name])).await.unwrap().revocation_epoch
+        cs.get(&interest(&[name]), 0).await.unwrap().revocation_epoch
     }
 
     #[tokio::test]

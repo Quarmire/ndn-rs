@@ -125,6 +125,14 @@ pub(crate) fn decode_value(val: &[u8]) -> Option<(u64, StoredStamp, Bytes)> {
     Some((field(0), stamp, Bytes::copy_from_slice(data)))
 }
 
+/// Just the `stale_at` of a stored value, without copying its Data out.
+#[cfg_attr(not(feature = "fjall"), allow(dead_code))]
+pub(crate) fn decode_stale_at(val: &[u8]) -> Option<u64> {
+    let (header, _) = val.split_first_chunk::<HEADER_LEN>()?;
+    let (stale_at, _) = header.split_first_chunk::<8>()?;
+    Some(u64::from_be_bytes(*stale_at))
+}
+
 pub(crate) fn write_var(buf: &mut Vec<u8>, val: u64) {
     if val < 253 {
         buf.push(val as u8);
@@ -174,12 +182,4 @@ pub(crate) fn read_var(buf: &[u8]) -> Option<(u64, usize)> {
             ))
         }
     }
-}
-
-pub(crate) fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }

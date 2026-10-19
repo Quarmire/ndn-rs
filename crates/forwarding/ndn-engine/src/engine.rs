@@ -1012,6 +1012,13 @@ pub(crate) async fn run_face_sender(
     // G4: if this face has an egress scheduler installed, the send loop drains *it* (in
     // priority order) instead of the raw `rx`. `None` ⇒ the FIFO default (drain `rx`).
     let scheduler = face_states.get(&face_id).and_then(|s| s.scheduler.clone());
+    // LP reliability (RTT samples, RTO expiry, duplicate window) and congestion
+    // marking time themselves on the engine's runtime, like everything else in
+    // the engine. The retx tick below already sleeps on the runtime; with the
+    // features on the host clock, a simulated link's RTO elapsed in however
+    // much wall time the simulator took, not in virtual time.
+    face.link_service
+        .wire_clock(Arc::clone(&runtime) as Arc<dyn ndn_runtime::Now>);
     // NDNLPv2 reliability lives entirely in the per-face `ReliabilityFeature`
     // (runtime-mutable via `faces/update` / discovery enablement). The send arm
     // frames through it when enabled; the retx tick pumps its retransmissions
@@ -1035,7 +1042,19 @@ pub(crate) async fn run_face_sender(
     if let Some(feature) = lp_reliability_feature.as_ref() {
         const DATAGRAM_FRAGMENT_MTU: usize = 1452; // matches NFD's peer faces
         if matches!(face.kind(), FaceKind::Udp) {
-            feature.set_mtu(DATAGRAM_FRAGMENT_MTU);
+            // Never above what the transport itself sends (`UdpFace` advertises
+            // 1400). A reliable frame of 1401-1452 B otherwise hit
+            // `LpLinkService::send`'s re-fragment branch, which re-framed its
+            // payload under fresh TxSequences and left the original TxSequence
+            // tracked but never on the wire: RTO "retransmitted" it by
+            // re-fragmenting again (whole extra copies of the packet, invisible
+            // to LP dedup) and then gave it up. NFD's GenericLinkService
+            // fragments at `Transport::getMtu()`, so the two never disagree.
+            let mtu = face
+                .transport
+                .send_mtu()
+                .map_or(DATAGRAM_FRAGMENT_MTU, |m| m.min(DATAGRAM_FRAGMENT_MTU));
+            feature.set_mtu(mtu);
             // A fragmenting datagram face needs the lossy-link retry profile.
             // `LpLinkService::new()` hands every face
             // `ReliabilityConfig::default()` — max_retries 1 — so the tuned
@@ -1055,12 +1074,8 @@ pub(crate) async fn run_face_sender(
     // Retransmit / Ack pump interval. This bounds BOTH how fast a lost frame
     // can be resent AND how long a standalone Ack waits — and a late Ack
     // inflates the peer's RTT sample, which inflates its RTO, so an oversized
-    // tick feeds back into slower recovery. At 50 ms it dominated a local mesh
-    // whose RTT is ~1-2 ms: with a predictive stream delivering in cursor
-    // order, each stall head-of-line-blocks the frames behind it. Datagram
-    // faces (the ones that fragment, where a single lost fragment kills a whole
-    // group) get a 10 ms pump; everything else keeps 50 ms, since stream faces
-    // do not fragment and their kernel already retransmits.
+    // tick feeds back into slower recovery.
+    //
     // Two cadences on one timer, matching NFD's LpReliability.
     //
     // NFD flushes pending Acks on `idleAckTimerPeriod` = 5 ms and runs
@@ -1248,8 +1263,12 @@ pub(crate) async fn run_face_sender(
                             }
                         }
                     }
-                    // Acks go out every tick (5 ms), as NFD does.
-                    if let Some(ack) = feature.take_acks() {
+                    // Acks no outgoing frame has piggybacked go out every tick
+                    // (5 ms, NFD's idleAckTimerPeriod), all of them batched into
+                    // as few packets as the MTU allows -- normally one. The recv
+                    // path no longer Acks per frame; this tick and `on_send`'s
+                    // piggybacking are the only Ack emitters.
+                    while let Some(ack) = feature.take_acks() {
                         let _ = face.send_bytes(ack).await;
                     }
                 }

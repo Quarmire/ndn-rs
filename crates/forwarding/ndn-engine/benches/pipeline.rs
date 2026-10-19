@@ -346,8 +346,7 @@ fn bench_cs_insert(c: &mut Criterion) {
         let stage = CsInsertStage {
             cs: Arc::clone(&cs) as Arc<dyn ErasedContentStore>,
             admission: Arc::new(ndn_store::AdmitAllPolicy),
-            // Bench Data carries no validation outcome; admit it so the
-            // insert path is what gets measured.
+            // The bench Data is unsigned; admit it so every call measures a real insert.
             admit_unverified: true,
         };
         let wire = data_wire(4);

@@ -24,6 +24,9 @@ thiserror  = { workspace = true }
 smallvec   = { workspace = true }
 serde      = { workspace = true, optional = true }
 web-time   = "1"
+# `Now`: the engine's runtime clock, wired into LP reliability and congestion
+# marking so their timers follow virtual time under a simulated runtime.
+ndn-runtime = { workspace = true }
 
 # ring (via ndn-packet "std") doesn't build for wasm32-unknown-unknown.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

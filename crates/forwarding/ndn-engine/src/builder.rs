@@ -751,7 +751,13 @@ impl EngineBuilder {
                 Arc::clone(&face_table),
                 Arc::clone(&face_states),
                 Arc::clone(&reassembly),
-            ),
+            )
+            // Partial groups age on the runtime clock, like the sweeper that
+            // expires them (which already sleeps on the runtime).
+            .with_reassembly_clock({
+                let runtime = Arc::clone(&runtime);
+                Arc::new(move || runtime.now())
+            }),
             cs_lookup: CsLookupStage {
                 cs: Arc::clone(&cs),
                 validator: engine_validator.clone(),
@@ -779,6 +785,11 @@ impl EngineBuilder {
                 pit: Arc::clone(&pit),
                 dead_nonce_list: Some(Arc::clone(&dead_nonce_list)),
             },
+            // The engine fetches the certificates its own Data path needs, for
+            // every profile that validates: before this, `default` got a no-op
+            // fetcher and `accept-signed` none, so forwarded Data whose signer's
+            // cert was not already cached was parked and dropped when the
+            // pending timeout expired (docs/nfd-divergence-findings.md, Round 17).
             validation: ValidationStage::new(
                 validator,
                 crate::stages::validation::PendingQueueConfig::default(),
@@ -925,10 +936,10 @@ fn resolve_security_profile(
         (profile @ (SecurityProfile::AcceptSigned | SecurityProfile::Default), None) => {
             if matches!(profile, SecurityProfile::Default) {
                 tracing::info!(target: t::SECURITY,
-                    "No SecurityManager configured; using AcceptSigned validation \
-                     (DigestSha256 or stronger required, hierarchy not enforced). \
-                     Configure a [security] block with trust anchors for full \
-                     hierarchical validation."
+                    "No SecurityManager configured: profile \"default\" has no trust \
+                     anchors, so only DigestSha256 Data validates and key-signed Data \
+                     is dropped. Configure a [security] identity whose PIB holds trust \
+                     anchors, or profile = \"accept-signed\"."
                 );
             }
             Some(Arc::new(Validator::new(TrustSchema::accept_all()).accept_signed()))

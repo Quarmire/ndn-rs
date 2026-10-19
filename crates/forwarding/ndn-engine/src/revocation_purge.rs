@@ -362,7 +362,7 @@ mod tests {
 
         /// The revocation stamp of the entry held for `name`, if one is held.
         async fn stamp(&self, name: &str) -> Option<Option<u64>> {
-            let entry = self.cs.get_erased(&Interest::new(n(name))).await?;
+            let entry = self.cs.get_erased(&Interest::new(n(name)), 0).await?;
             Some(entry.revocation_epoch)
         }
     }
@@ -433,8 +433,12 @@ mod tests {
     }
 
     impl ContentStore for UpdateDuringInsert {
-        fn get(&self, interest: &Interest) -> impl Future<Output = Option<CsEntry>> + Send {
-            self.inner.get(interest)
+        fn get(
+            &self,
+            interest: &Interest,
+            now_ns: u64,
+        ) -> impl Future<Output = Option<CsEntry>> + Send {
+            self.inner.get(interest, now_ns)
         }
 
         fn insert(
