@@ -71,15 +71,30 @@ pub fn new_key_name(identity: &Name) -> Result<Name, crate::TrustError> {
     Ok(identity.clone().append(KEY_COMPONENT).append(hex.as_str()))
 }
 
+/// Whether `name` has the key shape `…/KEY/<key-id>` (`KEY` second from last).
+pub fn is_key_name(name: &Name) -> bool {
+    let comps = name.components();
+    comps.len() >= 2 && is_key_component(&comps[comps.len() - 2])
+}
+
 /// The name of a certificate of `key_name` issued by `issuer_id` at
 /// `version`: `<key_name>/<issuer_id>/v=<version>`. A certificate-shaped
 /// `key_name` is first reduced to its key ([`key_name_of`]).
+///
+/// A key not named `…/KEY/<key-id>` (a free-form key name, as earlier
+/// releases allowed) has no certificate name of that shape that
+/// [`key_name_of`] maps back to it, so a cache lookup by its KeyLocator could
+/// never find the certificate. Its certificate is named after the key
+/// itself: a legacy key-named certificate.
 pub fn cert_name(key_name: &Name, issuer_id: &str, version: u64) -> Name {
-    key_name_of(key_name)
-        .append_component(NameComponent::generic(Bytes::copy_from_slice(
-            issuer_id.as_bytes(),
-        )))
-        .append_version(version)
+    let key = key_name_of(key_name);
+    if !is_key_name(&key) {
+        return key;
+    }
+    key.append_component(NameComponent::generic(Bytes::copy_from_slice(
+        issuer_id.as_bytes(),
+    )))
+    .append_version(version)
 }
 
 /// [`cert_name`] with a fresh version ([`next_version`]).
@@ -156,6 +171,18 @@ mod tests {
             cert_name(&cert, SELF_ISSUER, 9),
             n("/home/bob/member/phone/KEY/k1/self/v=9")
         );
+    }
+
+    /// A free-form key name keeps a key-named certificate, which resolves
+    /// back to the key; a v2 suffix on it would name a certificate of no key.
+    #[test]
+    fn a_free_form_key_names_its_certificate_after_itself() {
+        let key = n("/alpha/goodkey");
+        assert!(!is_key_name(&key));
+        let cert = cert_name(&key, SELF_ISSUER, 3);
+        assert_eq!(cert, key);
+        assert!(is_cert_of(&cert, &key));
+        assert!(is_key_name(&n("/home/bob/member/phone/KEY/k1")));
     }
 
     #[test]

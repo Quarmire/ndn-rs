@@ -113,15 +113,25 @@ impl NetworkRegionTable {
 /// 9 — the 3 extra being exactly the returns to the originator — which put 35%
 /// more packets on a shared medium and cost ~30% of video throughput.
 ///
-/// `None` for a QUIC link face: a link is one connection to one device,
-/// identified by its key, and devices behind one NAT (or on one host) share
-/// an address — a relay must forward between them.
+/// `None` for a connection face (QUIC, TCP, WebSocket, WebTransport, WebRTC):
+/// each connection is one peer, so it cannot duplicate another face the way an
+/// on-demand UDP face does, and peers behind one NAT (or on one host, e.g.
+/// several processes on loopback) share an address — a relay must forward
+/// between them.
 fn peer_host(
     face_table: &ndn_transport::FaceTable,
     face_id: ndn_transport::FaceId,
 ) -> Option<String> {
+    use ndn_transport::FaceKind;
     let face = face_table.get(face_id)?;
-    if face.kind() == ndn_transport::FaceKind::Quic {
+    if matches!(
+        face.kind(),
+        FaceKind::Quic
+            | FaceKind::Tcp
+            | FaceKind::WebSocket
+            | FaceKind::WebTransport
+            | FaceKind::WebRtc
+    ) {
         return None;
     }
     let uri = face.remote_uri()?;
@@ -575,6 +585,52 @@ mod tests {
             host_of_remote_uri("unix:///run/nfd/nfd.sock"),
             host_of_remote_uri("internal://management"),
         );
+    }
+
+    /// A face of `kind` to `uri`, for `peer_host`.
+    struct UriFace(ndn_transport::FaceId, ndn_transport::FaceKind, &'static str);
+
+    impl ndn_transport::Transport for UriFace {
+        fn id(&self) -> ndn_transport::FaceId {
+            self.0
+        }
+        fn kind(&self) -> ndn_transport::FaceKind {
+            self.1
+        }
+        fn remote_uri(&self) -> Option<String> {
+            Some(self.2.to_string())
+        }
+        async fn send_bytes(&self, _wire: bytes::Bytes) -> Result<(), ndn_transport::FaceError> {
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<bytes::Bytes, ndn_transport::FaceError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Two UDP faces to one host are one node; two connections (TCP, QUIC, …)
+    /// from one host are two peers, e.g. processes on loopback, and a relay
+    /// forwards between them.
+    #[test]
+    fn only_datagram_faces_share_a_peer_host() {
+        use ndn_transport::{FaceId, FaceKind, FaceTable};
+        let table = FaceTable::new();
+        let udp = |id, uri| table.insert(UriFace(FaceId(id), FaceKind::Udp, uri));
+        let a = udp(1, "udp4://127.0.0.1:6363");
+        let b = udp(2, "udp4://127.0.0.1:40759");
+        assert_eq!(super::peer_host(&table, a), super::peer_host(&table, b));
+        assert_eq!(super::peer_host(&table, a).as_deref(), Some("127.0.0.1"));
+        for kind in [
+            FaceKind::Tcp,
+            FaceKind::Quic,
+            FaceKind::WebSocket,
+            FaceKind::WebTransport,
+            FaceKind::WebRtc,
+        ] {
+            let f = table.insert(UriFace(FaceId(10), kind, "tcp4://127.0.0.1:6363"));
+            assert_eq!(super::peer_host(&table, f), None, "{kind:?}");
+            table.remove(f);
+        }
     }
 
     use super::*;

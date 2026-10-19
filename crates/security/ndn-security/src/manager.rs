@@ -133,11 +133,12 @@ impl SecurityManager {
 
     /// Issue a self-signed certificate and register it as a trust anchor.
     ///
-    /// The certificate is named `<key_name>/self/<version>` (NDN Certificate
-    /// Format v2; [`crate::cert_name`]). A legacy key stored under a
-    /// certificate-shaped name `…/KEY/<id>/<issuer>/<version>` (what earlier
-    /// releases' `ephemeral` and `ndn-sec keygen` created) names the
-    /// certificate itself, so the KeyLocator its signer stamps still resolves.
+    /// The certificate of a `…/KEY/<id>` key is named `<key_name>/self/<version>`
+    /// (NDN Certificate Format v2; [`crate::cert_name`]). A legacy key stored
+    /// under a certificate-shaped name `…/KEY/<id>/<issuer>/<version>` (what
+    /// earlier releases' `ephemeral` and `ndn-sec keygen` created) names the
+    /// certificate itself, and so does a free-form key name (no `KEY`
+    /// component), so the KeyLocator its signer stamps still resolves.
     ///
     /// `validity_ms` is the lifetime in milliseconds; `u64::MAX` for
     /// non-expiring anchors. The resulting cert carries the full wire-
