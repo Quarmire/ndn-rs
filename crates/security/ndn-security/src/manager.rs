@@ -104,7 +104,7 @@ impl SecurityManager {
 
     /// Register an **externally-held** signer under `key_name` — e.g. a
     /// `CustodianSigner` backed by the device enclave or a remote fob, or a
-    /// YubiKey PIV slot signer from [`crate::yubikey::YubikeyPiv`]. The
+    /// YubiKey PIV slot signer (`yubikey::YubikeyPiv`, feature `yubikey-piv`). The
     /// private key never enters this manager; `get_signer_sync(key_name)`
     /// returns this signer, so a [`KeyChain`](crate::KeyChain) (and an
     /// `ndn_identity::Identity`) built over this manager signs *through* the

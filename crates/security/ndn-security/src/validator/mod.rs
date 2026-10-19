@@ -484,7 +484,7 @@ impl Validator {
     /// and is `Invalid` ([`TrustError::NotPublicKeySignature`]) — the outcome
     /// carries no trust path to tell integrity from authentication, so a
     /// caller content with integrity checks the digest itself
-    /// ([`verify_digest`](crate::verify_digest)).
+    /// ([`verify_digest`]).
     pub async fn validate_interest(&self, interest: &Interest) -> InterestValidationOutcome {
         let Some(sig_info) = interest.sig_info() else {
             return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);

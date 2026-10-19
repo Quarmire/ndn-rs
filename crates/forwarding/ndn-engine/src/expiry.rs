@@ -24,7 +24,7 @@ const HOUSEKEEPING: Duration = Duration::from_secs(1);
 
 /// Expires PIT entries at their deadlines: the task sleeps until the soonest one the PIT may
 /// hold ([`Pit::next_expiry`]), woken earlier when an entry expiring sooner comes in, and wakes
-/// at most every [`HOUSEKEEPING`] otherwise. An idle forwarder does not spin.
+/// at most every housekeeping second otherwise. An idle forwarder does not spin.
 #[tracing::instrument(
     level = "info",
     target = "engine",

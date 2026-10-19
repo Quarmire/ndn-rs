@@ -154,7 +154,7 @@ pub fn certified_in(p: &Participant, vault: &dyn KeyVault, namespace: &Name) -> 
             if !cert.is_valid_now() {
                 return None;
             }
-            let revoked = revoked_on_chain(&p.keyring().context_for(&key), &cert, &issuer_cert);
+            let revoked = revoked_on_chain(&p.keyring().context_for(&key), &cert, issuer_cert);
             Some(Certified {
                 key,
                 valid_until: cert.valid_until,
@@ -402,7 +402,7 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
         (EnrollLink::Invite(invite), false) => {
             return Err(refusal(
                 status::BAD_PARAMS,
-                p.words().invite_for_another_role(namespace, &invite.role, role),
+                p.words().invite_for_another_role(namespace, invite.role, role),
             ));
         }
         (EnrollLink::Anchor(_), false) => {

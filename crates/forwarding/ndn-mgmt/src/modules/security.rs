@@ -38,6 +38,7 @@ use schema::{
 use validation::{security_validate, security_validation_stats};
 use yubikey::{security_yubikey_detect, security_yubikey_generate};
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_security(
     verb_name: &[u8],
     params: ControlParameters,

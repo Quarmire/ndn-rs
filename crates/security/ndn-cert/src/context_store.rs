@@ -155,6 +155,11 @@ pub fn remove_stored_context(pib_root: &Path, namespace: &Name) -> Result<(), Co
     }
 }
 
+/// One persisted context file adopted, or why it was refused.
+type AdoptedRead = Result<Arc<SignedTrustContext>, ContextStoreError>;
+/// One stored context file with its signed Data as stored, or why it was refused.
+type StoredRead = Result<(SignedTrustContext, Data), ContextStoreError>;
+
 /// Load every stored context under `pib_root` into `keyring`, re-verifying
 /// each one. Returns one entry per `*.tc` file (sorted by path) with the
 /// adopted context or why that file was refused; a missing store directory
@@ -162,7 +167,7 @@ pub fn remove_stored_context(pib_root: &Path, namespace: &Name) -> Result<(), Co
 pub fn load_persisted_contexts(
     pib_root: &Path,
     keyring: &Keyring,
-) -> Result<Vec<(PathBuf, Result<Arc<SignedTrustContext>, ContextStoreError>)>, ContextStoreError> {
+) -> Result<Vec<(PathBuf, AdoptedRead)>, ContextStoreError> {
     Ok(read_stored_contexts(pib_root)?
         .into_iter()
         .map(|(path, stored)| {
@@ -179,7 +184,7 @@ pub fn load_persisted_contexts(
 /// (byte-identical Data, never re-signed).
 pub fn read_stored_contexts(
     pib_root: &Path,
-) -> Result<Vec<(PathBuf, Result<(SignedTrustContext, Data), ContextStoreError>)>, ContextStoreError>
+) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError>
 {
     let dir = pib_root.join(CONTEXTS_DIR);
     let entries = match std::fs::read_dir(&dir) {
@@ -224,7 +229,7 @@ pub fn read_stored_context(
 pub fn read_stored_versions(
     pib_root: &Path,
     namespace: &Name,
-) -> Result<Vec<(PathBuf, Result<(SignedTrustContext, Data), ContextStoreError>)>, ContextStoreError>
+) -> Result<Vec<(PathBuf, StoredRead)>, ContextStoreError>
 {
     let dir = context_versions_dir(pib_root, namespace);
     let entries = match std::fs::read_dir(&dir) {

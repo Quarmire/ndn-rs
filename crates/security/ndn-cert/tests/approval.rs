@@ -1146,13 +1146,13 @@ async fn a_schema_update_changes_the_link_policy_never_narrowing_silently() {
         &schema,
         &other_hint,
         None,
-        Some(&[relay.clone()]),
+        Some(std::slice::from_ref(&relay)),
         false,
     )
     .await
     .unwrap()
     .expect("a relay added");
-    assert_eq!(v7.bump.context.relays(), [relay.clone()]);
+    assert_eq!(v7.bump.context.relays(), std::slice::from_ref(&relay));
     let v8 = bump_context_schema(root.as_ref(), &v7.bump.data, &schema, &hint, None, None, false)
         .await
         .unwrap()

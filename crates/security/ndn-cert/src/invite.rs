@@ -35,6 +35,9 @@
 //! "pending" (admin approval); that path is not taken by a token and is
 //! reported as [`InviteEnrollError::ChallengeIncomplete`].
 
+// Boxing the error variants would change the public API; these are cold control-plane results.
+#![allow(clippy::result_large_err)]
+
 use std::sync::Arc;
 
 use ndn_packet::encode::InterestBuilder;
@@ -195,6 +198,8 @@ impl InviteLink {
 
 /// The link a device enrolls with: an invite, or — for a role the namespace
 /// certifies on an admin's approval — its anchor link.
+// Boxing would change the public API; these are cold control-plane results.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum EnrollLink {
     /// `ndn-trust://invite`: a token of the namespace's CA.

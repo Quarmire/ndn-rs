@@ -14,7 +14,7 @@
 //! - **Name scope** — a token authorizes a cert only under a constrained name
 //!   prefix; a request for a name outside the scope is rejected. A redeemed
 //!   scoped token's attestation leaf records the scope (evidence
-//!   [`TOKEN_SCOPE_EVIDENCE`](crate::policy::TOKEN_SCOPE_EVIDENCE)), so an
+//!   [`TOKEN_SCOPE_EVIDENCE`]), so an
 //!   issuance policy such as [`RolePolicy`](crate::RolePolicy) can tell a
 //!   guest invite from a member invite.
 

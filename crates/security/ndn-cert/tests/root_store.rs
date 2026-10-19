@@ -114,7 +114,7 @@ async fn a_root_operation_needs_the_unlock_and_a_wrong_one_changes_nothing() {
     let bump = bump_context_revoking(
         signer.as_ref(),
         &out.init.context_data,
-        &[out.device_key.clone()],
+        std::slice::from_ref(&out.device_key),
     )
     .await
     .unwrap()
@@ -202,7 +202,7 @@ async fn moving_a_file_root_seals_it_without_losing_it() {
     // Same key: it signs the next version of the context it anchors.
     let signer = reopened.signer(Some(&secret("sealed now"))).await.unwrap();
     assert!(
-        bump_context_revoking(signer.as_ref(), &out.init.context_data, &[out.device_key.clone()])
+        bump_context_revoking(signer.as_ref(), &out.init.context_data, std::slice::from_ref(&out.device_key))
             .await
             .unwrap()
             .is_some()

@@ -3358,8 +3358,7 @@ channel = 161
             "[[face]]\nkind = \"quic\"\nbind = \"192.0.2.7:0\"\nlisten = false\n\
              [relays]\nnamespace = false\n",
         )
-        .err()
-        .expect("a socket that neither listens nor dials is refused");
+        .expect_err("a socket that neither listens nor dials is refused");
         assert!(err.to_string().contains("no [[peer]] has an endpoint"), "{err}");
         // The namespace's relays (on by default) are something to dial.
         assert!(
@@ -3419,8 +3418,7 @@ channel = 161
             let err = ForwarderConfig::from_str(&format!(
                 "[[face]]\nkind = \"quic\"\nbind = \"0.0.0.0:6367\"\nadvertise = [{bad}]\n"
             ))
-            .err()
-            .expect("a malformed advertise entry is refused");
+            .expect_err("a malformed advertise entry is refused");
             assert!(err.to_string().contains("advertise entries must be"), "{err}");
         }
     }

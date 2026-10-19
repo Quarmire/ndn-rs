@@ -1,7 +1,7 @@
 //! The `device-approval` challenge: a key is certified once an admin
 //! approved it — a local operator of the CA host, or a current admin device
 //! through its signed decision (see [`crate::approval`]). The challenge
-//! opens or resumes the key's durable [`ApprovalRecord`](crate::approval::ApprovalRecord)
+//! opens or resumes the key's durable [`ApprovalRecord`]
 //! in the CA's [`ApprovalStore`] and answers pending (with the request id and
 //! verification code), approved (with the approval as attestation) or
 //! denied / expired (with the reason and what to do).

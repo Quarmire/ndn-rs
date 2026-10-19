@@ -1,7 +1,7 @@
 //! NDNCERT CA-side processor. Transport-agnostic; the Producer wiring lives
 //! in `ndn-identity`. In-flight session state lives in [`DashMap`]; issued
 //! certs and revocations are written through an optional
-//! [`CaStore`](crate::store::CaStore) so they survive restarts.
+//! [`CaStore`] so they survive restarts.
 
 use std::{sync::Arc, time::Duration};
 

@@ -148,12 +148,12 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
     ));
 
     // The root device revokes the device's key: v2, signed by the root.
-    let bump = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let bump = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
         .await
         .unwrap()
         .expect("a new version");
     assert_eq!(bump.context.version(), 2);
-    assert_eq!(bump.added, [root.device_key.clone()]);
+    assert_eq!(bump.added, std::slice::from_ref(&root.device_key));
     // Everything else is carried over.
     assert_eq!(bump.context.ca_endpoints(), root.init.context.ca_endpoints());
     assert_eq!(bump.context.anchors().len(), 1);
@@ -171,7 +171,7 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
         panic!("expected an update: {refreshed:?}");
     };
     assert_eq!((update.previous, update.context.version()), (1, 2));
-    assert_eq!(update.revoked, [root.device_key.clone()]);
+    assert_eq!(update.revoked, std::slice::from_ref(&root.device_key));
     assert_eq!(update.data.raw(), bump.data.raw(), "kept verbatim to store and republish");
     assert_eq!(relay.version_of(&n("/home/bob")), Some(2));
 
@@ -212,7 +212,7 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
     let forged_v2 = bump(
         &forged_pib,
         &forged.init.context_data,
-        &[genuine.device_key.clone()],
+        std::slice::from_ref(&genuine.device_key),
     )
     .await
     .unwrap()
@@ -261,7 +261,7 @@ async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
 async fn a_lower_or_equal_version_never_replaces_the_held_one() {
     let dir = tempfile::tempdir().unwrap();
     let (pib, root) = root_device(dir.path());
-    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
         .await
         .unwrap()
         .unwrap();
@@ -307,7 +307,7 @@ async fn a_failed_refresh_never_drops_a_good_context() {
     let (pib, root) = root_device(dir.path());
     let (relay, validator) = node_holding(&root);
     let ns = n("/home/bob");
-    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
         .await
         .unwrap()
         .unwrap();
@@ -357,14 +357,14 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
     // root under the same name — does not sign this namespace.
     let device = pib.get_signer(&root.device_key).unwrap();
     assert!(matches!(
-        bump_context_revoking(device.as_ref(), held, &[root.device_key.clone()]).await,
+        bump_context_revoking(device.as_ref(), held, std::slice::from_ref(&root.device_key)).await,
         Err(BumpError::NotAnAnchor { .. })
     ));
     let (forged_pib, _) = root_device(other_dir.path().join("forged").as_path());
     let forged = RootStore::open(&forged_pib).unwrap().unwrap();
     let forged = forged.signer(None).await.unwrap();
     assert!(matches!(
-        bump_context_revoking(forged.as_ref(), held, &[root.device_key.clone()]).await,
+        bump_context_revoking(forged.as_ref(), held, std::slice::from_ref(&root.device_key)).await,
         Err(BumpError::NotAnAnchor { .. })
     ));
 
@@ -382,12 +382,12 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
     ));
 
     // Revoking twice adds nothing.
-    let v2 = bump(&pib, held, &[root.device_key.clone()])
+    let v2 = bump(&pib, held, std::slice::from_ref(&root.device_key))
         .await
         .unwrap()
         .unwrap();
     assert!(
-        bump(&pib, &v2.data, &[root.device_key.clone()])
+        bump(&pib, &v2.data, std::slice::from_ref(&root.device_key))
             .await
             .unwrap()
             .is_none()
@@ -428,7 +428,7 @@ impl CaExchange for RefusingVersion {
 async fn a_version_refused_for_now_is_fetched_again_later() {
     let dir = tempfile::tempdir().unwrap();
     let (pib, root) = root_device(dir.path());
-    let v2 = bump(&pib, &root.init.context_data, &[root.device_key.clone()])
+    let v2 = bump(&pib, &root.init.context_data, std::slice::from_ref(&root.device_key))
         .await
         .unwrap()
         .expect("a new version");

@@ -82,17 +82,19 @@ pub fn spawn_status_watch(p: Arc<Participant>, vault: Arc<dyn KeyVault>, cancel:
             let read_again = match listed {
                 Ok(list) => {
                     for request in list.into_iter().filter(|r| r.state == OutgoingState::Pending) {
-                        if !watching.contains_key(&request.key_name) {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            watching.entry(request.key_name)
+                        {
                             let (p, vault, key, cancel) = (
                                 Arc::clone(&p),
                                 Arc::clone(&vault),
-                                request.key_name.clone(),
+                                slot.key().clone(),
                                 cancel.child_token(),
                             );
                             let task = tokio::spawn(async move {
                                 wait_for_decision(&p, vault.as_ref(), &key, None, &cancel).await;
                             });
-                            watching.insert(request.key_name, task);
+                            slot.insert(task);
                         }
                     }
                     None

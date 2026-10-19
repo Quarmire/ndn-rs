@@ -1201,6 +1201,8 @@ pub struct ApprovalService {
 }
 
 /// The CA's answer to a pushed decision (JSON content).
+// Boxing would change the public API; these are cold control-plane results.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 pub enum DecisionAnswer {
@@ -1615,6 +1617,8 @@ pub fn admin_chain(cert_data: &Data, cert: &Certificate, kept: &[Bytes]) -> Vec<
 }
 
 /// One poll's outcome for the requester.
+// Boxing would change the public API; these are cold control-plane results.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ApprovalPoll {
     /// Approved: the certificate, fetched and checked.

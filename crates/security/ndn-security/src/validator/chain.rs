@@ -659,7 +659,7 @@ impl Validator {
 
     /// Whether a walk resolves `name` (a KeyLocator) without fetching: a
     /// certificate valid now is cached, or a certificate of it was refused
-    /// recently ([`Self::refused_certs`]). The forwarder's validation stage
+    /// recently (the validator's refused-certificate memory). The forwarder's validation stage
     /// re-validates Data parked for `name` once this holds.
     pub fn can_resolve(&self, name: &Name) -> bool {
         self.cert_cache.get_valid(name).is_some() || self.refused_cert(name).is_some()

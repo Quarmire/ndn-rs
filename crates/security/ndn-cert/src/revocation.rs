@@ -8,6 +8,9 @@
 //! CA's, and nothing to sign when the held version revokes them all already
 //! ([`crate::revocations_to_add`]).
 
+// Boxing the error variants would change the public API; these are cold control-plane results.
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 
 use ndn_packet::Name;

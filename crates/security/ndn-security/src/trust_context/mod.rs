@@ -2007,7 +2007,7 @@ mod tests {
         let ctx = SignedTrustContext::hierarchical(n("/home")).with_link_policy(policy);
         let content = ctx.encode_content();
         let malformed_policy = tlv_bytes(tlv::LINK_POLICY, b"no separators");
-        let twice = with_fields(&content, &[malformed_policy.clone()]);
+        let twice = with_fields(&content, std::slice::from_ref(&malformed_policy));
         assert!(matches!(
             SignedTrustContext::decode_content(&twice, 1),
             Err(SignedTrustContextError::DuplicateField("LinkPolicy"))
@@ -2313,7 +2313,7 @@ mod tests {
             tlv_bytes(tlv::SCHEMA_FORMAT, &[9]),
             tlv_bytes(tlv::SCHEMA_BODY, b"/<**d> => /<**k>"),
         ]);
-        let content = with_fields(&ctx.encode_content(), &[unknown.clone()]);
+        let content = with_fields(&ctx.encode_content(), std::slice::from_ref(&unknown));
         let decoded = SignedTrustContext::decode_content(&content, 1).unwrap();
         let formats: Vec<_> = decoded.published_schemas().iter().map(|b| b.format).collect();
         assert_eq!(formats, [SchemaFormat::NativeText, SchemaFormat::Unknown(9)]);

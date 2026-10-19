@@ -789,6 +789,8 @@ pub enum RefreshError {
 }
 
 /// What [`refresh_context`] found.
+// Boxing would change the public API; these are cold control-plane results.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ContextRefresh {
     /// The namespace serves the version held.

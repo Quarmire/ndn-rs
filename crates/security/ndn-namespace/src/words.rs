@@ -80,17 +80,17 @@ pub struct HostWords {
     /// E.g. "Make the PIB readable by this daemon".
     pub make_key_storage_readable: String,
     /// What the host's configuration calls the margin before expiry at
-    /// which certificates are renewed. E.g. "[security] renew_before".
+    /// which certificates are renewed. E.g. "\[security\] renew_before".
     pub renew_before: String,
     /// Why this device serves no trust context by name, after "not
-    /// published:". E.g. "[security] serve_contexts = false".
+    /// published:". E.g. "\[security\] serve_contexts = false".
     pub contexts_not_served: String,
     /// How to enroll another key for a namespace this device holds a
     /// certificate in, after "To enroll another key anyway,". E.g. "run
     /// again with --force and another --device name".
     pub enroll_another_key: String,
     /// How a recovery goes on from the held version when nothing answers,
-    /// after "and you know no version newer than v<N> was made,". E.g.
+    /// after "and you know no version newer than v\<N\> was made,". E.g.
     /// "retry with --from-held".
     pub recover_from_held: String,
 }

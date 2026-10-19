@@ -258,7 +258,7 @@ async fn a_relay_never_serves_cached_data_of_a_key_revoked_by_an_update() {
     let bump = ndn_cert::bump_context_revoking(
         root.as_ref(),
         &ns.ns.init.context_data,
-        &[ns.ns.device_key.clone()],
+        std::slice::from_ref(&ns.ns.device_key),
     )
     .await
     .unwrap()

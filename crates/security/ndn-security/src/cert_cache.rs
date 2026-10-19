@@ -251,7 +251,7 @@ impl CertCache {
         self.by_digest.insert(digest, key_name.clone());
         {
             let mut names = self.by_key.entry(key_name).or_default();
-            if !names.iter().any(|n| *n == cert.name) {
+            if !names.contains(&cert.name) {
                 names.push(Arc::clone(&cert.name));
             }
         }

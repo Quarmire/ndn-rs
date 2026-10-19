@@ -1,6 +1,6 @@
 //! Engine-backed certificate fetching.
 //!
-//! A [`Validator`] resolves a signing cert it has not cached through its
+//! A [`Validator`](ndn_security::Validator) resolves a signing cert it has not cached through its
 //! [`CertFetcher`]. On an embedded engine the natural fetch path is the engine
 //! itself: express the cert Interest on an in-process app face and let the
 //! forwarder route it to whoever serves the cert (the producer, the CA that

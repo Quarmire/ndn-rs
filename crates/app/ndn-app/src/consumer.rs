@@ -160,6 +160,8 @@ impl<'a> ReplySource<'a> {
 }
 
 /// One reply off the face of a segment pipeline ([`ReplySource::next_segment`]).
+// Not boxed: `Data` is the common case per segment; boxing would allocate on the hot path.
+#[allow(clippy::large_enum_variant)]
 enum SegmentReply {
     /// A segment Data, and whether it carried a congestion mark.
     Data(Data, bool),

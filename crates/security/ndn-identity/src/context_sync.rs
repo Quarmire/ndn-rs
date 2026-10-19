@@ -2,7 +2,7 @@
 //! refresh.
 //!
 //! Subscribes to a trust context's SVS group so a republished
-//! [`SignedTrustContext`](ndn_security::SignedTrustContext) propagates to
+//! [`SignedTrustContext`] propagates to
 //! fleet nodes without polling, and adopts each new version into the local
 //! [`Keyring`] under the same rule as the pull refresh. This is the
 //! *subscribe* half; a publisher puts the signed context Data into the group
@@ -184,6 +184,8 @@ pub enum ContextFetchError {
 }
 
 /// What happened when a sync update was processed.
+// Boxing would change the public API; these are cold control-plane results.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ContextSyncOutcome {
     /// A newer version, signed by an anchor of the held one (directly or

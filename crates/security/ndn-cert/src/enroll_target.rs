@@ -8,6 +8,9 @@
 //! a role the namespace certifies on an admin's approval, so the role must
 //! be given.
 
+// Boxing the error variants would change the public API; these are cold control-plane results.
+#![allow(clippy::result_large_err)]
+
 use std::fmt;
 
 use ndn_packet::Name;

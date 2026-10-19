@@ -759,7 +759,7 @@ mod tests {
             (vec![unreadable()], false),
         ] {
             let (out, _) = run(answers).await;
-            let not = out.err().expect("not taken");
+            let not = out.expect_err("not taken");
             assert_eq!(not.is_refused(), refusal, "{}", not.into_inner());
         }
         let (out, _) = run(vec![refused()]).await;
