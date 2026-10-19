@@ -12,6 +12,7 @@ use ndn_face::local::InProcHandle;
 use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::{ChunkedProducer, ForwarderClient};
+#[cfg(not(target_arch = "wasm32"))]
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, Name};
 use ndn_security::Signer;
