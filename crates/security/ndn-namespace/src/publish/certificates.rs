@@ -16,9 +16,10 @@
 //!   CA's certificate), and one an enrollment or a renewal adds while the
 //!   device runs (a renewed certificate has its own name, so the old one
 //!   stays retrievable by name while the key name resolves to the new one);
-//! - every valid certificate the engine's key store caches for the key the
-//!   device signs with, kept or not: an ephemeral identity serves its
-//!   self-signed certificate, so a verifier resolves its KeyLocator here.
+//! - every valid certificate the engine's key store caches for each key the
+//!   device signs with (the node key and every signing identity's), kept or
+//!   not: an ephemeral identity serves its self-signed certificate, so a
+//!   verifier resolves its KeyLocator here.
 //!
 //! Which certificate answers is [`ndn_security::CertSet`]'s rule. A
 //! certificate that a held trust context revokes (its key, or the
@@ -46,14 +47,14 @@ pub struct OwnCertificates {
 
 impl OwnCertificates {
     /// Serve `stored` (the certificate Data the host keeps) and the
-    /// certificates the engine's key store caches for `signing_key` (the
-    /// key the device signs with) that `keyring` does not revoke, now and as
-    /// long as `cancel` runs, and withdraw each one a context adopted later
-    /// revokes.
+    /// certificates the engine's key store caches for `signing_keys` (the
+    /// keys the device signs with: its node key and each signing identity's)
+    /// that `keyring` does not revoke, now and as long as `cancel` runs, and
+    /// withdraw each one a context adopted later revokes.
     pub fn spawn(
         engine: &ForwarderEngine,
         stored: Vec<Bytes>,
-        signing_key: Option<&Name>,
+        signing_keys: &[Name],
         keyring: &Keyring,
         cancel: CancellationToken,
     ) -> Arc<Self> {
@@ -65,9 +66,14 @@ impl OwnCertificates {
             face_id,
             certs: RwLock::new(CertSet::new()),
         });
-        let running = signing_key
-            .zip(engine.security())
-            .map(|(key, mgr)| running_certificates(&mgr, key))
+        let running: Vec<Bytes> = engine
+            .security()
+            .map(|mgr| {
+                signing_keys
+                    .iter()
+                    .flat_map(|key| running_certificates(&mgr, key))
+                    .collect()
+            })
             .unwrap_or_default();
         for wire in stored.into_iter().chain(running) {
             match Data::decode(wire.clone()) {

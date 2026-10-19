@@ -402,7 +402,10 @@ async fn issue(
     match poll {
         Ok(ApprovalPoll::Pending(_)) => Issue::Pending,
         Ok(ApprovalPoll::Issued(issued)) => {
-            let _one_at_a_time = p.enrolling.lock().await;
+            // One enrollment at a time in this namespace; another
+            // namespace's enrollment neither waits on it nor changes.
+            let lock = p.enroll_lock(&namespace);
+            let _one_at_a_time = lock.lock().await;
             let enrolling = Enrolling {
                 namespace,
                 identity,

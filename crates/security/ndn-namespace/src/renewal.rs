@@ -143,16 +143,22 @@ async fn renew_one(
         .into_iter()
         .filter_map(|wire| Data::decode(wire).ok())
         .collect();
-    let issued = ndn_identity::renew_via_engine(p.engine(), p.keyring(), &held.data, &kept, signer)
-        .await
-        .map_err(|e| {
-            let state = if e.is_final() {
-                RenewalState::Refused
-            } else {
-                RenewalState::Failed
-            };
-            (state, e.to_string())
-        })?;
+    let issued = ndn_identity::renew_via_engine(
+        p.engine(),
+        p.keyring(),
+        &held.data,
+        &kept,
+        Arc::clone(&signer),
+    )
+    .await
+    .map_err(|e| {
+        let state = if e.is_final() {
+            RenewalState::Refused
+        } else {
+            RenewalState::Failed
+        };
+        (state, e.to_string())
+    })?;
     vault.store_certificate(&held.key, &issued.data).map_err(|e| {
         failed(format!(
             "the CA issued {}, but storing it in {} failed ({e}); the current certificate stays \
@@ -171,6 +177,12 @@ async fn renew_one(
     }
     if let Some(mgr) = p.engine().security() {
         mgr.cert_cache().insert(issued.cert.clone());
+        // A key the running device does not hold yet (its certificate was
+        // not valid when the device started) signs its identity's Data from
+        // now on — unless the identity signs with another key already.
+        if mgr.get_signer_sync(&held.key).is_err() {
+            mgr.register_signer(held.key.clone(), signer);
+        }
     }
     if let Some(own) = p.own_certs() {
         own.serve(issued.data.raw().clone());
@@ -179,6 +191,12 @@ async fn renew_one(
         }
     }
     p.certificates_changed.notify_one();
+    crate::membership::renewed(
+        p,
+        p.keyring().context_for(&held.key).namespace(),
+        &held.key,
+        issued.cert.valid_until,
+    );
     tracing::info!(
         target: "security",
         key = %held.key,

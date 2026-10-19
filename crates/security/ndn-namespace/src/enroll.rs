@@ -4,10 +4,13 @@
 //! `/<ns>/<role>/<device>/KEY/<id>` in its [`KeyVault`] (the private key
 //! never leaves it), adopts the namespace's trust context if it is not held
 //! (the link names the expected fingerprint of its root), obtains a
-//! certificate from the namespace's CA, keeps it beside the key (and the
-//! issuer certificates of its chain, [`KeyVault::keep_issuers`]), and makes
-//! the identity the vault's default; the host then switches the running
-//! device to the new key as it allows ([`KeyVault::activate`]).
+//! certificate from the namespace's CA and keeps it beside the key (and the
+//! issuer certificates of its chain, [`KeyVault::keep_issuers`]). The new
+//! identity is **added** to the identities the device signs as: Data under
+//! the namespace is signed with the new key, the device's identities in
+//! other namespaces and its node identity stay as they were
+//! ([`KeyVault::activate`]). Only a device's first identity becomes the
+//! vault's default — its node identity.
 //!
 //! How the certificate is obtained is the namespace's policy, read from its
 //! trust context ([`ndn_cert::ApprovalPolicy`]):
@@ -27,8 +30,9 @@
 //!   requires one beside the approval.
 //!
 //! A failed enrollment leaves the previous state: the new key (and anything
-//! kept for it) is deleted and the default identity is only changed as the
-//! last step, after the certificate is kept.
+//! kept for it) is deleted, and nothing else changes. One enrollment runs at
+//! a time per namespace; enrollments in different namespaces never wait on
+//! each other.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -442,22 +446,25 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
 
 /// Enroll `request.identity` (`/<ns>/<role>/<device>`) with the CA its link
 /// names: by invite (enrolled at once) or on an admin's approval (pending,
-/// finished by [`crate::approval_wait`]). One enrollment at a time.
-/// Refused (`409`) when the vault holds a valid certificate in the
-/// namespace already, unless `request.force`.
+/// finished by [`crate::approval_wait`]). One enrollment at a time per
+/// namespace. Refused (`409`) when the vault holds a valid certificate in
+/// the namespace already, unless `request.force`.
 pub async fn enroll(
     p: &Participant,
     vault: &dyn KeyVault,
     request: EnrollRequest,
 ) -> Result<EnrollOutcome, TrustRefusal> {
-    let Ok(_one_at_a_time) = p.enrolling.try_lock() else {
-        return Err(refusal(
-            409,
-            "another enrollment is running on this node; wait for it to finish",
-        ));
-    };
     let link = parse_link(&request.link_uri, p.words())?;
     let namespace = link.namespace().clone();
+    let lock = p.enroll_lock(&namespace);
+    let Ok(_one_at_a_time) = lock.try_lock() else {
+        return Err(refusal(
+            409,
+            format!(
+                "another enrollment in {namespace} is running on this node; wait for it to finish"
+            ),
+        ));
+    };
     let identity = request.identity.clone();
     let Some(device) = parse_device_identity(&namespace, &identity) else {
         return Err(refusal(
@@ -753,11 +760,14 @@ pub async fn enroll_by_approval(
 }
 
 /// Keep the certificate the CA issued for `key` (generated for
-/// `enrolling.identity`) and select it: the vault (the identity becomes its
-/// default), issuer chain, the engine's key store and validation cache,
-/// served by name, the renewal timer told, the running device switched as
-/// the host allows ([`KeyVault::activate`]). `kept_failed`: what to do when
-/// keeping it fails (the key is then deleted).
+/// `enrolling.identity`) and add the identity to those the device signs as:
+/// the vault, issuer chain, the engine's key store (the namespace's Data is
+/// signed with `key` from now on) and validation cache, served by name, the
+/// renewal timer told, the running device told as the host allows
+/// ([`KeyVault::activate`]). The device's other identities stay as they
+/// were; only a device without a default identity records this one as its
+/// default — its node identity. `kept_failed`: what to do when keeping it
+/// fails (the key is then deleted).
 pub async fn install(
     p: &Participant,
     vault: &dyn KeyVault,
@@ -774,16 +784,13 @@ pub async fn install(
         adopted_context,
         mut context_check,
     } = enrolling;
-    let kept = vault
-        .store_certificate(key, &issued.data)
-        .and_then(|()| vault.make_default(&identity));
-    if let Err(e) = kept {
+    if let Err(e) = vault.store_certificate(key, &issued.data) {
         discard(vault, key);
         return Err(refusal(
             status::SERVER_ERROR,
             format!(
-                "the CA issued {}, but storing it in {} failed ({e}); nothing was kept and the \
-                 previous identity stays selected. {kept_failed}",
+                "the CA issued {}, but storing it in {} failed ({e}); nothing was kept and \
+                 nothing changed. {kept_failed}",
                 issued.cert.name,
                 vault.location()
             ),
@@ -802,10 +809,11 @@ pub async fn install(
         );
     }
 
-    // The running engine's key store holds the identity (so an app asking
-    // the engine to sign as it can).
+    // The running engine's key store signs the identity's Data with the new
+    // key from now on (`SecurityManager::signer_for`), beside the device's
+    // other identities.
     if let Some(mgr) = p.engine().security() {
-        mgr.register_signer(key.clone(), Arc::clone(&signer));
+        mgr.register_identity_signer(key.clone(), Arc::clone(&signer));
         mgr.cert_cache().insert(issued.cert.clone());
     }
     // Peers validating the device's Data can fetch the certificate, and its
@@ -818,7 +826,33 @@ pub async fn install(
     }
     // The renewal timer schedules the new certificate's renewal.
     p.certificates_changed.notify_one();
-    let activation = vault.activate(&identity, key, signer);
+    let activation = {
+        // Of two installs in different namespaces, only the first of a
+        // device without an identity becomes its default.
+        let _installing = p.installing.lock();
+        let first_identity = match vault.default_identity() {
+            Ok(default) => default.is_none(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "security",
+                    error = %e,
+                    "cannot read the default identity; the enrolled identity does not become it"
+                );
+                false
+            }
+        };
+        if first_identity && let Err(e) = vault.make_default(&identity) {
+            tracing::warn!(
+                target: "security",
+                identity = %identity,
+                error = %e,
+                "the device's first identity was not recorded as its default identity; it is \
+                 chosen again as the first enrolled at the next start"
+            );
+        }
+        vault.activate(&identity, key, signer, first_identity)
+    };
+    crate::membership::enrolled(p, &namespace, key);
     // The other certificates the device holds in the namespace, judged
     // against the context held now: the one checked before asking, or the
     // one adopted on the way (checked here when there is something to
@@ -836,6 +870,7 @@ pub async fn install(
         certificate = %issued.cert.name,
         issuer = ?issued.issuer.as_ref().map(Name::to_string),
         signing_now = activation.signing_now,
+        node_identity = activation.node_identity,
         "{}",
         p.words().enrolled()
     );
@@ -858,6 +893,7 @@ pub async fn install(
         pib: vault.location(),
         previous_identity: previous_identity.map(|n| n.to_string()),
         signing_now: activation.signing_now,
+        node_identity: activation.node_identity,
         at_next_start: activation.at_next_start,
         still_valid: still_valid.iter().map(Certified::still_valid).collect(),
         unusable: unusable.iter().filter_map(Certified::unusable).collect(),

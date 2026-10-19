@@ -27,11 +27,11 @@ tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] 
 tokio-util    = { workspace = true }
 tracing       = { workspace = true }
 async-trait   = { workspace = true }
+parking_lot   = { workspace = true }
 
 [dev-dependencies]
 tokio         = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util"] }
 tempfile      = "3"
-parking_lot   = { workspace = true }
 
 [lints]
 workspace = true
