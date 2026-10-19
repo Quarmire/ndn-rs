@@ -10,8 +10,13 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Monotonic clock, the one [`sleep`] runs on: tokio's natively (so the periodic deadlines move
-/// with a paused, virtual tokio clock exactly as the sleeps do), `performance.now()` on wasm.
+/// Monotonic clock, always the SAME clock [`sleep`] runs on: `tokio::time::Instant` natively,
+/// `performance.now()` on wasm. Natively this must not be `std::time::Instant` — the driver
+/// loops compute a deadline, `sleep` until it, then compare against `Instant::now()`. Under a
+/// paused/virtual tokio clock (simulation, `start_paused` tests) `tokio::time::sleep` elapses in
+/// virtual time while a std deadline only passes in wall time, so the periodic timer would
+/// re-arm in a hot loop until the WALL clock caught up — sync cadence (and every outcome that
+/// rides it) would depend on host speed. Unpaused, tokio's clock is the std monotonic clock.
 #[cfg(not(target_arch = "wasm32"))]
 pub use tokio::time::Instant;
 #[cfg(target_arch = "wasm32")]
