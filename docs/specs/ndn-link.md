@@ -2,7 +2,7 @@
 
 - **Status:** Draft
 - **Scope:** This spec covers the wire protocol and the admission rules of a *link*: a QUIC connection between two NDN forwarders. Each device is identified by its NDN key, which it presents in TLS 1.3 as an RFC 7250 raw public key. The spec defines:
-  - the handshake, the key fingerprint, and the link messages (LinkHello, LinkVerdict, EnrollmentLink, ObservedAddress, Reachability, Presence);
+  - the handshake, the key fingerprint, and the link messages (LinkHello, LinkVerdict, EnrollmentLink, ObservedAddress, Reachability, Presence), and the memberships a hello carries for the namespaces a device takes part in beyond the one its link key is certified in;
   - how NDN packets are framed in QUIC datagrams, and the timeouts;
   - the close reason codes;
   - admission and enrollment-link scope, routes, the duplicate-link rule, backoff and rate limits;
@@ -45,6 +45,7 @@ The normative text describes what ndn-rs does today: crate `ndn-face-quic` (ndn-
 | wake token / wake notifier | An opaque token a device registers with a relay (for example a platform push token), and the relay host's hook that receives it to wake the device (§17.4). |
 | presence | A relay's list of the devices of a namespace linked to it now, sent to each of them on the control stream (§5.7, §14.8). |
 | member | A device of a namespace identified in a trust context this side holds. |
+| membership | A namespace a device is a member of with a key other than its link key: that key's certificate chain, shown in the hello (and in punch messages) with a *binding*, that key's signature over the link key's fingerprint and a value of this connection only (§5.8). A device takes part in many namespaces with one link key. |
 | enrollment link | A link admitted with a *scope*: it carries only one device's enrollment in the listed namespaces (§8). |
 | full link | A link without a scope. |
 | path | One QUIC connection of a link. A link has at most one path of each kind: the *link path* (dialled to a configured endpoint, or accepted) and the *direct path* (made by a punch, §14). |
@@ -65,7 +66,7 @@ dialer                                              listener
   | raw public keys both ways (client auth mandatory)   |
   |<--------------------------------------------------->|  §3
   | open bidi stream 0 (control stream)                 |
-  | LinkHello (0x0450) -------------------------------> |  §5.2
+  | LinkHello (0x0450), with its Memberships (0x045C) -> |  §5.2, §5.8
   | <------------------------------- LinkHello (0x0450) |
   |        each side decides admission (§7)             |
   | LinkVerdict (0x0452) -----------------------------> |  §5.3 (sent concurrently;
@@ -140,6 +141,7 @@ The handshake proves one thing only: the peer holds the private half of the key 
 - **Dialer:** MUST refuse a listener key that is not one of the forms in §3.2. If the dial has an expected fingerprint, the dialer MUST fail the handshake unless the listener's fingerprint equals it. No link message is exchanged with the wrong device. ndn-rs reports this locally as "unexpected key" and does not retry it as transient (§13).
 - **Listener:** MUST refuse a dialer key not in the forms of §3.2. It makes no other check during the handshake.
 - A device selects its link key at each handshake. A device that switches keys (for example after enrolling, §8.5) presents the new key on its next link.
+- A device has **one link key**, whatever the number of namespaces it takes part in: in ndn-fwd, its node key. Its other namespaces' keys never appear in TLS; the hello shows them as memberships bound to the connection (§5.8).
 
 ## 4. Control stream
 
@@ -173,7 +175,7 @@ All TLV-TYPEs are in the application range (types above 252, written as 3-byte V
 | 0x0446 | Presence | control stream, after the verdict, relay → device | Name, PresentDevice* (§5.7) |
 | 0x0448 | PresentDevice | Presence | Name, KeyDigest |
 | 0x044A | KeyDigest | PresentDevice | 32 bytes: a key fingerprint (§3.3) |
-| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data*, DirectPath? |
+| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data*, Membership*, DirectPath? |
 | 0x0451 | LinkVersion | LinkHello | 1 byte: the protocol version, `0x01` |
 | 0x0452 | LinkVerdict | control stream, message 2 | EnrollmentLink? |
 | 0x0453 | (unassigned) | — | — |
@@ -181,10 +183,12 @@ All TLV-TYPEs are in the application range (types above 252, written as 3-byte V
 | 0x0456 | (unassigned) | — | — |
 | 0x0458 | ObservedAddress | control stream, after the verdict | a UDP address (§5.5) |
 | 0x045A | DirectPath | LinkHello | 8 bytes: the session of the punch whose direct path this connection is (§14.6) |
-| 0x06 | Data | LinkHello | a certificate Data packet, whole |
+| 0x045C | Membership | LinkHello, PunchMessage | Data+, MembershipBinding (§5.8) |
+| 0x045E | MembershipBinding | Membership | the signature of the membership certificate's key over the binding transcript (§5.8) |
+| 0x06 | Data | LinkHello, Membership | a certificate Data packet, whole |
 | 0x07 | Name | EnrollmentLink, Presence, PresentDevice | a Name: a namespace (EnrollmentLink, Presence) or a device (PresentDevice) |
 
-The other numbers of 0x0440–0x044F are unassigned. The punch messages of §14 use 0x0460–0x046C ([§14.3](#143-the-punch-interest-and-its-answer)).
+The other numbers of 0x0440–0x045F are unassigned. The punch messages of §14 use 0x0460–0x046C ([§14.3](#143-the-punch-interest-and-its-answer)).
 
 ### 5.2 LinkHello (0x0450)
 
@@ -192,6 +196,7 @@ The other numbers of 0x0440–0x044F are unassigned. The punch messages of §14 
 LinkHello      = LINK-HELLO-TYPE TLV-LENGTH
                  LinkVersion
                  *Certificate
+                 *Membership       ; §5.8
                  [DirectPath]
 LinkVersion    = LINK-VERSION-TYPE TLV-LENGTH(=1) %x01
 Certificate    = Data              ; NDN Certificate Format v2 Data packet
@@ -204,7 +209,8 @@ DirectPath     = DIRECT-PATH-TYPE TLV-LENGTH(=8) 8OCTET
 - After LinkVersion come zero or more certificate Data TLVs, copied unchanged:
   - The first is the sender's own certificate for the key it presented in TLS (the *leaf*).
   - The rest are the issuers the sender keeps, nearest first (the leaf's issuer, then that certificate's issuer, …).
-- A sender with no certificate for its link key (a device not enrolled anywhere, linked by expected fingerprint or on an enrollment link) sends LinkVersion only.
+- A sender with no certificate for its link key (a device not enrolled anywhere, linked by expected fingerprint or on an enrollment link) sends no certificate.
+- After the certificates come the sender's memberships (§5.8): one per namespace it is a member of with a key other than its link key, at most `MEMBERSHIPS_MAX` = 8. A sender that links for its enrollment only (§8.2) sends neither certificates nor memberships.
 - DirectPath: the dialer of a direct path MUST send the session of its punch (§14.6); a listener that punches the dialer's key now sends the session of that punch (of the one it began last, when it runs several). Otherwise it is absent. ndn-rs writes it last.
 - How ndn-fwd builds the chain: it takes its newest currently valid certificate under the current key name. It then repeatedly takes the newest currently valid certificate under the key name in the previous certificate's KeyLocator (the certificate name without its last two components). It stops at a self-signed certificate (KeyLocator names the certificate's own key), at a certificate it does not keep, at a certificate already in the chain, or at **8 certificates in total**. A self-signed root that ndn-fwd keeps is therefore included as the last element.
 - The root at the end: a sender SHOULD end the chain with its namespace's self-signed root certificate, so that a relay that does not hold the namespace can check the chain offline against it (§7.1, §15.2). When the chain the host keeps does not end in a self-signed certificate, `ndn-link` appends the anchor of the held trust context that the last certificate's issuer names, if there is one. A hello therefore carries at most 9 certificates: the leaf and at most 8 issuers, which is what a receiver uses ([Decision 2](#20-decisions)). Punch messages carry the same chain (§14.3).
@@ -214,12 +220,13 @@ DirectPath     = DIRECT-PATH-TYPE TLV-LENGTH(=8) 8OCTET
 - Elements are processed in order:
   - LinkVersion: the value MUST be exactly one byte, the version. A value of any other length makes the hello malformed. If LinkVersion appears more than once, the last one wins.
   - Data (0x06): appended to the certificate list in order. The Data is not parsed at this stage.
+  - Membership (0x045C): decoded as §5.8 says (a malformed one makes the hello malformed) and appended to the membership list. Its certificates are not parsed at this stage. A receiver that predates memberships ignores them, as any even type above 31, and admits the sender by its link key's certificate alone.
   - Any other even type above 31: ignored.
   - DirectPath (0x045A): the value MUST be exactly 8 bytes; any other length makes the hello malformed.
   - Any other type (odd, or 0–31): malformed.
 - If no version is present, the hello is malformed.
 - If the version is present and ≠ 1, the receiver MUST NOT admit the link. ndn-rs logs that the peer speaks a different version and asks the user to update the older device.
-- A receiver uses the leaf and at most the **first 8** issuer certificates (`MAX_CHAIN` = 8) and ignores the rest.
+- A receiver uses the leaf and at most the **first 8** issuer certificates (`MAX_CHAIN` = 8) and ignores the rest; of the memberships, it uses at most the first `MEMBERSHIPS_MAX` = 8, and of each, its first certificate and at most 8 issuers.
 
 ### 5.3 LinkVerdict (0x0452) and EnrollmentLink (0x0454)
 
@@ -309,6 +316,45 @@ Sent by a relay to a device of a namespace it holds, after the verdicts: which o
 - **Sender.** The message is the full list for its namespace; an empty list says that no device of the namespace the receiver may meet is linked there. ndn-rs writes the namespace Name first, and lists at most `PRESENCE_MAX` = 256 devices in one message. A sender MUST NOT send a Presence whose TLV-VALUE exceeds `MAX_MESSAGE` (§4.2); ndn-rs logs a warning and sends nothing instead. The latest Presence for a namespace not yet written replaces an earlier one still queued for the same namespace.
 - **Receiver.** A Presence without its namespace Name, a PresentDevice without its Name or KeyDigest, or a KeyDigest that is not 32 bytes makes the message malformed (0x15). If a field appears more than once, the last one wins. The latest Presence for a namespace replaces the earlier one for that namespace; an empty list removes the namespace. A receiver MAY bound the number of namespaces it keeps; ndn-rs keeps at most 256 at once and closes the link with 0x15 when a Presence would add another.
 
+### 5.8 Membership (0x045C) and its binding
+
+A device takes part in many namespaces with one link key (§3.4). In each namespace other than the one its link key is certified in, it holds another key and that key's certificate. The hello shows each such namespace as a Membership:
+
+```
+Membership        = MEMBERSHIP-TYPE TLV-LENGTH
+                    1*Certificate       ; the namespace certificate, then its issuers, root last
+                    MembershipBinding
+MembershipBinding = MEMBERSHIP-BINDING-TYPE TLV-LENGTH 1*OCTET   ; a signature value
+```
+
+The certificates are the chain of the namespace key as §5.2 describes it for the link key: the device's certificate in the namespace first, then the issuers it keeps nearest first, ending in the namespace's self-signed root (`ndn-link` appends the anchor of the held context as for the link key's chain). The **binding** is the namespace key's signature over the *binding transcript*:
+
+```
+binding transcript = "ndn-link/1 membership" %x00     ; 22 bytes: 21 ASCII bytes and a zero byte
+                     link-key-fingerprint             ; 32 bytes: the SENDER's link key fingerprint (§3.3)
+                     channel-binding                  ; 32 bytes: the value of this connection (below)
+                     SHA-256(certificate)             ; 32 bytes: of the membership's first certificate, its whole Data TLV
+```
+
+118 bytes in all. The signature algorithm is that of the certificate's key: Ed25519 (RFC 8032, 64 bytes) for an Ed25519 key, ECDSA P-256 with SHA-256 (the DER `Ecdsa-Sig-Value`, as NDN signatures carry it) for a P-256 key. Any other key cannot be bound.
+
+**The channel binding** is what makes a binding hold on one connection only:
+
+- on a link (a QUIC connection): the TLS 1.3 exporter of the connection ([RFC 8446] §7.5), `TLS-Exporter("EXPORTER-ndn-link/1 membership", "", 32)`: label `EXPORTER-ndn-link/1 membership` (30 ASCII bytes), an empty context, 32 bytes. Both sides of one connection compute the same value, and no other connection has it (quinn `Connection::export_keying_material`);
+- in a punch message (§14.3), which no connection carries yet: SHA-256(`"ndn-link/1 punch"` ‖ the 8-byte session), the same in the request and its answer. The punch's signature by the link key and its SignatureNonce/SignatureTime make it fresh (§14.4); the binding ties the membership to that link key and that punch.
+
+**Sender rules.**
+
+- A sender MUST show a membership only with the key its certificate certifies, and MUST compute its binding anew for each connection (or punch). It shows one membership per namespace, at most `MEMBERSHIPS_MAX` = 8, and none for the namespace its link key's certificate is in nor for a certificate of its link key. ndn-rs writes the certificates in chain order, then the binding.
+- A membership whose key cannot sign is left out; ndn-rs logs why.
+
+**Receiver rules.**
+
+- Inside a Membership, every Data (0x06) is appended to its certificates in order; MembershipBinding is its binding (non-empty; the last wins when repeated); any other even type above 31 is ignored; any other type makes the message malformed. A Membership without a certificate, or without a binding, makes the message malformed.
+- How a receiver identifies the sender from its memberships, and what it refuses, is §7.1.
+
+**What a binding proves, and what it cannot.** The sender's link key was proven in the handshake (§3.4); the binding is a signature by the namespace key over that link key and a value only this connection has. So the holder of the namespace key vouches, for this connection, that the device behind this link key is it. A certificate of a key the sender does not hold cannot be bound (the binding does not verify under the certificate's key), and a binding taken from another connection names another exporter value, so neither verifies (§7.1 M3). The receiver recomputes the transcript from its own view of the connection: the peer's TLS key and the exporter; nothing in it is read from the hello but the certificate.
+
 ## 6. Closing a link
 
 ### 6.1 Close reason codes
@@ -320,20 +366,21 @@ A side closes a link with a QUIC `CONNECTION_CLOSE` of type 0x1d (application). 
 | 0x00 | Shutdown | The device is shutting down. ndn-fwd closes every link with it, then waits up to 1 s for the peer to be told. | yes |
 | 0x01 | Replaced | A newer link between the same two devices took this link's place (§11), or another path of the same punch came up first (§14.6). Also closes a direct path whose device punches again: after the closing side's network changed, or when the other device punches while this side still has a direct path to it (§14.7). | yes |
 | 0x02 | Idle | An enrollment link carried nothing for `ENROLLMENT_IDLE` (§8.4). | yes |
-| 0x03 | Enrolled | The device enrolled. It closes its enrollment link and links again holding its certificate (§8.5). | yes |
+| 0x03 | Enrolled | The device enrolled, or its memberships changed otherwise. It closes its enrollment link and links again holding its certificate, or closes a full link whose hello no longer shows the namespaces it holds now, so that the other side knows it in each (§8.5). | yes |
 | 0x04 | PathExpired | A connection names, in its DirectPath, a punch the closing side does not run with that key (it ended, or never began), or the listener of a direct path did not take it as one (§14.6). | yes |
 | 0x05 | Asleep | The device closed its link to sleep: its on-demand link carried nothing for its idle time while its host was not active, or its link mode is `off` and nobody asks for the link (§16.2). It links again when it has something to send or is woken; a relay it asked meanwhile holds Interests for it and wakes it (§17). | yes |
 | 0x06 | Released | The device no longer uses this relay: a relay it prefers is back, this relay is not among the ones chosen now, or it was removed from the device's configuration or no longer advertised by its namespace (§15.6). Not a fault of either side. | yes |
 | 0x10 | Unrecognized | The key has no valid certificate in a namespace the closing side holds or can check (§7.1), no `[[peer]]` expects its fingerprint, and no enrollment link is possible. | no |
 | 0x11 | CertificateForAnotherKey | The leaf certificate in the hello certifies a different key than the one the handshake proved. | no |
-| 0x12 | Revoked | The leaf, or a sent issuer, is revoked by a held trust context. Also sent when a revocation is adopted while the link is up (§12). | no |
+| 0x12 | Revoked | The leaf, or a sent issuer, is revoked by a held trust context, and no other certificate or membership of the hello identifies the peer (§7.1). Also sent when a revocation adopted while the link is up leaves it no identity (§12). | no |
 | 0x13 | RoleNotAllowed | The namespace's link policy does not let the peer's role link, or does not let it relay when this side reaches others through it. | no |
 | 0x14 | NotTheExpectedDevice | The peer is valid, but not the device or key a `[[peer]]` entry expects. | no |
-| 0x15 | Protocol | A link message is malformed or carries another LinkVersion, the peer sent no link message within `MESSAGE_DEADLINE` (§6.3), a certificate in the hello does not decode, the peer does not support datagrams, or the peer misbehaved. | no |
+| 0x15 | Protocol | A link message is malformed or carries another LinkVersion, the peer sent no link message within `MESSAGE_DEADLINE` (§6.3), a certificate in the hello (of its link key or of a membership) does not decode, the peer does not support datagrams, or the peer misbehaved. | no |
 | 0x16 | Busy | Too many link attempts (§13), too many enrollment links (§8.4), too many punches (§14.4), as many direct paths as the side may have (§14.9), or a serving quota is full (§15.3). | yes |
 | 0x17 | NoLinkKey | This device has no usable link key. | yes¹ |
-| 0x18 | DirectPathsOff | Direct paths between the two devices are off: the link policy of the namespace the peer is identified in turns them off or does not pair the two devices' roles (§7.4), or the closing side's `[[peer]]` for it says `direct = false`. Refuses a direct path (§14.6) or a punch (§14.4). | no |
+| 0x18 | DirectPathsOff | Direct paths between the two devices are off: the link policy of every namespace the peer is identified in turns them off or does not pair the two devices' roles there (§7.4; one namespace that pairs them is enough), or the closing side's `[[peer]]` for it says `direct = false`. Refuses a direct path (§14.6) or a punch (§14.4). | no |
 | 0x19 | NotServed | This relay's serving policy does not serve the device's namespace or key (§15.2), or another root key's namespace of the same name is served or held here (§15.3). Use another relay, or ask this relay's operator to serve the namespace. | no |
+| 0x1A | MembershipNotBound | A Membership of the hello is not bound to this link: its binding does not verify under its certificate's key for the sender's link key on this connection (§5.8, §7.1 M3) — the sender does not hold the certificate's key (a forged membership), or the binding was made for another connection (a replayed one) — or the certificate's key is neither Ed25519 nor P-256. | no |
 
 ¹ ndn-rs never sends 0x17 on the wire. A device without a link key cannot complete a handshake.
 
@@ -370,15 +417,17 @@ The rules below are those of the `ndn-link` crate, which ndn-fwd uses. An implem
 
 ### 7.1 Identifying the peer from its hello
 
-Before these steps, a side that knows a certificate of the peer's key MUST refuse with **0x12** if a held trust context revokes that certificate, whatever the hello carries. "Knows" means a certificate it serves or has cached whose public key is the peer's NDN public key; ndn-rs looks it up by the key's SHA-256 fingerprint. A revoked device that sends no certificate therefore gets no enrollment link either. A key the side knows no certificate of cannot be told from a new key, because a revoked device can always make one. For such keys the CA, which refuses to certify a revoked device again, is the backstop ([Decision 5](#20-decisions)).
+A peer is identified by its link key's certificate (the leaf, steps 1–11 below) and by each membership its hello carries (steps M1–M5). Each yields an *identity* — a device of a namespace — or nothing. Some outcomes refuse the link at once (*refuse*); others, marked *refuse unless identified*, refuse it only when no other certificate or membership of the hello identifies the peer: the refusal of the first such outcome applies then. This keeps a revocation per namespace: a device revoked in A but a member of C in good standing is still identified in C ([Decision 31](#20-decisions)).
 
-Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refusal: an expected fingerprint or an enrollment link may still admit the peer.
+Before these steps, a side that knows a certificate of the peer's key MUST, if a held trust context revokes that certificate, skip steps 1–11 and *refuse unless identified* with **0x12**, whatever the hello carries. "Knows" means a certificate it serves or has cached whose public key is the peer's NDN public key; ndn-rs looks it up by the key's SHA-256 fingerprint. A revoked device that sends no certificate and no membership therefore gets no enrollment link either. A key the side knows no certificate of cannot be told from a new key, because a revoked device can always make one. For such keys the CA, which refuses to certify a revoked device again, is the backstop ([Decision 5](#20-decisions)).
+
+Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refusal: another membership, an expected fingerprint or an enrollment link may still admit the peer.
 
 1. If the hello carries no certificate: **Unknown**.
 2. Decode the leaf as a Data packet, then as a certificate. On failure, refuse with **0x15**.
 3. If the leaf's public key (normalized per §3.2) ≠ the peer's NDN public key, refuse with **0x11**. The comparison is byte by byte, so a certificate MUST carry a P-256 key as the uncompressed-point SPKI of §3.2 ([Decision 12](#20-decisions)).
 4. Decode the first `MAX_CHAIN` (8) issuers. If any fails to decode, refuse with **0x15**. Find the held trust context whose namespace is the longest prefix of the leaf's name. If there is none, the peer is identified offline against its root instead: steps R1–R7 below.
-5. If the context revokes the leaf, refuse with **0x12**. A revocation entry covers every name it is a prefix of, so revoking a key name covers all of its certificates ([trust-context.md](trust-context.md)).
+5. If the context revokes the leaf, *refuse unless identified* with **0x12**. A revocation entry covers every name it is a prefix of, so revoking a key name covers all of its certificates ([trust-context.md](trust-context.md)).
 6. The leaf's name MUST be a device key name `/<ns>/<role>/<device>/KEY/<key-id>[/…]`, where:
    - `<role>` is a GenericNameComponent (0x08) equal to `admin`, `member`, `node` or `guest`;
    - `<device>` is a GenericNameComponent of 1–63 bytes from `[A-Za-z0-9._-]`, starting with a letter or digit, and not `KEY`, `CA` or a role word (in any case);
@@ -387,11 +436,11 @@ Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refus
    Otherwise: **Unknown**.
 7. If the leaf is not within its ValidityPeriod now: **Unknown**.
 8. (The issuers were decoded in step 4.)
-9. If the context revokes any of those issuers, refuse with **0x12**.
+9. If the context revokes any of those issuers, *refuse unless identified* with **0x12**.
 10. Validate the leaf in the held trust context ([trust-context.md](trust-context.md): chain to an anchor, schema, hierarchical rule), with a chain depth of at most 8.
     - Issuers come from the hello first. A missing issuer may then be taken from certificates the side itself serves or has cached.
     - The side MUST NOT fetch anything (the link is not up yet). It also MUST NOT add the peer's certificates to its general certificate cache.
-    - If validation fails or the chain is incomplete: **Unknown**, except that a side whose serving policy is not `own` refuses with **0x19** when the last decoded issuer is a self-signed certificate that is not an anchor of the held context: the peer is of another root's namespace with the held namespace's name, or a name under it, and the side could not route both (§15.3).
+    - If validation fails or the chain is incomplete: **Unknown**, except that a side whose serving policy is not `own` *refuses unless identified* with **0x19** when the last decoded issuer is a self-signed certificate that is not an anchor of the held context: the peer is of another root's namespace with the held namespace's name, or a name under it, and the side could not route both (§15.3).
 11. Otherwise the peer is the device `/<ns>/<role>/<device>` of namespace `/<ns>`. The leaf and issuer names are remembered for §12.
 
 **A namespace this side does not hold.** The peer is checked offline against the self-signed root certificate at the end of the chain its hello carries (§5.2). Steps:
@@ -406,39 +455,53 @@ Steps, in order. *Unknown(why)* means "no namespace identity". It is not a refus
 
 A served device is never matched to a `[[peer]]` by its device name: only a held namespace confirms the device a peer entry names. When a peer entry exists for a link anyway (it was dialed, or its `key` matches), a served identity counts as **Unknown** for §7.3.
 
+**Memberships.** Then, for each of the first `MEMBERSHIPS_MAX` (8) Memberships of the hello, in order (§5.8):
+
+- M1. Decode its first certificate as a Data packet, then as a certificate. On failure, refuse with **0x15**.
+- M2. Recompute the binding transcript (§5.8) from this side's own view: the **peer's** link key fingerprint (from TLS), this connection's channel binding (the TLS exporter; for a punch, the punch value), and SHA-256 of that certificate's Data.
+- M3. Verify the binding over it under the certificate's public key, with the algorithm of that key (Ed25519 or ECDSA P-256). If the key is of another type, or the signature does not verify, refuse with **0x1A** (MembershipNotBound): the sender does not hold the certificate's key, or the binding was made for another connection or another link key. The check comes before anything is validated, and nothing of the membership is used when it fails.
+- M4. Identify the certificate with the membership's other certificates as its issuers, exactly as steps 4–11 (or R1–R7) do for the leaf, with the bound key in place of the TLS key (step 3 is M3). Its outcomes are those of the leaf's: 0x15 refuses; 0x12 and 0x19 *refuse unless identified*; Unknown identifies nothing.
+- M5. An identity in a namespace already identified (by the leaf or an earlier membership) is not counted again.
+
+The peer's identities are, in order, the leaf's and those of its memberships. When there are none, the first *refuse unless identified* refusal applies, if any; otherwise the peer is **Unknown** (why: the leaf's reason; for a hello without a leaf, the first membership's).
+
 ### 7.2 Configured peers
 
 A configured peer has an optional expected fingerprint (`key`) and an optional expected device name (`device`); at least one is present. The **peer entry** for a link is:
 
 - the `[[peer]]` this side dialed, for a dialed link;
-- otherwise the first `[[peer]]` whose `key` equals the fingerprint, or whose `device` equals the device name identified in a held namespace.
+- otherwise the first `[[peer]]` whose `key` equals the fingerprint, or whose `device` equals a device name identified in a held namespace (by the leaf or by a membership).
 
 *key-expected* means a peer entry exists and its `key` equals the fingerprint.
 
 ### 7.3 Decision
 
-Rules are evaluated in order. The first that applies decides.
+Rules are evaluated in order. The first that applies decides. *Identified* means the peer has at least one identity (§7.1); each rule that speaks of "the identity" applies to each of them, as said.
 
 1. If a peer entry exists and has a `key` that ≠ the fingerprint: refuse **0x14**.
 2. If a peer entry exists and has a `device`:
-   - If the peer was identified as a different device: refuse **0x14**.
+   - If the peer was identified, and none of its identities is that device: refuse **0x14**. Otherwise the identity that is that device *decides* the link (it comes first).
    - If the peer is Unknown and not key-expected:
-     - If this side dialed the link, and holds no certificate (for the key it links with now) in `ns`, admit as a **device-side enrollment link** for `ns` (§8.2). Here `ns` is the held namespace that is the longest prefix of the expected device name; if none is held, it is the expected device name without its last two components.
+     - If this side dialed the link, and holds no certificate in `ns` (of its link key or of a membership), admit as a **device-side enrollment link** for `ns` (§8.2). Here `ns` is the held namespace that is the longest prefix of the expected device name; if none is held, it is the expected device name without its last two components.
      - Otherwise refuse **0x10**.
-3. If the peer was identified in a held namespace, look up that namespace's link policy (§7.4):
-   - If the policy does not allow the peer's role to link: refuse **0x13**.
-   - If the peer entry is a relay — another entry names it in `relay`, or this side uses it as a relay (§15.5) — and the policy does not allow the peer's role to relay: refuse **0x13**.
-4. If the peer was identified in a held namespace and a peer entry exists: admit a **full link**.
-5. If the peer was identified and no peer entry exists, the serving policy decides (§15.2):
-   - served: admit a **full link** (for a namespace other than this side's own, under its quotas, §15.3);
-   - otherwise refuse with the serving policy's code (**0x19**, or **0x16** for a full quota). A served device gets no enrollment link: it proved who it is, and this side does not serve it. When this side is eligible to relay enrollments (§8.1), the 0x19 reason says the device can enroll over it by linking with a hello that holds no certificate of another namespace (rule 6).
+3. Each identity in a held namespace is judged by that namespace's link policy (§7.4); the identities it does not allow are dropped:
+   - the policy does not allow the identity's role to link: **0x13**;
+   - the peer entry is a relay — another entry names it in `relay`, or this side uses it as a relay (§15.5) — and the policy does not allow the identity's role to relay: **0x13**.
+
+   If the identity rule 2 chose is dropped, or every identity is: refuse with the first of these refusals.
+4. If the peer was identified and a peer entry exists: admit a **full link**, by the remaining identities (served identities do not count here, §7.1).
+5. If the peer was identified and no peer entry exists, the serving policy decides (§15.2), for each remaining identity:
+   - the peer is admitted on a **full link** by every identity the policy serves (for a namespace other than this side's own, under its quotas, §15.3). Identities of this side's own namespaces come first, then those served without limits, then those under quotas; the first decides the link (its quotas, if any, bound the link, §15.3);
+   - when the policy serves none, refuse with the refusal of the first (**0x19**, or **0x16** for a full quota). A served device gets no enrollment link: it proved who it is, and this side does not serve it. When this side is eligible to relay enrollments (§8.1), the 0x19 reason says the device can enroll over it by linking with a hello that holds no certificate of another namespace (rule 6).
 6. If the peer is Unknown and not key-expected:
    - If the link was not dialed by this side, has no peer entry, and this side is eligible to relay enrollments (§8.1), admit as a **relay-side enrollment link**. If no enrollment slot is free, refuse **0x16** instead (§8.4).
    - Otherwise, if its hello carries no certificate, it has no peer entry and the serving policy is `listed` or `open`: refuse **0x19** (a relay routes a served device by the device name its certificate gives).
    - Otherwise refuse **0x10**.
 7. Otherwise admit a **full link**: a key-expected peer, whether identified or not.
 
-A revoked key or issuer is refused in §7.1 before any of these rules, so it never reaches an enrollment link through them. This includes a peer that sends no certificate, when the side knows a revoked certificate of its key (§7.1).
+The identities a link is admitted by are what the rest of this spec calls the peer's identities on the link: its routes (§10), presence (§14.8), revocation while linked (§12) and transit (§15.7) apply to each.
+
+A revoked key or issuer is refused in §7.1 before any of these rules, unless another certificate or membership identifies the peer, so it never reaches an enrollment link through them. This includes a peer that sends no certificate, when the side knows a revoked certificate of its key (§7.1).
 
 Under the default serving policy `own`, rule 5 admits unasked only the devices of the namespaces this side holds a certificate in. A device of a held namespace this side has no certificate in, which earlier versions admitted, is refused with 0x19 unless a peer entry names it ([Decision 20](#20-decisions)).
 
@@ -469,7 +532,7 @@ A side is eligible to relay enrollments for namespace `ns` when all of these hol
 
 - the link policy has `enrollment_links` = true;
 - the context names at least one CA endpoint;
-- the side's current certificate is a device certificate in `ns` whose role the policy lets relay.
+- the side holds a device certificate in `ns` (of its link key, or of a membership, §5.8) whose role the policy lets relay.
 
 The relay's LinkVerdict carries an EnrollmentLink listing **every** namespace it is eligible for, in no defined order. Its face scope (§8.3) is:
 
@@ -555,14 +618,21 @@ Examples for `ns` = `/home`, with CA endpoint `/home/CA`:
   - ndn-fwd checks every 30 s (`ENROLLMENT_IDLE / 4`), so the close happens 120–150 s after the last packet.
   - The device side applies no idle close.
 
-### 8.5 Relink after enrollment
+### 8.5 Relink after enrollment, and when memberships change
 
 Each side records, per link, the namespaces the link is an enrollment link for *on this device's behalf*. These are:
 
 - the namespaces in the peer's EnrollmentLink; and
 - `ns`, if this side admitted the link as a device-side enrollment link.
 
-When the device switches to another key (it enrolled), it checks each such link. If its new current certificate is a device certificate in one of the recorded namespaces, it closes that link with **0x03** (Enrolled) and dials that `[[peer]]` again once, even if the peer is not persistent. It now presents its certificate and gets a full link.
+It also records, per full link, the namespaces its own hello showed there: its link key certificate's and its memberships' (§5.8).
+
+When the device's identities change — it enrolled (its link key changed, or a membership was added), or a membership ended — it checks each link:
+
+- an enrollment link for a namespace it now holds a device certificate in (of its link key, or of a membership): it closes the link with **0x03** (Enrolled) and dials that `[[peer]]` again once, even if the peer is not persistent. It now presents its certificate and gets a full link;
+- a full link whose hello showed other namespaces than the device holds now: it closes the link path with **0x03** too, so that it is made again with a hello showing them (a hello is sent once per connection). A link this device dialled it dials again once; one the other device dialled, that device dials again (0x03 is transient). Direct paths stay until they end.
+
+ndn-rs does this in `Links::identities_changed`, which the host calls on each change of its signing identities or link key (ndn-fwd: the identity watch of its node identity; a mobile host: its identity core).
 
 ## 9. NDN packets: datagram framing
 
@@ -590,16 +660,17 @@ When a link is up, the admitting side installs routes over its face. These are s
 |---|---|
 | relay-side enrollment link | none |
 | device-side enrollment link for `ns` | (`ns`, 0) |
-| link path to a relay this device uses (§15.5) | this device's namespace (the namespace of the certificate it links with now) at cost *r*, the relay's rank (§15.6) — or, when the relay's entry has `routes`, or this device holds no certificate, its default routes at *r*; plus, for every `[[peer]]` X whose `relay` names it, X's default routes at *r* + `VIA_RELAY_COST` |
+| link path to a relay this device uses (§15.5) | the namespaces of this device it uses the relay for (§15.5: for a relay its person added, every namespace it holds a certificate in, of its link key or of a membership; for one a namespace advertises, each of its namespaces whose trust context advertises that relay) at cost *r*, the relay's rank (§15.6) — or, when the relay's entry has `routes`, or there is no such namespace, its default routes at *r*; plus, for every `[[peer]]` X whose `relay` names it, X's default routes at *r* + `VIA_RELAY_COST` |
 | other full link | the peer's *default routes* at cost 0, plus, for every `[[peer]]` X whose `relay` names this link's peer entry, X's default routes at cost `VIA_RELAY_COST` = 10 |
 
-**Default routes** of the peer entry P (if any), given the identified peer (if any), are the first of these that applies:
+**Default routes** of the peer entry P (if any), given the identities the link was admitted by (if any, §7.3), are the first of these that applies:
 
 1. P's `routes`, if configured;
-2. `/<ns>` of the identified peer, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1). This holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) falls to rule 3 ([Decision 8](#20-decisions));
-3. the identified peer's device name `/<ns>/<role>/<device>` (also for a served device, §15.2: the relay routes it by the name its certificate gives);
-4. P's `device`, if the peer was not identified;
-5. otherwise none.
+2. for each identity: `/<ns>` of the identity, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1); else its device name `/<ns>/<role>/<device>` (also for a served device, §15.2: the relay routes it by the name its certificate gives). The `node` rule holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) is routed by its device name ([Decision 8](#20-decisions));
+3. P's `device`, if the peer was not identified;
+4. otherwise none.
+
+A device admitted by its A certificate and its C membership is thus routed by both of its device names, and loses the routes of one when that membership is revoked (§12).
 
 For a peer reached through a relay, the default routes are computed from that peer's own entry with no identity, so they are its `routes`, else its `device`.
 
@@ -625,7 +696,10 @@ Example with the test keys of §19: the P-256 key's fingerprint `0ca9…` is sma
 
 ## 12. Revocation while linked
 
-When a side adopts a trust context version, it checks every up link whose identified device lies under that context's namespace. If any recorded certificate name of the link (the leaf or an issuer sent in the hello, §7.1 step 11) is revoked by the new version, the side closes the link at once with **0x12**.
+When a side adopts a trust context version, it checks, on every up link, each identity the link was admitted by (§7.3) that lies under that context's namespace. If any recorded certificate name of that identity (its certificate or an issuer sent with it in the hello or the membership, §7.1 step 11, M4) is revoked by the new version, the identity is taken from the link:
+
+- when no identity is left, the side closes the link at once with **0x12**;
+- otherwise the link stays, admitted by the others: its faces lose the routes of that identity (its device name, and its namespace for a `node` this side dials, §10), and, on a relay, the device is told the namespace's empty presence list and the other members of that namespace no longer see it listed (§14.8).
 
 A link admitted only by expected fingerprint (no identity) is not affected. It ends when the operator removes the `[[peer]] key`.
 
@@ -693,10 +767,10 @@ A candidate is a kind and a UDP address (§5.5 encoding). Kinds: 0 host (an inte
 
 ### 14.3 The punch Interest and its answer
 
-Name: `<device>/32=link/32=punch/<session>` followed by a ParametersSha256DigestComponent, where `<device>` is the punched device's name and `<session>` 8 random bytes as a GenericNameComponent. The Interest MUST be an NDN signed Interest (InterestSignatureInfo with SignatureNonce and SignatureTime) signed with the sender's link key, MustBeFresh, InterestLifetime `PUNCH_ANSWER_TIMEOUT` = 4 s. Its ApplicationParameters, and the Content of the answering Data (named as the Interest, signed with the answerer's link key), are a punch message:
+Name: `<device>/32=link/32=punch/<session>` followed by a ParametersSha256DigestComponent, where `<device>` is the punched device's name (any of its names: a device takes punches under the name of each namespace it holds a certificate in) and `<session>` 8 random bytes as a GenericNameComponent. The Interest MUST be an NDN signed Interest (InterestSignatureInfo with SignatureNonce and SignatureTime) signed with the sender's link key, MustBeFresh, InterestLifetime `PUNCH_ANSWER_TIMEOUT` = 4 s. Its ApplicationParameters, and the Content of the answering Data (named as the Interest, signed with the answerer's link key), are a punch message:
 
 ```
-PunchMessage = PunchKey *Candidate [PunchRefusal] *Certificate
+PunchMessage = PunchKey *Candidate [PunchRefusal] *Certificate *Membership
 PunchKey     = 0x0460 TLV-LENGTH SubjectPublicKeyInfo   ; the sender's link key, as in TLS (§3.2)
 Candidate    = 0x0462 TLV-LENGTH CandidateKind UdpAddress
 CandidateKind = 0x0464 TLV-LENGTH(=1) OCTET
@@ -705,9 +779,14 @@ PunchRefusal = 0x0468 TLV-LENGTH RefusalCode RefusalText
 RefusalCode  = 0x046A TLV-LENGTH NonNegativeInteger    ; a code of §6.1
 RefusalText  = 0x046C TLV-LENGTH *OCTET                 ; UTF-8, for a person
 Certificate  = Data                                     ; the sender's certificate, then issuers (as §5.2)
+Membership   = 0x045C …                                 ; as §5.8, bound to this punch
 ```
 
-Exactly one PunchKey is REQUIRED. Unknown even types above 31 are skipped; any other unknown type makes the message malformed. Each side verifies the other's signature with the PunchKey and identifies the sender from the certificates exactly as from a LinkHello (§7.1, §7.3: the punched side as for a link it did not dial, the punching side as for the peer entry it dialled, or, for a member, as for a link it did not dial). An answer that does not verify, or identifies another device than P, makes no direct path. For a member punched by membership (§14.8), the answer MUST also be signed by the key its relay listed, and its certificate MUST identify the listed device.
+Exactly one PunchKey is REQUIRED. Unknown even types above 31 are skipped; any other unknown type makes the message malformed.
+
+**Punches per namespace.** A punch is about one namespace: that of the punched device's name (the request), or of the name of this device the request was sent to (the answer, and a refusal). When the sender's link key is not certified in that namespace but it is a member of it with another key, its message carries that one Membership (§5.8), and no other. Its binding's channel value is the punch's: SHA-256(`"ndn-link/1 punch"` ‖ session), so it is signed by that namespace's key, binds the fingerprint of the link key the message is signed with and the direct path will be dialled or accepted with, and holds for this punch only. The PunchKey stays the link key: the direct path's TLS key is the one the punch names (§14.5), and its hello shows the same membership again, bound to the direct path's connection (§14.6).
+
+Each side verifies the other's signature with the PunchKey and identifies the sender from the certificates and memberships exactly as from a LinkHello (§7.1 with the punch's channel value, §7.3: the punched side as for a link it did not dial, the punching side as for the peer entry it dialled, or, for a member, as for a link it did not dial). An answer that does not verify, or identifies another device than P, makes no direct path. For a member punched by membership (§14.8), the answer MUST also be signed by the key its relay listed, and one of its identities MUST be the listed device.
 
 ### 14.4 Answering a punch
 
@@ -749,7 +828,7 @@ A direct path ends like any link (idle timeout 8 s, close). Its face and routes 
 
 Devices of a namespace that are linked to a common relay make direct paths with each other without a peer entry for each other, where the namespace's role matrix allows them. Nothing watches traffic: membership and the policy decide.
 
-**Relay side.** A relay that holds a namespace's trust context sends each *member* linked to it — a device identified in that held context (§7.1 steps 1–11, not a served device) over a full link path — a Presence for that namespace (§5.7). It lists the other members linked to it now whose role the context's role matrix pairs with the receiver's (`allows_direct_path(receiver's role, other's role)`), each by device name and key fingerprint. The relay sends it when a member's full link comes up, when a member's last path ends, and when it adopts a new version of a trust context (the matrix may have changed). A member whose role pairs with none of the others gets an empty list. The relay needs no certificate in the namespace, only its trust context. A relay MUST NOT send presence for a namespace whose trust context it does not hold: it serves such a namespace by root fingerprint or as an open relay (§15.2), and can apply neither its membership nor its policy.
+**Relay side.** A relay that holds a namespace's trust context sends each *member* linked to it — a device the link was admitted by an identity in that held context (§7.1 steps 1–11 for its link key, M1–M5 for a membership; not a served device) over a full link path — a Presence for that namespace (§5.7). A device admitted in several held namespaces gets one Presence per namespace, and is listed in each under its name there; the key fingerprint listed is always its link key's. It lists the other members linked to it now whose role the context's role matrix pairs with the receiver's (`allows_direct_path(receiver's role, other's role)`), each by device name and key fingerprint. The relay sends it when a member's full link comes up, when a member's last path ends, when a member's identity in the namespace is revoked while it stays linked by another (it gets the namespace's empty list, §12), and when it adopts a new version of a trust context (the matrix may have changed). A member whose role pairs with none of the others gets an empty list. The relay needs no certificate in the namespace, only its trust context. A relay MUST NOT send presence for a namespace whose trust context it does not hold: it serves such a namespace by root fingerprint or as an open relay (§15.2), and can apply neither its membership nor its policy.
 
 **Why the control stream.** The alternatives were signed presence records (published per device, or in a namespace sync group) and a signed-Interest listing the relay answers. The control stream was chosen ([Decision 27](#20-decisions)) because:
 
@@ -758,13 +837,16 @@ Devices of a namespace that are linked to a common relay make direct paths with 
 - it is current by construction: it changes when links come and go, with no record lifetimes, no polling and no freshness to tune, and it says "linked here now", which a record cannot;
 - it costs nothing while nothing changes: no Interests, no signatures, no state outside the links.
 
-**Device side.** A device follows the presence sent on the full link path to each peer entry that is a relay — one it uses (§15.5) or one another peer is reached through — or that is identified in a held namespace whose link policy lets its role relay (`allows_relay`, §7.4), such as a plain `[[peer]]` for the namespace's relay. Unless direct paths by membership are off (`DirectOptions::membership`, default on; ndn-fwd `[direct] membership`), for each listed namespace it holds a certificate in, it punches every listed device that
+**Device side.** A device follows the presence sent on the full link path to each peer entry that is a relay — one it uses (§15.5) or one another peer is reached through — or that is identified in a held namespace whose link policy lets its role relay (`allows_relay`, §7.4), such as a plain `[[peer]]` for the namespace's relay. Unless direct paths by membership are off (`DirectOptions::membership`, default on; ndn-fwd `[direct] membership`), for each listed namespace it holds a certificate in (of its link key or of a membership), it punches every listed device that
 
-- is not itself (by key or device name);
+- is not itself (by key or by any of its device names);
 - has a key fingerprint greater than its own (§3.3 order). The device with the smaller fingerprint punches and the other answers, the order in which the smaller fingerprint also dials (§14.5), so two members never punch each other at once;
 - is named under the listed namespace;
 - has no peer entry (by key or device name): a peer entry is punched as such (§14.1);
-- is paired with this device's role by the role matrix of this device's own trust context (§7.4).
+- is paired with this device's role in that namespace by the role matrix of this device's own trust context of it (§7.4);
+- is not punched already for another namespace the relay lists it in (a device is punched once, by its link key).
+
+The punch is in the listed namespace: it shows this device's membership of it when its link key is not certified there (§14.3).
 
 For each such member it routes the member's device name over the relay's link face at `VIA_RELAY_COST` (§10), and punches it through that relay with the rules of §14.3–§14.7 and the bound of §14.9, for as long as the relay lists it. When the relay no longer lists the member, or the relay's link ends, the device stops punching it and removes that route; a direct path that is up stays until it ends.
 
@@ -826,7 +908,7 @@ The link policy still decides which roles of a namespace may relay for it (§7.3
 
 The serving policy applies to links nobody asked for: no peer entry of the relay dialled the link, expects its key or names its device (§7.3 rule 5). A peer entry admits its device whatever the policy. The policies (`ServePolicy`; ndn-fwd `[relay_service] serve`):
 
-- **`own`** (the default): devices of the namespaces in which the relay holds a certificate (the certificate it links with now). A device of a namespace whose trust context it holds but in which it holds no certificate, or of a namespace it does not hold, is refused with **0x19**.
+- **`own`** (the default): devices of the namespaces in which the relay holds a certificate (of its link key, or of a membership, §5.8). A device of a namespace whose trust context it holds but in which it holds no certificate, or of a namespace it does not hold, is refused with **0x19** — unless another of its identities is served (§7.3 rule 5): a device of A and C is served by a relay of C by its C membership.
 - **`listed`** (`roots`, optional quotas): those, and devices of the namespaces whose root key fingerprint is in `roots`. A device of a held namespace is checked as any device of it (revocations, link policy, §7.1 steps 1–11) and served when the fingerprint of one of the held context's anchors is listed. A device of a namespace the relay does not hold is checked offline against the root in its hello (§7.1 R1–R7) and served when that root's fingerprint is listed. Without quotas, only the one-root-per-name rule of §15.3 bounds them.
 - **`open`** (quotas): devices of any namespace whose hello chain ends in a self-signed root certificate that validates the device's certificate (§7.1 R1–R7), under the quotas of §15.3. The relay's own namespaces are never under quota.
 
@@ -876,19 +958,21 @@ A relay a device uses is a peer entry with a *relay use*: its source and prefere
 
 A relay of the device's own namespace must still hold a role the link policy lets relay, or the device refuses it with **0x13** (§7.3 rule 3).
 
+**Which of the device's namespaces a relay is used for.** A device in several namespaces uses relays for each: a relay its person added is used for every namespace it holds a certificate in; a relay a namespace advertises, for each of the device's namespaces whose held trust context advertises it (by device name or key), however many of them do (`relay_namespaces`). A device in none counts all its relays together.
+
 ### 15.6 Choosing relays, failover and failback
 
-**Order.** Relays are ordered by preference (lower first); of equal preference, a `user` relay comes before a `namespace` one, then they keep the order in which they were added. `count` relays are linked at once (`RelayOptions::count`, default 1; ndn-fwd `[relays] count`, 1–8).
+**Order.** Relays are ordered by preference (lower first); of equal preference, a `user` relay comes before a `namespace` one, then they keep the order in which they were added. `count` relays are linked at once for each namespace the device uses relays for (`RelayOptions::count`, default 1; ndn-fwd `[relays] count`, 1–8).
 
-**Choice.** Walking the order until `count` relays are chosen:
+**Choice.** Walking the order, a relay is considered while at least one of the namespaces it is used for has fewer than `count` relays chosen:
 
 - an `off` relay that the host does not ask for and that is not linked is skipped;
 - a relay that is linked, or whose last dial did not fail, is **chosen**;
 - a relay whose last dial failed, or that closed its link with **0x00** (Shutdown), is **retried**: dialled again with its backoff (§13.1) while the next one in the order stands in.
 
-Relays after the chosen ones stand by, undialled. Chosen and retried relays are dialled as their mode says (§16.1). The choice is made again whenever a relay's link comes up or ends, a dial of a relay fails, or a peer is added, removed, connected, disconnected or changes mode.
+Relays not considered stand by, undialled. Chosen and retried relays are dialled as their mode says (§16.1). A chosen relay counts for each namespace it is used for; a retried one for none. The choice is made again whenever a relay's link comes up or ends, a dial of a relay fails, or a peer is added, removed, connected, disconnected or changes mode.
 
-**Routes.** The link path to a relay routes this device's namespace at a cost equal to the relay's rank in the whole order (0 for the first, 1 for the next, …), and the routes of the peers reached through it at that rank + 10 (§10). Traffic therefore takes the most preferred linked relay.
+**Routes.** The link path to a relay routes the namespaces of this device it is used for at a cost equal to the relay's rank in the whole order (0 for the first, 1 for the next, …), and the routes of the peers reached through it at that rank + 10 (§10). Traffic of each namespace therefore takes the most preferred linked relay used for it.
 
 **Failover.** When the link to a relay drops, its face and routes go, and traffic takes the next linked relay at once (with `count` > 1). A relay that closed the link with 0x00 (Shutdown) said it is going away: it is retried at once, so the next relay in the order is chosen and dialled without waiting for a dial of the first to fail. A link that dropped otherwise (timed out, replaced, …) may be a relay restarting or a short outage: the relay stays chosen and is dialled again after `BACKOFF_FIRST`; once a dial of it fails, it is retried and the next relay in the order is chosen and dialled.
 
@@ -905,7 +989,7 @@ A forwarder validates the Data it forwards against the trust contexts it holds. 
 - unsolicited Data is still dropped, as for any Data that answers no pending Interest;
 - Data under a namespace the relay holds is always validated, whatever is in transit.
 
-The namespace leaves transit when the last link of a device served for it ends. Host interface: `ndn-link` calls `FaceSink::transit(namespace, true)` when a path of a served device comes up and `FaceSink::transit(namespace, false)` when it ends; the calls pair up, so the host counts them per namespace ([Decision 30](#20-decisions)). The ndn-rs engine keeps the counts in `TransitPrefixes`. A forwarder that validates nothing in transit anyway does nothing here.
+The namespace leaves transit when the last link of a device served for it ends. Host interface: `ndn-link` calls `FaceSink::transit(namespace, true)` when a path of a served device comes up — once for each namespace a served identity of the link is in (§7.3) — and `FaceSink::transit(namespace, false)` when it ends; the calls pair up, so the host counts them per namespace ([Decision 30](#20-decisions)). The ndn-rs engine keeps the counts in `TransitPrefixes`. A forwarder that validates nothing in transit anyway does nothing here.
 
 ### 15.8 Devices behind one address
 
@@ -937,7 +1021,7 @@ A host going inactive (`set_active(false)`) closes nothing at once: its on-deman
 
 ### 16.3 The waiting face
 
-While an on-demand peer has a path to dial, the routes its link will get — its `routes`; else, for a relay this device uses, this device's namespace; else its `device` — lead to the waiting face at `WAITING_COST` = 1000, above any link's cost. An Interest the forwarder sends there:
+While an on-demand peer has a path to dial, the routes its link will get — its `routes`; else, for a relay this device uses, the namespaces it uses that relay for (§15.5); else its `device` — lead to the waiting face at `WAITING_COST` = 1000, above any link's cost. An Interest the forwarder sends there:
 
 - if the link is up already, is sent over it;
 - if the peer is a relay that is not chosen now, is answered with a Nack NoRoute;
@@ -1057,6 +1141,10 @@ Sleeping devices and their held Interests live in the relay's memory only. A rel
 | `WAKE_TOKEN_MAX` | 1024 bytes | §5.6 |
 | `PRESENCE_MAX` | 256 devices per Presence | §5.7 |
 | presence namespaces kept per link | 256 | §5.7 |
+| `MEMBERSHIPS_MAX` | 8 memberships sent and used per hello (one per namespace); 1 per punch message | §5.2, §5.8, §14.3 |
+| membership exporter | label `EXPORTER-ndn-link/1 membership`, empty context, 32 bytes | §5.8 |
+| binding transcript | `ndn-link/1 membership` 0x00 ‖ link key fingerprint ‖ channel binding ‖ SHA-256(certificate): 118 bytes | §5.8 |
+| punch channel binding | SHA-256(`ndn-link/1 punch` ‖ session) | §5.8, §14.3 |
 | `Quotas` default | 256 links, 32 per namespace, 100/s (burst 200) per key, 400/s (burst 800) per namespace | §15.3 |
 | `RelayOptions` default | count 1, namespace relays on, mode `always`, no hold | §15.5, §15.6 |
 | `DirectOptions` default | membership on, `max_paths` 8 | §14.8, §14.9 |
@@ -1209,6 +1297,11 @@ These are the TLV-VALUEs given to the real decoders (the outer TLV already strip
 | hello `fd045101010a00` (unknown even 0x0A, in 0–31) | malformed: unknown critical field |
 | hello `fd04510101fd045600` (unknown even 0x0456) | accepted, 0 certificates |
 | hello `fd04510101fd045700` (unknown odd 0x0457) | malformed: unknown critical field |
+| hello `fd04510101fd045c070600fd045e01aa` (a Membership: one Data, binding `aa`) | accepted, 0 certificates, 1 membership |
+| hello `fd04510101fd045c05fd045e01aa` (Membership without a certificate) | malformed |
+| hello `fd04510101fd045c020600` (Membership without a binding) | malformed |
+| hello `fd04510101fd045c060600fd045e00` (empty MembershipBinding) | malformed |
+| hello `fd04510101fd045c0b0600fd045e01aafd045f00` (unknown odd 0x045F inside a Membership) | malformed |
 | verdict `fd045700` | malformed: unknown critical field |
 | verdict `fd0454020800` (non-Name inside EnrollmentLink) | malformed |
 | verdict `fd045400` (empty EnrollmentLink) | malformed |
@@ -1303,7 +1396,54 @@ fd0446 3b                     Presence, length 59
 
 The same namespace with no device, which removes it at the receiver (12 B): `fd04460807060804686f6d65`. Malformed, as TLV-VALUEs: an empty value (no namespace), `0700fd0448070700fd044a01ab` (KeyDigest of 1 byte), `0700fd0448020700` (PresentDevice without KeyDigest).
 
-The full vectors, the malformed cases and the round trip of the empty list are asserted by `reachability_matches_the_spec_vectors_and_round_trips` and `presence_matches_the_spec_vector_and_round_trips` (Q/message.rs); the codes 0x05, 0x06 and 0x19 and their transient flags by `close_codes_round_trip` (Q/message.rs).
+The full vectors, the malformed cases and the round trip of the empty list are asserted by `reachability_matches_the_spec_vectors_and_round_trips` and `presence_matches_the_spec_vector_and_round_trips` (Q/message.rs); the codes 0x05, 0x06, 0x19 and 0x1A and their transient flags by `close_codes_round_trip` (Q/message.rs); the Membership decoder cases of §19.10 by `a_membership_needs_a_certificate_and_a_binding` (Q/message.rs).
+
+### 19.18 A membership and its binding
+
+The link key is the Ed25519 key of §19.1 (fingerprint `3475…c97e`). The device is also a member of `/work` with another key. All certificates have version 1767225600000 (`v=` = 2026-01-01T00:00:00Z in ms).
+
+- **Root of `/work`**: Ed25519 seed `03`×32, key `/work/KEY/2122232425262728`, public key `ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1`; self-signed certificate `/work/KEY/2122232425262728/self/v=1767225600000`, valid 20260101T000000–20360101T000000, 265 B:
+
+  ```
+  06fd0105072d0804776f726b08034b4559081032313232323332343235323632373238080473656c6636080000019b76daa8001414180800000000000000021908000000000036ee80152c302a300506032b6570032100ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1164e1b01051c1f071d0804776f726b08034b4559081032313232323332343235323632373238fd00fd26fd00fe0f323032363031303154303030303030fd00ff0f3230333630313031543030303030301740841fa024d19bb23a63bf6f9228af413d5a6281014f1524362c4ba19f74ac9fea7bc07d14e8de6fa8a6688769860da04fc92c865f2dc6c6bd58e7184487a35601
+  ```
+
+- **The device's `/work` certificate**: Ed25519 seed `04`×32, key `/work/member/phone/KEY/3132333435363738`, public key `ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c`; certificate `/work/member/phone/KEY/3132333435363738/NDNCERT/v=1767225600000` issued by the root, valid 20260101T000000–20270101T000000, 283 B:
+
+  ```
+  06fd0117073f0804776f726b08066d656d626572080570686f6e6508034b455908103331333233333334333533363337333808074e444e4345525436080000019b76daa8001414180800000000000000021908000000000036ee80152c302a300506032b6570032100ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c164e1b01051c1f071d0804776f726b08034b4559081032313232323332343235323632373238fd00fd26fd00fe0f323032363031303154303030303030fd00ff0f32303237303130315430303030303017403dc98f25465f7561620a7da039e130d69c5e9607d96aa3ee0d3a04703a1a480c5f9add6f6affc116c0efdd5e36f20629a0f9d05668545bcc4778c33fc9854f0b
+  ```
+
+- **Channel binding** (in place of a connection's exporter value): `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`.
+
+The binding transcript (118 B):
+
+```
+6e646e2d6c696e6b2f31206d656d6265727368697000                         "ndn-link/1 membership" 00
+34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e     link key fingerprint (§19.1)
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f     channel binding
+14bb26fdde55b6a50683847e00cc12f05e7b754b93304b858d9321e68d2691d4     SHA-256 of the /work certificate (283 B)
+```
+
+Its Ed25519 signature by the `/work` device key (seed `04`), the binding (64 B):
+
+```
+e77a3e5d85e0380c7c409d4b43a779b63c04e133ae3ba1f130dfad0a72042e768c3612fd1077ce641742f08c464a49c8e29a5a78c1878bb9f263cec1bf85c700
+```
+
+The Membership TLV (622 B): `fd045c fd0268` (length 616) ‖ the `/work` certificate ‖ the root ‖ `fd045e 40` ‖ the binding. A hello carrying it after the link key's chain of §19.5 identifies the device as `/home/member/phone` (by its link key) and `/work/member/phone` (by the membership) at a side that holds both namespaces; the same binding under another channel value, another link key fingerprint, or a key other than `ca93…be7c` does not verify (refused with 0x1A).
+
+These are asserted by `the_spec_vectors_are_what_this_code_writes` and `a_binding_holds_only_for_its_key_link_key_and_connection` (Q/membership.rs).
+
+### 19.19 The channel binding of a punch
+
+For the punch of session `0102030405060708` (§19.14), memberships are bound to SHA-256(`6e646e2d6c696e6b2f312070756e6368` ‖ `0102030405060708`), i.e. of ASCII `ndn-link/1 punch` and the session:
+
+```
+b2d0a9d0b6405643f3fba3edebfb5e1b6d777776ba5a3b90377f3635a6f489fa
+```
+
+Asserted by `the_spec_vectors_are_what_this_code_writes` (N/punch.rs).
 
 ## 20. Decisions
 
@@ -1339,10 +1479,11 @@ These points were open when this spec was first written. Each was decided, and c
 28. **The smaller fingerprint punches members; direct paths are bounded** (§14.8, §14.9). The same order as the dial (Decision 17) means two members never punch each other at once. `max_paths` bounds the state and keep-alives of direct paths; recent traffic only breaks ties among members membership already qualifies, and an answerer at its bound refuses with 0x16 so the punching side backs off.
 29. **Control messages after the verdict** (§5.6, §5.7) use the even types 0x0440–0x044A, so receivers that predate them skip them. The latest of each (per namespace for Presence) replaces what was sent before, at the receiver and in the sender's queue, so a slow reader costs no memory.
 30. **Served namespaces are carried in transit, unvalidated and uncached** (§15.7). A relay cannot validate the Data of a namespace whose trust context and certificates it does not hold, and fetching them would make serving depend on that namespace's infrastructure. Dropping that Data would make serving useless. Its consumers validate it end to end; the relay answers only pending Interests and caches nothing it could not validate, so it never serves unvalidated Data from its cache to a later requester. Validation is skipped only while a served link of that namespace is up, and never under a namespace the relay holds.
+31. **A link carries every membership** (§5.8, §7.1, §7.3, §12). A device takes part in many namespaces, with a key in each. A link keeps one key per device (the node key, in TLS); each other namespace is shown as a Membership: that key's chain and its signature binding the link key to this connection. Alternatives were one link per namespace key (a second handshake and connection per namespace and peer, and two links between the same two devices, which the duplicate-link rule forbids) and the same key certified in each namespace (the roles layout gives each namespace its own key, and a key compromised in one would be in all). The binding covers the link key fingerprint, so a membership cannot be moved to another device's link, and the TLS exporter, so it cannot be replayed onto another connection; the receiver recomputes both from its own view of the connection. A forged or replayed membership refuses the link with a code of its own (0x1A), since an honest device never sends one. The peer is admitted by any identity the local policy accepts, and routes, presence, transit and revocation follow each identity: a revocation in A takes A from the link and keeps it up by C. Revocations are per namespace at admission too: a revoked leaf or membership refuses the link only when nothing else identifies the peer. Relays are chosen per namespace (`count` for each), so a device of A and C is reachable through a relay of each. Punch messages carry the membership of the namespace the punch is in, bound to the punch's session, while the PunchKey stays the link key that the direct path's handshake proves. The Membership is an even TLV-TYPE above 31, so a receiver that predates it ignores it and admits the device by its link key's certificate, as before; a device's hello without memberships is the hello of ndn-link/1 before them.
 
 ## Appendix A. Code references (non-normative)
 
-`Q` = `ndn-ext/crates/faces/ndn-face-quic/src`; `N` = `ndn-ext/crates/faces/ndn-link/src` (admission; moved there from ndn-fwd); `F` = `ndn-fwd/binaries/ndn-fwd/src` (the daemon's host glue); `S` = `ndn-rs/crates/security/ndn-security/src`. Lines are as read on 2026-10-18, while concurrent work was still landing; a location names the line an item (function, type, constant) starts at, or its span.
+`Q` = `ndn-ext/crates/faces/ndn-face-quic/src`; `N` = `ndn-ext/crates/faces/ndn-link/src` (admission; moved there from ndn-fwd); `F` = `ndn-fwd/binaries/ndn-fwd/src` (the daemon's host glue); `S` = `ndn-rs/crates/security/ndn-security/src`. Lines are as read on 2026-10-18, and on 2026-10-19 for the rows of memberships (§5.8, Decision 31) and the rows they changed, while concurrent work was still landing; a location names the line an item (function, type, constant) starts at, or its span.
 
 | Claim | Location |
 |---|---|
@@ -1368,18 +1509,22 @@ These points were open when this spec was first written. Each was decided, and c
 | dialer checks expected fingerprint in the handshake | Q/verify.rs:64–81 |
 | listener checks key type only | Q/verify.rs:131–138 |
 | certificate Content: Ed25519 SPKI unwrapped to raw, else as is | S/cert_cache.rs:31–38; S/spki.rs:30–58 |
-| link message TLV-TYPEs 0x0440–0x045A; version 1; MAX_MESSAGE | Q/message.rs:44–57, :64, :67 |
-| hello encode / decode (version exactly one byte, types 0–31 and odd critical) | Q/message.rs:83–142 |
-| verdict encode / decode (Name only in 0x0454, never empty) | Q/message.rs:155–203 |
-| Reachability: `WAKE_TOKEN_MAX` 1024, encode / decode, malformed cases | Q/message.rs:215–282 |
-| Presence and PresentDevice: encode / decode, malformed cases | Q/message.rs:284–364 |
-| unknown even types above 31 skippable | Q/message.rs:394 (`skippable`) |
-| close codes (0x05, 0x06, 0x19 included) and transient set | Q/message.rs:414–536 |
-| decoder tests (vectors of §19.10); close-code test; Reachability and Presence vectors (§19.16, §19.17) | Q/message.rs:626, :639, :672, :698 |
-| hello exchange order; verdict exchange; datagram check | Q/link.rs:159–264 (`exchange_hello`, `admit`) |
-| failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:265–303 (tests in ndn-face-quic/tests/link.rs) |
-| message read and write: 20-byte header, expected type, MAX_MESSAGE, peer's close reason | Q/link.rs:305–377 |
-| after the verdict: outbox (latest replaces), received messages routed, 256 presence namespaces, Protocol close; ObservedAddress every 5 s | Q/link.rs:379–533 (`Outbox`, `Heard::take`, `observe`) |
+| link message TLV-TYPEs 0x0440–0x045E; version 1; MAX_MESSAGE | Q/message.rs:47–60, :67, :70; Q/membership.rs:31–32 |
+| hello encode / decode (version exactly one byte, types 0–31 and odd critical; Memberships) | Q/message.rs:91–157 |
+| verdict encode / decode (Name only in 0x0454, never empty) | Q/message.rs:171–219 |
+| Reachability: `WAKE_TOKEN_MAX` 1024, encode / decode, malformed cases | Q/message.rs:231–298 |
+| Presence and PresentDevice: encode / decode, malformed cases | Q/message.rs:300–373 |
+| unknown even types above 31 skippable | Q/message.rs:410 (`skippable`) |
+| close codes (0x05, 0x06, 0x19, 0x1A included) and transient set | Q/message.rs:430–560 |
+| decoder tests (vectors of §19.10); Membership decoder cases; close-code test; Reachability and Presence vectors (§19.16, §19.17) | Q/message.rs:563–, :632 (`a_membership_needs_a_certificate_and_a_binding`), :675 (`close_codes_round_trip`) |
+| Membership TLV 0x045C / 0x045E: encode, decode (certificate and binding required); `MEMBERSHIPS_MAX` | Q/membership.rs:31–43, :149–180 |
+| binding transcript (label ‖ link key fingerprint ‖ channel binding ‖ SHA-256 of the certificate); sign (Ed25519 / P-256 only); verify under the certificate's key | Q/membership.rs:63–72 (`binding_transcript`), :79 (`Membership::sign`), :117 (`Membership::verify`); Q/key.rs:54 (`LinkKeyAlgorithm::of_ndn_key`) |
+| channel binding: TLS exporter, label `EXPORTER-ndn-link/1 membership`, empty context, 32 bytes; same on both sides, differs per connection | Q/membership.rs:36; Q/link.rs:166 (`channel_binding`; test `both_sides_share_a_connections_binding_value_and_no_other_connection_does` in ndn-face-quic/tests/link.rs) |
+| vectors of §19.18 | Q/membership.rs:232 (`the_spec_vectors_are_what_this_code_writes`), :278 |
+| hello exchange order; verdict exchange; datagram check | Q/link.rs:176–279 (`exchange_hello`, `admit`) |
+| failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:281–317 (tests in ndn-face-quic/tests/link.rs) |
+| message read and write: 20-byte header, expected type, MAX_MESSAGE, peer's close reason | Q/link.rs:319–391 |
+| after the verdict: outbox (latest replaces), received messages routed, 256 presence namespaces, Protocol close; ObservedAddress every 5 s | Q/link.rs:393–547 (`Outbox`, `Heard::take`, `observe`) |
 | `send_reachability`, `peer_reachability`, `send_presence`, `presence`, `datagrams` (DATAGRAM frames only) | Q/link.rs:617–675 |
 | a dropped connection closes with code 0 and an empty reason (what §6.3 forbids) | quinn 0.11.12 src/connection.rs:946–961, :1254–1257 (lockfile pins quinn 0.11.9; same code at :928–939, :1241–1243) |
 | DATAGRAM_FLOOR 1100; send_mtu; TooLarge dropped | Q/link.rs:27, :603, :700, :734 |
@@ -1393,43 +1538,47 @@ These points were open when this spec was first written. Each was decided, and c
 | NackReason NoRoute = 150 | ndn-rs/crates/core/ndn-packet/src/nack.rs:29, :40 |
 | constants MESSAGE_DEADLINE … DIRECT_RETRY_REFUSED (`ndn_link::policy`); `Backoff` | N/policy.rs:10–79, :87 |
 | MAX_STATUS_HOLD = 60 s | ndn-rs/crates/security/ndn-cert/src/approval.rs:104 |
-| host chain: newest valid certificate and kept issuers, at most 8 | S/cert_set.rs:23, :118 (`chain_of`); ndn-rs/crates/security/ndn-namespace/src/publish/certificates.rs:182; F/links.rs:273 |
-| hello and punch chain end in the namespace root (`hello_chain`) | N/admission.rs:726 |
-| known certificates for offline validation; certificate of a key by fingerprint | F/links.rs:277–290; N/host.rs:17–41 |
-| own certificate / own role / namespace_of; enrollment eligibility | N/admission.rs:125–192 |
+| host chain: newest valid certificate and kept issuers, at most 8 | S/cert_set.rs:23, :118 (`chain_of`); ndn-rs/crates/security/ndn-namespace/src/publish/certificates.rs:188; F/links.rs:296 |
+| hello and punch chain end in the namespace root (`hello_chain`, `with_root`) | N/admission.rs:933, :942 |
+| known certificates for offline validation; certificate of a key by fingerprint | F/links.rs:336–347; N/host.rs:61–72 |
+| own certificates (link key's, then memberships'), own role, own device names, namespace_of; enrollment eligibility | N/admission.rs:155–241 |
+| `LinkTrust::own_memberships`, `OwnMembership`; memberships shown in a hello or punch (one per namespace, not the link key's, bound to the link key and channel) | N/host.rs:19–59; N/admission.rs:965 (`own_memberships`); N/links.rs:472–503 |
+| ndn-fwd memberships: every engine signing identity other than the node key, in a held namespace, with a served chain; relink on the identity watch | F/links.rs:283–335 (`DaemonTrust`), :490, :502 (`follow_identity_changes`) |
 | enrollment slots 32 / 4 per source, Busy | N/slots.rs:34–71 |
-| known revoked key refused 0x12 before the hello is read | N/admission.rs:195, :425–440 (test :1287) |
-| identify steps 1–11; collision with a held name → 0x19 | N/admission.rs:194–315 |
-| identify offline against the root in the hello (R1–R7) | N/admission.rs:322–396, :751 (`namespace_context`) |
-| offline validation in held contexts, depth 8, no fetch | N/admission.rs:402–418 |
-| peer entry lookup (first by key or device; served identities not by device); is_relay | N/admission.rs:445–461; N/peer.rs:181, :197 |
-| decision rules 7.3 | N/admission.rs:546–724 |
-| admission → verdict + scope (directions, filter, rates, served quotas) | N/admission.rs:465–532 |
+| known revoked key refused 0x12 (unless a membership identifies the peer) | N/admission.rs:255, :537 (test `a_revoked_key_sending_no_certificate_is_refused_as_revoked`) |
+| identify: leaf (steps 1–3), memberships (M1–M5), refusals held back unless identified; steps 4–11; collision with a held name → 0x19 | N/admission.rs:251–325 (`identify`), :331–427 (`identify_chain`) |
+| identify offline against the root in the hello (R1–R7) | N/admission.rs:434–508, :1030 (`namespace_context`) |
+| offline validation in held contexts, depth 8, no fetch | N/admission.rs:514–530 |
+| peer entry lookup (first by key or any held device name; served identities not by device); is_relay | N/admission.rs:558–582; N/peer.rs:181, :197–213 (`find_any`) |
+| decision rules 7.3 over identities; link policy per identity; serving per identity, own namespaces first | N/admission.rs:668–845, :838 (`link_policy_refusal`), :872 (`serve`) |
+| admission → verdict + scope (directions, filter, rates, served quotas) | N/admission.rs:586–653 |
 | serving policy, quotas and their defaults, one root per name, `serves` | N/serving.rs:45–121, :174–226, :244–308 (tests: N/admission.rs:1035–1155) |
-| routes and VIA_RELAY_COST; relay routes at rank; namespace route only for a node this side dials | N/routes.rs:25–78; N/links.rs:546–557 |
+| routes and VIA_RELAY_COST; routes per identity; relay routes at rank for the namespaces the relay is used for; namespace route only for a node this side dials | N/routes.rs:26–96; N/links.rs:618–625; N/relays.rs:154 (`relay_namespaces`) |
 | route origin static, CHILD_INHERIT; remove_routes | N/engine.rs:32–58 |
-| establish: hello, decide, slot, admit, reliability choice, register, routes, idle close; on end: asleep, presence, relay choice | N/links.rs:412–659 |
-| link up: awake, waiting Interests sent, Reachability sent, presence followed (relays, and peers whose role may relay) and announced | N/links.rs:678–709 |
-| duplicate-link rule `keeps_existing`; register | N/table.rs:30, :141–191 (test :415) |
-| revocation closes links | N/links.rs:154–159; N/table.rs:388 |
-| relink on key switch, 0x03 | N/links.rs:198–207; N/table.rs:348, :380; F/links.rs:424 |
-| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s), persistence for `always` only | N/links.rs:888–977; N/policy.rs:87 |
-| link wanted by mode and relay choice; keep: idle by datagrams, 0x05 / 0x06 closes | N/links.rs:778–844; N/control.rs:357–365 |
-| dial over path candidates and resolved addresses | N/links.rs:742; N/host.rs:82–98 |
+| establish: channel binding, hello (link key chain and memberships), decide, slot, admit, reliability choice, register (identities, namespaces shown), routes, transit per served identity, idle close; on end: asleep, presence per identity, relay choice | N/links.rs:451–746 |
+| link up: awake, waiting Interests sent, Reachability sent, presence followed (relays, and peers one of whose roles may relay) and announced per identity | N/links.rs:752–784 |
+| duplicate-link rule `keeps_existing`; register | N/table.rs:32, :172–222 (test :544) |
+| revocation while linked: per identity; routes and presence of a revoked membership taken; close when none is left | N/links.rs:155–159, :237 (`revoked`); N/table.rs:482 (`close_revoked`) |
+| relink after enrollment and when memberships change, 0x03 | N/links.rs:201 (`identities_changed`), :219 (`shown_namespaces`); N/table.rs:411, :430, :446; F/links.rs:502 |
+| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s), persistence for `always` only | N/links.rs:992–; N/policy.rs:87 |
+| link wanted by mode and relay choice; keep: idle by datagrams, 0x05 / 0x06 closes | N/links.rs:877–948; N/control.rs:357–365 |
+| dial over path candidates and resolved addresses | N/links.rs:841 (`dial_once`); N/host.rs:121–137 |
 | `LinkMode`, `RelaySource`, `RelayUse`, `PeerSpec` and defaults | N/peer.rs:19–132 |
 | host calls: add/remove peer, set_mode, connect, disconnect, set_active, set_wake_token, network_changed | N/control.rs:100–239 |
 | waiting face: WAITING_COST, DEMAND_PER_PEER / TOTAL, 4 s default lifetime, Congestion Nack, sending past the forwarder | N/waiting.rs:39–48, :106–232, :236–288; N/control.rs:243–331 |
-| relay order, choice, rank cost, status, namespace-advertised relays, release | N/relays.rs:29–49, :62–118, :134–189, :196–286, :290–300 (test `losing_the_preferred_relay_moves_to_the_next` in ndn-link/tests/links.rs) |
+| relay order, choice per namespace, rank cost, status, namespace-advertised relays, release | N/relays.rs:66–119, :80 (`relay_choice`), :154–177, :178–240, :242–332, :336 (test `losing_the_preferred_relay_moves_to_the_next` in ndn-link/tests/links.rs) |
 | asleep: `RelayService`, `HoldLimits`, `WakeNotifier`, `WakeRequest`, `WAKE_INTERVAL`; when asleep, held Interests, wake, forget, awake | N/asleep.rs:50–121, :144–309 (test `a_relay_holds_and_wakes_a_sleeping_device_and_delivers_when_it_links_again` in ndn-link/tests/links.rs) |
-| presence: `PRESENCE_MAX`, `DirectOptions`; announce (role matrix, held contexts only), follow, punch members (smaller fingerprint) and their routes | N/presence.rs:42–63, :75–118, :122–225 |
-| direct paths off / role pair (`pair_off`), bound (`direct_full`), member tie-breaker (`member_turn`), traffic record, member answer check, Busy at the bound | N/direct.rs:175, :337–423, :655–690, :779–785, :1212 |
-| after a network change: direct paths closed (0x01) and punched again from the new address, the loop going on from that punch; a punch from a key with a direct path up closes that path (0x01); a path replaced or punched again ends with no retry wait | N/control.rs:237; N/direct.rs:458–483, :811–820, :863–1003, :1249–1280; N/table.rs:295–331 (test ndn-link/tests/direct.rs) |
-| status: mode, relay, asleep, down, serve, held_total, wakes_sent | N/status.rs; N/links.rs:211 |
+| presence: `PRESENCE_MAX`, `DirectOptions`; announce per namespace over every identity (role matrix, held contexts only), follow, punch members (smaller fingerprint) and their routes | N/presence.rs:42–67, :79–122, :126–231; N/table.rs:286 (`members`) |
+| punch messages carry the Membership of the punch's namespace, bound to SHA-256(`ndn-link/1 punch` ‖ session); punches taken under each of this device's names | N/punch.rs:108, :195 (`punch_binding`); N/direct.rs:611 (`punch`), :679 (`check_answer`), :728 (`answer_punch`), :1066 (`refuse_punch`) |
+| invariants: a relay of C admits an A+C device by its C membership; an A-only relay by the leaf; forged and replayed bindings refused 0x1A; hellos without memberships, and listeners that skip them, still link | ndn-link/tests/memberships.rs:339, :380, :457, :491, :546 |
+| direct paths off over every identity / role pair (`pair_off`), bound (`direct_full`), member tie-breaker (`member_turn`), traffic record, member answer check, Busy at the bound | N/direct.rs:185, :347, :376–441, :679–724 |
+| after a network change: direct paths closed (0x01) and punched again from the new address, the loop going on from that punch; a punch from a key with a direct path up closes that path (0x01); a path replaced or punched again ends with no retry wait | N/control.rs:237; N/direct.rs:922–1062; N/table.rs:320–353 (test ndn-link/tests/direct.rs) |
+| status: mode, relay, asleep, down, serve, held_total, wakes_sent | N/status.rs; N/links.rs:254 |
 | `links/list` TLVs 0x04A0–0x04DC; `LinkModeArg` | ndn-rs/crates/core/ndn-mgmt-wire/src/link_status.rs:22–93, :97–168, :174 |
 | `links/connect`, `links/disconnect`, `links/mode` | ndn-rs/crates/core/ndn-mgmt-wire/src/nfd_command.rs:70–79; F/links_mgmt.rs:38–157 |
-| `[[peer]]` / `[[relay]]` → PeerSpec; `[relay_service]` → RelayService and the wake command; `[links]` → `bounded`; `[relays]`, `[direct]` | F/links.rs:57–178, :179–259, :338, :394–405 |
+| `[[peer]]` / `[[relay]]` → PeerSpec; `[relay_service]` → RelayService and the wake command; `[links]` → `bounded`; `[relays]`, `[direct]` | F/links.rs:61–152, :153–281, :401, :466–476 |
 | `[[peer]]`, `[relays]`, `[[relay]]`, `[relay_service]`, `[links]`, `[direct]` fields and bounds | ndn-rs/crates/platform/ndn-config/src/config.rs:1684, :1966, :2026, :2113, :2304, :2356 |
-| `in_enrollment` / `is_key_or_certificate_name`; name filter test cases | N/admission.rs:780–801, :825 |
+| `in_enrollment` / `is_key_or_certificate_name`; name filter test cases | N/admission.rs:1059–1080, test `an_enrollment_link_carries_only_the_enrollment` |
 | LinkPolicy fields, default, allows_link / allows_relay / allows_direct_paths / allows_direct_path, default pairs | S/trust_context/mod.rs:304–400 |
 | link_policy; relays; admits_enrollment_links; is_anchor; anchor_for; is_revoked prefix | S/trust_context/mod.rs:894, :903, :908, :929, :939, :962 |
 | `trust-context` keyword; rdr_prefix | S/trust_context/mod.rs:61; ndn-rs/crates/security/ndn-cert/src/onboarding.rs:57–63 |
@@ -1437,7 +1586,7 @@ These points were open when this spec was first written. Each was decided, and c
 | role words; device-name rules; parse_device_key | ndn-rs/crates/security/ndn-cert/src/roles.rs:67–101, :150–179, :260–301 |
 | certificate wire (vectors): name, MetaInfo, SPKI Content, ValidityPeriod | S/manager.rs:514–594; S/cert_name.rs:74–80 |
 | rustls ring cipher suites and groups | rustls 0.23.40 src/crypto/ring/mod.rs:68–80, :179–180 |
-| transit: `FaceSink::transit` and its pairing; engine `TransitPrefixes` (counted per namespace); validation skipped (so never cached) for a namespace in transit and not held | N/host.rs:68–76; N/links.rs:582–591, :650–651; N/engine.rs:60–66; ndn-rs/crates/forwarding/ndn-engine/src/transit.rs:1–53; …/ndn-engine/src/stages/validation.rs:260–268 |
+| transit: `FaceSink::transit` and its pairing (per served identity); engine `TransitPrefixes` (counted per namespace); validation skipped (so never cached) for a namespace in transit and not held | N/host.rs:107–115; N/links.rs:652–662, :723–725; N/engine.rs:60–66; ndn-rs/crates/forwarding/ndn-engine/src/transit.rs:1–53; …/ndn-engine/src/stages/validation.rs:260–268 |
 | "never back to the node it came from" not applied by address to QUIC link faces | ndn-rs/crates/forwarding/ndn-engine/src/stages/strategy.rs:119–130 (`peer_host`), :441–456 |
 
 [RFC 2119]: https://www.rfc-editor.org/rfc/rfc2119
