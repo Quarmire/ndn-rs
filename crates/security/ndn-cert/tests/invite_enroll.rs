@@ -88,7 +88,9 @@ async fn root_dev(tokens: &[(&str, &str)]) -> RootDevice {
     .unwrap();
     let store = TokenStore::new();
     for (token, role) in tokens {
-        store.add_scoped(*token, None, Some(ns().append(*role)));
+        store
+            .add_scoped(token, None, Some(ns().append(*role)))
+            .unwrap();
     }
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(TokenChallenge::new(store))];
     let config = CaConfig::new(
@@ -114,6 +116,7 @@ fn invite(identity_namespace: &str, token: &str, fingerprint: [u8; 32]) -> Strin
         token: token.into(),
         ttl_secs: None,
         anchor_fingerprint: Some(fingerprint),
+        device: None,
     }
     .to_uri()
 }
@@ -334,6 +337,7 @@ fn malformed_invites_are_refused_without_panicking() {
             token: token.into(),
             ttl_secs: None,
             anchor_fingerprint: fp,
+            device: None,
         }
         .to_uri()
     };

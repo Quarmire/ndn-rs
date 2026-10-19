@@ -353,7 +353,7 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `prefix` | `/demo` | CA namespace. The CA appends `/CA` itself (as do clients); a prefix ending in `/CA` is rejected at startup. |
 | `identity` | `/demo/CA` | CA signing identity, loaded from the node PIB (`[security] pib_path`). |
 | `ephemeral` | `false` | Mint a throwaway self-signed CA key at every start instead of loading `identity` (demo only; warned). |
-| `tokens` | `[]` | Legacy: non-empty selects a token challenge (ignored when `challenge` is set). A token `member-…` / `guest-…` (as `ndn-fwd-tokens new --role` mints them) is scoped to `<namespace>/<role>`. |
+| *(invites)* | — | Not configured. Every CA offers the `token` challenge over the invites made at runtime (`ndn-fwd-tokens -c <config> new`, management verb `ca/invite-create`). A leftover `tokens` key in `[ca]` or `[[ca.challenge]]` fails config load. |
 | `emit_attestations` | `false` | Embed a challenge attestation in each issued cert. |
 | `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days: one number for every role, or a `[ca.cert_validity_days]` table with `admin` / `member` / `node` / `guest` and `default` for the roles not listed (e.g. `default = 90`, `guest = 7`). The longest is the maximum advertised in INFO. Enrollments and renewals name no lifetime, so they get their role's; `ndn-fwd enroll` / `ndn-fwd renew` print the expiry issued. `0` or an unknown role is refused at startup. |
 | `renewable_roles` | `["admin", "member", "node"]` | Roles whose current, unrevoked certificates the CA renews for the same key without an invite ([Certificate renewal](../reference/renewal.md)). Guests are left out by default, so guest access ends at expiry. `[]`: the CA renews nothing. |
@@ -371,10 +371,11 @@ keeps its one CA in `<pib_path>/ca/`); the root's anchor certificate is
 `anchor-cert.data` there or a PIB trust anchor. `ndn-fwd init --namespace
 <ns>` writes all three. Startup fails if they are missing, mismatched, or
 the CA cert is not signed by the root. Issued certs, revocations and
-redeemed one-time tokens (SHA-256 hashes only) persist under
-`{issued,revoked,redeemed-tokens}/` of that directory: issued certs are
-served again after a restart, revoked ones are not, and a token redeemed
-before a restart stays refused even while it is still listed in the config.
+invites (a SHA-256 hash of each token, never the token) persist under
+`{issued,revoked,invites}/` of that directory. Issued certs are served again
+after a restart and revoked ones are not. Invites keep their state: one made
+before a restart is still redeemable, and one redeemed or withdrawn stays
+refused.
 
 `ndn-fwd init --namespace /<ns> [--device <name>]` (run on the root device)
 also mints the root device's admin identity `/<ns>/admin/<device>` (default device

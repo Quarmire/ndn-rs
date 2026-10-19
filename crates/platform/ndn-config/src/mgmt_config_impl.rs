@@ -11,14 +11,12 @@ use crate::config::ForwarderConfig;
 use ndn_mgmt::{CaInfo, MgmtConfig};
 
 /// Key names (case-insensitive, exact match) whose values are secrets and must
-/// be redacted from `config/get` (audit CFG-1). Covers CA invite tokens +
-/// enrolment PINs, SMTP/TURN credentials, link wake tokens (platform push
-/// tokens), and the ACME DNS-provider API token carried in the opaque
-/// `params` blob.
+/// be redacted from `config/get` (audit CFG-1). Covers enrolment PINs,
+/// SMTP/TURN credentials, link wake tokens (platform push tokens), and the
+/// ACME DNS-provider API token carried in the opaque `params` blob.
 const SECRET_KEYS: &[&str] = &[
     "password",
     "token",
-    "tokens",
     "wake_token",
     "pin",
     "credential",
@@ -102,8 +100,6 @@ mod cfg1_tests {
         let mut v: toml::Value = toml::from_str(
             r#"
 listen = "/run/x.sock"
-[ca]
-tokens = ["invite-secret"]
 [ca.challenge]
 pin = "1234"
 [smtp]
@@ -117,7 +113,7 @@ credential = "turnsecret"
         .unwrap();
         redact_secrets(&mut v);
         let out = toml::to_string_pretty(&v).unwrap();
-        for leaked in ["invite-secret", "hunter2", "1234", "turnsecret", "turnuser"] {
+        for leaked in ["hunter2", "1234", "turnsecret", "turnuser"] {
             assert!(!out.contains(leaked), "secret leaked: {leaked}\n{out}");
         }
         assert!(out.contains("<redacted>"), "expected redaction placeholder");

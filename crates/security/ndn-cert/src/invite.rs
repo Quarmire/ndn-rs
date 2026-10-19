@@ -2,10 +2,12 @@
 //! that takes a device from "holds nothing" to "holds a certificate for
 //! `/<ns>/<role>/<device>` issued by the namespace's CA".
 //!
-//! An invite (`ndn-fwd-tokens new --role member|guest`) carries the CA prefix,
-//! the identity namespace `/<ns>/<role>`, a one-time token scoped by the CA to
-//! that role, and — when minted with `--anchor-fp` — the fingerprint of the
-//! namespace's root anchor. [`enroll_with_invite`]:
+//! An invite ([`crate::invites::CaInvites::create`], made by the CA's host
+//! for a trust administrator) carries the CA prefix, the identity namespace
+//! `/<ns>/<role>`, a one-time token scoped by the CA to that role, the
+//! fingerprint of the namespace's root anchor (a namespace CA's invites
+//! always carry it) and, optionally, the device name the inviter suggests.
+//! [`enroll_with_invite`]:
 //!
 //! 1. reads the invite ([`InviteLink`]): only `member` and `guest` are ever
 //!    admitted by a token, and a role-carrying token must name the invite's
@@ -24,9 +26,15 @@
 //!    request names no lifetime: the CA's policy (`[ca] cert_validity_days`
 //!    on a namespace CA) decides it.
 //!
-//! A token minted with an expiry (`ndn-fwd-tokens new --ttl`) carries it
+//! An invite made with an expiry carries it in its token
 //! ([`crate::roles::token_expiry`]); an expired invite is refused before
 //! anything is sent, and the CA refuses the token after it too.
+//!
+//! The device name an invite suggests ([`InviteLink::device_hint`]) is a
+//! hint for the invitee's default device name, never a constraint: the token
+//! is scoped to `/<ns>/<role>`, and the invitee may enroll under any device
+//! name there (a name another key already holds is refused by the CA as
+//! usual).
 //!
 //! The device key is the caller's: it is generated and kept wherever the
 //! caller keeps keys (the `ndn-fwd` daemon's PIB, a phone's key store); only
@@ -74,10 +82,13 @@ pub struct InviteLink {
     /// The one-time token the CA's `token` challenge redeems.
     pub token: String,
     /// SHA-256 of the namespace's root anchor public key, when the invite
-    /// carries it (`ndn-fwd-tokens new --anchor-fp`).
+    /// carries it.
     pub expected_fingerprint: Option<[u8; 32]>,
     /// When the token stops being redeemable (Unix seconds), if it expires.
     pub expires_at_secs: Option<u64>,
+    /// The device name the inviter suggests (a valid device name): the
+    /// invitee's default, not a constraint.
+    pub device_hint: Option<String>,
 }
 
 impl InviteLink {
@@ -98,6 +109,7 @@ impl InviteLink {
             identity_namespace,
             token,
             anchor_fingerprint,
+            device,
             ..
         } = envelope
         else {
@@ -142,6 +154,9 @@ impl InviteLink {
                 });
             }
         }
+        if let Some(device) = device {
+            validate_device_name(device).map_err(|_| bad("device name", device))?;
+        }
         if token_admits != role {
             return Err(InviteEnrollError::TokenRole {
                 token_role: token_admits,
@@ -157,6 +172,7 @@ impl InviteLink {
             token: token.clone(),
             expected_fingerprint: *anchor_fingerprint,
             expires_at_secs,
+            device_hint: device.clone(),
         })
     }
 
@@ -269,15 +285,15 @@ pub enum InviteEnrollError {
     InviteRole(String),
     #[error(
         "the invite's token admits only {token_role} certificates, but the invite asks for a \
-         {invite_role} certificate under {identity_prefix}: the invite was altered or minted \
-         wrongly; ask for a new one (`ndn-fwd-tokens new --role {invite_role}`)"
+         {invite_role} certificate under {identity_prefix}: the invite was altered or made \
+         wrongly; ask for a new {invite_role} invite"
     )]
     TokenRole {
         token_role: Role,
         invite_role: Role,
         identity_prefix: String,
     },
-    #[error("{0}; choose another device name (--device)")]
+    #[error("{0}; choose another device name")]
     Device(RoleError),
     #[error("key {key} is not a device key under {identity_prefix} (<device>/KEY/<id>)")]
     KeyOutsideInvite {
@@ -286,8 +302,8 @@ pub enum InviteEnrollError {
     },
     #[error(
         "this node holds no trust context for {namespace}, and the invite carries no root \
-         fingerprint to check one against: ask for an invite minted with --anchor-fp, or adopt \
-         the context first (`ndn-fwd adopt <anchor link>`)"
+         fingerprint to check one against: ask for an invite that carries the root \
+         fingerprint, or adopt the namespace's trust context first"
     )]
     NoExpectedFingerprint { namespace: String },
     #[error(
@@ -302,14 +318,13 @@ pub enum InviteEnrollError {
     },
     #[error(
         "could not fetch the trust context for {namespace} ({detail}): this device needs a face \
-         and a route for {namespace} toward a forwarder that serves it (`ndn-ctl face create \
-         udp4://<host>:6363`, then `ndn-ctl route add {namespace} <face-id>`), then enroll again"
+         and a route for {namespace} toward a forwarder that serves it, then enroll again"
     )]
     ContextUnreachable { namespace: String, detail: String },
     #[error(
         "the trust context served for {namespace} was refused ({reason}): it is not signed by \
          the root the invite expects. This node's route for {namespace} leads to a forwarder \
-         serving another root; check the route (`ndn-ctl route list`) and the invite"
+         serving another root; check the route and the invite"
     )]
     ContextFromDifferentRoot { namespace: String, reason: String },
     #[error("trust context for {namespace} not adopted: {source}")]
@@ -320,9 +335,7 @@ pub enum InviteEnrollError {
     },
     #[error(
         "could not reach the CA {ca_prefix}/CA ({detail}): this device needs a face and a route \
-         for {namespace} toward a forwarder that serves it (`ndn-ctl face create \
-         udp4://<host>:6363`, then `ndn-ctl route add {namespace} <face-id>`), then enroll \
-         again"
+         for {namespace} toward a forwarder that serves it, then enroll again"
     )]
     CaUnreachable {
         ca_prefix: String,
@@ -339,8 +352,8 @@ pub enum InviteEnrollError {
     #[error("the CA refused the request: {0}")]
     CaRefused(String),
     #[error(
-        "the CA refused this device name: {0}. Enroll under another device name (--device), \
-         revoke that certificate first, or have an admin approve this device"
+        "the CA refused this device name: {0}. Enroll under another device name, revoke that \
+         certificate first, or have an admin approve this device"
     )]
     NameRefused(String),
     #[error("the CA did not complete the token challenge: {0}")]
@@ -355,6 +368,17 @@ pub enum InviteEnrollError {
 }
 
 impl InviteEnrollError {
+    /// Why the CA's `token` challenge refused the invite, when it said so
+    /// ([`TokenDenial`](crate::invites::TokenDenial): spent, withdrawn,
+    /// expired, unknown, …).
+    pub fn token_denial(&self) -> Option<crate::invites::TokenDenial> {
+        match self {
+            Self::TokenRefused(reason) => crate::invites::TokenDenial::of_reason(reason),
+            Self::TokenExpired { .. } => Some(crate::invites::TokenDenial::Expired),
+            _ => None,
+        }
+    }
+
     /// Classify a CA exchange failure.
     fn from_cert(e: CertError, invite: &InviteLink) -> Self {
         match e {

@@ -63,6 +63,7 @@ const T_ENVELOPE: u64 = 0x0470;
 const T_FORMAT_VERSION: u64 = 0x0471;
 const T_KIND: u64 = 0x0472;
 const T_BODY: u64 = 0x0473;
+const T_DEVICE_NAME: u64 = 0x0474; // invite: the device name the inviter suggests (a hint)
 
 const T_U64_VERSION: u64 = 0x0481; // anchor: context version
 const T_WIRE: u64 = 0x0482; // primary signed-Data blob (delegation / bundle / safebag); anchor: legacy unsigned context Content
@@ -164,6 +165,7 @@ impl TrustKind {
                 T_TOKEN,
                 T_TTL_SECS,
                 T_ANCHOR_FINGERPRINT,
+                T_DEVICE_NAME,
             ],
             TrustKind::Delegation => &[T_WIRE, T_PRINCIPAL_PUBKEY],
             TrustKind::Recovery => &[T_WIRE],
@@ -257,6 +259,10 @@ pub enum TrustEnvelope {
         ttl_secs: Option<u64>,
         /// SHA-256 of the CA's root anchor public key: the expected fingerprint.
         anchor_fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]>,
+        /// The device name the inviter suggests for the invitee's device: a
+        /// hint for its default name, not a constraint (the token is scoped
+        /// to the identity namespace, not to one device).
+        device: Option<String>,
     },
     /// A signed delegation plus the principal's public key needed to verify it.
     Delegation {
@@ -337,6 +343,7 @@ impl TrustEnvelope {
                 token,
                 ttl_secs,
                 anchor_fingerprint,
+                device,
             } => {
                 w.write_tlv(T_CA_PREFIX, ca_prefix.as_bytes());
                 w.write_tlv(T_ID_NAMESPACE, identity_namespace.as_bytes());
@@ -346,6 +353,9 @@ impl TrustEnvelope {
                 }
                 if let Some(fp) = anchor_fingerprint {
                     w.write_tlv(T_ANCHOR_FINGERPRINT, fp);
+                }
+                if let Some(device) = device {
+                    w.write_tlv(T_DEVICE_NAME, device.as_bytes());
                 }
             }
             TrustEnvelope::Delegation {
@@ -449,6 +459,7 @@ impl TrustEnvelope {
         let mut direction: Option<u8> = None;
         let mut fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]> = None;
         let mut context_data: Option<Bytes> = None;
+        let mut device: Option<String> = None;
 
         let fields = kind.body_fields();
         let mut r = TlvReader::new(body);
@@ -485,6 +496,7 @@ impl TrustEnvelope {
                         .try_into()
                         .map_err(|_| EnvelopeError::Malformed("anchor fingerprint length"))?,
                 )?,
+                T_DEVICE_NAME => set_once(&mut device, read_str(&v)?)?,
                 _ => unreachable!("every type in body_fields() has an arm"),
             }
         }
@@ -509,6 +521,7 @@ impl TrustEnvelope {
                 token: token.ok_or(need("token"))?,
                 ttl_secs,
                 anchor_fingerprint: fingerprint,
+                device,
             },
             TrustKind::Delegation => TrustEnvelope::Delegation {
                 signed_delegation: wire.ok_or(need("delegation wire"))?,
@@ -812,6 +825,7 @@ mod tests {
             token: "a1b2c3d4e5f6".into(),
             ttl_secs: Some(3600),
             anchor_fingerprint: Some([0x11; ANCHOR_FINGERPRINT_LEN]),
+            device: Some("living-room-tv".into()),
         });
         round_trip(&TrustEnvelope::Invite {
             ca_prefix: "/ndn".into(),
@@ -819,7 +833,15 @@ mod tests {
             token: "tok".into(),
             ttl_secs: None,
             anchor_fingerprint: None,
+            device: None,
         });
+    }
+
+    /// The device-name hint is non-critical: a reader that does not know it
+    /// skips it and still reads the invite.
+    #[test]
+    fn the_device_hint_is_non_critical() {
+        assert!(!is_critical(T_DEVICE_NAME));
     }
 
     #[test]
@@ -892,6 +914,7 @@ mod tests {
             token: "tok123".into(),
             ttl_secs: Some(900),
             anchor_fingerprint: None,
+            device: None,
         };
         let b64 = B64.encode(e.encode());
         let mirror = e.to_https_url("join.example");

@@ -167,7 +167,7 @@ A `FilePib` directory looks like this:
   contexts/*.tc             0600  adopted signed trust contexts (newest version)
   contexts/*.versions/      0700  every version held, <N>.tc (0600), served by name
   ca/                       0700  CA state on CA hosts (certs, issued/,
-                                  revoked/, redeemed-tokens/)
+                                  revoked/, invites/, approvals/)
 ```
 
 The whole PIB is owner-only, not just the private keys, so a single rule

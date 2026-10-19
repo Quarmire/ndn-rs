@@ -310,8 +310,10 @@ secret       = 1*VCHAR                                 ; generated: 2*HEXDIG low
 expiry       = 1*DIGIT                                 ; Unix seconds, decimal, fits u64
 ```
 
-`ndn-fwd-tokens new` mints `<role>-<32 lowercase hex>` (16 random bytes by
-default). With `--ttl` it appends `-until<now + ttl>`.
+An ndn-rs CA makes invites at runtime (`CaInvites::create`, management verb
+`ca/invite-create`, see [mgmt-trust.md](mgmt-trust.md#invites)). Each token
+is `<role>-<32 lowercase hex>` (16 random bytes), with `-until<now + ttl>`
+appended when a lifetime is asked.
 
 A reader derives:
 
@@ -334,33 +336,35 @@ Producers MUST NOT emit a `secret` that contains `-until`.
 
 ### 5.2 CA rules
 
-1. A namespace CA MUST refuse to load an `admin-…` or `node-…` token. It
-   MUST scope a token with no role to `<ns>/member`. It MUST scope a
-   `member-…` or `guest-…` token to `<ns>/<role>`. A CA that is not a
-   namespace CA scopes role tokens the same way and leaves other tokens
-   unscoped.
+1. A namespace CA makes invites only for `member` and `guest`. It refuses
+   `admin` and `node`: those are certified on an admin's approval. Every
+   invite is scoped to `<ns>/<role>`. Tokens are never configured.
 2. A token with an expiry is redeemable while the CA clock is before the
-   expiry (§5.1). A CA MUST NOT load a token whose expiry is malformed;
-   ndn-rs skips it with a warning, so it is never redeemable.
-3. A token is single-use. The CA removes it atomically on redemption. If
-   the CA has durable storage, it records the redemption before approving.
-   A recorded token is never accepted again, even if it is still
-   configured. An ndn-rs CA records the redemption as the hex of
-   SHA-256(`"ndncert-token-redemption/v1"` 0x00 ‖ token), which is
-   informative.
-4. The token is refused when its scope is not a prefix of the requested key
+   expiry (§5.1).
+3. Every invite is recorded durably before its token is shown. The CA
+   stores only the hex of SHA-256(`"ndncert-token-redemption/v1"` 0x00 ‖
+   token), never the token. This form is informative. The record holds the
+   invite's id, role, scope, expiry, suggested device name, maker and
+   state, so invites survive a restart.
+4. A token is single-use. Its redemption is recorded before issuance; a
+   redemption that cannot be recorded is refused, and the token stays
+   usable. A withdrawn invite is refused from the moment its withdrawal is
+   recorded. Ended invites are forgotten 30 days after they ended.
+5. The token is refused when its scope is not a prefix of the requested key
    name. A scope or expiry refusal does not spend the token.
 
 ### 5.3 `token` challenge (ndn-rs addition)
 
-- Challenge type `token`. One CHALLENGE round. Parameter `token` holds the
-  token.
+- Every CA offers challenge type `token` (listed or not). It runs one
+  CHALLENGE round, and the parameter `token` holds the token.
 - If redeemed, the CA continues to issuance (§4.4). The attestation leaf
   has kind `token` and, for a scoped token, the evidence `token_scope`
   holding the scope in URI form.
-- If refused, status 4 with ErrorCode 7. ErrorInfo is one of: `token
-  expired`, `token is scoped to <scope>; requested name is outside it`,
-  `invalid or already-redeemed token`, `missing 'token' parameter`.
+- If refused, the answer is status 4 with ErrorCode 7. ErrorInfo starts
+  with a stable code, then `: ` and a sentence. The code is one of
+  `invite-missing`, `invite-unknown`, `invite-redeemed`, `invite-withdrawn`,
+  `invite-expired`, `invite-out-of-scope` or `invite-not-recorded`
+  (`ndn_cert::TokenDenial`, read back with `TokenDenial::of_reason`).
 
 ### 5.4 Invitee checks
 
@@ -1181,11 +1185,11 @@ Paths are relative to the workspace root. `ndn-cert` =
 | Schema rules `#approve`, `#deny`, `#pending` | `ndn-cert/roles.rs:414-422` |
 | TokenStore: redemption hash, live, consume, scope | `ndn-cert/challenge/token.rs:88,107,228,246` (`token_hash`, `live_at`, `is_live`, `check_and_consume`) |
 | `token` challenge | `ndn-cert/challenge/token.rs:296` (`impl ChallengeHandler for TokenChallenge`) |
-| CA token loading rules (role scope, untagged → member, admin/node refused, `-until` second as expiry, malformed refused) | `ndn-cert/challenge/token.rs:170-206` (`TokenStore::add_invite_tokens`) |
+| CA invites: durable records (token hash only), single use, withdrawal, expiry, scope, denial codes | `ndn-cert/challenge/token.rs` (`TokenStore`, `TokenChallenge`), `ndn-cert/invites.rs` (`CaInvites`, `HostInvites`, `TokenDenial`) |
 | ApprovalPolicy, hint mapping, RolePolicy issuance | `ndn-cert/policy.rs:368,399,536` (`ApprovalPolicy`, `from_hint`, `impl IssuancePolicy for RolePolicy`) |
 | CA enforces the advertised approval policy | `ndn-cert/ca_policy.rs:274-300` (`ApprovalPolicy::reconcile`) |
 | Invite checks (expiry `token_expired`, malformed refused, role) | `ndn-cert/invite.rs:90-155` (`InviteLink::from_envelope`) |
-| Token minting (16 bytes hex, `-until`) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:140-142,184-187,247-255` |
+| Invite making (member/guest only, 16 bytes hex, `-until`, recorded before shown) | `ndn-cert/invites.rs` (`CaInvites::create`); verbs `ndn-mgmt` `modules/ca_invites.rs`; CLI `ndn-fwd/binaries/ndn-fwd-tokens` |
 | CA: TTL ≠ 0, namespace CA, policy from context | `ndn-fwd/binaries/ndn-fwd/src/ca.rs:99-201` |
 | CA: challenge set, implied `device-approval`, invite requirement | `ndn-fwd/binaries/ndn-fwd/src/ca.rs:597-695` |
 | Requester routing table, CA prefix choice | `ndn-rs/crates/security/ndn-namespace/src/enroll.rs:395-430` (`route`) |

@@ -174,12 +174,14 @@ prefix   = "/home/bob"      # serves /home/bob/CA/{INFO,NEW,CHALLENGE,APPROVAL,P
 identity = "/home/bob/CA"   # signing identity loaded from the PIB
 
 [[ca.challenge]]
-kind   = "token"
-tokens = ["member-<hex>", "guest-<hex>"]   # from ndn-fwd-tokens new --role …
-
-[[ca.challenge]]
 kind = "device-approval"     # optional here: a namespace CA offers it anyway
 ```
+
+Every CA offers the `token` challenge over its invites. Invites are made at
+runtime against the running daemon (`ndn-fwd-tokens -c <config> new --role
+member|guest [--namespace <ns>] [--ttl 7d] [--device <name>]`; `list` and
+`withdraw <id>` too), recorded under `invites/` of the CA's directory and
+kept across restarts. They are never configured.
 
 A namespace CA offers `device-approval` even when `[[ca.challenge]]` does not
 list it (the log says so). Pending requests are kept in
@@ -189,18 +191,17 @@ the CA host it decides as the local operator; on another node holding an
 admin certificate of the namespace it signs the decision with that admin key
 and pushes it to `/<prefix>/CA/APPROVAL` (listing via `/<prefix>/CA/PENDING`).
 
-Invite tokens carry their role: `ndn-fwd-tokens new --ca /home/bob --namespace
-/home/bob --role member|guest` (default `member`) mints `member-<hex>` /
-`guest-<hex>`, and the CA scopes such a token to `/<ns>/<role>`, so it cannot
-certify another role. `--role admin` (and `node`) is refused: those
-certificates need an admin's approval (`ndn-fwd enroll <anchor link> --role
-admin` on the device, `ndn-fwd approvals approve <code>` by an admin), and a
-namespace CA refuses to start with an `admin-…` or `node-…` token in its
-config. Tokens without a role
-prefix are scoped to `/<ns>/member`. Because every token is scoped, a request
-for a name the token cannot certify is refused before the token is spent.
+Invites carry their role. `ndn-fwd-tokens -c <config> new --role
+member|guest` (default `member`) makes a `member-<hex>` or `guest-<hex>`
+token, and the CA scopes it to `/<ns>/<role>`, so it cannot certify another
+role. `--role admin` (and `node`) is refused with the code
+`invite-role-needs-approval`: those certificates need an admin's approval
+(`ndn-fwd enroll <anchor link> --role admin` on the device,
+`ndn-fwd approvals approve <code>` by an admin). Because every invite is
+scoped, a request for a name it cannot certify is refused before it is
+spent.
 
-A CA with no challenge refuses to start; `kind = "nop"` (auto-approve) must be
+A CA that lists no challenge admits by invite only. `kind = "nop"` (auto-approve) must be
 listed explicitly. `ephemeral = true` replaces the PIB identity with a
 throwaway self-signed key for demos; an ephemeral CA keeps issuing any
 challenge-passing name under its prefix (no `RolePolicy`).

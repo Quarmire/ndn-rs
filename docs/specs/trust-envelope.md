@@ -109,7 +109,8 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0471` | FormatVersion | in Envelope | 1 byte, `01` | all |
 | `0x0472` | Kind | in Envelope | 1 byte: kind code (§3) | all |
 | `0x0473` | Body | in Envelope | nested: the body fields below | all |
-| `0x0474`–`0x0480` | — | — | unassigned | — |
+| `0x0474` | DeviceName | in Body | UTF-8 device name (one name component) | invite (optional): the device name the inviter suggests, a hint and not a constraint. Even type, so a reader that does not know it skips it. |
+| `0x0475`–`0x0480` | — | — | unassigned | — |
 | `0x0481` | Version | in Body | u64 (§4.4) | anchor: context version |
 | `0x0482` | Wire | in Body | opaque bytes | anchor: legacy unsigned context Content; delegation: signed delegation; recovery: bundle; bag: SafeBag |
 | `0x0483` | CaPrefix | in Body | NDN name string (§4.4) | invite |
@@ -143,7 +144,7 @@ and `*` a field that repeats zero or more times.
 | Kind | Body fields, in canonical order |
 |---|---|
 | anchor | Namespace?, AnchorFingerprint?, Version?, ContextData?, Wire? |
-| invite | CaPrefix, IdentityNamespace, Token, TtlSecs?, AnchorFingerprint? |
+| invite | CaPrefix, IdentityNamespace, Token, TtlSecs?, AnchorFingerprint?, DeviceName? |
 | delegation | Wire, PrincipalPubkey |
 | recovery | Wire |
 | bag | KeyName, Wire, Namespace?, AnchorFingerprint? |
@@ -804,8 +805,8 @@ means the decode succeeds.
   change; the nonce is the replay guard. `ndn-pair-kiosk` now draws a fresh nonce.
 - **Q16 Name strings.** Producers emit the canonical URI form; parsers do not check it, and
   consumers compare parsed Names (§4.4). Equal values give byte-identical envelopes without a
-  Name codec in the envelope layer. `ndn-fwd-tokens` (`--ca`) and `ndn-pair-kiosk` now
-  canonicalize their input.
+  Name codec in the envelope layer. The CA's invite maker (`ndn_cert::CaInvites::create`)
+  and `ndn-pair-kiosk` emit Names in canonical form.
 
 ## Appendix A. Code references (non-normative)
 
@@ -845,8 +846,8 @@ Paths are relative to the workspace root. Code in `ndn-fwd` may move to library 
 | Namespace init emits inline signed anchor | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:159-165` |
 | Init anchor link has a QR form within the shared limit (inline or by reference) | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:589-611` |
 | `ndn-fwd init` prints `anchor_uri`, `anchor_url` (ndn.local), `anchor_uri_fp`, QR hint by size | `ndn-fwd/binaries/ndn-fwd/src/onboard.rs:472-497` |
-| Invite emission, canonical `--ca`, TtlSecs = remaining token life, mirror via `--domain` | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:214-233` |
-| QR rendering (`qr::encode`, ASCII 2×1, SVG ≥256 px, 0600) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs:261-287` |
+| Invite emission (CA prefix and scope as Names, TtlSecs = remaining token life, DeviceName hint) | `ndn-rs/crates/security/ndn-cert/src/invites.rs` (`CaInvites::create`) |
+| Mirror via `--domain`; QR rendering (`qr::encode`, ASCII 2×1, SVG ≥256 px, 0600) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs` (`shown_link`, `render_qr`) |
 | Context authoring: signed vs unsigned legacy anchor; QR via `qr_uri` | `ndn-fwd/binaries/ndn-trust-context/src/lib.rs:103-148`; `ndn-fwd/binaries/ndn-trust-context/src/main.rs:142-206` |
 | QR rendering in `ndn-trust-context` | `ndn-fwd/binaries/ndn-trust-context/src/main.rs:274-298` |
 | Dev emitter, QR via `qr::encode` | `ndn-rs/crates/security/ndn-trust-envelope/examples/emit.rs:47-58` |

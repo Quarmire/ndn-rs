@@ -183,11 +183,14 @@ Each flow lists steps, what is stored where, failure handling, and status
 3. Optional: delegate the CA to a relay (F3).
 
 ### F2 Add a device
-- **By invite (token):** an admin creates an invite (`ndn-fwd-tokens new
-  --role member|guest --anchor-fp <fp> [--ttl <dur>]`, **have**; the token
-  carries its role and, with `--ttl`, its expiry, and the CA scopes it to
-  `/<ns>/<role>` and refuses it once expired) → QR/link carries CA prefix,
-  namespace, token, expected root fingerprint. New device: `ndn-fwd enroll
+- **By invite (token):** an admin makes an invite at the running CA
+  (`ca/invite-create`; CLI `ndn-fwd-tokens new [--namespace <ns>] --role
+  member|guest [--ttl <dur>] [--device <name>]`, **have**; `list` and
+  `withdraw <id>` too). The CA records it durably, keeping only a hash of
+  the token, scopes the token to `/<ns>/<role>` and refuses it once it is
+  expired, withdrawn or redeemed. The QR or link carries the CA prefix,
+  namespace, token, expected root fingerprint and optionally a suggested
+  device name. New device: `ndn-fwd enroll
   <invite> [--device <name>]` = adopt the trust context by namespace +
   expected fingerprint if not held (no version floor: an invite names none),
   generate the device key in the daemon's PIB, enroll with the token, check
@@ -263,10 +266,10 @@ Each flow lists steps, what is stored where, failure handling, and status
   with its role) or *owner* (holds the root key). `security/memberships`
   answers a JSON list of `{namespace, version, relation, role, identity,
   key, valid_until, node_identity, root_fingerprint}`; each change (adopted,
-  enrolled, renewed, revoked, root-changed) is published as JSON
-  `{namespace, relation, change, detail}` at
-  `/localhost/nfd/security/notifications`; `ndn-ctl status` prints them as
-  "trusted prefixes".
+  enrolled, renewed, revoked, root-changed) is a `membership-changed` event
+  of the trust stream `/localhost/nfd/security/notifications` (identifiers
+  and states only; `mgmt-trust.md`, "Notifications"); `ndn-ctl status`
+  prints the memberships as "trusted prefixes".
 
 ### F3 Delegate the CA to a relay
 1. The relay generates `/<ns>/CA` key locally; produces a cert request.
@@ -447,7 +450,7 @@ local segment (§9).
 <pib>/contexts/*.versions/<N>.tc  every version held, served by exact name
                       so nodes behind can follow version by version
 <pib>/ca/<hex>/       per namespace CA: CA cert, anchor cert, node cert,
-                      issued/, revoked/, redeemed-tokens/, approvals/ (CA
+                      issued/, revoked/, invites/, approvals/ (CA
                       hosts only; a PIB from before several CAs keeps its
                       one CA directly in <pib>/ca/)
 <pib>/root/<hex>/     root store of each namespace a root device holds the

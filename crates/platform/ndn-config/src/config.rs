@@ -200,15 +200,18 @@ fn default_observability_sample() -> f64 {
 /// (issued by the namespace root) are written by `ndn-fwd init --namespace <ns>`
 /// into the CA's directory (`ndn_cert::namespace::ca_dir`:
 /// `<pib_path>/ca/<hex of the namespace URI>/`, or `<pib_path>/ca/` for the
-/// CA a PIB from before several CAs holds), where issued certs and
-/// revocations persist too. With `ephemeral = true` the CA instead mints a
+/// CA a PIB from before several CAs holds), where issued certs, revocations
+/// and invites persist too. With `ephemeral = true` the CA instead mints a
 /// throwaway self-signed key at every start (demo only: certs it issued
-/// stop verifying after a restart).
+/// stop verifying after a restart, and its invites live in memory only).
 ///
-/// The CA refuses to start with no challenge configured: list them under
-/// `[[ca.challenge]]` (or the legacy `tokens`). `nop` (auto-approve) is
-/// only offered when listed explicitly.
+/// Every CA offers the `token` challenge, which redeems its invites: they
+/// are made at runtime by a trust administrator of the node (mgmt
+/// `ca/invite-create`), never configured here. List other challenges under
+/// `[[ca.challenge]]`; `nop` (auto-approve) is only offered when listed
+/// explicitly. Unknown keys are refused.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaTomlConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -225,12 +228,9 @@ pub struct CaTomlConfig {
     /// `identity` from the PIB. Demo only; logged as a warning.
     #[serde(default)]
     pub ephemeral: bool,
-    /// Legacy shortcut for a single `token` challenge with these one-time
-    /// invite tokens. Ignored when `challenge` is non-empty.
-    #[serde(default)]
-    pub tokens: Vec<String>,
-    /// Explicit challenge set — the CA offers exactly these. Serialized as
-    /// `[[ca.challenge]]` array-of-tables.
+    /// Explicit challenge set — the CA offers these, plus `token` (its
+    /// invites) and, on a namespace CA, `device-approval` when unlisted.
+    /// Serialized as `[[ca.challenge]]` array-of-tables.
     #[serde(default, rename = "challenge")]
     pub challenges: Vec<ChallengeConfig>,
     /// Embed a challenge attestation (how the challenge was satisfied) in each
@@ -491,18 +491,18 @@ impl<'de> Deserialize<'de> for CertValidityDays {
 /// `nop`, `token`, `pin`, `email`, `device-approval`. (`possession`/`yubikey`
 /// need certs / secrets, so they're wired in code.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeConfig {
     /// `nop` | `token` | `pin` | `email` | `device-approval`.
-    /// `device-approval` holds each request durably until an admin decides
+    /// `token` redeems the CA's invites (made at runtime; listing it only
+    /// places it in the offer order). `device-approval` holds each request
+    /// durably until an admin decides
     /// it: the CA host's local operator (`ndn-fwd approvals approve|deny`
     /// there), or an admin device's signed decision pushed to
     /// `/<prefix>/CA/APPROVAL` (`ndn-fwd approvals` on that device). A
     /// namespace CA offers it even when unlisted, for the roles its trust
     /// context certifies on approval.
     pub kind: String,
-    /// `token`: one-time invite tokens.
-    #[serde(default)]
-    pub tokens: Vec<String>,
     /// `pin`: the shared PIN (hashed by the handler).
     #[serde(default)]
     pub pin: Option<String>,
@@ -650,7 +650,6 @@ impl Default for CaTomlConfig {
             prefix: Self::default_prefix(),
             identity: Self::default_identity(),
             ephemeral: false,
-            tokens: Vec::new(),
             challenges: Vec::new(),
             emit_attestations: false,
             require_attestation: None,
@@ -3093,8 +3092,7 @@ mod tests {
 
         let two: ForwarderConfig = "[[ca]]\nenabled = true\nprefix = \"/home/bob\"\n\
              identity = \"/home/bob/CA\"\n[[ca.challenge]]\nkind = \"nop\"\n\
-             [[ca]]\nenabled = true\nprefix = \"/home/alice\"\nidentity = \"/home/alice/CA\"\n\
-             tokens = [\"t\"]\n"
+             [[ca]]\nenabled = true\nprefix = \"/home/alice\"\nidentity = \"/home/alice/CA\"\n"
             .parse()
             .unwrap();
         let ids: Vec<&str> = two.ca.iter().map(|c| c.identity.as_str()).collect();
@@ -3460,6 +3458,20 @@ channel = 161
             cfg.security.mgmt.trust_anchor_pib.as_deref(),
             Some("/etc/ndn/mgmt-pib")
         );
+    }
+
+    /// Invites are made at runtime, never configured: a leftover `[ca]
+    /// tokens` (or a challenge's `tokens`) is refused, not silently dropped.
+    #[test]
+    fn ca_tokens_are_refused() {
+        for bad in [
+            "[ca]\nenabled = true\ntokens = [\"member-ab\"]\n",
+            "[ca]\nenabled = true\n[[ca.challenge]]\nkind = \"token\"\ntokens = [\"x\"]\n",
+        ] {
+            assert!(ForwarderConfig::from_str(bad).is_err(), "{bad}");
+        }
+        let good = "[ca]\nenabled = true\n[[ca.challenge]]\nkind = \"token\"\n";
+        assert!(ForwarderConfig::from_str(good).is_ok());
     }
 
     #[test]

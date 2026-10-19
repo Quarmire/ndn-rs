@@ -10,10 +10,13 @@ ndn-fwd enroll 'ndn-trust://invite/…' [--device <name>] [--force] [-c ndn-fwd.
 
 ## Concept
 
-An invite (`ndn-fwd-tokens new --ca /<ns> --namespace /<ns> --anchor-fp <fp>
---role member|guest`) carries the CA prefix, the identity namespace
-`/<ns>/<role>`, a one-time token the CA scopes to that role, and the
-fingerprint of the namespace's root anchor. Enrolling with it does two
+An invite is made at the namespace's running CA by a trust administrator of
+its host: the management verb `ca/invite-create`, or `ndn-fwd-tokens -c
+<config> new [--namespace /<ns>] --role member|guest [--ttl <dur>]
+[--device <name>]` (see the [management spec](../../../specs/mgmt-trust.md#invites)).
+It carries the CA prefix, the identity namespace `/<ns>/<role>`, a one-time
+token the CA scopes to that role, the fingerprint of the namespace's root
+anchor and, optionally, a suggested device name. Enrolling with it does two
 things:
 
 1. **Adopt the trust context** for `/<ns>` if the device holds none — the
@@ -25,17 +28,21 @@ things:
 2. **Enroll** (NDNCERT 0.3, `token` challenge): a key generated on the
    device is certified by `/<ns>/CA` as `/<ns>/<role>/<device>/KEY/<id>`.
 
-A token admits only `member` or `guest`; admin and node certificates need an
-admin's approval. A role-carrying token (`member-…`, `guest-…`) must match
-the invite's role (checked locally), and the CA refuses any request outside
-the token's scope. `ndn-fwd-tokens qr` for a token without a role prefix
-makes a member invite (the namespace CA scopes such a token to members).
+An invite admits only `member` or `guest`; admin and node certificates need
+an admin's approval. Its token carries its role (`member-…`, `guest-…`),
+which must match the invite's role (checked locally), and the CA refuses any
+request outside the token's scope.
 
-An invite expires when its token was minted with `ndn-fwd-tokens new --ttl
-<dur>`: the token carries its expiry (`…-until<unix-secs>`), so the CA, which
-reads `[ca] tokens` from its config, refuses it after that time, and `ndn-fwd
-enroll` refuses the invite before contacting the CA. A token minted without
-`--ttl` stays redeemable until it is used.
+The CA keeps its invites durably under `invites/` of its directory, storing
+only a hash of each token, so an invite survives a restart. An invite made
+with `--ttl <dur>` carries its expiry in the token (`…-until<unix-secs>`): the
+CA refuses it after that time, and `ndn-fwd enroll` refuses it before
+contacting the CA. Without `--ttl` it stays redeemable until it is redeemed or
+withdrawn (`ndn-fwd-tokens withdraw <id>`). The CA lists its invites with
+`ndn-fwd-tokens list`.
+
+`ndn-fwd enroll` names the device after `--device`, else the device name the
+invite suggests, else the host name.
 
 A device name holds one certified key at a time. The namespace CA (`RolePolicy`)
 refuses to certify a key for `/<ns>/<role>/<device>` while it holds a valid,
@@ -148,7 +155,7 @@ output reminds the operator to add that key to every DV neighbour's
 | held context from another root | 403 | the two fingerprints |
 | no route / no answer | 504 | the device needs a link and a route for `/<ns>` toward a forwarder that serves it (an invite carries no host, so enrolling never creates them) |
 | invite expired (`--ttl`) | 400/403 | the expiry; ask for a new invite (refused by the CLI before anything is sent, and by the CA) |
-| token spent or out of scope | 403 | the CA's reason; ask for a new invite |
+| token spent, withdrawn, expired or out of scope | 403 | the CA's reason (its denial starts with a stable code: `invite-redeemed`, `invite-withdrawn`, `invite-expired`, `invite-out-of-scope`, …); ask for a new invite |
 | unauthorized local user | 403 | who may enroll and how to grant it |
 
 ## Code

@@ -1,0 +1,301 @@
+//! `/localhost/nfd/ca/{invite-create,invite-list,invite-withdraw}` — the
+//! invites of this node's CAs, through its [`InviteMgmtBackend`].
+//!
+//! Every verb is a trust change (`auth::TRUST_ADMIN_VERBS`): it reaches this
+//! module only from a local operator on the management socket, never over
+//! `/localhop`. The operator the kernel attests is recorded as the invite's
+//! maker.
+//!
+//! `ControlParameters.name` names the CA by its namespace or prefix (absent:
+//! the node's only CA; `invite-list` then lists every CA's). `invite-create`
+//! takes a JSON [`ndn_cert::InviteRequest`] in `Uri` and answers the JSON
+//! [`ndn_cert::CreatedInvite`] (the only time the token is shown);
+//! `invite-list` answers a JSON list of [`ndn_cert::CaInviteListing`];
+//! `invite-withdraw` takes the invite id in `Uri` and answers the withdrawn
+//! [`ndn_cert::InviteEntry`]. A refusal is a [`crate::TrustRefusal`] as JSON
+//! ([`crate::refusal_response`]).
+
+use std::sync::Arc;
+
+use ndn_cert::report::code;
+use ndn_mgmt_wire::{
+    ControlParameters, ControlResponse, control_response::status, nfd_command::verb,
+};
+
+use crate::{InviteMgmtBackend, MgmtResponse, TrustRefusal, refusal_response};
+
+/// Whether `verb_name` is one of this module's verbs.
+pub(crate) fn is_invite_verb(verb_name: &[u8]) -> bool {
+    [
+        verb::INVITE_CREATE,
+        verb::INVITE_LIST,
+        verb::INVITE_WITHDRAW,
+    ]
+    .contains(&verb_name)
+}
+
+pub(crate) fn handle_invites(
+    verb_name: &[u8],
+    params: ControlParameters,
+    handler: Option<&Arc<dyn InviteMgmtBackend>>,
+    operator: &str,
+) -> MgmtResponse {
+    answer(verb_name, params, handler, operator)
+        .unwrap_or_else(|refusal| refusal_response(&refusal))
+        .into()
+}
+
+fn answer(
+    verb_name: &[u8],
+    params: ControlParameters,
+    handler: Option<&Arc<dyn InviteMgmtBackend>>,
+    operator: &str,
+) -> Result<ControlResponse, TrustRefusal> {
+    let Some(handler) = handler else {
+        return Err(TrustRefusal::new(
+            code::INVITE_NO_CA,
+            "this node runs no CA, so it makes no invites",
+        ));
+    };
+    let ca = params.name.as_ref();
+    let uri = params
+        .uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match verb_name {
+        v if v == verb::INVITE_CREATE => {
+            let raw = uri.ok_or_else(|| {
+                missing(
+                    "invite-create",
+                    "a JSON invite request: role, ttl_secs, device",
+                )
+            })?;
+            let request: ndn_cert::InviteRequest = serde_json::from_str(raw).map_err(|e| {
+                TrustRefusal::new(
+                    code::INVITE_REQUEST_INVALID,
+                    format!("the invite request is not readable: {e}"),
+                )
+                .with("error", e)
+            })?;
+            json(&handler.create(ca, &request, operator)?)
+        }
+        v if v == verb::INVITE_LIST => json(&handler.list(ca)?),
+        v if v == verb::INVITE_WITHDRAW => {
+            let id = uri.ok_or_else(|| missing("invite-withdraw", "the invite id"))?;
+            json(&handler.withdraw(ca, id)?)
+        }
+        _ => Ok(ControlResponse::error(status::NOT_FOUND, "unknown ca verb")),
+    }
+}
+
+/// The refusal of a verb whose `Uri` is missing.
+fn missing(operation: &str, expects: &str) -> TrustRefusal {
+    TrustRefusal::new(
+        code::MISSING_PARAMETER,
+        format!("{operation} needs {expects} in Uri"),
+    )
+    .with("operation", operation)
+    .with("parameter", "Uri")
+    .with("expects", expects)
+}
+
+/// A success carrying `value` as JSON in the status text.
+fn json<T: serde::Serialize>(value: &T) -> Result<ControlResponse, TrustRefusal> {
+    Ok(match serde_json::to_string(value) {
+        Ok(text) => ControlResponse::ok_empty(text),
+        // Strings, numbers and lists of them always serialize.
+        Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_cert::{CaInvites, HostInvites, InviteIssuer, TokenStore};
+    use ndn_packet::Name;
+
+    fn host(namespaces: &[&str]) -> Arc<dyn InviteMgmtBackend> {
+        Arc::new(HostInvites::new(
+            namespaces
+                .iter()
+                .map(|ns| {
+                    let ns: Name = ns.parse().unwrap();
+                    CaInvites::new(
+                        TokenStore::new(),
+                        InviteIssuer {
+                            ca_prefix: ns.clone(),
+                            namespace: ns,
+                            expected_fingerprint: Some([1; 32]),
+                        },
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    fn call(
+        verb_name: &[u8],
+        ca: Option<&str>,
+        uri: Option<&str>,
+        handler: Option<&Arc<dyn InviteMgmtBackend>>,
+    ) -> ControlResponse {
+        let params = ControlParameters {
+            name: ca.map(|c| c.parse().unwrap()),
+            uri: uri.map(str::to_owned),
+            ..Default::default()
+        };
+        match handle_invites(verb_name, params, handler, "uid 1000 (alice)") {
+            MgmtResponse::Control(resp) => *resp,
+            _ => panic!("invite verbs answer at once"),
+        }
+    }
+
+    fn refusal_code(resp: &ControlResponse) -> String {
+        let refusal: TrustRefusal = serde_json::from_str(&resp.status_text).unwrap();
+        assert_eq!(resp.status_code, refusal.status_code);
+        refusal.code
+    }
+
+    /// Create, list and withdraw answer typed JSON; the maker is the
+    /// operator; the list shows no token.
+    #[test]
+    fn create_list_withdraw() {
+        let backend = host(&["/home/bob"]);
+        let made = call(
+            verb::INVITE_CREATE,
+            None,
+            Some(r#"{"role":"guest","ttl_secs":3600,"device":"tv"}"#),
+            Some(&backend),
+        );
+        assert!(made.is_ok(), "{}", made.status_text);
+        let made: ndn_cert::CreatedInvite = serde_json::from_str(&made.status_text).unwrap();
+        assert_eq!(made.info.role.as_deref(), Some("guest"));
+        assert_eq!(made.info.device.as_deref(), Some("tv"));
+        assert_eq!(made.info.created_by, "uid 1000 (alice)");
+        assert!(made.link.starts_with("ndn-trust://invite"));
+
+        let listed = call(verb::INVITE_LIST, None, None, Some(&backend));
+        assert!(!listed.status_text.contains(&made.token));
+        let listed: Vec<ndn_cert::CaInviteListing> =
+            serde_json::from_str(&listed.status_text).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].invites[0].id, made.id);
+
+        let gone = call(
+            verb::INVITE_WITHDRAW,
+            Some("/home/bob"),
+            Some(&made.id),
+            Some(&backend),
+        );
+        let gone: ndn_cert::InviteEntry = serde_json::from_str(&gone.status_text).unwrap();
+        assert_eq!(gone.info.state, ndn_cert::InviteState::Withdrawn);
+        let again = call(verb::INVITE_WITHDRAW, None, Some(&made.id), Some(&backend));
+        assert_eq!(refusal_code(&again), code::INVITE_ALREADY_WITHDRAWN.code);
+    }
+
+    /// Every refusal is coded: no CA, several CAs unnamed, a bad request, a
+    /// missing parameter.
+    #[test]
+    fn refusals_are_coded() {
+        let none = call(verb::INVITE_LIST, None, None, None);
+        assert_eq!(refusal_code(&none), code::INVITE_NO_CA.code);
+        let two = host(&["/home/bob", "/work/acme"]);
+        let member = Some(r#"{"role":"member"}"#);
+        let several = call(verb::INVITE_CREATE, None, member, Some(&two));
+        assert_eq!(refusal_code(&several), code::INVITE_SEVERAL_CAS.code);
+        let unknown = call(verb::INVITE_CREATE, Some("/nope"), member, Some(&two));
+        assert_eq!(refusal_code(&unknown), code::INVITE_CA_UNKNOWN.code);
+        assert!(call(verb::INVITE_CREATE, Some("/work/acme"), member, Some(&two)).is_ok());
+        let bad = call(
+            verb::INVITE_CREATE,
+            Some("/work/acme"),
+            Some("member"),
+            Some(&two),
+        );
+        assert_eq!(refusal_code(&bad), code::INVITE_REQUEST_INVALID.code);
+        let admin = call(
+            verb::INVITE_CREATE,
+            Some("/work/acme"),
+            Some(r#"{"role":"admin"}"#),
+            Some(&two),
+        );
+        assert_eq!(refusal_code(&admin), code::INVITE_ROLE_NEEDS_APPROVAL.code);
+        for v in [verb::INVITE_CREATE, verb::INVITE_WITHDRAW] {
+            let missing = call(v, Some("/work/acme"), None, Some(&two));
+            assert_eq!(refusal_code(&missing), code::MISSING_PARAMETER.code);
+        }
+        let listed = call(verb::INVITE_LIST, None, None, Some(&two));
+        let listed: Vec<ndn_cert::CaInviteListing> =
+            serde_json::from_str(&listed.status_text).unwrap();
+        assert_eq!(listed.len(), 2, "a listing names every CA");
+    }
+
+    /// The observer publishes created, redeemed and withdrawn events naming
+    /// the CA, the id and the role, never the token.
+    #[test]
+    fn invite_changes_reach_the_trust_stream() {
+        use crate::TrustEvent;
+        use ndn_mgmt_wire::events::EventSink;
+
+        #[derive(Default)]
+        struct Seen(parking_lot::Mutex<Vec<TrustEvent>>);
+        impl EventSink<TrustEvent> for Seen {
+            fn publish(&self, event: TrustEvent) {
+                self.0.lock().push(event);
+            }
+        }
+        let seen = Arc::new(Seen::default());
+        let ns: Name = "/home/bob".parse().unwrap();
+        let tokens = TokenStore::new();
+        tokens.set_observer(crate::events::invite_observer(ns.to_string(), seen.clone()));
+        let ca = CaInvites::new(
+            tokens,
+            InviteIssuer {
+                ca_prefix: ns.clone(),
+                namespace: ns.clone(),
+                expected_fingerprint: None,
+            },
+        );
+        let request = |role: &str| ndn_cert::InviteRequest {
+            role: role.into(),
+            ..Default::default()
+        };
+        let used = ca.create(&request("member"), "").unwrap();
+        let gone = ca.create(&request("guest"), "").unwrap();
+        let device: Name = "/home/bob/member/phone".parse().unwrap();
+        assert_eq!(
+            ca.tokens().consume_for(&used.token, &device),
+            ndn_cert::TokenCheck::Ok
+        );
+        ca.withdraw(&gone.id).unwrap();
+        let bob = || "/home/bob".to_owned();
+        let member = Some("member".to_owned());
+        assert_eq!(
+            *seen.0.lock(),
+            [
+                TrustEvent::InviteCreated {
+                    ca: bob(),
+                    id: used.id.clone(),
+                    role: member.clone()
+                },
+                TrustEvent::InviteCreated {
+                    ca: bob(),
+                    id: gone.id.clone(),
+                    role: Some("guest".into())
+                },
+                TrustEvent::InviteRedeemed {
+                    ca: bob(),
+                    id: used.id.clone(),
+                    role: member
+                },
+                TrustEvent::InviteWithdrawn {
+                    ca: bob(),
+                    id: gone.id.clone()
+                },
+            ]
+        );
+        let json = serde_json::to_string(&*seen.0.lock()).unwrap();
+        assert!(!json.contains(&used.token) && !json.contains(&gone.token));
+    }
+}

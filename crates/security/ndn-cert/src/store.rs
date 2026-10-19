@@ -1,20 +1,22 @@
 //! Durable CA state: the issued certificates a CA serves on cert-fetch, its
-//! revocation set, the one-time tokens already redeemed and the requests
-//! for an admin's approval.
+//! revocation set, its invites and the requests for an admin's approval.
 //! [`CaState::with_store`](crate::CaState::with_store) loads a [`CaSnapshot`]
 //! at construction and writes every new issuance / revocation through the
 //! [`CaStore`] before it takes effect, so a restarted CA keeps serving the
 //! certs it issued and keeps refusing the ones it revoked;
 //! [`TokenStore::with_store`](crate::TokenStore::with_store) does the same
-//! for token redemptions, so a redeemed invite stays spent across restarts,
-//! and [`ApprovalStore::with_store`](crate::approval::ApprovalStore::with_store)
+//! for invites (made, redeemed, withdrawn), so an invite made at runtime
+//! survives a restart and a redeemed one stays spent, and
+//! [`ApprovalStore::with_store`](crate::approval::ApprovalStore::with_store)
 //! for approval records, so a pending request survives a restart.
 
 use std::path::{Path, PathBuf};
 
 use ndn_security::secure_fs;
 
-use crate::{approval::ApprovalRecord, ca::deserialize_cert, error::CertError};
+use crate::{
+    approval::ApprovalRecord, ca::deserialize_cert, error::CertError, invites::InviteRecord,
+};
 
 /// What a [`CaStore`] holds, as loaded at CA startup.
 #[derive(Debug, Default, Clone)]
@@ -32,21 +34,28 @@ pub trait CaStore: Send + Sync {
     fn record_issued(&self, cert_name: &str, wire: &[u8]) -> Result<(), CertError>;
     /// Durably record a revocation.
     fn record_revoked(&self, cert_name: &str) -> Result<(), CertError>;
-    /// Hashes of the one-time tokens already redeemed (see
+    /// The CA's invite records (see
     /// [`TokenStore::with_store`](crate::TokenStore::with_store)). The
-    /// default refuses: a store that cannot persist redemptions must not
-    /// back a single-use token challenge.
-    fn redeemed_tokens(&self) -> Result<Vec<String>, CertError> {
+    /// default refuses: a store that cannot persist invites must not back a
+    /// single-use token challenge.
+    fn invite_records(&self) -> Result<Vec<InviteRecord>, CertError> {
         Err(CertError::Storage(
-            "this CA store does not persist token redemptions".into(),
+            "this CA store does not persist invites".into(),
         ))
     }
-    /// Durably record that the token hashing to `token_hash` was redeemed.
-    /// Only the hash is ever given to the store, never the token itself.
-    fn record_redeemed_token(&self, token_hash: &str) -> Result<(), CertError> {
-        let _ = token_hash;
+    /// Durably record (create or replace) an invite record. A record holds
+    /// only a hash of the invite's token, never the token itself.
+    fn record_invite(&self, record: &InviteRecord) -> Result<(), CertError> {
+        let _ = record;
         Err(CertError::Storage(
-            "this CA store does not persist token redemptions".into(),
+            "this CA store does not persist invites".into(),
+        ))
+    }
+    /// Remove the invite record `id` (ended long enough ago to forget).
+    fn remove_invite(&self, id: &str) -> Result<(), CertError> {
+        let _ = id;
+        Err(CertError::Storage(
+            "this CA store does not persist invites".into(),
         ))
     }
     /// The approval records (see
@@ -80,7 +89,7 @@ pub trait CaStore: Send + Sync {
 /// ```text
 /// issued/<sha256(name-uri)>.data   signed certificate Data TLV
 /// revoked/<sha256(name-uri)>       revoked certificate name URI
-/// redeemed-tokens/<sha256(hash)>   hash of a redeemed one-time token
+/// invites/<sha256(id)>.json        invite record (JSON; a hash of the token)
 /// approvals/<sha256(id)>.json      approval record (JSON)
 /// ```
 ///
@@ -91,7 +100,7 @@ pub trait CaStore: Send + Sync {
 /// than failing startup.
 ///
 /// The store is owner-only (directories `0700`, entries `0600`, via
-/// [`ndn_security::secure_fs`]): the redeemed-token hashes and the issuance
+/// [`ndn_security::secure_fs`]): the invite records and the issuance
 /// record are the CA's private state. Opening an existing store tightens
 /// group/other-accessible entries and refuses ones owned by another user.
 pub struct FileCaStore {
@@ -102,7 +111,7 @@ impl FileCaStore {
     /// Open (creating if needed) a store rooted at `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, CertError> {
         let dir = dir.into();
-        for sub in ["issued", "revoked", REDEEMED_TOKENS_DIR, APPROVALS_DIR] {
+        for sub in ["issued", "revoked", INVITES_DIR, APPROVALS_DIR] {
             secure_fs::create_private_dir_all(&dir.join(sub))
                 .map_err(|e| io_err(&dir.join(sub), e))?;
         }
@@ -168,28 +177,36 @@ impl CaStore for FileCaStore {
         Self::write_atomic(&path, cert_name.as_bytes())
     }
 
-    fn redeemed_tokens(&self) -> Result<Vec<String>, CertError> {
-        let dir = self.dir.join(REDEEMED_TOKENS_DIR);
-        let mut hashes = Vec::new();
+    fn invite_records(&self) -> Result<Vec<InviteRecord>, CertError> {
+        let dir = self.dir.join(INVITES_DIR);
+        let mut records = Vec::new();
         for entry in std::fs::read_dir(&dir).map_err(|e| io_err(&dir, e))? {
             let path = entry.map_err(|e| io_err(&dir, e))?.path();
-            if path.extension().is_some() {
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let hash = std::fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
-            let hash = hash.trim();
-            if !hash.is_empty() {
-                hashes.push(hash.to_string());
-            }
+            let bytes = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
+            // An unreadable record fails the load (fail closed): skipping it
+            // could forget that its invite was redeemed or withdrawn.
+            let record = serde_json::from_slice::<InviteRecord>(&bytes)
+                .map_err(|e| CertError::Storage(format!("{}: {e}", path.display())))?;
+            records.push(record);
         }
-        Ok(hashes)
+        Ok(records)
     }
 
-    fn record_redeemed_token(&self, token_hash: &str) -> Result<(), CertError> {
-        // The token hash is already a fixed-length hex digest, but hash it
-        // again for the file name so a malformed value can never escape `dir`.
-        let path = self.dir.join(REDEEMED_TOKENS_DIR).join(hex(token_hash));
-        Self::write_atomic(&path, token_hash.as_bytes())
+    fn record_invite(&self, record: &InviteRecord) -> Result<(), CertError> {
+        let path = self.invite_path(&record.id);
+        Self::write_atomic(&path, &serde_json::to_vec_pretty(record)?)
+    }
+
+    fn remove_invite(&self, id: &str) -> Result<(), CertError> {
+        let path = self.invite_path(id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&path, e)),
+        }
     }
 
     fn approval_records(&self) -> Result<Vec<ApprovalRecord>, CertError> {
@@ -233,9 +250,13 @@ impl FileCaStore {
             .join(APPROVALS_DIR)
             .join(format!("{}.json", hex(request_id)))
     }
+
+    fn invite_path(&self, id: &str) -> PathBuf {
+        self.dir.join(INVITES_DIR).join(format!("{}.json", hex(id)))
+    }
 }
 
-const REDEEMED_TOKENS_DIR: &str = "redeemed-tokens";
+const INVITES_DIR: &str = "invites";
 const APPROVALS_DIR: &str = "approvals";
 
 fn hex(s: &str) -> String {

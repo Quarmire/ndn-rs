@@ -210,10 +210,10 @@ sends its certificate and its issuer chain with the renewal), and serves that
 earlier CA's certificate from then on, so validators that fetch it by name
 still find it. See [certificate renewal](./renewal.md).
 
-**Re-enrolling after `compromised`.** On the new root device mint invites
-(`ndn-fwd-tokens new --ca <ns> --namespace <ns> --anchor-fp <new root
-fingerprint> --role member`); on each device, once it holds `N+1`
-(`ndn-fwd context refresh`), `ndn-fwd enroll <invite> --force`.
+**Re-enrolling after `compromised`.** Once the new root device runs its CA,
+make invites there (`ndn-fwd-tokens -c <config> new --role member`). They
+carry the new root's fingerprint. On each device, once it holds `N+1`
+(`ndn-fwd context refresh`), run `ndn-fwd enroll <invite> --force`.
 
 ## How other nodes follow
 
@@ -245,17 +245,17 @@ not yet authenticated context lists (a forger could list any public key).
 adopt it. That is why the new root signs `N+2` right away: from then on the
 newest version is root-signed, and the new root's fingerprint (`anchor_fp`
 in `recover`'s output) is the namespace's expected fingerprint again. The
-anchor link `recover` prints carries it with `N+2` inline, and invites are
-minted with it:
+anchor link `recover` prints carries it with `N+2` inline. Invites made at
+the new root's CA carry it too:
 
 ```sh
-ndn-fwd-tokens new --ca /home/bob --namespace /home/bob --anchor-fp <new root fingerprint> --role member
+ndn-fwd-tokens -c <new root's config> new --role member
 ```
 
-Links and invites minted before the recovery carry the old root's
-fingerprint: a device that already holds the context still enrolls with one
-when the old root stays an anchor (`destroyed`), but a device that holds
-nothing can no longer adopt with it. Mint new ones.
+Links and invites made before the recovery carry the old root's fingerprint.
+A device that already holds the context can still enroll with one when the
+old root stays an anchor (`destroyed`). A device that holds nothing can no
+longer adopt with it, so make new ones.
 
 Rejected alternatives: accepting a link whose fingerprint names any anchor
 of the fetched context (unauthenticated, see above); printing a link with

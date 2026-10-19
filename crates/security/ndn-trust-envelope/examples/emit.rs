@@ -36,6 +36,7 @@ fn main() {
             token: args[3].clone(),
             ttl_secs: args.get(4).and_then(|s| s.parse().ok()),
             anchor_fingerprint: None,
+            device: None,
         },
         // Round-trip check: parse a URI back and describe it.
         Some("decode") if args.len() == 2 => {

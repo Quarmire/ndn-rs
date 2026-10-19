@@ -10,7 +10,7 @@ use ndn_cert::approval::{ApprovalStore, DEFAULT_REQUEST_TTL, Decision};
 use ndn_cert::challenge::combinator::AllOf;
 use ndn_cert::challenge::device_approval::DeviceApprovalChallenge;
 use ndn_cert::protocol::CertRequest;
-use ndn_cert::{ChallengeHandler, ChallengeOutcome, TokenChallenge, TokenStore};
+use ndn_cert::{ChallengeHandler, ChallengeOutcome, TokenChallenge, TokenDenial, TokenStore};
 use ndn_packet::Name;
 
 fn approvals() -> ApprovalStore {
@@ -41,26 +41,35 @@ fn is_approved(o: &ChallengeOutcome) -> bool {
     matches!(o, ChallengeOutcome::Approved { .. })
 }
 
+/// The stable code a denial starts with.
+fn denial(o: &ChallengeOutcome) -> Option<TokenDenial> {
+    match o {
+        ChallengeOutcome::Denied(reason) => TokenDenial::of_reason(reason),
+        _ => None,
+    }
+}
+
 /// CTX.03 (single-use): a redeemed token re-presented is rejected.
 #[tokio::test]
 async fn ctx03_redeemed_token_reuse_rejected() {
     let store = TokenStore::new();
-    store.add("one-shot");
+    store.add("one-shot").unwrap();
     let ch = TokenChallenge::new(store);
 
     let first = verify_token(&ch, "/home/bob/alice", "one-shot").await;
     assert!(is_approved(&first), "first use must be approved");
 
     let second = verify_token(&ch, "/home/bob/alice", "one-shot").await;
-    assert!(
-        matches!(second, ChallengeOutcome::Denied(_)),
+    assert_eq!(
+        denial(&second),
+        Some(TokenDenial::Redeemed),
         "a redeemed token must be inert on reuse"
     );
 }
 
-/// CTX.03 across a restart: with a persistent store, a token redeemed before
-/// the CA restarts is refused afterwards even though the config re-adds it;
-/// only a hash of it lands on disk.
+/// CTX.03 across a restart: with a persistent store, an invite redeemed
+/// before the CA restarts is refused afterwards, an unredeemed one still
+/// works; only a hash of each token lands on disk.
 #[tokio::test]
 async fn ctx03_redeemed_token_stays_spent_across_restart() {
     use ndn_cert::{CaStore, FileCaStore};
@@ -70,34 +79,30 @@ async fn ctx03_redeemed_token_stays_spent_across_restart() {
     let open = || -> Arc<dyn CaStore> { Arc::new(FileCaStore::open(dir.path()).unwrap()) };
 
     let store = TokenStore::with_store(open()).unwrap();
-    store.add_many(["one-shot", "spare"]);
+    store.add("one-shot").unwrap();
+    store.add("spare").unwrap();
     let ch = TokenChallenge::new(store);
     assert!(is_approved(
         &verify_token(&ch, "/home/bob/alice", "one-shot").await
     ));
     drop(ch);
 
-    // Restart: same config tokens, same store directory.
-    let store = TokenStore::with_store(open()).unwrap();
-    store.add_many(["one-shot", "spare"]);
-    assert_eq!(store.len(), 1, "the redeemed token is not re-armed");
-    let ch = TokenChallenge::new(store);
+    // Restart: same store directory.
+    let ch = TokenChallenge::new(TokenStore::with_store(open()).unwrap());
     let replay = verify_token(&ch, "/home/bob/mallory", "one-shot").await;
-    assert!(
-        matches!(replay, ChallengeOutcome::Denied(_)),
+    assert_eq!(
+        denial(&replay),
+        Some(TokenDenial::Redeemed),
         "redeemed token must be refused after restart"
     );
     assert!(is_approved(
         &verify_token(&ch, "/home/bob/bob", "spare").await
     ));
 
-    let hashes = open().redeemed_tokens().unwrap();
-    assert_eq!(hashes.len(), 2);
-    assert!(
-        hashes
-            .iter()
-            .all(|h| !h.contains("one-shot") && !h.contains("spare"))
-    );
+    let records = open().invite_records().unwrap();
+    assert_eq!(records.len(), 2);
+    let stored = serde_json::to_string(&records).unwrap();
+    assert!(!stored.contains("one-shot") && !stored.contains("spare"));
 }
 
 /// CTX.04 (TTL): a token past its TTL is rejected.
@@ -105,15 +110,18 @@ async fn ctx03_redeemed_token_stays_spent_across_restart() {
 async fn ctx04_expired_token_rejected() {
     let store = TokenStore::new();
     // Already expired (zero TTL means expires_at = now; a later check is >).
-    store.add_scoped("stale", Some(Duration::from_nanos(0)), None);
+    store
+        .add_scoped("stale", Some(Duration::from_nanos(0)), None)
+        .unwrap();
     std::thread::sleep(Duration::from_millis(2));
     let ch = TokenChallenge::new(store);
 
     let outcome = verify_token(&ch, "/home/bob/alice", "stale").await;
-    match outcome {
-        ChallengeOutcome::Denied(r) => assert!(r.contains("expired"), "got: {r}"),
-        other => panic!("expired token must be denied, got {other:?}"),
-    }
+    assert_eq!(
+        denial(&outcome),
+        Some(TokenDenial::Expired),
+        "got {outcome:?}"
+    );
 }
 
 /// CTX.05 (scope): a scoped token cannot mint a cert outside its name scope,
@@ -122,15 +130,16 @@ async fn ctx04_expired_token_rejected() {
 async fn ctx05_scoped_token_enforced() {
     let store = TokenStore::new();
     let scope: Name = "/home/bob/guests".parse().unwrap();
-    store.add_scoped("guest-invite", None, Some(scope));
+    store.add_scoped("guest-invite", None, Some(scope)).unwrap();
     let ch = TokenChallenge::new(store);
 
     // Outside scope → denied, and (crucially) the token is NOT consumed.
     let outside = verify_token(&ch, "/home/bob/admin/mallory", "guest-invite").await;
-    match outside {
-        ChallengeOutcome::Denied(r) => assert!(r.contains("scope"), "got: {r}"),
-        other => panic!("out-of-scope must be denied, got {other:?}"),
-    }
+    assert_eq!(
+        denial(&outside),
+        Some(TokenDenial::OutOfScope),
+        "got {outside:?}"
+    );
 
     // Inside scope → approved, and the attestation records the scope so an
     // issuance policy can tell what kind of invite admitted the request.
@@ -161,7 +170,9 @@ async fn ctx05b_scoped_token_under_allof_enforced() {
 
     let tokens = TokenStore::new();
     let scope: Name = "/home/bob/guests".parse().unwrap();
-    tokens.add_scoped("guest-invite", None, Some(scope));
+    tokens
+        .add_scoped("guest-invite", None, Some(scope))
+        .unwrap();
     let approvals = approvals();
 
     let gate = AllOf::new(vec![
@@ -174,10 +185,12 @@ async fn ctx05b_scoped_token_under_allof_enforced() {
     let state = gate.begin(&req("/home/bob/admin/mallory")).await.unwrap();
     let mut p0 = token_params("guest-invite");
     p0.insert("subchallenge".into(), serde_json::Value::String("0".into()));
-    match gate.verify(&state, &p0).await.unwrap() {
-        ChallengeOutcome::Denied(r) => assert!(r.contains("scope"), "got: {r}"),
-        other => panic!("out-of-scope token under AllOf must be denied, got {other:?}"),
-    }
+    let outcome = gate.verify(&state, &p0).await.unwrap();
+    assert_eq!(
+        denial(&outcome),
+        Some(TokenDenial::OutOfScope),
+        "out-of-scope token under AllOf must be denied, got {outcome:?}"
+    );
 
     // In-scope request: the token sub passes (gate then awaits approval).
     let state = gate.begin(&req("/home/bob/guests/phone")).await.unwrap();
@@ -197,7 +210,7 @@ async fn ctx05b_scoped_token_under_allof_enforced() {
 #[tokio::test]
 async fn ctx06_approval_gate_blocks_without_admin() {
     let tokens = TokenStore::new();
-    tokens.add("invite-tok");
+    tokens.add("invite-tok").unwrap();
     let approvals = approvals();
 
     let gate = AllOf::new(vec![
