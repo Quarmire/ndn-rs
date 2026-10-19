@@ -721,10 +721,8 @@ impl Pit {
         #[cfg(target_arch = "wasm32")]
         let out = {
             let mut entries = self.entries.lock().unwrap();
-            match entries.get_mut(token) {
-                Some(e) if release(e) => entries.remove(token),
-                _ => None,
-            }
+            let emptied = entries.get_mut(token).is_some_and(release);
+            if emptied { entries.remove(token) } else { None }
         };
         if let Some(e) = out.as_ref() {
             self.notify_remove(e);
