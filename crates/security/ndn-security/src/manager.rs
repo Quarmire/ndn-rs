@@ -81,12 +81,19 @@ impl SecurityManager {
             TrustSchema::new(),
             Arc::new(dashmap::DashMap::new()),
         ));
+        Self::with_keyring(Arc::new(Keyring::with_ambient(ambient)))
+    }
+
+    /// A manager whose signer choice ([`signer_for`](Self::signer_for))
+    /// follows the trust contexts of `keyring`, a keyring shared with a
+    /// validator or a host. Its key store and certificate cache start empty.
+    pub fn with_keyring(keyring: Arc<Keyring>) -> Self {
         Self {
             keys: DashMap::new(),
             by_identity: DashMap::new(),
             next_seq: AtomicU64::new(0),
             cert_cache: Arc::new(CertCache::new()),
-            keyring: Arc::new(Keyring::with_ambient(ambient)),
+            keyring,
         }
     }
 
