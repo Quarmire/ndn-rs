@@ -345,7 +345,7 @@ binding transcript = "ndn-link/1 membership" %x00     ; 22 bytes: 21 ASCII bytes
 
 **Sender rules.**
 
-- A sender MUST show a membership only with the key its certificate certifies, and MUST compute its binding anew for each connection (or punch). It shows one membership per namespace, at most `MEMBERSHIPS_MAX` = 8, and none for the namespace its link key's certificate is in nor for a certificate of its link key. ndn-rs writes the certificates in chain order, then the binding.
+- A sender MUST show a membership only with the key its certificate certifies, and MUST compute its binding anew for each connection (or punch), over the fingerprint of the link key that connection's handshake presented (or that signs the punch message). A device that switches link keys binds its next connection to the new key; ndn-rs fixes the key of each connection when its handshake starts (`Handshaken::local_key`). It shows one membership per namespace, at most `MEMBERSHIPS_MAX` = 8, and none for the namespace its link key's certificate is in nor for a certificate of its link key. ndn-rs writes the certificates in chain order, then the binding.
 - A membership whose key cannot sign is left out; ndn-rs logs why.
 
 **Receiver rules.**
@@ -1488,23 +1488,23 @@ These points were open when this spec was first written. Each was decided, and c
 | Claim | Location |
 |---|---|
 | ALPN `ndn-link/1`; internal server name `ndn-link` | Q/endpoint.rs:25, :29 |
-| TLS 1.3 only; ALPN set; SNI off; resumption off (dialer) | Q/endpoint.rs:547, :556–559 (`client_config`) |
-| TLS 1.3 only; ALPN; no session storage, 0 tickets, 0 early data (listener) | Q/endpoint.rs:654, :658–663 (`server_config`) |
-| keep-alive 10 s, idle 30 s, dial handshake 5 s, direct path 2 s / 8 s (defaults) | Q/endpoint.rs:56–67; applied in `transport_config` :633–646 |
-| keep-alive and idle timeout bounds 2–60 s, ≥ 3 × keep-alive, ≤ 600 s, refusal texts | Q/endpoint.rs:71–135 (`bounded`; test `transport_settings_stay_within_nat_safe_bounds` :723) |
-| 1 bidi stream, 0 uni streams, 4 MiB datagram buffers | Q/endpoint.rs:641–644 |
+| TLS 1.3 only; ALPN set; SNI off; resumption off (dialer); the link key fixed for each dial | Q/endpoint.rs:559, :568–581 (`client_config`), :400–403 |
+| TLS 1.3 only; ALPN; no session storage, 0 tickets, 0 early data (listener); the link key fixed for each inbound connection | Q/endpoint.rs:668, :672–683 (`server_config`), :497–524 |
+| keep-alive 10 s, idle 30 s, dial handshake 5 s, direct path 2 s / 8 s (defaults) | Q/endpoint.rs:56–67; applied in `transport_config` :653–666 |
+| keep-alive and idle timeout bounds 2–60 s, ≥ 3 × keep-alive, ≤ 600 s, refusal texts | Q/endpoint.rs:71–135 (`bounded`; test `transport_settings_stay_within_nat_safe_bounds` :743) |
+| 1 bidi stream, 0 uni streams, 4 MiB datagram buffers | Q/endpoint.rs:661–664 |
 | `max_datagram_frame_size` = min(buffer, 65535) | quinn-proto 0.11.16 src/transport_parameters.rs:170–172 |
-| handshake limits 64 / 4 / 8 / 60 s, refusal window 60 s; refusal count, decay and reset | Q/endpoint.rs:142–167, :211–277 (test :705) |
-| Retry when busy; refuse over limits | Q/endpoint.rs:274 (`busy`), :488–492, :512 |
+| handshake limits 64 / 4 / 8 / 60 s, refusal window 60 s; refusal count, decay and reset | Q/endpoint.rs:142–167, :211–277 (test :725) |
+| Retry when busy; refuse over limits | Q/endpoint.rs:274 (`busy`), :488–496, :532 |
 | CONNECTION_REFUSED → Busy; close mapping and `is_transient` of errors | Q/link.rs:69–107 |
-| stateless-reset key derived from the device key (local) | Q/endpoint.rs:678 (`endpoint_config`) |
-| endpoint close with code + text, 1 s grace | Q/endpoint.rs:533–537; N/links.rs:185–192 |
-| link endpoint on a host-bound socket; rebind | Q/endpoint.rs:327 (`from_socket`), :520 (`rebind`) |
-| Ed25519 SPKI prefix (12 B), P-256 SPKI prefix (26 B), `04` check | Q/key.rs:18–26, :103–122 |
-| NDN public key form (raw Ed25519 / P-256 SPKI) | Q/key.rs:133–141 |
-| fingerprint = SHA-256(NDN public key); hex text; parse; `Ord` | Q/key.rs:55–85 |
-| link key from signer: Ed25519 wrapped to SPKI; P-256 SPKI as is | Q/key.rs:193–236 |
-| signature schemes ed25519 / ecdsa_secp256r1_sha256 | Q/key.rs:36–41, :297–308; Q/verify.rs:21–24 |
+| stateless-reset key derived from the device key (local) | Q/endpoint.rs:698 (`endpoint_config`) |
+| endpoint close with code + text, 1 s grace | Q/endpoint.rs:553–557; N/links.rs:185–192 |
+| link endpoint on a host-bound socket; rebind | Q/endpoint.rs:327 (`from_socket`), :540 (`rebind`) |
+| Ed25519 SPKI prefix (12 B), P-256 SPKI prefix (26 B), `04` check | Q/key.rs:18–26, :128–147 |
+| NDN public key form (raw Ed25519 / P-256 SPKI) | Q/key.rs:158–166 |
+| fingerprint = SHA-256(NDN public key); hex text; parse; `Ord` | Q/key.rs:77–111 |
+| link key from signer: Ed25519 wrapped to SPKI; P-256 SPKI as is | Q/key.rs:218–262 |
+| signature schemes ed25519 / ecdsa_secp256r1_sha256 | Q/key.rs:36–41, :333–344; Q/verify.rs:21–24 |
 | raw public keys required; client auth mandatory; TLS 1.2 sigs refused | Q/verify.rs:83–90, :105–107, :119–125, :141–148, :163–165, :194, :208 |
 | dialer checks expected fingerprint in the handshake | Q/verify.rs:64–81 |
 | listener checks key type only | Q/verify.rs:131–138 |
@@ -1519,16 +1519,16 @@ These points were open when this spec was first written. Each was decided, and c
 | decoder tests (vectors of §19.10); Membership decoder cases; close-code test; Reachability and Presence vectors (§19.16, §19.17) | Q/message.rs:563–, :632 (`a_membership_needs_a_certificate_and_a_binding`), :675 (`close_codes_round_trip`) |
 | Membership TLV 0x045C / 0x045E: encode, decode (certificate and binding required); `MEMBERSHIPS_MAX` | Q/membership.rs:31–43, :149–180 |
 | binding transcript (label ‖ link key fingerprint ‖ channel binding ‖ SHA-256 of the certificate); sign (Ed25519 / P-256 only); verify under the certificate's key | Q/membership.rs:63–72 (`binding_transcript`), :79 (`Membership::sign`), :117 (`Membership::verify`); Q/key.rs:54 (`LinkKeyAlgorithm::of_ndn_key`) |
-| channel binding: TLS exporter, label `EXPORTER-ndn-link/1 membership`, empty context, 32 bytes; same on both sides, differs per connection | Q/membership.rs:36; Q/link.rs:166 (`channel_binding`; test `both_sides_share_a_connections_binding_value_and_no_other_connection_does` in ndn-face-quic/tests/link.rs) |
+| channel binding: TLS exporter, label `EXPORTER-ndn-link/1 membership`, empty context, 32 bytes; same on both sides, differs per connection; bound to the key this connection's handshake presented | Q/membership.rs:36; Q/link.rs:177 (`channel_binding`), :151 (`local_key`; test `both_sides_share_a_connections_binding_value_and_no_other_connection_does` in ndn-face-quic/tests/link.rs) |
 | vectors of §19.18 | Q/membership.rs:232 (`the_spec_vectors_are_what_this_code_writes`), :278 |
-| hello exchange order; verdict exchange; datagram check | Q/link.rs:176–279 (`exchange_hello`, `admit`) |
-| failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:281–317 (tests in ndn-face-quic/tests/link.rs) |
-| message read and write: 20-byte header, expected type, MAX_MESSAGE, peer's close reason | Q/link.rs:319–391 |
-| after the verdict: outbox (latest replaces), received messages routed, 256 presence namespaces, Protocol close; ObservedAddress every 5 s | Q/link.rs:393–547 (`Outbox`, `Heard::take`, `observe`) |
-| `send_reachability`, `peer_reachability`, `send_presence`, `presence`, `datagrams` (DATAGRAM frames only) | Q/link.rs:617–675 |
+| hello exchange order; verdict exchange; datagram check | Q/link.rs:187–290 (`exchange_hello`, `admit`) |
+| failed exchange closes with 0x15 and its reason, counted against the source | Q/link.rs:292–328 (tests in ndn-face-quic/tests/link.rs) |
+| message read and write: 20-byte header, expected type, MAX_MESSAGE, peer's close reason | Q/link.rs:330–402 |
+| after the verdict: outbox (latest replaces), received messages routed, 256 presence namespaces, Protocol close; ObservedAddress every 5 s | Q/link.rs:404–558 (`Outbox`, `Heard::take`, `observe`) |
+| `send_reachability`, `peer_reachability`, `send_presence`, `presence`, `datagrams` (DATAGRAM frames only) | Q/link.rs:657–712 |
 | a dropped connection closes with code 0 and an empty reason (what §6.3 forbids) | quinn 0.11.12 src/connection.rs:946–961, :1254–1257 (lockfile pins quinn 0.11.9; same code at :928–939, :1241–1243) |
-| DATAGRAM_FLOOR 1100; send_mtu; TooLarge dropped | Q/link.rs:27, :603, :700, :734 |
-| scoped face send / receive, Nack paths | Q/link.rs:692–760 |
+| DATAGRAM_FLOOR 1100; send_mtu; TooLarge dropped | Q/link.rs:28, :778, :740 |
+| scoped face send / receive, Nack paths | Q/link.rs:720–810 |
 | scope: `Carries::Everything`, `SharedRate`, rate buckets (Ack-only frames free, shared bucket after the link's), frame classification, fragments, Nack | Q/scope.rs:44–100, :128–156, :194–272, :292, :322 (test `links_sharing_a_rate_take_no_more_than_it_together` :475) |
 | LP wrap / fragment / reliable / Nack / Ack encoders | ndn-rs/crates/core/ndn-packet/src/lp/encode.rs:7–92 |
 | fragment if len + 4 > mtu; plain LP wrap otherwise | ndn-rs/crates/core/ndn-transport/src/link_service/mod.rs:372–428, :253–300 |
@@ -1542,7 +1542,7 @@ These points were open when this spec was first written. Each was decided, and c
 | hello and punch chain end in the namespace root (`hello_chain`, `with_root`) | N/admission.rs:933, :942 |
 | known certificates for offline validation; certificate of a key by fingerprint | F/links.rs:336–347; N/host.rs:61–72 |
 | own certificates (link key's, then memberships'), own role, own device names, namespace_of; enrollment eligibility | N/admission.rs:155–241 |
-| `LinkTrust::own_memberships`, `OwnMembership`; memberships shown in a hello or punch (one per namespace, not the link key's, bound to the link key and channel) | N/host.rs:19–59; N/admission.rs:965 (`own_memberships`); N/links.rs:472–503 |
+| `LinkTrust::own_memberships`, `OwnMembership`; memberships shown in a hello or punch (one per namespace, not the link key's, bound to the link key the handshake presented and the channel) | N/host.rs:19–59; N/admission.rs:965 (`own_memberships`); N/links.rs:472–502 |
 | ndn-fwd memberships: every engine signing identity other than the node key, in a held namespace, with a served chain; relink on the identity watch | F/links.rs:283–335 (`DaemonTrust`), :490, :502 (`follow_identity_changes`) |
 | enrollment slots 32 / 4 per source, Busy | N/slots.rs:34–71 |
 | known revoked key refused 0x12 (unless a membership identifies the peer) | N/admission.rs:255, :537 (test `a_revoked_key_sending_no_certificate_is_refused_as_revoked`) |
@@ -1552,17 +1552,17 @@ These points were open when this spec was first written. Each was decided, and c
 | peer entry lookup (first by key or any held device name; served identities not by device); is_relay | N/admission.rs:558–582; N/peer.rs:181, :197–213 (`find_any`) |
 | decision rules 7.3 over identities; link policy per identity; serving per identity, own namespaces first | N/admission.rs:668–845, :838 (`link_policy_refusal`), :872 (`serve`) |
 | admission → verdict + scope (directions, filter, rates, served quotas) | N/admission.rs:586–653 |
-| serving policy, quotas and their defaults, one root per name, `serves` | N/serving.rs:45–121, :174–226, :244–308 (tests: N/admission.rs:1035–1155) |
-| routes and VIA_RELAY_COST; routes per identity; relay routes at rank for the namespaces the relay is used for; namespace route only for a node this side dials | N/routes.rs:26–96; N/links.rs:618–625; N/relays.rs:154 (`relay_namespaces`) |
+| serving policy, quotas and their defaults, one root per name, `serves` | N/serving.rs:45–121, :174–226, :244–308 (tests `own_serves_only_the_namespaces_this_device_is_in`, `listed_serves_listed_roots_only`, `open_enforces_quotas_and_one_root_per_name` in N/admission.rs) |
+| routes and VIA_RELAY_COST; routes per identity; relay routes at rank for the namespaces the relay is used for; namespace route only for a node this side dials | N/routes.rs:26–96; N/links.rs:617–624; N/relays.rs:154 (`relay_namespaces`) |
 | route origin static, CHILD_INHERIT; remove_routes | N/engine.rs:32–58 |
-| establish: channel binding, hello (link key chain and memberships), decide, slot, admit, reliability choice, register (identities, namespaces shown), routes, transit per served identity, idle close; on end: asleep, presence per identity, relay choice | N/links.rs:451–746 |
-| link up: awake, waiting Interests sent, Reachability sent, presence followed (relays, and peers one of whose roles may relay) and announced per identity | N/links.rs:752–784 |
+| establish: channel binding, hello (link key chain and memberships), decide, slot, admit, reliability choice, register (identities, namespaces shown), routes, transit per served identity, idle close; on end: asleep, presence per identity, relay choice | N/links.rs:451–745 |
+| link up: awake, waiting Interests sent, Reachability sent, presence followed (relays, and peers one of whose roles may relay) and announced per identity | N/links.rs:751–783 |
 | duplicate-link rule `keeps_existing`; register | N/table.rs:32, :172–222 (test :544) |
-| revocation while linked: per identity; routes and presence of a revoked membership taken; close when none is left | N/links.rs:155–159, :237 (`revoked`); N/table.rs:482 (`close_revoked`) |
+| revocation while linked: per identity; routes and presence of a revoked membership taken; close when none is left | N/links.rs:155–159, :237 (`revoked`); N/table.rs:482 (`close_revoked`) (test `revoking_one_membership_keeps_the_link_by_another_and_the_last_closes_it` in ndn-link/tests/memberships.rs) |
 | relink after enrollment and when memberships change, 0x03 | N/links.rs:201 (`identities_changed`), :219 (`shown_namespaces`); N/table.rs:411, :430, :446; F/links.rs:502 |
-| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s), persistence for `always` only | N/links.rs:992–; N/policy.rs:87 |
-| link wanted by mode and relay choice; keep: idle by datagrams, 0x05 / 0x06 closes | N/links.rs:877–948; N/control.rs:357–365 |
-| dial over path candidates and resolved addresses | N/links.rs:841 (`dial_once`); N/host.rs:121–137 |
+| dial loop, `Backoff` (500 ms doubling to 30 s; refused 60 s), persistence for `always` only | N/links.rs:991–; N/policy.rs:87 |
+| link wanted by mode and relay choice; keep: idle by datagrams, 0x05 / 0x06 closes | N/links.rs:876–947; N/control.rs:357–365 |
+| dial over path candidates and resolved addresses | N/links.rs:840 (`dial_once`); N/host.rs:114–137 |
 | `LinkMode`, `RelaySource`, `RelayUse`, `PeerSpec` and defaults | N/peer.rs:19–132 |
 | host calls: add/remove peer, set_mode, connect, disconnect, set_active, set_wake_token, network_changed | N/control.rs:100–239 |
 | waiting face: WAITING_COST, DEMAND_PER_PEER / TOTAL, 4 s default lifetime, Congestion Nack, sending past the forwarder | N/waiting.rs:39–48, :106–232, :236–288; N/control.rs:243–331 |
@@ -1586,7 +1586,7 @@ These points were open when this spec was first written. Each was decided, and c
 | role words; device-name rules; parse_device_key | ndn-rs/crates/security/ndn-cert/src/roles.rs:67–101, :150–179, :260–301 |
 | certificate wire (vectors): name, MetaInfo, SPKI Content, ValidityPeriod | S/manager.rs:514–594; S/cert_name.rs:74–80 |
 | rustls ring cipher suites and groups | rustls 0.23.40 src/crypto/ring/mod.rs:68–80, :179–180 |
-| transit: `FaceSink::transit` and its pairing (per served identity); engine `TransitPrefixes` (counted per namespace); validation skipped (so never cached) for a namespace in transit and not held | N/host.rs:107–115; N/links.rs:652–662, :723–725; N/engine.rs:60–66; ndn-rs/crates/forwarding/ndn-engine/src/transit.rs:1–53; …/ndn-engine/src/stages/validation.rs:260–268 |
+| transit: `FaceSink::transit` and its pairing (per served identity); engine `TransitPrefixes` (counted per namespace); validation skipped (so never cached) for a namespace in transit and not held | N/host.rs:101–109; N/links.rs:651–661, :722–724; N/engine.rs:60–66; ndn-rs/crates/forwarding/ndn-engine/src/transit.rs:1–53; …/ndn-engine/src/stages/validation.rs:260–268 |
 | "never back to the node it came from" not applied by address to QUIC link faces | ndn-rs/crates/forwarding/ndn-engine/src/stages/strategy.rs:119–130 (`peer_host`), :441–456 |
 
 [RFC 2119]: https://www.rfc-editor.org/rfc/rfc2119

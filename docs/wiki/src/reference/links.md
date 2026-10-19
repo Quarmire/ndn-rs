@@ -120,8 +120,11 @@ Which relays a device uses is the deployer's and the user's choice:
 - **none** — `namespace = false` and no `[[relay]]`: LAN and `[[peer]]` links
   only.
 
-The device links to its preferred relay (`[relays] count` of them), routes
-through each by preference, and fails over to the next when one is lost: at
+For each trusted prefix it is a member of, the device links to its preferred
+relays (`[relays] count` of them for each prefix: a `[[relay]]` counts for
+every prefix, a relay a prefix advertises for each prefix that advertises
+it), routes each prefix through the relays used for it by preference, and
+fails over to the next when one is lost: at
 once when the relay says it is shutting down, otherwise once a redial of it
 fails (it may only be restarting). A
 relay of another namespace admits devices by its serving policy
