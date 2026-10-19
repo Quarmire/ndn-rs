@@ -1,6 +1,6 @@
 //! How the device takes part in each namespace (trusted prefix) it holds —
 //! following, member (with a role) or owner — as data ([`memberships`]) and
-//! as events when that changes ([`Participant::membership_events`]).
+//! as events when that changes ([`Participant::events`]).
 //!
 //! - **owner**: the device holds the namespace's root key
 //!   ([`ContextStore::holds_root_key`](crate::ContextStore::holds_root_key));
@@ -15,20 +15,25 @@
 
 use std::collections::HashMap;
 
-use ndn_cert::report::{MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation};
+use ndn_cert::report::{
+    ContextChange, MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation,
+};
 use ndn_cert::roles::parse_device_key;
 use ndn_packet::Name;
-use ndn_security::trust_context::anchor_fingerprint;
+use ndn_security::cert_name::key_name_of;
+use ndn_security::trust_context::{KeyRole, anchor_fingerprint};
 use ndn_security::{Keyring, SignedTrustContext};
 
 use crate::enroll::{certified_in, revoked_on_chain};
 use crate::{KeyVault, Participant, hex, iso};
 
 /// What the device last saw of one namespace: to tell an adoption, a
-/// revocation of its own certificate and a root change apart.
+/// revocation of its own certificate and a root change apart, and what a
+/// new version revokes.
 pub(crate) struct Seen {
     version: u64,
     roots: Vec<[u8; 32]>,
+    revocations: Vec<Name>,
 }
 
 impl Seen {
@@ -36,6 +41,7 @@ impl Seen {
         Self {
             version: ctx.version(),
             roots: root_fingerprints(ctx),
+            revocations: ctx.revocations().to_vec(),
         }
     }
 }
@@ -49,11 +55,13 @@ pub(crate) fn seen_now(keyring: &Keyring) -> HashMap<Name, Seen> {
         .collect()
 }
 
-/// The fingerprints of `ctx`'s trust anchors, sorted.
+/// The fingerprints of `ctx`'s root anchors (every trust anchor but a
+/// recovery kit's: adding or removing a kit changes no root), sorted.
 fn root_fingerprints(ctx: &SignedTrustContext) -> Vec<[u8; 32]> {
     let mut roots: Vec<[u8; 32]> = ctx
         .anchors()
         .iter()
+        .filter(|a| !ctx.has_key_role(&key_name_of(a.key()), KeyRole::RECOVERY_ANCHOR))
         .map(|a| anchor_fingerprint(a.value()))
         .collect();
     roots.sort();
@@ -153,40 +161,59 @@ pub(crate) fn relation_now(p: &Participant, ctx: &SignedTrustContext) -> Members
 }
 
 /// `ctx` was kept as its namespace's newest version
-/// ([`keep::keep`](crate::keep::keep)): an adoption when the namespace is
-/// new to the device, a root change when other anchors sign it, and a
-/// revocation when it revokes the chain of the key the device signs the
-/// namespace's Data with — each published as a [`MembershipEvent`].
-pub(crate) fn kept(p: &Participant, ctx: &SignedTrustContext) {
+/// ([`keep::keep`](crate::keep::keep)), reached `how`: told as a
+/// `context-updated` event, then what it changes about the device's
+/// membership — an adoption when the namespace is new to the device, a root
+/// change when other anchors sign it, and a revocation when it revokes the
+/// chain of the key the device signs the namespace's Data with — each
+/// published as a [`MembershipEvent`]. Nothing for a version no newer than
+/// the one seen.
+pub(crate) fn kept(p: &Participant, ctx: &SignedTrustContext, how: ContextChange) {
     let namespace = ctx.namespace();
-    let now = Seen::of(ctx);
-    let roots = now.roots.clone();
-    let before = p.seen.lock().insert(namespace.clone(), now);
-    let event = |change, detail: String| MembershipEvent {
+    let before = {
+        let mut seen = p.seen.lock();
+        if seen
+            .get(namespace)
+            .is_some_and(|before| ctx.version() <= before.version)
+        {
+            return;
+        }
+        seen.insert(namespace.clone(), Seen::of(ctx))
+    };
+    let revoked = ctx
+        .revocations()
+        .iter()
+        .filter(|r| before.as_ref().is_some_and(|b| !b.revocations.contains(r)))
+        .map(Name::to_string)
+        .collect();
+    crate::events::context_kept(
+        p,
+        namespace,
+        before.as_ref().map(|b| b.version),
+        ctx.version(),
+        how,
+        revoked,
+    );
+    let event = |change| MembershipEvent {
         namespace: namespace.to_string(),
         relation: relation_now(p, ctx),
         change,
-        detail,
+        version: ctx.version(),
+        key: None,
+        revoked: None,
+        replaced_version: None,
+        valid_until: None,
+        request: None,
     };
     let Some(before) = before else {
-        p.publish_membership(event(
-            MembershipChange::Adopted,
-            format!("adopted {namespace} v{}", ctx.version()),
-        ));
+        p.publish_membership(event(MembershipChange::Adopted));
         return;
     };
-    if ctx.version() <= before.version {
-        return;
-    }
-    if roots != before.roots {
-        p.publish_membership(event(
-            MembershipChange::RootChanged,
-            format!(
-                "{namespace} v{} is signed by a new root (a recovery replaced v{}'s)",
-                ctx.version(),
-                before.version
-            ),
-        ));
+    if root_fingerprints(ctx) != before.roots {
+        p.publish_membership(MembershipEvent {
+            replaced_version: Some(before.version),
+            ..event(MembershipChange::RootChanged)
+        });
     }
     let revoked = p.engine().security().and_then(|mgr| {
         let signing = mgr.signing_identity_for(namespace).ok()?;
@@ -195,19 +222,24 @@ pub(crate) fn kept(p: &Participant, ctx: &SignedTrustContext) {
         Some((signing.key, name))
     });
     if let Some((key, name)) = revoked {
-        p.publish_membership(event(
-            MembershipChange::Revoked,
-            format!(
-                "{namespace} v{} revokes {name}: this device's key {key} no longer validates \
-                 there; enroll in {namespace} again",
-                ctx.version()
-            ),
-        ));
+        p.publish_membership(MembershipEvent {
+            key: Some(key.to_string()),
+            revoked: Some(name.to_string()),
+            ..event(MembershipChange::Revoked)
+        });
     }
 }
 
-/// The device enrolled `key` in `namespace` (now signing its Data with it).
-pub(crate) fn enrolled(p: &Participant, namespace: &Name, key: &Name) {
+/// The device enrolled `key` in `namespace` (now signing its Data with it),
+/// certified until `valid_until`, after `request` when it waited for an
+/// admin's approval.
+pub(crate) fn enrolled(
+    p: &Participant,
+    namespace: &Name,
+    key: &Name,
+    valid_until: u64,
+    request: Option<&str>,
+) {
     let Some(ctx) = p.held_context(namespace) else {
         return;
     };
@@ -215,7 +247,12 @@ pub(crate) fn enrolled(p: &Participant, namespace: &Name, key: &Name) {
         namespace: namespace.to_string(),
         relation: relation_now(p, &ctx),
         change: MembershipChange::Enrolled,
-        detail: format!("enrolled {key} in {namespace}"),
+        version: ctx.version(),
+        key: Some(key.to_string()),
+        revoked: None,
+        replaced_version: None,
+        valid_until: Some(iso(valid_until)),
+        request: request.map(str::to_owned),
     });
 }
 
@@ -229,6 +266,11 @@ pub(crate) fn renewed(p: &Participant, namespace: &Name, key: &Name, valid_until
         namespace: namespace.to_string(),
         relation: relation_now(p, &ctx),
         change: MembershipChange::Renewed,
-        detail: format!("renewed {key}: valid until {}", iso(valid_until)),
+        version: ctx.version(),
+        key: Some(key.to_string()),
+        revoked: None,
+        replaced_version: None,
+        valid_until: Some(iso(valid_until)),
+        request: None,
     });
 }
