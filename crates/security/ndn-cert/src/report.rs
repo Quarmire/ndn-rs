@@ -1,7 +1,9 @@
 //! What the trust-admin operations of a device in a personal namespace
 //! report: adopting a trust context, enrolling, refreshing held contexts,
-//! taking a version made on the device, renewing certificates — and why one
-//! changed nothing ([`TrustRefusal`]).
+//! taking a version made on the device, renewing certificates, the device's
+//! membership in each namespace it holds ([`MembershipInfo`], and
+//! [`MembershipEvent`] when one changes) — and why one changed nothing
+//! ([`TrustRefusal`]).
 //!
 //! Plain data with a stable JSON form (the `ndn-fwd` management verbs carry
 //! them in the ControlResponse status text; `ndn-mgmt` re-exports them). The
@@ -128,10 +130,17 @@ pub struct EnrolledInfo {
     pub pib: String,
     /// The node's identity before this enrollment, if any.
     pub previous_identity: Option<String>,
-    /// Whether the running node signs with the new key now (management
-    /// responses, discovery records). `false` when `[security] identity` in
-    /// its config names another identity, which keeps precedence.
+    /// Whether the running node signs as the new identity now: the Data it
+    /// publishes under the namespace is signed with the new key (each
+    /// trusted prefix with its own key; the device's other identities are
+    /// unchanged). `false` when the host can only take it at its next start.
     pub signing_now: bool,
+    /// Whether the new identity became the node identity (management
+    /// responses, discovery records, links): only when the node had no
+    /// persistent identity before. An enrollment never changes an existing
+    /// node identity.
+    #[serde(default)]
+    pub node_identity: bool,
     /// What changes only at the next start, and why (empty: nothing).
     pub at_next_start: Vec<String>,
     /// Certificates in this namespace this node held before a `force`
@@ -230,5 +239,94 @@ pub struct RenewalInfo {
     /// Its lifetime in seconds, as the CA's policy for the role set it.
     pub validity_secs: Option<u64>,
     /// Why, for `refused` and `failed`.
+    pub detail: String,
+}
+
+/// How a device takes part in a namespace (a trusted prefix) it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MembershipRelation {
+    /// The namespace's trust context is adopted: the device verifies its
+    /// Data but holds no certificate in it, so it cannot publish under it.
+    Following,
+    /// The device holds a currently valid, unrevoked device certificate in
+    /// the namespace: it publishes under it with that key.
+    Member,
+    /// The device holds the namespace's root key: the namespace's versions
+    /// are made here.
+    Owner,
+}
+
+impl MembershipRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Following => "following",
+            Self::Member => "member",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+impl std::fmt::Display for MembershipRelation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One namespace a device holds and how it takes part in it
+/// (`security/memberships` answers a JSON list of these, one per held
+/// namespace).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MembershipInfo {
+    pub namespace: String,
+    /// The version of the namespace's trust context held.
+    pub version: u64,
+    pub relation: MembershipRelation,
+    /// The device's role in the namespace (`admin`, `member`, `node`,
+    /// `guest`, …); empty when it holds no device certificate there.
+    pub role: String,
+    /// The device identity it signs the namespace's Data as,
+    /// `/<ns>/<role>/<device>`; empty when it holds none.
+    pub identity: String,
+    /// That identity's key; empty when none.
+    pub key: String,
+    /// The key's certificate validity end, ISO 8601 (UTC); empty when none.
+    pub valid_until: String,
+    /// Whether `identity` is the node identity (management responses,
+    /// discovery records, links).
+    pub node_identity: bool,
+    /// Hex of the SHA-256 fingerprint of the namespace's root (its first
+    /// trust anchor's public key): what an anchor link names.
+    pub root_fingerprint: String,
+}
+
+/// What changed a device's membership in a namespace
+/// ([`MembershipEvent::change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MembershipChange {
+    /// The namespace's trust context was adopted: the device follows it.
+    Adopted,
+    /// The device enrolled: it holds a certificate in the namespace now.
+    Enrolled,
+    /// A certificate of the device in the namespace was renewed.
+    Renewed,
+    /// A version of the namespace revokes a certificate of the device (or an
+    /// issuer on its chain).
+    Revoked,
+    /// The namespace's root changed (a recovery): a new root signs it.
+    RootChanged,
+}
+
+/// A change of the device's membership in one namespace, published as it
+/// happens (`/localhost/nfd/security/notifications`, JSON).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MembershipEvent {
+    pub namespace: String,
+    /// The device's relation to the namespace after the change.
+    pub relation: MembershipRelation,
+    pub change: MembershipChange,
+    /// What changed, in words (the key enrolled or renewed, the version
+    /// adopted, what a revocation names).
     pub detail: String,
 }
