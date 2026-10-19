@@ -8,7 +8,8 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(missing_docs)]
 #![cfg_attr(all(not(feature = "std"), not(target_arch = "wasm32")), no_std)]
-#[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
+// Declared on every target: modules such as `lp::fragment` name `alloc::`
+// paths directly, and wasm32 builds without `std` are not `no_std`.
 extern crate alloc;
 
 pub(crate) mod compat;
