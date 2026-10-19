@@ -10,6 +10,7 @@ Connects application processes to the NDN forwarder over Unix sockets, with an o
 | `IpcServer` | Unix-socket server endpoint (used by the forwarder) |
 | `RouterClient` | Ergonomic wrapper around `IpcClient` for common app operations |
 | `MgmtClient` | Control-plane client — sends NFD management commands to the forwarder |
+| `events::EventSubscription` | Follows the daemon's trust or links change notifications in order, on a connection of its own (resync on a gap; see `docs/specs/mgmt-trust.md` § Notifications) |
 | `ChunkedProducer` | Segments a large object and serves it over NDN |
 | `ChunkedConsumer` | Reassembles a segmented object from multiple Data packets |
 | `ServiceRegistry` | Local service advertisement and prefix lookup |

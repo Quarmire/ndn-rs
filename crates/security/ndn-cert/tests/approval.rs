@@ -1487,9 +1487,9 @@ fn expired_outgoing_request_ends_locally() {
     assert_eq!(ended.len(), 1);
     match &ended[0].state {
         OutgoingState::Expired { reason } => {
-            assert!(
-                reason.contains("never answered") && reason.contains("ask again"),
-                "{reason}"
+            assert_eq!(
+                reason.code,
+                ndn_cert::report::detail_code::REQUEST_UNANSWERED
             )
         }
         other => panic!("{other:?}"),
@@ -1497,4 +1497,48 @@ fn expired_outgoing_request_ends_locally() {
     assert_eq!(store.sealed_key(&stale.key_name).unwrap(), None);
     assert!(store.sealed_key(&live.key_name).unwrap().is_some());
     assert_eq!(store.outstanding(&live.identity).unwrap(), Some(live));
+}
+
+#[tokio::test]
+async fn the_host_is_told_of_every_request_opened_and_decided() {
+    let rd = RootDevice::new().await;
+    let ca = rd.start_ca(DEFAULT_REQUEST_TTL);
+    let seen: Arc<std::sync::Mutex<Vec<(String, &'static str)>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    ca.approvals.set_observer(Arc::new(
+        move |record: &ndn_cert::approval::ApprovalRecord| {
+            sink.lock()
+                .unwrap()
+                .push((record.request_id.clone(), record.state.as_str()));
+        },
+    ));
+
+    let first = key("node", "laptop", 41);
+    let (denied, _) = request(&rd, &ca, &first).await;
+    let second = key("node", "phone", 42);
+    let (approved, _) = request(&rd, &ca, &second).await;
+    // A poll resuming a pending request opens nothing new.
+    let _ = poll(&rd, &ca, &first, Some(&denied)).await;
+    ca.approvals
+        .decide_locally(
+            &denied,
+            Decision::Deny {
+                reason: "not mine".into(),
+            },
+            "uid 1000 (alice)",
+        )
+        .unwrap();
+    ca.approvals
+        .decide_locally(&approved, Decision::Approve, "uid 1000 (alice)")
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (denied.clone(), "pending"),
+            (approved.clone(), "pending"),
+            (denied, "denied"),
+            (approved, "approved"),
+        ]
+    );
 }

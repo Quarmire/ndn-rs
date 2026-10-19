@@ -33,16 +33,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_cert::report::{RenewalInfo, RenewalState, TrustRefusal};
+use ndn_cert::report::{Detail, RenewalInfo, RenewalState, TrustRefusal, code, detail_code};
 use ndn_cert::roles::parse_device_key;
 use ndn_identity::RenewBefore;
 use ndn_identity::renewal::{Due, Failed, Now, RenewalSchedule};
-use ndn_mgmt_wire::control_response::status;
 use ndn_packet::{Data, Name};
 use ndn_security::Certificate;
 use tokio_util::sync::CancellationToken;
 
-use crate::{KeyVault, Participant, iso, refusal};
+use crate::words::refuse;
+use crate::{KeyVault, Participant, iso};
 
 /// The first scan runs this soon after start, once faces and routes are up.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(10);
@@ -117,24 +117,35 @@ async fn renew_one(
     p: &Participant,
     vault: &dyn KeyVault,
     held: &Held,
-) -> Result<Certificate, (RenewalState, String)> {
-    let failed = |why: String| (RenewalState::Failed, why);
+) -> Result<Certificate, (RenewalState, Detail)> {
+    let failed = |why: Detail| (RenewalState::Failed, why);
     if p.keyring()
         .context_for(&held.cert.name)
         .is_revoked(&held.cert.name)
     {
         return Err((
             RenewalState::Refused,
-            format!(
-                "the trust context of its namespace revokes {}; a revoked key is never renewed: \
-                 enroll a new key with a new invite",
-                held.key
-            ),
+            Detail::new(
+                detail_code::RENEWAL_REVOKED,
+                format!(
+                    "the trust context of its namespace revokes {}; a revoked key is never \
+                     renewed: enroll a new key with a new invite",
+                    held.key
+                ),
+            )
+            .with("key", &held.key),
         ));
     }
-    let signer = vault
-        .signer(&held.key)
-        .map_err(|e| failed(format!("the key {} cannot sign: {e}", held.key)))?;
+    let signer = vault.signer(&held.key).map_err(|e| {
+        failed(
+            Detail::new(
+                detail_code::RENEWAL_KEY_UNAVAILABLE,
+                format!("the key {} cannot sign: {e}", held.key),
+            )
+            .with("key", &held.key)
+            .with("error", &e),
+        )
+    })?;
     // The issuer certificates the vault kept answer the walk of the current
     // certificate's chain first: after a recovery nobody else may serve the
     // earlier CA's certificate.
@@ -152,21 +163,31 @@ async fn renew_one(
     )
     .await
     .map_err(|e| {
-        let state = if e.is_final() {
-            RenewalState::Refused
+        let (state, code) = if e.is_final() {
+            (RenewalState::Refused, detail_code::RENEWAL_REFUSED)
         } else {
-            RenewalState::Failed
+            (RenewalState::Failed, detail_code::RENEWAL_FAILED)
         };
-        (state, e.to_string())
+        (state, Detail::new(code, e.to_string()).with("error", &e))
     })?;
-    vault.store_certificate(&held.key, &issued.data).map_err(|e| {
-        failed(format!(
-            "the CA issued {}, but storing it in {} failed ({e}); the current certificate stays \
-             in use until it expires",
-            issued.cert.name,
-            vault.location()
-        ))
-    })?;
+    vault
+        .store_certificate(&held.key, &issued.data)
+        .map_err(|e| {
+            failed(
+                Detail::new(
+                    detail_code::RENEWAL_NOT_STORED,
+                    format!(
+                        "the CA issued {}, but storing it in {} failed ({e}); the current \
+                     certificate stays in use until it expires",
+                        issued.cert.name,
+                        vault.location()
+                    ),
+                )
+                .with("certificate", &issued.cert.name)
+                .with("location", vault.location())
+                .with("error", &e),
+            )
+        })?;
     // The new certificate's issuer chain, kept and served as at enrollment.
     if let Err(e) = vault.keep_issuers(&issued.issuers) {
         tracing::warn!(
@@ -221,7 +242,7 @@ fn key_identity(key: &Name) -> Name {
     Name::from_components(comps[..at].iter().cloned())
 }
 
-fn info(held: &Held, result: &Result<Certificate, (RenewalState, String)>) -> RenewalInfo {
+fn info(held: &Held, result: &Result<Certificate, (RenewalState, Detail)>) -> RenewalInfo {
     let mut info = RenewalInfo {
         key: held.key.to_string(),
         state: RenewalState::Renewed,
@@ -230,7 +251,7 @@ fn info(held: &Held, result: &Result<Certificate, (RenewalState, String)>) -> Re
         certificate: None,
         valid_until: None,
         validity_secs: None,
-        detail: String::new(),
+        detail: None,
     };
     match result {
         Ok(cert) => {
@@ -241,7 +262,7 @@ fn info(held: &Held, result: &Result<Certificate, (RenewalState, String)>) -> Re
         }
         Err((state, detail)) => {
             info.state = *state;
-            info.detail = detail.clone();
+            info.detail = Some(detail.clone());
         }
     }
     info
@@ -255,18 +276,19 @@ pub async fn renew_now(
 ) -> Result<Vec<RenewalInfo>, TrustRefusal> {
     let _one_at_a_time = p.renewing.lock().await;
     let held = held_certificates(p, vault)
-        .map_err(|why| refusal(status::SERVER_ERROR, p.words().renewal_unreadable(why)))?;
+        .map_err(|why| refuse(code::RENEWAL_KEYS_UNREADABLE, [("error", why)]))?;
     if held.is_empty() {
-        return Err(refusal(
-            status::NOT_FOUND,
-            p.words().nothing_to_renew(&vault.location()),
+        return Err(refuse(
+            code::NOTHING_TO_RENEW,
+            [("location", vault.location())],
         ));
     }
     let mut out = Vec::with_capacity(held.len());
     for h in &held {
         let result = renew_one(p, vault, h).await;
-        if let Err((_, why)) = &result {
-            tracing::warn!(target: "security", key = %h.key, error = %why, "certificate not renewed");
+        if let Err((state, why)) = &result {
+            tracing::warn!(target: "security", key = %h.key, error = %why.text, "certificate not renewed");
+            crate::events::renewal_failed(p, &h.key, *state, Some(&why.code));
         }
         out.push(info(h, &result));
     }
@@ -334,6 +356,7 @@ pub fn spawn_periodic(
                     }
                     Err(failure) => failure,
                 };
+                crate::events::renewal_failed(&p, &h.key, state, Some(&why.code));
                 match schedule.failed(&h.cert, state == RenewalState::Refused, Now::current()) {
                     Failed::Expired => tracing::error!(
                         target: "security",
@@ -355,7 +378,7 @@ pub fn spawn_periodic(
                         valid_until = %iso(h.cert.valid_until),
                         attempts,
                         retry_in_secs = delay.as_secs(),
-                        error = %why,
+                        error = %why.text,
                         "certificate renewal failed; the certificate works until it expires"
                     ),
                 }

@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(
             results[0].state,
             crate::RefreshState::Updated,
-            "{}",
+            "{:?}",
             results[0].detail
         );
         assert_eq!(device.keyring().version_of(&ns), Some(2));

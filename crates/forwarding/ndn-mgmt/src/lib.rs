@@ -21,6 +21,7 @@ use ndn_mgmt_wire::{
 };
 
 pub mod auth;
+pub mod events;
 pub mod module;
 pub mod modules;
 #[cfg(not(target_arch = "wasm32"))]
@@ -54,6 +55,7 @@ pub use auth::{COMMAND_SIG_TIME_TOLERANCE_MS, CommandReplayCache};
 pub use module::{CaInfo, MgmtConfig, MgmtContext, MgmtModule, MgmtRouter};
 // Re-exported for out-of-core mgmt modules (e.g. ndn-discovery's service module)
 // that enforce the same operator/reserved-name policy as the built-ins.
+pub use events::MgmtEvents;
 pub use modules::common::{is_management_face, is_reserved_name};
 pub use modules::faces::provision::{
     FaceProvisioner, ProvisionError, ProvisionRequest, ProvisionedFace,
@@ -61,6 +63,7 @@ pub use modules::faces::provision::{
 pub use modules::faces::{FaceEvent, FaceEventKind};
 pub use modules::rib::{RouteEvent, RouteEventKind};
 pub use modules::strategy::{StrategyEvent, StrategyEventKind, create_strategy_by_name};
+pub use ndn_mgmt_wire::events::{EventSink, LinkEvent};
 pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
@@ -168,7 +171,9 @@ pub fn mount_management(
     Arc::clone(&face_events).install(engine, cancel.clone());
     Arc::clone(&route_events).install(engine, cancel.clone());
     Arc::clone(&strategy_events).install(engine, cancel.clone());
-    install_membership_events(engine, &handles, &cancel);
+    Arc::clone(&handles.events.trust).install(engine, cancel.clone());
+    Arc::clone(&handles.events.links).install(engine, cancel.clone());
+    forward_trust_events(engine, &handles, &cancel);
 
     engine.set_face_lifecycle_sink(Arc::new(NotificationFaceLifecycleSink {
         stream: Arc::clone(&face_events),
@@ -215,10 +220,11 @@ pub fn notifications_prefix(module_name: &'static [u8]) -> Name {
     ])
 }
 
-/// `/localhost/nfd/security/notifications`: the trust-admin backend's
-/// [`MembershipEvent`]s, JSON-encoded, one Data per event — when the
-/// backend publishes them ([`TrustAdminMgmtBackend::membership_events`]).
-fn install_membership_events(
+/// Forward the trust-admin backend's [`TrustEvent`]s (when it makes them,
+/// [`TrustAdminMgmtBackend::trust_events`]) to the trust stream
+/// `/localhost/nfd/security/notifications`, where the host's other trust
+/// sources (its CAs' approvals and invites) publish too.
+fn forward_trust_events(
     engine: &ForwarderEngine,
     handles: &MgmtHandles,
     cancel: &CancellationToken,
@@ -226,12 +232,11 @@ fn install_membership_events(
     let Some(mut events) = handles
         .trust_context_handler
         .as_ref()
-        .and_then(|backend| backend.membership_events())
+        .and_then(|backend| backend.trust_events())
     else {
         return;
     };
-    let stream = NotificationStream::<MembershipEvent>::new(notifications_prefix(b"security"));
-    Arc::clone(&stream).install(engine, cancel.clone());
+    let stream = Arc::clone(&handles.events.trust);
     let cancel = cancel.clone();
     engine.runtime().spawn(Box::pin(async move {
         use tokio::sync::broadcast::error::RecvError;
@@ -242,22 +247,17 @@ fn install_membership_events(
             };
             match event {
                 Ok(event) => stream.publish(event),
+                // A subscriber is told to resync when it asks for an event
+                // the stream never held; the gap here is the same to it.
                 Err(RecvError::Lagged(missed)) => tracing::warn!(
                     target: "mgmt.security",
                     missed,
-                    "membership notifications fell behind; {missed} events were not published \
-                     (security/memberships has the current state)"
+                    "trust notifications fell behind; {missed} events were not published"
                 ),
                 Err(RecvError::Closed) => return,
             }
         }
     }));
-}
-
-impl NotificationEvent for MembershipEvent {
-    fn encode(&self) -> Bytes {
-        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
-    }
 }
 
 /// Runtime handles for management of pluggable protocol components.
@@ -287,6 +287,9 @@ pub struct MgmtHandles {
     pub ble_handler: Option<Arc<dyn BleMgmtBackend>>,
     /// Read-only pending device-approval backend (`ca` module).
     pub approval_handler: Option<Arc<dyn ApprovalMgmtBackend>>,
+    /// The invites of this node's CAs (`ca/invite-create`, `invite-list`,
+    /// `invite-withdraw`). None: the node runs no CA.
+    pub invite_handler: Option<Arc<dyn InviteMgmtBackend>>,
     /// Trust-admin backend (`security/context-adopt`, `security/enroll`, and
     /// the live signing identity `security/identity-status` reports). None:
     /// those verbs answer that this host does not change its trust at runtime.
@@ -309,6 +312,11 @@ pub struct MgmtHandles {
     /// (routing, discovery, custom strategies, ext faces). Served generically at
     /// `/localhost/nfd/ext/…`. Empty = no extensions registered.
     pub control_surfaces: Vec<Arc<dyn ndn_mgmt_wire::ControlSurface>>,
+    /// The trust and links change-notification streams, served at
+    /// `/localhost/nfd/security/notifications` and
+    /// `/localhost/nfd/links/notifications`. The host creates them before its
+    /// subsystems and hands each the stream it publishes to.
+    pub events: MgmtEvents,
 }
 
 impl MgmtHandles {
@@ -477,18 +485,58 @@ impl ApprovalMgmtBackend for ndn_cert::ApprovalStore {
     }
 }
 
+/// Backend of the `ca/invite-*` verbs: the invites of the CAs this node
+/// runs ([`ndn_cert::HostInvites`] implements it). A request names its CA by
+/// namespace or prefix (`None`: the node's only CA). Like the approval
+/// verbs, they reach it only from a local operator. Refusals carry the
+/// codes of the `invites` section of [`ndn_cert::report::code`].
+pub trait InviteMgmtBackend: Send + Sync {
+    /// Make an invite; `operator` is the local operator the kernel attests,
+    /// recorded as its maker.
+    fn create(
+        &self,
+        ca: Option<&Name>,
+        request: &ndn_cert::InviteRequest,
+        operator: &str,
+    ) -> Result<ndn_cert::CreatedInvite, TrustRefusal>;
+    /// The invites of the CA named, or of every CA when none is.
+    fn list(&self, ca: Option<&Name>) -> Result<Vec<ndn_cert::CaInviteListing>, TrustRefusal>;
+    /// Withdraw the invite `id`.
+    fn withdraw(&self, ca: Option<&Name>, id: &str) -> Result<ndn_cert::InviteEntry, TrustRefusal>;
+}
+
+impl InviteMgmtBackend for ndn_cert::HostInvites {
+    fn create(
+        &self,
+        ca: Option<&Name>,
+        request: &ndn_cert::InviteRequest,
+        operator: &str,
+    ) -> Result<ndn_cert::CreatedInvite, TrustRefusal> {
+        ndn_cert::HostInvites::create(self, ca, request, operator)
+    }
+
+    fn list(&self, ca: Option<&Name>) -> Result<Vec<ndn_cert::CaInviteListing>, TrustRefusal> {
+        ndn_cert::HostInvites::list(self, ca)
+    }
+
+    fn withdraw(&self, ca: Option<&Name>, id: &str) -> Result<ndn_cert::InviteEntry, TrustRefusal> {
+        ndn_cert::HostInvites::withdraw(self, ca, id)
+    }
+}
+
 // What the trust-admin verbs answer: owned by `ndn-cert` (any host of a
 // personal namespace produces them, see the `ndn-namespace` crate).
 pub use ndn_cert::NodeIdentitySource;
 pub use ndn_cert::report::{
-    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
-    MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation, PendingEnrollInfo,
-    RefreshState, RenewalInfo, RenewalState, TrustRefusal,
+    AdoptedContextInfo, ApprovalDecision, ContextRefreshInfo, EnrollOutcome, EnrollRequest,
+    EnrolledInfo, IdentityStatus, MembershipChange, MembershipEvent, MembershipInfo,
+    MembershipRelation, PendingEnrollInfo, RefreshState, RenewalInfo, RenewalState,
+    RootStoreStatus, SigningIdentityStatus, TrustEvent, TrustRefusal,
 };
 
 /// Where this node keeps the root key of a namespace it is the root device
-/// of (`security/identity-status` reports each as `root_store=<kind>
-/// root_key=<key>`).
+/// of (`security/identity-status` reports each in
+/// [`IdentityStatus::root_stores`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootStoreInfo {
     /// The namespace whose root it is.
@@ -519,6 +567,35 @@ pub struct SigningIdentityInfo {
     pub signing: Vec<(Name, Name)>,
 }
 
+/// A [`TrustRefusal`] for a verb this node's backend does not implement.
+pub fn not_at_runtime(operation: &str, reason: &str) -> TrustRefusal {
+    TrustRefusal::new(ndn_cert::report::code::NOT_AT_RUNTIME, reason).with("operation", operation)
+}
+
+/// A [`TrustRefusal`] for a verb whose required parameter is missing:
+/// `operation` needs `expects` in the ControlParameters field `parameter`
+/// (`Uri`, `Name`, `ContextData`).
+pub fn missing_parameter(operation: &str, parameter: &str, expects: &str) -> TrustRefusal {
+    TrustRefusal::new(
+        ndn_cert::report::code::MISSING_PARAMETER,
+        format!("{operation} needs {expects} in {parameter}"),
+    )
+    .with("operation", operation)
+    .with("parameter", parameter)
+    .with("expects", expects)
+}
+
+/// The answer of a verb that refuses: the refusal's status code, and the
+/// refusal as JSON in the status text (`ndn-rs/docs/specs/mgmt-trust.md`).
+/// Clients read it back with `ndn_ipc::trust_refusal`.
+pub fn refusal_response(refusal: &TrustRefusal) -> ControlResponse {
+    match serde_json::to_string(refusal) {
+        Ok(json) => ControlResponse::error(refusal.status_code, json),
+        // A map of strings and plain fields always serializes.
+        Err(e) => ControlResponse::error(refusal.status_code, format!("encode: {e}")),
+    }
+}
+
 /// Backend for the trust-admin verbs: adopt a trust context
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
 /// refresh held contexts (`security/context-refresh`), take a newer version
@@ -535,10 +612,10 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
 
     async fn enroll(&self, request: EnrollRequest) -> Result<EnrollOutcome, TrustRefusal> {
         let _ = request;
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not enroll at runtime".to_owned(),
-        })
+        Err(not_at_runtime(
+            "enroll",
+            "this node does not enroll at runtime",
+        ))
     }
 
     /// Check the held context of `namespace` (every held one when `None`)
@@ -548,10 +625,10 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         namespace: Option<Name>,
     ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
         let _ = namespace;
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not refresh trust contexts at runtime".to_owned(),
-        })
+        Err(not_at_runtime(
+            "context-refresh",
+            "this node does not refresh trust contexts at runtime",
+        ))
     }
 
     /// Adopt `context_data` (a signed trust-context Data) as the next version
@@ -562,28 +639,28 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         context_data: bytes::Bytes,
     ) -> Result<ContextRefreshInfo, TrustRefusal> {
         let _ = context_data;
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not take trust-context updates at runtime".to_owned(),
-        })
+        Err(not_at_runtime(
+            "context-update",
+            "this node does not take trust-context updates at runtime",
+        ))
     }
 
     /// Renew, now, every certificate a namespace CA issued to this node's
     /// keys.
     async fn renew(&self) -> Result<Vec<RenewalInfo>, TrustRefusal> {
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not renew certificates at runtime".to_owned(),
-        })
+        Err(not_at_runtime(
+            "renew",
+            "this node does not renew certificates at runtime",
+        ))
     }
 
     /// The requests for an admin's approval this node made
     /// (`security/enroll-status`), oldest first.
     async fn enroll_status(&self) -> Result<Vec<ndn_cert::OutgoingRequest>, TrustRefusal> {
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not enroll at runtime".to_owned(),
-        })
+        Err(not_at_runtime(
+            "enroll-status",
+            "this node does not enroll at runtime",
+        ))
     }
 
     /// The node identity and every identity the node signs as, if the
@@ -596,16 +673,17 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
     /// How the node takes part in each namespace it holds
     /// (`security/memberships`): following, member (role) or owner.
     async fn memberships(&self) -> Result<Vec<MembershipInfo>, TrustRefusal> {
-        Err(TrustRefusal {
-            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
-            reason: "this node does not report its trusted prefixes".to_owned(),
-        })
+        Err(not_at_runtime(
+            "memberships",
+            "this node does not report its trusted prefixes",
+        ))
     }
 
-    /// A receiver of the node's membership changes, served at
+    /// A receiver of the trust changes the node makes (contexts kept,
+    /// memberships, enrollments ended, renewals failed), served at
     /// `/localhost/nfd/security/notifications`; `None`: none are published.
     /// Called once, when management is mounted.
-    fn membership_events(&self) -> Option<tokio::sync::broadcast::Receiver<MembershipEvent>> {
+    fn trust_events(&self) -> Option<tokio::sync::broadcast::Receiver<TrustEvent>> {
         None
     }
 
@@ -868,13 +946,20 @@ pub async fn run_ndn_mgmt_handler(
                 name = %interest.name,
                 "nfd-mgmt: trust change over /localhop refused"
             );
-            let resp = ControlResponse::error(
-                status::UNAUTHORIZED,
-                "trust changes — adopting, enrolling, revoking, refreshing, and listing or \
-                 deciding approval requests — are accepted only on this node's local \
-                 management socket; run `ndn-fwd adopt` / `enroll` / `revoke` / `context \
-                 refresh` / `approvals` on the node itself (an admin device decides another \
-                 node's requests with `ndn-fwd approvals` on its own node)",
+            let operation = format!(
+                "{}/{}",
+                String::from_utf8_lossy(&parsed.module),
+                String::from_utf8_lossy(&parsed.verb)
+            );
+            let resp = refusal_response(
+                &TrustRefusal::new(
+                    ndn_cert::report::code::TRUST_CHANGE_OVER_LOCALHOP,
+                    "trust changes — adopting, enrolling, revoking, refreshing, making invites, \
+                     and listing or deciding approval requests — are accepted only on this \
+                     node's local management socket: make them on the node itself (an admin \
+                     device decides another node's requests on its own node)",
+                )
+                .with("operation", operation),
             );
             send_response(
                 &handle,
@@ -887,14 +972,15 @@ pub async fn run_ndn_mgmt_handler(
         }
         let is_trust_admin = is_trust_admin_command;
         if is_trust_admin {
-            if let Err(reason) = authorize_trust_admin(source_face, &engine, config.as_ref()) {
+            if let Err(refusal) = authorize_trust_admin(source_face, &engine, config.as_ref()) {
                 tracing::warn!(
                     target: "mgmt.security",
                     name = %interest.name,
-                    %reason,
+                    code = %refusal.code,
+                    reason = %refusal.reason,
                     "nfd-mgmt: trust change refused"
                 );
-                let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                let resp = refusal_response(&refusal);
                 send_response(
                     &handle,
                     &interest.name,
@@ -945,14 +1031,15 @@ pub async fn run_ndn_mgmt_handler(
                 ) {
                     CommandAuth::LocalOperator => None,
                     CommandAuth::Signature => Some((validator, required)),
-                    CommandAuth::Refused(reason) => {
+                    CommandAuth::Refused(refusal) => {
                         tracing::warn!(
                             target: "mgmt.security",
                             name = %interest.name,
-                            %reason,
+                            code = %refusal.code,
+                            reason = %refusal.reason,
                             "nfd-mgmt: unsigned local command refused"
                         );
-                        let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                        let resp = refusal_response(&refusal);
                         send_response(
                             &handle,
                             &interest.name,
@@ -984,7 +1071,7 @@ pub async fn run_ndn_mgmt_handler(
                 reflexive_prefetch_localhop_cert(consumer, &interest, validator).await;
             }
             if let Some((active_validator, effective_required)) = signature_check
-                && let Err(reason) = authorize_command(
+                && let Err(refusal) = authorize_command(
                     &interest,
                     active_validator,
                     effective_required,
@@ -992,7 +1079,7 @@ pub async fn run_ndn_mgmt_handler(
                 )
                 .await
             {
-                let resp = ControlResponse::error(status::UNAUTHORIZED, reason);
+                let resp = refusal_response(&refusal);
                 send_response(
                     &handle,
                     &interest.name,
@@ -1042,6 +1129,7 @@ pub async fn run_ndn_mgmt_handler(
             compute_handler: mgmt_handles.compute_handler.as_ref(),
             ble_handler: mgmt_handles.ble_handler.as_ref(),
             approval_handler: mgmt_handles.approval_handler.as_ref(),
+            invite_handler: mgmt_handles.invite_handler.as_ref(),
             trust_context_handler: mgmt_handles.trust_context_handler.as_ref(),
             webtransport_status_handler: mgmt_handles.webtransport_status_handler.as_ref(),
             #[cfg(not(target_arch = "wasm32"))]

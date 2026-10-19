@@ -104,7 +104,9 @@ impl MgmtClient {
     }
 
     /// As [`exchange`](Self::exchange) but `Ok(None)` when `timeout` elapses with
-    /// no response (the notification long-poll).
+    /// no response (the notification long-poll, deferred commands). An answer
+    /// arriving after its request timed out is skipped by the next request,
+    /// which reads only a Data named under its own Interest.
     async fn exchange_timeout(
         &self,
         interest_wire: &Bytes,
@@ -113,10 +115,20 @@ impl MgmtClient {
         let lp = ndn_packet::lp::encode_lp_packet(interest_wire);
         match &self.recv {
             MgmtRecv::Face => {
+                let expected = expected_response_name(interest_wire)?;
                 self.face.send_bytes(lp).await?;
-                match tokio::time::timeout(timeout, self.face.recv_bytes()).await {
+                let answer = async {
+                    loop {
+                        let wire = crate::forwarder_client::strip_lp(self.face.recv_bytes().await?);
+                        match ndn_packet::Data::decode(wire.clone()) {
+                            Ok(data) if !data.name.has_prefix(&expected) => continue,
+                            _ => return Ok::<_, ForwarderError>(wire),
+                        }
+                    }
+                };
+                match tokio::time::timeout(timeout, answer).await {
                     Err(_) => Ok(None),
-                    Ok(r) => Ok(Some(crate::forwarder_client::strip_lp(r?))),
+                    Ok(r) => r.map(Some),
                 }
             }
             MgmtRecv::Mux(mux) => {
@@ -355,9 +367,74 @@ impl MgmtClient {
         Ok(ndn_mgmt_wire::ApprovalListing::decode(content))
     }
 
+    /// `ca/invite-create`: make an invite at the CA `ca` names (its
+    /// namespace or prefix; `None`: the daemon's only CA). Local operators
+    /// only (trust-admin verb). Returns the invite with its token and
+    /// `ndn-trust://invite` link, shown this once. A refusal is
+    /// [`ForwarderError::Command`] carrying a structured refusal
+    /// ([`crate::trust_refusal_in`]).
+    pub async fn ca_invite_create(
+        &self,
+        ca: Option<&Name>,
+        request: &ndn_cert::InviteRequest,
+    ) -> Result<ndn_cert::CreatedInvite, ForwarderError> {
+        // Strings and numbers: serializing cannot fail.
+        let request = serde_json::to_string(request).expect("an invite request serializes");
+        self.invite_command(verb::INVITE_CREATE, ca, Some(request))
+            .await
+    }
+
+    /// `ca/invite-list`: the invites of the CA `ca` names, or of every CA of
+    /// the daemon when `None`, without tokens. Refused like
+    /// [`ca_invite_create`](Self::ca_invite_create).
+    pub async fn ca_invite_list(
+        &self,
+        ca: Option<&Name>,
+    ) -> Result<Vec<ndn_cert::CaInviteListing>, ForwarderError> {
+        self.invite_command(verb::INVITE_LIST, ca, None).await
+    }
+
+    /// `ca/invite-withdraw`: withdraw the invite `id` of the CA `ca` names
+    /// (`None`: the daemon's only CA); returns it as withdrawn. Refused like
+    /// [`ca_invite_create`](Self::ca_invite_create).
+    pub async fn ca_invite_withdraw(
+        &self,
+        ca: Option<&Name>,
+        id: &str,
+    ) -> Result<ndn_cert::InviteEntry, ForwarderError> {
+        self.invite_command(verb::INVITE_WITHDRAW, ca, Some(id.to_owned()))
+            .await
+    }
+
+    /// A `ca/invite-*` command: the CA in `Name`, the argument in `Uri`; the
+    /// answer is JSON in the status text.
+    async fn invite_command<T: serde::de::DeserializeOwned>(
+        &self,
+        verb_name: &[u8],
+        ca: Option<&Name>,
+        uri: Option<String>,
+    ) -> Result<T, ForwarderError> {
+        let params = ControlParameters {
+            name: ca.cloned(),
+            uri,
+            ..Default::default()
+        };
+        let resp = self
+            .send_interest(command_name(module::CA, verb_name, &params))
+            .await?;
+        if !resp.is_ok() {
+            return Err(ForwarderError::Command {
+                code: resp.status_code,
+                text: resp.status_text,
+            });
+        }
+        serde_json::from_str(&resp.status_text).map_err(|_| ForwarderError::MalformedResponse)
+    }
+
     /// `links/list`: this device's QUIC links and the paths that reach each
     /// linked device. Local operators only. A daemon that runs no links
-    /// answers with a refusal: [`ForwarderError::Command`] with its reason.
+    /// refuses (code `links-not-running`): [`ForwarderError::Command`]
+    /// carrying a [`TrustRefusal`](crate::refusal::TrustRefusal).
     pub async fn link_list(
         &self,
         timeout: std::time::Duration,
@@ -389,53 +466,73 @@ impl MgmtClient {
     }
 
     /// `links/connect`: link now to the configured device labelled `label`
-    /// (as `link list` shows it), whatever its mode. The answer's
-    /// `status_text` says what was done, or why nothing was.
-    pub async fn link_connect(&self, label: &str) -> Result<ControlResponse, ForwarderError> {
-        let params = ndn_mgmt_wire::link_command(label, None);
-        self.send_interest(command_name(module::LINKS, verb::CONNECT, &params))
-            .await
+    /// (as `link list` shows it), whatever its mode. The answer says what
+    /// was done (code `linking`); a refusal is [`ForwarderError::Command`]
+    /// carrying a [`TrustRefusal`](crate::refusal::TrustRefusal)
+    /// ([`trust_refusal_in`](crate::trust_refusal_in)).
+    pub async fn link_connect(
+        &self,
+        label: &str,
+    ) -> Result<crate::refusal::Detail, ForwarderError> {
+        self.link_command(verb::CONNECT, label, None).await
     }
 
-    /// `links/disconnect`: close the link labelled `label` and keep it closed
-    /// until connected again or its mode is set. Answered like
-    /// [`link_connect`](Self::link_connect).
-    pub async fn link_disconnect(&self, label: &str) -> Result<ControlResponse, ForwarderError> {
-        let params = ndn_mgmt_wire::link_command(label, None);
-        self.send_interest(command_name(module::LINKS, verb::DISCONNECT, &params))
-            .await
+    /// `links/disconnect`: stop asking for the link labelled `label` (code
+    /// `link-released`). Answered like [`link_connect`](Self::link_connect).
+    pub async fn link_disconnect(
+        &self,
+        label: &str,
+    ) -> Result<crate::refusal::Detail, ForwarderError> {
+        self.link_command(verb::DISCONNECT, label, None).await
     }
 
     /// `links/mode`: set the mode of the link labelled `label` until the
-    /// daemon restarts (the config's mode applies again then). Answered like
-    /// [`link_connect`](Self::link_connect).
+    /// daemon restarts (code `link-mode-set`; the config's mode applies
+    /// again then). Answered like [`link_connect`](Self::link_connect).
     pub async fn link_mode(
         &self,
         label: &str,
         mode: ndn_mgmt_wire::LinkModeArg,
-    ) -> Result<ControlResponse, ForwarderError> {
-        let params = ndn_mgmt_wire::link_command(label, Some(mode));
-        self.send_interest(command_name(module::LINKS, verb::MODE, &params))
-            .await
+    ) -> Result<crate::refusal::Detail, ForwarderError> {
+        self.link_command(verb::MODE, label, Some(mode)).await
+    }
+
+    /// A `links/*` command on the link labelled `label`: the answer is a
+    /// detail as JSON in the status text.
+    async fn link_command(
+        &self,
+        verb_name: &[u8],
+        label: &str,
+        mode: Option<ndn_mgmt_wire::LinkModeArg>,
+    ) -> Result<crate::refusal::Detail, ForwarderError> {
+        let params = ndn_mgmt_wire::link_command(label, mode);
+        json_answer(
+            self.send_interest(command_name(module::LINKS, verb_name, &params))
+                .await?,
+        )
     }
 
     /// `ca/approve`: approve the pending request `target` names (its request
     /// id or its six-digit verification code). On the CA host the daemon
     /// records the local operator as the approver; on an admin device it
     /// signs the approval with its admin key and pushes it to the CA, so the
-    /// Interest lives `timeout`, and so does the wait. The answer's
-    /// `status_text` says what was recorded, or why nothing was.
+    /// Interest lives `timeout`, and so does the wait. Answers the request as
+    /// decided; a refusal is [`ForwarderError::Command`] carrying a
+    /// [`TrustRefusal`](ndn_cert::report::TrustRefusal) as JSON
+    /// ([`crate::trust_refusal_in`]).
     pub async fn ca_approve(
         &self,
         target: &str,
         timeout: std::time::Duration,
-    ) -> Result<ControlResponse, ForwarderError> {
+    ) -> Result<ndn_cert::report::ApprovalDecision, ForwarderError> {
         let params = ControlParameters {
             uri: Some(target.to_owned()),
             ..Default::default()
         };
-        self.deferred_command(module::CA, verb::APPROVE, &params, timeout)
-            .await
+        let resp = self
+            .deferred_command(module::CA, verb::APPROVE, &params, timeout)
+            .await?;
+        json_answer(resp)
     }
 
     /// `ca/deny`: deny the pending request `target` names, with `reason`
@@ -446,7 +543,7 @@ impl MgmtClient {
         target: &str,
         reason: &str,
         timeout: std::time::Duration,
-    ) -> Result<ControlResponse, ForwarderError> {
+    ) -> Result<ndn_cert::report::ApprovalDecision, ForwarderError> {
         let uri = if reason.is_empty() {
             target.to_owned()
         } else {
@@ -456,8 +553,10 @@ impl MgmtClient {
             uri: Some(uri),
             ..Default::default()
         };
-        self.deferred_command(module::CA, verb::DENY, &params, timeout)
-            .await
+        let resp = self
+            .deferred_command(module::CA, verb::DENY, &params, timeout)
+            .await?;
+        json_answer(resp)
     }
 
     /// `cs/config`. `Some(capacity)` sets the new bytes cap; always
@@ -556,11 +655,16 @@ impl MgmtClient {
     /// Fetch one NFD-style notification event from
     /// `/localhost/nfd/<module>/notifications`. With `seq = None` it requests
     /// the latest event (`CanBePrefix`); with `Some(n)` it long-polls sequence
-    /// `n` — the producer holds the Interest until that event publishes (up to
-    /// its own budget). Returns `Ok(Some((seq, content)))` for an event,
-    /// `Ok(None)` if `timeout` elapsed with no event (re-issue the same seq),
-    /// or `Err` on a transport/decode failure. Mirrors
+    /// `n` — the producer holds the Interest until that event publishes (for
+    /// the Interest's lifetime, `timeout`, at most 60 s). Returns
+    /// `Ok(Some((seq, content)))` for an event, `Ok(None)` if `timeout`
+    /// elapsed with no event (re-issue the same seq), or `Err` on a
+    /// transport/decode failure. Mirrors
     /// `daemon/mgmt/notification-stream.hpp` subscribers.
+    ///
+    /// The long-poll holds this client's receive lock: every other command
+    /// on this client waits for it. Subscribe on a connection of its own —
+    /// [`EventSubscription::connect`](crate::events::EventSubscription::connect).
     pub async fn notification(
         &self,
         module: &str,
@@ -624,17 +728,20 @@ impl MgmtClient {
         self.dataset(module::SECURITY, verb::IDENTITY_LIST).await
     }
 
-    /// `security/identity-status`. `status_text` is a space-separated
-    /// key=value line: `identity=<name> is_ephemeral=<bool>
-    /// pib_path=<path>`, then — for the node identity, the key the daemon
-    /// signs its own packets with — `key=<key>` and, when it holds a
-    /// certificate for it, `valid_until=<ISO 8601> days_left=<n.n>`; then
-    /// `node_identity_source=<source>` (why it is the node identity) and one
-    /// `signing_identity=<identity>` per identity the daemon signs Data as;
-    /// then one `root_store=<kind> root_key=<key>` pair per namespace it is
-    /// the root device of. Works without a configured PIB.
-    pub async fn security_identity_status(&self) -> Result<ControlResponse, ForwarderError> {
-        self.dataset(module::SECURITY, verb::IDENTITY_STATUS).await
+    /// `security/identity-status`: the daemon's node identity — the key it
+    /// signs its own packets with — with its certificate's expiry and why it
+    /// is the node identity, every identity it signs Data as, and where the
+    /// root key of each namespace it is the root device of lives. Works
+    /// without a configured PIB. A refusal is [`ForwarderError::Command`];
+    /// an answer that is not the JSON report is
+    /// [`ForwarderError::MalformedResponse`].
+    pub async fn security_identity_status(
+        &self,
+    ) -> Result<ndn_cert::report::IdentityStatus, ForwarderError> {
+        let resp = self
+            .dataset(module::SECURITY, verb::IDENTITY_STATUS)
+            .await?;
+        json_answer(resp)
     }
 
     /// `security/memberships`: how the daemon takes part in each namespace
@@ -775,31 +882,12 @@ impl MgmtClient {
             .await
     }
 
-    /// `security/ca-token-add`. Generated token returned in
-    /// `ControlParameters::uri`.
-    pub async fn security_ca_token_add(
-        &self,
-        description: &str,
-    ) -> Result<ControlParameters, ForwarderError> {
-        let params = ControlParameters {
-            uri: Some(description.to_owned()),
-            ..Default::default()
-        };
-        self.command(module::SECURITY, verb::CA_TOKEN_ADD, &params)
-            .await
-    }
-
-    /// List pending NDNCERT CA enrollment requests: `security/ca-requests`.
-    pub async fn security_ca_requests(&self) -> Result<ControlResponse, ForwarderError> {
-        self.dataset(module::SECURITY, verb::CA_REQUESTS).await
-    }
-
     /// `security/context-adopt`: ask the daemon to adopt the trust context
     /// the `ndn-trust://anchor` link names (it may fetch the context by
     /// name). The command Interest lives `timeout`, and so does the wait;
     /// the daemon answers within it. Success carries
-    /// `ndn_mgmt::AdoptedContextInfo` as JSON in `status_text`; a refusal's
-    /// `status_text` says why and what to do instead.
+    /// `ndn_mgmt::AdoptedContextInfo` as JSON in `status_text`; a refusal
+    /// carries a `TrustRefusal` as JSON ([`crate::trust_refusal`]).
     pub async fn security_context_adopt(
         &self,
         link_uri: &str,
@@ -823,8 +911,8 @@ impl MgmtClient {
     /// certificate in the namespace. The command Interest lives `timeout`,
     /// and so does the wait. Success carries `ndn_mgmt::EnrollOutcome` as
     /// JSON in `status_text` (`enrolled`, or `pending` an admin's approval,
-    /// which the daemon then completes on its own); a refusal's
-    /// `status_text` says why and what to do instead.
+    /// which the daemon then completes on its own); a refusal carries a
+    /// `TrustRefusal` as JSON ([`crate::trust_refusal`]).
     pub async fn security_enroll(
         &self,
         link_uri: &str,
@@ -1338,6 +1426,18 @@ async fn build_signed_interest_with_lifetime(
                 .await
         }
     }
+}
+
+/// The JSON report a successful answer carries; a non-OK answer is
+/// [`ForwarderError::Command`] (a structured refusal: [`crate::trust_refusal_in`]).
+fn json_answer<T: serde::de::DeserializeOwned>(resp: ControlResponse) -> Result<T, ForwarderError> {
+    if !resp.is_ok() {
+        return Err(ForwarderError::Command {
+            code: resp.status_code,
+            text: resp.status_text,
+        });
+    }
+    serde_json::from_str(&resp.status_text).map_err(|_| ForwarderError::MalformedResponse)
 }
 
 #[cfg(test)]

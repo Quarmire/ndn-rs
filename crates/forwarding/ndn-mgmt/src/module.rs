@@ -140,6 +140,7 @@ pub struct MgmtContext<'a> {
     pub compute_handler: Option<&'a Arc<dyn ComputeMgmtBackend>>,
     pub ble_handler: Option<&'a Arc<dyn BleMgmtBackend>>,
     pub approval_handler: Option<&'a Arc<dyn ApprovalMgmtBackend>>,
+    pub invite_handler: Option<&'a Arc<dyn crate::InviteMgmtBackend>>,
     pub trust_context_handler: Option<&'a Arc<dyn crate::TrustAdminMgmtBackend>>,
     pub webtransport_status_handler: Option<&'a Arc<dyn WtCertStatusBackend>>,
     #[cfg(not(target_arch = "wasm32"))]

@@ -22,27 +22,56 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_cert::report::{AdoptedContextInfo, ContextRefreshInfo, RefreshState, TrustRefusal};
+use ndn_cert::report::{
+    AdoptedContextInfo, ContextChange, ContextRefreshInfo, Detail, RefreshState, TrustRefusal,
+    code, detail_code,
+};
 use ndn_cert::{AdoptError, AnchorLink, CaRevocation, ContextUpdate, LinkAdoption};
-use ndn_mgmt_wire::control_response::status;
 use ndn_packet::{Data, Name};
 use ndn_security::SignedTrustContext;
 
-use crate::{Participant, hex, refusal};
+use crate::words::{detail, refuse};
+use crate::{Participant, hex};
 
-/// The status code an adoption refusal is reported with.
-pub fn adopt_status(e: &AdoptError) -> u64 {
+/// The refusal of an adoption that failed with `e`.
+pub fn adopt_refusal(e: &AdoptError) -> TrustRefusal {
+    // The two that tell what to check on this device's routes, worded by
+    // each host ([`crate::HostWords::add_route`], `list_routes`).
     match e {
+        AdoptError::Fetch { namespace, source } => {
+            return refuse(
+                code::CONTEXT_UNREACHABLE,
+                [
+                    ("namespace", namespace.clone()),
+                    ("source", source.to_string()),
+                    ("error", e.to_string()),
+                ],
+            );
+        }
+        AdoptError::WrongContext { namespace, reason } => {
+            return refuse(
+                code::CONTEXT_REFUSED,
+                [
+                    ("namespace", namespace.clone()),
+                    ("wrong_context", reason.clone()),
+                    ("error", e.to_string()),
+                ],
+            );
+        }
+        _ => {}
+    }
+    let kind = match e {
         AdoptError::BadLink(_)
         | AdoptError::NotAnchor(_)
         | AdoptError::LinkMissing(_)
         | AdoptError::BadNamespace(_)
         | AdoptError::BadData(_)
-        | AdoptError::UnsignedLegacyContext => status::BAD_PARAMS,
-        AdoptError::Fetch { .. } => 504,
-        AdoptError::InProgress(_) => 409,
-        _ => status::UNAUTHORIZED,
-    }
+        | AdoptError::UnsignedLegacyContext => code::LINK_INVALID,
+        AdoptError::Fetch { .. } => code::CONTEXT_UNREACHABLE,
+        AdoptError::InProgress(_) => code::TRUST_CHANGE_IN_PROGRESS,
+        _ => code::CONTEXT_REFUSED,
+    };
+    TrustRefusal::new(kind, e.to_string()).with("error", e)
 }
 
 /// What [`keep`] did with a version this device adopted.
@@ -55,49 +84,70 @@ pub struct Kept {
     pub ca: Option<CaRevocation>,
 }
 
-impl Kept {
-    /// The CA's part, worded to end an answer's detail; empty when the CA
-    /// had nothing to stop serving.
-    pub fn ca_detail(&self) -> String {
-        let Some(ca) = &self.ca else {
-            return String::new();
-        };
-        let mut detail = String::new();
-        if !ca.revoked.is_empty() {
-            let names: Vec<String> = ca.revoked.iter().map(ToString::to_string).collect();
-            detail = format!(
-                "; this node's CA no longer serves {} (the version revokes their keys) and \
-                 their device names are free for a new key",
-                names.join(", ")
-            );
+/// The params of a detail saying what became of a version adopted
+/// (`kept`, [`keep`]'s result): `stored` (where) or `cause` (why it is not
+/// kept) with its params, `published`, and the CA's part (`ca_revoked`,
+/// `ca_not_persisted`).
+pub(crate) fn kept_params(
+    p: &Participant,
+    kept: &Result<Kept, TrustRefusal>,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![("published", p.publisher().is_some().to_string())];
+    let not_kept = match kept {
+        Ok(kept) => {
+            if let Some(ca) = &kept.ca {
+                if !ca.revoked.is_empty() {
+                    let names: Vec<String> = ca.revoked.iter().map(ToString::to_string).collect();
+                    params.push(("ca_revoked", names.join(", ")));
+                }
+                if let Some(e) = &ca.not_persisted {
+                    params.push(("ca_not_persisted", e.to_string()));
+                }
+            }
+            match &kept.stored {
+                Ok(stored) => {
+                    params.push(("stored", stored.clone()));
+                    None
+                }
+                Err(e) => Some(e),
+            }
         }
-        if let Some(e) = &ca.not_persisted {
-            detail.push_str(&format!(
-                "; the CA could not record that in its store ({e}): it holds for this run, and \
-                 the CA follows the stored trust context again when the daemon starts"
-            ));
+        Err(e) => Some(e),
+    };
+    if let Some(e) = not_kept {
+        // The cause's params, then its code; this detail's own win.
+        for (k, v) in &e.params {
+            if let Some(k) = cause_param(k) {
+                params.push((k, v.clone()));
+            }
         }
-        detail
+        params.push(("cause", e.code.clone()));
     }
+    params
 }
 
-/// How an update reached this device, for the log.
-#[derive(Debug, Clone, Copy)]
-pub enum Adopted {
-    /// A refresh fetched it from upstream.
-    ByRefresh,
-    /// It was pushed over the namespace's sync group.
-    OverSync,
+/// The params a cause of [`kept_params`] may carry (those of
+/// `context-not-stored` and `context-superseded`).
+fn cause_param(key: &str) -> Option<&'static str> {
+    ["namespace", "version", "now", "error", "location"]
+        .into_iter()
+        .find(|k| *k == key)
 }
 
-/// Keep `ctx` (signed Data `data`), already in the keyring: this device's
-/// CA of its namespace stops serving every certificate it revokes, and it is
+/// Keep `ctx` (signed Data `data`), already in the keyring, reached `how`:
+/// this device's CA of its namespace stops serving every certificate it
+/// revokes, the host is told ([`crate::Participant::events`]), and it is
 /// stored and published by name as the namespace's newest version (the
 /// versions before it stay stored and served). Refused (`409`) when the
 /// keyring meanwhile holds a newer version of the namespace: that one is
 /// what is kept (and followed). A failure to store it is reported in
 /// [`Kept::stored`]: the version holds for this run all the same.
-pub fn keep(p: &Participant, ctx: &SignedTrustContext, data: &Data) -> Result<Kept, TrustRefusal> {
+pub fn keep(
+    p: &Participant,
+    ctx: &SignedTrustContext,
+    data: &Data,
+    how: ContextChange,
+) -> Result<Kept, TrustRefusal> {
     let _keeping = p
         .keeping
         .lock()
@@ -105,22 +155,22 @@ pub fn keep(p: &Participant, ctx: &SignedTrustContext, data: &Data) -> Result<Ke
     if let Some(held) = p.keyring().version_of(ctx.namespace())
         && held > ctx.version()
     {
-        return Err(refusal(
-            409,
-            format!(
-                "{} v{} was adopted, but v{held} was adopted meanwhile by another command; \
-                 v{held} is the version this node holds, stores and publishes",
-                ctx.namespace(),
-                ctx.version()
-            ),
+        return Err(refuse(
+            code::CONTEXT_SUPERSEDED,
+            [
+                ("namespace", ctx.namespace().to_string()),
+                ("version", ctx.version().to_string()),
+                ("now", held.to_string()),
+            ],
         ));
     }
     let ca = p
         .ca_for(ctx.namespace())
         .and_then(|ca| ca.follow_context(ctx));
-    // The version holds for this run whether or not it is stored: what it
-    // changes about the device's membership is published now.
-    crate::membership::kept(p, ctx);
+    // The version holds for this run whether or not it is stored: the host
+    // is told of it, and of what it changes about the device's membership,
+    // now.
+    crate::membership::kept(p, ctx, how);
     Ok(Kept {
         stored: store_and_publish(p, ctx, data),
         ca,
@@ -151,15 +201,14 @@ fn store_and_publish(
     data: &Data,
 ) -> Result<String, TrustRefusal> {
     let stored = p.store().persist(ctx, data).map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
-            format!(
-                "adopted {} v{} for this run, but storing it failed ({e}); it will be gone \
-                 after a restart — fix {}",
-                ctx.namespace(),
-                ctx.version(),
-                p.store().location()
-            ),
+        refuse(
+            code::CONTEXT_NOT_STORED,
+            [
+                ("namespace", ctx.namespace().to_string()),
+                ("version", ctx.version().to_string()),
+                ("error", e),
+                ("location", p.store().location()),
+            ],
         )
     })?;
     if let Some(publisher) = p.publisher() {
@@ -180,7 +229,7 @@ pub fn keep_adopted(
     expected_fingerprint: &[u8; 32],
 ) -> Result<AdoptedContextInfo, TrustRefusal> {
     let ctx = &adopted.context;
-    let stored = keep(p, ctx, &adopted.data)?.stored?;
+    let stored = keep(p, ctx, &adopted.data, ContextChange::Adopt)?.stored?;
     tracing::info!(
         target: "security",
         namespace = %ctx.namespace(),
@@ -211,7 +260,6 @@ pub async fn adopt_link(
     p: &Participant,
     link: &AnchorLink,
 ) -> Result<AdoptedContextInfo, TrustRefusal> {
-    let refuse = |e: AdoptError| refusal(adopt_status(&e), e.to_string());
     // A fetched context must come from the forwarders serving the
     // namespace, not from this device's own publisher (which holds only the
     // versions this device already has).
@@ -231,22 +279,22 @@ pub async fn adopt_link(
                 error = %e,
                 "trust context not adopted"
             );
-            refuse(e)
+            adopt_refusal(&e)
         })?;
     drop(bypass);
     keep_adopted(p, &adopted, &link.expected_fingerprint)
 }
 
 /// Keep `update`, adopted into the keyring by a refresh or from the
-/// namespace's sync group: store and publish every version walked through,
-/// then the newest — so this device comes back with it after a restart and
-/// the devices behind it can follow the same versions by name. A failure to
-/// store one is logged and does not undo the adoption; what became of the
-/// newest is returned ([`keep`]).
+/// namespace's sync group (`how`): store and publish every version walked
+/// through, then the newest — so this device comes back with it after a
+/// restart and the devices behind it can follow the same versions by name. A
+/// failure to store one is logged and does not undo the adoption; what
+/// became of the newest is returned ([`keep`]).
 pub fn keep_update(
     p: &Participant,
     update: &ContextUpdate,
-    how: Adopted,
+    how: ContextChange,
 ) -> Result<Kept, TrustRefusal> {
     let namespace = update.context.namespace();
     for step in &update.walked {
@@ -260,7 +308,7 @@ pub fn keep_update(
             );
         }
     }
-    let kept = keep(p, &update.context, &update.data);
+    let kept = keep(p, &update.context, &update.data, how);
     let walked: Vec<u64> = update.walked.iter().map(|s| s.context.version()).collect();
     let revoked: Vec<String> = update.revoked.iter().map(Name::to_string).collect();
     tracing::info!(
@@ -276,16 +324,6 @@ pub fn keep_update(
         "adopted trust-context update"
     );
     kept
-}
-
-/// Whether a version this device keeps is published ([`keep`] publishes
-/// only with a publisher), worded for a detail.
-pub(crate) fn publication(p: &Participant) -> String {
-    if p.publisher().is_some() {
-        " and published".into()
-    } else {
-        p.words().not_published()
-    }
 }
 
 /// Adopt `wire` (a signed trust-context Data) as the next version of the
@@ -304,21 +342,22 @@ pub async fn apply_update(
     p: &Participant,
     wire: Bytes,
 ) -> Result<ContextRefreshInfo, TrustRefusal> {
-    let data = Data::decode(wire)
-        .map_err(|e| refusal(status::BAD_PARAMS, format!("not a Data packet: {e}")))?;
+    let invalid =
+        |error: String| TrustRefusal::new(code::UPDATE_INVALID, error.clone()).with("error", error);
+    let data = Data::decode(wire).map_err(|e| invalid(format!("not a Data packet: {e}")))?;
     let namespace = ndn_security::context_namespace_of(&data.name).ok_or_else(|| {
-        refusal(
-            status::BAD_PARAMS,
-            format!(
-                "{} is not a trust-context name (<ns>/32=trust-context/v=<N>)",
-                data.name
-            ),
-        )
+        invalid(format!(
+            "{} is not a trust-context name (<ns>/32=trust-context/v=<N>)",
+            data.name
+        ))
     })?;
     let _one_change = p.context_change.lock().await;
-    let held = p
-        .held_context(&namespace)
-        .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&namespace)))?;
+    let held = p.held_context(&namespace).ok_or_else(|| {
+        refuse(
+            code::CONTEXT_NOT_HELD,
+            [("namespace", namespace.to_string())],
+        )
+    })?;
     if let Some((version, location)) = stored_copy(p, &held, &data) {
         return Ok(ContextRefreshInfo {
             namespace: namespace.to_string(),
@@ -326,37 +365,46 @@ pub async fn apply_update(
             held_version: held.version(),
             version,
             revoked: Vec::new(),
-            detail: format!(
-                "already took v{version} (holds v{}); stored {location}",
-                held.version(),
-            ),
+            detail: Detail::new(
+                detail_code::UPDATE_ALREADY_TAKEN,
+                format!(
+                    "already took v{version} (holds v{}); stored {location}",
+                    held.version(),
+                ),
+            )
+            .with("version", version)
+            .with("held", held.version())
+            .with("stored", location),
         });
     }
     let (ctx, signer) = ndn_cert::open_context_update(&held, &data)
         .await
         .map_err(|e| {
-            refusal(
-                403,
+            TrustRefusal::new(
+                code::UPDATE_REFUSED,
                 format!(
                     "refused a trust-context update for {namespace}: {e}; the held version v{} \
                      stays in force",
                     held.version()
                 ),
             )
+            .with("namespace", &namespace)
+            .with("held_version", held.version())
+            .with("error", e)
         })?;
     let context = Arc::new(ctx);
     p.keyring()
         .adopt_update_from(&held, Arc::clone(&context))
         .map_err(|now| {
-            refusal(
-                409,
-                format!(
-                    "{namespace} changed meanwhile (now v{}); make the new version again",
-                    now.unwrap_or_default()
-                ),
+            let now = now.unwrap_or_default();
+            TrustRefusal::new(
+                code::CONTEXT_CHANGED_MEANWHILE,
+                format!("{namespace} changed meanwhile (now v{now}); make the new version again"),
             )
+            .with("namespace", &namespace)
+            .with("now", now)
         })?;
-    let kept = keep(p, &context, &data);
+    let kept = keep(p, &context, &data, ContextChange::Update);
     let revoked: Vec<String> = context
         .revocations()
         .iter()
@@ -373,29 +421,19 @@ pub async fn apply_update(
         stored = kept.as_ref().is_ok_and(|k| k.stored.is_ok()),
         "adopted trust-context version made on this device"
     );
-    let adopted = format!(
-        "adopted v{} (signed by {}, an anchor of v{})",
-        context.version(),
-        signer.name,
-        held.version()
-    );
+    let mut params = kept_params(p, &kept);
+    params.extend([
+        ("version", context.version().to_string()),
+        ("signer", signer.name.to_string()),
+        ("held", held.version().to_string()),
+    ]);
     Ok(ContextRefreshInfo {
         namespace: namespace.to_string(),
         state: RefreshState::Updated,
         held_version: held.version(),
         version: context.version(),
         revoked,
-        detail: match kept {
-            Ok(kept) => match &kept.stored {
-                Ok(stored) => format!(
-                    "{adopted}; stored {stored}{}{}",
-                    publication(p),
-                    kept.ca_detail()
-                ),
-                Err(e) => format!("{adopted}, but {}{}", e.reason, kept.ca_detail()),
-            },
-            Err(e) => format!("{adopted}, but {}", e.reason),
-        },
+        detail: detail(detail_code::UPDATE_ADOPTED, params),
     })
 }
 

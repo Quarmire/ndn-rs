@@ -20,6 +20,7 @@ pub mod ecdh;
 pub mod enroll_target;
 pub mod error;
 pub mod invite;
+pub mod invites;
 pub mod issuers;
 pub mod namespace;
 pub mod node_identity;
@@ -55,7 +56,7 @@ pub use challenge::email::{EmailChallenge, EmailSender};
 pub use challenge::nop::NopChallenge;
 pub use challenge::pin::PinChallenge;
 pub use challenge::possession::PossessionChallenge;
-pub use challenge::token::{ApprovalRoleToken, TokenChallenge, TokenCheck, TokenStore};
+pub use challenge::token::{TokenChallenge, TokenCheck, TokenStore, WithdrawError};
 #[cfg(feature = "yubikey-challenge")]
 pub use challenge::yubikey::YubikeyHotpChallenge;
 pub use challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState};
@@ -79,6 +80,11 @@ pub use invite::{
     EnrollLink, INVITE_ENROLL_MAX_EXCHANGES, InviteEnrollError, InviteEnrollFailure,
     InviteEnrollment, InviteLink, IssuedCertificate, IssuedCheckError, check_chain,
     enroll_with_invite, ensure_invite_context, new_device_key_name,
+};
+pub use invites::{
+    CaInviteListing, CaInvites, CreatedInvite, HostInvites, InviteEntry, InviteEvent,
+    InviteEventKind, InviteInfo, InviteIssuer, InviteObserver, InviteRecord, InviteRequest,
+    InviteState, TokenDenial,
 };
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_dir, ca_dir_of,

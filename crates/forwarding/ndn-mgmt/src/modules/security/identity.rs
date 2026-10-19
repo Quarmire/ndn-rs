@@ -7,19 +7,16 @@ use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_security::FilePib;
 
-/// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>][
-/// valid_until=<ISO 8601> days_left=<n>][ node_identity_source=<source>][
-/// signing_identity=<identity>]…[ root_store=<kind> root_key=<key>]…`. With
-/// a trust-admin backend tracking the identities the node signs as (they
-/// change at runtime through `security/enroll`), `identity`, `key` and the
-/// certificate's expiry describe the **node identity** (its own packets:
-/// management responses, discovery records, links) and
-/// `node_identity_source` the rule that chose it
-/// ([`ndn_cert::NodeIdentitySource`]); one `signing_identity` follows per
+/// [`crate::IdentityStatus`] as JSON. With a trust-admin backend tracking
+/// the identities the node signs as (they change at runtime through
+/// `security/enroll`), `identity`, `key` and the certificate's expiry
+/// describe the **node identity** (its own packets: management responses,
+/// discovery records, links), `node_identity_source` the rule that chose it
+/// ([`ndn_cert::NodeIdentitySource`]) and `signing_identities` every
 /// identity the node signs Data as (each trusted prefix with its own key).
-/// Without one, the configured identity, else the first trust anchor's. One
-/// `root_store`/`root_key` pair per namespace this node is the root device
-/// of, where its root key lives.
+/// Without one, the configured identity, else the first trust anchor's.
+/// `root_stores`: one per namespace this node is the root device of, where
+/// its root key lives.
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
     config: &dyn crate::MgmtConfig,
@@ -31,63 +28,70 @@ pub(super) fn security_identity_status(
         Some(pos) => key[..pos].to_string(),
         None => key,
     };
-    let mut node = String::new();
-    let (identity_name, is_ephemeral, key, valid_until) = if let Some(signing) = signing {
-        node.push_str(&format!(" node_identity_source={}", signing.source));
-        for (identity, _) in &signing.signing {
-            node.push_str(&format!(" signing_identity={identity}"));
-        }
+    let mut report = crate::IdentityStatus {
+        identity: None,
+        is_ephemeral,
+        pib_path: config
+            .pib_path()
+            .map(str::to_owned)
+            .unwrap_or_else(|| dirs_or_tmp_pib().display().to_string()),
+        key: None,
+        valid_until: None,
+        days_left: None,
+        node_identity_source: None,
+        signing_identities: Vec::new(),
+        root_stores: root_stores
+            .iter()
+            .map(|r| crate::RootStoreStatus {
+                namespace: r.namespace.to_string(),
+                kind: r.kind.clone(),
+                key: r.key.to_string(),
+            })
+            .collect(),
+    };
+    if let Some(signing) = signing {
         let key = signing.key.to_string();
-        (
-            identity_of(key.clone()),
-            signing.ephemeral,
-            Some(key),
-            signing.valid_until,
-        )
+        report.identity = Some(identity_of(key.clone()));
+        report.is_ephemeral = signing.ephemeral;
+        report.key = Some(key);
+        if let Some(until) = signing.valid_until {
+            let (iso, days_left) = expiry(until);
+            report.valid_until = Some(iso);
+            report.days_left = Some(days_left);
+        }
+        report.node_identity_source = Some(signing.source);
+        report.signing_identities = signing
+            .signing
+            .iter()
+            .map(|(identity, key)| crate::SigningIdentityStatus {
+                identity: identity.to_string(),
+                key: key.to_string(),
+            })
+            .collect();
     } else if let Some(id) = config.security_identity() {
-        (id.to_owned(), is_ephemeral, None, None)
+        report.identity = Some(id.to_owned());
     } else if let Some(mgr) = engine.security() {
-        let name = mgr
+        report.identity = mgr
             .trust_anchor_names()
             .first()
-            .map(|n| identity_of(n.to_string()))
-            .unwrap_or_else(|| "(none)".to_string());
-        (name, is_ephemeral, None, None)
-    } else {
-        ("(none)".to_string(), is_ephemeral, None, None)
-    };
-
-    let pib_path = config
-        .pib_path()
-        .map(str::to_owned)
-        .unwrap_or_else(|| dirs_or_tmp_pib().display().to_string());
-
-    let key = key.map(|k| format!(" key={k}")).unwrap_or_default();
-    let expiry = valid_until.map(expiry_fields).unwrap_or_default();
-    let roots: String = root_stores
-        .iter()
-        .map(|r| format!(" root_store={} root_key={}", r.kind, r.key))
-        .collect();
-    let text = format!(
-        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}{node}{roots}\n"
-    );
-    ControlResponse::ok_empty(text)
+            .map(|n| identity_of(n.to_string()));
+    }
+    match serde_json::to_string(&report) {
+        Ok(json) => ControlResponse::ok_empty(json),
+        Err(e) => ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}")),
+    }
 }
 
-/// ` valid_until=<ISO 8601>Z days_left=<n.n>` for a certificate valid until
-/// `valid_until` (ns since the Unix epoch); `days_left` is negative once it
-/// expired.
-fn expiry_fields(valid_until: u64) -> String {
+/// `(<ISO 8601>Z, days left)` for a certificate valid until `valid_until`
+/// (ns since the Unix epoch); days left is negative once it expired.
+fn expiry(valid_until: u64) -> (String, f64) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0);
     let days_left = (i128::from(valid_until) - now) as f64 / 86_400e9;
     let iso = ndn_security::iso8601::format_iso_basic(valid_until);
-    format!(
-        " valid_until={}Z days_left={days_left:.1}",
-        String::from_utf8_lossy(&iso)
-    )
+    (format!("{}Z", String::from_utf8_lossy(&iso)), days_left)
 }
 
 /// Default PIB path (mirrors `default_pib_path()` in `main.rs`).

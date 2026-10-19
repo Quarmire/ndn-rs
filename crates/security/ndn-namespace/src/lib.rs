@@ -25,6 +25,10 @@
 //! - [`admin`]: the root device's side — hand a version made offline to the
 //!   running device (retry / undo rule), and the anti-fork check before a
 //!   recovery.
+//! - [`root`]: root-device operations — make a namespace, revoke, recovery
+//!   kits, recover, move the root key, update the schema — with the host's
+//!   secret entry and running device behind traits, typed outcomes and
+//!   coded refusals.
 //!
 //! # What a host provides
 //!
@@ -40,21 +44,22 @@
 //! - optionally a running [`publish::PublishedContexts`] and
 //!   [`publish::OwnCertificates`] (serving by name), a [`sync::ContextSync`],
 //!   and the [`ndn_cert::CaState`] of each namespace CA the device runs;
-//! - its [`HostWords`]: how the person at the device does what a refusal or
-//!   a log line asks of them, in the host's own terms — its commands or app
-//!   actions, its configuration, where it keeps keys. The library quotes
-//!   them and names no host itself; [`HostWords::default`] is neutral. A
-//!   forwarder supplies its CLI (`` `ndn-fwd enroll` ``, `[security]
-//!   renew_before`, "the PIB directory"), an app its own actions. Each
-//!   message that quotes them is a [`HostWords`] method, so a host can test
-//!   how its words read.
+//! - its [`HostWords`] for its own log lines: how the person at the device
+//!   does what a log line asks of them, in the host's own terms — its
+//!   commands or app actions, its configuration, where it keeps keys.
+//!   [`HostWords::default`] is neutral.
 //!
 //! and passes a [`KeyVault`] — where device keys and certificates are kept,
 //! and how the running device switches to a new key — to each operation
 //! that touches keys. Every operation answers with the plain report types of
-//! [`ndn_cert::report`] or a [`TrustRefusal`] (an HTTP-like status code and
-//! a reason that says what to do); the host maps them to its own surface
-//! (management verbs, FFI types).
+//! [`ndn_cert::report`] or a [`TrustRefusal`]: a stable code with its
+//! parameters (catalogued in [`ndn_cert::report::code`] and
+//! `ndn-rs/docs/specs/mgmt-trust.md`) and a neutral sentence, and prose
+//! inside an outcome is a [`Detail`] the same way. Nothing the library
+//! answers names a host's commands, configuration or storage: a client
+//! words its own message from the code — [`HostWords::render`] and
+//! [`HostWords::render_detail`] rebuild the library's sentences with the
+//! client's phrases.
 //!
 //! The host keeps its process lifecycle: it spawns the periodic tasks
 //! ([`refresh::spawn_periodic`], [`renewal::spawn_periodic`],
@@ -64,12 +69,14 @@ pub mod admin;
 pub mod approval_wait;
 pub mod approver;
 pub mod enroll;
+mod events;
 pub mod host;
 pub mod keep;
 pub mod membership;
 pub mod publish;
 pub mod refresh;
 pub mod renewal;
+pub mod root;
 pub mod sync;
 mod words;
 
@@ -83,9 +90,9 @@ pub use host::{
     Activation, ContextStore, KeyUnavailable, KeyVault, PibContextStore, StoredContext,
 };
 pub use ndn_cert::report::{
-    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
+    AdoptedContextInfo, ContextRefreshInfo, Detail, EnrollOutcome, EnrollRequest, EnrolledInfo,
     MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation, PendingEnrollInfo,
-    RefreshState, RenewalInfo, RenewalState, TrustRefusal,
+    RefreshState, RenewalInfo, RenewalState, TrustEvent, TrustRefusal, code, detail_code,
 };
 pub use words::HostWords;
 
@@ -106,8 +113,9 @@ pub struct ParticipantParts {
     /// holds and serves a CA of): each follows every version of its
     /// namespace's trust context this device keeps.
     pub cas: Vec<Arc<CaState>>,
-    /// How the person at the device does what a refusal or a log line asks
-    /// of them, in the host's terms.
+    /// How the person at the device does what the host's log lines ask of
+    /// them, in the host's terms (only logs quote them: refusals and
+    /// details are neutral, worded by each client).
     pub words: HostWords,
 }
 
@@ -131,8 +139,8 @@ pub struct Participant {
     /// only the first of a device without an identity becomes its node
     /// identity.
     pub(crate) installing: parking_lot::Mutex<()>,
-    /// Membership changes, as they happen ([`membership_events`](Self::membership_events)).
-    membership_events: tokio::sync::broadcast::Sender<MembershipEvent>,
+    /// Trust changes, as they happen ([`events`](Self::events)).
+    events: tokio::sync::broadcast::Sender<TrustEvent>,
     /// What the device last saw of each namespace it holds, to tell an
     /// adoption, a revocation of its certificate and a root change apart.
     pub(crate) seen:
@@ -179,7 +187,7 @@ impl Participant {
             words,
             enroll_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             installing: parking_lot::Mutex::new(()),
-            membership_events: tokio::sync::broadcast::channel(MEMBERSHIP_EVENTS_CAP).0,
+            events: tokio::sync::broadcast::channel(EVENTS_CAP).0,
             seen: parking_lot::Mutex::new(membership::seen_now(&keyring)),
             keeping: std::sync::Mutex::new(()),
             context_change: tokio::sync::Mutex::new(()),
@@ -223,9 +231,27 @@ impl Participant {
         &self.cas
     }
 
-    /// The host's words, quoted in refusals and logs.
+    /// The host's words, for its own log lines.
     pub fn words(&self) -> &HostWords {
         &self.words
+    }
+
+    /// A receiver of every [`TrustEvent`] this device makes from now on: a
+    /// trust-context version kept, an enrollment finished, a certificate
+    /// renewed or not, its membership in a namespace changed — for the
+    /// host's change notifications (a forwarder serves them on
+    /// `/localhost/nfd/security/notifications`). A receiver that falls more
+    /// than a few hundred events behind loses the oldest
+    /// (`RecvError::Lagged`); the listing verbs have the state
+    /// ([`membership::memberships`] for memberships).
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<TrustEvent> {
+        self.events.subscribe()
+    }
+
+    /// Tell every [`events`](Self::events) receiver of `event` (none:
+    /// dropped).
+    pub(crate) fn emit(&self, event: TrustEvent) {
+        let _ = self.events.send(event);
     }
 
     /// The trust context this device holds for `namespace`.
@@ -246,43 +272,24 @@ impl Participant {
         )
     }
 
-    /// A receiver of every [`MembershipEvent`] from now on: the device
-    /// adopted a namespace, enrolled or renewed in one, a version revokes
-    /// one of its certificates, or a namespace's root changed. A receiver
-    /// that falls more than a few hundred events behind loses the oldest
-    /// (`RecvError::Lagged`); [`membership::memberships`] is the state.
-    pub fn membership_events(&self) -> tokio::sync::broadcast::Receiver<MembershipEvent> {
-        self.membership_events.subscribe()
-    }
-
-    /// Publish `event` to the [`membership_events`](Self::membership_events)
-    /// receivers (none: dropped).
+    /// Tell the host of a membership change ([`TrustEvent::MembershipChanged`]).
     pub(crate) fn publish_membership(&self, event: MembershipEvent) {
         tracing::info!(
             target: "security",
             namespace = %event.namespace,
             relation = %event.relation,
             change = ?event.change,
-            "{}",
-            event.detail
+            "membership changed"
         );
-        let _ = self.membership_events.send(event);
+        self.emit(TrustEvent::MembershipChanged(event));
     }
 }
 
 /// One namespace's enrollment lock ([`Participant::enroll_lock`]).
 pub(crate) type EnrollLock = Arc<tokio::sync::Mutex<()>>;
 
-/// How many membership events a slow receiver may fall behind.
-const MEMBERSHIP_EVENTS_CAP: usize = 256;
-
-/// A [`TrustRefusal`] with `status_code` and `reason`.
-pub fn refusal(status_code: u64, reason: impl Into<String>) -> TrustRefusal {
-    TrustRefusal {
-        status_code,
-        reason: reason.into(),
-    }
-}
+/// How many trust events a slow receiver may fall behind.
+const EVENTS_CAP: usize = 256;
 
 /// Lower-case hex of `bytes`.
 pub fn hex(bytes: &[u8]) -> String {

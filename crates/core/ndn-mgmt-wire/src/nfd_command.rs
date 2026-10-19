@@ -67,6 +67,20 @@ pub mod verb {
     /// `ca/deny` — deny a pending request (`<id or code>[:<reason>]` in
     /// `uri`). Same authorization as `approve`.
     pub const DENY: &[u8] = b"deny";
+    /// `ca/invite-create` — make an invite at this node's CA: a JSON
+    /// `ndn_cert::InviteRequest` (`role`, optional `ttl_secs`, optional
+    /// `device`) in `ControlParameters.uri`; the answer's status text is the
+    /// JSON `ndn_cert::CreatedInvite` (id, token, `ndn-trust://invite` link,
+    /// …) — the only time the token is shown. Authorized like `approve`.
+    pub const INVITE_CREATE: &[u8] = b"invite-create";
+    /// `ca/invite-list` — this node's CA's invites (no tokens), as a JSON
+    /// list of `ndn_cert::InviteEntry` in the status text. Authorized like
+    /// `approve`.
+    pub const INVITE_LIST: &[u8] = b"invite-list";
+    /// `ca/invite-withdraw` — withdraw the invite whose id is in `uri`; the
+    /// answer is the withdrawn `ndn_cert::InviteEntry` as JSON. Authorized
+    /// like `approve`.
+    pub const INVITE_WITHDRAW: &[u8] = b"invite-withdraw";
     /// `links/connect` — link now to the configured device whose label is in
     /// `ControlParameters.uri`, whatever its mode, until it is disconnected.
     pub const CONNECT: &[u8] = b"connect";
@@ -111,8 +125,6 @@ pub mod verb {
     pub const KEY_DELETE: &[u8] = b"key-delete";
     pub const CA_INFO: &[u8] = b"ca-info";
     pub const CA_ENROLL: &[u8] = b"ca-enroll";
-    pub const CA_TOKEN_ADD: &[u8] = b"ca-token-add";
-    pub const CA_REQUESTS: &[u8] = b"ca-requests";
     pub const YUBIKEY_DETECT: &[u8] = b"yubikey-detect";
     pub const YUBIKEY_GENERATE: &[u8] = b"yubikey-generate";
     pub const SCHEMA_RULE_ADD: &[u8] = b"schema-rule-add";

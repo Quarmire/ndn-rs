@@ -676,13 +676,12 @@ fn versions(first: &u64, last: &u64) -> String {
 pub enum CatchUpStop {
     #[error(
         "that is {gap} versions, more than the {max} a refresh follows one by one; adopt the \
-         namespace again from a current anchor link (`ndn-fwd adopt <link>`)"
+         namespace again from a current anchor link"
     )]
     TooFar { gap: u64, max: u64 },
     #[error(
         "v{version} was refused: {refusal}. Whatever served it does not serve this namespace's \
-         versions; if the namespace changed its root, adopt it again from a current anchor link \
-         (`ndn-fwd adopt <link>`)"
+         versions; if the namespace changed its root, adopt it again from a current anchor link"
     )]
     Refused {
         version: u64,
@@ -748,7 +747,7 @@ pub trait VersionSource {
 /// version stays in force in every case.
 #[derive(Debug, thiserror::Error)]
 pub enum RefreshError {
-    #[error("no trust context is held for {0}; adopt it first (`ndn-fwd adopt`)")]
+    #[error("no trust context is held for {0}; adopt it first")]
     NotHeld(String),
     /// Nothing answered the Interest for the newest version's name (no
     /// route, no reply, a Nack): the namespace could not be asked at all.

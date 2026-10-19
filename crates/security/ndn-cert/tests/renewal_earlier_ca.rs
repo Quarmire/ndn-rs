@@ -121,7 +121,9 @@ async fn earlier() -> Earlier {
         .await
         .unwrap();
     let tokens = TokenStore::new();
-    tokens.add_scoped("member-aa", None, Some(ns().append("member")));
+    tokens
+        .add_scoped("member-aa", None, Some(ns().append("member")))
+        .unwrap();
     Earlier {
         ca: ca(Arc::clone(&mgr), ca_key, tokens),
         mgr,
@@ -198,6 +200,7 @@ async fn enroll(earlier: &Earlier) -> Device {
         token: "member-aa".into(),
         ttl_secs: None,
         anchor_fingerprint: Some(earlier.fingerprint),
+        device: None,
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();

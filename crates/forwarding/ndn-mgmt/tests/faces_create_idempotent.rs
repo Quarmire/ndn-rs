@@ -36,6 +36,7 @@ async fn setup() -> TestEnv {
         extra_modules: Vec::new(),
         face_provisioners: Vec::new(),
         control_surfaces: Vec::new(),
+        events: Default::default(),
         security_is_ephemeral: true,
         command_validator: None,
         localhop_command_validator: None,
@@ -49,6 +50,7 @@ async fn setup() -> TestEnv {
         webtransport_status_handler: None,
         ble_handler: None,
         approval_handler: None,
+        invite_handler: None,
         trust_context_handler: None,
         runtime_policy: None,
     };

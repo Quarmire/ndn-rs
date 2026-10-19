@@ -4,8 +4,8 @@
 //! Both are narrow and synchronous: each method is one local storage step,
 //! and every protocol rule — which version wins, when a key is deleted,
 //! which certificate is renewed — stays in this crate. A method that fails
-//! says why in words that end up in a [`TrustRefusal`](ndn_cert::report::TrustRefusal)
-//! reason or a log line.
+//! says why (a fact: what failed, where) in text that ends up in a
+//! [`TrustRefusal`](ndn_cert::report::TrustRefusal) parameter or a log line.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,8 +14,6 @@ use bytes::Bytes;
 use ndn_cert::{RequestStore, RootStore};
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, FilePib, SignedTrustContext, Signer};
-
-use crate::HostWords;
 
 /// One stored trust-context version, read back and re-verified, or why it
 /// could not be.
@@ -32,8 +30,8 @@ pub struct StoredContext {
 /// the PIB's root store. A host that persists elsewhere (an app handing each
 /// version to its platform storage) implements this itself.
 pub trait ContextStore: Send + Sync {
-    /// Where the store is, worded to end "fix …" in a refusal (`the PIB
-    /// directory (/var/lib/ndn/pib)`).
+    /// Where the store is, as a fact for a refusal's `location` (a
+    /// directory: `/var/lib/ndn/pib`).
     fn location(&self) -> String;
 
     /// Keep version `ctx` (signed Data `data`, byte for byte) as a version
@@ -58,27 +56,17 @@ pub trait ContextStore: Send + Sync {
 /// A [`ContextStore`] beside a PIB: `<pib>/contexts/`
 /// ([`ndn_cert::context_store`]) and the PIB's root stores, one per
 /// namespace whose root it holds ([`ndn_cert::RootStore::open_all`]). Its
-/// location is worded with the host's [`HostWords::key_storage_dir`]
-/// ([`PibContextStore::with_words`]).
+/// location is the PIB directory.
 #[derive(Debug, Clone)]
 pub struct PibContextStore {
     root: PathBuf,
-    /// What the host calls the directory, as something to fix.
-    called: String,
 }
 
 impl PibContextStore {
     pub fn new(pib_root: impl Into<PathBuf>) -> Self {
         Self {
             root: pib_root.into(),
-            called: HostWords::default().key_storage_dir,
         }
-    }
-
-    /// The store with its location worded in the host's `words`.
-    pub fn with_words(mut self, words: &HostWords) -> Self {
-        self.called = words.key_storage_dir.clone();
-        self
     }
 
     pub fn root(&self) -> &Path {
@@ -103,7 +91,7 @@ fn stored(list: Vec<StoredRead>) -> Vec<StoredContext> {
 
 impl ContextStore for PibContextStore {
     fn location(&self) -> String {
-        format!("{} ({})", self.called, self.root.display())
+        self.root.display().to_string()
     }
 
     fn persist(&self, ctx: &SignedTrustContext, data: &Data) -> Result<String, String> {
@@ -166,7 +154,7 @@ pub struct Activation {
     /// persistent identity before).
     pub node_identity: bool,
     /// What changes only at the next start, and why (empty: nothing).
-    pub at_next_start: Vec<String>,
+    pub at_next_start: Vec<ndn_cert::report::Detail>,
 }
 
 /// Where a device's keys and their certificates are kept.
@@ -176,7 +164,8 @@ pub struct Activation {
 /// vault (a [`Signer`] signs with it). A forwarder implements it over its
 /// PIB; an app over its sealed key storage.
 pub trait KeyVault: Send + Sync {
-    /// Where the keys are, for messages (a PIB path, a storage directory).
+    /// Where the keys are, as a fact for messages (a PIB path, a storage
+    /// directory).
     fn location(&self) -> String;
 
     /// The identity the device loads by default — its node identity, when

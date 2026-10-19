@@ -122,16 +122,16 @@ pub enum AdoptError {
     #[error("not a readable trust link: {0}")]
     BadLink(String),
     #[error(
-        "the anchor link carries no {0}; ask the namespace's owner for a new invite/QR \
-         (`ndn-fwd init` prints one as anchor_uri)"
+        "the anchor link carries no {0}; ask the namespace's owner for a new invite/QR (the \
+         root device shows its anchor link)"
     )]
     LinkMissing(&'static str),
     #[error("anchor link carries an invalid namespace {0:?}")]
     BadNamespace(String),
     #[error(
         "the anchor link carries only a fingerprint, so the context has to be fetched over \
-         NDN: that needs the running daemon with a link and a route toward a node serving \
-         the context (start ndn-fwd and retry), or use an anchor link with the context inline"
+         NDN: that needs the running forwarder with a link and a route toward a node serving \
+         the context (start it and retry), or use an anchor link with the context inline"
     )]
     InlineContextRequired,
     #[error(
@@ -141,9 +141,8 @@ pub enum AdoptError {
     UnsignedLegacyContext,
     #[error(
         "could not fetch the trust context of {namespace}: {source}. Check that this node \
-         has a route for {namespace} toward a node that holds the namespace's context \
-         (`ndn-ctl route add {namespace} --face <face-id>`), or use an anchor link with the \
-         context inline"
+         has a route for {namespace} toward a node that holds the namespace's context, or use \
+         an anchor link with the context inline"
     )]
     Fetch {
         namespace: String,
@@ -153,8 +152,8 @@ pub enum AdoptError {
     #[error(
         "the reply for {namespace} carried a trust context that this node refused \
          ({reason}): it is not the namespace the link names. This node's route for {namespace} \
-         leads to another namespace's node or to an impersonator — check the route \
-         (`ndn-ctl route list`) and that you scanned the right code"
+         leads to another namespace's node or to an impersonator — check the route and that \
+         you scanned the right code"
     )]
     WrongContext { namespace: String, reason: String },
     #[error("{0}")]

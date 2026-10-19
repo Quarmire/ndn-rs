@@ -38,8 +38,9 @@ use ndn_packet::Name;
 use ndn_security::Signer;
 use tokio_util::sync::CancellationToken;
 
-use crate::enroll::{Enrolling, discard, expire_overdue, install, request_store};
-use crate::{KeyUnavailable, KeyVault, Participant};
+use crate::enroll::{Enrolling, Spent, discard, expire_overdue, install, request_store};
+use crate::words::detail;
+use crate::{Detail, KeyUnavailable, KeyVault, Participant, detail_code};
 
 /// The first pause after the CA could not be asked (or answered a status
 /// early); it doubles up to [`RETRY_MAX`] while that goes on.
@@ -81,7 +82,8 @@ pub fn spawn_status_watch(
         loop {
             watching.retain(|_, task| !task.is_finished());
             let listed = request_store(vault.as_ref())
-                .and_then(|store| store.list().map_err(|e| crate::refusal(500, e.to_string())));
+                .map_err(|e| e.reason)
+                .and_then(|store| store.list().map_err(|e| e.to_string()));
             let read_again = match listed {
                 Ok(list) => {
                     for request in list
@@ -108,7 +110,7 @@ pub fn spawn_status_watch(
                 Err(e) => {
                     tracing::warn!(
                         target: "security",
-                        error = %e.reason,
+                        error = %e,
                         "cannot read this node's requests for an admin's approval; reading them \
                          again in {}s",
                         RETRY_MAX.as_secs()
@@ -157,6 +159,12 @@ pub async fn wait_for_decision(
         request,
         not_reached,
     };
+    // This wait ended the record: the host is told (nothing when issued: the
+    // installation told it of the enrollment).
+    let ended_here = |request: OutgoingRequest| {
+        crate::events::request_ended(p, &request);
+        Waited::Ended(request)
+    };
     loop {
         // The record as kept now: another task may have ended it.
         let (store, mut request) = match current(vault, key_name) {
@@ -179,7 +187,7 @@ pub async fn wait_for_decision(
             }
         };
         if request.overdue(crate::now_secs()) {
-            if let Err(e) = expire_overdue(vault, &store, p.words()) {
+            if let Err(e) = expire_overdue(p, vault, &store) {
                 tracing::warn!(target: "security", key = %key_name, error = %e.reason, "a request past its expiry could not be ended here");
             }
             return match current(vault, key_name) {
@@ -193,10 +201,10 @@ pub async fn wait_for_decision(
             request.ca_prefix.parse::<Name>(),
         ) else {
             request.state = OutgoingState::Failed {
-                reason: p.words().request_names_no_ca(),
+                reason: detail(detail_code::REQUEST_NAMES_NO_CA, []),
             };
             record(&store, &request);
-            return Waited::Ended(request);
+            return ended_here(request);
         };
         let longest = if probing {
             STATUS_PROBE_LIFETIME
@@ -249,7 +257,7 @@ pub async fn wait_for_decision(
             }
             Ok(RequestStatus::Approved { .. }) => {
                 match issue(p, vault, &store, request.clone()).await {
-                    Issue::Ended(request) => return Waited::Ended(request),
+                    Issue::Ended(request) => return ended_here(*request),
                     // The status said approved, the exchange says pending (the
                     // CA was replaced in between): wait, never loop fast.
                     Issue::Pending => Some(retry),
@@ -261,7 +269,7 @@ pub async fn wait_for_decision(
                 }
             }
             Ok(RequestStatus::Denied { reason, .. }) => {
-                return Waited::Ended(end(
+                return ended_here(end(
                     vault,
                     &store,
                     request,
@@ -270,7 +278,7 @@ pub async fn wait_for_decision(
                 ));
             }
             Ok(RequestStatus::Expired { reason, .. }) => {
-                return Waited::Ended(end(
+                return ended_here(end(
                     vault,
                     &store,
                     request,
@@ -324,20 +332,23 @@ fn end(
     vault: &dyn KeyVault,
     store: &RequestStore,
     mut request: OutgoingRequest,
-    state: impl FnOnce(String) -> OutgoingState,
+    state: impl FnOnce(Detail) -> OutgoingState,
     reason: &str,
 ) -> OutgoingRequest {
-    let reason = match request.key_name.parse::<Name>() {
-        Ok(key) => match vault.discard(&key) {
-            Ok(()) => format!("{reason}; the key {key} was deleted"),
-            Err(e) => format!(
-                "{reason}; the key {key} could not be deleted ({e}): delete it from {}",
-                vault.location()
-            ),
-        },
-        Err(_) => reason.to_owned(),
-    };
-    tracing::warn!(target: "security", request = %request.request_id, error = %reason, "request for an admin's approval ended");
+    let mut params = vec![("error", reason.to_owned())];
+    if let Ok(key) = request.key_name.parse::<Name>() {
+        params.push(("key", key.to_string()));
+        match vault.discard(&key) {
+            Ok(()) => params.push(("deleted", "true".to_owned())),
+            Err(e) => params.extend([
+                ("deleted", "false".to_owned()),
+                ("delete_error", e.to_string()),
+                ("location", vault.location()),
+            ]),
+        }
+    }
+    let reason = detail(detail_code::REQUEST_ENDED, params);
+    tracing::warn!(target: "security", request = %request.request_id, error = %reason.text, "request for an admin's approval ended");
     request.state = state(reason);
     record(store, &request);
     request
@@ -346,7 +357,7 @@ fn end(
 /// What the issuance exchange of an approved request did.
 enum Issue {
     /// The record ended (issued, or failed / denied / expired with why).
-    Ended(OutgoingRequest),
+    Ended(Box<OutgoingRequest>),
     /// The CA still answers pending: keep waiting.
     Pending,
     /// The CA could not be asked, or the key not read: ask again (why).
@@ -373,20 +384,23 @@ async fn issue(
     );
     let (Ok(namespace), Ok(ca_prefix), Ok(identity), Ok(key)) = parsed else {
         request.state = OutgoingState::Failed {
-            reason: p.words().request_names_no_key(),
+            reason: detail(detail_code::REQUEST_NAMES_NO_KEY, []),
         };
         record(store, &request);
-        return Issue::Ended(request);
+        return Issue::Ended(Box::new(request));
     };
     let signer: Arc<dyn Signer> = match vault.signer(&key) {
         Ok(signer) => signer,
         Err(KeyUnavailable::Unreadable(why)) => return Issue::Retry(why),
         Err(KeyUnavailable::Gone(why)) => {
             request.state = OutgoingState::Failed {
-                reason: p.words().request_key_gone(&key, why),
+                reason: detail(
+                    detail_code::REQUEST_KEY_GONE,
+                    [("key", key.to_string()), ("why", why)],
+                ),
             };
             record(store, &request);
-            return Issue::Ended(request);
+            return Issue::Ended(Box::new(request));
         }
     };
     let poll = ndn_identity::poll_approval_via_engine(
@@ -420,7 +434,8 @@ async fn issue(
                 signer,
                 &issued,
                 enrolling,
-                &p.words().approval_used(),
+                Spent::Approval,
+                Some(&id),
             )
             .await
             {
@@ -438,20 +453,35 @@ async fn issue(
                 }
                 Err(e) => {
                     tracing::error!(target: "security", request = %id, error = %e.reason, "approved, but the certificate was not kept");
-                    OutgoingState::Failed { reason: e.reason }
+                    OutgoingState::Failed {
+                        reason: detail(
+                            detail_code::REQUEST_ENDED,
+                            e.params
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.clone()))
+                                .chain([("cause", e.code.clone()), ("error", e.reason.clone())]),
+                        ),
+                    }
                 }
             };
             record(store, &request);
-            Issue::Ended(request)
+            Issue::Ended(Box::new(request))
         }
         Err(e) if !e.is_final() => Issue::Retry(e.to_string()),
         Err(e) => {
             discard(vault, &key);
-            let reason = format!("{e}; the key {key} was deleted");
-            tracing::warn!(target: "security", request = %id, error = %reason, "request for an admin's approval ended");
+            let reason = detail(
+                detail_code::REQUEST_ENDED,
+                [
+                    ("error", e.to_string()),
+                    ("key", key.to_string()),
+                    ("deleted", "true".to_owned()),
+                ],
+            );
+            tracing::warn!(target: "security", request = %id, error = %reason.text, "request for an admin's approval ended");
             request.state = OutgoingState::ended(&e, reason);
             record(store, &request);
-            Issue::Ended(request)
+            Issue::Ended(Box::new(request))
         }
     }
 }

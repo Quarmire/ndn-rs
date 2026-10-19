@@ -16,6 +16,11 @@ ndn-tlv        = { workspace = true, features = ["std"] }
 ndn-transport  = { workspace = true }
 ndn-face      = { workspace = true }
 ndn-security   = { workspace = true }
+# The structured trust refusals management verbs answer (`trust_refusal`)
+# and the typed answers of the trust-admin verbs.
+ndn-cert       = { path = "../../security/ndn-cert", default-features = false }
+serde_json     = { workspace = true }
+serde          = { workspace = true }
 async-trait    = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio          = { workspace = true, features = ["sync", "rt", "macros"] }

@@ -91,8 +91,8 @@ impl DeviceApprovalChallenge {
         let role = device.role;
         let Some(token) = params.get(TOKEN_PARAM).and_then(|v| v.as_str()) else {
             return Err(format!(
-                "this CA approves a {role} device only together with an invite: ask with an \
-                 invite link of this namespace (`ndn-fwd enroll <invite link> --role {role}`)"
+                "this CA approves a {role} device only together with an invite: ask as {role} \
+                 with an invite link of this namespace"
             ));
         };
         let refused = move || {

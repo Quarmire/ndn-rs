@@ -11,11 +11,11 @@ macro_rules! require_validator {
         match $engine.validator() {
             Some(v) => v,
             None => {
-                return ControlResponse::error(
-                    status::NOT_FOUND,
-                    "validation is disabled; set [security] profile = \"default\" or \
-                     \"accept-signed\" to enable trust schema management",
-                );
+                return crate::refusal_response(&ndn_cert::report::TrustRefusal::new(
+                    ndn_cert::report::code::VALIDATION_DISABLED,
+                    "validation is disabled on this node, so it manages no trust schema; \
+                     enable validation in its configuration",
+                ));
             }
         }
     };

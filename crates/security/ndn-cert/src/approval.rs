@@ -313,16 +313,52 @@ pub enum RefusalKind {
 }
 
 /// A refused decision or listing: what is wrong and what to do instead.
+/// `code` (an approval code of [`crate::report::code`]) and `params` say it
+/// as data; a CA that sends none is read by its `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{reason}")]
 pub struct ApprovalRefusal {
     pub kind: RefusalKind,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub params: crate::report::Params,
+    /// The neutral sentence.
     pub reason: String,
 }
 
+impl ApprovalRefusal {
+    /// With the parameter `key` = `value`.
+    pub fn with(mut self, key: &str, value: impl std::fmt::Display) -> Self {
+        self.params.insert(key.to_owned(), value.to_string());
+        self
+    }
+}
+
+/// A refusal of `kind` with the generic approval code of that kind (its
+/// reason says what failed).
 fn refuse(kind: RefusalKind, reason: impl Into<String>) -> ApprovalRefusal {
+    use crate::report::code;
+    let generic = match kind {
+        RefusalKind::NotFound => code::APPROVAL_NOT_FOUND,
+        RefusalKind::Conflict => code::APPROVAL_CONFLICT,
+        RefusalKind::Unauthorized => code::APPROVAL_UNAUTHORIZED,
+        RefusalKind::BadRequest => code::APPROVAL_BAD_DECISION,
+        RefusalKind::Storage => code::APPROVAL_NOT_RECORDED,
+    };
+    refuse_as(kind, generic, reason)
+}
+
+/// A refusal of `kind` with the approval code `code`.
+fn refuse_as(
+    kind: RefusalKind,
+    code: crate::report::RefusalCode,
+    reason: impl Into<String>,
+) -> ApprovalRefusal {
     ApprovalRefusal {
         kind,
+        code: code.code.to_owned(),
+        params: crate::report::Params::new(),
         reason: reason.into(),
     }
 }
@@ -354,7 +390,13 @@ struct StoreInner {
     /// Bumped whenever a record is decided or removed: held status
     /// Interests wait on it ([`ApprovalService::answer_status`]).
     changed: tokio::sync::watch::Sender<u64>,
+    /// Told of every record opened or decided ([`ApprovalStore::set_observer`]).
+    observer: parking_lot::RwLock<Option<ApprovalObserver>>,
 }
+
+/// Told of a request record the moment it is opened (pending) or decided
+/// (approved / denied), once it is durable.
+pub type ApprovalObserver = Arc<dyn Fn(&ApprovalRecord) + Send + Sync>;
 
 impl ApprovalStore {
     /// Records in memory only: lost on restart (tests, ephemeral demo CAs).
@@ -395,6 +437,7 @@ impl ApprovalStore {
                 records: Mutex::new(records),
                 persist,
                 changed: tokio::sync::watch::Sender::new(0),
+                observer: parking_lot::RwLock::new(None),
             }),
         }
     }
@@ -432,6 +475,19 @@ impl ApprovalStore {
     /// Wake every held status Interest to look at its record again.
     fn changed(&self) {
         self.inner.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Tell `observer` of every request record opened or decided from now
+    /// on (the host's change notifications); replaces an earlier one.
+    pub fn set_observer(&self, observer: ApprovalObserver) {
+        *self.inner.observer.write() = Some(observer);
+    }
+
+    fn observed(&self, record: &ApprovalRecord) {
+        let observer = self.inner.observer.read().clone();
+        if let Some(observer) = observer {
+            observer(record);
+        }
     }
 
     /// The state of request `request_id` as a requester is told it
@@ -581,8 +637,8 @@ impl ApprovalStore {
         if live.len() >= MAX_PENDING {
             return Err(OpenRefusal::Refused(format!(
                 "this CA already holds {MAX_PENDING} requests waiting for an admin's decision; \
-                 nothing is pending for {key_uri}: ask an admin to decide the waiting requests \
-                 (`ndn-fwd approvals list`), then ask again"
+                 nothing is pending for {key_uri}: ask an admin to decide the waiting requests, \
+                 then ask again"
             )));
         }
         let group = pending_group(&key_uri);
@@ -595,7 +651,7 @@ impl ApprovalStore {
             return Err(OpenRefusal::Refused(format!(
                 "{MAX_PENDING_PER_PREFIX} requests under {group} are already waiting for an \
                  admin's decision; nothing is pending for {key_uri}: ask an admin to decide \
-                 them (`ndn-fwd approvals list`), then ask again"
+                 them, then ask again"
             )));
         }
         let request_id = new_request_id().map_err(|e| {
@@ -638,6 +694,8 @@ impl ApprovalStore {
             return Err(OpenRefusal::Refused(why));
         }
         records.insert(request_id, record.clone());
+        drop(records);
+        self.observed(&record);
         tracing::info!(
             request = %record.request_id,
             key = %record.key_name,
@@ -678,25 +736,30 @@ impl ApprovalStore {
             return Err(refuse(
                 RefusalKind::NotFound,
                 format!("no request {request_id} at this CA"),
-            ));
+            )
+            .with("target", request_id));
         };
         if !current.is_pending() {
-            return Err(refuse(
+            return Err(refuse_as(
                 RefusalKind::Conflict,
+                crate::report::code::APPROVAL_DECIDED,
                 format!(
                     "request {request_id} is already {}; a decision is final",
                     current.state.as_str()
                 ),
-            ));
+            )
+            .with("request", request_id)
+            .with("state", current.state.as_str()));
         }
         if now > current.expires_secs {
-            return Err(refuse(
+            let expired = iso_secs(current.expires_secs);
+            return Err(refuse_as(
                 RefusalKind::Conflict,
-                format!(
-                    "request {request_id} expired at {}; the device must ask again",
-                    iso_secs(current.expires_secs)
-                ),
-            ));
+                crate::report::code::APPROVAL_EXPIRED,
+                format!("request {request_id} expired at {expired}; the device must ask again"),
+            )
+            .with("request", request_id)
+            .with("expired", expired));
         }
         let mut record = current.clone();
         record.state = match decision {
@@ -718,6 +781,7 @@ impl ApprovalStore {
         drop(records);
         // Held status Interests for it are answered now.
         self.changed();
+        self.observed(&record);
         tracing::info!(
             request = %record.request_id,
             key = %record.key_name,
@@ -770,7 +834,7 @@ impl ApprovalStore {
         if record.key_name != key_name.to_string() {
             return Err(bad(format!(
                 "request {request_id} is not for {key_name}; nothing changed: check the request \
-                 id and key on the device (`ndn-fwd approvals list`)"
+                 id and key on the device"
             )));
         }
         let content = data
@@ -904,16 +968,16 @@ pub fn check_listing_fresh(
 fn gone_reason(ca_prefix: &Name, id: &str) -> String {
     format!(
         "this CA ({ca_prefix}) holds no request {id}: it expired and was removed, or the CA was \
-         replaced since. Nothing is pending any more; ask again (`ndn-fwd enroll`) and have an \
-         admin approve the new request"
+         replaced since. Nothing is pending any more; ask again and have an admin approve the \
+         new request"
     )
 }
 
 /// Why request `id`, pending until `expires_secs`, ended.
 fn expired_reason(id: &str, expires_secs: u64) -> String {
     format!(
-        "request {id} expired at {} without an admin's decision; ask again (`ndn-fwd enroll`) \
-         and have an admin approve the new request",
+        "request {id} expired at {} without an admin's decision; ask again and have an admin \
+         approve the new request",
         iso_secs(expires_secs)
     )
 }
@@ -1086,32 +1150,38 @@ fn find_in(pending: &[ApprovalRecord], target: &str) -> Result<ApprovalRecord, A
         return Ok(r.clone());
     }
     let Some(code) = normalize_code(target) else {
-        return Err(refuse(
+        return Err(refuse_as(
             RefusalKind::NotFound,
+            crate::report::code::APPROVAL_UNKNOWN_TARGET,
             format!(
-                "no pending request {target:?}: give the request id or the six-digit code \
-                 `ndn-fwd approvals list` shows"
+                "no pending request {target:?}: give the request id or the six-digit code the \
+                 list of pending requests shows"
             ),
-        ));
+        )
+        .with("target", target));
     };
     let matches: Vec<&ApprovalRecord> = pending.iter().filter(|r| r.code == code).collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
-        [] => Err(refuse(
+        [] => Err(refuse_as(
             RefusalKind::NotFound,
+            crate::report::code::APPROVAL_NO_CODE_MATCH,
             format!(
                 "no pending request shows the code {code}: check the code on the new device \
-                 against `ndn-fwd approvals list` (a request that expired or was decided is \
+                 against the list of pending requests (a request that expired or was decided is \
                  not pending)"
             ),
-        )),
-        _ => Err(refuse(
+        )
+        .with("code", &code)),
+        _ => Err(refuse_as(
             RefusalKind::Conflict,
+            crate::report::code::APPROVAL_AMBIGUOUS,
             format!(
-                "several pending requests show the code {code}: decide by request id \
-                 (`ndn-fwd approvals list` shows them)"
+                "several pending requests show the code {code}: decide by request id (the list \
+                 of pending requests shows them)"
             ),
-        )),
+        )
+        .with("code", &code)),
     }
 }
 
@@ -1694,8 +1764,8 @@ pub enum ApprovalEnrollError {
     )]
     CaUnreachable { ca_prefix: String, detail: String },
     #[error(
-        "the CA refused this device name: {0}. Ask under another device name (--device), or \
-         revoke that certificate first"
+        "the CA refused this device name: {0}. Ask under another device name, or revoke that \
+         certificate first"
     )]
     NameRefused(String),
     #[error("the CA refused the request: {0}")]
@@ -1959,7 +2029,9 @@ impl OutgoingRequest {
     }
 }
 
-/// Where an outgoing request stands.
+/// Where an outgoing request stands. An ended request's `reason` says why
+/// and what to do, as a [`Detail`](crate::report::Detail) (codes in
+/// `ndn-rs/docs/specs/mgmt-trust.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum OutgoingState {
@@ -1968,15 +2040,15 @@ pub enum OutgoingState {
         certificate: String,
     },
     Denied {
-        reason: String,
+        reason: crate::report::Detail,
     },
     Expired {
-        reason: String,
+        reason: crate::report::Detail,
     },
-    /// Approved, but the certificate could not be kept; `reason` says why
-    /// and what to do.
+    /// Approved, but the certificate could not be kept, or the request
+    /// ended on a final failure.
     Failed {
-        reason: String,
+        reason: crate::report::Detail,
     },
 }
 
@@ -1993,7 +2065,7 @@ impl OutgoingState {
 
     /// The state a request ends in after the final poll error `e`; `reason`
     /// says why and what to do (the caller adds what it did with the key).
-    pub fn ended(e: &ApprovalEnrollError, reason: String) -> Self {
+    pub fn ended(e: &ApprovalEnrollError, reason: crate::report::Detail) -> Self {
         match e {
             ApprovalEnrollError::Denied(_) => Self::Denied { reason },
             ApprovalEnrollError::Expired(_) => Self::Expired { reason },
@@ -2080,12 +2152,18 @@ impl RequestStore {
         let now = now_secs();
         let mut ended = Vec::new();
         for mut r in self.list()?.into_iter().filter(|r| r.overdue(now)) {
+            let expired = iso_secs(r.expires_secs);
             r.state = OutgoingState::Expired {
-                reason: format!(
-                    "the CA never answered before request {} expired (at {}); ask again",
-                    r.request_id,
-                    iso_secs(r.expires_secs)
-                ),
+                reason: crate::report::Detail::new(
+                    crate::report::detail_code::REQUEST_UNANSWERED,
+                    format!(
+                        "the CA never answered before request {} expired (at {expired}); ask \
+                         again",
+                        r.request_id
+                    ),
+                )
+                .with("request", &r.request_id)
+                .with("expired", expired),
             };
             self.remove_sealed_key(&r.key_name)?;
             self.save(&r)?;

@@ -309,7 +309,7 @@ impl IssuancePolicy for RequireAttestationKind {
             };
             IssuanceDecision::Deny(format!(
                 "names under {} require a `{}` challenge attestation signed by an admin \
-                 device{local}: approve it from an admin device (`ndn-fwd approvals approve`)",
+                 device{local}: approve it from an admin device",
                 self.prefix, self.required_kind
             ))
         } else {
@@ -336,7 +336,7 @@ pub const TOKEN_SCOPE_EVIDENCE: &str = "scope";
 ///   when an invite token was redeemed with the request as well;
 /// - an invite **token** admits a `member` when it is unscoped or scoped
 ///   inside `/<ns>/member`, and a `guest` only when scoped inside
-///   `/<ns>/guest` (`ndn-fwd-tokens new --role guest`), unless the role
+///   `/<ns>/guest` (a guest invite), unless the role
 ///   needs an approval;
 /// - a **renewal** (the CA's built-in [`RENEWAL_CHALLENGE`](crate::renewal::RENEWAL_CHALLENGE):
 ///   the requester proved it holds a current, unrevoked certificate this CA
@@ -568,8 +568,8 @@ impl IssuancePolicy for RolePolicy {
             if needs_approval && self.approval.invite_also && !invited() {
                 return IssuanceDecision::Deny(format!(
                     "this CA certifies a {role} device only on an invite AND an admin's \
-                     approval, and the approved request redeemed no invite: ask again with an \
-                     invite link (`ndn-fwd enroll <invite link> --role {role}`)"
+                     approval, and the approved request redeemed no invite: ask again as {role} \
+                     with an invite link"
                 ));
             }
             return issue;
@@ -585,9 +585,9 @@ impl IssuancePolicy for RolePolicy {
         }
         if needs_approval {
             return IssuanceDecision::Deny(format!(
-                "{role} certificates need an admin's approval: ask with `ndn-fwd enroll <anchor \
-                 link> --role {role}` and approve the request on an admin device (`ndn-fwd \
-                 approvals approve <code>`); a token alone never issues one"
+                "{role} certificates need an admin's approval: ask as {role} with the \
+                 namespace's anchor link and have an admin approve the request on an admin \
+                 device; a token alone never issues one"
             ));
         }
         let role_scope = role_prefix(&self.namespace, role);

@@ -55,7 +55,7 @@ fn ctx16_clockless_monotonic_version_and_single_use() {
 
     // …and single-use tokens (no TTL set ⇒ no clock dependence).
     let store = TokenStore::new();
-    store.add("baked-invite"); // unbounded: no expiry, no scope
+    store.add("baked-invite").unwrap(); // unbounded: no expiry, no scope
     assert!(store.consume("baked-invite"), "first use ok");
     assert!(!store.consume("baked-invite"), "reuse rejected, clock-free");
 }

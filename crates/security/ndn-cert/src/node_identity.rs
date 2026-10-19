@@ -26,8 +26,10 @@ use ndn_security::{Certificate, FilePib};
 use crate::roles::parse_device_key;
 use crate::root_store::RootStore;
 
-/// Which rule chose the node identity ([`NodeIdentity::source`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which rule chose the node identity ([`NodeIdentity::source`]). Its JSON
+/// form is [`as_str`](Self::as_str).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum NodeIdentitySource {
     /// The host's configuration names it (`[security] identity`).
     Configured,

@@ -12,10 +12,12 @@
 pub mod blocking;
 pub mod chunked;
 pub mod client;
+pub mod events;
 // Single-reader demux for the management+data seam (ForwarderClient::from_raw_fd).
 mod face_mux;
 pub mod forwarder_client;
 pub mod mgmt_client;
+pub mod refusal;
 pub mod registry;
 pub mod server;
 
@@ -24,5 +26,6 @@ pub use chunked::{ChunkedConsumer, ChunkedProducer, NDN_DEFAULT_SEGMENT_SIZE};
 pub use client::IpcClient;
 pub use forwarder_client::{ForwarderClient, ForwarderError};
 pub use mgmt_client::MgmtClient;
+pub use refusal::{trust_refusal, trust_refusal_in, trust_refusal_of};
 pub use registry::ServiceRegistry;
 pub use server::IpcServer;

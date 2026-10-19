@@ -33,13 +33,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ndn_cert::report::{Detail, code, detail_code};
 use ndn_cert::roles::{Role, parse_device_key};
 use ndn_cert::{ApprovalRecord, ApprovalStore, ApproverError, Decision, RefusalKind};
-use ndn_mgmt_wire::control_response::status;
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, Signer};
 
-use crate::{KeyVault, Participant, TrustRefusal, refusal};
+use crate::words::refuse;
+use crate::{KeyVault, Participant, TrustRefusal};
 
 /// An admin key of this device in a namespace whose CA runs elsewhere.
 #[derive(Clone)]
@@ -57,11 +58,12 @@ pub struct AdminCredential {
 
 /// The requests a device can see: its own CA's records (oldest first),
 /// then each administered namespace's in credential order, and a note for
-/// each namespace whose requests could not be listed.
+/// each namespace whose requests could not be listed
+/// (`approvals-ca-unreachable`, `approvals-not-listed`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Listing {
     pub records: Vec<ApprovalRecord>,
-    pub notes: Vec<String>,
+    pub notes: Vec<Detail>,
 }
 
 /// This device's admin keys, one per namespace (the newest valid
@@ -76,10 +78,11 @@ pub fn admin_credentials(
     local_cas: &[Name],
 ) -> Result<Vec<AdminCredential>, TrustRefusal> {
     let unreadable = |e: String| {
-        refusal(
-            status::SERVER_ERROR,
+        TrustRefusal::new(
+            code::KEYS_UNREADABLE,
             format!("cannot read this node's admin keys: {e}"),
         )
+        .with("error", e)
     };
     let keys = vault.keys().map_err(unreadable)?;
     let namespaces: Vec<Name> = p
@@ -157,7 +160,7 @@ pub async fn list(
 ) -> Result<Listing, TrustRefusal> {
     let creds = credentials()?;
     if local.is_empty() && creds.is_empty() {
-        return Err(nothing_here(p));
+        return Err(nothing_here());
     }
     let local =
         (!local.is_empty()).then(|| local.iter().flat_map(ApprovalStore::records).collect());
@@ -201,7 +204,7 @@ pub async fn decide(
     if creds.is_empty() {
         return Err(match local_miss {
             Some(miss) => miss.into(),
-            None => nothing_here(p),
+            None => nothing_here(),
         });
     }
     // The namespaces this device administers: ask each CA what is pending.
@@ -220,36 +223,30 @@ pub async fn decide(
     let (cred, record) = match found.len() {
         1 => found.remove(0),
         0 => {
-            let mut reason = p.words().no_pending_request(
-                target,
-                if !local.is_empty() {
-                    "this node's CA or at the CAs of the namespaces it administers"
-                } else {
-                    "the CAs of the namespaces this node administers"
-                },
-            );
-            let mut code = status::NOT_FOUND;
-            if let Some(first) = failed.first() {
-                code = first.status_code;
+            let scope = if local.is_empty() {
+                "administered"
+            } else {
+                "local-and-administered"
+            };
+            let mut params = vec![("target", target.to_owned()), ("scope", scope.to_owned())];
+            if !failed.is_empty() {
                 let reasons: Vec<&str> = failed.iter().map(|r| r.reason.as_str()).collect();
-                reason.push_str(&format!(
-                    "; not every CA could be asked: {}",
-                    reasons.join("; ")
-                ));
+                params.push(("unasked", reasons.join("; ")));
             }
-            return Err(refusal(code, reason));
+            let mut refused = refuse(code::APPROVAL_NOT_PENDING, params);
+            if let Some(first) = failed.first() {
+                refused.status_code = first.status_code;
+            }
+            return Err(refused);
         }
         _ => {
             let at: Vec<String> = found
                 .iter()
                 .map(|(c, r)| format!("{} ({})", r.request_id, c.ca_prefix))
                 .collect();
-            return Err(refusal(
-                409,
-                format!(
-                    "requests in several namespaces show {target:?}: {}; decide by request id",
-                    at.join(", ")
-                ),
+            return Err(refuse(
+                code::APPROVAL_AMBIGUOUS,
+                [("target", target.to_owned()), ("matches", at.join(", "))],
             ));
         }
     };
@@ -276,8 +273,8 @@ pub async fn decide(
 }
 
 /// Nothing to approve on this device, and how to change that.
-fn nothing_here(p: &Participant) -> TrustRefusal {
-    refusal(status::NOT_FOUND, p.words().nothing_to_approve())
+fn nothing_here() -> TrustRefusal {
+    refuse(code::NOTHING_TO_APPROVE, [])
 }
 
 /// The pending requests at `cred`'s CA.
@@ -298,22 +295,43 @@ async fn fetch(
 
 /// A refused remote listing or decision, with what to do.
 fn approver_refusal(cred: &AdminCredential, e: ApproverError) -> TrustRefusal {
-    match e {
+    let ca = &cred.ca_prefix;
+    let kind = match e {
         ApproverError::Refused(r) => {
-            let mut r = TrustRefusal::from(r);
-            r.reason = format!("the CA {} refused: {}", cred.ca_prefix, r.reason);
-            r
+            // The CA's own refusal, nested as the cause: its status, retry
+            // and next step stand.
+            let cause = TrustRefusal::from(r);
+            let mut out = refuse(
+                code::APPROVAL_REFUSED_BY_CA,
+                cause
+                    .params
+                    .iter()
+                    .filter(|(k, _)| !matches!(k.as_str(), "ca" | "cause" | "error"))
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .chain([
+                        ("ca", ca.to_string()),
+                        ("cause", cause.code.clone()),
+                        ("error", cause.reason.clone()),
+                    ]),
+            );
+            out.status_code = cause.status_code;
+            out.retry = cause.retry;
+            out.next = cause.next;
+            return out;
         }
-        ApproverError::CaUnreachable { .. } => refusal(504, e.to_string()),
-        ApproverError::BadAnswer(_) => refusal(502, e.to_string()),
-        ApproverError::Signing(_) => refusal(status::SERVER_ERROR, e.to_string()),
-    }
+        ApproverError::CaUnreachable { .. } => code::APPROVAL_CA_UNREACHABLE,
+        ApproverError::BadAnswer(_) => code::APPROVAL_CA_BAD_ANSWER,
+        ApproverError::Signing(_) => code::SIGNING_FAILED,
+    };
+    TrustRefusal::new(kind, e.to_string())
+        .with("ca", ca)
+        .with("error", &e)
 }
 
 /// The listing note for a namespace whose CA could not be asked: why, and
-/// what to do. The refusal (status and reason) is what [`list`] answers
-/// when no namespace at all could be listed.
-fn unlisted(cred: &AdminCredential, e: ApproverError) -> (TrustRefusal, String) {
+/// what to do. The refusal (its status) is what [`list`] answers when no
+/// namespace at all could be listed.
+fn unlisted(cred: &AdminCredential, e: ApproverError) -> (TrustRefusal, Detail) {
     let ns = &cred.namespace;
     let unreachable = match &e {
         ApproverError::CaUnreachable { detail, .. } => Some(detail.clone()),
@@ -321,13 +339,24 @@ fn unlisted(cred: &AdminCredential, e: ApproverError) -> (TrustRefusal, String) 
     };
     let r = approver_refusal(cred, e);
     let note = match unreachable {
-        Some(detail) => format!(
-            "{ns}: unreachable ({detail}); its requests are not shown — retry when it is up"
-        ),
-        None => format!(
-            "{ns}: not listed ({}); its requests are not shown",
-            r.reason
-        ),
+        Some(detail) => Detail::new(
+            detail_code::APPROVALS_CA_UNREACHABLE,
+            format!(
+                "{ns}: unreachable ({detail}); its requests are not shown — retry when it is up"
+            ),
+        )
+        .with("namespace", ns)
+        .with("error", detail),
+        None => Detail::new(
+            detail_code::APPROVALS_NOT_LISTED,
+            format!(
+                "{ns}: not listed ({}); its requests are not shown",
+                r.reason
+            ),
+        )
+        .with("namespace", ns)
+        .with("error", &r.reason)
+        .with_cause(&r.code, &r.params),
     };
     (r, note)
 }
@@ -339,7 +368,7 @@ fn unlisted(cred: &AdminCredential, e: ApproverError) -> (TrustRefusal, String) 
 /// seeing its own queue while another namespace's CA is down.
 fn merge_listing(
     local: Option<Vec<ApprovalRecord>>,
-    remote: Vec<Result<Vec<ApprovalRecord>, (TrustRefusal, String)>>,
+    remote: Vec<Result<Vec<ApprovalRecord>, (TrustRefusal, Detail)>>,
 ) -> Result<Listing, TrustRefusal> {
     let mut listed = local.is_some();
     let mut listing = Listing {
@@ -360,13 +389,20 @@ fn merge_listing(
         }
     }
     match first_failure {
-        Some(code) if !listed => Err(refusal(
-            code,
-            format!(
-                "could not list the pending requests of any namespace this node administers: {}",
-                listing.notes.join("; ")
-            ),
-        )),
+        Some(status_code) if !listed => {
+            let notes: Vec<&str> = listing.notes.iter().map(|n| n.text.as_str()).collect();
+            let notes = notes.join("; ");
+            let mut refused = TrustRefusal::new(
+                code::APPROVALS_UNLISTED,
+                format!(
+                    "could not list the pending requests of any namespace this node \
+                     administers: {notes}"
+                ),
+            )
+            .with("notes", notes);
+            refused.status_code = status_code;
+            Err(refused)
+        }
         _ => Ok(listing),
     }
 }
@@ -392,12 +428,10 @@ mod tests {
         }
     }
 
-    fn unreachable(ns: &str) -> (TrustRefusal, String) {
+    fn unreachable(ns: &str) -> (TrustRefusal, Detail) {
         (
-            refusal(504, "no answer"),
-            format!(
-                "{ns}: unreachable (no answer); its requests are not shown — retry when it is up"
-            ),
+            TrustRefusal::new(code::APPROVAL_CA_UNREACHABLE, "no answer"),
+            Detail::new(detail_code::APPROVALS_CA_UNREACHABLE, "no answer").with("namespace", ns),
         )
     }
 
@@ -422,9 +456,9 @@ mod tests {
         assert_eq!(listing.records, vec![record("2b", "/home")]);
         assert_eq!(listing.notes.len(), 1);
 
-        // Nothing could be listed: refused, saying which and why.
+        // Nothing could be listed: refused, with the first failure's status.
         let r = merge_listing(None, vec![Err(unreachable("/work"))]).unwrap_err();
-        assert_eq!(r.status_code, 504);
-        assert!(r.reason.contains("/work: unreachable"), "{}", r.reason);
+        assert!(r.is(code::APPROVALS_UNLISTED), "{r:?}");
+        assert_eq!(r.status_code, code::APPROVAL_CA_UNREACHABLE.status_code);
     }
 }

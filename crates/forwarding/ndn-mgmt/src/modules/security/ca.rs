@@ -1,4 +1,4 @@
-//! `security/ca-*` — NDNCERT CA info / token issuance / enrollment.
+//! `security/ca-*` — NDNCERT CA info / enrollment.
 
 use ndn_cert::CertError;
 use ndn_engine::ForwarderEngine;
@@ -10,10 +10,7 @@ use tracing::Instrument as _;
 
 pub(super) fn security_ca_info(config: &dyn crate::MgmtConfig) -> ControlResponse {
     match config.ca_info() {
-        None => ControlResponse::error(
-            status::NOT_FOUND,
-            "no CA configured (set [security] ca_prefix in router TOML)",
-        ),
+        None => crate::refusal_response(&crate::not_at_runtime("ca-info", "this node runs no CA")),
         Some(ca) => {
             let info = format!(
                 "ca_prefix={}\nca_info={}\nmax_validity_days={}\nchallenges={}\n",
@@ -25,25 +22,6 @@ pub(super) fn security_ca_info(config: &dyn crate::MgmtConfig) -> ControlRespons
             ControlResponse::ok_empty(info)
         }
     }
-}
-
-pub(super) fn security_ca_requests() -> ControlResponse {
-    // CaState not yet embedded in the router process.
-    ControlResponse::ok_empty("0 pending requests\n".to_string())
-}
-
-pub(super) fn security_ca_token_add(params: ControlParameters) -> ControlResponse {
-    let description = params.uri.unwrap_or_default();
-    let mut token_bytes = [0u8; 16];
-    let _ = getrandom::getrandom(&mut token_bytes);
-    let token: String = token_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    tracing::info!(target: "mgmt.security", token = %token, description = %description, "security/ca-token-add");
-    let echo = ControlParameters {
-        // Token returned in `uri` (repurposed as a generic string slot).
-        uri: Some(format!("token={token} description={description}")),
-        ..Default::default()
-    };
-    ControlResponse::ok("OK", echo)
 }
 
 /// Start a background NDNCERT enrollment session.

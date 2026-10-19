@@ -129,6 +129,7 @@ mod tests {
             webtransport_status_handler: None,
             ble_handler: None,
             approval_handler: None,
+            invite_handler: None,
             trust_context_handler: None,
             #[cfg(not(target_arch = "wasm32"))]
             runtime_policy: None,

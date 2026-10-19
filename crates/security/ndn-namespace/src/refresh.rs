@@ -34,15 +34,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_cert::ContextRefresh;
-use ndn_cert::report::{ContextRefreshInfo, RefreshState, TrustRefusal};
+use ndn_cert::report::{
+    ContextChange, ContextRefreshInfo, Detail, RefreshState, TrustRefusal, code, detail_code,
+};
 use ndn_engine::ForwarderEngine;
-use ndn_mgmt_wire::control_response::status;
 use ndn_packet::Name;
 use ndn_security::SignedTrustContext;
 use tokio_util::sync::CancellationToken;
 
-use crate::keep::{Adopted, keep_update, publication};
-use crate::{Participant, refusal};
+use crate::Participant;
+use crate::keep::{keep_update, kept_params};
+use crate::words::{detail, refuse};
 
 /// The latest the first periodic check runs after start (or after one
 /// period, if shorter) when the routes of the held namespaces never get a
@@ -95,7 +97,7 @@ pub async fn refresh_contexts(
         Some(ns) => vec![
             held.into_iter()
                 .find(|c| *c.namespace() == ns)
-                .ok_or_else(|| refusal(status::NOT_FOUND, p.words().no_context(&ns)))?,
+                .ok_or_else(|| refuse(code::CONTEXT_NOT_HELD, [("namespace", ns.to_string())]))?,
         ],
         None => held,
     };
@@ -115,7 +117,7 @@ pub async fn refresh_contexts(
 async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefreshInfo {
     let namespace = held.namespace().clone();
     let held_version = p.keyring().version_of(&namespace).unwrap_or(held.version());
-    let info = |state, version, revoked: Vec<String>, detail: String| ContextRefreshInfo {
+    let info = |state, version, revoked: Vec<String>, detail: Detail| ContextRefreshInfo {
         namespace: namespace.to_string(),
         state,
         held_version,
@@ -128,7 +130,10 @@ async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefre
             RefreshState::Source,
             held_version,
             Vec::new(),
-            "this node holds the namespace root key: new versions are made here".into(),
+            Detail::new(
+                detail_code::REFRESH_SOURCE,
+                "this node holds the namespace root key: new versions are made here",
+            ),
         );
     }
 
@@ -163,13 +168,23 @@ async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefre
             RefreshState::Behind,
             held_version,
             Vec::new(),
-            format!(
-                "the answer names v{answered}, but v{verified} exists (its signed Data, served \
-                 over the namespace's sync group by {by}, follows from the held version under \
-                 the continuity rule) and is not held: a cache may answer with the previous \
-                 metadata for up to {} s after a new version, or the upstream has not \
-                 refreshed yet; nothing changed — refresh again",
-                crate::publish::METADATA_FRESHNESS.as_secs()
+            Detail::new(
+                detail_code::REFRESH_BEHIND,
+                format!(
+                    "the answer names v{answered}, but v{verified} exists (its signed Data, \
+                     served over the namespace's sync group by {by}, follows from the held \
+                     version under the continuity rule) and is not held: a cache may answer \
+                     with the previous metadata for up to {} s after a new version, or the \
+                     upstream has not refreshed yet; nothing changed — refresh again",
+                    crate::publish::METADATA_FRESHNESS.as_secs()
+                ),
+            )
+            .with("answered", answered)
+            .with("verified", verified)
+            .with("by", &by)
+            .with(
+                "freshness_secs",
+                crate::publish::METADATA_FRESHNESS.as_secs(),
             ),
         )
     };
@@ -183,7 +198,11 @@ async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefre
                 RefreshState::Current,
                 version,
                 Vec::new(),
-                format!("the namespace serves v{version}, the version held"),
+                Detail::new(
+                    detail_code::REFRESH_CURRENT,
+                    format!("the namespace serves v{version}, the version held"),
+                )
+                .with("version", version),
             )
         }
         Ok(ContextRefresh::UpstreamOlder { held, offered }) => {
@@ -201,49 +220,47 @@ async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefre
                 RefreshState::UpstreamOlder,
                 held,
                 Vec::new(),
-                format!(
-                    "the answer names v{offered}, older than the held v{held}: the forwarder \
-                     that answered has not refreshed yet, or a cache answered with the metadata \
-                     of an earlier version (it may for up to {} s after a new one); nothing \
-                     changed",
-                    crate::publish::METADATA_FRESHNESS.as_secs()
+                Detail::new(
+                    detail_code::REFRESH_UPSTREAM_OLDER,
+                    format!(
+                        "the answer names v{offered}, older than the held v{held}: the forwarder \
+                         that answered has not refreshed yet, or a cache answered with the \
+                         metadata of an earlier version (it may for up to {} s after a new \
+                         one); nothing changed",
+                        crate::publish::METADATA_FRESHNESS.as_secs()
+                    ),
+                )
+                .with("offered", offered)
+                .with("held", held)
+                .with(
+                    "freshness_secs",
+                    crate::publish::METADATA_FRESHNESS.as_secs(),
                 ),
             )
         }
         Ok(ContextRefresh::Updated(update)) => {
             let version = update.context.version();
             let revoked: Vec<String> = update.revoked.iter().map(Name::to_string).collect();
-            let kept = keep_update(p, &update, Adopted::ByRefresh);
-            let walked: Vec<u64> = update.walked.iter().map(|s| s.context.version()).collect();
-            let through = match walked.as_slice() {
-                [] => String::new(),
-                walked => format!(
-                    " through {} (each signed by an anchor of the version before it)",
-                    walked
-                        .iter()
-                        .map(|v| format!("v{v}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            };
-            let from = walked.last().copied().unwrap_or(update.previous);
-            let detail = match &kept {
-                Ok(k) => match &k.stored {
-                    Ok(stored) => format!(
-                        "adopted v{version} (signed by {}, an anchor of v{from}){through}; stored \
-                         {stored}{}{}",
-                        update.signer.name,
-                        publication(p),
-                        k.ca_detail()
-                    ),
-                    Err(e) => format!(
-                        "adopted v{version}{through} for this run, but {}{}",
-                        e.reason,
-                        k.ca_detail()
-                    ),
-                },
-                Err(e) => format!("adopted v{version}{through} for this run, but {}", e.reason),
-            };
+            let kept = keep_update(p, &update, ContextChange::Refresh);
+            let walked: Vec<String> = update
+                .walked
+                .iter()
+                .map(|s| s.context.version().to_string())
+                .collect();
+            let from = update
+                .walked
+                .last()
+                .map_or(update.previous, |s| s.context.version());
+            let mut params = kept_params(p, &kept);
+            params.extend([
+                ("version", version.to_string()),
+                ("signer", update.signer.name.to_string()),
+                ("from", from.to_string()),
+            ]);
+            if !walked.is_empty() {
+                params.push(("walked", walked.join(",")));
+            }
+            let detail = detail(detail_code::CONTEXT_UPDATED, params);
             info(RefreshState::Updated, version, revoked, detail)
         }
         Err(e) => {
@@ -257,7 +274,16 @@ async fn refresh_one(p: &Participant, held: &SignedTrustContext) -> ContextRefre
                 ndn_cert::RefreshError::NoAnswer { .. } => RefreshState::Unreachable,
                 _ => RefreshState::Failed,
             };
-            info(state, held_version, Vec::new(), e.to_string())
+            let code = match state {
+                RefreshState::Unreachable => detail_code::REFRESH_UNREACHABLE,
+                _ => detail_code::REFRESH_FAILED,
+            };
+            info(
+                state,
+                held_version,
+                Vec::new(),
+                Detail::new(code, e.to_string()).with("error", &e),
+            )
         }
     }
 }
@@ -301,9 +327,11 @@ mod tests {
     /// v3 (signed by the recovery key) and v4 (the new root's, newest). v4
     /// alone does not follow from v2, so the daemon follows v3 then v4 by
     /// exact name, adopts v4, and keeps both, so the nodes behind it can
-    /// follow the same way.
+    /// follow the same way. The host is told once: v2 → v4 by refresh, and
+    /// the root change.
     #[tokio::test]
     async fn a_refresh_follows_a_recovery_and_keeps_every_version_it_walked() {
+        use ndn_cert::report::{MembershipChange, TrustEvent};
         use ndn_engine::{EngineBuilder, EngineConfig};
         use ndn_security::{Keyring, SecurityManager};
 
@@ -378,12 +406,13 @@ mod tests {
             cas: Vec::new(),
             words: Default::default(),
         });
+        let mut events = admin.events();
 
         let results = refresh_contexts(&admin, Some(ns.clone())).await.unwrap();
         assert_eq!(
             results[0].state,
             RefreshState::Updated,
-            "{}",
+            "{:?}",
             results[0].detail
         );
         assert_eq!((results[0].held_version, results[0].version), (2, 4));
@@ -396,6 +425,27 @@ mod tests {
             .map(|(_, stored)| stored.unwrap().0.version())
             .collect();
         assert_eq!(kept, [3, 4]);
+        match events.try_recv().unwrap() {
+            TrustEvent::ContextUpdated {
+                namespace,
+                held_version,
+                version,
+                how,
+                ..
+            } => assert_eq!(
+                (namespace, held_version, version, how),
+                (ns.to_string(), Some(2), 4, ContextChange::Refresh)
+            ),
+            other => panic!("{other:?}"),
+        }
+        match events.try_recv().unwrap() {
+            TrustEvent::MembershipChanged(m) => assert_eq!(
+                (m.namespace, m.change, m.version, m.replaced_version),
+                (ns.to_string(), MembershipChange::RootChanged, 4, Some(2))
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(events.try_recv().is_err());
         shutdown.shutdown().await;
     }
 
@@ -445,7 +495,7 @@ mod tests {
         assert_eq!(
             results[0].state,
             RefreshState::Unreachable,
-            "{}",
+            "{:?}",
             results[0].detail
         );
         assert_eq!((results[0].held_version, results[0].version), (1, 1));

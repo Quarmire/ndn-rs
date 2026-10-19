@@ -17,6 +17,7 @@ define the bytes on the wire:
 | [trust-envelope.md](trust-envelope.md) | `ndn-trust://` envelopes: kinds, TLV 0x0470–0x048F, carriage forms incl. QR |
 | [recovery-kit.md](recovery-kit.md) | Recovery kits: BIP39 → Ed25519 recovery key, key naming, file kit (PBES2), hardware kit |
 | [local-refusal.md](local-refusal.md) | NackReason 170–176 for local faces |
+| [mgmt-trust.md](mgmt-trust.md) | Trust management outcomes: refusal codes, next-step classes, details, per-verb catalogues (trust-admin, approvals, links, invites, root-device operations, notifications) |
 
 ## Other specifications
 

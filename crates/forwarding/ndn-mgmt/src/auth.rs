@@ -6,6 +6,8 @@ use std::sync::Arc;
 use ndn_engine::ForwarderEngine;
 use ndn_transport::{FaceId, PeerCredentials};
 
+use ndn_cert::report::{TrustRefusal, code};
+
 use crate::module::MgmtConfig;
 
 #[cfg(test)]
@@ -171,7 +173,7 @@ pub(crate) async fn authorize_command(
     validator: Option<&ndn_security::Validator>,
     require_signed: bool,
     replay_cache: Option<&CommandReplayCache>,
-) -> Result<(), String> {
+) -> Result<(), TrustRefusal> {
     if !require_signed {
         if interest.sig_info().is_none() {
             tracing::warn!(
@@ -184,12 +186,13 @@ pub(crate) async fn authorize_command(
         return Ok(());
     }
     let Some(validator) = validator else {
-        return Err("refused: this command must be signed by a key trusted by \
-             `[security.mgmt] trust_anchor_pib`, and none is configured. Send it over \
-             this node's local management socket as the daemon's user, root, or a \
-             member of `[security] trust_admin_groups`, or set trust_anchor_pib in \
-             the daemon config."
-            .to_string());
+        return Err(TrustRefusal::new(
+            code::COMMAND_NO_ANCHOR,
+            "refused: this command must be signed by a key a command trust anchor of this \
+             node vouches for, and none is configured. Send it over this node's local \
+             management socket as the daemon's user, root, or a member of one of its \
+             trust-admin groups, or configure a command trust anchor.",
+        ));
     };
     // DigestSha256 verifies byte integrity but carries no key identity.
     // Per NFD command-authenticator.cpp, only key-backed signature types
@@ -197,9 +200,11 @@ pub(crate) async fn authorize_command(
     // the validator refuses a MAC (HMAC, BLAKE3-keyed), which no public key
     // verifies. DigestSha256-only Interests are treated as unsigned here.
     if !is_key_signed(interest) {
-        return Err("command rejected: key-backed signature required \
-             (DigestSha256 does not establish key identity)"
-            .to_string());
+        return Err(TrustRefusal::new(
+            code::COMMAND_UNSIGNED,
+            "command rejected: key-backed signature required (DigestSha256 does not establish \
+             key identity)",
+        ));
     }
     use ndn_security::InterestValidationOutcome::*;
     // A validator with a cert fetcher (e.g. the localhop validator) walks the
@@ -214,19 +219,28 @@ pub(crate) async fn authorize_command(
     };
     match outcome {
         Valid => {}
-        Invalid(e) => return Err(format!("invalid command signature: {e}")),
-        Pending => return Err("signing certificate not yet resolved".to_string()),
+        Invalid(e) => {
+            return Err(signature_refused(format!("invalid command signature: {e}")));
+        }
+        Pending => {
+            return Err(TrustRefusal::new(
+                code::COMMAND_SIGNER_PENDING,
+                "signing certificate not yet resolved",
+            ));
+        }
     }
 
     // Replay protection requires a stable signer identity; reject any
     // signed command without a Name-shaped KeyLocator.
     if let Some(cache) = replay_cache {
-        let sig_info = interest
-            .sig_info()
-            .ok_or_else(|| "signed command missing SignatureInfo for replay check".to_string())?;
+        let sig_info = interest.sig_info().ok_or_else(|| {
+            signature_refused("signed command missing SignatureInfo for replay check".into())
+        })?;
         let signer = sig_info
             .key_locator_name()
-            .ok_or_else(|| "signed command missing KeyLocator name for replay check".to_string())
+            .ok_or_else(|| {
+                signature_refused("signed command missing KeyLocator name for replay check".into())
+            })
             .map(|arc_name| arc_name.as_ref().clone())?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -234,7 +248,7 @@ pub(crate) async fn authorize_command(
             .unwrap_or(0);
         let last_seen = cache
             .lock()
-            .map_err(|_| "command replay cache poisoned".to_string())?
+            .map_err(|_| signature_refused("command replay cache poisoned".into()))?
             .get(&signer)
             .copied();
         let accepted = check_sig_time(
@@ -242,14 +256,21 @@ pub(crate) async fn authorize_command(
             now_ms,
             last_seen,
             COMMAND_SIG_TIME_TOLERANCE_MS,
-        )?;
+        )
+        .map_err(signature_refused)?;
         cache
             .lock()
-            .map_err(|_| "command replay cache poisoned".to_string())?
+            .map_err(|_| signature_refused("command replay cache poisoned".into()))?
             .insert(signer, accepted);
     }
 
     Ok(())
+}
+
+/// A refused command signature (`command-signature-refused`), `error` its
+/// sentence.
+fn signature_refused(error: String) -> TrustRefusal {
+    TrustRefusal::new(code::COMMAND_SIGNATURE_REFUSED, error.clone()).with("error", error)
 }
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
@@ -296,6 +317,19 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
         ndn_mgmt_wire::nfd_command::module::CA,
         ndn_mgmt_wire::nfd_command::verb::DENY,
     ),
+    // Who may join by invite, and the invites themselves (ids, makers).
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::INVITE_CREATE,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::INVITE_LIST,
+    ),
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::INVITE_WITHDRAW,
+    ),
 ];
 
 /// `true` when `module/verb` changes this node's trust and must pass
@@ -319,23 +353,28 @@ pub(crate) enum Caller {
     OtherUser { uid: u32 },
 }
 
-/// The local-operator credential set and how it is configured, rendered for a
-/// refusal: who the daemon accepts and how to become one of them.
+/// The local-operator credential set and how it is configured, for a
+/// refusal's params: who the daemon accepts.
 struct OperatorSet {
     daemon_uid: u32,
-    configured: String,
+    /// The trust-admin groups configured, `, `-separated (empty: none).
+    groups: String,
 }
 
 impl OperatorSet {
     fn new(daemon_uid: u32, groups: &[String]) -> Self {
-        let configured = if groups.is_empty() {
-            "none configured".to_owned()
-        } else {
-            format!("currently: {}", groups.join(", "))
-        };
         Self {
             daemon_uid,
-            configured,
+            groups: groups.join(", "),
+        }
+    }
+
+    /// The groups as a refusal's sentence quotes them.
+    fn configured(&self) -> String {
+        if self.groups.is_empty() {
+            "none configured".to_owned()
+        } else {
+            format!("currently: {}", self.groups)
         }
     }
 }
@@ -395,13 +434,13 @@ fn identify_caller(
 /// process connected to the management socket. Internally generated
 /// commands (`source_face == None`) pass. Otherwise the caller must be a
 /// local operator ([`Caller::Operator`]); a face without peer credentials
-/// (not the local socket) is refused. The `Err` text is shown to the
-/// operator verbatim.
+/// (not the local socket) is refused (`trust-change-unidentified`, another
+/// user `trust-change-not-operator`).
 pub(crate) fn authorize_trust_admin(
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
     config: &dyn MgmtConfig,
-) -> Result<(), String> {
+) -> Result<(), TrustRefusal> {
     let Some(fid) = source_face else {
         return Ok(());
     };
@@ -437,28 +476,36 @@ pub(crate) fn caller_label(source_face: Option<FaceId>, engine: &ForwarderEngine
     }
 }
 
-fn trust_admin_decision(caller: &Caller, set: &OperatorSet) -> Result<(), String> {
-    let OperatorSet {
-        daemon_uid,
-        configured,
-    } = set;
+fn trust_admin_decision(caller: &Caller, set: &OperatorSet) -> Result<(), TrustRefusal> {
+    let daemon_uid = set.daemon_uid;
+    let configured = set.configured();
     match caller {
         Caller::Operator => Ok(()),
-        Caller::Unidentified => Err(format!(
-            "refused: changing this node's trust must be requested over the \
-             forwarder's local management socket, where the kernel reports who \
-             is asking; this request arrived on a face that carries no caller \
-             identity. Run the command on this node against the daemon's Unix \
-             socket, as the daemon's user (uid {daemon_uid}), root, or a member \
-             of a group in `[security] trust_admin_groups` ({configured})."
-        )),
-        Caller::OtherUser { uid } => Err(format!(
-            "refused: only the daemon's user (uid {daemon_uid}), root, or members of \
-             `[security] trust_admin_groups` ({configured}) may change this node's \
-             trust; this request came from uid {uid}. Run the command as the daemon's \
-             user or root, or add a group you belong to to `[security] \
-             trust_admin_groups` in the daemon config and restart."
-        )),
+        Caller::Unidentified => Err(TrustRefusal::new(
+            code::TRUST_CHANGE_UNIDENTIFIED,
+            format!(
+                "refused: changing this node's trust must be requested over the forwarder's \
+                 local management socket, where the kernel reports who is asking; this request \
+                 arrived on a face that carries no caller identity. Ask on this node over that \
+                 socket, as the daemon's user (uid {daemon_uid}), root, or a member of one of \
+                 the trust-admin groups of its configuration ({configured})."
+            ),
+        )
+        .with("daemon_uid", daemon_uid)
+        .with("groups", &set.groups)),
+        Caller::OtherUser { uid } => Err(TrustRefusal::new(
+            code::TRUST_CHANGE_NOT_OPERATOR,
+            format!(
+                "refused: only the daemon's user (uid {daemon_uid}), root, or members of the \
+                 trust-admin groups of its configuration ({configured}) may change this node's \
+                 trust; this request came from uid {uid}. Ask as the daemon's user or root, or \
+                 add a group you belong to to those groups in the daemon's configuration and \
+                 restart it."
+            ),
+        )
+        .with("uid", uid)
+        .with("daemon_uid", daemon_uid)
+        .with("groups", &set.groups)),
     }
 }
 
@@ -470,8 +517,8 @@ pub(crate) enum CommandAuth {
     LocalOperator,
     /// Decided by the command signature ([`authorize_command`]).
     Signature,
-    /// Refused; the text is shown to the operator verbatim.
-    Refused(String),
+    /// Refused (`command-not-operator`, `command-signer-unverifiable`).
+    Refused(TrustRefusal),
 }
 
 /// Authenticate a non-trust-admin, non-`/localhop` command by who sent it.
@@ -512,36 +559,44 @@ fn local_command_decision(
 ) -> CommandAuth {
     match caller {
         Caller::Operator if !key_signed => CommandAuth::LocalOperator,
-        Caller::Operator if require_signed && !has_validator => CommandAuth::Refused(
-            "refused: this command is signed by a key, but no `[security.mgmt] \
-             trust_anchor_pib` is configured to verify that key. You are a local \
-             operator on this socket, so send the command unsigned (without \
-             `--identity`), or set trust_anchor_pib in the daemon config and restart."
-                .to_owned(),
-        ),
+        Caller::Operator if require_signed && !has_validator => {
+            CommandAuth::Refused(TrustRefusal::new(
+                code::COMMAND_SIGNER_UNVERIFIABLE,
+                "refused: this command is signed by a key, but no command trust anchor is \
+                 configured to verify that key. You are a local operator on this socket, so \
+                 send the command unsigned, or configure a command trust anchor and restart.",
+            ))
+        }
         Caller::Operator | Caller::Unidentified => CommandAuth::Signature,
         Caller::OtherUser { .. } if !require_signed || (key_signed && has_validator) => {
             CommandAuth::Signature
         }
         Caller::OtherUser { uid } => {
-            let OperatorSet {
-                daemon_uid,
-                configured,
-            } = set;
+            let daemon_uid = set.daemon_uid;
+            let configured = set.configured();
             let anchor = if has_validator {
                 ""
             } else {
                 " (none is configured yet)"
             };
-            CommandAuth::Refused(format!(
-                "refused: unsigned management commands are accepted on the local socket \
-                 only from the daemon's user (uid {daemon_uid}), root, or members of \
-                 `[security] trust_admin_groups` ({configured}); this request came from \
-                 uid {uid}. Run the command as the daemon's user or root, add a group you \
-                 belong to to `[security] trust_admin_groups` in the daemon config and \
-                 restart, or sign the command with a key trusted by `[security.mgmt] \
-                 trust_anchor_pib`{anchor}."
-            ))
+            CommandAuth::Refused(
+                TrustRefusal::new(
+                    code::COMMAND_NOT_OPERATOR,
+                    format!(
+                        "refused: unsigned management commands are accepted on the local \
+                         socket only from the daemon's user (uid {daemon_uid}), root, or \
+                         members of its trust-admin groups ({configured}); this request came \
+                         from uid {uid}. Ask as the daemon's user or root, add a group you \
+                         belong to to those groups in the daemon's configuration and restart \
+                         it, or sign the command with a key a command trust anchor vouches \
+                         for{anchor}."
+                    ),
+                )
+                .with("uid", uid)
+                .with("daemon_uid", daemon_uid)
+                .with("groups", &set.groups)
+                .with("anchor_configured", has_validator),
+            )
         }
     }
 }
@@ -731,6 +786,14 @@ mod trust_admin_tests {
         assert!(is_trust_admin_verb(b"security", b"context-refresh"));
         assert!(is_trust_admin_verb(b"security", b"context-update"));
         assert!(is_trust_admin_verb(b"security", b"renew"));
+        for verb in [
+            b"invite-create" as &[u8],
+            b"invite-list",
+            b"invite-withdraw",
+        ] {
+            assert!(is_trust_admin_verb(b"ca", verb));
+        }
+        assert!(!is_trust_admin_verb(b"security", b"ca-token-add"));
         assert!(!is_trust_admin_verb(b"security", b"ca-enroll"));
         assert!(!is_trust_admin_verb(b"security", b"anchor-list"));
         assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));
@@ -741,7 +804,7 @@ mod trust_admin_tests {
         peer: Option<PeerCredentials>,
         in_group: impl Fn(&PeerCredentials) -> bool,
         g: &[String],
-    ) -> Result<(), String> {
+    ) -> Result<(), TrustRefusal> {
         trust_admin_decision(
             &classify_caller(peer, DAEMON, in_group, g),
             &OperatorSet::new(DAEMON, g),
@@ -751,14 +814,21 @@ mod trust_admin_tests {
     #[test]
     fn foreign_uid_outside_allowed_groups_is_refused() {
         let g = groups(&["ndnadmin"]);
-        assert!(trust(peer(1000, 1000), |_| false, &g).is_err());
+        let refused = trust(peer(1000, 1000), |_| false, &g).unwrap_err();
+        assert!(refused.is(code::TRUST_CHANGE_NOT_OPERATOR), "{refused:?}");
+        assert_eq!(
+            (refused.param("uid"), refused.param("groups")),
+            (Some("1000"), Some("ndnadmin"))
+        );
     }
 
     #[test]
     fn missing_peer_credentials_are_refused() {
         let g = groups(&["ndnadmin"]);
-        assert!(trust(None, |_| true, &g).is_err());
-        assert!(trust(None, |_| true, &[]).is_err());
+        for g in [g.as_slice(), &[]] {
+            let refused = trust(None, |_| true, g).unwrap_err();
+            assert!(refused.is(code::TRUST_CHANGE_UNIDENTIFIED), "{refused:?}");
+        }
     }
 
     #[test]
@@ -813,7 +883,7 @@ mod trust_admin_tests {
         assert_eq!(command(peer(DAEMON, 5), true, true), CommandAuth::Signature);
         assert!(matches!(
             command(peer(DAEMON, 5), true, false),
-            CommandAuth::Refused(_)
+            CommandAuth::Refused(r) if r.is(code::COMMAND_SIGNER_UNVERIFIABLE)
         ));
     }
 
@@ -822,10 +892,14 @@ mod trust_admin_tests {
     #[test]
     fn other_local_user_must_sign() {
         for has_validator in [false, true] {
-            assert!(matches!(
-                command(peer(1000, 1000), false, has_validator),
-                CommandAuth::Refused(_)
-            ));
+            let CommandAuth::Refused(r) = command(peer(1000, 1000), false, has_validator) else {
+                panic!("an unsigned command of another user is refused");
+            };
+            assert!(r.is(code::COMMAND_NOT_OPERATOR), "{r:?}");
+            assert_eq!(
+                (r.param("uid"), r.param("anchor_configured")),
+                (Some("1000"), Some(has_validator.to_string().as_str()))
+            );
         }
         assert!(matches!(
             command(peer(1000, 1000), true, false),
@@ -931,10 +1005,7 @@ mod e01_tests {
             result.is_err(),
             "DigestSha256 must be rejected with a key validator"
         );
-        assert!(
-            result.unwrap_err().contains("key-backed"),
-            "error message must explain why"
-        );
+        assert!(result.unwrap_err().is(code::COMMAND_UNSIGNED));
     }
 
     /// A properly-signed command Interest dispatches when the validator's
@@ -1015,7 +1086,7 @@ mod e01_tests {
             let interest = Interest::decode(wire).unwrap();
             let result = authorize_command(&interest, Some(&validator), true, None).await;
             let err = result.expect_err("a MAC keyed with a public key must not authorize");
-            assert!(err.contains("not a public-key signature"), "{err}");
+            assert!(err.is(code::COMMAND_SIGNATURE_REFUSED), "{err:?}");
         }
     }
 
@@ -1142,10 +1213,7 @@ mod e01_tests {
         let err = authorize_command(&interest_replay, Some(&validator), true, Some(&cache))
             .await
             .expect_err("replayed signed command must be rejected");
-        assert!(
-            err.contains("replay") || err.contains("reorder") || err.contains("SignatureTime"),
-            "rejection reason should mention replay/reorder/SignatureTime, got: {err}"
-        );
+        assert!(err.is(code::COMMAND_SIGNATURE_REFUSED), "{err:?}");
     }
 
     /// `build_mgmt_response_wire` falls back to `DigestSha256` when no

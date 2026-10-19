@@ -95,9 +95,6 @@ pub enum PolicyError {
         version: u64,
         advertised: ApprovalPolicy,
     },
-    /// The context advertises approval roles that also redeem an invite,
-    /// but the CA offers no token challenge to redeem it.
-    InviteWithoutToken { advertised: ApprovalPolicy },
 }
 
 fn quoted(roles: &[String]) -> String {
@@ -201,13 +198,6 @@ impl fmt::Display for PolicyError {
                     advertised.invite_also
                 )
             }
-            Self::InviteWithoutToken { advertised } => write!(
-                f,
-                "[ca] the namespace's trust context advertises {}, but [ca] offers \
-                 no token challenge to redeem the invites: add a [[ca.challenge]] \
-                 entry with kind = \"token\" and the invite tokens",
-                advertised.describe()
-            ),
         }
     }
 }
@@ -503,7 +493,7 @@ pub fn same_link_policy(a: &LinkPolicy, b: &LinkPolicy) -> bool {
 /// One challenge a CA offers, in offer order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChallengeSlot {
-    /// The one `token` challenge, over the tokens of every `token` entry.
+    /// The one `token` challenge, redeeming the CA's invites.
     Token,
     /// The one `device-approval` challenge.
     DeviceApproval,
@@ -515,6 +505,9 @@ pub enum ChallengeSlot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChallengeOrder {
     pub slots: Vec<ChallengeSlot>,
+    /// `token` is offered although no entry lists it: every CA redeems its
+    /// invites.
+    pub token_unlisted: bool,
     /// `device-approval` is offered although no entry lists it: the
     /// namespace's trust context advertises approval roles.
     pub approval_unlisted: bool,
@@ -523,9 +516,10 @@ pub struct ChallengeOrder {
 /// The challenges a CA offers for the configured challenge `kinds`, in
 /// order: each `token` and `device-approval` entry joins one challenge,
 /// offered where its kind is first listed; every other entry is its own.
-/// A namespace CA (`approval`: the policy its trust context advertises)
-/// whose policy names approval roles also offers `device-approval`, last,
-/// when no entry lists it.
+/// Every CA offers `token` (its invites, made at runtime), after the listed
+/// ones when no entry lists it. A namespace CA (`approval`: the policy its
+/// trust context advertises) whose policy names approval roles also offers
+/// `device-approval`, last, when no entry lists it.
 pub fn challenge_order<'a>(
     kinds: impl IntoIterator<Item = &'a str>,
     approval: Option<&ApprovalPolicy>,
@@ -541,6 +535,10 @@ pub fn challenge_order<'a>(
             slots.push(slot);
         }
     }
+    let token_unlisted = !slots.contains(&ChallengeSlot::Token);
+    if token_unlisted {
+        slots.push(ChallengeSlot::Token);
+    }
     let approval_unlisted = approval.is_some_and(|p| !p.roles.is_empty())
         && !slots.contains(&ChallengeSlot::DeviceApproval);
     if approval_unlisted {
@@ -548,6 +546,7 @@ pub fn challenge_order<'a>(
     }
     ChallengeOrder {
         slots,
+        token_unlisted,
         approval_unlisted,
     }
 }
@@ -1083,7 +1082,19 @@ mod tests {
             order.slots,
             [Configured(0), Token, DeviceApproval, Configured(4)]
         );
-        assert!(!order.approval_unlisted);
+        assert!(!order.approval_unlisted && !order.token_unlisted);
+    }
+
+    /// Every CA redeems its invites: `token` is offered when unlisted, after
+    /// the listed challenges.
+    #[test]
+    fn every_ca_offers_the_token_challenge() {
+        use ChallengeSlot::*;
+        let order = challenge_order(["pin"], None);
+        assert_eq!(order.slots, [Configured(0), Token]);
+        assert!(order.token_unlisted);
+        let order = challenge_order([], None);
+        assert_eq!(order.slots, [Token]);
     }
 
     #[test]
@@ -1093,6 +1104,10 @@ mod tests {
         let order = challenge_order(["token"], Some(&policy));
         assert_eq!(order.slots, [Token, DeviceApproval]);
         assert!(order.approval_unlisted);
+        assert_eq!(
+            challenge_order([], Some(&policy)).slots,
+            [Token, DeviceApproval]
+        );
         // Listed: where listed.
         let order = challenge_order(["device-approval", "token"], Some(&policy));
         assert_eq!(order.slots, [DeviceApproval, Token]);
@@ -1103,6 +1118,6 @@ mod tests {
             invite_also: false,
         };
         assert_eq!(challenge_order(["token"], Some(&none)).slots, [Token]);
-        assert_eq!(challenge_order(["nop"], None).slots, [Configured(0)]);
+        assert_eq!(challenge_order(["nop"], None).slots, [Configured(0), Token]);
     }
 }

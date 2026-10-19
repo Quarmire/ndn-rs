@@ -87,7 +87,9 @@ async fn root_dev(tokens: &[&str]) -> RootDevice {
     .unwrap();
     let store = TokenStore::new();
     for token in tokens {
-        store.add_scoped(*token, None, Some(ns().append("member")));
+        store
+            .add_scoped(token, None, Some(ns().append("member")))
+            .unwrap();
     }
     let approvals = ApprovalStore::new(ns(), Some(ns()), DEFAULT_REQUEST_TTL);
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![
@@ -138,6 +140,7 @@ async fn enroll(
         token: token.into(),
         ttl_secs: None,
         anchor_fingerprint: Some(root_dev.fingerprint),
+        device: None,
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();

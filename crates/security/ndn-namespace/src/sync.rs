@@ -57,6 +57,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use ndn_app::{AppError, Consumer, EngineAppExt, Producer};
+use ndn_cert::report::ContextChange;
 use ndn_engine::ForwarderEngine;
 use ndn_face::local::{InProcFace, InProcHandle};
 use ndn_identity::context_sync::{self as group, ContextFetchError, ContextFetcher};
@@ -68,7 +69,7 @@ use ndn_transport::{FaceId, FacePersistency, FaceScope};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::keep::{Adopted, keep_update};
+use crate::keep::keep_update;
 use crate::refresh::faces_up;
 use crate::{ContextStore, Participant};
 
@@ -361,7 +362,7 @@ impl Group {
             Arc::clone(admin.keyring()),
             move |update| {
                 // `keep_update` logs what became of it.
-                let _ = keep_update(&keeper, update, Adopted::OverSync);
+                let _ = keep_update(&keeper, update, ContextChange::Sync);
             },
             move |found: &group::VerifiedVersion| {
                 let Some(verified) = &verified else { return };
@@ -651,12 +652,38 @@ mod tests {
     use std::time::Duration;
 
     use ndn_cert::RootStore;
+    use ndn_cert::report::TrustEvent;
     use ndn_engine::{EngineBuilder, EngineConfig, ShutdownHandle};
     use ndn_security::{Ed25519Signer, FilePib, Keyring, SecurityManager, Signer};
     use ndn_transport::FaceKind;
 
     use super::*;
     use crate::{ParticipantParts, PibContextStore};
+
+    /// The next trust event `events` receives (within a few seconds).
+    async fn next_event(events: &mut tokio::sync::broadcast::Receiver<TrustEvent>) -> TrustEvent {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("no trust event")
+            .expect("the event stream closed")
+    }
+
+    /// The `context-updated` event of `ns` from `held` to `version`.
+    fn updated(
+        ns: &Name,
+        held: u64,
+        version: u64,
+        how: ContextChange,
+        revoked: &[&str],
+    ) -> TrustEvent {
+        TrustEvent::ContextUpdated {
+            namespace: ns.to_string(),
+            held_version: Some(held),
+            version,
+            how,
+            revoked: revoked.iter().map(|r| r.to_string()).collect(),
+        }
+    }
 
     /// A non-local face on each engine, pumped to the other.
     fn link(a: &ForwarderEngine, b: &ForwarderEngine, cancel: &CancellationToken) -> FaceId {
@@ -753,7 +780,9 @@ mod tests {
     /// A device that never refreshes adopts the root device's revocation
     /// pushed over the namespace's sync group, and stores it byte for byte;
     /// a version a stranger signed, announced in the same group, is refused:
-    /// the root's next version is still adopted over it.
+    /// the root's next version is still adopted over it. Each version kept
+    /// is told once, as reached (handed over on the root device, pushed over
+    /// sync on the device); the refused one is never told.
     #[tokio::test]
     async fn a_revocation_pushed_over_sync_is_adopted_and_a_forged_version_refused() {
         let (root_dev, device) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -803,6 +832,7 @@ mod tests {
         )
         .unwrap();
         let dev = node(&dev_engine, dev_keyring, device.path(), &cancel);
+        let (mut root_events, mut dev_events) = (root.events(), dev.events());
 
         // The root device revokes a key (the version `ndn-fwd revoke` hands
         // its daemon).
@@ -815,6 +845,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.raw(), v2.raw());
+        let k1 = ["/home/bob/member/phone/KEY/k1"];
+        assert_eq!(
+            next_event(&mut root_events).await,
+            updated(&ns, 1, 2, ContextChange::Update, &k1)
+        );
+        assert_eq!(
+            next_event(&mut dev_events).await,
+            updated(&ns, 1, 2, ContextChange::Sync, &k1)
+        );
 
         // Another member announces v3, signed by a stranger listing itself
         // as an anchor.
@@ -892,6 +931,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.raw(), v3.raw());
+        let k2 = ["/home/bob/member/tablet/KEY/k2"];
+        assert_eq!(
+            next_event(&mut root_events).await,
+            updated(&ns, 2, 3, ContextChange::Update, &k2)
+        );
+        assert_eq!(
+            next_event(&mut dev_events).await,
+            updated(&ns, 2, 3, ContextChange::Sync, &k2)
+        );
+        assert!(root_events.try_recv().is_err() && dev_events.try_recv().is_err());
 
         cancel.cancel();
         drop(rogue_handle);
@@ -1258,12 +1307,13 @@ mod tests {
         assert_eq!(
             results[0].state,
             crate::RefreshState::Behind,
-            "{}",
+            "{:?}",
             results[0].detail
         );
-        assert!(
-            results[0].detail.contains(&member.to_string()),
-            "{}",
+        assert_eq!(
+            results[0].detail.param("by"),
+            Some(member.to_string().as_str()),
+            "{:?}",
             results[0].detail
         );
         assert_eq!(admin.keyring().version_of(&ns), Some(1));

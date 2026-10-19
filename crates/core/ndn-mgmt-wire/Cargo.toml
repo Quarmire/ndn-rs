@@ -20,9 +20,12 @@ bytes   = { workspace = true }
 # Direct (not workspace-inherited) so we can set default-features = false for
 # no_std (thiserror 2 supports no_std without its std feature).
 thiserror = { version = "2", default-features = false }
+# The JSON event types of the notification streams (`events`); no_std + alloc.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

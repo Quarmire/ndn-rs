@@ -10,6 +10,8 @@
 
 #[path = "cs_erase.rs"]
 mod cs_erase;
+#[path = "event_streams.rs"]
+mod event_streams;
 #[path = "extra_modules.rs"]
 mod extra_modules;
 #[path = "face_lifecycle_sink_publishes.rs"]

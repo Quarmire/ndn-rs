@@ -26,6 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 const APP_FACE_ID: FaceId = FaceId(7300);
 
+/// What the backend answers once reached (the test only counts the calls).
+fn reached() -> TrustRefusal {
+    ndn_mgmt::not_at_runtime("any", "backend reached")
+}
+
 #[derive(Default)]
 struct CountingBackend {
     calls: AtomicUsize,
@@ -35,18 +40,12 @@ struct CountingBackend {
 impl TrustAdminMgmtBackend for CountingBackend {
     async fn adopt(&self, _link_uri: String) -> Result<AdoptedContextInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(TrustRefusal {
-            status_code: 500,
-            reason: "backend reached".into(),
-        })
+        Err(reached())
     }
 
     async fn enroll(&self, _request: EnrollRequest) -> Result<EnrollOutcome, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(TrustRefusal {
-            status_code: 500,
-            reason: "backend reached".into(),
-        })
+        Err(reached())
     }
 
     async fn update_context(
@@ -54,10 +53,7 @@ impl TrustAdminMgmtBackend for CountingBackend {
         _context_data: bytes::Bytes,
     ) -> Result<ContextRefreshInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(TrustRefusal {
-            status_code: 500,
-            reason: "backend reached".into(),
-        })
+        Err(reached())
     }
 
     async fn refresh_contexts(
@@ -65,10 +61,7 @@ impl TrustAdminMgmtBackend for CountingBackend {
         _namespace: Option<Name>,
     ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(TrustRefusal {
-            status_code: 500,
-            reason: "backend reached".into(),
-        })
+        Err(reached())
     }
 }
 
@@ -146,6 +139,7 @@ async fn localhop_trust_admin_verbs_never_run() {
         extra_modules: Vec::new(),
         face_provisioners: Vec::new(),
         control_surfaces: Vec::new(),
+        events: Default::default(),
         security_is_ephemeral: true,
         command_validator: None,
         localhop_command_validator: Some(accepting_validator(
@@ -162,6 +156,7 @@ async fn localhop_trust_admin_verbs_never_run() {
         webtransport_status_handler: None,
         ble_handler: None,
         approval_handler: None,
+        invite_handler: None,
         trust_context_handler: Some(backend.clone() as Arc<dyn TrustAdminMgmtBackend>),
         runtime_policy: None,
     };

@@ -19,10 +19,10 @@ pub(super) fn security_yubikey_detect() -> ControlResponse {
     }
     #[cfg(not(feature = "yubikey-piv"))]
     {
-        ControlResponse::error(
-            status::NOT_FOUND,
-            "yubikey-piv feature is not compiled in; rebuild ndn-fwd with --features yubikey-piv",
-        )
+        crate::refusal_response(&crate::not_at_runtime(
+            "yubikey",
+            "this build has no YubiKey PIV support",
+        ))
     }
 }
 
@@ -111,9 +111,9 @@ pub(super) async fn security_yubikey_generate(
     #[cfg(not(feature = "yubikey-piv"))]
     {
         let _ = (key_name, pib, engine);
-        ControlResponse::error(
-            status::NOT_FOUND,
-            "yubikey-piv feature is not compiled in; rebuild ndn-fwd with --features yubikey-piv",
-        )
+        crate::refusal_response(&crate::not_at_runtime(
+            "yubikey",
+            "this build has no YubiKey PIV support",
+        ))
     }
 }

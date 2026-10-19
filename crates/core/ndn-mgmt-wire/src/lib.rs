@@ -26,6 +26,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 pub mod control_parameters;
 pub mod control_response;
 pub mod control_surface;
+pub mod events;
 pub mod link_status;
 pub mod nfd_command;
 pub mod nfd_dataset;
@@ -34,8 +35,8 @@ pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;
 pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
 pub use link_status::{
-    LinkAsleepEntry, LinkEntry, LinkListing, LinkModeArg, LinkPathEntry, LinkRelayEntry,
-    link_command, parse_link_command,
+    LinkAsleepEntry, LinkCommandError, LinkDetail, LinkEntry, LinkListing, LinkModeArg,
+    LinkPathEntry, LinkRelayEntry, LinkWords, link_code, link_command, parse_link_command,
 };
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
 pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};
@@ -244,10 +245,20 @@ pub mod ca_tlv {
     pub const EXPIRES: u64 = 0xDE; // NonNegativeInteger, Unix seconds
     pub const APPROVER: u64 = 0xE0; // UTF-8 string, optional (who decided)
     pub const REASON: u64 = 0xE2; // UTF-8 string, optional (a denial's reason)
-    /// Top-level UTF-8 string beside the entries: a namespace whose requests
-    /// could not be listed, why, and what to do (`/home/bob: unreachable
-    /// (…); its requests are not shown — retry when it is up`).
-    pub const NOTE: u64 = 0xE4;
+    // 0xE4 (a note as free text) is retired.
+    /// Top-level nested entry beside the requests: a namespace whose
+    /// requests could not be listed ([`ApprovalNote`](crate::ApprovalNote)).
+    pub const NOTE: u64 = 0xE6;
+    /// UTF-8 string in a note: its code.
+    pub const NOTE_CODE: u64 = 0xE8;
+    /// Nested in a note, one per parameter: [`PARAM_NAME`], [`PARAM_VALUE`].
+    pub const NOTE_PARAM: u64 = 0xEA;
+    /// UTF-8 string in a [`NOTE_PARAM`].
+    pub const PARAM_NAME: u64 = 0xEC;
+    /// UTF-8 string in a [`NOTE_PARAM`].
+    pub const PARAM_VALUE: u64 = 0xEE;
+    /// UTF-8 string in a note: its neutral sentence.
+    pub const NOTE_TEXT: u64 = 0xF0;
 }
 
 /// One request for an admin's approval, as `ca/list-approvals` lists it.
@@ -276,6 +287,24 @@ pub struct PendingApproval {
     pub reason: String,
 }
 
+/// Why a namespace's requests are missing from a `ca/list-approvals`
+/// answer, as structured data: a stable code (`approvals-ca-unreachable`,
+/// `approvals-not-listed`; `ndn-rs/docs/specs/mgmt-trust.md`) with its
+/// parameters, and a neutral sentence a client may show as it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApprovalNote {
+    pub code: String,
+    pub params: alloc::collections::BTreeMap<String, String>,
+    pub text: String,
+}
+
+impl ApprovalNote {
+    /// The parameter `key`, if set.
+    pub fn param(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(String::as_str)
+    }
+}
+
 /// The `ca/list-approvals` answer: the rows that could be listed, plus a
 /// note for each namespace whose requests could not be (its CA is
 /// unreachable). A listing with notes is partial, never an error: the
@@ -283,7 +312,7 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApprovalListing {
     pub rows: alloc::vec::Vec<PendingApproval>,
-    pub notes: alloc::vec::Vec<String>,
+    pub notes: alloc::vec::Vec<ApprovalNote>,
 }
 
 impl ApprovalListing {
@@ -317,7 +346,16 @@ impl ApprovalListing {
             });
         }
         for note in &self.notes {
-            w.write_tlv(ca_tlv::NOTE, note.as_bytes());
+            w.write_nested(ca_tlv::NOTE, |inner| {
+                inner.write_tlv(ca_tlv::NOTE_CODE, note.code.as_bytes());
+                for (name, value) in &note.params {
+                    inner.write_nested(ca_tlv::NOTE_PARAM, |p| {
+                        p.write_tlv(ca_tlv::PARAM_NAME, name.as_bytes());
+                        p.write_tlv(ca_tlv::PARAM_VALUE, value.as_bytes());
+                    });
+                }
+                inner.write_tlv(ca_tlv::NOTE_TEXT, note.text.as_bytes());
+            });
         }
         w.finish()
     }
@@ -332,7 +370,7 @@ impl ApprovalListing {
                 break;
             };
             if typ == ca_tlv::NOTE {
-                out.notes.push(String::from_utf8_lossy(&body).into_owned());
+                out.notes.push(decode_note(body));
                 continue;
             }
             if typ != ca_tlv::PENDING_APPROVAL {
@@ -366,6 +404,35 @@ impl ApprovalListing {
     }
 }
 
+/// A `ca/list-approvals` note's body. Unknown TLVs are skipped.
+fn decode_note(body: Bytes) -> ApprovalNote {
+    let text = |v: &Bytes| String::from_utf8_lossy(v).into_owned();
+    let mut note = ApprovalNote::default();
+    let mut reader = TlvReader::new(body);
+    while !reader.is_empty() {
+        let Ok((t, v)) = reader.read_tlv() else { break };
+        match t {
+            ca_tlv::NOTE_CODE => note.code = text(&v),
+            ca_tlv::NOTE_TEXT => note.text = text(&v),
+            ca_tlv::NOTE_PARAM => {
+                let (mut name, mut value) = (String::new(), String::new());
+                let mut param = TlvReader::new(v);
+                while !param.is_empty() {
+                    let Ok((t, v)) = param.read_tlv() else { break };
+                    match t {
+                        ca_tlv::PARAM_NAME => name = text(&v),
+                        ca_tlv::PARAM_VALUE => value = text(&v),
+                        _ => {}
+                    }
+                }
+                note.params.insert(name, value);
+            }
+            _ => {}
+        }
+    }
+    note
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,9 +463,16 @@ mod tests {
         ];
         let listing = ApprovalListing {
             rows,
-            notes: alloc::vec![
-                "/home/carol: unreachable (no answer); its requests are not shown".into()
-            ],
+            notes: alloc::vec![ApprovalNote {
+                code: "approvals-ca-unreachable".into(),
+                params: [
+                    ("namespace".into(), "/home/carol".into()),
+                    ("error".into(), "no answer".into()),
+                ]
+                .into_iter()
+                .collect(),
+                text: "/home/carol: unreachable (no answer)".into(),
+            }],
         };
         let wire = listing.encode();
         assert_eq!(ApprovalListing::decode(&wire), listing);

@@ -110,6 +110,7 @@ mod tests {
             token: "member-aa".into(),
             ttl_secs: None,
             anchor_fingerprint: Some([1; 32]),
+            device: None,
         }
         .to_uri()
     }

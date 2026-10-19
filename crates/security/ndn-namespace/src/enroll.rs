@@ -38,8 +38,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_cert::report::{
-    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
-    PendingEnrollInfo, RefreshState, TrustRefusal,
+    AdoptedContextInfo, ContextRefreshInfo, Detail, EnrollOutcome, EnrollRequest, EnrolledInfo,
+    PendingEnrollInfo, RefreshState, TrustRefusal, code, detail_code,
 };
 use ndn_cert::roles::{Role, parse_device_identity, parse_device_key};
 use ndn_cert::{
@@ -47,45 +47,75 @@ use ndn_cert::{
     IssuedCertificate, OutgoingRequest, OutgoingState, RequestStore, anchor_fingerprint,
     new_device_key_name,
 };
-use ndn_mgmt_wire::control_response::status;
 use ndn_packet::{Data, Name};
 use ndn_security::{Certificate, SignedTrustContext, Signer};
 
-use crate::{HostWords, KeyVault, Participant, hex, iso, now_secs, refusal};
+use crate::words::refuse;
+use crate::{KeyVault, Participant, hex, iso, now_secs};
 
-/// The status code an invite enrollment's refusal is reported with.
-pub fn invite_status(e: &InviteEnrollError) -> u64 {
+/// The refusal of an invite enrollment that failed with `e`: its code by
+/// what failed, `error` its text.
+pub fn invite_refusal(e: &InviteEnrollError) -> TrustRefusal {
     use InviteEnrollError as E;
-    match e {
+    let kind = match e {
         E::BadInvite(_)
         | E::NotInvite(_)
         | E::InviteField { .. }
         | E::InviteRole(_)
         | E::TokenRole { .. }
-        | E::Device(_)
-        | E::KeyOutsideInvite { .. }
-        | E::NoExpectedFingerprint { .. } => status::BAD_PARAMS,
-        E::ContextUnreachable { .. } | E::CaUnreachable { .. } => 504,
-        E::NameRefused(_) => 409,
+        | E::NoExpectedFingerprint { .. } => code::INVITE_INVALID,
+        E::Device(_) => code::DEVICE_NAME_INVALID,
+        E::KeyOutsideInvite { .. } => code::IDENTITY_OUTSIDE_INVITE,
+        E::DifferentRoot { .. } => code::DIFFERENT_ROOT,
+        E::ContextUnreachable { .. } => code::CONTEXT_UNREACHABLE,
+        E::ContextFromDifferentRoot { .. } => code::CONTEXT_REFUSED,
         E::Adopt {
             source: ndn_cert::AdoptError::InProgress(_),
             ..
-        } => 409,
-        E::Signing(_) => status::SERVER_ERROR,
-        _ => status::UNAUTHORIZED,
-    }
+        } => code::TRUST_CHANGE_IN_PROGRESS,
+        E::Adopt { .. } => code::CONTEXT_REFUSED,
+        E::CaUnreachable { .. } => code::CA_UNREACHABLE,
+        E::TokenRefused(_) | E::TokenExpired { .. } => code::INVITE_REFUSED,
+        E::NameRefused(_) => code::DEVICE_NAME_TAKEN,
+        E::CaRefused(_) | E::ChallengeIncomplete(_) => code::CA_REFUSED,
+        E::Signing(_) => code::SIGNING_FAILED,
+        E::IssuedCertificate(_) => code::ISSUED_CERTIFICATE_REFUSED,
+    };
+    TrustRefusal::new(kind, e.to_string()).with("error", e)
 }
 
-/// The status code a refused approval request is answered with.
-pub fn approval_status(e: &ApprovalEnrollError) -> u64 {
-    match e {
-        ApprovalEnrollError::CaUnreachable { .. } | ApprovalEnrollError::UntrustedAnswer(_) => 504,
-        ApprovalEnrollError::NameRefused(_) => 409,
-        ApprovalEnrollError::Signing(_) => status::SERVER_ERROR,
-        ApprovalEnrollError::Expired(_) => 410,
-        ApprovalEnrollError::Denied(_)
-        | ApprovalEnrollError::CaRefused(_)
-        | ApprovalEnrollError::IssuedCertificate(_) => status::UNAUTHORIZED,
+/// The refusal of a request for an admin's approval that failed with `e`:
+/// its code by what failed, `error` its text.
+pub fn approval_refusal(e: &ApprovalEnrollError) -> TrustRefusal {
+    use ApprovalEnrollError as E;
+    let kind = match e {
+        E::Denied(_) => code::REQUEST_DENIED,
+        E::Expired(_) => code::REQUEST_EXPIRED,
+        E::CaUnreachable { .. } | E::UntrustedAnswer(_) => code::CA_UNREACHABLE,
+        E::NameRefused(_) => code::DEVICE_NAME_TAKEN,
+        E::CaRefused(_) => code::CA_REFUSED,
+        E::Signing(_) => code::SIGNING_FAILED,
+        E::IssuedCertificate(_) => code::ISSUED_CERTIFICATE_REFUSED,
+    };
+    TrustRefusal::new(kind, e.to_string()).with("error", e)
+}
+
+/// What an enrollment spent on a certificate it could not keep, for the
+/// refusal (`spent` of `certificate-not-kept`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spent {
+    /// An invite's token: ask for a new invite.
+    Invite,
+    /// An admin's approval: ask again, for a new approval.
+    Approval,
+}
+
+impl Spent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Spent::Invite => "invite",
+            Spent::Approval => "approval",
+        }
     }
 }
 
@@ -97,14 +127,16 @@ fn device_of<'a>(invite: &InviteLink, identity: &'a Name) -> Result<&'a str, Tru
         .then(|| std::str::from_utf8(&comps[comps.len() - 1].value).ok())
         .flatten();
     device.ok_or_else(|| {
-        refusal(
-            status::BAD_PARAMS,
+        TrustRefusal::new(
+            code::IDENTITY_OUTSIDE_INVITE,
             format!(
                 "the identity to enroll, {identity}, is not <device> under the invite's \
                  identity namespace {}",
                 invite.identity_prefix
             ),
         )
+        .with("identity", identity)
+        .with("prefix", &invite.identity_prefix)
     })
 }
 
@@ -203,7 +235,7 @@ pub fn context_check_budget() -> Duration {
 /// force, and the result says which version the judgement used.
 async fn check_context(p: &Participant, namespace: &Name) -> Option<ContextRefreshInfo> {
     let held = p.keyring().version_of(namespace)?;
-    let not_checked = |detail: String| ContextRefreshInfo {
+    let not_checked = |detail: Detail| ContextRefreshInfo {
         namespace: namespace.to_string(),
         state: RefreshState::Failed,
         held_version: held,
@@ -221,29 +253,28 @@ async fn check_context(p: &Participant, namespace: &Name) -> Option<ContextRefre
     .await
     {
         Ok(Ok(mut results)) => results.pop(),
-        Ok(Err(e)) => Some(not_checked(e.reason)),
-        Err(_) => Some(not_checked(
-            p.words()
-                .context_check_timed_out(budget.as_secs(), namespace),
+        Ok(Err(e)) => Some(not_checked(
+            Detail::new(detail_code::REFRESH_FAILED, e.reason.clone()).with("error", &e.reason),
         )),
+        Err(_) => Some(not_checked(crate::words::detail(
+            detail_code::CONTEXT_CHECK_TIMED_OUT,
+            [
+                ("budget_secs", budget.as_secs().to_string()),
+                ("namespace", namespace.to_string()),
+            ],
+        ))),
     }
 }
 
-/// The clause a refusal adds when the check of the trust context did not
-/// confirm the version held is the newest: the judgement used that version.
-fn judged_on_held(check: &ContextRefreshInfo) -> String {
+/// Whether the check of the trust context confirmed the version held is
+/// the newest; else certificates were judged against that version.
+fn confirmed(check: &ContextRefreshInfo) -> bool {
     match check.state {
-        RefreshState::Updated | RefreshState::Current | RefreshState::Source => String::new(),
+        RefreshState::Updated | RefreshState::Current | RefreshState::Source => true,
         RefreshState::UpstreamOlder
         | RefreshState::Behind
         | RefreshState::Unreachable
-        | RefreshState::Failed => {
-            format!(
-                " (judged against the trust context v{} this node holds; whether a newer \
-                 version revokes it could not be checked: {})",
-                check.version, check.detail
-            )
-        }
+        | RefreshState::Failed => false,
     }
 }
 
@@ -290,40 +321,43 @@ pub(crate) fn discard(vault: &dyn KeyVault, key: &Name) {
 /// The device's request records ([`KeyVault::request_store`]).
 pub fn request_store(vault: &dyn KeyVault) -> Result<RequestStore, TrustRefusal> {
     vault.request_store().map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
+        TrustRefusal::new(
+            code::REQUESTS_UNREADABLE,
             format!("cannot open this node's request records: {e}"),
         )
+        .with("error", e)
     })
 }
 
 /// End the device's pending requests the CA never answered before they
 /// expired ([`RequestStore::expire_overdue`]) and delete their keys, so a
-/// new request may go out. `words`: the host's, for the log line.
+/// new request may go out; the host is told of each
+/// ([`Participant::events`]).
 pub fn expire_overdue(
+    p: &Participant,
     vault: &dyn KeyVault,
     store: &RequestStore,
-    words: &HostWords,
 ) -> Result<(), TrustRefusal> {
     let ended = store.expire_overdue().map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
+        TrustRefusal::new(
+            code::REQUESTS_UNREADABLE,
             format!("cannot update this node's request records: {e}"),
         )
+        .with("error", e)
     })?;
     for r in ended {
         if let Ok(key) = r.key_name.parse::<Name>() {
             discard(vault, &key);
         }
-        tracing::warn!(target: "security", request = %r.request_id, key = %r.key_name, "{}", words.request_expired_unanswered());
+        tracing::warn!(target: "security", request = %r.request_id, key = %r.key_name, "{}", p.words().request_expired_unanswered());
+        crate::events::request_ended(p, &r);
     }
     Ok(())
 }
 
 /// Parse the link an enrollment was given: an invite, or an anchor link.
-/// `words`: the host's, for the refusal.
-pub fn parse_link(uri: &str, words: &HostWords) -> Result<EnrollLink, TrustRefusal> {
-    EnrollLink::parse(uri).map_err(|e| refusal(status::BAD_PARAMS, words.not_an_enroll_link(e)))
+pub fn parse_link(uri: &str) -> Result<EnrollLink, TrustRefusal> {
+    EnrollLink::parse(uri).map_err(|e| refuse(code::NOT_AN_ENROLL_LINK, [("error", e.to_string())]))
 }
 
 /// Hold the trust context of the namespace `link` names: adopt it (and keep
@@ -347,16 +381,19 @@ pub async fn ensure_context(
         if fingerprints.contains(&expected) {
             return Ok(None);
         }
-        return Err(refusal(
-            status::UNAUTHORIZED,
+        let held = fingerprints.first().map(|f| hex(f)).unwrap_or_default();
+        let expected = hex(&expected);
+        return Err(TrustRefusal::new(
+            code::DIFFERENT_ROOT,
             format!(
                 "the trust context this node holds for {namespace} is signed by a different \
-                 root (fingerprint {}) than the link expects ({}): check where the link came \
-                 from; this node keeps the context it holds",
-                fingerprints.first().map(|f| hex(f)).unwrap_or_default(),
-                hex(&expected)
+                 root (fingerprint {held}) than the link expects ({expected}): check where the \
+                 link came from; this node keeps the context it holds"
             ),
-        ));
+        )
+        .with("namespace", namespace)
+        .with("held", held)
+        .with("expected", expected));
     }
     let from_invite;
     let anchor = match link {
@@ -366,7 +403,7 @@ pub async fn ensure_context(
                 let e = InviteEnrollError::NoExpectedFingerprint {
                     namespace: namespace.to_string(),
                 };
-                return Err(refusal(invite_status(&e), e.to_string()));
+                return Err(invite_refusal(&e).with("namespace", namespace));
             };
             from_invite = anchor;
             &from_invite
@@ -414,25 +451,35 @@ pub fn route(p: &Participant, link: &EnrollLink, role: Role) -> Result<Route, Tr
         (EnrollLink::Invite(invite), false) if invite.role == role => return Ok(Route::Invite),
         (_, true) => {}
         (EnrollLink::Invite(invite), false) => {
-            return Err(refusal(
-                status::BAD_PARAMS,
-                p.words()
-                    .invite_for_another_role(namespace, invite.role, role),
+            return Err(refuse(
+                code::INVITE_FOR_ANOTHER_ROLE,
+                [
+                    ("namespace", namespace.to_string()),
+                    ("invite_role", invite.role.to_string()),
+                    ("role", role.to_string()),
+                ],
             ));
         }
         (EnrollLink::Anchor(_), false) => {
-            return Err(refusal(
-                status::BAD_PARAMS,
-                p.words().role_by_invite(namespace, role, policy.describe()),
+            return Err(refuse(
+                code::ROLE_BY_INVITE,
+                [
+                    ("namespace", namespace.to_string()),
+                    ("role", role.to_string()),
+                    ("policy", policy.describe()),
+                ],
             ));
         }
     }
     let token = match (link, policy.invite_also) {
         (EnrollLink::Invite(invite), true) => Some(invite.token.clone()),
         (EnrollLink::Anchor(_), true) => {
-            return Err(refusal(
-                status::BAD_PARAMS,
-                p.words().role_by_invite_and_approval(namespace, role),
+            return Err(refuse(
+                code::ROLE_NEEDS_INVITE_AND_APPROVAL,
+                [
+                    ("namespace", namespace.to_string()),
+                    ("role", role.to_string()),
+                ],
             ));
         }
         _ => None,
@@ -454,27 +501,30 @@ pub async fn enroll(
     vault: &dyn KeyVault,
     request: EnrollRequest,
 ) -> Result<EnrollOutcome, TrustRefusal> {
-    let link = parse_link(&request.link_uri, p.words())?;
+    let link = parse_link(&request.link_uri)?;
     let namespace = link.namespace().clone();
     let lock = p.enroll_lock(&namespace);
     let Ok(_one_at_a_time) = lock.try_lock() else {
-        return Err(refusal(
-            409,
+        return Err(TrustRefusal::new(
+            code::ENROLL_BUSY,
             format!(
                 "another enrollment in {namespace} is running on this node; wait for it to finish"
             ),
-        ));
+        )
+        .with("namespace", &namespace));
     };
     let identity = request.identity.clone();
     let Some(device) = parse_device_identity(&namespace, &identity) else {
-        return Err(refusal(
-            status::BAD_PARAMS,
+        return Err(TrustRefusal::new(
+            code::IDENTITY_INVALID,
             format!(
                 "the identity to enroll, {identity}, is not /<namespace>/<role>/<device> in the \
                  namespace {namespace} the link names (roles: admin, member, node, guest; a \
                  device name of letters, digits, '-', '_', '.')"
             ),
-        ));
+        )
+        .with("identity", &identity)
+        .with("namespace", &namespace));
     };
     // The device name the invite admits, before anything is fetched.
     if let EnrollLink::Invite(invite) = &link
@@ -488,7 +538,7 @@ pub async fn enroll(
 
     let previous_identity = vault
         .default_identity()
-        .map_err(|e| refusal(status::SERVER_ERROR, e))?;
+        .map_err(|e| TrustRefusal::new(code::KEYS_UNREADABLE, e.clone()).with("error", e))?;
     // Judge the certificates held against the namespace's newest trust
     // context, not a possibly stale held one: a newer version may revoke one.
     let context_check = check_context(p, &namespace).await;
@@ -498,17 +548,21 @@ pub async fn enroll(
         .collect();
     if !held.is_empty() && !request.force {
         let still_valid: Vec<String> = held.iter().map(Certified::still_valid).collect();
-        return Err(refusal(
-            409,
-            p.words().already_certified(
-                &namespace,
-                &still_valid.join(", "),
-                &context_check
-                    .as_ref()
-                    .map(judged_on_held)
-                    .unwrap_or_default(),
-            ),
-        ));
+        let mut params = vec![
+            ("namespace", namespace.to_string()),
+            ("still_valid", still_valid.join(", ")),
+        ];
+        if let Some(check) = context_check.as_ref().filter(|c| !confirmed(c)) {
+            params.push(("judged_version", check.version.to_string()));
+            params.push(("judged_detail", check.detail.text.clone()));
+            params.push(("cause", check.detail.code.clone()));
+            for (k, v) in &check.detail.params {
+                if !matches!(k.as_str(), "namespace" | "still_valid" | "cause") {
+                    params.push((k.as_str(), v.clone()));
+                }
+            }
+        }
+        return Err(refuse(code::ALREADY_CERTIFIED, params));
     }
 
     let enrolling = Enrolling {
@@ -550,19 +604,20 @@ fn generate_key(
     identity: &Name,
 ) -> Result<(Name, Arc<dyn Signer>), TrustRefusal> {
     let key = new_device_key_name(identity).map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
+        TrustRefusal::new(
+            code::KEY_NOT_GENERATED,
             format!("cannot name the device key (the system RNG failed): {e}"),
         )
+        .with("error", e)
     })?;
     let signer = vault.generate(&key).map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
-            format!(
-                "cannot generate the device key in {}: {e}",
-                vault.location()
-            ),
+        let location = vault.location();
+        TrustRefusal::new(
+            code::KEY_NOT_GENERATED,
+            format!("cannot generate the device key in {location}: {e}"),
         )
+        .with("error", e)
+        .with("location", location)
     })?;
     Ok((key, signer))
 }
@@ -594,20 +649,23 @@ pub async fn enroll_by_invite(
         Ok(enrollment) => enrollment.issued,
         Err(failure) => {
             discard(vault, &key);
-            let mut reason = failure.error.to_string();
+            let mut refusal = invite_refusal(&failure.error);
             if let Some(adopted) = &enrolling.adopted_context {
-                reason.push_str(&format!(
+                refusal.reason.push_str(&format!(
                     ". The trust context {} v{} was adopted on the way and stays adopted",
                     adopted.namespace, adopted.version
                 ));
+                refusal = refusal
+                    .with("adopted_namespace", &adopted.namespace)
+                    .with("adopted_version", adopted.version);
             }
             tracing::warn!(
                 target: "security",
                 identity = %identity,
-                error = %reason,
+                error = %refusal.reason,
                 "enrollment failed; nothing was kept for the new key"
             );
-            return Err(refusal(invite_status(&failure.error), reason));
+            return Err(refusal);
         }
     };
     install(
@@ -617,7 +675,8 @@ pub async fn enroll_by_invite(
         signer,
         &issued,
         enrolling,
-        &p.words().invite_spent(),
+        Spent::Invite,
+        None,
     )
     .await
     .map(EnrollOutcome::Enrolled)
@@ -659,12 +718,13 @@ pub async fn enroll_by_approval(
 ) -> Result<EnrollOutcome, TrustRefusal> {
     let requests = request_store(vault)?;
     let identity = enrolling.identity.to_string();
-    let outstanding = expire_overdue(vault, &requests, p.words()).and_then(|()| {
+    let outstanding = expire_overdue(p, vault, &requests).and_then(|()| {
         requests.outstanding(&identity).map_err(|e| {
-            refusal(
-                status::SERVER_ERROR,
+            TrustRefusal::new(
+                code::REQUESTS_UNREADABLE,
                 format!("cannot read this node's request records: {e}"),
             )
+            .with("error", e)
         })
     })?;
     if let Some(outstanding) = outstanding {
@@ -711,14 +771,14 @@ pub async fn enroll_by_approval(
                 .and_then(|()| requests.save(&record).map_err(|e| e.to_string()))
             {
                 discard(vault, &key);
-                return Err(refusal(
-                    status::SERVER_ERROR,
-                    p.words().request_not_recorded(
-                        &record.request_id,
-                        &record.code,
-                        e,
-                        &vault.location(),
-                    ),
+                return Err(refuse(
+                    code::REQUEST_NOT_RECORDED,
+                    [
+                        ("request", record.request_id.clone()),
+                        ("code", record.code.clone()),
+                        ("error", e),
+                        ("location", vault.location()),
+                    ],
                 ));
             }
             // Its status Interest goes out now.
@@ -742,7 +802,8 @@ pub async fn enroll_by_approval(
             signer,
             &issued,
             enrolling,
-            &p.words().approval_used(),
+            Spent::Approval,
+            None,
         )
         .await
         .map(EnrollOutcome::Enrolled),
@@ -754,7 +815,7 @@ pub async fn enroll_by_approval(
                 error = %e,
                 "request for an admin's approval refused; nothing was kept for the new key"
             );
-            Err(refusal(approval_status(&e), e.to_string()))
+            Err(approval_refusal(&e))
         }
     }
 }
@@ -766,8 +827,12 @@ pub async fn enroll_by_approval(
 /// renewal timer told, the running device told as the host allows
 /// ([`KeyVault::activate`]). The device's other identities stay as they
 /// were; only a device without a default identity records this one as its
-/// default — its node identity. `kept_failed`: what to do when keeping it
-/// fails (the key is then deleted).
+/// default — its node identity. The host is told
+/// ([`Participant::events`]: `enrolled`, with `request`, the request for an
+/// admin's approval it waited for). `spent`: what getting the certificate
+/// used up, for the refusal when keeping it fails (the key is then
+/// deleted).
+#[allow(clippy::too_many_arguments)]
 pub async fn install(
     p: &Participant,
     vault: &dyn KeyVault,
@@ -775,7 +840,8 @@ pub async fn install(
     signer: Arc<dyn Signer>,
     issued: &IssuedCertificate,
     enrolling: Enrolling,
-    kept_failed: &str,
+    spent: Spent,
+    request: Option<&str>,
 ) -> Result<EnrolledInfo, TrustRefusal> {
     let Enrolling {
         namespace,
@@ -786,14 +852,14 @@ pub async fn install(
     } = enrolling;
     if let Err(e) = vault.store_certificate(key, &issued.data) {
         discard(vault, key);
-        return Err(refusal(
-            status::SERVER_ERROR,
-            format!(
-                "the CA issued {}, but storing it in {} failed ({e}); nothing was kept and \
-                 nothing changed. {kept_failed}",
-                issued.cert.name,
-                vault.location()
-            ),
+        return Err(refuse(
+            code::CERTIFICATE_NOT_KEPT,
+            [
+                ("certificate", issued.cert.name.to_string()),
+                ("location", vault.location()),
+                ("error", e),
+                ("spent", spent.as_str().to_owned()),
+            ],
         ));
     }
 
@@ -852,7 +918,7 @@ pub async fn install(
         }
         vault.activate(&identity, key, signer, first_identity)
     };
-    crate::membership::enrolled(p, &namespace, key);
+    crate::membership::enrolled(p, &namespace, key, issued.cert.valid_until, request);
     // The other certificates the device holds in the namespace, judged
     // against the context held now: the one checked before asking, or the
     // one adopted on the way (checked here when there is something to
@@ -902,17 +968,18 @@ pub async fn install(
 }
 
 /// The device's requests for an admin's approval, oldest first (overdue
-/// ones ended first). `words`: the host's, for the log line.
+/// ones ended first, [`expire_overdue`]).
 pub fn enroll_status(
+    p: &Participant,
     vault: &dyn KeyVault,
-    words: &HostWords,
 ) -> Result<Vec<OutgoingRequest>, TrustRefusal> {
     let store = request_store(vault)?;
-    expire_overdue(vault, &store, words)?;
+    expire_overdue(p, vault, &store)?;
     store.list().map_err(|e| {
-        refusal(
-            status::SERVER_ERROR,
+        TrustRefusal::new(
+            code::REQUESTS_UNREADABLE,
             format!("cannot read this node's request records: {e}"),
         )
+        .with("error", e)
     })
 }

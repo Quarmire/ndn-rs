@@ -322,10 +322,9 @@ pub fn token_role(token: &str) -> Option<Role> {
 const TOKEN_EXPIRY_MARK: &str = "-until";
 
 /// `token` with an absolute expiry (Unix seconds) appended:
-/// `<token>-until<secs>`. The expiry travels inside the token, so the CA
-/// (which reads tokens from its config) and the invitee (which reads the
-/// invite) both see the same deadline, however long the token sat in a
-/// config file or a message.
+/// `<token>-until<secs>`. The expiry travels inside the token, so the
+/// invitee (which reads the invite) sees the same deadline the CA keeps
+/// with the invite, however long the link sat in a message.
 pub fn token_with_expiry(token: &str, expires_at_secs: u64) -> String {
     format!("{token}{TOKEN_EXPIRY_MARK}{expires_at_secs}")
 }

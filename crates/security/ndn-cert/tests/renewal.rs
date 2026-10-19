@@ -83,7 +83,9 @@ async fn namespace(policy: impl FnOnce(Name) -> Box<dyn ndn_cert::IssuancePolicy
         ("member-bb", "member"),
         ("guest-gg", "guest"),
     ] {
-        store.add_scoped(token, None, Some(ns().append(role)));
+        store
+            .add_scoped(token, None, Some(ns().append(role)))
+            .unwrap();
     }
     let challenges: Vec<Box<dyn ChallengeHandler>> = vec![Box::new(TokenChallenge::new(store))];
     let mut config = CaConfig::new(
@@ -127,6 +129,7 @@ async fn enroll(ns: &Namespace, role: &str, token: &str, device: &str, seed: u8)
         token: token.into(),
         ttl_secs: None,
         anchor_fingerprint: Some(ns.fingerprint),
+        device: None,
     }
     .to_uri();
     let invite = InviteLink::from_uri(&uri).unwrap();

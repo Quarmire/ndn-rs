@@ -13,7 +13,9 @@
 //! per namespace whose CA could not be asked
 //! ([`ndn_mgmt_wire::ApprovalListing`]); `approve` takes the request id or
 //! verification code in `Uri`, `deny` takes `<id or code>[:<reason>]`. Both
-//! answer a sentence saying what was recorded.
+//! answer the request as decided, a [`crate::ApprovalDecision`] as JSON. A
+//! refusal is a [`crate::TrustRefusal`] as JSON (codes of the approvals
+//! section of `ndn-rs/docs/specs/mgmt-trust.md`).
 
 use std::sync::Arc;
 
@@ -26,7 +28,8 @@ use ndn_mgmt_wire::{
 };
 
 use crate::module::{MgmtContext, MgmtModule};
-use crate::{ApprovalMgmtBackend, MgmtResponse};
+use crate::{ApprovalDecision, ApprovalMgmtBackend, MgmtResponse, TrustRefusal, refusal_response};
+use ndn_cert::report::code;
 
 fn handle_ca(
     verb_name: &[u8],
@@ -35,11 +38,11 @@ fn handle_ca(
     operator: String,
 ) -> MgmtResponse {
     let Some(handler) = handler else {
-        return ControlResponse::error(
-            status::NOT_FOUND,
+        return refusal_response(&crate::not_at_runtime(
+            "approvals",
             "this node neither runs a CA that takes approval requests nor is an admin device \
              of a namespace: there is nothing to approve here",
-        )
+        ))
         .into();
     };
     let handler = Arc::clone(handler);
@@ -49,22 +52,27 @@ fn handle_ca(
                 .list()
                 .await
                 .map(|listing| listing.encode())
-                .map_err(|r| ControlResponse::error(r.status_code, r.reason))
+                .map_err(|r| refusal_response(&r))
         })),
         v if v == verb::APPROVE || v == verb::DENY => {
             let Some((target, decision)) = decision_of(v == verb::APPROVE, params.uri.as_deref())
             else {
-                return ControlResponse::error(
-                    status::BAD_PARAMS,
-                    "give the request id or the six-digit code (`ndn-fwd approvals list` shows \
-                     them) in Uri; a denial may add `:<reason>`",
-                )
+                return refusal_response(&TrustRefusal::new(
+                    code::APPROVAL_TARGET_MISSING,
+                    "give the request id or the six-digit code (the list of pending requests \
+                     shows them) in Uri; a denial may add `:<reason>`",
+                ))
                 .into();
             };
             MgmtResponse::Deferred(Box::pin(async move {
                 match handler.decide(target, decision, operator).await {
-                    Ok(row) => ControlResponse::ok_empty(decided(&row)),
-                    Err(r) => ControlResponse::error(r.status_code, r.reason),
+                    Ok(row) => match serde_json::to_string(&decided(row)) {
+                        Ok(json) => ControlResponse::ok_empty(json),
+                        Err(e) => {
+                            ControlResponse::error(status::SERVER_ERROR, format!("encode: {e}"))
+                        }
+                    },
+                    Err(r) => refusal_response(&r),
                 }
             }))
         }
@@ -95,25 +103,20 @@ fn decision_of(approve: bool, uri: Option<&str>) -> Option<(String, ndn_cert::De
     (!target.is_empty()).then(|| (target.to_owned(), ndn_cert::Decision::Deny { reason }))
 }
 
-/// What a decision recorded, in one sentence.
-fn decided(row: &PendingApproval) -> String {
-    let subject = if row.role.is_empty() {
-        row.key_name.clone()
-    } else {
-        format!("{} device {:?} ({})", row.role, row.device, row.key_name)
-    };
-    let outcome = if row.state == "approved" {
-        "the device's next request gets its certificate".to_owned()
-    } else {
-        format!(
-            "reason: {}; the device is told so at its next request",
-            row.reason
-        )
-    };
-    format!(
-        "{} request {} for {subject} at {} (code {}), recorded as decided by {}; {outcome}",
-        row.state, row.request_id, row.namespace, row.code, row.approver
-    )
+/// The answer to a decision: the request as decided.
+fn decided(row: PendingApproval) -> ApprovalDecision {
+    ApprovalDecision {
+        request_id: row.request_id,
+        key_name: row.key_name,
+        namespace: row.namespace,
+        role: row.role,
+        device: row.device,
+        code: row.code,
+        state: row.state,
+        approver: row.approver,
+        reason: row.reason,
+        expires_secs: row.expires_secs,
+    }
 }
 
 pub(crate) struct CaModule;
@@ -131,6 +134,9 @@ impl MgmtModule for CaModule {
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
         let operator = crate::auth::caller_label(ctx.source_face, ctx.engine);
+        if super::ca_invites::is_invite_verb(verb) {
+            return super::ca_invites::handle_invites(verb, params, ctx.invite_handler, &operator);
+        }
         handle_ca(verb, params, ctx.approval_handler, operator)
     }
 }
@@ -190,16 +196,21 @@ mod ca_tests {
             ..Default::default()
         };
         let op = || "uid 1000 (alice)".to_owned();
-        assert!(
-            answer(handle_ca(
-                verb::APPROVE,
-                uri("482 913"),
-                Some(&dyn_backend),
-                op()
-            ))
-            .await
-            .is_ok()
+        let approved = answer(handle_ca(
+            verb::APPROVE,
+            uri("482 913"),
+            Some(&dyn_backend),
+            op(),
+        ))
+        .await;
+        assert!(approved.is_ok());
+        let approved: ApprovalDecision =
+            serde_json::from_str(&approved.status_text).expect("the decision as JSON");
+        assert_eq!(
+            (approved.request_id.as_str(), approved.state.as_str()),
+            ("482 913", "approved")
         );
+        assert_eq!(approved.approver, op());
         assert!(
             answer(handle_ca(
                 verb::DENY,
@@ -235,7 +246,12 @@ mod ca_tests {
             None,
             String::new(),
         );
-        assert_eq!(answer(none).await.status_code, status::NOT_FOUND);
+        let code_of = |cr: ControlResponse| {
+            serde_json::from_str::<TrustRefusal>(&cr.status_text)
+                .expect("a structured refusal")
+                .code
+        };
+        assert_eq!(code_of(answer(none).await), code::NOT_AT_RUNTIME.code);
         let backend: Arc<dyn ApprovalMgmtBackend> = Arc::new(Recording::default());
         let no_target = handle_ca(
             verb::APPROVE,
@@ -243,6 +259,9 @@ mod ca_tests {
             Some(&backend),
             String::new(),
         );
-        assert_eq!(answer(no_target).await.status_code, status::BAD_PARAMS);
+        assert_eq!(
+            code_of(answer(no_target).await),
+            code::APPROVAL_TARGET_MISSING.code
+        );
     }
 }

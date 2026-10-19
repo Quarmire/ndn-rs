@@ -15,6 +15,7 @@ pub(crate) mod common;
 
 pub(crate) mod ble;
 pub(crate) mod ca;
+pub(crate) mod ca_invites;
 pub(crate) mod coding;
 pub(crate) mod compute;
 pub(crate) mod config;
