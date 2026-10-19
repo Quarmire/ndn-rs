@@ -250,12 +250,19 @@ impl HostWords {
         )
     }
 
-    /// An enrollment installed its certificate (a log).
-    pub fn enrolled(&self) -> String {
-        format!(
-            "enrolled; {}'s default identity is now this one",
-            self.key_storage
-        )
+    /// An enrollment installed its certificate (a log): `node_identity`, it
+    /// is the device's first identity and became its node identity.
+    pub fn enrolled(&self, node_identity: bool) -> String {
+        if node_identity {
+            format!(
+                "enrolled; {}'s default identity is now this one, the node identity",
+                self.key_storage
+            )
+        } else {
+            "enrolled; this identity signs its trusted prefix's Data beside the others, and the \
+             node identity stays"
+                .to_owned()
+        }
     }
 
     /// A request record whose namespace or CA does not parse.
@@ -395,7 +402,8 @@ mod tests {
             w.invite_spent(),
             w.approval_used(),
             w.request_not_recorded("r1", "123456", "disk full", "/keys"),
-            w.enrolled(),
+            w.enrolled(true),
+            w.enrolled(false),
             w.request_names_no_ca(),
             w.request_names_no_key(),
             w.request_key_gone(&ns, "gone"),

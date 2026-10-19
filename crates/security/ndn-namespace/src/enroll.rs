@@ -872,7 +872,7 @@ pub async fn install(
         signing_now = activation.signing_now,
         node_identity = activation.node_identity,
         "{}",
-        p.words().enrolled()
+        p.words().enrolled(activation.node_identity)
     );
     Ok(EnrolledInfo {
         identity: identity.to_string(),
