@@ -179,9 +179,12 @@ async fn renew_one(
         mgr.cert_cache().insert(issued.cert.clone());
         // A key the running device does not hold yet (its certificate was
         // not valid when the device started) signs its identity's Data from
-        // now on — unless the identity signs with another key already.
+        // now on — unless the identity signs with another key already — and
+        // the host is told, as at an enrollment (never as a first identity).
         if mgr.get_signer_sync(&held.key).is_err() {
-            mgr.register_signer(held.key.clone(), signer);
+            mgr.register_signer(held.key.clone(), Arc::clone(&signer));
+            let identity = key_identity(&held.key);
+            vault.activate(&identity, &held.key, signer, false);
         }
     }
     if let Some(own) = p.own_certs() {
@@ -206,6 +209,16 @@ async fn renew_one(
         "certificate renewed (same key); stored, served and signing with it"
     );
     Ok(issued.cert)
+}
+
+/// The identity of the device key `key`: its name before `KEY`.
+fn key_identity(key: &Name) -> Name {
+    let comps = key.components();
+    let at = comps
+        .iter()
+        .position(|c| c.value.as_ref() == b"KEY")
+        .unwrap_or(comps.len());
+    Name::from_components(comps[..at].iter().cloned())
 }
 
 fn info(held: &Held, result: &Result<Certificate, (RenewalState, String)>) -> RenewalInfo {
