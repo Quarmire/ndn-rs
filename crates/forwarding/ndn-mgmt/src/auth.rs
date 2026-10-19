@@ -330,6 +330,11 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
         ndn_mgmt_wire::nfd_command::module::CA,
         ndn_mgmt_wire::nfd_command::verb::INVITE_WITHDRAW,
     ),
+    // Who the namespace's CAs certified: the members, local operators only.
+    (
+        ndn_mgmt_wire::nfd_command::module::CA,
+        ndn_mgmt_wire::nfd_command::verb::ISSUED_LIST,
+    ),
 ];
 
 /// `true` when `module/verb` changes this node's trust and must pass
@@ -790,6 +795,7 @@ mod trust_admin_tests {
             b"invite-create" as &[u8],
             b"invite-list",
             b"invite-withdraw",
+            b"issued-list",
         ] {
             assert!(is_trust_admin_verb(b"ca", verb));
         }
@@ -1280,6 +1286,9 @@ mod e01_tests {
         assert!(is_public_dataset_verb(m::CS, b"info"));
         // CS config (capacity/erase) is a command and stays gated.
         assert!(!is_public_dataset_verb(m::CS, b"config"));
+        // CS list (the cached names) is a read like `cs/info`; erase is not.
+        assert!(is_public_dataset_verb(m::CS, b"list"));
+        assert!(!is_public_dataset_verb(m::CS, b"erase"));
     }
 
     #[test]

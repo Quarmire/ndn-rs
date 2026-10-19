@@ -137,7 +137,13 @@ pub struct CaState {
     /// of this CA's identity is verified under; unset, the CA renews only
     /// the certificates it issued.
     earlier_ca: std::sync::OnceLock<Arc<Keyring>>,
+    /// Told of every certificate this CA issues, once it is recorded.
+    issued_observer: std::sync::OnceLock<IssuedObserver>,
 }
+
+/// Told of each certificate a CA issues (by invite, on an approval, or a
+/// renewal), once it is recorded and served ([`CaState::set_issued_observer`]).
+pub type IssuedObserver = Arc<dyn Fn(&Certificate) + Send + Sync>;
 
 impl CaState {
     /// In-memory CA: issued certs and revocations are lost on drop. Use
@@ -154,6 +160,7 @@ impl CaState {
             issuing: tokio::sync::Mutex::new(()),
             in_flight: DashSet::new(),
             earlier_ca: std::sync::OnceLock::new(),
+            issued_observer: std::sync::OnceLock::new(),
         };
         state.serve_own_certificate();
         state
@@ -192,6 +199,12 @@ impl CaState {
     /// later call is ignored.
     pub fn accept_earlier_ca_certificates(&self, keyring: Arc<Keyring>) {
         let _ = self.earlier_ca.set(keyring);
+    }
+
+    /// Tell `observer` of every certificate this CA issues from now on.
+    /// Set once: a later call is ignored.
+    pub fn set_issued_observer(&self, observer: IssuedObserver) {
+        let _ = self.issued_observer.set(observer);
     }
 
     /// Serve the CA's own certificate on cert-fetch so requesters can walk
@@ -1148,6 +1161,53 @@ impl CaState {
         issued
     }
 
+    /// Every certificate this CA issued, its own and earlier CAs'
+    /// certificates excepted, decoded, each with whether it is revoked here
+    /// (itself or through its key). In no particular order.
+    pub fn issued_certificates(&self) -> Vec<(Certificate, bool)> {
+        let own = self.signing_key_name();
+        self.served_certs
+            .iter()
+            .filter_map(|entry| {
+                let cert = deserialize_cert(entry.value())?;
+                let key = cert.key_name();
+                let ca_cert = own
+                    .as_ref()
+                    .is_some_and(|own| *own == key || is_other_key_of_identity(own, &key));
+                (!ca_cert).then(|| (cert, self.is_revoked(entry.key())))
+            })
+            .collect()
+    }
+
+    /// The issuers above `cert`, as far as this CA can walk them: each
+    /// KeyLocator from `cert`'s up, through the certificates this CA serves
+    /// (its own, earlier CAs'). The last one names a key it serves no
+    /// certificate of (the namespace root's). At most
+    /// [`MAX_ISSUER_CHAIN`] names.
+    pub fn issuer_chain(&self, cert: &Certificate) -> Vec<ndn_packet::Name> {
+        let mut chain: Vec<ndn_packet::Name> = Vec::new();
+        let mut next = cert.issuer.clone();
+        while let Some(locator) = next.take() {
+            if chain.len() == MAX_ISSUER_CHAIN || chain.contains(&*locator) {
+                break;
+            }
+            let key = ndn_security::cert_name::key_name_of(&locator);
+            next = self
+                .served_certs
+                .get(&locator.to_string())
+                .and_then(|wire| deserialize_cert(&wire))
+                .or_else(|| {
+                    self.served_certs.iter().find_map(|e| {
+                        let issuer = deserialize_cert(e.value())?;
+                        (issuer.key_name() == key).then_some(issuer)
+                    })
+                })
+                .and_then(|issuer| issuer.issuer);
+            chain.push((*locator).clone());
+        }
+        chain
+    }
+
     /// Revoke, as this CA's operator, every certificate it issued under
     /// `prefix` — a key name covers each certificate of that key. No
     /// possession proof: this is the CA host's own administration (its
@@ -1247,6 +1307,9 @@ impl CaState {
             store.record_issued(&cert_name_str, &cert_bytes)?;
         }
         self.served_certs.insert(cert_name_str.clone(), cert_bytes);
+        if let Some(observer) = self.issued_observer.get() {
+            observer(&cert);
+        }
 
         Ok(ChallengeResponseTlv {
             status: STATUS_SUCCESS,
@@ -1415,6 +1478,9 @@ fn generate_request_id_bytes() -> Result<[u8; 8], CertError> {
     crate::ecdh::fill_random(&mut bytes)?;
     Ok(bytes)
 }
+
+/// The most issuers [`CaState::issuer_chain`] walks above a certificate.
+pub const MAX_ISSUER_CHAIN: usize = 8;
 
 /// What [`CaState::revoke_issued_under`] revoked.
 #[derive(Debug, Default)]

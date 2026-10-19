@@ -150,6 +150,33 @@ pub fn invite_observer(
     Arc::new(move |event| sink.publish(invite_event(&ca, event)))
 }
 
+/// The trust event of a certificate the CA `ca` (its prefix) of namespace
+/// `namespace` issued: its name and, when it follows the namespace layout,
+/// the role it certifies.
+pub fn issued_event(
+    ca: &str,
+    namespace: &ndn_packet::Name,
+    certificate: &ndn_packet::Name,
+) -> TrustEvent {
+    let key = ndn_security::cert_name::key_name_of(certificate);
+    TrustEvent::CertificateIssued {
+        ca: ca.to_owned(),
+        certificate: certificate.to_string(),
+        role: ndn_cert::roles::parse_device_key(namespace, &key)
+            .map(|d| d.role.as_str().to_owned()),
+    }
+}
+
+/// An observer for [`ndn_cert::CaState::set_issued_observer`] of the CA
+/// `ca` (its prefix) of `namespace`, publishing [`issued_event`]s to `sink`.
+pub fn issued_observer(
+    ca: String,
+    namespace: ndn_packet::Name,
+    sink: Arc<dyn EventSink<TrustEvent>>,
+) -> ndn_cert::IssuedObserver {
+    Arc::new(move |cert| sink.publish(issued_event(&ca, &namespace, &cert.name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +242,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_issued_certificate_is_told_with_its_role() {
+        let ns: ndn_packet::Name = "/home/bob".parse().unwrap();
+        let cert: ndn_packet::Name = "/home/bob/node/pi/KEY/%01/NDNCERT/v=1".parse().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&issued_event("/home/bob", &ns, &cert).encode()).unwrap();
+        assert_eq!(json["kind"], "certificate-issued");
+        assert_eq!(json["ca"], "/home/bob");
+        assert_eq!(json["role"], "node");
+        assert!(json["certificate"].as_str().unwrap().contains("NDNCERT"));
     }
 
     #[test]

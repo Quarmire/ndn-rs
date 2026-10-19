@@ -57,7 +57,7 @@ pub(crate) fn build_mgmt_response_wire(
 
 /// Per-Data payload budget for status datasets (matches ndn-cxx
 /// `mgmt/status-dataset-context.cpp` — `MAX_NDN_PACKET_SIZE - 800`).
-const MAX_DATASET_PAYLOAD_LEN: usize = 8000;
+pub(crate) const MAX_DATASET_PAYLOAD_LEN: usize = 8000;
 
 /// Segment a status dataset into Data wires named
 /// `<interest>/v=<version>/seg=<n>`. The last segment carries

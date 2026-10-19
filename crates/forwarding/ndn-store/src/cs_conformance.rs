@@ -7,7 +7,7 @@ use bytes::Bytes;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsMeta};
+use crate::{ContentStore, CsListedEntry, CsMeta};
 
 /// Round 14 of `docs/nfd-divergence-findings.md`: a `LatestPublisher` prefix
 /// holds many versions of which only the newest is fresh. A CanBePrefix +
@@ -53,4 +53,69 @@ pub(crate) async fn only_the_fresh_version_answers_latest<C: ContentStore>(cs: &
         Some(version(N)),
         "without MustBeFresh the answer is still the freshest, not an arbitrary one"
     );
+}
+
+/// `list` reports what is held at or under a prefix — never a sibling whose
+/// first component merely starts with the same bytes — in canonical name
+/// order, capped, with the uncapped total, each entry's wire size and its
+/// freshness at the caller's time.
+pub(crate) async fn lists_entries_under_a_prefix<C: ContentStore>(cs: &C) {
+    const NOW: u64 = 1_000_000_000;
+    let name = |uri: &str| -> Arc<Name> { Arc::new(uri.parse().unwrap()) };
+    let meta = |stale_at: u64| CsMeta {
+        stale_at,
+        revocation_epoch: None,
+    };
+    // Inserted out of name order.
+    for (uri, data, stale_at) in [
+        ("/p/c/d", "dd", u64::MAX),
+        ("/p/b", "bbb", u64::MAX),
+        ("/q/x", "x", u64::MAX),
+        ("/p/a", "a", 0),
+        ("/pz", "z", u64::MAX),
+    ] {
+        cs.insert(Bytes::from(data), name(uri), meta(stale_at))
+            .await;
+    }
+    let entry = |uri: &str, bytes: usize, fresh: bool| CsListedEntry {
+        name: name(uri),
+        bytes,
+        fresh,
+    };
+
+    let capped = cs.list(&name("/p"), 2, NOW).await;
+    assert_eq!(
+        capped.total, 3,
+        "every entry under /p counts, listed or not"
+    );
+    assert_eq!(
+        capped.entries,
+        vec![entry("/p/a", 1, false), entry("/p/b", 3, true)],
+        "the first two in name order, stale judged at the caller's time"
+    );
+
+    let all = cs.list(&name("/p"), 10, NOW).await;
+    assert_eq!(all.total, 3);
+    assert_eq!(
+        all.entries,
+        vec![
+            entry("/p/a", 1, false),
+            entry("/p/b", 3, true),
+            entry("/p/c/d", 2, true),
+        ]
+    );
+
+    let exact = cs.list(&name("/p/c/d"), 10, NOW).await;
+    assert_eq!(
+        exact.entries,
+        vec![entry("/p/c/d", 2, true)],
+        "at the prefix"
+    );
+
+    let root = cs.list(&Name::root(), 0, NOW).await;
+    assert_eq!(root.total, 5, "the root holds everything");
+    assert!(root.entries.is_empty(), "a zero cap lists nothing");
+
+    let none = cs.list(&name("/r"), 10, NOW).await;
+    assert_eq!((none.total, none.entries.len()), (0, 0));
 }

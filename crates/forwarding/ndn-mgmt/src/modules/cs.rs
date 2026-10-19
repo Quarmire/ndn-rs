@@ -1,27 +1,59 @@
-//! `/localhost/nfd/cs/{config, info, erase}` — content store.
+//! `/localhost/nfd/cs/{config, info, erase, list}` — content store.
 
 use async_trait::async_trait;
 use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{
-    ControlParameters, ControlResponse,
+    ControlParameters, ControlResponse, CsEntry, CsListing,
     control_response::status,
     nfd_command::{module, verb},
 };
+use ndn_packet::Name;
 
 use crate::MgmtResponse;
 use crate::module::{MgmtContext, MgmtModule};
+use crate::wire::MAX_DATASET_PAYLOAD_LEN;
 
 async fn handle_cs(
     verb_name: &[u8],
     params: ControlParameters,
     engine: &ForwarderEngine,
-) -> ControlResponse {
+) -> MgmtResponse {
     match verb_name {
-        v if v == verb::CONFIG => cs_config(params, engine),
-        v if v == verb::INFO => cs_info(engine),
-        v if v == verb::ERASE => cs_erase(params, engine).await,
-        _ => ControlResponse::error(status::NOT_FOUND, "unknown cs verb"),
+        v if v == verb::CONFIG => cs_config(params, engine).into(),
+        v if v == verb::INFO => cs_info(engine).into(),
+        v if v == verb::ERASE => cs_erase(params, engine).await.into(),
+        v if v == verb::LIST => MgmtResponse::Dataset(cs_list_dataset(params, engine).await),
+        _ => ControlResponse::error(status::NOT_FOUND, "unknown cs verb").into(),
     }
+}
+
+/// `cs/list` lists this many entries when the command carries no Count.
+const CS_LIST_DEFAULT_COUNT: u64 = 100;
+
+/// `cs/list`: the entries the CS holds under the Name parameter (absent: all
+/// of them), the first Count (default [`CS_LIST_DEFAULT_COUNT`]) in canonical
+/// name order, each judged fresh at the engine's now, and the total held
+/// there. The answer fits one dataset segment — clients read only the first
+/// — so it may list fewer than Count; the total still counts every entry.
+async fn cs_list_dataset(params: ControlParameters, engine: &ForwarderEngine) -> bytes::Bytes {
+    let prefix = params.name.unwrap_or_else(Name::root);
+    let limit = params.count.unwrap_or(CS_LIST_DEFAULT_COUNT);
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let now_ns = engine.runtime().unix_nanos();
+    let held = engine.cs().list_erased(&prefix, limit, now_ns).await;
+    let listing = CsListing {
+        entries: held
+            .entries
+            .into_iter()
+            .map(|e| CsEntry {
+                name: (*e.name).clone(),
+                bytes: e.bytes as u64,
+                fresh: e.fresh,
+            })
+            .collect(),
+        total: held.total as u64,
+    };
+    listing.encode_within(MAX_DATASET_PAYLOAD_LEN)
 }
 
 // NFD `CsFlagBit` (ndn-cxx nfd-constants.hpp): admit gates insertion, serve
@@ -108,6 +140,115 @@ impl MgmtModule for CsModule {
         params: ControlParameters,
         ctx: &MgmtContext<'_>,
     ) -> MgmtResponse {
-        handle_cs(verb, params, ctx.engine).await.into()
+        handle_cs(verb, params, ctx.engine).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ndn_engine::{EngineBuilder, EngineConfig};
+    use ndn_store::CsMeta;
+    use std::sync::Arc;
+
+    async fn insert(engine: &ForwarderEngine, uri: &str, data: &'static [u8], fresh: bool) {
+        let meta = CsMeta {
+            stale_at: if fresh { u64::MAX } else { 0 },
+            revocation_epoch: None,
+        };
+        engine
+            .cs()
+            .insert_erased(
+                Bytes::from_static(data),
+                Arc::new(uri.parse().unwrap()),
+                meta,
+            )
+            .await;
+    }
+
+    async fn list(engine: &ForwarderEngine, params: ControlParameters) -> (usize, CsListing) {
+        match handle_cs(verb::LIST, params, engine).await {
+            MgmtResponse::Dataset(body) => (body.len(), CsListing::decode(&body)),
+            _ => panic!("cs/list answers a dataset"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_answers_what_the_cs_holds_under_the_prefix() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        insert(&engine, "/a/3", b"ccc", true).await;
+        insert(&engine, "/a/1", b"a", false).await;
+        insert(&engine, "/a/2", b"bb", true).await;
+        insert(&engine, "/b/1", b"d", true).await;
+
+        let (_, capped) = list(
+            &engine,
+            ControlParameters {
+                name: Some("/a".parse().unwrap()),
+                count: Some(2),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(capped.total, 3);
+        let entry = |uri: &str, bytes: u64, fresh: bool| CsEntry {
+            name: uri.parse().unwrap(),
+            bytes,
+            fresh,
+        };
+        assert_eq!(
+            capped.entries,
+            vec![entry("/a/1", 1, false), entry("/a/2", 2, true)]
+        );
+
+        let (_, all) = list(&engine, ControlParameters::default()).await;
+        assert_eq!(all.total, 4, "no Name: the whole CS");
+        assert_eq!(all.entries.len(), 4, "no Count: a default cap above 4");
+
+        shutdown.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_fits_one_dataset_segment_and_still_counts_everything() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        const HELD: usize = 400;
+        for i in 0..HELD {
+            let uri = format!("/many/{i:040}");
+            engine
+                .cs()
+                .insert_erased(
+                    Bytes::from_static(b"x"),
+                    Arc::new(uri.parse().unwrap()),
+                    CsMeta {
+                        stale_at: u64::MAX,
+                        revocation_epoch: None,
+                    },
+                )
+                .await;
+        }
+        let (len, listing) = list(
+            &engine,
+            ControlParameters {
+                count: Some(HELD as u64),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(len <= MAX_DATASET_PAYLOAD_LEN, "one segment: {len} bytes");
+        assert_eq!(listing.total, HELD as u64);
+        assert!(!listing.entries.is_empty() && listing.entries.len() < HELD);
+        assert!(
+            listing.entries.windows(2).all(|w| w[0].name < w[1].name),
+            "the first ones in name order"
+        );
+
+        shutdown.shutdown().await;
     }
 }

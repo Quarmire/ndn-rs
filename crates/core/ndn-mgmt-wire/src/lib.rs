@@ -26,6 +26,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 pub mod control_parameters;
 pub mod control_response;
 pub mod control_surface;
+pub mod cs_listing;
 pub mod events;
 pub mod link_status;
 pub mod nfd_command;
@@ -34,6 +35,7 @@ pub mod nfd_dataset;
 pub use control_parameters::ControlParameters;
 pub use control_response::ControlResponse;
 pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
+pub use cs_listing::{CsEntry, CsListing};
 pub use link_status::{
     LinkAsleepEntry, LinkCommandError, LinkDetail, LinkEntry, LinkListing, LinkModeArg,
     LinkPathEntry, LinkRelayEntry, LinkWords, link_code, link_command, parse_link_command,

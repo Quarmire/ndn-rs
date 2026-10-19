@@ -86,7 +86,11 @@ Key contracts:
 - The defaulted admin methods matter for NFD parity: `admit_enabled` /
   `serve_enabled` back the `cs/config` Admit/Serve toggles (when serving is off,
   `get` returns `None`; when admission is off, `insert` is a no-op), and
-  `variant_name` / `stats` back `cs/info`. Copy the real handling from `LruCs`.
+  `variant_name` / `stats` back `cs/info`. `list` backs `cs/list`: the first
+  `limit` entries under a prefix in canonical name order (name, wire size,
+  fresh at `now_ns`) and the total held there, without touching recency or
+  hit counters; the default lists nothing. Copy the real handling from
+  `LruCs`; `cs_conformance::lists_entries_under_a_prefix` checks it.
 - `ErasedContentStore` (the object-safe, boxed-future view) is auto-implemented
   for any `ContentStore` via a blanket impl — you get `Arc<dyn
   ErasedContentStore>` for free.

@@ -34,9 +34,9 @@ pub mod strategy_table;
 pub mod trie;
 
 pub use content_store::{
-    AdmitAllPolicy, ContentStore, CsAdmissionPolicy, CsCapacity, CsEntry, CsEntryFilter, CsMeta,
-    CsStats, DefaultAdmissionPolicy, EARLIER_PROCESS_EPOCH, ErasedContentStore, InsertResult,
-    NullCs,
+    AdmitAllPolicy, ContentStore, CsAdmissionPolicy, CsCapacity, CsEntry, CsEntryFilter,
+    CsListedEntry, CsMeta, CsPrefixListing, CsStats, DefaultAdmissionPolicy, EARLIER_PROCESS_EPOCH,
+    ErasedContentStore, InsertResult, NullCs,
 };
 pub use dead_nonce_list::{DEFAULT_DEAD_NONCE_LIFETIME, DeadNonceList, NonceFingerprint};
 pub use fib::{Fib, FibEntry, FibNexthop};

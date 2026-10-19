@@ -37,8 +37,11 @@ use sha2::{Digest, Sha256};
 
 use ndn_packet::{Interest, Name};
 
-use crate::cs_keycodec::{StoredStamp, name_to_key, prefix_upper_bound};
-use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
+use crate::cs_keycodec::{StoredStamp, key_to_name, name_to_key, prefix_upper_bound};
+use crate::{
+    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsListedEntry, CsMeta, CsPrefixListing,
+    InsertResult,
+};
 
 /// Persistent CS backed by bundled SQLite. `max_bytes` bounds *logical* Data
 /// bytes (the `data` column; excludes SQLite page overhead); rows survive
@@ -527,6 +530,60 @@ impl ContentStore for SqliteCs {
             ],
         );
     }
+
+    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+        // BLOB keys compare bytewise, which is canonical name order (see
+        // `cs_keycodec`). Reads no `data`, and leaves `last_access` alone:
+        // listing is not a use.
+        let prefix_key = name_to_key(prefix);
+        let upper = prefix_upper_bound(&prefix_key);
+        let range = if upper.is_some() {
+            "key >= ?1 AND key < ?2"
+        } else {
+            "key >= ?1"
+        };
+        let mut bounds: Vec<&[u8]> = vec![prefix_key.as_slice()];
+        bounds.extend(upper.as_deref());
+        let Ok(conn) = self.conn.lock() else {
+            return CsPrefixListing::default();
+        };
+        let total: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM cs WHERE {range}"),
+                rusqlite::params_from_iter(&bounds),
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(Vec<u8>, i64, i64)> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        };
+        let rows = conn
+            .prepare(&format!(
+                "SELECT key, length(data), stale_at FROM cs WHERE {range} ORDER BY key LIMIT {}",
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(&bounds), read)?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            })
+            .unwrap_or_default();
+        let entries = rows
+            .into_iter()
+            .filter_map(|(key, len, stale_at)| {
+                Some(CsListedEntry {
+                    name: Arc::new(key_to_name(&key)?),
+                    bytes: len as usize,
+                    fresh: ndn_fwd_core::freshness::fresh_until(now_ns, from_i64(stale_at)),
+                })
+            })
+            .collect();
+        CsPrefixListing {
+            entries,
+            total: total as usize,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -601,6 +658,13 @@ mod tests {
         let (_d, path) = tmp();
         let cs = SqliteCs::open(&path, 1 << 20).unwrap();
         crate::cs_conformance::only_the_fresh_version_answers_latest(&cs).await;
+    }
+
+    #[tokio::test]
+    async fn lists_entries_under_a_prefix() {
+        let (_d, path) = tmp();
+        let cs = SqliteCs::open(&path, 1 << 20).unwrap();
+        crate::cs_conformance::lists_entries_under_a_prefix(&cs).await;
     }
 
     #[tokio::test]

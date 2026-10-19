@@ -411,6 +411,16 @@ pub mod code {
     pub const INVITE_NOT_MADE: RefusalCode =
         RefusalCode::new("invite-not-made", 500, true, NextStep::FixLocal);
 
+    // --- issued certificates (ca/issued-list)
+
+    /// This node runs no CA, so it issued no certificates. Params: none.
+    pub const ISSUED_NO_CA: RefusalCode =
+        RefusalCode::new("issued-no-ca", 404, false, NextStep::UseOtherDevice);
+    /// This node runs no CA of the namespace (or CA prefix) asked. Params:
+    /// `requested`, `namespaces` (`, `-separated, those of its CAs).
+    pub const ISSUED_CA_UNKNOWN: RefusalCode =
+        RefusalCode::new("issued-ca-unknown", 404, false, NextStep::FixRequest);
+
     // --- trust-admin gate and management parameters
 
     /// This node does not do `operation` at runtime (its host has no such
@@ -779,6 +789,17 @@ pub mod code {
     /// The idle close is out of bounds. Params: `idle_secs`, `min`, `max`.
     pub const LINK_IDLE_OUT_OF_RANGE: RefusalCode =
         RefusalCode::new("link-idle-out-of-range", 400, false, NextStep::FixRequest);
+
+    // --- data inspection (security/data-inspect)
+
+    /// Nothing answered the Interest for the name within the time given:
+    /// no Data under it reached this node from its content store or the
+    /// network. Params: `name`, `timeout_ms`, `nack` (when a Nack came
+    /// instead: `no-route`, `congestion`, `duplicate`, `not-yet`,
+    /// `unspecified`, or its code), `error` (when the fetch failed
+    /// otherwise).
+    pub const DATA_NOT_FOUND: RefusalCode =
+        RefusalCode::new("data-not-found", 504, true, NextStep::RetryLater);
 }
 
 /// Why a trust-admin operation changed nothing, as structured data: a
@@ -1197,6 +1218,72 @@ pub struct RootStoreStatus {
     pub key: String,
 }
 
+/// The verdict of `security/data-inspect` on a Data
+/// ([`DataInspection::verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DataVerdict {
+    /// The signature verifies and the chain reaches a trust anchor of the
+    /// governing trust context (or the Data carries a SHA-256 digest that
+    /// matches: integrity only, no signer).
+    Valid,
+    /// The Data fails validation, or this node's forwarder refused it with
+    /// a final verdict.
+    Invalid,
+    /// A certificate on the chain could not be had in time (or the
+    /// forwarder refused the Data for now: `unverifiable`).
+    Pending,
+    /// This node validates nothing (validation is disabled).
+    Unchecked,
+    /// A verdict this client does not know (a newer peer).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to `security/data-inspect`, JSON in the ControlResponse
+/// status text: the Data under the name asked for — from this node's
+/// content store or the network — its signature, metadata and, for a
+/// certificate, its validity, and what this node's validator says of it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DataInspection {
+    /// The name of the Data that answered (the name asked for when the
+    /// forwarder refused the Data: detail `data-refused`).
+    pub name: String,
+    /// `Ed25519`, `EcdsaSha256`, `RsaSha256`, `HmacSha256`,
+    /// `DigestSha256`, `DigestBlake3`, `Blake3Keyed`, or the SignatureType
+    /// code in decimal; empty when the forwarder refused the Data.
+    pub signature_type: String,
+    /// The KeyLocator name: the key or certificate that signed it.
+    pub signer: Option<String>,
+    /// The SignatureTime, ISO 8601 basic UTC (`20261019T120000Z`), when
+    /// the signature carries one.
+    pub signed_at: Option<String>,
+    /// `Blob`, `Link`, `Key`, `Nack`, `Manifest`, `PrefixAnn`, or the
+    /// ContentType code in decimal; empty when the forwarder refused the
+    /// Data.
+    pub content_type: String,
+    /// The FreshnessPeriod in milliseconds, when it carries one.
+    pub freshness_ms: Option<u64>,
+    /// The length of its Content.
+    pub content_bytes: u64,
+    /// A certificate's ValidityPeriod NotBefore, ISO 8601 basic UTC.
+    pub valid_from: Option<String>,
+    /// A certificate's ValidityPeriod NotAfter, ISO 8601 basic UTC.
+    pub valid_until: Option<String>,
+    /// The held trust context whose namespace covers the name (the
+    /// longest): the trusted prefix that vouches for it. `None` when no
+    /// held context covers it.
+    pub namespace: Option<String>,
+    pub verdict: DataVerdict,
+    /// Why the verdict, as a coded [`Detail`] (`data-*` in
+    /// [`detail_code`]).
+    pub detail: Detail,
+    /// The signing keys the validation walked (each hop's KeyLocator name),
+    /// the signer's first, ending at the trust anchor; empty unless the
+    /// chain was walked to its end.
+    pub chain: Vec<String>,
+}
+
 /// The codes of the [`Detail`]s trust-admin and approval outcomes carry
 /// (documented with their params in `ndn-rs/docs/specs/mgmt-trust.md`).
 /// A detail may also carry a refusal code ([`code`]) when it reports a
@@ -1292,6 +1379,28 @@ pub mod detail_code {
     /// A namespace's requests could not be listed. Params: `namespace`,
     /// `cause` (the refusal code) with its params, `error` (its text).
     pub const APPROVALS_NOT_LISTED: &str = "approvals-not-listed";
+
+    // --- security/data-inspect (`DataInspection::detail`)
+
+    /// The signature verifies and the chain reaches a trust anchor.
+    /// Params: `signer`, `namespace` (when a held context covers the name).
+    pub const DATA_VALID: &str = "data-valid";
+    /// The Data carries a SHA-256 digest that matches: its bytes are intact,
+    /// but no signer vouches for it.
+    pub const DATA_DIGEST_ONLY: &str = "data-digest-only";
+    /// The Data fails validation. Params: `error`.
+    pub const DATA_INVALID: &str = "data-invalid";
+    /// This node's forwarder refused the Data that answered, so it was not
+    /// kept to inspect. Params: `refusal` (`chain`, `revoked`,
+    /// `bad-signature`, `schema`, `untrusted-root`, `context`,
+    /// `unverifiable`), `final` (`true`/`false`: whether asking again gets
+    /// the same answer).
+    pub const DATA_REFUSED: &str = "data-refused";
+    /// A certificate on the chain could not be had in time. Params:
+    /// `certificate` (the first one missing, when known), `timeout_ms`.
+    pub const DATA_CHAIN_INCOMPLETE: &str = "data-chain-incomplete";
+    /// This node validates nothing (validation is disabled).
+    pub const DATA_UNCHECKED: &str = "data-unchecked";
 }
 
 /// How a device takes part in a namespace (a trusted prefix) it holds.
@@ -1452,6 +1561,18 @@ pub enum TrustEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
     },
+    /// A CA of this node issued a certificate (by invite, on an admin's
+    /// approval, or a renewal). The certificate is public: the CA serves
+    /// it. Who it certifies, its validity: `ca/issued-list`.
+    CertificateIssued {
+        ca: String,
+        /// The certificate's name, `<key>/NDNCERT/<version>`.
+        certificate: String,
+        /// The role it certifies, when the name follows the namespace
+        /// layout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
     /// This node now holds `version` of the namespace's trust context.
     ContextUpdated {
         namespace: String,
@@ -1607,6 +1728,44 @@ mod catalogue_tests {
                 "{code:?} is not documented in mgmt-trust.md"
             );
         }
+    }
+
+    /// A data inspection reads back from its JSON wire form unchanged; a
+    /// peer's unknown verdict reads as `unknown`.
+    #[test]
+    fn a_data_inspection_round_trips_through_json() {
+        let inspection = DataInspection {
+            name: "/home/bob/photos/1/v=3/seg=0".into(),
+            signature_type: "Ed25519".into(),
+            signer: Some("/home/bob/member/phone/KEY/%01".into()),
+            signed_at: Some("20261019T120000Z".into()),
+            content_type: "Blob".into(),
+            freshness_ms: Some(10_000),
+            content_bytes: 4096,
+            valid_from: None,
+            valid_until: None,
+            namespace: Some("/home/bob".into()),
+            verdict: DataVerdict::Valid,
+            detail: Detail::new(detail_code::DATA_VALID, "neutral")
+                .with("signer", "/home/bob/member/phone/KEY/%01"),
+            chain: vec![
+                "/home/bob/member/phone/KEY/%01/home/v=1".into(),
+                "/home/bob/KEY/root/self/v=1".into(),
+            ],
+        };
+        let json = serde_json::to_string(&inspection).unwrap();
+        assert!(json.contains("\"verdict\":\"valid\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<DataInspection>(&json).unwrap(),
+            inspection
+        );
+        let newer = json.replace("\"valid\"", "\"a-newer-verdict\"");
+        assert_eq!(
+            serde_json::from_str::<DataInspection>(&newer)
+                .unwrap()
+                .verdict,
+            DataVerdict::Unknown
+        );
     }
 
     /// A refusal reads back from its JSON wire form unchanged; a peer's

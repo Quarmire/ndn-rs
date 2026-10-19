@@ -85,10 +85,10 @@ real NFD TLVs — do not invent your own envelope.
   status-dataset verbs (e.g. `faces/list`) that return raw TLV blocks instead.
 
 For a real, complete module read `ndn-mgmt/src/modules/cs.rs` — `CsModule`
-implements `cs/config`, `cs/info`, and `cs/erase` in ~110 lines, matching NFD's
-`CsManager` flag semantics (Admit/Serve bits, capacity). Note how it pulls
-`engine.cs()` off the context and echoes the effective state back in the
-response.
+implements `cs/config`, `cs/info`, `cs/erase` and the `cs/list` dataset,
+matching NFD's `CsManager` flag semantics (Admit/Serve bits, capacity). Note
+how it pulls `engine.cs()` off the context and echoes the effective state back
+in the response.
 
 ## Step 3 — register the module
 

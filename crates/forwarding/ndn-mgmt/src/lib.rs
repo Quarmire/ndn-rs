@@ -287,8 +287,9 @@ pub struct MgmtHandles {
     pub ble_handler: Option<Arc<dyn BleMgmtBackend>>,
     /// Read-only pending device-approval backend (`ca` module).
     pub approval_handler: Option<Arc<dyn ApprovalMgmtBackend>>,
-    /// The invites of this node's CAs (`ca/invite-create`, `invite-list`,
-    /// `invite-withdraw`). None: the node runs no CA.
+    /// The invites of this node's CAs and the certificates they issued
+    /// (`ca/invite-create`, `invite-list`, `invite-withdraw`,
+    /// `issued-list`). None: the node runs no CA.
     pub invite_handler: Option<Arc<dyn InviteMgmtBackend>>,
     /// Trust-admin backend (`security/context-adopt`, `security/enroll`, and
     /// the live signing identity `security/identity-status` reports). None:
@@ -485,11 +486,13 @@ impl ApprovalMgmtBackend for ndn_cert::ApprovalStore {
     }
 }
 
-/// Backend of the `ca/invite-*` verbs: the invites of the CAs this node
-/// runs ([`ndn_cert::HostInvites`] implements it). A request names its CA by
-/// namespace or prefix (`None`: the node's only CA). Like the approval
-/// verbs, they reach it only from a local operator. Refusals carry the
-/// codes of the `invites` section of [`ndn_cert::report::code`].
+/// Backend of the `ca/invite-*` and `ca/issued-list` verbs: the invites of
+/// the CAs this node runs and the certificates they issued
+/// ([`ndn_cert::HostCas`] implements it). A request names its CA by
+/// namespace or prefix (`None`: the node's only CA; a listing, every CA).
+/// Like the approval verbs, they reach it only from a local operator.
+/// Refusals carry the codes of the `invites` and `issued certificates`
+/// sections of [`ndn_cert::report::code`].
 pub trait InviteMgmtBackend: Send + Sync {
     /// Make an invite; `operator` is the local operator the kernel attests,
     /// recorded as its maker.
@@ -503,24 +506,36 @@ pub trait InviteMgmtBackend: Send + Sync {
     fn list(&self, ca: Option<&Name>) -> Result<Vec<ndn_cert::CaInviteListing>, TrustRefusal>;
     /// Withdraw the invite `id`.
     fn withdraw(&self, ca: Option<&Name>, id: &str) -> Result<ndn_cert::InviteEntry, TrustRefusal>;
+    /// The certificates the CA named issued, or every CA's when none is.
+    fn issued_list(
+        &self,
+        ca: Option<&Name>,
+    ) -> Result<Vec<ndn_cert::CaIssuedListing>, TrustRefusal>;
 }
 
-impl InviteMgmtBackend for ndn_cert::HostInvites {
+impl InviteMgmtBackend for ndn_cert::HostCas {
     fn create(
         &self,
         ca: Option<&Name>,
         request: &ndn_cert::InviteRequest,
         operator: &str,
     ) -> Result<ndn_cert::CreatedInvite, TrustRefusal> {
-        ndn_cert::HostInvites::create(self, ca, request, operator)
+        self.invites().create(ca, request, operator)
     }
 
     fn list(&self, ca: Option<&Name>) -> Result<Vec<ndn_cert::CaInviteListing>, TrustRefusal> {
-        ndn_cert::HostInvites::list(self, ca)
+        self.invites().list(ca)
     }
 
     fn withdraw(&self, ca: Option<&Name>, id: &str) -> Result<ndn_cert::InviteEntry, TrustRefusal> {
-        ndn_cert::HostInvites::withdraw(self, ca, id)
+        self.invites().withdraw(ca, id)
+    }
+
+    fn issued_list(
+        &self,
+        ca: Option<&Name>,
+    ) -> Result<Vec<ndn_cert::CaIssuedListing>, TrustRefusal> {
+        self.issued().list(ca)
     }
 }
 

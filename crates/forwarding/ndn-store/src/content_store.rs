@@ -74,6 +74,43 @@ pub struct CsStats {
 /// [`ContentStore::evict_matching`]).
 pub type CsEntryFilter = dyn Fn(&Bytes) -> bool + Send + Sync;
 
+/// One cached Data as [`ContentStore::list`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsListedEntry {
+    pub name: Arc<Name>,
+    /// Wire size of the cached Data, in bytes.
+    pub bytes: usize,
+    /// Whether it still satisfies `MustBeFresh` at the listing's `now_ns`.
+    pub fresh: bool,
+}
+
+/// What a content store holds at or under a prefix (see
+/// [`ContentStore::list`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CsPrefixListing {
+    /// The first entries in canonical name order, at most the asked limit.
+    pub entries: Vec<CsListedEntry>,
+    /// How many entries the store holds at or under the prefix, listed or
+    /// not.
+    pub total: usize,
+}
+
+impl CsPrefixListing {
+    /// The listing of `entries` (every entry under the prefix, any order)
+    /// capped at `limit`: keeps the first `limit` in canonical name order.
+    pub fn first_in_name_order(mut entries: Vec<CsListedEntry>, limit: usize) -> Self {
+        let total = entries.len();
+        if total > limit {
+            // Partition instead of sorting everything: only the kept head is
+            // sorted below.
+            entries.select_nth_unstable_by(limit, |a, b| a.name.cmp(&b.name));
+            entries.truncate(limit);
+        }
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Self { entries, total }
+    }
+}
+
 /// Content store interface. Methods are `async` so persistent (disk-backed)
 /// implementations are supported; in-memory ones complete synchronously.
 ///
@@ -160,6 +197,21 @@ pub trait ContentStore: Send + Sync + 'static {
     fn stats(&self) -> CsStats {
         CsStats::default()
     }
+
+    /// The entries named at or under `prefix`: the first `limit` in
+    /// canonical name order, each judged fresh or stale at `now_ns` (the
+    /// caller's clock, like [`get`](Self::get)), and how many there are in
+    /// all. Read-only (no recency or hit accounting) and scans the subtree:
+    /// for operators inspecting the cache, never the forwarding path. A store
+    /// that cannot enumerate reports nothing.
+    fn list(
+        &self,
+        _prefix: &Name,
+        _limit: usize,
+        _now_ns: u64,
+    ) -> impl Future<Output = CsPrefixListing> + Send {
+        async { CsPrefixListing::default() }
+    }
 }
 
 /// Object-safe [`ContentStore`] with boxed futures. A blanket impl wraps any
@@ -201,6 +253,13 @@ pub trait ErasedContentStore: Send + Sync + 'static {
         data: &'a Bytes,
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn list_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        limit: usize,
+        now_ns: u64,
+    ) -> Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>>;
 
     fn capacity(&self) -> CsCapacity;
     fn set_capacity(&self, max_bytes: usize);
@@ -263,6 +322,15 @@ impl<T: ContentStore> ErasedContentStore for T {
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(self.restamp(name, data, epoch))
+    }
+
+    fn list_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        limit: usize,
+        now_ns: u64,
+    ) -> Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>> {
+        Box::pin(self.list(prefix, limit, now_ns))
     }
 
     fn capacity(&self) -> CsCapacity {

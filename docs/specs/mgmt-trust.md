@@ -4,14 +4,15 @@ Status: normative for ndn-rs management clients.
 
 ## Overview
 
-The trust-admin, approval, invite, link and root-device operations of a
-device in a personal namespace answer with structured data, never with a
-host's phrasing. Every refusal carries a stable machine **code**, the status
-code it is answered with, whether retrying unchanged can help, the class of
-the next step, named **parameters** (names, versions, times, paths) and a
-neutral default sentence. Prose inside a successful outcome (why a refresh
-failed, what changes at the next start, a note on an approval listing) is a
-**detail**: a code, parameters and a neutral default sentence.
+The trust-admin, approval, invite, issued-certificate, link and root-device
+operations of a device in a personal namespace answer with structured data,
+never with a host's phrasing. Every refusal carries a stable machine
+**code**, the status code it is answered with, whether retrying unchanged can
+help, the class of the next step, named **parameters** (names, versions,
+times, paths) and a neutral default sentence. Prose inside a successful
+outcome (why a refresh failed, what changes at the next start, a note on an
+approval listing) is a **detail**: a code, parameters and a neutral default
+sentence.
 
 A client (CLI, TUI, mobile app) words its own message from the code and
 parameters — naming its own commands, buttons or screens — and falls back to
@@ -571,6 +572,118 @@ back with `TokenDenial::of_reason`). The codes are `invite-missing`,
 such a denial as `invite-refused` (Trust-admin verbs), with the denial in
 `error`.
 
+## Issued certificates
+
+`ca/issued-list` lists the certificates each CA of a device issued: the
+members of each namespace as its root device knows them. Like the invite
+verbs it is a trust-admin verb, accepted only from a local operator on the
+management socket, never over `/localhop`. It lists what the running CA
+holds: the record in its own directory (`<ca dir>/issued/`,
+`<ca dir>/revoked/`), loaded when it starts and written before every
+issuance and revocation takes effect. The CA's own certificate and those
+of earlier CAs of its identity are not listed.
+
+| verb | ControlParameters | success (status text, JSON) |
+|---|---|---|
+| `ca/issued-list` | `Name`?: one CA, by namespace or prefix (absent: every CA) | `[ndn_cert::CaIssuedListing]` `[{ca, namespace, certificates: [IssuedEntry]}]`, CAs in the order the device runs them |
+
+An `IssuedEntry` is `{certificate, key, identity, role?, device?,
+valid_from, valid_until, revoked}`:
+
+- `certificate`: the certificate's name; `key`: the key it certifies
+  (`<identity>/KEY/<id>`); `identity`: the key name without `KEY/<id>`.
+- `role` and `device`: the identity's role (`admin`, `member`, `node`,
+  `guest`) and device name, when the identity follows the namespace's role
+  layout `/<ns>/<role>/<device>`; absent otherwise.
+- `valid_from`, `valid_until`: the validity period, ISO 8601 basic, UTC
+  (`20261017T120000Z`).
+- `revoked`: the CA revoked the certificate or its key, or the trust
+  context version the device holds for the certificate's name revokes the
+  certificate, its key, or a key on its issuer chain (the CA's key, the
+  namespace root's).
+
+Certificates are ordered by `identity`, then newest first (latest
+`valid_from`), then by `certificate`. A renewed device has one entry per
+certificate it was issued.
+
+| code | status | retry | next | params | meaning |
+|---|---|---|---|---|---|
+| `issued-no-ca` | 404 | no | use-other-device | — | this device runs no CA, so it issued no certificates |
+| `issued-ca-unknown` | 404 | no | fix-request | `requested`, `namespaces` | this device runs no CA of the namespace (or prefix) asked |
+
+## Data inspection
+
+`security/data-inspect` says what a device's own validator makes of the
+Data under a name. The device fetches it like any app on it: one Interest
+(CanBePrefix, not MustBeFresh) through its forwarder, so its content store
+answers when it holds one and the FIB forwards it otherwise. It validates
+the Data that answered with its validator — dispatched to the held trust
+context whose namespace covers the name — walking the certificate chain to
+a trust anchor and fetching the certificates it misses. The fetch and the
+validation share the time the command gives. Read only, but the device
+expresses Interests and fetches certificates on the caller's behalf, so the
+verb is no public read: it goes through the command gate (a local operator
+on the management socket, or a command signed by a key the command trust
+anchors vouch for). Answered deferred.
+
+| verb | ControlParameters | success (status text, JSON) |
+|---|---|---|
+| `security/data-inspect` | Name: the Data's name or a prefix of it; ExpirationPeriod?: how long to wait for the Data and its certificates, in milliseconds (absent: 4000; at most 60000) | `ndn_cert::report::DataInspection` |
+
+```json
+{
+  "name": "/home/bob/photos/1/v=3/seg=0",
+  "signature_type": "Ed25519",
+  "signer": "/home/bob/member/phone/KEY/%01",
+  "signed_at": "20261019T120000Z",
+  "content_type": "Blob",
+  "freshness_ms": 10000,
+  "content_bytes": 4096,
+  "valid_from": null,
+  "valid_until": null,
+  "namespace": "/home/bob",
+  "verdict": "valid",
+  "detail": { "code": "data-valid", "params": { "signer": "/home/bob/member/phone/KEY/%01", "namespace": "/home/bob" }, "text": "…" },
+  "chain": ["/home/bob/member/phone/KEY/%01", "/home/bob/KEY/root"]
+}
+```
+
+| field | type | meaning |
+|---|---|---|
+| `name` | string | the name of the Data that answered (the name asked for when the forwarder refused the Data) |
+| `signature_type` | string | `Ed25519`, `EcdsaSha256`, `RsaSha256`, `HmacSha256`, `DigestSha256`, `DigestBlake3`, `Blake3Keyed`, or the SignatureType code in decimal; empty when the forwarder refused the Data |
+| `signer` | string? | the KeyLocator name: the key (or certificate) that signed it |
+| `signed_at` | string? | the SignatureTime, ISO 8601 basic UTC, when the signature carries one |
+| `content_type` | string | `Blob`, `Link`, `Key`, `Nack`, `Manifest`, `PrefixAnn`, or the ContentType code in decimal; empty when the forwarder refused the Data |
+| `freshness_ms` | integer? | the FreshnessPeriod |
+| `content_bytes` | integer | the length of the Content |
+| `valid_from`, `valid_until` | string? | a certificate's ValidityPeriod, ISO 8601 basic UTC; absent for Data that is no certificate, and for a bound the certificate does not set |
+| `namespace` | string? | the held trust context whose namespace covers the name (the longest): the trusted prefix that vouches for it; absent when none covers it |
+| `verdict` | string | `valid`, `invalid`, `pending` (a certificate on the chain could not be had in time), `unchecked` (the device validates nothing); a client reads an unknown value as unknown |
+| `detail` | detail | why the verdict (codes below) |
+| `chain` | list of string | the signing keys the validation walked, the signer's first, ending at the trust anchor; empty unless the chain was walked to its end |
+
+A Data the device's forwarder refuses (its pipeline validates Data from
+other devices) never reaches the inspection: the answer then carries only
+the name asked for, the trusted prefix, and the refusal (`data-refused`);
+the verdict is `invalid` for a final refusal and `pending` for
+`unverifiable`. Data from a local producer is not validated on the way, so
+the verdict is the inspection's own.
+
+| code | where | params | meaning |
+|---|---|---|---|
+| `data-valid` | `DataInspection.detail` | `signer`, `namespace`? | the signature verifies and the chain reaches a trust anchor (verdict `valid`) |
+| `data-digest-only` | 〃 | — | the Data carries a matching SHA-256 digest: intact, but no signer vouches for it (verdict `valid`) |
+| `data-invalid` | 〃 | `error` | the Data fails validation: bad signature, revoked key, a signer the trust context does not authorize, an untrusted root, an expired certificate (verdict `invalid`) |
+| `data-refused` | 〃 | `refusal` (`chain`, `revoked`, `bad-signature`, `schema`, `untrusted-root`, `context`, `unverifiable`), `final` (`true`/`false`) | the device's forwarder refused the Data that answered, so it was not kept to inspect (verdict `invalid`, or `pending` when not final) |
+| `data-chain-incomplete` | 〃 | `certificate`? (the first one missing), `timeout_ms` | a certificate on the chain could not be had in time (verdict `pending`) |
+| `data-unchecked` | 〃 | — | the device validates nothing: validation is disabled (verdict `unchecked`) |
+
+| code | status | retry | next | params | meaning |
+|---|---|---|---|---|---|
+| `data-not-found` | 504 | yes | retry-later | `name`, `timeout_ms`, `nack`? (`no-route`, `congestion`, `duplicate`, `not-yet`, `unspecified`, or the NackReason code), `error`? | nothing under the name reached the device in time: no Data in its content store, none from the network |
+| `missing-parameter` | 400 | no | fix-request | `operation` = `data-inspect`, `parameter` = `Name`, `expects` | no name was given |
+
 ## Root-device operations (library)
 
 New versions of a namespace's trust context are signed where its root (or a
@@ -727,7 +840,8 @@ same `N`.
 Sources of the trust stream, in one daemon: the device's own changes
 (`ndn_namespace::Participant::events`, forwarded from the trust-admin
 backend's `TrustAdminMgmtBackend::trust_events`), and each CA it runs (its
-approval store's and invite store's observers publish directly). Each
+approval store's and invite store's observers and its issuance observer,
+`CaState::set_issued_observer`, publish directly). Each
 change is published once, by the code that made it: a version kept is told
 by the keeping (whichever way it came), an enrollment by the installation of
 its certificate, a request ended by what ended it (the CA's answer, its
@@ -780,6 +894,7 @@ Trust stream:
 | `invite-created` | `ca`, `id`, `role`? | a CA of this node made an invite |
 | `invite-withdrawn` | `ca`, `id` | an invite was withdrawn before it was used |
 | `invite-redeemed` | `ca`, `id`, `role`? | a device redeemed an invite |
+| `certificate-issued` | `ca`, `certificate`, `role`? | a CA of this node issued a certificate (by invite, on an admin's approval, or a renewal) |
 | `context-updated` | `namespace`, `held_version`?, `version`, `how`: `adopt` \| `refresh` \| `update` \| `sync`, `revoked`? | this node now holds `version` of the namespace's trust context |
 | `membership-changed` | `namespace`, `relation`, `change`, `version`, `key`?, `revoked`?, `replaced_version`?, `valid_until`?, `request`? | this node's membership in the namespace changed |
 | `enrollment-ended` | `namespace`, `identity`, `request`, `state`: `denied` \| `expired` \| `failed` | this node's request for an admin's approval ended without a certificate |
@@ -789,8 +904,13 @@ Fields:
 
 - `ca`: the CA's prefix. `request`: the request id (`ca/list-approvals`,
   `security/enroll-status`). `id`: the invite id (`ca/invite-list`).
-  `role`: the role the key asks for or the invite grants, when it follows
-  the namespace layout.
+  `role`: the role the key asks for, the invite grants or the certificate
+  certifies, when it follows the namespace layout.
+- `certificate-issued`: `certificate` is the issued certificate's name
+  (`<key>/NDNCERT/<version>`); the CA serves it, so it is no secret. It is
+  told once the CA recorded it; who it certifies and its validity are read
+  through `ca/issued-list`. An approval's certificate is issued when the
+  device next asks after the decision, so it follows `approval-decided`.
 - `context-updated`: `held_version` is the version held before (absent for
   a namespace new to the node). `how`: `adopt` — from an anchor link
   (`security/context-adopt`, on the way to an enrollment, or an app's
@@ -846,6 +966,6 @@ reason or any other free text, an approver's identity, a refusal's words or
 any secret. A client words each event itself from its kind and fields and
 reads the details through the verbs gated to local trust administrators:
 `ca/list-approvals` (who asks, the code), `security/enroll-status` (why a
-request ended), `ca/invite-list`, `security/memberships`, `links/list`, and
-`security/identity-status` / `security/context-refresh` for the versions
-held.
+request ended), `ca/invite-list`, `ca/issued-list`, `security/memberships`,
+`links/list`, and `security/identity-status` / `security/context-refresh`
+for the versions held.

@@ -81,6 +81,11 @@ pub mod verb {
     /// answer is the withdrawn `ndn_cert::InviteEntry` as JSON. Authorized
     /// like `approve`.
     pub const INVITE_WITHDRAW: &[u8] = b"invite-withdraw";
+    /// `ca/issued-list` — the certificates this node's CAs issued (the one
+    /// `ControlParameters.name` names, by namespace or prefix; absent: every
+    /// CA), as a JSON list of `ndn_cert::CaIssuedListing` in the status
+    /// text. Authorized like `approve`.
+    pub const ISSUED_LIST: &[u8] = b"issued-list";
     /// `links/connect` — link now to the configured device whose label is in
     /// `ControlParameters.uri`, whatever its mode, until it is disconnected.
     pub const CONNECT: &[u8] = b"connect";
@@ -193,6 +198,13 @@ pub mod verb {
     /// `ndn_cert::report::MembershipInfo`. Read only; changes are published
     /// at `/localhost/nfd/security/notifications`.
     pub const MEMBERSHIPS: &[u8] = b"memberships";
+    /// `security/data-inspect` — fetch the Data under the name in
+    /// `ControlParameters.name` (CanBePrefix: from the content store or the
+    /// network, through this node's forwarder), validate it, and answer
+    /// `ndn_cert::report::DataInspection` as JSON. `ExpirationPeriod`: how
+    /// long to wait for the Data and its certificates, in milliseconds.
+    /// Read only; through the command gate (local operators).
+    pub const DATA_INSPECT: &[u8] = b"data-inspect";
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

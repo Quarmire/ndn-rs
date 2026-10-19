@@ -21,6 +21,7 @@ pub mod enroll_target;
 pub mod error;
 pub mod invite;
 pub mod invites;
+pub mod issued;
 pub mod issuers;
 pub mod namespace;
 pub mod node_identity;
@@ -46,7 +47,7 @@ pub use approval::{
 pub use attestation::{
     ATTESTATION_DESCRIPTION_KEY, AttestationSet, ChallengeAttestation, Combinator,
 };
-pub use ca::{CaConfig, CaRevocation, CaState};
+pub use ca::{CaConfig, CaRevocation, CaState, IssuedObserver};
 pub use ca_policy::{
     ChallengeOrder, ChallengeSlot, NamespacePolicies, PolicyError, PolicyInput, SchemaPlanError,
     SchemaUpdatePlan, challenge_order, plan_schema_update, same_link_policy,
@@ -86,6 +87,7 @@ pub use invites::{
     InviteEventKind, InviteInfo, InviteIssuer, InviteObserver, InviteRecord, InviteRequest,
     InviteState, TokenDenial,
 };
+pub use issued::{CaIssued, CaIssuedListing, HostCas, HostIssued, IssuedEntry};
 pub use namespace::{
     NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_dir, ca_dir_of,
     ca_key_name, device_key_name, init_namespace, init_namespace_in_pib,

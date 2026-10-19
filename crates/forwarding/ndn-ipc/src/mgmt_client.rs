@@ -406,8 +406,22 @@ impl MgmtClient {
             .await
     }
 
-    /// A `ca/invite-*` command: the CA in `Name`, the argument in `Uri`; the
-    /// answer is JSON in the status text.
+    /// `ca/issued-list`: the certificates the CA `ca` names issued, or every
+    /// CA of the daemon's when `None` — by identity, newest first, each with
+    /// its role and device (under the namespace's role layout), validity
+    /// and whether the held trust context or the CA revokes it. Local
+    /// operators only. A refusal (`issued-no-ca`, `issued-ca-unknown`) is
+    /// [`ForwarderError::Command`] carrying a structured refusal
+    /// ([`crate::trust_refusal_in`]).
+    pub async fn ca_issued_list(
+        &self,
+        ca: Option<&Name>,
+    ) -> Result<Vec<ndn_cert::CaIssuedListing>, ForwarderError> {
+        self.invite_command(verb::ISSUED_LIST, ca, None).await
+    }
+
+    /// A `ca/invite-*` or `ca/issued-list` command: the CA in `Name`, the
+    /// argument in `Uri`; the answer is JSON in the status text.
     async fn invite_command<T: serde::de::DeserializeOwned>(
         &self,
         verb_name: &[u8],
@@ -585,6 +599,38 @@ impl MgmtClient {
             ..Default::default()
         };
         self.command(module::CS, verb::ERASE, &params).await
+    }
+
+    /// `cs/list`: the names the content store holds under `prefix` (`None`:
+    /// all of them), the first `limit` in canonical name order, each with its
+    /// wire size and whether it is still fresh, and the total held there. The
+    /// daemon answers in one dataset segment, so it may list fewer than
+    /// `limit`; `total` always counts every entry. A public read like
+    /// `cs/info` (sent unsigned); a refusal — e.g. a daemon without the verb
+    /// — is [`ForwarderError::Command`].
+    pub async fn cs_list(
+        &self,
+        prefix: Option<&ndn_packet::Name>,
+        limit: u64,
+    ) -> Result<ndn_mgmt_wire::CsListing, ForwarderError> {
+        let params = ControlParameters {
+            name: prefix.cloned(),
+            count: Some(limit),
+            ..Default::default()
+        };
+        let interest_wire = build_dataset_interest(command_name(module::CS, verb::LIST, &params));
+        let content = self.send_content_bytes(interest_wire).await?;
+        // A refusal is a ControlResponse; the dataset is the listing.
+        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
+        {
+            let resp =
+                ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)?;
+            return Err(ForwarderError::Command {
+                code: resp.status_code,
+                text: resp.status_text,
+            });
+        }
+        Ok(ndn_mgmt_wire::CsListing::decode(&content))
     }
 
     /// List discovered neighbors: `neighbors/list`.
@@ -1000,6 +1046,35 @@ impl MgmtClient {
             timeout,
         )
         .await
+    }
+
+    /// `security/data-inspect`: have the daemon fetch the Data under `name`
+    /// (CanBePrefix: from its content store or the network, through its own
+    /// forwarder), validate it with its validator and say what it found:
+    /// the Data's signature, metadata, the trusted prefix covering it, the
+    /// verdict with its coded detail, and the certificate chain walked.
+    /// Local operators only (the command gate). The command Interest lives
+    /// `timeout`, and so does the wait; the daemon is given a little less
+    /// for the fetch and the validation, so its answer arrives in time. A
+    /// refusal (`missing-parameter`, `data-not-found` when nothing answered
+    /// in time) is [`ForwarderError::Command`] carrying a structured
+    /// refusal ([`crate::trust_refusal_in`]).
+    pub async fn security_data_inspect(
+        &self,
+        name: &Name,
+        timeout: std::time::Duration,
+    ) -> Result<ndn_cert::report::DataInspection, ForwarderError> {
+        let params = ControlParameters {
+            name: Some(name.clone()),
+            expiration_period: Some(
+                u64::try_from(data_inspect_budget(timeout).as_millis()).unwrap_or(u64::MAX),
+            ),
+            ..Default::default()
+        };
+        let resp = self
+            .deferred_command(module::SECURITY, verb::DATA_INSPECT, &params, timeout)
+            .await?;
+        json_answer(resp)
     }
 
     /// A `<module>/<verb>` command the daemon answers only after network
@@ -1440,6 +1515,14 @@ fn json_answer<T: serde::de::DeserializeOwned>(resp: ControlResponse) -> Result<
     serde_json::from_str(&resp.status_text).map_err(|_| ForwarderError::MalformedResponse)
 }
 
+/// How long the daemon is given for `security/data-inspect` (its fetch and
+/// validation) out of the client's `timeout`: a fifth less, at most a second
+/// less, so its answer travels back before the client stops waiting.
+fn data_inspect_budget(timeout: std::time::Duration) -> std::time::Duration {
+    let margin = (timeout / 5).min(std::time::Duration::from_secs(1));
+    (timeout - margin).max(std::time::Duration::from_millis(1))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1565,5 +1648,22 @@ mod tests {
                 _ => None,
             });
         assert_eq!(locator.as_ref(), Some(&key_name));
+    }
+
+    /// The daemon's data-inspect budget ends before the client's wait does,
+    /// and is never zero.
+    #[test]
+    fn data_inspect_budget_ends_before_the_wait() {
+        use std::time::Duration;
+        for ms in [1u64, 5, 100, 1_000, 4_000, 10_000, 60_000] {
+            let timeout = Duration::from_millis(ms);
+            let budget = super::data_inspect_budget(timeout);
+            assert!(budget > Duration::ZERO, "{ms} ms");
+            assert!(budget < timeout || ms <= 1, "{ms} ms: {budget:?}");
+        }
+        assert_eq!(
+            super::data_inspect_budget(Duration::from_secs(10)),
+            Duration::from_secs(9)
+        );
     }
 }

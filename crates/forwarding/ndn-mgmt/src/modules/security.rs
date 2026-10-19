@@ -3,6 +3,7 @@
 
 mod ca;
 mod identity;
+mod inspect;
 mod schema;
 mod validation;
 mod yubikey;
@@ -297,6 +298,9 @@ impl MgmtModule for SecurityModule {
         }
         if verb == verb::MEMBERSHIPS {
             return security_memberships(ctx.trust_context_handler);
+        }
+        if verb == verb::DATA_INSPECT {
+            return inspect::security_data_inspect(params, ctx.engine, ctx.cancel);
         }
         handle_security(
             verb,

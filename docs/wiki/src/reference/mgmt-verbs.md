@@ -19,7 +19,7 @@ One module per row; one file per module under
 | `fib` | `modules/fib.rs` | FIB list, add-nexthop, remove-nexthop. |
 | `rib` | `modules/rib.rs` | RIB register, unregister, list. |
 | `strategy-choice` | `modules/strategy.rs` | Strategy set, unset, list. |
-| `cs` | `modules/cs.rs` | Content store info, config, erase. |
+| `cs` | `modules/cs.rs` | Content store info, config, erase, list. |
 | `routing` | `modules/routing.rs` | Routing-protocol typed status (per `RoutingProtocolStatus`). |
 | `discovery` | `modules/discovery.rs` | Discovery-protocol neighbours. |
 | `measurements` | `modules/measurements.rs` | Strategy measurement state (Instrument-leaning). |
@@ -97,6 +97,29 @@ reassembled segmented `Data`.
 | `info` | Return capacity / hit / miss / size. |
 | `config` | Adjust admission policy at runtime. |
 | `erase` | Erase entries matching a prefix. |
+| `list` | The names held under a prefix, capped, with the total (ndn-rs extension; see below). |
+
+`cs/list` takes ControlParameters in the name like a command, but is a
+public read like `cs/info` and `*/list`: served unsigned under
+`/localhost`. `Name` is the prefix (absent: the whole store) and `Count`
+the cap (absent: 100). The answer is a dataset, `ndn_mgmt_wire::CsListing`
+(`MgmtClient::cs_list` decodes it):
+
+```text
+CsListing   = CsListTotal *CsListEntry
+CsListTotal = 0x0500 NonNegativeInteger  ; entries held under the prefix
+CsListEntry = 0x0502 (Name               ; the cached Data's name (0x07)
+                      CsEntryBytes       ; 0x0504 NonNegativeInteger: wire size
+                      CsEntryFresh)      ; 0x0506 NonNegativeInteger: 1 fresh, 0 stale
+```
+
+Entries are the first `Count` under the prefix in canonical name order,
+fresh meaning the entry still satisfies `MustBeFresh` at the forwarder's
+clock. The listing always fits one dataset segment (8000 bytes, roughly 100
+entries of 60-byte names), so it may hold fewer than `Count`; the total
+still counts every entry. Listing touches neither LRU order nor hit/miss
+counters. A store that cannot enumerate (`NullCs`) answers an empty
+listing with total 0. Unknown TLVs inside the dataset are skipped.
 
 `reflexive` (ndn-rs extension; reflexive-forwarding control):
 
@@ -106,6 +129,13 @@ reassembled segmented `Data`.
 | `config` | Set the per-face cap and route-lifetime ceiling. |
 | `flush` | Drop all reverse routes immediately. |
 | `info` | Settings, live route count, and counters. |
+
+`security` (selected; the trust verbs and their answers are specified in
+`docs/specs/mgmt-trust.md`):
+
+| Verb | Effect |
+|---|---|
+| `data-inspect` | Fetch the Data under `Name` (CanBePrefix: content store, else the network), validate it, answer `ndn_cert::report::DataInspection` as JSON: signature, metadata, the trusted prefix covering it, verdict with a coded detail, chain walked. `ExpirationPeriod` bounds the wait (ms). Command gate; answered deferred (`MgmtClient::security_data_inspect`). |
 
 The full per-module verb list is in each module file's
 docstring.

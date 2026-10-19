@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 use ndn_packet::{Interest, Name};
 
 use crate::fresh_index::FreshIndex;
-use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult};
+use crate::{
+    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsListedEntry, CsMeta, CsPrefixListing,
+    CsStats, InsertResult,
+};
 
 /// In-memory LRU content store, bounded by total byte capacity. `get()` skips
 /// the Mutex via an atomic empty check so cache-cold paths are lock-free.
@@ -305,6 +308,27 @@ impl ContentStore for LruCs {
             entry.revocation_epoch = Some(epoch);
         }
     }
+
+    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+        let entries = {
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner
+                .prefix_index
+                .descendants(prefix)
+                .into_iter()
+                .filter_map(|name| {
+                    // `peek`: listing is not a use, so LRU order is untouched.
+                    let entry = inner.cache.peek(name.as_ref())?;
+                    Some(CsListedEntry {
+                        bytes: entry.data.len(),
+                        fresh: entry.is_fresh(now_ns),
+                        name,
+                    })
+                })
+                .collect()
+        };
+        CsPrefixListing::first_in_name_order(entries, limit)
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +566,11 @@ mod tests {
     #[tokio::test]
     async fn only_the_fresh_version_answers_latest() {
         crate::cs_conformance::only_the_fresh_version_answers_latest(&LruCs::new(1 << 20)).await;
+    }
+
+    #[tokio::test]
+    async fn lists_entries_under_a_prefix() {
+        crate::cs_conformance::lists_entries_under_a_prefix(&LruCs::new(1 << 20)).await;
     }
 
     #[tokio::test]

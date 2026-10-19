@@ -20,7 +20,10 @@ use ndn_packet::{Interest, Name};
 use crate::cs_keycodec::{
     HEADER_LEN, StoredStamp, decode_stale_at, decode_value, encode_value, key_to_name, name_to_key,
 };
-use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, InsertResult};
+use crate::{
+    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsListedEntry, CsMeta, CsPrefixListing,
+    InsertResult,
+};
 
 /// Persistent CS. `max_bytes` bounds *logical* Data bytes (excludes LSM
 /// overhead); data survives process restarts.
@@ -341,6 +344,33 @@ impl ContentStore for FjallCs {
                 .insert(&key, encode_value(stale_at, stamp, data));
         }
     }
+
+    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+        // Keys sort in canonical name order (see `cs_keycodec`), so the first
+        // `limit` keys under the prefix are the listed entries; the rest are
+        // only counted. No Data is copied out.
+        let prefix_key = name_to_key(prefix);
+        let mut listing = CsPrefixListing::default();
+        for guard in self.keyspace.prefix(&prefix_key) {
+            let Ok((key, val)) = guard.into_inner() else {
+                continue;
+            };
+            let Some(stale_at) = decode_stale_at(&val) else {
+                continue;
+            };
+            listing.total += 1;
+            if listing.entries.len() < limit
+                && let Some(name) = key_to_name(&key)
+            {
+                listing.entries.push(CsListedEntry {
+                    name: Arc::new(name),
+                    bytes: val.len() - HEADER_LEN,
+                    fresh: ndn_fwd_core::freshness::fresh_until(now_ns, stale_at),
+                });
+            }
+        }
+        listing
+    }
 }
 
 #[cfg(test)]
@@ -500,6 +530,11 @@ mod tests {
     #[tokio::test]
     async fn only_the_fresh_version_answers_latest() {
         crate::cs_conformance::only_the_fresh_version_answers_latest(&open_temp_cs(1 << 20)).await;
+    }
+
+    #[tokio::test]
+    async fn lists_entries_under_a_prefix() {
+        crate::cs_conformance::lists_entries_under_a_prefix(&open_temp_cs(1 << 20)).await;
     }
 
     #[tokio::test]

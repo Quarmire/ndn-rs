@@ -10,7 +10,8 @@ use bytes::Bytes;
 use ndn_packet::{Interest, Name};
 
 use crate::{
-    CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, ErasedContentStore, InsertResult,
+    CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsPrefixListing, CsStats, ErasedContentStore,
+    InsertResult,
 };
 
 #[derive(Debug)]
@@ -166,6 +167,16 @@ impl ErasedContentStore for ObservableCs {
         self.inner.restamp_erased(name, data, epoch)
     }
 
+    fn list_erased<'a>(
+        &'a self,
+        prefix: &'a Name,
+        limit: usize,
+        now_ns: u64,
+    ) -> std::pin::Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>> {
+        // A listing is not a lookup: no hit/miss counted, no event.
+        self.inner.list_erased(prefix, limit, now_ns)
+    }
+
     fn capacity(&self) -> CsCapacity {
         self.inner.capacity()
     }
@@ -304,5 +315,31 @@ mod tests {
         assert_eq!(stats.inserts, 1);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn list_reaches_the_wrapped_store_without_counting_a_lookup() {
+        let observer = Arc::new(CountingObserver::new());
+        let inner: Arc<dyn ErasedContentStore> = Arc::new(LruCs::new(65536));
+        let cs = ObservableCs::new(inner, Some(Arc::clone(&observer) as _));
+        cs.insert_erased(
+            Bytes::from_static(b"data"),
+            arc_name(&["a", "1"]),
+            CsMeta {
+                stale_at: u64::MAX,
+                revocation_epoch: None,
+            },
+        )
+        .await;
+
+        let listing = cs.list_erased(&arc_name(&["a"]), 10, NOW).await;
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.entries[0].name, arc_name(&["a", "1"]));
+        assert_eq!(listing.entries[0].bytes, 4);
+        assert!(listing.entries[0].fresh);
+        let stats = cs.stats();
+        assert_eq!((stats.hits, stats.misses), (0, 0));
+        assert_eq!(observer.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(observer.misses.load(Ordering::Relaxed), 0);
     }
 }

@@ -6,7 +6,10 @@ use bytes::Bytes;
 
 use ndn_packet::{Interest, Name};
 
-use crate::{ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsStats, InsertResult};
+use crate::{
+    ContentStore, CsCapacity, CsEntry, CsEntryFilter, CsMeta, CsPrefixListing, CsStats,
+    InsertResult,
+};
 
 /// Shards a `ContentStore` across N instances to reduce lock contention.
 /// Shard selection hashes the first name component so related content
@@ -107,6 +110,25 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
     async fn restamp(&self, name: &Name, data: &Bytes, epoch: u64) {
         let idx = self.shard_for(name);
         self.shards[idx].restamp(name, data, epoch).await
+    }
+
+    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+        // A non-empty prefix lives in one shard; the root spans them all.
+        if !prefix.is_empty() {
+            let idx = self.shard_for(prefix);
+            return self.shards[idx].list(prefix, limit, now_ns).await;
+        }
+        // Each shard's first `limit` hold the overall first `limit`.
+        let mut total = 0;
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            let listing = shard.list(prefix, limit, now_ns).await;
+            total += listing.total;
+            entries.extend(listing.entries);
+        }
+        let mut listing = CsPrefixListing::first_in_name_order(entries, limit);
+        listing.total = total;
+        listing
     }
 
     fn stats(&self) -> CsStats {
@@ -230,5 +252,10 @@ mod tests {
         cs.insert(Bytes::from_static(b"data"), arc_name(&["a"]), meta_fresh())
             .await;
         assert!(cs.get(&interest(&["a"]), NOW).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn lists_entries_under_a_prefix_across_shards() {
+        crate::cs_conformance::lists_entries_under_a_prefix(&make_sharded(4, 1 << 20)).await;
     }
 }

@@ -10,6 +10,8 @@
 
 #[path = "cs_erase.rs"]
 mod cs_erase;
+#[path = "cs_list.rs"]
+mod cs_list;
 #[path = "event_streams.rs"]
 mod event_streams;
 #[path = "extra_modules.rs"]
