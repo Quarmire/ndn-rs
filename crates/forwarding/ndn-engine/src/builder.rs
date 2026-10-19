@@ -663,8 +663,9 @@ impl EngineBuilder {
 
         // Shared with the dispatcher's TlvDecodeStage so `faces/list` can read
         // per-face reassembly counters and the sweeper can expire stale groups.
-        let reassembly: Arc<dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>> =
-            Arc::new(dashmap::DashMap::new());
+        let reassembly: Arc<
+            dashmap::DashMap<ndn_transport::FaceId, ndn_packet::fragment::ReassemblyBuffer>,
+        > = Arc::new(dashmap::DashMap::new());
 
         let inner = Arc::new(EngineInner {
             start_timestamp_ms: crate::engine::unix_time_ms(),
@@ -1181,7 +1182,7 @@ mod tests {
             .unwrap();
 
         let rname: ndn_packet::Name = "/rfx/ingress-test".parse().unwrap();
-        let wire = InterestBuilder::new("/some/compute/job")
+        let wire = InterestBuilder::new(ndn_packet::name!("/some/compute/job"))
             .reflexive_name(rname.clone())
             .lifetime(Duration::from_secs(4))
             .build();
@@ -1228,7 +1229,7 @@ mod tests {
 
         // I1 from the consumer face installs the reverse route R → consumer_id.
         let rname: ndn_packet::Name = "/rfx/reverse-test".parse().unwrap();
-        let i1 = InterestBuilder::new("/svc/compute")
+        let i1 = InterestBuilder::new(ndn_packet::name!("/svc/compute"))
             .reflexive_name(rname.clone())
             .lifetime(Duration::from_secs(4))
             .build();
@@ -1243,7 +1244,7 @@ mod tests {
 
         // I2 named under R, from a different face, must be reverse-routed to the
         // consumer face.
-        let i2 = InterestBuilder::new("/rfx/reverse-test/params")
+        let i2 = InterestBuilder::new(ndn_packet::name!("/rfx/reverse-test/params"))
             .lifetime(Duration::from_secs(2))
             .build();
         inject(&engine, i2, ndn_transport::FaceId(777)).await;
@@ -1271,7 +1272,7 @@ mod tests {
 
         // Install a route for R via an I1 from the consumer face.
         let rname: ndn_packet::Name = "/rfx/installed".parse().unwrap();
-        let i1 = InterestBuilder::new("/svc/x")
+        let i1 = InterestBuilder::new(ndn_packet::name!("/svc/x"))
             .reflexive_name(rname.clone())
             .lifetime(Duration::from_secs(4))
             .build();
@@ -1285,7 +1286,7 @@ mod tests {
 
         // A reverse Interest under a DIFFERENT reflexive name (no route) must not
         // reach the install face.
-        let other = InterestBuilder::new("/rfx/not-installed/params")
+        let other = InterestBuilder::new(ndn_packet::name!("/rfx/not-installed/params"))
             .lifetime(Duration::from_secs(2))
             .build();
         inject(&engine, other, ndn_transport::FaceId(778)).await;
@@ -1317,7 +1318,7 @@ mod tests {
         let (consumer_id, mut rx) = add_capture(&engine);
 
         let rname: ndn_packet::Name = "/rfx/priv-test".parse().unwrap();
-        let i1 = InterestBuilder::new("/svc/y")
+        let i1 = InterestBuilder::new(ndn_packet::name!("/svc/y"))
             .reflexive_name(rname.clone())
             .lifetime(Duration::from_secs(4))
             .build();
@@ -1331,7 +1332,7 @@ mod tests {
 
         // An unrelated, non-reflexive name must not be delivered to the install
         // face via the reflexive route (no FIB widening / privilege escalation).
-        let unrelated = InterestBuilder::new("/some/unrelated/data")
+        let unrelated = InterestBuilder::new(ndn_packet::name!("/some/unrelated/data"))
             .lifetime(Duration::from_secs(2))
             .build();
         inject(&engine, unrelated, ndn_transport::FaceId(779)).await;

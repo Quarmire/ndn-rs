@@ -16,7 +16,8 @@ fn far_future() -> u64 {
 
 fn interest_for(name_s: &str) -> ndn_packet::Interest {
     use ndn_packet::encode::InterestBuilder;
-    let wire = InterestBuilder::new(name_s).build();
+    let wire =
+        InterestBuilder::new(name_s.parse::<ndn_packet::Name>().expect("valid NDN name")).build();
     ndn_packet::Interest::decode(wire).unwrap()
 }
 

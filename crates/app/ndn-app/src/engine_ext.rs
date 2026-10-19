@@ -13,12 +13,13 @@
 //!
 //! ```no_run
 //! use ndn_app::{EngineAppExt, EngineBuilder};
+//! use ndn_app::prelude::name;
 //! use tokio_util::sync::CancellationToken;
 //!
 //! # async fn ex() -> anyhow::Result<()> {
 //! let (engine, _shutdown) = EngineBuilder::new(Default::default()).build().await?;
 //! let cancel = CancellationToken::new();
-//! let producer = engine.register_producer("/ndn/ble/test", cancel.child_token());
+//! let producer = engine.register_producer(name!("/ndn/ble/test"), cancel.child_token());
 //! # Ok(()) }
 //! ```
 
@@ -75,16 +76,17 @@ pub trait EngineAppExt {
     ///
     /// ```no_run
     /// # use ndn_app::{EngineAppExt, EngineBuilder};
+    /// # use ndn_app::prelude::name;
     /// # use tokio_util::sync::CancellationToken;
     /// # async fn ex() -> anyhow::Result<()> {
     /// let (engine, _sd) = EngineBuilder::new(Default::default()).build().await?;
     /// let cancel = CancellationToken::new();
     /// let alice = engine.app_node(cancel.child_token());
     /// let bob   = engine.app_node(cancel.child_token());
-    /// let _g = alice.serve("/alice", |i, r| async move {
+    /// let _g = alice.serve(name!("/alice"), |i, r| async move {
     ///     let _ = r.respond((*i.name).clone(), "hi").await;
     /// }).await?;
-    /// let data = bob.fetch("/alice/greeting").await?;
+    /// let data = bob.fetch(name!("/alice/greeting")).await?;
     /// # let _ = data; Ok(()) }
     /// ```
     ///

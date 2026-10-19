@@ -82,12 +82,14 @@ undesirable.
 
 `bytes::Bytes` and `Arc` refcounting need atomic compare-and-swap. Some small
 single-core microcontrollers (the `riscv32imc` floor among them) have no
-hardware CAS instruction. `ndn-packet` therefore exposes a `portable-atomic`
-feature that routes `Bytes` and `Arc` refcounting through the
-`portable-atomic-util` crate:
+hardware CAS instruction. `ndn-foundation-types` (whose `Name` shares its
+components through an `Arc`) and `ndn-packet` therefore expose a
+`portable-atomic` feature that routes `Bytes` and `Arc` refcounting through the
+`portable-atomic-util` crate; `ndn-packet`'s feature turns on the foundation
+crate's:
 
 ```toml
-portable-atomic = ["dep:portable-atomic-util", "bytes/extra-platforms"]
+portable-atomic = ["dep:portable-atomic-util", "bytes/extra-platforms", "ndn-foundation-types/portable-atomic"]
 ```
 
 The dependent binary picks the CAS polyfill via a `portable-atomic` feature or a

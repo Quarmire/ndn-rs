@@ -645,10 +645,8 @@ async fn send_sync_interest(
     let mut app_params = dialect.encode_state_vector(&entries).to_vec();
 
     if let Some(mapping_bytes) = mapping {
-        let local_key = node.local_key();
-        let local_name: Name = local_key.parse().unwrap_or_else(|_| Name::root());
         let seq = node.local_seq().await;
-        let mapping_tlv = encode_mapping_data(&local_name, seq, &mapping_bytes);
+        let mapping_tlv = encode_mapping_data(node.local_name(), seq, &mapping_bytes);
         app_params.extend_from_slice(&mapping_tlv);
     }
 

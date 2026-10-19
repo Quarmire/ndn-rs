@@ -29,7 +29,8 @@
 //! // Decide trust once with `verifying`; then `fetch` returns `SafeData` —
 //! // proof the signature checked out. (Bare `node.fetch` is unverified.)
 //! let keychain = KeyChain::ephemeral("/example")?;
-//! let safe = node.verifying(keychain.validator()).fetch("/example/data").await?;
+//! let name: Name = "/example/data".parse()?;
+//! let safe = node.verifying(keychain.validator()).fetch(name).await?;
 //! # let _ = safe; Ok(()) }
 //! ```
 //!
@@ -63,7 +64,7 @@ pub use ndn_transport as transport;
 
 // ── Flagship types at the top level ─────────────────────────────────────
 pub use ndn_packet::encode::{DataBuilder, InterestBuilder};
-pub use ndn_packet::{Data, Interest, NackReason, Name, NameComponent};
+pub use ndn_packet::{Data, Interest, NackReason, Name, NameComponent, name};
 
 pub use ndn_security::{
     SafeData, SignWith, Signer, SignerSelection, SigningInfo, TrustSchema, Unverified, Validator,
@@ -86,7 +87,7 @@ pub use ndn_engine::{EngineBuilder, EngineConfig};
 pub use ndn_transport::FaceId;
 
 pub mod prelude {
-    pub use crate::{Data, DataBuilder, Interest, InterestBuilder, Name};
+    pub use crate::{Data, DataBuilder, Interest, InterestBuilder, Name, name};
     // The safe-fetch types, so `verifying(...).fetch()` and `SafeData` are in
     // reach without a separate `use ndn_security::...`.
     pub use crate::{SafeData, Unverified, Validator};

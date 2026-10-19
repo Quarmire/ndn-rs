@@ -1,5 +1,5 @@
 #[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 use ndn_tlv::TlvError;
 
@@ -23,7 +23,7 @@ impl From<TlvError> for PacketError {
 
 impl From<ndn_foundation_types::name::NameError> for PacketError {
     fn from(e: ndn_foundation_types::name::NameError) -> Self {
-        PacketError::MalformedPacket(e.0.into())
+        PacketError::MalformedPacket(e.to_string())
     }
 }
 

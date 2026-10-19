@@ -46,7 +46,11 @@ async fn marks_raise_then_decay_face_congestion() {
     // records the link-level mark at the top of the data pipeline).
     for i in 0..5u32 {
         let name = format!("/cf/{i}");
-        let data = DataBuilder::new(name.as_str(), b"x").sign_digest_sha256();
+        let data = DataBuilder::new(
+            name.parse::<ndn_packet::Name>().expect("valid NDN name"),
+            b"x",
+        )
+        .sign_digest_sha256();
         let wire = encode_lp_with_headers(
             &data,
             &LpHeaders {

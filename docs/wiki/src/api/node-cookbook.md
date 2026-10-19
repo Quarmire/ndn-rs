@@ -33,8 +33,9 @@ dedicated connection to the same forwarder.)
 ## Fetch one Data
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node) -> Result<(), ndn::AppError> {
-let data = node.fetch("/peer/greeting").await?;        // unverified
+let data = node.fetch(name!("/peer/greeting")).await?;        // unverified
 println!("{} bytes", data.content().map(|c| c.len()).unwrap_or(0));
 # Ok(()) }
 ```
@@ -45,8 +46,9 @@ Decide trust once with `verifying`; then `fetch` returns `SafeData` — proof th
 signature checked out.
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node, validator: ndn::Validator) -> Result<(), ndn::AppError> {
-let safe = node.verifying(validator).fetch("/peer/greeting").await?;
+let safe = node.verifying(validator).fetch(name!("/peer/greeting")).await?;
 # let _ = safe; Ok(()) }
 ```
 
@@ -57,14 +59,15 @@ the modifiers, then a terminal verb. This replaces the old `fetch_object_*`
 method family.
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node, validator: ndn::Validator) -> Result<(), ndn::AppError> {
 // simple — whole object in memory
-let bytes = node.object("/alice/photo").fetch().await?;
+let bytes = node.object(name!("/alice/photo")).fetch().await?;
 
 // verified + forwarding hint + a progress bar
-let bytes = node.object("/alice/photo")
+let bytes = node.object(name!("/alice/photo"))
     .verify(validator)
-    .hint(["/gateway"])
+    .hint([name!("/gateway")])
     .progress(|done, total| eprintln!("{done}/{total}"))
     .fetch().await?;
 # let _ = bytes; Ok(()) }
@@ -85,8 +88,9 @@ concurrently with any fetches on the same `Node`. Serving stops when the
 returned guard is dropped. The handler gets the `Interest` and a `Responder`.
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node) -> Result<(), ndn::AppError> {
-let _guard = node.serve("/alice/notes", |interest, reply| async move {
+let _guard = node.serve(name!("/alice/notes"), |interest, reply| async move {
     let body = format!("note for {}", &*interest.name);
     let _ = reply.respond((*interest.name).clone(), body).await;
 }).await?;
@@ -97,10 +101,11 @@ let _guard = node.serve("/alice/notes", |interest, reply| async move {
 ## Serve a static object or file
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node) -> Result<(), ndn::AppError> {
-let _g = node.serve_object("/alice/notes/today", "buy milk").await?;
+let _g = node.serve_object(name!("/alice/notes/today"), "buy milk").await?;
 # #[cfg(unix)]
-let _g = node.serve_file("/alice/share/big.bin", "/path/to/big.bin").await?;
+let _g = node.serve_file(name!("/alice/share/big.bin"), "/path/to/big.bin").await?;
 # Ok(()) }
 ```
 
@@ -110,11 +115,12 @@ Segments are `DigestSha256` (unsigned). For **signed** serving, build a
 ## Publish / subscribe (dataset sync)
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node) -> Result<(), ndn::AppError> {
-let publisher = node.publish("/svs/chatroom", "/alice").await?;
+let publisher = node.publish(name!("/svs/chatroom"), name!("/alice")).await?;
 publisher.put(b"hello room").await?;
 
-let subscriber = node.subscribe("/svs/chatroom", "/alice").await?;
+let subscriber = node.subscribe(name!("/svs/chatroom"), name!("/alice")).await?;
 // while let Some(sample) = subscriber.recv().await { ... }
 # Ok(()) }
 ```
@@ -122,8 +128,9 @@ let subscriber = node.subscribe("/svs/chatroom", "/alice").await?;
 ## Query responder
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node) -> Result<(), ndn::AppError> {
-let queryable = node.query("/alice/svc").await?;
+let queryable = node.query(name!("/alice/svc")).await?;
 // while let Some(q) = queryable.recv().await { q.reply(answer).await?; }
 # Ok(()) }
 ```
@@ -133,12 +140,13 @@ let queryable = node.query("/alice/svc").await?;
 With `ndn-app`'s `serde` feature, objects (de)serialize as JSON Content:
 
 ```rust,ignore
+# use ndn::name;
 # async fn run(node: ndn::Node, validator: ndn::Validator) -> Result<(), ndn::AppError> {
 # #[derive(serde::Serialize, serde::Deserialize)] struct Profile { name: String }
 let me = Profile { name: "alice".into() };
-let _g = node.serve_object_typed("/alice/profile", &me).await?;
+let _g = node.serve_object_typed(name!("/alice/profile"), &me).await?;
 
-let them: Profile = node.object("/bob/profile").verify(validator).fetch_as().await?;
+let them: Profile = node.object(name!("/bob/profile")).verify(validator).fetch_as().await?;
 # let _ = them; Ok(()) }
 ```
 
@@ -148,6 +156,7 @@ Two `Node`s on one embedded engine talk to each other with no forwarder process.
 Ideal for tests.
 
 ```rust,ignore
+# use ndn::name;
 use ndn::{EngineAppExt, EngineBuilder};
 use ndn_engine::EngineConfig;
 use tokio_util::sync::CancellationToken;
@@ -158,10 +167,10 @@ let cancel = CancellationToken::new();
 let alice = engine.app_node(cancel.child_token());
 let bob   = engine.app_node(cancel.child_token());
 
-let _g = alice.serve("/alice", |i, r| async move {
+let _g = alice.serve(name!("/alice"), |i, r| async move {
     let _ = r.respond((*i.name).clone(), "hi").await;
 }).await?;
-let data = bob.fetch("/alice/greeting").await?;   // routes engine → FIB → alice
+let data = bob.fetch(name!("/alice/greeting")).await?;   // routes engine → FIB → alice
 # let _ = data; Ok(()) }
 ```
 

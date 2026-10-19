@@ -27,14 +27,15 @@
 //!
 //! ```no_run
 //! # use ndn_app::Node;
+//! # use ndn_app::prelude::name;
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let node = Node::connect("/run/nfd/nfd.sock").await?;
 //! // serve dynamic content (the "Responder" pattern, now first-class)
-//! let _guard = node.serve("/notes", |interest, reply| async move {
+//! let _guard = node.serve(name!("/notes"), |interest, reply| async move {
 //!     let _ = reply.respond((*interest.name).clone(), "hello").await;
 //! }).await?;
 //! // fetch on the same connection, concurrently
-//! let data = node.fetch("/peer/greeting").await?;
+//! let data = node.fetch(name!("/peer/greeting")).await?;
 //! # let _ = data; Ok(()) }
 //! ```
 
@@ -243,10 +244,11 @@ impl Node {
     ///
     /// ```no_run
     /// # use ndn_app::Node;
+    /// # use ndn_app::prelude::name;
     /// # use bytes::Bytes;
     /// # async fn run(node: Node) -> Result<(), Box<dyn std::error::Error>> {
     /// let (tx, rx) = tokio::sync::watch::channel(Bytes::from_static(b"init"));
-    /// let _guard = node.serve_latest("/muas/telemetry", rx).await?;
+    /// let _guard = node.serve_latest(name!("/muas/telemetry"), rx).await?;
     /// tx.send(Bytes::from_static(b"alt=1360.5"))?; // consumers now see this
     /// # Ok(()) }
     /// ```

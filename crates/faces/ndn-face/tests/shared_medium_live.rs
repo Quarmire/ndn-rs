@@ -64,8 +64,10 @@ async fn n02_live_udp_shared_medium_source_addrs_drive_reassembly() {
     let sender_a_addr = sender_a.local_addr().unwrap();
     let sender_b_addr = sender_b.local_addr().unwrap();
 
-    let data_a = DataBuilder::new("/shared/a", &vec![0xA1; 500]).sign_digest_sha256();
-    let data_b = DataBuilder::new("/shared/b", &vec![0xB2; 500]).sign_digest_sha256();
+    let data_a =
+        DataBuilder::new(ndn_packet::name!("/shared/a"), &vec![0xA1; 500]).sign_digest_sha256();
+    let data_b =
+        DataBuilder::new(ndn_packet::name!("/shared/b"), &vec![0xB2; 500]).sign_digest_sha256();
     let frags_a = fragment_packet(&data_a, 120, 0);
     let frags_b = fragment_packet(&data_b, 120, 0);
     assert!(
@@ -136,7 +138,7 @@ async fn n09_live_udp_shared_medium_nack_is_ignored() {
     let prefix: ndn_packet::Name = "/shared-n09".parse().unwrap();
     engine.fib().add_nexthop(&prefix, SHARED, 0);
 
-    let interest = InterestBuilder::new("/shared-n09/item")
+    let interest = InterestBuilder::new(ndn_packet::name!("/shared-n09/item"))
         .lifetime(Duration::from_secs(2))
         .build();
     consumer.send(interest.clone()).await.unwrap();

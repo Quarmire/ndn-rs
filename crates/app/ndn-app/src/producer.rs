@@ -492,11 +492,17 @@ mod router_tests {
         };
 
         Producer::new(conn, prefix)
-            .route("/config", tag("config", Arc::clone(&hits)))
+            .route(
+                ndn_packet::name!("/config"),
+                tag("config", Arc::clone(&hits)),
+            )
             // `/data` and the more specific `/data/v2` both registered: the
             // longest match must win for `/app/data/v2/...`.
-            .route("/data", tag("data", Arc::clone(&hits)))
-            .route("/data/v2", tag("data-v2", Arc::clone(&hits)))
+            .route(ndn_packet::name!("/data"), tag("data", Arc::clone(&hits)))
+            .route(
+                ndn_packet::name!("/data/v2"),
+                tag("data-v2", Arc::clone(&hits)),
+            )
             .fallback(tag("fallback", Arc::clone(&hits)))
             .serve()
             .await

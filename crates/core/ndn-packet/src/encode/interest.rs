@@ -96,7 +96,7 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
 /// ```
 /// # use ndn_packet::encode::InterestBuilder;
 /// # use std::time::Duration;
-/// let wire = InterestBuilder::new("/ndn/test")
+/// let wire = InterestBuilder::new(ndn_packet::name!("/ndn/test"))
 ///     .lifetime(Duration::from_millis(2000))
 ///     .must_be_fresh()
 ///     .build();
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn interest_builder_basic() {
-        let wire = InterestBuilder::new("/ndn/test").build();
+        let wire = InterestBuilder::new(crate::name!("/ndn/test")).build();
         let interest = Interest::decode(wire).unwrap();
         assert_eq!(interest.name.to_string(), "/ndn/test");
         assert!(interest.nonce().is_some());
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn interest_builder_custom_lifetime() {
-        let wire = InterestBuilder::new("/test")
+        let wire = InterestBuilder::new(crate::name!("/test"))
             .lifetime(Duration::from_millis(2000))
             .build();
         let interest = Interest::decode(wire).unwrap();
@@ -594,14 +594,14 @@ mod tests {
 
     #[test]
     fn interest_builder_from_str() {
-        let wire = InterestBuilder::new("/a/b/c").build();
+        let wire = InterestBuilder::new(crate::name!("/a/b/c")).build();
         let interest = Interest::decode(wire).unwrap();
         assert_eq!(interest.name.len(), 3);
     }
 
     #[test]
     fn interest_builder_app_params_preserves_selectors() {
-        let wire = InterestBuilder::new("/cmd")
+        let wire = InterestBuilder::new(crate::name!("/cmd"))
             .can_be_prefix()
             .must_be_fresh()
             .lifetime(Duration::from_millis(2000))
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn interest_builder_forwarding_hint() {
         let hint: Name = "/ndn/gateway".parse().unwrap();
-        let wire = InterestBuilder::new("/test")
+        let wire = InterestBuilder::new(crate::name!("/test"))
             .forwarding_hint(vec![hint])
             .build();
         let interest = Interest::decode(wire).unwrap();
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn interest_builder_sign_sync_roundtrip() {
         let key_name: Name = "/key/test".parse().unwrap();
-        let wire = InterestBuilder::new("/signed/cmd")
+        let wire = InterestBuilder::new(crate::name!("/signed/cmd"))
             .app_parameters(b"params".to_vec())
             .sign_sync(
                 crate::SignatureType::SignatureEd25519,
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn interest_builder_sign_sync_auto_anti_replay() {
         // Anti-replay fields (nonce, time) must be injected regardless of sig type.
-        let wire = InterestBuilder::new("/cmd").sign_sync(
+        let wire = InterestBuilder::new(crate::name!("/cmd")).sign_sync(
             crate::SignatureType::DigestSha256,
             None,
             |region| Bytes::copy_from_slice(sha2::Sha256::digest(region).as_ref()),
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn interest_builder_sign_sync_empty_params_default() {
-        let wire = InterestBuilder::new("/cmd").sign_sync(
+        let wire = InterestBuilder::new(crate::name!("/cmd")).sign_sync(
             crate::SignatureType::DigestSha256,
             None,
             |region| {
@@ -695,7 +695,7 @@ mod tests {
         // Signed region is (name components sans PSDC) || AppParameters ||
         // SigInfo; region[0] is the first component's type, not the outer NAME.
         let key_name: Name = "/test-key".parse().unwrap();
-        let wire = InterestBuilder::new("/test")
+        let wire = InterestBuilder::new(crate::name!("/test"))
             .app_parameters(b"data".to_vec())
             .sign_sync(crate::SignatureType::SignatureEd25519, Some(&key_name), |region| {
                 assert_eq!(
@@ -719,7 +719,7 @@ mod tests {
         let captured: RefCell<Option<Vec<u8>>> = RefCell::new(None);
 
         let key_name: Name = "/test-key".parse().unwrap();
-        let wire = InterestBuilder::new("/ndn/rs/audit/a09")
+        let wire = InterestBuilder::new(crate::name!("/ndn/rs/audit/a09"))
             .app_parameters(b"hello world".to_vec())
             .sign_sync(
                 crate::SignatureType::SignatureEd25519,
@@ -748,7 +748,7 @@ mod tests {
 
         let mut cx = Context::from_waker(Waker::noop());
 
-        let fut = InterestBuilder::new("/test")
+        let fut = InterestBuilder::new(crate::name!("/test"))
             .app_parameters(b"p".to_vec())
             .sign(
                 crate::SignatureType::DigestSha256,
@@ -769,7 +769,7 @@ mod tests {
         assert!(async_i.sig_value().is_some());
         assert!(async_i.signed_region().is_some());
 
-        let sync_wire = InterestBuilder::new("/test")
+        let sync_wire = InterestBuilder::new(crate::name!("/test"))
             .app_parameters(b"p".to_vec())
             .sign_sync(crate::SignatureType::DigestSha256, None, |region| {
                 Bytes::copy_from_slice(sha2::Sha256::digest(region).as_ref())
@@ -783,7 +783,7 @@ mod tests {
     fn interest_builder_sign_sync_with_all_options() {
         let hint: Name = "/ndn/relay".parse().unwrap();
         let key_name: Name = "/my/key".parse().unwrap();
-        let wire = InterestBuilder::new("/prefix/command")
+        let wire = InterestBuilder::new(crate::name!("/prefix/command"))
             .can_be_prefix()
             .must_be_fresh()
             .lifetime(Duration::from_millis(8000))
@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn wire_interest_builder_selectors() {
-        let wire = InterestBuilder::new("/A")
+        let wire = InterestBuilder::new(crate::name!("/A"))
             .can_be_prefix()
             .must_be_fresh()
             .lifetime(Duration::from_millis(1000))
@@ -908,7 +908,7 @@ mod tests {
     /// `pin_face(face_id)` LP-wraps the Interest with `NextHopFaceId`.
     #[test]
     fn pin_face_emits_lp_next_hop_face_id() {
-        let wire = InterestBuilder::new("/ndn/test/hello")
+        let wire = InterestBuilder::new(crate::name!("/ndn/test/hello"))
             .lifetime(Duration::from_millis(1000))
             .pin_face(42)
             .build();
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn interest_reflexive_name_roundtrip() {
         let rname: Name = "/rfx/abc123".parse().unwrap();
-        let wire = InterestBuilder::new("/compute/sum")
+        let wire = InterestBuilder::new(crate::name!("/compute/sum"))
             .reflexive_name(rname.clone())
             .lifetime(Duration::from_millis(2000))
             .build();
@@ -944,7 +944,7 @@ mod tests {
         );
 
         // Absent by default.
-        let plain = Interest::decode(InterestBuilder::new("/x").build()).unwrap();
+        let plain = Interest::decode(InterestBuilder::new(crate::name!("/x")).build()).unwrap();
         assert!(plain.reflexive_name().is_none());
     }
 
@@ -955,7 +955,7 @@ mod tests {
     fn signed_interest_carries_reflexive_name() {
         let rname: Name = "/rfx/deadbeef".parse().unwrap();
         let kl: Name = "/op/KEY/k1".parse().unwrap();
-        let wire = InterestBuilder::new("/localhop/nfd/rib/register")
+        let wire = InterestBuilder::new(crate::name!("/localhop/nfd/rib/register"))
             .must_be_fresh()
             .lifetime(Duration::from_secs(4))
             .reflexive_name(rname.clone())
@@ -986,7 +986,7 @@ mod tests {
     /// Without `pin_face`, the builder emits a bare Interest — no LP wrap.
     #[test]
     fn no_pin_face_emits_bare_interest() {
-        let wire = InterestBuilder::new("/ndn/test/data")
+        let wire = InterestBuilder::new(crate::name!("/ndn/test/data"))
             .lifetime(Duration::from_millis(1000))
             .build();
         assert!(!crate::lp::is_lp_packet(&wire), "no LP wrap when unpinned");

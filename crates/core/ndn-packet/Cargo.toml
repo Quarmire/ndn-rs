@@ -30,7 +30,7 @@ std-wasm = ["std"]
 ## The dependent binary must pick a CAS polyfill via a `portable-atomic`
 ## feature or rustflag (typically `--cfg portable_atomic_unsafe_assume_single_core`
 ## on uniprocessor MCUs).
-portable-atomic = ["dep:portable-atomic-util", "bytes/extra-platforms"]
+portable-atomic = ["dep:portable-atomic-util", "bytes/extra-platforms", "ndn-foundation-types/portable-atomic"]
 
 [dependencies]
 ndn-foundation-types = { workspace = true, default-features = false }

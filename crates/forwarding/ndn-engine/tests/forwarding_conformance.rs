@@ -93,7 +93,7 @@ async fn native_interest_decision_conformance() {
             engine.fib().add_nexthop(&prefix, nexthop, 0);
         }
 
-        let mut ib = InterestBuilder::new("/conf/data");
+        let mut ib = InterestBuilder::new(ndn_packet::name!("/conf/data"));
         if let Some(h) = case.hop_limit {
             ib = ib.hop_limit(h);
         }
@@ -140,7 +140,7 @@ async fn native_data_satisfies_pit_to_consumer() {
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
     // Consumer (face A) Interest → forwarded to producer (face B), PIT entry in.
-    let interest = InterestBuilder::new("/conf/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/conf/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -153,7 +153,7 @@ async fn native_data_satisfies_pit_to_consumer() {
     );
 
     // Producer (face B) Data → satisfies the PIT, delivered to consumer (face A).
-    let data = DataBuilder::new("/conf/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/conf/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     assert!(
         recv_timeout(&handle_a)
@@ -193,7 +193,7 @@ async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
     // Populate the cache the ordinary way: Interest out, Data back.
     handle_a
         .send(
-            InterestBuilder::new("/cshit/one")
+            InterestBuilder::new(ndn_packet::name!("/cshit/one"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -205,7 +205,7 @@ async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
             // A positive FreshnessPeriod is required: DefaultAdmissionPolicy
             // refuses FreshnessPeriod=0 Data, so without this the Data is
             // never cached and the test would assert against an empty store.
-            DataBuilder::new("/cshit/one", b"cached")
+            DataBuilder::new(ndn_packet::name!("/cshit/one"), b"cached")
                 .freshness(Duration::from_secs(60))
                 .sign_digest_sha256(),
         )
@@ -219,7 +219,7 @@ async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
     // must NOT see it again.
     handle_a
         .send(
-            InterestBuilder::new("/cshit/one")
+            InterestBuilder::new(ndn_packet::name!("/cshit/one"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -262,7 +262,8 @@ async fn native_unsolicited_data_dropped() {
         .expect("engine build");
 
     // No prior Interest → no PIT entry.
-    let data = DataBuilder::new("/conf/unsolicited", b"payload").sign_digest_sha256();
+    let data =
+        DataBuilder::new(ndn_packet::name!("/conf/unsolicited"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     assert!(
         recv_timeout(&handle_a).await.is_none(),

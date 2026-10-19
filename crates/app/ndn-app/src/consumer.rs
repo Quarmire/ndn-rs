@@ -1645,7 +1645,7 @@ mod subscription_tests {
 
     #[test]
     fn persistent_interest_carries_subscription_request() {
-        let prefix = Name::from("/vpn/downlink");
+        let prefix = ndn_packet::name!("/vpn/downlink");
         let opts = SubscribeOptions {
             max_data_count: 256,
             lifetime: Duration::from_secs(120),
@@ -1671,8 +1671,8 @@ mod subscription_tests {
         // forwarder can correlate a re-attach after a face flap (F15).
         let id = fresh_subscription_id();
         let opts = SubscribeOptions::default();
-        let a = build_persistent_interest(&Name::from("/s"), &opts, &id);
-        let b = build_persistent_interest(&Name::from("/s"), &opts, &id);
+        let a = build_persistent_interest(&ndn_packet::name!("/s"), &opts, &id);
+        let b = build_persistent_interest(&ndn_packet::name!("/s"), &opts, &id);
         let ida =
             SubscriptionRequest::find_in(Interest::decode(a).unwrap().app_parameters().unwrap())
                 .unwrap()
@@ -1745,7 +1745,7 @@ mod subscription_tests {
         });
         let mut sub = Subscription {
             conn: conn.clone(),
-            prefix: Name::from("/s"),
+            prefix: ndn_packet::name!("/s"),
             opts: SubscribeOptions {
                 staleness: Some(Duration::from_millis(20)),
                 ..SubscribeOptions::default()
@@ -1971,7 +1971,8 @@ mod subscription_tests {
             lifetime: Duration::from_secs(100_000),
             ..SubscribeOptions::default()
         };
-        let wire = build_persistent_interest(&Name::from("/x"), &opts, &fresh_subscription_id());
+        let wire =
+            build_persistent_interest(&ndn_packet::name!("/x"), &opts, &fresh_subscription_id());
         let interest = Interest::decode(wire).unwrap();
         let sr = SubscriptionRequest::find_in(interest.app_parameters().unwrap()).unwrap();
         assert_eq!(sr.max_lifetime_secs, MAX_PERSISTENT_LIFETIME_SECS);

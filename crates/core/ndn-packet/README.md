@@ -6,7 +6,7 @@ Core NDN packet types and their TLV wire-format codec. Fields are decoded lazily
 
 | Type | Role |
 |------|------|
-| `Name` / `NameComponent` | Hierarchical NDN name backed by `SmallVec<[NameComponent; 8]>` |
+| `Name` / `NameComponent` | Hierarchical NDN name: one shared `Arc<[NameComponent]>` (16 bytes, O(1) clone); parse text with `str::parse` (fallible) or `name!` for literals |
 | `Interest` | Interest packet with optional `Selector`, lazy nonce/lifetime decode |
 | `Data` | Data packet carrying content, `MetaInfo`, and `SignatureInfo` |
 | `Nack` / `NackReason` | Network-layer negative acknowledgement |

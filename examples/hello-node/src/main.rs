@@ -25,14 +25,14 @@ async fn main() -> anyhow::Result<()> {
     let bob: Node = engine.app_node(cancel.child_token());
 
     let _guard = alice
-        .serve("/hello", |interest, reply| async move {
+        .serve(ndn::name!("/hello"), |interest, reply| async move {
             let _ = reply
                 .respond((*interest.name).clone(), "hello from ndn-rs")
                 .await;
         })
         .await?;
 
-    let data = bob.fetch("/hello/world").await?;
+    let data = bob.fetch(ndn::name!("/hello/world")).await?;
     let payload = data.content().map(|c| c.as_ref()).unwrap_or_default();
     println!("{} => {}", data.name, String::from_utf8_lossy(payload));
 

@@ -61,7 +61,7 @@ async fn interest_incoming_face_id_gated_on_local_fields() {
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
     // (1) Default: LocalFields off on the producer face → no IncomingFaceId.
-    let i1 = InterestBuilder::new("/lf/off")
+    let i1 = InterestBuilder::new(ndn_packet::name!("/lf/off"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(i1).await.expect("inject interest 1");
@@ -77,7 +77,7 @@ async fn interest_incoming_face_id_gated_on_local_fields() {
     // (2) Enable LocalFields on the producer face (the runtime toggle
     //     faces/update drives) → IncomingFaceId == the ingress (consumer) face.
     engine.set_local_fields(FaceId(FACE_B), true);
-    let i2 = InterestBuilder::new("/lf/on")
+    let i2 = InterestBuilder::new(ndn_packet::name!("/lf/on"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(i2).await.expect("inject interest 2");
@@ -115,7 +115,7 @@ async fn data_incoming_face_id_is_producer_ingress_face() {
     engine.set_local_fields(FaceId(FACE_A), true);
 
     // Consumer Interest → forwarded to producer, PIT entry recorded.
-    let interest = InterestBuilder::new("/lf/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/lf/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -125,7 +125,7 @@ async fn data_incoming_face_id_is_producer_ingress_face() {
 
     // Producer Data → satisfies PIT, delivered to consumer with IncomingFaceId
     // = the producer face the Data arrived on.
-    let data = DataBuilder::new("/lf/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/lf/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     let egress = recv_timeout(&handle_a)
         .await

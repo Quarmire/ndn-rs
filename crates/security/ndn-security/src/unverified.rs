@@ -123,7 +123,8 @@ mod tests {
     use ndn_packet::encode::DataBuilder;
 
     fn sample_data() -> Data {
-        let wire = DataBuilder::new("/demo/thing", b"payload").sign_digest_sha256();
+        let wire =
+            DataBuilder::new(ndn_packet::name!("/demo/thing"), b"payload").sign_digest_sha256();
         Data::decode(wire).expect("decode sample data")
     }
 

@@ -1234,7 +1234,7 @@ mod persistent_tests {
             subscription_id,
         };
         let ap_bytes = sr.encode();
-        InterestBuilder::new(name)
+        InterestBuilder::new(name.parse::<ndn_packet::Name>().expect("valid NDN name"))
             .app_parameters(ap_bytes.to_vec())
             .sign_digest_sha256()
     }
@@ -1616,7 +1616,7 @@ mod persistent_tests {
             subscription_id: None,
         };
         let ap_bytes = sr.encode();
-        let wire = InterestBuilder::new("/persistent/v2")
+        let wire = InterestBuilder::new(ndn_packet::name!("/persistent/v2"))
             .app_parameters(ap_bytes.to_vec())
             .sign_digest_sha256();
 
@@ -1795,7 +1795,7 @@ mod persistent_tests {
             subscription_id: None,
         };
         let ap_bytes = sr.encode();
-        let wire = InterestBuilder::new("/stream")
+        let wire = InterestBuilder::new(ndn_packet::name!("/stream"))
             .can_be_prefix()
             .app_parameters(ap_bytes.to_vec())
             .sign_digest_sha256();
@@ -1864,7 +1864,7 @@ mod persistent_tests {
 
         // Non-persistent Interest with CanBePrefix.
         let prefix_name: Name = "/classical/prefix".parse().unwrap();
-        let wire = InterestBuilder::new("/classical/prefix")
+        let wire = InterestBuilder::new(ndn_packet::name!("/classical/prefix"))
             .can_be_prefix()
             .build();
         let action = run_check(&check, wire);

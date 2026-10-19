@@ -64,8 +64,14 @@ async fn demux_serves_and_fetches_on_one_connection() {
     // A fetches /b (served by B) while A is itself serving /a; B fetches /a.
     let mut a_consumer = Consumer::new(a.clone() as Arc<dyn Connection>);
     let mut b_consumer = Consumer::new(b.clone() as Arc<dyn Connection>);
-    let from_b = a_consumer.fetch("/b").await.expect("A fetches /b");
-    let from_a = b_consumer.fetch("/a").await.expect("B fetches /a");
+    let from_b = a_consumer
+        .fetch(ndn_packet::name!("/b"))
+        .await
+        .expect("A fetches /b");
+    let from_a = b_consumer
+        .fetch(ndn_packet::name!("/a"))
+        .await
+        .expect("B fetches /a");
 
     assert_eq!(
         from_b.content().map(|c| c.to_vec()),

@@ -89,7 +89,7 @@ async fn a_shadowed_route_is_named_by_the_diagnostic() {
         .fib()
         .add_nexthop(&"/svc".parse().unwrap(), FaceId(PEER), 10);
 
-    let interest = InterestBuilder::new("/svc/data/item/1")
+    let interest = InterestBuilder::new(ndn_packet::name!("/svc/data/item/1"))
         .lifetime(Duration::from_secs(2))
         .build();
     hc.send(interest).await.unwrap();
@@ -160,7 +160,7 @@ async fn same_prefix_routes_merge_and_the_diagnostic_shows_both_faces() {
         .fib()
         .add_nexthop(&"/svc/data".parse().unwrap(), FaceId(PEER), 10);
 
-    let interest = InterestBuilder::new("/svc/data/item/1")
+    let interest = InterestBuilder::new(ndn_packet::name!("/svc/data/item/1"))
         .lifetime(Duration::from_secs(2))
         .build();
     hc.send(interest).await.unwrap();

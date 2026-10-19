@@ -32,7 +32,13 @@ async fn make_leaf(mgr: &SecurityManager, key: &Name, issuer: &Name) -> Certific
 
 fn sign_with(mgr: &SecurityManager, data_name: &str, key: &Name) -> Data {
     let signer = mgr.get_signer_sync(key).unwrap();
-    let wire = DataBuilder::new(data_name, b"x").sign_sync(signer.sig_type(), Some(key), |r| {
+    let wire = DataBuilder::new(
+        data_name
+            .parse::<ndn_packet::Name>()
+            .expect("valid NDN name"),
+        b"x",
+    )
+    .sign_sync(signer.sig_type(), Some(key), |r| {
         signer.sign_sync(r).unwrap_or_default()
     });
     Data::decode(wire).unwrap()

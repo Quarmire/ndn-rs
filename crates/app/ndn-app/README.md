@@ -26,9 +26,9 @@ High-level Consumer, Producer, and Subscriber APIs for NDN applications. Support
 
 ```rust
 // Connect to a running ndn-fwd forwarder
-use ndn_app::Consumer;
+use ndn_app::{Consumer, prelude::name};
 let mut consumer = Consumer::connect("/run/nfd/nfd.sock").await?;
-let data = consumer.fetch("/example/data").await?;
+let data = consumer.fetch(name!("/example/data")).await?;
 
 // Or run embedded
 use ndn_app::{Consumer, Producer, EngineBuilder};

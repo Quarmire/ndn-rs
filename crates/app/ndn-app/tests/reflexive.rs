@@ -78,7 +78,8 @@ async fn reflexive_reverse_pull_round_trip() {
     // the puller's reverse pull with "approved".
     let mut advertiser = Consumer::from_handle(advertiser_handle);
     let r = random_reflexive_name();
-    let forward = InterestBuilder::new("/svc/req1").lifetime(Duration::from_secs(4));
+    let forward =
+        InterestBuilder::new(ndn_packet::name!("/svc/req1")).lifetime(Duration::from_secs(4));
     let d1 = advertiser
         .fetch_reflexive(
             forward,
@@ -131,7 +132,8 @@ async fn reflexive_cert_distribution_via_signed_wire() {
     engine.fib().add_nexthop(&localhop, FaceId(2), 0);
 
     // The certificate the requester will serve (a Data named like a cert).
-    let cert_wire: Bytes = DataBuilder::new("/op/alice/KEY/k1", b"PUBKEY").build();
+    let cert_wire: Bytes =
+        DataBuilder::new(ndn_packet::name!("/op/alice/KEY/k1"), b"PUBKEY").build();
 
     let producer = Producer::from_handle(serve_handle, localhop.clone());
     let side = Arc::new(tokio::sync::Mutex::new(Consumer::from_handle(pull_handle)));
@@ -166,7 +168,7 @@ async fn reflexive_cert_distribution_via_signed_wire() {
     let r = random_reflexive_name();
     let kl: Name = "/op/alice/KEY/k1".parse().unwrap();
     // A SIGNED forward command that still carries R (the real announce is signed).
-    let wire = InterestBuilder::new("/localhop/nfd/rib/register")
+    let wire = InterestBuilder::new(ndn_packet::name!("/localhop/nfd/rib/register"))
         .must_be_fresh()
         .lifetime(Duration::from_secs(4))
         .reflexive_name(r.clone())
@@ -201,7 +203,8 @@ async fn pull_reflexive_errors_without_reflexive_name() {
     // must refuse before touching the wire.
     let (_face, handle) = InProcFace::new(FaceId(1), 64);
     let mut consumer = Consumer::from_handle(handle);
-    let plain = Interest::decode(InterestBuilder::new("/svc/x").build()).unwrap();
+    let plain =
+        Interest::decode(InterestBuilder::new(ndn_packet::name!("/svc/x")).build()).unwrap();
     let err = consumer
         .pull_reflexive(&plain, "params", Duration::from_millis(200))
         .await

@@ -27,7 +27,7 @@ pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes, TrustError>>
 /// let kc = KeyChain::ephemeral("/com/example/alice")?;
 /// let signer = kc.signer()?;
 ///
-/// let wire = DataBuilder::new("/com/example/alice/data", b"hello")
+/// let wire = DataBuilder::new(ndn_packet::name!("/com/example/alice/data"), b"hello")
 ///     .sign_with_sync(&*signer)?;
 /// # Ok(())
 /// # }
@@ -148,7 +148,7 @@ mod tests {
         let kc = KeyChain::ephemeral("/test/producer").unwrap();
         let signer = kc.signer().unwrap();
 
-        let wire = DataBuilder::new("/test/producer/data", b"payload")
+        let wire = DataBuilder::new(ndn_packet::name!("/test/producer/data"), b"payload")
             .sign_with_sync(&*signer)
             .unwrap();
 
@@ -165,10 +165,10 @@ mod tests {
         let seed = [7u8; 32];
         let key_name: ndn_packet::Name = "/test/key".parse().unwrap();
         let signer = Ed25519Signer::from_seed(&seed, key_name);
-        let sync_wire = DataBuilder::new("/test/data", b"payload")
+        let sync_wire = DataBuilder::new(ndn_packet::name!("/test/data"), b"payload")
             .sign_with_sync(&signer)
             .unwrap();
-        let async_wire = DataBuilder::new("/test/data", b"payload")
+        let async_wire = DataBuilder::new(ndn_packet::name!("/test/data"), b"payload")
             .sign_with(&signer)
             .await
             .unwrap();
@@ -184,7 +184,7 @@ mod tests {
         let key_name: ndn_packet::Name = "/test/key".parse().unwrap();
         let signer = Ed25519Signer::from_seed(&seed, key_name);
 
-        let wire = InterestBuilder::new("/test/prefix")
+        let wire = InterestBuilder::new(ndn_packet::name!("/test/prefix"))
             .sign_with_sync(&signer)
             .unwrap();
 

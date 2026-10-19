@@ -51,11 +51,15 @@ async fn make_leaf(mgr: &SecurityManager, key_name: &Name, issuer_key: &Name) {
 /// Sign `data_name` with the key registered under `key_name`.
 fn sign_with(mgr: &SecurityManager, data_name: &str, key_name: &Name) -> Data {
     let signer = mgr.get_signer_sync(key_name).unwrap();
-    let wire = DataBuilder::new(data_name, b"payload").sign_sync(
-        signer.sig_type(),
-        Some(key_name),
-        |region| signer.sign_sync(region).unwrap_or_default(),
-    );
+    let wire = DataBuilder::new(
+        data_name
+            .parse::<ndn_packet::Name>()
+            .expect("valid NDN name"),
+        b"payload",
+    )
+    .sign_sync(signer.sig_type(), Some(key_name), |region| {
+        signer.sign_sync(region).unwrap_or_default()
+    });
     Data::decode(wire).unwrap()
 }
 

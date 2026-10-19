@@ -42,7 +42,11 @@ async fn priority_egress_forwards_both_classes() {
     let producer = tokio::spawn(async move {
         for name in ["/bulk/seg=0", "/ctrl/v=1"] {
             let _interest = handle_b.recv().await.expect("forwarded interest");
-            let data = DataBuilder::new(name, b"payload").sign_digest_sha256();
+            let data = DataBuilder::new(
+                name.parse::<ndn_packet::Name>().expect("valid NDN name"),
+                b"payload",
+            )
+            .sign_digest_sha256();
             handle_b.send(data).await.expect("send data");
         }
     });
@@ -51,7 +55,10 @@ async fn priority_egress_forwards_both_classes() {
     // the scheduler-drained egress delivers the forwarded Interest to B and the Data
     // back to A in each case.
     for name in ["/bulk/seg=0", "/ctrl/v=1"] {
-        let interest = InterestBuilder::new(name).must_be_fresh().build();
+        let interest =
+            InterestBuilder::new(name.parse::<ndn_packet::Name>().expect("valid NDN name"))
+                .must_be_fresh()
+                .build();
         handle_a.send(interest).await.expect("express interest");
         let got = tokio::time::timeout(Duration::from_secs(2), handle_a.recv())
             .await
@@ -90,11 +97,14 @@ async fn drr_egress_forwards() {
 
     let producer = tokio::spawn(async move {
         let _i = handle_b.recv().await.expect("forwarded interest");
-        let data = DataBuilder::new("/bulk/seg=0", b"payload").sign_digest_sha256();
+        let data =
+            DataBuilder::new(ndn_packet::name!("/bulk/seg=0"), b"payload").sign_digest_sha256();
         handle_b.send(data).await.expect("send data");
     });
 
-    let interest = InterestBuilder::new("/bulk/seg=0").must_be_fresh().build();
+    let interest = InterestBuilder::new(ndn_packet::name!("/bulk/seg=0"))
+        .must_be_fresh()
+        .build();
     handle_a.send(interest).await.expect("express interest");
     let got = tokio::time::timeout(Duration::from_secs(2), handle_a.recv())
         .await

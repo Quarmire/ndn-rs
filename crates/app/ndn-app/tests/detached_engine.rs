@@ -23,14 +23,14 @@ async fn detached_engine_keeps_forwarding() {
     let bob = engine.app_node(cancel.child_token());
 
     let _guard = alice
-        .serve("/alice", |i, r| async move {
+        .serve(ndn_packet::name!("/alice"), |i, r| async move {
             let _ = r.respond((*i.name).clone(), "hi").await;
         })
         .await
         .expect("serve");
 
     let data = bob
-        .fetch("/alice/greeting")
+        .fetch(ndn_packet::name!("/alice/greeting"))
         .await
         .expect("a detached engine must keep forwarding — detach() may not tear anything down");
     assert_eq!(

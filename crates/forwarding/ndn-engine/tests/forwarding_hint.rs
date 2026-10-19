@@ -46,7 +46,7 @@ async fn forwarding_hint_routes_by_delegation() {
     let hint: Name = "/hint".parse().unwrap();
     engine.fib().add_nexthop(&hint, FaceId(TARGET), 0);
 
-    let i = InterestBuilder::new("/app/data")
+    let i = InterestBuilder::new(ndn_packet::name!("/app/data"))
         .lifetime(Duration::from_secs(2))
         .forwarding_hint(vec![hint])
         .build();
@@ -78,7 +78,7 @@ async fn forwarding_hint_stripped_in_producer_region() {
     let hint: Name = "/hint".parse().unwrap();
     engine.fib().add_nexthop(&hint, FaceId(TARGET), 0);
 
-    let i = InterestBuilder::new("/app/data")
+    let i = InterestBuilder::new(ndn_packet::name!("/app/data"))
         .lifetime(Duration::from_secs(2))
         .forwarding_hint(vec![hint])
         .build();

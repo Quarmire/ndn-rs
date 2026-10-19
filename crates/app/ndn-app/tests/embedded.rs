@@ -162,7 +162,10 @@ async fn embedded_consumer_get() {
             .await
     });
 
-    let content: Bytes = consumer.get("/data/item").await.expect("get");
+    let content: Bytes = consumer
+        .get(ndn_packet::name!("/data/item"))
+        .await
+        .expect("get");
     assert_eq!(&content[..], b"raw bytes");
 
     shutdown.shutdown().await;

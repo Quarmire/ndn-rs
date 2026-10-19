@@ -91,13 +91,13 @@ async fn run_announcement_flow(
         .fib()
         .add_nexthop(&"/carrier".parse().unwrap(), FaceId(NEIGHBOR), 0);
 
-    let interest = InterestBuilder::new("/carrier/d")
+    let interest = InterestBuilder::new(ndn_packet::name!("/carrier/d"))
         .lifetime(Duration::from_secs(2))
         .build();
     hc.send(interest).await.unwrap();
     let _ = recv_timeout(&hnb).await;
 
-    let data = DataBuilder::new("/carrier/d", b"x").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/carrier/d"), b"x").sign_digest_sha256();
     let wire = data_with_prefix_announcement(&data, &pa);
     hnb.send(wire).await.unwrap();
     let _ = recv_timeout(&hc).await;
@@ -159,7 +159,7 @@ async fn learned_route_forwards_followup_interest() {
         "fixture must install the learned route before probing it"
     );
 
-    let followup = InterestBuilder::new("/learned/item")
+    let followup = InterestBuilder::new(ndn_packet::name!("/learned/item"))
         .lifetime(Duration::from_secs(2))
         .build();
     consumer.send(followup).await.unwrap();
@@ -228,7 +228,7 @@ async fn no_route_interest_is_broadcast() {
         .expect("engine build");
     use_self_learning(&engine);
 
-    let interest = InterestBuilder::new("/undiscovered/d")
+    let interest = InterestBuilder::new(ndn_packet::name!("/undiscovered/d"))
         .lifetime(Duration::from_secs(2))
         .build();
     hc.send(interest).await.unwrap();

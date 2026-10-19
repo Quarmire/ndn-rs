@@ -3,6 +3,8 @@
 //! `Hash`, and the TLV type-number constants for the above.
 //!
 //! `std` (default off) enables `bytes/std` and `Hash::of` via `sha2`.
+//! `portable-atomic` (default off) routes `Bytes` and `Name`'s `Arc`
+//! refcounting through `portable-atomic` for targets without atomic CAS.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -13,6 +15,8 @@
 // is not in the extern prelude, so it must be declared even when `std` is on
 // (where it is otherwise harmless).
 extern crate alloc;
+
+mod compat;
 
 pub mod codec;
 pub use codec::{TlvCodecError, TlvDecode, TlvEncode};
@@ -35,7 +39,7 @@ pub mod tlv_type {
 }
 
 pub mod name;
-pub use name::{Name, NameComponent};
+pub use name::{Name, NameComponent, NameError};
 
 pub mod hash;
 pub use hash::Hash;

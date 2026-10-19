@@ -86,7 +86,7 @@ let _info = SigningInfo::key("/alice/KEY/k1".parse()?);        // by specific ke
 let _info = SigningInfo::digest_sha256();                      // integrity only, no key
 
 let keychain = KeyChain::ephemeral("/alice")?;
-let wire = keychain.sign_packet(DataBuilder::new("/alice/note", b"hi"), &info)?;
+let wire = keychain.sign_packet(DataBuilder::new(name!("/alice/note"), b"hi"), &info)?;
 # Ok(()) }
 ```
 

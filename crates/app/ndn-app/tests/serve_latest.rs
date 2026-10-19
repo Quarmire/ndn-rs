@@ -40,7 +40,7 @@ async fn must_be_fresh_always_gets_the_latest_value() {
     // A latest-wins telemetry stream, initial value "v0".
     let (tx, rx) = tokio::sync::watch::channel(Bytes::from_static(b"v0"));
     let _guard = producer
-        .serve_latest("/muas/telemetry", rx)
+        .serve_latest(ndn_packet::name!("/muas/telemetry"), rx)
         .await
         .expect("serve_latest");
 

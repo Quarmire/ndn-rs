@@ -26,7 +26,7 @@ async fn node_serve_and_fetch() {
     let bob = engine.app_node(cancel.child_token());
 
     let _guard = alice
-        .serve("/alice", |interest, reply| async move {
+        .serve(ndn_packet::name!("/alice"), |interest, reply| async move {
             let _ = reply
                 .respond((*interest.name).clone(), "hi from alice")
                 .await;
@@ -34,7 +34,10 @@ async fn node_serve_and_fetch() {
         .await
         .expect("serve");
 
-    let data = bob.fetch("/alice/greeting").await.expect("fetch");
+    let data = bob
+        .fetch(ndn_packet::name!("/alice/greeting"))
+        .await
+        .expect("fetch");
     assert_eq!(
         data.content().map(|c| c.to_vec()),
         Some(b"hi from alice".to_vec()),
@@ -59,7 +62,7 @@ async fn node_fetch_large_data() {
     let payload = vec![0xABu8; 40_000];
     let expected = payload.clone();
     let _guard = alice
-        .serve("/alice/blob", move |interest, reply| {
+        .serve(ndn_packet::name!("/alice/blob"), move |interest, reply| {
             let payload = payload.clone();
             async move {
                 let _ = reply.respond((*interest.name).clone(), payload).await;
@@ -68,7 +71,10 @@ async fn node_fetch_large_data() {
         .await
         .expect("serve");
 
-    let data = bob.fetch("/alice/blob").await.expect("fetch");
+    let data = bob
+        .fetch(ndn_packet::name!("/alice/blob"))
+        .await
+        .expect("fetch");
     assert_eq!(data.content().map(|c| c.to_vec()), Some(expected));
 
     drop(cancel);
@@ -92,12 +98,12 @@ async fn engine_node_serve_object_roundtrip() {
     // Larger than one segment, so this exercises RDR metadata + windowed fetch.
     let payload = vec![0x5Au8; 20_000];
     let _guard = alice
-        .serve_object("/alice/blob", payload.clone())
+        .serve_object(ndn_packet::name!("/alice/blob"), payload.clone())
         .await
         .expect("serve_object");
 
     let got = bob
-        .object("/alice/blob")
+        .object(ndn_packet::name!("/alice/blob"))
         .fetch()
         .await
         .expect("fetch_object");
@@ -124,8 +130,14 @@ async fn engine_node_publish_subscribe() {
     let alice = engine.app_node(cancel.child_token());
     let bob = engine.app_node(cancel.child_token());
 
-    let publisher = alice.publish("/svs/room", "/alice").await.expect("publish");
-    let mut subscriber = bob.subscribe("/svs/room", "/bob").await.expect("subscribe");
+    let publisher = alice
+        .publish(ndn_packet::name!("/svs/room"), ndn_packet::name!("/alice"))
+        .await
+        .expect("publish");
+    let mut subscriber = bob
+        .subscribe(ndn_packet::name!("/svs/room"), ndn_packet::name!("/bob"))
+        .await
+        .expect("subscribe");
 
     // Let both sides register their group prefix and exchange initial state.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -152,15 +164,16 @@ async fn pinned_node_rejects_sync_patterns() {
     let node = Node::from_connection(Arc::new(InProcConnection::new(handle)));
 
     assert!(matches!(
-        node.publish("/g", "/me").await,
+        node.publish(ndn_packet::name!("/g"), ndn_packet::name!("/me"))
+            .await,
         Err(ndn_app::AppError::Unsupported(_))
     ));
     assert!(matches!(
-        node.query("/svc").await,
+        node.query(ndn_packet::name!("/svc")).await,
         Err(ndn_app::AppError::Unsupported(_))
     ));
     assert!(matches!(
-        node.serve_object("/o", "x").await,
+        node.serve_object(ndn_packet::name!("/o"), "x").await,
         Err(ndn_app::AppError::Unsupported(_))
     ));
 }

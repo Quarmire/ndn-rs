@@ -1,7 +1,7 @@
 //! NDN Name and NameComponent — re-exported from `ndn-foundation-types` so
 //! lightweight consumers can pull in name primitives without `ndn-packet`.
 
-pub use ndn_foundation_types::name::{Name, NameComponent};
+pub use ndn_foundation_types::name::{Name, NameComponent, NameError};
 
 /// Construct a [`Name`] from an NDN URI string literal.
 ///

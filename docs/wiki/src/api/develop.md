@@ -59,7 +59,7 @@ use ndn::Consumer;
 
 # async fn run() -> Result<(), ndn::AppError> {
 let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?;
-let data = consumer.fetch("/example/hello").await?;
+let data = consumer.fetch(name!("/example/hello")).await?;
 println!("got {} bytes", data.content().len());
 # Ok(()) }
 ```
@@ -89,7 +89,7 @@ use ndn::prelude::*;
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let keychain = KeyChain::ephemeral("/example")?;
 // connect registers the prefix; with_signer makes published Data signed.
-let producer = Producer::connect("/tmp/ndn-fwd.sock", "/example")
+let producer = Producer::connect("/tmp/ndn-fwd.sock", name!("/example"))
     .await?
     .with_signer(keychain.signer()?);
 producer
@@ -118,7 +118,7 @@ use ndn::prelude::*;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let keychain = KeyChain::ephemeral("/example")?;
-let producer = Producer::connect("/tmp/ndn-fwd.sock", "/example/time")
+let producer = Producer::connect("/tmp/ndn-fwd.sock", name!("/example/time"))
     .await?
     .with_signer(keychain.signer()?);
 producer.serve(|interest, responder| async move {
@@ -140,7 +140,7 @@ use ndn::prelude::*;
 use ndn::Subscriber;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let mut sub = Subscriber::connect("/tmp/ndn-fwd.sock", "/svs/chatroom").await?;
+let mut sub = Subscriber::connect("/tmp/ndn-fwd.sock", name!("/svs/chatroom")).await?;
 while let Some(sample) = sub.recv().await {
     println!("{}: {:?}", sample.publisher, sample.payload);
 }
@@ -176,7 +176,7 @@ let (_engine, _shutdown) = EngineBuilder::new(EngineConfig::default())
     .build()
     .await?;
 let mut consumer = Consumer::new(InProcConnection::from_handle(handle));
-let _ = consumer.fetch("/example/hello").await?;
+let _ = consumer.fetch(name!("/example/hello")).await?;
 # Ok(()) }
 ```
 
@@ -194,7 +194,7 @@ use ndn::prelude::*;
 // and self-signed cert.
 let keychain = KeyChain::ephemeral("/alice")?;
 // Sign a Data with that key → ready-to-send wire bytes.
-let wire = keychain.sign_data(DataBuilder::new("/alice/notes/1", b"hi"))?;
+let wire = keychain.sign_data(DataBuilder::new(name!("/alice/notes/1"), b"hi"))?;
 # Ok(()) }
 ```
 
@@ -236,7 +236,7 @@ as this tier, returning `nb::Result` rather than a future:
 ```rust,ignore
 use ndn_embedded::{Consumer, Producer};
 
-// native:   let data = consumer.fetch("/ndn/sensor/temp").await?;
+// native:   let data = consumer.fetch(name!("/ndn/sensor/temp")).await?;
 // embedded:  poll the same call (here driven to completion with nb::block!)
 let mut c: Consumer<_> = Consumer::new(&mut face, seed);
 let data: &[u8] = nb::block!(c.fetch("/ndn/sensor/temp"))?;

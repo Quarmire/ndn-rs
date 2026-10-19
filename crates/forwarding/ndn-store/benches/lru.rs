@@ -18,7 +18,8 @@ fn far_future() -> u64 {
 
 fn interest_for(name_s: &str) -> ndn_packet::Interest {
     use ndn_packet::encode::InterestBuilder;
-    let wire = InterestBuilder::new(name_s).build();
+    let wire =
+        InterestBuilder::new(name_s.parse::<ndn_packet::Name>().expect("valid NDN name")).build();
     ndn_packet::Interest::decode(wire).unwrap()
 }
 
@@ -115,7 +116,9 @@ fn bench_get_can_be_prefix(g: &mut BenchmarkGroup<criterion::measurement::WallTi
         },
     ));
     use ndn_packet::encode::InterestBuilder;
-    let wire = InterestBuilder::new("/ndn/prefix").can_be_prefix().build();
+    let wire = InterestBuilder::new(ndn_packet::name!("/ndn/prefix"))
+        .can_be_prefix()
+        .build();
     let interest = ndn_packet::Interest::decode(wire).unwrap();
     g.throughput(Throughput::Elements(1));
     g.bench_function("get_can_be_prefix", |b| {

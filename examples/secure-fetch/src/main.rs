@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     //    verify.
     let mut consumer = consumer.verifying(producer_kc.validator());
     let safe = consumer
-        .fetch("/demo/alice/thing")
+        .fetch(ndn::name!("/demo/alice/thing"))
         .await
         .map_err(|e| anyhow::anyhow!("verified fetch: {e}"))?;
     println!(
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     //    here, or the loud `.trust_unchecked()` you can grep for in review.
     let unverified = consumer
         .unverified()
-        .fetch_unverified("/demo/alice/thing")
+        .fetch_unverified(ndn::name!("/demo/alice/thing"))
         .await
         .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     match unverified.verify(consumer.validator()).await {

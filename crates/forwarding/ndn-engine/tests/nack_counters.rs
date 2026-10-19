@@ -28,14 +28,14 @@ async fn in_and_out_nacks_are_counted() {
 
     // (1) out_nacks: an Interest with no FIB route → forwarder Nacks back on the
     //     ingress face.
-    let interest = InterestBuilder::new("/unrouted/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/unrouted/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
     let _ = tokio::time::timeout(Duration::from_millis(300), handle_a.recv()).await;
 
     // (2) in_nacks: inject a Nack wire on face A.
-    let interest_wire = InterestBuilder::new("/some/interest")
+    let interest_wire = InterestBuilder::new(ndn_packet::name!("/some/interest"))
         .lifetime(Duration::from_secs(2))
         .build();
     let nack_wire = encode_lp_nack(NackReason::NoRoute, &interest_wire);

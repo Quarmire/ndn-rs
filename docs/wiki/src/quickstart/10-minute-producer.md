@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let validator = keychain.validator();
 
     // fetch_verified returns SafeData only if the signature checks out.
-    let safe = consumer.fetch_verified("/example/hello", &validator).await?;
+    let safe = consumer.fetch_verified(name!("/example/hello"), &validator).await?;
     println!("{}", String::from_utf8_lossy(safe.data().content().unwrap_or_default()));
     Ok(())
 }

@@ -193,7 +193,7 @@ mod tests {
     async fn in_proc_recv_with_meta_surfaces_source_as_incoming_face_id() {
         let (face, handle) = InProcFace::new(FaceId(7), 4);
         // Engine side delivers a Data tagged with the face it arrived on.
-        let data = DataBuilder::new("/m/d", b"x").sign_digest_sha256();
+        let data = DataBuilder::new(ndn_packet::name!("/m/d"), b"x").sign_digest_sha256();
         face.send_bytes_with_source(data, FaceId(42)).await.unwrap();
 
         let conn = InProcConnection::new(handle);

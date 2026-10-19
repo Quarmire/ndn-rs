@@ -148,7 +148,7 @@ mod tests {
 
     fn make_ctx_with_freshness(name: &str, verified: bool) -> PacketContext {
         let n: Name = name.parse().unwrap();
-        let wire = DataBuilder::new(name, b"x")
+        let wire = DataBuilder::new(n.clone(), b"x")
             .freshness(std::time::Duration::from_secs(60))
             .sign_sync(SignatureType::DigestSha256, None, |_| {
                 Bytes::from_static(&[0u8; 32])
@@ -345,7 +345,7 @@ mod tests {
             ndn_runtime::default_runtime(),
         );
 
-        let wire = DataBuilder::new("/test/d12/signed", b"content")
+        let wire = DataBuilder::new(ndn_packet::name!("/test/d12/signed"), b"content")
             .freshness(std::time::Duration::from_secs(60))
             .sign_sync(SignatureType::SignatureEd25519, Some(&key_name), |region| {
                 signer.sign_sync(region).unwrap()
@@ -393,7 +393,7 @@ mod tests {
             ndn_runtime::default_runtime(),
         );
 
-        let wire = DataBuilder::new("/test/d12/bogus", b"content").sign_sync(
+        let wire = DataBuilder::new(ndn_packet::name!("/test/d12/bogus"), b"content").sign_sync(
             SignatureType::SignatureEd25519,
             Some(&key_name),
             |_| Bytes::from(vec![0u8; 64]),
@@ -418,7 +418,7 @@ mod tests {
         let validation = ValidationStage::disabled();
         let (stage, cs) = make_insert_stage();
 
-        let wire = DataBuilder::new("/test/d12/network-novalidator", b"x")
+        let wire = DataBuilder::new(ndn_packet::name!("/test/d12/network-novalidator"), b"x")
             .freshness(std::time::Duration::from_secs(60))
             .sign_sync(SignatureType::DigestSha256, None, |_| {
                 Bytes::from_static(&[0u8; 32])

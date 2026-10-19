@@ -372,8 +372,10 @@ impl ForwarderClient {
         if self.dead.load(Ordering::Relaxed) {
             return false;
         }
-        let probe = ndn_packet::encode::InterestBuilder::new("/localhost/nfd/status/general")
-            .sign_digest_sha256();
+        let probe = ndn_packet::encode::InterestBuilder::new(ndn_packet::name!(
+            "/localhost/nfd/status/general"
+        ))
+        .sign_digest_sha256();
         match self.control.send_bytes(probe).await {
             Ok(_) => true,
             Err(_) => {

@@ -154,14 +154,14 @@ async fn n08_admit_all_caches_unsolicited_data_served_from_cs() {
         .expect("engine build");
 
     // Unsolicited Data on face B (no pending Interest). Fresh so it is admissible.
-    let data = DataBuilder::new("/u/obj", b"payload")
+    let data = DataBuilder::new(ndn_packet::name!("/u/obj"), b"payload")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Consumer Interest on face A with NO route → only a CS hit can answer it.
-    let interest = InterestBuilder::new("/u/obj")
+    let interest = InterestBuilder::new(ndn_packet::name!("/u/obj"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -187,13 +187,13 @@ async fn n08_drop_all_does_not_cache_unsolicited_data() {
         .await
         .expect("engine build");
 
-    let data = DataBuilder::new("/u/obj2", b"payload")
+    let data = DataBuilder::new(ndn_packet::name!("/u/obj2"), b"payload")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let interest = InterestBuilder::new("/u/obj2")
+    let interest = InterestBuilder::new(ndn_packet::name!("/u/obj2"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -223,7 +223,7 @@ async fn n08_admit_local_only_caches_local_unsolicited_data() {
         .await
         .expect("engine build");
 
-    let local_data = DataBuilder::new("/u/local", b"local")
+    let local_data = DataBuilder::new(ndn_packet::name!("/u/local"), b"local")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     local_handle
@@ -231,7 +231,7 @@ async fn n08_admit_local_only_caches_local_unsolicited_data() {
         .await
         .expect("inject local data");
 
-    let network_data = DataBuilder::new("/u/network", b"network")
+    let network_data = DataBuilder::new(ndn_packet::name!("/u/network"), b"network")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     network_handle
@@ -242,7 +242,7 @@ async fn n08_admit_local_only_caches_local_unsolicited_data() {
 
     handle_a
         .send(
-            InterestBuilder::new("/u/local")
+            InterestBuilder::new(ndn_packet::name!("/u/local"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -255,7 +255,7 @@ async fn n08_admit_local_only_caches_local_unsolicited_data() {
 
     handle_a
         .send(
-            InterestBuilder::new("/u/network")
+            InterestBuilder::new(ndn_packet::name!("/u/network"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -287,7 +287,7 @@ async fn n08_admit_network_only_caches_network_unsolicited_data() {
         .await
         .expect("engine build");
 
-    let local_data = DataBuilder::new("/u/local2", b"local")
+    let local_data = DataBuilder::new(ndn_packet::name!("/u/local2"), b"local")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     local_handle
@@ -295,7 +295,7 @@ async fn n08_admit_network_only_caches_network_unsolicited_data() {
         .await
         .expect("inject local data");
 
-    let network_data = DataBuilder::new("/u/network2", b"network")
+    let network_data = DataBuilder::new(ndn_packet::name!("/u/network2"), b"network")
         .freshness(Duration::from_secs(60))
         .sign_digest_sha256();
     network_handle
@@ -306,7 +306,7 @@ async fn n08_admit_network_only_caches_network_unsolicited_data() {
 
     handle_a
         .send(
-            InterestBuilder::new("/u/local2")
+            InterestBuilder::new(ndn_packet::name!("/u/local2"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -320,7 +320,7 @@ async fn n08_admit_network_only_caches_network_unsolicited_data() {
 
     handle_a
         .send(
-            InterestBuilder::new("/u/network2")
+            InterestBuilder::new(ndn_packet::name!("/u/network2"))
                 .lifetime(Duration::from_secs(2))
                 .build(),
         )
@@ -348,7 +348,7 @@ async fn n09_no_route_nack_suppressed_on_multi_access_ingress() {
         .await
         .expect("engine build");
 
-    let interest = InterestBuilder::new("/n09/no-route")
+    let interest = InterestBuilder::new(ndn_packet::name!("/n09/no-route"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -380,7 +380,7 @@ async fn n09_incoming_nack_on_multi_access_face_is_ignored() {
     let prefix: Name = "/n09".parse().unwrap();
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
-    let interest = InterestBuilder::new("/n09/item")
+    let interest = InterestBuilder::new(ndn_packet::name!("/n09/item"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -420,7 +420,7 @@ async fn data_not_echoed_back_out_point_to_point_ingress() {
     let prefix: Name = "/echo".parse().unwrap();
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
-    let interest = InterestBuilder::new("/echo/x")
+    let interest = InterestBuilder::new(ndn_packet::name!("/echo/x"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -429,7 +429,7 @@ async fn data_not_echoed_back_out_point_to_point_ingress() {
 
     // Data arrives on face A — the same face that holds the PIT in-record.
     // The carve-out must suppress echoing it back out A (point-to-point).
-    let data = DataBuilder::new("/echo/x", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/echo/x"), b"payload").sign_digest_sha256();
     handle_a.send(data).await.expect("inject data");
     let got = recv_timeout(&handle_a).await;
     assert!(
@@ -460,13 +460,13 @@ async fn data_echoed_back_out_adhoc_ingress() {
     let prefix: Name = "/echo".parse().unwrap();
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
-    let interest = InterestBuilder::new("/echo/x")
+    let interest = InterestBuilder::new(ndn_packet::name!("/echo/x"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
     let _ = recv_timeout(&handle_b).await;
 
-    let data = DataBuilder::new("/echo/x", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/echo/x"), b"payload").sign_digest_sha256();
     handle_a.send(data).await.expect("inject data");
     let got = recv_timeout(&handle_a).await;
     assert!(

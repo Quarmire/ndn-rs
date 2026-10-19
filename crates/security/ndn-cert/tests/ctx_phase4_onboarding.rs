@@ -111,7 +111,7 @@ async fn ctx01_adopt_to_verify_no_ca() {
 
     // Verify a Bob-signed Data — no CA was ever contacted.
     let signer = root_dev.mgr.get_signer_sync(&root_dev.anchor_key).unwrap();
-    let wire = DataBuilder::new("/home/bob/note", b"hello").sign_sync(
+    let wire = DataBuilder::new(ndn_packet::name!("/home/bob/note"), b"hello").sign_sync(
         signer.sig_type(),
         Some(&root_dev.anchor_key),
         |r| signer.sign_sync(r).unwrap_or_default(),

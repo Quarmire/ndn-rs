@@ -56,7 +56,7 @@ async fn client_over_socketpair_fetches_from_engine() {
     let cancel = CancellationToken::new();
 
     // A producer serving /seam/test, embedded in the engine process.
-    let producer = engine.register_producer("/seam/test", cancel.child_token());
+    let producer = engine.register_producer(ndn_packet::name!("/seam/test"), cancel.child_token());
     tokio::spawn(async move {
         let _ = producer
             .serve(|interest, responder| async move {
@@ -80,7 +80,7 @@ async fn client_over_socketpair_fetches_from_engine() {
 
     // The Interest crosses the seam → engine → producer → Data back across it.
     let data = consumer
-        .fetch("/seam/test/hello")
+        .fetch(ndn_packet::name!("/seam/test/hello"))
         .await
         .expect("fetch across the IPC seam");
 

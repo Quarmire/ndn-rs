@@ -26,7 +26,7 @@ Connects application processes to the NDN forwarder over Unix sockets, with an o
 use ndn_ipc::RouterClient;
 
 let client = RouterClient::connect("/run/nfd/nfd.sock").await?;
-client.register_prefix("/myapp/data").await?;
+client.register_prefix(&"/myapp/data".parse()?).await?;
 ```
 
 Part of the [ndn-rs](../../README.md) workspace.

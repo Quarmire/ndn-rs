@@ -136,7 +136,7 @@ fn write_fields<B: BufMut>(
 /// ```
 /// # use ndn_packet::encode::DataBuilder;
 /// # use std::time::Duration;
-/// let wire = DataBuilder::new("/test", b"hello")
+/// let wire = DataBuilder::new(ndn_packet::name!("/test"), b"hello")
 ///     .freshness(Duration::from_secs(10))
 ///     .build();
 /// ```
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn data_builder_basic() {
-        let wire = DataBuilder::new("/test", b"hello").build();
+        let wire = DataBuilder::new(crate::name!("/test"), b"hello").build();
         let data = Data::decode(wire).unwrap();
         assert_eq!(data.name.to_string(), "/test");
         assert_eq!(data.content().map(|b| b.as_ref()), Some(b"hello".as_ref()));
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn data_builder_freshness() {
-        let wire = DataBuilder::new("/test", b"x")
+        let wire = DataBuilder::new(crate::name!("/test"), b"x")
             .freshness(Duration::from_secs(60))
             .build();
         let data = Data::decode(wire).unwrap();
@@ -628,7 +628,7 @@ mod tests {
         use crate::meta_info::ContentType;
         // ContentType=6 (ndn-svs "encapsulated Data" marker), the first
         // MetaInfo field, alongside freshness + FinalBlockId.
-        let wire = DataBuilder::new("/test", b"inner")
+        let wire = DataBuilder::new(crate::name!("/test"), b"inner")
             .content_type(ContentType::Other(6))
             .freshness(Duration::from_secs(4))
             .final_block_id_typed_seg(2)
@@ -647,10 +647,10 @@ mod tests {
         // Identical builders each call (DataBuilder isn't Clone); zip → pairs.
         let mk = || -> Vec<DataBuilder> {
             vec![
-                DataBuilder::new("/test", b"hello"),
-                DataBuilder::new("/a/b/c", b""),
-                DataBuilder::new("/x", &[0xABu8; 5000]),
-                DataBuilder::new("/t", b"inner")
+                DataBuilder::new(crate::name!("/test"), b"hello"),
+                DataBuilder::new(crate::name!("/a/b/c"), b""),
+                DataBuilder::new(crate::name!("/x"), &[0xABu8; 5000]),
+                DataBuilder::new(crate::name!("/t"), b"inner")
                     .content_type(ContentType::Other(6))
                     .freshness(Duration::from_secs(4))
                     .final_block_id_typed_seg(2),
@@ -677,7 +677,7 @@ mod tests {
         use crate::meta_info::ContentType;
         // ContentType present but no freshness/FinalBlockId must still
         // produce a MetaInfo block.
-        let wire = DataBuilder::new("/t", b"")
+        let wire = DataBuilder::new(crate::name!("/t"), b"")
             .content_type(ContentType::Other(6))
             .build();
         let data = Data::decode(wire).unwrap();
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn default_content_type_omits_metainfo() {
         // No content_type set → Blob default → no MetaInfo on the wire.
-        let wire = DataBuilder::new("/t", b"x").build();
+        let wire = DataBuilder::new(crate::name!("/t"), b"x").build();
         let data = Data::decode(wire).unwrap();
         assert!(
             data.meta_info().is_none(),
@@ -706,7 +706,7 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
 
         let key_name: Name = "/key/test".parse().unwrap();
-        let fut = DataBuilder::new("/signed/data", b"payload")
+        let fut = DataBuilder::new(crate::name!("/signed/data"), b"payload")
             .freshness(Duration::from_secs(10))
             .sign(
                 SignatureType::SignatureEd25519,
@@ -757,7 +757,7 @@ mod tests {
         // Async path
         let mut cx = Context::from_waker(Waker::noop());
 
-        let fut = DataBuilder::new("/signed/data", b"payload")
+        let fut = DataBuilder::new(crate::name!("/signed/data"), b"payload")
             .freshness(Duration::from_secs(10))
             .sign(
                 SignatureType::SignatureEd25519,
@@ -778,7 +778,7 @@ mod tests {
         };
 
         // Sync path
-        let sync_wire = DataBuilder::new("/signed/data", b"payload")
+        let sync_wire = DataBuilder::new(crate::name!("/signed/data"), b"payload")
             .freshness(Duration::from_secs(10))
             .sign_sync(SignatureType::SignatureEd25519, Some(&key_name), sign_fn);
 
@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn data_builder_sign_sync_no_freshness() {
         let key_name: Name = "/key/test".parse().unwrap();
-        let wire = DataBuilder::new("/test", b"content").sign_sync(
+        let wire = DataBuilder::new(crate::name!("/test"), b"content").sign_sync(
             SignatureType::SignatureEd25519,
             Some(&key_name),
             |region| {
@@ -817,7 +817,7 @@ mod tests {
     /// `build()` must emit a real `SHA-256(signed region)`, not zero bytes.
     #[test]
     fn a10_databuilder_build_emits_real_sha256() {
-        let wire = DataBuilder::new("/test", b"hello").build();
+        let wire = DataBuilder::new(crate::name!("/test"), b"hello").build();
         let data = Data::decode(wire).expect("Data must decode");
 
         let signed = data.signed_region();
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn wire_data_builder_no_freshness_omits_metainfo() {
-        let wire = DataBuilder::new("/A", b"X").build();
+        let wire = DataBuilder::new(crate::name!("/A"), b"X").build();
 
         assert_eq!(wire[0], 0x06);
         assert_eq!(
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn wire_data_builder_freshness_nni() {
-        let wire = DataBuilder::new("/A", b"X")
+        let wire = DataBuilder::new(crate::name!("/A"), b"X")
             .freshness(Duration::from_secs(10))
             .build();
 
@@ -873,7 +873,7 @@ mod tests {
 
         let mut cx = Context::from_waker(Waker::noop());
 
-        let fut = DataBuilder::new("/A", b"X").sign(
+        let fut = DataBuilder::new(crate::name!("/A"), b"X").sign(
             SignatureType::SignatureEd25519,
             None,
             |_: &[u8]| std::future::ready(Bytes::from_static(&[0xFF; 64])),

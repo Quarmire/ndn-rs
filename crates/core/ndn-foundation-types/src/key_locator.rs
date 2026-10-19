@@ -7,7 +7,7 @@ use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::codec::TlvCodecError;
-use crate::name::{Name, NameError};
+use crate::name::Name;
 use crate::tlv_type;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,8 +49,8 @@ impl KeyLocator {
         let (kt, kv) = inner.read_tlv()?;
         match kt {
             t if t == tlv_type::NAME => {
-                let name = Name::decode(kv)
-                    .map_err(|NameError(_)| TlvCodecError::MalformedField(tlv_type::NAME))?;
+                let name =
+                    Name::decode(kv).map_err(|_| TlvCodecError::MalformedField(tlv_type::NAME))?;
                 Ok(KeyLocator::Name(Box::new(name)))
             }
             t if t == tlv_type::KEY_DIGEST => Ok(KeyLocator::KeyDigest(kv)),

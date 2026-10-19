@@ -540,7 +540,7 @@ mod tests {
         use crate::SigningInfo;
         use ndn_packet::{Data, SignatureType, encode::DataBuilder};
         let kc = KeyChain::ephemeral("/com/example/alice").unwrap();
-        let builder = DataBuilder::new("/com/example/alice/test", b"body");
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/alice/test"), b"body");
         let wire = kc
             .sign_packet(builder, &SigningInfo::digest_sha256())
             .expect("digest sign_packet must succeed");
@@ -560,7 +560,7 @@ mod tests {
         use ndn_packet::{Data, SignatureType, encode::DataBuilder};
         let kc = KeyChain::ephemeral("/com/example/bob").unwrap();
         let identity = kc.name().clone();
-        let builder = DataBuilder::new("/com/example/bob/data", b"payload");
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/bob/data"), b"payload");
         let wire = kc
             .sign_packet(builder, &SigningInfo::identity(identity))
             .expect("identity sign_packet must succeed");
@@ -587,7 +587,7 @@ mod tests {
         use ndn_packet::encode::DataBuilder;
         let kc = KeyChain::ephemeral("/com/example/alice").unwrap();
         let other: Name = "/com/example/bob".parse().unwrap();
-        let builder = DataBuilder::new("/com/example/alice/data", b"body");
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/alice/data"), b"body");
         let err = kc.sign_packet(builder, &SigningInfo::identity(other));
         assert!(
             matches!(err, Err(TrustError::KeyStore(_))),
@@ -661,7 +661,7 @@ mod tests {
         let cert_name = (*cert.name).clone();
         let kc = KeyChain::from_parts(mgr, identity.clone(), key_name);
 
-        let builder = DataBuilder::new("/test/s12/cert/d", b"body");
+        let builder = DataBuilder::new(ndn_packet::name!("/test/s12/cert/d"), b"body");
         let wire = kc
             .sign_packet(builder, &SigningInfo::cert(cert_name))
             .expect("cert sign_packet must succeed");
@@ -676,7 +676,7 @@ mod tests {
         use ndn_packet::{Data, encode::DataBuilder};
         let kc = KeyChain::ephemeral("/com/example/dave").unwrap();
         let for_name: Name = "/com/example/dave/some/data".parse().unwrap();
-        let builder = DataBuilder::new("/com/example/dave/d", b"body");
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/dave/d"), b"body");
         let wire = kc
             .sign_packet(builder, &SigningInfo::suggested(for_name))
             .expect("suggested sign_packet must succeed");
@@ -750,7 +750,7 @@ mod tests {
         use ndn_packet::encode::DataBuilder;
         let kc = KeyChain::ephemeral("/com/example/eve").unwrap();
         let ghost: Name = "/com/example/ghost/KEY/x".parse().unwrap();
-        let builder = DataBuilder::new("/com/example/eve/d", b"body");
+        let builder = DataBuilder::new(ndn_packet::name!("/com/example/eve/d"), b"body");
         let err = kc.sign_packet(builder, &SigningInfo::key(ghost));
         assert!(
             matches!(err, Err(TrustError::CertNotFound { .. })),
@@ -765,7 +765,7 @@ mod tests {
         use ndn_packet::{Interest, encode::InterestBuilder};
         let kc = KeyChain::ephemeral("/com/example/frank").unwrap();
         let identity = kc.name().clone();
-        let builder = InterestBuilder::new("/com/example/frank/x");
+        let builder = InterestBuilder::new(ndn_packet::name!("/com/example/frank/x"));
         let wire = kc
             .sign_packet(builder, &SigningInfo::identity(identity))
             .expect("interest sign_packet must succeed");

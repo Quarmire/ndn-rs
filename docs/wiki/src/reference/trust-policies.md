@@ -38,7 +38,7 @@ use ndn_security::{TrustSchema, Validator};
 let validator = Validator::new(TrustSchema::hierarchical());
 let mut consumer = Consumer::connect("/tmp/ndn-fwd.sock").await?
     .verifying(validator);
-let _safe = consumer.fetch("/lab/alice/notes/2026-05-20").await?; // SafeData
+let _safe = consumer.fetch(name!("/lab/alice/notes/2026-05-20")).await?; // SafeData
 # Ok(()) }
 ```
 

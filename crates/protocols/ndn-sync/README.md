@@ -35,7 +35,7 @@ let (handle, mut updates) = join_svs_group(app_handle, SvsConfig {
 }).await?;
 
 // Publish
-handle.publish("/ndn/chat/alice/msg/1").await?;
+handle.publish("/ndn/chat/alice/msg/1".parse()?).await?;
 
 // Receive
 while let Some(update) = updates.recv().await {

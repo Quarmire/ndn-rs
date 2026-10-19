@@ -73,7 +73,7 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
 
     let manager = Arc::new(manager);
 
-    let challenge = build_challenge(&config.factory_credential, &key_name);
+    let challenge = build_challenge(&config.factory_credential, &key_name)?;
 
     // ZTP path assumes a system NDN router. Custom transports should call
     // `NdncertClient` directly.
@@ -123,8 +123,11 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
     Ok(Identity::from_keychain(keychain, renewal))
 }
 
-fn build_challenge(credential: &FactoryCredential, _key_name: &Name) -> ChallengeParams {
-    match credential {
+fn build_challenge(
+    credential: &FactoryCredential,
+    _key_name: &Name,
+) -> Result<ChallengeParams, IdentityError> {
+    Ok(match credential {
         FactoryCredential::Token(token) => ChallengeParams::Token {
             token: token.clone(),
         },
@@ -142,19 +145,17 @@ fn build_challenge(credential: &FactoryCredential, _key_name: &Name) -> Challeng
             key_seed,
         } => {
             use ndn_security::{Ed25519Signer, Signer};
-            let signer = Ed25519Signer::from_seed(
-                key_seed,
-                cert_name
-                    .parse()
-                    .unwrap_or_else(|_| ndn_packet::Name::root()),
-            );
+            let key_name: Name = cert_name.parse().map_err(|e| {
+                IdentityError::Name(format!("factory certificate name {cert_name:?}: {e}"))
+            })?;
+            let signer = Ed25519Signer::from_seed(key_seed, key_name);
             let sig = signer.sign_sync(cert_name.as_bytes()).unwrap_or_default();
             ChallengeParams::Possession {
                 cert_name: cert_name.clone(),
                 signature: sig.to_vec(),
             }
         }
-    }
+    })
 }
 
 fn derive_ca_prefix(namespace: &Name) -> Name {

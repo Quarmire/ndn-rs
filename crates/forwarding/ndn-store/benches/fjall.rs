@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ndn_packet::{Name, NameComponent};
+use ndn_packet::Name;
 use ndn_store::{ContentStore, CsMeta, FjallCs};
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
@@ -16,7 +16,8 @@ fn far_future() -> u64 {
 
 fn interest_for(name_s: &str) -> ndn_packet::Interest {
     use ndn_packet::encode::InterestBuilder;
-    let wire = InterestBuilder::new(name_s).build();
+    let wire =
+        InterestBuilder::new(name_s.parse::<ndn_packet::Name>().expect("valid NDN name")).build();
     ndn_packet::Interest::decode(wire).unwrap()
 }
 

@@ -68,14 +68,14 @@ async fn consumer_receives_data(require_validation: bool) -> bool {
         .add_nexthop(&"/sec".parse::<Name>().unwrap(), FaceId(FACE_B), 0);
 
     // Consumer A Interest → forwarded to producer B (PIT entry in).
-    let interest = InterestBuilder::new("/sec/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/sec/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
     let _ = recv_timeout(&handle_b).await; // drain forwarded Interest at B
 
     // Producer B Data. No validator is configured, so it cannot be validated.
-    let data = DataBuilder::new("/sec/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/sec/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
 
     let got = recv_timeout(&handle_a).await.as_ref().is_some_and(is_data);

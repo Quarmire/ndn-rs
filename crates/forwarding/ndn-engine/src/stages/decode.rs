@@ -605,7 +605,7 @@ mod content_sha256_tests {
     }
 
     fn build_data_wire(content: &[u8]) -> bytes::Bytes {
-        DataBuilder::new("/test/content-sha256", content).sign_sync(
+        DataBuilder::new(ndn_packet::name!("/test/content-sha256"), content).sign_sync(
             SignatureType::DigestSha256,
             None,
             |_| bytes::Bytes::from(vec![0u8; 32]),
@@ -782,8 +782,10 @@ mod reassembly_endpoint_tests {
     fn n02_distinct_endpoints_isolate_overlapping_sequences() {
         let s = stage();
         let face = FaceId(7);
-        let a = DataBuilder::new("/peer/a", &vec![0xAA; 300]).sign_digest_sha256();
-        let b = DataBuilder::new("/peer/b", &vec![0xBB; 300]).sign_digest_sha256();
+        let a =
+            DataBuilder::new(ndn_packet::name!("/peer/a"), &vec![0xAA; 300]).sign_digest_sha256();
+        let b =
+            DataBuilder::new(ndn_packet::name!("/peer/b"), &vec![0xBB; 300]).sign_digest_sha256();
         let fa = fragment_packet(&a, 100, 0);
         let fb = fragment_packet(&b, 100, 0);
         assert!(fa.len() > 1 && fb.len() > 1, "both must be multi-fragment");
@@ -815,7 +817,8 @@ mod reassembly_endpoint_tests {
     fn n02_decode_inbound_reassembles_then_decodes() {
         let s = stage();
         let face = FaceId(9);
-        let data = DataBuilder::new("/peer/c", &vec![0xCC; 300]).sign_digest_sha256();
+        let data =
+            DataBuilder::new(ndn_packet::name!("/peer/c"), &vec![0xCC; 300]).sign_digest_sha256();
         let frags = fragment_packet(&data, 100, 0);
         assert!(frags.len() > 1, "fixture must be multi-fragment");
 
@@ -842,8 +845,10 @@ mod reassembly_endpoint_tests {
 
         let s = stage();
         let face = FaceId(11);
-        let data_a = DataBuilder::new("/peer/udp-a", &vec![0xA1; 300]).sign_digest_sha256();
-        let data_b = DataBuilder::new("/peer/udp-b", &vec![0xB2; 300]).sign_digest_sha256();
+        let data_a = DataBuilder::new(ndn_packet::name!("/peer/udp-a"), &vec![0xA1; 300])
+            .sign_digest_sha256();
+        let data_b = DataBuilder::new(ndn_packet::name!("/peer/udp-b"), &vec![0xB2; 300])
+            .sign_digest_sha256();
         let frags_a = fragment_packet(&data_a, 100, 0);
         let frags_b = fragment_packet(&data_b, 100, 0);
         assert!(

@@ -67,7 +67,7 @@ async fn partitioned_n1_forwards_interest_and_satisfies_data() {
     engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
 
     // Consumer (face A) Interest → forwarded to producer (face B), PIT entry in.
-    let interest = InterestBuilder::new("/conf/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/conf/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -80,7 +80,7 @@ async fn partitioned_n1_forwards_interest_and_satisfies_data() {
     );
 
     // Producer (face B) Data → satisfies the PIT, delivered to consumer (face A).
-    let data = DataBuilder::new("/conf/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/conf/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     assert!(
         recv_timeout(&handle_a)
@@ -113,7 +113,7 @@ async fn partitioned_n4_forwards_interest_and_satisfies_data() {
         .fib()
         .add_nexthop(&"/conf".parse::<Name>().unwrap(), FaceId(FACE_B), 0);
 
-    let interest = InterestBuilder::new("/conf/data")
+    let interest = InterestBuilder::new(ndn_packet::name!("/conf/data"))
         .lifetime(Duration::from_secs(2))
         .build();
     handle_a.send(interest).await.expect("inject interest");
@@ -125,7 +125,7 @@ async fn partitioned_n4_forwards_interest_and_satisfies_data() {
         "partitioned (N=4): Interest must reach the producer face"
     );
 
-    let data = DataBuilder::new("/conf/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/conf/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     assert!(
         recv_timeout(&handle_a)
@@ -164,7 +164,7 @@ async fn partitioned_aggregates_same_name_across_workers() {
         .add_nexthop(&"/conf".parse::<Name>().unwrap(), FaceId(FACE_B), 0);
 
     let mk = || {
-        InterestBuilder::new("/conf/data")
+        InterestBuilder::new(ndn_packet::name!("/conf/data"))
             .lifetime(Duration::from_secs(2))
             .build()
     };
@@ -188,7 +188,7 @@ async fn partitioned_aggregates_same_name_across_workers() {
     );
 
     // One Data satisfies both downstream faces.
-    let data = DataBuilder::new("/conf/data", b"payload").sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/conf/data"), b"payload").sign_digest_sha256();
     handle_b.send(data).await.expect("inject data");
     assert!(
         recv_timeout(&handle_a)

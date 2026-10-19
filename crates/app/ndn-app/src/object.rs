@@ -7,15 +7,16 @@
 //!
 //! ```no_run
 //! # use ndn_app::Node;
+//! # use ndn_app::prelude::name;
 //! # use std::sync::Arc;
 //! # async fn run(node: Node, validator: ndn_security::Validator) -> Result<(), Box<dyn std::error::Error>> {
 //! // simple
-//! let bytes = node.object("/alice/photo").fetch().await?;
+//! let bytes = node.object(name!("/alice/photo")).fetch().await?;
 //!
 //! // verified + forwarding hint + a progress bar
-//! let bytes = node.object("/alice/photo")
+//! let bytes = node.object(name!("/alice/photo"))
 //!     .verify(validator)
-//!     .hint(["/gateway"])
+//!     .hint([name!("/gateway")])
 //!     .progress(|done, total| eprintln!("{done}/{total}"))
 //!     .fetch().await?;
 //! # let _ = bytes; Ok(()) }

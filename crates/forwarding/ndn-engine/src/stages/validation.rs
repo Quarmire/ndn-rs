@@ -455,11 +455,13 @@ mod tests {
             ndn_runtime::default_runtime(),
         );
 
-        let wire = DataBuilder::new("/localhost/nfd/status/general", b"forged").sign_sync(
-            SignatureType::DigestSha256,
-            None,
-            |_| Bytes::from_static(&[0u8; 32]),
-        );
+        let wire = DataBuilder::new(
+            ndn_packet::name!("/localhost/nfd/status/general"),
+            b"forged",
+        )
+        .sign_sync(SignatureType::DigestSha256, None, |_| {
+            Bytes::from_static(&[0u8; 32])
+        });
         let data = Data::decode(wire.clone()).unwrap();
         let mut ctx = PacketContext::new(wire, FaceId(1), 0);
         ctx.name = Some(Arc::clone(&data.name));

@@ -64,7 +64,7 @@ async fn consumer_fetch_verified_yields_safedata() {
 
     // The safe path: fetch + verify against the pinned anchor → SafeData.
     let safe = consumer
-        .fetch_verified("/demo/alice/thing", &validator)
+        .fetch_verified(ndn_packet::name!("/demo/alice/thing"), &validator)
         .await
         .expect("verified fetch yields SafeData");
     assert_eq!(
@@ -75,7 +75,7 @@ async fn consumer_fetch_verified_yields_safedata() {
     // The explicit-unverified surface forces a choice — you can't get a usable
     // value without `.verify()` (here) or a loud `.trust_unchecked()`.
     let unverified = consumer
-        .fetch_unverified("/demo/alice/thing")
+        .fetch_unverified(ndn_packet::name!("/demo/alice/thing"))
         .await
         .expect("fetch");
     assert!(
@@ -126,7 +126,10 @@ async fn verifying_consumer_short_verb_returns_safedata() {
 
     // Configure the validator once; the short verb is now safe.
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
-    let safe = consumer.fetch("/demo/bob/thing").await.expect("verified");
+    let safe = consumer
+        .fetch(ndn_packet::name!("/demo/bob/thing"))
+        .await
+        .expect("verified");
     assert_eq!(
         safe.data().content().map(|c| c.to_vec()),
         Some(b"signed".to_vec())
@@ -171,7 +174,10 @@ async fn signing_producer_short_verb_respond_is_verified() {
     });
 
     let mut consumer = Consumer::from_handle(consumer_handle).verifying(producer_kc.validator());
-    let safe = consumer.fetch("/demo/carol/thing").await.expect("verified");
+    let safe = consumer
+        .fetch(ndn_packet::name!("/demo/carol/thing"))
+        .await
+        .expect("verified");
     assert_eq!(
         safe.data().content().map(|c| c.to_vec()),
         Some(b"dynamic".to_vec())

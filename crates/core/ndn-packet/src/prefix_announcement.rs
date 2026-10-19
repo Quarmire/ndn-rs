@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn rejects_data_without_pa_keyword() {
-        let data = DataBuilder::new("/app/svc/data", b"x").sign_digest_sha256();
+        let data = DataBuilder::new(crate::name!("/app/svc/data"), b"x").sign_digest_sha256();
         assert!(PrefixAnnouncement::decode(data).is_err());
     }
 }

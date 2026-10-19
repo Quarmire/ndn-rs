@@ -67,7 +67,7 @@ async fn next_hop_face_id_gated_on_local_fields() {
 
     // (1) Default: LocalFields off on the ingress face → NextHopFaceId ignored,
     //     Interest follows the FIB to C, not the pinned face B.
-    let i1 = InterestBuilder::new("/nh/off")
+    let i1 = InterestBuilder::new(ndn_packet::name!("/nh/off"))
         .lifetime(Duration::from_secs(2))
         .pin_face(FACE_B)
         .build();
@@ -87,7 +87,7 @@ async fn next_hop_face_id_gated_on_local_fields() {
     // (2) Enable LocalFields on the ingress face → NextHopFaceId honoured,
     //     overriding the FIB: the Interest goes to the pinned face B.
     engine.set_local_fields(FaceId(FACE_A), true);
-    let i2 = InterestBuilder::new("/nh/on")
+    let i2 = InterestBuilder::new(ndn_packet::name!("/nh/on"))
         .lifetime(Duration::from_secs(2))
         .pin_face(FACE_B)
         .build();

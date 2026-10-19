@@ -79,8 +79,10 @@ let node = Node::connect("/run/ndn-fwd/ndn-fwd.sock").await?;
 Interest. Serving stops when the returned guard drops.
 
 ```rust,ignore
+use ndn::prelude::name;
+
 # async fn serve(node: ndn::Node) -> anyhow::Result<()> {
-let _guard = node.serve("/alice/clock", |interest, reply| async move {
+let _guard = node.serve(name!("/alice/clock"), |interest, reply| async move {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -129,7 +131,7 @@ use ndn::security::{Certificate, TrustSchema};
 let validator = Validator::new(TrustSchema::hierarchical());
 validator.add_trust_anchor(alice_cert);
 
-let safe = node.verifying(validator).fetch("/alice/notes/today").await?;
+let safe = node.verifying(validator).fetch(ndn::name!("/alice/notes/today")).await?;
 println!("{}", String::from_utf8_lossy(safe.data().content().unwrap_or_default()));
 # Ok(()) }
 ```
@@ -145,11 +147,13 @@ If `/alice` is one publisher in a multi-publisher feed, use the sync
 patterns — both run on the same `Node`:
 
 ```rust,ignore
+use ndn::prelude::name;
+
 # async fn sub(node: ndn::Node) -> anyhow::Result<()> {
-let publisher = node.publish("/team/notes", "/alice").await?;
+let publisher = node.publish(name!("/team/notes"), name!("/alice")).await?;
 publisher.put(b"buy milk").await?;
 
-let mut sub = node.subscribe("/team/notes", "/alice").await?;
+let mut sub = node.subscribe(name!("/team/notes"), name!("/alice")).await?;
 while let Some(sample) = sub.recv().await {
     println!("{}: {:?}", sample.publisher, sample.payload);
 }
