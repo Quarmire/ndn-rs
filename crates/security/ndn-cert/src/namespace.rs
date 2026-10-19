@@ -26,17 +26,18 @@ use ndn_security::{
 };
 use ndn_trust_envelope::TrustEnvelope;
 
-use crate::ca::serialize_cert;
+use crate::ca::{deserialize_cert, serialize_cert};
 use crate::ca_policy::NamespacePolicies;
 use crate::context_store::{
-    ContextStoreError, context_file_path, persist_context, remove_stored_context,
+    ContextStoreError, context_file_path, namespace_hex, persist_context, remove_stored_context,
 };
 use crate::onboarding::anchor_fingerprint;
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
-/// Directory (under the PIB root) holding the root device's certificate Data wires
-/// (CA, root anchor, primary device) and the CA's persistent state.
+/// Directory (under the PIB root) of the CAs a root device runs: each
+/// CA's certificate Data wires (CA, root anchor, primary device) and its
+/// persistent state, in the CA's own directory ([`ca_dir`]).
 pub const CA_DIR: &str = "ca";
 /// The CA signing cert (issued by the namespace root), as raw signed Data TLV.
 pub const CA_CERT_FILE: &str = "ca-cert.data";
@@ -64,6 +65,41 @@ pub fn ca_key_name(namespace: &Name) -> Name {
 /// The primary device's signing key name: `<device identity>/KEY/device`.
 pub fn device_key_name(device_identity: &Name) -> Name {
     device_identity.clone().append("KEY").append("device")
+}
+
+/// The directory of the CA of `namespace` (identity `<namespace>/CA`):
+/// [`ca_dir_of`] that identity.
+pub fn ca_dir(pib_root: &Path, namespace: &Name) -> PathBuf {
+    ca_dir_of(pib_root, &namespace.clone().append("CA"))
+}
+
+/// The directory of the CA whose signing identity is `ca_identity`: its
+/// certificates ([`CA_CERT_FILE`], [`ANCHOR_CERT_FILE`],
+/// [`DEVICE_CERT_FILE`]) and its state ([`crate::FileCaStore`]).
+/// `<pib>/ca` itself when the CA certificate there certifies a key of
+/// `ca_identity` — a PIB from before several CAs, whose CA stays where it
+/// is — else `<pib>/ca/<hex of the namespace URI>` for a namespace CA
+/// `<ns>/CA` (the hex rule of [`crate::context_store`]), or of the
+/// identity's URI for any other.
+pub fn ca_dir_of(pib_root: &Path, ca_identity: &Name) -> PathBuf {
+    let legacy = pib_root.join(CA_DIR);
+    let legacy_identity = std::fs::read(legacy.join(CA_CERT_FILE))
+        .ok()
+        .and_then(|wire| deserialize_cert(&wire))
+        .map(|cert| cert.key_name())
+        .filter(|key| key.len() >= 2)
+        .map(|key| Name::from_components(key.components()[..key.len() - 2].iter().cloned()));
+    if legacy_identity.as_ref() == Some(ca_identity) {
+        return legacy;
+    }
+    let comps = ca_identity.components();
+    let keyed = match comps.split_last() {
+        Some((last, parent)) if last.value.as_ref() == b"CA" && !parent.is_empty() => {
+            Name::from_components(parent.iter().cloned())
+        }
+        _ => ca_identity.clone(),
+    };
+    legacy.join(namespace_hex(&keyed))
 }
 
 /// Result of initializing a namespace on its root device.
@@ -196,11 +232,11 @@ pub struct PersistedNamespace {
     pub device_cert: Certificate,
     /// Where the signed context was stored (the node's adopted-context store).
     pub context_path: PathBuf,
-    /// `<pib>/ca/ca-cert.data`.
+    /// [`CA_CERT_FILE`] in the namespace's [`ca_dir`].
     pub ca_cert_path: PathBuf,
-    /// `<pib>/ca/anchor-cert.data`.
+    /// [`ANCHOR_CERT_FILE`] in the namespace's [`ca_dir`].
     pub anchor_cert_path: PathBuf,
-    /// `<pib>/ca/device-cert.data`.
+    /// [`DEVICE_CERT_FILE`] in the namespace's [`ca_dir`].
     pub device_cert_path: PathBuf,
     /// Where the root key lives now.
     pub root_store: RootStore,
@@ -243,14 +279,15 @@ pub enum NamespaceInitError {
 ///
 /// - root key `<ns>/KEY/root` in the root store `root` ([`crate::root_store`]:
 ///   OS keychain, passphrase-sealed file, YubiKey PIV, or plaintext `file`),
-///   recorded in `<pib>/root/store.toml`; its self-signed anchor cert is a PIB
-///   trust anchor;
+///   recorded in `<pib>/root/<hex of ns>/store.toml`; its self-signed anchor
+///   cert is a PIB trust anchor;
 /// - CA signing identity `<ns>/CA` (key `<ns>/CA/KEY/ca`) with a cert issued
-///   by the root, plus both certs as signed Data in `<pib>/ca/`;
+///   by the root, plus both certs as signed Data in the namespace's
+///   [`ca_dir`];
 /// - the primary device's admin identity `<ns>/admin/<device>` (key
 ///   `<ns>/admin/<device>/KEY/device`) with a cert issued by the CA, so the
 ///   forwarder loads it with `[security] identity` instead of falling back to
-///   an ephemeral key; its signed cert Data is `<pib>/ca/device-cert.data`;
+///   an ephemeral key; its signed cert Data is [`DEVICE_CERT_FILE`] there;
 /// - the root-signed context (generated schema, advertising the CA endpoint
 ///   `<ns>/CA`) in the node's adopted-context store, so the root device validates its
 ///   own namespace.
@@ -260,10 +297,12 @@ pub enum NamespaceInitError {
 /// FilePib: the daemon uses them unattended.
 ///
 /// `device` must pass [`crate::roles::validate_device_name`]. An existing
-/// root, CA key, device key or stored context for `namespace` is never
-/// silently replaced: without `force` this fails with
-/// [`NamespaceInitError::AlreadyInitialized`]. A PIB holding the root of
-/// another namespace is refused even with `force`.
+/// root (a root store of `namespace`, or its root key in the PIB), CA key,
+/// device key or stored context for `namespace` is never silently
+/// replaced: without `force` this fails with
+/// [`NamespaceInitError::AlreadyInitialized`]. The roots of other
+/// namespaces the PIB holds are neither a refusal nor touched: a device can
+/// be the root device of several namespaces.
 ///
 /// The context advertises the default enrollment policy
 /// ([`ApprovalPolicy::default`](crate::policy::ApprovalPolicy::default)), states the default link policy
@@ -306,20 +345,12 @@ pub async fn init_namespace_in_pib_with(
     let device_identity = device_identity(namespace, Role::Admin, device)?;
     let device_key = device_key_name(&device_identity);
     let context_path = context_file_path(pib.root(), namespace);
-    let held_root = RootStore::open(pib)?;
-    if let Some(held) = &held_root
-        && held.namespace() != namespace
-    {
-        return Err(RootStoreError::OtherNamespace {
-            pib: pib.root().display().to_string(),
-            held: held.namespace().to_string(),
-            requested: namespace.to_string(),
-        }
-        .into());
-    }
+    let held_root = RootStore::open_for(pib, namespace)?;
+    let ca_dir = ca_dir(pib.root(), namespace);
     let existing = if let Some(held) = &held_root {
         Some(format!(
-            "root key {anchor_key} ({} root store)",
+            "root key {} ({} root store)",
+            held.key_name(),
             held.kind()
         ))
     } else if pib.has_private_key(&anchor_key) {
@@ -396,7 +427,6 @@ pub async fn init_namespace_in_pib_with(
     )
     .await?;
 
-    let ca_dir = pib.root().join(CA_DIR);
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| NamespaceInitError::Io { path, source }

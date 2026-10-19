@@ -4,7 +4,8 @@
 //! The device picks the path per namespace by whether it runs that
 //! namespace's CA ([`ndn_cert::approval`]):
 //!
-//! - **this device runs the CA** (`local`, its [`ApprovalStore`]): the CA's
+//! - **this device runs the CA** (`local`, its [`ApprovalStore`]; one per
+//!   CA the device runs): the CA's
 //!   durable records are read and decided directly. The approver recorded
 //!   is the local operator the host names (`uid 1000 (alice)`); the issued
 //!   certificate's attestation names them and claims no signature.
@@ -66,13 +67,13 @@ pub struct Listing {
 /// This device's admin keys, one per namespace (the newest valid
 /// certificate): a device key `/<ns>/admin/<device>/KEY/…` of a namespace
 /// whose trust context the participant holds, with a current certificate
-/// the context does not revoke, issued by a CA other than `local_ca` (this
-/// device's own, decided locally). A key whose signer is unavailable is
-/// skipped with a warning.
+/// the context does not revoke, issued by a CA other than those in
+/// `local_cas` (this device's own, decided locally). A key whose signer is
+/// unavailable is skipped with a warning.
 pub fn admin_credentials(
     p: &Participant,
     vault: &dyn KeyVault,
-    local_ca: Option<&Name>,
+    local_cas: &[Name],
 ) -> Result<Vec<AdminCredential>, TrustRefusal> {
     let unreadable = |e: String| {
         refusal(
@@ -115,7 +116,7 @@ pub fn admin_credentials(
         let Some(ca_prefix) = ndn_cert::issuing_ca_prefix(&cert) else {
             continue;
         };
-        if local_ca == Some(&ca_prefix) {
+        if local_cas.contains(&ca_prefix) {
             continue;
         }
         let signer = match vault.signer(&key) {
@@ -145,20 +146,21 @@ pub fn admin_credentials(
     Ok(out.into_iter().map(|(_, c)| c).collect())
 }
 
-/// Every request this device can see: `local` (its own CA's store, `None`
-/// when it runs no CA that takes approval requests) and what each
+/// Every request this device can see: `local` (the stores of its own CAs
+/// that take approval requests; empty when it runs none) and what each
 /// administered namespace's CA answers. Refused only when nothing at all
 /// could be listed.
 pub async fn list(
     p: &Participant,
-    local: Option<&ApprovalStore>,
+    local: &[ApprovalStore],
     credentials: impl FnOnce() -> Result<Vec<AdminCredential>, TrustRefusal>,
 ) -> Result<Listing, TrustRefusal> {
     let creds = credentials()?;
-    if local.is_none() && creds.is_empty() {
+    if local.is_empty() && creds.is_empty() {
         return Err(nothing_here(p));
     }
-    let local = local.map(|store| store.records());
+    let local =
+        (!local.is_empty()).then(|| local.iter().flat_map(ApprovalStore::records).collect());
     let mut remote = Vec::with_capacity(creds.len());
     for cred in &creds {
         remote.push(match fetch(p, cred).await {
@@ -170,20 +172,21 @@ pub async fn list(
 }
 
 /// Decide the pending request `target` names (its request id or its
-/// verification code): at this device's own CA (`local`) first, decided by
-/// `operator`; else at the CA of the one administered namespace that has
-/// it, with that namespace's admin key. Returns the request as decided.
+/// verification code): at this device's own CAs (`local`) first — the one
+/// whose store holds it — decided by `operator`; else at the CA of the one
+/// administered namespace that has it, with that namespace's admin key.
+/// Returns the request as decided.
 pub async fn decide(
     p: &Participant,
-    local: Option<&ApprovalStore>,
+    local: &[ApprovalStore],
     credentials: impl FnOnce() -> Result<Vec<AdminCredential>, TrustRefusal>,
     target: &str,
     decision: Decision,
     operator: &str,
 ) -> Result<ApprovalRecord, TrustRefusal> {
-    // This device's own CA first: its local operator decides.
+    // This device's own CAs first: its local operator decides.
     let mut local_miss = None;
-    if let Some(store) = local {
+    for store in local {
         match store.find_pending(target) {
             Ok(_) => {
                 return store
@@ -219,7 +222,7 @@ pub async fn decide(
         0 => {
             let mut reason = p.words().no_pending_request(
                 target,
-                if local.is_some() {
+                if !local.is_empty() {
                     "this node's CA or at the CAs of the namespaces it administers"
                 } else {
                     "the CAs of the namespaces this node administers"
@@ -329,8 +332,8 @@ fn unlisted(cred: &AdminCredential, e: ApproverError) -> (TrustRefusal, String) 
     (r, note)
 }
 
-/// Merge this device's own CA's records (`local`, `None` when it runs no
-/// CA) with what each administered namespace's CA answered: the records
+/// Merge the records of this device's own CAs (`local`, `None` when it runs
+/// no CA) with what each administered namespace's CA answered: the records
 /// that could be listed, and a note for each namespace that could not.
 /// Refused only when nothing at all could be listed — a CA host keeps
 /// seeing its own queue while another namespace's CA is down.

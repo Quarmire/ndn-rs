@@ -79,12 +79,17 @@ pub struct ForwarderConfig {
     #[serde(default)]
     pub listeners: ListenersConfig,
 
-    /// Opt-in in-process NDNCERT CA for the namespace whose root this node's
-    /// PIB holds (`[ca]`; `ndn-fwd init` writes its identity). A CA can also
-    /// run out-of-process, with `[security.mgmt] localhop_trust_anchor_pib`
-    /// pointing at its PIB.
-    #[serde(default)]
-    pub ca: CaTomlConfig,
+    /// Opt-in in-process NDNCERT CAs, one per namespace whose root this
+    /// node's PIB holds (`ndn-fwd init` writes each identity): one `[ca]`
+    /// table, or one `[[ca]]` table per CA — a list either way. A CA can
+    /// also run out-of-process, with `[security.mgmt]
+    /// localhop_trust_anchor_pib` pointing at its PIB.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many_ca",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ca: Vec<CaTomlConfig>,
 
     /// NDN-native span publisher. Spans served under `ndn_prefix` as
     /// OTLP `Span` protobufs (OTLP wire format inside Data content).
@@ -184,18 +189,21 @@ fn default_observability_sample() -> f64 {
     0.01
 }
 
-/// Embedded NDNCERT CA. Serves `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}`
-/// plus cert-fetch for the certs it issued, and — with the
-/// `device-approval` challenge — `/<prefix>/CA/APPROVAL` (an admin device's
-/// signed decision) and `/<prefix>/CA/PENDING` (the pending requests, to an
-/// admin key).
+/// One embedded NDNCERT CA (`[ca]`, or one `[[ca]]` entry per CA). Serves
+/// `/<prefix>/CA/{INFO,NEW,CHALLENGE/<id>}` plus cert-fetch for the certs
+/// it issued, and — with the `device-approval` challenge —
+/// `/<prefix>/CA/APPROVAL` (an admin device's signed decision) and
+/// `/<prefix>/CA/PENDING` (the pending requests, to an admin key).
 ///
 /// By default the CA signs with the identity `identity` loaded from the node's
-/// PIB (`[security] pib_path`): its key and its `ca/ca-cert.data` certificate
-/// (issued by the namespace root) are written by `ndn-fwd init --namespace <ns>`.
-/// Issued certs and revocations persist under `<pib_path>/ca/`. With
-/// `ephemeral = true` the CA instead mints a throwaway self-signed key at
-/// every start (demo only: certs it issued stop verifying after a restart).
+/// PIB (`[security] pib_path`): its key and its `ca-cert.data` certificate
+/// (issued by the namespace root) are written by `ndn-fwd init --namespace <ns>`
+/// into the CA's directory (`ndn_cert::namespace::ca_dir`:
+/// `<pib_path>/ca/<hex of the namespace URI>/`, or `<pib_path>/ca/` for the
+/// CA a PIB from before several CAs holds), where issued certs and
+/// revocations persist too. With `ephemeral = true` the CA instead mints a
+/// throwaway self-signed key at every start (demo only: certs it issued
+/// stop verifying after a restart).
 ///
 /// The CA refuses to start with no challenge configured: list them under
 /// `[[ca.challenge]]` (or the legacy `tokens`). `nop` (auto-approve) is
@@ -1170,7 +1178,7 @@ impl ForwarderConfig {
         self.relay_service.validate()?;
         self.links.validate()?;
         self.direct.validate()?;
-        self.ca.validate()?;
+        validate_cas(&self.ca)?;
 
         if self.engine.cs_capacity_mb > 65536 {
             return Err(ConfigError::Invalid(format!(
@@ -1774,6 +1782,62 @@ where
         OneOrMany::One(s) => vec![s],
         OneOrMany::Many(v) => v,
     })
+}
+
+/// `ca`: one `[ca]` table (the form before several CAs) or `[[ca]]` tables,
+/// one per CA — a list either way. Each table is read as
+/// [`CaTomlConfig`], so a bad key is reported as such.
+fn one_or_many_ca<'de, D>(deserializer: D) -> Result<Vec<CaTomlConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Cas;
+    impl<'de> serde::de::Visitor<'de> for Cas {
+        type Value = Vec<CaTomlConfig>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a [ca] table or [[ca]] tables")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            CaTomlConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                .map(|ca| vec![ca])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+    deserializer.deserialize_any(Cas)
+}
+
+/// Each CA on its own ([`CaTomlConfig::validate`]), then across them: two
+/// enabled CAs of one identity or prefix would serve the same names. With
+/// several CAs an error names the entry (`[[ca]] #2 (/home/alice/CA)`).
+fn validate_cas(cas: &[CaTomlConfig]) -> Result<(), ConfigError> {
+    let label = |i: usize| format!("[[ca]] #{} ({})", i + 1, cas[i].identity);
+    for (i, ca) in cas.iter().enumerate() {
+        ca.validate().map_err(|e| match e {
+            ConfigError::Invalid(why) if cas.len() > 1 => {
+                ConfigError::Invalid(format!("{}: {why}", label(i)))
+            }
+            e => e,
+        })?;
+        if !ca.enabled {
+            continue;
+        }
+        if let Some(j) = cas[..i]
+            .iter()
+            .position(|o| o.enabled && (o.identity == ca.identity || o.prefix == ca.prefix))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{} and {} are the same CA (identity {}, prefix {}): one entry per CA, one CA \
+                 per trusted prefix; merge the two entries",
+                label(j),
+                label(i),
+                ca.identity,
+                ca.prefix
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_peers(peers: &[PeerConfig], relays: &[RelayConfig]) -> Result<(), ConfigError> {
@@ -3001,7 +3065,58 @@ mod tests {
             assert!(err.contains("renamed to `[ca]`"), "{err}");
         }
         let cfg: ForwarderConfig = "[ca]\nenabled = true\n".parse().unwrap();
-        assert!(cfg.ca.enabled);
+        assert!(cfg.ca[0].enabled);
+    }
+
+    /// `[ca]` (one table) and `[[ca]]` (one table per CA) both parse into
+    /// the list of CAs, nested `[[ca.challenge]]` belonging to its own CA;
+    /// it survives a round trip; an error in one of several names the
+    /// entry; two entries of one CA are refused.
+    #[test]
+    fn ca_is_one_table_or_one_table_per_ca() {
+        let one: ForwarderConfig = "[ca]\nenabled = true\nprefix = \"/home/bob\"\n\
+             identity = \"/home/bob/CA\"\n[[ca.challenge]]\nkind = \"nop\"\n"
+            .parse()
+            .unwrap();
+        let many: ForwarderConfig = "[[ca]]\nenabled = true\nprefix = \"/home/bob\"\n\
+             identity = \"/home/bob/CA\"\n[[ca.challenge]]\nkind = \"nop\"\n"
+            .parse()
+            .unwrap();
+        for cfg in [&one, &many] {
+            assert_eq!(cfg.ca.len(), 1);
+            assert_eq!(cfg.ca[0].identity, "/home/bob/CA");
+            assert_eq!(cfg.ca[0].challenges.len(), 1);
+        }
+        assert!(ForwarderConfig::from_str("").unwrap().ca.is_empty());
+
+        let two: ForwarderConfig = "[[ca]]\nenabled = true\nprefix = \"/home/bob\"\n\
+             identity = \"/home/bob/CA\"\n[[ca.challenge]]\nkind = \"nop\"\n\
+             [[ca]]\nenabled = true\nprefix = \"/home/alice\"\nidentity = \"/home/alice/CA\"\n\
+             tokens = [\"t\"]\n"
+            .parse()
+            .unwrap();
+        let ids: Vec<&str> = two.ca.iter().map(|c| c.identity.as_str()).collect();
+        assert_eq!(ids, ["/home/bob/CA", "/home/alice/CA"]);
+        assert_eq!(
+            (two.ca[0].challenges.len(), two.ca[1].challenges.len()),
+            (1, 0)
+        );
+        let again: ForwarderConfig = two.to_toml_string().unwrap().parse().unwrap();
+        let ids: Vec<&str> = again.ca.iter().map(|c| c.identity.as_str()).collect();
+        assert_eq!(ids, ["/home/bob/CA", "/home/alice/CA"]);
+
+        let err = "[[ca]]\nidentity = \"/home/bob/CA\"\n\
+             [[ca]]\nidentity = \"/home/alice/CA\"\ndirect_pairs = [\"member\"]\n"
+            .parse::<ForwarderConfig>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[[ca]] #2 (/home/alice/CA)"), "{err}");
+        let err = "[[ca]]\nenabled = true\nprefix = \"/home/bob\"\n\
+             [[ca]]\nenabled = true\nprefix = \"/home/bob\"\nidentity = \"/home/bob/x\"\n"
+            .parse::<ForwarderConfig>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merge the two entries"), "{err}");
     }
 
     use super::*;
@@ -3013,12 +3128,12 @@ mod tests {
     #[test]
     fn cert_validity_days_is_a_number_or_a_per_role_table() {
         let cfg: ForwarderConfig = "[ca]\ncert_validity_days = 30\n".parse().unwrap();
-        assert_eq!(cfg.ca.cert_validity_days, CertValidityDays::uniform(30));
-        assert_eq!(cfg.ca.cert_validity_days.for_role("guest"), 30);
+        assert_eq!(cfg.ca[0].cert_validity_days, CertValidityDays::uniform(30));
+        assert_eq!(cfg.ca[0].cert_validity_days.for_role("guest"), 30);
 
         let src = "[ca.cert_validity_days]\nmember = 1\nguest = 7\n";
         let cfg: ForwarderConfig = src.parse().unwrap();
-        let days = cfg.ca.cert_validity_days;
+        let days = cfg.ca[0].cert_validity_days;
         assert_eq!(days.for_role("member"), 1);
         assert_eq!(days.for_role("guest"), 7);
         assert_eq!(
@@ -3027,13 +3142,13 @@ mod tests {
         );
         assert_eq!(days.max_days(), CaTomlConfig::DEFAULT_CERT_VALIDITY_DAYS);
         let again: ForwarderConfig = cfg.to_toml_string().unwrap().parse().unwrap();
-        assert_eq!(again.ca.cert_validity_days, days);
+        assert_eq!(again.ca[0].cert_validity_days, days);
 
         let cfg: ForwarderConfig = "[ca.cert_validity_days]\ndefault = 10\nnode = 20\n"
             .parse()
             .unwrap();
-        assert_eq!(cfg.ca.cert_validity_days.for_role("member"), 10);
-        assert_eq!(cfg.ca.cert_validity_days.max_days(), 20);
+        assert_eq!(cfg.ca[0].cert_validity_days.for_role("member"), 10);
+        assert_eq!(cfg.ca[0].cert_validity_days.max_days(), 20);
 
         assert!(
             "[ca.cert_validity_days]\nfriend = 7\n"
@@ -3046,7 +3161,7 @@ mod tests {
                 .is_err()
         );
         let cfg: ForwarderConfig = "[ca]\n".parse().unwrap();
-        assert_eq!(cfg.ca.renewable_roles, ["admin", "member", "node"]);
+        assert_eq!(cfg.ca[0].renewable_roles, ["admin", "member", "node"]);
     }
 
     /// `[security] renew_before` is a lifetime fraction, a time before
@@ -3446,15 +3561,15 @@ channel = 161
             "ab".repeat(32)
         ))
         .unwrap();
-        let relays = cfg.ca.relays.as_deref().unwrap();
+        let relays = cfg.ca[0].relays.as_deref().unwrap();
         assert_eq!(relays.len(), 2);
         assert_eq!((relays[1].endpoint.len(), relays[1].preference), (2, 2));
-        assert_eq!(ForwarderConfig::from_str("").unwrap().ca.relays, None);
         assert_eq!(
-            ForwarderConfig::from_str("[ca]\nrelay = []\n")
-                .unwrap()
-                .ca
-                .relays,
+            ForwarderConfig::from_str("[ca]\n").unwrap().ca[0].relays,
+            None
+        );
+        assert_eq!(
+            ForwarderConfig::from_str("[ca]\nrelay = []\n").unwrap().ca[0].relays,
             Some(Vec::new())
         );
         for (bad, why) in [

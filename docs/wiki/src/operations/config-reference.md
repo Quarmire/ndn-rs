@@ -358,15 +358,23 @@ it issued. See [NDNCERT setup](../guides/ndncert-setup.md).
 | `cert_validity_days` | `90` | Lifetime of the certificates the CA issues, in days: one number for every role, or a `[ca.cert_validity_days]` table with `admin` / `member` / `node` / `guest` and `default` for the roles not listed (e.g. `default = 90`, `guest = 7`). The longest is the maximum advertised in INFO. Enrollments and renewals name no lifetime, so they get their role's; `ndn-fwd enroll` / `ndn-fwd renew` print the expiry issued. `0` or an unknown role is refused at startup. |
 | `renewable_roles` | `["admin", "member", "node"]` | Roles whose current, unrevoked certificates the CA renews for the same key without an invite ([Certificate renewal](../reference/renewal.md)). Guests are left out by default, so guest access ends at expiry. `[]`: the CA renews nothing. |
 
-Without `ephemeral`, the CA loads its key from the PIB and its certificate
-(issued by the namespace root) from `<pib_path>/ca/ca-cert.data`; the root's anchor
-certificate is `<pib_path>/ca/anchor-cert.data` or a PIB trust anchor. `ndn-fwd
-init --namespace <ns>` writes all three. Startup fails if they are missing,
-mismatched, or the CA cert is not signed by the root. Issued certs,
-revocations and redeemed one-time tokens (SHA-256 hashes only) persist under
-`<pib_path>/ca/{issued,revoked,redeemed-tokens}/`: issued certs are served
-again after a restart, revoked ones are not, and a token redeemed before a
-restart stays refused even while it is still listed in the config.
+A device that is the root of several trusted prefixes runs one CA per
+prefix: write one `[[ca]]` table per CA instead of the single `[ca]` table
+(both forms parse into the same list; `[[ca.challenge]]` after a `[[ca]]`
+belongs to that CA; two enabled entries with one identity or prefix are
+refused, and an error names its entry, e.g. `[[ca]] #2 (/work/acme/CA)`).
+
+Without `ephemeral`, a CA loads its key from the PIB and its certificate
+(issued by the namespace root) from `ca-cert.data` in its directory,
+`<pib_path>/ca/<hex of the namespace URI>/` (a PIB from before several CAs
+keeps its one CA in `<pib_path>/ca/`); the root's anchor certificate is
+`anchor-cert.data` there or a PIB trust anchor. `ndn-fwd init --namespace
+<ns>` writes all three. Startup fails if they are missing, mismatched, or
+the CA cert is not signed by the root. Issued certs, revocations and
+redeemed one-time tokens (SHA-256 hashes only) persist under
+`{issued,revoked,redeemed-tokens}/` of that directory: issued certs are
+served again after a restart, revoked ones are not, and a token redeemed
+before a restart stays refused even while it is still listed in the config.
 
 `ndn-fwd init --namespace /<ns> [--device <name>]` (run on the root device)
 also mints the root device's admin identity `/<ns>/admin/<device>` (default device

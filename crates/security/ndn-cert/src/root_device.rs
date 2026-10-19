@@ -2,7 +2,9 @@
 //! store ([`crate::root_store`]) of a namespace whose held trust context
 //! lists that root as an anchor. New versions of the context are made only
 //! there (revocations, recovery kits, schema updates), so every such command
-//! starts with [`root_device`].
+//! starts with [`root_device`]. A device can be the root device of several
+//! namespaces: such a command names the one it acts on, or acts on the only
+//! one this PIB holds the root of.
 //!
 //! A device that ran `ndn-fwd recover` holds the new root; the lost device
 //! still holds its old root store, but once a version without that root is
@@ -29,6 +31,18 @@ pub enum RootDeviceError {
         .pib.display()
     )]
     NoRoot { pib: PathBuf, work: String },
+    #[error(
+        "{} holds no root of {namespace} (it holds the roots of {}): {work} on the root device of \
+         {namespace}, or name one of the trusted prefixes this device holds the root of",
+        .pib.display(),
+        .held.join(", ")
+    )]
+    NoRootOf {
+        pib: PathBuf,
+        namespace: Name,
+        held: Vec<String>,
+        work: String,
+    },
     #[error(transparent)]
     Store(#[from] ContextStoreError),
     #[error(
@@ -47,10 +61,14 @@ pub enum RootDeviceError {
     },
     #[error(transparent)]
     Kit(#[from] RecoveryError),
-    #[error("{} holds no trust context; pass --namespace <ns>", .pib.display())]
+    #[error("{} holds no trust context; pass --namespace <prefix>", .pib.display())]
     NoContext { pib: PathBuf },
-    #[error("{} holds several trust contexts; pass --namespace <ns>", .pib.display())]
-    SeveralContexts { pib: PathBuf },
+    #[error(
+        "{} holds several trust contexts ({}); pass --namespace <prefix>",
+        .pib.display(),
+        .held.join(", ")
+    )]
+    SeveralContexts { pib: PathBuf, held: Vec<String> },
 }
 
 /// The root device's root store and the version of its namespace's trust
@@ -73,17 +91,76 @@ pub fn held_context(
     })
 }
 
-/// `pib`'s root store and the context it is the root of: the store must
-/// hold the key of an anchor of the held version. `work` says what is done
-/// only on the root device, for the refusal on any other device (`devices
-/// are revoked`).
-pub fn root_device(pib: &FilePib, work: &str) -> Result<RootDevice, RootDeviceError> {
+/// `pib`'s root store of `namespace` — of the only namespace whose root it
+/// holds when `None` (several: [`RootStoreError::SeveralRoots`], listing
+/// them) — and the context it is the root of: the store must hold the key
+/// of an anchor of the held version. `work` says what is done only on the
+/// root device, for the refusal on any other device (`devices are
+/// revoked`).
+pub fn root_device(
+    pib: &FilePib,
+    namespace: Option<&Name>,
+    work: &str,
+) -> Result<RootDevice, RootDeviceError> {
     let pib_dir = pib.root();
-    let store = RootStore::open(pib)?.ok_or_else(|| RootDeviceError::NoRoot {
-        pib: pib_dir.to_path_buf(),
+    let store = match namespace {
+        Some(ns) => RootStore::open_for(pib, ns)?.ok_or_else(|| no_root_of(pib, ns, work))?,
+        None => RootStore::open(pib)?.ok_or_else(|| RootDeviceError::NoRoot {
+            pib: pib_dir.to_path_buf(),
+            work: work.to_string(),
+        })?,
+    };
+    of_store(pib, store)
+}
+
+/// `pib`'s root store of the namespace that covers `name` (the longest of
+/// the namespaces whose root it holds that is a prefix of it) and the
+/// context it is the root of, as [`root_device`]. `None` when the PIB holds
+/// roots, none of a namespace covering `name`.
+pub fn root_device_covering(
+    pib: &FilePib,
+    name: &Name,
+    work: &str,
+) -> Result<Option<RootDevice>, RootDeviceError> {
+    let stores = RootStore::open_all(pib)?;
+    if stores.is_empty() {
+        return Err(RootDeviceError::NoRoot {
+            pib: pib.root().to_path_buf(),
+            work: work.to_string(),
+        });
+    }
+    match stores
+        .into_iter()
+        .filter(|s| name.has_prefix(s.namespace()))
+        .max_by_key(|s| s.namespace().len())
+    {
+        Some(store) => of_store(pib, store).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn no_root_of(pib: &FilePib, namespace: &Name, work: &str) -> RootDeviceError {
+    let held: Vec<String> = RootStore::open_all(pib)
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s.namespace().to_string())
+        .collect();
+    if held.is_empty() {
+        return RootDeviceError::NoRoot {
+            pib: pib.root().to_path_buf(),
+            work: work.to_string(),
+        };
+    }
+    RootDeviceError::NoRootOf {
+        pib: pib.root().to_path_buf(),
+        namespace: namespace.clone(),
+        held,
         work: work.to_string(),
-    })?;
-    let (context, data) = held_context(pib_dir, store.namespace())?;
+    }
+}
+
+fn of_store(pib: &FilePib, store: RootStore) -> Result<RootDevice, RootDeviceError> {
+    let (context, data) = held_context(pib.root(), store.namespace())?;
     if !store.holds_anchor_of(&context) {
         return Err(RootDeviceError::NoLongerRoot {
             key: store.key_name().clone(),
@@ -115,6 +192,7 @@ pub fn kit_namespace(kit_file: Option<&Path>, pib_dir: &Path) -> Result<Name, Ro
         }),
         _ => Err(RootDeviceError::SeveralContexts {
             pib: pib_dir.to_path_buf(),
+            held: held.iter().map(ToString::to_string).collect(),
         }),
     }
 }
@@ -142,7 +220,7 @@ mod tests {
             &NewRootStore::File,
         ))
         .unwrap();
-        let root = root_device(&pib, "devices are revoked").unwrap();
+        let root = root_device(&pib, None, "devices are revoked").unwrap();
         assert_eq!(root.context.namespace(), &ns);
         assert_eq!(root.data.raw(), out.init.context_data.raw());
         assert_eq!(kit_namespace(None, dir.path()).unwrap(), ns);
@@ -151,7 +229,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let other_pib = FilePib::new(other.path()).unwrap();
         crate::persist_context(other.path(), &out.init.context, &out.init.context_data).unwrap();
-        let refused = root_device(&other_pib, "devices are revoked")
+        let refused = root_device(&other_pib, None, "devices are revoked")
             .err()
             .unwrap();
         assert!(

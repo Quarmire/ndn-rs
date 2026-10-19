@@ -1,12 +1,14 @@
 //! Planning a revocation on the root device, before the root is unlocked.
 //!
 //! A revocation is a new version of the trust context that lists keys as
-//! revoked ([`crate::bump_context_revoking`]). What a name designates: a key
-//! or certificate name, its key; a device identity, every key the namespace
-//! CA of the root device certified for exactly that identity (read from its
-//! store, `<pib>/ca/`). Never the root's key (every key chains to it) nor the
-//! CA's, and nothing to sign when the held version revokes them all already
-//! ([`crate::revocations_to_add`]).
+//! revoked ([`crate::bump_context_revoking`]). It is made in the namespace
+//! covering the name (of those whose root the device holds, the longest
+//! that is a prefix of it). What a name designates: a key or certificate
+//! name, its key; a device identity, every key the namespace CA of the root
+//! device certified for exactly that identity (read from its store,
+//! [`crate::namespace::ca_dir`]). Never the root's key (every key chains to
+//! it) nor the CA's, and nothing to sign when the held version revokes them
+//! all already ([`crate::revocations_to_add`]).
 
 // Boxing the error variants would change the public API; these are cold control-plane results.
 #![allow(clippy::result_large_err)]
@@ -18,8 +20,9 @@ use ndn_security::FilePib;
 
 use crate::context_update::{BumpError, key_name_of, revocations_to_add};
 use crate::error::CertError;
-use crate::namespace::CA_DIR;
-use crate::root_device::{RootDevice, RootDeviceError, root_device};
+use crate::namespace::ca_dir;
+use crate::root_device::{RootDevice, RootDeviceError, root_device_covering};
+use crate::root_store::RootStore;
 use crate::store::{CaStore, FileCaStore};
 
 /// Why a revocation is refused before anything is signed.
@@ -28,10 +31,11 @@ pub enum RevocationError {
     #[error(transparent)]
     RootDevice(#[from] RootDeviceError),
     #[error(
-        "{name} is not in {namespace}, the namespace whose root this device holds; nothing was \
-         signed"
+        "{name} is not in a trusted prefix whose root this device holds ({}); nothing was \
+         signed",
+        .held.join(", ")
     )]
-    OutsideNamespace { name: Name, namespace: Name },
+    OutsideNamespace { name: Name, held: Vec<String> },
     #[error(
         "refusing to revoke {name}: it is the namespace CA, and every device certificate of \
          {namespace} chains to it. Replacing the CA (a compromised relay) is not built yet; \
@@ -68,14 +72,18 @@ pub struct RevocationPlan {
 }
 
 /// The key names `name` designates: itself (or the key of a certificate
-/// name), else every key the namespace CA of the PIB `pib_dir` certified for
-/// the device identity `name` — keys of exactly that identity, not of names
-/// below it.
-pub fn keys_to_revoke(pib_dir: &Path, name: &Name) -> Result<Vec<Name>, RevocationError> {
+/// name), else every key the CA of `namespace` on the PIB `pib_dir`
+/// certified for the device identity `name` — keys of exactly that
+/// identity, not of names below it.
+pub fn keys_to_revoke(
+    pib_dir: &Path,
+    namespace: &Name,
+    name: &Name,
+) -> Result<Vec<Name>, RevocationError> {
     if let Some(key) = key_name_of(name) {
         return Ok(vec![key]);
     }
-    let ca_dir = pib_dir.join(CA_DIR);
+    let ca_dir = ca_dir(pib_dir, namespace);
     let issued = if ca_dir.is_dir() {
         FileCaStore::open(&ca_dir)
             .and_then(|store| store.load())
@@ -107,24 +115,27 @@ pub fn keys_to_revoke(pib_dir: &Path, name: &Name) -> Result<Vec<Name>, Revocati
 }
 
 /// Every check of a revocation of `name` that needs no key: `pib` is the
-/// root device of the namespace containing `name`, and `name` designates
+/// root device of a namespace containing `name`, and `name` designates
 /// keys that may be revoked — never the root's nor the CA's.
 pub fn plan_revocation(pib: &FilePib, name: &Name) -> Result<RevocationPlan, RevocationError> {
-    let root = root_device(pib, "devices are revoked")?;
-    let namespace = root.context.namespace().clone();
-    if !name.has_prefix(&namespace) {
+    let Some(root) = root_device_covering(pib, name, "devices are revoked")? else {
         return Err(RevocationError::OutsideNamespace {
             name: name.clone(),
-            namespace,
+            held: RootStore::open_all(pib)
+                .map_err(RootDeviceError::from)?
+                .iter()
+                .map(|s| s.namespace().to_string())
+                .collect(),
         });
-    }
+    };
+    let namespace = root.context.namespace().clone();
     if name.has_prefix(&namespace.clone().append("CA")) {
         return Err(RevocationError::NamespaceCa {
             name: name.clone(),
             namespace,
         });
     }
-    let keys = keys_to_revoke(pib.root(), name)?;
+    let keys = keys_to_revoke(pib.root(), &namespace, name)?;
     let adding = revocations_to_add(&root.context, &keys).map_err(RevocationError::Refused)?;
     Ok(RevocationPlan { root, keys, adding })
 }
@@ -151,7 +162,7 @@ mod tests {
             &NewRootStore::File,
         ))
         .unwrap();
-        FileCaStore::open(dir.join(CA_DIR))
+        FileCaStore::open(ca_dir(dir, &n("/home/bob")))
             .unwrap()
             .record_issued(
                 &out.device_cert.name.to_string(),
@@ -170,14 +181,18 @@ mod tests {
         assert_eq!(plan.adding, vec![out.device_key.clone()]);
         // A key name designates itself; a certificate name its key.
         let key = n("/home/bob/member/phone/KEY/k");
-        assert_eq!(keys_to_revoke(dir.path(), &key).unwrap(), vec![key.clone()]);
+        let ns = n("/home/bob");
         assert_eq!(
-            keys_to_revoke(dir.path(), &out.device_cert.name).unwrap(),
+            keys_to_revoke(dir.path(), &ns, &key).unwrap(),
+            vec![key.clone()]
+        );
+        assert_eq!(
+            keys_to_revoke(dir.path(), &ns, &out.device_cert.name).unwrap(),
             vec![out.device_key.clone()]
         );
         // Only exactly that identity, not names below or above it.
         assert!(matches!(
-            keys_to_revoke(dir.path(), &n("/home/bob/admin")),
+            keys_to_revoke(dir.path(), &ns, &n("/home/bob/admin")),
             Err(RevocationError::NoneIssued { .. })
         ));
     }
@@ -191,7 +206,7 @@ mod tests {
             ("/home/bob/CA", "it is the namespace CA"),
             ("/home/bob/CA/KEY/ca", "it is the namespace CA"),
             ("/home/bob/member/tablet", "issued no certificate"),
-            ("/home/alice/member/phone/KEY/k", "is not in /home/bob"),
+            ("/home/alice/member/phone/KEY/k", "holds (/home/bob)"),
         ] {
             let e = plan_revocation(&pib, &n(name)).err().unwrap().to_string();
             assert!(e.contains(refused), "{name}: {e}");

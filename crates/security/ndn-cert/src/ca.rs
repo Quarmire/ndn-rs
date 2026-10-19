@@ -615,6 +615,14 @@ impl CaState {
         }
     }
 
+    /// Whether this is the CA of `namespace`: it signs with a key of the
+    /// identity `<namespace>/CA`.
+    pub fn is_ca_of(&self, namespace: &ndn_packet::Name) -> bool {
+        let ca_identity = namespace.clone().append("CA");
+        self.signing_key_name()
+            .is_some_and(|key| key.has_prefix(&ca_identity) && key.len() == ca_identity.len() + 2)
+    }
+
     /// The certificate of [`signing_key_name`](Self::signing_key_name): from
     /// the manager's cert cache (a CA cert issued by a root) or its trust
     /// anchors (a self-signed CA).
@@ -1168,9 +1176,7 @@ impl CaState {
     /// revoked already are skipped, so following the same version again
     /// changes nothing. `None` when this is not the CA of `ctx`'s namespace.
     pub fn follow_context(&self, ctx: &ndn_security::SignedTrustContext) -> Option<CaRevocation> {
-        let ca_identity = ctx.namespace().clone().append("CA");
-        let key = self.signing_key_name()?;
-        if !(key.has_prefix(&ca_identity) && key.len() == ca_identity.len() + 2) {
+        if !self.is_ca_of(ctx.namespace()) {
             return None;
         }
         let mut followed = CaRevocation::default();

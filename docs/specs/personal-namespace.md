@@ -68,7 +68,12 @@ Terms used throughout:
 
 The root device (the primary device) is the first admin. The root key lives
 in a **root store** the owner picks at `ndn-fwd init --root-store`, recorded
-in `<pib>/root/store.toml` (**have**, `ndn_cert::root_store`):
+per namespace in `<pib>/root/<hex of the namespace URI>/store.toml` (a PIB
+from before several roots keeps its one `<pib>/root/store.toml`, loaded as
+before) (**have**, `ndn_cert::root_store`). A device can be the root device
+of several namespaces (trusted prefixes): one store and one CA each; a root
+command names the prefix with `--namespace` when the PIB holds several
+roots and is refused, listing them, when it does not:
 
 | Store | Private key | Unlock per root operation |
 |---|---|---|
@@ -411,11 +416,15 @@ local segment (§9).
                       unless [security] serve_contexts = false)
 <pib>/contexts/*.versions/<N>.tc  every version held, served by exact name
                       so nodes behind can follow version by version
-<pib>/ca/             CA cert, anchor cert, node cert, issued/, revoked/,
-                      redeemed-tokens/   (CA hosts only)
-<pib>/root/           root store of a root device: store.toml (kind, key,
-                      public key, anchor cert), root.safebag /
-                      root-keychain.safebag (sealed roots)
+<pib>/ca/<hex>/       per namespace CA: CA cert, anchor cert, node cert,
+                      issued/, revoked/, redeemed-tokens/, approvals/ (CA
+                      hosts only; a PIB from before several CAs keeps its
+                      one CA directly in <pib>/ca/)
+<pib>/root/<hex>/     root store of each namespace a root device holds the
+                      root of: store.toml (kind, namespace, key, public key,
+                      anchor cert), root.safebag / root-keychain.safebag
+                      (sealed roots); <pib>/root/store.toml for the one root
+                      of a PIB from before several roots
 $XDG_STATE_HOME/ndn-fwd/tls/   persistent self-signed WebTransport listener
                       certs (QUIC links use the device key, nothing here)
 ```

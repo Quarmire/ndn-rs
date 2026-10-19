@@ -68,8 +68,8 @@ use zeroize::Zeroizing;
 use crate::ca::serialize_cert;
 use crate::context_update::{ContextBump, UpdateRefusal, open_context_update};
 use crate::namespace::{
-    ANCHOR_CERT_FILE, CA_CERT_FILE, CA_CERT_VALIDITY_MS, CA_DIR, DEVICE_CERT_FILE,
-    DEVICE_CERT_VALIDITY_MS, NamespaceInitError, ca_key_name, certify_new_key,
+    ANCHOR_CERT_FILE, CA_CERT_FILE, CA_CERT_VALIDITY_MS, DEVICE_CERT_FILE, DEVICE_CERT_VALIDITY_MS,
+    NamespaceInitError, ca_dir, ca_key_name, certify_new_key,
 };
 use crate::roles::{Role, RoleError, device_identity, validate_namespace};
 use crate::root_store::{
@@ -223,7 +223,8 @@ pub enum RecoveryError {
     KeptKitsNeedCompromised,
     #[error(
         "{pib} holds the root of {namespace} ({kind} root store): this already is a root \
-         device of the namespace. Recover on a replacement device whose PIB holds no root"
+         device of the namespace. Recover on a replacement device whose PIB holds no root of \
+         {namespace} (the roots of other trusted prefixes may stay)"
     )]
     AlreadyRootDevice {
         pib: String,
@@ -231,8 +232,8 @@ pub enum RecoveryError {
         kind: String,
     },
     #[error(
-        "{path} exists: this PIB already holds a CA identity. Recover into the PIB of a device \
-         that runs no CA"
+        "{path} exists: this PIB already holds a CA identity of the namespace. Recover into the \
+         PIB of a device that runs no CA of it"
     )]
     CaPresent { path: PathBuf },
     #[error("refusing to revoke {name}: it covers the anchor {anchor} of the new version")]
@@ -1071,23 +1072,38 @@ impl RecoveredNamespace {
     /// again (the daemon refused the new version): the root store, the new
     /// keys, the PIB trust anchor and the certificate files.
     pub fn undo(&self, pib: &FilePib) {
+        let ca_dir = self
+            .ca_cert_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| ca_dir(pib.root(), &self.namespace));
         remove_recovered(
             pib,
+            &self.namespace,
             Some(&self.root_store),
             &[
                 self.anchor.key_name(),
                 self.ca_key.clone(),
                 self.device_key.clone(),
             ],
+            &ca_dir,
         );
     }
 }
 
-/// Best effort: remove what a recovery wrote.
-fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
+/// Best effort: remove what a recovery of `namespace` wrote (its root
+/// store, `keys`, the certificate files in its CA directory `ca_dir`); the
+/// roots and CAs of other namespaces stay.
+fn remove_recovered(
+    pib: &FilePib,
+    namespace: &Name,
+    store: Option<&RootStore>,
+    keys: &[Name],
+    ca_dir: &Path,
+) {
     let store = store
         .cloned()
-        .or_else(|| RootStore::open(pib).ok().flatten());
+        .or_else(|| RootStore::open_for(pib, namespace).ok().flatten());
     if let Some(store) = store
         && let Err(e) = store.destroy(pib)
     {
@@ -1099,7 +1115,6 @@ fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
         }
         let _ = pib.remove_trust_anchor(key);
     }
-    let ca_dir = pib.root().join(CA_DIR);
     for file in [CA_CERT_FILE, ANCHOR_CERT_FILE, DEVICE_CERT_FILE] {
         let _ = std::fs::remove_file(ca_dir.join(file));
     }
@@ -1111,8 +1126,9 @@ fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
 ///
 /// 1. the kit's key must be a recovery anchor of `N` ([`kit_anchor`]), every
 ///    kit in `kept_kits` too (with the old root compromised; see
-///    [`RecoveryPlan::kept_kits`]), and the PIB must hold no namespace root
-///    and no CA identity — checked before anything is written or signed;
+///    [`RecoveryPlan::kept_kits`]), and the PIB must hold no root and no CA
+///    identity of the namespace (those of other namespaces may stay) —
+///    checked before anything is written or signed;
 /// 2. a new root `<ns>/KEY/<id>` in the root store `root` (as `ndn-fwd
 ///    init` creates one), self-signed; a new CA key `<ns>/CA/KEY/<id>` with
 ///    a certificate by the new root; a new admin identity
@@ -1124,8 +1140,9 @@ fn remove_recovered(pib: &FilePib, store: Option<&RootStore>, keys: &[Name]) {
 ///    ([`reissue_version`]), so the newest version names the root as its
 ///    signer and the root's fingerprint is the expected fingerprint of the
 ///    namespace's anchor links and invites from now on;
-/// 4. the root store, the PIB trust anchor and `<pib>/ca/{ca-cert,
-///    anchor-cert,device-cert}.data` written (the CA endpoint stays
+/// 4. the root store (`<pib>/root/<hex of ns>/`), the PIB trust anchor and
+///    the CA's `{ca-cert,anchor-cert,device-cert}.data` in the namespace's
+///    [`ca_dir`] written (the CA endpoint stays
 ///    `<ns>/CA`).
 ///
 /// `N+1` and `N+2` are returned, not stored: the caller hands them, in that
@@ -1149,23 +1166,14 @@ pub async fn recover_namespace_in_pib(
     validate_namespace(&namespace)?;
     let recovery_key = kit_anchor(&ctx, &recovery.public_key().unwrap_or_default())?;
     split_anchors(&ctx, &recovery_key, old_root, kept_kits)?;
-    if let Some(store) = RootStore::open(pib)? {
-        return Err(if store.namespace() == &namespace {
-            RecoveryError::AlreadyRootDevice {
-                pib: pib.root().display().to_string(),
-                namespace: namespace.to_string(),
-                kind: store.kind().to_string(),
-            }
-        } else {
-            RootStoreError::OtherNamespace {
-                pib: pib.root().display().to_string(),
-                held: store.namespace().to_string(),
-                requested: namespace.to_string(),
-            }
-            .into()
+    if let Some(store) = RootStore::open_for(pib, &namespace)? {
+        return Err(RecoveryError::AlreadyRootDevice {
+            pib: pib.root().display().to_string(),
+            namespace: namespace.to_string(),
+            kind: store.kind().to_string(),
         });
     }
-    let ca_dir = pib.root().join(CA_DIR);
+    let ca_dir = ca_dir(pib.root(), &namespace);
     for file in [CA_CERT_FILE, ANCHOR_CERT_FILE, DEVICE_CERT_FILE] {
         let path = ca_dir.join(file);
         if path.exists() {
@@ -1270,7 +1278,13 @@ pub async fn recover_namespace_in_pib(
             })
         }
         Err(e) => {
-            remove_recovered(pib, None, &[root_key, ca_key, device_key]);
+            remove_recovered(
+                pib,
+                &namespace,
+                None,
+                &[root_key, ca_key, device_key],
+                &ca_dir,
+            );
             Err(e)
         }
     }

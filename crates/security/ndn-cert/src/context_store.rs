@@ -65,8 +65,10 @@ pub enum ContextStoreError {
     Adopt(#[from] AdoptError),
 }
 
-/// The hex of `namespace`'s URI: the file stem of its store entries.
-fn namespace_stem(namespace: &Name) -> String {
+/// The hex of `namespace`'s URI: the file stem of its store entries, and
+/// the directory name of its root store ([`crate::root_store`]) and CA
+/// ([`crate::namespace::ca_dir`]).
+pub fn namespace_hex(namespace: &Name) -> String {
     let uri = namespace.to_string();
     let mut stem = String::with_capacity(uri.len() * 2);
     for b in uri.as_bytes() {
@@ -78,7 +80,7 @@ fn namespace_stem(namespace: &Name) -> String {
 /// `<pib_root>/contexts/<hex of the namespace URI>.tc`: the newest version
 /// held.
 pub fn context_file_path(pib_root: &Path, namespace: &Name) -> PathBuf {
-    let stem = namespace_stem(namespace);
+    let stem = namespace_hex(namespace);
     pib_root
         .join(CONTEXTS_DIR)
         .join(format!("{stem}.{CONTEXT_FILE_EXT}"))
@@ -87,7 +89,7 @@ pub fn context_file_path(pib_root: &Path, namespace: &Name) -> PathBuf {
 /// `<pib_root>/contexts/<hex of the namespace URI>.versions`: every version
 /// held.
 pub fn context_versions_dir(pib_root: &Path, namespace: &Name) -> PathBuf {
-    let stem = namespace_stem(namespace);
+    let stem = namespace_hex(namespace);
     pib_root
         .join(CONTEXTS_DIR)
         .join(format!("{stem}.{VERSIONS_DIR_EXT}"))

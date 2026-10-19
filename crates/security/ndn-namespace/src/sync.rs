@@ -718,7 +718,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: Some(sync),
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         }));
         groups.spawn(Arc::clone(&admin), cancel.child_token());
@@ -768,7 +768,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let root_signer = RootStore::open(&pib)
+        let root_signer = RootStore::open_for(&pib, &ns)
             .unwrap()
             .unwrap()
             .signer(None)
@@ -1248,7 +1248,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: Some(sync),
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         });
 

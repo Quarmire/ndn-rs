@@ -326,7 +326,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let root = RootStore::open(&pib)
+        let root = RootStore::open_for(&pib, &ns)
             .unwrap()
             .unwrap()
             .signer(None)
@@ -375,7 +375,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: None,
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         });
 
@@ -437,7 +437,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: None,
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         });
 
@@ -476,7 +476,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let root = RootStore::open(&pib)
+        let root = RootStore::open_for(&pib, &ns)
             .unwrap()
             .unwrap()
             .signer(None)
@@ -518,7 +518,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: None,
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         }));
         let cancel = CancellationToken::new();

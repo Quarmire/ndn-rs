@@ -736,7 +736,7 @@ mod tests {
             publisher: None,
             own_certs: None,
             sync: None,
-            ca: None,
+            cas: Vec::new(),
             words: Default::default(),
         });
 

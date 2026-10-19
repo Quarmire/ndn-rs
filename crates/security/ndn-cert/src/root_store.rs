@@ -6,19 +6,26 @@
 //! and always because an operator asked. So it is kept apart from the keys
 //! the daemon uses unattended and is unlocked for one operation at a time.
 //!
-//! A root device records its store in data, `<pib>/root/store.toml` (written
-//! owner-only, [`ndn_security::secure_fs`]): the [`RootStoreKind`], the root
-//! key name, its public key and anchor certificate name, and kind-specific
-//! fields. Whether a node is the root device of a context is decided from
-//! that descriptor and the context's anchor public keys
-//! ([`RootStore::holds_anchor_of`]) — the private key is never loaded for it.
+//! A root device records each store in data: one per namespace whose root
+//! it holds, `<pib>/root/<hex of the namespace URI>/store.toml` (the hex
+//! rule of [`crate::context_store`]; written owner-only,
+//! [`ndn_security::secure_fs`]), beside that store's material: the
+//! [`RootStoreKind`], the root key name, its public key and anchor
+//! certificate name, and kind-specific fields. A device can hold the roots
+//! of several namespaces ([`RootStore::open_all`]); a command acting on one
+//! names it ([`RootStore::open_for`]). A PIB from before several roots keeps
+//! its one descriptor at `<pib>/root/store.toml` (material in `<pib>/root/`),
+//! which loads as before and stays where it is. Whether a node is the root
+//! device of a context is decided from the descriptors and the context's
+//! anchor public keys ([`RootStore::holds_anchor_of`]) — the private key is
+//! never loaded for it.
 //!
 //! | Kind          | Private key                                  | Unlock per operation |
 //! |---------------|----------------------------------------------|----------------------|
-//! | `os-keyring`  | SafeBag `<pib>/root/root-keychain.safebag`, sealed by a random 32-byte passphrase kept in the OS keychain (Secret Service, macOS Keychain, Windows Credential Manager) | none: the keychain releases it to the logged-in user |
-//! | `sealed-file` | SafeBag `<pib>/root/root.safebag`, sealed by the operator's passphrase | the passphrase |
+//! | `os-keyring`  | SafeBag `root-keychain.safebag` in the store's directory, sealed by a random 32-byte passphrase kept in the OS keychain (Secret Service, macOS Keychain, Windows Credential Manager) | none: the keychain releases it to the logged-in user |
+//! | `sealed-file` | SafeBag `root.safebag` in the store's directory, sealed by the operator's passphrase | the passphrase |
 //! | `yubikey-piv` | generated on a YubiKey PIV slot (P-256), never exportable | the PIV PIN (and a touch, per the recorded policy) |
-//! | `file`        | plaintext PKCS#8 in the FilePib (`<pib>/keys/…`) | none — unprotected; namespaces made before root stores, and tests |
+//! | `file`        | plaintext PKCS#8 in the FilePib (`<pib>/keys/…`) | none — unprotected; namespaces made before root stores (no descriptor), and tests |
 //!
 //! SafeBags use the PBES2 sealing of [`ndn_security::safebag`] (PBKDF2-HMAC-
 //! SHA256, 600 000 iterations, AES-256-CBC) and carry the anchor certificate,
@@ -50,11 +57,12 @@ use ndn_security::{
 };
 use zeroize::Zeroizing;
 
-use crate::namespace::{ANCHOR_CERT_FILE, CA_DIR};
+use crate::context_store::namespace_hex;
+use crate::namespace::{ANCHOR_CERT_FILE, ca_dir};
 
-/// Directory (under the PIB root) of the root store.
+/// Directory (under the PIB root) of the root stores.
 pub const ROOT_STORE_DIR: &str = "root";
-/// The root store descriptor in [`ROOT_STORE_DIR`].
+/// The root store descriptor in a store's directory.
 pub const ROOT_STORE_FILE: &str = "store.toml";
 /// The passphrase-sealed root of a `sealed-file` store.
 pub const SEALED_SAFEBAG_FILE: &str = "root.safebag";
@@ -339,14 +347,11 @@ pub enum RootStoreError {
     #[error("{path}: {reason}")]
     Descriptor { path: PathBuf, reason: String },
     #[error(
-        "{pib} holds the root of {held}; a PIB holds one namespace root. Initialize {requested} \
-         with another --pib"
+        "{pib} holds the roots of several trusted prefixes ({}): name the one to act on \
+         (`--namespace <prefix>` in the ndn-fwd CLI)",
+        .held.join(", ")
     )]
-    OtherNamespace {
-        pib: String,
-        held: String,
-        requested: String,
-    },
+    SeveralRoots { pib: String, held: Vec<String> },
     #[error("cannot move the root from {from} to {to}: {reason}")]
     Unmovable {
         from: RootStoreKind,
@@ -373,9 +378,10 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> RootStoreError + '_ {
     }
 }
 
-/// `<pib>/root/store.toml`.
-pub fn descriptor_path(pib_root: &Path) -> PathBuf {
-    pib_root.join(ROOT_STORE_DIR).join(ROOT_STORE_FILE)
+/// `<pib>/root/<hex of the namespace URI>`: the directory of `namespace`'s
+/// root store (its descriptor [`ROOT_STORE_FILE`] and material).
+pub fn root_store_dir(pib_root: &Path, namespace: &Name) -> PathBuf {
+    pib_root.join(ROOT_STORE_DIR).join(namespace_hex(namespace))
 }
 
 /// Whether two encodings of a public key are the same key (an Ed25519 key
@@ -437,6 +443,10 @@ const DESCRIPTOR_HEADER: &str = "\
 #[derive(Clone, Debug)]
 pub struct RootStore {
     pib_root: PathBuf,
+    /// The directory of the descriptor and the material:
+    /// [`root_store_dir`], or `<pib>/root` for a store from before several
+    /// roots.
+    dir: PathBuf,
     kind: RootStoreKind,
     namespace: Name,
     key_name: Name,
@@ -451,22 +461,123 @@ pub struct RootStore {
 }
 
 impl RootStore {
-    /// The root store of the PIB at `pib`: its descriptor, else a root key
-    /// `<ns>/KEY/root` that is a trust anchor of the PIB with its private
-    /// key in the FilePib (a namespace made before root stores; kind
-    /// `file`). `None`: this PIB holds no namespace root.
+    /// Every root store of the PIB at `pib`, by namespace: each
+    /// `<pib>/root/<hex>/store.toml`, the one `<pib>/root/store.toml` of a
+    /// PIB from before several roots, and every root key `<ns>/KEY/root`
+    /// that is a trust anchor of the PIB with its private key in the
+    /// FilePib and no descriptor (a namespace made before root stores; kind
+    /// `file`). Empty: this PIB holds no namespace root. A descriptor that
+    /// cannot be read, one filed under another namespace's directory, and
+    /// two descriptors of one namespace are errors.
+    pub fn open_all(pib: &FilePib) -> Result<Vec<RootStore>, RootStoreError> {
+        let root_dir = pib.root().join(ROOT_STORE_DIR);
+        let mut stores = Vec::new();
+        if let Some(store) = Self::read_descriptor(pib.root(), &root_dir)? {
+            stores.push(store);
+        }
+        let entries = match std::fs::read_dir(&root_dir) {
+            Ok(entries) => entries
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io_err(&root_dir))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io_err(&root_dir)(e)),
+        };
+        for entry in entries {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(store) = Self::read_descriptor(pib.root(), &dir)? else {
+                continue;
+            };
+            if entry.file_name().to_str() != Some(namespace_hex(&store.namespace).as_str()) {
+                return Err(RootStoreError::Descriptor {
+                    path: dir.join(ROOT_STORE_FILE),
+                    reason: format!(
+                        "it records the root of {}, whose store is {}; move the directory there",
+                        store.namespace,
+                        root_store_dir(pib.root(), &store.namespace).display()
+                    ),
+                });
+            }
+            stores.push(store);
+        }
+        stores.sort_by_key(|s| s.namespace.to_string());
+        if let Some(pair) = stores.windows(2).find(|w| w[0].namespace == w[1].namespace) {
+            return Err(RootStoreError::Descriptor {
+                path: pair[1].descriptor_path(),
+                reason: format!(
+                    "{} records a root of {} too; keep the store whose key is an anchor of the \
+                     held trust context and remove the other",
+                    pair[0].descriptor_path().display(),
+                    pair[0].namespace
+                ),
+            });
+        }
+        let legacy = Self::legacy(pib, &stores)?;
+        stores.extend(legacy);
+        stores.sort_by_key(|s| s.namespace.to_string());
+        Ok(stores)
+    }
+
+    /// The root store of `namespace` in the PIB at `pib` ([`open_all`](Self::open_all));
+    /// `None`: this PIB holds no root of it.
+    pub fn open_for(pib: &FilePib, namespace: &Name) -> Result<Option<RootStore>, RootStoreError> {
+        Ok(Self::open_all(pib)?
+            .into_iter()
+            .find(|s| &s.namespace == namespace))
+    }
+
+    /// The one root store of the PIB at `pib` ([`open_all`](Self::open_all)).
+    /// `None`: this PIB holds no namespace root. A PIB holding the roots of
+    /// several namespaces is refused ([`RootStoreError::SeveralRoots`],
+    /// listing them): name the namespace with [`open_for`](Self::open_for).
     pub fn open(pib: &FilePib) -> Result<Option<RootStore>, RootStoreError> {
-        let path = descriptor_path(pib.root());
+        let mut all = Self::open_all(pib)?;
+        if all.len() > 1 {
+            return Err(RootStoreError::SeveralRoots {
+                pib: pib.root().display().to_string(),
+                held: all.iter().map(|s| s.namespace.to_string()).collect(),
+            });
+        }
+        Ok(all.pop())
+    }
+
+    /// The root store of `namespace` when one is named
+    /// ([`open_for`](Self::open_for)), else the one root store
+    /// ([`open`](Self::open)) — what a command acting on one root opens.
+    pub fn open_named(
+        pib: &FilePib,
+        namespace: Option<&Name>,
+    ) -> Result<Option<RootStore>, RootStoreError> {
+        match namespace {
+            Some(ns) => Self::open_for(pib, ns),
+            None => Self::open(pib),
+        }
+    }
+
+    /// Whether the PIB at `pib` holds the root of an anchor of `ctx`
+    /// ([`holds_anchor_of`](Self::holds_anchor_of) over every root store).
+    pub fn any_holds_anchor_of(
+        pib: &FilePib,
+        ctx: &SignedTrustContext,
+    ) -> Result<bool, RootStoreError> {
+        Ok(Self::open_all(pib)?.iter().any(|s| s.holds_anchor_of(ctx)))
+    }
+
+    /// The store whose descriptor is in `dir`, if there is one.
+    fn read_descriptor(pib_root: &Path, dir: &Path) -> Result<Option<RootStore>, RootStoreError> {
+        let path = dir.join(ROOT_STORE_FILE);
         match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse(pib.root(), &path, &text).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::legacy(pib),
+            Ok(text) => Self::parse(pib_root, dir, &text).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io_err(&path)(e)),
         }
     }
 
-    fn parse(pib_root: &Path, path: &Path, text: &str) -> Result<RootStore, RootStoreError> {
+    fn parse(pib_root: &Path, dir: &Path, text: &str) -> Result<RootStore, RootStoreError> {
         let bad = |reason: String| RootStoreError::Descriptor {
-            path: path.to_path_buf(),
+            path: dir.join(ROOT_STORE_FILE),
             reason,
         };
         let d: Descriptor = toml::from_str(text).map_err(|e| bad(e.to_string()))?;
@@ -480,6 +591,7 @@ impl RootStore {
             .map_err(|e| bad(format!("public_key is not base64: {e}")))?;
         let store = RootStore {
             pib_root: pib_root.to_path_buf(),
+            dir: dir.to_path_buf(),
             kind: d.kind,
             namespace: name("namespace", &d.namespace)?,
             key_name: name("key_name", &d.key_name)?,
@@ -504,13 +616,18 @@ impl RootStore {
             && (bag.contains('/') || bag.contains('\\') || bag.starts_with('.'))
         {
             return Err(bad(format!(
-                "safebag {bag:?} must be a file name in {ROOT_STORE_DIR}/"
+                "safebag {bag:?} must be a file name in {}",
+                dir.display()
             )));
         }
         Ok(store)
     }
 
-    fn legacy(pib: &FilePib) -> Result<Option<RootStore>, RootStoreError> {
+    /// The roots `<ns>/KEY/root` kept in the FilePib before root stores:
+    /// a trust anchor of the PIB with its private key there, of a namespace
+    /// none of `described` records.
+    fn legacy(pib: &FilePib, described: &[RootStore]) -> Result<Vec<RootStore>, RootStoreError> {
+        let mut found = Vec::new();
         for anchor in pib.trust_anchors()? {
             let key = ndn_security::cert_name::key_name_of(&anchor.name);
             let comps = key.components();
@@ -521,8 +638,16 @@ impl RootStore {
                 continue;
             }
             let namespace = Name::from_components(comps[..comps.len() - 2].iter().cloned());
-            return Ok(Some(RootStore {
+            if described
+                .iter()
+                .chain(found.iter())
+                .any(|s: &RootStore| s.namespace == namespace)
+            {
+                continue;
+            }
+            found.push(RootStore {
                 pib_root: pib.root().to_path_buf(),
+                dir: root_store_dir(pib.root(), &namespace),
                 kind: RootStoreKind::File,
                 namespace,
                 key_name: key,
@@ -532,9 +657,15 @@ impl RootStore {
                 keychain: None,
                 yubikey: None,
                 legacy: true,
-            }));
+            });
         }
-        Ok(None)
+        Ok(found)
+    }
+
+    /// Where this store's descriptor is (or is written, for a root kept in
+    /// the FilePib before root stores).
+    pub fn descriptor_path(&self) -> PathBuf {
+        self.dir.join(ROOT_STORE_FILE)
     }
 
     pub fn kind(&self) -> RootStoreKind {
@@ -581,9 +712,7 @@ impl RootStore {
     }
 
     fn safebag_path(&self) -> Option<PathBuf> {
-        self.safebag
-            .as_ref()
-            .map(|f| self.pib_root.join(ROOT_STORE_DIR).join(f))
+        self.safebag.as_ref().map(|f| self.dir.join(f))
     }
 
     /// Where the private key is, for messages.
@@ -667,7 +796,7 @@ impl RootStore {
                 kind: self.kind,
                 key: self.key_name.to_string(),
                 location: self.location(),
-                descriptor: descriptor_path(&self.pib_root),
+                descriptor: self.descriptor_path(),
             });
         }
         Ok(signer)
@@ -709,7 +838,7 @@ impl RootStore {
                 kind: self.kind,
                 key: self.key_name.to_string(),
                 location: self.location(),
-                descriptor: descriptor_path(&self.pib_root),
+                descriptor: self.descriptor_path(),
             });
         }
         Ok(token.signer_with(
@@ -766,7 +895,7 @@ impl RootStore {
 
     /// The root's anchor certificate as signed Data (for a SafeBag).
     fn anchor_wire(&self, pib: &FilePib) -> Result<Bytes, RootStoreError> {
-        let path = pib.root().join(CA_DIR).join(ANCHOR_CERT_FILE);
+        let path = ca_dir(pib.root(), &self.namespace).join(ANCHOR_CERT_FILE);
         if let Ok(wire) = std::fs::read(&path) {
             return Ok(Bytes::from(wire));
         }
@@ -863,10 +992,10 @@ impl RootStore {
                 kind: self.kind,
                 key: self.key_name.to_string(),
                 location: self.location(),
-                descriptor: descriptor_path(pib.root()),
+                descriptor: self.descriptor_path(),
             });
         }
-        let draft = pending.write_material(pib, &self.key_name, anchor)?;
+        let draft = pending.write_material(pib, &self.dir, &self.key_name, anchor)?;
         let moved = RootStore {
             kind: target,
             namespace: self.namespace.clone(),
@@ -899,18 +1028,25 @@ impl RootStore {
 
     /// Remove this store's private material (keychain entry, SafeBag, PIB
     /// key; a YubiKey slot is left as it is) and its descriptor — for
-    /// `ndn-fwd init --force`, which replaces the root.
+    /// `ndn-fwd init --force`, which replaces the root. The roots of other
+    /// namespaces are untouched.
     pub(crate) fn destroy(&self, pib: &FilePib) -> Result<(), RootStoreError> {
         match self.kind {
             RootStoreKind::File => pib.delete_key(&self.key_name)?,
             _ => self.remove_material(pib),
         }
-        let path = descriptor_path(pib.root());
+        let path = self.descriptor_path();
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&path)(e)),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(&path)(e)),
         }
+        // The namespace's own directory, once empty; `<pib>/root` of a
+        // store from before several roots stays.
+        if self.dir != pib.root().join(ROOT_STORE_DIR) {
+            let _ = std::fs::remove_dir(&self.dir);
+        }
+        Ok(())
     }
 
     /// Best effort: the SafeBag (overwritten, then removed) and keychain
@@ -940,13 +1076,12 @@ impl RootStore {
             keychain: self.keychain.clone(),
             yubikey: self.yubikey.clone(),
         };
-        let path = descriptor_path(&self.pib_root);
+        let path = self.descriptor_path();
         let body = toml::to_string(&d).map_err(|e| RootStoreError::Descriptor {
             path: path.clone(),
             reason: e.to_string(),
         })?;
-        let dir = self.pib_root.join(ROOT_STORE_DIR);
-        ndn_security::secure_fs::create_private_dir_all(&dir).map_err(io_err(&dir))?;
+        ndn_security::secure_fs::create_private_dir_all(&self.dir).map_err(io_err(&self.dir))?;
         ndn_security::secure_fs::write_private(&path, format!("{DESCRIPTOR_HEADER}{body}"))
             .map_err(io_err(&path))
     }
@@ -1118,17 +1253,20 @@ impl PendingRoot {
         })
     }
 
-    /// Write the store's material (SafeBag, keychain entry) for the root
-    /// `key` whose anchor certificate is `anchor`; the descriptor is not
-    /// written. Returns the store, its identity fields to be completed.
+    /// Write the store's material (SafeBag, keychain entry) into `dir` for
+    /// the root `key` whose anchor certificate is `anchor`; the descriptor
+    /// is not written. Returns the store, its identity fields to be
+    /// completed.
     fn write_material(
         &self,
         pib: &FilePib,
+        dir: &Path,
         key: &Name,
         anchor: Bytes,
     ) -> Result<RootStore, RootStoreError> {
         let mut store = RootStore {
             pib_root: pib.root().to_path_buf(),
+            dir: dir.to_path_buf(),
             kind: RootStoreKind::File,
             namespace: Name::root(),
             key_name: key.clone(),
@@ -1174,8 +1312,7 @@ impl PendingRoot {
                 };
                 let bag = SafeBag::encrypt(anchor, pkcs8, sealing.expose())
                     .map_err(|e| RootStoreError::Trust(TrustError::KeyStore(e.to_string())))?;
-                let dir = pib.root().join(ROOT_STORE_DIR);
-                ndn_security::secure_fs::create_private_dir_all(&dir).map_err(io_err(&dir))?;
+                ndn_security::secure_fs::create_private_dir_all(dir).map_err(io_err(dir))?;
                 let path = dir.join(file);
                 ndn_security::secure_fs::write_private(&path, bag.encode())
                     .map_err(io_err(&path))?;
@@ -1185,8 +1322,9 @@ impl PendingRoot {
         Ok(store)
     }
 
-    /// Record the root, now that the namespace anchor `anchor` is signed:
-    /// seal it (SafeBag, keychain) and write the descriptor.
+    /// Record the root of `namespace`, now that its anchor `anchor` is
+    /// signed: seal it (SafeBag, keychain) and write the descriptor, in the
+    /// namespace's [`root_store_dir`].
     pub(crate) fn commit(
         self,
         pib: &FilePib,
@@ -1202,7 +1340,8 @@ impl PendingRoot {
                 "the root anchor certificate has no signed wire".into(),
             ))
         })?;
-        let draft = self.write_material(pib, &key, wire)?;
+        let dir = root_store_dir(pib.root(), namespace);
+        let draft = self.write_material(pib, &dir, &key, wire)?;
         let store = RootStore {
             namespace: namespace.clone(),
             anchor_cert: (*anchor.name).clone(),
@@ -1550,7 +1689,7 @@ mod tests {
     #[test]
     fn descriptors_are_validated() {
         let dir = tempfile::tempdir().unwrap();
-        let path = descriptor_path(dir.path());
+        let path = root_store_dir(dir.path(), &"/home/bob".parse().unwrap());
         let ok = r#"
 kind = "yubikey-piv"
 namespace = "/home/bob"
