@@ -144,8 +144,14 @@ mod tests {
         let m = MeasurementsTable::new();
         let fib = FibEntry {
             nexthops: vec![
-                FibNexthop { face_id: FaceId(1), cost: 1 },
-                FibNexthop { face_id: FaceId(2), cost: 1 },
+                FibNexthop {
+                    face_id: FaceId(1),
+                    cost: 1,
+                },
+                FibNexthop {
+                    face_id: FaceId(2),
+                    cost: 1,
+                },
             ],
         };
         let suppressed = [FaceId(1), FaceId(2)];
@@ -154,7 +160,9 @@ mod tests {
 
         let actions = s.decide(&ctx).expect("a verdict");
         assert!(
-            !actions.iter().any(|a| matches!(a, ForwardingAction::Nack(_))),
+            !actions
+                .iter()
+                .any(|a| matches!(a, ForwardingAction::Nack(_))),
             "suppression must never answer Nack"
         );
         assert!(
@@ -173,7 +181,9 @@ mod tests {
         let ctx = make_ctx(&name, FaceId(9), Some(&fib), &m);
         let actions = s.decide(&ctx).expect("a verdict");
         assert!(
-            actions.iter().any(|a| matches!(a, ForwardingAction::Nack(NackReason::NoRoute))),
+            actions
+                .iter()
+                .any(|a| matches!(a, ForwardingAction::Nack(NackReason::NoRoute))),
             "an empty nexthop set is genuinely NoRoute"
         );
     }
@@ -262,4 +272,3 @@ mod tests {
         assert_eq!(last.value.as_ref(), &[5u8]);
     }
 }
-

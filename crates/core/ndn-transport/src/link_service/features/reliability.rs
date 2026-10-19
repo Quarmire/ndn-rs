@@ -287,7 +287,10 @@ mod tests {
         // The other half of the contract: answering is unconditional, but
         // sending reliably stays opt-in.
         let f = ReliabilityFeature::new();
-        assert!(f.frame(b"x").is_empty(), "disabled face must not frame reliably");
+        assert!(
+            f.frame(b"x").is_empty(),
+            "disabled face must not frame reliably"
+        );
         assert!(
             f.take_retransmissions().is_empty(),
             "disabled face must not retransmit its own traffic"

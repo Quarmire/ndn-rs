@@ -116,7 +116,10 @@ impl NetworkRegionTable {
 /// `None` for a QUIC link face: a link is one connection to one device,
 /// identified by its key, and devices behind one NAT (or on one host) share
 /// an address — a relay must forward between them.
-fn peer_host(face_table: &ndn_transport::FaceTable, face_id: ndn_transport::FaceId) -> Option<String> {
+fn peer_host(
+    face_table: &ndn_transport::FaceTable,
+    face_id: ndn_transport::FaceId,
+) -> Option<String> {
     let face = face_table.get(face_id)?;
     if face.kind() == ndn_transport::FaceKind::Quic {
         return None;
@@ -521,7 +524,9 @@ fn host_of_remote_uri(uri: &str) -> &str {
     if let Some(end) = after_scheme.find(']') {
         &after_scheme[..=end]
     } else {
-        after_scheme.rsplit_once(':').map_or(after_scheme, |(h, _)| h)
+        after_scheme
+            .rsplit_once(':')
+            .map_or(after_scheme, |(h, _)| h)
     }
 }
 

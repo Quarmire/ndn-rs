@@ -561,7 +561,6 @@ impl LpReliability {
         self.unacked_evictions
     }
 
-
     pub fn rto_us(&self) -> u64 {
         self.rto_us
     }
@@ -757,7 +756,9 @@ mod tests {
         for wire in &sent[1..4] {
             receiver.on_receive(wire);
         }
-        let acks = receiver.flush_acks().expect("receiver must ack what it got");
+        let acks = receiver
+            .flush_acks()
+            .expect("receiver must ack what it got");
         rel.on_receive(&acks);
 
         let repairs = rel.take_fast_retransmits();
@@ -1032,9 +1033,18 @@ mod duplicate_suppression_tests {
         let mut rel = LpReliability::new(1400);
         const TX: u64 = 77;
 
-        assert!(!rel.on_receive(&reliable_frame(TX)), "first arrival is not a duplicate");
-        assert!(rel.on_receive(&reliable_frame(TX)), "retransmission must be flagged duplicate");
-        assert!(rel.on_receive(&reliable_frame(TX)), "and stay flagged while in the window");
+        assert!(
+            !rel.on_receive(&reliable_frame(TX)),
+            "first arrival is not a duplicate"
+        );
+        assert!(
+            rel.on_receive(&reliable_frame(TX)),
+            "retransmission must be flagged duplicate"
+        );
+        assert!(
+            rel.on_receive(&reliable_frame(TX)),
+            "and stay flagged while in the window"
+        );
         assert_eq!(rel.duplicate_frames(), 2);
 
         // Every arrival queued an Ack, duplicates included.
@@ -1052,7 +1062,10 @@ mod duplicate_suppression_tests {
     fn distinct_txsequences_are_not_duplicates() {
         let mut rel = LpReliability::new(1400);
         for tx in 0..50u64 {
-            assert!(!rel.on_receive(&reliable_frame(tx)), "tx={tx} is first-seen");
+            assert!(
+                !rel.on_receive(&reliable_frame(tx)),
+                "tx={tx} is first-seen"
+            );
         }
         assert_eq!(rel.duplicate_frames(), 0);
     }
