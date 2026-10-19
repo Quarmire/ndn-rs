@@ -1114,6 +1114,20 @@ so the engine-built
 `accept-signed` is the validator's `accept_signed()` mode (the walk ends at the
 verified signer). KEY-name KeyLocators resolve through the cert cache's key
 index, and a self-signed certificate (cert-v2 or legacy key-named) verifies
-against the key it carries. One policy differs from the bullet above: with no
-SecurityManager, `default` runs signature-only (logged at startup) rather than
-failing closed.
+against the key it carries. For a while the merged line ran `default` with no
+SecurityManager signature-only (as `accept_signed`), contradicting the bullet
+above, `SecurityProfile::Default`'s docs and its own startup log line.
+
+**Owner decision (2026-10-19): `default` with no SecurityManager fails
+closed.** It refuses everything it would have to validate: the engine builds
+its validator with `Validator::refuse_without_anchors()`, so every Data from a
+non-local face that names a signer is refused at once, before any certificate
+fetch, with the final local refusal `untrusted-root`
+(`TrustError::NoTrustAnchors`), while the trust context governing its name
+holds no anchor. DigestSha256 Data still passes its digest check, local faces
+stay unvalidated, and anchors added to the engine's validator later (or a
+context adopted into its keyring) are honoured. The engine logs one WARN at
+build. Anyone wanting less chooses `accept-signed` (signature only) or
+`disabled` explicitly. ndn-fwd is unaffected in practice (it always has a
+SecurityManager, ephemeral at worst); a config with no `[security]` table
+still runs `disabled`, and the daemon now says so at startup.

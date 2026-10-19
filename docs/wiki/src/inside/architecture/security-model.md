@@ -144,6 +144,19 @@ signer's certificate — fetched if not cached, a self-signed one included — b
 that certificate need not reach an anchor. On a forwarder the certificate is
 itself Data the engine validated the same way before the fetch received it.
 
+The forwarder's `default` profile walks to an anchor. An engine built with
+`default` and **no `SecurityManager`** has no anchors, so it fails closed: its
+validator is built with `Validator::refuse_without_anchors()`, which refuses
+every packet naming a signer while the trust context governing its name holds
+no anchor — `TrustError::NoTrustAnchors`, the final local refusal
+`untrusted-root` — before any certificate is looked up or fetched. DigestSha256
+Data still passes its digest check, local faces are not validated, and anchors
+added to the engine's validator later (or a trust context adopted into its
+keyring) are honoured for the names they govern. It never degrades to
+signature-only checking: an embedder that wants that chooses `accept-signed`,
+and one that validates end to end itself chooses `disabled`. The engine logs
+one WARN at build saying so.
+
 ### Interoperable trust schemas (LVS)
 
 Beyond ndn-rs's native `SchemaRule`s, a schema can import a **LightVerSec (LVS)**

@@ -430,6 +430,12 @@ fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
             Refusal::UntrustedRoot,
             "REFUSED — chain ends at a self-signed certificate that is not a trust anchor",
         ),
+        TrustError::NoTrustAnchors { .. } => (
+            Refusal::UntrustedRoot,
+            "REFUSED — no trust anchor configured (profile \"default\" without a security manager \
+             fails closed): configure trust anchors, or choose profile \"accept-signed\" or \
+             \"disabled\" explicitly",
+        ),
         TrustError::ExpectedContextRefused { .. } => (
             Refusal::Context,
             "REFUSED — trust context does not meet the adoption/update expectation",

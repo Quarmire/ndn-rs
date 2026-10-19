@@ -13,6 +13,8 @@
 mod broadcast_data_parity;
 #[path = "congestion_feedback.rs"]
 mod congestion_feedback;
+#[path = "default_profile_without_manager.rs"]
+mod default_profile_without_manager;
 #[path = "egress_scheduler.rs"]
 mod egress_scheduler;
 #[path = "face_factory.rs"]

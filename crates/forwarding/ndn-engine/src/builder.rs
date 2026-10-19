@@ -932,20 +932,28 @@ fn resolve_security_profile(
 
         (SecurityProfile::Custom(v), _) => Some(v),
 
-        // No SecurityManager: `Default` degrades to `AcceptSigned`.
-        (profile @ (SecurityProfile::AcceptSigned | SecurityProfile::Default), None) => {
-            if matches!(profile, SecurityProfile::Default) {
-                tracing::info!(target: t::SECURITY,
-                    "No SecurityManager configured: profile \"default\" has no trust \
-                     anchors, so only DigestSha256 Data validates and key-signed Data \
-                     is dropped. Configure a [security] identity whose PIB holds trust \
-                     anchors, or profile = \"accept-signed\"."
-                );
-            }
+        // No SecurityManager: `Default` has no trust anchors, so it fails
+        // closed. Every Data from a non-local face that names a signer is
+        // refused at once, a final `untrusted-root` (local faces are exempt
+        // from validation as always; DigestSha256 Data still checks its
+        // digest). Anchors added to this validator later are honoured.
+        (SecurityProfile::Default, None) => {
+            tracing::warn!(target: t::SECURITY,
+                "Security profile \"default\" without a SecurityManager: no trust anchors are \
+                 configured, so every signed Data arriving on a non-local face is REFUSED \
+                 (untrusted-root); local faces are unaffected. Configure a security manager \
+                 (a [security] identity whose PIB holds trust anchors, or adopt a trust \
+                 context), or choose profile \"accept-signed\" (signature only) or \
+                 \"disabled\" explicitly."
+            );
             Some(Arc::new(
-                Validator::new(TrustSchema::accept_all()).accept_signed(),
+                Validator::new(TrustSchema::hierarchical()).refuse_without_anchors(),
             ))
         }
+
+        (SecurityProfile::AcceptSigned, None) => Some(Arc::new(
+            Validator::new(TrustSchema::accept_all()).accept_signed(),
+        )),
 
         (SecurityProfile::AcceptSigned, Some(mgr)) => {
             // Share the manager's keyring: its ambient context already

@@ -93,7 +93,10 @@ pub enum Refusal {
     /// The trust schema or trust context does not authorize the signer for
     /// the name.
     Schema,
-    /// The chain ends at a self-signed certificate that is no trust anchor.
+    /// The chain ends at a self-signed certificate that is no trust anchor,
+    /// or the governing trust context holds no trust anchor at all (a
+    /// `default`-profile forwarder with no security manager), so no chain
+    /// can end at one.
     UntrustedRoot,
     /// A trust context arrived for a namespace being adopted or updated and
     /// failed that expectation (a foreign fingerprint, or an update not

@@ -111,6 +111,10 @@ pub struct Validator {
     /// packet's signature verified against its signer's certificate suffices
     /// ([`Self::accept_signed`]).
     pub(super) require_anchor: bool,
+    /// Whether a packet that names a signer is refused at once while the
+    /// trust context governing its name holds no trust anchor
+    /// ([`Self::refuse_without_anchors`]).
+    pub(super) refuse_without_anchors: bool,
     /// Certificate packets refused because their chain ends at a self-signed
     /// certificate that is no trust anchor, by the key each certifies, with
     /// the instant (ns) until which each answers for its key. A walk resolves
@@ -146,6 +150,7 @@ impl Validator {
             expectations: Default::default(),
             expecting: Default::default(),
             require_anchor: true,
+            refuse_without_anchors: false,
             refused_certs: DashMap::new(),
         }
     }
@@ -178,6 +183,7 @@ impl Validator {
             expectations: Default::default(),
             expecting: Default::default(),
             require_anchor: true,
+            refuse_without_anchors: false,
             refused_certs: DashMap::new(),
         }
     }
@@ -206,6 +212,7 @@ impl Validator {
             expectations: Default::default(),
             expecting: Default::default(),
             require_anchor: true,
+            refuse_without_anchors: false,
             refused_certs: DashMap::new(),
         }
     }
@@ -223,6 +230,37 @@ impl Validator {
     pub fn accept_signed(mut self) -> Self {
         self.require_anchor = false;
         self
+    }
+
+    /// Refuse every packet that names a signer — with
+    /// [`TrustError::NoTrustAnchors`], a final verdict, before any
+    /// certificate is looked up or fetched — while the trust context
+    /// governing its name holds no trust anchor: no chain could end at one,
+    /// so waiting for certificates could only end in the same refusal later.
+    /// DigestSha256 Data still validates (integrity only, no signer).
+    ///
+    /// This is [`SecurityProfile::Default`](crate::SecurityProfile::Default)
+    /// without a `SecurityManager`: it fails closed. Once anchors are added
+    /// to (or a context is adopted into) this validator's keyring, the names
+    /// they govern are validated in full.
+    pub fn refuse_without_anchors(mut self) -> Self {
+        self.refuse_without_anchors = true;
+        self
+    }
+
+    /// Under [`Self::refuse_without_anchors`], the refusal of a packet named
+    /// `name` that names a signer, if the context governing `name` holds no
+    /// trust anchor.
+    pub(super) fn unanchored(&self, name: &Name) -> Option<TrustError> {
+        if !self.refuse_without_anchors || !self.require_anchor {
+            return None;
+        }
+        let ctx = self.keyring.context_for(name);
+        ctx.anchors()
+            .is_empty()
+            .then(|| TrustError::NoTrustAnchors {
+                namespace: ctx.namespace().to_string(),
+            })
     }
 
     /// The keyring this validator dispatches against.
@@ -408,6 +446,9 @@ impl Validator {
                 Err(e) => ValidationResult::Invalid(e),
             };
         }
+        if let Some(refused) = self.unanchored(&data.name) {
+            return ValidationResult::Invalid(refused);
+        }
 
         // KeyDigest-form requires chain walking via validate_chain().
         let key_name: std::sync::Arc<Name> = match &sig_info.key_locator {
@@ -504,6 +545,9 @@ impl Validator {
                 "DigestSha256 (0)",
                 DIGEST_NO_SIGNER,
             ));
+        }
+        if let Some(refused) = self.unanchored(&interest.name) {
+            return InterestValidationOutcome::Invalid(refused);
         }
 
         let key_name: std::sync::Arc<Name> = match &sig_info.key_locator {

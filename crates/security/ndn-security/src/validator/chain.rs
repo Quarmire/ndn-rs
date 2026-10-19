@@ -116,6 +116,9 @@ impl Validator {
             }
             return result(ValidationResult::Invalid(TrustError::InvalidSignature));
         }
+        if let Some(refused) = self.unanchored(&data.name) {
+            return result(ValidationResult::Invalid(refused));
+        }
 
         // KeyDigest cannot drive a fetch — it requires a pre-loaded cert.
         let first_key: Arc<Name> = match &sig_info.key_locator {
@@ -197,6 +200,9 @@ impl Validator {
                 "DigestSha256 (0)",
                 DIGEST_NO_SIGNER,
             ));
+        }
+        if let Some(refused) = self.unanchored(&interest.name) {
+            return InterestValidationOutcome::Invalid(refused);
         }
 
         let first_key: Arc<Name> = match &sig_info.key_locator {
@@ -1416,6 +1422,49 @@ mod tests {
             ValidationResult::Invalid(TrustError::ChainCycle { .. }) => {}
             other => panic!("expected ChainCycle, got: {other:?}"),
         }
+    }
+
+    /// `refuse_without_anchors`: with no anchor in the governing context,
+    /// key-signed Data is refused at once (no certificate is asked for) by
+    /// every Data path; DigestSha256 Data still validates; once an anchor is
+    /// added the chain is walked as usual.
+    #[tokio::test]
+    async fn refuse_without_anchors_refuses_until_an_anchor_is_added() {
+        let signer = Ed25519Signer::from_seed(&[26u8; 32], name1("key"));
+        let data = Data::decode(make_signed_data(&signer, "data", "key").await).unwrap();
+        let validator = Validator::new(wildcard_schema()).refuse_without_anchors();
+
+        match validator.validate_chain_cached(&data).await {
+            (ValidationResult::Invalid(TrustError::NoTrustAnchors { .. }), None) => {}
+            other => panic!("expected NoTrustAnchors with nothing to fetch, got: {other:?}"),
+        }
+        assert!(matches!(
+            validator.validate(&data).await,
+            ValidationResult::Invalid(TrustError::NoTrustAnchors { .. })
+        ));
+        let digest = Data::decode(
+            ndn_packet::encode::DataBuilder::new(name1("data"), b"x").sign_digest_sha256(),
+        )
+        .unwrap();
+        assert!(matches!(
+            validator.validate_chain(&digest).await,
+            ValidationResult::Valid(_)
+        ));
+
+        validator.add_trust_anchor(Certificate {
+            name: Arc::new(signer.key_name().clone()),
+            public_key: Bytes::copy_from_slice(&signer.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        });
+        assert!(matches!(
+            validator.validate_chain(&data).await,
+            ValidationResult::Valid(_)
+        ));
     }
 
     /// A chain of distinct keys longer than the validator's limit ends the

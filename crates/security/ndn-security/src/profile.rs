@@ -17,9 +17,17 @@ pub enum SecurityProfile {
     /// - `CertFetcher` for missing certificates (the engine fetches them
     ///   through its own faces)
     ///
-    /// **When no `SecurityManager` is set** there are no trust anchors: the
-    /// chain walk still runs, so DigestSha256 Data validates but key-signed
-    /// Data fails closed. It never degrades to signature-only checking.
+    /// **When no `SecurityManager` is set** there are no trust anchors, and
+    /// `Default` fails closed: every Data from a non-local face that names a
+    /// signer is refused at once with the final local refusal
+    /// `untrusted-root` ([`TrustError::NoTrustAnchors`](crate::TrustError::NoTrustAnchors),
+    /// [`Validator::refuse_without_anchors`]). DigestSha256 Data still
+    /// validates (integrity only, no signer); local faces are not validated,
+    /// as under every profile. It never degrades to signature-only checking:
+    /// choose [`AcceptSigned`](Self::AcceptSigned) or
+    /// [`Disabled`](Self::Disabled) explicitly for that. Trust anchors added
+    /// to the engine's validator later (or a trust context adopted into its
+    /// keyring) are honoured for the names they govern.
     ///
     /// Use [`Disabled`](Self::Disabled) to explicitly turn off all validation.
     Default,

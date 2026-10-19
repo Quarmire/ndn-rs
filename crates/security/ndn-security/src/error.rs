@@ -30,6 +30,18 @@ pub enum TrustError {
          issued it (`ndn-fwd adopt <anchor link>`), or add {cert} as a trust anchor"
     )]
     UntrustedSelfSigned { cert: String, namespace: String },
+    /// The trust context governing the packet holds no trust anchor, so no
+    /// signer can be trusted: the validator refuses at once
+    /// ([`Validator::refuse_without_anchors`](crate::Validator::refuse_without_anchors),
+    /// security profile `default` without a security manager).
+    #[error(
+        "no trust anchor is configured for {namespace}, so no signer can be trusted (security \
+         profile \"default\" without a security manager fails closed): configure trust anchors \
+         (a security manager / [security] identity whose PIB holds them, or `ndn-fwd adopt \
+         <anchor link>`), or choose profile \"accept-signed\" (signature only) or \"disabled\" \
+         explicitly"
+    )]
+    NoTrustAnchors { namespace: String },
     #[error("key store error: {0}")]
     KeyStore(String),
     #[error("unsupported signature type: {name} (code {code})")]

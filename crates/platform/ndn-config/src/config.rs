@@ -2653,11 +2653,16 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub auto_init: bool,
 
-    /// `"default"` (full chain validation), `"accept-signed"` (signature
-    /// only, no chain walk), or `"disabled"` (no validation; implies
-    /// `validator_enabled = false`). Default `"default"` when the `[security]`
-    /// table is present. When it is absent entirely, `SecurityConfig::default()`
-    /// applies, whose `validator_enabled` is `false`: Data is NOT validated.
+    /// `"default"` (full chain validation to a trust anchor), `"accept-signed"`
+    /// (signature only, no chain walk), or `"disabled"` (no validation;
+    /// implies `validator_enabled = false`). Default `"default"` when the
+    /// `[security]` table is present. `"default"` on an engine with no
+    /// security manager has no trust anchors and fails closed: every
+    /// key-signed Data from a non-local face is refused `untrusted-root`
+    /// (ndn-fwd always loads one, ephemeral at worst). When the table is
+    /// absent entirely, `SecurityConfig::default()` applies, whose
+    /// `validator_enabled` is `false`: Data is NOT validated (ndn-fwd warns
+    /// at startup).
     #[serde(default = "default_security_profile")]
     pub profile: String,
 

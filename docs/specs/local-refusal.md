@@ -119,7 +119,7 @@ own state for each of its downstreams.
 | 171 | `AB` | `revoked` | `Revoked` | A certificate on the chain is revoked in the governing trust context. | yes |
 | 172 | `AC` | `bad-signature` | `BadSignature` | The signature does not verify (forged, or altered in transit), the key encoding is invalid, or the Data has no usable signing-key reference (see §4.2). | yes |
 | 173 | `AD` | `schema` | `Schema` | The trust schema or trust context does not authorize this signer for this name, or does not allow an issuer to certify a certificate on the chain. | yes |
-| 174 | `AE` | `untrusted-root` | `UntrustedRoot` | The chain ends at a self-signed certificate that is not a trust anchor of the governing trust context. | yes |
+| 174 | `AE` | `untrusted-root` | `UntrustedRoot` | The chain ends at a self-signed certificate that is not a trust anchor of the governing trust context, or the governing trust context holds no trust anchor at all, so no chain can end at one (§4.2). | yes |
 | 175 | `AF` | `context` | `Context` | A trust context Data arrived for a namespace that is being adopted or updated and failed that expectation: it is signed by an anchor whose fingerprint is not the expected fingerprint, an update is not signed by an anchor of the held version, or the context does not open. | yes |
 | 176 | `B0` | `unverifiable` | `Unverifiable` | The Data cannot be verified now. Every source the forwarder asked for the signing certificate answered definitively that none is available there (a NoRoute Nack), or served a certificate this forwarder refused. | **no** |
 
@@ -171,6 +171,7 @@ one of three ways: valid, invalid with an error, or pending on a missing certifi
 | No SignatureInfo; a KeyDigest KeyLocator whose certificate is not cached; no KeyLocator on a signature type that does not require one at decode | 172 ([Decision 1](#8-decisions)) |
 | Schema mismatch; certificate not authorized by its issuer | 173 |
 | Chain ends at a self-signed certificate that is not an anchor | 174 |
+| The governing trust context holds no trust anchor (ndn-rs: `default` profile with no `SecurityManager`), checked before the KeyLocator is resolved, for every Data that names a signer | 174 |
 | Trust context at an expected name fails the adoption or update expectation | 175 |
 | Any other chain error (too deep, cycle, unsupported signature type, key store, certificate not found) | 170 |
 | Pending: the signing (or an issuer) certificate is not cached | none yet; see below |
