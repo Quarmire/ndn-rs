@@ -192,6 +192,36 @@ impl SecurityManager {
         self.insert_key(key_name, Arc::new(signer), false);
     }
 
+    /// Stop holding `key_name`: it no longer signs anything, and its identity
+    /// signs with another key of it still held (the smallest name), or leaves
+    /// the signing set when none is. Returns whether the key was held.
+    pub fn remove_key(&self, key_name: &Name) -> bool {
+        if self.keys.remove(key_name).is_none() {
+            return false;
+        }
+        if let Some(identity) = identity_of_key(key_name) {
+            let next = self
+                .keys
+                .iter()
+                .filter(|r| identity_of_key(r.key()).as_ref() == Some(&identity))
+                .map(|r| Arc::clone(r.key()))
+                .min();
+            match next {
+                Some(key) => {
+                    if let Some(mut entry) = self.by_identity.get_mut(&identity)
+                        && entry.key.as_ref() == key_name
+                    {
+                        entry.key = key;
+                    }
+                }
+                None => {
+                    self.by_identity.remove(&identity);
+                }
+            }
+        }
+        true
+    }
+
     /// Issue a self-signed certificate and register it as a trust anchor.
     ///
     /// The certificate of a `…/KEY/<id>` key is named `<key_name>/self/<version>`
@@ -1376,5 +1406,20 @@ mod tests {
             mgr.signer_for(&n("/c/member/x/data")).unwrap().key_name(),
             &c_key
         );
+        // A removed key signs nothing; its identity falls back to a key it
+        // still holds, or leaves the signing set.
+        assert!(mgr.remove_key(&c_key));
+        assert!(mgr.signer_for(&n("/c/member/x/data")).is_err());
+        assert!(mgr.remove_key(&a_new));
+        assert_eq!(
+            mgr.signer_for(&n("/a/member/x/data")).unwrap().key_name(),
+            &a_old
+        );
+        let left: Vec<Name> = mgr
+            .signing_identities()
+            .into_iter()
+            .map(|s| s.identity)
+            .collect();
+        assert_eq!(left, vec![n("/a/member/x")]);
     }
 }
