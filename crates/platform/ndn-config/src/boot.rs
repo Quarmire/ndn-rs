@@ -158,8 +158,12 @@ pub fn configure_data_path(mut builder: EngineBuilder, cfg: &ForwarderConfig) ->
 
 /// Load the forwarder identity `[security] identity` from the PIB at
 /// `pib_path` -- its signing key, its certificate, and the PIB's trust anchors,
-/// which are what a `profile = "default"` validator chains forwarded Data to.
-/// With `[security] auto_init` a PIB without keys gets a generated self-signed
+/// which are what a `profile = "default"` validator chains forwarded Data to
+/// -- as the node identity, registered first, then every other PIB identity
+/// with a currently valid certificate
+/// ([`SecurityManager::from_pib`](ndn_security::SecurityManager::from_pib)),
+/// so Data under each trusted prefix is signed with its own key. With
+/// `[security] auto_init` a PIB without keys gets a generated self-signed
 /// identity (also an anchor); the `bool` reports that.
 ///
 /// `Ok(None)` when no identity is configured: the forwarder then runs on

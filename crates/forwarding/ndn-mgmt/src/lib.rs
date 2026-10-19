@@ -168,6 +168,7 @@ pub fn mount_management(
     Arc::clone(&face_events).install(engine, cancel.clone());
     Arc::clone(&route_events).install(engine, cancel.clone());
     Arc::clone(&strategy_events).install(engine, cancel.clone());
+    install_membership_events(engine, &handles, &cancel);
 
     engine.set_face_lifecycle_sink(Arc::new(NotificationFaceLifecycleSink {
         stream: Arc::clone(&face_events),
@@ -212,6 +213,51 @@ pub fn notifications_prefix(module_name: &'static [u8]) -> Name {
         NameComponent::generic(Bytes::from_static(module_name)),
         NameComponent::generic(Bytes::from_static(b"notifications")),
     ])
+}
+
+/// `/localhost/nfd/security/notifications`: the trust-admin backend's
+/// [`MembershipEvent`]s, JSON-encoded, one Data per event — when the
+/// backend publishes them ([`TrustAdminMgmtBackend::membership_events`]).
+fn install_membership_events(
+    engine: &ForwarderEngine,
+    handles: &MgmtHandles,
+    cancel: &CancellationToken,
+) {
+    let Some(mut events) = handles
+        .trust_context_handler
+        .as_ref()
+        .and_then(|backend| backend.membership_events())
+    else {
+        return;
+    };
+    let stream = NotificationStream::<MembershipEvent>::new(notifications_prefix(b"security"));
+    Arc::clone(&stream).install(engine, cancel.clone());
+    let cancel = cancel.clone();
+    engine.runtime().spawn(Box::pin(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            let event = tokio::select! {
+                _ = cancel.cancelled() => return,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(event) => stream.publish(event),
+                Err(RecvError::Lagged(missed)) => tracing::warn!(
+                    target: "mgmt.security",
+                    missed,
+                    "membership notifications fell behind; {missed} events were not published \
+                     (security/memberships has the current state)"
+                ),
+                Err(RecvError::Closed) => return,
+            }
+        }
+    }));
+}
+
+impl NotificationEvent for MembershipEvent {
+    fn encode(&self) -> Bytes {
+        Bytes::from(serde_json::to_vec(self).unwrap_or_default())
+    }
 }
 
 /// Runtime handles for management of pluggable protocol components.
@@ -433,30 +479,44 @@ impl ApprovalMgmtBackend for ndn_cert::ApprovalStore {
 
 // What the trust-admin verbs answer: owned by `ndn-cert` (any host of a
 // personal namespace produces them, see the `ndn-namespace` crate).
+pub use ndn_cert::NodeIdentitySource;
 pub use ndn_cert::report::{
     AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, EnrolledInfo,
-    PendingEnrollInfo, RefreshState, RenewalInfo, RenewalState, TrustRefusal,
+    MembershipChange, MembershipEvent, MembershipInfo, MembershipRelation, PendingEnrollInfo,
+    RefreshState, RenewalInfo, RenewalState, TrustRefusal,
 };
 
-/// Where this node keeps the root key of the namespace it is the root device
-/// of (`security/identity-status` reports it as `root_store=<kind>`).
+/// Where this node keeps the root key of a namespace it is the root device
+/// of (`security/identity-status` reports each as `root_store=<kind>
+/// root_key=<key>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootStoreInfo {
+    /// The namespace whose root it is.
+    pub namespace: Name,
     /// The store kind: `os-keyring`, `sealed-file`, `yubikey-piv`, `file`.
     pub kind: String,
     /// The root key, `<ns>/KEY/root`.
     pub key: Name,
 }
 
-/// The key the node currently signs its own packets with.
+/// The identities the node signs as: its node identity — the key of its
+/// own packets (management responses, discovery records, links) — and why,
+/// and every identity it signs Data as (each trusted prefix's Data with its
+/// own key).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningIdentityInfo {
+    /// The node key.
     pub key: Name,
     /// An in-memory key minted at startup (not persisted).
     pub ephemeral: bool,
-    /// When the key's certificate expires (ns since the Unix epoch), if the
-    /// node holds one for it.
+    /// When the node key's certificate expires (ns since the Unix epoch),
+    /// if the node holds one for it.
     pub valid_until: Option<u64>,
+    /// Which rule chose the node identity.
+    pub source: NodeIdentitySource,
+    /// Every identity the node signs Data as, with its key, sorted by
+    /// identity.
+    pub signing: Vec<(Name, Name)>,
 }
 
 /// Backend for the trust-admin verbs: adopt a trust context
@@ -526,16 +586,33 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         })
     }
 
-    /// The key the node signs with now, if the backend tracks it (it can
-    /// change at runtime through `security/enroll`).
+    /// The node identity and every identity the node signs as, if the
+    /// backend tracks them (they change at runtime through
+    /// `security/enroll`).
     fn signing_identity(&self) -> Option<SigningIdentityInfo> {
         None
     }
 
-    /// Where this node keeps the root key of a namespace it is the root
-    /// device of; `None` on every other node.
-    fn root_store(&self) -> Option<RootStoreInfo> {
+    /// How the node takes part in each namespace it holds
+    /// (`security/memberships`): following, member (role) or owner.
+    async fn memberships(&self) -> Result<Vec<MembershipInfo>, TrustRefusal> {
+        Err(TrustRefusal {
+            status_code: ndn_mgmt_wire::control_response::status::NOT_FOUND,
+            reason: "this node does not report its trusted prefixes".to_owned(),
+        })
+    }
+
+    /// A receiver of the node's membership changes, served at
+    /// `/localhost/nfd/security/notifications`; `None`: none are published.
+    /// Called once, when management is mounted.
+    fn membership_events(&self) -> Option<tokio::sync::broadcast::Receiver<MembershipEvent>> {
         None
+    }
+
+    /// Where this node keeps the root keys of the namespaces it is the root
+    /// device of, sorted by namespace; empty on every other node.
+    fn root_stores(&self) -> Vec<RootStoreInfo> {
+        Vec::new()
     }
 }
 

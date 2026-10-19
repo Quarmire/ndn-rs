@@ -48,7 +48,7 @@ async fn handle_security(
     is_ephemeral: bool,
     runtime_policy: Option<&Arc<RwLock<MgmtAccessPolicy>>>,
     signing: Option<crate::SigningIdentityInfo>,
-    root_store: Option<crate::RootStoreInfo>,
+    root_stores: Vec<crate::RootStoreInfo>,
 ) -> ControlResponse {
     // Verbs that don't need the PIB.
     match verb_name {
@@ -61,7 +61,7 @@ async fn handle_security(
         v if v == verb::SCHEMA_LIST => return security_schema_list(engine),
         v if v == verb::SCHEMA_SET => return security_schema_set(params, engine),
         v if v == verb::IDENTITY_STATUS => {
-            return security_identity_status(engine, config, is_ephemeral, signing, root_store);
+            return security_identity_status(engine, config, is_ephemeral, signing, root_stores);
         }
         v if v == verb::POLICY_GET => return security_policy_get(config, runtime_policy),
         v if v == verb::POLICY_SET => {
@@ -297,6 +297,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::ENROLL_STATUS {
             return security_enroll_status(ctx.trust_context_handler);
         }
+        if verb == verb::MEMBERSHIPS {
+            return security_memberships(ctx.trust_context_handler);
+        }
         handle_security(
             verb,
             params,
@@ -309,7 +312,8 @@ impl MgmtModule for SecurityModule {
                 .and_then(|backend| backend.signing_identity()),
             ctx.trust_context_handler
                 .filter(|_| verb == verb::IDENTITY_STATUS)
-                .and_then(|backend| backend.root_store()),
+                .map(|backend| backend.root_stores())
+                .unwrap_or_default(),
         )
         .await
         .into()
@@ -460,6 +464,26 @@ fn security_enroll_status(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>
     MgmtResponse::Deferred(Box::pin(async move {
         json_answer(backend.enroll_status().await)
     }))
+}
+
+/// `security/memberships`: how this node takes part in each namespace it
+/// holds — following, member (role) or owner — and the identity it signs
+/// each one's Data as (`ndn-ctl` prints them as "trusted prefixes"). Read
+/// only: answered to any local client, like `identity-status`. Answered
+/// deferred. Success: `200` with a JSON list of [`crate::MembershipInfo`] as
+/// status text.
+fn security_memberships(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return ControlResponse::error(
+            status::NOT_FOUND,
+            "this node holds no trusted prefixes at runtime (no trust-admin backend)",
+        )
+        .into();
+    };
+    let backend = Arc::clone(backend);
+    MgmtResponse::Deferred(Box::pin(
+        async move { json_answer(backend.memberships().await) },
+    ))
 }
 
 /// `security/context-refresh`: check the held trust context of the

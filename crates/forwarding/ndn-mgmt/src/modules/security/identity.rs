@@ -8,25 +8,35 @@ use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status
 use ndn_security::FilePib;
 
 /// `identity=<id> is_ephemeral=<bool> pib_path=<dir>[ key=<key>][
-/// valid_until=<ISO 8601> days_left=<n>][ root_store=<kind>
-/// root_key=<key>]`. With a trust-admin
-/// backend tracking the key the node signs with (it can change at runtime
-/// through `security/enroll`), that key, its identity and — when the node
-/// holds a certificate for it — the certificate's expiry are reported;
-/// otherwise the configured identity, else the first trust anchor's. On a
-/// namespace's root device, where its root key lives.
+/// valid_until=<ISO 8601> days_left=<n>][ node_identity_source=<source>][
+/// signing_identity=<identity>]…[ root_store=<kind> root_key=<key>]…`. With
+/// a trust-admin backend tracking the identities the node signs as (they
+/// change at runtime through `security/enroll`), `identity`, `key` and the
+/// certificate's expiry describe the **node identity** (its own packets:
+/// management responses, discovery records, links) and
+/// `node_identity_source` the rule that chose it
+/// ([`ndn_cert::NodeIdentitySource`]); one `signing_identity` follows per
+/// identity the node signs Data as (each trusted prefix with its own key).
+/// Without one, the configured identity, else the first trust anchor's. One
+/// `root_store`/`root_key` pair per namespace this node is the root device
+/// of, where its root key lives.
 pub(super) fn security_identity_status(
     engine: &ForwarderEngine,
     config: &dyn crate::MgmtConfig,
     is_ephemeral: bool,
     signing: Option<crate::SigningIdentityInfo>,
-    root_store: Option<crate::RootStoreInfo>,
+    root_stores: Vec<crate::RootStoreInfo>,
 ) -> ControlResponse {
     let identity_of = |key: String| match key.find("/KEY/") {
         Some(pos) => key[..pos].to_string(),
         None => key,
     };
+    let mut node = String::new();
     let (identity_name, is_ephemeral, key, valid_until) = if let Some(signing) = signing {
+        node.push_str(&format!(" node_identity_source={}", signing.source));
+        for (identity, _) in &signing.signing {
+            node.push_str(&format!(" signing_identity={identity}"));
+        }
         let key = signing.key.to_string();
         (
             identity_of(key.clone()),
@@ -54,11 +64,12 @@ pub(super) fn security_identity_status(
 
     let key = key.map(|k| format!(" key={k}")).unwrap_or_default();
     let expiry = valid_until.map(expiry_fields).unwrap_or_default();
-    let root = root_store
+    let roots: String = root_stores
+        .iter()
         .map(|r| format!(" root_store={} root_key={}", r.kind, r.key))
-        .unwrap_or_default();
+        .collect();
     let text = format!(
-        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}{root}\n"
+        "identity={identity_name} is_ephemeral={is_ephemeral} pib_path={pib_path}{key}{expiry}{node}{roots}\n"
     );
     ControlResponse::ok_empty(text)
 }

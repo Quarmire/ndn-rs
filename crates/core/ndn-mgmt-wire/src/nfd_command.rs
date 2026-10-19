@@ -175,6 +175,12 @@ pub mod verb {
     /// stored, served and kept signing with. Authorized like
     /// [`CONTEXT_ADOPT`].
     pub const RENEW: &[u8] = b"renew";
+    /// `security/memberships` — how this node takes part in each namespace
+    /// (trusted prefix) it holds: following, member (with its role and the
+    /// identity it signs the namespace's Data as) or owner; a JSON list of
+    /// `ndn_cert::report::MembershipInfo`. Read only; changes are published
+    /// at `/localhost/nfd/security/notifications`.
+    pub const MEMBERSHIPS: &[u8] = b"memberships";
 }
 
 /// `/localhost/nfd/<module>/<verb>/<full-0x68-TLV>`.

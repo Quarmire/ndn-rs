@@ -626,12 +626,25 @@ impl MgmtClient {
 
     /// `security/identity-status`. `status_text` is a space-separated
     /// key=value line: `identity=<name> is_ephemeral=<bool>
-    /// pib_path=<path>`, then — for the key the daemon signs with —
-    /// `key=<key>` and, when it holds a certificate for it,
-    /// `valid_until=<ISO 8601> days_left=<n.n>`. Works without a configured
-    /// PIB.
+    /// pib_path=<path>`, then — for the node identity, the key the daemon
+    /// signs its own packets with — `key=<key>` and, when it holds a
+    /// certificate for it, `valid_until=<ISO 8601> days_left=<n.n>`; then
+    /// `node_identity_source=<source>` (why it is the node identity) and one
+    /// `signing_identity=<identity>` per identity the daemon signs Data as;
+    /// then one `root_store=<kind> root_key=<key>` pair per namespace it is
+    /// the root device of. Works without a configured PIB.
     pub async fn security_identity_status(&self) -> Result<ControlResponse, ForwarderError> {
         self.dataset(module::SECURITY, verb::IDENTITY_STATUS).await
+    }
+
+    /// `security/memberships`: how the daemon takes part in each namespace
+    /// (trusted prefix) it holds — following, member (role, identity, key,
+    /// validity) or owner — as a JSON list of
+    /// `ndn_cert::report::MembershipInfo` in `status_text`. Changes are
+    /// published at `/localhost/nfd/security/notifications` (JSON
+    /// `ndn_cert::report::MembershipEvent`, one Data per event).
+    pub async fn security_memberships(&self) -> Result<ControlResponse, ForwarderError> {
+        self.dataset(module::SECURITY, verb::MEMBERSHIPS).await
     }
 
     /// Generate a new Ed25519 identity key: `security/identity-generate`.
