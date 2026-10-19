@@ -771,4 +771,50 @@ mod tests {
             .expect("interest sign_packet must succeed");
         let _interest = Interest::decode(wire).expect("Interest must decode");
     }
+
+    /// A PIB key an earlier release stored under a certificate-shaped name
+    /// (`ndn-sec keygen` / `ephemeral` wrote `<id>/KEY/<kid>/self/v=0` with
+    /// an NDNC summary certificate of the same name) still loads and signs,
+    /// and the KeyLocator it stamps resolves to that certificate's key.
+    #[test]
+    fn legacy_cert_named_pib_key_loads_and_signs() {
+        use crate::verifier::{Ed25519Verifier, VerifyOutcome};
+        use ndn_packet::{Data, encode::DataBuilder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pib = crate::pib::FilePib::new(dir.path()).unwrap();
+        let legacy: Name = "/legacy/node/KEY/0001/self/v=0".parse().unwrap();
+        let raw_pk = pib.generate_ed25519(&legacy).unwrap().public_key_bytes();
+        let now = crate::validator::now_ns();
+        let summary = Certificate {
+            name: Arc::new(legacy.clone()),
+            public_key: crate::spki::wrap_ed25519(&raw_pk),
+            valid_from: now,
+            valid_until: now + 3_600_000_000_000,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+        };
+        pib.store_cert(&legacy, &summary).unwrap();
+
+        let kc = KeyChain::open_or_create(dir.path(), "/legacy/node").unwrap();
+        assert_eq!(kc.key_name(), &legacy, "legacy key reused, not replaced");
+        let wire = kc
+            .sign_data(DataBuilder::new(ndn_packet::name!("/legacy/node/d"), b"body"))
+            .unwrap();
+        let data = Data::decode(wire).unwrap();
+        let locator = data.sig_info().unwrap().key_locator.as_ref().unwrap();
+        let locator = Arc::new(locator.as_name().unwrap().clone());
+        let cert = kc.cert_cache().get(&locator).expect("KeyLocator resolves");
+        assert_eq!(crate::cert_name::key_name_of(&cert.name), crate::cert_name::key_name_of(&legacy));
+        assert_eq!(
+            Ed25519Verifier.verify_sync(
+                data.signed_region(),
+                data.sig_value(),
+                &raw_pk,
+            ),
+            VerifyOutcome::Valid
+        );
+    }
 }
