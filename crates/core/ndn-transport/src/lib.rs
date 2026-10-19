@@ -51,7 +51,7 @@ pub use face_table::{FaceInfo, FaceTable};
 pub use forwarding::{ForwardingAction, NackReason};
 pub use link_profile::LinkProfile;
 pub use link_service::{
-    LinkService, LinkServiceFrame, LpLinkService, PassthroughLinkService,
+    LinkService, LinkServiceFrame, LpLinkService, PassthroughLinkService, ReliabilityCounters,
     default_link_service_for_kind,
 };
 pub use mac_addr::MacAddr;

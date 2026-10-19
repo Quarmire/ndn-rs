@@ -69,6 +69,24 @@ impl LinkServiceFrame {
     }
 }
 
+/// Counters of a link service's `ReliabilityFeature`, surfaced on
+/// `faces/list`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReliabilityCounters {
+    pub n_lp_resent_packets: u64,
+    pub rto_micros: u64,
+    pub n_lp_rto_expirations: u64,
+    pub n_lp_unacked_evictions: u64,
+    pub n_lp_fast_retx: u64,
+    /// Duplicates are how SPURIOUS retransmission becomes visible: a resend
+    /// whose original had already arrived repaired nothing and only consumed
+    /// airtime. Without it, fast-retx alone cannot distinguish a lossy link
+    /// from a too-eager loss detector.
+    pub n_lp_duplicate_frames: u64,
+    pub n_lp_acks_sent: u64,
+    pub n_lp_acks_received: u64,
+}
+
 /// Object-safe (no generics, no RPIT). The face table holds
 /// `Arc<dyn LinkService>` paired with `Arc<dyn ErasedTransport>`.
 pub trait LinkService: Send + Sync + 'static {
@@ -133,10 +151,8 @@ pub trait LinkService: Send + Sync + 'static {
         Vec::new()
     }
 
-    /// `(n_lp_resent_packets, rto_micros, n_lp_rto_expirations,
-    /// n_lp_unacked_evictions, n_lp_fast_retx)` if a `ReliabilityFeature` is
-    /// present.
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+    /// The `ReliabilityFeature`'s counters, if one is present.
+    fn reliability_counters(&self) -> Option<ReliabilityCounters> {
         None
     }
 
@@ -472,52 +488,52 @@ impl LinkService for LpLinkService {
             // Loops so a duplicate frame is consumed and the next real one is
             // awaited, rather than surfacing a frame the caller must re-drop.
             let (wire, addr) = loop {
-            let (wire, addr, radio_id) = transport.recv_bytes_with_meta().await?;
-            let ingress_ctx = IngressCtx::new(FaceId(transport.id().0));
-            let inbound = InboundLpFrame::with_meta(wire.clone(), addr.clone(), radio_id);
-            // Driven here, not via the feature pipeline, because the duplicate
-            // verdict decides whether this frame may continue at all.
-            let is_duplicate = self.reliability_feature.note_receive(&wire);
-            for feature in &self.features {
-                feature.on_ingress(&inbound, &ingress_ctx);
-            }
-            // Ack on receipt, not on the retransmit tick.
-            //
-            // An Ack parked until the next tick puts a floor under the peer's
-            // RTT sample, and therefore under its RTO: with a 50 ms pump the
-            // peer cannot measure anything faster than ~25 ms average, so its
-            // RTO can never track a 1-2 ms mesh. Worse, the two are a trap for
-            // each other — lowering the RTO below the tick (tried on the fleet:
-            // Quic's ~4.5 ms against a 10 ms pump) makes the sender retransmit
-            // BEFORE an Ack is physically possible, which manifested as NDNSF
-            // service calls timing out wholesale, not merely as wasted airtime.
-            // Acking here removes the floor so the RTO estimator can track the
-            // real link.
-            //
-            // `take_acks` drains ALL pending Acks into one frame, so a burst of
-            // fragments arriving back-to-back costs one Ack frame, not one per
-            // fragment. Self-gating: a peer that never sends a TxSequence
-            // queues nothing and this is a single uncontended lock check.
-            if let Some(ack) = self.reliability_feature.take_acks() {
-                let _ = transport.send_bytes(ack).await;
-            }
-            // Fast retransmit: those Acks may have revealed, by arriving ahead
-            // of older TxSequences, that an earlier frame is gone. Send those
-            // repairs from here rather than leaving them for the retransmit
-            // tick, so recovery costs roughly an RTT instead of an RTO -- the
-            // RFC 6298 floor alone is 200 ms. NFD repairs on this same path.
-            for wire in self.reliability_feature.take_fast_retransmits() {
-                let _ = transport.send_bytes(wire).await;
-            }
-            // Duplicate: the Ack above still went out (the peer retransmitted
-            // because it never got the first one), but the frame must NOT
-            // reach reassembly or forwarding — upstream the PIT would see an
-            // Interest whose nonce it already holds and misread this
-            // link-layer retransmission as a forwarding loop.
-            if is_duplicate {
-                continue;
-            }
-            break (wire, addr);
+                let (wire, addr, radio_id) = transport.recv_bytes_with_meta().await?;
+                let ingress_ctx = IngressCtx::new(FaceId(transport.id().0));
+                let inbound = InboundLpFrame::with_meta(wire.clone(), addr.clone(), radio_id);
+                // Driven here, not via the feature pipeline, because the duplicate
+                // verdict decides whether this frame may continue at all.
+                let is_duplicate = self.reliability_feature.note_receive(&wire);
+                for feature in &self.features {
+                    feature.on_ingress(&inbound, &ingress_ctx);
+                }
+                // Ack on receipt, not on the retransmit tick.
+                //
+                // An Ack parked until the next tick puts a floor under the peer's
+                // RTT sample, and therefore under its RTO: with a 50 ms pump the
+                // peer cannot measure anything faster than ~25 ms average, so its
+                // RTO can never track a 1-2 ms mesh. Worse, the two are a trap for
+                // each other — lowering the RTO below the tick (tried on the fleet:
+                // Quic's ~4.5 ms against a 10 ms pump) makes the sender retransmit
+                // BEFORE an Ack is physically possible, which manifested as NDNSF
+                // service calls timing out wholesale, not merely as wasted airtime.
+                // Acking here removes the floor so the RTO estimator can track the
+                // real link.
+                //
+                // `take_acks` drains ALL pending Acks into one frame, so a burst of
+                // fragments arriving back-to-back costs one Ack frame, not one per
+                // fragment. Self-gating: a peer that never sends a TxSequence
+                // queues nothing and this is a single uncontended lock check.
+                if let Some(ack) = self.reliability_feature.take_acks() {
+                    let _ = transport.send_bytes(ack).await;
+                }
+                // Fast retransmit: those Acks may have revealed, by arriving ahead
+                // of older TxSequences, that an earlier frame is gone. Send those
+                // repairs from here rather than leaving them for the retransmit
+                // tick, so recovery costs roughly an RTT instead of an RTO -- the
+                // RFC 6298 floor alone is 200 ms. NFD repairs on this same path.
+                for wire in self.reliability_feature.take_fast_retransmits() {
+                    let _ = transport.send_bytes(wire).await;
+                }
+                // Duplicate: the Ack above still went out (the peer retransmitted
+                // because it never got the first one), but the frame must NOT
+                // reach reassembly or forwarding — upstream the PIT would see an
+                // Interest whose nonce it already holds and misread this
+                // link-layer retransmission as a forwarding loop.
+                if is_duplicate {
+                    continue;
+                }
+                break (wire, addr);
             };
             Ok(LinkServiceFrame::with_addr(wire, addr))
         })
@@ -578,21 +594,18 @@ impl LinkService for LpLinkService {
         self.features.iter().map(|f| f.name()).collect()
     }
 
-    fn reliability_counters(&self) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64)> {
-        Some((
-            self.reliability_feature.n_lp_resent_packets(),
-            self.reliability_feature.rto_micros(),
-            self.reliability_feature.n_lp_rto_expirations(),
-            self.reliability_feature.n_lp_unacked_evictions(),
-            self.reliability_feature.n_lp_fast_retx(),
-            // Duplicates are how SPURIOUS retransmission becomes visible: a
-            // resend whose original had already arrived repaired nothing and
-            // only consumed airtime. Without it, fast-retx alone cannot
-            // distinguish a lossy link from a too-eager loss detector.
-            self.reliability_feature.n_lp_duplicate_frames(),
-            self.reliability_feature.n_lp_acks_sent(),
-            self.reliability_feature.n_lp_acks_received(),
-        ))
+    fn reliability_counters(&self) -> Option<ReliabilityCounters> {
+        let f = &self.reliability_feature;
+        Some(ReliabilityCounters {
+            n_lp_resent_packets: f.n_lp_resent_packets(),
+            rto_micros: f.rto_micros(),
+            n_lp_rto_expirations: f.n_lp_rto_expirations(),
+            n_lp_unacked_evictions: f.n_lp_unacked_evictions(),
+            n_lp_fast_retx: f.n_lp_fast_retx(),
+            n_lp_duplicate_frames: f.n_lp_duplicate_frames(),
+            n_lp_acks_sent: f.n_lp_acks_sent(),
+            n_lp_acks_received: f.n_lp_acks_received(),
+        })
     }
 
     fn congestion_counters(&self) -> Option<(u64, u64)> {
@@ -932,7 +945,8 @@ mod fragment_reliability_tests {
     #[tokio::test]
     async fn a_received_reliable_frame_is_acked_on_receipt_without_a_tick() {
         const PEER_TX_SEQ: u64 = 4242;
-        let inbound = ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ, None, &[]);
+        let inbound =
+            ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ, None, &[]);
 
         let sent = Arc::new(Mutex::new(Vec::new()));
         let tx = OneFrame {
