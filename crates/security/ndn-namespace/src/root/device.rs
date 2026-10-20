@@ -93,11 +93,20 @@ pub async fn ensure_same_pib(
     Ok(())
 }
 
+/// [`RunningDevice::reach`], a refusal naming `pib_dir` (`pib` param): the
+/// PIB whose device was to be reached.
+async fn reach_for(device: &dyn RunningDevice, pib_dir: &Path) -> Result<Reach, RootError> {
+    device
+        .reach()
+        .await
+        .map_err(|e| e.with("pib", pib_dir.display()))
+}
+
 /// Before the root is unlocked: refuse when the running device uses another
 /// PIB (it must not take a version made from this one) or cannot be used.
 /// No device running is no refusal: the version is kept for its next start.
 pub async fn check_device(device: &dyn RunningDevice, pib_dir: &Path) -> Result<(), RootError> {
-    match device.reach().await? {
+    match reach_for(device, pib_dir).await? {
         Reach::Running(session) => ensure_same_pib(&*session, &device.address(), pib_dir).await,
         Reach::NotRunning { .. } => Ok(()),
     }
@@ -109,7 +118,7 @@ pub async fn session_on(
     device: &dyn RunningDevice,
     pib_dir: &Path,
 ) -> Result<Box<dyn DeviceSession>, RootError> {
-    match device.reach().await? {
+    match reach_for(device, pib_dir).await? {
         Reach::Running(session) => {
             ensure_same_pib(&*session, &device.address(), pib_dir).await?;
             Ok(session)
@@ -140,7 +149,7 @@ impl ContextUpdateSink for SamePib<'_> {
     }
 
     async fn hand_over(&self, data: &Data) -> Result<ContextRefreshInfo, SinkError<RootError>> {
-        let session = match self.device.reach().await {
+        let session = match reach_for(self.device, self.pib_dir).await {
             Ok(Reach::Running(session)) => session,
             Ok(Reach::NotRunning { .. }) => return Err(SinkError::NotRunning),
             Err(e) => return Err(SinkError::NotReached(e)),

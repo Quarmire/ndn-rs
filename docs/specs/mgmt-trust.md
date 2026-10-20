@@ -725,12 +725,15 @@ file for a secret; a secret is dropped (zeroed) after its one use and never
 goes to the running device, which receives only the signed version.
 
 **Hand-over.** The host's `root::RunningDevice` reaches the device that uses
-the PIB (`ndn-fwd`: the management socket); the library refuses a device of
-another PIB (`device-other-pib`), hands each signed version over with the
-retry and undo rules of `ndn_namespace::admin::hand_over`, and keeps the
-version in the PIB for the device's next start when none runs. A recovery
-needs the device running (`device-not-running`): it refreshes the namespace
-by name first, so the recovery starts from the newest version (the
+the PIB; a daemon over its management socket is
+`root::daemon::MgmtDevice`, the one implementation `ndn-fwd` and `ndn-tui`
+share (it answers the `device-*` codes below, and keeps a refusal the daemon
+answered coded, its sentence in the host's words). The library refuses a
+device of another PIB (`device-other-pib`), hands each signed version over
+with the retry and undo rules of `ndn_namespace::admin::hand_over`, and keeps
+the version in the PIB for the device's next start when none runs. A
+recovery needs the device running (`device-not-running`): it refreshes the
+namespace by name first, so the recovery starts from the newest version (the
 `newest-*` codes).
 
 Params are strings. Names are NDN URIs, `pib` and `path` filesystem paths,
@@ -797,7 +800,7 @@ params too; a param shown `?` is set only when it applies.
 | `device-unreachable` | 403 | no | fix-local | `address`, `pib`, `error` | the running device cannot be used (permissions) |
 | `device-pib-unknown` | 500 | yes | retry-later | `address`, `error` | the running device did not say which PIB it uses |
 | `device-other-pib` | 409 | no | fix-request | `address`, `device_pib`, `pib` | the running device uses another PIB than the one worked on: a version made here must not go there |
-| `device-failed` | 500 | yes | retry-later | `address`, `error` | an exchange with the running device failed |
+| `device-failed` | 500 | yes | retry-later | `address`, `error`, `status_code`?, `reason`? | an exchange with the running device failed (`status_code`, `reason`: a refresh it refused) |
 | `hand-over-refused` | 409 | no | other | `version`, `status_code`, `device_code`, `reason` | the running device answered that it did not take the version (`device_code`: its refusal's code) |
 | `hand-over-unreadable` | 500 | no | wait | `version`, `error`, `answer` | the device's answer could not be read; it may have taken the version |
 | `hand-over-failed` | 504 | yes | wait | `version`, `failure` | handing the version over failed without an answer; it may still be taken |

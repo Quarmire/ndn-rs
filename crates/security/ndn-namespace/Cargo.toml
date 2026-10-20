@@ -23,6 +23,10 @@ ndn-store     = { workspace = true }
 ndn-sync      = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-mgmt-wire = { workspace = true }
+# The running device of a root operation over its management socket
+# (`root::daemon`); already in the tree through ndn-app.
+ndn-ipc       = { workspace = true }
+serde_json    = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util    = { workspace = true }

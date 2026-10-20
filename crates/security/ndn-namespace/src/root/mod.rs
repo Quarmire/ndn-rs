@@ -40,7 +40,8 @@
 //! - a [`RunningDevice`]: the running device that uses the same PIB, which
 //!   takes each signed version ([`device::hand_over`]: the retry and undo
 //!   rules of [`crate::admin`]); the library checks it uses the same PIB,
-//!   and keeps the version for its next start when none runs.
+//!   and keeps the version for its next start when none runs. A daemon
+//!   reached over its management socket is [`daemon::MgmtDevice`].
 //!
 //! # Outcomes and refusals
 //!
@@ -53,6 +54,7 @@
 //! codes are listed in `ndn-rs/docs/specs/mgmt-trust.md` ("Root-device
 //! operations (library)").
 
+pub mod daemon;
 pub mod device;
 mod error;
 pub mod init;
