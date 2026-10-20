@@ -8,6 +8,10 @@
 //! state vector; [`Subscriber`](crate::Subscriber) fetches that exact name.
 //! So an ndn-rs publisher and subscriber interoperate out of the box (and
 //! both interoperate with ndn-svs, which uses the same `getDataName`).
+//!
+//! The Data is signed by [`PublisherConfig::signer`]; without one it carries a
+//! `DigestSha256` (integrity only, no publisher), which a validating
+//! subscriber refuses.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -21,11 +25,11 @@ use tokio::sync::mpsc;
 use ndn_ipc::ForwarderClient;
 use ndn_packet::Name;
 
-use crate::AppError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::connection::IpcConnection;
 use crate::connection::{Connection, InProcConnection};
 use crate::rt;
+use crate::{AppError, DataSigner};
 
 #[derive(Clone)]
 pub struct PublisherConfig {
@@ -42,6 +46,14 @@ pub struct PublisherConfig {
     /// one store between two *concurrently live* publishers with the same node name (their
     /// seq spaces would collide).
     pub store: Option<Arc<dyn ndn_sync::DataStore>>,
+    /// Which key signs the published Data. [`DataSigner::ByName`] signs with
+    /// the key [`SecurityManager::signer_for`](ndn_security::SecurityManager::signer_for)
+    /// picks for the publisher's names (`<node>/<group>/…`) — the key of the
+    /// trusted prefix they lie in; constructing the publisher fails with
+    /// [`AppError::Signing`] when no key of the device may sign them. `None`
+    /// (the default) publishes `DigestSha256` Data: integrity only, no
+    /// publisher.
+    pub signer: Option<DataSigner>,
 }
 
 impl std::fmt::Debug for PublisherConfig {
@@ -50,6 +62,7 @@ impl std::fmt::Debug for PublisherConfig {
             .field("svs", &self.svs)
             .field("data_freshness", &self.data_freshness)
             .field("store", &self.store.as_ref().map(|_| "injected DataStore"))
+            .field("signer", &self.signer)
             .finish()
     }
 }
@@ -60,6 +73,7 @@ impl Default for PublisherConfig {
             svs: ndn_sync::SvsConfig::default(),
             data_freshness: Duration::from_secs(4),
             store: None,
+            signer: None,
         }
     }
 }
@@ -103,13 +117,7 @@ impl Publisher {
         let local_name = group.clone().append(format!("node-{}", std::process::id()));
         // Data lives at `<node>/<group>` (svs_data_name minus the seq);
         // register it so subscribers' fetch Interests reach this connection.
-        let data_prefix = {
-            let mut p = local_name.clone();
-            for c in group.components() {
-                p = p.append_component(c.clone());
-            }
-            p
-        };
+        let data_prefix = svs_data_prefix(&local_name, &group);
         client
             .register_prefix(&group)
             .await
@@ -176,6 +184,14 @@ impl Publisher {
         local_name: Name,
         config: PublisherConfig,
     ) -> Result<Self, AppError> {
+        // Resolved up front: a publisher whose Data no key may sign fails
+        // here, not at its first `put`.
+        let signer = match &config.signer {
+            Some(signer) => Some(publisher_signer(
+                signer.signer_for(&svs_data_prefix(&local_name, &group))?,
+            )),
+            None => None,
+        };
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let (net_out_tx, mut net_out_rx) = mpsc::channel::<Bytes>(64);
@@ -194,7 +210,7 @@ impl Publisher {
             .store
             .clone()
             .unwrap_or_else(|| Arc::new(ndn_sync::MemoryStore::new()));
-        let svsync = ndn_sync::SvSync::join(
+        let mut svsync = ndn_sync::SvSync::join(
             group,
             local_name.clone(),
             store,
@@ -202,6 +218,9 @@ impl Publisher {
             net_in_rx,
             svsync_config,
         );
+        if let Some(signer) = signer {
+            svsync.set_publisher_signer(signer);
+        }
         let svsync = Arc::new(svsync);
 
         // SvSync → Connection (Sync Interests + Data replies to fetches).
@@ -244,9 +263,10 @@ impl Publisher {
         })
     }
 
-    /// Publish `payload` as the next sequence number. Stores the signed Data
-    /// (served to subscribers) and advances + multicasts the state vector.
-    /// Returns the assigned sequence number.
+    /// Publish `payload` as the next sequence number. Stores the Data —
+    /// signed by [`PublisherConfig::signer`], else `DigestSha256` — (served to
+    /// subscribers) and advances + multicasts the state vector. Returns the
+    /// assigned sequence number.
     pub async fn put(&self, payload: impl AsRef<[u8]>) -> Result<u64, AppError> {
         self.svsync
             .publish_data(payload.as_ref())
@@ -267,6 +287,30 @@ impl Publisher {
     /// This publisher's node id within the group.
     pub fn local_name(&self) -> &Name {
         &self.local_name
+    }
+}
+
+/// Where an SVS publisher's Data lives: `<local_name>/<group>/<seq>/…`
+/// ([`ndn_sync::svs_data_name`] minus the seq). Routing fetch Interests to the
+/// publisher means registering this prefix.
+pub(crate) fn svs_data_prefix(local_name: &Name, group: &Name) -> Name {
+    let mut p = local_name.clone();
+    for c in group.components() {
+        p = p.append_component(c.clone());
+    }
+    p
+}
+
+/// Sign publications with `key`, asynchronously (a remote or enclave-held key
+/// signs too).
+fn publisher_signer(key: Arc<dyn ndn_security::Signer>) -> ndn_sync::PublisherSigner {
+    ndn_sync::PublisherSigner {
+        sig_type: key.sig_type(),
+        key_locator: key.key_name().clone(),
+        sign: Arc::new(move |region| {
+            let key = Arc::clone(&key);
+            Box::pin(async move { key.sign(&region).await.map_err(|e| e.to_string()) })
+        }),
     }
 }
 
@@ -482,5 +526,81 @@ mod tests {
 
         // (b) The sequence space resumed — no collision with the pre-restart name.
         assert_eq!(publisher.put(b"born-in-boot-2").await.expect("put"), 2);
+    }
+
+    /// An idle link: the publisher sends into the void and hears nothing.
+    fn idle_conn() -> Arc<LinkConn> {
+        let (out, _) = mpsc::unbounded_channel::<Bytes>();
+        let (_, inn) = mpsc::unbounded_channel::<Bytes>();
+        Arc::new(LinkConn {
+            out,
+            inn: Mutex::new(inn),
+        })
+    }
+
+    /// A publisher signing by name signs its publications with the key of the
+    /// trusted prefix its names lie in — a real signature over the Data,
+    /// under that key's KeyLocator — not a `DigestSha256`.
+    #[tokio::test]
+    async fn publisher_signs_with_the_key_its_names_select() {
+        use ndn_security::{SecurityManager, verifier::VerifyOutcome, verify_by_sig_type};
+
+        let n = |s: &str| -> Name { s.parse().unwrap() };
+        let mgr = Arc::new(SecurityManager::new());
+        let a_key = n("/a/member/x/KEY/k1");
+        mgr.generate_ed25519(a_key.clone()).unwrap();
+        mgr.generate_ed25519(n("/c/member/x/KEY/k2")).unwrap();
+        let store: Arc<dyn ndn_sync::DataStore> = Arc::new(ndn_sync::MemoryStore::new());
+        let (group, local) = (n("/a/room"), n("/a/member/x"));
+
+        let publisher = Publisher::from_connection(
+            idle_conn(),
+            group.clone(),
+            local.clone(),
+            PublisherConfig {
+                store: Some(Arc::clone(&store)),
+                signer: Some(DataSigner::ByName(Arc::clone(&mgr))),
+                ..Default::default()
+            },
+        )
+        .expect("publisher");
+        let seq = publisher.put(b"hello").await.expect("put");
+
+        let wire = store
+            .get(&ndn_sync::svs_data_name(&local, &group, seq))
+            .expect("published Data stored");
+        let data = ndn_packet::Data::decode(wire).unwrap();
+        let sig = data.sig_info().unwrap();
+        assert_eq!(sig.sig_type, ndn_packet::SignatureType::SignatureEd25519);
+        assert_eq!(*sig.key_locator_name().unwrap(), a_key);
+        let public_key = mgr.signer_for(&local).unwrap().public_key().unwrap();
+        let outcome = verify_by_sig_type(
+            sig.sig_type,
+            data.signed_region(),
+            data.sig_value(),
+            &public_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, VerifyOutcome::Valid);
+    }
+
+    /// A publisher whose names no key of the device may sign is refused when
+    /// it is built, rather than publishing unsigned Data.
+    #[tokio::test]
+    async fn publisher_without_a_key_for_its_names_is_refused() {
+        let mgr = Arc::new(ndn_security::SecurityManager::new());
+        mgr.generate_ed25519("/a/member/x/KEY/k1".parse().unwrap())
+            .unwrap();
+        let refused = Publisher::from_connection(
+            idle_conn(),
+            "/z/room".parse().unwrap(),
+            "/z/member/y".parse().unwrap(),
+            PublisherConfig {
+                signer: Some(DataSigner::ByName(mgr)),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(refused, Err(AppError::Signing(_))));
     }
 }

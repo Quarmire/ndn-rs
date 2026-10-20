@@ -49,7 +49,7 @@ use crate::consumer::{Consumer, VerifiedConsumer};
 use crate::demux::{DemuxConnection, ServeGuard};
 use crate::error::AppError;
 use crate::producer::Producer;
-use crate::publisher::{Publisher, PublisherConfig};
+use crate::publisher::{Publisher, PublisherConfig, svs_data_prefix};
 use crate::queryable::Queryable;
 use crate::responder::Responder;
 use crate::subscriber::{Subscriber, SubscriberConfig};
@@ -279,7 +279,9 @@ impl Node {
     /// A [`Publisher`] for dataset-sync group `group`, publishing under
     /// `local_name`. Runs on a dedicated connection (see the type-level note on
     /// the one-connection exception). Returns [`AppError::Unsupported`] if this
-    /// `Node` can't re-dial.
+    /// `Node` can't re-dial. Its Data carries a `DigestSha256`; to sign it, use
+    /// [`publish_with_config`](Self::publish_with_config) with
+    /// [`PublisherConfig::signer`].
     pub async fn publish(
         &self,
         group: impl Into<Name>,
@@ -432,15 +434,4 @@ impl Drop for ObjectServeGuard {
     fn drop(&mut self) {
         self._cancel.cancel();
     }
-}
-
-/// Where an SVS publisher's Data lives: `<local_name>/<group>/<seq>/…`. Routing
-/// fetch Interests to the publisher means registering `<local_name>/<group>`.
-/// Mirrors the derivation in `Publisher::connect`.
-fn svs_data_prefix(local_name: &Name, group: &Name) -> Name {
-    let mut p = local_name.clone();
-    for c in group.components() {
-        p = p.append_component(c.clone());
-    }
-    p
 }

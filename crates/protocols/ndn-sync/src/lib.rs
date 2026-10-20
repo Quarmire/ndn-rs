@@ -116,5 +116,5 @@ pub use svs_multi::{MultiSvs, spawn_multi_svs};
 pub use svs_sync::{RetryPolicy, SvsConfig, fetch_with_retry, join_svs_group};
 pub use svsync::{
     DataStore, IngestValidator, MAX_NDN_PACKET_SIZE, MAX_PUBLISHABLE_CONTENT, MemoryStore,
-    PublisherSigner, SvSync, SvSyncConfig, svs_data_name,
+    PublisherSigner, SignFn, SignFuture, SvSync, SvSyncConfig, svs_data_name,
 };

@@ -95,6 +95,7 @@ pub mod node;
 pub use node::{ConnectionProvider, Node, ObjectServeGuard};
 pub use responder::Responder;
 pub use security::KeyChain;
+pub use signing::DataSigner;
 pub use subscriber::{Sample, Subscriber, SubscriberConfig};
 
 pub use ndn_engine::{ForwarderEngine, ShutdownHandle};

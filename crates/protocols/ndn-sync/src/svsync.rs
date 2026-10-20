@@ -270,6 +270,8 @@ pub struct SvSync {
     /// testbed default). Returns `true` to accept.
     ingest_validator: Option<IngestValidator>,
     publisher_signer: Option<PublisherSigner>,
+    /// Held while a publication is numbered, signed and committed.
+    publishing: Mutex<()>,
     cancel: CancellationToken,
 }
 
@@ -283,17 +285,22 @@ pub type IngestValidator = Arc<
         + Sync,
 >;
 
+/// The signature value over a Data's signed region, or why the key could not
+/// sign it (what a [`SignFn`] resolves to).
+pub type SignFuture = std::pin::Pin<Box<dyn Future<Output = Result<Bytes, String>> + Send>>;
+
+/// Signs a Data's signed region (the closure inside a [`PublisherSigner`]).
+/// Asynchronous, so a key behind an I/O or IPC boundary (a custodian, an
+/// enclave) can sign publications too.
+pub type SignFn = Arc<dyn Fn(Bytes) -> SignFuture + Send + Sync>;
+
 /// A publisher's signing material for outbound publications, supplied as a
 /// closure so `ndn-sync` stays free of any security crate (mirrors
 /// [`IngestValidator`]). When set, published Data is signed with this instead of
 /// the default `DigestSha256`; signing the Data authenticates the publishing
 /// node and covers the encapsulated publication, so a receiver's
 /// [`IngestValidator`] can establish per-publication trust. `None` (the default)
-/// preserves the existing digest behaviour — purely additive.
-/// Signs a Data's signed region, returning the signature value (the closure
-/// inside a [`PublisherSigner`]).
-pub type SignFn = Arc<dyn Fn(&[u8]) -> Bytes + Send + Sync>;
-
+/// preserves the existing digest behaviour.
 #[derive(Clone)]
 pub struct PublisherSigner {
     /// Signature type to stamp (e.g. `SignatureEd25519`).
@@ -397,6 +404,7 @@ impl SvSync {
             content_type: config.content_type,
             ingest_validator: None,
             publisher_signer: None,
+            publishing: Mutex::new(()),
             cancel,
         }
     }
@@ -417,12 +425,15 @@ impl SvSync {
 
     /// Finalize a stamped builder: sign with [`PublisherSigner`] if set, else the
     /// default `DigestSha256`.
-    fn sign_or_build(&self, builder: DataBuilder) -> Bytes {
+    async fn sign_or_build(&self, builder: DataBuilder) -> Result<Bytes, SyncError> {
         match &self.publisher_signer {
-            Some(s) => {
-                builder.sign_sync(s.sig_type, Some(&s.key_locator), |region| (s.sign)(region))
-            }
-            None => builder.build(),
+            Some(s) => builder
+                .sign_fallible(s.sig_type, Some(&s.key_locator), |region| {
+                    (s.sign)(Bytes::copy_from_slice(region))
+                })
+                .await
+                .map_err(|e| SyncError::Protocol(format!("signing the publication failed: {e}"))),
+            None => Ok(builder.build()),
         }
     }
 
@@ -435,8 +446,8 @@ impl SvSync {
         }
     }
 
-    /// Name, sign (DigestSha256), store, and announce a new publication.
-    /// Returns the assigned sequence number.
+    /// Name, sign ([`PublisherSigner`] if set, else `DigestSha256`), store, and
+    /// announce a new publication. Returns the assigned sequence number.
     pub async fn publish_data(&self, payload: &[u8]) -> Result<u64, SyncError> {
         self.publish_data_with_mapping(payload, |_| None).await
     }
@@ -452,7 +463,7 @@ impl SvSync {
     ) -> Result<u64, SyncError> {
         // Size guard BEFORE claiming the seq: a content-oversize publication
         // would build an outer Data past the deliverable packet limit. Reject
-        // it before `fetch_add` so no seq is consumed — a rejected publish must
+        // it before claiming so no seq is consumed — a rejected publish must
         // leave the sequence space gap-free (a claimed-then-abandoned seq would
         // be a permanent hole peers can never fill, poisoning the producer).
         if payload.len() > MAX_PUBLISHABLE_CONTENT {
@@ -462,10 +473,16 @@ impl SvSync {
                 MAX_PUBLISHABLE_CONTENT
             )));
         }
-        let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        // One publication at a time: its seq is committed only once its Data
+        // is signed, so a signing failure claims no seq either.
+        let _publishing = self.publishing.lock().await;
+        let seq = self.seq.load(Ordering::Acquire) + 1;
         let name = svs_data_name(&self.node, &self.group, seq);
-        let wire = self.sign_or_build(self.stamp(DataBuilder::new(name.clone(), payload)));
+        let wire = self
+            .sign_or_build(self.stamp(DataBuilder::new(name.clone(), payload)))
+            .await?;
         self.store.insert(name, wire);
+        self.seq.store(seq, Ordering::Release);
         // Advance the core in lockstep (this node is the sole publisher
         // for its own id, so the core's counter tracks `self.seq`) and
         // multicast the new state vector.
@@ -528,6 +545,7 @@ impl SvSync {
         // Claim exactly this seq iff it is the next contiguous one → keeps
         // `self.seq` and the core's per-node counter in lockstep (one publish =
         // one increment), the same invariant `publish_data` maintains.
+        let _publishing = self.publishing.lock().await;
         self.seq
             .compare_exchange(seq - 1, seq, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|have| {
@@ -562,17 +580,24 @@ impl SvSync {
                 MAX_PUBLISHABLE_CONTENT
             )));
         }
-        let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        // One publication at a time, committed once every segment is signed
+        // (see `publish_data_with_mapping`).
+        let _publishing = self.publishing.lock().await;
+        let seq = self.seq.load(Ordering::Acquire) + 1;
         let base = svs_data_name(&self.node, &self.group, seq);
         let last = segments.len().saturating_sub(1) as u64;
+        let mut signed = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
             let name = base.clone().append_version(0).append_segment(i as u64);
-            let wire = self.sign_or_build(
-                self.stamp(DataBuilder::new(name.clone(), seg))
-                    .final_block_id_typed_seg(last),
-            );
+            let builder = self
+                .stamp(DataBuilder::new(name.clone(), seg))
+                .final_block_id_typed_seg(last);
+            signed.push((name, self.sign_or_build(builder).await?));
+        }
+        for (name, wire) in signed {
             self.store.insert(name, wire);
         }
+        self.seq.store(seq, Ordering::Release);
         match make_mapping(seq) {
             Some(mapping) => {
                 self.handle
@@ -1650,5 +1675,59 @@ mod tests {
             .await
             .expect("publish 2");
         assert_eq!(next, 2, "vector advanced by exactly one presigned mirror");
+    }
+
+    /// A publication whose signing fails claims no seq (the sequence space
+    /// stays gap-free), and a signer that signs asynchronously signs it.
+    #[tokio::test]
+    async fn failed_signing_claims_no_seq() {
+        let group = name("/edge/grp");
+        let node = name("/edge/grp/n");
+        let (out_tx, _out_rx) = mpsc::channel::<Bytes>(256);
+        let (_in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let store = Arc::new(MemoryStore::new());
+        let mut svs = SvSync::join(
+            group.clone(),
+            node.clone(),
+            Arc::clone(&store) as Arc<dyn DataStore>,
+            out_tx,
+            in_rx,
+            SvSyncConfig::default(),
+        );
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let failing = Arc::clone(&fail);
+        svs.set_publisher_signer(PublisherSigner {
+            sig_type: ndn_packet::SignatureType::SignatureEd25519,
+            key_locator: name("/edge/KEY/k"),
+            sign: Arc::new(move |_region| {
+                let fail = failing.load(Ordering::Acquire);
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    if fail {
+                        Err("key unavailable".to_owned())
+                    } else {
+                        Ok(Bytes::from_static(&[7; 64]))
+                    }
+                })
+            }),
+        });
+
+        let err = svs.publish_data(b"x").await.expect_err("signing fails");
+        assert!(matches!(err, SyncError::Protocol(_)));
+        let err = svs
+            .publish_segments_with_mapping(&[b"a".to_vec(), b"b".to_vec()], |_| None)
+            .await
+            .expect_err("signing fails");
+        assert!(matches!(err, SyncError::Protocol(_)));
+
+        fail.store(false, Ordering::Release);
+        let seq = svs.publish_data(b"x").await.expect("publish");
+        assert_eq!(seq, 1, "the failed publications claimed no seq");
+        let data = Data::decode(store.get(&svs_data_name(&node, &group, 1)).unwrap()).unwrap();
+        assert_eq!(
+            data.sig_info().unwrap().sig_type,
+            ndn_packet::SignatureType::SignatureEd25519
+        );
+        assert_eq!(data.sig_value(), &[7; 64][..]);
     }
 }
