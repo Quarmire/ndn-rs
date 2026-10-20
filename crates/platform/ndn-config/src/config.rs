@@ -1107,6 +1107,19 @@ impl ForwarderConfig {
         s.parse()
     }
 
+    /// The `[ca]` / `[[ca]]` entry for the CA of `namespace`: the one whose
+    /// identity is `<namespace>/CA`, else whose prefix is `namespace`.
+    pub fn ca_for(&self, namespace: &ndn_packet::Name) -> Option<&CaTomlConfig> {
+        let ca_identity = namespace.clone().append("CA");
+        let is = |raw: &str, name: &ndn_packet::Name| {
+            raw.parse::<ndn_packet::Name>().is_ok_and(|n| &n == name)
+        };
+        self.ca
+            .iter()
+            .find(|c| is(&c.identity, &ca_identity))
+            .or_else(|| self.ca.iter().find(|c| is(&c.prefix, namespace)))
+    }
+
     /// Deserialize the `[extensions.<name>]` slice into an extension subsystem's
     /// own config type. `Ok(None)` when the section is absent. This is the seam
     /// that lets an out-of-core subsystem (its own crate/repo) own its config

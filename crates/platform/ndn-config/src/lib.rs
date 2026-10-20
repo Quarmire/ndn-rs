@@ -10,6 +10,8 @@
 // `ndn_engine::EngineConfig` / `EngineBuilder` are native-only.
 #[cfg(all(feature = "boot", not(target_arch = "wasm32")))]
 pub mod boot;
+#[cfg(feature = "ca-policy")]
+pub mod ca_policy;
 pub mod config;
 pub mod error;
 pub mod mgmt;

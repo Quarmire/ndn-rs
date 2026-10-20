@@ -22,12 +22,19 @@ mgmt = ["dep:ndn-mgmt"]
 # crates beyond what `mgmt` pulls (via ndn-mgmt: ndn-engine, ndn-security,
 # ndn-store).
 boot = ["dep:ndn-mgmt", "dep:ndn-engine", "dep:ndn-security", "dep:ndn-store"]
+# `ca-policy`: the namespace policy a `[ca]` entry states, as the
+# `ndn_cert::PolicyInput` a trust context is reconciled with
+# (`CaTomlConfig::policy_input`). For the hosts that run a namespace CA or
+# sign a namespace's trust context (the forwarder, an admin screen); the
+# plain config stays free of ndn-cert.
+ca-policy = ["dep:ndn-cert", "dep:ndn-security"]
 
 [dependencies]
 portable-atomic = { workspace = true }
 ndn-mgmt-wire = { workspace = true }
 ndn-mgmt      = { workspace = true, optional = true }
 ndn-engine    = { workspace = true, optional = true }
+ndn-cert      = { workspace = true, optional = true }
 # Path dep so `default-features = false` sticks (as in ndn-mgmt): boot needs
 # only `SecurityProfile` / `SchemaRule`, not the sqlite PIB.
 ndn-security  = { path = "../../security/ndn-security", default-features = false, optional = true }
