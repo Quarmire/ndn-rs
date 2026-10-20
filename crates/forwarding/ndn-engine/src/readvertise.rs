@@ -34,12 +34,8 @@ pub trait ReadvertiseDestination: Send + Sync {
 /// routes — `AUTOCONF` (66), `DVR` (127), `NLSR` (128), `PREFIX_ANN` (129).
 /// Excluding routing origins is the loop-prevention: a prefix NLSR installed
 /// from a peer's LSA must not be re-announced as locally-originated.
-/// (Values mirror `ndn_config::control_parameters::origin`.)
 pub fn should_readvertise(origin: u64) -> bool {
-    const APP: u64 = 0;
-    const AUTOREG: u64 = 64;
-    const CLIENT: u64 = 65;
-    const STATIC: u64 = 255;
+    use ndn_mgmt_wire::control_parameters::origin::{APP, AUTOREG, CLIENT, STATIC};
     matches!(origin, APP | AUTOREG | CLIENT | STATIC)
 }
 

@@ -1725,6 +1725,7 @@ dependencies = [
  "ndn-face",
  "ndn-face-local",
  "ndn-fwd-core",
+ "ndn-mgmt-wire",
  "ndn-packet",
  "ndn-pathcontrol",
  "ndn-runtime",

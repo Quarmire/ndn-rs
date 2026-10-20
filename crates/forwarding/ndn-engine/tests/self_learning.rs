@@ -135,7 +135,9 @@ async fn untrusted_ed25519_pa(prefix: &str) -> Bytes {
 }
 
 /// Self-learning + a validated PrefixAnnouncement → a route is installed toward
-/// the announcing (neighbor) face.
+/// the announcing (neighbor) face, under NFD's prefix-announcement route origin
+/// (`ROUTE_ORIGIN_PREFIXANN` = 129), so `rib/list` reports it and an
+/// origin-scoped `rib/unregister` removes it as NFD does.
 #[tokio::test]
 async fn validated_announcement_installs_route() {
     let (engine, shutdown, _consumer, _neighbor) =
@@ -143,6 +145,19 @@ async fn validated_announcement_installs_route() {
     assert!(
         learned_route_present(&engine),
         "self-learning must install a /learned route toward the neighbor face"
+    );
+    let learned: Name = "/learned".parse().unwrap();
+    let origins: Vec<u64> = engine
+        .rib()
+        .dump()
+        .into_iter()
+        .filter(|(name, _)| *name == learned)
+        .flat_map(|(_, routes)| routes.into_iter().map(|r| r.origin))
+        .collect();
+    assert_eq!(
+        origins,
+        vec![ndn_mgmt_wire::control_parameters::origin::PREFIX_ANN],
+        "a learned route carries the prefix-announcement origin"
     );
     shutdown.shutdown().await;
 }

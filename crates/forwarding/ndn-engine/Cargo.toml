@@ -42,6 +42,7 @@ ndn-store     = { workspace = true }
 ndn-strategy  = { workspace = true }
 ndn-signals-core = { workspace = true }  # the SignalSource trait only (concrete sources are downstream)
 ndn-pathcontrol = { workspace = true }   # G3 PathControl primitive (forwarder hook)
+ndn-mgmt-wire = { workspace = true }    # RIB route-origin codes (`control_parameters::origin`)
 async-trait   = { workspace = true }     # object-safe PathAuthorizer
 ndn-runtime   = { workspace = true }
 web-time      = { workspace = true }

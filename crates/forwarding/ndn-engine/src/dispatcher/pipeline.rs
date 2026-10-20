@@ -699,14 +699,14 @@ impl PacketDispatcher {
         };
         match validator.validate(&pa.data).await {
             ndn_security::ValidationResult::Valid(_) => {
-                // NFD ROUTE_ORIGIN_PREFIXANN = 130. Monotonic deadline via the runtime
-                // (deterministic under a virtual runtime). (ndn-lab slice 0c.)
+                // Origin prefix-ann (NFD ROUTE_ORIGIN_PREFIXANN = 129). Monotonic deadline
+                // via the runtime (deterministic under a virtual runtime). (ndn-lab slice 0c.)
                 let expires_at = pa.expiration.map(|d| self.runtime.now() + d);
                 self.rib.add(
                     &pa.announced_prefix,
                     crate::rib::RibRoute {
                         face_id: ctx.face_id,
-                        origin: 130,
+                        origin: ndn_mgmt_wire::control_parameters::origin::PREFIX_ANN,
                         cost: 0,
                         flags: 0,
                         expires_at,
