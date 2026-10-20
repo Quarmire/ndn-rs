@@ -141,7 +141,7 @@ pub trait ContextUpdateSink: Send + Sync {
     type Error: From<HandOverError> + fmt::Display + Send;
 
     /// Who takes the version, worded to start a sentence (`the daemon at
-    /// /run/ndn-fwd.sock`).
+    /// /run/nfd/nfd.sock`, the daemon's [face socket](ndn_transport::DEFAULT_FACE_SOCKET)).
     fn peer(&self) -> String;
 
     /// Hand `data`, a signed version, to the running device once, reaching

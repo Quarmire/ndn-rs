@@ -2627,7 +2627,8 @@ pub struct StrategyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManagementConfig {
     /// Unix domain socket (or Named Pipe on Windows) for app/tool faces.
-    /// Default Unix: `/run/nfd/nfd.sock`; Windows: `\\.\pipe\ndn`.
+    /// Default [`ndn_transport::DEFAULT_FACE_SOCKET`]: `/run/nfd/nfd.sock`;
+    /// Windows: `\\.\pipe\ndn`.
     #[serde(default = "default_face_socket")]
     pub face_socket: String,
 }
@@ -2641,12 +2642,7 @@ impl Default for ManagementConfig {
 }
 
 fn default_face_socket() -> String {
-    #[cfg(unix)]
-    return "/run/nfd/nfd.sock".to_owned();
-    #[cfg(windows)]
-    return r"\\.\pipe\ndn".to_owned();
-    #[cfg(not(any(unix, windows)))]
-    return String::new();
+    ndn_transport::DEFAULT_FACE_SOCKET.to_owned()
 }
 
 /// `[[security.rule]]` data/key pattern pair. Variables captured in

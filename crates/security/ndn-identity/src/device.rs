@@ -75,15 +75,15 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
 
     let challenge = build_challenge(&config.factory_credential, &key_name)?;
 
-    // ZTP path assumes a system NDN router. Custom transports should call
-    // `NdncertClient` directly.
-    let socket = std::path::Path::new("/run/ndn/router.sock");
+    // ZTP path assumes the system forwarder at its default face socket.
+    // Custom transports should call `NdncertClient` directly.
+    let socket = std::path::Path::new(ndn_app::DEFAULT_FACE_SOCKET);
     if !socket.exists() {
-        return Err(IdentityError::Enrollment(
-            "ZTP requires a running NDN router at /run/ndn/router.sock; \
-             use NdncertClient directly for custom connectivity"
-                .to_string(),
-        ));
+        return Err(IdentityError::Enrollment(format!(
+            "ZTP requires a running NDN forwarder at {}; \
+             use NdncertClient directly for custom connectivity",
+            ndn_app::DEFAULT_FACE_SOCKET
+        )));
     }
 
     let consumer = ndn_app::Consumer::connect(socket).await?;
@@ -103,7 +103,7 @@ pub async fn run_provisioning(config: DeviceConfig) -> Result<Identity, Identity
     let renewer: Arc<dyn CertRenewer> = Arc::new(NdncertRenewer {
         connect: Arc::new(|| {
             Box::pin(async {
-                ndn_app::Consumer::connect(std::path::Path::new("/run/ndn/router.sock")).await
+                ndn_app::Consumer::connect(std::path::Path::new(ndn_app::DEFAULT_FACE_SOCKET)).await
             })
         }),
     });

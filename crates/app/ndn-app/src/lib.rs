@@ -92,6 +92,7 @@ pub use publisher::{Publisher, PublisherConfig};
 pub use queryable::{Query, Queryable};
 pub use reflexive::random_reflexive_name;
 pub mod node;
+pub use ndn_transport::DEFAULT_FACE_SOCKET;
 pub use node::{ConnectionProvider, Node, ObjectServeGuard};
 pub use responder::Responder;
 pub use security::KeyChain;

@@ -25,7 +25,7 @@
 //! use ndn::Node;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let node = Node::connect("/run/nfd/nfd.sock").await?;
+//! let node = Node::connect(ndn::transport::DEFAULT_FACE_SOCKET).await?;
 //! // Decide trust once with `verifying`; then `fetch` returns `SafeData` —
 //! // proof the signature checked out. (Bare `node.fetch` is unverified.)
 //! let keychain = KeyChain::ephemeral("/example")?;

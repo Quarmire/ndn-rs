@@ -29,7 +29,7 @@
 //! # use ndn_app::Node;
 //! # use ndn_app::prelude::name;
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let node = Node::connect("/run/nfd/nfd.sock").await?;
+//! let node = Node::connect(ndn_app::DEFAULT_FACE_SOCKET).await?;
 //! // serve dynamic content (the "Responder" pattern, now first-class)
 //! let _guard = node.serve(name!("/notes"), |interest, reply| async move {
 //!     let _ = reply.respond((*interest.name).clone(), "hello").await;

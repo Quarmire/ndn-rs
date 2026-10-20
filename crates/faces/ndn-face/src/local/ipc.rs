@@ -3,6 +3,8 @@
 //! [`IpcFace`] boxes the read/write halves so the concrete type is identical
 //! on every platform.
 //!
+//! The forwarder's default path is [`ndn_transport::DEFAULT_FACE_SOCKET`]:
+//!
 //! | Platform | Default path |
 //! |----------|-------------|
 //! | Unix     | `/run/nfd/nfd.sock` |

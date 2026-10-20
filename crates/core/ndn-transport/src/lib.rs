@@ -33,6 +33,19 @@ pub mod transport;
 
 pub use ndn_packet::fragment::DEFAULT_UDP_MTU;
 
+/// Where the forwarder takes app and tool faces unless configured otherwise
+/// (`ndn-fwd`'s `[management] face_socket`): NFD's Unix socket
+/// `/run/nfd/nfd.sock`, or the named pipe `\\.\pipe\ndn` on Windows. The one
+/// default every client and tool connects to.
+#[cfg(not(windows))]
+pub const DEFAULT_FACE_SOCKET: &str = "/run/nfd/nfd.sock";
+/// Where the forwarder takes app and tool faces unless configured otherwise
+/// (`ndn-fwd`'s `[management] face_socket`): NFD's Unix socket
+/// `/run/nfd/nfd.sock`, or the named pipe `\\.\pipe\ndn` on Windows. The one
+/// default every client and tool connects to.
+#[cfg(windows)]
+pub const DEFAULT_FACE_SOCKET: &str = r"\\.\pipe\ndn";
+
 pub use any_map::AnyMap;
 pub use congestion::CongestionController;
 pub use face::{
