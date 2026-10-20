@@ -644,10 +644,12 @@ routes with `CHILD_INHERIT` routes from ancestors, unless it or a nearer
 ancestor `CAPTURE`s. **Readvertise** (`ndn-engine/src/readvertise.rs`,
 NFD `rib/readvertise`) closes the loop the other way: a locally-originated
 `rib/register` (app/client/static origin — never a routing-learned route, to
-avoid announce loops) is pushed to a `ReadvertiseDestination`. `NlsrProtocol`
-registers one and folds the readvertised prefixes into its own NameLSA,
-re-originating (bumped seq) on change so peers learn an app's prefix without
-manual config.
+avoid announce loops) is pushed to every running routing protocol's
+`ReadvertiseDestination`, and withdrawn once the prefix's last local route
+leaves the RIB — unregistered, its face gone down, or expired. `NlsrProtocol`
+folds the readvertised prefixes into its own NameLSA, re-originating (bumped
+seq) on change; `DvProtocol` announces them in its prefix table (Prefix
+Sync). Either way peers learn an app's prefix without manual config.
 
 The self-learning strategy broadcasts discovery Interests when no route exists.
 When Data returns with an LP `PrefixAnnouncement`, the engine validates the
