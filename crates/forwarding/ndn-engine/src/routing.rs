@@ -316,6 +316,7 @@ impl RoutingManager {
             // still runs after a panicked task.
             let _ = handle.task.await;
         }
+        self.rib.clear_readvertise_destination(origin);
         let affected = self.rib.flush_origin(origin);
         let n = affected.len();
         for prefix in &affected {

@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use web_time::Instant;
 
@@ -12,10 +13,10 @@ use crate::readvertise::{ReadvertiseDestination, should_readvertise};
 #[derive(Clone, Debug)]
 pub struct RibRoute {
     pub face_id: FaceId,
-    /// See `ndn_config::control_parameters::origin` for standard values.
+    /// See `ndn_mgmt_wire::control_parameters::origin` for standard values.
     pub origin: u64,
     pub cost: u32,
-    /// See `ndn_config::control_parameters::route_flags`.
+    /// See `ndn_mgmt_wire::control_parameters::route_flags`.
     pub flags: u64,
     pub expires_at: Option<Instant>,
 }
@@ -38,63 +39,104 @@ impl RibRoute {
 ///
 /// Discovery protocols write directly to the FIB via `EngineDiscoveryContext`
 /// and are **not** tracked in the RIB.
+///
+/// # Readvertise
+///
+/// A prefix announced with [`Self::readvertise_announce`] stays announced to
+/// every registered [`ReadvertiseDestination`] until its last
+/// locally-originated route leaves the RIB — whichever way it leaves: an
+/// unregistration, its face going down, its expiry, or a flush.
 pub struct Rib {
     routes: DashMap<Name, Vec<RibRoute>>,
-    /// Optional readvertise sink. When set (by a routing protocol), locally-
-    /// originated registrations are announced into the routing plane so
-    /// remote nodes can reach the prefix (NFD `rib/readvertise`).
-    readvertise: RwLock<Option<Arc<dyn ReadvertiseDestination>>>,
+    readvertise: Mutex<Readvertise>,
+}
+
+/// The readvertised prefixes and where they are announced (NFD
+/// `rib/readvertise`).
+#[derive(Default)]
+struct Readvertise {
+    /// Prefixes currently announced into the routing plane.
+    announced: BTreeSet<Name>,
+    /// One destination per routing protocol, keyed by its route origin.
+    destinations: Vec<(u64, Arc<dyn ReadvertiseDestination>)>,
 }
 
 impl Rib {
     pub fn new() -> Self {
         Self {
             routes: DashMap::new(),
-            readvertise: RwLock::new(None),
+            readvertise: Mutex::new(Readvertise::default()),
         }
     }
 
-    /// Install the readvertise destination (e.g. NLSR). Idempotent; the last
-    /// writer wins. A registered destination is fed by
-    /// [`Self::readvertise_announce`] / [`Self::readvertise_withdraw`].
-    pub fn set_readvertise_destination(&self, dest: Arc<dyn ReadvertiseDestination>) {
-        *self.readvertise.write().expect("readvertise lock poisoned") = Some(dest);
+    fn readvertise_state(&self) -> std::sync::MutexGuard<'_, Readvertise> {
+        self.readvertise.lock().expect("readvertise lock poisoned")
     }
 
-    fn readvertise_dest(&self) -> Option<Arc<dyn ReadvertiseDestination>> {
-        self.readvertise
-            .read()
-            .expect("readvertise lock poisoned")
-            .clone()
+    /// Install the readvertise destination of the routing protocol running
+    /// under `origin` (replacing that protocol's previous one) and announce
+    /// every currently readvertised prefix to it, so a protocol started after
+    /// the apps registered still learns their prefixes.
+    pub fn set_readvertise_destination(&self, origin: u64, dest: Arc<dyn ReadvertiseDestination>) {
+        let mut state = self.readvertise_state();
+        for prefix in &state.announced {
+            dest.advertise(prefix);
+        }
+        state.destinations.retain(|(o, _)| *o != origin);
+        state.destinations.push((origin, dest));
+    }
+
+    /// Remove the readvertise destination of the routing protocol running
+    /// under `origin` (it stopped). The announced set is kept for the others.
+    pub fn clear_readvertise_destination(&self, origin: u64) {
+        self.readvertise_state()
+            .destinations
+            .retain(|(o, _)| *o != origin);
     }
 
     /// Announce `prefix` into the routing plane if `origin` is a locally-
-    /// originated registration (see [`should_readvertise`]) and a destination
-    /// is installed. A no-op otherwise — routing-learned routes never
-    /// readvertise (loop prevention).
+    /// originated registration (see [`should_readvertise`]) and the RIB holds
+    /// such a route for it. A no-op otherwise — routing-learned routes never
+    /// readvertise (loop prevention). Call after adding the route; the
+    /// prefix is withdrawn on its own once its last local route is gone.
     pub fn readvertise_announce(&self, prefix: &Name, origin: u64) {
-        if should_readvertise(origin)
-            && let Some(dest) = self.readvertise_dest()
-        {
+        if !should_readvertise(origin) {
+            return;
+        }
+        let mut state = self.readvertise_state();
+        // Checked under the lock, as the withdrawal is: a route removed
+        // before this point is not announced; one removed after it is
+        // withdrawn by the removal.
+        if !self.has_local_route(prefix) || !state.announced.insert(prefix.clone()) {
+            return;
+        }
+        for (_, dest) in &state.destinations {
             dest.advertise(prefix);
         }
     }
 
-    /// Withdraw `prefix` from the routing plane — but only once **no**
-    /// locally-originated route for it remains (a prefix served by several
-    /// local faces stays advertised until the last is gone, matching NFD).
-    /// Call after the route has been removed from the RIB.
-    pub fn readvertise_withdraw(&self, prefix: &Name) {
-        let Some(dest) = self.readvertise_dest() else {
-            return;
-        };
-        let still_local = self
-            .routes
+    fn has_local_route(&self, prefix: &Name) -> bool {
+        self.routes
             .get(prefix)
-            .map(|rs| rs.iter().any(|r| should_readvertise(r.origin)))
-            .unwrap_or(false);
-        if !still_local {
-            dest.withdraw(prefix);
+            .is_some_and(|rs| rs.iter().any(|r| should_readvertise(r.origin)))
+    }
+
+    /// Withdraw each of `prefixes` that is announced but has no locally-
+    /// originated route left (a prefix served by several local faces stays
+    /// announced until the last is gone, matching NFD). Every removal path
+    /// calls this with the prefixes it touched.
+    fn withdraw_unserved(&self, prefixes: &[Name]) {
+        if prefixes.is_empty() {
+            return;
+        }
+        let mut state = self.readvertise_state();
+        for prefix in prefixes {
+            if state.announced.contains(prefix) && !self.has_local_route(prefix) {
+                state.announced.remove(prefix);
+                for (_, dest) in &state.destinations {
+                    dest.withdraw(prefix);
+                }
+            }
         }
     }
 
@@ -118,71 +160,57 @@ impl Rib {
     }
 
     pub fn remove(&self, prefix: &Name, face_id: FaceId, origin: u64) -> bool {
-        let Some(mut entry) = self.routes.get_mut(prefix) else {
-            return false;
-        };
-        let before = entry.len();
-        entry.retain(|r| !(r.face_id == face_id && r.origin == origin));
-        let changed = entry.len() != before;
-        if entry.is_empty() {
-            drop(entry);
-            self.routes.remove(prefix);
-        }
-        changed
+        self.remove_at(prefix, |r| r.face_id == face_id && r.origin == origin)
     }
 
     pub fn remove_nexthop(&self, prefix: &Name, face_id: FaceId) -> bool {
+        self.remove_at(prefix, |r| r.face_id == face_id)
+    }
+
+    /// Remove `prefix`'s routes matching `doomed`; `true` if any was removed.
+    fn remove_at(&self, prefix: &Name, doomed: impl Fn(&RibRoute) -> bool) -> bool {
         let Some(mut entry) = self.routes.get_mut(prefix) else {
             return false;
         };
         let before = entry.len();
-        entry.retain(|r| r.face_id != face_id);
+        entry.retain(|r| !doomed(r));
         let changed = entry.len() != before;
-        if entry.is_empty() {
-            drop(entry);
-            self.routes.remove(prefix);
+        drop(entry);
+        // Re-checked under the shard lock: a route added meanwhile keeps it.
+        self.routes.remove_if(prefix, |_, routes| routes.is_empty());
+        if changed {
+            self.withdraw_unserved(std::slice::from_ref(prefix));
         }
         changed
     }
 
     pub fn flush_origin(&self, origin: u64) -> Vec<Name> {
-        let mut affected = Vec::new();
-        self.routes.retain(|name, routes| {
-            let before = routes.len();
-            routes.retain(|r| r.origin != origin);
-            if routes.len() != before {
-                affected.push(name.clone());
-            }
-            !routes.is_empty()
-        });
-        affected
+        self.retain_routes(|r| r.origin != origin)
     }
 
     pub fn flush_face(&self, face_id: FaceId) -> Vec<Name> {
-        let mut affected = Vec::new();
-        self.routes.retain(|name, routes| {
-            let before = routes.len();
-            routes.retain(|r| r.face_id != face_id);
-            if routes.len() != before {
-                affected.push(name.clone());
-            }
-            !routes.is_empty()
-        });
-        affected
+        self.retain_routes(|r| r.face_id != face_id)
     }
 
     /// Remove routes expired as of `now` (monotonic, from the runtime — deterministic under
     /// a virtual runtime). (ndn-lab slice 0c.)
     pub fn drain_expired(&self, now: Instant) -> Vec<Name> {
+        self.retain_routes(|r| r.expires_at.is_none_or(|exp| exp > now))
+    }
+
+    /// Keep only the routes satisfying `keep`; returns the prefixes that lost
+    /// a route.
+    fn retain_routes(&self, keep: impl Fn(&RibRoute) -> bool) -> Vec<Name> {
         let mut affected = Vec::new();
         self.routes.retain(|name, routes| {
             let before = routes.len();
-            routes.retain(|r| r.expires_at.is_none_or(|exp| exp > now));
+            routes.retain(&keep);
             if routes.len() != before {
                 affected.push(name.clone());
             }
             !routes.is_empty()
         });
+        self.withdraw_unserved(&affected);
         affected
     }
 
@@ -581,34 +609,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn readvertise_announces_local_only_and_withdraws_when_last_route_gone() {
-        use crate::readvertise::ReadvertiseDestination;
-        use std::sync::Mutex;
-
-        #[derive(Default)]
-        struct Recorder {
-            adv: Mutex<Vec<Name>>,
-            wd: Mutex<Vec<Name>>,
+    /// Records what a [`ReadvertiseDestination`] was told.
+    #[derive(Default)]
+    struct Recorder {
+        adv: std::sync::Mutex<Vec<Name>>,
+        wd: std::sync::Mutex<Vec<Name>>,
+    }
+    impl ReadvertiseDestination for Recorder {
+        fn advertise(&self, p: &Name) {
+            self.adv.lock().unwrap().push(p.clone());
         }
-        impl ReadvertiseDestination for Recorder {
-            fn advertise(&self, p: &Name) {
-                self.adv.lock().unwrap().push(p.clone());
-            }
-            fn withdraw(&self, p: &Name) {
-                self.wd.lock().unwrap().push(p.clone());
-            }
+        fn withdraw(&self, p: &Name) {
+            self.wd.lock().unwrap().push(p.clone());
         }
+    }
 
+    fn recording_rib() -> (Rib, Arc<Recorder>) {
         let rib = Rib::new();
         let rec = Arc::new(Recorder::default());
-        rib.set_readvertise_destination(Arc::clone(&rec) as Arc<dyn ReadvertiseDestination>);
+        rib.set_readvertise_destination(128, Arc::clone(&rec) as Arc<dyn ReadvertiseDestination>);
+        (rib, rec)
+    }
 
+    #[test]
+    fn readvertise_announces_local_only_and_withdraws_when_last_route_gone() {
+        let (rib, rec) = recording_rib();
         let p = nn("/app/svc");
         // App registration (origin 0) → announced.
         rib.add(&p, route(1, 0, 0));
         rib.readvertise_announce(&p, 0);
         // NLSR-learned (origin 128) → NOT announced (loop prevention).
+        rib.add(&nn("/learned"), route(1, 128, 0));
         rib.readvertise_announce(&nn("/learned"), 128);
         assert_eq!(rec.adv.lock().unwrap().clone(), vec![p.clone()]);
 
@@ -616,7 +647,6 @@ mod tests {
         // NOT withdraw (still served).
         rib.add(&p, route(2, 0, 0));
         rib.remove(&p, FaceId(1), 0);
-        rib.readvertise_withdraw(&p);
         assert!(
             rec.wd.lock().unwrap().is_empty(),
             "prefix still served by face 2 — must not withdraw"
@@ -624,8 +654,61 @@ mod tests {
 
         // Remove the last local route → withdraw fires.
         rib.remove(&p, FaceId(2), 0);
-        rib.readvertise_withdraw(&p);
         assert_eq!(rec.wd.lock().unwrap().clone(), vec![p]);
+    }
+
+    /// A crashed app's prefix must not stay advertised: losing the route to
+    /// its face going down, or to its expiry, withdraws it like an
+    /// unregistration does.
+    #[test]
+    fn readvertise_withdraws_on_face_down_and_on_expiry() {
+        let (rib, rec) = recording_rib();
+        let fib = Fib::new();
+        let a = nn("/app/a");
+        rib.add(&a, route(1, 0, 0));
+        rib.readvertise_announce(&a, 0);
+        rib.handle_face_down(FaceId(1), &fib);
+        assert_eq!(rec.wd.lock().unwrap().clone(), vec![a.clone()]);
+
+        let b = nn("/app/b");
+        let now = Instant::now();
+        rib.add(
+            &b,
+            RibRoute {
+                expires_at: Some(now + Duration::from_secs(1)),
+                ..route(2, 0, 0)
+            },
+        );
+        rib.readvertise_announce(&b, 0);
+        rib.drain_expired(now);
+        assert_eq!(rec.wd.lock().unwrap().len(), 1, "not expired yet");
+        rib.drain_expired(now + Duration::from_secs(2));
+        assert_eq!(rec.wd.lock().unwrap().clone(), vec![a, b]);
+    }
+
+    /// A routing protocol that starts after the apps registered still learns
+    /// their prefixes; each running protocol has its own destination.
+    #[test]
+    fn readvertise_replays_to_a_late_destination_and_feeds_every_protocol() {
+        let (rib, nlsr) = recording_rib();
+        let p = nn("/app/p");
+        rib.add(&p, route(1, 0, 0));
+        rib.readvertise_announce(&p, 0);
+
+        let dv = Arc::new(Recorder::default());
+        rib.set_readvertise_destination(127, Arc::clone(&dv) as Arc<dyn ReadvertiseDestination>);
+        assert_eq!(dv.adv.lock().unwrap().clone(), vec![p.clone()]);
+
+        rib.remove_nexthop(&p, FaceId(1));
+        assert_eq!(nlsr.wd.lock().unwrap().clone(), vec![p.clone()]);
+        assert_eq!(dv.wd.lock().unwrap().clone(), vec![p.clone()]);
+
+        // A stopped protocol's destination hears nothing more.
+        rib.clear_readvertise_destination(127);
+        rib.add(&p, route(1, 0, 0));
+        rib.readvertise_announce(&p, 0);
+        assert_eq!(dv.adv.lock().unwrap().len(), 1);
+        assert_eq!(nlsr.adv.lock().unwrap().len(), 2);
     }
 
     #[test]

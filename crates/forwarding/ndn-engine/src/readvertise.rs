@@ -2,14 +2,16 @@
 //! routing protocol (or upstream gateway) so a remote node can reach an
 //! app's prefix without manual config — NFD `rib/readvertise/`.
 //!
-//! The RIB calls [`Rib::readvertise_announce`](crate::Rib::readvertise_announce)
-//! / [`Rib::readvertise_withdraw`](crate::Rib::readvertise_withdraw) when a
-//! route is registered/unregistered through management. A registered
-//! [`ReadvertiseDestination`] (e.g. NLSR's [`ReadvertisedPrefixes`]) then
-//! announces the prefix into the routing plane. The origin-based
-//! [`should_readvertise`] policy readvertises only *locally-originated*
-//! registrations (app/client/static), never routes a routing protocol
-//! itself installed — which is what keeps an announce from looping back.
+//! Management calls [`Rib::readvertise_announce`](crate::Rib::readvertise_announce)
+//! when a route is registered; the RIB withdraws the prefix itself once its
+//! last locally-originated route is gone — unregistered, its face down, or
+//! expired. Each running routing protocol registers its own
+//! [`ReadvertiseDestination`] (e.g. a [`ReadvertisedPrefixes`]) under its
+//! route origin and announces the set into the routing plane. The
+//! origin-based [`should_readvertise`] policy readvertises only
+//! *locally-originated* registrations (app/client/static), never routes a
+//! routing protocol itself installed — which is what keeps an announce from
+//! looping back.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
