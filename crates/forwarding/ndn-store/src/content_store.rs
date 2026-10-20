@@ -84,30 +84,43 @@ pub struct CsListedEntry {
     pub fresh: bool,
 }
 
-/// What a content store holds at or under a prefix (see
+/// One page of what a content store holds at or under a prefix (see
 /// [`ContentStore::list`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CsPrefixListing {
-    /// The first entries in canonical name order, at most the asked limit.
+    /// The page: the first entries after the cursor in canonical name order,
+    /// at most the asked limit.
     pub entries: Vec<CsListedEntry>,
     /// How many entries the store holds at or under the prefix, listed or
-    /// not.
+    /// not, before or after the cursor.
     pub total: usize,
+    /// Whether entries under the prefix follow the page — the next page
+    /// starts after its last entry (after the cursor when the page is empty).
+    pub more: bool,
 }
 
 impl CsPrefixListing {
-    /// The listing of `entries` (every entry under the prefix, any order)
-    /// capped at `limit`: keeps the first `limit` in canonical name order.
-    pub fn first_in_name_order(mut entries: Vec<CsListedEntry>, limit: usize) -> Self {
+    /// The page of `entries` (every entry under the prefix, any order) that
+    /// starts after `after` (`None`: at the first) and holds at most `limit`,
+    /// in canonical name order.
+    pub fn page(mut entries: Vec<CsListedEntry>, after: Option<&Name>, limit: usize) -> Self {
         let total = entries.len();
-        if total > limit {
+        if let Some(after) = after {
+            entries.retain(|e| *e.name > *after);
+        }
+        let more = entries.len() > limit;
+        if more {
             // Partition instead of sorting everything: only the kept head is
             // sorted below.
             entries.select_nth_unstable_by(limit, |a, b| a.name.cmp(&b.name));
             entries.truncate(limit);
         }
         entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        Self { entries, total }
+        Self {
+            entries,
+            total,
+            more,
+        }
     }
 }
 
@@ -198,15 +211,19 @@ pub trait ContentStore: Send + Sync + 'static {
         CsStats::default()
     }
 
-    /// The entries named at or under `prefix`: the first `limit` in
-    /// canonical name order, each judged fresh or stale at `now_ns` (the
-    /// caller's clock, like [`get`](Self::get)), and how many there are in
-    /// all. Read-only (no recency or hit accounting) and scans the subtree:
-    /// for operators inspecting the cache, never the forwarding path. A store
-    /// that cannot enumerate reports nothing.
+    /// One page of the entries named at or under `prefix`: those after the
+    /// cursor `after` (`None`: from the first), at most `limit`, in canonical
+    /// name order, each judged fresh or stale at `now_ns` (the caller's
+    /// clock, like [`get`](Self::get)); how many there are in all; and
+    /// whether more follow the page. Paging with the last listed name as the
+    /// next cursor visits every entry exactly once while the store is
+    /// unchanged. Read-only (no recency or hit accounting) and scans the
+    /// subtree: for operators inspecting the cache, never the forwarding
+    /// path. A store that cannot enumerate reports nothing.
     fn list(
         &self,
         _prefix: &Name,
+        _after: Option<&Name>,
         _limit: usize,
         _now_ns: u64,
     ) -> impl Future<Output = CsPrefixListing> + Send {
@@ -257,6 +274,7 @@ pub trait ErasedContentStore: Send + Sync + 'static {
     fn list_erased<'a>(
         &'a self,
         prefix: &'a Name,
+        after: Option<&'a Name>,
         limit: usize,
         now_ns: u64,
     ) -> Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>>;
@@ -327,10 +345,11 @@ impl<T: ContentStore> ErasedContentStore for T {
     fn list_erased<'a>(
         &'a self,
         prefix: &'a Name,
+        after: Option<&'a Name>,
         limit: usize,
         now_ns: u64,
     ) -> Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>> {
-        Box::pin(self.list(prefix, limit, now_ns))
+        Box::pin(self.list(prefix, after, limit, now_ns))
     }
 
     fn capacity(&self) -> CsCapacity {

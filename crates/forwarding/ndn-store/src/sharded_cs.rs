@@ -112,22 +112,31 @@ impl<C: ContentStore> ContentStore for ShardedCs<C> {
         self.shards[idx].restamp(name, data, epoch).await
     }
 
-    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+    async fn list(
+        &self,
+        prefix: &Name,
+        after: Option<&Name>,
+        limit: usize,
+        now_ns: u64,
+    ) -> CsPrefixListing {
         // A non-empty prefix lives in one shard; the root spans them all.
         if !prefix.is_empty() {
             let idx = self.shard_for(prefix);
-            return self.shards[idx].list(prefix, limit, now_ns).await;
+            return self.shards[idx].list(prefix, after, limit, now_ns).await;
         }
-        // Each shard's first `limit` hold the overall first `limit`.
+        // Each shard's page holds its share of the overall page.
         let mut total = 0;
+        let mut more = false;
         let mut entries = Vec::new();
         for shard in &self.shards {
-            let listing = shard.list(prefix, limit, now_ns).await;
+            let listing = shard.list(prefix, after, limit, now_ns).await;
             total += listing.total;
+            more |= listing.more;
             entries.extend(listing.entries);
         }
-        let mut listing = CsPrefixListing::first_in_name_order(entries, limit);
+        let mut listing = CsPrefixListing::page(entries, None, limit);
         listing.total = total;
+        listing.more |= more;
         listing
     }
 

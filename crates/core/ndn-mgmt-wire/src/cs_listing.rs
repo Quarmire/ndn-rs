@@ -1,13 +1,15 @@
-//! The `cs/list` dataset (`/localhost/nfd/cs/list`): the names a forwarder's
-//! content store holds under a prefix, capped, with the total held there.
+//! The `cs/list` dataset (`/localhost/nfd/cs/list`): one page of the names a
+//! forwarder's content store holds under a prefix, with the total held there
+//! and whether more follow the page.
 //!
 //! An ndn-rs extension (NFD has no CS enumeration). The single source of
 //! truth for this wire shape: the native engine (`ndn-mgmt`) encodes it and
 //! every client (`ndn-ipc`) decodes it through here.
 //!
 //! ```text
-//! CsListing  = CsListTotal *CsListEntry
+//! CsListing  = CsListTotal [CsListMore] *CsListEntry
 //! CsListTotal = 0x0500 NonNegativeInteger   ; entries held under the prefix
+//! CsListMore  = 0x0508 NonNegativeInteger   ; 1: entries follow the page
 //! CsListEntry = 0x0502 (Name                ; the standard Name TLV (0x07)
 //!                       CsEntryBytes        ; 0x0504 NonNegativeInteger, wire size
 //!                       CsEntryFresh)       ; 0x0506 NonNegativeInteger, 1 fresh / 0 stale
@@ -20,9 +22,10 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::{nni_bytes, read_nni};
 
-/// `cs/list` TLV-TYPE codes: 0x0500–0x0507, clear of the trust context
+/// `cs/list` TLV-TYPE codes: 0x0500–0x0509, clear of the trust context
 /// (0x0410–0x042F), the link messages (0x0440–0x046F), the trust envelope
-/// (0x0470–0x049F) and the link status dataset (0x04A0–0x04F3).
+/// (0x0470–0x049F) and the link status dataset (0x04A0–0x04F3). All even:
+/// non-critical, so an older decoder skips what it does not know.
 pub mod cs_tlv {
     /// NonNegativeInteger: how many entries the CS holds under the prefix.
     pub const TOTAL: u64 = 0x0500;
@@ -32,6 +35,9 @@ pub mod cs_tlv {
     pub const BYTES: u64 = 0x0504;
     /// NonNegativeInteger in an entry: 1 while it satisfies MustBeFresh, else 0.
     pub const FRESH: u64 = 0x0506;
+    /// NonNegativeInteger: 1 when entries under the prefix follow the page;
+    /// absent (or 0) on the last page.
+    pub const MORE: u64 = 0x0508;
     /// The standard Name TLV, in an entry: the cached Data's name.
     pub const NAME: u64 = 0x07;
 }
@@ -57,32 +63,46 @@ impl Default for CsEntry {
     }
 }
 
-/// The `cs/list` answer.
+/// The `cs/list` answer: one page of a listing.
+///
+/// Pages run in canonical name order. The first page is asked with no
+/// cursor; each next one with [`next_after`](Self::next_after) of the
+/// previous page as the cursor, until a page says no more follow. Paging so
+/// visits every entry under the prefix exactly once while the store is
+/// unchanged; entries added or evicted meanwhile show up or drop out
+/// without shifting the rest.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CsListing {
-    /// The first entries under the prefix in canonical name order, at most
-    /// the asked count.
+    /// The page: the first entries under the prefix after the cursor, in
+    /// canonical name order, at most the asked count.
     pub entries: Vec<CsEntry>,
-    /// How many entries the CS holds under the prefix, listed or not.
+    /// How many entries the CS holds under the prefix, on any page.
     pub total: u64,
+    /// Whether entries under the prefix follow this page.
+    pub more: bool,
 }
 
 impl CsListing {
-    /// Encode into the `cs/list` dataset body.
-    pub fn encode(&self) -> Bytes {
-        self.encode_within(usize::MAX)
+    /// The cursor for the next page — the last listed name — or `None` when
+    /// this is the last page.
+    pub fn next_after(&self) -> Option<&Name> {
+        if self.more {
+            self.entries.last().map(|e| &e.name)
+        } else {
+            None
+        }
     }
 
-    /// As [`encode`](Self::encode), but the body never exceeds `max_len`
-    /// bytes: entries that would take it past are left out (the total still
-    /// counts them). Lets the daemon answer in one dataset segment.
-    pub fn encode_within(&self, max_len: usize) -> Bytes {
+    /// Encode into the `cs/list` dataset body.
+    pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         let (b, n) = nni_bytes(self.total);
         w.write_tlv(cs_tlv::TOTAL, &b[..n]);
+        if self.more {
+            w.write_tlv(cs_tlv::MORE, &[1]);
+        }
         for e in &self.entries {
-            let mut entry = TlvWriter::new();
-            entry.write_nested(cs_tlv::ENTRY, |inner| {
+            w.write_nested(cs_tlv::ENTRY, |inner| {
                 inner.write_nested(cs_tlv::NAME, |name| {
                     for comp in e.name.components() {
                         name.write_tlv(comp.typ, &comp.value);
@@ -96,10 +116,6 @@ impl CsListing {
                     inner.write_tlv(typ, &b[..n]);
                 }
             });
-            if w.len() + entry.len() > max_len {
-                break;
-            }
-            w.write_raw(&entry.finish());
         }
         w.finish()
     }
@@ -115,6 +131,7 @@ impl CsListing {
             };
             match typ {
                 cs_tlv::TOTAL => out.total = read_nni(&body).unwrap_or(0),
+                cs_tlv::MORE => out.more = read_nni(&body).unwrap_or(0) != 0,
                 cs_tlv::ENTRY => {
                     if let Some(entry) = decode_entry(body) {
                         out.entries.push(entry);
@@ -174,6 +191,7 @@ mod tests {
                 },
             ],
             total: 312,
+            more: true,
         }
     }
 
@@ -181,28 +199,35 @@ mod tests {
     fn cs_listing_round_trips() {
         let l = listing();
         assert_eq!(CsListing::decode(&l.encode()), l);
+        let last = CsListing {
+            more: false,
+            ..listing()
+        };
+        assert_eq!(CsListing::decode(&last.encode()), last);
         let empty = CsListing::default();
         assert_eq!(CsListing::decode(&empty.encode()), empty);
     }
 
     #[test]
-    fn encode_within_keeps_whole_entries_and_the_total() {
+    fn the_next_cursor_is_the_last_name_while_more_follow() {
         let l = listing();
-        let full = l.encode();
-        let one = CsListing::decode(&l.encode_within(full.len() - 1));
-        assert_eq!(one.total, 312, "the total survives the cut");
-        assert_eq!(one.entries, l.entries[..1], "only whole entries are kept");
-        assert_eq!(CsListing::decode(&l.encode_within(full.len())), l);
+        assert_eq!(l.next_after(), Some(&l.entries[1].name));
+        let last = CsListing {
+            more: false,
+            ..listing()
+        };
+        assert_eq!(last.next_after(), None);
     }
 
     #[test]
     fn unknown_tlvs_and_nameless_entries_are_skipped() {
         let mut w = TlvWriter::new();
-        w.write_tlv(0x0508, b"future");
+        w.write_tlv(0x050A, b"future");
         w.write_tlv(cs_tlv::TOTAL, &[3]);
         w.write_nested(cs_tlv::ENTRY, |i| i.write_tlv(cs_tlv::BYTES, &[9]));
         let decoded = CsListing::decode(&w.finish());
         assert_eq!(decoded.total, 3);
         assert!(decoded.entries.is_empty());
+        assert!(!decoded.more);
     }
 }

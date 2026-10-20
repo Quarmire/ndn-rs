@@ -309,7 +309,13 @@ impl ContentStore for LruCs {
         }
     }
 
-    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+    async fn list(
+        &self,
+        prefix: &Name,
+        after: Option<&Name>,
+        limit: usize,
+        now_ns: u64,
+    ) -> CsPrefixListing {
         let entries = {
             let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
             inner
@@ -327,7 +333,7 @@ impl ContentStore for LruCs {
                 })
                 .collect()
         };
-        CsPrefixListing::first_in_name_order(entries, limit)
+        CsPrefixListing::page(entries, after, limit)
     }
 }
 

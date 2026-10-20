@@ -346,25 +346,10 @@ impl MgmtClient {
             .must_be_fresh()
             .lifetime(timeout)
             .build();
-        let _guard = self.recv_lock.lock().await;
-        let data_wire = self
-            .exchange_timeout(&interest_wire, timeout)
-            .await?
-            .ok_or_else(|| no_answer_within(timeout))?;
-        let data =
-            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-        let content = data.content().map(|c| c.as_ref()).unwrap_or_default();
-        // A refusal is a ControlResponse; the dataset is the listing.
-        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
-        {
-            let resp = ControlResponse::decode(Bytes::copy_from_slice(content))
-                .map_err(|_| ForwarderError::MalformedResponse)?;
-            return Err(ForwarderError::Command {
-                code: resp.status_code,
-                text: resp.status_text,
-            });
-        }
-        Ok(ndn_mgmt_wire::ApprovalListing::decode(content))
+        let content = self.whole_answer_within(&interest_wire, timeout).await?;
+        Ok(ndn_mgmt_wire::ApprovalListing::decode(&dataset_or_refusal(
+            content,
+        )?))
     }
 
     /// `ca/invite-create`: make an invite at the CA `ca` names (its
@@ -458,25 +443,9 @@ impl MgmtClient {
             .must_be_fresh()
             .lifetime(timeout)
             .build();
-        let _guard = self.recv_lock.lock().await;
-        let data_wire = self
-            .exchange_timeout(&interest_wire, timeout)
-            .await?
-            .ok_or_else(|| no_answer_within(timeout))?;
-        let data =
-            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-        let content = data.content().cloned().unwrap_or_default();
-        // A refusal is a ControlResponse; the dataset is the listing.
-        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
-        {
-            let resp =
-                ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)?;
-            return Err(ForwarderError::Command {
-                code: resp.status_code,
-                text: resp.status_text,
-            });
-        }
-        ndn_mgmt_wire::LinkListing::decode(content).map_err(|_| ForwarderError::MalformedResponse)
+        let content = self.whole_answer_within(&interest_wire, timeout).await?;
+        ndn_mgmt_wire::LinkListing::decode(dataset_or_refusal(content)?)
+            .map_err(|_| ForwarderError::MalformedResponse)
     }
 
     /// `links/connect`: link now to the configured device labelled `label`
@@ -601,36 +570,36 @@ impl MgmtClient {
         self.command(module::CS, verb::ERASE, &params).await
     }
 
-    /// `cs/list`: the names the content store holds under `prefix` (`None`:
-    /// all of them), the first `limit` in canonical name order, each with its
-    /// wire size and whether it is still fresh, and the total held there. The
-    /// daemon answers in one dataset segment, so it may list fewer than
-    /// `limit`; `total` always counts every entry. A public read like
-    /// `cs/info` (sent unsigned); a refusal — e.g. a daemon without the verb
-    /// — is [`ForwarderError::Command`].
+    /// `cs/list`: one page of the names the content store holds under
+    /// `prefix` (`None`: all of them) — those after the cursor `after`
+    /// (`None`: from the first), at most `limit`, in canonical name order —
+    /// each with its wire size and whether it is still fresh; plus how many
+    /// are held under `prefix` in all and whether more follow the page.
+    ///
+    /// Page through with the previous page's
+    /// [`next_after`](ndn_mgmt_wire::CsListing::next_after) as `after` until
+    /// it is `None`: every entry comes once, in order, while the store is
+    /// unchanged. `limit` is never cut to fit a packet — the page is read
+    /// whole across dataset segments — so `u64::MAX` lists everything in one
+    /// call. A public read like `cs/info` (sent unsigned); a refusal — e.g. a
+    /// daemon without the verb — is [`ForwarderError::Command`].
     pub async fn cs_list(
         &self,
         prefix: Option<&ndn_packet::Name>,
+        after: Option<&ndn_packet::Name>,
         limit: u64,
     ) -> Result<ndn_mgmt_wire::CsListing, ForwarderError> {
         let params = ControlParameters {
             name: prefix.cloned(),
             count: Some(limit),
+            uri: after.map(ToString::to_string),
             ..Default::default()
         };
         let interest_wire = build_dataset_interest(command_name(module::CS, verb::LIST, &params));
         let content = self.send_content_bytes(interest_wire).await?;
-        // A refusal is a ControlResponse; the dataset is the listing.
-        if content.first() == Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8))
-        {
-            let resp =
-                ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)?;
-            return Err(ForwarderError::Command {
-                code: resp.status_code,
-                text: resp.status_text,
-            });
-        }
-        Ok(ndn_mgmt_wire::CsListing::decode(&content))
+        Ok(ndn_mgmt_wire::CsListing::decode(&dataset_or_refusal(
+            content,
+        )?))
     }
 
     /// List discovered neighbors: `neighbors/list`.
@@ -1096,16 +1065,8 @@ impl MgmtClient {
         let interest_wire =
             build_signed_interest_with_lifetime(&self.signing, name, Some(timeout), app_params)
                 .await?;
-        let _guard = self.recv_lock.lock().await;
-        let data_wire = self
-            .exchange_timeout(&interest_wire, timeout)
-            .await?
-            .ok_or_else(|| no_answer_within(timeout))?;
-        let data =
-            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-        let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
-        ControlResponse::decode(Bytes::copy_from_slice(content))
-            .map_err(|_| ForwarderError::MalformedResponse)
+        let content = self.whole_answer_within(&interest_wire, timeout).await?;
+        ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)
     }
 
     /// `security/policy-get`. JSON `MgmtAccessPolicy` in `status_text`;
@@ -1391,13 +1352,96 @@ impl MgmtClient {
         self.send_content_bytes(interest_wire).await
     }
 
+    /// As [`send_content_bytes`](Self::send_content_bytes) for an answer
+    /// that may take network round trips: `Ok` only for an answer within
+    /// `timeout`, and each further segment gets as long.
+    async fn whole_answer_within(
+        &self,
+        interest_wire: &Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes, ForwarderError> {
+        let _guard = self.recv_lock.lock().await;
+        let data_wire = self
+            .exchange_timeout(interest_wire, timeout)
+            .await?
+            .ok_or_else(|| no_answer_within(timeout))?;
+        let data =
+            ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
+        self.whole_content(data, Some(timeout)).await
+    }
+
     async fn send_content_bytes(&self, interest_wire: Bytes) -> Result<Bytes, ForwarderError> {
         let _guard = self.recv_lock.lock().await;
         let data_wire = self.exchange(&interest_wire).await?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-        let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
-        Ok(Bytes::copy_from_slice(content))
+        self.whole_content(data, None).await
+    }
+
+    /// The whole content of the answer that begins with `first`. A dataset
+    /// answer is segment 0 of a version (`…/v=<n>/seg=0`); its other segments
+    /// are fetched by exact name, seg=1 on until the one the FinalBlockId
+    /// names, and the contents joined in order. Any other answer is its own
+    /// content. With `timeout`, each segment Interest lives that long and the
+    /// wait for it is as long. The caller holds the receive lock.
+    async fn whole_content(
+        &self,
+        first: ndn_packet::Data,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Bytes, ForwarderError> {
+        let content = first
+            .content()
+            .cloned()
+            .ok_or(ForwarderError::MalformedResponse)?;
+        let Some(versioned) = first_segment_prefix(&first.name) else {
+            return Ok(content);
+        };
+        let mut last = final_segment(&first)?;
+        if last == Some(0) {
+            return Ok(content);
+        }
+        let mut whole = bytes::BytesMut::from(&content[..]);
+        let mut seg = 1u64;
+        loop {
+            let name = versioned.clone().append_segment(seg);
+            let mut builder = InterestBuilder::new(name.clone());
+            if let Some(t) = timeout {
+                builder = builder.lifetime(t);
+            }
+            let interest_wire = builder.build();
+            let data_wire = match timeout {
+                Some(t) => self
+                    .exchange_timeout(&interest_wire, t)
+                    .await?
+                    .ok_or_else(|| no_answer_within(t))?,
+                None => self.exchange(&interest_wire).await?,
+            };
+            let data = ndn_packet::Data::decode(data_wire)
+                .map_err(|_| ForwarderError::MalformedResponse)?;
+            if *data.name != name {
+                return Err(ForwarderError::MalformedResponse);
+            }
+            let part = data.content().ok_or(ForwarderError::MalformedResponse)?;
+            // The daemon no longer holds this version: its refusal says so.
+            if data.meta_info().map(|m| m.content_type)
+                == Some(ndn_packet::meta_info::ContentType::Nack)
+            {
+                let resp = ControlResponse::decode(part.clone())
+                    .map_err(|_| ForwarderError::MalformedResponse)?;
+                return Err(ForwarderError::Command {
+                    code: resp.status_code,
+                    text: resp.status_text,
+                });
+            }
+            whole.extend_from_slice(part);
+            if let Some(end) = final_segment(&data)? {
+                last = Some(end);
+            }
+            if last.is_some_and(|end| seg >= end) {
+                return Ok(whole.freeze());
+            }
+            seg += 1;
+        }
     }
 
     /// Dataset queries go out unsigned because NFD/yanfd/ndnd require
@@ -1433,9 +1477,32 @@ impl MgmtClient {
         let data_wire = self.exchange(&interest_wire).await?;
         let data =
             ndn_packet::Data::decode(data_wire).map_err(|_| ForwarderError::MalformedResponse)?;
-        let content = data.content().ok_or(ForwarderError::MalformedResponse)?;
-        ControlResponse::decode(Bytes::copy_from_slice(content))
-            .map_err(|_| ForwarderError::MalformedResponse)
+        let content = self.whole_content(data, None).await?;
+        ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)
+    }
+}
+
+/// `…/v=<n>` when `name` is segment 0 of a dataset version
+/// (`…/v=<n>/seg=0`), the prefix its other segments are named under.
+fn first_segment_prefix(name: &Name) -> Option<Name> {
+    let (last, versioned) = name.components().split_last()?;
+    if last.as_segment()? != 0 {
+        return None;
+    }
+    versioned.last()?.as_version()?;
+    Some(Name::from_components(versioned.iter().cloned()))
+}
+
+/// The last segment a dataset segment's FinalBlockId names, if it carries
+/// one; a FinalBlockId that is not a segment number is malformed.
+fn final_segment(data: &ndn_packet::Data) -> Result<Option<u64>, ForwarderError> {
+    match data.meta_info().and_then(|m| m.final_block_component()) {
+        None => Ok(None),
+        Some(component) => component
+            .ok()
+            .and_then(|c| c.as_segment())
+            .map(Some)
+            .ok_or(ForwarderError::MalformedResponse),
     }
 }
 
@@ -1501,6 +1568,19 @@ async fn build_signed_interest_with_lifetime(
                 .await
         }
     }
+}
+
+/// A listing dataset's content, or the refusal the daemon answered instead
+/// (a `ControlResponse`) as [`ForwarderError::Command`].
+fn dataset_or_refusal(content: Bytes) -> Result<Bytes, ForwarderError> {
+    if content.first() != Some(&(ndn_mgmt_wire::control_response::tlv::CONTROL_RESPONSE as u8)) {
+        return Ok(content);
+    }
+    let resp = ControlResponse::decode(content).map_err(|_| ForwarderError::MalformedResponse)?;
+    Err(ForwarderError::Command {
+        code: resp.status_code,
+        text: resp.status_text,
+    })
 }
 
 /// The JSON report a successful answer carries; a non-OK answer is

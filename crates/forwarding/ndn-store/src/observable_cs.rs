@@ -170,11 +170,12 @@ impl ErasedContentStore for ObservableCs {
     fn list_erased<'a>(
         &'a self,
         prefix: &'a Name,
+        after: Option<&'a Name>,
         limit: usize,
         now_ns: u64,
     ) -> std::pin::Pin<Box<dyn Future<Output = CsPrefixListing> + Send + 'a>> {
         // A listing is not a lookup: no hit/miss counted, no event.
-        self.inner.list_erased(prefix, limit, now_ns)
+        self.inner.list_erased(prefix, after, limit, now_ns)
     }
 
     fn capacity(&self) -> CsCapacity {
@@ -332,7 +333,7 @@ mod tests {
         )
         .await;
 
-        let listing = cs.list_erased(&arc_name(&["a"]), 10, NOW).await;
+        let listing = cs.list_erased(&arc_name(&["a"]), None, 10, NOW).await;
         assert_eq!(listing.total, 1);
         assert_eq!(listing.entries[0].name, arc_name(&["a", "1"]));
         assert_eq!(listing.entries[0].bytes, 4);

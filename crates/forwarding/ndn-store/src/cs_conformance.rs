@@ -56,9 +56,9 @@ pub(crate) async fn only_the_fresh_version_answers_latest<C: ContentStore>(cs: &
 }
 
 /// `list` reports what is held at or under a prefix — never a sibling whose
-/// first component merely starts with the same bytes — in canonical name
-/// order, capped, with the uncapped total, each entry's wire size and its
-/// freshness at the caller's time.
+/// first component merely starts with the same bytes — a page at a time in
+/// canonical name order, with the total, whether more follow, each entry's
+/// wire size and its freshness at the caller's time.
 pub(crate) async fn lists_entries_under_a_prefix<C: ContentStore>(cs: &C) {
     const NOW: u64 = 1_000_000_000;
     let name = |uri: &str| -> Arc<Name> { Arc::new(uri.parse().unwrap()) };
@@ -83,18 +83,25 @@ pub(crate) async fn lists_entries_under_a_prefix<C: ContentStore>(cs: &C) {
         fresh,
     };
 
-    let capped = cs.list(&name("/p"), 2, NOW).await;
+    let first = cs.list(&name("/p"), None, 2, NOW).await;
+    assert_eq!(first.total, 3, "every entry under /p counts, listed or not");
     assert_eq!(
-        capped.total, 3,
-        "every entry under /p counts, listed or not"
-    );
-    assert_eq!(
-        capped.entries,
+        first.entries,
         vec![entry("/p/a", 1, false), entry("/p/b", 3, true)],
         "the first two in name order, stale judged at the caller's time"
     );
+    assert!(first.more, "/p/c/d follows the page");
 
-    let all = cs.list(&name("/p"), 10, NOW).await;
+    let next = cs.list(&name("/p"), Some(&name("/p/b")), 2, NOW).await;
+    assert_eq!(next.total, 3, "the total ignores the cursor");
+    assert_eq!(
+        next.entries,
+        vec![entry("/p/c/d", 2, true)],
+        "the page after the cursor"
+    );
+    assert!(!next.more, "nothing follows the last page");
+
+    let all = cs.list(&name("/p"), None, 10, NOW).await;
     assert_eq!(all.total, 3);
     assert_eq!(
         all.entries,
@@ -104,18 +111,34 @@ pub(crate) async fn lists_entries_under_a_prefix<C: ContentStore>(cs: &C) {
             entry("/p/c/d", 2, true),
         ]
     );
+    assert!(!all.more);
 
-    let exact = cs.list(&name("/p/c/d"), 10, NOW).await;
+    let exact = cs.list(&name("/p/c/d"), None, 10, NOW).await;
     assert_eq!(
         exact.entries,
         vec![entry("/p/c/d", 2, true)],
         "at the prefix"
     );
 
-    let root = cs.list(&Name::root(), 0, NOW).await;
+    let root = cs.list(&Name::root(), None, 0, NOW).await;
     assert_eq!(root.total, 5, "the root holds everything");
     assert!(root.entries.is_empty(), "a zero cap lists nothing");
+    assert!(root.more, "but says entries follow");
 
-    let none = cs.list(&name("/r"), 10, NOW).await;
-    assert_eq!((none.total, none.entries.len()), (0, 0));
+    // Paging the root one entry at a time visits every entry once, in
+    // canonical order (a shorter component sorts first: /q before /pz).
+    let mut seen = Vec::new();
+    let mut after: Option<Arc<Name>> = None;
+    loop {
+        let page = cs.list(&Name::root(), after.as_deref(), 1, NOW).await;
+        seen.extend(page.entries.iter().map(|e| e.name.to_string()));
+        if !page.more {
+            break;
+        }
+        after = Some(Arc::clone(&page.entries.last().expect("a page").name));
+    }
+    assert_eq!(seen, ["/p/a", "/p/b", "/p/c/d", "/q/x", "/pz"]);
+
+    let none = cs.list(&name("/r"), None, 10, NOW).await;
+    assert_eq!((none.total, none.entries.len(), none.more), (0, 0, false));
 }

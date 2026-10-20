@@ -50,7 +50,15 @@ Datasets (read-only) use:
 /localhost/<forwarder>/<module>/list
 ```
 
-reassembled segmented `Data`.
+The Interest (CanBePrefix, MustBeFresh) is answered with segment 0 of a
+new version, `<Interest name>/v=<n>/seg=0`, at most 8000 bytes of content
+each. The last segment carries `FinalBlockId`. A reader fetches the rest by
+exact name, `…/v=<n>/seg=1` up to the `FinalBlockId`, and joins the
+contents in order. The daemon holds every segment of a multi-segment
+dataset for 10 s after answering, so each segment comes from one snapshot.
+A segment of a version no longer held is answered at once with a Data of
+ContentType Nack carrying a 404 `ControlResponse`: read the dataset again.
+`MgmtClient` reads every dataset this way.
 
 ## Selected verbs
 
@@ -97,29 +105,41 @@ reassembled segmented `Data`.
 | `info` | Return capacity / hit / miss / size. |
 | `config` | Adjust admission policy at runtime. |
 | `erase` | Erase entries matching a prefix. |
-| `list` | The names held under a prefix, capped, with the total (ndn-rs extension; see below). |
+| `list` | One page of the names held under a prefix, with the total and whether more follow (ndn-rs extension; see below). |
 
 `cs/list` takes ControlParameters in the name like a command, but is a
 public read like `cs/info` and `*/list`: served unsigned under
-`/localhost`. `Name` is the prefix (absent: the whole store) and `Count`
-the cap (absent: 100). The answer is a dataset, `ndn_mgmt_wire::CsListing`
-(`MgmtClient::cs_list` decodes it):
+`/localhost`. `Name` is the prefix (absent: the whole store), `Uri` the
+cursor — an NDN URI; the page starts after that name (absent: from the
+first) — and `Count` the page size (absent: 100). A `Uri` that is not a
+name is refused with 400. The answer is a dataset,
+`ndn_mgmt_wire::CsListing` (`MgmtClient::cs_list` decodes it):
 
 ```text
-CsListing   = CsListTotal *CsListEntry
+CsListing   = CsListTotal [CsListMore] *CsListEntry
 CsListTotal = 0x0500 NonNegativeInteger  ; entries held under the prefix
+CsListMore  = 0x0508 NonNegativeInteger  ; 1: entries follow this page
 CsListEntry = 0x0502 (Name               ; the cached Data's name (0x07)
                       CsEntryBytes       ; 0x0504 NonNegativeInteger: wire size
                       CsEntryFresh)      ; 0x0506 NonNegativeInteger: 1 fresh, 0 stale
 ```
 
-Entries are the first `Count` under the prefix in canonical name order,
-fresh meaning the entry still satisfies `MustBeFresh` at the forwarder's
-clock. The listing always fits one dataset segment (8000 bytes, roughly 100
-entries of 60-byte names), so it may hold fewer than `Count`; the total
-still counts every entry. Listing touches neither LRU order nor hit/miss
-counters. A store that cannot enumerate (`NullCs`) answers an empty
-listing with total 0. Unknown TLVs inside the dataset are skipped.
+Entries are the first `Count` under the prefix after the cursor, in
+canonical name order. Fresh means the entry still satisfies `MustBeFresh`
+at the forwarder's clock. The total counts every entry under the prefix,
+on any page. `CsListMore` is present only when entries follow the page.
+The page always holds `Count` entries when that many follow the cursor. It
+spans as many dataset segments as it needs, so `Count` = 2^64−1 lists
+everything in one read.
+
+To page through, ask the first page without a cursor. Then ask each next
+page with the last listed name as the cursor
+(`CsListing::next_after`), until a page has no `CsListMore`. While the
+store is unchanged, every entry comes exactly once, in order. An entry
+added or evicted between pages shows up or drops out without shifting the
+others. Listing touches neither LRU order nor hit/miss counters. A store
+that cannot enumerate (`NullCs`) answers an empty listing with total 0.
+Unknown TLVs inside the dataset are skipped.
 
 `reflexive` (ndn-rs extension; reflexive-forwarding control):
 

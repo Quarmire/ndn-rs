@@ -531,7 +531,13 @@ impl ContentStore for SqliteCs {
         );
     }
 
-    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+    async fn list(
+        &self,
+        prefix: &Name,
+        after: Option<&Name>,
+        limit: usize,
+        now_ns: u64,
+    ) -> CsPrefixListing {
         // BLOB keys compare bytewise, which is canonical name order (see
         // `cs_keycodec`). Reads no `data`, and leaves `last_access` alone:
         // listing is not a use.
@@ -544,6 +550,15 @@ impl ContentStore for SqliteCs {
         };
         let mut bounds: Vec<&[u8]> = vec![prefix_key.as_slice()];
         bounds.extend(upper.as_deref());
+        let after_key = after.map(name_to_key);
+        let mut page_bounds = bounds.clone();
+        let page_range = match &after_key {
+            Some(key) => {
+                page_bounds.push(key.as_slice());
+                format!("{range} AND key > ?{}", page_bounds.len())
+            }
+            None => range.to_owned(),
+        };
         let Ok(conn) = self.conn.lock() else {
             return CsPrefixListing::default();
         };
@@ -557,18 +572,21 @@ impl ContentStore for SqliteCs {
         let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(Vec<u8>, i64, i64)> {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         };
-        let rows = conn
+        // One row past the page tells whether more follow.
+        let mut rows = conn
             .prepare(&format!(
-                "SELECT key, length(data), stale_at FROM cs WHERE {range} ORDER BY key LIMIT {}",
-                i64::try_from(limit).unwrap_or(i64::MAX)
+                "SELECT key, length(data), stale_at FROM cs WHERE {page_range} ORDER BY key LIMIT {}",
+                i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
             ))
             .and_then(|mut stmt| {
                 let rows = stmt
-                    .query_map(rusqlite::params_from_iter(&bounds), read)?
+                    .query_map(rusqlite::params_from_iter(&page_bounds), read)?
                     .collect::<rusqlite::Result<Vec<_>>>();
                 rows
             })
             .unwrap_or_default();
+        let more = rows.len() > limit;
+        rows.truncate(limit);
         let entries = rows
             .into_iter()
             .filter_map(|(key, len, stale_at)| {
@@ -582,6 +600,7 @@ impl ContentStore for SqliteCs {
         CsPrefixListing {
             entries,
             total: total as usize,
+            more,
         }
     }
 }

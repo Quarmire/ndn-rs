@@ -71,7 +71,7 @@ use auth::{
     CommandAuth, authorize_command, authorize_trust_admin, effective_require_signed,
     is_public_dataset_verb, is_trust_admin_verb, local_command_auth, resolve_control_parameters,
 };
-use wire::{send_dataset, send_response};
+use wire::{HeldDatasets, send_dataset, send_response};
 
 /// Response from a management command dispatch.
 ///
@@ -879,6 +879,8 @@ pub async fn run_ndn_mgmt_handler(
     let router = build_mgmt_router(&mgmt_handles.extra_modules);
     // Shared with the tasks that answer deferred responses.
     let handle = Arc::new(handle);
+    // The segments of multi-segment datasets, for exact-name fetch.
+    let held_datasets = Arc::new(HeldDatasets::default());
 
     // Side consumer for reflexive certificate pulls during `/localhop`
     // authorization: when a remote node registers a prefix, it carries a
@@ -914,6 +916,18 @@ pub async fn run_ndn_mgmt_handler(
             name = %interest.name,
             "nfd-mgmt: received command"
         );
+
+        // A segment of a dataset answered before: served as it was built,
+        // ahead of any command parsing (no command name ends in a version
+        // and a segment).
+        if let Some(segment) =
+            held_datasets.answer(&interest.name, mgmt_handles.response_signer().as_deref())
+        {
+            if let Err(e) = handle.send(segment).await {
+                tracing::warn!(target: "engine", error = %e, "nfd-mgmt: failed to send dataset segment");
+            }
+            continue;
+        }
 
         let parsed = match parse_command_name(&interest.name) {
             Some(p) => p,
@@ -1174,6 +1188,7 @@ pub async fn run_ndn_mgmt_handler(
                     &interest.name,
                     bytes,
                     mgmt_handles.response_signer().as_deref(),
+                    &held_datasets,
                 )
                 .await;
             }
@@ -1198,11 +1213,15 @@ pub async fn run_ndn_mgmt_handler(
                 let handle = Arc::clone(&handle);
                 let name = Arc::clone(&interest.name);
                 let signer = mgmt_handles.command_response_signer.clone();
+                let held_datasets = Arc::clone(&held_datasets);
                 let answer = async move {
                     let result = pending.await;
                     let signer = signer.map(|s| s.current());
                     match result {
-                        Ok(bytes) => send_dataset(&handle, &name, bytes, signer.as_deref()).await,
+                        Ok(bytes) => {
+                            send_dataset(&handle, &name, bytes, signer.as_deref(), &held_datasets)
+                                .await
+                        }
                         Err(cr) => send_response(&handle, &name, &cr, signer.as_deref()).await,
                     }
                 };

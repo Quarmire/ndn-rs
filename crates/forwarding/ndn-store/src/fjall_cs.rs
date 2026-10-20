@@ -345,11 +345,18 @@ impl ContentStore for FjallCs {
         }
     }
 
-    async fn list(&self, prefix: &Name, limit: usize, now_ns: u64) -> CsPrefixListing {
+    async fn list(
+        &self,
+        prefix: &Name,
+        after: Option<&Name>,
+        limit: usize,
+        now_ns: u64,
+    ) -> CsPrefixListing {
         // Keys sort in canonical name order (see `cs_keycodec`), so the first
-        // `limit` keys under the prefix are the listed entries; the rest are
-        // only counted. No Data is copied out.
+        // `limit` keys under the prefix past the cursor are the page; the rest
+        // are only counted. No Data is copied out.
         let prefix_key = name_to_key(prefix);
+        let after_key = after.map(name_to_key);
         let mut listing = CsPrefixListing::default();
         for guard in self.keyspace.prefix(&prefix_key) {
             let Ok((key, val)) = guard.into_inner() else {
@@ -359,9 +366,14 @@ impl ContentStore for FjallCs {
                 continue;
             };
             listing.total += 1;
-            if listing.entries.len() < limit
-                && let Some(name) = key_to_name(&key)
-            {
+            if after_key.as_deref().is_some_and(|a| &*key <= a) {
+                continue;
+            }
+            if listing.entries.len() == limit {
+                listing.more = true;
+                continue;
+            }
+            if let Some(name) = key_to_name(&key) {
                 listing.entries.push(CsListedEntry {
                     name: Arc::new(name),
                     bytes: val.len() - HEADER_LEN,

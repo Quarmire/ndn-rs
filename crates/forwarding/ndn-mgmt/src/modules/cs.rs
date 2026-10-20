@@ -11,7 +11,6 @@ use ndn_packet::Name;
 
 use crate::MgmtResponse;
 use crate::module::{MgmtContext, MgmtModule};
-use crate::wire::MAX_DATASET_PAYLOAD_LEN;
 
 async fn handle_cs(
     verb_name: &[u8],
@@ -22,7 +21,7 @@ async fn handle_cs(
         v if v == verb::CONFIG => cs_config(params, engine).into(),
         v if v == verb::INFO => cs_info(engine).into(),
         v if v == verb::ERASE => cs_erase(params, engine).await.into(),
-        v if v == verb::LIST => MgmtResponse::Dataset(cs_list_dataset(params, engine).await),
+        v if v == verb::LIST => cs_list(params, engine).await,
         _ => ControlResponse::error(status::NOT_FOUND, "unknown cs verb").into(),
     }
 }
@@ -30,17 +29,32 @@ async fn handle_cs(
 /// `cs/list` lists this many entries when the command carries no Count.
 const CS_LIST_DEFAULT_COUNT: u64 = 100;
 
-/// `cs/list`: the entries the CS holds under the Name parameter (absent: all
-/// of them), the first Count (default [`CS_LIST_DEFAULT_COUNT`]) in canonical
-/// name order, each judged fresh at the engine's now, and the total held
-/// there. The answer fits one dataset segment — clients read only the first
-/// — so it may list fewer than Count; the total still counts every entry.
-async fn cs_list_dataset(params: ControlParameters, engine: &ForwarderEngine) -> bytes::Bytes {
+/// `cs/list`: one page of the entries the CS holds under the Name parameter
+/// (absent: all of them) — those after the cursor in Uri (an NDN URI; absent:
+/// from the first), at most Count (default [`CS_LIST_DEFAULT_COUNT`]), in
+/// canonical name order, each judged fresh at the engine's now — with the
+/// total held there and whether more follow. The page is a dataset of as many
+/// segments as it takes. A Uri that is not a name is refused.
+async fn cs_list(params: ControlParameters, engine: &ForwarderEngine) -> MgmtResponse {
+    let after = match params.uri.as_deref().map(str::parse::<Name>) {
+        None => None,
+        Some(Ok(after)) => Some(after),
+        Some(Err(_)) => {
+            return ControlResponse::error(
+                status::BAD_PARAMS,
+                "cs/list: the cursor (Uri) is not an NDN name",
+            )
+            .into();
+        }
+    };
     let prefix = params.name.unwrap_or_else(Name::root);
     let limit = params.count.unwrap_or(CS_LIST_DEFAULT_COUNT);
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let now_ns = engine.runtime().unix_nanos();
-    let held = engine.cs().list_erased(&prefix, limit, now_ns).await;
+    let held = engine
+        .cs()
+        .list_erased(&prefix, after.as_ref(), limit, now_ns)
+        .await;
     let listing = CsListing {
         entries: held
             .entries
@@ -52,8 +66,9 @@ async fn cs_list_dataset(params: ControlParameters, engine: &ForwarderEngine) ->
             })
             .collect(),
         total: held.total as u64,
+        more: held.more,
     };
-    listing.encode_within(MAX_DATASET_PAYLOAD_LEN)
+    MgmtResponse::Dataset(listing.encode())
 }
 
 // NFD `CsFlagBit` (ndn-cxx nfd-constants.hpp): admit gates insertion, serve
@@ -185,25 +200,29 @@ mod tests {
         insert(&engine, "/a/2", b"bb", true).await;
         insert(&engine, "/b/1", b"d", true).await;
 
-        let (_, capped) = list(
-            &engine,
-            ControlParameters {
-                name: Some("/a".parse().unwrap()),
-                count: Some(2),
-                ..Default::default()
-            },
-        )
-        .await;
-        assert_eq!(capped.total, 3);
+        let page = |uri: Option<&str>| ControlParameters {
+            name: Some("/a".parse().unwrap()),
+            count: Some(2),
+            uri: uri.map(str::to_owned),
+            ..Default::default()
+        };
+        let (_, first) = list(&engine, page(None)).await;
+        assert_eq!(first.total, 3);
         let entry = |uri: &str, bytes: u64, fresh: bool| CsEntry {
             name: uri.parse().unwrap(),
             bytes,
             fresh,
         };
         assert_eq!(
-            capped.entries,
+            first.entries,
             vec![entry("/a/1", 1, false), entry("/a/2", 2, true)]
         );
+        assert!(first.more);
+
+        let (_, next) = list(&engine, page(Some("/a/2"))).await;
+        assert_eq!(next.total, 3);
+        assert_eq!(next.entries, vec![entry("/a/3", 3, true)], "after /a/2");
+        assert!(!next.more);
 
         let (_, all) = list(&engine, ControlParameters::default()).await;
         assert_eq!(all.total, 4, "no Name: the whole CS");
@@ -213,7 +232,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_fits_one_dataset_segment_and_still_counts_everything() {
+    async fn a_cursor_that_is_not_a_name_is_refused() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let params = ControlParameters {
+            uri: Some("not a name".to_owned()),
+            ..Default::default()
+        };
+        match handle_cs(verb::LIST, params, &engine).await {
+            MgmtResponse::Control(resp) => assert_eq!(resp.status_code, status::BAD_PARAMS),
+            _ => panic!("a bad cursor is refused, not listed"),
+        }
+        shutdown.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_holds_every_entry_asked_for_past_one_segment() {
         let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
             .build()
             .await
@@ -241,12 +277,16 @@ mod tests {
             },
         )
         .await;
-        assert!(len <= MAX_DATASET_PAYLOAD_LEN, "one segment: {len} bytes");
+        assert!(
+            len > crate::wire::MAX_DATASET_PAYLOAD_LEN,
+            "more than one segment's worth: {len} bytes"
+        );
         assert_eq!(listing.total, HELD as u64);
-        assert!(!listing.entries.is_empty() && listing.entries.len() < HELD);
+        assert_eq!(listing.entries.len(), HELD, "nothing cut to fit");
+        assert!(!listing.more);
         assert!(
             listing.entries.windows(2).all(|w| w[0].name < w[1].name),
-            "the first ones in name order"
+            "in name order"
         );
 
         shutdown.shutdown().await;
