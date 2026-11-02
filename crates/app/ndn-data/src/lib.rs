@@ -1,10 +1,14 @@
-//! The data-layer contract: named, signed, versioned data that merges the
+//! The data layer: named, signed, versioned data that merges the
 //! filesystem, the database and the network into one model.
 //!
-//! This crate is a **contract only**. It defines the model's types and the
-//! seven verbs as the [`DataLayer`] trait; it implements none of them. The
-//! normative text is `ndn-rs/docs/specs/data-layer.md`; the design is the
-//! data-layer study (model revision 2, use cases, interface, plan).
+//! This crate holds the **contract** — the model's types and the seven verbs
+//! as the [`DataLayer`] trait — and its **reference implementation**,
+//! [`Device`]: one device's layer over NDN, built on `ndn-app` (fetching and
+//! serving), `ndn-sync` (State Vector Sync as the change notice, and the
+//! `DataStore` entries are kept in) and `ndn-security` (the device key, the
+//! validator). The normative text, wire format included, is
+//! `ndn-rs/docs/specs/data-layer.md`; the design is the data-layer study
+//! (model revision 2, use cases, interface, plan).
 //!
 //! # The model in one paragraph
 //!
@@ -38,32 +42,41 @@
 //!
 //! # Slices
 //!
-//! Each item says which slice of the plan gives it an implementation. Wire
-//! formats (names, TLVs, signatures) are not defined here and are not defined
-//! yet: each slice specifies the bytes it needs.
+//! Each item says which slice of the plan gives it an implementation; the
+//! spec defines the bytes of what is implemented ([`wire`]).
 //!
 //! | slice | fills |
 //! |---|---|
-//! | 1 | versions, members (owner only), merge rule, nested summaries, `get`, `put`, `watch` |
-//! | 2 | members across prefixes, `share`, cuts on removal, log rule, `snapshot`, re-check on cut arrival |
+//! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
+//! | 2 | `share` that removes (cuts), seals, log rule, re-check on cut arrival |
 //! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
 //! | 4 | signed blocks, one-key rule, retention by expiry |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
 //! | 6 | named functions whose answers are sealed to their inputs' audience |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
+//!
+//! [`Device`] answers a verb or option of a later slice with
+//! [`DataError::Local`] saying which slice adds it.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
 pub mod collection;
+pub mod device;
 pub mod error;
 pub mod layer;
+pub mod merge;
+mod rt;
 pub mod statement;
+mod tree;
 pub mod version;
+pub mod wire;
 
 pub use collection::{Child, Cut, Members, Rule, Summary};
+pub use device::{Clock, Config, Device, Transport};
 pub use error::{DataError, NextStep, Refusal};
 pub use layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, Share, State};
+pub use merge::{MergeError, MergeRule, MergeRules, MergeState, Yrs};
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Custody, Lease, Prune, Snapshot};
 pub use version::{

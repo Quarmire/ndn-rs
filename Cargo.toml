@@ -222,6 +222,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Synchronization
 parking_lot = "0.12"
+# The data layer's merge rule (/merge/yrs): Yjs in Rust, MIT.
+yrs = { version = "0.28", default-features = false }
 
 # Persistent storage
 fjall = "3"

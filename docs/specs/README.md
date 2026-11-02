@@ -23,7 +23,7 @@ define the bytes on the wire:
 
 | Spec | Covers |
 |---|---|
-| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals, types and the seven verbs (skeleton; each slice fills its sections and wire formats) |
+| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals, types and the seven verbs; slice 1 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, TLV 0x0520–0x057F), later slices skeleton |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
 | [ndnsf-invariants.md](ndnsf-invariants.md) | NDNSF security-invariant witnesses |
@@ -34,3 +34,21 @@ define the bytes on the wire:
 
 - [f28-non-minimal-varnum-decode.md](f28-non-minimal-varnum-decode.md): ruling on non-minimal VAR-NUMBER on the SVS wire
 - [named-time.md](named-time.md): historical design, superseded by the crates
+
+## Conventions
+
+### TLV-TYPE numbers
+
+Application TLV-TYPEs of these specs are allocated from 0x0400–0x05FF in
+blocks, one owner each. Allocate a new block from the free space and add it
+here before using it.
+
+| Block | Owner |
+|---|---|
+| 0x0403–0x040F | free (left below the trust-context block) |
+| 0x0410–0x042F | [trust-context.md](trust-context.md) |
+| 0x0440–0x046C | [ndn-link.md](ndn-link.md) (hello/verdict, punch) |
+| 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) |
+| 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
+| 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
+| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones reserved for critical additions) |
