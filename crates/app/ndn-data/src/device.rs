@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+#[cfg(not(target_arch = "wasm32"))]
 use futures::future::BoxFuture;
+#[cfg(target_arch = "wasm32")]
+use futures::future::LocalBoxFuture as BoxFuture;
 use futures::stream::{self, StreamExt};
 use ndn_app::{AppError, Connection, Consumer, Node, Responder, ServeGuard};
 use ndn_foundation_types::Hash;
@@ -1603,7 +1606,8 @@ fn check_collection(c: &Name) -> Result<(), DataError> {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl DataLayer for Device {
     async fn get(&self, name: &Name) -> Result<Answer, DataError> {
         let inner = &self.inner;

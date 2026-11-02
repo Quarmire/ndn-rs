@@ -146,7 +146,10 @@ pub struct Share {
 /// or when the person makes that gesture. No implementation exists yet; the
 /// conformance cases in `ndn-sim` (`ndn-data-conformance`) are written
 /// against this trait.
-#[async_trait::async_trait]
+/// The futures are `Send` natively; on wasm32 (one thread, non-`Send`
+/// timers) they are not.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait DataLayer: Send + Sync {
     /// `get(name) → version or state + age`.
     ///
