@@ -1701,6 +1701,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndn-data"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-core",
+ "ndn-foundation-types",
+ "thiserror",
+]
+
+[[package]]
 name = "ndn-discovery-core"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,143 @@
+//! Why a verb did not do what was asked, and what to do about it.
+//!
+//! Every [`DataError`] says why in its message and what to do in
+//! [`DataError::next`], with [`DataError::retry`] telling whether the same
+//! call, unchanged, can succeed later. Failures that the model degrades
+//! instead ("stale, never wrong", model invariant 5) are not errors: `get`
+//! answers older verified data with its [`Age`](crate::Age).
+
+use ndn_foundation_types::Name;
+
+use crate::collection::Cut;
+use crate::statement::Prune;
+use crate::version::{VersionId, Writer};
+
+/// What the caller can do about an error, by class. A host words the step
+/// itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NextStep {
+    /// Nothing: the outcome is final and correct.
+    None,
+    /// Ask again later, unchanged: no path or holder answered.
+    RetryLater,
+    /// Ask the collection's owner: for membership, a reading key, or the
+    /// re-admission of work a cut refused.
+    AskOwner,
+    /// Do it on a device holding the owner's key.
+    UseOwnerDevice,
+    /// Remove it with an edit to the collection instead: the data is someone
+    /// else's.
+    EditInstead,
+    /// Fix this device: its storage or its keys.
+    FixLocal,
+}
+
+/// Why a version was refused. A refused version is never served as data.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// Its key was cut and it lies outside the cut, whatever date it claims.
+    OutsideCut(Cut),
+    /// Its key is not a writer of the collection, by the members record and
+    /// the trust schema.
+    NotMember,
+    /// It does not verify: wrong signature, or bytes that do not match its
+    /// name (a poisoned cache).
+    BadSignature,
+    /// It is a summary or members record older than one already seen from
+    /// the same signer.
+    Rollback,
+}
+
+/// A data-layer error.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DataError {
+    /// Nothing by this name is held here and no holder answered.
+    #[error("{name} is not held here and no holder answered")]
+    Unavailable {
+        /// The name asked for.
+        name: Name,
+    },
+    /// A signed summary covering the name shows there is no such version.
+    #[error("no version is named {name}")]
+    NotFound {
+        /// The name asked for.
+        name: Name,
+    },
+    /// The data was pruned by its writer; this reader knows the prune.
+    #[error("{name} was pruned by {by:?}")]
+    Pruned {
+        /// The name asked for.
+        name: Name,
+        /// The prune record that covers it.
+        by: Prune,
+    },
+    /// The version is refused.
+    #[error("version {id:?} is refused: {why:?}")]
+    Refused {
+        /// The refused version.
+        id: VersionId,
+        /// Why.
+        why: Refusal,
+    },
+    /// This device's key may not write into the collection.
+    #[error("{writer:?} may not write into {collection}")]
+    NotAllowed {
+        /// The collection.
+        collection: Name,
+        /// This device's key.
+        writer: Writer,
+    },
+    /// Only the collection's owner signs its members record.
+    #[error("only the owner of {collection} may change its members")]
+    NotOwner {
+        /// The collection.
+        collection: Name,
+    },
+    /// Prune reaches only the pruner's own writes (model change M9).
+    #[error("{prefix} holds versions this key did not write; prune covers only its own writes")]
+    NotOwnWrites {
+        /// The prefix asked for.
+        prefix: Name,
+    },
+    /// This device is not in the data's seal audience.
+    #[error("{name} is sealed to an audience this device is not in")]
+    Sealed {
+        /// The name asked for.
+        name: Name,
+    },
+    /// A local failure: storage or keys.
+    #[error("local failure: {reason}")]
+    Local {
+        /// What failed.
+        reason: String,
+    },
+}
+
+impl DataError {
+    /// Whether the same call, unchanged, can succeed later.
+    pub fn retry(&self) -> bool {
+        match self {
+            DataError::Unavailable { .. } => true,
+            DataError::Refused { why, .. } => {
+                matches!(why, Refusal::BadSignature | Refusal::Rollback)
+            }
+            _ => false,
+        }
+    }
+
+    /// What to do about it.
+    pub fn next(&self) -> NextStep {
+        match self {
+            DataError::Unavailable { .. } => NextStep::RetryLater,
+            DataError::NotFound { .. } | DataError::Pruned { .. } => NextStep::None,
+            DataError::Refused { why, .. } => match why {
+                Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
+                Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
+            },
+            DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
+            DataError::NotOwner { .. } => NextStep::UseOwnerDevice,
+            DataError::NotOwnWrites { .. } => NextStep::EditInstead,
+            DataError::Local { .. } => NextStep::FixLocal,
+        }
+    }
+}

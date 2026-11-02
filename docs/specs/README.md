@@ -23,6 +23,7 @@ define the bytes on the wire:
 
 | Spec | Covers |
 |---|---|
+| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals, types and the seven verbs (skeleton; each slice fills its sections and wire formats) |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
 | [ndnsf-invariants.md](ndnsf-invariants.md) | NDNSF security-invariant witnesses |

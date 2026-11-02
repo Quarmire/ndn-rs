@@ -21,6 +21,7 @@ members = [
     "crates/security/ndn-security",
     "crates/forwarding/ndn-engine",
     "crates/app/ndn-app",
+    "crates/app/ndn-data",
     "crates/app/ndn-rs-prelude",
     "crates/forwarding/ndn-ipc",
     "crates/platform/ndn-config",
@@ -64,6 +65,7 @@ default-members = [
     "crates/security/ndn-security",
     "crates/forwarding/ndn-engine",
     "crates/app/ndn-app",
+    "crates/app/ndn-data",
     "crates/app/ndn-rs-prelude",
     "crates/forwarding/ndn-ipc",
     "crates/platform/ndn-config",
@@ -129,6 +131,7 @@ ndn-pathcontrol = { path = "crates/forwarding/ndn-pathcontrol" }
 ndn-security  = { path = "crates/security/ndn-security" }
 ndn-engine    = { path = "crates/forwarding/ndn-engine" }
 ndn-app       = { path = "crates/app/ndn-app" }
+ndn-data      = { path = "crates/app/ndn-data" }
 ndn-rs-prelude = { path = "crates/app/ndn-rs-prelude" }
 ndn-ipc       = { path = "crates/forwarding/ndn-ipc" }
 ndn-config    = { path = "crates/platform/ndn-config" }
