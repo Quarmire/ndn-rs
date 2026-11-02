@@ -1,4 +1,4 @@
-//! Engine-backed certificate fetching.
+//! Certificate fetching over an engine or a forwarder connection.
 //!
 //! A [`Validator`](ndn_security::Validator) resolves a signing cert it has not cached through its
 //! [`CertFetcher`]. On an embedded engine the natural fetch path is the engine
@@ -6,7 +6,9 @@
 //! forwarder route it to whoever serves the cert (the producer, the CA that
 //! issued it, a neighbour's CS). The engine cannot build that fetcher during
 //! `EngineBuilder::build` — app faces live above `ndn-engine` — so it is
-//! attached afterwards with [`install_engine_cert_fetcher`].
+//! attached afterwards with [`install_engine_cert_fetcher`]. An app on a
+//! forwarder connection fetches the same way over its connection:
+//! [`demux_cert_fetcher`] over a [`Node`](crate::Node)'s demultiplexer.
 //!
 //! Loop/amplification bounds: the fetcher dedups concurrent requests per name
 //! and backs off after a failure (one Interest per name per
@@ -17,7 +19,7 @@
 //!
 //! Resolving a chain keeps several fetches in flight on the one face at once:
 //! the leaf cert's Data is itself parked until its issuer's cert is fetched.
-//! The face is a [`DemuxConnection`], over which every
+//! The face is always a [`DemuxConnection`] (the types demand it), over which every
 //! [`Consumer`] fetch receives exactly the reply that answers its own
 //! Interest; a shared receive queue would hand the issuer's cert to the leaf
 //! fetch, which discards it as a straggler, and both fetches time out.
@@ -43,7 +45,7 @@ const DIRECT_FACE_BUFFER: usize = 256;
 /// name is fetched again.
 pub const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// The cert Interest both fetch paths express: see [`engine_fetch_fn`].
+/// The cert Interest every fetch path expresses: see [`demux_fetch_fn`].
 fn cert_interest(name: Name) -> InterestBuilder {
     InterestBuilder::new(name)
         .can_be_prefix()
@@ -65,17 +67,18 @@ fn miss(e: AppError) -> FetchMiss {
     }
 }
 
-/// A [`FetchFn`] that expresses each cert Interest through `engine` on one
-/// in-process app face (tied to `cancel`). Concurrent fetches share the face;
-/// each gets the reply (Data or Nack) to its own Interest.
+/// A [`FetchFn`] that expresses each cert Interest on `demux` — a
+/// [`Node`](crate::Node)'s ([`Node::demux`](crate::Node::demux)), or
+/// [`DemuxConnection::new`] over any [`Connection`] — so concurrent fetches
+/// share it and each gets the reply (Data or Nack) to its own Interest.
 ///
 /// The Interest names a key (or one certificate) and carries `CanBePrefix`,
 /// so it is answered by a certificate `<key>/<issuer-id>/<version>` (NDN
 /// Certificate Format v2), and `MustBeFresh`, so a content store holding a
 /// stale copy of an older certificate of the key does not answer it — after a
 /// renewal the new certificate comes from its producer.
-pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> FetchFn {
-    let conn: Arc<dyn Connection> = DemuxConnection::new(engine.app_face(cancel));
+pub fn demux_fetch_fn(demux: Arc<DemuxConnection>) -> FetchFn {
+    let conn: Arc<dyn Connection> = demux;
     Arc::new(move |name: Name| {
         let mut consumer = Consumer::new(Arc::clone(&conn));
         Box::pin(async move {
@@ -86,6 +89,23 @@ pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> F
                 .map_err(miss)
         })
     })
+}
+
+/// A [`CertFetcher`] over `demux` (see [`demux_fetch_fn`]) that fills
+/// `cache` (normally the cache of the validator it will be attached to) —
+/// for an app on a forwarder connection, such as a [`Node`](crate::Node)'s.
+pub fn demux_cert_fetcher(demux: Arc<DemuxConnection>, cache: Arc<CertCache>) -> Arc<CertFetcher> {
+    Arc::new(CertFetcher::new(
+        cache,
+        demux_fetch_fn(demux),
+        CERT_FETCH_TIMEOUT,
+    ))
+}
+
+/// A [`FetchFn`] that expresses each cert Interest through `engine` on one
+/// in-process app face (tied to `cancel`): [`demux_fetch_fn`] over it.
+pub fn engine_fetch_fn(engine: &ForwarderEngine, cancel: CancellationToken) -> FetchFn {
+    demux_fetch_fn(DemuxConnection::new(engine.app_face(cancel)))
 }
 
 /// A [`DirectFetchFn`]: the same cert Interest, expressed through `engine`

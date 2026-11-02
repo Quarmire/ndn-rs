@@ -4,20 +4,26 @@
 //! and shuttles packets. On Android / iOS use
 //! `ndn_engine::ForwarderEngine` with `ndn_face::local::AppFace`
 //! instead — there's no separate forwarder daemon to connect to.
+//!
+//! One task reads the control face and demultiplexes it: management replies
+//! go to the command awaiting them, the rest to [`ForwarderClient::recv`], so
+//! registering a prefix while a receive loop runs is always answered.
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use ndn_face::local::IpcFace;
 use ndn_packet::Name;
 use ndn_packet::lp::encode_lp_packet;
 use ndn_transport::{FaceId, Transport};
+
+use crate::face_mux::FaceMux;
+use crate::mgmt_client::MgmtClient;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForwarderError {
@@ -31,6 +37,12 @@ pub enum ForwarderError {
     MalformedResponse,
     #[error("signing failed: {0}")]
     SigningFailed(String),
+    /// The connection to the forwarder closed before the reply came.
+    #[error(
+        "the forwarder closed the connection before answering; check that it is still running, \
+         then reconnect and retry"
+    )]
+    Closed,
     /// An externally-registered data plane (e.g. the SHM ring in `ndn-ipc-shm`)
     /// failed to set up or move bytes. Carries the impl's own error rendered as
     /// text so this core crate need not know the data plane's error type.
@@ -102,19 +114,18 @@ enum DataTransport {
 
 pub struct ForwarderClient {
     control: Arc<IpcFace>,
-    pub mgmt: crate::mgmt_client::MgmtClient,
-    /// Single-reader demux over `control` for the management+data seam
-    /// (`from_raw_fd`): `recv()` drains its data plane and `mgmt` reads through
-    /// it, so they don't race on the one fd. `None` for the connect paths, where
-    /// the data plane is a separate SHM face (or sequential Unix usage).
-    mux: Option<Arc<crate::face_mux::FaceMux>>,
-    recv_lock: Mutex<()>,
+    pub mgmt: MgmtClient,
+    /// The control face's single reader. It routes each management reply to
+    /// the `mgmt` exchange awaiting it and everything else to `recv()` (the
+    /// Unix data plane), so a prefix registered while a receive loop waits is
+    /// answered to the registration, whatever the timing. It also watches the
+    /// face: on close it sets `dead` and cancels `cancel`.
+    mux: Arc<FaceMux>,
     transport: DataTransport,
-    /// Cancelled on control-face disconnect; propagates to SHM so
-    /// recv/send abort promptly.
+    /// Cancelled on control-face disconnect (by `mux`) or drop; propagates to
+    /// an external data plane so its recv/send abort promptly.
     cancel: CancellationToken,
     dead: Arc<AtomicBool>,
-    monitor_started: AtomicU8,
 }
 
 impl ForwarderClient {
@@ -156,51 +167,50 @@ impl ForwarderClient {
     ) -> Result<Self, ForwarderError> {
         let path = face_socket.as_ref().to_str().unwrap_or_default().to_owned();
         let control = Arc::new(ndn_face::local::ipc_face_connect(FaceId(0), &path).await?);
-        let cancel = CancellationToken::new();
-        let dead = Arc::new(AtomicBool::new(false));
+        let mut client = Self::over_control(control);
 
         if let (Some(name), Some(factory)) = (shm_name, data_plane_factory()) {
-            let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
             match factory
-                .connect(&mgmt, name, mtu, cancel.child_token())
+                .connect(&client.mgmt, name, mtu, client.cancel.child_token())
                 .await
             {
                 Ok(dp) => {
-                    return Ok(Self {
-                        control,
-                        mgmt,
-                        mux: None,
-                        recv_lock: Mutex::new(()),
-                        transport: DataTransport::External(dp),
-                        cancel,
-                        dead,
-                        monitor_started: AtomicU8::new(0),
-                    });
+                    // The control face now carries management only.
+                    client.mux.discard_data();
+                    client.transport = DataTransport::External(dp);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "data-plane setup failed, falling back to Unix");
                 }
             }
         }
+        Ok(client)
+    }
 
-        let mgmt = crate::mgmt_client::MgmtClient::from_face(Arc::clone(&control));
-        Ok(Self {
+    /// A Unix-data-plane client over `control`, read only by its [`FaceMux`].
+    /// Must be called from within a Tokio runtime (the reader is a task).
+    fn over_control(control: Arc<IpcFace>) -> Self {
+        let cancel = CancellationToken::new();
+        let dead = Arc::new(AtomicBool::new(false));
+        let mux = FaceMux::new(Arc::clone(&control), cancel.clone(), Arc::clone(&dead));
+        let mgmt = MgmtClient::from_mux(Arc::clone(&control), Arc::clone(&mux));
+        Self {
             control,
             mgmt,
-            mux: None,
-            recv_lock: Mutex::new(()),
+            mux,
             transport: DataTransport::Unix,
             cancel,
             dead,
-            monitor_started: AtomicU8::new(0),
-        })
+        }
     }
 
     /// Build a client over an already-connected `SOCK_STREAM` fd instead of
     /// dialing a socket path — the mobile counterpart to [`Self::connect`].
     /// Android hands the UI one half of a `socketpair()` across Binder; the UI
     /// adopts it here. Unix-only, and Unix data plane only (no SHM negotiation
-    /// over a handed fd — SHM is excluded on the mobile targets anyway).
+    /// over a handed fd — SHM is excluded on the mobile targets anyway). Must
+    /// be called from within a Tokio runtime (callers adopt the fd inside
+    /// `block_on`).
     #[cfg(unix)]
     pub fn from_raw_fd(fd: std::os::fd::RawFd) -> Result<Self, ForwarderError> {
         let control = Arc::new(ndn_face::local::ipc_face_from_raw_fd(
@@ -208,23 +218,7 @@ impl ForwarderClient {
             ndn_transport::FaceKind::Unix,
             fd,
         )?);
-        let cancel = CancellationToken::new();
-        // The seam multiplexes management + data over this one fd; a single-reader
-        // demux routes management responses to `mgmt` and the rest to `recv()` so
-        // they don't race. (Must be built in a runtime — callers adopt the fd
-        // inside `block_on`.)
-        let mux = crate::face_mux::FaceMux::new(Arc::clone(&control), cancel.child_token());
-        let mgmt = crate::mgmt_client::MgmtClient::from_mux(Arc::clone(&control), Arc::clone(&mux));
-        Ok(Self {
-            control,
-            mgmt,
-            mux: Some(mux),
-            recv_lock: Mutex::new(()),
-            transport: DataTransport::Unix,
-            cancel,
-            dead: Arc::new(AtomicBool::new(false)),
-            monitor_started: AtomicU8::new(0),
-        })
+        Ok(Self::over_control(control))
     }
 
     /// `rib/register`. Routes to the SHM face when in SHM mode; in
@@ -300,55 +294,13 @@ impl ForwarderClient {
         }
     }
 
-    /// Returns `None` if the data channel is closed.
+    /// Returns `None` if the data channel is closed. On the Unix data plane
+    /// this drains what the control face's reader did not route to a
+    /// management exchange (LP already stripped).
     pub async fn recv(&self) -> Option<Bytes> {
-        // Seam: the demux owns the single `control` reader and has already split
-        // management responses off; drain its data plane (LP already stripped).
-        if let Some(mux) = &self.mux {
-            return mux.recv().await;
-        }
-        self.start_monitor_once();
         match &self.transport {
             DataTransport::External(dp) => dp.recv().await,
-            DataTransport::Unix => {
-                let _guard = self.recv_lock.lock().await;
-                self.control.recv_bytes().await.ok().map(strip_lp)
-            }
-        }
-    }
-
-    /// SHM mode only: watches the control socket and cancels the
-    /// token on close so SHM recv/send abort. No-op for Unix.
-    fn start_monitor_once(&self) {
-        if self
-            .monitor_started
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        if matches!(&self.transport, DataTransport::External(_)) {
-            let control = Arc::clone(&self.control);
-            let cancel = self.cancel.clone();
-            let dead = Arc::clone(&self.dead);
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        result = control.recv_bytes() => {
-                            match result {
-                                Ok(_) => {}
-                                Err(_) => {
-                                    dead.store(true, Ordering::Relaxed);
-                                    cancel.cancel();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+            DataTransport::Unix => self.mux.recv().await,
         }
     }
 
@@ -358,14 +310,9 @@ impl ForwarderClient {
         matches!(&self.transport, DataTransport::External(_))
     }
 
+    /// True once the control face has closed (the forwarder went away).
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
-    }
-
-    /// Started automatically on first `recv`; call explicitly to
-    /// front-load it.
-    pub fn spawn_disconnect_monitor(&self) {
-        self.start_monitor_once();
     }
 
     pub async fn probe_alive(&self) -> bool {

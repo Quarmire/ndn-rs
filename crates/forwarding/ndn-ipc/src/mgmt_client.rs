@@ -35,9 +35,11 @@ pub struct MgmtClient {
 }
 
 /// How `MgmtClient` reads command responses. `Face` reads the face directly (a
-/// dedicated management connection). `Mux` registers the expected response with
-/// a [`FaceMux`](crate::face_mux::FaceMux) — used on the management+data seam,
-/// so a response is never swallowed by the data `recv`.
+/// dedicated management connection, nothing else reading it). `Mux` registers
+/// the expected response with a [`FaceMux`](crate::face_mux::FaceMux), the
+/// face's single reader — a [`ForwarderClient`](crate::ForwarderClient)'s
+/// control face, which its data `recv` shares — so a response is never
+/// swallowed by the data `recv`.
 enum MgmtRecv {
     Face,
     Mux(Arc<crate::face_mux::FaceMux>),
@@ -72,8 +74,8 @@ impl MgmtClient {
         }
     }
 
-    /// Read responses through `mux` (the seam demux) instead of the face
-    /// directly, so they don't race the data plane on a shared fd.
+    /// Read responses through `mux` (the face's single reader) instead of the
+    /// face directly, so they don't race the data plane on a shared face.
     pub(crate) fn from_mux(face: Arc<IpcFace>, mux: Arc<crate::face_mux::FaceMux>) -> Self {
         Self {
             face,
@@ -84,8 +86,8 @@ impl MgmtClient {
     }
 
     /// Send a raw (unwrapped) command Interest and return the LP-stripped
-    /// response Data wire. On the seam this registers the expected response with
-    /// the demux *before* sending, so the demux loop routes it back here.
+    /// response Data wire. Through a demux this registers the expected response
+    /// with it *before* sending, so the demux loop routes it back here.
     async fn exchange(&self, interest_wire: &Bytes) -> Result<Bytes, ForwarderError> {
         let lp = ndn_packet::lp::encode_lp_packet(interest_wire);
         match &self.recv {
@@ -96,9 +98,9 @@ impl MgmtClient {
                 ))
             }
             MgmtRecv::Mux(mux) => {
-                let rx = mux.expect(expected_response_name(interest_wire)?);
+                let reply = mux.expect(expected_response_name(interest_wire)?);
                 self.face.send_bytes(lp).await?;
-                rx.await.map_err(|_| ForwarderError::MalformedResponse)
+                reply.get().await
             }
         }
     }
@@ -132,12 +134,11 @@ impl MgmtClient {
                 }
             }
             MgmtRecv::Mux(mux) => {
-                let rx = mux.expect(expected_response_name(interest_wire)?);
+                let reply = mux.expect(expected_response_name(interest_wire)?);
                 self.face.send_bytes(lp).await?;
-                match tokio::time::timeout(timeout, rx).await {
+                match tokio::time::timeout(timeout, reply.get()).await {
                     Err(_) => Ok(None),
-                    Ok(Ok(d)) => Ok(Some(d)),
-                    Ok(Err(_)) => Ok(None),
+                    Ok(r) => r.map(Some),
                 }
             }
         }

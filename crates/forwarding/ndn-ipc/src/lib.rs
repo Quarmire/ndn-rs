@@ -13,7 +13,7 @@ pub mod blocking;
 pub mod chunked;
 pub mod client;
 pub mod events;
-// Single-reader demux for the management+data seam (ForwarderClient::from_raw_fd).
+// The single reader of a ForwarderClient's control face: management replies vs data.
 mod face_mux;
 pub mod forwarder_client;
 pub mod mgmt_client;

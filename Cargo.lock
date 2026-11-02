@@ -1901,6 +1901,7 @@ dependencies = [
  "ndn-security",
  "ndn-tlv",
  "ndn-transport",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.11.0",

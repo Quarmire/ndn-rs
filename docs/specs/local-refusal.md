@@ -526,9 +526,9 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | `FetchMiss` (Absent = NoRoute, Refused), combining sources | `ndn-rs/crates/security/ndn-security/src/cert_fetcher.rs:50-79` |
 | `retry_after`, `known_absent` | `ndn-rs/crates/security/ndn-security/src/cert_fetcher.rs:178-193` |
 | Negative cache `retry_at = now + negative_ttl` | `ndn-rs/crates/security/ndn-security/src/cert_fetcher.rs:270-284` |
-| `CERT_FETCH_TIMEOUT` = 4 s; cert Interest (CanBePrefix, MustBeFresh) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:44-52` |
-| Fetch error to `FetchMiss` | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:58-66` |
-| Engine fetcher (timeout = negative TTL = 4 s; direct fetch) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:122-131` |
+| `CERT_FETCH_TIMEOUT` = 4 s; cert Interest (CanBePrefix, MustBeFresh) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:46-54` |
+| Fetch error to `FetchMiss` | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:60-68` |
+| Engine fetcher (timeout = negative TTL = 4 s; direct fetch) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:148-161` |
 | Face locality by kind | `ndn-rs/crates/core/ndn-transport/src/face.rs:111-135` |
 | Locality by remote address, loopback test | `ndn-rs/crates/core/ndn-transport/src/face.rs:258-293` |
 

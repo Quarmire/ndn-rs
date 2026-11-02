@@ -73,8 +73,8 @@ pub use connection::{Connection, InProcConnection, LpInfo};
 // IpcConnection talks to an external `ndn-fwd` over a Unix socket (ndn-ipc).
 #[cfg(not(target_arch = "wasm32"))]
 pub use cert_fetch::{
-    CERT_FETCH_TIMEOUT, engine_cert_fetcher, engine_direct_fetch_fn, engine_fetch_fn,
-    install_engine_cert_fetcher,
+    CERT_FETCH_TIMEOUT, demux_cert_fetcher, demux_fetch_fn, engine_cert_fetcher,
+    engine_direct_fetch_fn, engine_fetch_fn, install_engine_cert_fetcher,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::IpcConnection;
