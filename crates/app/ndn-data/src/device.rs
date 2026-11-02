@@ -8,9 +8,12 @@
 //! Vector Sync in the namespace's group (`<namespace>/32=sync`) only says
 //! that a writer moved; the reader then fetches the writer's signed root,
 //! descends by digest into the branches it follows that changed, and fetches
-//! the log entries those name. Every entry is verified by the device's
-//! validator, admitted against the collection's members record, and applied
-//! by the collection's merge rule once its parents are applied.
+//! the log entries those name. A descent always finishes against the root it
+//! started from (the writer serves every node any root it signed listed), so
+//! a writer that keeps putting never makes a reader start over. Every entry
+//! is verified by the device's validator, admitted against the collection's
+//! members record, and applied by the collection's merge rule once its
+//! parents are applied.
 //!
 //! What a device follows: every collection or folder it has put into, read or
 //! watched. Nothing about correctness depends on a clock or on timing: a
@@ -28,7 +31,7 @@ use futures::future::BoxFuture;
 #[cfg(target_arch = "wasm32")]
 use futures::future::LocalBoxFuture as BoxFuture;
 use futures::stream::{self, StreamExt};
-use ndn_app::{AppError, Connection, Consumer, Node, Responder, ServeGuard};
+use ndn_app::{Connection, Consumer, Node, Responder, ServeGuard};
 use ndn_foundation_types::Hash;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, NackReason, Name};
@@ -188,6 +191,9 @@ enum Held {
 struct Peer {
     /// The highest head verified (summaries never go back).
     head: u64,
+    /// The head of the root kept in the store, so the rollback check
+    /// survives a restart.
+    kept: u64,
     /// The root last processed in full.
     root: Option<[u8; 32]>,
     /// Nodes and pages processed in full, by subject and page path.
@@ -254,20 +260,15 @@ struct Inner {
     serving: Mutex<Option<ServeGuard>>,
 }
 
-/// Why a descent stopped.
-enum Stop {
-    /// A node the root named is no longer served: start again from a newer root.
-    Superseded,
-    /// Something did not answer.
-    Unavailable,
-}
-
-/// Why a fetch got nothing.
-enum Miss {
-    /// The network said no (a Nack): not served, or superseded.
-    Gone,
-    /// Nothing answered in time.
-    Silent,
+/// Why a summary root was not taken.
+#[derive(Debug)]
+enum RootRefusal {
+    /// Its signature does not verify to a trust anchor.
+    NotVerified,
+    /// Its name, subject, writer or head do not match each other.
+    NotItsName,
+    /// Its head is lower than one this device verified or holds before.
+    Rollback { head: u64, seen: u64 },
 }
 
 fn local(reason: impl Into<String>) -> DataError {
@@ -665,6 +666,22 @@ impl Device {
     }
 }
 
+/// A summary root the store keeps under its discovery name `key`
+/// (`<D>/32=summary/<O>`): the highest one verified of `D` for `O`, as
+/// `(D, O, head)`.
+fn kept_root(key: &Name, wire: &Bytes) -> Option<(Name, Name, u64)> {
+    let k = parse_summary_name(key)?;
+    if k.head.is_some() || k.page.is_some() {
+        return None;
+    }
+    let data = Data::decode(wire.clone()).ok()?;
+    let s = parse_summary_name(&data.name)?;
+    if s.device != k.device || s.subject != k.subject || s.page.is_some() {
+        return None;
+    }
+    Some((s.device, s.subject, s.head?))
+}
+
 fn bare_interest(pkt: Bytes) -> Option<Interest> {
     let pkt = if pkt.first() == Some(&0x64) {
         ndn_packet::lp::LpPacket::decode(pkt).ok()?.fragment?
@@ -681,15 +698,18 @@ impl Inner {
 
     // ---- boot ---------------------------------------------------------------------------------
 
-    /// Rebuild what the store holds: the own log, and others' members
-    /// records, snapshots and applied versions (each verified when it was
-    /// stored). Others' versions are stored only once applied, so what comes
-    /// back is a causally complete prefix of each writer; members records go
-    /// first.
+    /// Rebuild what the store holds: the own log, others' members records,
+    /// snapshots and applied versions (each verified when it was stored),
+    /// and the highest summary root verified of each other device per
+    /// namespace, so a rolled-back root is still refused. Others' versions
+    /// are stored only once applied, so what comes back is a causally
+    /// complete prefix of each writer; members records go first.
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
+        let mut roots = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             let Some(parsed) = parse_log_name(&name) else {
+                roots.extend(kept_root(&name, &wire));
                 continue;
             };
             let Ok(data) = Data::decode(wire.clone()) else {
@@ -722,6 +742,13 @@ impl Inner {
                 st.head = st.head.max(seq);
             }
             self.take(&mut st, name, wire, writer, record, mine);
+        }
+        for (device, ns, head) in roots {
+            if device != self.device {
+                let peer = st.peers.entry((device, ns)).or_default();
+                peer.head = peer.head.max(head);
+                peer.kept = peer.kept.max(head);
+            }
         }
     }
 
@@ -933,20 +960,19 @@ impl Inner {
 
     // ---- fetching -----------------------------------------------------------------------------
 
-    async fn fetch(&self, name: Name, discover: bool) -> Result<Data, Miss> {
-        let _slot = self.slots.acquire().await.map_err(|_| Miss::Silent)?;
+    /// Fetch `name`; `None` if nothing answered in time or the network said
+    /// no.
+    async fn fetch(&self, name: Name, discover: bool) -> Option<Data> {
+        let _slot = self.slots.acquire().await.ok()?;
         let mut b = InterestBuilder::new(name).lifetime(self.config.lifetime);
         if discover {
             b = b.can_be_prefix().must_be_fresh();
         }
         match Consumer::new(self.node.connection()).fetch_with(b).await {
-            Ok(d) => Ok(d),
+            Ok(d) => Some(d),
             Err(e) => {
                 tracing::trace!(me = %self.device, "fetch missed: {e}");
-                match e {
-                    AppError::Nacked { .. } => Err(Miss::Gone),
-                    _ => Err(Miss::Silent),
-                }
+                None
             }
         }
     }
@@ -975,72 +1001,96 @@ impl Inner {
         }
     }
 
+    /// Take `data` as `device`'s signed summary root of `ns`: verify it,
+    /// check it against its name, and refuse it if its head is lower than
+    /// one verified (or an entry held) of that writer before — kept in the
+    /// store, so a restart does not forget it.
+    async fn accept_root(
+        &self,
+        device: &Name,
+        ns: &Name,
+        data: &Data,
+    ) -> Result<(Writer, NodeBody), RootRefusal> {
+        let writer = self
+            .verify(data)
+            .await
+            .map_err(|_| RootRefusal::NotVerified)?;
+        let body = data
+            .content()
+            .and_then(|c| wire::decode_node(c.clone()).ok())
+            .ok_or(RootRefusal::NotItsName)?;
+        let named = parse_summary_name(&data.name);
+        if device_of(writer.key()).as_ref() != Some(device)
+            || body.subject != *ns
+            || body.writer != *writer.key()
+            || body.page.is_some()
+            || named.as_ref().map(|n| (&n.device, &n.subject, n.head))
+                != Some((device, ns, Some(body.head)))
+        {
+            return Err(RootRefusal::NotItsName);
+        }
+        let mut st = self.st.lock();
+        let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
+        if body.head < peer.head {
+            return Err(RootRefusal::Rollback {
+                head: body.head,
+                seen: peer.head,
+            });
+        }
+        peer.head = body.head;
+        if body.head > peer.kept {
+            peer.kept = body.head;
+            self.store
+                .insert(summary_prefix(device, ns), data.raw().clone());
+        }
+        Ok((writer, body))
+    }
+
     /// Refresh `device`'s summary of `ns`: fetch its signed root and descend
-    /// into what this device follows. Returns whether it completed.
+    /// it, to the end, into what this device follows. A writer that moved
+    /// meanwhile is refreshed again from its newer root, which skips every
+    /// branch processed in full here. Returns whether it completed.
     async fn refresh(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
         if !self.st.lock().toward(ns) {
             return true;
         }
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
-        for _ in 0..4 {
-            let Ok(data) = self.fetch(summary_prefix(device, ns), true).await else {
-                return false;
-            };
-            let Ok(writer) = self.verify(&data).await else {
-                return false;
-            };
-            let Some(body) = data
-                .content()
-                .and_then(|c| wire::decode_node(c.clone()).ok())
-            else {
-                return false;
-            };
-            let named = parse_summary_name(&data.name);
-            if device_of(writer.key()).as_ref() != Some(device)
-                || body.subject != *ns
-                || body.writer != *writer.key()
-                || body.page.is_some()
-                || named.as_ref().map(|n| (&n.device, &n.subject, n.head))
-                    != Some((device, ns, Some(body.head)))
-            {
-                tracing::debug!(name = %data.name, "refused: a summary root that does not match its name");
+        let Some(data) = self.fetch(summary_prefix(device, ns), true).await else {
+            return false;
+        };
+        let (writer, body) = match self.accept_root(device, ns, &data).await {
+            Ok(taken) => taken,
+            Err(RootRefusal::Rollback { head, seen }) => {
+                tracing::warn!(%device, %ns, head, seen, "refused: a summary root older than one verified before (rollback); the writer must serve its newest root");
                 return false;
             }
-            let digest = wire::implicit_digest(data.raw());
-            {
-                let mut st = self.st.lock();
-                let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
-                if body.head < peer.head {
-                    tracing::warn!(%device, %ns, head = body.head, seen = peer.head, "refused: summary rollback");
-                    return false;
-                }
-                if peer.root == Some(digest) {
-                    return true;
-                }
+            Err(why) => {
+                tracing::debug!(name = %data.name, ?why, "refused: summary root");
+                return false;
             }
-            match self.descend(device, &writer, body.clone()).await {
-                Ok(()) => {
-                    let mut st = self.st.lock();
-                    let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
-                    peer.head = peer.head.max(body.head);
-                    peer.root = Some(digest);
-                    return true;
-                }
-                Err(Stop::Superseded) => continue,
-                Err(Stop::Unavailable) => return false,
-            }
+        };
+        let digest = wire::implicit_digest(data.raw());
+        let key = (device.clone(), ns.clone());
+        if self.st.lock().peers.get(&key).and_then(|p| p.root) == Some(digest) {
+            return true;
         }
-        false
+        if !self.descend(device, &writer, body).await {
+            return false;
+        }
+        self.st.lock().peers.entry(key).or_default().root = Some(digest);
+        true
     }
 
     /// Process a verified node (or page) of `writer`'s summary, published by
     /// `device`: its entries if followed, then its changed, relevant branches.
+    /// Returns whether all of it was processed; what was is kept, so the next
+    /// descent, from this root or a newer one, does not fetch it again.
     fn descend<'a>(
         self: &'a Arc<Self>,
         device: &'a Name,
         writer: &'a Writer,
         body: NodeBody,
-    ) -> BoxFuture<'a, Result<(), Stop>> {
+    ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             let subject = body.subject.clone();
             let path = body.page.clone().unwrap_or_default();
@@ -1120,15 +1170,12 @@ impl Inner {
                 }
             };
 
-            let mut failed = None;
             let fetched = stream::iter(wanted)
                 .map(|name| async move { self.take_fetched(name).await })
                 .buffer_unordered(self.config.window)
                 .collect::<Vec<_>>()
                 .await;
-            if fetched.iter().any(|ok| !ok) {
-                failed = Some(Stop::Unavailable);
-            }
+            let entries_taken = fetched.iter().all(|ok| *ok);
 
             let ns = namespace_of(&subject).unwrap_or_else(Name::root);
             let branch_results = stream::iter(
@@ -1158,28 +1205,28 @@ impl Inner {
             .map(|(name, key, digest, head)| {
                 let ns = ns.clone();
                 async move {
-                    let data = match self.fetch(name, false).await {
-                        Ok(d) => d,
-                        Err(Miss::Gone) => return Err(Stop::Superseded),
-                        Err(Miss::Silent) => return Err(Stop::Unavailable),
-                    };
+                    // The writer serves every node any root it signed lists
+                    // (§7): a miss is the network's, and what was processed
+                    // is kept for the next descent.
+                    let data = self.fetch(name.clone(), false).await?;
                     if wire::implicit_digest(data.raw()) != digest {
-                        return Err(Stop::Superseded);
+                        tracing::debug!(%name, "not the packet its parent lists; ignored");
+                        return None;
                     }
-                    let Some(child) = data
+                    let child = data
                         .content()
-                        .and_then(|c| wire::decode_node(c.clone()).ok())
-                    else {
-                        return Err(Stop::Unavailable);
-                    };
+                        .and_then(|c| wire::decode_node(c.clone()).ok())?;
                     if child.subject != key.0
                         || child.writer != *writer.key()
                         || child.head != head
                         || child.page != key.1
                     {
-                        return Err(Stop::Unavailable);
+                        tracing::debug!(%name, "a summary node that does not match its name; ignored");
+                        return None;
                     }
-                    self.descend(device, writer, child).await?;
+                    if !self.descend(device, writer, child).await {
+                        return None;
+                    }
                     self.st
                         .lock()
                         .peers
@@ -1187,29 +1234,19 @@ impl Inner {
                         .or_default()
                         .nodes
                         .insert(key, digest);
-                    Ok(())
+                    Some(())
                 }
             })
             .buffer_unordered(self.config.window)
             .collect::<Vec<_>>()
             .await;
-            for r in branch_results {
-                match r {
-                    Err(Stop::Superseded) => failed = Some(Stop::Superseded),
-                    Err(Stop::Unavailable) if failed.is_none() => failed = Some(Stop::Unavailable),
-                    _ => {}
-                }
-            }
-            match failed {
-                Some(stop) => Err(stop),
-                None => Ok(()),
-            }
+            entries_taken && branch_results.iter().all(Option::is_some)
         })
     }
 
     /// Fetch, verify and take one log entry; whether it is now held or refused.
     async fn take_fetched(self: &Arc<Self>, name: Name) -> bool {
-        let Ok(data) = self.fetch(name.clone(), false).await else {
+        let Some(data) = self.fetch(name.clone(), false).await else {
             return false;
         };
         self.take_data(&name, data).await.is_ok()
@@ -1436,8 +1473,14 @@ impl Inner {
             }
             let head = s.head?;
             let tree = st.trees.get_mut(&ns)?;
-            tree.build(&self.device, self.writer.key());
-            return tree.packet(&s.subject, s.page.as_ref(), head, name);
+            return tree.packet(
+                &self.device,
+                self.writer.key(),
+                &s.subject,
+                s.page.as_ref(),
+                head,
+                name,
+            );
         }
         let keys = self.device.clone().append("KEY");
         if name.has_prefix(&keys) {
@@ -1554,7 +1597,7 @@ impl Inner {
         let data = self
             .fetch(name.clone(), false)
             .await
-            .map_err(|_| DataError::Unavailable { name: name.clone() })?;
+            .ok_or_else(|| DataError::Unavailable { name: name.clone() })?;
         self.take_data(name, data)
             .await
             .map_err(|why| refused(name, why))?;
@@ -1864,5 +1907,145 @@ impl DataLayer for Device {
         }
         inner.publish(&ns).await;
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use ndn_app::AppError;
+    use ndn_security::TrustSchema;
+    use ndn_sync::MemoryStore;
+
+    const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
+
+    /// A forwarder that never delivers anything: the test hands the device
+    /// the packets it would have fetched.
+    struct Unconnected;
+
+    #[async_trait::async_trait]
+    impl Connection for Unconnected {
+        async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            futures::future::pending().await
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// A device key under `authority`'s namespace key `issuer`: its key
+    /// store, its key, and its certificate.
+    async fn device_key(
+        authority: &SecurityManager,
+        issuer: &Name,
+        device: &Name,
+    ) -> (Arc<SecurityManager>, Name, ndn_security::Certificate) {
+        let keys = Arc::new(SecurityManager::new());
+        let key = keys
+            .generate_ed25519(device.clone().append("KEY").append("1"))
+            .unwrap();
+        let public = keys.get_signer_sync(&key).unwrap().public_key().unwrap();
+        let cert = authority
+            .certify(&key, public, issuer, VALIDITY_MS)
+            .await
+            .unwrap();
+        keys.cert_cache().insert(cert.clone());
+        (keys, key, cert)
+    }
+
+    /// `device`'s signed summary root of `ns` at `head`.
+    fn root(keys: &SecurityManager, key: &Name, device: &Name, ns: &Name, head: u64) -> Data {
+        let body = NodeBody {
+            subject: ns.clone(),
+            writer: key.clone(),
+            head,
+            page: None,
+            entries: Vec::new(),
+            members: Vec::new(),
+            branches: Branches::Children(Vec::new()),
+        };
+        let signer = keys.get_signer_sync(key).unwrap();
+        let wire = DataBuilder::new(node_name(device, ns, head), &wire::encode_node(&body))
+            .sign_sync(signer.sig_type(), Some(key), |region| {
+                signer.sign_sync(region).unwrap()
+            });
+        Data::decode(wire).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_restarted_device_still_refuses_a_rolled_back_summary_root() {
+        let ns = n("/wendy");
+        let authority = SecurityManager::new();
+        let issuer = authority
+            .generate_ed25519(ns.clone().append("KEY").append("ns"))
+            .unwrap();
+        let public = authority
+            .get_signer_sync(&issuer)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let anchor = authority
+            .issue_self_signed_async(&issuer, public, VALIDITY_MS)
+            .await
+            .unwrap();
+        let (writer, reader) = (n("/wendy/laptop"), n("/rita/phone"));
+        let (writer_keys, writer_key, writer_cert) = device_key(&authority, &issuer, &writer).await;
+        let reader_keys = Arc::new(SecurityManager::new());
+        reader_keys
+            .generate_ed25519(reader.clone().append("KEY").append("1"))
+            .unwrap();
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        validator.cert_cache().insert(writer_cert);
+
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let start = || {
+            let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+            Device::start(
+                Transport {
+                    node: Node::from_connection(Arc::clone(&conn)),
+                    sync: conn,
+                },
+                reader.clone(),
+                Arc::clone(&reader_keys),
+                Arc::clone(&validator),
+                Arc::clone(&store),
+                Config::new(),
+            )
+        };
+        let at = |head| root(&writer_keys, &writer_key, &writer, &ns, head);
+
+        let first = start().await.unwrap();
+        first
+            .inner
+            .accept_root(&writer, &ns, &at(5))
+            .await
+            .expect("a first root is taken");
+        first.shutdown();
+        drop(first);
+
+        let again = start().await.unwrap();
+        let refused = again.inner.accept_root(&writer, &ns, &at(3)).await;
+        assert!(
+            matches!(refused, Err(RootRefusal::Rollback { head: 3, seen: 5 })),
+            "a root below the head verified before the restart is refused: {refused:?}"
+        );
+        again
+            .inner
+            .accept_root(&writer, &ns, &at(5))
+            .await
+            .expect("the same head is taken");
+        again
+            .inner
+            .accept_root(&writer, &ns, &at(8))
+            .await
+            .expect("a newer head is taken");
     }
 }

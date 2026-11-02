@@ -42,7 +42,7 @@ Every implementation MUST hold all of these.
    them.
 3. **Monotonic.** A writer's sequence and a collection's summary never go
    back. A reader MUST refuse a summary or members record older than one it
-   has seen from the same signer.
+   has seen from the same signer, also after the reader restarts.
 4. **Completeness is relative.** "I have everything" always means
    "everything in this signed summary".
 5. **Stale, never wrong.** Failures MUST degrade to older verified data, and
@@ -199,10 +199,18 @@ and pages are DigestSha256 packets; a reader MUST check each against the
 digest its parent lists. The **root**, the node of `O` itself, is the only
 signed one: `<D>/32=summary/<O>/seq=<head>`, signed by the device key,
 FreshnessPeriod 0 so that discovery always reaches the writer. A writer
-SHOULD sign a new root only when one is asked for and the tree changed;
-SHOULD keep recently superseded nodes servable so a reader descending a
-slightly older root completes; and MUST answer an Interest for a node it no
-longer serves with a Nack, so the reader starts from a newer root.
+SHOULD sign a new root only when one is asked for and the tree changed.
+
+A writer MUST serve every node and page that any root it signed lists, for
+as long as it holds the log entries that node lists — in slice 1 a writer
+never drops its own entries, so always, across its own restarts too (prune,
+slice 3, ends this only for what it prunes). Keeping them costs no storage:
+a node's content is fixed by the log up to its head, so a superseded node is
+rebuilt from the log when asked for; a writer MAY keep recently superseded
+packets ready. A writer MUST answer an Interest for a summary name that none
+of its roots listed with a Nack. Hence the time a reader's descent takes is
+bounded by the descent alone — its own fetches being answered — and never by
+how fast or how long the writer keeps putting.
 
 A reader:
 
@@ -212,13 +220,24 @@ A reader:
   seq its `Head`;
 - MUST refuse a root whose `Head` is lower than one it verified from that
   writer for `O`, or than the highest seq it holds of that writer under `O`
-  (invariant 3, "rollback");
+  (invariant 3, "rollback"). The highest `Head` verified per writer and
+  namespace is durable: the reader keeps it with what it holds (the
+  reference keeps the root itself), so a restarted reader refuses the same
+  rollback;
 - descends only into what it follows (the collections and folders it has
   put into, read or watched, and the names on the way to them), and only
   into children and pages whose digest differs from the one it last
   processed in full: an unchanged branch costs nothing. Watching a folder
   of 10,000 notes of which 37 changed costs the root, the folder node, the
   changed pages, the 37 notes and their new entries;
+- descends the root it verified to the end: it fetches the nodes and pages
+  that root lists, not a newer root's, until every branch it follows is
+  processed. A node that is not answered leaves the descent incomplete; the
+  branches processed in full stay processed, so the next descent skips
+  them. Only after a descent does the reader take the writer's newer root,
+  if the writer moved meanwhile, and descend from what it has processed.
+  One complete descent of a root gives the reader everything that root
+  covers in what it follows, however fast the writer keeps putting;
 - fetches the entries the visited nodes list that it does not hold.
 
 `watch` reports a `Summary` for each verified node of the watched name or
@@ -291,9 +310,33 @@ unsigned; a stranger in the group costs a reader a root fetch, never a
 wrong answer. A device's counter in a group starts at its log head when it
 joins, so it stays above anything an earlier run of the same key announced.
 
-Forwarders between devices MUST route `<O>/32=sync` to the other members
-with the multicast strategy: a device registers the group prefix for its own
-sync face, which shadows any shorter route.
+The group needs no configuration: no route names `<O>/32=sync` and no
+strategy is chosen for it. A device registers `<O>/32=sync` for its own sync
+face when it joins and does nothing else for the group. That registration is
+the group's longest match on the device's forwarder, and the routes a
+forwarder has toward the namespace's other devices are not prefixes of the
+group (a link between two devices routes each by its device name, §3), so
+longest-prefix match alone would deliver the group nowhere. Every
+forwarder — device or relay — therefore forwards the group by this rule:
+
+- A forwarder **carries** `O`'s group when a face is registered at or under
+  `<O>/32=sync` (a member on this node), or a link (a non-local face) is
+  routed at or under `<O>`.
+- A forwarder that carries the group MUST send every Interest under
+  `<O>/32=sync` with the multicast strategy, whatever its strategy choice
+  for the name, to: each face registered at or under `<O>/32=sync`; each
+  link routed at or under `<O>` (a device or relay of the namespace) or at a
+  prefix of `<O>` (a default route); and each link an Interest of the group
+  arrived on, for as long as that face is up (how a member of another
+  namespace is reached, toward which nothing routes into `<O>`). It sends one
+  copy per neighbour and none back toward the neighbour it came from.
+- A forwarder that does not carry the group (one holding default routes
+  only, like a hub) forwards it like any other name.
+
+A name is a sync group's when its second component is the keyword `sync`;
+nothing else in the group's Interests is read. The routes that make a
+forwarder carry a group are the ones its links already install for the
+person's devices and relays, so a person's devices sync with none set up.
 
 ## 13. Custody — slice 3
 
@@ -463,7 +506,8 @@ to equal bytes and equal nodes have equal digests.
 | Bad or lying clock | No effect on validity. | invariant 1 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
-| Holder rolls back | A summary older than one already seen is refused. | invariant 3, §7 |
+| Holder rolls back | A summary older than one already seen is refused, also by a reader that restarted since. | invariant 3, §7 |
+| Writer never pauses | Each descent finishes against the root it started from, whose nodes the writer keeps serving; the reader then continues from there and keeps up. | §7 |
 | Writer equivocates | Both versions are kept and reported. | invariant 2 |
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
 | Poisoned cache | Verification fails; the version is dropped and fetched elsewhere. | invariant 1, §4 |
@@ -475,5 +519,8 @@ to equal bytes and equal nodes have equal digests.
 implementation. Each case names the features it needs; a provider that
 lacks one is reported "not implemented", naming it. The slice-1 cases are
 c1 (offline notes on two devices), c7 (an older lens keeps a newer field),
-c8 (a laptop back after four months: 10,000 notes, 37 changed) and c11
-(citing a merged state).
+c8 (a laptop back after four months: 10,000 notes, 37 changed), c11
+(citing a merged state) and o4 (a reader keeps up with a writer that never
+pauses: it holds everything written before it looked, then every later
+moment's versions, while the writer keeps putting and a second reader
+makes it sign a new root many times a second).
