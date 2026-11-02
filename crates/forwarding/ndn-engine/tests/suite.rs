@@ -49,5 +49,7 @@ mod rejected_interest_pit;
 mod self_learning;
 #[path = "simultaneous_interests.rs"]
 mod simultaneous_interests;
+#[path = "sync_group.rs"]
+mod sync_group;
 #[path = "traceroute_responder.rs"]
 mod traceroute_responder;

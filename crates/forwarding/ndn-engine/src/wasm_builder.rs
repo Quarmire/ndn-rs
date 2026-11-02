@@ -350,6 +350,7 @@ impl WasmEngineBuilder {
                 network_region: Arc::new(crate::stages::strategy::NetworkRegionTable::new(
                     self.config.network_region.clone(),
                 )),
+                sync_groups: Arc::default(),
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),
