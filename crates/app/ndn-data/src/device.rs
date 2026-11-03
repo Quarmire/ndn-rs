@@ -33,7 +33,7 @@
 //! timeout only delays an answer, and an answer from older data says how old
 //! it may be.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -54,7 +54,7 @@ use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use crate::collection::{Child, Cut, Epoch, Members, Rule, Summary};
+use crate::collection::{Accepted, Child, Cut, Epoch, Members, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, State};
 use crate::merge::{MergeRule, MergeRules, MergeState};
@@ -158,13 +158,34 @@ struct HeldVersion {
     version: Version,
     op: Bytes,
     wire: Bytes,
+    /// Whether its payload came sealed.
+    sealed: bool,
+}
+
+/// What the records held say of one epoch of a collection (spec §9).
+struct Named {
+    /// The key check of the record that starts the epoch (or, until that
+    /// record is held, of a record keeping it).
+    check: [u8; 32],
+    /// Whether `check` is the starting record's own.
+    from_start: bool,
+    /// Every reader listed by a held record naming the epoch.
+    readers: Vec<Audience>,
 }
 
 /// One collection as this device knows it.
 #[derive(Default)]
 struct Coll {
-    /// The newest members record accepted.
+    /// The record in force: the merge of `records` (spec §6).
     members: Option<Members>,
+    /// The owner-signed records of the highest revision held, one per
+    /// signer (its latest), with each record's seq in its signer's log.
+    records: BTreeMap<Writer, (u64, Members)>,
+    /// Whether `members` merges records whose removals its epoch does not
+    /// carry out: a device of the audience resolves it with a new record.
+    unresolved: bool,
+    /// Every epoch a held owner-signed record of the collection names.
+    epochs: BTreeMap<Epoch, Named>,
     /// The merge state, once the rule is known and this device runs it.
     state: Option<Box<dyn MergeState>>,
     /// Every admitted version held, applied or waiting for its parents.
@@ -173,14 +194,18 @@ struct Coll {
     applied: BTreeMap<Writer, u64>,
     /// Per writer, every version seq this device knows it wrote here.
     entries: HashMap<Writer, BTreeSet<u64>>,
+    /// Per writer, the entries held and refused for what they carry (not
+    /// sealed, or an operation the rule refuses): later versions do not wait
+    /// for them.
+    skipped: HashMap<Writer, BTreeSet<u64>>,
     /// Admitted, not yet applied.
     pending: BTreeSet<VersionId>,
     /// Held while no members record is known (or the rule is not one this
     /// device runs).
     waiting: Vec<Arc<HeldVersion>>,
     /// Held but refused by the newest members record: their keys are not
-    /// writers, or lie outside a cut. A later revision that admits them
-    /// admits them.
+    /// writers, they lie outside a cut, or they are not sealed in a sealed
+    /// collection. A later revision that admits them admits them.
     outsiders: Vec<Arc<HeldVersion>>,
     /// Verified, sealed in an epoch whose key this device does not hold
     /// (yet, or ever: it is not of the audience).
@@ -217,6 +242,59 @@ impl Coll {
             })
             .collect()
     }
+
+    /// Whether later versions of `id`'s writer need not wait for `id`
+    /// ([`skipped_by`]).
+    fn skips(&self, id: &VersionId) -> bool {
+        skipped_by(self.members.as_ref(), &self.skipped, id)
+    }
+}
+
+/// A map that keeps its `cap` newest entries.
+struct Kept<V> {
+    map: HashMap<Name, V>,
+    order: VecDeque<Name>,
+    cap: usize,
+}
+
+impl<V> Kept<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get(&self, k: &Name) -> Option<&V> {
+        self.map.get(k)
+    }
+
+    fn insert(&mut self, k: Name, v: V) {
+        if self.map.insert(k.clone(), v).is_none() {
+            self.order.push_back(k);
+            if self.order.len() > self.cap
+                && let Some(old) = self.order.pop_front()
+            {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
+/// Grants a device keeps signed, so asking again gets the same packet.
+const GRANTS_KEPT: usize = 4096;
+/// Askers' seal keys a device keeps verified.
+const SEAL_KEYS_KEPT: usize = 1024;
+
+/// Why this device owes a collection a new members record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owed {
+    /// Its record merges concurrent ones whose epoch does not carry out
+    /// their removals (spec §6).
+    Merge,
+    /// A group its record names as a reader dropped a reader (spec §6).
+    Group,
 }
 
 /// What a held log entry is.
@@ -268,6 +346,8 @@ struct SignedRoot {
 
 /// Mutable state, under one lock never held across an await.
 struct St {
+    /// This device's namespace.
+    ns: Name,
     head: u64,
     trees: HashMap<Name, Tree>,
     roots: HashMap<Name, SignedRoot>,
@@ -284,10 +364,18 @@ struct St {
     keys: Keys,
     /// Epoch keys being asked for.
     asking: BTreeSet<(Name, Epoch)>,
-    /// Grants made, by name: one name, one packet.
-    grants: HashMap<Name, Bytes>,
+    /// Grants made, by name: one name, one packet while it is kept.
+    grants: Kept<Bytes>,
+    /// Askers' seal keys verified, by name.
+    seal_keys: Kept<[u8; 32]>,
     /// The device's seal key packet, once signed.
     seal_key: Option<Bytes>,
+    /// Collections of this namespace this device owes a new members record.
+    owed: BTreeMap<Name, Owed>,
+    /// Groups a record held names that this device is to follow.
+    to_follow: BTreeSet<Name>,
+    /// Per group, the collections whose record in force names it a reader.
+    sealed_to: HashMap<Name, BTreeSet<Name>>,
 }
 
 struct Inner {
@@ -350,35 +438,81 @@ fn owner_signed(keyring: &Keyring, entry: &Name, ns: &Name) -> bool {
     entry.has_prefix(ns) && keyring.context_for(entry).namespace() == ns
 }
 
+/// Whether later versions of `id`'s writer, and versions naming `id` as a
+/// parent, need not wait for it: `members` refuses it by its key (a cut
+/// that does not list it, a key no writer), or it is held and refused for
+/// what it carries (`skipped`).
+fn skipped_by(
+    members: Option<&Members>,
+    skipped: &HashMap<Writer, BTreeSet<u64>>,
+    id: &VersionId,
+) -> bool {
+    members.is_some_and(|m| m.refusal(id).is_some())
+        || skipped
+            .get(&id.writer)
+            .is_some_and(|s| s.contains(&id.seq.0))
+}
+
 /// The seq of `y` that a version naming `(y, t)` among its parents needs
-/// applied: `t`, or, when the newest members record refuses `(y, t)` by a
-/// cut, what the cut accepts of `y` — a parent outside a cut never arrives.
-fn needed(members: Option<&Members>, y: &Writer, t: u64) -> u64 {
-    let Some(m) = members else { return t };
-    match m.refusal(&VersionId {
+/// applied: `t`; or, when `(y, t)` never applies (a cut does not list it,
+/// or it was refused for what it carries), the highest version of `y` at or
+/// below `t` that does.
+fn needed(
+    members: Option<&Members>,
+    entries: &HashMap<Writer, BTreeSet<u64>>,
+    skipped: &HashMap<Writer, BTreeSet<u64>>,
+    y: &Writer,
+    t: u64,
+) -> u64 {
+    let id = |s: u64| VersionId {
         writer: y.clone(),
-        seq: Seq(t),
-    }) {
-        Some(Refusal::OutsideCut(cut)) => cut.accept.get(y).map_or(0, |s| s.0.min(t)),
-        _ => t,
+        seq: Seq(s),
+    };
+    if let Some(Refusal::OutsideCut(cut)) = members.and_then(|m| m.refusal(&id(t))) {
+        return cut.accept.highest_at_most(y, t).unwrap_or(0);
     }
+    if !skipped_by(members, skipped, &id(t)) {
+        return t;
+    }
+    entries
+        .get(y)
+        .and_then(|e| {
+            e.range(..t)
+                .rev()
+                .find(|s| !skipped_by(members, skipped, &id(**s)))
+                .copied()
+        })
+        .unwrap_or(0)
 }
 
 /// Whether a version is ready to apply: its writer's earlier entries here
-/// and its parents (as far as the cuts accept them) are applied.
+/// that apply at all, and its parents (as far as they apply), are applied.
 fn ready(
     entries: &HashMap<Writer, BTreeSet<u64>>,
+    skipped: &HashMap<Writer, BTreeSet<u64>>,
     applied: &BTreeMap<Writer, u64>,
     members: Option<&Members>,
     v: &Version,
 ) -> bool {
     let w = &v.id.writer;
-    let prev = entries
-        .get(w)
-        .and_then(|e| e.range(..v.id.seq.0).next_back().copied());
+    let prev = entries.get(w).and_then(|e| {
+        e.range(..v.id.seq.0)
+            .rev()
+            .find(|s| {
+                !skipped_by(
+                    members,
+                    skipped,
+                    &VersionId {
+                        writer: w.clone(),
+                        seq: Seq(**s),
+                    },
+                )
+            })
+            .copied()
+    });
     prev == applied.get(w).copied()
         && v.parents.iter().all(|(y, t)| {
-            let need = needed(members, y, t.0);
+            let need = needed(members, entries, skipped, y, t.0);
             need == 0 || applied.get(y).is_some_and(|a| *a >= need)
         })
 }
@@ -443,26 +577,24 @@ impl St {
         }
     }
 
-    /// Accept `body`, signed by `signer` (a device of the collection's
-    /// namespace, [`owner_signed`]), if it is the newest record of its
-    /// collection, and read the collection again under it.
+    /// Take `body`, the members record at seq `seq` of its signer's log,
+    /// signed by `signer` (a device of the collection's namespace,
+    /// [`owner_signed`]): note the epoch it names, and, if it is of the
+    /// highest revision held, merge it with the other signers' records of
+    /// that revision (spec §6) and read the collection again under the
+    /// merge. Owes a new record of this namespace's collections where the
+    /// merge leaves a removal undone, or where a group they are sealed to
+    /// dropped a reader.
     fn accept_members(
         &mut self,
+        seq: u64,
         body: MembersBody,
         signer: &Writer,
         rules: &MergeRules,
         me: &Writer,
     ) {
         let c = body.collection.clone();
-        let coll = self.colls.entry(c.clone()).or_default();
-        let newer = coll
-            .members
-            .as_ref()
-            .is_none_or(|m| (body.revision, signer) > (m.revision.0, &m.owner));
-        if !newer {
-            return;
-        }
-        coll.members = Some(Members {
+        let record = Members {
             collection: c.clone(),
             owner: signer.clone(),
             revision: Seq(body.revision),
@@ -479,9 +611,91 @@ impl St {
                 })
                 .collect(),
             epoch: body.epoch,
+            key_check: body.key_check,
             since: body.since,
             readmitted: Vec::new(),
-        });
+        };
+        let coll = self.colls.entry(c.clone()).or_default();
+        if let (Some(e), Some(check)) = (&record.epoch, record.key_check) {
+            let starts = seq == e.seq.0 && device_of(signer.key()).as_ref() == Some(&e.creator);
+            let named = coll.epochs.entry(e.clone()).or_insert_with(|| Named {
+                check,
+                from_start: starts,
+                readers: Vec::new(),
+            });
+            if starts && !named.from_start {
+                named.check = check;
+                named.from_start = true;
+            } else if named.check != check {
+                tracing::debug!(collection = %c, epoch = ?e, signer = ?signer, "a record names an epoch with another key check than the one held; the starting record's counts");
+            }
+            for r in &record.readers {
+                if !named.readers.contains(r) {
+                    named.readers.push(r.clone());
+                }
+            }
+        }
+        match coll.records.values().next().map(|(_, m)| m.revision) {
+            Some(r) if record.revision < r => return,
+            Some(r) if record.revision > r => coll.records.clear(),
+            _ => {}
+        }
+        if coll.records.get(signer).is_some_and(|(s, _)| *s >= seq) {
+            return;
+        }
+        coll.records.insert(signer.clone(), (seq, record));
+        let records: Vec<Members> = coll.records.values().map(|(_, m)| m.clone()).collect();
+        let (merged, unresolved) = Members::merge(&records).expect("a record was just inserted");
+        coll.unresolved = unresolved;
+        if coll.members.as_ref() == Some(&merged) {
+            return;
+        }
+        let dropped = coll
+            .members
+            .as_ref()
+            .is_some_and(|old| old.readers.iter().any(|r| !merged.readers.contains(r)));
+        let groups = |m: &Members| -> Vec<Name> {
+            m.readers
+                .iter()
+                .filter_map(|a| match a {
+                    Audience::Group(g) => Some(g.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (before, after) = (coll.members.as_ref().map(groups), groups(&merged));
+        coll.members = Some(merged);
+        for g in before.into_iter().flatten() {
+            if let Some(xs) = self.sealed_to.get_mut(&g) {
+                xs.remove(&c);
+            }
+        }
+        // A group's readers decide who reads here: follow it, so that its
+        // record is held and its removals heard (spec §6).
+        for g in after {
+            if !self.follows.contains(&g) {
+                self.to_follow.insert(g.clone());
+            }
+            self.sealed_to.entry(g).or_default().insert(c.clone());
+        }
+        if unresolved && namespace_of(&c).as_ref() == Some(&self.ns) {
+            self.owed.entry(c.clone()).or_insert(Owed::Merge);
+        }
+        if dropped {
+            // This namespace's collections sealed to `c` as a group move to
+            // a new epoch with it.
+            let own: Vec<Name> = self
+                .sealed_to
+                .get(&c)
+                .into_iter()
+                .flatten()
+                .filter(|x| namespace_of(x).as_ref() == Some(&self.ns))
+                .cloned()
+                .collect();
+            for x in own {
+                self.owed.insert(x, Owed::Group);
+            }
+        }
         self.reread(&c, rules, me);
     }
 
@@ -506,6 +720,7 @@ impl St {
         all.sort_by(|a, b| a.version.id.cmp(&b.version.id));
         coll.pending.clear();
         coll.applied.clear();
+        coll.skipped.clear();
         coll.state = match &members.rule {
             Rule::Merge { function } => rules.get(function).map(|r| r.start(me)),
             _ => None,
@@ -543,16 +758,25 @@ impl St {
             coll.waiting.push(hv);
             return false;
         };
-        if let Some(why) = members.refusal(&hv.version.id) {
-            tracing::debug!(id = ?hv.version.id, ?why, "refused in {c}");
-            self.refused.insert(hv.version.name.clone(), why);
-            coll.outsiders.push(hv);
-            return false;
-        }
         let history = members
             .since
             .as_ref()
             .is_some_and(|s| s.contains(&hv.version.id));
+        let why = members.refusal(&hv.version.id).or_else(|| {
+            (members.epoch.is_some() && !hv.sealed && !history).then_some(Refusal::Unsealed)
+        });
+        if let Some(why) = why {
+            tracing::debug!(id = ?hv.version.id, %why, "refused in {c}");
+            if why == Refusal::Unsealed {
+                coll.skipped
+                    .entry(hv.version.id.writer.clone())
+                    .or_default()
+                    .insert(hv.version.id.seq.0);
+            }
+            self.refused.insert(hv.version.name.clone(), why);
+            coll.outsiders.push(hv);
+            return false;
+        }
         match &members.rule {
             Rule::Merge { .. } => {
                 let Some(state) = &coll.state else {
@@ -563,6 +787,10 @@ impl St {
                 };
                 if !history && let Err(e) = state.check(&hv.version.id.writer, &hv.op) {
                     tracing::debug!(id = ?hv.version.id, "refused: {e}");
+                    coll.skipped
+                        .entry(hv.version.id.writer.clone())
+                        .or_default()
+                        .insert(hv.version.id.seq.0);
                     self.refused
                         .insert(hv.version.name.clone(), Refusal::BadSignature);
                     return false;
@@ -610,6 +838,7 @@ impl St {
             versions,
             applied,
             entries,
+            skipped,
             pending,
             ..
         } = coll;
@@ -617,9 +846,9 @@ impl St {
         let mut applied_now = Vec::new();
         loop {
             let next = pending.iter().find(|id| {
-                versions
-                    .get(id)
-                    .is_some_and(|hv| ready(entries, applied, members.as_ref(), &hv.version))
+                versions.get(id).is_some_and(|hv| {
+                    ready(entries, skipped, applied, members.as_ref(), &hv.version)
+                })
             });
             let Some(id) = next.cloned() else { break };
             pending.remove(&id);
@@ -639,6 +868,10 @@ impl St {
                 Err(e) => {
                     tracing::warn!(?id, "refused: {e}");
                     versions.remove(&id);
+                    skipped
+                        .entry(id.writer.clone())
+                        .or_default()
+                        .insert(id.seq.0);
                     refused.insert(hv.version.name.clone(), Refusal::BadSignature);
                 }
             }
@@ -653,6 +886,21 @@ impl St {
                 }
             }
         }
+    }
+
+    /// Hold `key` as the key of epoch `e` of `c` if it matches the key
+    /// check of the held record naming that epoch (spec §9), and open what
+    /// it unlocks. Whether it matched.
+    fn take_key(&mut self, c: &Name, e: &Epoch, key: ContentKey) -> bool {
+        let Some(named) = self.colls.get(c).and_then(|x| x.epochs.get(e)) else {
+            return false;
+        };
+        if seal::key_check(&key, c, e) != named.check {
+            return false;
+        }
+        self.keys.hold(c.clone(), e.clone(), key);
+        self.unlock(c);
+        true
     }
 
     /// Open the locked versions of `c` whose epoch key is now held, and
@@ -687,6 +935,7 @@ impl St {
                 version,
                 op,
                 wire: l.wire,
+                sealed: true,
             }));
         }
     }
@@ -711,7 +960,18 @@ impl St {
         let mut state = rules.get(function)?.start(me);
         let mut entries: HashMap<Writer, BTreeSet<u64>> = HashMap::new();
         for (w, t) in at.iter() {
-            let known: BTreeSet<u64> = coll.entries.get(w)?.range(..=t.0).copied().collect();
+            let known: BTreeSet<u64> = coll
+                .entries
+                .get(w)?
+                .range(..=t.0)
+                .copied()
+                .filter(|s| {
+                    !coll.skips(&VersionId {
+                        writer: w.clone(),
+                        seq: Seq(*s),
+                    })
+                })
+                .collect();
             if !known.contains(&t.0)
                 || known.iter().any(|s| {
                     !coll.versions.contains_key(&VersionId {
@@ -732,9 +992,15 @@ impl St {
             .map(Arc::as_ref)
             .collect();
         while !left.is_empty() {
-            let i = left
-                .iter()
-                .position(|hv| ready(&entries, &applied, Some(members), &hv.version))?;
+            let i = left.iter().position(|hv| {
+                ready(
+                    &entries,
+                    &coll.skipped,
+                    &applied,
+                    Some(members),
+                    &hv.version,
+                )
+            })?;
             let hv = left.swap_remove(i);
             let history = members
                 .since
@@ -752,11 +1018,13 @@ impl St {
 impl Device {
     /// Start the data layer of the device `device` (e.g.
     /// `/home/bob/member/laptop`): sign with the key `keys` holds for it,
-    /// verify with `validator`, keep what it holds in `store` (and pick up
-    /// what an earlier run stored there), serve `device`'s prefix, and join
-    /// its own namespace's sync group. Its namespace is that of the trust
-    /// context governing its name in `validator`'s keyring (spec §3); a
-    /// device no held context covers does not start.
+    /// keep its X25519 recipient secret with `keys` too
+    /// ([`SecurityManager::put_secret`], made on the first start), verify
+    /// with `validator`, keep what it holds in `store` (and pick up what an
+    /// earlier run stored there), serve `device`'s prefix, and join its own
+    /// namespace's sync group. Its namespace is that of the trust context
+    /// governing its name in `validator`'s keyring (spec §3); a device no
+    /// held context covers does not start.
     pub async fn start(
         transport: Transport,
         device: Name,
@@ -803,8 +1071,8 @@ impl Device {
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
         let window = config.window.max(1);
-        let recipient = recipient_key(&*store, &device);
-        let seal_keys = Keys::new(&device, recipient);
+        let recipient = recipient_key(&keys, &device)?;
+        let seal_keys = Keys::new(recipient);
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -818,6 +1086,7 @@ impl Device {
             config,
             svs,
             st: Mutex::new(St {
+                ns: ns.clone(),
                 head: 0,
                 trees: HashMap::new(),
                 roots: HashMap::new(),
@@ -831,8 +1100,12 @@ impl Device {
                 store,
                 keys: seal_keys,
                 asking: BTreeSet::new(),
-                grants: HashMap::new(),
+                grants: Kept::new(GRANTS_KEPT),
+                seal_keys: Kept::new(SEAL_KEYS_KEPT),
                 seal_key: None,
+                owed: BTreeMap::new(),
+                to_follow: BTreeSet::new(),
+                sealed_to: HashMap::new(),
             }),
             progress: Notify::new(),
             slots: Semaphore::new(window),
@@ -881,6 +1154,8 @@ impl Device {
             .map_err(|e| local(format!("cannot serve {device}: {e}")))?;
         *inner.serving.lock() = Some(guard);
         inner.join(&ns).await?;
+        // What the restored records owe: resolving merges, following groups.
+        inner.settle().await;
         Ok(Device { inner })
     }
 
@@ -940,43 +1215,65 @@ fn kept_root(key: &Name, wire: &Bytes) -> Option<(Name, Name, u64)> {
     Some((s.device, s.subject, s.head?))
 }
 
-/// Where the store keeps this device's recipient secret: a local name,
-/// never served.
+/// The name the key store keeps this device's recipient secret under.
 fn secret_name(device: &Name) -> Name {
     let base: Name = "/localhost/ndn-data/seal".parse().expect("a valid name");
     Name::from_components(base.components().iter().chain(device.components()).cloned())
 }
 
-/// This device's recipient key: the one its store keeps, else a new one,
-/// kept there.
-fn recipient_key(store: &dyn DataStore, device: &Name) -> RecipientKey {
+/// This device's recipient key: the one its key store keeps, else a new
+/// one, kept there (spec §9).
+fn recipient_key(keys: &SecurityManager, device: &Name) -> Result<RecipientKey, DataError> {
     let name = secret_name(device);
-    if let Some(b) = store.get(&name)
-        && let Ok(secret) = <[u8; 32]>::try_from(b.as_ref())
-    {
-        return RecipientKey::from_bytes(secret);
+    if let Some(b) = keys.secret(&name) {
+        return <[u8; 32]>::try_from(b.as_slice())
+            .map(RecipientKey::from_bytes)
+            .map_err(|_| {
+                local(format!(
+                    "the key store keeps {name} as {} octets; a recipient secret is 32",
+                    b.len()
+                ))
+            });
     }
     let key = RecipientKey::generate();
-    store.insert(name, Bytes::copy_from_slice(key.expose()));
-    key
+    keys.put_secret(name.clone(), key.expose())
+        .map_err(|e| local(format!("the key store cannot keep {name}: {e}")))?;
+    Ok(key)
 }
 
-/// The key a grant packet named `name` carries, opened with `recipient`;
-/// `None` if it is not wrapped to it under that name.
-fn open_grant(recipient: &RecipientKey, name: &Name, data: &Data) -> Option<ContentKey> {
-    let (ephemeral, wrapped) = wire::decode_grant(data.content()?.clone()).ok()?;
+/// Where the store keeps the epoch keys this device made: a local name
+/// (`/localhost/ndn-data/epoch/<device>`), under no prefix any device
+/// serves.
+fn made_keys_prefix(device: &Name) -> Name {
+    let base: Name = "/localhost/ndn-data/epoch".parse().expect("a valid name");
+    Name::from_components(base.components().iter().chain(device.components()).cloned())
+}
+
+/// The store name of the key of epoch `e` of `c` this device made.
+fn made_key_name(device: &Name, c: &Name, e: &Epoch) -> Name {
+    made_keys_prefix(device).append_component(ndn_packet::NameComponent::generic(
+        wire::encode_epoch_of(c, e),
+    ))
+}
+
+/// The collection and epoch a [`made_key_name`] of `device` names.
+fn parse_made_key_name(device: &Name, name: &Name) -> Option<(Name, Epoch)> {
+    let prefix = made_keys_prefix(device);
+    if !name.has_prefix(&prefix) || name.len() != prefix.len() + 1 {
+        return None;
+    }
+    wire::decode_epoch_of(name.components()[prefix.len()].value.clone())
+}
+
+/// The key a grant's Content (or a made key's stored value) carries,
+/// opened with `recipient` under `name`; `None` if it is not wrapped to it
+/// under that name.
+fn open_grant(recipient: &RecipientKey, name: &Name, content: Bytes) -> Option<ContentKey> {
+    let (ephemeral, wrapped) = wire::decode_grant(content).ok()?;
     let sealed = Sealed::from_bytes(&wrapped).ok()?;
     recipient
         .unwrap_ck(&ephemeral, &sealed, &name.encode_to_tlv())
         .ok()
-}
-
-/// Take a granted key: `granter`'s master secret, or one epoch key.
-fn take_grant(keys: &mut Keys, granter: Name, ask: GrantAsk, key: &ContentKey) {
-    match ask.of {
-        None => keys.add_master(granter, key),
-        Some((c, e)) => keys.add_epoch(c, e, key.clone()),
-    }
 }
 
 fn bare_interest(pkt: Bytes) -> Option<Interest> {
@@ -997,17 +1294,28 @@ impl Inner {
 
     /// Rebuild what the store holds: the own log, others' members records,
     /// snapshots and applied versions (each verified when it was stored),
-    /// and the highest summary root verified of each other device per
-    /// namespace, so a rolled-back root is still refused. Others' versions
-    /// are stored only once applied, so what comes back is a causally
-    /// complete prefix of each writer; members records go first.
+    /// the epoch keys made or granted here (each checked again against the
+    /// record naming its epoch), and the highest summary root verified of
+    /// each other device per namespace, so a rolled-back root is still
+    /// refused. Others' versions are stored only once applied, so what comes
+    /// back is a causally complete prefix of each writer; members records go
+    /// first, then the keys, then the rest.
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
-        let mut grants = Vec::new();
+        let mut keys = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
-            if let Some((granter, ask)) = parse_grant_name(&name) {
-                grants.push((name, granter, ask, wire));
+            if let Some((_, ask)) = parse_grant_name(&name) {
+                if parse_seal_key_name(&ask.seal_key).is_some_and(|(d, _)| d == self.device)
+                    && let Ok(data) = Data::decode(wire)
+                    && let Some(content) = data.content()
+                {
+                    keys.push((name, ask.collection, ask.epoch, content.clone()));
+                }
+                continue;
+            }
+            if let Some((c, e)) = parse_made_key_name(&self.device, &name) {
+                keys.push((name, c, e, wire));
                 continue;
             }
             let Some(parsed) = parse_log_name(&name) else {
@@ -1038,22 +1346,29 @@ impl Inner {
         }
         entries
             .sort_by_key(|(_, _, record, _, seq, _)| (!matches!(record, Record::Members(_)), *seq));
+        let rest = entries.split_off(
+            entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
+        );
         let mut st = self.st.lock();
-        // Grants first: own sealed entries open with the keys they gave.
-        for (name, granter, ask, wire) in grants {
-            let Ok(data) = Data::decode(wire) else {
-                continue;
-            };
-            if let Some(key) = open_grant(&st.keys.recipient, &name, &data) {
-                take_grant(&mut st.keys, granter, ask, &key);
+        let take_all = |st: &mut St, list: Vec<(Name, Bytes, Record, Writer, u64, bool)>| {
+            for (name, wire, record, writer, seq, mine) in list {
+                if mine {
+                    st.head = st.head.max(seq);
+                }
+                self.take(st, name, wire, writer, record, mine);
+            }
+        };
+        take_all(&mut st, entries);
+        // Keys next, so that sealed entries open as they are taken.
+        let recipient = st.keys.recipient.clone();
+        for (name, c, e, content) in keys {
+            let taken =
+                open_grant(&recipient, &name, content).is_some_and(|k| st.take_key(&c, &e, k));
+            if !taken {
+                tracing::debug!(%name, "a stored key that does not open, or does not match its epoch's key check; dropped");
             }
         }
-        for (name, wire, record, writer, seq, mine) in entries {
-            if mine {
-                st.head = st.head.max(seq);
-            }
-            self.take(&mut st, name, wire, writer, record, mine);
-        }
+        take_all(&mut st, rest);
         for (device, ns, head) in roots {
             if device != self.device {
                 let peer = st.peers.entry((device, ns)).or_default();
@@ -1061,6 +1376,9 @@ impl Inner {
                 peer.kept = peer.kept.max(head);
             }
         }
+        // A group's reader dropped in the log re-read is history: the
+        // records that moved its collections on are held too.
+        st.owed.retain(|_, why| *why == Owed::Merge);
     }
 
     // ---- sync groups --------------------------------------------------------------------------
@@ -1253,6 +1571,74 @@ impl Inner {
             self.publish(&ns).await;
         }
         Ok(())
+    }
+
+    /// Do what the records taken owe (spec §6): sign the record this device
+    /// owes a collection of its namespace — one resolving a merge that left
+    /// a removal undone, or one moving a collection sealed to a group that
+    /// dropped a reader to a new epoch — when it is of the collection's
+    /// audience, and publish it; follow the groups this namespace's records
+    /// name, so their readers can be checked and their removals heard.
+    async fn settle(self: &Arc<Self>) {
+        let mut signed = Vec::new();
+        let follow = {
+            let mut st = self.st.lock();
+            // Signing takes records, which may owe more; a few rounds settle
+            // any chain of groups.
+            for _ in 0..8 {
+                let owed = std::mem::take(&mut st.owed);
+                if owed.is_empty() {
+                    break;
+                }
+                for (c, why) in owed {
+                    let Some(coll) = st.colls.get(&c) else {
+                        continue;
+                    };
+                    let Some(current) = coll.members.clone() else {
+                        continue;
+                    };
+                    if why == Owed::Merge && !coll.unresolved {
+                        continue;
+                    }
+                    if namespace_of(&c).as_ref() != Some(&self.ns) || !self.reads(&st, &c) {
+                        tracing::debug!(collection = %c, ?why, "a new record is owed, by a device of its audience; not this one");
+                        continue;
+                    }
+                    let record = self.next_members(
+                        &st,
+                        &c,
+                        Some(&current),
+                        current.rule.clone(),
+                        current.writers.clone(),
+                        current.readers.clone(),
+                        true,
+                    );
+                    match self.append_members(&mut st, &c, record) {
+                        Ok(()) => {
+                            tracing::debug!(collection = %c, ?why, "signed a record in a new epoch");
+                            signed.push(c);
+                        }
+                        Err(e) => {
+                            tracing::warn!(collection = %c, "the record owed was not signed: {e}")
+                        }
+                    }
+                }
+            }
+            std::mem::take(&mut st.to_follow)
+        };
+        for g in follow {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                if let Err(e) = inner.look(&g).await {
+                    tracing::debug!(group = %g, "cannot follow the group: {e}");
+                }
+            });
+        }
+        for c in signed {
+            if let Err(e) = self.publish_about(&c, &[]).await {
+                tracing::debug!(collection = %c, "the record owed is not announced: {e}");
+            }
+        }
     }
 
     /// Refresh `device`'s summary of `ns` in the background, coalescing
@@ -1682,49 +2068,63 @@ impl Inner {
         let record = data
             .content()
             .and_then(|c| wire::decode_record(c.clone()).ok());
-        let mut st = self.st.lock();
-        let Some(record) = record else {
-            return refuse(&mut st, Refusal::BadSignature);
+        let chase = {
+            let mut st = self.st.lock();
+            let Some(record) = record else {
+                return refuse(&mut st, Refusal::BadSignature);
+            };
+            let subject_ok = match &record {
+                Record::Version(b) => parsed.subject.as_ref() == Some(&b.collection),
+                Record::Members(b) => parsed.subject.as_ref() == Some(&b.collection),
+                Record::Snapshot(_) => parsed.subject.is_none(),
+            };
+            if device_of(writer.key()).as_ref() != Some(&parsed.device) || !subject_ok {
+                return refuse(&mut st, Refusal::BadSignature);
+            }
+            let members = matches!(record, Record::Members(_));
+            self.take(
+                &mut st,
+                name.clone(),
+                data.raw().clone(),
+                writer,
+                record,
+                false,
+            );
+            // A group's record decides who reads the collections sealed to
+            // it: their keys may be asked for now.
+            let mut chase = Vec::new();
+            if let Some(c) = parsed.subject {
+                if members && let Some(xs) = st.sealed_to.get(&c) {
+                    chase.extend(xs.iter().cloned());
+                }
+                chase.push(c);
+            }
+            chase
         };
-        let subject_ok = match &record {
-            Record::Version(b) => parsed.subject.as_ref() == Some(&b.collection),
-            Record::Members(b) => parsed.subject.as_ref() == Some(&b.collection),
-            Record::Snapshot(_) => parsed.subject.is_none(),
-        };
-        if device_of(writer.key()).as_ref() != Some(&parsed.device) || !subject_ok {
-            return refuse(&mut st, Refusal::BadSignature);
-        }
-        let c = parsed.subject.clone();
-        self.take(
-            &mut st,
-            name.clone(),
-            data.raw().clone(),
-            writer,
-            record,
-            false,
-        );
-        drop(st);
-        if let Some(c) = c {
+        for c in chase {
             self.chase_keys(&c);
         }
+        self.settle().await;
         Ok(())
     }
 
     /// Ask, in the background, for every epoch key that a locked version of
-    /// `c` needs and that is not held or being asked for, when this device
-    /// is of `c`'s audience.
+    /// `c` needs, that is not held or being asked for, and that this device
+    /// may hold ([`Self::may_hold`]).
     fn chase_keys(self: &Arc<Self>, c: &Name) {
         let epochs: BTreeSet<Epoch> = {
             let st = self.st.lock();
             let Some(coll) = st.colls.get(c) else { return };
-            if coll.locked.is_empty() || !self.reads(&st, c) {
+            if coll.locked.is_empty() {
                 return;
             }
             coll.locked
                 .iter()
                 .map(|l| l.epoch().clone())
                 .filter(|e| {
-                    st.keys.key(c, e).is_none() && !st.asking.contains(&(c.clone(), e.clone()))
+                    st.keys.key(c, e).is_none()
+                        && !st.asking.contains(&(c.clone(), e.clone()))
+                        && self.may_hold(&st, c, e, &self.device, &self.ns)
                 })
                 .collect()
         };
@@ -1796,7 +2196,7 @@ impl Inner {
                     self.note_peer_head(st, &parsed.device, &c, parsed.seq);
                 }
                 if owner_signed(self.validator.keyring(), &name, &ns) {
-                    st.accept_members(body, &writer, &self.config.rules, self.me());
+                    st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
                 } else {
                     tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
                 }
@@ -1813,34 +2213,37 @@ impl Inner {
                 } else {
                     self.note_peer_head(st, &parsed.device, &c, seq);
                 }
-                if let Some(sealed) = &body.sealed {
-                    let opened = st
-                        .keys
-                        .key(&c, &sealed.epoch)
-                        .and_then(|k| seal::open_payload(&k, &name, &sealed.ciphertext));
-                    match opened {
-                        Some((fields, op)) => {
-                            body.fields = fields;
-                            body.op = op;
-                        }
-                        None => {
-                            st.held.insert(name.clone(), Held::Locked);
-                            st.colls.entry(c).or_default().locked.push(Locked {
-                                name,
-                                wire,
-                                writer,
-                                seq,
-                                body,
-                            });
-                            return;
-                        }
-                    }
+                let sealed = body.sealed.is_some();
+                if let Some(s) = body.sealed.clone() {
+                    let Some(key) = st.keys.key(&c, &s.epoch) else {
+                        st.held.insert(name.clone(), Held::Locked);
+                        st.colls.entry(c).or_default().locked.push(Locked {
+                            name,
+                            wire,
+                            writer,
+                            seq,
+                            body,
+                        });
+                        return;
+                    };
+                    let Some((fields, op)) = seal::open_payload(&key, &name, &s.ciphertext) else {
+                        tracing::debug!(%name, "refused: its payload does not open under its epoch's key");
+                        st.refused.insert(name, Refusal::BadSignature);
+                        return;
+                    };
+                    body.fields = fields;
+                    body.op = op;
                 }
                 let op = body.op.clone();
                 let version = version_of(&name, &writer, seq, body);
                 st.held
                     .insert(name.clone(), Held::Version(version.id.clone()));
-                st.admit(Arc::new(HeldVersion { version, op, wire }));
+                st.admit(Arc::new(HeldVersion {
+                    version,
+                    op,
+                    wire,
+                    sealed,
+                }));
             }
             Record::Snapshot(pins) => {
                 let snapshot = Snapshot {
@@ -1905,12 +2308,58 @@ impl Inner {
         Ok((name, seq))
     }
 
+    /// Sign `record` (a members record of `c` [`Self::next_members`] or
+    /// [`Self::default_members`] made) into the own log; keep the key of the
+    /// epoch it starts, if it starts one.
+    fn append_members(
+        &self,
+        st: &mut St,
+        c: &Name,
+        (body, key): (MembersBody, Option<ContentKey>),
+    ) -> Result<(), DataError> {
+        let epoch = body.epoch.clone();
+        self.append(st, Some(c), wire::encode_members(&body))?;
+        if let (Some(e), Some(key)) = (epoch, key) {
+            self.keep_made_key(st, c, e, key);
+        }
+        Ok(())
+    }
+
+    /// Hold `key`, which this device made as the key of epoch `e` of `c`,
+    /// and keep it with what it holds: wrapped to its own recipient key,
+    /// under a local name ([`made_key_name`]).
+    fn keep_made_key(&self, st: &mut St, c: &Name, e: Epoch, key: ContentKey) {
+        let name = made_key_name(&self.device, c, &e);
+        match wrap_ck_to(&st.keys.recipient.public(), &key, &name.encode_to_tlv()) {
+            Ok((ephemeral, wrapped)) => self
+                .store
+                .insert(name, wire::encode_grant(&ephemeral, &wrapped.to_bytes())),
+            Err(why) => {
+                tracing::warn!(collection = %c, epoch = ?e, "an epoch key made here is not kept for a restart: {why}");
+            }
+        }
+        st.keys.hold(c.clone(), e, key);
+    }
+
+    /// A new epoch of `c` that the members record at this device's log seq
+    /// `seq` starts: its key (32 random octets) and the key's check.
+    fn new_epoch(&self, c: &Name, seq: u64) -> (Epoch, [u8; 32], ContentKey) {
+        let epoch = Epoch {
+            creator: self.device.clone(),
+            seq: Seq(seq),
+        };
+        let key = ContentKey::generate();
+        let check = seal::key_check(&key, c, &epoch);
+        (epoch, check, key)
+    }
+
     /// The host default for a collection of this device's own namespace that
     /// nobody shared: merge with `/merge/yrs`, written and read by the
-    /// owner, sealed in an epoch this record (the own log's entry `seq`)
-    /// starts.
-    fn default_members(&self, c: &Name, seq: u64) -> MembersBody {
-        MembersBody {
+    /// owner's namespace, sealed in an epoch this record (the own log's entry
+    /// `seq`) starts; with the epoch's key.
+    fn default_members(&self, c: &Name, seq: u64) -> (MembersBody, Option<ContentKey>) {
+        let (epoch, check, key) = self.new_epoch(c, seq);
+        let body = MembersBody {
             collection: c.clone(),
             revision: 1,
             rule: Rule::Merge {
@@ -1919,21 +2368,21 @@ impl Inner {
             writers: vec![self.ns.clone()],
             readers: vec![Audience::Person(self.ns.clone())],
             cuts: Vec::new(),
-            epoch: Some(Epoch {
-                creator: self.device.clone(),
-                seq: Seq(seq),
-            }),
+            epoch: Some(epoch),
+            key_check: Some(check),
             since: None,
-        }
+        };
+        (body, Some(key))
     }
 
     /// The next members record of `c`, owned here, after `current` (spec
-    /// §6, §8, §9): a writer prefix removed gets a cut accepting what this
-    /// device saw of its keys in `c` (held versions and entries its writers'
-    /// summaries listed); a prefix written again drops its cut. A reader
-    /// removed — or `new_epoch` — starts a new epoch at this record; no
-    /// readers, no seal. A rule changed sets `since` to what this device
-    /// applied.
+    /// §6, §8, §9), and the key of the epoch it starts, if it starts one: a
+    /// writer prefix removed gets a cut accepting exactly the versions of
+    /// its keys in `c` this device holds verified; a prefix written again
+    /// drops its cut. A reader removed — or `new_epoch` — starts a new epoch
+    /// at this record, with a new random key; no readers, no seal. A rule
+    /// changed, or a seal on a collection that had none, sets `since` to
+    /// what this device applied.
     #[allow(clippy::too_many_arguments)]
     fn next_members(
         &self,
@@ -1944,7 +2393,7 @@ impl Inner {
         writers: Vec<Name>,
         readers: Vec<Audience>,
         new_epoch: bool,
-    ) -> MembersBody {
+    ) -> (MembersBody, Option<ContentKey>) {
         let seq = st.head + 1;
         let coll = st.colls.get(c);
         let covered = |of: &Name| writers.iter().any(|p| of.has_prefix(p));
@@ -1966,21 +2415,24 @@ impl Inner {
             .iter()
             .filter(|p| !covered(p))
         {
-            let mut accept = Frontier::new();
+            // Exactly the versions held verified — never what a summary
+            // only listed — that the record in force admits.
+            let mut accept = Accepted::new();
             if let Some(coll) = coll {
-                for id in coll.versions.keys() {
-                    if id.writer.key().has_prefix(p) {
-                        accept.include(id);
-                    }
-                }
-                for (w, seqs) in &coll.entries {
-                    if w.key().has_prefix(p)
-                        && let Some(s) = seqs.iter().next_back()
+                let held = coll
+                    .versions
+                    .keys()
+                    .cloned()
+                    .chain(coll.waiting.iter().map(|hv| hv.version.id.clone()))
+                    .chain(coll.locked.iter().map(|l| VersionId {
+                        writer: l.writer.clone(),
+                        seq: Seq(l.seq),
+                    }));
+                for id in held {
+                    if id.writer.key().has_prefix(p)
+                        && current.is_none_or(|m| m.refusal(&id).is_none())
                     {
-                        accept.include(&VersionId {
-                            writer: w.clone(),
-                            seq: Seq(*s),
-                        });
+                        accept.insert(&id);
                     }
                 }
             }
@@ -1993,16 +2445,21 @@ impl Inner {
         cuts.sort_by(|a, b| a.of.cmp(&b.of));
         let kept = current.and_then(|m| {
             let narrowed = m.readers.iter().any(|r| !readers.contains(r));
-            (!new_epoch && !narrowed).then(|| m.epoch.clone()).flatten()
+            (!new_epoch && !narrowed)
+                .then(|| m.epoch.clone().zip(m.key_check))
+                .flatten()
         });
-        let epoch = (!readers.is_empty()).then(|| {
-            kept.unwrap_or_else(|| Epoch {
-                creator: self.device.clone(),
-                seq: Seq(seq),
-            })
-        });
+        let (epoch, key_check, key) = match (readers.is_empty(), kept) {
+            (true, _) => (None, None, None),
+            (false, Some((e, check))) => (Some(e), Some(check), None),
+            (false, None) => {
+                let (e, check, key) = self.new_epoch(c, seq);
+                (Some(e), Some(check), Some(key))
+            }
+        };
+        let restarts = |m: &Members| m.rule != rule || (m.epoch.is_none() && epoch.is_some());
         let since = match current {
-            Some(m) if m.rule != rule => {
+            Some(m) if restarts(m) => {
                 let mut f = coll.map(Coll::at).unwrap_or_default();
                 for (w, s) in m.since.iter().flat_map(Frontier::iter) {
                     f.include(&VersionId {
@@ -2015,7 +2472,7 @@ impl Inner {
             Some(m) => m.since.clone(),
             None => None,
         };
-        MembersBody {
+        let body = MembersBody {
             collection: c.clone(),
             revision: current.map_or(1, |m| m.revision.0 + 1),
             rule,
@@ -2023,8 +2480,10 @@ impl Inner {
             readers,
             cuts,
             epoch,
+            key_check,
             since,
-        }
+        };
+        (body, key)
     }
 
     // ---- serving ------------------------------------------------------------------------------
@@ -2151,30 +2610,61 @@ impl Inner {
         Some(wire)
     }
 
-    /// Whether `device`, of namespace `dns`, is of `c`'s audience by the
-    /// newest members record held (spec §9): a device of `c`'s namespace
-    /// always; else one a reader names — its person, itself, or a group
-    /// (a collection) whose own newest record names either.
-    fn admits_reader(&self, st: &St, c: &Name, device: &Name, dns: &Name) -> bool {
-        if namespace_of(c).as_ref() == Some(dns) {
-            return true;
-        }
-        let Some(m) = st.colls.get(c).and_then(|x| x.members.as_ref()) else {
-            return false;
-        };
+    /// Whether `device`, of namespace `dns`, is of the audience `readers`
+    /// lists, in an epoch `creator` started (spec §9): the creator itself,
+    /// or one a reader names — its person, itself, or a group (a
+    /// collection) whose own newest record names either.
+    fn admits(
+        &self,
+        st: &St,
+        readers: &[Audience],
+        creator: Option<&Name>,
+        device: &Name,
+        dns: &Name,
+    ) -> bool {
         let direct = |a: &Audience| match a {
             Audience::Person(p) => p == dns,
             Audience::Device(d) => d == device,
             Audience::Group(_) => false,
         };
-        m.readers.iter().any(|a| match a {
-            Audience::Group(g) => st
-                .colls
-                .get(g)
-                .and_then(|x| x.members.as_ref())
-                .is_some_and(|gm| gm.readers.iter().any(direct)),
-            other => direct(other),
-        })
+        creator == Some(device)
+            || readers.iter().any(|a| match a {
+                Audience::Group(g) => st
+                    .colls
+                    .get(g)
+                    .and_then(|x| x.members.as_ref())
+                    .is_some_and(|gm| gm.readers.iter().any(direct)),
+                other => direct(other),
+            })
+    }
+
+    /// Whether `device`, of namespace `dns`, is of `c`'s audience by the
+    /// record in force: the readers it lists and the device that started
+    /// its epoch.
+    fn admits_reader(&self, st: &St, c: &Name, device: &Name, dns: &Name) -> bool {
+        let Some(m) = st.colls.get(c).and_then(|x| x.members.as_ref()) else {
+            return false;
+        };
+        let creator = m.epoch.as_ref().map(|e| &e.creator);
+        self.admits(st, &m.readers, creator, device, dns)
+    }
+
+    /// Whether `device`, of namespace `dns`, may hold the key of epoch `e`
+    /// of `c` (spec §9): a held owner-signed record of `c` names `e`, the
+    /// readers those records list (or `e`'s creator) admit it, and so does
+    /// the record in force when it seals `c`.
+    fn may_hold(&self, st: &St, c: &Name, e: &Epoch, device: &Name, dns: &Name) -> bool {
+        let Some(coll) = st.colls.get(c) else {
+            return false;
+        };
+        let Some(named) = coll.epochs.get(e) else {
+            return false;
+        };
+        self.admits(st, &named.readers, Some(&e.creator), device, dns)
+            && coll
+                .members
+                .as_ref()
+                .is_some_and(|m| m.epoch.is_none() || self.admits_reader(st, c, device, dns))
     }
 
     /// Whether this device reads `c`.
@@ -2191,37 +2681,58 @@ impl Inner {
             && !self.reads(st, c)
     }
 
-    /// Answer a grant asked of this device (spec §9): verify the asker's
-    /// seal key, check that the asker may hold the key asked for — this
-    /// device's master secret: a device of its own namespace; an epoch key
-    /// of `c`: a device of `c`'s current audience — and wrap the key to the
-    /// asker's seal key. One name, one packet. `None` (a Nack) otherwise.
+    /// The key of epoch `e` of `c` to grant `asker`, of namespace
+    /// `asker_ns`: held here, and the asker may hold it
+    /// ([`Self::may_hold`]).
+    fn grant_key(
+        &self,
+        st: &St,
+        c: &Name,
+        e: &Epoch,
+        asker: &Name,
+        asker_ns: &Name,
+    ) -> Option<ContentKey> {
+        if !self.may_hold(st, c, e, asker, asker_ns) {
+            return None;
+        }
+        st.keys.key(c, e)
+    }
+
+    /// Answer a grant asked of this device (spec §9): check that the asker
+    /// may hold the key of the epoch asked for and that it is held here
+    /// ([`Self::grant_key`]), verify the asker's seal key, and wrap the key
+    /// to it. One name, one packet while it is kept. `None` (a Nack)
+    /// otherwise.
     async fn grant(self: &Arc<Self>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
-        if let Some(p) = self.st.lock().grants.get(name) {
-            return Some(p.clone());
-        }
         let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
-        let data = self.fetch(ask.seal_key.clone(), false).await?;
-        let signer = self.verify(&data).await.ok()?;
-        if *data.name != ask.seal_key
-            || device_of(signer.key()).as_ref() != Some(&asker)
-            || wire::decode_seal_key(data.content()?.clone()).ok()? != public
-        {
-            tracing::debug!(%asker, "grant refused: its seal key does not verify as its own");
-            return None;
-        }
         let asker_ns = self.namespace_of_name(&asker);
+        let (c, e) = (&ask.collection, &ask.epoch);
+        let verified = {
+            let st = self.st.lock();
+            if self.grant_key(&st, c, e, &asker, &asker_ns).is_none() {
+                tracing::debug!(%asker, collection = %c, epoch = ?e, "grant refused: no record held names the epoch, the asker is not of its audience, or its key is not held here");
+                return None;
+            }
+            if let Some(p) = st.grants.get(name) {
+                return Some(p.clone());
+            }
+            st.seal_keys.get(&ask.seal_key).copied()
+        };
+        if verified.is_none() {
+            let data = self.fetch(ask.seal_key.clone(), false).await?;
+            let signer = self.verify(&data).await.ok()?;
+            if *data.name != ask.seal_key
+                || device_of(signer.key()).as_ref() != Some(&asker)
+                || wire::decode_seal_key(data.content()?.clone()).ok()? != public
+            {
+                tracing::debug!(%asker, "grant refused: its seal key does not verify as its own");
+                return None;
+            }
+        }
         let mut st = self.st.lock();
-        let key = match &ask.of {
-            None if asker_ns == self.ns => st.keys.master(&self.device),
-            None => None,
-            Some((c, e)) if self.admits_reader(&st, c, &asker, &asker_ns) => st.keys.key(c, e),
-            Some(_) => None,
-        };
-        let Some(key) = key else {
-            tracing::debug!(%asker, of = ?ask.of, "grant refused: not of the audience, or the key is not held here");
-            return None;
-        };
+        st.seal_keys.insert(ask.seal_key.clone(), public);
+        // Checked again: the records may have moved during the fetch.
+        let key = self.grant_key(&st, c, e, &asker, &asker_ns)?;
         let (ephemeral, wrapped) = wrap_ck_to(&public, &key, &name.encode_to_tlv()).ok()?;
         let wire = self
             .sign(DataBuilder::new(
@@ -2233,10 +2744,11 @@ impl Inner {
         Some(wire)
     }
 
-    /// Get the key of epoch `e` of `c` (spec §9): from the epoch's creator —
-    /// its master secret, for a device of `c`'s namespace, else the epoch
-    /// key — then from every other device known to write into `c`'s
-    /// namespace. Opens what it unlocks. Whether the key is held now.
+    /// Get the key of epoch `e` of `c` (spec §9): from the epoch's creator,
+    /// then from every other device known to write into `c`'s namespace. A
+    /// granted key is taken only if it matches the key check of the held
+    /// record naming the epoch. Opens what it unlocks. Whether the key is
+    /// held now.
     async fn obtain(self: &Arc<Self>, c: &Name, e: &Epoch) -> bool {
         let Some(ns) = namespace_of(c) else {
             return false;
@@ -2246,29 +2758,25 @@ impl Inner {
             if st.keys.key(c, e).is_some() {
                 return true;
             }
+            if !st.colls.get(c).is_some_and(|x| x.epochs.contains_key(e)) {
+                // Nothing to check a key against: no record held names it.
+                return false;
+            }
             if !st.asking.insert((c.clone(), e.clone())) {
                 return false;
             }
             seal_key_name(&self.device, &st.keys.recipient.public())
         };
-        let ask = |of: Option<(Name, Epoch)>| GrantAsk {
-            seal_key: seal_key.clone(),
-            of,
+        let ask = GrantAsk {
+            seal_key,
+            collection: c.clone(),
+            epoch: e.clone(),
         };
-        let of = Some((c.clone(), e.clone()));
-        let mut asks = Vec::new();
-        if ns == self.ns && !self.st.lock().keys.has_master(&e.creator) {
-            asks.push((e.creator.clone(), ask(None)));
-        }
-        asks.push((e.creator.clone(), ask(of.clone())));
+        let mut granters = vec![e.creator.clone()];
         let others = self.known_for(&self.st.lock(), &ns);
-        for d in others {
-            if d != e.creator && d != self.device {
-                asks.push((d, ask(of.clone())));
-            }
-        }
+        granters.extend(others.into_iter().filter(|d| *d != e.creator));
         let mut got = false;
-        for (granter, ask) in asks {
+        for granter in granters {
             if granter == self.device {
                 continue;
             }
@@ -2282,34 +2790,25 @@ impl Inner {
             if *data.name != name || device_of(signer.key()).as_ref() != Some(&granter) {
                 continue;
             }
-            let mut st = self.st.lock();
-            let Some(key) = open_grant(&st.keys.recipient, &name, &data) else {
+            let Some(content) = data.content().cloned() else {
                 continue;
             };
-            take_grant(&mut st.keys, granter, ask, &key);
+            let mut st = self.st.lock();
+            let Some(key) = open_grant(&st.keys.recipient, &name, content) else {
+                continue;
+            };
+            if !st.take_key(c, e, key) {
+                tracing::debug!(%granter, collection = %c, epoch = ?e, "refused: a granted key that does not match its epoch's key check");
+                continue;
+            }
             self.store.insert(name, data.raw().clone());
-            if st.keys.key(c, e).is_some() {
-                got = true;
-                break;
-            }
+            got = true;
+            break;
         }
-        let mut st = self.st.lock();
-        st.asking.remove(&(c.clone(), e.clone()));
-        if got {
-            // A master secret may open other collections' versions too.
-            let locked: Vec<Name> = st
-                .colls
-                .iter()
-                .filter(|(_, coll)| !coll.locked.is_empty())
-                .map(|(n, _)| n.clone())
-                .collect();
-            for l in locked {
-                st.unlock(&l);
-            }
-        } else {
+        self.st.lock().asking.remove(&(c.clone(), e.clone()));
+        if !got {
             tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key");
         }
-        drop(st);
         self.progress.notify_waiters();
         got
     }
@@ -2608,8 +3107,8 @@ impl DataLayer for Device {
                         }
                     });
                 }
-                let body = inner.default_members(collection, st.head + 1);
-                inner.append(&mut st, Some(collection), wire::encode_members(&body))?;
+                let record = inner.default_members(collection, st.head + 1);
+                inner.append_members(&mut st, collection, record)?;
             }
         }
         let key = inner.write_key(collection).await?;
@@ -2695,6 +3194,7 @@ impl DataLayer for Device {
                     version: version.clone(),
                     op,
                     wire,
+                    sealed: key.is_some(),
                 }),
             );
             st.emit(collection, &Change::Version(version), &id.writer, seq);
@@ -2804,10 +3304,10 @@ impl DataLayer for Device {
         }
         inner.follow(collection).await?;
         let before = inner.groups_of(&inner.st.lock(), collection);
-        let rotate = {
+        {
             let mut st = inner.st.lock();
             let current = st.colls.get(collection).and_then(|c| c.members.clone());
-            let body = inner.next_members(
+            let record = inner.next_members(
                 &st,
                 collection,
                 current.as_ref(),
@@ -2816,52 +3316,12 @@ impl DataLayer for Device {
                 members.readers,
                 false,
             );
-            let removed_reader = current
-                .as_ref()
-                .is_some_and(|cur| cur.readers.iter().any(|r| !body.readers.contains(r)));
-            inner.append(&mut st, Some(collection), wire::encode_members(&body))?;
-            // A collection sealed to this one as a group moves to a new
-            // epoch with it.
-            let group = Audience::Group(collection.clone());
-            let mut rotate: Vec<Name> = if removed_reader {
-                st.colls
-                    .iter()
-                    .filter(|(x, coll)| {
-                        namespace_of(x).as_ref() == Some(&ns)
-                            && coll
-                                .members
-                                .as_ref()
-                                .is_some_and(|m| m.readers.contains(&group))
-                    })
-                    .map(|(x, _)| x.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            rotate.sort();
-            for x in &rotate {
-                let cur = st
-                    .colls
-                    .get(x)
-                    .and_then(|c| c.members.clone())
-                    .expect("filtered on its record");
-                let body = inner.next_members(
-                    &st,
-                    x,
-                    Some(&cur),
-                    cur.rule.clone(),
-                    cur.writers.clone(),
-                    cur.readers.clone(),
-                    true,
-                );
-                inner.append(&mut st, Some(x), wire::encode_members(&body))?;
-            }
-            rotate
-        };
-        inner.publish_about(collection, &before).await?;
-        for x in rotate {
-            inner.publish_about(&x, &[]).await?;
+            inner.append_members(&mut st, collection, record)?;
         }
+        inner.publish_about(collection, &before).await?;
+        // A collection sealed to this one as a group moves to a new epoch
+        // with it, and a merge this record left unresolved is resolved.
+        inner.settle().await;
         Ok(())
     }
 }
@@ -3175,6 +3635,7 @@ mod tests {
                 readers: Vec::new(),
                 cuts: Vec::new(),
                 epoch: None,
+                key_check: None,
                 since: None,
             };
             let name = log_name(&device, Some(&c), 1);
@@ -3208,5 +3669,416 @@ mod tests {
             Some(n("/home/bob/member/laptop/KEY/1"))
         );
         dev.shutdown();
+    }
+
+    // ---- seals and cuts against crafted packets (the slice-2 review) -------------------------
+
+    /// A device of `ns` (whose trust context, and `others`', it holds), on a
+    /// forwarder that delivers nothing.
+    async fn device_in(device: &str, others: &[&str]) -> Device {
+        let device = n(device);
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        for ns in others {
+            assert!(validator.adopt_context(context(ns)));
+        }
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        start(&device, &keys_of(&device), &validator, &store)
+            .await
+            .unwrap()
+    }
+
+    fn share_of(rule: Rule, writers: &[&str], readers: Vec<Audience>) -> crate::layer::Share {
+        crate::layer::Share {
+            rule,
+            writers: writers.iter().map(|w| n(w)).collect(),
+            readers,
+            readmit: Vec::new(),
+        }
+    }
+
+    fn version_body(c: &Name, sealed: Option<SealedBody>) -> VersionBody {
+        VersionBody {
+            collection: c.clone(),
+            parents: Frontier::new(),
+            type_id: crate::TypeId {
+                name: n("/types/note"),
+                revision: 1,
+            },
+            seal: Seal { any_of: Vec::new() },
+            keep: crate::Keep::Forever,
+            dated: Timestamp(1),
+            fields: Content::new(),
+            op: Bytes::new(),
+            sealed,
+        }
+    }
+
+    /// Hand `dev` the log entry `seq` of `device` about `c` carrying
+    /// `record`, as if fetched and verified; why it is refused, if it is.
+    fn hand(dev: &Device, device: &Name, c: &Name, seq: u64, record: Record) -> Option<Refusal> {
+        let name = log_name(device, Some(c), seq);
+        let content = match &record {
+            Record::Version(b) => wire::encode_version(b),
+            Record::Members(b) => wire::encode_members(b),
+            Record::Snapshot(p) => wire::encode_snapshot(p),
+        };
+        // Its signature is never checked here; its key locator names the
+        // signer, as a restart reads it back.
+        let key = device.clone().append("KEY").append("1");
+        let packet = DataBuilder::new(name.clone(), &content).sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(&key),
+            |_| Bytes::from_static(&[0; 64]),
+        );
+        let mut st = dev.inner.st.lock();
+        dev.inner.take(
+            &mut st,
+            name.clone(),
+            packet,
+            Writer::new(key),
+            record,
+            false,
+        );
+        st.refused.get(&name).cloned()
+    }
+
+    #[tokio::test]
+    async fn a_grant_answers_only_an_epoch_a_held_record_names_and_only_its_audience() {
+        let dev = device_in("/alice/laptop", &["/alice"]).await;
+        let c = n("/alice/32=data/plan");
+        let bob = (n("/bob/phone"), n("/bob"));
+        let phone = (n("/alice/phone"), n("/alice"));
+        dev.share(
+            &c,
+            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]),
+        )
+        .await
+        .unwrap();
+        let (first, future) = {
+            let st = dev.inner.st.lock();
+            let first = st.colls[&c]
+                .members
+                .as_ref()
+                .unwrap()
+                .epoch
+                .clone()
+                .unwrap();
+            let future = Epoch {
+                creator: n("/alice/laptop"),
+                seq: Seq(st.head + 5),
+            };
+            (first, future)
+        };
+        let may = |e: &Epoch, (d, ns): &(Name, Name)| {
+            dev.inner
+                .grant_key(&dev.inner.st.lock(), &c, e, d, ns)
+                .is_some()
+        };
+        assert!(may(&first, &bob), "a reader of the epoch gets its key");
+        assert!(
+            !may(&future, &bob),
+            "an epoch no record names has no key to give, now or later"
+        );
+        // The owner's own other device is no reader unless listed.
+        assert!(!may(&first, &phone));
+        // Asked over the network, the future epoch gets no answer, without a
+        // fetch of the asker's seal key.
+        let ask = GrantAsk {
+            seal_key: seal_key_name(&bob.0, &[9; 32]),
+            collection: c.clone(),
+            epoch: future.clone(),
+        };
+        let name = grant_name(&n("/alice/laptop"), &ask);
+        assert_eq!(dev.inner.grant(&name, ask).await, None);
+
+        // Bob removed: the new epoch is not his, and nor is the old one any
+        // longer, by the record in force.
+        dev.share(
+            &c,
+            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/alice"))]),
+        )
+        .await
+        .unwrap();
+        let second = dev.inner.st.lock().colls[&c]
+            .members
+            .as_ref()
+            .unwrap()
+            .epoch
+            .clone()
+            .unwrap();
+        assert_ne!(second, first);
+        assert_ne!(second, future, "the new epoch is the record's own");
+        assert!(!may(&second, &bob) && !may(&first, &bob));
+        assert!(may(&second, &phone));
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_granted_key_is_taken_only_if_it_matches_the_check_of_its_epoch() {
+        let (owner, granter) = (n("/alice/laptop"), n("/bob/phone"));
+        let c = n("/alice/32=data/plan");
+        let epoch = Epoch {
+            creator: owner.clone(),
+            seq: Seq(1),
+        };
+        let right = ContentKey::generate();
+        let record = MembersBody {
+            collection: c.clone(),
+            revision: 1,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: vec![Audience::Person(n("/carol"))],
+            cuts: Vec::new(),
+            epoch: Some(epoch.clone()),
+            key_check: Some(seal::key_check(&right, &c, &epoch)),
+            since: None,
+        };
+        let version = |seq: u64| {
+            let name = log_name(&owner, Some(&c), seq);
+            let fields = Content::new().with("text", Bytes::from_static(b"budget"));
+            version_body(
+                &c,
+                Some(SealedBody {
+                    epoch: epoch.clone(),
+                    ciphertext: seal::seal_payload(&right, &name, &fields, b""),
+                }),
+            )
+        };
+        let device = n("/carol/phone");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        for ns in ["/alice", "/carol"] {
+            assert!(validator.adopt_context(context(ns)));
+        }
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        assert_eq!(hand(&dev, &owner, &c, 1, Record::Members(record)), None);
+        assert_eq!(hand(&dev, &owner, &c, 2, Record::Version(version(2))), None);
+
+        // Another device answers the ask with a key it chose, wrapped to the
+        // reader and signed: it opens, and is not the epoch's.
+        let public = dev.inner.st.lock().keys.recipient.public();
+        let grant = |key: &ContentKey| {
+            let ask = GrantAsk {
+                seal_key: seal_key_name(&device, &public),
+                collection: c.clone(),
+                epoch: epoch.clone(),
+            };
+            let name = grant_name(&granter, &ask);
+            let (eph, wrapped) = wrap_ck_to(&public, key, &name.encode_to_tlv()).unwrap();
+            let content = wire::encode_grant(&eph, &wrapped.to_bytes());
+            let packet = DataBuilder::new(name.clone(), &content).sign_digest_sha256();
+            (name, content, packet)
+        };
+        let chosen = ContentKey::generate();
+        let (name, content, packet) = grant(&chosen);
+        {
+            let mut st = dev.inner.st.lock();
+            let opened = open_grant(&st.keys.recipient, &name, content).unwrap();
+            assert!(
+                !st.take_key(&c, &epoch, opened),
+                "a key chosen by another device"
+            );
+            assert!(st.keys.key(&c, &epoch).is_none());
+            assert_eq!(st.colls[&c].locked.len(), 1, "nothing opens under it");
+        }
+        // A stored grant of the wrong key is checked again on restart.
+        store.insert(name, packet);
+        dev.shutdown();
+        drop(dev);
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        assert!(again.inner.st.lock().keys.key(&c, &epoch).is_none());
+        // Fetched again (a version is kept only once applied), it waits.
+        assert_eq!(
+            hand(&again, &owner, &c, 2, Record::Version(version(2))),
+            None
+        );
+        // The epoch's own key, from any device, is taken and opens it.
+        let (name, content, _) = grant(&right);
+        {
+            let mut st = again.inner.st.lock();
+            let opened = open_grant(&st.keys.recipient, &name, content).unwrap();
+            assert!(st.take_key(&c, &epoch, opened));
+            assert!(st.colls[&c].locked.is_empty());
+            assert!(matches!(
+                st.held.get(&log_name(&owner, Some(&c), 2)),
+                Some(Held::Version(_))
+            ));
+        }
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_removed_writer_cannot_fill_a_gap_below_what_its_cut_kept() {
+        let dev = device_in("/alice/laptop", &["/alice", "/bob"]).await;
+        let (c, bob) = (n("/alice/32=data/plan"), n("/bob/laptop"));
+        dev.share(&c, share_of(Rule::Log, &["/alice", "/bob"], Vec::new()))
+            .await
+            .unwrap();
+        let version = || Record::Version(version_body(&c, None));
+        assert_eq!(hand(&dev, &bob, &c, 40, version()), None);
+        assert_eq!(hand(&dev, &bob, &c, 100, version()), None);
+        // Bob's summary listed seq 70 too, never fetched: not kept.
+        dev.inner
+            .st
+            .lock()
+            .colls
+            .get_mut(&c)
+            .unwrap()
+            .entries
+            .entry(Writer::new(n("/bob/laptop/KEY/1")))
+            .or_default()
+            .insert(70);
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let id = |seq| VersionId {
+            writer: Writer::new(n("/bob/laptop/KEY/1")),
+            seq: Seq(seq),
+        };
+        {
+            let st = dev.inner.st.lock();
+            let cut = &st.colls[&c].members.as_ref().unwrap().cuts[0];
+            assert!(!cut.refuses(&id(40)) && !cut.refuses(&id(100)));
+            assert!(cut.refuses(&id(70)), "a seq only a summary listed");
+        }
+        // After his removal Bob signs seq 57, a seq he used elsewhere.
+        assert!(matches!(
+            hand(&dev, &bob, &c, 57, version()),
+            Some(Refusal::OutsideCut(_))
+        ));
+        assert!(matches!(
+            hand(&dev, &bob, &c, 101, version()),
+            Some(Refusal::OutsideCut(_))
+        ));
+        let st = dev.inner.st.lock();
+        assert_eq!(st.colls[&c].applied.get(&id(0).writer), Some(&100));
+        drop(st);
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_sealed_collection_refuses_an_unsealed_version_written_after_its_seal() {
+        let dev = device_in("/alice/laptop", &["/alice", "/bob"]).await;
+        let (c, bob) = (n("/alice/32=data/chat"), n("/bob/laptop"));
+        let bob_key = Writer::new(n("/bob/laptop/KEY/1"));
+        dev.share(&c, share_of(Rule::Log, &["/alice", "/bob"], Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            hand(&dev, &bob, &c, 1, Record::Version(version_body(&c, None))),
+            None
+        );
+        let readers = vec![Audience::Person(n("/alice")), Audience::Person(n("/bob"))];
+        dev.share(&c, share_of(Rule::Log, &["/alice", "/bob"], readers))
+            .await
+            .unwrap();
+        // Written before the seal: inside the record's `since`, kept.
+        assert_eq!(
+            dev.inner
+                .st
+                .lock()
+                .refused
+                .get(&log_name(&bob, Some(&c), 1)),
+            None
+        );
+        // Written by Bob before he heard the seal: refused, and saying why.
+        assert_eq!(
+            hand(&dev, &bob, &c, 2, Record::Version(version_body(&c, None))),
+            Some(Refusal::Unsealed)
+        );
+        // His next version, sealed, does not wait for the refused one.
+        let (epoch, key) = {
+            let st = dev.inner.st.lock();
+            let e = st.colls[&c]
+                .members
+                .as_ref()
+                .unwrap()
+                .epoch
+                .clone()
+                .unwrap();
+            let k = st.keys.key(&c, &e).unwrap();
+            (e, k)
+        };
+        let name = log_name(&bob, Some(&c), 3);
+        let sealed = SealedBody {
+            epoch,
+            ciphertext: seal::seal_payload(&key, &name, &Content::new(), b""),
+        };
+        assert_eq!(
+            hand(
+                &dev,
+                &bob,
+                &c,
+                3,
+                Record::Version(version_body(&c, Some(sealed)))
+            ),
+            None
+        );
+        assert_eq!(
+            dev.inner.st.lock().colls[&c].applied.get(&bob_key),
+            Some(&3)
+        );
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn the_recipient_secret_lives_in_the_key_store_and_made_keys_only_wrapped() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/alice")));
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/journal");
+        dev.share(
+            &c,
+            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/alice"))]),
+        )
+        .await
+        .unwrap();
+        let (public, epoch, key) = {
+            let st = dev.inner.st.lock();
+            let e = st.colls[&c]
+                .members
+                .as_ref()
+                .unwrap()
+                .epoch
+                .clone()
+                .unwrap();
+            let k = st.keys.key(&c, &e).unwrap();
+            (st.keys.recipient.public(), e, k)
+        };
+        let secret = keys
+            .secret(&secret_name(&device))
+            .expect("kept with the keys");
+        assert_eq!(
+            RecipientKey::from_bytes(secret[..].try_into().unwrap()).public(),
+            public
+        );
+        for (name, value) in store.scan_under(&Name::root(), 0) {
+            assert!(
+                !value
+                    .windows(32)
+                    .any(|w| w == secret.as_slice() || w == key.expose()),
+                "{name} holds a secret in the clear"
+            );
+            assert!(
+                !name.has_prefix(&device) || parse_log_name(&name).is_some(),
+                "{name}: only log entries are kept under the device's own prefix"
+            );
+        }
+        dev.shutdown();
+        drop(dev);
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        let st = again.inner.st.lock();
+        assert_eq!(st.keys.recipient.public(), public);
+        assert_eq!(
+            st.keys.key(&c, &epoch).map(|k| *k.expose()),
+            Some(*key.expose()),
+            "the made key comes back after a restart"
+        );
+        drop(st);
+        again.shutdown();
     }
 }

@@ -3,6 +3,8 @@
 //! [`Epoch`] their seal is read in, and the signed, nested [`Summary`] of
 //! what they hold.
 
+use std::collections::BTreeMap;
+
 use ndn_foundation_types::{Hash, Name};
 
 use crate::error::Refusal;
@@ -35,14 +37,17 @@ pub enum Rule {
 /// the keys listed here, so a reader can tell a member from a stranger
 /// posting under the same collection name. [`share`](crate::DataLayer::share)
 /// edits it; removing a member adds a [`Cut`], removing a reader starts a
-/// new [`Epoch`], changing the rule starts the collection again from
-/// [`since`](Self::since). Each revision supersedes the previous one and the
-/// revision number never goes back (model invariant 3).
+/// new [`Epoch`], changing the rule (or sealing a collection that was not)
+/// starts the collection again from [`since`](Self::since). Each revision
+/// supersedes the previous one and the revision number never goes back
+/// (model invariant 3). Records of one revision signed by different devices
+/// of the owner merge ([`Members::merge`]): removals win.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Members {
     /// The collection this record governs.
     pub collection: Name,
-    /// The owner's key, which signs this record.
+    /// The owner's key, which signs this record (of a merge: the highest
+    /// signer key among the records merged).
     pub owner: Writer,
     /// This record's revision.
     pub revision: Seq,
@@ -51,17 +56,23 @@ pub struct Members {
     /// Key-name prefixes whose keys may write (e.g. `/alice`, `/bob`).
     pub writers: Vec<Name>,
     /// Who may read; the collection's seal follows this list. Empty: the
-    /// collection is not sealed. The owner's namespace always reads.
+    /// collection is not sealed. The audience is exactly these readers and
+    /// the device that signed the record starting the [`epoch`](Self::epoch).
     pub readers: Vec<Audience>,
     /// Removals in force: a writer prefix this or an earlier revision
-    /// removed, with what stays accepted of its keys.
+    /// removed, with exactly the versions of its keys that stay accepted.
     pub cuts: Vec<Cut>,
     /// The epoch the collection is sealed in; `None` when it has no
     /// readers listed (not sealed).
     pub epoch: Option<Epoch>,
-    /// Set once the rule changed: the frontier the owner had applied when
-    /// it changed it. Versions inside it stay readable by name and listed
-    /// by `watch`, and stay out of the new rule's state.
+    /// The epoch's key check (spec §9): HKDF-SHA256 of the epoch's key, so
+    /// a reader takes a granted key only if it is the epoch's. Set exactly
+    /// when [`epoch`](Self::epoch) is.
+    pub key_check: Option<[u8; 32]>,
+    /// Set once the rule changed, or the collection was sealed after being
+    /// unsealed: the frontier the owner had applied then. Versions inside
+    /// it stay readable by name and listed by `watch`, and stay out of the
+    /// new rule's state.
     pub since: Option<Frontier>,
     /// Versions outside a cut that the owner signed back in.
     ///
@@ -74,8 +85,8 @@ pub struct Members {
 impl Members {
     /// Why this record refuses version `id`, if it does: a key under a
     /// writer prefix is admitted; else a key under a cut's prefix is
-    /// admitted inside the cut and refused outside it, whatever date it
-    /// claims; else the key is no member.
+    /// admitted if the cut accepts exactly that version and refused
+    /// otherwise, whatever date or seq it claims; else the key is no member.
     pub fn refusal(&self, id: &VersionId) -> Option<Refusal> {
         let key = id.writer.key();
         if self.writers.iter().any(|p| key.has_prefix(p)) {
@@ -87,17 +98,86 @@ impl Members {
             None => Some(Refusal::NotMember),
         }
     }
+
+    /// The one record that `records` — owner-signed records of one
+    /// collection and one revision, by distinct signers — stand for (spec
+    /// §6), and whether it must be resolved by a new record: writers and
+    /// readers are the intersection of theirs (a key is a writer only if
+    /// every record admits it), cuts the union by prefix (the intersection
+    /// of the accepted sets where two cut one prefix), rule and `since`
+    /// those of the highest signer key; the epoch is that of the record with
+    /// the fewest readers (ties: the highest signer key). When the merged
+    /// readers are fewer than that record's, a reader one record removed
+    /// would keep reading in it: the merge is then resolved by a record of
+    /// the next revision in a new epoch. `None` for no records.
+    pub fn merge(records: &[Members]) -> Option<(Members, bool)> {
+        let top = records.iter().max_by(|a, b| a.owner.cmp(&b.owner))?;
+        let covers = |m: &Members, p: &Name| m.writers.iter().any(|q| p.has_prefix(q));
+        let mut writers: Vec<Name> = records
+            .iter()
+            .flat_map(|m| m.writers.iter())
+            .filter(|p| records.iter().all(|m| covers(m, p)))
+            .cloned()
+            .collect();
+        writers.sort();
+        writers.dedup();
+        let broadest: Vec<Name> = writers
+            .iter()
+            .filter(|p| !writers.iter().any(|q| q != *p && p.has_prefix(q)))
+            .cloned()
+            .collect();
+        let readers: Vec<Audience> = top
+            .readers
+            .iter()
+            .filter(|r| records.iter().all(|m| m.readers.contains(r)))
+            .cloned()
+            .collect();
+        let mut cuts: BTreeMap<Name, Cut> = BTreeMap::new();
+        for cut in records.iter().flat_map(|m| m.cuts.iter()) {
+            match cuts.get_mut(&cut.of) {
+                Some(held) => held.accept = held.accept.intersection(&cut.accept),
+                None => {
+                    cuts.insert(cut.of.clone(), cut.clone());
+                }
+            }
+        }
+        let sealing = records
+            .iter()
+            .min_by(|a, b| {
+                a.readers
+                    .len()
+                    .cmp(&b.readers.len())
+                    .then_with(|| b.owner.cmp(&a.owner))
+            })
+            .expect("at least one record");
+        let unresolved = readers.len() < sealing.readers.len();
+        let merged = Members {
+            collection: top.collection.clone(),
+            owner: top.owner.clone(),
+            revision: top.revision,
+            rule: top.rule.clone(),
+            writers: broadest,
+            readers,
+            cuts: cuts.into_values().collect(),
+            epoch: sealing.epoch.clone(),
+            key_check: sealing.key_check,
+            since: top.since.clone(),
+            readmitted: Vec::new(),
+        };
+        Some((merged, unresolved))
+    }
 }
 
 /// The epoch a sealed collection is read in (model primitive "Seal").
 ///
 /// It is named by the members record that started it: the device that
 /// signed that record and the record's seq in its log. Its content key is
-/// derived by that device; readers of the collection's current audience get
-/// it on request, sealed to their own key. Removing a reader starts a new
-/// epoch, so reading moves forward: what a removed reader already holds it
-/// keeps (model invariant 9), and nothing written in the new epoch reaches
-/// it.
+/// 32 random octets that device made when it signed the record; the record
+/// carries the key's check, and a device holding the key grants it, sealed
+/// to the asker's own key, to readers that this record and the newest one
+/// admit. Removing a reader starts a new epoch, so reading moves forward:
+/// what a removed reader already holds it keeps (model invariant 9), and
+/// nothing written in the new epoch reaches it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch {
     /// The device (not key) that signed the record starting the epoch.
@@ -106,20 +186,116 @@ pub struct Epoch {
     pub seq: Seq,
 }
 
-/// A signed "up to here" for a key or a member (model change M3).
+/// Exactly the versions a [`Cut`] keeps, per key: the seqs of the key's
+/// versions in the collection that the cut's signer held verified (spec
+/// §8). Every other version of the cut's keys is outside it, whatever its
+/// seq: a removed writer cannot fill a gap below what was kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Accepted(BTreeMap<Writer, Vec<(u64, u64)>>);
+
+impl Accepted {
+    /// Nothing accepted.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether exactly `id` is accepted.
+    pub fn contains(&self, id: &VersionId) -> bool {
+        let Some(ranges) = self.0.get(&id.writer) else {
+            return false;
+        };
+        let s = id.seq.0;
+        let i = ranges.partition_point(|(lo, _)| *lo <= s);
+        i > 0 && ranges[i - 1].1 >= s
+    }
+
+    /// Accept `id`.
+    pub fn insert(&mut self, id: &VersionId) {
+        self.insert_range(&id.writer, id.seq.0, id.seq.0);
+    }
+
+    /// Accept every seq of `writer` from `lo` to `hi`, inclusive.
+    pub(crate) fn insert_range(&mut self, writer: &Writer, lo: u64, hi: u64) {
+        let ranges = self.0.entry(writer.clone()).or_default();
+        // The ranges that overlap or touch [lo, hi] fold into it.
+        let start = ranges.partition_point(|(_, h)| h.saturating_add(1) < lo);
+        let end = ranges.partition_point(|(l, _)| *l <= hi.saturating_add(1));
+        let (mut lo, mut hi) = (lo, hi);
+        if start < end {
+            lo = lo.min(ranges[start].0);
+            hi = hi.max(ranges[end - 1].1);
+        }
+        ranges.splice(start..end, [(lo, hi)]);
+    }
+
+    /// The highest accepted seq of `writer` at or below `seq`.
+    pub fn highest_at_most(&self, writer: &Writer, seq: u64) -> Option<u64> {
+        let ranges = self.0.get(writer)?;
+        let i = ranges.partition_point(|(lo, _)| *lo <= seq);
+        (i > 0).then(|| ranges[i - 1].1.min(seq))
+    }
+
+    /// The accepted seqs per key, as ascending, disjoint, inclusive ranges.
+    pub fn iter(&self) -> impl Iterator<Item = (&Writer, &[(u64, u64)])> {
+        self.0.iter().map(|(w, r)| (w, r.as_slice()))
+    }
+
+    /// Whether nothing is accepted.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// What both accept.
+    pub fn intersection(&self, other: &Accepted) -> Accepted {
+        let mut out = Accepted::new();
+        for (w, mine) in &self.0 {
+            let Some(theirs) = other.0.get(w) else {
+                continue;
+            };
+            let (mut i, mut j) = (0, 0);
+            while i < mine.len() && j < theirs.len() {
+                let lo = mine[i].0.max(theirs[j].0);
+                let hi = mine[i].1.min(theirs[j].1);
+                if lo <= hi {
+                    out.insert_range(w, lo, hi);
+                }
+                if mine[i].1 < theirs[j].1 {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+impl FromIterator<VersionId> for Accepted {
+    fn from_iter<I: IntoIterator<Item = VersionId>>(iter: I) -> Self {
+        let mut a = Accepted::new();
+        for id in iter {
+            a.insert(&id);
+        }
+        a
+    }
+}
+
+/// A signed "this much and no more" for a key or a member (model change
+/// M3).
 ///
-/// Everything by the keys under [`of`](Self::of) that lies inside
-/// [`accept`](Self::accept) stays valid; anything else by those keys is
-/// refused, whatever date it claims. It replaces clock-based signing-time
-/// validity. A reader that receives a cut re-checks everything it already
-/// accepted from those keys against it (open item "before a cut arrives").
-/// Cuts on removal are filled by slice 2, revocation cuts by slice 5.
+/// Exactly the versions by the keys under [`of`](Self::of) that
+/// [`accept`](Self::accept) lists stay valid; anything else by those keys is
+/// refused, whatever date or seq it claims. It replaces clock-based
+/// signing-time validity. A reader that receives a cut re-checks everything
+/// it already accepted from those keys against it (open item "before a cut
+/// arrives"). Cuts on removal are filled by slice 2, revocation cuts by
+/// slice 5.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Cut {
     /// The key, or the prefix of a member's keys, being ended.
     pub of: Name,
-    /// What stays valid: the frontier others had seen.
-    pub accept: Frontier,
+    /// What stays valid: exactly the versions the signer held verified.
+    pub accept: Accepted,
     /// The key that signed the cut (the collection owner, or the namespace
     /// authority for a revocation).
     pub signer: Writer,
@@ -127,7 +303,7 @@ pub struct Cut {
 
 impl Cut {
     /// Whether this cut refuses `id`: its key falls under [`of`](Self::of)
-    /// and it lies outside [`accept`](Self::accept).
+    /// and [`accept`](Self::accept) does not list it.
     pub fn refuses(&self, id: &VersionId) -> bool {
         id.writer.key().has_prefix(&self.of) && !self.accept.contains(id)
     }
@@ -179,18 +355,46 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_keeps_what_others_had_seen_and_refuses_the_rest() {
+    fn a_cut_keeps_exactly_what_its_signer_held_and_refuses_the_rest() {
         let cut = Cut {
             of: "/bob".parse().unwrap(),
-            accept: [id("/bob/phone/KEY/1", 41)].into_iter().collect(),
+            accept: [id("/bob/phone/KEY/1", 40), id("/bob/phone/KEY/1", 100)]
+                .into_iter()
+                .collect(),
             signer: Writer::new("/alice/laptop/KEY/1".parse().unwrap()),
         };
-        assert!(!cut.refuses(&id("/bob/phone/KEY/1", 41)));
-        assert!(cut.refuses(&id("/bob/phone/KEY/1", 42)));
+        assert!(!cut.refuses(&id("/bob/phone/KEY/1", 40)));
+        assert!(!cut.refuses(&id("/bob/phone/KEY/1", 100)));
+        assert!(cut.refuses(&id("/bob/phone/KEY/1", 101)));
+        // A seq the writer used elsewhere, below what was kept: a gap it
+        // cannot fill after its removal.
+        assert!(cut.refuses(&id("/bob/phone/KEY/1", 57)));
+        assert_eq!(
+            cut.accept
+                .highest_at_most(&id("/bob/phone/KEY/1", 0).writer, 99),
+            Some(40)
+        );
         // A key of the member never seen at all is outside the cut too.
         assert!(cut.refuses(&id("/bob/laptop/KEY/1", 1)));
         // Keys outside the member are not touched.
         assert!(!cut.refuses(&id("/carol/phone/KEY/1", 99)));
+    }
+
+    #[test]
+    fn accepted_sets_fold_ranges_and_intersect() {
+        let w = |s| id("/bob/phone/KEY/1", s);
+        let a: Accepted = [1, 2, 3, 7, 5, 6, 9].into_iter().map(w).collect();
+        assert_eq!(
+            a.iter().map(|(_, r)| r.to_vec()).collect::<Vec<_>>(),
+            vec![vec![(1, 3), (5, 7), (9, 9)]]
+        );
+        let b: Accepted = [2, 3, 4, 5, 9].into_iter().map(w).collect();
+        let both = a.intersection(&b);
+        assert_eq!(
+            both.iter().map(|(_, r)| r.to_vec()).collect::<Vec<_>>(),
+            vec![vec![(2, 3), (5, 5), (9, 9)]]
+        );
+        assert!(!both.contains(&w(4)) && !both.contains(&w(7)));
     }
 
     #[test]
@@ -210,6 +414,7 @@ mod tests {
             readers: Vec::new(),
             cuts: vec![cut.clone()],
             epoch: None,
+            key_check: None,
             since: None,
             readmitted: Vec::new(),
         };
@@ -226,6 +431,87 @@ mod tests {
         // Written back in, the prefix's keys are writers again.
         m.writers.push("/bob".parse().unwrap());
         assert_eq!(m.refusal(&id("/bob/phone/KEY/1", 42)), None);
+    }
+
+    #[test]
+    fn concurrent_records_merge_so_that_removals_win() {
+        let n = |s: &str| -> Name { s.parse().unwrap() };
+        let person = |s: &str| Audience::Person(n(s));
+        let record =
+            |signer: &str, seq: u64, writers: &[&str], readers: &[&str], cuts: Vec<Cut>| Members {
+                collection: n("/alice/32=data/docs/plan"),
+                owner: Writer::new(n(&format!("{signer}/KEY/1"))),
+                revision: Seq(2),
+                rule: Rule::Log,
+                writers: writers.iter().map(|w| n(w)).collect(),
+                readers: readers.iter().map(|r| person(r)).collect(),
+                cuts,
+                epoch: Some(Epoch {
+                    creator: n(signer),
+                    seq: Seq(seq),
+                }),
+                key_check: Some([seq as u8; 32]),
+                since: None,
+                readmitted: Vec::new(),
+            };
+        let cut = |of: &str, seqs: &[u64]| Cut {
+            of: n(of),
+            accept: seqs.iter().map(|s| id("/bob/phone/KEY/1", *s)).collect(),
+            signer: Writer::new(n("/alice/laptop/KEY/1")),
+        };
+        // The laptop removes Bob (writer and reader); the phone removes Carol.
+        let laptop = record(
+            "/alice/laptop",
+            9,
+            &["/alice"],
+            &["/alice", "/carol"],
+            vec![cut("/bob", &[3, 5])],
+        );
+        let phone = record(
+            "/alice/phone",
+            4,
+            &["/alice", "/bob"],
+            &["/alice", "/bob"],
+            vec![cut("/bob", &[3])],
+        );
+        let (m, unresolved) = Members::merge(&[laptop.clone(), phone.clone()]).unwrap();
+        assert_eq!(m.writers, vec![n("/alice")]);
+        assert_eq!(m.readers, vec![person("/alice")]);
+        assert_eq!(m.cuts.len(), 1);
+        assert!(
+            m.cuts[0].refuses(&id("/bob/phone/KEY/1", 5)),
+            "same prefix: intersection"
+        );
+        assert!(!m.cuts[0].refuses(&id("/bob/phone/KEY/1", 3)));
+        // Two readers each: the highest signer's epoch, which the reader the
+        // other removed holds — so the merge must be resolved.
+        let top = laptop.owner.clone().max(phone.owner.clone());
+        assert_eq!(m.owner, top);
+        assert!(unresolved);
+        // One record only removes: its epoch is new to the removed reader and
+        // nothing needs resolving.
+        let adds = record(
+            "/alice/phone",
+            4,
+            &["/alice"],
+            &["/alice", "/carol", "/dave"],
+            Vec::new(),
+        );
+        let (m, unresolved) = Members::merge(&[laptop.clone(), adds]).unwrap();
+        assert_eq!(m.readers, vec![person("/alice"), person("/carol")]);
+        assert_eq!(m.epoch, laptop.epoch);
+        assert_eq!(m.key_check, laptop.key_check);
+        assert!(!unresolved);
+        // A writer prefix is kept where every record admits its keys.
+        let narrower = record(
+            "/alice/phone",
+            4,
+            &["/alice/phone"],
+            &["/alice"],
+            Vec::new(),
+        );
+        let (m, _) = Members::merge(&[laptop, narrower]).unwrap();
+        assert_eq!(m.writers, vec![n("/alice/phone")]);
     }
 
     #[test]

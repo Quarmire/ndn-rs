@@ -45,7 +45,7 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::collection::{Epoch, Rule};
+use crate::collection::{Accepted, Epoch, Rule};
 use crate::version::{Audience, Content, Frontier, Keep, Seal, Seq, Timestamp, TypeId, Writer};
 
 /// TLV-TYPE numbers (0x0520–0x057F).
@@ -126,8 +126,8 @@ pub mod tlv {
     pub const WRITER: u64 = 0x0568;
     /// A members record's removals in force: `Cut*`, by prefix.
     pub const CUTS: u64 = 0x056A;
-    /// One removal: `Name` (the removed writer prefix), `Frontier` (what
-    /// stays accepted of its keys).
+    /// One removal: `Name` (the removed writer prefix), then per key whose
+    /// versions stay accepted, `Writer` and `Entries` (exactly those seqs).
     pub const CUT: u64 = 0x056C;
     /// The epoch a sealed collection is read in: `Name` (the device that
     /// signed the record starting it), `Seq` (that record's seq).
@@ -141,13 +141,15 @@ pub mod tlv {
     pub const CIPHERTEXT: u64 = 0x0574;
     /// A device's seal key: 32 octets, an X25519 public key.
     pub const SEAL_KEY: u64 = 0x0576;
-    /// What a grant answers: `Name` (the asker's seal key name), then for a
-    /// collection's epoch key `Name` (the collection) and `SealEpoch`.
+    /// What a grant answers: `Name` (the asker's seal key name), `Name` (the
+    /// collection), `SealEpoch`.
     pub const GRANT_ASK: u64 = 0x0578;
     /// A grant: `EphemeralKey`, `Ciphertext` (the key, wrapped).
     pub const GRANT: u64 = 0x057A;
     /// The granter's ephemeral X25519 public key: 32 octets.
     pub const EPHEMERAL_KEY: u64 = 0x057C;
+    /// An epoch key's check: 32 octets, HKDF-SHA256 of the key (spec §9).
+    pub const KEY_CHECK: u64 = 0x057E;
 }
 
 /// Keyword components of the layer's names.
@@ -158,6 +160,10 @@ const PAGE: &[u8] = b"page";
 const STATE: &[u8] = b"state";
 const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
+
+/// The most seqs one summary node lists in its `Entries` and
+/// `MembersEntries` together; a node listing more is refused.
+pub const NODE_SEQS: usize = 65_536;
 
 /// A summary node lists its children inline up to this many; beyond it they
 /// are paged into 16 buckets by the first nibble of SHA-256 of the child's
@@ -497,16 +503,16 @@ pub fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
     Some((name_of(&comps[..at]), public))
 }
 
-/// What a grant answers: the master secret of the granter (no collection),
-/// or the content key of one epoch of a collection, for the holder of a
-/// seal key.
+/// What a grant answers: the content key of one epoch of a collection, for
+/// the holder of a seal key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GrantAsk {
     /// The asker's seal key's name (`<device>/32=seal/<public key>`).
     pub seal_key: Name,
-    /// The collection and epoch whose key is asked for; `None` asks for the
-    /// granter's master secret.
-    pub of: Option<(Name, Epoch)>,
+    /// The collection whose epoch key is asked for.
+    pub collection: Name,
+    /// The epoch.
+    pub epoch: Epoch,
 }
 
 fn write_epoch(w: &mut TlvWriter, e: &Epoch) {
@@ -540,10 +546,8 @@ pub fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
     let mut w = TlvWriter::new();
     w.write_nested(tlv::GRANT_ASK, |w| {
         write_name(w, &ask.seal_key);
-        if let Some((c, e)) = &ask.of {
-            write_name(w, c);
-            write_epoch(w, e);
-        }
+        write_name(w, &ask.collection);
+        write_epoch(w, &ask.epoch);
     });
     granter
         .clone()
@@ -574,15 +578,43 @@ pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
         Ok(true)
     })
     .ok()?;
-    let mut names = names.into_iter();
-    let seal_key = names.next()?;
+    let [seal_key, collection]: [Name; 2] = names.try_into().ok()?;
     parse_seal_key_name(&seal_key)?;
-    let of = match (names.next(), epoch, names.next()) {
-        (None, None, None) => None,
-        (Some(c), Some(e), None) if is_collection_name(&c) => Some((c, e)),
-        _ => return None,
-    };
-    Some((name_of(&comps[..at]), GrantAsk { seal_key, of }))
+    if !is_collection_name(&collection) {
+        return None;
+    }
+    Some((
+        name_of(&comps[..at]),
+        GrantAsk {
+            seal_key,
+            collection,
+            epoch: epoch?,
+        },
+    ))
+}
+
+/// The value of a component naming one epoch of one collection: the
+/// collection's Name TLV, then its `SealEpoch`.
+pub(crate) fn encode_epoch_of(c: &Name, e: &Epoch) -> Bytes {
+    let mut w = TlvWriter::new();
+    write_name(&mut w, c);
+    write_epoch(&mut w, e);
+    w.finish()
+}
+
+/// Parse [`encode_epoch_of`].
+pub(crate) fn decode_epoch_of(value: Bytes) -> Option<(Name, Epoch)> {
+    let (mut c, mut e) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME if c.is_none() => c = Some(read_name(v)?),
+            tlv::SEAL_EPOCH => e = Some(read_epoch(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+    .ok()?;
+    Some((c?, e?))
 }
 
 /// Encode a seal key's Content: the X25519 public key.
@@ -864,8 +896,8 @@ pub struct SealedBody {
 pub struct CutBody {
     /// The removed writer prefix.
     pub of: Name,
-    /// What stays accepted of its keys.
-    pub accept: Frontier,
+    /// Exactly the versions of its keys that stay accepted.
+    pub accept: Accepted,
 }
 
 /// The body of a members log entry.
@@ -885,7 +917,10 @@ pub struct MembersBody {
     pub cuts: Vec<CutBody>,
     /// The epoch the collection is sealed in (readers listed only).
     pub epoch: Option<Epoch>,
-    /// The frontier the owner had applied when the rule last changed.
+    /// The epoch key's check; present exactly when `epoch` is.
+    pub key_check: Option<[u8; 32]>,
+    /// The frontier the owner had applied when the rule last changed (or
+    /// when it sealed a collection that was not sealed).
     pub since: Option<Frontier>,
 }
 
@@ -990,13 +1025,17 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
                 for c in &b.cuts {
                     w.write_nested(tlv::CUT, |w| {
                         write_name(w, &c.of);
-                        write_frontier(w, &c.accept);
+                        for (writer, ranges) in c.accept.iter() {
+                            w.write_nested(tlv::WRITER, |w| write_name(w, writer.key()));
+                            write_ranges(w, tlv::ENTRIES, ranges);
+                        }
                     });
                 }
             });
         }
-        if let Some(e) = &b.epoch {
+        if let (Some(e), Some(check)) = (&b.epoch, &b.key_check) {
             write_epoch(w, e);
+            w.write_tlv(tlv::KEY_CHECK, check);
         }
         if let Some(since) = &b.since {
             w.write_nested(tlv::RULE_SINCE, |w| write_frontier(w, since));
@@ -1167,6 +1206,7 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     let mut readers = None;
     let mut cuts = Vec::new();
     let mut epoch = None;
+    let mut key_check = None;
     let mut since = None;
     each(value, |typ, v| {
         match typ {
@@ -1206,23 +1246,14 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
                     if t != tlv::CUT {
                         return Ok(false);
                     }
-                    let (mut of, mut accept) = (None, None);
-                    each(v, |t, v| {
-                        match t {
-                            tlv_type::NAME => of = Some(read_name(v)?),
-                            tlv::FRONTIER => accept = Some(read_frontier(v)?),
-                            _ => return Ok(false),
-                        }
-                        Ok(true)
-                    })?;
-                    let (Some(of), Some(accept)) = (of, accept) else {
-                        return Err(bad("a cut names a prefix and a frontier"));
-                    };
-                    cuts.push(CutBody { of, accept });
+                    cuts.push(read_cut(v)?);
                     Ok(true)
                 })?;
             }
             tlv::SEAL_EPOCH => epoch = Some(read_epoch(v)?),
+            tlv::KEY_CHECK => {
+                key_check = Some(read_digest(&v).map_err(|_| bad("a key check is 32 octets"))?)
+            }
             tlv::RULE_SINCE => {
                 each(v, |t, v| {
                     if t != tlv::FRONTIER {
@@ -1237,6 +1268,11 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
         Ok(true)
     })?;
     let missing = |what| bad(format!("a members record has {what}"));
+    if epoch.is_some() != key_check.is_some() {
+        return Err(bad(
+            "a members record that names an epoch carries its key check, and only then",
+        ));
+    }
     Ok(MembersBody {
         collection: collection.ok_or_else(|| missing("a collection"))?,
         revision: revision.ok_or_else(|| missing("a revision"))?,
@@ -1245,8 +1281,85 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
         readers: readers.ok_or_else(|| missing("readers"))?,
         cuts,
         epoch,
+        key_check,
         since,
     })
+}
+
+/// Decode one `Cut`: its prefix, then per key `Writer` and `Entries`, keys
+/// ascending, each key's ranges ascending and disjoint.
+fn read_cut(value: Bytes) -> Result<CutBody, WireError> {
+    let mut of = None;
+    let mut accept = Accepted::new();
+    let mut writer: Option<Writer> = None;
+    let mut last: Option<Writer> = None;
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME if of.is_none() => of = Some(read_name(v)?),
+            tlv::WRITER => {
+                if writer.is_some() {
+                    return Err(bad("a cut's writer is followed by its entries"));
+                }
+                writer = Some(Writer::new(read_writer(v)?));
+            }
+            tlv::ENTRIES => {
+                let w = writer
+                    .take()
+                    .ok_or_else(|| bad("a cut's entries follow their writer"))?;
+                if last.as_ref().is_some_and(|l| *l >= w) {
+                    return Err(bad("a cut lists its writers once each, ascending"));
+                }
+                let ranges = read_ranges(v)?;
+                check_ranges(&ranges, u64::MAX, usize::MAX)?;
+                for (lo, hi) in ranges {
+                    accept.insert_range(&w, lo, hi);
+                }
+                last = Some(w);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    if writer.is_some() {
+        return Err(bad("a cut's writer is followed by its entries"));
+    }
+    let of = of.ok_or_else(|| bad("a cut names a prefix"))?;
+    Ok(CutBody { of, accept })
+}
+
+/// Read a `Writer` TLV's value: one Name, a key.
+fn read_writer(v: Bytes) -> Result<Name, WireError> {
+    let mut r = TlvReader::new(v);
+    let (t, v) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if t != tlv_type::NAME || !r.is_empty() {
+        return Err(bad("a writer is a key name"));
+    }
+    read_name(v)
+}
+
+/// Check seq ranges read from a record: ascending and disjoint, none above
+/// `head`, at most `most` seqs in all.
+fn check_ranges(ranges: &[(u64, u64)], head: u64, most: usize) -> Result<(), WireError> {
+    let mut prev: Option<u64> = None;
+    let mut count: u128 = 0;
+    for (lo, hi) in ranges {
+        if prev.is_some_and(|p| *lo <= p) {
+            return Err(bad("seq ranges are ascending and disjoint"));
+        }
+        if *hi > head {
+            return Err(bad(format!(
+                "a seq range reaches {hi}, above the node's head {head}"
+            )));
+        }
+        count += u128::from(hi - lo) + 1;
+        prev = Some(*hi);
+    }
+    if count > most as u128 {
+        return Err(bad(format!(
+            "a node lists {count} seqs; at most {most} are listed in one node"
+        )));
+    }
+    Ok(())
 }
 
 // ---- summaries --------------------------------------------------------------------------------
@@ -1355,14 +1468,7 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => subject = Some(read_name(v)?),
-            tlv::WRITER => {
-                let mut r = TlvReader::new(v);
-                let (t, v) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
-                if t != tlv_type::NAME {
-                    return Err(bad("a summary's writer is a key name"));
-                }
-                writer = Some(read_name(v)?);
-            }
+            tlv::WRITER => writer = Some(read_writer(v)?),
             tlv::SEQ => head = Some(read_nni(&v)?),
             tlv::PAGE_PATH => page = Some(v),
             tlv::ENTRIES => entries = read_ranges(v)?,
@@ -1435,10 +1541,13 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
         Ok(true)
     })?;
     let missing = |what| bad(format!("a summary node has {what}"));
+    let head = head.ok_or_else(|| missing("a head"))?;
+    check_ranges(&entries, head, NODE_SEQS)?;
+    check_ranges(&members, head, NODE_SEQS - seqs_in(&entries))?;
     Ok(NodeBody {
         subject: subject.ok_or_else(|| missing("a subject"))?,
         writer: writer.ok_or_else(|| missing("a writer"))?,
-        head: head.ok_or_else(|| missing("a head"))?,
+        head,
         page,
         entries,
         members,
@@ -1465,6 +1574,11 @@ pub fn bucket_of(component: &NameComponent, depth: usize) -> u8 {
 pub fn implicit_digest(wire: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(wire).into()
+}
+
+/// How many seqs `ranges` (checked: disjoint, at most [`NODE_SEQS`]) hold.
+fn seqs_in(ranges: &[(u64, u64)]) -> usize {
+    ranges.iter().map(|(lo, hi)| (hi - lo) as usize + 1).sum()
 }
 
 /// The seqs of ranges, ascending.
@@ -1602,17 +1716,19 @@ mod tests {
             readers: vec![Audience::Person(n("/alice"))],
             cuts: vec![CutBody {
                 of: n("/bob"),
-                accept: [crate::VersionId {
-                    writer: Writer::new(n("/bob/laptop/KEY/1")),
-                    seq: Seq(41),
-                }]
-                .into_iter()
-                .collect(),
+                accept: [40, 41, 100]
+                    .into_iter()
+                    .map(|s| crate::VersionId {
+                        writer: Writer::new(n("/bob/laptop/KEY/1")),
+                        seq: Seq(s),
+                    })
+                    .collect(),
             }],
             epoch: Some(Epoch {
                 creator: n("/alice/laptop"),
                 seq: Seq(7),
             }),
+            key_check: Some([7; 32]),
             since: None,
         };
         let wire = encode_members(&body);
@@ -1626,8 +1742,57 @@ mod tests {
             });
             w.finish()
         };
-        assert_eq!(decode_record(with(0x057E)), Ok(Record::Members(body)));
-        assert!(decode_record(with(0x057F)).is_err());
+        assert_eq!(
+            decode_record(wire.clone()),
+            Ok(Record::Members(body.clone()))
+        );
+        // Beyond this revision's numbers: a later revision's fields.
+        assert_eq!(
+            decode_record(with(0x0580)),
+            Ok(Record::Members(body.clone()))
+        );
+        assert!(decode_record(with(0x0581)).is_err());
+        // An epoch comes with its key check.
+        let unchecked = MembersBody {
+            key_check: None,
+            ..body
+        };
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::MEMBERS_RECORD, |w| {
+            let mut r = TlvReader::new(encode_members(&unchecked));
+            let (_, inner) = r.read_tlv().unwrap();
+            w.write_raw(&inner);
+            write_epoch(w, unchecked.epoch.as_ref().unwrap());
+        });
+        assert!(decode_record(w.finish()).is_err());
+    }
+
+    #[test]
+    fn a_node_listing_entries_beyond_its_head_or_out_of_order_or_too_many_is_refused() {
+        let node = |head: u64, entries: Vec<(u64, u64)>| NodeBody {
+            subject: n("/alice/32=data/notes"),
+            writer: n("/alice/laptop/KEY/1"),
+            head,
+            page: None,
+            entries,
+            members: vec![(1, 1)],
+            branches: Branches::Children(Vec::new()),
+        };
+        let ok = node(9, vec![(2, 4), (6, 9)]);
+        assert_eq!(decode_node(encode_node(&ok)), Ok(ok));
+        for (head, entries, why) in [
+            (9, vec![(2, 10)], "above the node's head"),
+            (9, vec![(6, 9), (2, 4)], "ascending and disjoint"),
+            (9, vec![(2, 6), (5, 9)], "ascending and disjoint"),
+            (u64::MAX, vec![(2, u64::MAX)], "at most"),
+            (70_000, vec![(2, 65_537)], "at most"),
+        ] {
+            let refused = decode_node(encode_node(&node(head, entries)));
+            assert!(
+                refused.as_ref().is_err_and(|e| e.0.contains(why)),
+                "{refused:?}, expected {why}"
+            );
+        }
     }
 
     #[test]
@@ -1666,14 +1831,18 @@ mod tests {
         );
         let key = seal_key_name(&n("/bob/phone"), &[9; 32]);
         assert_eq!(parse_seal_key_name(&key), Some((n("/bob/phone"), [9; 32])));
-        for of in [None, Some((n("/alice/32=data/docs/plan"), epoch))] {
-            let ask = GrantAsk {
-                seal_key: key.clone(),
-                of,
-            };
-            let name = grant_name(&n("/alice/laptop"), &ask);
-            assert_eq!(parse_grant_name(&name), Some((n("/alice/laptop"), ask)));
-        }
+        let ask = GrantAsk {
+            seal_key: key.clone(),
+            collection: n("/alice/32=data/docs/plan"),
+            epoch: epoch.clone(),
+        };
+        let name = grant_name(&n("/alice/laptop"), &ask);
+        assert_eq!(parse_grant_name(&name), Some((n("/alice/laptop"), ask)));
+        let c = n("/alice/32=data/docs/plan");
+        assert_eq!(
+            decode_epoch_of(encode_epoch_of(&c, &epoch)),
+            Some((c, epoch))
+        );
         assert_eq!(
             decode_grant(encode_grant(&[1; 32], b"wrapped")),
             Ok(([1; 32], Bytes::from_static(b"wrapped")))

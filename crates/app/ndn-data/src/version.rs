@@ -47,9 +47,8 @@ pub struct VersionId {
 ///
 /// Because a writer's versions form one numbered log, `writer ≤ seq` names
 /// all of that writer's versions up to `seq`. A frontier is used as a
-/// version's parents (what its writer had seen), as a collection's state
-/// (what a summary or a merged value covers), and as the accepted side of a
-/// [`Cut`](crate::Cut). It never refers to a clock.
+/// version's parents (what its writer had seen) and as a collection's state
+/// (what a summary or a merged value covers). It never refers to a clock.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Frontier(BTreeMap<Writer, Seq>);
 

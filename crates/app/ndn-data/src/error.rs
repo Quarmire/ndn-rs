@@ -38,7 +38,8 @@ pub enum NextStep {
 /// Why a version was refused. A refused version is never served as data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Refusal {
-    /// Its key was cut and it lies outside the cut, whatever date it claims.
+    /// Its key was cut and the cut does not list it, whatever date or seq
+    /// it claims.
     OutsideCut(Cut),
     /// Its key is not a writer of the collection, by the members record and
     /// the trust schema.
@@ -49,6 +50,11 @@ pub enum Refusal {
     /// It is a summary or members record older than one already seen from
     /// the same signer.
     Rollback,
+    /// It is not sealed, and the collection's members record seals the
+    /// collection: its writer wrote it before hearing the record that sealed
+    /// it. Versions inside the record's `since` (written before the seal)
+    /// are not refused for this.
+    Unsealed,
 }
 
 impl std::fmt::Display for Refusal {
@@ -58,12 +64,22 @@ impl std::fmt::Display for Refusal {
                 let accepted = cut
                     .accept
                     .iter()
-                    .map(|(w, s)| format!("{} up to {}", w.key(), s.0))
+                    .map(|(w, ranges)| {
+                        let seqs = ranges
+                            .iter()
+                            .map(|(lo, hi)| match lo == hi {
+                                true => lo.to_string(),
+                                false => format!("{lo}–{hi}"),
+                            })
+                            .collect::<Vec<_>>();
+                        format!("{} seq {}", w.key(), seqs.join(", "))
+                    })
                     .collect::<Vec<_>>();
                 write!(
                     f,
-                    "its key lies under {}, which the collection's owner removed, and it is \
-                     outside the cut that accepts {}, whatever date it claims; ask the owner",
+                    "its key lies under {}, which the collection's owner removed, and the cut \
+                     accepts exactly {}, which this version is not, whatever date or seq it \
+                     claims; ask the owner",
                     cut.of,
                     if accepted.is_empty() {
                         "nothing of it".to_owned()
@@ -82,6 +98,11 @@ impl std::fmt::Display for Refusal {
             Refusal::Rollback => {
                 f.write_str("it is older than one already verified from the same signer")
             }
+            Refusal::Unsealed => f.write_str(
+                "it is not sealed, and the collection's members record seals it: its writer \
+                 wrote it before hearing the record that sealed the collection; the writer \
+                 writes it again, sealed",
+            ),
         }
     }
 }
@@ -181,6 +202,8 @@ impl DataError {
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
+                // Final: only its writer can write it again, sealed.
+                Refusal::Unsealed => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,

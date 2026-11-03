@@ -198,16 +198,19 @@ A reader applies an admitted version `v = (w, s)` of collection `C` only
 when
 
 1. every entry of `w` in `C` below `s` — as `w`'s summary (§7) lists them —
-   is applied, and
+   is applied, unless it never applies: the record in force refuses it by
+   its key (a cut that does not list it, §8), or it was held and refused for
+   what it carries (`Unsealed`, §9; an operation the rule refuses), and
 2. for every `(y, t)` in `v`'s parents, the reader has applied `y`'s entries
    in `C` up to `t`.
 
 Until then `v` waits. The state's frontier `at` is, per writer, the highest
-seq applied; by these rules every entry at or below it is applied, so `at`
-names exactly the versions the value is computed from. A parent `(y, t)`
-that a cut refuses (§8) is needed only up to what the cut accepts of `y`:
-a version written on top of refused work is not held back by it (what of
-the refused work its operation depended on, the merge function decides).
+seq applied; by these rules every entry at or below it that applies at all
+is applied, so `at` names exactly the versions the value is computed from.
+A parent `(y, t)` that never applies is needed only up to the highest
+version of `y` below it that does (for a cut, the highest it accepts): a
+version written on top of refused work is not held back by it (what of the
+refused work its operation depended on, the merge function decides).
 
 ## 6. Members — slices 1, 2
 
@@ -215,40 +218,66 @@ The members record is signed by a device of the collection's owner
 namespace (the owner rule, §3). It lists the rule, the key-name prefixes
 that may write — of any namespace (`/bob` writes into
 `/alice/32=data/docs/plan`) — the audience that may read, the cuts of
-removed writers, the epoch the collection is sealed in, and, once the rule
-changed, where the current rule starts.
+removed writers, the epoch the collection is sealed in with its key check,
+and, once the rule changed, where the current rule starts.
 
 - A members record is an entry of its signer's log, `<D>/32=log/<C>/seq=<n>`
   with Content `MembersRecord` (§16.2). Its `Revision` is one more than the
-  highest revision its signer had accepted for `C` (1 for the first).
+  revision of the record in force at its signer (1 for the first).
 - A reader MUST ignore a members record that the owner rule (§3) does not
-  give to `C`'s namespace. Of the records it holds for `C` it uses the one
-  with the highest `(Revision, signer key name)`; a lower one never
-  replaces it.
-- **Admission.** A reader MUST apply to `C` only versions the newest record
-  admits (and, as for every entry, the trust schema admits under the
+  give to `C`'s namespace. The **record in force** is the merge of the
+  records it holds of the highest `Revision`, one per signer (its latest);
+  a record of a lower revision never changes it.
+- **Concurrent records.** Two devices of the owner may each sign revision
+  `n` from their own view (the laptop, offline, removes Bob while the phone
+  removes Carol). Their records merge, whatever order they arrive in:
+  writers are the intersection (a key is a writer only if every record
+  admits it), readers the intersection, cuts the union by prefix (where two
+  records cut one prefix, the intersection of what they accept), rule and
+  `Since` those of the record with the highest signer key name, and the
+  epoch (with its key check) that of the record with the fewest readers
+  (ties: the highest signer key name). Removals win. When the merged
+  readers are fewer than that record's — a reader one record removed is
+  still of the epoch another kept — the merge is **resolved**: a device of
+  the owner namespace that holds it and is of its audience MUST sign
+  revision `n + 1` with the merged writers, readers, cuts and rule, in a new
+  epoch. Devices resolving at once sign records of one revision and one
+  audience, whose merge needs no more.
+- **Admission.** A reader MUST apply to `C` only versions the record in
+  force admits (and, as for every entry, the trust schema admits under the
   writer's own name): a key under a writer prefix is admitted; else a key
-  under the prefix of one of the record's cuts is admitted inside the cut's
-  accepted frontier and refused outside it, `OutsideCut`, whatever date it
-  claims; any other key is refused `NotMember`. Versions that arrive before
-  any members record wait for one. Admission depends on the newest record
-  only, so every record that replaces another re-checks everything held of
+  under the prefix of one of the record's cuts is admitted exactly when the
+  cut lists that version, and refused otherwise, `OutsideCut`, whatever
+  date or seq it claims; any other key is refused `NotMember`. Versions that
+  arrive before any members record wait for one. Admission depends on the
+  record in force only, so every change of it re-checks everything held of
   `C` (§8).
 - **Removing a writer.** A record that drops a writer prefix `P` of the
-  previous revision MUST carry a cut of `P` whose accepted frontier is, per
-  key under `P`, the highest seq of it in `C` the signer had seen: the
-  versions it held and the entries that writers' verified summaries listed.
-  Cuts carry over to later revisions; a revision whose writers cover a cut's
-  prefix again drops that cut, and the prefix's keys are admitted again
-  (all of their versions, the owner having written them back in).
-- **Readers.** The audience is a list of people (a namespace), devices and
-  groups. A group is a collection: its members are the readers of the
-  group collection's newest members record. The collection's own
-  namespace always reads. A record with readers seals the collection
-  (§9) and names its epoch; a record that drops a reader — or whose group
-  dropped one — starts a new epoch; one that only adds keeps it.
+  record in force MUST carry a cut of `P` that lists, per key under `P`,
+  exactly the seqs of that key's versions in `C` the signer holds verified
+  — never entries a summary only listed. Cuts carry over to later
+  revisions; a revision whose writers cover a cut's prefix again drops that
+  cut, and the prefix's keys are admitted again (all of their versions, the
+  owner having written them back in).
+- **Readers.** The audience is exactly the readers listed — people (a
+  namespace), devices and groups — plus the device that signed the record
+  starting the epoch (§9). A group is a collection: its members are the
+  readers its own record in force lists. No device reads for being of the
+  owner's namespace: the host default record lists
+  `Person(<own namespace>)`, and a record listing `Device(/alice/laptop)`
+  alone leaves Alice's phone out of its epoch and every later one. A
+  record with readers seals the collection (§9) and names its epoch; a
+  record that drops a reader starts a new epoch; one that only adds keeps
+  it and copies its key check.
+- **Groups.** A device that holds a record naming `Group(G)` follows `G`
+  (§12), so that it holds `G`'s record and hears its changes. When a device
+  of `C`'s namespace that is of `C`'s audience takes a record of `G` that
+  drops a reader, it MUST sign a new record of `C` in a new epoch, whoever
+  owns `G`. Several owner devices rotating at once sign concurrent records,
+  which merge as above.
 - **Changing the rule.** A record whose rule differs from the previous
-  revision's carries `Since`: the frontier its signer had applied, joined
+  revision's — or that seals a collection the previous revision left
+  unsealed — carries `Since`: the frontier its signer had applied, joined
   with the previous `Since`. Versions inside `Since` stay held, readable by
   name and listed by `watch`, and are applied as history only: they order
   later versions (§5.2) and never enter the new rule's state. A state of
@@ -328,6 +357,10 @@ A reader:
   if the writer moved meanwhile, and descend from what it has processed.
   One complete descent of a root gives the reader everything that root
   covers in what it follows, however fast the writer keeps putting;
+- MUST refuse a node (or page) whose `Entries` or `MembersEntries` ranges
+  are not ascending and disjoint, reach above its `Head`, or list more than
+  65,536 seqs together: a node lists no entry its head does not cover, and
+  one node never makes a reader expand an unbounded list;
 - fetches the entries the visited nodes list that it does not hold.
 
 `watch` reports a `Summary` for each verified node of the watched name or
@@ -337,23 +370,31 @@ node lists none; its pages are not sub-collections).
 
 ## 8. Cut — slice 2 (removal), slice 5 (revocation)
 
-A cut is a signed "up to here" for a key or for a member's keys: everything
-inside its accepted frontier stays valid; anything else by those keys MUST
-be refused, whatever date it claims. A removal cut is carried by the members
-record that removes a writer (§6), signed with it by the owner.
+A cut is a signed list of exactly which versions of a key or of a member's
+keys stay valid: every version it lists stays valid; anything else by those
+keys MUST be refused, whatever date or seq it claims. A removal cut is
+carried by the members record that removes a writer (§6), signed with it by
+the owner.
 
+- A cut lists exact versions, never a limit. A writer's log is shared by
+  all its collections, so its seqs in one collection have gaps; under a
+  limit, a removed writer could sign a new entry at a seq of such a gap
+  below it — a new name, so no equivocation — and be admitted. Under a list
+  that entry is outside. The list is what the owner held verified: an entry
+  a summary only listed is not in it.
 - A cut replaces clock-based signing-time validity: no date in a version
   decides whether it is inside.
-- **Re-check when a cut arrives.** When a reader takes a members record
-  that replaces the one it used, it MUST read the collection again under
-  it: admit or refuse every version it holds of the collection anew, and
-  recompute the state from the versions admitted. A version it had applied
-  that the new record refuses by a cut is **withdrawn**: it leaves the
-  state, the reader MUST report it to every watcher of the collection as
-  `Withdrawn` (the version and the cut), whatever the watcher's frontier,
-  and `get` of it by name answers `Refused` (`OutsideCut`, next step: ask
-  the owner). A version applied before and still admitted is not delivered
-  again. The writer's own device does the same with its own versions.
+- **Re-check when a cut arrives.** When the record in force changes (a
+  newer record, or one that merges with it, §6), a reader MUST read the
+  collection again under it: admit or refuse every version it holds of the
+  collection anew, and recompute the state from the versions admitted. A
+  version it had applied that the new record refuses by a cut is
+  **withdrawn**: it leaves the state, the reader MUST report it to every
+  watcher of the collection as `Withdrawn` (the version and the cut),
+  whatever the watcher's frontier, and `get` of it by name answers
+  `Refused` (`OutsideCut`, next step: ask the owner). A version applied
+  before and still admitted is not delivered again. The writer's own
+  device does the same with its own versions.
 - Withdrawing is forward-only (invariant 9): copies already read stay read.
 - *Open (slice 5):* a cut can drop honest work (a stolen device's unseen
   offline edits). The owner MAY re-admit specific versions by signing them
@@ -366,52 +407,86 @@ application is never a seal audience: lenses hold no keys, and the host
 opens only what the person pointed at. Holders without the key store and
 forward ciphertext. Erasure is the destruction of the key.
 
-- **Epochs.** A collection whose newest members record lists readers is
+- **Epochs.** A collection whose record in force lists readers is
   **sealed** in that record's epoch, `(D, n)`: the device that signed the
   record starting the epoch and that record's seq in its log. A record with
   no readers leaves the collection unsealed from then on.
-- **Keys.** Each device holds an X25519 **recipient key**, kept with what
-  it holds and never sent; its public half is its **seal key**, the packet
-  `<D>/32=seal/<public key>` signed by the device key. A device's **master
-  secret** is SHA-256 of a domain label (`ndn-data/seal/master/1`) and its
-  recipient secret. The content key of epoch `(D, n)` of collection `C` is
-  SHA-256 of `ndn-data/seal/epoch/1`, `D`'s master secret, and the TLVs of
-  `C` and `D` and `n` as 8 octets, big-endian.
+- **Epoch keys.** The content key of an epoch is 32 random octets that `D`
+  makes when it signs the record starting the epoch, and keeps with what it
+  holds. Nothing derives it: no key of an epoch exists before its record is
+  signed, and no device holds a secret that yields the keys of epochs to
+  come. The record starting the epoch carries its **key check**
+  (`KeyCheck`, §16.2): HKDF-SHA256 (RFC 5869) with the key as input keying
+  material, no salt, and as info `ndn-data/seal/check/1`, the TLVs of `C`
+  and of `D`, and `n` as 8 octets, big-endian; 32 octets. A record that
+  keeps the epoch copies it. A device MUST take a key as epoch `E`'s of `C`
+  — granted, or read back after a restart — only if it matches the check of
+  a held owner-signed record of `C` naming `E` (the starting record's, when
+  held); a key that does not is dropped.
+- **Recipient keys.** Each device holds an X25519 **recipient key**, kept
+  with its signing keys in its key store — never with the data it holds,
+  which may be served or copied — and never sent; its public half is its
+  **seal key**, the packet `<D>/32=seal/<public key>` signed by the device
+  key. Epoch keys a device made or was granted stay with what it holds,
+  wrapped to its seal key, under no name any device serves (the reference
+  keeps grants as received and its own keys under
+  `/localhost/ndn-data/epoch/<D>/…`).
 - **Sealing.** A writer of a sealed collection encrypts each version's
   payload — its `Fields` and `MergeOp` TLVs — with ChaCha20-Poly1305 under
-  the content key of the epoch its newest record names, a random 96-bit
+  the content key of the epoch its record in force names, a random 96-bit
   nonce, and the TLV of the version's own name as associated data; the
   record carries `Sealed` (the epoch and `nonce ‖ tag ‖ ciphertext`) in
   place of them. A reader opens it with that epoch's key; a payload that
   does not open under it is refused as a bad signature. A reader without
   the key holds the version verified and closed, applies nothing that waits
-  on it, and asks for the key if it is of the audience.
-- **Grants.** A device asks for a key with the Interest
-  `<G>/32=grant/<GrantAsk>`, `GrantAsk` naming its own seal key and, for an
-  epoch key, the collection and epoch. The granter `G` fetches and verifies
-  that seal key (signed by the asker's device key), and answers, signed
-  by its own key, with the key wrapped to it: a fresh X25519 key agrees a
-  secret with the seal key, the wrapping key is SHA-256 of
-  `ndn-security/confidentiality/x25519-kek/1`, that secret, the ephemeral
-  and the seal key, and the key is sealed under it (ChaCha20-Poly1305, the
-  grant's name as associated data). One grant name has one packet. `G`
-  MUST grant only: its own master secret to a device of its own namespace
-  (with it, a device of the namespace derives every epoch key `G` started:
-  one grant per pair of devices, whatever the number of collections); an
-  epoch key of `C` that it holds or derives, to a device of `C`'s
-  **current** audience by the newest record it holds. Anything else gets
-  no answer. An asker tries the epoch's creator first, then every other
-  device it knows to write into `C`'s namespace. A grant received is kept
-  with what the device holds.
-- **Forward only.** A removed reader is refused every grant from then on,
-  and the epoch that removal starts is new to it, so nothing written after
-  it reaches it; what it already opened it keeps, said plainly (invariant
-  9). A reader added later is granted the keys of the epochs before it: it
-  reads the collection's history.
+  on it, and asks for the key if it may hold it. A reader MUST refuse a
+  version of a sealed collection that is not sealed, `Unsealed`, unless it
+  lies inside the record's `Since`: its writer wrote it before hearing the
+  record that sealed the collection, and relays have it in clear. A record
+  that seals a collection its previous revision left unsealed sets `Since`
+  (§6), so what was written before stays held, as history.
+- **Grants.** A device asks for an epoch key with the Interest
+  `<G>/32=grant/<GrantAsk>`, `GrantAsk` naming its own seal key, the
+  collection `C` and the epoch `E`. The granter `G` MUST answer only when
+  (1) an owner-signed record of `C` it holds names `E`, (2) the readers the
+  held records naming `E` list, or `E`'s creator, admit the asker, (3) the
+  record in force, when it seals `C`, admits the asker, and (4) `G` holds
+  `E`'s key; anything else gets no answer, and `G` fetches nothing for it.
+  It then fetches and verifies the asker's seal key (signed by the asker's
+  device key) and answers, signed by its own key, with the key wrapped to
+  it: a fresh X25519 key agrees a secret with the seal key, the wrapping
+  key is HKDF-SHA256 of that secret (no salt; info
+  `ndn-security/confidentiality/x25519-kek/1`, the ephemeral and the seal
+  key), and the key is sealed under it (ChaCha20-Poly1305, the grant's name
+  as associated data). Any device holding `E`'s key may grant it: the
+  asker checks what it gets against the record. A granter keeps the grants
+  it signed (the reference, its last 4,096), so asking again gets the same
+  packet; past that it signs the name anew, a packet that opens to the same
+  key. An asker asks only for an epoch a held record names and that it may
+  hold by (2) and (3) as far as it can tell, the epoch's creator first,
+  then every other device it knows to write into `C`'s namespace. Keys are
+  per epoch for every reader: a device of the owner's own namespace is
+  granted like any other (a second device of 10,000 collections, each in
+  its own epoch, asks 10,000 grants once).
+- **Forward only.** A removed reader is refused every grant from then on
+  (condition 3), and the epoch that removal starts has a key that did not
+  exist before, so nothing written after it reaches it; what it already
+  opened it keeps, said plainly (invariant 9). A reader added by a record
+  that only adds is of the epoch it keeps, and reads that epoch's history;
+  an epoch that ended before a reader was listed stays closed to it.
 - A device outside a sealed collection's audience answers `get` of it, of
   its states and of its versions with `Sealed` (next step: ask the owner).
-- Every relay, cache or repository carries the ciphertext and the grants
-  (each wrapped to one device), and can read neither.
+- **What a relay sees.** Every relay, cache or repository carries the
+  ciphertext and the grants (each wrapped to one device) and reads no
+  payload and no key. It does see, in clear: every name (devices,
+  collections and their paths, log seqs, summaries); members records —
+  rule, writers, readers (people, devices, groups), cuts with the exact
+  versions they keep, revision and `Since`; each epoch and its key check;
+  each version's record but its payload — collection, writer, seq,
+  parents, type, the seal it declares, keep, the writer's date — and the
+  ciphertext's size; seal keys; and who asks whom for which epoch's key
+  (the grant's name names the asker's seal key, the collection and the
+  epoch), and when.
 
 ## 10. Type — slice 1
 
@@ -603,9 +678,9 @@ that names the slice.
   the `SnapshotRecord`.
 - **`share(C, {rule, writers, readers})`** signs the next members revision
   (`C` of the device's own namespace only, §3: else `NotOwner`), with the
-  cuts, epoch and `Since` of §6. Removing a reader of a collection that
-  others are sealed to as a group re-signs those collections in a new epoch
-  too.
+  cuts, epoch and `Since` of §6. A collection sealed to a group moves to a
+  new epoch when the group drops a reader, signed by a device of the
+  collection's own namespace (§6), whoever owns the group.
 - **`prune(prefix, upto)`** of another device's entry, or up to a frontier
   naming another key, answers `NotOwnWrites` (§14).
 - A verb given a name it cannot take answers `BadName` (§3).
@@ -668,9 +743,8 @@ Every name parses one way, and a reader MUST refuse one that does not:
   GenericNameComponent of 32 octets follows, the X25519 public key, equal
   to the `SealKey` the packet carries.
 - **Grant.** `G` is the components before the first `32=grant`; one
-  GenericNameComponent follows whose value is one `GrantAsk` TLV: its first
-  Name a seal key name, then either nothing (a master secret) or a
-  collection Name and a `SealEpoch` (an epoch key).
+  GenericNameComponent follows whose value is one `GrantAsk` TLV: a seal key
+  name, a collection Name and a `SealEpoch`.
 
 ### 16.2 TLV-TYPE numbers
 
@@ -701,7 +775,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0540 | FieldName | UTF-8 |
 | 0x0542 | FieldValue | octets; empty removes the field |
 | 0x0544 | MergeOp | octets: the merge function's operation |
-| 0x0546 | MembersRecord | Name (collection), Revision, Rule, Writers, Readers, [Cuts], [SealEpoch], [RuleSince] |
+| 0x0546 | MembersRecord | Name (collection), Revision, Rule, Writers, Readers, [Cuts], [SealEpoch, KeyCheck], [RuleSince] |
 | 0x0548 | Rule | RuleKind [Name (merge function)] |
 | 0x054A | RuleKind | NonNegativeInteger: 0 one key, 1 log, 2 merge |
 | 0x054C | Writers | Name* (key-name prefixes) |
@@ -710,7 +784,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0552 | SummaryNode | Name (subject), Writer, Seq (head), [PagePath], [Entries], [MembersEntries], [Children \| Pages] |
 | 0x0554 | Entries | SeqRange* |
 | 0x0556 | MembersEntries | SeqRange* |
-| 0x0558 | SeqRange | Seq (low), Seq (high), low ≤ high |
+| 0x0558 | SeqRange | Seq (low), Seq (high), low ≤ high; a list of them is ascending and disjoint, and a summary node's lie at or below its Head and hold at most 65,536 seqs together (§7) |
 | 0x055A | Children | Child*, by component |
 | 0x055C | Child | Name (one component), Seq (head), Digest |
 | 0x055E | Digest | 32 octets: SHA-256 of the child's whole Data packet |
@@ -720,15 +794,16 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0566 | PagePath | octets, one bucket each (pages only) |
 | 0x0568 | Writer | Name (the writer's key) |
 | 0x056A | Cuts | Cut*, by prefix |
-| 0x056C | Cut | Name (removed writer prefix), Frontier (accepted) |
+| 0x056C | Cut | Name (removed writer prefix), then per key it keeps versions of, by key: Writer, Entries (exactly those seqs, §8) |
 | 0x056E | SealEpoch | Name (the device that signed the record starting it), Seq (that record's seq) |
-| 0x0570 | RuleSince | Frontier: what the owner had applied when the rule changed |
+| 0x0570 | RuleSince | Frontier: what the owner had applied when the rule changed, or when it sealed the collection |
 | 0x0572 | Sealed | SealEpoch, Ciphertext |
 | 0x0574 | Ciphertext | octets: nonce (12) ‖ tag (16) ‖ ciphertext, ChaCha20-Poly1305 |
 | 0x0576 | SealKey | 32 octets: X25519 public key |
-| 0x0578 | GrantAsk | Name (the asker's seal key), [Name (collection), SealEpoch] |
+| 0x0578 | GrantAsk | Name (the asker's seal key), Name (collection), SealEpoch |
 | 0x057A | Grant | EphemeralKey, Ciphertext (the key, wrapped) |
 | 0x057C | EphemeralKey | 32 octets: the granter's X25519 public key for this grant |
+| 0x057E | KeyCheck | 32 octets: HKDF-SHA256 of the epoch's key (§9) |
 
 Names are the Name TLV (0x07). Inside a record, fields appear in the order
 the table lists them; lists are sorted as stated, so equal content encodes
@@ -755,7 +830,7 @@ to equal bytes and equal nodes have equal digests.
   signing keys (Ed25519 or P-256, possibly in a TPM or a YubiKey that signs
   and cannot agree keys). The one addition, `wrap_ck_to`, is the agreement
   that makes that key: an ephemeral X25519 key against the reader's
-  published X25519 seal key, hashed into the key-encryption key, then
+  published X25519 seal key, HKDF-SHA256 into the key-encryption key, then
   `wrap_ck`. Epoch keys, not the in-tree `ndn_security::abe` (rabe,
   opt-in): an audience here is a short list of people, devices and groups
   the owner's devices check against the owner-signed record they hold, so
@@ -765,8 +840,17 @@ to equal bytes and equal nodes have equal digests.
   rabe's curve gives about 100-bit security and pairing crypto is heavy
   for phones and the browser build. ndn-ext's `ndn-sealed-box` does the
   same agreement but cannot be used from ndn-rs, and takes only ephemeral
-  recipient keys. A master secret per device keeps a namespace's own
-  devices at one grant per pair.
+  recipient keys.
+- **Random epoch keys and a key check**, not keys derived from a secret
+  per device: a derived key exists before its epoch does, so a reader
+  could collect the keys of epochs to come, and every holder of the secret
+  could never be left out of an audience. One random key per epoch costs a
+  grant per epoch per reading device; the check (HKDF, the one key
+  derivation of the layer) lets a reader verify any granted key against the
+  owner-signed record, so any holder of the key may grant it.
+- **Exact cuts** reuse `Writer` and `Entries`, the summary node's own
+  fields for "this key's seqs", rather than a frontier: a frontier is a
+  limit, and a cut must not be one (§8).
 
 ## 17. Failure model
 
@@ -784,8 +868,14 @@ to equal bytes and equal nodes have equal digests.
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
 | Poisoned cache | Verification fails; the version is dropped and fetched elsewhere. | invariant 1, §4 |
 | Stranger in a sync group | Costs a root fetch; its entries are refused `NotMember`. | §6, §12 |
-| Removed reader | Refused every grant; the new epoch's versions stay closed to it; what it opened before it keeps. | §9 |
-| Relay or repository of another person | Carries ciphertext and grants wrapped to one device each; reads neither. | §9 |
+| Removed reader | Refused every grant; the key of the epoch its removal starts did not exist before it, so the new epoch's versions stay closed to it; what it opened before it keeps. | §9 |
+| Owner's devices edit members at once | Records of one revision merge, removals winning; a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. | §6 |
+| Group member removed | Every collection sealed to the group, of any owner, moves to a new epoch signed by a device of its own namespace. | §6 |
+| Own device left out | An audience that does not list it leaves it out of the epoch and every later one; no device holds a secret that yields future keys. | §6, §9 |
+| Removed writer fills a gap | A new entry at a seq below what its cut kept is refused: the cut lists exactly the versions kept. | §8 |
+| Wrong key granted | Refused against the epoch's key check; the right key from any device is taken. | §9 |
+| Writer behind on a seal | Its unsealed version is refused `Unsealed`; its later sealed versions do not wait for it. | §5.2, §9 |
+| Relay or repository of another person | Carries ciphertext and grants wrapped to one device each; reads no payload and no key, and sees the metadata §9 lists. | §9 |
 | Member offline | Its newest verified summary is what the reader is complete against; it catches up when the member returns. | §7 |
 
 ## 18. Conformance
@@ -805,6 +895,11 @@ c4 (a note sealed to Alice opens for her host, and a device outside the
 audience cannot read it), c9 (a family chat under the log rule: members'
 messages reach every member, a non-member's post reaches no one), c10
 (prune of another's comment refused, the removal done as an edit), o1 (a
-cut that arrives after a version was accepted withdraws it) and o3
+cut that arrives after a version was accepted withdraws it), o3
 (completeness with many writers, measured: a full check of every member's
-summary and the catch-up of one new version, with 8 and with 32 writers).
+summary and the catch-up of one new version, with 8 and with 32 writers),
+and the attacks the slice-2 security review found: r1 (two of the owner's
+devices remove readers at once; neither removed reader opens what is
+written after), r2 (a member leaves a group another person's collection is
+sealed to; that collection moves to a new epoch) and r3 (the owner lists
+one of her devices alone; her other device opens nothing written after).
