@@ -22,16 +22,23 @@
 //! What is NOT collapsed here (deliberately): each group still routes its own
 //! prefix to the shared face (the FIB axis), and each group keeps its own state
 //! vector (that is the irreducible O(chains) data).
+//!
+//! **Order.** Nothing here is served in hash or random order: groups by name,
+//! their publish and ack channels round-robin by name, and the driver's
+//! sources (timer, inbound, publishes, acks, control) round-robin from the
+//! one after the source served last. When several are ready at one instant,
+//! the order their Sync Interests leave in, and so the order they draw their
+//! jitter in, is the same every run (a seeded virtual-time simulation replays
+//! exactly).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_packet::{Interest, Name};
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{ObservedState, SyncHandle};
@@ -109,7 +116,7 @@ impl Drop for MultiSvs {
 /// `<group>/v=N[/params]`; find the trailing version component whose prefix is a
 /// joined group (scanning from the end handles a group prefix that itself
 /// contains a version component).
-fn demux_group(raw: &Bytes, groups: &HashMap<Name, GroupCore>) -> Option<Name> {
+fn demux_group(raw: &Bytes, groups: &BTreeMap<Name, GroupCore>) -> Option<Name> {
     let interest = Interest::decode(raw.clone()).ok()?;
     let comps = interest.name.components();
     for i in (0..comps.len()).rev() {
@@ -123,6 +130,91 @@ fn demux_group(raw: &Bytes, groups: &HashMap<Name, GroupCore>) -> Option<Name> {
     None
 }
 
+/// One channel per group, merged: the next message is taken round-robin by
+/// group name, starting after the group served last, so no group starves and
+/// the order is the same every run.
+struct Inboxes<T> {
+    /// Sorted by group name.
+    rx: Vec<(Name, mpsc::Receiver<T>)>,
+    /// Index the next poll starts at.
+    next: usize,
+}
+
+impl<T> Inboxes<T> {
+    fn new() -> Self {
+        Self {
+            rx: Vec::new(),
+            next: 0,
+        }
+    }
+
+    fn insert(&mut self, group: Name, rx: mpsc::Receiver<T>) {
+        match self.rx.binary_search_by(|(g, _)| g.cmp(&group)) {
+            Ok(at) => self.rx[at].1 = rx,
+            Err(at) => {
+                if at < self.next {
+                    self.next += 1;
+                }
+                self.rx.insert(at, (group, rx));
+            }
+        }
+    }
+
+    fn remove(&mut self, group: &Name) {
+        if let Ok(at) = self.rx.binary_search_by(|(g, _)| g.cmp(group)) {
+            self.rx.remove(at);
+            if at < self.next {
+                self.next -= 1;
+            }
+        }
+    }
+
+    /// The next message of any group, with its group. A group whose sender is
+    /// gone is dropped; `None` once no group is left.
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Name, T)>> {
+        let mut k = 0;
+        while k < self.rx.len() {
+            let at = (self.next + k) % self.rx.len();
+            match self.rx[at].1.poll_recv(cx) {
+                Poll::Ready(Some(msg)) => {
+                    self.next = at + 1;
+                    return Poll::Ready(Some((self.rx[at].0.clone(), msg)));
+                }
+                Poll::Ready(None) => {
+                    // Restart the pass from the same position over what is left.
+                    self.rx.remove(at);
+                    self.next = at;
+                    k = 0;
+                }
+                Poll::Pending => k += 1,
+            }
+        }
+        if self.rx.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// What wakes the driver.
+enum Event {
+    Cancelled,
+    /// The shared timer: some group's deadline (or a pending retry) came due.
+    Due,
+    /// An inbound Sync Interest off the shared face.
+    Inbound(Bytes),
+    /// A group's publish, with its mapping.
+    Publish(Name, Option<Bytes>),
+    /// A group's two-phase ack.
+    Ack(Name, String, u64),
+    Control(MultiControl),
+}
+
+/// The driver's sources besides cancellation: timer, inbound, publishes, acks,
+/// control.
+const SOURCES: usize = 5;
+
 async fn multi_task(
     local_name: Name,
     send: mpsc::Sender<Bytes>,
@@ -130,12 +222,13 @@ async fn multi_task(
     mut control_rx: mpsc::Receiver<MultiControl>,
     cancel: CancellationToken,
 ) {
-    let mut groups: HashMap<Name, GroupCore> = HashMap::new();
+    let mut groups: BTreeMap<Name, GroupCore> = BTreeMap::new();
     // N dynamic publish/ack receivers merged into the one task, keyed by group.
-    let mut publish_map: tokio_stream::StreamMap<Name, ReceiverStream<(Name, Option<Bytes>)>> =
-        tokio_stream::StreamMap::new();
-    let mut ack_map: tokio_stream::StreamMap<Name, ReceiverStream<(String, u64)>> =
-        tokio_stream::StreamMap::new();
+    let mut publishes: Inboxes<(Name, Option<Bytes>)> = Inboxes::new();
+    let mut acks: Inboxes<(String, u64)> = Inboxes::new();
+    // The source polled first for the next event: the one after the source
+    // served last.
+    let mut turn = 0;
 
     loop {
         // Per-group maintenance: deliver buffered gaps (non-blocking), and reap
@@ -153,8 +246,8 @@ async fn multi_task(
         }
         for g in closed {
             groups.remove(&g);
-            publish_map.remove(&g);
-            ack_map.remove(&g);
+            publishes.remove(&g);
+            acks.remove(&g);
         }
 
         // One shared timer: the earliest group deadline, capped by a pending
@@ -168,10 +261,46 @@ async fn multi_task(
             wake = wake.min(now + PENDING_RETRY);
         }
 
-        tokio::select! {
-            _ = cancel.cancelled() => break,
+        // The next event. Cancellation first; then the sources round-robin from
+        // `turn`, so each ready source gets its turn and several ready at one
+        // instant are taken in the same order every run (`tokio::select!` would
+        // pick among them at random).
+        let event = {
+            let cancelled = cancel.cancelled();
+            let sleep = rt::sleep(wake.saturating_duration_since(now));
+            tokio::pin!(cancelled, sleep);
+            std::future::poll_fn(|cx| {
+                if cancelled.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Event::Cancelled);
+                }
+                for k in 0..SOURCES {
+                    let source = (turn + k) % SOURCES;
+                    // `Ready(None)`: a closed channel, or no group joined yet.
+                    let polled = match source {
+                        0 => sleep.as_mut().poll(cx).map(|()| Some(Event::Due)),
+                        1 => recv.poll_recv(cx).map(|m| m.map(Event::Inbound)),
+                        2 => publishes
+                            .poll_next(cx)
+                            .map(|m| m.map(|(g, (_, mapping))| Event::Publish(g, mapping))),
+                        3 => acks
+                            .poll_next(cx)
+                            .map(|m| m.map(|(g, (key, seq))| Event::Ack(g, key, seq))),
+                        _ => control_rx.poll_recv(cx).map(|m| m.map(Event::Control)),
+                    };
+                    if let Poll::Ready(Some(event)) = polled {
+                        turn = (source + 1) % SOURCES;
+                        return Poll::Ready(event);
+                    }
+                }
+                Poll::Pending
+            })
+            .await
+        };
 
-            _ = rt::sleep(wake.saturating_duration_since(now)) => {
+        match event {
+            Event::Cancelled => break,
+
+            Event::Due => {
                 let now = Instant::now();
                 // Service every group whose periodic deadline came due.
                 for gc in groups.values_mut() {
@@ -182,7 +311,7 @@ async fn multi_task(
             }
 
             // Inbound Sync Interest off the shared face → demux to its group.
-            Some(raw) = recv.recv() => {
+            Event::Inbound(raw) => {
                 if let Some(group) = demux_group(&raw, &groups)
                     && let Some(gc) = groups.get_mut(&group)
                 {
@@ -190,58 +319,58 @@ async fn multi_task(
                 }
             }
 
-            // A group's publish, tagged by group via the StreamMap key.
-            Some((group, (pub_name, mapping))) = publish_map.next(), if !publish_map.is_empty() => {
-                let _ = pub_name;
+            Event::Publish(group, mapping) => {
                 if let Some(gc) = groups.get_mut(&group) {
                     gc.on_publish(mapping, &send).await;
                 }
             }
 
-            // A group's two-phase ack.
-            Some((group, (key, seq))) = ack_map.next(), if !ack_map.is_empty() => {
+            Event::Ack(group, key, seq) => {
                 if let Some(gc) = groups.get_mut(&group) {
                     gc.on_ack(&key, seq).await;
                 }
             }
 
-            Some(ctl) = control_rx.recv() => match ctl {
-                MultiControl::Join { group, config, reply } => {
-                    if groups.contains_key(&group) {
-                        let _ = reply.send(None);
-                    } else {
-                        let config = *config;
-                        let (update_tx, update_rx) = mpsc::channel(config.channel_capacity);
-                        let (publish_tx, publish_rx) = mpsc::channel(64);
-                        let (ack_tx, ack_rx) = mpsc::channel(64);
-                        let observed = Arc::new(ObservedState::default());
-                        let mut gc = GroupCore::new(
-                            group.clone(),
-                            &local_name,
-                            config,
-                            update_tx,
-                            Arc::clone(&observed),
-                        );
-                        gc.announce(&send).await;
-                        groups.insert(group.clone(), gc);
-                        publish_map.insert(group.clone(), ReceiverStream::new(publish_rx));
-                        ack_map.insert(group.clone(), ReceiverStream::new(ack_rx));
-                        // Per-group handle: a dropped/left handle closes `update_rx`,
-                        // which the maintenance pass above reaps. The token is the
-                        // handle's own (leave/drop consumes the handle → closes the
-                        // channel → reaped); the driver watches the channel, not it.
-                        let handle = SyncHandle::new(update_rx, publish_tx, CancellationToken::new())
-                            .with_ack_channel(ack_tx)
-                            .with_observed(observed);
-                        let _ = reply.send(Some(handle));
-                    }
+            Event::Control(MultiControl::Join {
+                group,
+                config,
+                reply,
+            }) => {
+                if groups.contains_key(&group) {
+                    let _ = reply.send(None);
+                } else {
+                    let config = *config;
+                    let (update_tx, update_rx) = mpsc::channel(config.channel_capacity);
+                    let (publish_tx, publish_rx) = mpsc::channel(64);
+                    let (ack_tx, ack_rx) = mpsc::channel(64);
+                    let observed = Arc::new(ObservedState::default());
+                    let mut gc = GroupCore::new(
+                        group.clone(),
+                        &local_name,
+                        config,
+                        update_tx,
+                        Arc::clone(&observed),
+                    );
+                    gc.announce(&send).await;
+                    groups.insert(group.clone(), gc);
+                    publishes.insert(group.clone(), publish_rx);
+                    acks.insert(group.clone(), ack_rx);
+                    // Per-group handle: a dropped/left handle closes `update_rx`,
+                    // which the maintenance pass above reaps. The token is the
+                    // handle's own (leave/drop consumes the handle → closes the
+                    // channel → reaped); the driver watches the channel, not it.
+                    let handle = SyncHandle::new(update_rx, publish_tx, CancellationToken::new())
+                        .with_ack_channel(ack_tx)
+                        .with_observed(observed);
+                    let _ = reply.send(Some(handle));
                 }
-                MultiControl::Leave(group) => {
-                    groups.remove(&group);
-                    publish_map.remove(&group);
-                    ack_map.remove(&group);
-                }
-            },
+            }
+
+            Event::Control(MultiControl::Leave(group)) => {
+                groups.remove(&group);
+                publishes.remove(&group);
+                acks.remove(&group);
+            }
         }
     }
 }
@@ -380,5 +509,54 @@ mod tests {
             .expect("channel open");
         let interest = Interest::decode(raw).expect("decode");
         assert_eq!(interest.name.components()[..1], group.components()[..]);
+    }
+
+    /// Messages waiting in several groups' channels come out round-robin by
+    /// group name, whatever order the groups were joined in; a group whose
+    /// sender is gone leaves the rotation.
+    #[tokio::test]
+    async fn inboxes_take_groups_round_robin_by_name() {
+        let mut inboxes: Inboxes<u32> = Inboxes::new();
+        let mut senders = Vec::new();
+        for g in ["/c", "/a", "/b"] {
+            let (tx, rx) = mpsc::channel(8);
+            inboxes.insert(g.parse().unwrap(), rx);
+            senders.push((g, tx));
+        }
+        for (g, tx) in &senders {
+            let base = if *g == "/a" {
+                10
+            } else if *g == "/b" {
+                20
+            } else {
+                30
+            };
+            tx.send(base + 1).await.unwrap();
+            tx.send(base + 2).await.unwrap();
+        }
+        drop(senders.remove(2)); // "/b"'s sender: its two messages still come out
+        let mut got = Vec::new();
+        while got.len() < 6 {
+            let (g, m) = std::future::poll_fn(|cx| inboxes.poll_next(cx))
+                .await
+                .expect("messages left");
+            got.push((g.to_string(), m));
+        }
+        let got: Vec<(&str, u32)> = got.iter().map(|(g, m)| (g.as_str(), *m)).collect();
+        assert_eq!(
+            got,
+            [
+                ("/a", 11),
+                ("/b", 21),
+                ("/c", 31),
+                ("/a", 12),
+                ("/b", 22),
+                ("/c", 32)
+            ]
+        );
+        drop(senders);
+        let left = std::future::poll_fn(|cx| inboxes.poll_next(cx)).await;
+        assert!(left.is_none(), "every sender is gone");
+        assert!(inboxes.rx.is_empty());
     }
 }

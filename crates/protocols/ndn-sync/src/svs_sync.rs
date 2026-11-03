@@ -56,7 +56,7 @@
 //! [`svs_local`](crate::svs_local), which disambiguates pre- and
 //! post-restart sequence spaces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,8 +314,10 @@ pub(crate) struct GroupCore {
     pub(crate) next_send: Instant,
     /// Gap updates awaiting delivery, coalesced per publisher (N-11 / NS-7): a
     /// re-advertised range widens the buffered `[low, high]` rather than queueing
-    /// a second entry, and delivery never blocks the driver.
-    pub(crate) pending: HashMap<String, SyncUpdate>,
+    /// a second entry, and delivery never blocks the driver. Ordered by
+    /// publisher, so the gaps one Sync Interest reveals are delivered in the
+    /// same order every run.
+    pub(crate) pending: BTreeMap<String, SyncUpdate>,
     pub(crate) update_tx: mpsc::Sender<SyncUpdate>,
     /// Observed per-name high-water (N-9) — a read-only depth on the data.
     pub(crate) observed: Arc<ObservedState>,
@@ -341,7 +343,7 @@ impl GroupCore {
             suppressing: false,
             recorded: HashMap::new(),
             next_send,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
             update_tx,
             observed,
         }
@@ -562,7 +564,7 @@ pub(crate) const PENDING_RETRY: Duration = Duration::from_millis(5);
 /// under-cover: an already-fetched seq is re-derived as an idempotent re-fetch,
 /// a missed one is a permanent hole); `high` takes the larger; the newest
 /// mapping / serving party wins.
-fn coalesce_pending(pending: &mut HashMap<String, SyncUpdate>, update: SyncUpdate) {
+fn coalesce_pending(pending: &mut BTreeMap<String, SyncUpdate>, update: SyncUpdate) {
     match pending.get_mut(&update.publisher) {
         Some(existing) => {
             existing.low_seq = existing.low_seq.min(update.low_seq);
