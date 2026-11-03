@@ -13,9 +13,7 @@
 //! `recv` loop, routing each inbound packet:
 //!
 //! - a **bare Interest** whose name falls under a registered serve prefix
-//!   (longest match wins) → that prefix's serve channel; one whose name falls
-//!   under none, but whose forwarding hint names a delegation under one, →
-//!   that prefix's channel (it was routed here by its hint);
+//!   (longest match wins) → that prefix's serve channel;
 //! - a **Data or Nack answering a pending Interest** → every [`Replies`]
 //!   stream that registered that Interest ([`Replies::expect`]);
 //! - **everything else** (unmatched Data/Nacks, unmatched Interests) → a
@@ -291,29 +289,18 @@ pub struct DemuxConnection {
 }
 
 /// Pick the longest registered serve prefix that is a prefix of `name`, dropping
-/// closed channels lazily; failing that, the longest one that is a prefix of a
-/// forwarding-hint delegation the Interest carries — the forwarder brought it
-/// here because its hint names this producer (a repository asked for another
-/// producer's data). Returns a cloned sender to use outside the lock.
+/// closed channels lazily. Returns a cloned sender to use outside the lock.
 fn route(serves: &Serves, pkt: &Bytes) -> Option<mpsc::UnboundedSender<Bytes>> {
     if is_lp_packet(pkt) {
         return None;
     }
     let interest = Interest::decode(pkt.clone()).ok()?;
     let guard = serves.lock();
-    let longest = |under: &Name| {
-        guard
-            .iter()
-            .filter(|(p, tx)| !tx.is_closed() && under.has_prefix(p))
-            .max_by_key(|(p, _)| p.len())
-            .map(|(_, tx)| tx.clone())
-    };
-    longest(&interest.name).or_else(|| {
-        interest
-            .forwarding_hint()?
-            .iter()
-            .find_map(|delegation| longest(delegation.as_ref()))
-    })
+    guard
+        .iter()
+        .filter(|(p, tx)| !tx.is_closed() && interest.name.has_prefix(p))
+        .max_by_key(|(p, _)| p.len())
+        .map(|(_, tx)| tx.clone())
 }
 
 impl DemuxConnection {
