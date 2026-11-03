@@ -1,8 +1,9 @@
 # Data layer: named, signed, versioned data
 
 - **Status:** Slices 1, 2 and 3 normative (slice 3: large payloads in
-  pieces, hold records, leases capped by keep, audits and repair, `prune`
-  of one's own writes and the erasure of fully pruned epochs, §13, §14);
+  pieces, hold records naming their holders, leases capped by keep, signed
+  asks, audits, repair and release on whole proofs, `prune` of one's own
+  writes and the erasure of fully pruned epochs, §13, §14);
   slices 1 and 2: versions, collections with
   owner-signed members records whose writers and readers are of any
   namespace, the merge rule and its function `/merge/yrs`, the log rule,
@@ -645,6 +646,11 @@ every operation inline, so `put` of a larger payload answers `TooLarge`
 (next step: put it into a log collection and refer to it by name), and a
 reader refuses a version in pieces of a merge collection (`NotInline`).
 
+A payload carries at most 64 MiB (`PAYLOAD_MAX`, 67,108,864 octets), as a
+reader assembles it whole: `put` of more answers `TooLarge`, and a reader
+refuses, when it decodes the record, a `Chunks` whose `Size` is above it
+(or at most `INLINE_MAX`).
+
 - Chunk `i` is `P[4096·i ..]`, at most 4,096 octets, the packet
   `<V>/seg=<i>` (`V` the version's name, `seg=` a SegmentNameComponent).
 - The manifest tree lists the chunks with fan-out 128: depth `d` is the
@@ -668,35 +674,63 @@ reader refuses a version in pieces of a merge collection (`NotInline`).
 ### 13.2 Hold records and leases
 
 - A **hold record** is an entry of an owner device's log about collection
-  `C` (Content `HoldRecord`: `C`, `Copies`, `KeepUntil` — until when — and
-  the `Frontier` the asker had applied). It is the custody policy, taken
-  only when owner-signed (the owner rule, §3). `hold(C, {copies, until})`
-  signs one when the device's newest differs.
+  `C` (Content `HoldRecord`: `C`, `Copies`, `KeepUntil` — until when — the
+  `Frontier` `at` the asker had applied, and `Holders`: the holder devices
+  the owner chose, by name, ascending). It is the custody policy, taken
+  only when owner-signed (the owner rule, §3). `hold(C, {copies, until,
+  holders})` signs one when the device's newest differs in any of them.
+  Each copy is kept by a distinct device the record names: `hold` answers
+  `BadRequest` (next step: `FixRequest`) when it names fewer holders than
+  `copies`, or a name that is no device name (§16.1) or the asking device.
 - A **lease** is an entry of the holder `H`'s log about `C` (Content
   `LeaseRecord`: `C`, the hold record's name, `KeepUntil`, and the
   `Frontier` `holds`). It promises every version of `C` inside `holds` that
   applies — admitted by the record in force, not pruned — with its pieces,
-  each until the earlier of the lease's date and the version's keep. The
-  newest lease of a holder for `C` supersedes its older ones. Both records
-  are listed in summary nodes under `MembersEntries`, which from slice 3
-  lists every entry of a collection that is not a version.
+  each until the earlier of the lease's date and the version's keep. A
+  reader keeps one lease per holder *device*: the newest by log seq,
+  whichever of the device's keys signed it, so a device counts once however
+  many keys it has. It counts a lease only when the hold record it answers
+  is held and names that device a holder; the asking device never counts
+  for itself (by device name, not key). Both records are listed in summary
+  nodes under `MembersEntries`, which from slice 3 lists every entry of a
+  collection that is not a version.
 - **Keep caps hold.** A lease's date MUST NOT pass the hold record's, nor
   the latest `Keep::Until` date of the versions inside `holds` when every
   one of them is kept until a date. A holder signs no lease that would end
   by its clock, and a reader does not count a lease that breaks either
   bound (or whose hold record or versions it does not hold yet). Retention
   by expiry — deleting at keep — is slice 4.
-- **Asking.** The owner device asks a holder with the Interest
-  `<H>/32=hold/<HoldAsk>` (the hold record's name). A device holds only for
-  the namespaces its host lists; it verifies the record, follows `C`, takes
-  every version inside the record's frontier with every piece (fetching
-  back what it lost: re-replication), signs the lease over what its store
-  holds whole and answers with it (a DigestSha256 Data whose Content is the
-  lease's packet). It signs a new lease when what it holds grows. Holders
-  publish once into the groups of the namespaces they hold for, so owner
-  devices know whom to ask. A holder serves every entry and piece of a
-  collection it holds, whoever wrote it, by its own name and under
-  `<H>/32=held/…`.
+- **Asking.** The owner device `A` asks each holder `H` its record names
+  with the Interest `<H>/32=hold/<HoldAsk>`: the hold record's name, a
+  fresh 16-octet `Nonce`, and `Asker`, `A`'s proof of asking — a Data
+  packet `<A>/32=ask/<binding>` signed by `A`'s device key, `binding` the
+  SHA-256 of `H`'s Name TLV followed by the `HoldAsk` TLV without its
+  `Asker`. The proof binds the holder and this one ask, so it serves no
+  other. A device holds only for the namespaces its host lists, and
+  answers a hold ask only when, in this order: `C` is of such a namespace;
+  the proof's key locator names the device that signed the hold record —
+  any other ask is dropped before a signature is checked; that asker has
+  no other hold ask in progress here; the proof is named for this ask and
+  verifies to a key of that device (at most 8 proofs are verified at once);
+  the record, fetched and verified, is that device's newest hold record for
+  `C` and names `H`; and its date is past now. `H` then follows `C`, takes
+  every version inside `at` with every piece (fetching back what it lost —
+  re-replication — from the writer or another holder), signs the lease
+  over what its store holds whole, and answers with it (a DigestSha256 Data
+  whose Content is the lease's packet). It keeps its last 1,024 answers by
+  name, so an ask asked again gets the same packet at no cost. It signs a
+  new lease when what it holds grows. Holders join the groups of the
+  namespaces they hold for, to hear what they keep; an owner asks only the
+  devices its record names, never one heard in a group (sync Interests are
+  unsigned, §12). A holder serves every entry and piece of a collection it
+  holds, whoever wrote it, by its own name and under `<H>/32=held/…`.
+- **What a holder stores** is bounded by what the owner signed. Of records,
+  only those it accepts: owner-signed members and hold records, leases of
+  a holder the hold record they answer names (or its own), and prunes it
+  does not ignore (§14). Of another device's versions, only those of a log
+  collection it holds, admitted by the record in force and inside the `at`
+  of the hold record it accepted; re-replication fetches back that set and
+  no more.
 
 ### 13.3 Audits
 
@@ -705,23 +739,70 @@ reader refuses a version in pieces of a merge collection (`NotInline`).
   log entry of each version inside `holds` that applies and whose keep has
   not passed, and each manifest node and chunk of it — and asks each with
   the Interest `<H>/32=audit/<AuditAsk>` (`Nonce`, 16 fresh random octets,
-  and the piece's name). `H` answers under that name, signed by its device
-  key, FreshnessPeriod 0, `AuditAnswer`: the piece's whole packet, or
-  `Missing`. A holder answers only for collections it holds.
-- Verdict: **kept** when every answer is signed by `H` and is the piece (its
-  digest is the one the auditor holds: the version packet's, or the one its
-  manifest lists); **broken** when a signed answer is `Missing` or not the
-  piece — signed evidence; **unanswered** when some ask got no answer.
-  Only evidence makes a lease broken: a timeout is never a verdict, so a
-  slow network can only cause a copy more, never a wrong judgement.
-- **Repair.** A lease broken or unanswered, or one that holds less than the
-  hold record asked, does not count. `hold` asks its holder again (it
-  fetches back what it lost, from the writer or other holders), then the
-  other devices heard in the namespace, in name order, until `copies`
-  leases are live, hold what was asked and are audited kept.
-- **Release.** A host MAY drop its own chunks of a large version that a
-  live lease it audited kept holds (`Device::release`); otherwise it
-  answers `NotHeld` (next step: hold first).
+  the piece's name, and `Asker`, the auditor's proof binding `H` and the
+  ask as in §13.2). A manifest node the auditor lacks, needed to list the
+  chunks, it fetches from the writer or the holders, and at last asks of
+  the audited holder itself through an audit ask, judged like any other.
+- `H` answers only an ask about a collection it holds, from an owner device
+  whose hold record held here names `H` (by the proof's key locator, before
+  any signature is checked), with at most 64 audits of that asker in
+  progress, its proof verified (§13.2). It answers under the ask's name,
+  signed by its device key, FreshnessPeriod 0, `AuditAnswer`: `Piece`, the
+  piece's whole packet; `PrunedBy`, the packet of the prune record that
+  ended the piece's version (§14); `RefusedBy`, the packet of the members
+  record of the revision in force there that refuses the version; or
+  `Missing`, it does not hold the piece and knows no record that ends it.
+  The same answer cache as §13.2 applies.
+- The auditor judges each answer:
+  - `Piece` whose digest is the one the auditor holds (the version
+    packet's, or the one its manifest lists): the piece is there.
+  - `Missing`, or a `Piece` that is not the piece: signed evidence of a
+    breach, as the auditor's own records say the piece should be there.
+  - `PrunedBy`: the auditor verifies and takes the record (§14). It
+    excuses the piece — which leaves the audit — when it covers the
+    version; a verified prune that does not, or a record that is not a
+    prune of the version's writer in `C`, is evidence. A record it cannot
+    verify yet is no answer.
+  - `RefusedBy`: verified and taken, it excuses the piece when the record
+    in force at the auditor now refuses the version; when the auditor
+    still admits it, the two views differ and it is no answer, never
+    evidence.
+  - Nothing signed by `H`: no answer.
+- Verdict: **broken** on any evidence; else **unanswered** when an ask got
+  no answer, or no device produced a manifest node a promised version's
+  chunks are listed in (the audit is unverified, never kept); else
+  **kept**. Only evidence makes a lease broken: a timeout is never a
+  verdict, so a slow network can only cause a copy more, never a wrong
+  judgement.
+- **Repair.** A lease not live, broken or unanswered, or one that holds
+  less than the hold record's `at`, does not count. While fewer than
+  `copies` count, `hold` asks every holder the record names whose lease
+  does not count, all at once (a holder asked again fetches back what it
+  lost), and audits each lease that comes back. It asks no other device.
+  `Custody` lists the live leases with this device's audit of each, those
+  found broken or unanswered before repair, and `unkept`: the versions
+  inside `at` that this device does not keep whole and that no lease
+  audited kept holds.
+- **Release.** A host MAY drop its own chunks of a large version
+  (`Device::release`, by version or by collection) only on fresh evidence,
+  never on a stored verdict:
+  1. It holds the version whole, and its own hold record for `C`. The
+     candidates are the holders that record names whose live lease holds
+     the version.
+  2. While it asks them it serves none of the version's chunks and
+     manifest nodes, to anyone (quarantine); its log entry stays served.
+  3. It asks each candidate one audit ask marked `Whole`, naming the
+     version's log entry, under a fresh nonce. The answer is `Proof`:
+     SHA-256 over the nonce, then, for each piece of the version — its log
+     entry, its manifest nodes in heap order, its chunks in order — the
+     piece's length (8 octets, big-endian) and its whole packet. A holder
+     lacking any piece answers `Missing` (or `PrunedBy`, `RefusedBy`). The
+     releaser checks the proof against its own copy.
+  4. It drops the chunks only when at least `copies` (at least one)
+     distinct holder devices proved. Otherwise it keeps them, saying for
+     each version which holder proved what (`Released::kept`), and when it
+     released nothing it answers `NotHeld` with those reasons (next step:
+     hold first).
 
 ### 13.4 What a holder can and cannot do
 
@@ -731,16 +812,36 @@ reader refuses a version in pieces of a merge collection (`NotInline`).
   name, so no cache and no earlier answer answers it, and the pieces are
   the auditor's choice. A holder keeping a fraction `f` of what it promised
   passes one audit with probability at most about `f^16`.
+- It cannot make an owner release on a copy it cannot produce: a release
+  asks a proof over every piece of the version, under a fresh nonce, from
+  each of `copies` distinct holders, while the releaser serves none of
+  those pieces.
+- It cannot be counted unless the owner's hold record names it, nor be
+  counted twice under two keys; a device the owner did not choose gets no
+  hold ask and its lease counts for nothing.
+- It cannot be made to work by a stranger: an ask from a device that is not
+  the owner device its record names costs it a parse, no signature check
+  and no fetch; an owner's asks are bounded (one hold ask and 64 audits in
+  progress per asker, 8 proofs verified at once), and a replayed ask is
+  answered from the cache.
+- It cannot be framed by records its auditor has not heard yet: a prune or
+  a members record it followed is its answer, and it is evidence against it
+  only where the auditor's own records prove the piece should be there.
 - It cannot read sealed data it holds without being of the audience: it
-  stores and serves ciphertext (§9 lists the metadata it sees).
+  stores and serves ciphertext (§9 lists the metadata it sees). A device of
+  the namespace is an owner device (§3): it may sign the members record
+  that defines the audience, so no audience rule binds it, and it reads
+  and owns. A holder that must not read is therefore enrolled outside the
+  namespace it holds for.
 - It cannot keep its promise past keep and be counted, nor extend a lease
   past the owner's date.
-- It can fetch an asked piece from elsewhere at audit time (an audit proves
-  it can produce the data, not that it stored it); two holders can collude
-  that way, so `copies` holders owned by one party are one failure domain.
-  It can stop answering: its lease becomes unanswered and repair starts,
-  but nothing marks it broken without evidence. It sees which pieces are
-  asked, and when.
+- It can fetch an asked piece from elsewhere at audit time — a cache, or
+  another holder — but not from the releaser during a release: an audit
+  proves it can produce the data, not that it stored it. Two holders can
+  collude that way, so `copies` holders owned by one party are one failure
+  domain. It can stop answering: its lease becomes unanswered and repair
+  starts, but nothing marks it broken without evidence. It sees which
+  pieces are asked, and when.
 
 ## 14. Prune — slices 2 (scope), 3
 
@@ -756,25 +857,48 @@ A prune is an entry of the pruner's log about collection `C` (Content
   version stays theirs, readable by its name. A reader ignores a prune
   record that names another key.
 - It covers the signer's versions of `C` (or the one version named) with
-  seq at most `upto`'s for its key. Prune applies to log collections: a
-  merge collection's state is computed from every version, so `prune`
-  answers `NotPrunable` (next step: edit instead).
+  seq at most `upto`'s for its key — versions only, never the signer's
+  members, hold, lease or prune records or snapshots. `upto` MUST be below
+  the prune record's own seq, or the prune would swallow versions written
+  after it: `prune` answers `BadRequest` (next step: `FixRequest`) for an
+  `upto` past the device's newest entry (the record takes the next seq),
+  and a reader ignores a prune record whose `upto` reaches its own seq.
+  Prune applies to log collections: a merge collection's state is computed
+  from every version, so `prune` answers `NotPrunable` (next step: edit
+  instead).
 - A reader that knows a prune MUST report `Pruned` for what it covers, not
   the data, drop its copies (record and pieces), tell its watchers
-  (`Change::Pruned`) and serve none of it; later versions do not wait for
-  it. A holder drops it too: its leases end for it, and audits never ask
-  for it. The writer keeps a local tombstone so its summary still lists the
-  entry (the log never changes).
+  (`Change::Pruned`) and serve none of it — by the prune records it holds,
+  whether or not it held the version, by its own name, under `32=held` and
+  in audit answers, also after a restart, which drops pieces and records a
+  prune covers that the store still keeps; a piece fetched for a pruned
+  version is not stored. Later versions do not wait for it. A holder drops
+  it too: its leases end for it, and audits never ask for it. The writer
+  keeps a local tombstone so its summary still lists the entry (the log
+  never changes).
 - **What "erased" means.** A device destroys the key of epoch `E` of `C` —
-  the key it holds, the key it made, the grants it kept — once `E` is not
-  the record in force's epoch and every version of `C` it knows sealed in
-  `E` is pruned; it then refuses that key if granted again. From then on
-  every copy of that ciphertext anywhere, in any holder, cache or backup,
-  is unreadable to whoever did not keep the key. Not erased: what a reader
-  already opened (plaintext it kept, forward-only, invariant 9); a key a
-  device copied out of the layer; versions of an epoch that still has
-  unpruned versions — those are deleted by honest devices and holders
-  only; and copies in caches, which expire by their own policy.
+  the key it holds, the key it made, the grants it kept or signed for
+  others — once all of these hold: `E` is not the record in force's epoch;
+  at least one version sealed in `E` is pruned; every version of `C` it
+  knows of is pruned, held and of another epoch (or unsealed), or not held
+  and never applies (refused); and every writer known to write into `C`
+  has left `E`, as signed data shows — it is this device, the record in
+  force admits no further version of it (cut, or not a writer), or it has
+  a version in the record in force's epoch. Until then the erasure is
+  pending, since a writer that has not moved on may still write into `E`;
+  it is checked again whenever a version, a members record or a prune
+  arrives. Erasing, the device stores an erased-epoch marker, which a
+  restart loads before the keys, and from then on refuses that key if
+  granted again — unless an admitted version sealed in `E` that no prune
+  covers arrives (from a writer it had not heard of): then it takes the key
+  again and removes the marker. From
+  erasure on, every copy of that ciphertext anywhere, in any holder, cache
+  or backup, is unreadable to whoever did not keep the key. Not erased:
+  what a reader already opened (plaintext it kept, forward-only, invariant
+  9); a key a device copied out of the layer; versions of an epoch that
+  still has unpruned versions or a writer that has not left it — those are
+  deleted by honest devices and holders only; and copies in caches, which
+  expire by their own policy.
 - **What a pruner can and cannot do.** It drops only its own versions; it
   cannot end another writer's data or another holder's promise for it, and
   it cannot recall copies already made.
@@ -787,7 +911,7 @@ A prune is an entry of the pruner's log about collection `C` (Content
 | `put` | `put(collection, content, {type, keep}) → (writer, seq)` | 1 (`batch`: 4) |
 | `watch` | `watch(collection, since F) → summary, new versions…` | 1 |
 | `snapshot` | `snapshot(names \| collections) → snapshot` | 1 |
-| `hold` | `hold(prefix, {copies, until}) → custody` | 3 |
+| `hold` | `hold(prefix, {copies, until, holders}) → custody` | 3 |
 | `prune` | `prune(prefix, upto)` | 2 (refusing others' writes), 3 |
 | `share` | `share(collection, {rule, readers, writers})` | 1 (adding), 2 (removing, the rule) |
 
@@ -833,13 +957,21 @@ that names the slice.
   cuts, epoch and `Since` of §6. A collection sealed to a group moves to a
   new epoch when the group drops a reader, signed by a device of the
   collection's own namespace (§6), whoever owns the group.
-- **`hold(C, {copies, until})`** (a device of `C`'s namespace, else
-  `NotOwner`) signs the hold record, audits every live lease and repairs
-  (§13), and answers `Custody`: the live leases with this device's audit
-  of each, and those found broken or unanswered before repair.
+- **`hold(C, {copies, until, holders})`** (a device of `C`'s namespace,
+  else `NotOwner`) names the holder devices, at least `copies` of them,
+  none of them this device: else `BadRequest`, whose next step,
+  `FixRequest`, is to correct the request itself (name more holders, or
+  devices). It signs the hold record naming them, audits every live lease
+  and repairs by asking the named holders only (§13), and answers
+  `Custody`: the live leases with this device's audit of each, those found
+  broken or unanswered before repair, and `unkept`, what nothing confirms
+  is kept (§13.3). Releasing the device's own copy of what holders keep is
+  host policy outside the verbs (`Device::release`, §13.3).
 - **`prune(prefix, upto)`** of another device's entry, or up to a frontier
   naming another key, answers `NotOwnWrites`; of a merge collection,
-  `NotPrunable`; else it signs the prune record and publishes it (§14).
+  `NotPrunable`; up to a seq past the device's newest entry, `BadRequest`
+  (next step `FixRequest`); else it signs the prune record and publishes
+  it (§14).
 - A verb given a name it cannot take answers `BadName` (§3).
 
 ## 16. Wire format — slices 1–3
@@ -875,13 +1007,14 @@ both from the NDN naming conventions.
 | hold ask (answer: the lease's packet) | `<H>/32=hold/<HoldAsk TLV>` | DigestSha256 |
 | held packet (answer: the packet) | `<H>/32=held/<Name TLV>` | DigestSha256 |
 | audit ask and answer | `<H>/32=audit/<AuditAsk TLV>`, Content `AuditAnswer`, FreshnessPeriod 0 | the holder's device key |
+| asker's proof (inside a hold or audit ask, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
 from the node, one octet (0–15) each. Log entries are named after the
 writer's device, not the collection, because a writer of another namespace
 can only sign under its own (`/bob/laptop/32=log/alice/32=data/docs/plan/seq=3`).
-Data packets carry no MetaInfo besides the root's FreshnessPeriod;
-ContentType is BLOB.
+Data packets carry no MetaInfo besides the FreshnessPeriod the table
+lists; ContentType is BLOB.
 
 Every name parses one way, and a reader MUST refuse one that does not:
 
@@ -909,6 +1042,14 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Grant.** `G` is the components before the first `32=grant`; one
   GenericNameComponent follows whose value is one `GrantAsk` TLV: a seal key
   name, a collection Name and a `SealEpoch`.
+- **Hold ask, audit ask.** `H` is the components before the first
+  `32=hold` (`32=audit`), a device name; one GenericNameComponent follows
+  whose value is one `HoldAsk` (`AuditAsk`) TLV. A hold ask's record is a
+  log entry with a collection.
+- **Asker's proof.** `A` is the components before the first `32=ask`, a
+  device name; one GenericNameComponent of 32 octets follows, the binding:
+  SHA-256 of the holder's Name TLV followed by the ask's TLV without its
+  `Asker` (§13.2).
 
 ### 16.2 TLV-TYPE numbers
 
@@ -969,22 +1110,32 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x057C | EphemeralKey | 32 octets: the granter's X25519 public key for this grant |
 | 0x057E | KeyCheck | 32 octets: HKDF-SHA256 of the epoch's key (§9) |
 | 0x0521 | Chunks | Size, Digest (the root manifest node's packet), in a VersionRecord in place of Fields and MergeOp, or after a Sealed without Ciphertext (§13.1) |
-| 0x0523 | Size | NonNegativeInteger: the payload's octets, more than 6,144 |
-| 0x0525 | HoldRecord | Name (collection), Copies, KeepUntil, Frontier (what the asker had applied) |
+| 0x0523 | Size | NonNegativeInteger: the payload's octets, more than 6,144 and at most 67,108,864 (`PAYLOAD_MAX`, §13.1) |
+| 0x0525 | HoldRecord | Name (collection), Copies, KeepUntil, Frontier (what the asker had applied), Holders |
 | 0x0527 | Copies | NonNegativeInteger |
 | 0x0529 | LeaseRecord | Name (collection), Name (the hold record), KeepUntil, Frontier (what it holds) |
-| 0x052B | PruneRecord | Name (collection or version), Frontier (up to) |
-| 0x052D | HoldAsk | Name (the hold record) |
-| 0x052F | AuditAsk | Nonce, Name (the piece) |
+| 0x052B | PruneRecord | Name (collection or version), Frontier (up to, below the record's own seq) |
+| 0x052D | HoldAsk | Name (the hold record), Nonce, Asker |
+| 0x052F | AuditAsk | Nonce, Name (the piece; with Whole, the version's log entry), [Whole], Asker |
 | 0x0531 | Nonce | 16 octets, fresh random per ask |
-| 0x0533 | AuditAnswer | Piece or Missing |
+| 0x0533 | AuditAnswer | one of Piece, Missing, Proof, PrunedBy, RefusedBy |
 | 0x0535 | Piece | octets: the piece's whole Data packet |
-| 0x0537 | Missing | empty |
+| 0x0537 | Missing | empty: the holder does not hold the piece and knows no record that ends it |
+| 0x0539 | Holders | Name* (the holder devices the owner chose), ascending; required in a HoldRecord |
+| 0x053B | Asker | octets: the asker's proof, the Data packet `<A>/32=ask/<binding>` (§13.2) |
+| 0x053D | Whole | empty: the audit asks one proof over every piece of the version (§13.3, release) |
+| 0x053F | Proof | 32 octets: SHA-256 over the Nonce, then each piece's length (8 octets, big-endian) and whole packet: the log entry, the manifest nodes in heap order, the chunks in order |
+| 0x0541 | PrunedBy | octets: the packet of the prune record that ended the piece's version |
+| 0x0543 | RefusedBy | octets: the packet of the members record that refuses the piece's version |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
 them: a version in pieces read as one without a payload, or a hold, lease
-or prune record mistaken for nothing, would be wrong, not stale.
+or prune record mistaken for nothing, would be wrong, not stale. So with
+the custody fields: a reader passing over `Holders` would count any
+device's lease, a holder passing over `Whole` would answer a release with
+one piece, and an auditor passing over `PrunedBy` would judge an honest
+holder broken. A hold record without `Holders` is refused.
 
 Names are the Name TLV (0x07). Inside a record, fields appear in the order
 the table lists them; lists are sorted as stated, so equal content encodes
@@ -1045,6 +1196,21 @@ to equal bytes and equal nodes have equal digests.
   like everything else and carry the writer's own monotonic order; the
   audit answer is the one per-ask signature, under a nonce name no cache can
   hold.
+- **Holders named in the hold record**, not learned from sync: sync
+  Interests are unsigned (§12), so a device heard in a group is no evidence
+  of anything; the owner's signed choice is the one policy every reader
+  checks a lease against.
+- **The asker's proof is a signed Data packet** (`<A>/32=ask/<binding>`)
+  rather than a signed Interest, so the existing validator and trust
+  schema check it like any packet of `A`, and its key locator names the
+  claimed asker before any signature is checked, which is what lets a
+  holder drop a stranger's ask for the cost of a parse.
+- **Release by quarantine and a whole proof**, not a holder-specific
+  encoding of the pieces: any encoding a holder can compute from its
+  storage it can also compute from the plain pieces fetched from the
+  releaser at the time of the ask. Only the releaser refusing to serve them
+  removes that relay; the proof over every piece then makes the holder
+  hold all of them at once.
 - **A members record's parent** reuses `Seq` and `Digest`, the pair a
   summary's child and page name their packet by, in a position of its own
   rather than a new number: both are even, so a reader of the previous
@@ -1057,7 +1223,7 @@ to equal bytes and equal nodes have equal digests.
 | Failure | Required behaviour | Rests on |
 |---|---|---|
 | Partition / offline | Reads and writes continue locally under each device's key; collections reconcile from summaries when a path returns. | §4, §7 |
-| Lost device | Its leases lapse; repair copies elsewhere; a cut ends its key at what others had seen. | §8, §13 |
+| Lost device | Its leases lapse; repair asks the other holders the hold record names; a cut ends its key at what others had seen. | §8, §13 |
 | Compromised key | The cut keeps what was signed before it and refuses the rest; sealed data re-keys forward. | §8, §9 |
 | Bad or lying clock | No effect on validity. | invariant 1 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
@@ -1077,6 +1243,10 @@ to equal bytes and equal nodes have equal digests.
 | Writer behind on a seal | Its unsealed version is refused `Unsealed`; its later sealed versions do not wait for it. | §5.2, §9 |
 | Relay or repository of another person | Carries ciphertext and grants wrapped to one device each; reads no payload and no key, and sees the metadata §9 lists. | §9 |
 | Member offline | Its newest verified summary is what the reader is complete against; it catches up when the member returns. | §7 |
+| Holder relays audits | Passes spot audits (they prove it can produce, not that it stores), but cannot make the owner release: a release asks a proof over every piece while the owner serves none of them. | §13.3, §13.4 |
+| Stranger asks a holder | Dropped for the cost of a parse: only an owner device whose hold record names the holder may ask, and its asks are bounded. | §13.2, §13.3 |
+| Holder hears a prune first | Its audit answer names the prune; the auditor verifies and takes it, and the piece is excused. | §13.3, §14 |
+| Writer offline when an epoch is pruned | Erasure stays pending until it has left the epoch; a version it sealed in an erased epoch, arriving later, brings the key back. | §14 |
 
 ## 18. Conformance
 
@@ -1113,6 +1283,11 @@ read whole and verified), h2 (a holder that silently lost what it leased is
 caught by audit and repaired, and released data stays readable from it), h3
 (a holder keeping three quarters of what it promised fails its audit), h4
 (no lease outlives keep, before or after the keep passes), h5 (prune ends
-leases: the holder drops what it covers, audits never ask for it) and h6
+leases: the holder drops what it covers, audits never ask for it), h6
 (sealed data held by a device outside its audience stays unreadable to it
-and readable from it).
+and readable from it), h7 (with one copy, the only holder's loss leaves the
+photo kept nowhere, and `hold` reports it unkept, claiming no repair), and
+from the slice-3 security review h8 (a holder that keeps nothing and
+relays audits from the owner cannot make it release: the owner keeps its
+copy, saying why) and h9 (a prune the holder heard before its auditor does
+not frame it: its answer names the prune, and the audit passes).
