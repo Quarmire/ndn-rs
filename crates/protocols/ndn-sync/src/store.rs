@@ -116,6 +116,12 @@ impl<S: SyncBackend> DataStore for BackendStore<S> {
             .filter_map(|(k, v)| Name::decode(k).ok().map(|n| (n, v)))
             .collect()
     }
+
+    fn remove(&self, name: &Name) {
+        if let Err(e) = self.backend.delete(&name_key(name)) {
+            tracing::warn!(%name, error = %e, "BackendStore: delete failed");
+        }
+    }
 }
 
 #[cfg(test)]

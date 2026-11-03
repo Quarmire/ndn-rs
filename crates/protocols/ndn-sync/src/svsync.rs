@@ -140,6 +140,10 @@ pub trait DataStore: Send + Sync {
         let _ = (prefix, limit);
         Vec::new()
     }
+    /// Delete whatever is stored under exactly `name`; nothing when nothing
+    /// is. Used by stores that drop data on purpose: a pruned entry, a
+    /// payload the device released to a holder, an erased epoch key.
+    fn remove(&self, name: &Name);
 }
 
 /// In-memory [`DataStore`]. The default; persistent stores (e.g. an
@@ -199,6 +203,10 @@ impl DataStore for MemoryStore {
             out.truncate(limit);
         }
         out
+    }
+
+    fn remove(&self, name: &Name) {
+        self.map.write().expect("MemoryStore poisoned").remove(name);
     }
 }
 
