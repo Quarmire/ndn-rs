@@ -48,7 +48,7 @@
 //! | slice | fills |
 //! |---|---|
 //! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
-//! | 2 | `share` that removes (cuts), seals, log rule, re-check on cut arrival |
+//! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule, `prune` refusing others' writes |
 //! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
 //! | 4 | signed blocks, one-key rule, retention by expiry |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
@@ -67,12 +67,13 @@ pub mod error;
 pub mod layer;
 pub mod merge;
 mod rt;
+mod seal;
 pub mod statement;
 mod tree;
 pub mod version;
 pub mod wire;
 
-pub use collection::{Child, Cut, Members, Rule, Summary};
+pub use collection::{Child, Cut, Epoch, Members, Rule, Summary};
 pub use device::{Clock, Config, Device, Transport};
 pub use error::{DataError, NextStep, Refusal};
 pub use layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, Share, State};

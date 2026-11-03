@@ -12,8 +12,21 @@
 //! started from (the writer serves every node any root it signed listed), so
 //! a writer that keeps putting never makes a reader start over. Every entry
 //! is verified by the device's validator, admitted against the collection's
-//! members record, and applied by the collection's merge rule once its
-//! parents are applied.
+//! newest members record (its writers and the cuts of removed ones), and
+//! applied by the collection's rule once its parents are applied. A members
+//! record that arrives later re-checks everything held of its collection:
+//! what it refuses is withdrawn and reported.
+//!
+//! Sealed collections (spec §9) carry their payloads encrypted under an
+//! epoch key; the device asks for the keys it may hold (`seal`), and serves
+//! them, wrapped, to the readers the newest members record admits.
+//!
+//! Groups: a device publishes each change about a collection into the sync
+//! group of the collection's namespace and of every namespace its members
+//! record names, so the notice reaches every member's devices through their
+//! own namespace's group; a notice from a device makes the reader refresh
+//! that device's summary of every followed namespace the device writes into
+//! by the members records held.
 //!
 //! What a device follows: every collection or folder it has put into, read or
 //! watched. Nothing about correctness depends on a clock or on timing: a
@@ -41,21 +54,24 @@ use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use crate::collection::{Child, Members, Rule, Summary};
+use crate::collection::{Child, Cut, Epoch, Members, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, State};
 use crate::merge::{MergeRule, MergeRules, MergeState};
 use crate::rt::{self, Instant};
+use crate::seal::{self, Keys};
 use crate::statement::{Custody, Snapshot};
 use crate::tree::{Entry, Tree};
 use crate::version::{
-    Content, Frontier, Payload, Seal, Seq, Timestamp, Version, VersionId, Writer,
+    Audience, Content, Frontier, Payload, Seal, Seq, Timestamp, Version, VersionId, Writer,
 };
 use crate::wire::{
-    self, Branches, MembersBody, NodeBody, Record, VersionBody, device_of, log_name, namespace_of,
-    node_name, page_name, parse_log_name, parse_state_name, parse_summary_name, seqs_of,
-    state_name, subject_namespace, summary_prefix,
+    self, Branches, CutBody, GrantAsk, MembersBody, NodeBody, Record, SealedBody, VersionBody,
+    device_of, grant_name, log_name, namespace_of, node_name, page_name, parse_grant_name,
+    parse_log_name, parse_seal_key_name, parse_state_name, parse_summary_name, seal_key_name,
+    seqs_of, state_name, subject_namespace, summary_prefix,
 };
+use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
 /// A wall clock: the date a device's clock shows. Display and retention
 /// only; no decision of the layer reads it.
@@ -162,9 +178,33 @@ struct Coll {
     /// Held while no members record is known (or the rule is not one this
     /// device runs).
     waiting: Vec<Arc<HeldVersion>>,
-    /// Held but refused: their keys are not writers of the newest members
-    /// record. A later revision that admits their keys admits them.
+    /// Held but refused by the newest members record: their keys are not
+    /// writers, or lie outside a cut. A later revision that admits them
+    /// admits them.
     outsiders: Vec<Arc<HeldVersion>>,
+    /// Verified, sealed in an epoch whose key this device does not hold
+    /// (yet, or ever: it is not of the audience).
+    locked: Vec<Locked>,
+}
+
+/// A verified version whose payload is sealed and not opened.
+struct Locked {
+    name: Name,
+    wire: Bytes,
+    writer: Writer,
+    seq: u64,
+    body: VersionBody,
+}
+
+impl Locked {
+    fn epoch(&self) -> &Epoch {
+        &self
+            .body
+            .sealed
+            .as_ref()
+            .expect("a locked version is sealed")
+            .epoch
+    }
 }
 
 impl Coll {
@@ -182,6 +222,8 @@ impl Coll {
 /// What a held log entry is.
 enum Held {
     Version(VersionId),
+    /// A version whose payload is sealed and not opened here.
+    Locked,
     Members,
     Snapshot(Snapshot),
 }
@@ -238,6 +280,14 @@ struct St {
     refused: HashMap<Name, Refusal>,
     /// Where applied versions of other writers are kept.
     store: Arc<dyn DataStore>,
+    /// The seal keys held.
+    keys: Keys,
+    /// Epoch keys being asked for.
+    asking: BTreeSet<(Name, Epoch)>,
+    /// Grants made, by name: one name, one packet.
+    grants: HashMap<Name, Bytes>,
+    /// The device's seal key packet, once signed.
+    seal_key: Option<Bytes>,
 }
 
 struct Inner {
@@ -300,11 +350,26 @@ fn owner_signed(keyring: &Keyring, entry: &Name, ns: &Name) -> bool {
     entry.has_prefix(ns) && keyring.context_for(entry).namespace() == ns
 }
 
+/// The seq of `y` that a version naming `(y, t)` among its parents needs
+/// applied: `t`, or, when the newest members record refuses `(y, t)` by a
+/// cut, what the cut accepts of `y` — a parent outside a cut never arrives.
+fn needed(members: Option<&Members>, y: &Writer, t: u64) -> u64 {
+    let Some(m) = members else { return t };
+    match m.refusal(&VersionId {
+        writer: y.clone(),
+        seq: Seq(t),
+    }) {
+        Some(Refusal::OutsideCut(cut)) => cut.accept.get(y).map_or(0, |s| s.0.min(t)),
+        _ => t,
+    }
+}
+
 /// Whether a version is ready to apply: its writer's earlier entries here
-/// and its parents are applied.
+/// and its parents (as far as the cuts accept them) are applied.
 fn ready(
     entries: &HashMap<Writer, BTreeSet<u64>>,
     applied: &BTreeMap<Writer, u64>,
+    members: Option<&Members>,
     v: &Version,
 ) -> bool {
     let w = &v.id.writer;
@@ -312,9 +377,10 @@ fn ready(
         .get(w)
         .and_then(|e| e.range(..v.id.seq.0).next_back().copied());
     prev == applied.get(w).copied()
-        && v.parents
-            .iter()
-            .all(|(y, t)| applied.get(y).is_some_and(|a| *a >= t.0))
+        && v.parents.iter().all(|(y, t)| {
+            let need = needed(members, y, t.0);
+            need == 0 || applied.get(y).is_some_and(|a| *a >= need)
+        })
 }
 
 impl St {
@@ -367,9 +433,19 @@ impl St {
         }
     }
 
+    /// Tell every watcher of collection `c`, whatever its frontier.
+    fn tell(&mut self, c: &Name, change: &Change) {
+        self.watchers.retain(|w| !w.tx.is_closed());
+        for w in &self.watchers {
+            if c.has_prefix(&w.target) {
+                let _ = w.tx.send(Ok(change.clone()));
+            }
+        }
+    }
+
     /// Accept `body`, signed by `signer` (a device of the collection's
     /// namespace, [`owner_signed`]), if it is the newest record of its
-    /// collection.
+    /// collection, and read the collection again under it.
     fn accept_members(
         &mut self,
         body: MembersBody,
@@ -386,12 +462,6 @@ impl St {
         if !newer {
             return;
         }
-        if coll.state.is_none()
-            && let Rule::Merge { function } = &body.rule
-            && let Some(rule) = rules.get(function)
-        {
-            coll.state = Some(rule.start(me));
-        }
         coll.members = Some(Members {
             collection: c.clone(),
             owner: signer.clone(),
@@ -399,46 +469,110 @@ impl St {
             rule: body.rule,
             writers: body.writers,
             readers: body.readers,
-            cuts: Vec::new(),
+            cuts: body
+                .cuts
+                .into_iter()
+                .map(|b| Cut {
+                    of: b.of,
+                    accept: b.accept,
+                    signer: signer.clone(),
+                })
+                .collect(),
+            epoch: body.epoch,
+            since: body.since,
             readmitted: Vec::new(),
         });
-        let waiting = std::mem::take(&mut coll.waiting);
-        let outsiders = std::mem::take(&mut coll.outsiders);
-        for v in waiting.into_iter().chain(outsiders) {
-            self.refused.remove(&v.version.name);
-            self.admit(v);
+        self.reread(&c, rules, me);
+    }
+
+    /// Read collection `c` again under its newest members record (spec
+    /// §8): every version held is admitted or refused anew and the state is
+    /// rebuilt from the admitted ones. A version applied before that the
+    /// record now refuses is withdrawn and reported to the watchers; one
+    /// applied before and still admitted is not delivered again.
+    fn reread(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
+        let Some(coll) = self.colls.get_mut(c) else {
+            return;
+        };
+        let Some(members) = coll.members.clone() else {
+            return;
+        };
+        let before = coll.at();
+        let mut all: Vec<Arc<HeldVersion>> = std::mem::take(&mut coll.versions)
+            .into_values()
+            .chain(std::mem::take(&mut coll.waiting))
+            .chain(std::mem::take(&mut coll.outsiders))
+            .collect();
+        all.sort_by(|a, b| a.version.id.cmp(&b.version.id));
+        coll.pending.clear();
+        coll.applied.clear();
+        coll.state = match &members.rule {
+            Rule::Merge { function } => rules.get(function).map(|r| r.start(me)),
+            _ => None,
+        };
+        let delivered: BTreeSet<VersionId> = all
+            .iter()
+            .map(|hv| hv.version.id.clone())
+            .filter(|id| before.contains(id))
+            .collect();
+        let mut withdrawn = Vec::new();
+        for hv in all {
+            let id = hv.version.id.clone();
+            self.refused.remove(&hv.version.name);
+            self.admit_one(hv);
+            if delivered.contains(&id)
+                && let Some(Refusal::OutsideCut(cut)) = members.refusal(&id)
+            {
+                withdrawn.push((id, cut));
+            }
+        }
+        self.apply_ready(c, &delivered);
+        for (id, cut) in withdrawn {
+            tracing::info!(?id, collection = %c, "withdrawn: a cut that arrived later refuses it");
+            self.tell(c, &Change::Withdrawn { id, cut });
         }
     }
 
-    /// Admit a verified version of another writer: hold it until the
-    /// members record is known, refuse it if its key is not a member, else
-    /// queue it and apply what became ready.
-    fn admit(&mut self, hv: Arc<HeldVersion>) {
+    /// Admit a verified, opened version, or hold it: until the members
+    /// record is known (and its rule is one this device runs), or as
+    /// refused by it. Returns whether it was queued to apply.
+    fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
         let coll = self.colls.entry(c.clone()).or_default();
         let Some(members) = &coll.members else {
             coll.waiting.push(hv);
-            return;
+            return false;
         };
-        let key = hv.version.id.writer.key();
-        if !members.writers.iter().any(|p| key.has_prefix(p)) {
-            tracing::debug!(id = ?hv.version.id, "refused: not a writer of {c}");
-            self.refused
-                .insert(hv.version.name.clone(), Refusal::NotMember);
+        if let Some(why) = members.refusal(&hv.version.id) {
+            tracing::debug!(id = ?hv.version.id, ?why, "refused in {c}");
+            self.refused.insert(hv.version.name.clone(), why);
             coll.outsiders.push(hv);
-            return;
+            return false;
         }
-        let Some(state) = &coll.state else {
-            // The rule is not one this device runs; the version stays held
-            // and `get` says why.
-            coll.waiting.push(hv);
-            return;
-        };
-        if let Err(e) = state.check(&hv.version.id.writer, &hv.op) {
-            tracing::debug!(id = ?hv.version.id, "refused: {e}");
-            self.refused
-                .insert(hv.version.name.clone(), Refusal::BadSignature);
-            return;
+        let history = members
+            .since
+            .as_ref()
+            .is_some_and(|s| s.contains(&hv.version.id));
+        match &members.rule {
+            Rule::Merge { .. } => {
+                let Some(state) = &coll.state else {
+                    // The rule is not one this device runs; the version stays
+                    // held and `get` says why.
+                    coll.waiting.push(hv);
+                    return false;
+                };
+                if !history && let Err(e) = state.check(&hv.version.id.writer, &hv.op) {
+                    tracing::debug!(id = ?hv.version.id, "refused: {e}");
+                    self.refused
+                        .insert(hv.version.name.clone(), Refusal::BadSignature);
+                    return false;
+                }
+            }
+            Rule::Log => {}
+            Rule::OneKey => {
+                coll.waiting.push(hv);
+                return false;
+            }
         }
         coll.entries
             .entry(hv.version.id.writer.clone())
@@ -446,10 +580,20 @@ impl St {
             .insert(hv.version.id.seq.0);
         coll.pending.insert(hv.version.id.clone());
         coll.versions.insert(hv.version.id.clone(), hv);
-        self.apply_ready(&c);
+        true
     }
 
-    fn apply_ready(&mut self, c: &Name) {
+    /// Admit a verified, opened version and apply what became ready.
+    fn admit(&mut self, hv: Arc<HeldVersion>) {
+        let c = hv.version.collection.clone();
+        if self.admit_one(hv) {
+            self.apply_ready(&c, &BTreeSet::new());
+        }
+    }
+
+    /// Apply every pending version of `c` that is ready, and deliver each
+    /// to the watchers unless `quiet` lists it (delivered before).
+    fn apply_ready(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
         let St {
             colls,
             watchers,
@@ -460,25 +604,41 @@ impl St {
         let Some(coll) = colls.get_mut(c) else {
             return;
         };
+        let Coll {
+            members,
+            state,
+            versions,
+            applied,
+            entries,
+            pending,
+            ..
+        } = coll;
+        let since = members.as_ref().and_then(|m| m.since.as_ref());
         let mut applied_now = Vec::new();
         loop {
-            let next = coll.pending.iter().find(|id| {
-                coll.versions
+            let next = pending.iter().find(|id| {
+                versions
                     .get(id)
-                    .is_some_and(|hv| ready(&coll.entries, &coll.applied, &hv.version))
+                    .is_some_and(|hv| ready(entries, applied, members.as_ref(), &hv.version))
             });
             let Some(id) = next.cloned() else { break };
-            coll.pending.remove(&id);
-            let hv = Arc::clone(&coll.versions[&id]);
-            let state = coll.state.as_mut().expect("admitted versions have a state");
-            match state.apply(&id.writer, &hv.op) {
+            pending.remove(&id);
+            let hv = Arc::clone(&versions[&id]);
+            let history = since.is_some_and(|s| s.contains(&id));
+            let done = match state.as_mut() {
+                Some(state) if !history => state.apply(&id.writer, &hv.op),
+                _ => Ok(()),
+            };
+            match done {
                 Ok(()) => {
-                    coll.applied.insert(id.writer.clone(), id.seq.0);
-                    applied_now.push(hv);
+                    applied.insert(id.writer.clone(), id.seq.0);
+                    if !quiet.contains(&id) {
+                        applied_now.push(hv);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(?id, "refused: {e}");
-                    coll.versions.remove(&id);
+                    versions.remove(&id);
                     refused.insert(hv.version.name.clone(), Refusal::BadSignature);
                 }
             }
@@ -495,8 +655,44 @@ impl St {
         }
     }
 
+    /// Open the locked versions of `c` whose epoch key is now held, and
+    /// admit them.
+    fn unlock(&mut self, c: &Name) {
+        let Some(coll) = self.colls.get_mut(c) else {
+            return;
+        };
+        let locked = std::mem::take(&mut coll.locked);
+        let mut opened = Vec::new();
+        for l in locked {
+            match self.keys.key(c, l.epoch()) {
+                Some(key) => opened.push((key, l)),
+                None => self.colls.get_mut(c).expect("held").locked.push(l),
+            }
+        }
+        for (key, l) in opened {
+            let sealed = l.body.sealed.as_ref().expect("locked versions are sealed");
+            let Some((fields, op)) = seal::open_payload(&key, &l.name, &sealed.ciphertext) else {
+                tracing::debug!(name = %l.name, "refused: its payload does not open under its epoch's key");
+                self.held.remove(&l.name);
+                self.refused.insert(l.name.clone(), Refusal::BadSignature);
+                continue;
+            };
+            let mut body = l.body;
+            body.fields = fields;
+            body.op = op.clone();
+            let version = version_of(&l.name, &l.writer, l.seq, body);
+            self.held
+                .insert(l.name.clone(), Held::Version(version.id.clone()));
+            self.admit(Arc::new(HeldVersion {
+                version,
+                op,
+                wire: l.wire,
+            }));
+        }
+    }
+
     /// The merged value of `c` at exactly `at`, from held versions; `None`
-    /// while some version inside `at` is not held.
+    /// while some version inside `at` is not held, or `c` has no merge rule.
     fn value_at(
         &self,
         c: &Name,
@@ -508,7 +704,8 @@ impl St {
         if *at == coll.at() {
             return coll.state.as_ref().map(|s| s.value());
         }
-        let Some(Rule::Merge { function }) = coll.members.as_ref().map(|m| &m.rule) else {
+        let members = coll.members.as_ref()?;
+        let Rule::Merge { function } = &members.rule else {
             return None;
         };
         let mut state = rules.get(function)?.start(me);
@@ -537,9 +734,15 @@ impl St {
         while !left.is_empty() {
             let i = left
                 .iter()
-                .position(|hv| ready(&entries, &applied, &hv.version))?;
+                .position(|hv| ready(&entries, &applied, Some(members), &hv.version))?;
             let hv = left.swap_remove(i);
-            state.apply(&hv.version.id.writer, &hv.op).ok()?;
+            let history = members
+                .since
+                .as_ref()
+                .is_some_and(|s| s.contains(&hv.version.id));
+            if !history {
+                state.apply(&hv.version.id.writer, &hv.op).ok()?;
+            }
             applied.insert(hv.version.id.writer.clone(), hv.version.id.seq.0);
         }
         Some(state.value())
@@ -600,6 +803,8 @@ impl Device {
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
         let window = config.window.max(1);
+        let recipient = recipient_key(&*store, &device);
+        let seal_keys = Keys::new(&device, recipient);
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -624,6 +829,10 @@ impl Device {
                 watchers: Vec::new(),
                 refused: HashMap::new(),
                 store,
+                keys: seal_keys,
+                asking: BTreeSet::new(),
+                grants: HashMap::new(),
+                seal_key: None,
             }),
             progress: Notify::new(),
             slots: Semaphore::new(window),
@@ -731,6 +940,45 @@ fn kept_root(key: &Name, wire: &Bytes) -> Option<(Name, Name, u64)> {
     Some((s.device, s.subject, s.head?))
 }
 
+/// Where the store keeps this device's recipient secret: a local name,
+/// never served.
+fn secret_name(device: &Name) -> Name {
+    let base: Name = "/localhost/ndn-data/seal".parse().expect("a valid name");
+    Name::from_components(base.components().iter().chain(device.components()).cloned())
+}
+
+/// This device's recipient key: the one its store keeps, else a new one,
+/// kept there.
+fn recipient_key(store: &dyn DataStore, device: &Name) -> RecipientKey {
+    let name = secret_name(device);
+    if let Some(b) = store.get(&name)
+        && let Ok(secret) = <[u8; 32]>::try_from(b.as_ref())
+    {
+        return RecipientKey::from_bytes(secret);
+    }
+    let key = RecipientKey::generate();
+    store.insert(name, Bytes::copy_from_slice(key.expose()));
+    key
+}
+
+/// The key a grant packet named `name` carries, opened with `recipient`;
+/// `None` if it is not wrapped to it under that name.
+fn open_grant(recipient: &RecipientKey, name: &Name, data: &Data) -> Option<ContentKey> {
+    let (ephemeral, wrapped) = wire::decode_grant(data.content()?.clone()).ok()?;
+    let sealed = Sealed::from_bytes(&wrapped).ok()?;
+    recipient
+        .unwrap_ck(&ephemeral, &sealed, &name.encode_to_tlv())
+        .ok()
+}
+
+/// Take a granted key: `granter`'s master secret, or one epoch key.
+fn take_grant(keys: &mut Keys, granter: Name, ask: GrantAsk, key: &ContentKey) {
+    match ask.of {
+        None => keys.add_master(granter, key),
+        Some((c, e)) => keys.add_epoch(c, e, key.clone()),
+    }
+}
+
 fn bare_interest(pkt: Bytes) -> Option<Interest> {
     let pkt = if pkt.first() == Some(&0x64) {
         ndn_packet::lp::LpPacket::decode(pkt).ok()?.fragment?
@@ -756,7 +1004,12 @@ impl Inner {
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
+        let mut grants = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
+            if let Some((granter, ask)) = parse_grant_name(&name) {
+                grants.push((name, granter, ask, wire));
+                continue;
+            }
             let Some(parsed) = parse_log_name(&name) else {
                 roots.extend(kept_root(&name, &wire));
                 continue;
@@ -786,6 +1039,15 @@ impl Inner {
         entries
             .sort_by_key(|(_, _, record, _, seq, _)| (!matches!(record, Record::Members(_)), *seq));
         let mut st = self.st.lock();
+        // Grants first: own sealed entries open with the keys they gave.
+        for (name, granter, ask, wire) in grants {
+            let Ok(data) = Data::decode(wire) else {
+                continue;
+            };
+            if let Some(key) = open_grant(&st.keys.recipient, &name, &data) {
+                take_grant(&mut st.keys, granter, ask, &key);
+            }
+        }
         for (name, wire, record, writer, seq, mine) in entries {
             if mine {
                 st.head = st.head.max(seq);
@@ -867,16 +1129,123 @@ impl Inner {
         }
     }
 
+    /// A notice in `ns`'s group that `update.name` moved: refresh that
+    /// device's summary of `ns`, and of every other namespace this device
+    /// follows that the device writes into by the members records held
+    /// (spec §12): a member of another namespace notices through its own
+    /// namespace's group.
     fn on_update(self: &Arc<Self>, ns: &Name, update: SyncUpdate) {
         let device = update.name;
         tracing::trace!(me = %self.device, %ns, %device, high = update.high_seq, "sync update");
         if device == self.device {
             return;
         }
-        if let Some(g) = self.st.lock().groups.get_mut(ns) {
-            g.members.insert(device.clone());
+        let targets = {
+            let mut st = self.st.lock();
+            if let Some(g) = st.groups.get_mut(ns) {
+                g.members.insert(device.clone());
+            }
+            let mut targets = self.written_by(&st, &device);
+            targets.insert(ns.clone());
+            targets
+        };
+        for t in targets {
+            self.schedule(t, device.clone());
         }
-        self.schedule(ns.clone(), device);
+    }
+
+    /// The namespace of the trust context governing `name` here (empty when
+    /// none is held).
+    fn namespace_of_name(&self, name: &Name) -> Name {
+        self.validator
+            .keyring()
+            .context_for(name)
+            .namespace()
+            .clone()
+    }
+
+    /// The namespaces this device follows (has joined the group of) that
+    /// `device` may write into: its own, and those of whose collections a
+    /// members record held lists a writer of `device`'s namespace.
+    fn written_by(&self, st: &St, device: &Name) -> BTreeSet<Name> {
+        let dns = self.namespace_of_name(device);
+        let mut out = BTreeSet::new();
+        if dns.is_empty() {
+            return out;
+        }
+        if st.groups.contains_key(&dns) {
+            out.insert(dns.clone());
+        }
+        for (c, coll) in &st.colls {
+            if st.groups.keys().all(|g| out.contains(g)) {
+                break;
+            }
+            let Some(m) = &coll.members else { continue };
+            let Some(ns) = namespace_of(c) else { continue };
+            if out.contains(&ns) || !st.groups.contains_key(&ns) {
+                continue;
+            }
+            if m.writers.iter().any(|w| self.namespace_of_name(w) == dns) {
+                out.insert(ns);
+            }
+        }
+        out
+    }
+
+    /// The devices heard that may write into namespace `ns`: those heard in
+    /// its group, and those heard in any group whose namespace writes into
+    /// `ns` by the members records held.
+    fn known_for(&self, st: &St, ns: &Name) -> Vec<Name> {
+        let mut out: BTreeSet<Name> = st
+            .groups
+            .get(ns)
+            .map(|g| g.members.iter().cloned().collect())
+            .unwrap_or_default();
+        for g in st.groups.values() {
+            for d in &g.members {
+                if !out.contains(d) && self.written_by(st, d).contains(ns) {
+                    out.insert(d.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// The namespaces whose groups a change about `c` is published into:
+    /// `c`'s own, and every namespace held here that its members record
+    /// names among the writers or readers (a group reader by the namespace
+    /// of its collection).
+    fn groups_of(&self, st: &St, c: &Name) -> Vec<Name> {
+        let own = namespace_of(c).expect("a collection has a namespace");
+        let mut out = vec![own];
+        let Some(m) = st.colls.get(c).and_then(|coll| coll.members.as_ref()) else {
+            return out;
+        };
+        let named = m
+            .writers
+            .iter()
+            .cloned()
+            .chain(m.readers.iter().map(|a| match a {
+                Audience::Person(n) | Audience::Device(n) => n.clone(),
+                Audience::Group(g) => namespace_of(g).unwrap_or_else(|| g.clone()),
+            }));
+        for n in named {
+            let ns = self.namespace_of_name(&n);
+            if !ns.is_empty() && wire::is_namespace(&ns) && !out.contains(&ns) {
+                out.push(ns);
+            }
+        }
+        out
+    }
+
+    /// Publish a change about `c` into each of its groups ([`Self::groups_of`]).
+    async fn publish_about(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
+        let groups = self.groups_of(&self.st.lock(), c);
+        for ns in groups {
+            self.join(&ns).await?;
+            self.publish(&ns).await;
+        }
+        Ok(())
     }
 
     /// Refresh `device`'s summary of `ns` in the background, coalescing
@@ -958,19 +1327,14 @@ impl Inner {
     }
 
     /// Follow `target` and, the first time, look at what every device known
-    /// in its group holds of it, for at most the first-look time.
+    /// to write into its namespace holds of it, for at most the first-look
+    /// time.
     async fn look(self: &Arc<Self>, target: &Name) -> Result<(), DataError> {
         if !self.follow(target).await? {
             return Ok(());
         }
         let ns = namespace_of(target).expect("followed names have a namespace");
-        let devices: Vec<Name> = {
-            let st = self.st.lock();
-            st.groups
-                .get(&ns)
-                .map(|g| g.members.iter().cloned().collect())
-                .unwrap_or_default()
-        };
+        let devices = self.known_for(&self.st.lock(), &ns);
         let all = futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d)));
         let _ = rt::timeout(self.config.first_look, all).await;
         Ok(())
@@ -992,15 +1356,9 @@ impl Inner {
         }
     }
 
-    /// Refresh in the background every device known in `ns`'s group.
+    /// Refresh in the background every device known to write into `ns`.
     fn refresh_group(self: &Arc<Self>, ns: &Name) {
-        let devices: Vec<Name> = {
-            let st = self.st.lock();
-            st.groups
-                .get(ns)
-                .map(|g| g.members.iter().cloned().collect())
-                .unwrap_or_default()
-        };
+        let devices = self.known_for(&self.st.lock(), ns);
         for d in devices {
             self.schedule(ns.clone(), d);
         }
@@ -1162,7 +1520,7 @@ impl Inner {
                         }
                     }
                     // Learned entries may make held versions ready.
-                    st.apply_ready(&subject);
+                    st.apply_ready(&subject, &BTreeSet::new());
                     let summary = Summary {
                         collection: subject.clone(),
                         signer: writer.clone(),
@@ -1329,6 +1687,7 @@ impl Inner {
         if device_of(writer.key()).as_ref() != Some(&parsed.device) || !subject_ok {
             return refuse(&mut st, Refusal::BadSignature);
         }
+        let c = parsed.subject.clone();
         self.take(
             &mut st,
             name.clone(),
@@ -1337,7 +1696,37 @@ impl Inner {
             record,
             false,
         );
+        drop(st);
+        if let Some(c) = c {
+            self.chase_keys(&c);
+        }
         Ok(())
+    }
+
+    /// Ask, in the background, for every epoch key that a locked version of
+    /// `c` needs and that is not held or being asked for, when this device
+    /// is of `c`'s audience.
+    fn chase_keys(self: &Arc<Self>, c: &Name) {
+        let epochs: BTreeSet<Epoch> = {
+            let st = self.st.lock();
+            let Some(coll) = st.colls.get(c) else { return };
+            if coll.locked.is_empty() || !self.reads(&st, c) {
+                return;
+            }
+            coll.locked
+                .iter()
+                .map(|l| l.epoch().clone())
+                .filter(|e| {
+                    st.keys.key(c, e).is_none() && !st.asking.contains(&(c.clone(), e.clone()))
+                })
+                .collect()
+        };
+        for e in epochs {
+            let (inner, c) = (Arc::clone(self), c.clone());
+            rt::spawn(async move {
+                inner.obtain(&c, &e).await;
+            });
+        }
     }
 
     /// Hold a verified log entry and let its collection take it. Members
@@ -1405,21 +1794,45 @@ impl Inner {
                     tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
                 }
             }
-            Record::Version(body) => {
+            Record::Version(mut body) => {
                 let c = body.collection.clone();
-                let op = body.op.clone();
-                let version = version_of(&name, &writer, parsed.seq, body);
-                st.held
-                    .insert(name.clone(), Held::Version(version.id.clone()));
+                let seq = parsed.seq;
                 if mine {
                     let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
                     st.trees
                         .entry(ns.clone())
                         .or_insert_with(|| Tree::new(ns))
-                        .add(&c, parsed.seq, Entry::Version);
+                        .add(&c, seq, Entry::Version);
                 } else {
-                    self.note_peer_head(st, &parsed.device, &c, parsed.seq);
+                    self.note_peer_head(st, &parsed.device, &c, seq);
                 }
+                if let Some(sealed) = &body.sealed {
+                    let opened = st
+                        .keys
+                        .key(&c, &sealed.epoch)
+                        .and_then(|k| seal::open_payload(&k, &name, &sealed.ciphertext));
+                    match opened {
+                        Some((fields, op)) => {
+                            body.fields = fields;
+                            body.op = op;
+                        }
+                        None => {
+                            st.held.insert(name.clone(), Held::Locked);
+                            st.colls.entry(c).or_default().locked.push(Locked {
+                                name,
+                                wire,
+                                writer,
+                                seq,
+                                body,
+                            });
+                            return;
+                        }
+                    }
+                }
+                let op = body.op.clone();
+                let version = version_of(&name, &writer, seq, body);
+                st.held
+                    .insert(name.clone(), Held::Version(version.id.clone()));
                 st.admit(Arc::new(HeldVersion { version, op, wire }));
             }
             Record::Snapshot(pins) => {
@@ -1486,8 +1899,10 @@ impl Inner {
     }
 
     /// The host default for a collection of this device's own namespace that
-    /// nobody shared: merge with `/merge/yrs`, written and read by the owner.
-    fn default_members(&self, c: &Name) -> MembersBody {
+    /// nobody shared: merge with `/merge/yrs`, written and read by the
+    /// owner, sealed in an epoch this record (the own log's entry `seq`)
+    /// starts.
+    fn default_members(&self, c: &Name, seq: u64) -> MembersBody {
         MembersBody {
             collection: c.clone(),
             revision: 1,
@@ -1495,7 +1910,113 @@ impl Inner {
                 function: crate::merge::Yrs::new().function().clone(),
             },
             writers: vec![self.ns.clone()],
-            readers: vec![crate::Audience::Person(self.ns.clone())],
+            readers: vec![Audience::Person(self.ns.clone())],
+            cuts: Vec::new(),
+            epoch: Some(Epoch {
+                creator: self.device.clone(),
+                seq: Seq(seq),
+            }),
+            since: None,
+        }
+    }
+
+    /// The next members record of `c`, owned here, after `current` (spec
+    /// §6, §8, §9): a writer prefix removed gets a cut accepting what this
+    /// device saw of its keys in `c` (held versions and entries its writers'
+    /// summaries listed); a prefix written again drops its cut. A reader
+    /// removed — or `new_epoch` — starts a new epoch at this record; no
+    /// readers, no seal. A rule changed sets `since` to what this device
+    /// applied.
+    #[allow(clippy::too_many_arguments)]
+    fn next_members(
+        &self,
+        st: &St,
+        c: &Name,
+        current: Option<&Members>,
+        rule: Rule,
+        writers: Vec<Name>,
+        readers: Vec<Audience>,
+        new_epoch: bool,
+    ) -> MembersBody {
+        let seq = st.head + 1;
+        let coll = st.colls.get(c);
+        let covered = |of: &Name| writers.iter().any(|p| of.has_prefix(p));
+        let mut cuts: Vec<CutBody> = current
+            .map(|m| {
+                m.cuts
+                    .iter()
+                    .filter(|k| !covered(&k.of))
+                    .map(|k| CutBody {
+                        of: k.of.clone(),
+                        accept: k.accept.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for p in current
+            .map(|m| m.writers.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| !covered(p))
+        {
+            let mut accept = Frontier::new();
+            if let Some(coll) = coll {
+                for id in coll.versions.keys() {
+                    if id.writer.key().has_prefix(p) {
+                        accept.include(id);
+                    }
+                }
+                for (w, seqs) in &coll.entries {
+                    if w.key().has_prefix(p)
+                        && let Some(s) = seqs.iter().next_back()
+                    {
+                        accept.include(&VersionId {
+                            writer: w.clone(),
+                            seq: Seq(*s),
+                        });
+                    }
+                }
+            }
+            cuts.retain(|k| k.of != *p);
+            cuts.push(CutBody {
+                of: p.clone(),
+                accept,
+            });
+        }
+        cuts.sort_by(|a, b| a.of.cmp(&b.of));
+        let kept = current.and_then(|m| {
+            let narrowed = m.readers.iter().any(|r| !readers.contains(r));
+            (!new_epoch && !narrowed).then(|| m.epoch.clone()).flatten()
+        });
+        let epoch = (!readers.is_empty()).then(|| {
+            kept.unwrap_or_else(|| Epoch {
+                creator: self.device.clone(),
+                seq: Seq(seq),
+            })
+        });
+        let since = match current {
+            Some(m) if m.rule != rule => {
+                let mut f = coll.map(Coll::at).unwrap_or_default();
+                for (w, s) in m.since.iter().flat_map(Frontier::iter) {
+                    f.include(&VersionId {
+                        writer: w.clone(),
+                        seq: s,
+                    });
+                }
+                Some(f)
+            }
+            Some(m) => m.since.clone(),
+            None => None,
+        };
+        MembersBody {
+            collection: c.clone(),
+            revision: current.map_or(1, |m| m.revision.0 + 1),
+            rule,
+            writers,
+            readers,
+            cuts,
+            epoch,
+            since,
         }
     }
 
@@ -1503,7 +2024,23 @@ impl Inner {
 
     async fn answer(self: Arc<Self>, interest: Interest, responder: Responder) {
         let name = (*interest.name).clone();
+        if let Some((granter, ask)) = parse_grant_name(&name)
+            && granter == self.device
+        {
+            // A grant fetches the asker's seal key first: its own task, so
+            // the serving future stays free of fetches (wasm32 timers are
+            // not `Send`).
+            rt::spawn(async move {
+                let reply = self.grant(&name, ask).await;
+                self.reply(&name, responder, reply).await;
+            });
+            return;
+        }
         let reply = self.packet_for(&name, interest.selectors().can_be_prefix);
+        self.reply(&name, responder, reply).await;
+    }
+
+    async fn reply(&self, name: &Name, responder: Responder, reply: Option<Bytes>) {
         tracing::trace!(me = %self.device, %name, answered = reply.is_some(), "interest");
         let sent = match reply {
             Some(wire) => responder.respond_bytes(wire).await,
@@ -1544,6 +2081,14 @@ impl Inner {
                 name,
             );
         }
+        if let Some((device, public)) = parse_seal_key_name(name)
+            && device == self.device
+        {
+            let mut st = self.st.lock();
+            return (public == st.keys.recipient.public())
+                .then(|| self.seal_key_packet(&mut st))
+                .flatten();
+        }
         let keys = self.device.clone().append("KEY");
         if name.has_prefix(&keys) {
             return self
@@ -1582,6 +2127,221 @@ impl Inner {
         Some(wire)
     }
 
+    // ---- seals --------------------------------------------------------------------------------
+
+    /// This device's seal key packet `<D>/32=seal/<public key>`, signed
+    /// once, when first asked for.
+    fn seal_key_packet(&self, st: &mut St) -> Option<Bytes> {
+        if let Some(p) = &st.seal_key {
+            return Some(p.clone());
+        }
+        let public = st.keys.recipient.public();
+        let name = seal_key_name(&self.device, &public);
+        let wire = self
+            .sign(DataBuilder::new(name, &wire::encode_seal_key(&public)))
+            .ok()?;
+        st.seal_key = Some(wire.clone());
+        Some(wire)
+    }
+
+    /// Whether `device`, of namespace `dns`, is of `c`'s audience by the
+    /// newest members record held (spec §9): a device of `c`'s namespace
+    /// always; else one a reader names — its person, itself, or a group
+    /// (a collection) whose own newest record names either.
+    fn admits_reader(&self, st: &St, c: &Name, device: &Name, dns: &Name) -> bool {
+        if namespace_of(c).as_ref() == Some(dns) {
+            return true;
+        }
+        let Some(m) = st.colls.get(c).and_then(|x| x.members.as_ref()) else {
+            return false;
+        };
+        let direct = |a: &Audience| match a {
+            Audience::Person(p) => p == dns,
+            Audience::Device(d) => d == device,
+            Audience::Group(_) => false,
+        };
+        m.readers.iter().any(|a| match a {
+            Audience::Group(g) => st
+                .colls
+                .get(g)
+                .and_then(|x| x.members.as_ref())
+                .is_some_and(|gm| gm.readers.iter().any(direct)),
+            other => direct(other),
+        })
+    }
+
+    /// Whether this device reads `c`.
+    fn reads(&self, st: &St, c: &Name) -> bool {
+        self.admits_reader(st, c, &self.device, &self.ns)
+    }
+
+    /// Whether `c` is sealed and this device is not of its audience.
+    fn sealed_off(&self, st: &St, c: &Name) -> bool {
+        st.colls
+            .get(c)
+            .and_then(|x| x.members.as_ref())
+            .is_some_and(|m| m.epoch.is_some())
+            && !self.reads(st, c)
+    }
+
+    /// Answer a grant asked of this device (spec §9): verify the asker's
+    /// seal key, check that the asker may hold the key asked for — this
+    /// device's master secret: a device of its own namespace; an epoch key
+    /// of `c`: a device of `c`'s current audience — and wrap the key to the
+    /// asker's seal key. One name, one packet. `None` (a Nack) otherwise.
+    async fn grant(self: &Arc<Self>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
+        if let Some(p) = self.st.lock().grants.get(name) {
+            return Some(p.clone());
+        }
+        let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
+        let data = self.fetch(ask.seal_key.clone(), false).await?;
+        let signer = self.verify(&data).await.ok()?;
+        if *data.name != ask.seal_key
+            || device_of(signer.key()).as_ref() != Some(&asker)
+            || wire::decode_seal_key(data.content()?.clone()).ok()? != public
+        {
+            tracing::debug!(%asker, "grant refused: its seal key does not verify as its own");
+            return None;
+        }
+        let asker_ns = self.namespace_of_name(&asker);
+        let mut st = self.st.lock();
+        let key = match &ask.of {
+            None if asker_ns == self.ns => st.keys.master(&self.device),
+            None => None,
+            Some((c, e)) if self.admits_reader(&st, c, &asker, &asker_ns) => st.keys.key(c, e),
+            Some(_) => None,
+        };
+        let Some(key) = key else {
+            tracing::debug!(%asker, of = ?ask.of, "grant refused: not of the audience, or the key is not held here");
+            return None;
+        };
+        let (ephemeral, wrapped) = wrap_ck_to(&public, &key, &name.encode_to_tlv()).ok()?;
+        let wire = self
+            .sign(DataBuilder::new(
+                name.clone(),
+                &wire::encode_grant(&ephemeral, &wrapped.to_bytes()),
+            ))
+            .ok()?;
+        st.grants.insert(name.clone(), wire.clone());
+        Some(wire)
+    }
+
+    /// Get the key of epoch `e` of `c` (spec §9): from the epoch's creator —
+    /// its master secret, for a device of `c`'s namespace, else the epoch
+    /// key — then from every other device known to write into `c`'s
+    /// namespace. Opens what it unlocks. Whether the key is held now.
+    async fn obtain(self: &Arc<Self>, c: &Name, e: &Epoch) -> bool {
+        let Some(ns) = namespace_of(c) else {
+            return false;
+        };
+        let seal_key = {
+            let mut st = self.st.lock();
+            if st.keys.key(c, e).is_some() {
+                return true;
+            }
+            if !st.asking.insert((c.clone(), e.clone())) {
+                return false;
+            }
+            seal_key_name(&self.device, &st.keys.recipient.public())
+        };
+        let ask = |of: Option<(Name, Epoch)>| GrantAsk {
+            seal_key: seal_key.clone(),
+            of,
+        };
+        let of = Some((c.clone(), e.clone()));
+        let mut asks = Vec::new();
+        if ns == self.ns && !self.st.lock().keys.has_master(&e.creator) {
+            asks.push((e.creator.clone(), ask(None)));
+        }
+        asks.push((e.creator.clone(), ask(of.clone())));
+        let others = self.known_for(&self.st.lock(), &ns);
+        for d in others {
+            if d != e.creator && d != self.device {
+                asks.push((d, ask(of.clone())));
+            }
+        }
+        let mut got = false;
+        for (granter, ask) in asks {
+            if granter == self.device {
+                continue;
+            }
+            let name = grant_name(&granter, &ask);
+            let Some(data) = self.fetch(name.clone(), false).await else {
+                continue;
+            };
+            let Ok(signer) = self.verify(&data).await else {
+                continue;
+            };
+            if *data.name != name || device_of(signer.key()).as_ref() != Some(&granter) {
+                continue;
+            }
+            let mut st = self.st.lock();
+            let Some(key) = open_grant(&st.keys.recipient, &name, &data) else {
+                continue;
+            };
+            take_grant(&mut st.keys, granter, ask, &key);
+            self.store.insert(name, data.raw().clone());
+            if st.keys.key(c, e).is_some() {
+                got = true;
+                break;
+            }
+        }
+        let mut st = self.st.lock();
+        st.asking.remove(&(c.clone(), e.clone()));
+        if got {
+            // A master secret may open other collections' versions too.
+            let locked: Vec<Name> = st
+                .colls
+                .iter()
+                .filter(|(_, coll)| !coll.locked.is_empty())
+                .map(|(n, _)| n.clone())
+                .collect();
+            for l in locked {
+                st.unlock(&l);
+            }
+        } else {
+            tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key");
+        }
+        drop(st);
+        self.progress.notify_waiters();
+        got
+    }
+
+    /// The key of `c`'s current epoch, for writing: obtained if this device
+    /// reads `c` and lacks it. `Ok(None)` when `c` is not sealed.
+    async fn write_key(
+        self: &Arc<Self>,
+        c: &Name,
+    ) -> Result<Option<(Epoch, ContentKey)>, DataError> {
+        let epoch = {
+            let st = self.st.lock();
+            let Some(e) = st
+                .colls
+                .get(c)
+                .and_then(|x| x.members.as_ref())
+                .and_then(|m| m.epoch.clone())
+            else {
+                return Ok(None);
+            };
+            if !self.reads(&st, c) {
+                return Err(DataError::Sealed { name: c.clone() });
+            }
+            if let Some(k) = st.keys.key(c, &e) {
+                return Ok(Some((e, k)));
+            }
+            e
+        };
+        if !self.obtain(c, &epoch).await {
+            let (c2, e2) = (c.clone(), epoch.clone());
+            self.wait_for(|st| st.keys.key(&c2, &e2).is_some()).await;
+        }
+        let st = self.st.lock();
+        match st.keys.key(c, &epoch) {
+            Some(k) => Ok(Some((epoch, k))),
+            None => Err(DataError::Unavailable { name: c.clone() }),
+        }
+    }
+
     // ---- answers ------------------------------------------------------------------------------
 
     fn age(&self, st: &St, c: &Name) -> Age {
@@ -1594,33 +2354,59 @@ impl Inner {
         }
     }
 
-    /// The state of merge collection `c` now, or why there is none.
-    fn state_now(&self, st: &St, c: &Name) -> Result<State, DataError> {
+    /// The newest of `c` by its rule now, or why there is none: a merge
+    /// collection's state; a log collection's newest version — of the
+    /// versions applied that no other applied version names as a parent,
+    /// the greatest by writer key and seq (spec §5).
+    fn newest(&self, st: &St, c: &Name) -> Result<Got, DataError> {
         let Some(coll) = st.colls.get(c) else {
             return Err(DataError::Unavailable { name: c.clone() });
         };
         let Some(members) = &coll.members else {
             return Err(DataError::Unavailable { name: c.clone() });
         };
-        let Rule::Merge { function } = &members.rule else {
-            return Err(local(format!(
-                "{c} uses the {:?} rule; this device implements the merge rule only (the log \
-                 rule is data-layer slice 2, one key slice 4)",
-                members.rule
-            )));
-        };
-        let Some(state) = &coll.state else {
-            return Err(local(format!(
-                "{c} merges with {function}, which this device does not run"
-            )));
-        };
+        if self.sealed_off(st, c) {
+            return Err(DataError::Sealed { name: c.clone() });
+        }
         let at = coll.at();
-        Ok(State {
-            name: state_name(c, &at),
-            collection: c.clone(),
-            at,
-            value: state.value(),
-        })
+        match &members.rule {
+            Rule::Merge { function } => {
+                let Some(state) = &coll.state else {
+                    return Err(local(format!(
+                        "{c} merges with {function}, which this device does not run"
+                    )));
+                };
+                Ok(Got::State(State {
+                    name: state_name(c, &at),
+                    collection: c.clone(),
+                    at,
+                    value: state.value(),
+                }))
+            }
+            Rule::Log => {
+                let since = members.since.as_ref();
+                let applied: Vec<&Version> = coll
+                    .versions
+                    .values()
+                    .map(|hv| &hv.version)
+                    .filter(|v| at.contains(&v.id) && !since.is_some_and(|s| s.contains(&v.id)))
+                    .collect();
+                applied
+                    .iter()
+                    .filter(|v| {
+                        !applied
+                            .iter()
+                            .any(|w| w.id != v.id && w.parents.contains(&v.id))
+                    })
+                    .max_by(|a, b| a.id.cmp(&b.id))
+                    .map(|v| Got::Version((*v).clone()))
+                    .ok_or_else(|| DataError::Unavailable { name: c.clone() })
+            }
+            Rule::OneKey => Err(local(format!(
+                "{c} uses the one-key rule, which is data-layer slice 4; this device reads the \
+                 merge and log rules"
+            ))),
+        }
     }
 
     async fn get_log_entry(self: &Arc<Self>, name: &Name) -> Result<Answer, DataError> {
@@ -1641,6 +2427,13 @@ impl Inner {
                         got: Got::Version(v.version.clone()),
                         age: Age::Exact,
                     })
+                }
+                Held::Locked => {
+                    let c = parse_log_name(name)?.subject?;
+                    if self.reads(st, &c) {
+                        return None;
+                    }
+                    Err(DataError::Sealed { name: name.clone() })
                 }
                 Held::Members => Err(DataError::NotFound { name: name.clone() }),
             })
@@ -1665,8 +2458,11 @@ impl Inner {
             .map_err(|why| refused(name, why))?;
         if let Some(c) = &parsed.subject {
             let c = c.clone();
-            self.wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
-                .await;
+            self.wait_for(|st| {
+                st.colls.get(&c).is_some_and(|coll| coll.members.is_some())
+                    && !matches!(st.held.get(name), Some(Held::Locked))
+            })
+            .await;
         }
         answer(&self.st.lock())
             .unwrap_or_else(|| Err(DataError::Unavailable { name: name.clone() }))
@@ -1724,6 +2520,9 @@ impl DataLayer for Device {
             let rules = inner.config.rules.clone();
             let me = inner.writer.clone();
             let value = |st: &St| st.value_at(&c, &at, &rules, &me);
+            if inner.sealed_off(&inner.st.lock(), &c) {
+                return Err(DataError::Sealed { name: name.clone() });
+            }
             if !inner.wait_for(|st| value(st).is_some()).await {
                 return Err(DataError::Unavailable { name: name.clone() });
             }
@@ -1744,11 +2543,23 @@ impl DataLayer for Device {
         }
         check_collection(name)?;
         inner.look(name).await?;
+        // A reader holding sealed versions waits (at most the first-look
+        // time) for the keys it asks for.
+        let locked = {
+            let st = inner.st.lock();
+            st.colls.get(name).is_some_and(|x| !x.locked.is_empty()) && inner.reads(&st, name)
+        };
+        if locked {
+            inner.chase_keys(name);
+            inner
+                .wait_for(|st| st.colls.get(name).is_none_or(|x| x.locked.is_empty()))
+                .await;
+        }
         let st = inner.st.lock();
-        let state = inner.state_now(&st, name)?;
+        let got = inner.newest(&st, name)?;
         Ok(Answer {
             age: inner.age(&st, name),
-            got: Got::State(state),
+            got,
         })
     }
 
@@ -1774,11 +2585,11 @@ impl DataLayer for Device {
                 .wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
                 .await;
         }
-        let id = {
+        {
             let mut st = inner.st.lock();
             if st.colls.get(collection).is_none_or(|c| c.members.is_none()) {
                 if ns != inner.ns {
-                    let heard = st.groups.get(&ns).is_some_and(|g| !g.members.is_empty());
+                    let heard = !inner.known_for(&st, &ns).is_empty();
                     return Err(if heard {
                         DataError::NotAllowed {
                             collection: collection.clone(),
@@ -1790,9 +2601,13 @@ impl DataLayer for Device {
                         }
                     });
                 }
-                let body = inner.default_members(collection);
+                let body = inner.default_members(collection, st.head + 1);
                 inner.append(&mut st, Some(collection), wire::encode_members(&body))?;
             }
+        }
+        let key = inner.write_key(collection).await?;
+        let id = {
+            let mut st = inner.st.lock();
             let coll = st.colls.get_mut(collection).expect("members known");
             let members = coll.members.as_ref().expect("members known");
             if !members
@@ -1805,18 +2620,41 @@ impl DataLayer for Device {
                     writer: inner.writer.clone(),
                 });
             }
+            if key.as_ref().map(|(e, _)| e) != members.epoch.as_ref() {
+                // The record moved to another epoch while the key was asked
+                // for: ask again.
+                return Err(DataError::Unavailable {
+                    name: collection.clone(),
+                });
+            }
             let seal = Seal {
                 any_of: members.readers.clone(),
             };
             let parents = coll.at();
-            let Some(state) = coll.state.as_mut() else {
-                drop(st);
-                let st = inner.st.lock();
-                return Err(inner.state_now(&st, collection).err().unwrap_or_else(|| {
-                    local(format!("{collection} has no merge state on this device"))
-                }));
+            let op = match &members.rule {
+                Rule::Merge { function } => {
+                    let function = function.clone();
+                    let Some(state) = coll.state.as_mut() else {
+                        return Err(local(format!(
+                            "{collection} merges with {function}, which this device does not run"
+                        )));
+                    };
+                    state.edit(&content).map_err(|e| local(e.to_string()))?
+                }
+                Rule::Log => Bytes::new(),
+                Rule::OneKey => {
+                    return Err(local(format!(
+                        "{collection} uses the one-key rule, which is data-layer slice 4; this \
+                         device writes merge and log collections"
+                    )));
+                }
             };
-            let op = state.edit(&content).map_err(|e| local(e.to_string()))?;
+            let seq = st.head + 1;
+            let name = log_name(&inner.device, Some(collection), seq);
+            let sealed = key.as_ref().map(|(epoch, k)| SealedBody {
+                epoch: epoch.clone(),
+                ciphertext: seal::seal_payload(k, &name, &content, &op),
+            });
             let body = VersionBody {
                 collection: collection.clone(),
                 parents,
@@ -1826,9 +2664,8 @@ impl DataLayer for Device {
                 dated: (inner.config.clock)(),
                 fields: content,
                 op: op.clone(),
+                sealed,
             };
-            let seq = st.head + 1;
-            let name = log_name(&inner.device, Some(collection), seq);
             let wire = inner.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
             st.head = seq;
             let version = version_of(&name, &inner.writer, seq, body);
@@ -1856,7 +2693,7 @@ impl DataLayer for Device {
             st.emit(collection, &Change::Version(version), &id.writer, seq);
             id
         };
-        inner.publish(&ns).await;
+        inner.publish_about(collection).await?;
         Ok(id)
     }
 
@@ -1917,9 +2754,20 @@ impl DataLayer for Device {
         )))
     }
 
-    async fn prune(&self, prefix: &Name, _upto: &Frontier) -> Result<(), DataError> {
+    async fn prune(&self, prefix: &Name, upto: &Frontier) -> Result<(), DataError> {
+        let inner = &self.inner;
+        // Prune reaches only the pruner's own writes (model change M9): a
+        // version another key signed is removed by an edit instead.
+        let others_entry = parse_log_name(prefix).is_some_and(|p| p.device != inner.device);
+        let others_key = upto.iter().any(|(w, _)| *w != inner.writer);
+        if others_entry || others_key {
+            return Err(DataError::NotOwnWrites {
+                prefix: prefix.clone(),
+            });
+        }
         Err(local(format!(
-            "prune is data-layer slice 3; this device cannot drop its writes under {prefix} yet"
+            "prune of one's own writes is data-layer slice 3; this device cannot drop its writes \
+             under {prefix} yet"
         )))
     }
 
@@ -1941,35 +2789,71 @@ impl DataLayer for Device {
                 "re-admitting versions outside a cut is data-layer slice 5; share without readmit",
             ));
         }
+        if members.rule == Rule::OneKey {
+            return Err(local(
+                "the one-key rule is data-layer slice 4; share a collection with the merge or the \
+                 log rule",
+            ));
+        }
         inner.follow(collection).await?;
-        {
+        let rotate = {
             let mut st = inner.st.lock();
             let current = st.colls.get(collection).and_then(|c| c.members.clone());
-            if let Some(cur) = &current {
-                if cur.rule != members.rule {
-                    return Err(local(format!(
-                        "{collection} keeps the rule it was first shared with ({:?}); a rule \
-                         change would make its readers merge differently",
-                        cur.rule
-                    )));
-                }
-                if let Some(gone) = cur.writers.iter().find(|p| !members.writers.contains(p)) {
-                    return Err(local(format!(
-                        "removing writer {gone} needs a cut at what this device saw of it \
-                         (data-layer slice 2); share keeps every current writer"
-                    )));
-                }
-            }
-            let body = MembersBody {
-                collection: collection.clone(),
-                revision: current.map_or(1, |m| m.revision.0 + 1),
-                rule: members.rule,
-                writers: members.writers,
-                readers: members.readers,
-            };
+            let body = inner.next_members(
+                &st,
+                collection,
+                current.as_ref(),
+                members.rule,
+                members.writers,
+                members.readers,
+                false,
+            );
+            let removed_reader = current
+                .as_ref()
+                .is_some_and(|cur| cur.readers.iter().any(|r| !body.readers.contains(r)));
             inner.append(&mut st, Some(collection), wire::encode_members(&body))?;
+            // A collection sealed to this one as a group moves to a new
+            // epoch with it.
+            let group = Audience::Group(collection.clone());
+            let mut rotate: Vec<Name> = if removed_reader {
+                st.colls
+                    .iter()
+                    .filter(|(x, coll)| {
+                        namespace_of(x).as_ref() == Some(&ns)
+                            && coll
+                                .members
+                                .as_ref()
+                                .is_some_and(|m| m.readers.contains(&group))
+                    })
+                    .map(|(x, _)| x.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            rotate.sort();
+            for x in &rotate {
+                let cur = st
+                    .colls
+                    .get(x)
+                    .and_then(|c| c.members.clone())
+                    .expect("filtered on its record");
+                let body = inner.next_members(
+                    &st,
+                    x,
+                    Some(&cur),
+                    cur.rule.clone(),
+                    cur.writers.clone(),
+                    cur.readers.clone(),
+                    true,
+                );
+                inner.append(&mut st, Some(x), wire::encode_members(&body))?;
+            }
+            rotate
+        };
+        inner.publish_about(collection).await?;
+        for x in rotate {
+            inner.publish_about(&x).await?;
         }
-        inner.publish(&ns).await;
         Ok(())
     }
 }
@@ -2281,6 +3165,9 @@ mod tests {
                 },
                 writers: vec![wire::namespace_of(&c).unwrap()],
                 readers: Vec::new(),
+                cuts: Vec::new(),
+                epoch: None,
+                since: None,
             };
             let name = log_name(&device, Some(&c), 1);
             let content = wire::encode_members(&body);

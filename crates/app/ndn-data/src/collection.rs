@@ -1,9 +1,11 @@
 //! Collections: the growing side of the model — their [`Rule`], their
-//! owner-signed [`Members`], the [`Cut`]s that end a member or a key, and
-//! the signed, nested [`Summary`] of what they hold.
+//! owner-signed [`Members`], the [`Cut`]s that end a member or a key, the
+//! [`Epoch`] their seal is read in, and the signed, nested [`Summary`] of
+//! what they hold.
 
 use ndn_foundation_types::{Hash, Name};
 
+use crate::error::Refusal;
 use crate::version::{Audience, Frontier, Seq, VersionId, Writer};
 
 /// What "newest" means in a collection. The collection decides, not the app.
@@ -32,9 +34,10 @@ pub enum Rule {
 /// Writers write under their own prefixes; the collection gathers exactly
 /// the keys listed here, so a reader can tell a member from a stranger
 /// posting under the same collection name. [`share`](crate::DataLayer::share)
-/// edits it; removing a member adds a [`Cut`]. Each revision supersedes the
-/// previous one and the revision number never goes back (model invariant 3).
-/// Owner-only records are filled by slice 1, the rest by slice 2.
+/// edits it; removing a member adds a [`Cut`], removing a reader starts a
+/// new [`Epoch`], changing the rule starts the collection again from
+/// [`since`](Self::since). Each revision supersedes the previous one and the
+/// revision number never goes back (model invariant 3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Members {
     /// The collection this record governs.
@@ -47,16 +50,60 @@ pub struct Members {
     pub rule: Rule,
     /// Key-name prefixes whose keys may write (e.g. `/alice`, `/bob`).
     pub writers: Vec<Name>,
-    /// Who may read; the collection's seal follows this list.
+    /// Who may read; the collection's seal follows this list. Empty: the
+    /// collection is not sealed. The owner's namespace always reads.
     pub readers: Vec<Audience>,
-    /// Removals and revocations in force.
+    /// Removals in force: a writer prefix this or an earlier revision
+    /// removed, with what stays accepted of its keys.
     pub cuts: Vec<Cut>,
+    /// The epoch the collection is sealed in; `None` when it has no
+    /// readers listed (not sealed).
+    pub epoch: Option<Epoch>,
+    /// Set once the rule changed: the frontier the owner had applied when
+    /// it changed it. Versions inside it stay readable by name and listed
+    /// by `watch`, and stay out of the new rule's state.
+    pub since: Option<Frontier>,
     /// Versions outside a cut that the owner signed back in.
     ///
     /// This answers the open item "a cut can drop honest work": a stolen
     /// device's offline edits that nobody had seen fall outside its cut, and
     /// the owner may re-admit specific ones. Filled by slice 5.
     pub readmitted: Vec<VersionId>,
+}
+
+impl Members {
+    /// Why this record refuses version `id`, if it does: a key under a
+    /// writer prefix is admitted; else a key under a cut's prefix is
+    /// admitted inside the cut and refused outside it, whatever date it
+    /// claims; else the key is no member.
+    pub fn refusal(&self, id: &VersionId) -> Option<Refusal> {
+        let key = id.writer.key();
+        if self.writers.iter().any(|p| key.has_prefix(p)) {
+            return None;
+        }
+        match self.cuts.iter().find(|c| key.has_prefix(&c.of)) {
+            Some(cut) if cut.accept.contains(id) => None,
+            Some(cut) => Some(Refusal::OutsideCut(cut.clone())),
+            None => Some(Refusal::NotMember),
+        }
+    }
+}
+
+/// The epoch a sealed collection is read in (model primitive "Seal").
+///
+/// It is named by the members record that started it: the device that
+/// signed that record and the record's seq in its log. Its content key is
+/// derived by that device; readers of the collection's current audience get
+/// it on request, sealed to their own key. Removing a reader starts a new
+/// epoch, so reading moves forward: what a removed reader already holds it
+/// keeps (model invariant 9), and nothing written in the new epoch reaches
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Epoch {
+    /// The device (not key) that signed the record starting the epoch.
+    pub creator: Name,
+    /// That record's seq in the device's log.
+    pub seq: Seq,
 }
 
 /// A signed "up to here" for a key or a member (model change M3).
@@ -144,6 +191,41 @@ mod tests {
         assert!(cut.refuses(&id("/bob/laptop/KEY/1", 1)));
         // Keys outside the member are not touched.
         assert!(!cut.refuses(&id("/carol/phone/KEY/1", 99)));
+    }
+
+    #[test]
+    fn a_record_admits_its_writers_and_what_its_cuts_accept_whatever_else() {
+        let alice = Writer::new("/alice/laptop/KEY/1".parse().unwrap());
+        let cut = Cut {
+            of: "/bob".parse().unwrap(),
+            accept: [id("/bob/phone/KEY/1", 41)].into_iter().collect(),
+            signer: alice.clone(),
+        };
+        let mut m = Members {
+            collection: "/alice/32=data/docs/plan".parse().unwrap(),
+            owner: alice,
+            revision: Seq(2),
+            rule: Rule::Log,
+            writers: vec!["/alice".parse().unwrap()],
+            readers: Vec::new(),
+            cuts: vec![cut.clone()],
+            epoch: None,
+            since: None,
+            readmitted: Vec::new(),
+        };
+        assert_eq!(m.refusal(&id("/alice/phone/KEY/1", 7)), None);
+        assert_eq!(m.refusal(&id("/bob/phone/KEY/1", 41)), None);
+        assert_eq!(
+            m.refusal(&id("/bob/phone/KEY/1", 42)),
+            Some(Refusal::OutsideCut(cut))
+        );
+        assert_eq!(
+            m.refusal(&id("/mallory/phone/KEY/1", 1)),
+            Some(Refusal::NotMember)
+        );
+        // Written back in, the prefix's keys are writers again.
+        m.writers.push("/bob".parse().unwrap());
+        assert_eq!(m.refusal(&id("/bob/phone/KEY/1", 42)), None);
     }
 
     #[test]

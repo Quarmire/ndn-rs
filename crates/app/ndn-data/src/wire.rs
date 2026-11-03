@@ -16,6 +16,8 @@
 //! | summary root of namespace `O` | `<D>/32=summary/<O>/seq=<head>` | the device key |
 //! | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256; its parent lists its digest |
 //! | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256; its parent lists its digest |
+//! | seal key | `<D>/32=seal/<X25519 public key>` | the device key |
+//! | grant | `<G>/32=grant/<GrantAsk TLV>` | the granter's device key |
 //!
 //! `X` is a name of the tree from `O` to a collection: `O/32=data` (the
 //! root's one child) or `O/32=data/<path>`, a folder or collection. Two
@@ -26,9 +28,11 @@
 //! forwarder's trust and link libraries route and multicast it by.
 //!
 //! Every name parses one way: `D` and `O` have no keyword component, so
-//! the first `32=log` or `32=summary` ends `D`, `32=data` ends `O`, and the
-//! layer's other keywords (`32=page`, `32=state`) follow a subject whose
-//! only keyword is its marker. A node or page name always ends in its head:
+//! the first `32=log`, `32=summary`, `32=seal` or `32=grant` ends `D`,
+//! `32=data` ends `O`, and the layer's other keywords (`32=page`,
+//! `32=state`) follow a subject whose only keyword is its marker; a seal
+//! key's and a grant's last component is one opaque value (a key, a TLV).
+//! A node or page name always ends in its head:
 //! only a root is discovered without one (`<D>/32=summary/<O>`), and a
 //! namespace never ends in a `seq=` component.
 //!
@@ -41,7 +45,7 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::collection::Rule;
+use crate::collection::{Epoch, Rule};
 use crate::version::{Audience, Content, Frontier, Keep, Seal, Seq, Timestamp, TypeId, Writer};
 
 /// TLV-TYPE numbers (0x0520–0x057F).
@@ -120,6 +124,30 @@ pub mod tlv {
     pub const PAGE_PATH: u64 = 0x0566;
     /// The node's writer: `Name` (key).
     pub const WRITER: u64 = 0x0568;
+    /// A members record's removals in force: `Cut*`, by prefix.
+    pub const CUTS: u64 = 0x056A;
+    /// One removal: `Name` (the removed writer prefix), `Frontier` (what
+    /// stays accepted of its keys).
+    pub const CUT: u64 = 0x056C;
+    /// The epoch a sealed collection is read in: `Name` (the device that
+    /// signed the record starting it), `Seq` (that record's seq).
+    pub const SEAL_EPOCH: u64 = 0x056E;
+    /// The frontier the owner had applied when it changed the rule: `Frontier`.
+    pub const RULE_SINCE: u64 = 0x0570;
+    /// A sealed version's payload, in place of `Fields` and `MergeOp`:
+    /// `SealEpoch`, `Ciphertext`.
+    pub const SEALED: u64 = 0x0572;
+    /// Octets: nonce (12) ‖ tag (16) ‖ ciphertext, ChaCha20-Poly1305.
+    pub const CIPHERTEXT: u64 = 0x0574;
+    /// A device's seal key: 32 octets, an X25519 public key.
+    pub const SEAL_KEY: u64 = 0x0576;
+    /// What a grant answers: `Name` (the asker's seal key name), then for a
+    /// collection's epoch key `Name` (the collection) and `SealEpoch`.
+    pub const GRANT_ASK: u64 = 0x0578;
+    /// A grant: `EphemeralKey`, `Ciphertext` (the key, wrapped).
+    pub const GRANT: u64 = 0x057A;
+    /// The granter's ephemeral X25519 public key: 32 octets.
+    pub const EPHEMERAL_KEY: u64 = 0x057C;
 }
 
 /// Keyword components of the layer's names.
@@ -128,6 +156,8 @@ const LOG: &[u8] = b"log";
 const SUMMARY: &[u8] = b"summary";
 const PAGE: &[u8] = b"page";
 const STATE: &[u8] = b"state";
+const SEAL: &[u8] = b"seal";
+const GRANT: &[u8] = b"grant";
 
 /// A summary node lists its children inline up to this many; beyond it they
 /// are paged into 16 buckets by the first nibble of SHA-256 of the child's
@@ -443,6 +473,168 @@ pub fn parse_state_name(name: &Name) -> Option<(Name, Frontier)> {
         .map(|f| (collection, f))
 }
 
+/// A device's seal key's name: `<device>/32=seal/<public key>`, the last
+/// component the 32 octets of its X25519 public key.
+pub fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
+    device
+        .clone()
+        .append_component(kw(SEAL))
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(public)))
+}
+
+/// Parse `<device>/32=seal/<public key>`.
+pub fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, SEAL))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let last = &comps[at + 1];
+    if last.typ != tlv_type::GENERIC_NAME_COMPONENT {
+        return None;
+    }
+    let public = <[u8; 32]>::try_from(last.value.as_ref()).ok()?;
+    Some((name_of(&comps[..at]), public))
+}
+
+/// What a grant answers: the master secret of the granter (no collection),
+/// or the content key of one epoch of a collection, for the holder of a
+/// seal key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GrantAsk {
+    /// The asker's seal key's name (`<device>/32=seal/<public key>`).
+    pub seal_key: Name,
+    /// The collection and epoch whose key is asked for; `None` asks for the
+    /// granter's master secret.
+    pub of: Option<(Name, Epoch)>,
+}
+
+fn write_epoch(w: &mut TlvWriter, e: &Epoch) {
+    w.write_nested(tlv::SEAL_EPOCH, |w| {
+        write_name(w, &e.creator);
+        write_nni(w, tlv::SEQ, e.seq.0);
+    });
+}
+
+fn read_epoch(value: Bytes) -> Result<Epoch, WireError> {
+    let (mut creator, mut seq) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => creator = Some(read_name(v)?),
+            tlv::SEQ => seq = Some(read_nni(&v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (creator, seq) {
+        (Some(creator), Some(seq)) if is_device_name(&creator) => Ok(Epoch {
+            creator,
+            seq: Seq(seq),
+        }),
+        _ => Err(bad("an epoch names a device and a seq")),
+    }
+}
+
+/// A grant's name: `<granter>/32=grant/<GrantAsk TLV>`.
+pub fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::GRANT_ASK, |w| {
+        write_name(w, &ask.seal_key);
+        if let Some((c, e)) = &ask.of {
+            write_name(w, c);
+            write_epoch(w, e);
+        }
+    });
+    granter
+        .clone()
+        .append_component(kw(GRANT))
+        .append_component(NameComponent::generic(w.finish()))
+}
+
+/// Parse `<granter>/32=grant/<GrantAsk TLV>`.
+pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, GRANT))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let mut r = TlvReader::new(comps[at + 1].value.clone());
+    let (typ, value) = r.read_tlv().ok()?;
+    if typ != tlv::GRANT_ASK || !r.is_empty() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut epoch = None;
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => names.push(read_name(v)?),
+            tlv::SEAL_EPOCH => epoch = Some(read_epoch(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+    .ok()?;
+    let mut names = names.into_iter();
+    let seal_key = names.next()?;
+    parse_seal_key_name(&seal_key)?;
+    let of = match (names.next(), epoch, names.next()) {
+        (None, None, None) => None,
+        (Some(c), Some(e), None) if is_collection_name(&c) => Some((c, e)),
+        _ => return None,
+    };
+    Some((name_of(&comps[..at]), GrantAsk { seal_key, of }))
+}
+
+/// Encode a seal key's Content: the X25519 public key.
+pub fn encode_seal_key(public: &[u8; 32]) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_tlv(tlv::SEAL_KEY, public);
+    w.finish()
+}
+
+/// Decode a seal key's Content.
+pub fn decode_seal_key(content: Bytes) -> Result<[u8; 32], WireError> {
+    let mut r = TlvReader::new(content);
+    let (typ, v) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if typ != tlv::SEAL_KEY || !r.is_empty() {
+        return Err(bad("a seal key packet carries one SealKey"));
+    }
+    read_digest(&v).map_err(|_| bad("a seal key is 32 octets"))
+}
+
+/// Encode a grant's Content: the granter's ephemeral public key and the
+/// wrapped key.
+pub fn encode_grant(ephemeral: &[u8; 32], wrapped: &[u8]) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::GRANT, |w| {
+        w.write_tlv(tlv::EPHEMERAL_KEY, ephemeral);
+        w.write_tlv(tlv::CIPHERTEXT, wrapped);
+    });
+    w.finish()
+}
+
+/// Decode a grant's Content.
+pub fn decode_grant(content: Bytes) -> Result<([u8; 32], Bytes), WireError> {
+    let mut r = TlvReader::new(content);
+    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if typ != tlv::GRANT || !r.is_empty() {
+        return Err(bad("a grant packet carries one Grant"));
+    }
+    let (mut eph, mut wrapped) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv::EPHEMERAL_KEY => eph = Some(read_digest(&v)?),
+            tlv::CIPHERTEXT => wrapped = Some(v),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (eph, wrapped) {
+        (Some(e), Some(w)) => Ok((e, w)),
+        _ => Err(bad("a grant has an ephemeral key and a wrapped key")),
+    }
+}
+
 // ---- primitives -------------------------------------------------------------------------------
 
 fn write_nni(w: &mut TlvWriter, typ: u64, v: u64) {
@@ -645,10 +837,35 @@ pub struct VersionBody {
     pub keep: Keep,
     /// The writer's clock.
     pub dated: Timestamp,
-    /// The fields the writer set (an empty value removes the field).
+    /// The fields the writer set (an empty value removes the field); empty
+    /// while the payload is sealed and not opened.
     pub fields: Content,
-    /// The merge function's operation.
+    /// The merge function's operation (empty under the log rule, and while
+    /// the payload is sealed and not opened).
     pub op: Bytes,
+    /// The payload sealed: when present, `Fields` and `MergeOp` travel
+    /// inside it ([`encode_payload`]) and not beside it.
+    pub sealed: Option<SealedBody>,
+}
+
+/// A sealed payload: the epoch whose key seals it, and the ciphertext of
+/// [`encode_payload`] (`nonce ‖ tag ‖ ciphertext`), its AAD the TLV of the
+/// version's own name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedBody {
+    /// The epoch.
+    pub epoch: Epoch,
+    /// The ciphertext.
+    pub ciphertext: Bytes,
+}
+
+/// One removal in a members record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutBody {
+    /// The removed writer prefix.
+    pub of: Name,
+    /// What stays accepted of its keys.
+    pub accept: Frontier,
 }
 
 /// The body of a members log entry.
@@ -664,6 +881,12 @@ pub struct MembersBody {
     pub writers: Vec<Name>,
     /// Readers.
     pub readers: Vec<Audience>,
+    /// Removals in force, by prefix.
+    pub cuts: Vec<CutBody>,
+    /// The epoch the collection is sealed in (readers listed only).
+    pub epoch: Option<Epoch>,
+    /// The frontier the owner had applied when the rule last changed.
+    pub since: Option<Frontier>,
 }
 
 /// What a log entry says.
@@ -694,17 +917,52 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
             Keep::Forever => w.write_tlv(tlv::KEEP_FOREVER, &[]),
         });
         write_nni(w, tlv::DATED, b.dated.0);
-        w.write_nested(tlv::FIELDS, |w| {
-            for (name, value) in b.fields.fields() {
-                w.write_nested(tlv::FIELD, |w| {
-                    w.write_tlv(tlv::FIELD_NAME, name.as_bytes());
-                    w.write_tlv(tlv::FIELD_VALUE, value);
-                });
-            }
-        });
-        w.write_tlv(tlv::MERGE_OP, &b.op);
+        match &b.sealed {
+            Some(s) => w.write_nested(tlv::SEALED, |w| {
+                write_epoch(w, &s.epoch);
+                w.write_tlv(tlv::CIPHERTEXT, &s.ciphertext);
+            }),
+            None => write_payload(w, &b.fields, &b.op),
+        }
     });
     w.finish()
+}
+
+fn write_payload(w: &mut TlvWriter, fields: &Content, op: &[u8]) {
+    w.write_nested(tlv::FIELDS, |w| {
+        for (name, value) in fields.fields() {
+            w.write_nested(tlv::FIELD, |w| {
+                w.write_tlv(tlv::FIELD_NAME, name.as_bytes());
+                w.write_tlv(tlv::FIELD_VALUE, value);
+            });
+        }
+    });
+    w.write_tlv(tlv::MERGE_OP, op);
+}
+
+/// What a sealed version's ciphertext carries: its `Fields` and `MergeOp`
+/// TLVs, as an unsealed version carries them.
+pub fn encode_payload(fields: &Content, op: &[u8]) -> Bytes {
+    let mut w = TlvWriter::new();
+    write_payload(&mut w, fields, op);
+    w.finish()
+}
+
+/// Decode an opened payload ([`encode_payload`]).
+pub fn decode_payload(bytes: Bytes) -> Result<(Content, Bytes), WireError> {
+    let (mut fields, mut op) = (None, None);
+    each(bytes, |typ, v| {
+        match typ {
+            tlv::FIELDS => fields = Some(read_fields(v)?),
+            tlv::MERGE_OP => op = Some(v),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (fields, op) {
+        (Some(f), Some(o)) => Ok((f, o)),
+        _ => Err(bad("a sealed payload carries fields and a merge op")),
+    }
 }
 
 /// Encode a members record.
@@ -727,6 +985,22 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
             }
         });
         write_audiences(w, tlv::READERS, &b.readers);
+        if !b.cuts.is_empty() {
+            w.write_nested(tlv::CUTS, |w| {
+                for c in &b.cuts {
+                    w.write_nested(tlv::CUT, |w| {
+                        write_name(w, &c.of);
+                        write_frontier(w, &c.accept);
+                    });
+                }
+            });
+        }
+        if let Some(e) = &b.epoch {
+            write_epoch(w, e);
+        }
+        if let Some(since) = &b.since {
+            w.write_nested(tlv::RULE_SINCE, |w| write_frontier(w, since));
+        }
     });
     w.finish()
 }
@@ -776,6 +1050,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut dated = None;
     let mut fields = None;
     let mut op = None;
+    let mut sealed = None;
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
@@ -814,40 +1089,35 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                 })?;
             }
             tlv::DATED => dated = Some(Timestamp(read_nni(&v)?)),
-            tlv::FIELDS => {
-                let mut c = Content::new();
+            tlv::FIELDS => fields = Some(read_fields(v)?),
+            tlv::MERGE_OP => op = Some(v),
+            tlv::SEALED => {
+                let (mut epoch, mut ciphertext) = (None, None);
                 each(v, |t, v| {
-                    if t != tlv::FIELD {
-                        return Ok(false);
+                    match t {
+                        tlv::SEAL_EPOCH => epoch = Some(read_epoch(v)?),
+                        tlv::CIPHERTEXT => ciphertext = Some(v),
+                        _ => return Ok(false),
                     }
-                    let (mut name, mut value) = (None, None);
-                    each(v, |t, v| {
-                        match t {
-                            tlv::FIELD_NAME => {
-                                name = Some(
-                                    String::from_utf8(v.to_vec())
-                                        .map_err(|_| bad("a field name is UTF-8"))?,
-                                )
-                            }
-                            tlv::FIELD_VALUE => value = Some(v),
-                            _ => return Ok(false),
-                        }
-                        Ok(true)
-                    })?;
-                    let (Some(name), Some(value)) = (name, value) else {
-                        return Err(bad("a field has a name and a value"));
-                    };
-                    c = std::mem::take(&mut c).with(name, value);
                     Ok(true)
                 })?;
-                fields = Some(c);
+                let (Some(epoch), Some(ciphertext)) = (epoch, ciphertext) else {
+                    return Err(bad("a sealed payload has an epoch and a ciphertext"));
+                };
+                sealed = Some(SealedBody { epoch, ciphertext });
             }
-            tlv::MERGE_OP => op = Some(v),
             _ => return Ok(false),
         }
         Ok(true)
     })?;
     let missing = |what| bad(format!("a version record has {what}"));
+    let (fields, op) = match (fields, op, &sealed) {
+        (None, None, Some(_)) => (Content::new(), Bytes::new()),
+        (Some(f), Some(o), None) => (f, o),
+        (_, _, Some(_)) => return Err(bad("a sealed version carries its fields sealed only")),
+        (None, _, None) => return Err(missing("fields")),
+        (_, None, None) => return Err(missing("a merge op")),
+    };
     Ok(VersionBody {
         collection: collection.ok_or_else(|| missing("a collection"))?,
         parents: parents.ok_or_else(|| missing("parents"))?,
@@ -855,9 +1125,38 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         seal: seal.ok_or_else(|| missing("a seal"))?,
         keep: keep.ok_or_else(|| missing("a keep"))?,
         dated: dated.ok_or_else(|| missing("a date"))?,
-        fields: fields.ok_or_else(|| missing("fields"))?,
-        op: op.ok_or_else(|| missing("a merge op"))?,
+        fields,
+        op,
+        sealed,
     })
+}
+
+fn read_fields(v: Bytes) -> Result<Content, WireError> {
+    let mut c = Content::new();
+    each(v, |t, v| {
+        if t != tlv::FIELD {
+            return Ok(false);
+        }
+        let (mut name, mut value) = (None, None);
+        each(v, |t, v| {
+            match t {
+                tlv::FIELD_NAME => {
+                    name = Some(
+                        String::from_utf8(v.to_vec()).map_err(|_| bad("a field name is UTF-8"))?,
+                    )
+                }
+                tlv::FIELD_VALUE => value = Some(v),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        let (Some(name), Some(value)) = (name, value) else {
+            return Err(bad("a field has a name and a value"));
+        };
+        c = std::mem::take(&mut c).with(name, value);
+        Ok(true)
+    })?;
+    Ok(c)
 }
 
 fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
@@ -866,6 +1165,9 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     let mut rule = None;
     let mut writers = None;
     let mut readers = None;
+    let mut cuts = Vec::new();
+    let mut epoch = None;
+    let mut since = None;
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
@@ -899,6 +1201,37 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
                 writers = Some(list);
             }
             tlv::READERS => readers = Some(read_audiences(v)?),
+            tlv::CUTS => {
+                each(v, |t, v| {
+                    if t != tlv::CUT {
+                        return Ok(false);
+                    }
+                    let (mut of, mut accept) = (None, None);
+                    each(v, |t, v| {
+                        match t {
+                            tlv_type::NAME => of = Some(read_name(v)?),
+                            tlv::FRONTIER => accept = Some(read_frontier(v)?),
+                            _ => return Ok(false),
+                        }
+                        Ok(true)
+                    })?;
+                    let (Some(of), Some(accept)) = (of, accept) else {
+                        return Err(bad("a cut names a prefix and a frontier"));
+                    };
+                    cuts.push(CutBody { of, accept });
+                    Ok(true)
+                })?;
+            }
+            tlv::SEAL_EPOCH => epoch = Some(read_epoch(v)?),
+            tlv::RULE_SINCE => {
+                each(v, |t, v| {
+                    if t != tlv::FRONTIER {
+                        return Ok(false);
+                    }
+                    since = Some(read_frontier(v)?);
+                    Ok(true)
+                })?;
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -910,6 +1243,9 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
         rule: rule.ok_or_else(|| missing("a rule"))?,
         writers: writers.ok_or_else(|| missing("writers"))?,
         readers: readers.ok_or_else(|| missing("readers"))?,
+        cuts,
+        epoch,
+        since,
     })
 }
 
@@ -1264,6 +1600,20 @@ mod tests {
             },
             writers: vec![n("/alice")],
             readers: vec![Audience::Person(n("/alice"))],
+            cuts: vec![CutBody {
+                of: n("/bob"),
+                accept: [crate::VersionId {
+                    writer: Writer::new(n("/bob/laptop/KEY/1")),
+                    seq: Seq(41),
+                }]
+                .into_iter()
+                .collect(),
+            }],
+            epoch: Some(Epoch {
+                creator: n("/alice/laptop"),
+                seq: Seq(7),
+            }),
+            since: None,
         };
         let wire = encode_members(&body);
         let with = |extra: u64| {
@@ -1276,7 +1626,57 @@ mod tests {
             });
             w.finish()
         };
-        assert_eq!(decode_record(with(0x0570)), Ok(Record::Members(body)));
-        assert!(decode_record(with(0x0571)).is_err());
+        assert_eq!(decode_record(with(0x057E)), Ok(Record::Members(body)));
+        assert!(decode_record(with(0x057F)).is_err());
+    }
+
+    #[test]
+    fn sealed_versions_and_grants_parse_back() {
+        let epoch = Epoch {
+            creator: n("/alice/laptop"),
+            seq: Seq(3),
+        };
+        let body = VersionBody {
+            collection: n("/alice/32=data/docs/plan"),
+            parents: Frontier::new(),
+            type_id: TypeId {
+                name: n("/types/note"),
+                revision: 1,
+            },
+            seal: Seal {
+                any_of: vec![Audience::Person(n("/bob"))],
+            },
+            keep: Keep::Forever,
+            dated: Timestamp(5),
+            fields: Content::new(),
+            op: Bytes::new(),
+            sealed: Some(SealedBody {
+                epoch: epoch.clone(),
+                ciphertext: Bytes::from_static(b"opaque"),
+            }),
+        };
+        assert_eq!(
+            decode_record(encode_version(&body)),
+            Ok(Record::Version(body))
+        );
+        let fields = Content::new().with("text", Bytes::from_static(b"hi"));
+        assert_eq!(
+            decode_payload(encode_payload(&fields, b"op")),
+            Ok((fields, Bytes::from_static(b"op")))
+        );
+        let key = seal_key_name(&n("/bob/phone"), &[9; 32]);
+        assert_eq!(parse_seal_key_name(&key), Some((n("/bob/phone"), [9; 32])));
+        for of in [None, Some((n("/alice/32=data/docs/plan"), epoch))] {
+            let ask = GrantAsk {
+                seal_key: key.clone(),
+                of,
+            };
+            let name = grant_name(&n("/alice/laptop"), &ask);
+            assert_eq!(parse_grant_name(&name), Some((n("/alice/laptop"), ask)));
+        }
+        assert_eq!(
+            decode_grant(encode_grant(&[1; 32], b"wrapped")),
+            Ok(([1; 32], Bytes::from_static(b"wrapped")))
+        );
     }
 }
