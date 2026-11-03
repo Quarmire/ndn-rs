@@ -4144,8 +4144,11 @@ impl Inner {
             h.until = body.until;
         }
         self.look(&c).await.ok()?;
-        // The asker moved since a first look: see what it has now.
-        self.refresh(&ns, &parsed.device).await;
+        // See what every device writing into the namespace has now: the
+        // asker moved since a first look, and another holder's lease names
+        // where a lost piece may still be (re-replication).
+        let devices = self.known_for(&self.st.lock(), &ns);
+        futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d))).await;
         self.repair_held(&c).await;
         let at = body.at.clone();
         self.wait_for(|st| {
