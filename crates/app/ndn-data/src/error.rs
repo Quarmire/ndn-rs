@@ -51,6 +51,41 @@ pub enum Refusal {
     Rollback,
 }
 
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::OutsideCut(cut) => {
+                let accepted = cut
+                    .accept
+                    .iter()
+                    .map(|(w, s)| format!("{} up to {}", w.key(), s.0))
+                    .collect::<Vec<_>>();
+                write!(
+                    f,
+                    "its key lies under {}, which the collection's owner removed, and it is \
+                     outside the cut that accepts {}, whatever date it claims; ask the owner",
+                    cut.of,
+                    if accepted.is_empty() {
+                        "nothing of it".to_owned()
+                    } else {
+                        accepted.join(", ")
+                    }
+                )
+            }
+            Refusal::NotMember => f.write_str(
+                "its key is not a writer of the collection by its members record; ask the owner",
+            ),
+            Refusal::BadSignature => f.write_str(
+                "it does not verify (signature, name or sealed payload); it may verify when \
+                 fetched from another holder",
+            ),
+            Refusal::Rollback => {
+                f.write_str("it is older than one already verified from the same signer")
+            }
+        }
+    }
+}
+
 /// A data-layer error.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DataError {
@@ -84,7 +119,7 @@ pub enum DataError {
         by: Prune,
     },
     /// The version is refused.
-    #[error("version {id:?} is refused: {why:?}")]
+    #[error("version {} of {} is refused: {why}", id.seq.0, id.writer.key())]
     Refused {
         /// The refused version.
         id: VersionId,
