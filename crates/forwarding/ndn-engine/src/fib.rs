@@ -100,38 +100,6 @@ impl FibTrie {
             path.pop();
         }
     }
-
-    /// Visit the entries on the way to `prefix` (the root first) and every
-    /// entry at or beneath `prefix`, each with its name's components.
-    fn visit_around(&self, prefix: &Name, visit: &mut impl FnMut(&[NameComponent], &FibEntry)) {
-        let comps = prefix.components();
-        let mut node = self;
-        for (depth, comp) in comps.iter().enumerate() {
-            if let Some(e) = &node.entry {
-                visit(&comps[..depth], e);
-            }
-            match node.children.get(comp) {
-                Some(child) => node = child,
-                None => return,
-            }
-        }
-        node.visit_subtree(&mut comps.to_vec(), visit);
-    }
-
-    fn visit_subtree(
-        &self,
-        path: &mut Vec<NameComponent>,
-        visit: &mut impl FnMut(&[NameComponent], &FibEntry),
-    ) {
-        if let Some(e) = &self.entry {
-            visit(path, e);
-        }
-        for (comp, child) in &self.children {
-            path.push(comp.clone());
-            child.visit_subtree(path, visit);
-            path.pop();
-        }
-    }
 }
 
 pub struct Fib {
@@ -188,14 +156,6 @@ impl Fib {
         let mut out = Vec::new();
         self.trie.load().dump(&mut Vec::new(), &mut out);
         out
-    }
-
-    /// Visit, in one snapshot, the entries on the way to `prefix` (the root
-    /// first) and every entry at or beneath it, each with its name's
-    /// components: every route an Interest toward anything in `prefix` could
-    /// take.
-    pub fn visit_around(&self, prefix: &Name, mut visit: impl FnMut(&[NameComponent], &FibEntry)) {
-        self.trie.load().visit_around(prefix, &mut visit);
     }
 
     pub fn remove_prefix(&self, prefix: &Name) {

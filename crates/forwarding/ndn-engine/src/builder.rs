@@ -780,7 +780,6 @@ impl EngineBuilder {
                 enrichers: self.enrichers,
                 runtime: Arc::clone(&runtime),
                 network_region: Arc::clone(&network_region),
-                sync_groups: Arc::default(),
             },
             pit_match: PitMatchStage {
                 pit: Arc::clone(&pit),

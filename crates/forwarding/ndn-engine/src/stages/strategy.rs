@@ -27,8 +27,6 @@ use ndn_store::{Pit, StrategyTable};
 use ndn_strategy::{ErasedStrategy, MeasurementsTable, SignalsTable, StrategyContext};
 use ndn_transport::face::FaceScope;
 
-use super::sync_group::{self, SyncGroups};
-
 /// Outcome of consulting the `NextHopFaceId` LP header (NDNLPv2 0x0330)
 /// before strategy dispatch.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -120,7 +118,7 @@ impl NetworkRegionTable {
 /// on-demand UDP face does, and peers behind one NAT (or on one host, e.g.
 /// several processes on loopback) share an address — a relay must forward
 /// between them.
-pub(super) fn peer_host(
+fn peer_host(
     face_table: &ndn_transport::FaceTable,
     face_id: ndn_transport::FaceId,
 ) -> Option<String> {
@@ -152,8 +150,6 @@ pub struct StrategyStage {
     pub enrichers: Vec<Arc<dyn ContextEnricher>>,
     pub runtime: Arc<dyn ndn_runtime::Runtime>,
     pub network_region: Arc<NetworkRegionTable>,
-    /// Namespace sync groups, forwarded by their own rule ([`super::sync_group`]).
-    pub sync_groups: Arc<SyncGroups>,
 }
 
 impl StrategyStage {
@@ -235,16 +231,7 @@ impl StrategyStage {
             trace!(target: t::FWD_FIB, face=%ctx.face_id, name=%name, matched=false, "fib lookup: no entry");
         }
 
-        // A namespace's sync group goes to its members and over every link
-        // toward the namespace, with multicast — not by longest-prefix match,
-        // where a member's own registration would hide those links (see
-        // `sync_group`). `None`: this node does not carry the group.
-        let group_fib = sync_group::group_prefix(&fib_name).and_then(|group| {
-            self.sync_groups
-                .nexthops(&group, ctx.face_id, &self.fib, &self.face_table)
-        });
-        let is_group = group_fib.is_some();
-        let strategy_fib: Option<ndn_strategy::FibEntry> = group_fib.or_else(|| {
+        let strategy_fib: Option<ndn_strategy::FibEntry> =
             fib_entry_ref.map(|e| ndn_strategy::FibEntry {
                 nexthops: e
                     .nexthops
@@ -254,8 +241,7 @@ impl StrategyStage {
                         cost: nh.cost,
                     })
                     .collect(),
-            })
-        });
+            });
 
         // Hot path: known cross-layer inputs (RSSI, GPS, …) come from
         // `signals`, so when no open-ended enricher is registered and no A-LAL
@@ -349,13 +335,10 @@ impl StrategyStage {
         // best-route that prefers the fast face. For non-hinted Interests
         // `fib_name == name`, so this is a no-op. (NFD picks the strategy for the
         // namespace being forwarded.)
-        let strategy = if is_group {
-            Arc::clone(self.sync_groups.strategy())
-        } else {
-            self.strategy_table
-                .lpm(&fib_name)
-                .unwrap_or_else(|| Arc::clone(&self.default_strategy))
-        };
+        let strategy = self
+            .strategy_table
+            .lpm(&fib_name)
+            .unwrap_or_else(|| Arc::clone(&self.default_strategy));
         trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, fib_name=%fib_name, strategy=%strategy.name(), "strategy invoked");
 
         let actions = if let Some(a) = strategy.decide_sync(&sctx) {
@@ -827,7 +810,6 @@ mod concurrent_pass_tests {
                 enrichers: Vec::new(),
                 runtime,
                 network_region: Arc::new(NetworkRegionTable::new(Vec::new())),
-                sync_groups: Arc::default(),
             },
             matcher: PitMatchStage {
                 pit,

@@ -2,7 +2,6 @@ pub mod cs;
 pub mod decode;
 pub mod pit;
 pub mod strategy;
-pub mod sync_group;
 // `ndn-security` is wasm-buildable, so the real validation pipeline
 // compiles for both targets — no wasm stub.
 pub mod validation;
@@ -14,5 +13,4 @@ pub use pit::{PitCheckStage, PitMatchStage};
 // crates) used before the trait moved to `ndn-strategy`.
 pub use ndn_strategy::erased::ErasedStrategy;
 pub use strategy::StrategyStage;
-pub use sync_group::SyncGroups;
 pub use validation::ValidationStage;
