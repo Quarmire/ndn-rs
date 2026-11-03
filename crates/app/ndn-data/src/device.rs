@@ -1238,9 +1238,16 @@ impl Inner {
         out
     }
 
-    /// Publish a change about `c` into each of its groups ([`Self::groups_of`]).
-    async fn publish_about(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
-        let groups = self.groups_of(&self.st.lock(), c);
+    /// Publish a change about `c` into each of its groups ([`Self::groups_of`])
+    /// and into `also` (the groups of members a new record removed, so the
+    /// removed hear the cut that ends them).
+    async fn publish_about(self: &Arc<Self>, c: &Name, also: &[Name]) -> Result<(), DataError> {
+        let mut groups = self.groups_of(&self.st.lock(), c);
+        for ns in also {
+            if !groups.contains(ns) {
+                groups.push(ns.clone());
+            }
+        }
         for ns in groups {
             self.join(&ns).await?;
             self.publish(&ns).await;
@@ -2693,7 +2700,7 @@ impl DataLayer for Device {
             st.emit(collection, &Change::Version(version), &id.writer, seq);
             id
         };
-        inner.publish_about(collection).await?;
+        inner.publish_about(collection, &[]).await?;
         Ok(id)
     }
 
@@ -2796,6 +2803,7 @@ impl DataLayer for Device {
             ));
         }
         inner.follow(collection).await?;
+        let before = inner.groups_of(&inner.st.lock(), collection);
         let rotate = {
             let mut st = inner.st.lock();
             let current = st.colls.get(collection).and_then(|c| c.members.clone());
@@ -2850,9 +2858,9 @@ impl DataLayer for Device {
             }
             rotate
         };
-        inner.publish_about(collection).await?;
+        inner.publish_about(collection, &before).await?;
         for x in rotate {
-            inner.publish_about(&x).await?;
+            inner.publish_about(&x, &[]).await?;
         }
         Ok(())
     }
