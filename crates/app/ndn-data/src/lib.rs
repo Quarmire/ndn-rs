@@ -73,7 +73,7 @@ mod tree;
 pub mod version;
 pub mod wire;
 
-pub use collection::{Child, Cut, Epoch, Members, Rule, Summary};
+pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{Clock, Config, Device, Transport};
 pub use error::{DataError, NextStep, Refusal};
 pub use layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, Share, State};

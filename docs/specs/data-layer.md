@@ -223,26 +223,55 @@ and, once the rule changed, where the current rule starts.
 
 - A members record is an entry of its signer's log, `<D>/32=log/<C>/seq=<n>`
   with Content `MembersRecord` (§16.2). Its `Revision` is one more than the
-  revision of the record in force at its signer (1 for the first).
+  revision of the record in force at its signer (1 for the first), and from
+  revision 2 it names that record as its **parent**: its revision and the
+  SHA-256 of its `MembersRecord` TLV — the Content of the packet carrying
+  it or, when the record in force was a merge of concurrent records
+  (below), the `MembersRecord` that merge stands for, encoded as §16.2
+  lists (its parent the one its records share, none when they name
+  different ones). The digest is of the Content, not of the whole Data
+  packet: a merge is carried by no packet, and devices holding the same
+  records compute the same merge, so the same digest, whoever signed what.
 - A reader MUST ignore a members record that the owner rule (§3) does not
   give to `C`'s namespace. The **record in force** is the merge of the
   records it holds of the highest `Revision`, one per signer (its latest);
-  a record of a lower revision never changes it.
+  a record of a lower revision changes it only as the parent the records
+  of the highest revision name (below). A reader keeps, besides those,
+  every record of the revision below that it took and every merge of them
+  it computed: the parents they may name.
 - **Concurrent records.** Two devices of the owner may each sign revision
-  `n` from their own view (the laptop, offline, removes Bob while the phone
-  removes Carol). Their records merge, whatever order they arrive in:
-  writers are the intersection (a key is a writer only if every record
-  admits it), readers the intersection, cuts the union by prefix (where two
-  records cut one prefix, the intersection of what they accept), rule and
-  `Since` those of the record with the highest signer key name, and the
-  epoch (with its key check) that of the record with the fewest readers
-  (ties: the highest signer key name). Removals win. When the merged
-  readers are fewer than that record's — a reader one record removed is
-  still of the epoch another kept — the merge is **resolved**: a device of
-  the owner namespace that holds it and is of its audience MUST sign
-  revision `n + 1` with the merged writers, readers, cuts and rule, in a new
-  epoch. Devices resolving at once sign records of one revision and one
-  audience, whose merge needs no more.
+  `n` from their own view (the laptop adds Carol while the phone, offline,
+  removes Bob). Their records merge, whatever order they arrive in:
+  - **Against their parent.** When every record merged names one parent
+    `P` and the reader holds it, writers and readers are `P`'s, plus every
+    one a record lists that `P` does not (an addition), minus every one of
+    `P`'s that a record does not list (a removal). A removal beats an
+    addition: a writer prefix one record adds is no writer when it covers,
+    or lies under, a prefix another record removed. Rule and `Since` are
+    `P`'s unless a record changed them, then that record's; when several
+    did, those of the one with the highest signer key name.
+  - **Without one.** When the records name different parents or none, or
+    the reader does not hold the one they name, writers are the
+    intersection (a key is a writer only if every record admits it),
+    readers the intersection, rule and `Since` those of the record with
+    the highest signer key name. An addition is then lost until a record
+    resolving the merge (below) arrives from a device that held `P`.
+  - Either way cuts are the union by prefix (where two records cut one
+    prefix, the intersection of what they accept), and the epoch (with its
+    key check) is that of the record listing the fewest readers the merge
+    leaves out, then the fewest readers (ties: the highest signer key
+    name). Removals win.
+  - **Resolving.** A merge is **resolved** — a device of the owner
+    namespace that holds it and is of its audience MUST sign revision
+    `n + 1` with the merged writers, readers, cuts and rule, naming the
+    merge as its parent — in a new epoch when the merged readers leave out
+    a reader of the epoch kept or, merged against `P`, a reader of `P` or
+    of any record merged (a reader one record removed is still of the
+    epoch another kept); and in the epoch kept, with its key check, when
+    they only list a reader no merged record naming that epoch lists (one
+    record added a reader while another moved to a new epoch). Devices
+    resolving at once sign records of one revision, one parent and one
+    audience, whose merge needs no more.
 - **Admission.** A reader MUST apply to `C` only versions the record in
   force admits (and, as for every entry, the trust schema admits under the
   writer's own name): a key under a writer prefix is admitted; else a key
@@ -775,7 +804,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0540 | FieldName | UTF-8 |
 | 0x0542 | FieldValue | octets; empty removes the field |
 | 0x0544 | MergeOp | octets: the merge function's operation |
-| 0x0546 | MembersRecord | Name (collection), Revision, Rule, Writers, Readers, [Cuts], [SealEpoch, KeyCheck], [RuleSince] |
+| 0x0546 | MembersRecord | Name (collection), Revision, Rule, Writers, Readers, [Cuts], [SealEpoch, KeyCheck], [RuleSince], [Seq, Digest] (the parent, from revision 2: its revision, one below this record's, and the SHA-256 of its `MembersRecord`, §6) |
 | 0x0548 | Rule | RuleKind [Name (merge function)] |
 | 0x054A | RuleKind | NonNegativeInteger: 0 one key, 1 log, 2 merge |
 | 0x054C | Writers | Name* (key-name prefixes) |
@@ -787,7 +816,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0558 | SeqRange | Seq (low), Seq (high), low ≤ high; a list of them is ascending and disjoint, and a summary node's lie at or below its Head and hold at most 65,536 seqs together (§7) |
 | 0x055A | Children | Child*, by component |
 | 0x055C | Child | Name (one component), Seq (head), Digest |
-| 0x055E | Digest | 32 octets: SHA-256 of the child's whole Data packet |
+| 0x055E | Digest | 32 octets: SHA-256 of the child's whole Data packet; in a `MembersRecord`, of the parent's `MembersRecord` (§6) |
 | 0x0560 | Pages | Page*, by bucket |
 | 0x0562 | Page | Bucket, Seq (head), Digest |
 | 0x0564 | Bucket | NonNegativeInteger 0–15 |
@@ -851,6 +880,12 @@ to equal bytes and equal nodes have equal digests.
 - **Exact cuts** reuse `Writer` and `Entries`, the summary node's own
   fields for "this key's seqs", rather than a frontier: a frontier is a
   limit, and a cut must not be one (§8).
+- **A members record's parent** reuses `Seq` and `Digest`, the pair a
+  summary's child and page name their packet by, in a position of its own
+  rather than a new number: both are even, so a reader of the previous
+  revision of this format passes over them and merges concurrent records
+  by intersection, as it did. The digest is of the parent's Content
+  because the record in force may be a merge no packet carries (§6).
 
 ## 17. Failure model
 
@@ -869,7 +904,7 @@ to equal bytes and equal nodes have equal digests.
 | Poisoned cache | Verification fails; the version is dropped and fetched elsewhere. | invariant 1, §4 |
 | Stranger in a sync group | Costs a root fetch; its entries are refused `NotMember`. | §6, §12 |
 | Removed reader | Refused every grant; the key of the epoch its removal starts did not exist before it, so the new epoch's versions stay closed to it; what it opened before it keeps. | §9 |
-| Owner's devices edit members at once | Records of one revision merge, removals winning; a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. | §6 |
+| Owner's devices edit members at once | Records of one revision merge against the parent they name, keeping every addition and removal, removals winning (by intersection when the parent is not held); a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. | §6 |
 | Group member removed | Every collection sealed to the group, of any owner, moves to a new epoch signed by a device of its own namespace. | §6 |
 | Own device left out | An audience that does not list it leaves it out of the epoch and every later one; no device holds a secret that yields future keys. | §6, §9 |
 | Removed writer fills a gap | A new entry at a seq below what its cut kept is refused: the cut lists exactly the versions kept. | §8 |
@@ -898,8 +933,11 @@ messages reach every member, a non-member's post reaches no one), c10
 cut that arrives after a version was accepted withdraws it), o3
 (completeness with many writers, measured: a full check of every member's
 summary and the catch-up of one new version, with 8 and with 32 writers),
-and the attacks the slice-2 security review found: r1 (two of the owner's
-devices remove readers at once; neither removed reader opens what is
-written after), r2 (a member leaves a group another person's collection is
-sealed to; that collection moves to a new epoch) and r3 (the owner lists
-one of her devices alone; her other device opens nothing written after).
+and the slice-2 security review: r1 (two of the owner's devices remove
+readers at once; neither removed reader opens what is written after), r2
+(a member leaves a group another person's collection is sealed to; that
+collection moves to a new epoch), r3 (the owner lists one of her devices
+alone; her other device opens nothing written after) and r4 (one of the
+owner's devices adds Carol while another, offline, removes Bob, both from
+one record; Carol then writes and reads everywhere, Bob's later edits are
+refused and he opens nothing written after).

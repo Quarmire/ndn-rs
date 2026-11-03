@@ -54,7 +54,7 @@ use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
-use crate::collection::{Accepted, Child, Cut, Epoch, Members, Rule, Summary};
+use crate::collection::{Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, State};
 use crate::merge::{MergeRule, MergeRules, MergeState};
@@ -181,9 +181,15 @@ struct Coll {
     /// The owner-signed records of the highest revision held, one per
     /// signer (its latest), with each record's seq in its signer's log.
     records: BTreeMap<Writer, (u64, Members)>,
-    /// Whether `members` merges records whose removals its epoch does not
-    /// carry out: a device of the audience resolves it with a new record.
-    unresolved: bool,
+    /// Every record of `records`' revision taken and every merge of them
+    /// computed, by digest: the parents records of the next revision name.
+    level: HashMap<[u8; 32], Members>,
+    /// The same at the revision below `records`': the parents they may
+    /// name, which their merge is made against (spec §6).
+    parents: HashMap<[u8; 32], Members>,
+    /// What `members`, a merge of concurrent records, leaves to resolve:
+    /// a device of the audience resolves it with a new record.
+    resolve: Resolve,
     /// Every epoch a held owner-signed record of the collection names.
     epochs: BTreeMap<Epoch, Named>,
     /// The merge state, once the rule is known and this device runs it.
@@ -290,8 +296,8 @@ const SEAL_KEYS_KEPT: usize = 1024;
 /// Why this device owes a collection a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owed {
-    /// Its record merges concurrent ones whose epoch does not carry out
-    /// their removals (spec §6).
+    /// Its record merges concurrent ones and leaves a reader to add to its
+    /// epoch or a removal to carry out in a new one (spec §6).
     Merge,
     /// A group its record names as a reader dropped a reader (spec §6).
     Group,
@@ -581,10 +587,11 @@ impl St {
     /// signed by `signer` (a device of the collection's namespace,
     /// [`owner_signed`]): note the epoch it names, and, if it is of the
     /// highest revision held, merge it with the other signers' records of
-    /// that revision (spec §6) and read the collection again under the
-    /// merge. Owes a new record of this namespace's collections where the
-    /// merge leaves a removal undone, or where a group they are sealed to
-    /// dropped a reader.
+    /// that revision against the parent they name, if held (spec §6), and
+    /// read the collection again under the merge; a record of the revision
+    /// below is held as a parent they may name. Owes a new record of this
+    /// namespace's collections where the merge leaves a reader to add or a
+    /// removal undone, or where a group they are sealed to dropped a reader.
     fn accept_members(
         &mut self,
         seq: u64,
@@ -613,6 +620,7 @@ impl St {
             epoch: body.epoch,
             key_check: body.key_check,
             since: body.since,
+            parent: body.parent,
             readmitted: Vec::new(),
         };
         let coll = self.colls.entry(c.clone()).or_default();
@@ -635,18 +643,43 @@ impl St {
                 }
             }
         }
+        let digest = record.as_parent().digest;
         match coll.records.values().next().map(|(_, m)| m.revision) {
-            Some(r) if record.revision < r => return,
-            Some(r) if record.revision > r => coll.records.clear(),
-            _ => {}
+            // A late record of the revision below: a parent the held ones
+            // may name.
+            Some(r) if record.revision < r => {
+                if record.revision.0 + 1 != r.0 || coll.parents.contains_key(&digest) {
+                    return;
+                }
+                coll.parents.insert(digest, record);
+            }
+            Some(r) if record.revision > r => {
+                let level = std::mem::take(&mut coll.level);
+                coll.parents = if record.revision.0 == r.0 + 1 {
+                    level
+                } else {
+                    HashMap::new()
+                };
+                coll.records.clear();
+                coll.level.insert(digest, record.clone());
+                coll.records.insert(signer.clone(), (seq, record));
+            }
+            _ => {
+                if coll.records.get(signer).is_some_and(|(s, _)| *s >= seq) {
+                    return;
+                }
+                coll.level.insert(digest, record.clone());
+                coll.records.insert(signer.clone(), (seq, record));
+            }
         }
-        if coll.records.get(signer).is_some_and(|(s, _)| *s >= seq) {
-            return;
-        }
-        coll.records.insert(signer.clone(), (seq, record));
         let records: Vec<Members> = coll.records.values().map(|(_, m)| m.clone()).collect();
-        let (merged, unresolved) = Members::merge(&records).expect("a record was just inserted");
-        coll.unresolved = unresolved;
+        let parents = &coll.parents;
+        let (merged, resolve) =
+            Members::merge(&records, |p| parents.get(&p.digest)).expect("a record is held");
+        coll.resolve = resolve;
+        if records.len() > 1 {
+            coll.level.insert(merged.as_parent().digest, merged.clone());
+        }
         if coll.members.as_ref() == Some(&merged) {
             return;
         }
@@ -678,7 +711,7 @@ impl St {
             }
             self.sealed_to.entry(g).or_default().insert(c.clone());
         }
-        if unresolved && namespace_of(&c).as_ref() == Some(&self.ns) {
+        if resolve != Resolve::Nothing && namespace_of(&c).as_ref() == Some(&self.ns) {
             self.owed.entry(c.clone()).or_insert(Owed::Merge);
         }
         if dropped {
@@ -1299,7 +1332,8 @@ impl Inner {
     /// each other device per namespace, so a rolled-back root is still
     /// refused. Others' versions are stored only once applied, so what comes
     /// back is a causally complete prefix of each writer; members records go
-    /// first, then the keys, then the rest.
+    /// first, by revision (so each revision's merge is made against the
+    /// records in force below it), then the keys, then the rest.
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
@@ -1344,8 +1378,10 @@ impl Inner {
                 mine,
             ));
         }
-        entries
-            .sort_by_key(|(_, _, record, _, seq, _)| (!matches!(record, Record::Members(_)), *seq));
+        entries.sort_by_key(|(_, _, record, _, seq, _)| match record {
+            Record::Members(b) => (false, b.revision, *seq),
+            _ => (true, 0, *seq),
+        });
         let rest = entries.split_off(
             entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
         );
@@ -1574,11 +1610,13 @@ impl Inner {
     }
 
     /// Do what the records taken owe (spec §6): sign the record this device
-    /// owes a collection of its namespace — one resolving a merge that left
-    /// a removal undone, or one moving a collection sealed to a group that
-    /// dropped a reader to a new epoch — when it is of the collection's
-    /// audience, and publish it; follow the groups this namespace's records
-    /// name, so their readers can be checked and their removals heard.
+    /// owes a collection of its namespace — one resolving a merge, in the
+    /// epoch it keeps when it only adds readers to that epoch and in a new
+    /// one when it left a removal undone, or one moving a collection sealed
+    /// to a group that dropped a reader to a new epoch — when it is of the
+    /// collection's audience, and publish it; follow the groups this
+    /// namespace's records name, so their readers can be checked and their
+    /// removals heard.
     async fn settle(self: &Arc<Self>) {
         let mut signed = Vec::new();
         let follow = {
@@ -1597,9 +1635,11 @@ impl Inner {
                     let Some(current) = coll.members.clone() else {
                         continue;
                     };
-                    if why == Owed::Merge && !coll.unresolved {
-                        continue;
-                    }
+                    let new_epoch = match (why, coll.resolve) {
+                        (Owed::Merge, Resolve::Nothing) => continue,
+                        (Owed::Merge, Resolve::Readers) => false,
+                        (Owed::Merge, Resolve::Epoch) | (Owed::Group, _) => true,
+                    };
                     if namespace_of(&c).as_ref() != Some(&self.ns) || !self.reads(&st, &c) {
                         tracing::debug!(collection = %c, ?why, "a new record is owed, by a device of its audience; not this one");
                         continue;
@@ -1611,11 +1651,11 @@ impl Inner {
                         current.rule.clone(),
                         current.writers.clone(),
                         current.readers.clone(),
-                        true,
+                        new_epoch,
                     );
                     match self.append_members(&mut st, &c, record) {
                         Ok(()) => {
-                            tracing::debug!(collection = %c, ?why, "signed a record in a new epoch");
+                            tracing::debug!(collection = %c, ?why, new_epoch, "signed the record owed");
                             signed.push(c);
                         }
                         Err(e) => {
@@ -2371,6 +2411,7 @@ impl Inner {
             epoch: Some(epoch),
             key_check: Some(check),
             since: None,
+            parent: None,
         };
         (body, Some(key))
     }
@@ -2382,7 +2423,7 @@ impl Inner {
     /// drops its cut. A reader removed — or `new_epoch` — starts a new epoch
     /// at this record, with a new random key; no readers, no seal. A rule
     /// changed, or a seal on a collection that had none, sets `since` to
-    /// what this device applied.
+    /// what this device applied. The record names `current` as its parent.
     #[allow(clippy::too_many_arguments)]
     fn next_members(
         &self,
@@ -2482,6 +2523,7 @@ impl Inner {
             epoch,
             key_check,
             since,
+            parent: current.map(Members::as_parent),
         };
         (body, key)
     }
@@ -3637,6 +3679,7 @@ mod tests {
                 epoch: None,
                 key_check: None,
                 since: None,
+                parent: None,
             };
             let name = log_name(&device, Some(&c), 1);
             let content = wire::encode_members(&body);
@@ -3832,6 +3875,7 @@ mod tests {
             epoch: Some(epoch.clone()),
             key_check: Some(seal::key_check(&right, &c, &epoch)),
             since: None,
+            parent: None,
         };
         let version = |seq: u64| {
             let name = log_name(&owner, Some(&c), seq);
@@ -4078,6 +4122,103 @@ mod tests {
             Some(*key.expose()),
             "the made key comes back after a restart"
         );
+        drop(st);
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_records_of_one_parent_keep_an_addition_and_a_removal_and_resolve() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/alice")));
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/plan");
+        let person = |s: &str| Audience::Person(n(s));
+        dev.share(
+            &c,
+            share_of(
+                Rule::Log,
+                &["/alice", "/bob"],
+                vec![person("/alice"), person("/bob")],
+            ),
+        )
+        .await
+        .unwrap();
+        let first = dev.inner.st.lock().colls[&c].members.clone().unwrap();
+        // The laptop adds Carol; the phone, from the same record, removes Bob.
+        dev.share(
+            &c,
+            share_of(
+                Rule::Log,
+                &["/alice", "/bob", "/carol"],
+                vec![person("/alice"), person("/bob"), person("/carol")],
+            ),
+        )
+        .await
+        .unwrap();
+        let phone = n("/alice/phone");
+        let removed_in = Epoch {
+            creator: phone.clone(),
+            seq: Seq(1),
+        };
+        let removes = MembersBody {
+            collection: c.clone(),
+            revision: 2,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: vec![person("/alice")],
+            cuts: vec![CutBody {
+                of: n("/bob"),
+                accept: Accepted::new(),
+            }],
+            epoch: Some(removed_in.clone()),
+            key_check: Some(seal::key_check(&ContentKey::generate(), &c, &removed_in)),
+            since: None,
+            parent: Some(first.as_parent()),
+        };
+        assert_eq!(hand(&dev, &phone, &c, 1, Record::Members(removes)), None);
+        let merged = {
+            let st = dev.inner.st.lock();
+            let coll = &st.colls[&c];
+            let m = coll.members.clone().unwrap();
+            assert_eq!(m.revision, Seq(2));
+            assert_eq!(m.writers, vec![n("/alice"), n("/carol")]);
+            assert_eq!(m.readers, vec![person("/alice"), person("/carol")]);
+            assert_eq!(
+                m.cuts.iter().map(|k| &k.of).collect::<Vec<_>>(),
+                [&n("/bob")]
+            );
+            // Until resolved, the epoch Bob is not of.
+            assert_eq!(m.epoch.as_ref(), Some(&removed_in));
+            assert_eq!(coll.resolve, Resolve::Epoch);
+            m
+        };
+        // The laptop, of the merged audience, resolves it: the merged
+        // record, in a new epoch of its own, signed from the merge.
+        dev.inner.settle().await;
+        let resolved = {
+            let st = dev.inner.st.lock();
+            let m = st.colls[&c].members.clone().unwrap();
+            assert_eq!(m.revision, Seq(3));
+            assert_eq!(m.writers, merged.writers);
+            assert_eq!(m.readers, merged.readers);
+            assert_eq!(m.parent, Some(merged.as_parent()));
+            let e = m.epoch.clone().unwrap();
+            assert_eq!(e.creator, device);
+            assert!(st.keys.key(&c, &e).is_some());
+            assert_eq!(st.colls[&c].resolve, Resolve::Nothing);
+            m
+        };
+        // A restart takes the records back revision by revision and owes
+        // nothing more.
+        dev.shutdown();
+        drop(dev);
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        let st = again.inner.st.lock();
+        assert_eq!(st.colls[&c].members.as_ref(), Some(&resolved));
+        assert_eq!(st.head, 3);
         drop(st);
         again.shutdown();
     }

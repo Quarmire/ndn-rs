@@ -45,7 +45,7 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use crate::collection::{Accepted, Epoch, Rule};
+use crate::collection::{Accepted, Cut, Epoch, Members, Parent, Rule};
 use crate::version::{Audience, Content, Frontier, Keep, Seal, Seq, Timestamp, TypeId, Writer};
 
 /// TLV-TYPE numbers (0x0520–0x057F).
@@ -56,7 +56,8 @@ pub mod tlv {
     pub const FRONTIER: u64 = 0x0522;
     /// One writer of a frontier: `Name` (key) + `Seq`.
     pub const FRONTIER_ENTRY: u64 = 0x0524;
-    /// A sequence number (NonNegativeInteger).
+    /// A sequence number (NonNegativeInteger); in a members record, its
+    /// parent's revision.
     pub const SEQ: u64 = 0x0526;
     /// A content type: `Name` + `Revision`.
     pub const TYPE_ID: u64 = 0x0528;
@@ -112,7 +113,8 @@ pub mod tlv {
     pub const CHILDREN: u64 = 0x055A;
     /// One sub-collection: `Name` (one component), `Seq` (head), `Digest`.
     pub const CHILD: u64 = 0x055C;
-    /// SHA-256 implicit digest of a summary packet (32 octets).
+    /// SHA-256 implicit digest of a summary packet (32 octets); in a members
+    /// record, SHA-256 of its parent's `MembersRecord`.
     pub const DIGEST: u64 = 0x055E;
     /// Sub-collections, paged by hash: `Page*`, by bucket.
     pub const PAGES: u64 = 0x0560;
@@ -922,6 +924,33 @@ pub struct MembersBody {
     /// The frontier the owner had applied when the rule last changed (or
     /// when it sealed a collection that was not sealed).
     pub since: Option<Frontier>,
+    /// The record in force at the signer when it signed this one (spec
+    /// §6); none at revision 1.
+    pub parent: Option<Parent>,
+}
+
+impl From<&Members> for MembersBody {
+    fn from(m: &Members) -> Self {
+        Self {
+            collection: m.collection.clone(),
+            revision: m.revision.0,
+            rule: m.rule.clone(),
+            writers: m.writers.clone(),
+            readers: m.readers.clone(),
+            cuts: m
+                .cuts
+                .iter()
+                .map(|Cut { of, accept, .. }| CutBody {
+                    of: of.clone(),
+                    accept: accept.clone(),
+                })
+                .collect(),
+            epoch: m.epoch.clone(),
+            key_check: m.key_check,
+            since: m.since.clone(),
+            parent: m.parent,
+        }
+    }
 }
 
 /// What a log entry says.
@@ -1039,6 +1068,10 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
         }
         if let Some(since) = &b.since {
             w.write_nested(tlv::RULE_SINCE, |w| write_frontier(w, since));
+        }
+        if let Some(p) = &b.parent {
+            write_nni(w, tlv::SEQ, p.revision.0);
+            w.write_tlv(tlv::DIGEST, &p.digest);
         }
     });
     w.finish()
@@ -1208,6 +1241,7 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     let mut epoch = None;
     let mut key_check = None;
     let mut since = None;
+    let (mut parent_revision, mut parent_digest) = (None, None);
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
@@ -1263,6 +1297,10 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
                     Ok(true)
                 })?;
             }
+            tlv::SEQ => parent_revision = Some(read_nni(&v)?),
+            tlv::DIGEST => {
+                parent_digest = Some(read_digest(&v).map_err(|_| bad("a digest is 32 octets"))?)
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -1273,9 +1311,22 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
             "a members record that names an epoch carries its key check, and only then",
         ));
     }
+    let revision = revision.ok_or_else(|| missing("a revision"))?;
+    let parent = match (parent_revision, parent_digest) {
+        (None, None) => None,
+        (Some(r), Some(digest)) if r.checked_add(1) == Some(revision) => Some(Parent {
+            revision: Seq(r),
+            digest,
+        }),
+        _ => {
+            return Err(bad(
+                "a members record's parent is a revision one below its own and a digest",
+            ));
+        }
+    };
     Ok(MembersBody {
         collection: collection.ok_or_else(|| missing("a collection"))?,
-        revision: revision.ok_or_else(|| missing("a revision"))?,
+        revision,
         rule: rule.ok_or_else(|| missing("a rule"))?,
         writers: writers.ok_or_else(|| missing("writers"))?,
         readers: readers.ok_or_else(|| missing("readers"))?,
@@ -1283,6 +1334,7 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
         epoch,
         key_check,
         since,
+        parent,
     })
 }
 
@@ -1730,6 +1782,7 @@ mod tests {
             }),
             key_check: Some([7; 32]),
             since: None,
+            parent: None,
         };
         let wire = encode_members(&body);
         let with = |extra: u64| {
@@ -1752,6 +1805,33 @@ mod tests {
             Ok(Record::Members(body.clone()))
         );
         assert!(decode_record(with(0x0581)).is_err());
+        // A record names its parent, of the revision before its own; a
+        // parent of any other revision, or half a parent, is refused.
+        let parented = MembersBody {
+            revision: 2,
+            parent: Some(Parent {
+                revision: Seq(1),
+                digest: [9; 32],
+            }),
+            ..body.clone()
+        };
+        assert_eq!(
+            decode_record(encode_members(&parented)),
+            Ok(Record::Members(parented.clone()))
+        );
+        let skewed = MembersBody {
+            revision: 3,
+            ..parented.clone()
+        };
+        assert!(decode_record(encode_members(&skewed)).is_err());
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::MEMBERS_RECORD, |w| {
+            let mut r = TlvReader::new(encode_members(&body));
+            let (_, inner) = r.read_tlv().unwrap();
+            w.write_raw(&inner);
+            w.write_tlv(tlv::DIGEST, &[9; 32]);
+        });
+        assert!(decode_record(w.finish()).is_err());
         // An epoch comes with its key check.
         let unchecked = MembersBody {
             key_check: None,

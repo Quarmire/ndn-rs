@@ -6,9 +6,11 @@
 use std::collections::BTreeMap;
 
 use ndn_foundation_types::{Hash, Name};
+use sha2::{Digest, Sha256};
 
 use crate::error::Refusal;
 use crate::version::{Audience, Frontier, Seq, VersionId, Writer};
+use crate::wire;
 
 /// What "newest" means in a collection. The collection decides, not the app.
 /// A writer is always one key.
@@ -40,8 +42,10 @@ pub enum Rule {
 /// new [`Epoch`], changing the rule (or sealing a collection that was not)
 /// starts the collection again from [`since`](Self::since). Each revision
 /// supersedes the previous one and the revision number never goes back
-/// (model invariant 3). Records of one revision signed by different devices
-/// of the owner merge ([`Members::merge`]): removals win.
+/// (model invariant 3). Each names its [`parent`](Self::parent), the record
+/// its signer had in force; records of one revision signed by different
+/// devices of the owner merge ([`Members::merge`]) against the parent they
+/// share: every addition and every removal is kept, and removals win.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Members {
     /// The collection this record governs.
@@ -74,6 +78,9 @@ pub struct Members {
     /// it stay readable by name and listed by `watch`, and stay out of the
     /// new rule's state.
     pub since: Option<Frontier>,
+    /// The record in force at its signer when it signed this one; `None`
+    /// for revision 1 (and for a record from a signer that named none).
+    pub parent: Option<Parent>,
     /// Versions outside a cut that the owner signed back in.
     ///
     /// This answers the open item "a cut can drop honest work": a stolen
@@ -99,26 +106,91 @@ impl Members {
         }
     }
 
+    /// What this record is as a parent: its revision and the SHA-256 of
+    /// its `MembersRecord` TLV (spec §6, §16.2) — the Content of the packet
+    /// that carries it. A merge is digested as the record it stands for.
+    pub fn as_parent(&self) -> Parent {
+        let body = wire::MembersBody::from(self);
+        Parent {
+            revision: self.revision,
+            digest: Sha256::digest(wire::encode_members(&body)).into(),
+        }
+    }
+
     /// The one record that `records` — owner-signed records of one
     /// collection and one revision, by distinct signers — stand for (spec
-    /// §6), and whether it must be resolved by a new record: writers and
-    /// readers are the intersection of theirs (a key is a writer only if
-    /// every record admits it), cuts the union by prefix (the intersection
-    /// of the accepted sets where two cut one prefix), rule and `since`
-    /// those of the highest signer key; the epoch is that of the record with
-    /// the fewest readers (ties: the highest signer key). When the merged
-    /// readers are fewer than that record's, a reader one record removed
-    /// would keep reading in it: the merge is then resolved by a record of
-    /// the next revision in a new epoch. `None` for no records.
-    pub fn merge(records: &[Members]) -> Option<(Members, bool)> {
+    /// §6), and what it leaves to resolve. `held` finds a record in force
+    /// this device held by what it is as a parent.
+    ///
+    /// When every record names one parent `P` and `held` has it, they merge
+    /// three ways against it: writers and readers are `P`'s, plus every one
+    /// a record added and minus every one a record removed — a removal
+    /// beating another record's addition of a prefix it covers or lies
+    /// under; the rule and `since` are `P`'s unless a record changed them,
+    /// then those of the highest signer key among the records that did.
+    /// Otherwise writers and readers are the intersection of theirs (a key
+    /// is a writer only if every record admits it), rule and `since` those
+    /// of the highest signer key. Either way cuts are the union by prefix
+    /// (the intersection of the accepted sets where two cut one prefix),
+    /// and the epoch is that of the record listing the fewest readers the
+    /// merge leaves out, then the fewest readers, then the highest signer
+    /// key. `None` for no records.
+    pub fn merge<'a>(
+        records: &[Members],
+        held: impl Fn(&Parent) -> Option<&'a Members>,
+    ) -> Option<(Members, Resolve)> {
         let top = records.iter().max_by(|a, b| a.owner.cmp(&b.owner))?;
-        let covers = |m: &Members, p: &Name| m.writers.iter().any(|q| p.has_prefix(q));
-        let mut writers: Vec<Name> = records
+        if let [one] = records {
+            return Some((one.clone(), Resolve::Nothing));
+        }
+        let shared = records
             .iter()
-            .flat_map(|m| m.writers.iter())
-            .filter(|p| records.iter().all(|m| covers(m, p)))
-            .cloned()
-            .collect();
+            .map(|m| m.parent)
+            .reduce(|a, b| a.filter(|p| b == Some(*p)))
+            .flatten();
+        let base = shared.and_then(|p| held(&p).filter(|m| m.as_parent() == p));
+        let mut writers: Vec<Name> = match base {
+            Some(p) => {
+                let removed: Vec<(usize, &Name)> = records
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, m)| {
+                        p.writers
+                            .iter()
+                            .filter(move |w| !m.writers.contains(w))
+                            .map(move |w| (i, w))
+                    })
+                    .collect();
+                let added = records.iter().enumerate().flat_map(|(i, m)| {
+                    m.writers
+                        .iter()
+                        .filter(move |w| !p.writers.contains(w))
+                        .map(move |w| (i, w))
+                });
+                // A removal beats another record's addition of a prefix it
+                // covers or lies under.
+                let beaten = |i: usize, a: &Name| {
+                    removed
+                        .iter()
+                        .any(|(j, q)| *j != i && (a.has_prefix(q) || q.has_prefix(a)))
+                };
+                p.writers
+                    .iter()
+                    .filter(|w| !removed.iter().any(|(_, q)| q == w))
+                    .chain(added.filter(|(i, a)| !beaten(*i, a)).map(|(_, a)| a))
+                    .cloned()
+                    .collect()
+            }
+            None => {
+                let covers = |m: &Members, p: &Name| m.writers.iter().any(|q| p.has_prefix(q));
+                records
+                    .iter()
+                    .flat_map(|m| m.writers.iter())
+                    .filter(|p| records.iter().all(|m| covers(m, p)))
+                    .cloned()
+                    .collect()
+            }
+        };
         writers.sort();
         writers.dedup();
         let broadest: Vec<Name> = writers
@@ -126,12 +198,27 @@ impl Members {
             .filter(|p| !writers.iter().any(|q| q != *p && p.has_prefix(q)))
             .cloned()
             .collect();
-        let readers: Vec<Audience> = top
-            .readers
-            .iter()
-            .filter(|r| records.iter().all(|m| m.readers.contains(r)))
-            .cloned()
-            .collect();
+        let mut readers: Vec<Audience> = Vec::new();
+        match base {
+            Some(p) => {
+                let removed = |r: &Audience| records.iter().any(|m| !m.readers.contains(r));
+                let added = records
+                    .iter()
+                    .flat_map(|m| m.readers.iter())
+                    .filter(|r| !p.readers.contains(r));
+                for r in p.readers.iter().filter(|r| !removed(r)).chain(added) {
+                    if !readers.contains(r) {
+                        readers.push(r.clone());
+                    }
+                }
+            }
+            None => readers.extend(
+                top.readers
+                    .iter()
+                    .filter(|r| records.iter().all(|m| m.readers.contains(r)))
+                    .cloned(),
+            ),
+        }
         let mut cuts: BTreeMap<Name, Cut> = BTreeMap::new();
         for cut in records.iter().flat_map(|m| m.cuts.iter()) {
             match cuts.get_mut(&cut.of) {
@@ -141,31 +228,90 @@ impl Members {
                 }
             }
         }
+        let ruling = match base {
+            Some(p) => records
+                .iter()
+                .filter(|m| m.rule != p.rule || m.since != p.since)
+                .max_by(|a, b| a.owner.cmp(&b.owner))
+                .unwrap_or(p),
+            None => top,
+        };
+        let left_out = |r: &Audience| !readers.contains(r);
         let sealing = records
             .iter()
             .min_by(|a, b| {
-                a.readers
-                    .len()
-                    .cmp(&b.readers.len())
-                    .then_with(|| b.owner.cmp(&a.owner))
+                let key = |m: &Members| {
+                    let out = m.readers.iter().filter(|r| left_out(r)).count();
+                    (out, m.readers.len())
+                };
+                key(a).cmp(&key(b)).then_with(|| b.owner.cmp(&a.owner))
             })
             .expect("at least one record");
-        let unresolved = readers.len() < sealing.readers.len();
+        let removed = sealing.readers.iter().any(left_out)
+            || base.is_some_and(|p| {
+                p.readers
+                    .iter()
+                    .chain(records.iter().flat_map(|m| m.readers.iter()))
+                    .any(left_out)
+            });
+        // The audience of the epoch kept: every reader a merged record
+        // naming it lists.
+        let of_epoch = |r: &Audience| {
+            records
+                .iter()
+                .any(|m| m.epoch == sealing.epoch && m.readers.contains(r))
+        };
+        let resolve = if removed {
+            Resolve::Epoch
+        } else if !readers.iter().all(of_epoch) {
+            Resolve::Readers
+        } else {
+            Resolve::Nothing
+        };
         let merged = Members {
             collection: top.collection.clone(),
             owner: top.owner.clone(),
             revision: top.revision,
-            rule: top.rule.clone(),
+            rule: ruling.rule.clone(),
             writers: broadest,
             readers,
             cuts: cuts.into_values().collect(),
             epoch: sealing.epoch.clone(),
             key_check: sealing.key_check,
-            since: top.since.clone(),
+            since: ruling.since.clone(),
+            parent: shared,
             readmitted: Vec::new(),
         };
-        Some((merged, unresolved))
+        Some((merged, resolve))
     }
+}
+
+/// The record a members record was signed from (spec §6): the record in
+/// force at its signer, by revision and by the SHA-256 of its
+/// `MembersRecord` TLV ([`Members::as_parent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Parent {
+    /// The parent's revision, one below the record's.
+    pub revision: Seq,
+    /// SHA-256 of the parent's `MembersRecord` TLV.
+    pub digest: [u8; 32],
+}
+
+/// What a merge of concurrent members records leaves to do (spec §6): a
+/// device of the owner's namespace that is of the merged audience resolves
+/// it with a record of the next revision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Resolve {
+    /// Nothing: the merge stands.
+    #[default]
+    Nothing,
+    /// A record listing the merged readers in the epoch the merge keeps:
+    /// a reader one record added is not of that epoch's audience.
+    Readers,
+    /// A record in a new epoch: the merge leaves out a reader of the epoch
+    /// it keeps or — merged against their parent — a reader of the parent
+    /// or of a record merged.
+    Epoch,
 }
 
 /// The epoch a sealed collection is read in (model primitive "Seal").
@@ -416,6 +562,7 @@ mod tests {
             epoch: None,
             key_check: None,
             since: None,
+            parent: None,
             readmitted: Vec::new(),
         };
         assert_eq!(m.refusal(&id("/alice/phone/KEY/1", 7)), None);
@@ -433,32 +580,56 @@ mod tests {
         assert_eq!(m.refusal(&id("/bob/phone/KEY/1", 42)), None);
     }
 
-    #[test]
-    fn concurrent_records_merge_so_that_removals_win() {
-        let n = |s: &str| -> Name { s.parse().unwrap() };
-        let person = |s: &str| Audience::Person(n(s));
-        let record =
-            |signer: &str, seq: u64, writers: &[&str], readers: &[&str], cuts: Vec<Cut>| Members {
-                collection: n("/alice/32=data/docs/plan"),
-                owner: Writer::new(n(&format!("{signer}/KEY/1"))),
-                revision: Seq(2),
-                rule: Rule::Log,
-                writers: writers.iter().map(|w| n(w)).collect(),
-                readers: readers.iter().map(|r| person(r)).collect(),
-                cuts,
-                epoch: Some(Epoch {
-                    creator: n(signer),
-                    seq: Seq(seq),
-                }),
-                key_check: Some([seq as u8; 32]),
-                since: None,
-                readmitted: Vec::new(),
-            };
-        let cut = |of: &str, seqs: &[u64]| Cut {
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    fn person(s: &str) -> Audience {
+        Audience::Person(n(s))
+    }
+
+    /// A record of revision 2 by `signer`, naming no parent, in the epoch
+    /// `signer`'s log entry `seq` started.
+    fn record(
+        signer: &str,
+        seq: u64,
+        writers: &[&str],
+        readers: &[&str],
+        cuts: Vec<Cut>,
+    ) -> Members {
+        Members {
+            collection: n("/alice/32=data/docs/plan"),
+            owner: Writer::new(n(&format!("{signer}/KEY/1"))),
+            revision: Seq(2),
+            rule: Rule::Log,
+            writers: writers.iter().map(|w| n(w)).collect(),
+            readers: readers.iter().map(|r| person(r)).collect(),
+            cuts,
+            epoch: Some(Epoch {
+                creator: n(signer),
+                seq: Seq(seq),
+            }),
+            key_check: Some([seq as u8; 32]),
+            since: None,
+            parent: None,
+            readmitted: Vec::new(),
+        }
+    }
+
+    fn cut(of: &str, seqs: &[u64]) -> Cut {
+        Cut {
             of: n(of),
             accept: seqs.iter().map(|s| id("/bob/phone/KEY/1", *s)).collect(),
             signer: Writer::new(n("/alice/laptop/KEY/1")),
-        };
+        }
+    }
+
+    fn none(_: &Parent) -> Option<&'static Members> {
+        None
+    }
+
+    #[test]
+    fn concurrent_records_without_a_held_parent_merge_by_intersection() {
         // The laptop removes Bob (writer and reader); the phone removes Carol.
         let laptop = record(
             "/alice/laptop",
@@ -474,7 +645,7 @@ mod tests {
             &["/alice", "/bob"],
             vec![cut("/bob", &[3])],
         );
-        let (m, unresolved) = Members::merge(&[laptop.clone(), phone.clone()]).unwrap();
+        let (m, resolve) = Members::merge(&[laptop.clone(), phone.clone()], none).unwrap();
         assert_eq!(m.writers, vec![n("/alice")]);
         assert_eq!(m.readers, vec![person("/alice")]);
         assert_eq!(m.cuts.len(), 1);
@@ -487,7 +658,7 @@ mod tests {
         // other removed holds — so the merge must be resolved.
         let top = laptop.owner.clone().max(phone.owner.clone());
         assert_eq!(m.owner, top);
-        assert!(unresolved);
+        assert_eq!(resolve, Resolve::Epoch);
         // One record only removes: its epoch is new to the removed reader and
         // nothing needs resolving.
         let adds = record(
@@ -497,11 +668,11 @@ mod tests {
             &["/alice", "/carol", "/dave"],
             Vec::new(),
         );
-        let (m, unresolved) = Members::merge(&[laptop.clone(), adds]).unwrap();
+        let (m, resolve) = Members::merge(&[laptop.clone(), adds], none).unwrap();
         assert_eq!(m.readers, vec![person("/alice"), person("/carol")]);
         assert_eq!(m.epoch, laptop.epoch);
         assert_eq!(m.key_check, laptop.key_check);
-        assert!(!unresolved);
+        assert_eq!(resolve, Resolve::Nothing);
         // A writer prefix is kept where every record admits its keys.
         let narrower = record(
             "/alice/phone",
@@ -510,8 +681,142 @@ mod tests {
             &["/alice"],
             Vec::new(),
         );
-        let (m, _) = Members::merge(&[laptop, narrower]).unwrap();
+        let (m, _) = Members::merge(&[laptop, narrower], none).unwrap();
         assert_eq!(m.writers, vec![n("/alice/phone")]);
+    }
+
+    #[test]
+    fn concurrent_records_of_one_held_parent_keep_every_addition_and_removal() {
+        let parent = Members {
+            revision: Seq(1),
+            ..record(
+                "/alice/laptop",
+                1,
+                &["/alice", "/bob"],
+                &["/alice", "/bob"],
+                Vec::new(),
+            )
+        };
+        let from = |m: Members| Members {
+            parent: Some(parent.as_parent()),
+            ..m
+        };
+        let held = |p: &Parent| (p.digest == parent.as_parent().digest).then_some(&parent);
+        // The laptop adds Carol in the parent's epoch; the phone removes Bob
+        // in a new one.
+        let laptop = from(Members {
+            epoch: parent.epoch.clone(),
+            key_check: parent.key_check,
+            ..record(
+                "/alice/laptop",
+                0,
+                &["/alice", "/bob", "/carol"],
+                &["/alice", "/bob", "/carol"],
+                Vec::new(),
+            )
+        });
+        let phone = from(record(
+            "/alice/phone",
+            4,
+            &["/alice"],
+            &["/alice"],
+            vec![cut("/bob", &[3])],
+        ));
+        let (m, resolve) = Members::merge(&[laptop.clone(), phone.clone()], held).unwrap();
+        assert_eq!(m.writers, vec![n("/alice"), n("/carol")]);
+        assert_eq!(m.readers, vec![person("/alice"), person("/carol")]);
+        assert_eq!(m.cuts, phone.cuts);
+        assert_eq!(m.parent, Some(parent.as_parent()));
+        // The epoch Bob is not of, until a record in a new one resolves it:
+        // the merge removed a reader of the parent.
+        assert_eq!(m.epoch, phone.epoch);
+        assert_eq!(resolve, Resolve::Epoch);
+        // Without the parent, or with records of different parents, the
+        // intersection: the addition is lost.
+        let (m, _) = Members::merge(&[laptop.clone(), phone.clone()], none).unwrap();
+        assert_eq!(m.readers, vec![person("/alice")]);
+        let elsewhere = Members {
+            parent: None,
+            ..phone.clone()
+        };
+        let (m, _) = Members::merge(&[laptop.clone(), elsewhere], held).unwrap();
+        assert_eq!(m.writers, vec![n("/alice")]);
+
+        // A removal beats another record's addition under the prefix it
+        // removed, not its own record's.
+        let tablet = from(record(
+            "/alice/laptop",
+            0,
+            &["/alice", "/bob", "/bob/tablet"],
+            &["/alice", "/bob"],
+            Vec::new(),
+        ));
+        let own = from(record(
+            "/alice/phone",
+            4,
+            &["/alice", "/bob/laptop"],
+            &["/alice", "/bob"],
+            vec![cut("/bob", &[3])],
+        ));
+        let (m, _) = Members::merge(&[tablet, own], held).unwrap();
+        // (Names in canonical order: a shorter component first.)
+        assert_eq!(m.writers, vec![n("/bob/laptop"), n("/alice")]);
+
+        // A rule one record changed wins over one that kept the parent's;
+        // two changes, the highest signer's.
+        let merged = Rule::Merge {
+            function: n("/merge/yrs"),
+        };
+        let changed = from(Members {
+            rule: merged.clone(),
+            ..laptop.clone()
+        });
+        let (m, _) = Members::merge(&[changed.clone(), phone.clone()], held).unwrap();
+        assert_eq!(m.rule, merged);
+        let (m, _) = Members::merge(&[phone.clone(), changed.clone()], held).unwrap();
+        assert_eq!(m.rule, merged, "whatever order the records come in");
+        let other = from(Members {
+            rule: Rule::OneKey,
+            ..phone.clone()
+        });
+        let (m, _) = Members::merge(&[changed.clone(), other.clone()], held).unwrap();
+        let top = [&changed, &other]
+            .into_iter()
+            .max_by(|a, b| a.owner.cmp(&b.owner));
+        assert_eq!(m.rule, top.unwrap().rule);
+
+        // Only additions, one in another epoch than the parent's (a group
+        // rotated): the merge keeps that epoch, and a record listing the
+        // reader added in it resolves the merge.
+        let rotated = from(record(
+            "/alice/phone",
+            4,
+            &["/alice", "/bob"],
+            &["/alice", "/bob"],
+            Vec::new(),
+        ));
+        let (m, resolve) = Members::merge(&[laptop.clone(), rotated.clone()], held).unwrap();
+        assert_eq!(
+            m.readers,
+            vec![person("/alice"), person("/bob"), person("/carol")]
+        );
+        assert_eq!(m.epoch, rotated.epoch);
+        assert_eq!(resolve, Resolve::Readers);
+        // Both add in the parent's epoch: its audience lists both readers.
+        let dave = from(Members {
+            epoch: parent.epoch.clone(),
+            key_check: parent.key_check,
+            ..record(
+                "/alice/phone",
+                0,
+                &["/alice", "/bob"],
+                &["/alice", "/bob", "/dave"],
+                Vec::new(),
+            )
+        });
+        let (m, resolve) = Members::merge(&[laptop, dave], held).unwrap();
+        assert_eq!(m.readers.len(), 4);
+        assert_eq!(resolve, Resolve::Nothing);
     }
 
     #[test]
