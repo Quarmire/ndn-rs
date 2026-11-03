@@ -741,13 +741,24 @@ to equal bytes and equal nodes have equal digests.
 - **Pages** keep every summary packet small (at most 64 references) so a
   changed note in a folder of any size costs a logarithmic number of packets.
 - **Seals reuse** `ndn-security`'s confidentiality content key
-  (ChaCha20-Poly1305, `wrap_ck`) and its X25519 recipient wrap
-  (`wrap_ck_to`). Epoch keys, not attribute-based encryption: an audience
-  here is a short list of people, devices and groups that the owner's
-  devices check against the owner-signed record they hold, so no attribute
-  authority, no pairing crypto (whose curve gives about 100-bit security)
-  and nothing beyond what the browser build carries; a master secret per
-  device keeps a namespace's own devices at one grant per pair.
+  (ChaCha20-Poly1305) and its key wrap `wrap_ck`, which seals a key under
+  a key-encryption key. `wrap_ck` needs a key-encryption key both ends
+  already share, and two people's devices share none: their only keys are
+  signing keys (Ed25519 or P-256, possibly in a TPM or a YubiKey that signs
+  and cannot agree keys). The one addition, `wrap_ck_to`, is the agreement
+  that makes that key: an ephemeral X25519 key against the reader's
+  published X25519 seal key, hashed into the key-encryption key, then
+  `wrap_ck`. Epoch keys, not the in-tree `ndn_security::abe` (rabe,
+  opt-in): an audience here is a short list of people, devices and groups
+  the owner's devices check against the owner-signed record they hold, so
+  ABE's attribute authority is not needed — and would not remove the
+  agreement, since an authority must deliver each reader's attribute keys
+  confidentially too (`ndn-nacabe` does it with an X25519 sealed box);
+  rabe's curve gives about 100-bit security and pairing crypto is heavy
+  for phones and the browser build. ndn-ext's `ndn-sealed-box` does the
+  same agreement but cannot be used from ndn-rs, and takes only ephemeral
+  recipient keys. A master secret per device keeps a namespace's own
+  devices at one grant per pair.
 
 ## 17. Failure model
 
