@@ -3,7 +3,9 @@
 //!
 //! Each node summarises one name (a collection, a folder, or both): the
 //! writer's entries directly in it, its members records, and its children by
-//! digest. A node with more than [`PAGE_FANOUT`] children pages them by hash.
+//! digest. The root is the namespace `O`; its one child is `O/32=data`, the
+//! folder every collection `O/32=data/<path>` lies under. A node with more
+//! than [`PAGE_FANOUT`] children pages them by hash.
 //! A node's name carries its head, and its content is fixed by the writer's
 //! log up to that head, so one name has one packet. Inner nodes and pages are
 //! DigestSha256 packets a reader checks against the digest its parent lists;
@@ -437,10 +439,14 @@ mod tests {
         let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
         let mut tree = Tree::new(n("/alice"));
         for i in 0..200u64 {
-            tree.add(&n(&format!("/alice/notes/n{i}")), i + 1, Entry::Version);
+            tree.add(
+                &n(&format!("/alice/32=data/notes/n{i}")),
+                i + 1,
+                Entry::Version,
+            );
         }
         tree.build(&device, &writer);
-        let folder = tree.node(&n("/alice/notes")).unwrap();
+        let folder = tree.node(&n("/alice/32=data/notes")).unwrap();
         let before = folder.built.as_ref().unwrap();
         let Branches::Pages(pages) = decode_node(
             Data::decode(before.wire.clone())
@@ -457,10 +463,10 @@ mod tests {
         let old_name = before.name.clone();
         let old_digests: Vec<_> = pages.iter().map(|p| (p.bucket, p.digest)).collect();
 
-        tree.add(&n("/alice/notes/n7"), 201, Entry::Version);
+        tree.add(&n("/alice/32=data/notes/n7"), 201, Entry::Version);
         tree.build(&device, &writer);
         let after = tree
-            .node(&n("/alice/notes"))
+            .node(&n("/alice/32=data/notes"))
             .unwrap()
             .built
             .as_ref()
@@ -484,8 +490,15 @@ mod tests {
             .count();
         assert_eq!(changed, 1, "one changed note changes one page");
         assert!(
-            tree.packet(&device, &writer, &n("/alice/notes"), None, 200, &old_name)
-                .is_some(),
+            tree.packet(
+                &device,
+                &writer,
+                &n("/alice/32=data/notes"),
+                None,
+                200,
+                &old_name
+            )
+            .is_some(),
             "the superseded node is still served by its name"
         );
     }
@@ -543,11 +556,15 @@ mod tests {
     fn every_packet_a_root_listed_is_served_however_many_puts_follow() {
         let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
         let mut tree = Tree::new(n("/alice"));
-        tree.add(&n("/alice/todo"), 1, Entry::Members);
-        tree.add(&n("/alice/todo"), 2, Entry::Version);
+        tree.add(&n("/alice/32=data/todo"), 1, Entry::Members);
+        tree.add(&n("/alice/32=data/todo"), 2, Entry::Version);
         // 1100 notes: the folder is paged and its fuller buckets sub-paged.
         for i in 0..1100u64 {
-            tree.add(&n(&format!("/alice/notes/n{i}")), i + 3, Entry::Version);
+            tree.add(
+                &n(&format!("/alice/32=data/notes/n{i}")),
+                i + 3,
+                Entry::Version,
+            );
         }
         let then = listed(&mut tree, &device, &writer);
         assert!(
@@ -564,10 +581,14 @@ mod tests {
         for i in 0..600u64 {
             seq += 1;
             let note = if i % 2 == 0 { i * 7 % 1100 } else { 1100 + i };
-            tree.add(&n(&format!("/alice/notes/n{note}")), seq, Entry::Version);
+            tree.add(
+                &n(&format!("/alice/32=data/notes/n{note}")),
+                seq,
+                Entry::Version,
+            );
             if i % 50 == 0 {
                 seq += 1;
-                tree.add(&n("/alice/todo"), seq, Entry::Version);
+                tree.add(&n("/alice/32=data/todo"), seq, Entry::Version);
             }
             if i % 100 == 99 {
                 tree.build(&device, &writer);
@@ -593,7 +614,7 @@ mod tests {
             );
         }
         // What no root listed is not served: note n0's only head is 3.
-        let n0 = n("/alice/notes/n0");
+        let n0 = n("/alice/32=data/notes/n0");
         assert_eq!(
             tree.packet(&device, &writer, &n0, None, 4, &node_name(&device, &n0, 4)),
             None

@@ -36,7 +36,7 @@ use ndn_foundation_types::Hash;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, NackReason, Name};
 use ndn_security::safe_data::TrustPath;
-use ndn_security::{SecurityManager, Signer, ValidationResult, Validator, sync_group};
+use ndn_security::{Keyring, SecurityManager, Signer, ValidationResult, Validator, sync_group};
 use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
@@ -52,9 +52,9 @@ use crate::version::{
     Content, Frontier, Payload, Seal, Seq, Timestamp, Version, VersionId, Writer,
 };
 use crate::wire::{
-    self, Branches, MembersBody, NodeBody, Record, VersionBody, device_of, is_collection_name,
-    log_name, namespace_of, node_name, page_name, parse_log_name, parse_state_name,
-    parse_summary_name, seqs_of, state_name, summary_prefix,
+    self, Branches, MembersBody, NodeBody, Record, VersionBody, device_of, log_name, namespace_of,
+    node_name, page_name, parse_log_name, parse_state_name, parse_summary_name, seqs_of,
+    state_name, subject_namespace, summary_prefix,
 };
 
 /// A wall clock: the date a device's clock shows. Display and retention
@@ -289,6 +289,17 @@ fn frontier_of(writer: &Writer, head: u64) -> Frontier {
     .collect()
 }
 
+/// Whether the members record named `entry` (`<D>/32=log/<C>/seq=<n>`, its
+/// signature verified) is signed by a device of `C`'s namespace `ns`, so its
+/// owner (spec §3): the trust context governing the record's name — the one
+/// the validator verified it under, the held context whose namespace is the
+/// longest prefix of it — is `ns`'s own. The device `D` then lies under
+/// `ns`; a device under `ns` that a longer held namespace governs (a
+/// `/home/bob` device, for `/home`) is that namespace's device, not `ns`'s.
+fn owner_signed(keyring: &Keyring, entry: &Name, ns: &Name) -> bool {
+    entry.has_prefix(ns) && keyring.context_for(entry).namespace() == ns
+}
+
 /// Whether a version is ready to apply: its writer's earlier entries here
 /// and its parents are applied.
 fn ready(
@@ -315,11 +326,21 @@ impl St {
         })
     }
 
+    /// Whether something followed lies under `subject`. Under a root (a
+    /// namespace) only its own data names count: `/home/bob/32=data/x` is
+    /// under `/home/bob`'s root, not `/home`'s.
     fn toward(&self, subject: &Name) -> bool {
-        self.follows
-            .range(subject.clone()..)
-            .next()
-            .is_some_and(|t| t.has_prefix(subject))
+        let under = |s: &Name| {
+            self.follows
+                .range(s.clone()..)
+                .next()
+                .is_some_and(|t| t.has_prefix(s))
+        };
+        if wire::is_namespace(subject) {
+            under(&wire::data_folder(subject))
+        } else {
+            under(subject)
+        }
     }
 
     fn page_relevant(&self, subject: &Name, path: &[u8]) -> bool {
@@ -346,8 +367,9 @@ impl St {
         }
     }
 
-    /// Accept `body`, signed by `signer`, if it is the newest record of its
-    /// collection from the collection's owner namespace.
+    /// Accept `body`, signed by `signer` (a device of the collection's
+    /// namespace, [`owner_signed`]), if it is the newest record of its
+    /// collection.
     fn accept_members(
         &mut self,
         body: MembersBody,
@@ -355,11 +377,6 @@ impl St {
         rules: &MergeRules,
         me: &Writer,
     ) {
-        let owner_ns = device_of(signer.key()).and_then(|d| namespace_of(&d));
-        if owner_ns.is_none() || owner_ns != namespace_of(&body.collection) {
-            tracing::debug!(collection = %body.collection, signer = ?signer, "members record not from the collection's owner; ignored");
-            return;
-        }
         let c = body.collection.clone();
         let coll = self.colls.entry(c.clone()).or_default();
         let newer = coll
@@ -530,10 +547,13 @@ impl St {
 }
 
 impl Device {
-    /// Start the data layer of the device `device` (e.g. `/alice/laptop`):
-    /// sign with the key `keys` holds for it, verify with `validator`, keep
-    /// what it holds in `store` (and pick up what an earlier run stored there),
-    /// serve `device`'s prefix, and join its own namespace's sync group.
+    /// Start the data layer of the device `device` (e.g.
+    /// `/home/bob/member/laptop`): sign with the key `keys` holds for it,
+    /// verify with `validator`, keep what it holds in `store` (and pick up
+    /// what an earlier run stored there), serve `device`'s prefix, and join
+    /// its own namespace's sync group. Its namespace is that of the trust
+    /// context governing its name in `validator`'s keyring (spec §3); a
+    /// device no held context covers does not start.
     pub async fn start(
         transport: Transport,
         device: Name,
@@ -552,7 +572,30 @@ impl Device {
                 identity.key
             )));
         }
-        let ns = namespace_of(&device).ok_or_else(|| local("a device has a name"))?;
+        if !wire::is_device_name(&device) {
+            return Err(local(format!(
+                "{device} has a keyword or digest component; a device name is plain components \
+                 (<namespace>/<role>/<device>), so the layer's names after it (32=log, \
+                 32=summary) say where it ends"
+            )));
+        }
+        let ns = validator.keyring().context_for(&device).namespace().clone();
+        if ns.is_empty() {
+            return Err(local(format!(
+                "no trust context covers {device}: the validator holds none whose namespace is a \
+                 prefix of it, so nothing says which namespace the device writes for (its sync \
+                 group, the collections it owns); adopt its namespace's trust context (enroll \
+                 the device) and start it again"
+            )));
+        }
+        if !wire::is_namespace(&ns) {
+            return Err(local(format!(
+                "{device} lies in the trust context of {ns}, whose namespace has a keyword, \
+                 digest or sequence-number component, which a collection name \
+                 <namespace>/32=data/<path> cannot carry; enroll the device in a namespace of \
+                 plain components"
+            )));
+        }
         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
@@ -640,6 +683,12 @@ impl Device {
     /// The device's name.
     pub fn name(&self) -> &Name {
         &self.inner.device
+    }
+
+    /// The device's namespace: that of the trust context governing its name
+    /// (spec §3), whose collections it owns and whose sync group it joins.
+    pub fn namespace(&self) -> &Name {
+        &self.inner.ns
     }
 
     /// Signatures this device has made.
@@ -889,9 +938,8 @@ impl Inner {
     /// which summaries on the way to it were processed (they were processed
     /// without it). Returns whether it is new.
     async fn follow(self: &Arc<Self>, target: &Name) -> Result<bool, DataError> {
-        let ns = namespace_of(target).ok_or_else(|| DataError::NotFound {
-            name: target.clone(),
-        })?;
+        wire::data_marker(target).map_err(|why| bad_name(target, why))?;
+        let ns = namespace_of(target).expect("a data name has a namespace");
         let new = {
             let mut st = self.st.lock();
             let new = st.follows.insert(target.clone());
@@ -1074,20 +1122,22 @@ impl Inner {
         if self.st.lock().peers.get(&key).and_then(|p| p.root) == Some(digest) {
             return true;
         }
-        if !self.descend(device, &writer, body).await {
+        if !self.descend(device, ns, &writer, body).await {
             return false;
         }
         self.st.lock().peers.entry(key).or_default().root = Some(digest);
         true
     }
 
-    /// Process a verified node (or page) of `writer`'s summary, published by
-    /// `device`: its entries if followed, then its changed, relevant branches.
-    /// Returns whether all of it was processed; what was is kept, so the next
-    /// descent, from this root or a newer one, does not fetch it again.
+    /// Process a verified node (or page) of `writer`'s summary of `ns`,
+    /// published by `device`: its entries if followed, then its changed,
+    /// relevant branches. Returns whether all of it was processed; what was
+    /// is kept, so the next descent, from this root or a newer one, does not
+    /// fetch it again.
     fn descend<'a>(
         self: &'a Arc<Self>,
         device: &'a Name,
+        ns: &'a Name,
         writer: &'a Writer,
         body: NodeBody,
     ) -> BoxFuture<'a, bool> {
@@ -1130,7 +1180,6 @@ impl Inner {
                     };
                     st.emit(&subject, &Change::Summary(summary), writer, body.head);
                 }
-                let ns = namespace_of(&subject).unwrap_or_else(Name::root);
                 let seen = |st: &St, key: &(Name, Option<Bytes>), digest: &[u8; 32]| {
                     st.peers
                         .get(&(device.clone(), ns.clone()))
@@ -1143,7 +1192,10 @@ impl Inner {
                             .iter()
                             .filter(|c| {
                                 let sub = subject.clone().append_component(c.component.clone());
-                                (st.inside(&sub) || st.toward(&sub))
+                                // The tree of `ns` runs through its `32=data`:
+                                // any other child names no data of `ns`.
+                                wire::data_marker(&sub) == Ok(ns.len())
+                                    && (st.inside(&sub) || st.toward(&sub))
                                     && !seen(&st, &(sub, None), &c.digest)
                             })
                             .cloned()
@@ -1177,7 +1229,6 @@ impl Inner {
                 .await;
             let entries_taken = fetched.iter().all(|ok| *ok);
 
-            let ns = namespace_of(&subject).unwrap_or_else(Name::root);
             let branch_results = stream::iter(
                 children
                     .into_iter()
@@ -1202,40 +1253,37 @@ impl Inner {
                         )
                     })),
             )
-            .map(|(name, key, digest, head)| {
-                let ns = ns.clone();
-                async move {
-                    // The writer serves every node any root it signed lists
-                    // (§7): a miss is the network's, and what was processed
-                    // is kept for the next descent.
-                    let data = self.fetch(name.clone(), false).await?;
-                    if wire::implicit_digest(data.raw()) != digest {
-                        tracing::debug!(%name, "not the packet its parent lists; ignored");
-                        return None;
-                    }
-                    let child = data
-                        .content()
-                        .and_then(|c| wire::decode_node(c.clone()).ok())?;
-                    if child.subject != key.0
-                        || child.writer != *writer.key()
-                        || child.head != head
-                        || child.page != key.1
-                    {
-                        tracing::debug!(%name, "a summary node that does not match its name; ignored");
-                        return None;
-                    }
-                    if !self.descend(device, writer, child).await {
-                        return None;
-                    }
-                    self.st
-                        .lock()
-                        .peers
-                        .entry((device.clone(), ns))
-                        .or_default()
-                        .nodes
-                        .insert(key, digest);
-                    Some(())
+            .map(|(name, key, digest, head)| async move {
+                // The writer serves every node any root it signed lists
+                // (§7): a miss is the network's, and what was processed
+                // is kept for the next descent.
+                let data = self.fetch(name.clone(), false).await?;
+                if wire::implicit_digest(data.raw()) != digest {
+                    tracing::debug!(%name, "not the packet its parent lists; ignored");
+                    return None;
                 }
+                let child = data
+                    .content()
+                    .and_then(|c| wire::decode_node(c.clone()).ok())?;
+                if child.subject != key.0
+                    || child.writer != *writer.key()
+                    || child.head != head
+                    || child.page != key.1
+                {
+                    tracing::debug!(%name, "a summary node that does not match its name; ignored");
+                    return None;
+                }
+                if !self.descend(device, ns, writer, child).await {
+                    return None;
+                }
+                self.st
+                    .lock()
+                    .peers
+                    .entry((device.clone(), ns.clone()))
+                    .or_default()
+                    .nodes
+                    .insert(key, digest);
+                Some(())
             })
             .buffer_unordered(self.config.window)
             .collect::<Vec<_>>()
@@ -1327,6 +1375,14 @@ impl Inner {
         let Some(parsed) = parse_log_name(&name) else {
             return;
         };
+        let about = match &record {
+            Record::Version(b) => Some(&b.collection),
+            Record::Members(b) => Some(&b.collection),
+            Record::Snapshot(_) => None,
+        };
+        if about != parsed.subject.as_ref() {
+            return;
+        }
         if mine || !matches!(record, Record::Version(_)) {
             self.store.insert(name.clone(), wire.clone());
         }
@@ -1334,15 +1390,20 @@ impl Inner {
             Record::Members(body) => {
                 st.held.insert(name.clone(), Held::Members);
                 let c = body.collection.clone();
+                let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
                 if mine {
                     st.trees
-                        .entry(namespace_of(&c).expect("a collection has a namespace"))
-                        .or_insert_with(|| Tree::new(namespace_of(&c).expect("namespace")))
+                        .entry(ns.clone())
+                        .or_insert_with(|| Tree::new(ns.clone()))
                         .add(&c, parsed.seq, Entry::Members);
                 } else {
                     self.note_peer_head(st, &parsed.device, &c, parsed.seq);
                 }
-                st.accept_members(body, &writer, &self.config.rules, self.me());
+                if owner_signed(self.validator.keyring(), &name, &ns) {
+                    st.accept_members(body, &writer, &self.config.rules, self.me());
+                } else {
+                    tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
+                }
             }
             Record::Version(body) => {
                 let c = body.collection.clone();
@@ -1351,9 +1412,10 @@ impl Inner {
                 st.held
                     .insert(name.clone(), Held::Version(version.id.clone()));
                 if mine {
+                    let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
                     st.trees
-                        .entry(namespace_of(&c).expect("a collection has a namespace"))
-                        .or_insert_with(|| Tree::new(namespace_of(&c).expect("namespace")))
+                        .entry(ns.clone())
+                        .or_insert_with(|| Tree::new(ns))
                         .add(&c, parsed.seq, Entry::Version);
                 } else {
                     self.note_peer_head(st, &parsed.device, &c, parsed.seq);
@@ -1462,7 +1524,7 @@ impl Inner {
             && s.device == self.device
         {
             let mut st = self.st.lock();
-            let ns = namespace_of(&s.subject)?;
+            let ns = subject_namespace(&s.subject)?;
             if s.subject == ns && s.page.is_none() {
                 if s.head.is_none() && !can_be_prefix {
                     return None;
@@ -1641,12 +1703,15 @@ fn version_of(name: &Name, writer: &Writer, seq: u64, body: VersionBody) -> Vers
     }
 }
 
-fn check_collection(c: &Name) -> Result<(), DataError> {
-    if is_collection_name(c) {
-        Ok(())
-    } else {
-        Err(DataError::NotFound { name: c.clone() })
+fn bad_name(name: &Name, why: wire::NotDataName) -> DataError {
+    DataError::BadName {
+        name: name.clone(),
+        why: why.to_string(),
     }
+}
+
+fn check_collection(c: &Name) -> Result<(), DataError> {
+    wire::check_collection_name(c).map_err(|why| bad_name(c, why))
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -1797,7 +1862,6 @@ impl DataLayer for Device {
 
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError> {
         let inner = &self.inner;
-        check_collection(collection)?;
         inner.follow(collection).await?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
@@ -1819,7 +1883,7 @@ impl DataLayer for Device {
                 tx,
             });
         }
-        let ns = namespace_of(collection).expect("checked above");
+        let ns = namespace_of(collection).expect("followed, so a data name");
         inner.refresh_group(&ns);
         Ok(Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx))))
     }
@@ -1914,7 +1978,7 @@ impl DataLayer for Device {
 mod tests {
     use super::*;
     use ndn_app::AppError;
-    use ndn_security::TrustSchema;
+    use ndn_security::{SignedTrustContext, TrustSchema};
     use ndn_sync::MemoryStore;
 
     const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
@@ -1997,32 +2061,18 @@ mod tests {
             .unwrap();
         let (writer, reader) = (n("/wendy/laptop"), n("/rita/phone"));
         let (writer_keys, writer_key, writer_cert) = device_key(&authority, &issuer, &writer).await;
-        let reader_keys = Arc::new(SecurityManager::new());
-        reader_keys
-            .generate_ed25519(reader.clone().append("KEY").append("1"))
-            .unwrap();
+        let reader_keys = keys_of(&reader);
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
+        assert!(validator.adopt_context(context("/rita")));
         validator.cert_cache().insert(writer_cert);
 
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let start = || {
-            let conn: Arc<dyn Connection> = Arc::new(Unconnected);
-            Device::start(
-                Transport {
-                    node: Node::from_connection(Arc::clone(&conn)),
-                    sync: conn,
-                },
-                reader.clone(),
-                Arc::clone(&reader_keys),
-                Arc::clone(&validator),
-                Arc::clone(&store),
-                Config::new(),
-            )
-        };
         let at = |head| root(&writer_keys, &writer_key, &writer, &ns, head);
 
-        let first = start().await.unwrap();
+        let first = start(&reader, &reader_keys, &validator, &store)
+            .await
+            .unwrap();
         first
             .inner
             .accept_root(&writer, &ns, &at(5))
@@ -2031,7 +2081,9 @@ mod tests {
         first.shutdown();
         drop(first);
 
-        let again = start().await.unwrap();
+        let again = start(&reader, &reader_keys, &validator, &store)
+            .await
+            .unwrap();
         let refused = again.inner.accept_root(&writer, &ns, &at(3)).await;
         assert!(
             matches!(refused, Err(RootRefusal::Rollback { head: 3, seen: 5 })),
@@ -2047,5 +2099,219 @@ mod tests {
             .accept_root(&writer, &ns, &at(8))
             .await
             .expect("a newer head is taken");
+    }
+
+    /// A key store holding a key for `device`.
+    fn keys_of(device: &Name) -> Arc<SecurityManager> {
+        let keys = Arc::new(SecurityManager::new());
+        keys.generate_ed25519(device.clone().append("KEY").append("1"))
+            .unwrap();
+        keys
+    }
+
+    /// A trust context of namespace `ns` (its anchors do not matter here).
+    fn context(ns: &str) -> Arc<SignedTrustContext> {
+        Arc::new(SignedTrustContext::hierarchical(n(ns)))
+    }
+
+    /// Start `device` on a forwarder that delivers nothing.
+    async fn start(
+        device: &Name,
+        keys: &Arc<SecurityManager>,
+        validator: &Arc<Validator>,
+        store: &Arc<dyn DataStore>,
+    ) -> Result<Device, DataError> {
+        let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+        Device::start(
+            Transport {
+                node: Node::from_connection(Arc::clone(&conn)),
+                sync: conn,
+            },
+            device.clone(),
+            Arc::clone(keys),
+            Arc::clone(validator),
+            Arc::clone(store),
+            Config::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_device_is_of_the_namespace_whose_trust_context_governs_it() {
+        let device = n("/home/bob/member/laptop");
+        let keys = keys_of(&device);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        match start(&device, &keys, &validator, &store).await {
+            Err(e @ DataError::Local { .. }) => {
+                assert!(e.to_string().contains("no trust context covers"), "{e}");
+                assert_eq!(e.next(), crate::NextStep::FixLocal);
+            }
+            other => panic!(
+                "a device no trust context covers started: {:?}",
+                other.err()
+            ),
+        }
+        assert!(validator.adopt_context(context("/home")));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        assert_eq!(dev.namespace(), &n("/home"));
+        dev.shutdown();
+        // The longest held namespace governs it.
+        assert!(validator.adopt_context(context("/home/bob")));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        assert_eq!(dev.namespace(), &n("/home/bob"));
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_name_without_its_marker_is_refused_with_how_to_name_it() {
+        let device = n("/home/bob/member/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/home/bob")));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&device, &keys_of(&device), &validator, &store)
+            .await
+            .unwrap();
+        let unmarked = n("/home/bob/notes/trip");
+        let options = || PutOptions {
+            type_id: crate::TypeId {
+                name: n("/types/note"),
+                revision: 1,
+            },
+            keep: crate::Keep::Forever,
+            batch: None,
+        };
+        let share = crate::layer::Share {
+            rule: Rule::Merge {
+                function: n("/merge/yrs"),
+            },
+            writers: vec![n("/home/bob")],
+            readers: Vec::new(),
+            readmit: Vec::new(),
+        };
+        let refusals = [
+            dev.put(&unmarked, Content::new(), options()).await.err(),
+            dev.get(&unmarked).await.err(),
+            dev.watch(&unmarked, &Frontier::new()).await.err(),
+            dev.share(&unmarked, share.clone()).await.err(),
+            dev.snapshot(std::slice::from_ref(&unmarked)).await.err(),
+        ];
+        for refusal in refusals {
+            let Some(e @ DataError::BadName { .. }) = refusal else {
+                panic!("an unmarked collection name was not refused as one: {refusal:?}");
+            };
+            assert_eq!((e.next(), e.retry()), (crate::NextStep::FixName, false));
+            assert!(e.to_string().contains("<namespace>/32=data/<path>"), "{e}");
+        }
+        // The namespace's folder is watched; a collection needs a path.
+        let folder = wire::data_folder(&n("/home/bob"));
+        assert!(dev.watch(&folder, &Frontier::new()).await.is_ok());
+        let Err(DataError::BadName { why, .. }) = dev.put(&folder, Content::new(), options()).await
+        else {
+            panic!("a put into the namespace's folder was not refused");
+        };
+        assert_eq!(why, wire::NotDataName::NoPath.to_string());
+        dev.shutdown();
+    }
+
+    #[test]
+    fn a_members_record_is_the_owners_by_the_longest_held_namespace() {
+        let record = |device: &str, collection: &str| log_name(&n(device), Some(&n(collection)), 1);
+        let (bob, home) = (n("/home/bob"), n("/home"));
+        let both = Keyring::new();
+        both.adopt(context("/home"));
+        both.adopt(context("/home/bob"));
+        // A /home/bob device lies under /home, but /home/bob governs it.
+        let laptop = "/home/bob/member/laptop";
+        assert!(!owner_signed(
+            &both,
+            &record(laptop, "/home/32=data/x"),
+            &home
+        ));
+        assert!(owner_signed(
+            &both,
+            &record(laptop, "/home/bob/32=data/x"),
+            &bob
+        ));
+        let hub = "/home/member/hub";
+        assert!(owner_signed(&both, &record(hub, "/home/32=data/x"), &home));
+        assert!(!owner_signed(
+            &both,
+            &record(hub, "/home/bob/32=data/x"),
+            &bob
+        ));
+        // Held alone, /home governs every device under it.
+        let only_home = Keyring::new();
+        only_home.adopt(context("/home"));
+        assert!(owner_signed(
+            &only_home,
+            &record(laptop, "/home/32=data/x"),
+            &home
+        ));
+        assert!(!owner_signed(
+            &only_home,
+            &record(laptop, "/home/bob/32=data/x"),
+            &bob
+        ));
+        // No context held: nobody owns anything.
+        assert!(!owner_signed(
+            &Keyring::new(),
+            &record(hub, "/home/32=data/x"),
+            &home
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reader_takes_members_records_only_from_the_namespaces_own_devices() {
+        let reader = n("/home/member/hub");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/home")));
+        assert!(validator.adopt_context(context("/home/bob")));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let take = |signer: &str, collection: &str| {
+            let (device, c) = (n(signer), n(collection));
+            let body = MembersBody {
+                collection: c.clone(),
+                revision: 1,
+                rule: Rule::Merge {
+                    function: n("/merge/yrs"),
+                },
+                writers: vec![wire::namespace_of(&c).unwrap()],
+                readers: Vec::new(),
+            };
+            let name = log_name(&device, Some(&c), 1);
+            let content = wire::encode_members(&body);
+            let packet = DataBuilder::new(name.clone(), &content).sign_digest_sha256();
+            let mut st = dev.inner.st.lock();
+            dev.inner.take(
+                &mut st,
+                name,
+                packet,
+                Writer::new(device.append("KEY").append("1")),
+                Record::Members(body),
+                false,
+            );
+            st.colls
+                .get(&c)
+                .and_then(|coll| coll.members.as_ref())
+                .map(|m| m.owner.key().clone())
+        };
+        assert_eq!(
+            take("/home/bob/member/laptop", "/home/32=data/x"),
+            None,
+            "a /home/bob device does not own /home's collections"
+        );
+        assert_eq!(
+            take("/home/member/phone", "/home/32=data/x"),
+            Some(n("/home/member/phone/KEY/1"))
+        );
+        assert_eq!(
+            take("/home/bob/member/laptop", "/home/bob/32=data/y"),
+            Some(n("/home/bob/member/laptop/KEY/1"))
+        );
+        dev.shutdown();
     }
 }

@@ -30,6 +30,9 @@ pub enum NextStep {
     EditInstead,
     /// Fix this device: its storage or its keys.
     FixLocal,
+    /// Ask again with a name the layer can use: the error says how such a
+    /// name is formed.
+    FixName,
 }
 
 /// Why a version was refused. A refused version is never served as data.
@@ -62,6 +65,15 @@ pub enum DataError {
     NotFound {
         /// The name asked for.
         name: Name,
+    },
+    /// The name cannot name what the verb takes: a collection is
+    /// `<namespace>/32=data/<path>` (spec §3). Nothing by it can exist.
+    #[error("{name} is not a data-layer name: {why}")]
+    BadName {
+        /// The name given.
+        name: Name,
+        /// Why not, and how to name it.
+        why: String,
     },
     /// The data was pruned by its writer; this reader knows the prune.
     #[error("{name} was pruned by {by:?}")]
@@ -130,6 +142,7 @@ impl DataError {
         match self {
             DataError::Unavailable { .. } => NextStep::RetryLater,
             DataError::NotFound { .. } | DataError::Pruned { .. } => NextStep::None,
+            DataError::BadName { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,

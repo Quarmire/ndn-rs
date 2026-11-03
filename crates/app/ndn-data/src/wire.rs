@@ -1,24 +1,36 @@
 //! The data layer's bytes: the names it publishes under and the TLV records
 //! those Data packets carry (`docs/specs/data-layer.md`, "Wire format").
 //!
-//! Every packet a device publishes is named under its own device name `D`
-//! (its key name without `KEY/<id>`), so the hierarchical trust schema — data
-//! and key share their first component — admits it everywhere, and Interests
-//! for it route to the device:
+//! A collection is named `<O>/32=data/<path>`: its namespace `O` (any
+//! number of components), the KeywordNameComponent `data` marking where `O`
+//! ends, and at least one path component; no other component of it is a
+//! keyword or digest. Every packet a device publishes is named under its own
+//! device name `D` (its key name without `KEY/<id>`), so the hierarchical
+//! trust schema — data and key share their identity prefix — admits it
+//! everywhere, and Interests for it route to the device:
 //!
 //! | packet | name | signed by |
 //! |---|---|---|
-//! | log entry (version, members record) | `<D>/32=log/<collection>/seq=<n>` | the device key |
+//! | log entry (version, members record) | `<D>/32=log/<C>/seq=<n>` | the device key |
 //! | log entry (snapshot) | `<D>/32=log/seq=<n>` | the device key |
 //! | summary root of namespace `O` | `<D>/32=summary/<O>/seq=<head>` | the device key |
 //! | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256; its parent lists its digest |
-//! | summary page of `X` | `<D>/32=summary/<X>/32=page/<path>/seq=<head>` | DigestSha256; its parent lists its digest |
+//! | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256; its parent lists its digest |
 //!
-//! Two names are never fetched: the state name `<collection>/32=state/<F>`
-//! (the merged value at frontier `F`, computed by every reader) and the sync
-//! group `<O>/32=sync` (State Vector Sync Interests, notifications only),
-//! [`ndn_security::sync_group`]: the one definition the forwarder's trust
-//! and link libraries route and multicast it by.
+//! `X` is a name of the tree from `O` to a collection: `O/32=data` (the
+//! root's one child) or `O/32=data/<path>`, a folder or collection. Two
+//! names are never fetched: the state name
+//! `<C>/32=state/<F>` (the merged value at frontier `F`, computed by every
+//! reader) and the sync group `<O>/32=sync` (State Vector Sync Interests,
+//! notifications only), [`ndn_security::sync_group`]: the one definition the
+//! forwarder's trust and link libraries route and multicast it by.
+//!
+//! Every name parses one way: `D` and `O` have no keyword component, so
+//! the first `32=log` or `32=summary` ends `D`, `32=data` ends `O`, and the
+//! layer's other keywords (`32=page`, `32=state`) follow a subject whose
+//! only keyword is its marker. A node or page name always ends in its head:
+//! only a root is discovered without one (`<D>/32=summary/<O>`), and a
+//! namespace never ends in a `seq=` component.
 //!
 //! TLV-TYPEs are allocated from 0x0520–0x057F, all even (non-critical): a
 //! decoder skips an even TLV it does not know and refuses an odd one, so a
@@ -111,6 +123,7 @@ pub mod tlv {
 }
 
 /// Keyword components of the layer's names.
+const DATA: &[u8] = b"data";
 const LOG: &[u8] = b"log";
 const SUMMARY: &[u8] = b"summary";
 const PAGE: &[u8] = b"page";
@@ -142,27 +155,134 @@ fn name_of(comps: &[NameComponent]) -> Name {
     Name::from_components(comps.iter().cloned())
 }
 
-/// Whether `name` can name a collection: not the root, and free of keyword
-/// components (those mark the layer's own names).
-pub fn is_collection_name(name: &Name) -> bool {
-    !name.is_empty()
-        && name
-            .components()
-            .iter()
-            .all(|c| c.typ != tlv_type::KEYWORD && c.typ != tlv_type::IMPLICIT_SHA256)
+/// A component that may stand in a namespace or a collection's path: no
+/// keyword (those mark the layer's own names) and no digest.
+fn is_plain(c: &NameComponent) -> bool {
+    !matches!(
+        c.typ,
+        tlv_type::KEYWORD | tlv_type::IMPLICIT_SHA256 | tlv_type::PARAMETERS_SHA256
+    )
 }
 
-/// The namespace a name lies in: its first component. A collection's owner
-/// is the person whose namespace it is (the hierarchical trust schema's
-/// unit); its sync group and every writer's summary root are per namespace.
-/// Slice 1 runs in one-component namespaces only (spec §3): the sync group
-/// the device joins, `<first component>/32=sync`, is the group a forwarder
-/// holding that namespace's trust context carries only when the context's
-/// namespace is that one component.
+/// Whether `name` can be a namespace: not the root, and only plain
+/// components that are not sequence numbers (a summary root's name
+/// `<D>/32=summary/<O>/seq=<head>` ends in one, so `O` must not).
+pub fn is_namespace(name: &Name) -> bool {
+    is_namespace_comps(name.components())
+}
+
+fn is_namespace_comps(comps: &[NameComponent]) -> bool {
+    !comps.is_empty()
+        && comps
+            .iter()
+            .all(|c| is_plain(c) && c.typ != tlv_type::SEQUENCE_NUM)
+}
+
+/// Whether `name` can be a device name: not the root, and no keyword or
+/// digest component, so the first `32=log` or `32=summary` after it ends it.
+pub fn is_device_name(name: &Name) -> bool {
+    is_device_comps(name.components())
+}
+
+fn is_device_comps(comps: &[NameComponent]) -> bool {
+    !comps.is_empty() && comps.iter().all(is_plain)
+}
+
+/// Why a name is not a data-layer name `<namespace>/32=data/<path>`: each
+/// says what to do instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NotDataName {
+    /// It has no `32=data` component.
+    #[error(
+        "it has no 32=data component, so nothing in it says where its namespace ends; name a \
+         collection <namespace>/32=data/<path> (for the namespace /home/bob: \
+         /home/bob/32=data/notes)"
+    )]
+    NoMarker,
+    /// Nothing that can be a namespace precedes its `32=data`.
+    #[error(
+        "what precedes its 32=data component is not a namespace (one or more components, none \
+         a keyword, digest or sequence number); name a collection \
+         <namespace>/32=data/<path> under the namespace that owns it"
+    )]
+    NoNamespace,
+    /// Nothing follows its `32=data`, where a collection is asked for.
+    #[error(
+        "nothing follows its 32=data component; a collection has a path, \
+         <namespace>/32=data/<path> (watch <namespace>/32=data to follow every collection of \
+         the namespace)"
+    )]
+    NoPath,
+    /// It has a keyword or digest component besides its one `32=data`.
+    #[error(
+        "it has a keyword or digest component besides its one 32=data marker; those mark the \
+         layer's own names (32=log, 32=summary, 32=state), so a collection \
+         <namespace>/32=data/<path> has only plain components besides it"
+    )]
+    OtherKeyword,
+}
+
+/// Where the namespace of a data name `<O>/32=data[/<path>]` ends: the
+/// index of its one `32=data` component. `O` is a namespace
+/// ([`is_namespace`]) and every path component is plain; the path may be
+/// empty (`<O>/32=data` is the folder of every collection of `O`).
+pub fn data_marker(name: &Name) -> Result<usize, NotDataName> {
+    let comps = name.components();
+    let at = comps
+        .iter()
+        .position(|c| is_kw(c, DATA))
+        .ok_or(NotDataName::NoMarker)?;
+    if !is_namespace_comps(&comps[..at]) {
+        return Err(NotDataName::NoNamespace);
+    }
+    if !comps[at + 1..].iter().all(is_plain) {
+        return Err(NotDataName::OtherKeyword);
+    }
+    Ok(at)
+}
+
+/// `<namespace>/32=data`: the folder of every collection of `namespace`, the
+/// root's one child in a writer's summary of it.
+pub fn data_folder(namespace: &Name) -> Name {
+    namespace.clone().append_component(kw(DATA))
+}
+
+/// Whether `name` is a collection or folder name `<O>/32=data[/<path>]`.
+pub fn is_data_name(name: &Name) -> bool {
+    data_marker(name).is_ok()
+}
+
+/// Whether `name` can name a collection: `<O>/32=data/<path>`, with at
+/// least one path component.
+pub fn check_collection_name(name: &Name) -> Result<(), NotDataName> {
+    let at = data_marker(name)?;
+    if at + 1 == name.len() {
+        return Err(NotDataName::NoPath);
+    }
+    Ok(())
+}
+
+/// Whether `name` can name a collection (see [`check_collection_name`]).
+pub fn is_collection_name(name: &Name) -> bool {
+    check_collection_name(name).is_ok()
+}
+
+/// The namespace of a collection or folder name: the components before its
+/// `32=data` marker. A collection's owner is that namespace (spec §3); its
+/// sync group and every writer's summary root are per namespace.
 pub fn namespace_of(name: &Name) -> Option<Name> {
-    name.components()
-        .first()
-        .map(|c| Name::from_components([c.clone()]))
+    let at = data_marker(name).ok()?;
+    Some(name_of(&name.components()[..at]))
+}
+
+/// The namespace a summary subject lies in: the subject itself for a root
+/// (a namespace), else the namespace of the data name it is.
+pub fn subject_namespace(subject: &Name) -> Option<Name> {
+    if is_namespace(subject) {
+        Some(subject.clone())
+    } else {
+        namespace_of(subject)
+    }
 }
 
 /// The device a key belongs to: the key name without `KEY/<key-id>`.
@@ -197,15 +317,17 @@ pub struct LogName {
     pub seq: u64,
 }
 
-/// Parse `<device>/32=log[/<subject>]/seq=<seq>`.
+/// Parse `<device>/32=log[/<subject>]/seq=<seq>`: the device is everything
+/// before the first `32=log` (a device name has no keyword), the subject a
+/// collection name (its one keyword is its `32=data`).
 pub fn parse_log_name(name: &Name) -> Option<LogName> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, LOG))?;
-    let seq = comps.last()?.as_sequence_num()?;
-    if at == 0 || at + 1 >= comps.len() {
+    let (last, subject) = comps[at + 1..].split_last()?;
+    let seq = last.as_sequence_num()?;
+    if !is_device_comps(&comps[..at]) {
         return None;
     }
-    let subject = &comps[at + 1..comps.len() - 1];
     let subject = (!subject.is_empty()).then(|| name_of(subject));
     if subject.as_ref().is_some_and(|s| !is_collection_name(s)) {
         return None;
@@ -245,7 +367,8 @@ pub fn page_name(device: &Name, subject: &Name, path: &[u8], head: u64) -> Name 
 pub struct SummaryName {
     /// The device that wrote the summary.
     pub device: Name,
-    /// The collection or folder summarised.
+    /// What the node summarises: a namespace (the root), or a data name
+    /// under it, `<O>/32=data[/<path>]` (a folder or collection).
     pub subject: Name,
     /// The page path, for a page.
     pub page: Option<Bytes>,
@@ -253,18 +376,26 @@ pub struct SummaryName {
     pub head: Option<u64>,
 }
 
-/// Parse a summary name or discovery prefix.
+/// Parse a summary name, or a root's discovery prefix
+/// `<device>/32=summary/<O>`. The device is everything before the first
+/// `32=summary`; a trailing sequence number is the head. Only a root's
+/// discovery prefix lacks the head (a namespace never ends in a sequence
+/// number), so a node or page without one is no summary name and a
+/// collection path's own last component is never taken for the head.
 pub fn parse_summary_name(name: &Name) -> Option<SummaryName> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, SUMMARY))?;
-    if at == 0 {
+    if !is_device_comps(&comps[..at]) {
         return None;
     }
     let mut rest = &comps[at + 1..];
     let mut head = None;
-    if let Some(s) = rest.last().and_then(NameComponent::as_sequence_num) {
+    if let Some((s, before)) = rest
+        .split_last()
+        .and_then(|(last, before)| Some((last.as_sequence_num()?, before)))
+    {
         head = Some(s);
-        rest = &rest[..rest.len() - 1];
+        rest = before;
     }
     let (subject, page) = match rest.iter().position(|c| is_kw(c, PAGE)) {
         Some(p) if p + 2 == rest.len() => (&rest[..p], Some(rest[p + 1].value.clone())),
@@ -272,7 +403,9 @@ pub fn parse_summary_name(name: &Name) -> Option<SummaryName> {
         None => (rest, None),
     };
     let subject = name_of(subject);
-    is_collection_name(&subject).then(|| SummaryName {
+    let root = is_namespace(&subject);
+    let named = head.is_some() || (root && page.is_none());
+    ((root || is_data_name(&subject)) && named).then(|| SummaryName {
         device: name_of(&comps[..at]),
         subject,
         page,
@@ -1013,43 +1146,118 @@ mod tests {
 
     #[test]
     fn names_parse_back() {
+        for (d, ns, c) in [
+            ("/alice/laptop", "/alice", "/alice/32=data/notes/trip"),
+            (
+                "/home/bob/member/phone",
+                "/home/bob",
+                "/home/bob/32=data/notes/trip",
+            ),
+            // A writer of another namespace: the log entry names both.
+            (
+                "/home/bob/member/phone",
+                "/alice",
+                "/alice/32=data/docs/plan",
+            ),
+            // A path may end in a sequence number; the head still parses.
+            ("/alice/laptop", "/alice", "/alice/32=data/sensor/seq=4"),
+        ] {
+            let (d, ns, c) = (n(d), n(ns), n(c));
+            assert_eq!(namespace_of(&c), Some(ns.clone()), "{c}");
+            let log = log_name(&d, Some(&c), 9);
+            assert_eq!(
+                parse_log_name(&log),
+                Some(LogName {
+                    device: d.clone(),
+                    subject: Some(c.clone()),
+                    seq: 9
+                }),
+                "{log}"
+            );
+            let snap = log_name(&d, None, 3);
+            assert_eq!(parse_log_name(&snap).unwrap().subject, None);
+            let node = parse_summary_name(&node_name(&d, &c, 5)).unwrap();
+            assert_eq!(
+                (&node.device, &node.subject, node.head, &node.page),
+                (&d, &c, Some(5), &None)
+            );
+            let page = page_name(&d, &c, &[3, 10], 7);
+            let p = parse_summary_name(&page).unwrap();
+            assert_eq!((&p.device, &p.subject), (&d, &c));
+            assert_eq!(p.page.as_deref(), Some(&[3u8, 10][..]));
+            assert_eq!(p.head, Some(7));
+            let root = parse_summary_name(&summary_prefix(&d, &ns)).unwrap();
+            assert_eq!(
+                (root.device, root.subject, root.head, root.page),
+                (d.clone(), ns.clone(), None, None)
+            );
+            let signed = parse_summary_name(&node_name(&d, &ns, 11)).unwrap();
+            assert_eq!((signed.subject, signed.head), (ns.clone(), Some(11)));
+            // The root's one child, the folder of every collection.
+            let folder = data_folder(&ns);
+            assert_eq!(folder, n(&format!("{ns}/32=data")));
+            assert_eq!(subject_namespace(&folder), Some(ns.clone()));
+            assert_eq!(subject_namespace(&ns), Some(ns.clone()));
+            assert_eq!(subject_namespace(&c), Some(ns.clone()));
+            assert!(is_data_name(&folder) && !is_collection_name(&folder));
+            let at: Frontier = [crate::VersionId {
+                writer: Writer::new(d.clone().append("KEY").append("1")),
+                seq: Seq(4),
+            }]
+            .into_iter()
+            .collect();
+            assert_eq!(parse_state_name(&state_name(&c, &at)), Some((c, at)));
+        }
+        assert_eq!(
+            device_of(&n("/home/bob/member/phone/KEY/1")),
+            Some(n("/home/bob/member/phone"))
+        );
+    }
+
+    #[test]
+    fn a_name_without_its_marker_is_no_collection() {
+        for (name, why) in [
+            ("/alice/notes/trip", NotDataName::NoMarker),
+            ("/home/bob/notes", NotDataName::NoMarker),
+            ("/32=data/notes", NotDataName::NoNamespace),
+            ("/alice/seq=3/32=data/notes", NotDataName::NoNamespace),
+            ("/alice/32=data", NotDataName::NoPath),
+            ("/alice/32=data/notes/32=data/x", NotDataName::OtherKeyword),
+            ("/alice/32=data/notes/32=state", NotDataName::OtherKeyword),
+        ] {
+            assert_eq!(check_collection_name(&n(name)), Err(why), "{name}");
+            assert_eq!(
+                namespace_of(&n(name)).is_some(),
+                why == NotDataName::NoPath,
+                "{name}"
+            );
+        }
         let d = n("/alice/laptop");
-        let c = n("/alice/notes/trip");
-        let log = log_name(&d, Some(&c), 9);
+        // An unmarked subject is no log entry's collection.
         assert_eq!(
-            parse_log_name(&log),
-            Some(LogName {
-                device: d.clone(),
-                subject: Some(c.clone()),
-                seq: 9
-            })
+            parse_log_name(&log_name(&d, Some(&n("/alice/notes")), 1)),
+            None
         );
-        let snap = log_name(&d, None, 3);
-        assert_eq!(parse_log_name(&snap).unwrap().subject, None);
-        let page = page_name(&d, &c, &[3, 10], 7);
-        let p = parse_summary_name(&page).unwrap();
-        assert_eq!((p.device, p.subject), (d.clone(), c.clone()));
-        assert_eq!(p.page.as_deref(), Some(&[3u8, 10][..]));
-        assert_eq!(p.head, Some(7));
-        let root = parse_summary_name(&summary_prefix(&d, &n("/alice"))).unwrap();
+        // An unmarked subject is a namespace: this names the root of
+        // `/alice/notes`, never a node of the namespace `/alice`.
+        let root = parse_summary_name(&n("/alice/laptop/32=summary/alice/notes/seq=2")).unwrap();
+        assert_eq!(subject_namespace(&root.subject), Some(n("/alice/notes")));
+        // Without its head a node name is not one (only a root is discovered).
         assert_eq!(
-            (root.subject, root.head, root.page),
-            (n("/alice"), None, None)
+            parse_summary_name(&summary_prefix(&d, &n("/alice/32=data/notes"))),
+            None
         );
-        let at: Frontier = [crate::VersionId {
-            writer: Writer::new(n("/alice/laptop/KEY/1")),
-            seq: Seq(4),
-        }]
-        .into_iter()
-        .collect();
-        assert_eq!(parse_state_name(&state_name(&c, &at)), Some((c, at)));
-        assert_eq!(device_of(&n("/alice/laptop/KEY/1")), Some(d));
+        // A device name has no keyword: the first 32=log ends it.
+        assert_eq!(
+            parse_log_name(&n("/alice/32=data/x/32=log/alice/32=data/y/seq=1")),
+            None
+        );
     }
 
     #[test]
     fn unknown_even_fields_are_skipped_and_odd_ones_refused() {
         let body = MembersBody {
-            collection: n("/alice/notes"),
+            collection: n("/alice/32=data/notes"),
             revision: 1,
             rule: Rule::Merge {
                 function: n("/merge/yrs"),

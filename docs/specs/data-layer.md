@@ -62,27 +62,48 @@ retention only.
 
 ## 3. Names, devices, namespaces — slice 1
 
+- A **namespace** `O` is the name of a trust context
+  ([trust-context.md](trust-context.md)): one or more components (`/alice`,
+  `/home/bob`), none of them a KeywordNameComponent (type 0x20), a digest
+  component or a SequenceNumNameComponent. It is the unit of the
+  hierarchical trust schema, so it is the person data belongs to.
+- A **collection name** is `<O>/32=data/<path>`: the namespace, the
+  KeywordNameComponent `data` (the **marker**, which says where `O` ends),
+  and a path of one or more components. No component of it besides the
+  marker is a KeywordNameComponent or a digest component: keyword
+  components mark the layer's own names (§16.1). A **folder** is
+  `<O>/32=data/<path>` with a path that other collections extend, and
+  `<O>/32=data` is the folder of every collection of `O`. The **owner** of
+  collection `C` is its namespace, the components before its marker.
+- `put`, `get`, `share` and `snapshot` take collection names; `watch` takes
+  a collection or folder name (`<O>/32=data[/<path>]`). A verb given a name
+  that is none of these — no marker, nothing before it, nothing after it
+  where a collection is asked for, or another keyword or digest component —
+  answers `BadName`, saying which and how the name must be formed
+  (`NextStep::FixName`). `get` also takes log entry and state names (§11).
 - A **device** `D` is the identity of one key: the key is named
   `<D>/KEY/<key-id>` (NDN key naming). `D` is the device's name in seals
-  and the prefix it serves.
-- The **namespace** of a name is its first component (`/alice`). It is the
-  unit of the hierarchical trust schema (data and signing key share their
-  first component), so it is the person a collection belongs to: the
-  **owner** of collection `C` is the namespace of `C`.
-- Slice 1: the data layer runs in namespaces of one component. A trust
-  context's namespace may have more (`/home/bob`), and the forwarder's
-  libraries carry its group under that whole name (`/home/bob/32=sync`,
-  §12), while a collection's name alone does not say where such a
-  namespace ends: its devices would join `/home/32=sync`, which nothing
-  carries. A device's key, and every collection it shares, MUST therefore
-  lie in a trust context whose namespace is one component, so the
-  namespace the data layer derives and the one the forwarder holds are the
-  same name.
+  and the prefix it serves; it has no KeywordNameComponent or digest
+  component (`<O>/<role>/<device>`, as ndn-cert names it).
+- **A device's own namespace** is the namespace of the trust context that
+  governs `D` in the device's validator: the held context whose namespace
+  is the longest prefix of `D`. It is the group a device joins (§12), the
+  namespace of the host's default members record (§5) and the only one
+  whose collections it may `share` (§15). A device that no held context
+  governs (only the ambient, root context matches it) MUST NOT start, and
+  says so.
+- **The owner rule.** A members record `<D>/32=log/<C>/seq=<n>` is signed
+  by a device of `C`'s namespace `O` exactly when `D` lies under `O` and
+  the trust context that governs the record's name in the reader's
+  validator — the one its signature verified under, the held context whose
+  namespace is the longest prefix of the name — is `O`'s own. A device of a
+  longer held namespace is that namespace's device: with `/home` and
+  `/home/bob` held, `/home/bob/member/laptop` owns `/home/bob/32=data/x` and
+  not `/home/32=data/x`, although `/home` is a prefix of its name. A reader
+  holding `/home` alone verifies that device's records under `/home` (its
+  chain ends at `/home`'s anchor), so to it the device is `/home`'s.
 - Every packet a device signs MUST be named under `D`, so any forwarder's
   hierarchical schema admits it and Interests for it route to the device.
-- A **collection name** MUST NOT contain a KeywordNameComponent (type
-  0x20) or an ImplicitSha256DigestComponent: keyword components mark the
-  layer's own names (§14.1). A verb given such a name answers `NotFound`.
 
 ## 4. Version and log — slice 1 (blocks: slice 4)
 
@@ -107,7 +128,7 @@ A version is an immutable record signed by one key. It carries
   (§9). Keep is recorded; enforcing it is slices 3 and 4.
 
 A version is the Data packet `<D>/32=log/<C>/seq=<n>` whose Content is a
-`VersionRecord` (§14.3), signed by the key `<D>/KEY/<id>`. A reader MUST
+`VersionRecord` (§16.2), signed by the key `<D>/KEY/<id>`. A reader MUST
 refuse (and MUST NOT apply) a log entry whose signature does not verify
 against its trust context, whose signing key is not a key of the `D` its
 name starts with, or whose record's collection is not the `C` in its name.
@@ -116,9 +137,9 @@ name starts with, or whose record's collection is not the `C` in its name.
 
 A collection is a named, growing set of versions with a rule and a members
 record. It exists when its first members record is signed (§6): `share`, or
-a writer's first `put` into a collection of its own namespace, which signs
-the host's default record (merge with `/merge/yrs`, the namespace writing
-and reading).
+a writer's first `put` into a collection of its own namespace (§3), which
+signs the host's default record (merge with `/merge/yrs`, the namespace
+writing and reading).
 
 | Rule | Meaning |
 |---|---|
@@ -163,16 +184,18 @@ names exactly the versions the value is computed from.
 
 ## 6. Members — slice 1 (owner, adding), slice 2 (removal, readers' keys)
 
-The members record is signed by a key of the collection's owner namespace.
-It lists the rule, the key-name prefixes that may write — of any namespace
-(`/bob` writes into `/alice/docs/plan`) — and the audience that may read.
+The members record is signed by a device of the collection's owner
+namespace (the owner rule, §3). It lists the rule, the key-name prefixes
+that may write — of any namespace (`/bob` writes into
+`/alice/32=data/docs/plan`) — and the audience that may read.
 
 - A members record is an entry of its signer's log, `<D>/32=log/<C>/seq=<n>`
-  with Content `MembersRecord` (§14.3). Its `Revision` is one more than the
+  with Content `MembersRecord` (§16.2). Its `Revision` is one more than the
   highest revision its signer had accepted for `C` (1 for the first).
-- A reader MUST ignore a members record whose signer's namespace is not
-  `C`'s. Of the records it holds for `C` it uses the one with the highest
-  `(Revision, signer key name)`; a lower one never replaces it.
+- A reader MUST ignore a members record that the owner rule (§3) does not
+  give to `C`'s namespace. Of the records it holds for `C` it uses the one
+  with the highest `(Revision, signer key name)`; a lower one never
+  replaces it.
 - A reader MUST apply to `C` only versions by keys under a prefix of the
   record's writers (and, as for every entry, admitted by the trust schema
   under the writer's own name). Versions that arrive before any members
@@ -184,9 +207,13 @@ It lists the rule, the key-name prefixes that may write — of any namespace
 
 A writer's summary of a namespace `O` is its own log's index over `O`: a
 tree of **nodes**, one per name under `O` the writer wrote into (and every
-name on the way there). Completeness is per writer: with many writers each
-publishes its own, and a reader gathers them from the members it hears in
-the namespace's sync group (§12).
+name on the way there). The tree runs from `O` through its marker: the
+root is the node of `O`, its one child the folder `O/32=data`, and below
+that one node per path component down to each collection
+`O/32=data/<path>`. A reader descends from a root only into the child
+`32=data`; any other child of a root names no data of `O`. Completeness is
+per writer: with many writers each publishes its own, and a reader gathers
+them from the members it hears in the namespace's sync group (§12).
 
 A node of name `X` carries:
 
@@ -203,7 +230,7 @@ A node of name `X` carries:
 
 A node's content is fixed by the writer's log up to its head, so one node
 name (`<D>/32=summary/<X>/seq=<head>`, a page
-`<D>/32=summary/<X>/32=page/<path>/seq=<head>`) has one packet. Inner nodes
+`<D>/32=summary/<X>/32=page/<buckets>/seq=<head>`) has one packet. Inner nodes
 and pages are DigestSha256 packets; a reader MUST check each against the
 digest its parent lists. The **root**, the node of `O` itself, is the only
 signed one: `<D>/32=summary/<O>/seq=<head>`, signed by the device key,
@@ -237,8 +264,8 @@ A reader:
   put into, read or watched, and the names on the way to them), and only
   into children and pages whose digest differs from the one it last
   processed in full: an unchanged branch costs nothing. Watching a folder
-  of 10,000 notes of which 37 changed costs the root, the folder node, the
-  changed pages, the 37 notes and their new entries;
+  of 10,000 notes of which 37 changed costs the root, the `O/32=data` node,
+  the folder node, the changed pages, the 37 notes and their new entries;
 - descends the root it verified to the end: it fetches the nodes and pages
   that root lists, not a newer root's, until every branch it follows is
   processed. A node that is not answered leaves the descent incomplete; the
@@ -310,11 +337,14 @@ Each namespace `O` has a **sync group** `<O>/32=sync`: `O`'s whole name,
 however many components it has, then the KeywordNameComponent `sync`
 (`ndn_security::sync_group`, the one definition the data layer and the
 forwarder's libraries share). It runs as State Vector Sync (ndn-svs v2
-dialect). A device joins its own namespace's group, and the group of every
-other namespace whose collections it puts into, reads or watches. Each
-member's state-vector entry is named by its device name `D`; the device
-publishes into `O`'s group after every entry it signs about a collection
-under `O`.
+dialect). A device joins its own namespace's group — `O` the namespace of
+the trust context governing it (§3), so the very group the forwarder's
+libraries carry for that context — and the group of every other namespace
+whose collections it puts into, reads or watches, `O` read off the
+collection's name at its marker (`/home/bob/32=data/notes` →
+`/home/bob/32=sync`). Each member's state-vector entry is named by its
+device name `D`; the device publishes into `O`'s group after every entry it
+signs about a collection of `O`.
 
 The group only says "`D` moved". It carries no data and decides nothing: a
 reader that hears it fetches `D`'s root for `O` (§7). Sync Interests are
@@ -409,23 +439,32 @@ that names the slice.
   answers `Unavailable` when no member of that group was heard, else
   `NotAllowed`.
 - **`watch(C, since F)`** reports every held version of `C` (or of the
-  collections under folder `C`) outside `F`, then every version applied
-  later and the summaries of §7, each outside `F`; it starts a refresh of
-  every member known in the group. The stream ends when the device stops.
+  collections under folder `C`, which may be `<O>/32=data`) outside `F`,
+  then every version applied later and the summaries of §7, each outside
+  `F`; it starts a refresh of every member known in the group. The stream
+  ends when the device stops.
 - **`snapshot(names)`** pins, for each name, the current state name of a
   merge collection or the exact name of a version or snapshot, and signs
   the `SnapshotRecord`.
-- **`share(C, members)`** signs the next members revision (owner namespace
-  only: else `NotOwner`).
+- **`share(C, members)`** signs the next members revision (`C` of the
+  device's own namespace only, §3: else `NotOwner`).
+- A verb given a name it cannot take answers `BadName` (§3).
 
 ## 16. Wire format — slice 1
 
 ### 16.1 Names
 
-`D` is the device name, `C` a collection, `O` a namespace, `X` any
-collection or folder name under `O`. `32=` is a KeywordNameComponent,
-`seq=` a SequenceNumNameComponent (0x3A), both from the NDN naming
-conventions.
+`D` is the device name, `C` a collection, `O` a namespace, `X` a name of a
+summary tree: `O/32=data` or `O/32=data/<path>`, a folder or collection.
+`32=` is a KeywordNameComponent, `seq=` a SequenceNumNameComponent (0x3A),
+both from the NDN naming conventions.
+
+| Name | Form |
+|---|---|
+| namespace `O` | one or more components; none a keyword, digest or `seq=` |
+| device `D` | one or more components; none a keyword or digest |
+| collection `C` | `<O>/32=data/<path>`, one or more path components; none a keyword or digest |
+| folder | `<O>/32=data[/<path>]` (a watch target, a summary node) |
 
 | Packet | Name | Signature |
 |---|---|---|
@@ -433,16 +472,36 @@ conventions.
 | snapshot | `<D>/32=log/seq=<n>` | device key |
 | summary root of `O` | `<D>/32=summary/<O>/seq=<head>`, FreshnessPeriod 0 | device key |
 | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256 |
-| summary page of `X` | `<D>/32=summary/<X>/32=page/<path>/seq=<head>` | DigestSha256 |
+| summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256 |
 | state (never fetched) | `<C>/32=state/<Frontier TLV>` | — |
 | sync group | `<O>/32=sync` (State Vector Sync Interests) | — |
 
-`<path>` is a GenericNameComponent whose octets are the buckets taken from
-the node, one octet (0–15) each. Log entries are named after the writer's
-device, not the collection, because a writer of another namespace can only
-sign under its own (`/bob/laptop/32=log/alice/docs/plan/seq=3`). Data
-packets carry no MetaInfo besides the root's FreshnessPeriod; ContentType is
-BLOB.
+`<buckets>` is a GenericNameComponent whose octets are the buckets taken
+from the node, one octet (0–15) each. Log entries are named after the
+writer's device, not the collection, because a writer of another namespace
+can only sign under its own (`/bob/laptop/32=log/alice/32=data/docs/plan/seq=3`).
+Data packets carry no MetaInfo besides the root's FreshnessPeriod;
+ContentType is BLOB.
+
+Every name parses one way, and a reader MUST refuse one that does not:
+
+- **Collection.** The namespace is the components before the first
+  `32=data`; the path, the ones after it. A name with no marker, nothing
+  before it, nothing after it, or another keyword or digest component is
+  no collection.
+- **Log entry.** `D` is the components before the first `32=log` (`D` has
+  no keyword); the last component is `seq=<n>`; what lies between is empty
+  (a snapshot) or a collection name.
+- **Summary.** `D` is the components before the first `32=summary`; a last
+  `seq=` component is the head; a `32=page` then the next-to-last
+  component is the page. What remains is the subject: a namespace (the
+  root) or a folder or collection name. Only a root's discovery name
+  `<D>/32=summary/<O>` lacks the head — a namespace never ends in `seq=` —
+  so a node or page name always carries it, and the subject's own last
+  component is never read as the head. A subject without a marker is a
+  namespace, never a node under one.
+- **State.** `32=state` is the next-to-last component and the collection
+  name precedes it.
 
 ### 16.2 TLV-TYPE numbers
 
@@ -533,7 +592,8 @@ to equal bytes and equal nodes have equal digests.
 `ndn-data-conformance` (ndn-sim) runs the study's use cases against an
 implementation. Each case names the features it needs; a provider that
 lacks one is reported "not implemented", naming it. The slice-1 cases are
-c1 (offline notes on two devices), c7 (an older lens keeps a newer field),
+c1 (offline notes on two devices, in the two-component namespace
+`/home/bob`), c7 (an older lens keeps a newer field),
 c8 (a laptop back after four months: 10,000 notes, 37 changed), c11
 (citing a merged state) and o4 (a reader keeps up with a writer that never
 pauses: it holds everything written before it looked, then every later
