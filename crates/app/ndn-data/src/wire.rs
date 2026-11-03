@@ -16,7 +16,9 @@
 //!
 //! Two names are never fetched: the state name `<collection>/32=state/<F>`
 //! (the merged value at frontier `F`, computed by every reader) and the sync
-//! group `<O>/32=sync` (State Vector Sync Interests, notifications only).
+//! group `<O>/32=sync` (State Vector Sync Interests, notifications only),
+//! [`ndn_security::sync_group`]: the one definition the forwarder's trust
+//! and link libraries route and multicast it by.
 //!
 //! TLV-TYPEs are allocated from 0x0520–0x057F, all even (non-critical): a
 //! decoder skips an even TLV it does not know and refuses an odd one, so a
@@ -113,7 +115,6 @@ const LOG: &[u8] = b"log";
 const SUMMARY: &[u8] = b"summary";
 const PAGE: &[u8] = b"page";
 const STATE: &[u8] = b"state";
-const SYNC: &[u8] = b"sync";
 
 /// A summary node lists its children inline up to this many; beyond it they
 /// are paged into 16 buckets by the first nibble of SHA-256 of the child's
@@ -154,6 +155,10 @@ pub fn is_collection_name(name: &Name) -> bool {
 /// The namespace a name lies in: its first component. A collection's owner
 /// is the person whose namespace it is (the hierarchical trust schema's
 /// unit); its sync group and every writer's summary root are per namespace.
+/// Slice 1 runs in one-component namespaces only (spec §3): the sync group
+/// the device joins, `<first component>/32=sync`, is the group a forwarder
+/// holding that namespace's trust context carries only when the context's
+/// namespace is that one component.
 pub fn namespace_of(name: &Name) -> Option<Name> {
     name.components()
         .first()
@@ -168,11 +173,6 @@ pub fn device_of(key: &Name) -> Option<Name> {
         && comps[n - 2].typ == tlv_type::GENERIC_NAME_COMPONENT
         && comps[n - 2].value.as_ref() == b"KEY")
         .then(|| name_of(&comps[..n - 2]))
-}
-
-/// The sync group of namespace `ns`: `<ns>/32=sync`.
-pub fn group_name(ns: &Name) -> Name {
-    ns.clone().append_component(kw(SYNC))
 }
 
 /// A log entry's name: `<device>/32=log[/<subject>]/seq=<seq>`.

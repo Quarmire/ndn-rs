@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use ndn_packet::{Data, Name};
+use ndn_packet::{Data, Name, NameComponent};
 use ndn_tlv::{TlvWriter, read_varu64};
 
 use crate::cert_cache::Certificate;
@@ -59,6 +59,24 @@ pub enum SignedTrustContextError {
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
 /// Canonical home; `ndn-cert`'s onboarding re-exports this.
 pub const TRUST_CONTEXT_KEYWORD: &[u8] = b"trust-context";
+
+/// The keyword component naming a namespace's sync group: `/<ns>/32=sync`.
+pub const SYNC_GROUP_KEYWORD: &[u8] = b"sync";
+
+/// The sync group of `namespace`: `<namespace>/32=sync`, the State Vector
+/// Sync group in which the namespace's devices say they wrote
+/// (`docs/specs/data-layer.md` §12). `namespace` is the context's whole
+/// namespace name, however many components it has. A forwarder holding the
+/// namespace's context runs the group with the multicast strategy and
+/// routes it over each link that carries the namespace; a member registers
+/// it for its own sync face, beside those routes.
+pub fn sync_group(namespace: &Name) -> Name {
+    namespace
+        .clone()
+        .append_component(NameComponent::keyword(Bytes::from_static(
+            SYNC_GROUP_KEYWORD,
+        )))
+}
 
 /// Which encoding the schema bytes use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1637,6 +1655,21 @@ mod tests {
         );
         assert_eq!(key_identity(&n("/home/bob/KEY/root")), n("/home/bob"));
         assert_eq!(key_identity(&n("/home/bob")), n("/home/bob"));
+    }
+
+    #[test]
+    fn sync_group_is_the_whole_namespace_then_keyword_sync() {
+        for ns in ["/alice", "/home/bob"] {
+            let group = sync_group(&n(ns));
+            let comps = group.components();
+            assert_eq!(
+                Name::from_components(comps[..comps.len() - 1].to_vec()),
+                n(ns)
+            );
+            let last = comps.last().unwrap();
+            assert_eq!(last.typ, ndn_packet::tlv_type::KEYWORD);
+            assert_eq!(last.value.as_ref(), SYNC_GROUP_KEYWORD);
+        }
     }
 
     #[test]

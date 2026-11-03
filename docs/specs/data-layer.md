@@ -69,6 +69,15 @@ retention only.
   unit of the hierarchical trust schema (data and signing key share their
   first component), so it is the person a collection belongs to: the
   **owner** of collection `C` is the namespace of `C`.
+- Slice 1: the data layer runs in namespaces of one component. A trust
+  context's namespace may have more (`/home/bob`), and the forwarder's
+  libraries carry its group under that whole name (`/home/bob/32=sync`,
+  §12), while a collection's name alone does not say where such a
+  namespace ends: its devices would join `/home/32=sync`, which nothing
+  carries. A device's key, and every collection it shares, MUST therefore
+  lie in a trust context whose namespace is one component, so the
+  namespace the data layer derives and the one the forwarder holds are the
+  same name.
 - Every packet a device signs MUST be named under `D`, so any forwarder's
   hierarchical schema admits it and Interests for it route to the device.
 - A **collection name** MUST NOT contain a KeywordNameComponent (type
@@ -297,12 +306,15 @@ and makes a merged state citable: a link carries the snapshot's name.
 
 ## 12. Sync notice — slice 1
 
-Each namespace `O` has a **sync group** `<O>/32=sync`, run as State Vector
-Sync (ndn-svs v2 dialect). A device joins its own namespace's group, and the
-group of every other namespace whose collections it puts into, reads or
-watches. Each member's state-vector entry is named by its device name `D`;
-the device publishes into `O`'s group after every entry it signs about a
-collection under `O`.
+Each namespace `O` has a **sync group** `<O>/32=sync`: `O`'s whole name,
+however many components it has, then the KeywordNameComponent `sync`
+(`ndn_security::sync_group`, the one definition the data layer and the
+forwarder's libraries share). It runs as State Vector Sync (ndn-svs v2
+dialect). A device joins its own namespace's group, and the group of every
+other namespace whose collections it puts into, reads or watches. Each
+member's state-vector entry is named by its device name `D`; the device
+publishes into `O`'s group after every entry it signs about a collection
+under `O`.
 
 The group only says "`D` moved". It carries no data and decides nothing: a
 reader that hears it fetches `D`'s root for `O` (§7). Sync Interests are
@@ -310,33 +322,36 @@ unsigned; a stranger in the group costs a reader a root fetch, never a
 wrong answer. A device's counter in a group starts at its log head when it
 joins, so it stays above anything an earlier run of the same key announced.
 
-The group needs no configuration: no route names `<O>/32=sync` and no
-strategy is chosen for it. A device registers `<O>/32=sync` for its own sync
-face when it joins and does nothing else for the group. That registration is
-the group's longest match on the device's forwarder, and the routes a
-forwarder has toward the namespace's other devices are not prefixes of the
-group (a link between two devices routes each by its device name, §3), so
-longest-prefix match alone would deliver the group nowhere. Every
-forwarder — device or relay — therefore forwards the group by this rule:
+The group needs no configuration, and no forwarder treats its name
+specially: a forwarder carries it with an ordinary strategy choice and
+ordinary routes, which the libraries that already know the namespace's
+membership install from data the forwarder holds.
 
-- A forwarder **carries** `O`'s group when a face is registered at or under
-  `<O>/32=sync` (a member on this node), or a link (a non-local face) is
-  routed at or under `<O>`.
-- A forwarder that carries the group MUST send every Interest under
-  `<O>/32=sync` with the multicast strategy, whatever its strategy choice
-  for the name, to: each face registered at or under `<O>/32=sync`; each
-  link routed at or under `<O>` (a device or relay of the namespace) or at a
-  prefix of `<O>` (a default route); and each link an Interest of the group
-  arrived on, for as long as that face is up (how a member of another
-  namespace is reached, toward which nothing routes into `<O>`). It sends one
-  copy per neighbour and none back toward the neighbour it came from.
-- A forwarder that does not carry the group (one holding default routes
-  only, like a hub) forwards it like any other name.
+- **Strategy (trust-context library).** A forwarder that holds `O`'s
+  trust context runs `<O>/32=sync` with the multicast strategy from the
+  moment it holds the context — held at start, or adopted later
+  (`ndn_namespace::sync_group`). A newer version of the context leaves the
+  choice as it is.
+- **Routes (link library).** A link carries `O` when its peer was admitted
+  in `O` and the forwarder holds `O`'s trust context. Such a link gets a
+  route for `<O>/32=sync` beside the routes it gets for the peer's device
+  name or namespace (`ndn_link::group_routes`), with the same lifecycle:
+  added when the link is up, taken when a revocation takes the link's last
+  membership in `O`, and gone with the link's face when the link ends. An
+  enrollment link carries no group; nor does a link admitted only in a
+  namespace the forwarder serves without holding it.
+- **Members.** A device registers `<O>/32=sync` for its own sync face when
+  it joins and does nothing else for the group. Its registration sits
+  beside the link routes in the same entry, so the multicast strategy sends
+  each Sync Interest to the local member and over every link that carries
+  `O`, never back toward the face it came from.
 
-A name is a sync group's when its second component is the keyword `sync`;
-nothing else in the group's Interests is read. The routes that make a
-forwarder carry a group are the ones its links already install for the
-person's devices and relays, so a person's devices sync with none set up.
+A forwarder holding no trust context for `O` (a hub with default routes)
+forwards the group like any other name. A member of another namespace (a
+`/bob` device in `/alice`'s group) is reached only once the members record
+of the collection drives its routes (slice 2); in slice 1 a group reaches
+the devices of `O` and the links that carry `O`. A forwarder learns no
+route from the face a Sync Interest arrived on.
 
 ## 13. Custody — slice 3
 

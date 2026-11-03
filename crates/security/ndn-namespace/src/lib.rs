@@ -21,7 +21,11 @@
 //! - [`renewal`]: renew the device's certificates before they expire.
 //! - [`publish`]: serve held trust contexts by name (RDR) and the device's
 //!   own certificates.
-//! - [`sync`]: the namespaces' sync groups, which push each new version.
+//! - [`sync`]: the namespaces' trust-context sync groups, which push each
+//!   new version.
+//! - [`sync_group`]: each held namespace's data-layer sync group
+//!   (`<ns>/32=sync`), run with the multicast strategy from the moment the
+//!   namespace is held ([`Participant::new`] sets it up).
 //! - [`admin`]: the root device's side — hand a version made offline to the
 //!   running device (retry / undo rule), and the anti-fork check before a
 //!   recovery.
@@ -78,6 +82,7 @@ pub mod refresh;
 pub mod renewal;
 pub mod root;
 pub mod sync;
+pub mod sync_group;
 mod words;
 
 use std::sync::Arc;
@@ -165,6 +170,9 @@ pub struct Participant {
 }
 
 impl Participant {
+    /// The participant `parts` make. Every namespace the keyring holds, now
+    /// and once adopted, gets its sync group run on the engine
+    /// ([`sync_group`]).
     pub fn new(parts: ParticipantParts) -> Self {
         let ParticipantParts {
             engine,
@@ -176,6 +184,7 @@ impl Participant {
             cas,
             words,
         } = parts;
+        sync_group::carry_held(&engine, &keyring);
         Self {
             engine,
             keyring: Arc::clone(&keyring),

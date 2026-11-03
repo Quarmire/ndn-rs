@@ -36,7 +36,7 @@ use ndn_foundation_types::Hash;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, NackReason, Name};
 use ndn_security::safe_data::TrustPath;
-use ndn_security::{SecurityManager, Signer, ValidationResult, Validator};
+use ndn_security::{SecurityManager, Signer, ValidationResult, Validator, sync_group};
 use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc};
@@ -52,9 +52,9 @@ use crate::version::{
     Content, Frontier, Payload, Seal, Seq, Timestamp, Version, VersionId, Writer,
 };
 use crate::wire::{
-    self, Branches, MembersBody, NodeBody, Record, VersionBody, device_of, group_name,
-    is_collection_name, log_name, namespace_of, node_name, page_name, parse_log_name,
-    parse_state_name, parse_summary_name, seqs_of, state_name, summary_prefix,
+    self, Branches, MembersBody, NodeBody, Record, VersionBody, device_of, is_collection_name,
+    log_name, namespace_of, node_name, page_name, parse_log_name, parse_state_name,
+    parse_summary_name, seqs_of, state_name, summary_prefix,
 };
 
 /// A wall clock: the date a device's clock shows. Display and retention
@@ -773,7 +773,7 @@ impl Inner {
             );
             st.head
         };
-        let group = group_name(ns);
+        let group = sync_group(ns);
         self.sync
             .register_prefix(&group)
             .await
@@ -812,7 +812,7 @@ impl Inner {
         let mut st = self.st.lock();
         let now = Instant::now();
         for (ns, g) in st.groups.iter_mut() {
-            if interest.name.has_prefix(&group_name(ns)) && g.busy.is_empty() {
+            if interest.name.has_prefix(&sync_group(ns)) && g.busy.is_empty() {
                 g.confirmed = Some(now);
             }
         }
@@ -882,7 +882,7 @@ impl Inner {
                 }
             }
         };
-        let _ = tx.send((group_name(ns), None)).await;
+        let _ = tx.send((sync_group(ns), None)).await;
     }
 
     /// Start following `target`: join its namespace's group, and forget
