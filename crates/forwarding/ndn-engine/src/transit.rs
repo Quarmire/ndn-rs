@@ -10,8 +10,10 @@
 //! router would, answering only pending Interests (unsolicited Data is
 //! dropped as always), and caches none of it. The link layer marks such a
 //! namespace while a device it serves for it is linked, and unmarks it when
-//! the last one leaves. A namespace this forwarder holds is never in
-//! transit: its Data is validated whatever the marks say.
+//! the last one leaves; the first mark and the last unmark run the host's
+//! action (it runs the namespace's sync group with the multicast strategy
+//! meanwhile). A namespace this forwarder holds is never in transit: its
+//! Data is validated whatever the marks say.
 
 use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock};
@@ -25,18 +27,25 @@ pub struct TransitPrefixes {
 }
 
 impl TransitPrefixes {
-    /// One more reason to carry `prefix` in transit.
-    pub fn add(&self, prefix: &Name) {
-        *self
+    /// One more reason to carry `prefix` in transit. The first one also
+    /// runs `first`, under the lock: of a first `add` and a last
+    /// [`remove`](Self::remove) racing, their actions happen in the order
+    /// of their counts.
+    pub fn add(&self, prefix: &Name, first: impl FnOnce()) {
+        let mut prefixes = self
             .prefixes
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(prefix.clone())
-            .or_default() += 1;
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = prefixes.entry(prefix.clone()).or_default();
+        *count += 1;
+        if *count == 1 {
+            first();
+        }
     }
 
-    /// One reason less; the last one takes `prefix` out of transit.
-    pub fn remove(&self, prefix: &Name) {
+    /// One reason less; the last one takes `prefix` out of transit and
+    /// runs `last`, under the lock.
+    pub fn remove(&self, prefix: &Name, last: impl FnOnce()) {
         let mut prefixes = self
             .prefixes
             .write()
@@ -45,6 +54,7 @@ impl TransitPrefixes {
             *count -= 1;
             if *count == 0 {
                 prefixes.remove(prefix);
+                last();
             }
         }
     }
@@ -65,12 +75,18 @@ mod tests {
         let transit = TransitPrefixes::default();
         let ns: Name = "/ra".parse().unwrap();
         let data: Name = "/ra/member/m1/x".parse().unwrap();
-        transit.add(&ns);
-        transit.add(&ns);
-        transit.remove(&ns);
+        let (firsts, lasts) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let first = || firsts.set(firsts.get() + 1);
+        let last = || lasts.set(lasts.get() + 1);
+        transit.add(&ns, first);
+        transit.add(&ns, first);
+        transit.remove(&ns, last);
         assert!(transit.covers(&data));
-        transit.remove(&ns);
+        assert_eq!((firsts.get(), lasts.get()), (1, 0));
+        transit.remove(&ns, last);
         assert!(!transit.covers(&data));
+        transit.remove(&ns, last);
+        assert_eq!((firsts.get(), lasts.get()), (1, 1));
         assert!(!transit.covers(&"/rb/x".parse().unwrap()));
     }
 }

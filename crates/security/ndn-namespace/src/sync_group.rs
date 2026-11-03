@@ -13,6 +13,12 @@
 //! carries the group of every namespace the keyring holds then and of each
 //! one it adopts later; nothing in this crate drops a held namespace, so the
 //! strategy stays while the forwarder runs.
+//!
+//! A relay carries the group of a namespace it serves without holding it
+//! while the namespace is in transit there (the link library's host calls
+//! [`carry`] when the first served device of it links and [`release`] when
+//! the last one leaves), so the namespace's devices linked to it reach each
+//! other in their group.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,6 +32,25 @@ use ndn_strategy::{ErasedStrategy, MulticastStrategy};
 /// Run `namespace`'s sync group with the multicast strategy on `engine`.
 pub fn carry(engine: &ForwarderEngine, namespace: &Name) {
     install(&engine.strategy_table(), namespace);
+}
+
+/// Undo [`carry`]: `namespace`'s sync group takes the strategy of the
+/// prefixes above it again — unless `engine` holds the namespace's trust
+/// context, whose group keeps the multicast strategy [`carry_held`] gave it.
+pub fn release(engine: &ForwarderEngine, namespace: &Name) {
+    if engine
+        .keyring()
+        .is_some_and(|k| k.version_of(namespace).is_some())
+    {
+        return;
+    }
+    engine.strategy_table().remove(&sync_group(namespace));
+    tracing::debug!(
+        target: "security",
+        %namespace,
+        group = %sync_group(namespace),
+        "the namespace's sync group no longer runs with the multicast strategy"
+    );
 }
 
 fn install(strategies: &StrategyTable<dyn ErasedStrategy>, namespace: &Name) {
@@ -111,6 +136,31 @@ mod tests {
             Some(multicast)
         );
         assert_eq!(engine.strategy_table().dump().len(), before + 2);
+        shutdown.shutdown().await;
+    }
+
+    /// A namespace carried without being held is released back to the
+    /// strategies above it; a held one keeps its multicast.
+    #[tokio::test]
+    async fn release_drops_the_strategy_of_a_namespace_not_held_only() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .security(Arc::new(ndn_security::SecurityManager::new()))
+            .build()
+            .await
+            .unwrap();
+        let keyring = engine.keyring().expect("the engine validates");
+        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
+        let multicast = MulticastStrategy::strategy_name();
+        for ns in ["/alice", "/visitor"] {
+            carry(&engine, &n(ns));
+            assert_eq!(
+                strategy_at(&engine, &sync_group(&n(ns))),
+                Some(multicast.clone())
+            );
+            release(&engine, &n(ns));
+        }
+        assert_eq!(strategy_at(&engine, &n("/alice/32=sync")), Some(multicast));
+        assert_eq!(strategy_at(&engine, &n("/visitor/32=sync")), None);
         shutdown.shutdown().await;
     }
 }
