@@ -3669,17 +3669,38 @@ impl Inner {
         name: &Name,
         digest: &[u8; 32],
     ) -> Option<Bytes> {
+        self.get_piece_from(c, name, digest, None)
+            .await
+            .map(|(w, _)| w)
+    }
+
+    /// [`Self::get_piece`], trying `first` before the others, and saying
+    /// which source answered (`None`: its writer by name; `Some(h)`: holder
+    /// `h`). The store answers first whatever `first` says.
+    async fn get_piece_from(
+        self: &Arc<Self>,
+        c: &Name,
+        name: &Name,
+        digest: &[u8; 32],
+        first: Option<&Option<Name>>,
+    ) -> Option<(Bytes, Option<Name>)> {
         if let Some(w) = self.store.get(name)
             && wire::implicit_digest(&w) == *digest
         {
-            return Some(w);
+            return Some((w, None));
         }
         let holders = self.holders_of(&self.st.lock(), c);
         // An Interest for this device's own name goes nowhere useful: its
         // own pieces it released are asked of the holders only.
         let own = parse_piece_name(name).is_some_and(|p| p.log.device == self.device);
-        let mut sources = if own { Vec::new() } else { vec![None] };
+        let mut sources: Vec<Option<Name>> = if own { Vec::new() } else { vec![None] };
         sources.extend(holders.into_iter().map(Some));
+        if let Some(f) = first
+            && let Some(i) = sources.iter().position(|s| s == f)
+        {
+            let f = sources.remove(i);
+            sources.insert(0, f);
+        }
         for source in sources {
             let data = match &source {
                 None => self.fetch(name.clone(), false).await,
@@ -3692,7 +3713,7 @@ impl Inner {
             }
             let w = data.raw().clone();
             self.store.insert(name.clone(), w.clone());
-            return Some(w);
+            return Some((w, source));
         }
         None
     }
@@ -3721,12 +3742,28 @@ impl Inner {
                 digests.insert(kid, d);
             }
         }
+        // The source is chosen per version, from what answered: the first
+        // chunk is asked alone (the writer first, then each holder), and
+        // every other chunk goes first to whoever answered it — a writer that
+        // released its chunks costs one miss, not one per chunk.
+        let first_digest = *digests.get(&PieceKind::Chunk(0))?;
+        let (first_wire, source) = self
+            .get_piece_from(c, &piece_name(v, PieceKind::Chunk(0)), &first_digest, None)
+            .await?;
+        let first_chunk = if assemble {
+            pieces::open_chunk(&shape, 0, &first_wire, &first_digest)?
+        } else {
+            Bytes::new()
+        };
         let digests = &digests;
-        let got: Vec<Option<Bytes>> = stream::iter(0..shape.chunks)
+        let source = &source;
+        let rest: Vec<Option<Bytes>> = stream::iter(1..shape.chunks)
             .map(|i| async move {
                 let kind = PieceKind::Chunk(i);
                 let d = *digests.get(&kind)?;
-                let w = self.get_piece(c, &piece_name(v, kind), &d).await?;
+                let (w, _) = self
+                    .get_piece_from(c, &piece_name(v, kind), &d, Some(source))
+                    .await?;
                 if assemble {
                     pieces::open_chunk(&shape, i, &w, &d)
                 } else {
@@ -3737,7 +3774,8 @@ impl Inner {
             .collect()
             .await;
         let mut out = Vec::with_capacity(if assemble { chunks.size as usize } else { 0 });
-        for g in got {
+        out.extend_from_slice(&first_chunk);
+        for g in rest {
             out.extend_from_slice(&g?);
         }
         Some(out)
