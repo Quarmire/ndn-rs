@@ -64,7 +64,9 @@ pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn, FetchMiss};
 pub use cert_set::CertSet;
-pub use confidentiality::{ContentKey, EpochPolicy, RotatingKey, Sealed, unwrap_ck, wrap_ck};
+pub use confidentiality::{
+    ContentKey, EpochPolicy, RecipientKey, RotatingKey, Sealed, unwrap_ck, wrap_ck, wrap_ck_to,
+};
 pub use error::TrustError;
 pub use keychain::{KeyAlgorithm, KeyChain};
 pub use keyring::Keyring;

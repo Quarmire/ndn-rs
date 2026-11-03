@@ -34,8 +34,10 @@
 use core::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use ndn_crypto_core::{open_in_place, seal_in_place};
 use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of a content key, in bytes (ChaCha20-Poly1305 key = 256 bits).
@@ -66,6 +68,10 @@ pub enum ConfidentialityError {
     /// An unwrapped content key did not have exactly [`CK_LEN`] bytes.
     #[error("wrapped content key has wrong length")]
     BadKeyLength,
+    /// An X25519 public key gave an all-zero shared secret (a low-order
+    /// point): no key can be agreed with it.
+    #[error("the X25519 public key agrees no shared secret (low-order point)")]
+    BadPublicKey,
 }
 
 /// A symmetric content key (ChaCha20-Poly1305, 256-bit). The raw bytes are
@@ -186,6 +192,94 @@ pub fn unwrap_ck(
         .try_into()
         .map_err(|_| ConfidentialityError::BadKeyLength)?;
     Ok(ContentKey::from_bytes(arr))
+}
+
+/// Length of an X25519 key (public or secret), in bytes.
+pub const X25519_LEN: usize = 32;
+
+/// Domain label of the KEK derivation in [`wrap_ck_to`] / [`RecipientKey::unwrap_ck`].
+const X25519_KEK_LABEL: &[u8] = b"ndn-security/confidentiality/x25519-kek/1";
+
+/// A recipient's long-lived X25519 key pair: the per-recipient key-wrap path
+/// for a recipient whose signing key cannot agree keys (or must not). The
+/// public half is published, authenticated by the recipient's signing key;
+/// a sender wraps a content key to it with [`wrap_ck_to`], and only the
+/// holder of the secret opens it. The secret is zeroized on drop.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct RecipientKey {
+    secret: [u8; X25519_LEN],
+}
+
+impl RecipientKey {
+    /// A fresh key pair from the system CSPRNG.
+    pub fn generate() -> Self {
+        let mut secret = [0u8; X25519_LEN];
+        OsRng.fill_bytes(&mut secret);
+        Self { secret }
+    }
+
+    /// The key pair of a stored secret.
+    pub fn from_bytes(secret: [u8; X25519_LEN]) -> Self {
+        Self { secret }
+    }
+
+    /// The secret, to store it. Treat the result as secret.
+    pub fn expose(&self) -> &[u8; X25519_LEN] {
+        &self.secret
+    }
+
+    /// The public half, to publish.
+    pub fn public(&self) -> [u8; X25519_LEN] {
+        MontgomeryPoint::mul_base_clamped(self.secret).to_bytes()
+    }
+
+    /// Open a content key [`wrap_ck_to`] wrapped to this key's public half,
+    /// given the sender's `ephemeral` public key and the same `aad`.
+    pub fn unwrap_ck(
+        &self,
+        ephemeral: &[u8; X25519_LEN],
+        wrapped: &Sealed,
+        aad: &[u8],
+    ) -> Result<ContentKey, ConfidentialityError> {
+        let shared = MontgomeryPoint(*ephemeral).mul_clamped(self.secret);
+        let kek = x25519_kek(&shared, ephemeral, &self.public())?;
+        unwrap_ck(&kek, wrapped, aad)
+    }
+}
+
+/// Wrap `ck` to the X25519 public key `recipient`: a fresh ephemeral key
+/// agrees a secret with it, a KEK is derived from that secret and both
+/// public keys (SHA-256, domain-separated), and the CK is wrapped under it
+/// binding `aad` ([`wrap_ck`]). Returns the ephemeral public key, which the
+/// recipient needs, and the wrapped key. Authenticity is the caller's: sign
+/// what carries them, and take `recipient` only from data its holder signed.
+pub fn wrap_ck_to(
+    recipient: &[u8; X25519_LEN],
+    ck: &ContentKey,
+    aad: &[u8],
+) -> Result<([u8; X25519_LEN], Sealed), ConfidentialityError> {
+    let ephemeral = RecipientKey::generate();
+    let public = ephemeral.public();
+    let shared = MontgomeryPoint(*recipient).mul_clamped(ephemeral.secret);
+    let kek = x25519_kek(&shared, &public, recipient)?;
+    Ok((public, wrap_ck(&kek, ck, aad)))
+}
+
+fn x25519_kek(
+    shared: &MontgomeryPoint,
+    ephemeral: &[u8; X25519_LEN],
+    recipient: &[u8; X25519_LEN],
+) -> Result<ContentKey, ConfidentialityError> {
+    let shared = shared.to_bytes();
+    if shared == [0u8; X25519_LEN] {
+        return Err(ConfidentialityError::BadPublicKey);
+    }
+    let mut h = Sha256::new();
+    h.update(X25519_KEK_LABEL);
+    h.update(shared);
+    h.update(ephemeral);
+    h.update(recipient);
+    Ok(ContentKey::from_bytes(h.finalize().into()))
 }
 
 /// When to rotate a content key: after `max_age`, or after `max_uses` seals,
@@ -420,5 +514,25 @@ mod tests {
         let (_epoch, sealed) = rk.seal(0, b"hello", b"/svc/topic");
         let shipped_ck = ContentKey::from_bytes(*rk.content_key().expose());
         assert_eq!(shipped_ck.open(&sealed, b"/svc/topic").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn only_the_recipient_opens_a_key_wrapped_to_it() {
+        let ck = ContentKey::generate();
+        let bob = RecipientKey::generate();
+        let (ephemeral, wrapped) = wrap_ck_to(&bob.public(), &ck, b"/grant/1").unwrap();
+        let opened = bob.unwrap_ck(&ephemeral, &wrapped, b"/grant/1").unwrap();
+        assert_eq!(opened.expose(), ck.expose());
+        let mallory = RecipientKey::generate();
+        assert!(
+            mallory
+                .unwrap_ck(&ephemeral, &wrapped, b"/grant/1")
+                .is_err()
+        );
+        assert!(bob.unwrap_ck(&ephemeral, &wrapped, b"/grant/2").is_err());
+        assert_eq!(
+            wrap_ck_to(&[0u8; X25519_LEN], &ck, b"").err(),
+            Some(ConfidentialityError::BadPublicKey)
+        );
     }
 }

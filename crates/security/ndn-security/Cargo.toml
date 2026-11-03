@@ -41,6 +41,9 @@ pkcs5         = { version = "0.7",  default-features = false, features = ["alloc
 sha2          = { workspace = true }
 # Zeroize content-key material on drop (the `confidentiality` module).
 zeroize       = { version = "1", features = ["derive"] }
+# X25519 for per-recipient content-key wrap (`confidentiality::wrap_ck_to`);
+# already in the tree under ed25519-dalek. Pure Rust, wasm-safe.
+curve25519-dalek = { version = "4", default-features = false, features = ["zeroize"] }
 # Symmetric crypto for SafeBag's PKCS#8-encrypted private key wrapping
 # (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC, matching what OpenSSL's
 # PKCS8_encrypt produces by default on modern releases).
