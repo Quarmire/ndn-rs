@@ -348,7 +348,7 @@ name (`<D>/32=summary/<X>/seq=<head>`, a page
 `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>`) has one packet. Inner nodes
 and pages are DigestSha256 packets; a reader MUST check each against the
 digest its parent lists. The **root**, the node of `O` itself, is the only
-signed one: `<D>/32=summary/<O>/seq=<head>`, signed by the device key,
+signed one: `<D>/32=summary/<O>/32=root/seq=<head>`, signed by the device key,
 FreshnessPeriod 0 so that discovery always reaches the writer. A writer
 SHOULD sign a new root only when one is asked for and the tree changed.
 
@@ -862,7 +862,7 @@ both from the NDN naming conventions.
 |---|---|---|
 | version, members record | `<D>/32=log/<C>/seq=<n>` | device key |
 | snapshot | `<D>/32=log/seq=<n>` | device key |
-| summary root of `O` | `<D>/32=summary/<O>/seq=<head>`, FreshnessPeriod 0 | device key |
+| summary root of `O` | `<D>/32=summary/<O>/32=root/seq=<head>`, FreshnessPeriod 0; discovered by `<D>/32=summary/<O>/32=root` (CanBePrefix, MustBeFresh), which no node or page name extends, so only a root answers it | device key |
 | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256 |
 | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256 |
 | state (never fetched) | `<C>/32=state/<Frontier TLV>` | — |
@@ -895,8 +895,9 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Summary.** `D` is the components before the first `32=summary`; a last
   `seq=` component is the head; a `32=page` then the next-to-last
   component is the page. What remains is the subject: a namespace (the
-  root) or a folder or collection name. Only a root's discovery name
-  `<D>/32=summary/<O>` lacks the head — a namespace never ends in `seq=` —
+  root) or a folder or collection name. A root's subject is followed by
+  `32=root`, and only its discovery name
+  `<D>/32=summary/<O>/32=root` lacks the head — a namespace never ends in `seq=` —
   so a node or page name always carries it, and the subject's own last
   component is never read as the head. A subject without a marker is a
   namespace, never a node under one.

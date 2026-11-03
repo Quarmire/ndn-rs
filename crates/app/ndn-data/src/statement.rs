@@ -117,6 +117,11 @@ pub struct Custody {
     pub leases: Vec<Lease>,
     /// The leases this call found broken or unanswered, before repair.
     pub broken: Vec<Lease>,
+    /// The versions asked for that no kept lease holds after repair and
+    /// that this device does not hold whole either: kept nowhere this
+    /// device can confirm. They are lost unless a copy turns up; the next
+    /// step is to put them again from wherever a copy is left.
+    pub unkept: Vec<Name>,
 }
 
 /// A signed record dropping the pruner's own versions under a prefix up to a

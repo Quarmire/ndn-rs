@@ -72,7 +72,7 @@ use crate::wire::{
     device_of, grant_name, hold_ask_name, log_name, namespace_of, node_name, page_name,
     parse_audit_ask_name, parse_grant_name, parse_held_name, parse_hold_ask_name, parse_log_name,
     parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name, piece_name,
-    seal_key_name, seqs_of, state_name, subject_namespace, summary_prefix,
+    root_name, root_prefix, seal_key_name, seqs_of, state_name, subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -2291,7 +2291,7 @@ impl Inner {
         if body.head > peer.kept {
             peer.kept = body.head;
             self.store
-                .insert(summary_prefix(device, ns), data.raw().clone());
+                .insert(root_prefix(device, ns), data.raw().clone());
         }
         Ok((writer, body))
     }
@@ -2305,20 +2305,7 @@ impl Inner {
             return true;
         }
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
-        // A node of the same summary on its way to another reader satisfies
-        // this prefix Interest too (a forwarder matches Data to pending
-        // Interests by name alone): ask again for the root itself.
-        let mut data = None;
-        for _ in 0..3 {
-            let Some(d) = self.fetch(summary_prefix(device, ns), true).await else {
-                return false;
-            };
-            if parse_summary_name(&d.name).is_some_and(|s| s.subject == *ns) {
-                data = Some(d);
-                break;
-            }
-        }
-        let Some(data) = data else {
+        let Some(data) = self.fetch(root_prefix(device, ns), true).await else {
             return false;
         };
         let (writer, body) = match self.accept_root(device, ns, &data).await {
@@ -3210,7 +3197,7 @@ impl Inner {
             return Some(r.wire.clone());
         }
         let builder =
-            DataBuilder::new(node_name(&self.device, ns, head), &content).freshness(ROOT_FRESHNESS);
+            DataBuilder::new(root_name(&self.device, ns, head), &content).freshness(ROOT_FRESHNESS);
         let wire = self.sign(builder).ok()?;
         st.roots.insert(
             ns.clone(),
@@ -4923,17 +4910,37 @@ impl DataLayer for Device {
             }
         }
         let st = inner.st.lock();
-        let leases = inner
-            .live_leases(&st, prefix)
+        let live = inner.live_leases(&st, prefix);
+        let leases = live
             .iter()
             .filter_map(|h| inner.lease_of(&st, prefix, h))
             .collect();
+        // What was asked that nothing confirms is kept: not held whole here,
+        // and inside no lease audited kept.
+        let mut unkept = Vec::new();
+        if let Some(coll) = st.colls.get(prefix) {
+            let kept: Vec<&LeaseHeld> = live
+                .iter()
+                .filter_map(|h| coll.leases.get(h))
+                .filter(|l| l.audit.kept())
+                .collect();
+            for hv in coll.versions.values() {
+                if at.contains(&hv.version.id)
+                    && !inner.keeps(coll, &hv.version.id)
+                    && !kept.iter().any(|l| l.body.holds.contains(&hv.version.id))
+                {
+                    unkept.push(hv.version.name.clone());
+                }
+            }
+            unkept.sort();
+        }
         Ok(Custody {
             prefix: prefix.clone(),
             copies: want.copies,
             until: want.until,
             leases,
             broken,
+            unkept,
         })
     }
 
@@ -5110,7 +5117,7 @@ mod tests {
             branches: Branches::Children(Vec::new()),
         };
         let signer = keys.get_signer_sync(key).unwrap();
-        let wire = DataBuilder::new(node_name(device, ns, head), &wire::encode_node(&body))
+        let wire = DataBuilder::new(root_name(device, ns, head), &wire::encode_node(&body))
             .sign_sync(signer.sig_type(), Some(key), |region| {
                 signer.sign_sync(region).unwrap()
             });

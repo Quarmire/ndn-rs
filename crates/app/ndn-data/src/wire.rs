@@ -200,6 +200,7 @@ const MANIFEST: &[u8] = b"manifest";
 const HOLD: &[u8] = b"hold";
 const AUDIT: &[u8] = b"audit";
 const HELD: &[u8] = b"held";
+const ROOT: &[u8] = b"root";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces (log rule) or is refused (merge rule).
@@ -428,16 +429,30 @@ pub fn parse_log_name(name: &Name) -> Option<LogName> {
     })
 }
 
-/// `<device>/32=summary/<subject>`: the prefix every summary packet of
-/// `subject` by `device` lies under, and the root's discovery name.
-pub fn summary_prefix(device: &Name, subject: &Name) -> Name {
+/// `<device>/32=summary/<subject>`: the prefix every summary node and page
+/// of `subject` by `device` lies under.
+fn summary_prefix(device: &Name, subject: &Name) -> Name {
     let mut comps = device.components().to_vec();
     comps.push(kw(SUMMARY));
     comps.extend(subject.components().iter().cloned());
     Name::from_components(comps)
 }
 
-/// A summary node's (or root's) name: `<device>/32=summary/<subject>/seq=<head>`.
+/// `<device>/32=summary/<O>/32=root`: the discovery name of `device`'s
+/// signed root of namespace `O`. No node or page name extends it (theirs
+/// go on with `32=data`), so a prefix Interest for it can only be answered
+/// by a root.
+pub fn root_prefix(device: &Name, ns: &Name) -> Name {
+    summary_prefix(device, ns).append_component(kw(ROOT))
+}
+
+/// A signed root's name: `<device>/32=summary/<O>/32=root/seq=<head>`.
+pub fn root_name(device: &Name, ns: &Name, head: u64) -> Name {
+    root_prefix(device, ns).append_sequence_num(head)
+}
+
+/// A summary node's name: `<device>/32=summary/<subject>/seq=<head>`,
+/// `subject` a folder or collection.
 pub fn node_name(device: &Name, subject: &Name, head: u64) -> Name {
     summary_prefix(device, subject).append_sequence_num(head)
 }
@@ -486,14 +501,24 @@ pub fn parse_summary_name(name: &Name) -> Option<SummaryName> {
         head = Some(s);
         rest = before;
     }
+    // A root's name ends its subject (a namespace) with `32=root`; a node's
+    // or page's subject is a data name, which never carries it.
+    let marked_root = rest.last().is_some_and(|c| is_kw(c, ROOT));
+    if marked_root {
+        rest = &rest[..rest.len() - 1];
+    }
     let (subject, page) = match rest.iter().position(|c| is_kw(c, PAGE)) {
+        Some(_) if marked_root => return None,
         Some(p) if p + 2 == rest.len() => (&rest[..p], Some(rest[p + 1].value.clone())),
         Some(_) => return None,
         None => (rest, None),
     };
     let subject = name_of(subject);
     let root = is_namespace(&subject);
-    let named = head.is_some() || (root && page.is_none());
+    if root != marked_root {
+        return None;
+    }
+    let named = head.is_some() || root;
     ((root || is_data_name(&subject)) && named).then(|| SummaryName {
         device: name_of(&comps[..at]),
         subject,
@@ -2237,13 +2262,19 @@ mod tests {
             assert_eq!((&p.device, &p.subject), (&d, &c));
             assert_eq!(p.page.as_deref(), Some(&[3u8, 10][..]));
             assert_eq!(p.head, Some(7));
-            let root = parse_summary_name(&summary_prefix(&d, &ns)).unwrap();
+            let root = parse_summary_name(&root_prefix(&d, &ns)).unwrap();
             assert_eq!(
                 (root.device, root.subject, root.head, root.page),
                 (d.clone(), ns.clone(), None, None)
             );
-            let signed = parse_summary_name(&node_name(&d, &ns, 11)).unwrap();
+            let signed = parse_summary_name(&root_name(&d, &ns, 11)).unwrap();
             assert_eq!((signed.subject, signed.head), (ns.clone(), Some(11)));
+            // A root is named only with its marker, and no node name lies
+            // under a root's discovery name: a prefix Interest for a root
+            // can be answered by a root alone.
+            assert_eq!(parse_summary_name(&node_name(&d, &ns, 11)), None);
+            let folder_node = node_name(&d, &data_folder(&ns), 11);
+            assert!(!folder_node.has_prefix(&root_prefix(&d, &ns)));
             // The root's one child, the folder of every collection.
             let folder = data_folder(&ns);
             assert_eq!(folder, n(&format!("{ns}/32=data")));
@@ -2291,11 +2322,17 @@ mod tests {
         );
         // An unmarked subject is a namespace: this names the root of
         // `/alice/notes`, never a node of the namespace `/alice`.
-        let root = parse_summary_name(&n("/alice/laptop/32=summary/alice/notes/seq=2")).unwrap();
+        let root =
+            parse_summary_name(&n("/alice/laptop/32=summary/alice/notes/32=root/seq=2")).unwrap();
         assert_eq!(subject_namespace(&root.subject), Some(n("/alice/notes")));
         // Without its head a node name is not one (only a root is discovered).
         assert_eq!(
             parse_summary_name(&summary_prefix(&d, &n("/alice/32=data/notes"))),
+            None
+        );
+        // A data subject never takes the root marker.
+        assert_eq!(
+            parse_summary_name(&root_prefix(&d, &n("/alice/32=data/notes"))),
             None
         );
         // A device name has no keyword: the first 32=log ends it.
