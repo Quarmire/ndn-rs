@@ -36,7 +36,7 @@ pub fn carry(engine: &ForwarderEngine, namespace: &Name) {
 
 /// Undo [`carry`]: `namespace`'s sync group takes the strategy of the
 /// prefixes above it again — unless `engine` holds the namespace's trust
-/// context, whose group keeps the multicast strategy [`carry_held`] gave it.
+/// context, whose group keeps the multicast strategy `carry_held` gave it.
 pub fn release(engine: &ForwarderEngine, namespace: &Name) {
     if engine
         .keyring()
