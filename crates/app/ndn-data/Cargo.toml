@@ -23,6 +23,7 @@ futures-core = { version = "0.3", default-features = false, features = ["alloc"]
 parking_lot  = { workspace = true }
 sha2         = { workspace = true }
 hkdf         = { workspace = true }
+getrandom    = { workspace = true }
 tracing      = { workspace = true }
 web-time     = { workspace = true }
 yrs          = { workspace = true }

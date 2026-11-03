@@ -33,6 +33,9 @@ pub enum NextStep {
     /// Ask again with a name the layer can use: the error says how such a
     /// name is formed.
     FixName,
+    /// Ask holders to keep it first (`hold`), and audit them: nothing
+    /// confirms it is kept anywhere else.
+    HoldFirst,
 }
 
 /// Why a version was refused. A refused version is never served as data.
@@ -55,6 +58,9 @@ pub enum Refusal {
     /// it. Versions inside the record's `since` (written before the seal)
     /// are not refused for this.
     Unsealed,
+    /// Its payload travels in pieces, and the collection's merge rule needs
+    /// every operation inline in its version (spec §4.1).
+    NotInline,
 }
 
 impl std::fmt::Display for Refusal {
@@ -102,6 +108,11 @@ impl std::fmt::Display for Refusal {
                 "it is not sealed, and the collection's members record seals it: its writer \
                  wrote it before hearing the record that sealed the collection; the writer \
                  writes it again, sealed",
+            ),
+            Refusal::NotInline => f.write_str(
+                "its payload travels in pieces, and the collection's merge rule needs every \
+                 operation inline; its writer writes it again inline, or puts the large value \
+                 into a log collection and refers to it by name",
             ),
         }
     }
@@ -173,6 +184,39 @@ pub enum DataError {
         /// The name asked for.
         name: Name,
     },
+    /// The payload is too large for the collection's rule: a merge
+    /// collection carries every operation inline (spec §4.1).
+    #[error(
+        "a payload of {size} octets is larger than the {limit} a merge collection carries \
+         inline in {collection}; put the large value into a log collection, where it travels \
+         in pieces, and refer to it by name"
+    )]
+    TooLarge {
+        /// The collection.
+        collection: Name,
+        /// The payload's octets.
+        size: u64,
+        /// The most a version carries inline.
+        limit: u64,
+    },
+    /// Prune does not apply to this collection's rule (spec §14).
+    #[error("{name} cannot be pruned: {why}")]
+    NotPrunable {
+        /// The name given.
+        name: Name,
+        /// Why, and what to do instead.
+        why: String,
+    },
+    /// Nothing confirms the data is kept anywhere but here, so this device
+    /// keeps its copy.
+    #[error(
+        "{name} is not held by any live lease this device audited as kept; ask holders to keep \
+         it (hold) and release it after their audit passes"
+    )]
+    NotHeld {
+        /// The name given.
+        name: Name,
+    },
     /// A local failure: storage or keys.
     #[error("local failure: {reason}")]
     Local {
@@ -198,16 +242,16 @@ impl DataError {
         match self {
             DataError::Unavailable { .. } => NextStep::RetryLater,
             DataError::NotFound { .. } | DataError::Pruned { .. } => NextStep::None,
-            DataError::BadName { .. } => NextStep::FixName,
+            DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
-                // Final: only its writer can write it again, sealed.
-                Refusal::Unsealed => NextStep::None,
+                Refusal::Unsealed | Refusal::NotInline => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,
-            DataError::NotOwnWrites { .. } => NextStep::EditInstead,
+            DataError::NotOwnWrites { .. } | DataError::NotPrunable { .. } => NextStep::EditInstead,
+            DataError::NotHeld { .. } => NextStep::HoldFirst,
             DataError::Local { .. } => NextStep::FixLocal,
         }
     }

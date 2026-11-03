@@ -40,8 +40,8 @@ const RECENT: usize = 4096;
 pub(crate) enum Entry {
     /// A version.
     Version,
-    /// A members record.
-    Members,
+    /// A record that is not a version: members, hold, lease or prune.
+    Record,
 }
 
 #[derive(Default)]
@@ -102,7 +102,7 @@ impl Tree {
         node.head = node.head.max(seq);
         match entry {
             Entry::Version => node.entries.insert(seq),
-            Entry::Members => node.members.insert(seq),
+            Entry::Record => node.members.insert(seq),
         };
         for (name, wire) in retired {
             self.remember(name, wire);
@@ -556,7 +556,7 @@ mod tests {
     fn every_packet_a_root_listed_is_served_however_many_puts_follow() {
         let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
         let mut tree = Tree::new(n("/alice"));
-        tree.add(&n("/alice/32=data/todo"), 1, Entry::Members);
+        tree.add(&n("/alice/32=data/todo"), 1, Entry::Record);
         tree.add(&n("/alice/32=data/todo"), 2, Entry::Version);
         // 1100 notes: the folder is paged and its fuller buckets sub-paged.
         for i in 0..1100u64 {

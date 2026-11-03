@@ -152,6 +152,40 @@ pub mod tlv {
     pub const EPHEMERAL_KEY: u64 = 0x057C;
     /// An epoch key's check: 32 octets, HKDF-SHA256 of the key (spec §9).
     pub const KEY_CHECK: u64 = 0x057E;
+
+    // Slice 3: odd numbers, critical — a reader that does not know them
+    // must refuse what carries them rather than pass over it.
+
+    /// A version's payload carried in pieces, in place of `Fields` and
+    /// `MergeOp` (or of a sealed payload's `Ciphertext`): `Size`, `Digest`
+    /// (of the root manifest node's packet).
+    pub const CHUNKS: u64 = 0x0521;
+    /// NonNegativeInteger: the payload's octets.
+    pub const SIZE: u64 = 0x0523;
+    /// The Content of a hold log entry: `Name` (collection), `Copies`,
+    /// `KeepUntil` (until), `Frontier` (what the asker had applied).
+    pub const HOLD_RECORD: u64 = 0x0525;
+    /// NonNegativeInteger: how many holders.
+    pub const COPIES: u64 = 0x0527;
+    /// The Content of a lease log entry: `Name` (collection), `Name` (the
+    /// hold record answered), `KeepUntil` (until), `Frontier` (what it
+    /// holds).
+    pub const LEASE_RECORD: u64 = 0x0529;
+    /// The Content of a prune log entry: `Name` (collection or version),
+    /// `Frontier` (up to).
+    pub const PRUNE_RECORD: u64 = 0x052B;
+    /// What a hold ask names: `Name` (the hold record).
+    pub const HOLD_ASK: u64 = 0x052D;
+    /// What an audit asks: `Nonce`, `Name` (the piece).
+    pub const AUDIT_ASK: u64 = 0x052F;
+    /// Octets: an audit's fresh random nonce (16).
+    pub const NONCE: u64 = 0x0531;
+    /// An audit's answer: `Piece` or `Missing`.
+    pub const AUDIT_ANSWER: u64 = 0x0533;
+    /// Octets: the piece's whole Data packet.
+    pub const PIECE: u64 = 0x0535;
+    /// Empty: the holder does not hold the piece.
+    pub const MISSING: u64 = 0x0537;
 }
 
 /// Keyword components of the layer's names.
@@ -162,6 +196,22 @@ const PAGE: &[u8] = b"page";
 const STATE: &[u8] = b"state";
 const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
+const MANIFEST: &[u8] = b"manifest";
+const HOLD: &[u8] = b"hold";
+const AUDIT: &[u8] = b"audit";
+
+/// The most payload octets a version carries in its own packet; a larger
+/// payload travels in pieces (log rule) or is refused (merge rule).
+pub const INLINE_MAX: usize = 6144;
+
+/// The payload octets one chunk carries (the last may carry fewer).
+pub const CHUNK: usize = 4096;
+
+/// The digests one manifest node lists.
+pub const FANOUT: usize = 128;
+
+/// The octets of an audit's nonce.
+pub const NONCE_LEN: usize = 16;
 
 /// The most seqs one summary node lists in its `Entries` and
 /// `MembersEntries` together; a node listing more is refused.
@@ -595,6 +645,216 @@ pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
     ))
 }
 
+// ---- slice 3: pieces, hold asks, audits ---------------------------------------------------------
+
+/// A piece of a large version (spec §4.1): a chunk of its payload, or a node
+/// of its manifest tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PieceKind {
+    /// Chunk `i` of the payload: `<V>/seg=<i>`.
+    Chunk(u64),
+    /// Manifest node `k`, in heap order from the root (0):
+    /// `<V>/32=manifest/seg=<k>`.
+    Manifest(u64),
+}
+
+/// A parsed piece name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PieceName {
+    /// The version's log entry name, `V`.
+    pub version: Name,
+    /// The version as parsed.
+    pub log: LogName,
+    /// Which piece.
+    pub kind: PieceKind,
+}
+
+/// The name of piece `kind` of the version named `version`.
+pub fn piece_name(version: &Name, kind: PieceKind) -> Name {
+    match kind {
+        PieceKind::Chunk(i) => version.clone().append_segment(i),
+        PieceKind::Manifest(k) => version
+            .clone()
+            .append_component(kw(MANIFEST))
+            .append_segment(k),
+    }
+}
+
+/// Parse `<V>/seg=<i>` or `<V>/32=manifest/seg=<k>`, `V` a version's log
+/// entry name (with a collection).
+pub fn parse_piece_name(name: &Name) -> Option<PieceName> {
+    let comps = name.components();
+    let (last, rest) = comps.split_last()?;
+    let n = last.as_segment()?;
+    let (rest, kind) = match rest.split_last() {
+        Some((m, before)) if is_kw(m, MANIFEST) => (before, PieceKind::Manifest(n)),
+        _ => (rest, PieceKind::Chunk(n)),
+    };
+    let version = name_of(rest);
+    let log = parse_log_name(&version)?;
+    log.subject.as_ref()?;
+    Some(PieceName { version, log, kind })
+}
+
+/// A hold ask's name: `<holder>/32=hold/<HoldAsk TLV>`, the TLV naming the
+/// owner device's hold record.
+pub fn hold_ask_name(holder: &Name, record: &Name) -> Name {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::HOLD_ASK, |w| write_name(w, record));
+    holder
+        .clone()
+        .append_component(kw(HOLD))
+        .append_component(NameComponent::generic(w.finish()))
+}
+
+/// Parse `<holder>/32=hold/<HoldAsk TLV>`: the holder and the hold record's
+/// name, a log entry with a collection.
+pub fn parse_hold_ask_name(name: &Name) -> Option<(Name, Name)> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, HOLD))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let mut r = TlvReader::new(comps[at + 1].value.clone());
+    let (typ, value) = r.read_tlv().ok()?;
+    if typ != tlv::HOLD_ASK || !r.is_empty() {
+        return None;
+    }
+    let mut record = None;
+    each(value, |t, v| {
+        if t != tlv_type::NAME {
+            return Ok(false);
+        }
+        record = Some(read_name(v)?);
+        Ok(true)
+    })
+    .ok()?;
+    let record = record?;
+    parse_log_name(&record)?.subject?;
+    Some((name_of(&comps[..at]), record))
+}
+
+/// What an audit asks a holder for: one piece, under a fresh nonce.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AuditAsk {
+    /// Random octets the auditor chose for this ask alone.
+    pub nonce: [u8; NONCE_LEN],
+    /// The piece: a version's log entry, or a chunk or manifest node of it.
+    pub piece: Name,
+}
+
+/// An audit ask's name: `<holder>/32=audit/<AuditAsk TLV>`.
+pub fn audit_ask_name(holder: &Name, ask: &AuditAsk) -> Name {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::AUDIT_ASK, |w| {
+        w.write_tlv(tlv::NONCE, &ask.nonce);
+        write_name(w, &ask.piece);
+    });
+    holder
+        .clone()
+        .append_component(kw(AUDIT))
+        .append_component(NameComponent::generic(w.finish()))
+}
+
+/// Parse `<holder>/32=audit/<AuditAsk TLV>`.
+pub fn parse_audit_ask_name(name: &Name) -> Option<(Name, AuditAsk)> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, AUDIT))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let mut r = TlvReader::new(comps[at + 1].value.clone());
+    let (typ, value) = r.read_tlv().ok()?;
+    if typ != tlv::AUDIT_ASK || !r.is_empty() {
+        return None;
+    }
+    let (mut nonce, mut piece) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv::NONCE => {
+                nonce = Some(
+                    <[u8; NONCE_LEN]>::try_from(v.as_ref())
+                        .map_err(|_| bad("a nonce is 16 octets"))?,
+                )
+            }
+            tlv_type::NAME => piece = Some(read_name(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+    .ok()?;
+    Some((
+        name_of(&comps[..at]),
+        AuditAsk {
+            nonce: nonce?,
+            piece: piece?,
+        },
+    ))
+}
+
+/// A holder's answer to an audit ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuditAnswer {
+    /// The piece's whole Data packet.
+    Piece(Bytes),
+    /// The holder does not hold it.
+    Missing,
+}
+
+/// Encode an audit answer (the Content of the holder's signed reply).
+pub fn encode_audit_answer(a: &AuditAnswer) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::AUDIT_ANSWER, |w| match a {
+        AuditAnswer::Piece(wire) => w.write_tlv(tlv::PIECE, wire),
+        AuditAnswer::Missing => w.write_tlv(tlv::MISSING, &[]),
+    });
+    w.finish()
+}
+
+/// Decode an audit answer.
+pub fn decode_audit_answer(content: Bytes) -> Result<AuditAnswer, WireError> {
+    let mut r = TlvReader::new(content);
+    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if typ != tlv::AUDIT_ANSWER || !r.is_empty() {
+        return Err(bad("an audit answer is one AuditAnswer"));
+    }
+    let mut answer = None;
+    each(value, |t, v| {
+        match t {
+            tlv::PIECE => answer = Some(AuditAnswer::Piece(v)),
+            tlv::MISSING => answer = Some(AuditAnswer::Missing),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    answer.ok_or_else(|| bad("an audit answer carries a piece or says it is missing"))
+}
+
+/// A manifest node's Content: the digests it lists, in order.
+pub fn encode_manifest(digests: &[[u8; 32]]) -> Bytes {
+    let mut w = TlvWriter::new();
+    for d in digests {
+        w.write_tlv(tlv::DIGEST, d);
+    }
+    w.finish()
+}
+
+/// Decode a manifest node's Content.
+pub fn decode_manifest(content: Bytes) -> Result<Vec<[u8; 32]>, WireError> {
+    let mut out = Vec::new();
+    each(content, |t, v| {
+        if t != tlv::DIGEST {
+            return Ok(false);
+        }
+        out.push(read_digest(&v)?);
+        Ok(true)
+    })?;
+    if out.is_empty() || out.len() > FANOUT {
+        return Err(bad(format!("a manifest node lists 1 to {FANOUT} digests")));
+    }
+    Ok(out)
+}
+
 /// The value of a component naming one epoch of one collection: the
 /// collection's Name TLV, then its `SealEpoch`.
 pub(crate) fn encode_epoch_of(c: &Name, e: &Epoch) -> Bytes {
@@ -880,6 +1140,10 @@ pub struct VersionBody {
     /// The payload sealed: when present, `Fields` and `MergeOp` travel
     /// inside it ([`encode_payload`]) and not beside it.
     pub sealed: Option<SealedBody>,
+    /// The payload carried in pieces (spec §4.1): when present, the
+    /// payload — sealed or not — travels in them, and neither `Fields` nor
+    /// `MergeOp` nor the sealed `Ciphertext` stands in the record.
+    pub chunks: Option<ChunksBody>,
 }
 
 /// A sealed payload: the epoch whose key seals it, and the ciphertext of
@@ -889,8 +1153,55 @@ pub struct VersionBody {
 pub struct SealedBody {
     /// The epoch.
     pub epoch: Epoch,
-    /// The ciphertext.
+    /// The ciphertext; empty when the version's payload travels in pieces
+    /// (the pieces carry it).
     pub ciphertext: Bytes,
+}
+
+/// A payload carried in pieces: its octets and the digest of its manifest
+/// tree's root node packet (spec §4.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunksBody {
+    /// The payload's octets as carried (sealed: the ciphertext's).
+    pub size: u64,
+    /// SHA-256 of the root manifest node's whole Data packet.
+    pub root: [u8; 32],
+}
+
+/// The body of a hold log entry: an owner device's custody policy for a
+/// collection (spec §13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldBody {
+    /// The collection to hold.
+    pub collection: Name,
+    /// How many holders.
+    pub copies: u32,
+    /// Until when.
+    pub until: Timestamp,
+    /// What the asker had applied of the collection when it asked.
+    pub at: Frontier,
+}
+
+/// The body of a lease log entry: a holder's promise (spec §13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseBody {
+    /// The collection held.
+    pub collection: Name,
+    /// The owner's hold record the lease answers.
+    pub hold: Name,
+    /// Until when.
+    pub until: Timestamp,
+    /// What the holder held, verified, when it signed.
+    pub holds: Frontier,
+}
+
+/// The body of a prune log entry (spec §14).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PruneBody {
+    /// A collection, or one of the pruner's version names in it.
+    pub prefix: Name,
+    /// Up to where, for the pruner's own key only.
+    pub upto: Frontier,
 }
 
 /// One removal in a members record.
@@ -962,6 +1273,30 @@ pub enum Record {
     Members(MembersBody),
     /// A snapshot's pins.
     Snapshot(Vec<Name>),
+    /// A hold record.
+    Hold(HoldBody),
+    /// A lease.
+    Lease(LeaseBody),
+    /// A prune record.
+    Prune(PruneBody),
+}
+
+impl Record {
+    /// The collection a log entry with this record is about (its name's
+    /// subject): `None` for a snapshot.
+    pub fn subject(&self) -> Option<Name> {
+        match self {
+            Record::Version(b) => Some(b.collection.clone()),
+            Record::Members(b) => Some(b.collection.clone()),
+            Record::Snapshot(_) => None,
+            Record::Hold(b) => Some(b.collection.clone()),
+            Record::Lease(b) => Some(b.collection.clone()),
+            Record::Prune(b) => match parse_log_name(&b.prefix) {
+                Some(l) => l.subject,
+                None => Some(b.prefix.clone()),
+            },
+        }
+    }
 }
 
 /// Encode a version record.
@@ -981,12 +1316,20 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
             Keep::Forever => w.write_tlv(tlv::KEEP_FOREVER, &[]),
         });
         write_nni(w, tlv::DATED, b.dated.0);
-        match &b.sealed {
-            Some(s) => w.write_nested(tlv::SEALED, |w| {
-                write_epoch(w, &s.epoch);
-                w.write_tlv(tlv::CIPHERTEXT, &s.ciphertext);
-            }),
-            None => write_payload(w, &b.fields, &b.op),
+        match (&b.sealed, &b.chunks) {
+            (Some(s), chunks) => {
+                w.write_nested(tlv::SEALED, |w| {
+                    write_epoch(w, &s.epoch);
+                    if chunks.is_none() {
+                        w.write_tlv(tlv::CIPHERTEXT, &s.ciphertext);
+                    }
+                });
+                if let Some(c) = chunks {
+                    write_chunks(w, c);
+                }
+            }
+            (None, Some(c)) => write_chunks(w, c),
+            (None, None) => write_payload(w, &b.fields, &b.op),
         }
     });
     w.finish()
@@ -1002,6 +1345,13 @@ fn write_payload(w: &mut TlvWriter, fields: &Content, op: &[u8]) {
         }
     });
     w.write_tlv(tlv::MERGE_OP, op);
+}
+
+fn write_chunks(w: &mut TlvWriter, c: &ChunksBody) {
+    w.write_nested(tlv::CHUNKS, |w| {
+        write_nni(w, tlv::SIZE, c.size);
+        w.write_tlv(tlv::DIGEST, &c.root);
+    });
 }
 
 /// What a sealed version's ciphertext carries: its `Fields` and `MergeOp`
@@ -1088,6 +1438,52 @@ pub fn encode_snapshot(pins: &[Name]) -> Bytes {
     w.finish()
 }
 
+/// Encode a hold record.
+pub fn encode_hold(b: &HoldBody) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::HOLD_RECORD, |w| {
+        write_name(w, &b.collection);
+        write_nni(w, tlv::COPIES, u64::from(b.copies));
+        write_nni(w, tlv::KEEP_UNTIL, b.until.0);
+        write_frontier(w, &b.at);
+    });
+    w.finish()
+}
+
+/// Encode a lease.
+pub fn encode_lease(b: &LeaseBody) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::LEASE_RECORD, |w| {
+        write_name(w, &b.collection);
+        write_name(w, &b.hold);
+        write_nni(w, tlv::KEEP_UNTIL, b.until.0);
+        write_frontier(w, &b.holds);
+    });
+    w.finish()
+}
+
+/// Encode a prune record.
+pub fn encode_prune(b: &PruneBody) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::PRUNE_RECORD, |w| {
+        write_name(w, &b.prefix);
+        write_frontier(w, &b.upto);
+    });
+    w.finish()
+}
+
+/// Encode any log record.
+pub fn encode_record(r: &Record) -> Bytes {
+    match r {
+        Record::Version(b) => encode_version(b),
+        Record::Members(b) => encode_members(b),
+        Record::Snapshot(p) => encode_snapshot(p),
+        Record::Hold(b) => encode_hold(b),
+        Record::Lease(b) => encode_lease(b),
+        Record::Prune(b) => encode_prune(b),
+    }
+}
+
 /// Decode a log entry's Content.
 pub fn decode_record(content: Bytes) -> Result<Record, WireError> {
     let mut r = TlvReader::new(content);
@@ -1109,7 +1505,96 @@ pub fn decode_record(content: Bytes) -> Result<Record, WireError> {
             })?;
             Ok(Record::Snapshot(pins))
         }
+        tlv::HOLD_RECORD => decode_hold(value).map(Record::Hold),
+        tlv::LEASE_RECORD => decode_lease(value).map(Record::Lease),
+        tlv::PRUNE_RECORD => decode_prune(value).map(Record::Prune),
         other => Err(bad(format!("{other:#x} is not a log record"))),
+    }
+}
+
+fn decode_hold(value: Bytes) -> Result<HoldBody, WireError> {
+    let (mut collection, mut copies, mut until, mut at) = (None, None, None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => collection = Some(read_name(v)?),
+            tlv::COPIES => {
+                copies = Some(u32::try_from(read_nni(&v)?).map_err(|_| bad("copies fit 32 bits"))?)
+            }
+            tlv::KEEP_UNTIL => until = Some(Timestamp(read_nni(&v)?)),
+            tlv::FRONTIER => at = Some(read_frontier(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (collection, copies, until, at) {
+        (Some(collection), Some(copies), Some(until), Some(at))
+            if is_collection_name(&collection) =>
+        {
+            Ok(HoldBody {
+                collection,
+                copies,
+                until,
+                at,
+            })
+        }
+        _ => Err(bad(
+            "a hold record names a collection, how many copies, until when, and a frontier",
+        )),
+    }
+}
+
+fn decode_lease(value: Bytes) -> Result<LeaseBody, WireError> {
+    let mut names = Vec::new();
+    let (mut until, mut holds) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => names.push(read_name(v)?),
+            tlv::KEEP_UNTIL => until = Some(Timestamp(read_nni(&v)?)),
+            tlv::FRONTIER => holds = Some(read_frontier(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    let bad_lease = || {
+        bad("a lease names a collection, the hold record it answers, until when, and a frontier")
+    };
+    let [collection, hold]: [Name; 2] = names.try_into().map_err(|_| bad_lease())?;
+    let held_about = parse_log_name(&hold).and_then(|l| l.subject);
+    match (until, holds) {
+        (Some(until), Some(holds))
+            if is_collection_name(&collection) && held_about.as_ref() == Some(&collection) =>
+        {
+            Ok(LeaseBody {
+                collection,
+                hold,
+                until,
+                holds,
+            })
+        }
+        _ => Err(bad_lease()),
+    }
+}
+
+fn decode_prune(value: Bytes) -> Result<PruneBody, WireError> {
+    let (mut prefix, mut upto) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => prefix = Some(read_name(v)?),
+            tlv::FRONTIER => upto = Some(read_frontier(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (prefix, upto) {
+        (Some(prefix), Some(upto))
+            if is_collection_name(&prefix)
+                || parse_log_name(&prefix).is_some_and(|l| l.subject.is_some()) =>
+        {
+            Ok(PruneBody { prefix, upto })
+        }
+        _ => Err(bad(
+            "a prune record names a collection or a version, and the frontier it prunes up to",
+        )),
     }
 }
 
@@ -1123,6 +1608,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut fields = None;
     let mut op = None;
     let mut sealed = None;
+    let mut chunks = None;
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
@@ -1173,22 +1659,58 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                     }
                     Ok(true)
                 })?;
-                let (Some(epoch), Some(ciphertext)) = (epoch, ciphertext) else {
-                    return Err(bad("a sealed payload has an epoch and a ciphertext"));
+                let Some(epoch) = epoch else {
+                    return Err(bad("a sealed payload names its epoch"));
                 };
-                sealed = Some(SealedBody { epoch, ciphertext });
+                sealed = Some((epoch, ciphertext));
+            }
+            tlv::CHUNKS => {
+                let (mut size, mut root) = (None, None);
+                each(v, |t, v| {
+                    match t {
+                        tlv::SIZE => size = Some(read_nni(&v)?),
+                        tlv::DIGEST => root = Some(read_digest(&v)?),
+                        _ => return Ok(false),
+                    }
+                    Ok(true)
+                })?;
+                let (Some(size), Some(root)) = (size, root) else {
+                    return Err(bad("a payload in pieces has a size and a root digest"));
+                };
+                if size as usize <= INLINE_MAX {
+                    return Err(bad(format!(
+                        "a payload of {size} octets travels inline, not in pieces"
+                    )));
+                }
+                chunks = Some(ChunksBody { size, root });
             }
             _ => return Ok(false),
         }
         Ok(true)
     })?;
     let missing = |what| bad(format!("a version record has {what}"));
-    let (fields, op) = match (fields, op, &sealed) {
-        (None, None, Some(_)) => (Content::new(), Bytes::new()),
-        (Some(f), Some(o), None) => (f, o),
-        (_, _, Some(_)) => return Err(bad("a sealed version carries its fields sealed only")),
-        (None, _, None) => return Err(missing("fields")),
-        (_, None, None) => return Err(missing("a merge op")),
+    let sealed = match (sealed, &chunks) {
+        (None, _) => None,
+        (Some((epoch, Some(ciphertext))), None) => Some(SealedBody { epoch, ciphertext }),
+        (Some((epoch, None)), Some(_)) => Some(SealedBody {
+            epoch,
+            ciphertext: Bytes::new(),
+        }),
+        (Some((_, None)), None) => return Err(bad("a sealed payload has a ciphertext")),
+        (Some((_, Some(_))), Some(_)) => {
+            return Err(bad("a payload in pieces has no ciphertext in its record"));
+        }
+    };
+    let (fields, op) = match (fields, op, sealed.is_some() || chunks.is_some()) {
+        (None, None, true) => (Content::new(), Bytes::new()),
+        (Some(f), Some(o), false) => (f, o),
+        (_, _, true) => {
+            return Err(bad(
+                "a sealed version, or one in pieces, carries its fields only there",
+            ));
+        }
+        (None, _, false) => return Err(missing("fields")),
+        (_, None, false) => return Err(missing("a merge op")),
     };
     Ok(VersionBody {
         collection: collection.ok_or_else(|| missing("a collection"))?,
@@ -1200,6 +1722,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         fields,
         op,
         sealed,
+        chunks,
     })
 }
 
@@ -1899,6 +2422,7 @@ mod tests {
                 epoch: epoch.clone(),
                 ciphertext: Bytes::from_static(b"opaque"),
             }),
+            chunks: None,
         };
         assert_eq!(
             decode_record(encode_version(&body)),

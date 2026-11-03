@@ -15,7 +15,7 @@ use ndn_foundation_types::Name;
 
 use crate::collection::{Cut, Rule, Summary};
 use crate::error::DataError;
-use crate::statement::{Custody, Snapshot};
+use crate::statement::{Custody, Prune, Snapshot};
 use crate::version::{Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId};
 
 /// The options of a [`put`](DataLayer::put).
@@ -99,6 +99,15 @@ pub enum Change {
         id: VersionId,
         /// The cut that refuses it.
         cut: Cut,
+    },
+    /// A version delivered earlier was pruned by its writer: the reader
+    /// dropped it, and a `get` of it answers [`DataError::Pruned`]. Filled
+    /// by slice 3.
+    Pruned {
+        /// The version.
+        id: VersionId,
+        /// The prune record that covers it.
+        by: Prune,
     },
     /// Two different versions with one `(writer, seq)`: evidence against that
     /// key (model invariant 2). Readers keep both and report.
@@ -194,16 +203,23 @@ pub trait DataLayer: Send + Sync {
 
     /// `hold(prefix, {copies, until}) → custody`.
     ///
-    /// Ask holders to keep what is under `prefix`, and get their signed
-    /// leases back, never beyond the data's keep. Filled by slice 3.
+    /// Ask holders to keep the collection `prefix` and get their signed
+    /// leases back, never beyond the data's keep. Each call audits every
+    /// live lease (random pieces, fresh nonces) and repairs: a lease found
+    /// broken or unanswered is asked again, then other holders, until
+    /// `copies` leases are kept. Only a device of the collection's namespace
+    /// asks ([`DataError::NotOwner`] otherwise). Filled by slice 3.
     async fn hold(&self, prefix: &Name, want: Hold) -> Result<Custody, DataError>;
 
     /// `prune(prefix, upto)`.
     ///
-    /// Drop this writer's own versions under `prefix` up to `upto`; the
-    /// record spreads like data and ends the leases it covers. Versions by
-    /// other keys are refused with [`DataError::NotOwnWrites`]. Sealed data
-    /// is erased by destroying its key. Filled by slice 3.
+    /// Drop this writer's own versions of the collection `prefix` (or the
+    /// one version `prefix` names) up to `upto`; the record spreads like
+    /// data and ends the leases it covers. Versions by other keys are
+    /// refused with [`DataError::NotOwnWrites`]; a merge collection's
+    /// versions with [`DataError::NotPrunable`]. Sealed data is erased by
+    /// destroying its epoch's key once every version of the epoch is
+    /// pruned. Filled by slice 3.
     async fn prune(&self, prefix: &Name, upto: &Frontier) -> Result<(), DataError>;
 
     /// `share(collection, {readers, writers})`.

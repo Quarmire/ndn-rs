@@ -23,7 +23,7 @@ define the bytes on the wire:
 
 | Spec | Covers |
 |---|---|
-| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals, types and the seven verbs; slice 1 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, TLV 0x0520–0x057F), later slices skeleton |
+| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals, types and the seven verbs; slices 1–3 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, seals, large payloads, custody leases and audits, prune; TLV 0x0520–0x057F), later slices skeleton |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
 | [ndnsf-invariants.md](ndnsf-invariants.md) | NDNSF security-invariant witnesses |
@@ -51,4 +51,4 @@ here before using it.
 | 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) |
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
 | 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
-| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones reserved for critical additions) |
+| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537) |

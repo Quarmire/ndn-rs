@@ -73,6 +73,12 @@ impl Keys {
     pub(crate) fn hold(&mut self, c: Name, epoch: Epoch, key: ContentKey) {
         self.held.insert((c, epoch), key);
     }
+
+    /// Destroy the content key of `epoch` of `c`: the held copy is dropped
+    /// (and zeroed, [`ContentKey`] is `ZeroizeOnDrop`). Whether one was held.
+    pub(crate) fn forget(&mut self, c: &Name, epoch: &Epoch) -> bool {
+        self.held.remove(&(c.clone(), epoch.clone())).is_some()
+    }
 }
 
 /// Seal a version's fields and operation under `key`, bound to its name.

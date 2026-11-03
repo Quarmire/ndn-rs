@@ -197,8 +197,8 @@ impl Content {
     }
 }
 
-/// What a version carries: one entry, or a block of many small entries under
-/// one signature.
+/// What a version carries: one entry, a block of many small entries under
+/// one signature, or a large entry carried in pieces.
 ///
 /// A block carries a digest per entry so each entry verifies on its own; the
 /// producer states the delay it accepts to fill one (model change M6). Blocks
@@ -209,6 +209,14 @@ pub enum Payload {
     Entry(Content),
     /// Several entries under one signature, in order.
     Block(Vec<Content>),
+    /// A single entry too large to carry in the version's own packet: it
+    /// travels in pieces, each verified against the version's signed
+    /// manifest (spec §4.1). Listing and watching report its size; a `get`
+    /// of the version's name reads it whole, as an [`Entry`](Self::Entry).
+    Large {
+        /// The payload's octets, as carried (sealed: the ciphertext's).
+        size: u64,
+    },
 }
 
 /// An immutable record signed by one key (model primitive "Version").
