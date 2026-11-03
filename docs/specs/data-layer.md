@@ -482,42 +482,50 @@ specially: a forwarder carries it with an ordinary strategy choice and
 ordinary routes, which the libraries that already know the namespace's
 membership install from data the forwarder holds.
 
-- **Strategy (trust-context library).** A forwarder that holds `O`'s
-  trust context runs `<O>/32=sync` with the multicast strategy from the
-  moment it holds the context — held at start, or adopted later
+- **Strategy (trust-context and link libraries).** A forwarder that holds
+  `O`'s trust context runs `<O>/32=sync` with the multicast strategy from
+  the moment it holds the context — held at start, or adopted later
   (`ndn_namespace::sync_group`). A newer version of the context leaves the
-  choice as it is.
+  choice as it is. A relay that serves `O`'s devices without holding `O`
+  runs the group with multicast while `O` is in transit there, from the
+  first served device of `O` linked until the last one leaves
+  ([ndn-link.md](ndn-link.md) §15.7).
 - **Routes (link library).** A link carries `O` when its peer was admitted
-  in `O` and the forwarder holds `O`'s trust context. Such a link gets a
-  route for `<O>/32=sync` beside the routes it gets for the peer's device
-  name or namespace (`ndn_link::group_routes`), with the same lifecycle:
-  added when the link is up, taken when a revocation takes the link's last
-  membership in `O`, and gone with the link's face when the link ends. An
-  enrollment link carries no group; nor does a link admitted only in a
-  namespace the forwarder serves without holding it.
+  in `O`: as a member of `O`, held here, or as a device the forwarder
+  serves for `O` without holding it. Such a link gets a route for
+  `<O>/32=sync` beside the routes it gets for the peer's device name or
+  namespace (`ndn_link::group_routes`), with the same lifecycle: added when
+  the link is up, taken when a revocation takes the link's last membership
+  in `O`, and gone with the link's face when the link ends. An enrollment
+  link carries no group.
 - **Members.** A device registers `<O>/32=sync` for its own sync face when
   it joins and does nothing else for the group. Its registration sits
   beside the link routes in the same entry, so the multicast strategy sends
   each Sync Interest to the local member and over every link that carries
   `O`, never back toward the face it came from.
 
-A forwarder holding no trust context for `O` (a hub with default routes)
-forwards the group like any other name. A forwarder learns no route from
-the face a Sync Interest arrived on.
+A forwarder that neither holds `O` nor serves its devices (a hub with
+default routes) forwards the group like any other name. A forwarder learns
+no route from the face a Sync Interest arrived on.
 
 **Reaching other people.** A person's devices reach another person's when
 their forwarders link — directly (each names the other's device in a peer
 entry) or through a relay both use — and hold each other's trust contexts
 (§3). A forwarder routes a namespace it follows (holds without a
-certificate in it) over every relay its person added, as it routes its own
-([ndn-link.md](ndn-link.md) §10, §15.5), so the other person's device
-names and, by route inheritance, their group go to the relay; a relay
-that holds the contexts of the namespaces it serves routes each linked
-device's name and each of those groups to the devices admitted in it, and
-runs the groups with multicast. Nothing is routed by hand and no route is
-learnt from traffic: the routes come from the links' admitted identities
-and the contexts held, the groups a device publishes into from the members
-records it holds.
+certificate in it) over every relay it uses, as it routes its own: one its
+person added, and one its namespace advertises in its trust context
+([ndn-link.md](ndn-link.md) §10, §15.5). The other person's device names
+and, by route inheritance, their group go to the relay. The relay needs no
+context of the people it carries: it serves their devices against their
+roots (`open`, or `listed`), routes each linked device's name, its issuers'
+key names and its namespace's group to it, runs the group with multicast
+while the namespace is in transit, and forwards their Data unvalidated; the
+devices validate it end to end, fetching the chain from the device that
+signed it. Two people who each advertise a community relay and adopt
+each other's anchor link reach each other with no further step. Nothing is
+routed by hand and no route is learnt from traffic: the routes come from
+the links' admitted identities and the contexts held, the groups a device
+publishes into from the members records it holds.
 
 ## 13. Custody — slice 3
 
