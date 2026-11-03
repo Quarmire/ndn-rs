@@ -70,9 +70,9 @@ use crate::wire::{
     self, AuditAnswer, AuditAsk, Branches, ChunksBody, CutBody, GrantAsk, HoldBody, LeaseBody,
     MembersBody, NodeBody, PieceKind, PruneBody, Record, SealedBody, VersionBody, audit_ask_name,
     device_of, grant_name, hold_ask_name, log_name, namespace_of, node_name, page_name,
-    parse_audit_ask_name, parse_grant_name, parse_hold_ask_name, parse_log_name, parse_piece_name,
-    parse_seal_key_name, parse_state_name, parse_summary_name, piece_name, seal_key_name, seqs_of,
-    state_name, subject_namespace, summary_prefix,
+    parse_audit_ask_name, parse_grant_name, parse_held_name, parse_hold_ask_name, parse_log_name,
+    parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name, piece_name,
+    seal_key_name, seqs_of, state_name, subject_namespace, summary_prefix,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -3102,6 +3102,15 @@ impl Inner {
             });
             return;
         }
+        if let Some((holder, piece)) = parse_held_name(&name)
+            && holder == self.device
+        {
+            let reply = self
+                .packet_for(&piece, false)
+                .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256());
+            self.reply(&name, responder, reply).await;
+            return;
+        }
         if let Some((holder, ask)) = parse_audit_ask_name(&name)
             && holder == self.device
         {
@@ -3127,7 +3136,7 @@ impl Inner {
     fn packet_for(&self, name: &Name, can_be_prefix: bool) -> Option<Bytes> {
         // Own log entries and pieces of own versions; and, of a collection
         // this device holds for its owner, every entry and piece it keeps
-        // (readers reach it with a forwarding hint naming it).
+        // (readers ask it for them under its own name, `32=held`).
         let log = parse_log_name(name).or_else(|| parse_piece_name(name).map(|p| p.log));
         if let Some(parsed) = log {
             if parsed.device == self.device {
@@ -3655,23 +3664,18 @@ impl Inner {
         out
     }
 
-    /// Fetch `name` from `holder`: the Interest carries `holder` as its
-    /// forwarding hint, so it reaches the holder whoever wrote the data.
-    async fn fetch_hinted(&self, name: Name, holder: &Name) -> Option<Data> {
-        let _slot = self.slots.acquire().await.ok()?;
-        let b = InterestBuilder::new(name)
-            .lifetime(self.config.lifetime)
-            .forwarding_hint(vec![holder.clone()]);
-        Consumer::new(self.node.connection())
-            .fetch_with(b)
-            .await
-            .map_err(|e| tracing::trace!(me = %self.device, %holder, "hinted fetch missed: {e}"))
-            .ok()
+    /// Fetch `name`, another device's packet, from `holder`, which keeps
+    /// it for that device's collection: asked under the holder's own name
+    /// ([`wire::held_name`]), answered with the packet inside.
+    async fn fetch_held(&self, name: &Name, holder: &Name) -> Option<Data> {
+        let reply = self.fetch(wire::held_name(holder, name), false).await?;
+        let inner = Data::decode(reply.content()?.clone()).ok()?;
+        (*inner.name == *name).then_some(inner)
     }
 
     /// Piece `name` of a large version of `c`, checked against `digest`:
     /// from the store, else from its writer by name, else from each holder
-    /// of `c`; stored once found.
+    /// of `c` ([`Self::fetch_held`]); stored once found.
     async fn get_piece(
         self: &Arc<Self>,
         c: &Name,
@@ -3684,12 +3688,15 @@ impl Inner {
             return Some(w);
         }
         let holders = self.holders_of(&self.st.lock(), c);
-        let mut sources = vec![None];
+        // An Interest for this device's own name goes nowhere useful: its
+        // own pieces it released are asked of the holders only.
+        let own = parse_piece_name(name).is_some_and(|p| p.log.device == self.device);
+        let mut sources = if own { Vec::new() } else { vec![None] };
         sources.extend(holders.into_iter().map(Some));
         for source in sources {
             let data = match &source {
                 None => self.fetch(name.clone(), false).await,
-                Some(h) => self.fetch_hinted(name.clone(), h).await,
+                Some(h) => self.fetch_held(name, h).await,
             };
             let Some(data) = data else { continue };
             if *data.name != *name || wire::implicit_digest(data.raw()) != *digest {

@@ -199,6 +199,7 @@ const GRANT: &[u8] = b"grant";
 const MANIFEST: &[u8] = b"manifest";
 const HOLD: &[u8] = b"hold";
 const AUDIT: &[u8] = b"audit";
+const HELD: &[u8] = b"held";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces (log rule) or is refused (merge rule).
@@ -732,6 +733,31 @@ pub fn parse_hold_ask_name(name: &Name) -> Option<(Name, Name)> {
     let record = record?;
     parse_log_name(&record)?.subject?;
     Some((name_of(&comps[..at]), record))
+}
+
+/// The name that asks holder `holder` for a packet it keeps of another
+/// device, `piece` (a log entry, a chunk or a manifest node):
+/// `<holder>/32=held/<Name TLV>`. It routes to the holder by its own name.
+pub fn held_name(holder: &Name, piece: &Name) -> Name {
+    holder
+        .clone()
+        .append_component(kw(HELD))
+        .append_component(NameComponent::generic(piece.encode_to_tlv()))
+}
+
+/// Parse `<holder>/32=held/<Name TLV>`.
+pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, HELD))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let mut r = TlvReader::new(comps[at + 1].value.clone());
+    let (typ, value) = r.read_tlv().ok()?;
+    if typ != tlv_type::NAME || !r.is_empty() {
+        return None;
+    }
+    Some((name_of(&comps[..at]), read_name(value).ok()?))
 }
 
 /// What an audit asks a holder for: one piece, under a fresh nonce.

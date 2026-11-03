@@ -660,8 +660,9 @@ reader refuses a version in pieces of a merge collection (`NotInline`).
   and a sealed payload stays sealed in pieces: holders see the size.
 - A reader lists such a version with `Payload::Large { size }` and reads it
   whole on `get` of its name (or of the log collection's newest): each
-  piece from its store, else by name, else by name with a ForwardingHint
-  naming each holder of a live lease it knows (§13.2); a piece that is not
+  piece from its store, else by name, else from each holder of a live lease
+  it knows (§13.2) by the Interest `<H>/32=held/<Name TLV>`, which the
+  holder answers (DigestSha256) with the packet inside; a piece that is not
   the one its parent lists is dropped and fetched elsewhere.
 
 ### 13.2 Hold records and leases
@@ -694,7 +695,8 @@ reader refuses a version in pieces of a merge collection (`NotInline`).
   lease's packet). It signs a new lease when what it holds grows. Holders
   publish once into the groups of the namespaces they hold for, so owner
   devices know whom to ask. A holder serves every entry and piece of a
-  collection it holds, whoever wrote it.
+  collection it holds, whoever wrote it, by its own name and under
+  `<H>/32=held/…`.
 
 ### 13.3 Audits
 
@@ -871,6 +873,7 @@ both from the NDN naming conventions.
 | chunk of version `V` | `<V>/seg=<i>` | DigestSha256 |
 | manifest node of `V` | `<V>/32=manifest/seg=<k>`, Content `Digest*` | DigestSha256 |
 | hold ask (answer: the lease's packet) | `<H>/32=hold/<HoldAsk TLV>` | DigestSha256 |
+| held packet (answer: the packet) | `<H>/32=held/<Name TLV>` | DigestSha256 |
 | audit ask and answer | `<H>/32=audit/<AuditAsk TLV>`, Content `AuditAnswer`, FreshnessPeriod 0 | the holder's device key |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
@@ -1033,8 +1036,10 @@ to equal bytes and equal nodes have equal digests.
   digest-of-packet links; RDR's flat manifest (`ndn-app`, TLV 0xF504) caps at
   256 segments and lists payload hashes, so the tree here is FLIC-like
   instead: nested, any size, digests of whole packets, the root in the
-  signed record. ForwardingHint (NDN's own) reaches a holder for another
-  producer's names.
+  signed record. A holder is asked for another producer's packet under its
+  own name (`32=held`), which routes like any of its names; a forwarding
+  hint would need every forwarder on the way to route the hint, which the
+  link layer does not promise.
 - **Leases and holds are log entries**, so they spread through summaries
   like everything else and carry the writer's own monotonic order; the
   audit answer is the one per-ask signature, under a nonce name no cache can
