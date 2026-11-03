@@ -44,6 +44,12 @@ pub struct SecurityManager {
     next_seq: AtomicU64,
     cert_cache: Arc<CertCache>,
     keyring: Arc<Keyring>,
+    /// Key material that is not a signing key, by name
+    /// ([`secret`](Self::secret)): what this run kept or read.
+    secrets: DashMap<Name, zeroize::Zeroizing<Vec<u8>>>,
+    /// The PIB this manager was loaded from, which keeps its secrets
+    /// across runs.
+    pib: Option<crate::pib::FilePib>,
 }
 
 /// An identity's signing key and when the identity was first registered.
@@ -94,6 +100,8 @@ impl SecurityManager {
             next_seq: AtomicU64::new(0),
             cert_cache: Arc::new(CertCache::new()),
             keyring,
+            secrets: DashMap::new(),
+            pib: None,
         }
     }
 
@@ -130,6 +138,38 @@ impl SecurityManager {
     /// over NDN.
     pub fn cert_cache_arc(&self) -> Arc<CertCache> {
         Arc::clone(&self.cert_cache)
+    }
+
+    /// The secret kept under `name` ([`put_secret`](Self::put_secret)):
+    /// key material that is not a signing key, such as a device's X25519
+    /// recipient secret. Read from the PIB this manager was loaded from when
+    /// this run has not kept it; `None` when neither holds it.
+    pub fn secret(&self, name: &Name) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        if let Some(s) = self.secrets.get(name) {
+            return Some(s.clone());
+        }
+        let stored = match self.pib.as_ref()?.secret(name) {
+            Ok(stored) => stored?,
+            Err(e) => {
+                tracing::warn!(target: "security", %name, error = %e, "a secret kept in the PIB cannot be read");
+                return None;
+            }
+        };
+        self.secrets.insert(name.clone(), stored.clone());
+        Some(stored)
+    }
+
+    /// Keep `secret` under `name` with the keys: in memory for this run,
+    /// and in the PIB this manager was loaded from
+    /// ([`from_pib`](Self::from_pib), [`auto_init`](Self::auto_init)), so a
+    /// later run reads it back. Fails only when the PIB cannot store it.
+    pub fn put_secret(&self, name: Name, secret: &[u8]) -> Result<(), TrustError> {
+        if let Some(pib) = &self.pib {
+            pib.store_secret(&name, secret)?;
+        }
+        self.secrets
+            .insert(name, zeroize::Zeroizing::new(secret.to_vec()));
+        Ok(())
     }
 
     /// Generate a new Ed25519 key pair from a random seed and store it.
@@ -586,9 +626,11 @@ impl SecurityManager {
     }
 
     /// The node key `key_name` first, then the PIB's other signing
-    /// identities, then its trust anchors.
+    /// identities, then its trust anchors; the PIB keeps the manager's
+    /// secrets ([`put_secret`](Self::put_secret)).
     fn from_pib_key(pib: &crate::pib::FilePib, key_name: &Name) -> Result<Self, TrustError> {
-        let mgr = SecurityManager::new();
+        let mut mgr = SecurityManager::new();
+        mgr.pib = Some(pib.clone());
 
         let signer = pib.get_signer(key_name)?;
         mgr.insert_key(key_name.clone(), signer, true);
@@ -1150,6 +1192,48 @@ mod tests {
         let loaded = SecurityManager::from_pib(&pib, &identity).unwrap();
         assert_eq!(identity_signer(&loaded, &identity), (key.clone(), pk));
         assert!(loaded.trust_anchor(&key).is_some(), "self anchor reloads");
+    }
+
+    /// A secret kept with the keys of a manager loaded from a PIB is in the
+    /// PIB, owner-only, and the next run's manager reads it back; a manager
+    /// of no PIB keeps it for its own life only.
+    #[test]
+    fn a_secret_kept_with_the_keys_survives_a_restart_through_the_pib() {
+        let dir = tempfile::tempdir().unwrap();
+        let pib_path = dir.path().join("pib");
+        let identity = n("/alice/laptop");
+        let name = n("/localhost/ndn-data/seal/alice/laptop");
+        let (first, _) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert_eq!(first.secret(&name), None);
+        first.put_secret(name.clone(), &[7; 32]).unwrap();
+        assert_eq!(
+            first.secret(&name).as_deref().map(Vec::as_slice),
+            Some(&[7u8; 32][..])
+        );
+        drop(first);
+        let (again, generated) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
+        assert!(!generated);
+        assert_eq!(
+            again.secret(&name).as_deref().map(Vec::as_slice),
+            Some(&[7u8; 32][..])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file = std::fs::read_dir(pib_path.join("secrets"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+                .join("secret");
+            let mode = std::fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "owner-only");
+        }
+        let memory = SecurityManager::new();
+        memory.put_secret(name.clone(), &[1; 32]).unwrap();
+        assert!(memory.secret(&name).is_some());
+        assert!(SecurityManager::new().secret(&name).is_none());
     }
 
     /// With two identities in one PIB, the requested one is loaded with its

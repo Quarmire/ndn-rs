@@ -52,6 +52,9 @@ impl From<PibError> for TrustError {
 ///   root/                   # a namespace root device's root store, kept by
 ///     store.toml            # `ndn_cert::root_store`: where the root key
 ///     root.safebag          # lives, and its passphrase-sealed SafeBag
+///   secrets/<sha256>/       # key material that is not a signing key
+///     name.uri              # (e.g. a device's X25519 recipient secret),
+///     secret                # by name: the raw octets
 ///   default-identity        # the node's default identity, NDN URI (optional)
 /// ```
 ///
@@ -75,6 +78,7 @@ impl From<PibError> for TrustError {
 /// (BE), 8B valid_from (ns, BE), 8B valid_until (ns, BE; `u64::MAX` =
 /// never), 4B pk_len (BE), then the public key bytes. V1 omits the
 /// `sig_type` field and defaults to `SignatureEd25519` on read.
+#[derive(Clone)]
 pub struct FilePib {
     root: PathBuf,
 }
@@ -200,6 +204,33 @@ impl FilePib {
 
     pub fn list_keys(&self) -> Result<Vec<Name>, PibError> {
         list_names_in(&self.root.join("keys"))
+    }
+
+    /// Keep `secret` under `name`: key material that is not a signing key,
+    /// such as a device's X25519 recipient secret, stored owner-only like a
+    /// private key (`secrets/<sha256>/secret`). Replaces what was kept
+    /// under `name`.
+    pub fn store_secret(&self, name: &Name, secret: &[u8]) -> Result<(), PibError> {
+        let dir = self.root.join(SECRETS_DIR).join(name_hash(name));
+        secure_fs::create_private_dir_all(&dir)?;
+        secure_fs::write_private(&dir.join(SECRET_FILE), secret)?;
+        secure_fs::write_private(&dir.join("name.uri"), name_to_uri(name))?;
+        Ok(())
+    }
+
+    /// The secret kept under `name` ([`store_secret`](Self::store_secret)),
+    /// `None` if none is.
+    pub fn secret(&self, name: &Name) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, PibError> {
+        let path = self
+            .root
+            .join(SECRETS_DIR)
+            .join(name_hash(name))
+            .join(SECRET_FILE);
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(zeroize::Zeroizing::new(bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PibError::Io(e)),
+        }
     }
 
     /// Keys stored for `identity`, sorted by name: every key whose name
@@ -583,6 +614,10 @@ impl FilePib {
 
 /// `<pib>/default-identity`: the default identity's NDN URI.
 const DEFAULT_IDENTITY_FILE: &str = "default-identity";
+/// `<pib>/secrets/<sha256>/`: one named secret ([`FilePib::store_secret`]).
+const SECRETS_DIR: &str = "secrets";
+/// The secret's octets in its directory.
+const SECRET_FILE: &str = "secret";
 const NDNC_MAGIC: &[u8; 4] = b"NDNC";
 const NDNC_VERSION_V1: u8 = 1;
 const NDNC_VERSION_V2: u8 = 2;
