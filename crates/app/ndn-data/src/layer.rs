@@ -124,12 +124,16 @@ pub enum Change {
 pub type Changes = Pin<Box<dyn Stream<Item = Result<Change, DataError>> + Send>>;
 
 /// What a [`hold`](DataLayer::hold) asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Hold {
-    /// How many holders.
+    /// How many holders, each a distinct device, must keep it.
     pub copies: u32,
     /// Until when; each lease is capped by the data's keep.
     pub until: Timestamp,
+    /// The holder devices the owner chooses, by name: at least `copies` of
+    /// them, none of them this device. Only they are asked, and only their
+    /// leases count (spec §13.2).
+    pub holders: Vec<Name>,
 }
 
 /// The new content of a collection's members record, for
@@ -201,14 +205,17 @@ pub trait DataLayer: Send + Sync {
     /// slice 2.
     async fn snapshot(&self, of: &[Name]) -> Result<Snapshot, DataError>;
 
-    /// `hold(prefix, {copies, until}) → custody`.
+    /// `hold(prefix, {copies, until, holders}) → custody`.
     ///
-    /// Ask holders to keep the collection `prefix` and get their signed
-    /// leases back, never beyond the data's keep. Each call audits every
-    /// live lease (random pieces, fresh nonces) and repairs: a lease found
-    /// broken or unanswered is asked again, then other holders, until
-    /// `copies` leases are kept. Only a device of the collection's namespace
-    /// asks ([`DataError::NotOwner`] otherwise). Filled by slice 3.
+    /// Ask the holder devices the owner names to keep the collection
+    /// `prefix` and get their signed leases back, never beyond the data's
+    /// keep. Each call audits every live lease (random pieces, fresh nonces)
+    /// and repairs: a named holder whose lease is broken, unanswered or
+    /// missing is asked, until `copies` distinct holder devices hold it
+    /// kept. Only a device of the collection's namespace asks
+    /// ([`DataError::NotOwner`] otherwise); fewer holders than copies, or a
+    /// holder that is no device or this device itself, is
+    /// [`DataError::BadRequest`]. Filled by slice 3.
     async fn hold(&self, prefix: &Name, want: Hold) -> Result<Custody, DataError>;
 
     /// `prune(prefix, upto)`.
@@ -217,9 +224,10 @@ pub trait DataLayer: Send + Sync {
     /// one version `prefix` names) up to `upto`; the record spreads like
     /// data and ends the leases it covers. Versions by other keys are
     /// refused with [`DataError::NotOwnWrites`]; a merge collection's
-    /// versions with [`DataError::NotPrunable`]. Sealed data is erased by
-    /// destroying its epoch's key once every version of the epoch is
-    /// pruned. Filled by slice 3.
+    /// versions with [`DataError::NotPrunable`]; up to past this device's
+    /// newest entry with [`DataError::BadRequest`]. Sealed data is erased by
+    /// destroying its epoch's key once every writer's versions of the epoch
+    /// are pruned or cut. Filled by slice 3.
     async fn prune(&self, prefix: &Name, upto: &Frontier) -> Result<(), DataError>;
 
     /// `share(collection, {readers, writers})`.

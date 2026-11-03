@@ -120,6 +120,12 @@ pub trait DataStore: Send + Sync {
     fn insert(&self, name: Name, wire: Bytes);
     /// Return the encoded Data previously stored under `name`.
     fn get(&self, name: &Name) -> Option<Bytes>;
+    /// Whether something is stored under exactly `name`. The default reads
+    /// it ([`get`](Self::get)); a store whose reads cost more than a lookup
+    /// (one that decodes erasure-coded shards, say) answers without reading.
+    fn contains(&self, name: &Name) -> bool {
+        self.get(name).is_some()
+    }
     /// Return the lexicographically-smallest stored Data whose name has
     /// `prefix` as a prefix — the answer to a `CanBePrefix` Interest
     /// (e.g. a seq-name Interest matching that seq's segment 0). The

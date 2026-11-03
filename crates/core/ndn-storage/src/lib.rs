@@ -434,6 +434,11 @@ mod sync {
         /// Fetch the value stored under `key`. `Ok(None)` is a genuine miss; `Err` is an
         /// engine failure.
         fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>>;
+        /// Whether a value is stored under `key`, without reading it where the engine can.
+        /// Default: [`get`](Self::get).
+        fn contains(&self, key: &[u8]) -> StorageResult<bool> {
+            Ok(self.get(key)?.is_some())
+        }
         /// Store `value` under `key` (overwriting any existing value).
         fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()>;
         /// Remove `key` if present.
@@ -527,6 +532,9 @@ mod sync {
     impl SyncBackend for SyncMemoryBackend {
         fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> {
             Ok(self.with_map(|m| m.get(key).cloned()))
+        }
+        fn contains(&self, key: &[u8]) -> StorageResult<bool> {
+            Ok(self.with_map(|m| m.contains_key(key)))
         }
         fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
             self.with_map(|m| m.insert(key.to_vec(), value));
@@ -971,6 +979,11 @@ mod fjall_backend {
             // A real read error is surfaced (was previously collapsed into `None`).
             let v = self.keyspace.get(key).map_err(StorageError::backend)?;
             Ok(v.map(|s| Bytes::copy_from_slice(&s)))
+        }
+        fn contains(&self, key: &[u8]) -> StorageResult<bool> {
+            self.keyspace
+                .contains_key(key)
+                .map_err(StorageError::backend)
         }
         fn put(&self, key: &[u8], value: Bytes) -> StorageResult<()> {
             self.keyspace

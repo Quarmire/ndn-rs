@@ -36,6 +36,9 @@ pub enum NextStep {
     /// Ask holders to keep it first (`hold`), and audit them: nothing
     /// confirms it is kept anywhere else.
     HoldFirst,
+    /// Ask again as the error says: the request, as given, asks for
+    /// something no device does (a prune past the log, too few holders).
+    FixRequest,
 }
 
 /// Why a version was refused. A refused version is never served as data.
@@ -185,18 +188,20 @@ pub enum DataError {
         name: Name,
     },
     /// The payload is too large for the collection's rule: a merge
-    /// collection carries every operation inline (spec §4.1).
+    /// collection carries every operation inline (spec §4.1); a log
+    /// collection, in pieces, up to [`PAYLOAD_MAX`](crate::wire::PAYLOAD_MAX).
     #[error(
-        "a payload of {size} octets is larger than the {limit} a merge collection carries \
-         inline in {collection}; put the large value into a log collection, where it travels \
-         in pieces, and refer to it by name"
+        "a payload of {size} octets is larger than the {limit} a version of {collection} carries \
+         (inline in a merge collection, in pieces in a log collection); put a large value into a \
+         log collection, where it travels in pieces, split one larger than that, and refer to it \
+         by name"
     )]
     TooLarge {
         /// The collection.
         collection: Name,
         /// The payload's octets.
         size: u64,
-        /// The most a version carries inline.
+        /// The most a version of the collection carries.
         limit: u64,
     },
     /// Prune does not apply to this collection's rule (spec §14).
@@ -210,12 +215,22 @@ pub enum DataError {
     /// Nothing confirms the data is kept anywhere but here, so this device
     /// keeps its copy.
     #[error(
-        "{name} is not held by any live lease this device audited as kept; ask holders to keep \
-         it (hold) and release it after their audit passes"
+        "{name} is not released: {why}; ask holders that keep it to hold it (hold), then release \
+         it again"
     )]
     NotHeld {
         /// The name given.
         name: Name,
+        /// Why the evidence did not suffice: which holders proved what.
+        why: String,
+    },
+    /// The request asks for something no device does as given.
+    #[error("{name}: {why}")]
+    BadRequest {
+        /// The name given.
+        name: Name,
+        /// Why, and what to ask instead.
+        why: String,
     },
     /// A local failure: storage or keys.
     #[error("local failure: {reason}")]
@@ -252,6 +267,7 @@ impl DataError {
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,
             DataError::NotOwnWrites { .. } | DataError::NotPrunable { .. } => NextStep::EditInstead,
             DataError::NotHeld { .. } => NextStep::HoldFirst,
+            DataError::BadRequest { .. } => NextStep::FixRequest,
             DataError::Local { .. } => NextStep::FixLocal,
         }
     }

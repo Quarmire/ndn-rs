@@ -67,12 +67,13 @@ use crate::version::{
     Audience, Content, Frontier, Keep, Payload, Seal, Seq, Timestamp, Version, VersionId, Writer,
 };
 use crate::wire::{
-    self, AuditAnswer, AuditAsk, Branches, ChunksBody, CutBody, GrantAsk, HoldBody, LeaseBody,
-    MembersBody, NodeBody, PieceKind, PruneBody, Record, SealedBody, VersionBody, audit_ask_name,
-    device_of, grant_name, hold_ask_name, log_name, namespace_of, node_name, page_name,
-    parse_audit_ask_name, parse_grant_name, parse_held_name, parse_hold_ask_name, parse_log_name,
-    parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name, piece_name,
-    root_name, root_prefix, seal_key_name, seqs_of, state_name, subject_namespace,
+    self, AuditAnswer, AuditAsk, Branches, ChunksBody, CutBody, GrantAsk, HoldAsk, HoldBody,
+    LeaseBody, MembersBody, NodeBody, PieceKind, PruneBody, Record, SealedBody, VersionBody,
+    audit_ask_name, device_of, grant_name, hold_ask_name, log_name, namespace_of, node_name,
+    page_name, parse_audit_ask_name, parse_grant_name, parse_held_name, parse_hold_ask_name,
+    parse_log_name, parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name,
+    piece_name, piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name,
+    subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -108,8 +109,13 @@ pub struct Config {
     /// Fetches in flight at once.
     pub window: usize,
     /// The namespaces whose collections this device keeps for their owners
-    /// under custody leases (spec §13): it answers their owners' hold asks
-    /// and audits. Empty: the device is not a holder.
+    /// under custody leases (spec §13): it answers the hold asks and audits
+    /// of the owner devices whose hold records name it a holder. Empty: the
+    /// device is not a holder. A holder enrolled in a namespace it holds for
+    /// is a device of that person: of every audience `Person` of that
+    /// namespace admits, and able to sign the owner's records; a holder that
+    /// must not read what it keeps is enrolled outside the namespaces it
+    /// holds for (spec §13.4).
     pub hold_for: Vec<Name>,
     /// How many random pieces an audit asks each holder for.
     pub audit_pieces: usize,
@@ -163,8 +169,8 @@ impl std::fmt::Debug for Config {
     }
 }
 
-/// What a [`Device::release`] dropped.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a [`Device::release`] dropped, and what it kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Released {
     /// Large versions whose pieces were dropped.
     pub versions: u32,
@@ -172,6 +178,9 @@ pub struct Released {
     pub pieces: u32,
     /// Their octets.
     pub bytes: u64,
+    /// The versions kept here, as too few holders proved they keep them,
+    /// each with why.
+    pub kept: Vec<(Name, String)>,
 }
 
 /// How a device reaches its forwarder: a [`Node`] for fetching and serving,
@@ -201,8 +210,11 @@ struct HeldVersion {
     chunks: Option<ChunksBody>,
 }
 
-/// A lease of a collection this device knows, the newest of its holder.
+/// A lease of a collection this device knows, the newest of its holder
+/// device (by log seq, which the device's keys share).
 struct LeaseHeld {
+    /// The key that signed it.
+    writer: Writer,
     seq: u64,
     name: Name,
     body: LeaseBody,
@@ -266,16 +278,18 @@ struct Coll {
     /// The hold records of the owner's devices, the newest of each: its
     /// seq, its name, what it asks.
     holds: BTreeMap<Writer, (u64, Name, HoldBody)>,
-    /// The leases on the collection, by holder key.
-    leases: BTreeMap<Writer, LeaseHeld>,
+    /// The leases on the collection, by holder device: one device counts
+    /// once, whatever keys sign for it (spec §13.2).
+    leases: BTreeMap<Name, LeaseHeld>,
     /// The prune records known (spec §14).
     prunes: Vec<Prune>,
     /// The keep and epoch of each version dropped as pruned, so the leases
     /// that held it can still be checked against it, and its epoch's key
     /// destroyed once the epoch is all pruned.
     pruned_keeps: HashMap<VersionId, (Keep, Option<Epoch>)>,
-    /// Epochs whose key this device destroyed: every version sealed in them
-    /// is pruned (spec §14).
+    /// Epochs whose key this device destroyed: every writer's versions
+    /// sealed in them are pruned or cut (spec §14). Kept in the store, so a
+    /// restart refuses their keys too.
     erased: BTreeSet<Epoch>,
 }
 
@@ -424,12 +438,29 @@ impl<V> Kept<V> {
             }
         }
     }
+
+    /// Drop every entry whose key `keep` refuses.
+    fn retain(&mut self, mut keep: impl FnMut(&Name) -> bool) {
+        self.map.retain(|k, _| keep(k));
+        let map = &self.map;
+        self.order.retain(|k| map.contains_key(k));
+    }
 }
 
 /// Grants a device keeps signed, so asking again gets the same packet.
 const GRANTS_KEPT: usize = 4096;
 /// Askers' seal keys a device keeps verified.
 const SEAL_KEYS_KEPT: usize = 1024;
+/// Answers to hold and audit asks a holder keeps signed, by the ask's name:
+/// the same ask asked again (a replay) costs no work and no signature.
+const ANSWERS_KEPT: usize = 1024;
+/// Asker proofs a holder verifies at once, whoever claims to ask: what a
+/// stranger's asks can cost it before they are refused.
+const ASKS_VERIFYING: usize = 8;
+/// Hold asks of one owner device a holder works on at once.
+const HOLDS_PER_ASKER: usize = 1;
+/// Audit asks of one owner device a holder answers at once.
+const AUDITS_PER_ASKER: usize = 64;
 
 /// Why this device owes a collection a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -459,6 +490,9 @@ struct Holding {
     hold: Name,
     /// Until when the owner asked.
     until: Timestamp,
+    /// What the hold record asks to keep: the versions inside it are all
+    /// this device stores of the collection (spec §13.2).
+    at: Frontier,
     /// The newest lease signed: what it holds and until when.
     lease: Option<(Frontier, Timestamp)>,
 }
@@ -537,6 +571,14 @@ struct St {
     holding: BTreeMap<Name, Holding>,
     /// Large versions whose pieces are being fetched.
     fetching: BTreeSet<Name>,
+    /// Own large versions whose pieces this device serves to no one while a
+    /// release audits their holders (spec §13.3): an answer relayed from
+    /// this device proves nothing.
+    quarantine: BTreeSet<Name>,
+    /// Per asker device, its hold and audit asks this holder is working on.
+    asks: HashMap<Name, usize>,
+    /// Answers to hold and audit asks signed, by the ask's name.
+    answers: Kept<Bytes>,
 }
 
 struct Inner {
@@ -554,6 +596,8 @@ struct Inner {
     st: Mutex<St>,
     progress: Notify,
     slots: Semaphore,
+    /// Asker proofs being verified ([`ASKS_VERIFYING`]).
+    verifying: Semaphore,
     signatures: AtomicU64,
     started: Instant,
     serving: Mutex<Option<ServeGuard>>,
@@ -1089,16 +1133,40 @@ impl St {
 
     /// Hold `key` as the key of epoch `e` of `c` if it matches the key
     /// check of the held record naming that epoch (spec §9), and open what
-    /// it unlocks. Whether it matched.
+    /// it unlocks. Whether it matched. The key of an epoch this device
+    /// erased is refused, unless a version sealed in it that no prune covers
+    /// is held locked here: a writer this device had not heard of wrote in
+    /// the epoch, so its erasure was early, and the key is taken again
+    /// (spec §14).
     fn take_key(&mut self, c: &Name, e: &Epoch, key: ContentKey) -> bool {
-        let Some(coll) = self.colls.get(c) else {
+        let Some(coll) = self.colls.get_mut(c) else {
             return false;
         };
         let Some(named) = coll.epochs.get(e) else {
             return false;
         };
-        if coll.erased.contains(e) || seal::key_check(&key, c, e) != named.check {
+        if seal::key_check(&key, c, e) != named.check {
             return false;
+        }
+        if coll.erased.contains(e) {
+            let live = coll.locked.iter().any(|l| {
+                let id = VersionId {
+                    writer: l.writer.clone(),
+                    seq: Seq(l.seq),
+                };
+                l.epoch() == e
+                    && coll.pruned(&id).is_none()
+                    && coll
+                        .members
+                        .as_ref()
+                        .is_some_and(|m| m.refusal(&id).is_none())
+            });
+            if !live {
+                return false;
+            }
+            tracing::info!(collection = %c, epoch = ?e, "an erased epoch's key taken again: a version sealed in it that no prune covers arrived");
+            coll.erased.remove(e);
+            self.store.remove(&erased_name(c, e));
         }
         self.keys.hold(c.clone(), e.clone(), key);
         self.unlock(c);
@@ -1420,9 +1488,13 @@ impl Device {
                 sealed_to: HashMap::new(),
                 holding: BTreeMap::new(),
                 fetching: BTreeSet::new(),
+                quarantine: BTreeSet::new(),
+                asks: HashMap::new(),
+                answers: Kept::new(ANSWERS_KEPT),
             }),
             progress: Notify::new(),
             slots: Semaphore::new(window),
+            verifying: Semaphore::new(ASKS_VERIFYING),
             signatures: AtomicU64::new(0),
             started: Instant::now(),
             serving: Mutex::new(None),
@@ -1532,11 +1604,18 @@ impl Device {
     }
 
     /// Drop this device's own copies of the chunks of the large versions
-    /// under `name` (a version's name, or a collection) that a live lease
-    /// this device audited as kept holds: the host's storage policy (the
-    /// phone keeps only recent originals). The version records and their
-    /// manifests stay; a later `get` reads the chunks from the holders.
-    /// [`DataError::NotHeld`] when no such lease holds what `name` names.
+    /// under `name` (a version's name, or a collection), the host's storage
+    /// policy (the phone keeps only recent originals), on fresh evidence
+    /// that enough other holders keep exactly those pieces (spec §13.3):
+    /// for each version, at least the `copies` of this device's hold record
+    /// of distinct holder devices it names, each with a live lease holding
+    /// the version, prove to a `whole` audit ask that they hold every piece
+    /// of it. While they are asked, this device serves none of those pieces
+    /// to anyone, so a holder relaying them from this device proves
+    /// nothing. The version records and their manifests stay; a later `get`
+    /// reads the chunks from the holders. Versions too few holders proved
+    /// stay, each with why ([`Released::kept`]); when none was released,
+    /// [`DataError::NotHeld`] says why.
     pub async fn release(&self, name: &Name) -> Result<Released, DataError> {
         let inner = &self.inner;
         let (c, only) = match parse_log_name(name) {
@@ -1549,30 +1628,83 @@ impl Device {
                 (name.clone(), None)
             }
         };
-        let st = inner.st.lock();
-        let Some(coll) = st.colls.get(&c) else {
-            return Err(DataError::Unavailable { name: name.clone() });
-        };
-        let kept: Vec<&LeaseHeld> = inner
-            .live_leases(&st, &c)
-            .iter()
-            .filter_map(|h| coll.leases.get(h))
-            .filter(|l| l.audit.kept())
-            .collect();
-        let mut out = Released::default();
-        let mut unheld = false;
-        for hv in coll.versions.values() {
-            let Some(chunks) = hv.chunks else { continue };
-            if only.as_ref().is_some_and(|n| *n != hv.version.name) {
-                continue;
+        // What to release: the versions in pieces under `name` this device
+        // holds whole (what each proof is checked against), with the named
+        // holders whose live leases hold them.
+        let (targets, copies) = {
+            let st = inner.st.lock();
+            let Some(coll) = st.colls.get(&c) else {
+                return Err(DataError::Unavailable { name: name.clone() });
+            };
+            let Some((_, _, hold)) = coll.holds.get(&inner.writer) else {
+                return Err(DataError::NotHeld {
+                    name: name.clone(),
+                    why: format!("this device asked no holder to keep {c}"),
+                });
+            };
+            let live = inner.live_leases(&st, &c);
+            let mut targets = Vec::new();
+            for hv in coll.versions.values() {
+                let Some(chunks) = hv.chunks else { continue };
+                if only.as_ref().is_some_and(|n| *n != hv.version.name)
+                    || !inner.store.contains(&hv.version.name)
+                    || !inner.pieces_held(&hv.version.name, &chunks)
+                {
+                    continue;
+                }
+                let holders: Vec<Name> = live
+                    .iter()
+                    .filter(|d| {
+                        hold.holders.contains(d)
+                            && coll.leases[*d].body.holds.contains(&hv.version.id)
+                    })
+                    .cloned()
+                    .collect();
+                targets.push((hv.version.name.clone(), chunks, holders));
             }
-            if !kept.iter().any(|l| l.body.holds.contains(&hv.version.id)) {
-                unheld = true;
+            (targets, hold.copies.max(1) as usize)
+        };
+        let mut out = Released::default();
+        if targets.is_empty() {
+            return Ok(out);
+        }
+        // Fresh evidence, with this device's own copies of the pieces served
+        // to no one meanwhile.
+        let proved: Vec<Vec<(Name, Result<(), String>)>> = {
+            let _quarantine = Quarantine::new(inner, targets.iter().map(|(v, ..)| v.clone()));
+            futures::future::join_all(targets.iter().map(|(v, chunks, holders)| {
+                futures::future::join_all(holders.iter().map(move |h| async move {
+                    (h.clone(), inner.proves_kept(h, v, chunks).await)
+                }))
+            }))
+            .await
+        };
+        for ((v, chunks, holders), proofs) in targets.into_iter().zip(proved) {
+            let kept = proofs.iter().filter(|(_, p)| p.is_ok()).count();
+            if kept < copies {
+                let mut why: Vec<String> = proofs
+                    .into_iter()
+                    .map(|(h, p)| match p {
+                        Ok(()) => format!("{h} proved it keeps every piece"),
+                        Err(e) => e,
+                    })
+                    .collect();
+                if holders.is_empty() {
+                    why.push("no holder the hold record names has a live lease holding it".into());
+                }
+                out.kept.push((
+                    v,
+                    format!(
+                        "{kept} of the {copies} distinct holders asked for proved they keep it \
+                         without this device ({})",
+                        why.join("; ")
+                    ),
+                ));
                 continue;
             }
             out.versions += 1;
             for i in 0..Shape::of(chunks.size).chunks {
-                let p = piece_name(&hv.version.name, PieceKind::Chunk(i));
+                let p = piece_name(&v, PieceKind::Chunk(i));
                 if let Some(w) = inner.store.get(&p) {
                     inner.store.remove(&p);
                     out.pieces += 1;
@@ -1580,10 +1712,43 @@ impl Device {
                 }
             }
         }
-        if out.versions == 0 && unheld {
-            return Err(DataError::NotHeld { name: name.clone() });
+        if out.versions == 0 {
+            let why = out
+                .kept
+                .iter()
+                .map(|(v, why)| format!("{v}: {why}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(DataError::NotHeld {
+                name: name.clone(),
+                why,
+            });
         }
         Ok(out)
+    }
+}
+
+/// Own versions whose pieces this device serves to no one while a release
+/// asks their holders for proofs; served again when dropped.
+struct Quarantine<'a> {
+    inner: &'a Inner,
+    versions: Vec<Name>,
+}
+
+impl<'a> Quarantine<'a> {
+    fn new(inner: &'a Inner, versions: impl IntoIterator<Item = Name>) -> Self {
+        let versions: Vec<Name> = versions.into_iter().collect();
+        inner.st.lock().quarantine.extend(versions.iter().cloned());
+        Quarantine { inner, versions }
+    }
+}
+
+impl Drop for Quarantine<'_> {
+    fn drop(&mut self) {
+        let mut st = self.inner.st.lock();
+        for v in &self.versions {
+            st.quarantine.remove(v);
+        }
     }
 }
 
@@ -1676,6 +1841,27 @@ fn untomb(name: &Name) -> Option<Name> {
         .then(|| Name::from_components(name.components()[prefix.len()..].iter().cloned()))
 }
 
+/// Where the store keeps a marker for each epoch whose key this device
+/// destroyed (`/localhost/ndn-data/erased/<epoch>`), so a restart refuses
+/// the key if granted again (spec §14).
+fn erased_prefix() -> Name {
+    "/localhost/ndn-data/erased".parse().expect("a valid name")
+}
+
+fn erased_name(c: &Name, e: &Epoch) -> Name {
+    erased_prefix().append_component(ndn_packet::NameComponent::generic(wire::encode_epoch_of(
+        c, e,
+    )))
+}
+
+fn parse_erased_name(name: &Name) -> Option<(Name, Epoch)> {
+    let prefix = erased_prefix();
+    if !name.has_prefix(&prefix) || name.len() != prefix.len() + 1 {
+        return None;
+    }
+    wire::decode_epoch_of(name.components()[prefix.len()].value.clone())
+}
+
 /// The key a grant's Content (or a made key's stored value) carries,
 /// opened with `recipient` under `name`; `None` if it is not wrapped to it
 /// under that name.
@@ -1713,12 +1899,17 @@ impl Inner {
     /// merge is made against the records in force below it), then the keys,
     /// then the other records, then versions. The own versions this device
     /// pruned come back as the tombstones it kept, so its summary lists
-    /// them as before.
+    /// them as before; the epochs it erased come back first, so their keys
+    /// stay refused; and any piece or record of a version a prune covers
+    /// (stored by a walk that was under way when the prune arrived) is
+    /// dropped.
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
         let mut keys = Vec::new();
         let mut tombs = Vec::new();
+        let mut erased = Vec::new();
+        let mut pieces = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if let Some((_, ask)) = parse_grant_name(&name) {
                 if parse_seal_key_name(&ask.seal_key).is_some_and(|(d, _)| d == self.device)
@@ -1742,8 +1933,15 @@ impl Inner {
                 }
                 continue;
             }
+            if let Some(ce) = parse_erased_name(&name) {
+                erased.push(ce);
+                continue;
+            }
             let Some(parsed) = parse_log_name(&name) else {
-                roots.extend(kept_root(&name, &wire));
+                match parse_piece_name(&name) {
+                    Some(p) => pieces.push((name, p.version)),
+                    None => roots.extend(kept_root(&name, &wire)),
+                }
                 continue;
             };
             let Ok(data) = Data::decode(wire.clone()) else {
@@ -1768,18 +1966,23 @@ impl Inner {
                 mine,
             ));
         }
-        // Members records first, by revision; then the other records
-        // (holds, leases, prunes), so that what they say is known as the
-        // versions come back; then versions and snapshots.
+        // Members records first, by revision; then the other records (hold
+        // records, then leases, then prunes), so that what they say is known
+        // as the versions come back; then versions and snapshots.
         entries.sort_by_key(|(_, _, record, _, seq, _)| match record {
             Record::Members(b) => (0, b.revision, *seq),
-            Record::Hold(_) | Record::Lease(_) | Record::Prune(_) => (1, 0, *seq),
+            Record::Hold(_) => (1, 0, *seq),
+            Record::Lease(_) => (1, 1, *seq),
+            Record::Prune(_) => (1, 2, *seq),
             Record::Version(_) | Record::Snapshot(_) => (2, 0, *seq),
         });
         let rest = entries.split_off(
             entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
         );
         let mut st = self.st.lock();
+        for (c, e) in erased {
+            st.colls.entry(c).or_default().erased.insert(e);
+        }
         let take_all = |st: &mut St, list: Vec<(Name, Bytes, Record, Writer, u64, bool)>| {
             for (name, wire, record, writer, seq, mine) in list {
                 if mine {
@@ -1818,6 +2021,24 @@ impl Inner {
                 let peer = st.peers.entry((device, ns)).or_default();
                 peer.head = peer.head.max(head);
                 peer.kept = peer.kept.max(head);
+            }
+        }
+        // What a prune covers that the store still keeps: pieces a walk
+        // stored after the prune dropped their version, and their records.
+        for (name, version) in pieces {
+            if pruned_name(&st, &version).is_some() {
+                self.store.remove(&name);
+            }
+        }
+        let pruned: Vec<Name> = st
+            .held
+            .iter()
+            .filter(|(_, h)| matches!(h, Held::Pruned(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in pruned {
+            for (n, _) in self.store.scan_under(&name, 0) {
+                self.store.remove(&n);
             }
         }
         // A group's reader dropped in the log re-read is history: the
@@ -2613,12 +2834,15 @@ impl Inner {
         }
     }
 
-    /// Hold a verified log entry and let its collection take it. Records
-    /// that are not versions, snapshots and own entries are stored now;
-    /// others' versions once applied — or now, when this device holds their
-    /// collection for its owner (spec §13). A version a known prune covers
-    /// is dropped unseen. Returns a large version whose pieces this device,
-    /// holding its collection, is to fetch.
+    /// Hold a verified log entry and let its collection take it. Own entries
+    /// and snapshots are stored now; members, hold, lease and prune records
+    /// once accepted (owner-signed, a holder's newest lease answering a hold
+    /// record that names it, a prune of the signer's own writes); others'
+    /// versions once applied — or now, when this device holds their log
+    /// collection for its owner and the accepted hold record asks for them
+    /// (spec §13.2). A version a known prune covers is dropped unseen.
+    /// Returns a large version whose pieces this device, holding its
+    /// collection, is to fetch.
     fn take(
         &self,
         st: &mut St,
@@ -2663,17 +2887,24 @@ impl Inner {
             st.held.insert(name, Held::Pruned(p));
             return None;
         }
-        let holding = parsed
-            .subject
-            .as_ref()
-            .is_some_and(|c| st.holding.contains_key(c));
-        let admitted = parsed
-            .subject
-            .as_ref()
-            .and_then(|c| st.colls.get(c))
-            .and_then(|x| x.members.as_ref())
-            .is_none_or(|m| m.refusal(&id).is_none());
-        if mine || !matches!(record, Record::Version(_)) || (holding && admitted) {
+        // A holder keeps exactly what the accepted hold record asks of a
+        // log collection: versions the record in force admits, inside the
+        // record's frontier (spec §13.2).
+        let keeps = parsed.subject.as_ref().is_some_and(|c| {
+            let Some(h) = st.holding.get(c) else {
+                return false;
+            };
+            st.colls
+                .get(c)
+                .and_then(|x| x.members.as_ref())
+                .is_some_and(|m| {
+                    m.rule == Rule::Log && m.refusal(&id).is_none() && h.at.contains(&id)
+                })
+        });
+        if mine
+            || matches!(record, Record::Snapshot(_))
+            || (keeps && matches!(record, Record::Version(_)))
+        {
             self.store.insert(name.clone(), wire.clone());
         }
         if let Some(c) = &parsed.subject {
@@ -2697,6 +2928,7 @@ impl Inner {
                 let c = body.collection.clone();
                 let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
                 if owner_signed(self.validator.keyring(), &name, &ns) {
+                    self.store.insert(name.clone(), wire);
                     st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
                     // The rule may now be the log rule, which prune applies to.
                     let dropped = st.drop_pruned(&c);
@@ -2712,7 +2944,7 @@ impl Inner {
                 let seq = parsed.seq;
                 let sealed = body.sealed.is_some();
                 let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
-                let fetch = (holding && admitted)
+                let fetch = keeps
                     .then(|| body.chunks.map(|ch| (name.clone(), ch)))
                     .flatten();
                 if let Some(s) = body.sealed.clone() {
@@ -2752,6 +2984,11 @@ impl Inner {
                     epoch,
                     chunks,
                 }));
+                // A writer's version in a newer epoch may be what a pending
+                // erasure waited for.
+                if st.colls.get(&c).is_some_and(|x| !x.pruned_keeps.is_empty()) {
+                    self.erase(st, &c);
+                }
                 fetch
             }
             Record::Snapshot(pins) => {
@@ -2777,6 +3014,7 @@ impl Inner {
                     .get(&writer)
                     .is_none_or(|(s, _, _)| *s < parsed.seq)
                 {
+                    self.store.insert(name.clone(), wire);
                     coll.holds.insert(writer, (parsed.seq, name, body));
                 }
                 None
@@ -2785,19 +3023,39 @@ impl Inner {
                 st.held.insert(name.clone(), Held::Record);
                 let c = body.collection.clone();
                 if mine {
+                    let at = st
+                        .colls
+                        .get(&c)
+                        .and_then(|x| x.holds.values().find(|(_, n, _)| *n == body.hold))
+                        .map(|(_, _, b)| b.at.clone());
                     let h = st.holding.entry(c.clone()).or_insert_with(|| Holding {
                         hold: body.hold.clone(),
                         until: body.until,
+                        at: Frontier::new(),
                         lease: None,
                     });
                     h.hold = body.hold.clone();
                     h.lease = Some((body.holds.clone(), body.until));
+                    if let Some(at) = at {
+                        h.at = at;
+                    }
                 }
                 let coll = st.colls.entry(c).or_default();
-                if coll.leases.get(&writer).is_none_or(|l| l.seq < parsed.seq) {
+                // One device counts once, whatever keys it signs with: its
+                // newest lease by log seq, which its keys share.
+                let device = parsed.device;
+                if coll.leases.get(&device).is_none_or(|l| l.seq < parsed.seq) {
+                    let named = coll
+                        .holds
+                        .values()
+                        .any(|(_, n, b)| *n == body.hold && b.holders.contains(&device));
+                    if mine || named {
+                        self.store.insert(name.clone(), wire);
+                    }
                     coll.leases.insert(
-                        writer,
+                        device,
                         LeaseHeld {
+                            writer,
                             seq: parsed.seq,
                             name,
                             body,
@@ -2810,14 +3068,22 @@ impl Inner {
             Record::Prune(body) => {
                 st.held.insert(name.clone(), Held::Record);
                 let c = parsed.subject.clone()?;
-                // Prune reaches only its signer's own writes (spec §14).
+                // Prune reaches only its signer's own writes (spec §14), and
+                // only entries its signer wrote before it: a seq at or past
+                // the prune's own would swallow later versions.
                 let own_key = body.upto.iter().all(|(w, _)| *w == writer);
                 let own_entry = parse_log_name(&body.prefix)
                     .is_none_or(|l| l.device == parsed.device && l.subject.as_ref() == Some(&c));
+                let before = body.upto.iter().all(|(_, s)| s.0 < parsed.seq);
                 if !own_key || !own_entry {
                     tracing::debug!(%name, "a prune record that names another key's writes; ignored");
                     return None;
                 }
+                if !before {
+                    tracing::debug!(%name, "a prune record reaching past its own seq; ignored");
+                    return None;
+                }
+                self.store.insert(name.clone(), wire);
                 let prune = Prune {
                     id,
                     name,
@@ -3078,13 +3344,13 @@ impl Inner {
             });
             return;
         }
-        if let Some((holder, record)) = parse_hold_ask_name(&name)
+        if let Some((holder, ask)) = parse_hold_ask_name(&name)
             && holder == self.device
         {
-            // Taking a hold fetches the owner's record and the collection:
-            // its own task.
+            // Taking a hold verifies the asker and fetches the owner's record
+            // and the collection: its own task.
             rt::spawn(async move {
-                let reply = self.accept_hold(&name, &record).await;
+                let reply = self.accept_hold(&name, ask).await;
                 self.reply(&name, responder, reply).await;
             });
             return;
@@ -3101,8 +3367,11 @@ impl Inner {
         if let Some((holder, ask)) = parse_audit_ask_name(&name)
             && holder == self.device
         {
-            let reply = self.audit_answer(&name, &ask);
-            self.reply(&name, responder, reply).await;
+            // Answering verifies the asker first: its own task.
+            rt::spawn(async move {
+                let reply = self.audit_answer(&name, &ask).await;
+                self.reply(&name, responder, reply).await;
+            });
             return;
         }
         let reply = self.packet_for(&name, interest.selectors().can_be_prefix);
@@ -3123,21 +3392,28 @@ impl Inner {
     fn packet_for(&self, name: &Name, can_be_prefix: bool) -> Option<Bytes> {
         // Own log entries and pieces of own versions; and, of a collection
         // this device holds for its owner, every entry and piece it keeps
-        // (readers ask it for them under its own name, `32=held`).
+        // (readers ask it for them under its own name, `32=held`). Nothing
+        // a known prune covers (by the prune records restored, not only the
+        // versions held), and no piece of an own version a release is
+        // auditing its holders for.
         let log = parse_log_name(name).or_else(|| parse_piece_name(name).map(|p| p.log));
         if let Some(parsed) = log {
-            if parsed.device == self.device {
-                return self.store.get(name);
-            }
             let st = self.st.lock();
+            let version = strip_piece(name);
+            if pruned_name(&st, &version).is_some()
+                || matches!(st.held.get(&version), Some(Held::Pruned(_)))
+            {
+                return None;
+            }
+            if parsed.device == self.device {
+                let quarantined = version != *name && st.quarantine.contains(&version);
+                return (!quarantined).then(|| self.store.get(name)).flatten();
+            }
             let held = parsed
                 .subject
                 .as_ref()
                 .is_some_and(|c| st.holding.contains_key(c));
-            if held && !matches!(st.held.get(&strip_piece(name)), Some(Held::Pruned(_))) {
-                return self.store.get(name);
-            }
-            return None;
+            return held.then(|| self.store.get(name)).flatten();
         }
         if let Some(s) = parse_summary_name(name)
             && s.device == self.device
@@ -3628,27 +3904,45 @@ struct Ask {
     digest: [u8; 32],
 }
 
+/// One ask of an asker device a holder is working on ([`Inner::ask_slot`]).
+struct AskSlot<'a> {
+    inner: &'a Inner,
+    asker: Name,
+}
+
+impl Drop for AskSlot<'_> {
+    fn drop(&mut self) {
+        let mut st = self.inner.st.lock();
+        if let Some(n) = st.asks.get_mut(&self.asker) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.asks.remove(&self.asker);
+            }
+        }
+    }
+}
+
+/// What one audit ask came to (spec §13.3).
+enum Asked {
+    /// Signed by the holder and the piece: its packet.
+    Piece(Bytes),
+    /// Signed evidence of a broken promise.
+    Breach(Breach),
+    /// The holder named a record ending the piece's version, which the
+    /// auditor verified and took: not the holder's to keep.
+    Excused,
+    /// No answer, or none that is evidence: no verdict.
+    Unanswered,
+}
+
 impl Inner {
     // ---- large payloads -----------------------------------------------------------------------
 
-    /// The devices whose live leases this device knows hold `c`, by name,
-    /// this device excluded: where pieces are fetched from by forwarding
-    /// hint when their writer no longer serves them.
+    /// The holder devices whose live leases this device counts for `c`
+    /// ([`Self::live_leases`]), by name: where pieces are fetched from by
+    /// forwarding hint when their writer no longer serves them.
     fn holders_of(&self, st: &St, c: &Name) -> Vec<Name> {
-        let now = (self.config.clock)();
-        let Some(coll) = st.colls.get(c) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Name> = coll
-            .leases
-            .iter()
-            .filter(|(_, l)| lease_refusal(coll, &l.body).is_none() && l.body.until > now)
-            .filter_map(|(h, _)| device_of(h.key()))
-            .filter(|d| *d != self.device)
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+        self.live_leases(st, c)
     }
 
     /// Fetch `name`, another device's packet, from `holder`, which keeps
@@ -3712,6 +4006,13 @@ impl Inner {
                 continue;
             }
             let w = data.raw().clone();
+            // A walk under way when a prune arrived stores nothing of what
+            // the prune covers (spec §14).
+            let st = self.st.lock();
+            if pruned_name(&st, &strip_piece(name)).is_some() {
+                tracing::debug!(%name, "fetched after its version was pruned; not kept");
+                return None;
+            }
             self.store.insert(name.clone(), w.clone());
             return Some((w, source));
         }
@@ -3781,14 +4082,10 @@ impl Inner {
         Some(out)
     }
 
-    /// Whether every piece of the large version `v` is in the store.
+    /// Whether every piece of the large version `v` is in the store (a
+    /// presence check: no piece is read).
     fn pieces_held(&self, v: &Name, chunks: &ChunksBody) -> bool {
-        let shape = Shape::of(chunks.size);
-        shape
-            .manifests()
-            .map(PieceKind::Manifest)
-            .chain((0..shape.chunks).map(PieceKind::Chunk))
-            .all(|k| self.store.get(&piece_name(v, k)).is_some())
+        piece_names(v, chunks).all(|p| self.store.contains(&p))
     }
 
     /// Read version `v` whole: a large payload is fetched piece by piece
@@ -3863,16 +4160,25 @@ impl Inner {
     }
 
     /// Destroy the key of every epoch of `c` whose versions are all pruned
-    /// (spec §14): not the epoch of the record in force, at least one of
-    /// its versions pruned, and every version of `c` this device knows of
-    /// held (so its epoch is known) and either pruned or of another epoch.
-    /// The held key, the key this device made and every grant it keeps of
-    /// that epoch go; a key granted again is refused.
+    /// or cut, as the signed records held show (spec §14): not the epoch of
+    /// the record in force; at least one of its versions pruned; every
+    /// version of `c` this device knows of held (so its epoch is known) and
+    /// pruned, refused, or of another epoch; and every writer known to write
+    /// into `c` done with the epoch — this device itself, a key the record
+    /// in force admits no further version of (cut, or no writer), or one
+    /// that wrote a version in the record in force's epoch. Until then the
+    /// erasure is pending: a writer that has not moved on may still write
+    /// into the epoch. The held key, the key this device made, every grant
+    /// it keeps of that epoch, stored or signed for others, go; the erasure
+    /// is kept in the store, and a key granted again is refused.
     fn erase(&self, st: &mut St, c: &Name) {
         let Some(coll) = st.colls.get(c) else {
             return;
         };
-        let current = coll.members.as_ref().and_then(|m| m.epoch.clone());
+        let Some(members) = coll.members.as_ref() else {
+            return;
+        };
+        let current = members.epoch.clone();
         let epoch_of = |id: &VersionId| -> Option<Option<Epoch>> {
             if let Some(hv) = coll.versions.get(id) {
                 return Some(hv.epoch.clone());
@@ -3890,6 +4196,23 @@ impl Inner {
                 .find(|hv| hv.version.id == *id)
                 .map(|hv| hv.epoch.clone())
         };
+        // Whether writer `w` is done with every epoch before the current
+        // one: it writes no more here, or it already wrote in the current.
+        let moved_on = |w: &Writer, seqs: &BTreeSet<u64>| {
+            *w == self.writer
+                || members
+                    .refusal(&VersionId {
+                        writer: w.clone(),
+                        seq: Seq(u64::MAX),
+                    })
+                    .is_some()
+                || seqs.iter().any(|s| {
+                    epoch_of(&VersionId {
+                        writer: w.clone(),
+                        seq: Seq(*s),
+                    }) == Some(current.clone())
+                })
+        };
         let mut gone = Vec::new();
         'epochs: for e in coll.epochs.keys() {
             if Some(e) == current.as_ref() || coll.erased.contains(e) || st.keys.key(c, e).is_none()
@@ -3904,6 +4227,10 @@ impl Inner {
                 continue;
             }
             for (w, seqs) in &coll.entries {
+                if !moved_on(w, seqs) {
+                    tracing::debug!(collection = %c, epoch = ?e, writer = ?w, "erasure pending: a writer may still write in the epoch");
+                    continue 'epochs;
+                }
                 for s in seqs {
                     let id = VersionId {
                         writer: w.clone(),
@@ -3930,6 +4257,7 @@ impl Inner {
             coll.erased.insert(e.clone());
         }
         for e in gone {
+            self.store.insert(erased_name(c, &e), Bytes::new());
             st.keys.forget(c, &e);
             self.store.remove(&made_key_name(&self.device, c, &e));
             for (n, _) in self.store.scan_under(&Name::root(), 0) {
@@ -3940,7 +4268,10 @@ impl Inner {
                     self.store.remove(&n);
                 }
             }
-            tracing::info!(collection = %c, epoch = ?e, "erased: every version of the epoch is pruned; its key is destroyed");
+            st.grants.retain(|n| {
+                parse_grant_name(n).is_none_or(|(_, ask)| ask.collection != *c || ask.epoch != e)
+            });
+            tracing::info!(collection = %c, epoch = ?e, "erased: every writer's versions of the epoch are pruned or cut; its key is destroyed");
         }
     }
 
@@ -4014,7 +4345,7 @@ impl Inner {
         }
         let hold = h.hold.clone();
         if h.lease.as_ref() == Some(&(holds.clone(), until))
-            && let Some(l) = coll.leases.get(&self.writer)
+            && let Some(l) = coll.leases.get(&self.device)
             && l.body.hold == hold
             && let Some(w) = self.store.get(&l.name)
         {
@@ -4059,17 +4390,22 @@ impl Inner {
         }
     }
 
-    /// Fetch back what this holder lost of `c`: records from what it holds
-    /// in memory, pieces from their writer or other holders.
+    /// Fetch back what this holder lost of `c` of what its accepted hold
+    /// record asks: records from what it holds in memory, pieces from their
+    /// writer or other holders.
     async fn repair_held(self: &Arc<Self>, c: &Name) {
         let large: Vec<(Name, ChunksBody)> = {
             let st = self.st.lock();
-            let Some(coll) = st.colls.get(c) else {
+            let (Some(coll), Some(h)) = (st.colls.get(c), st.holding.get(c)) else {
+                return;
+            };
+            let Some(m) = coll.members.as_ref().filter(|m| m.rule == Rule::Log) else {
                 return;
             };
             let mut large = Vec::new();
-            for hv in coll.versions.values() {
-                if self.store.get(&hv.version.name).is_none() {
+            let asked = |id: &VersionId| h.at.contains(id) && m.refusal(id).is_none();
+            for hv in coll.versions.values().filter(|hv| asked(&hv.version.id)) {
+                if !self.store.contains(&hv.version.name) {
                     self.store.insert(hv.version.name.clone(), hv.wire.clone());
                 }
                 if let Some(ch) = hv.chunks {
@@ -4077,7 +4413,14 @@ impl Inner {
                 }
             }
             for l in &coll.locked {
-                if self.store.get(&l.name).is_none() {
+                let id = VersionId {
+                    writer: l.writer.clone(),
+                    seq: Seq(l.seq),
+                };
+                if !asked(&id) {
+                    continue;
+                }
+                if !self.store.contains(&l.name) {
                     self.store.insert(l.name.clone(), l.wire.clone());
                 }
                 if let Some(ch) = l.body.chunks {
@@ -4099,17 +4442,94 @@ impl Inner {
             .await;
     }
 
-    /// Answer an owner's hold ask (spec §13): verify its hold record (an
-    /// owner device's, of a namespace this device holds for, asking past
-    /// now), hold the collection, take it and every piece of it inside the
-    /// record's frontier (fetching back what was lost), and answer with the
-    /// lease, signed. `None` (a Nack) otherwise.
-    async fn accept_hold(self: &Arc<Self>, ask: &Name, record: &Name) -> Option<Bytes> {
+    /// The device an ask's proof claims asks, by its key locator, and the
+    /// proof's packet: unverified, for the checks that cost nothing.
+    fn claimed_asker(proof: &Bytes) -> Option<(Data, Name)> {
+        let data = Data::decode(proof.clone()).ok()?;
+        let key = data.sig_info()?.key_locator_name()?;
+        let asker = device_of(&key)?;
+        Some((data, asker))
+    }
+
+    /// Whether `proof` is `asker`'s, for the ask whose binding is
+    /// `binding`: named `<asker>/32=ask/<binding>` and signed by a key of
+    /// `asker` that verifies to a trust anchor. At most [`ASKS_VERIFYING`]
+    /// proofs are verified at once.
+    async fn proves(&self, proof: &Data, asker: &Name, binding: &[u8; 32]) -> bool {
+        if *proof.name != wire::ask_name(asker, binding) {
+            return false;
+        }
+        let Ok(_turn) = self.verifying.acquire().await else {
+            return false;
+        };
+        self.verify(proof)
+            .await
+            .is_ok_and(|w| device_of(w.key()).as_ref() == Some(asker))
+    }
+
+    /// Count one more ask of `asker` in progress, if it has fewer than
+    /// `limit`; the slot is given back when dropped.
+    fn ask_slot(&self, asker: &Name, limit: usize) -> Option<AskSlot<'_>> {
+        let mut st = self.st.lock();
+        let n = st.asks.entry(asker.clone()).or_default();
+        if *n >= limit {
+            tracing::debug!(%asker, "ask refused: the asker has as many in progress as it may");
+            return None;
+        }
+        *n += 1;
+        Some(AskSlot {
+            inner: self,
+            asker: asker.clone(),
+        })
+    }
+
+    /// A proof of who asks for this device's own asks: `<me>/32=ask/
+    /// <binding>`, signed by the device key.
+    fn ask_proof(&self, binding: &[u8; 32]) -> Option<Bytes> {
+        self.sign(
+            DataBuilder::new(wire::ask_name(&self.device, binding), &[]).freshness(Duration::ZERO),
+        )
+        .ok()
+    }
+
+    /// A fresh nonce from the device's entropy.
+    fn nonce(&self) -> [u8; wire::NONCE_LEN] {
+        let mut nonce = [0u8; wire::NONCE_LEN];
+        (self.config.entropy)(&mut nonce);
+        nonce
+    }
+
+    /// Answer a hold ask (spec §13.2): from the owner device that signed
+    /// the hold record it names (its proof verified), for a namespace this
+    /// device holds for, a record naming this device a holder and asking
+    /// past now. Hold the collection, take it and every piece of it inside
+    /// the record's frontier (fetching back what was lost), and answer with
+    /// the lease, signed. One ask of each asker at a time; the same ask
+    /// asked again gets the same answer. `None` (a Nack) otherwise, and a
+    /// stranger's ask costs nothing but its parse.
+    async fn accept_hold(self: &Arc<Self>, name: &Name, ask: HoldAsk) -> Option<Bytes> {
+        if let Some(r) = self.st.lock().answers.get(name) {
+            return Some(r.clone());
+        }
+        let record = &ask.record;
         let parsed = parse_log_name(record)?;
         let c = parsed.subject.clone()?;
         let ns = namespace_of(&c)?;
         if !self.config.hold_for.contains(&ns) {
             tracing::debug!(collection = %c, "hold refused: this device holds for none of its namespace");
+            return None;
+        }
+        let (proof, asker) = Self::claimed_asker(&ask.asker)?;
+        if asker != parsed.device {
+            tracing::debug!(%record, %asker, "hold refused: only the device that signed the hold record asks for it");
+            return None;
+        }
+        let _slot = self.ask_slot(&asker, HOLDS_PER_ASKER)?;
+        if !self
+            .proves(&proof, &asker, &ask.binding(&self.device))
+            .await
+        {
+            tracing::debug!(%record, %asker, "hold refused: the asker's proof does not verify");
             return None;
         }
         if !self.st.lock().held.contains_key(record) {
@@ -4126,9 +4546,13 @@ impl Inner {
                 .map(|(_, _, b)| b.clone())
         };
         let Some(body) = body else {
-            tracing::debug!(%record, "hold refused: not an owner device's hold record");
+            tracing::debug!(%record, "hold refused: not an owner device's newest hold record");
             return None;
         };
+        if !body.holders.contains(&self.device) {
+            tracing::debug!(%record, "hold refused: the record does not name this device a holder");
+            return None;
+        }
         if body.until <= (self.config.clock)() {
             tracing::debug!(%record, "hold refused: it asks for nothing past now");
             return None;
@@ -4138,10 +4562,12 @@ impl Inner {
             let h = st.holding.entry(c.clone()).or_insert_with(|| Holding {
                 hold: record.clone(),
                 until: body.until,
+                at: body.at.clone(),
                 lease: None,
             });
             h.hold = record.clone();
             h.until = body.until;
+            h.at = body.at.clone();
         }
         self.look(&c).await.ok()?;
         // See what every device writing into the namespace has now: the
@@ -4164,34 +4590,123 @@ impl Inner {
         if new && let Err(e) = self.publish_about(&c, &[]).await {
             tracing::debug!(collection = %c, "the lease is not announced: {e}");
         }
-        Some(DataBuilder::new(ask.clone(), &lease).sign_digest_sha256())
+        let reply = DataBuilder::new(name.clone(), &lease).sign_digest_sha256();
+        self.st.lock().answers.insert(name.clone(), reply.clone());
+        Some(reply)
     }
 
-    /// Answer an audit ask of a collection this device holds (spec §13):
-    /// the piece asked for, from the store, or that it is missing; signed
-    /// by the device key, under the ask's own name, so no cache answers it
-    /// and nothing answers it but this device. `None` (a Nack) for a
-    /// collection it does not hold.
-    fn audit_answer(&self, name: &Name, ask: &AuditAsk) -> Option<Bytes> {
+    /// Answer an audit ask of a collection this device holds (spec §13.3),
+    /// from an owner device whose hold record held here names this device a
+    /// holder (its proof verified): the piece asked for, from the store;
+    /// to a `whole` ask, the proof over every piece of the version; else
+    /// why it is not held — the prune record that ended its version, the
+    /// members record that refuses it, or that it is missing. Signed by the
+    /// device key, under the ask's own name, so no cache answers it and
+    /// nothing answers it but this device; the same ask asked again gets
+    /// the same packet. `None` (a Nack) otherwise, at no signature's cost.
+    async fn audit_answer(self: &Arc<Self>, name: &Name, ask: &AuditAsk) -> Option<Bytes> {
+        if let Some(r) = self.st.lock().answers.get(name) {
+            return Some(r.clone());
+        }
         let log =
             parse_log_name(&ask.piece).or_else(|| parse_piece_name(&ask.piece).map(|p| p.log))?;
         let c = log.subject?;
-        let pruned = {
+        let (proof, asker) = Self::claimed_asker(&ask.asker)?;
+        {
             let st = self.st.lock();
-            if !st.holding.contains_key(&c) {
+            let owner = st.holding.contains_key(&c)
+                && st.colls.get(&c).is_some_and(|coll| {
+                    coll.holds.iter().any(|(w, (_, _, b))| {
+                        device_of(w.key()).as_ref() == Some(&asker)
+                            && b.holders.contains(&self.device)
+                    })
+                });
+            if !owner {
+                tracing::debug!(collection = %c, %asker, "audit refused: no hold record held here from the asker names this device");
                 return None;
             }
-            matches!(st.held.get(&strip_piece(&ask.piece)), Some(Held::Pruned(_)))
+        }
+        let _slot = self.ask_slot(&asker, AUDITS_PER_ASKER)?;
+        if !self
+            .proves(&proof, &asker, &ask.binding(&self.device))
+            .await
+        {
+            tracing::debug!(collection = %c, %asker, "audit refused: the asker's proof does not verify");
+            return None;
+        }
+        let answer = self.audit_content(&c, ask);
+        let wire = self
+            .sign(
+                DataBuilder::new(name.clone(), &wire::encode_audit_answer(&answer))
+                    .freshness(Duration::ZERO),
+            )
+            .ok()?;
+        self.st.lock().answers.insert(name.clone(), wire.clone());
+        Some(wire)
+    }
+
+    /// What this holder answers `ask` of `c` with ([`Self::audit_answer`]).
+    fn audit_content(&self, c: &Name, ask: &AuditAsk) -> AuditAnswer {
+        let st = self.st.lock();
+        let version = strip_piece(&ask.piece);
+        let prune = pruned_name(&st, &version).or_else(|| match st.held.get(&version) {
+            Some(Held::Pruned(p)) => Some(p.clone()),
+            _ => None,
+        });
+        if let Some(p) = prune {
+            return match self.store.get(&p.name) {
+                Some(w) => AuditAnswer::PrunedBy(w),
+                None => AuditAnswer::Missing,
+            };
+        }
+        if matches!(
+            st.refused.get(&version),
+            Some(Refusal::NotMember | Refusal::OutsideCut(_))
+        ) && let Some(coll) = st.colls.get(c)
+        {
+            // The owner-signed record this holder holds of the revision in
+            // force: it refuses the version, which the auditor checks.
+            let record = coll.records.iter().find_map(|(w, (seq, _))| {
+                let device = device_of(w.key())?;
+                self.store.get(&log_name(&device, Some(c), *seq))
+            });
+            if let Some(w) = record {
+                return AuditAnswer::RefusedBy(w);
+            }
+        }
+        if !ask.whole {
+            return self
+                .store
+                .get(&ask.piece)
+                .map_or(AuditAnswer::Missing, AuditAnswer::Piece);
+        }
+        let chunks = st.colls.get(c).and_then(|coll| {
+            coll.versions
+                .values()
+                .find(|hv| hv.version.name == version)
+                .map(|hv| hv.chunks)
+                .or_else(|| {
+                    coll.locked
+                        .iter()
+                        .find(|l| l.name == version)
+                        .map(|l| l.body.chunks)
+                })
+        });
+        drop(st);
+        let Some(Some(chunks)) = chunks else {
+            return AuditAnswer::Missing;
         };
-        let answer = match self.store.get(&ask.piece) {
-            Some(w) if !pruned => AuditAnswer::Piece(w),
-            _ => AuditAnswer::Missing,
-        };
-        self.sign(
-            DataBuilder::new(name.clone(), &wire::encode_audit_answer(&answer))
-                .freshness(Duration::ZERO),
-        )
-        .ok()
+        let mut wires = Vec::new();
+        for n in std::iter::once(version.clone()).chain(piece_names(&version, &chunks)) {
+            match self.store.get(&n) {
+                Some(w) => wires.push(w),
+                None => return AuditAnswer::Missing,
+            }
+        }
+        AuditAnswer::Proof(wire::version_proof(
+            &ask.nonce,
+            wires.iter().map(|w| w.as_ref()),
+        ))
     }
 
     // ---- custody, the owner's side ----------------------------------------------------------
@@ -4210,23 +4725,27 @@ impl Inner {
         }
     }
 
-    /// Every piece the lease of `holder` on `c` promises (spec §13): of
-    /// each version inside it that applies and whose keep has not passed,
-    /// its log entry and, in pieces, every manifest node and chunk — each
-    /// with the digest the holder's answer must have. Manifest nodes not in
-    /// the store are fetched (checked against the record) to learn the
-    /// chunks' digests.
-    async fn promised(self: &Arc<Self>, c: &Name, holder: &Writer) -> Vec<Ask> {
+    /// Every piece the lease of holder device `holder` on `c` promises
+    /// (spec §13.3): of each version inside it that applies by this device's
+    /// records and whose keep has not passed, its log entry and, in pieces,
+    /// every manifest node and chunk — each with the digest the holder's
+    /// answer must have. Manifest nodes not in the store are fetched
+    /// (checked against the record) to learn the chunks' digests, from the
+    /// writer, the holders, and at last from the audited holder itself
+    /// through an audit ask: its answer is evidence like any other. A node
+    /// no one produces leaves the audit unverified, never passed.
+    async fn promised(self: &Arc<Self>, c: &Name, holder: &Name) -> Promised {
         let now = (self.config.clock)();
+        let mut out = Promised::default();
         let versions: Vec<(Name, [u8; 32], Option<ChunksBody>)> = {
             let st = self.st.lock();
             let Some(coll) = st.colls.get(c) else {
-                return Vec::new();
+                return out;
             };
             let Some(lease) = coll.leases.get(holder) else {
-                return Vec::new();
+                return out;
             };
-            let mut out = Vec::new();
+            let mut list = Vec::new();
             for (w, upto) in lease.body.holds.iter() {
                 let Some(seqs) = coll.entries.get(w) else {
                     continue;
@@ -4264,35 +4783,47 @@ impl Inner {
                     if matches!(keep, Keep::Until(t) if t <= now) {
                         continue;
                     }
-                    out.push((name, wire::implicit_digest(&w), chunks));
+                    list.push((name, wire::implicit_digest(&w), chunks));
                 }
             }
-            out
+            list
         };
-        let mut asks = Vec::new();
-        for (name, digest, chunks) in versions {
-            asks.push(Ask {
-                piece: name.clone(),
-                digest,
-            });
-            let Some(chunks) = chunks else { continue };
+        'versions: for (name, digest, chunks) in versions {
+            let Some(chunks) = chunks else {
+                out.asks.push(Ask {
+                    piece: name,
+                    digest,
+                });
+                continue;
+            };
             let shape = Shape::of(chunks.size);
             let mut digests: HashMap<PieceKind, [u8; 32]> = HashMap::new();
             digests.insert(PieceKind::Manifest(0), chunks.root);
-            let mut whole = true;
             for k in shape.manifests() {
                 let kind = PieceKind::Manifest(k);
                 let Some(expected) = digests.get(&kind).copied() else {
-                    whole = false;
-                    break;
+                    continue 'versions;
                 };
-                let listed = match self.get_piece(c, &piece_name(&name, kind), &expected).await {
-                    Some(w) => pieces::open_node(&shape, k, &w, &expected),
-                    None => None,
+                let node = piece_name(&name, kind);
+                let w = match self.get_piece(c, &node, &expected).await {
+                    Some(w) => w,
+                    None => match self.check_piece(c, holder, &node, &expected).await {
+                        Asked::Piece(w) => w,
+                        Asked::Breach(breach) => {
+                            out.broken.get_or_insert((node, breach));
+                            continue 'versions;
+                        }
+                        Asked::Excused => continue 'versions,
+                        Asked::Unanswered => {
+                            tracing::debug!(%name, "no one produces its manifest: the audit is unverified");
+                            out.unverified += 1;
+                            continue 'versions;
+                        }
+                    },
                 };
-                let Some(listed) = listed else {
-                    whole = false;
-                    break;
+                let Some(listed) = pieces::open_node(&shape, k, &w, &expected) else {
+                    tracing::debug!(%name, "its writer's manifest does not list its chunks; not audited");
+                    continue 'versions;
                 };
                 for (kid, d) in shape
                     .children(k)
@@ -4303,78 +4834,180 @@ impl Inner {
                     digests.insert(kid, d);
                 }
             }
-            if !whole {
-                tracing::debug!(%name, "its manifest is not to be had; its pieces are not audited");
-                continue;
-            }
+            out.asks.push(Ask {
+                piece: name.clone(),
+                digest,
+            });
             let mut pieces: Vec<(PieceKind, [u8; 32])> = digests.into_iter().collect();
             pieces.sort();
-            asks.extend(pieces.into_iter().map(|(k, d)| Ask {
+            out.asks.extend(pieces.into_iter().map(|(k, d)| Ask {
                 piece: piece_name(&name, k),
                 digest: d,
             }));
         }
-        asks
+        out
     }
 
-    /// Audit the lease of `holder` on `c` (spec §13): ask for random pieces
-    /// of what it promises, each under a fresh nonce, and check every
-    /// answer: signed by the holder, and the piece. The verdict is kept
-    /// with the lease.
-    async fn audit(self: &Arc<Self>, c: &Name, holder: &Writer) -> Audit {
-        let Some(device) = device_of(holder.key()) else {
-            return Audit::NotAudited;
+    /// Ask holder device `holder` for `piece` under a fresh nonce, with this
+    /// device's proof of asking; or, `whole`, for the proof over every
+    /// piece of the version `piece` names. The nonce asked under, and the
+    /// answer: `None` when no answer signed by the holder came back,
+    /// `Some(None)` when one did that is no answer.
+    async fn ask_holder(
+        &self,
+        holder: &Name,
+        piece: &Name,
+        whole: bool,
+    ) -> Option<([u8; wire::NONCE_LEN], Option<AuditAnswer>)> {
+        let mut ask = AuditAsk {
+            nonce: self.nonce(),
+            piece: piece.clone(),
+            whole,
+            asker: Bytes::new(),
         };
-        let mut all = self.promised(c, holder).await;
+        ask.asker = self.ask_proof(&ask.binding(holder))?;
+        let name = audit_ask_name(holder, &ask);
+        let data = self.fetch(name.clone(), false).await?;
+        if *data.name != name {
+            return None;
+        }
+        let signer = self.verify(&data).await.ok()?;
+        if device_of(signer.key()).as_ref() != Some(holder) {
+            return None;
+        }
+        let answer = data
+            .content()
+            .and_then(|b| wire::decode_audit_answer(b.clone()).ok());
+        Some((ask.nonce, answer))
+    }
+
+    /// Ask `holder` for `piece` of `c`, whose packet's digest this device
+    /// holds as `digest`, and judge the answer (spec §13.3): the piece; a
+    /// signed `Missing`, or bytes that are not the piece — evidence, as this
+    /// device's records say the piece should be there; a record the holder
+    /// names as ending the piece's version, which this device verifies and
+    /// takes: excused when it does end it, evidence when a verified prune
+    /// does not; or nothing that is evidence.
+    async fn check_piece(
+        self: &Arc<Self>,
+        c: &Name,
+        holder: &Name,
+        piece: &Name,
+        digest: &[u8; 32],
+    ) -> Asked {
+        match self.ask_holder(holder, piece, false).await {
+            None => Asked::Unanswered,
+            Some((_, Some(AuditAnswer::Piece(w)))) if wire::implicit_digest(&w) == *digest => {
+                Asked::Piece(w)
+            }
+            Some((_, Some(AuditAnswer::Missing))) => Asked::Breach(Breach::Missing),
+            Some((_, Some(AuditAnswer::PrunedBy(w)))) => self.excused_by_prune(c, piece, w).await,
+            Some((_, Some(AuditAnswer::RefusedBy(w)))) => {
+                self.excused_by_members(c, piece, w).await
+            }
+            Some(_) => Asked::Breach(Breach::Wrong),
+        }
+    }
+
+    /// A holder's answer that the prune record `wire` ended `piece`'s
+    /// version: verified and taken, it excuses the piece if it covers it.
+    async fn excused_by_prune(self: &Arc<Self>, c: &Name, piece: &Name, wire: Bytes) -> Asked {
+        let version = strip_piece(piece);
+        let Ok(data) = Data::decode(wire) else {
+            return Asked::Breach(Breach::Wrong);
+        };
+        let name = (*data.name).clone();
+        let (Some(p), Some(v)) = (parse_log_name(&name), parse_log_name(&version)) else {
+            return Asked::Breach(Breach::Wrong);
+        };
+        if p.device != v.device || p.subject.as_ref() != Some(c) {
+            // Only the version's own writer prunes it.
+            return Asked::Breach(Breach::Wrong);
+        }
+        if self.take_data(&name, data).await.is_err() {
+            // Not verified here (yet): no verdict either way.
+            return Asked::Unanswered;
+        }
+        if pruned_name(&self.st.lock(), &version).is_some() {
+            Asked::Excused
+        } else {
+            Asked::Breach(Breach::Wrong)
+        }
+    }
+
+    /// A holder's answer that the members record `wire` refuses `piece`'s
+    /// version: verified and taken, it excuses the piece if the record in
+    /// force here now refuses the version; if it still admits it, the two
+    /// devices' views differ and nothing is evidence.
+    async fn excused_by_members(self: &Arc<Self>, c: &Name, piece: &Name, wire: Bytes) -> Asked {
+        let version = strip_piece(piece);
+        let Ok(data) = Data::decode(wire) else {
+            return Asked::Breach(Breach::Wrong);
+        };
+        let name = (*data.name).clone();
+        if parse_log_name(&name).is_none_or(|l| l.subject.as_ref() != Some(c)) {
+            return Asked::Breach(Breach::Wrong);
+        }
+        if self.take_data(&name, data).await.is_err() {
+            return Asked::Unanswered;
+        }
+        let st = self.st.lock();
+        let refused = st.colls.get(c).is_some_and(|coll| {
+            version_id(coll, &version).is_some_and(|id| {
+                coll.members
+                    .as_ref()
+                    .is_some_and(|m| m.refusal(&id).is_some())
+            })
+        });
+        if refused {
+            Asked::Excused
+        } else {
+            Asked::Unanswered
+        }
+    }
+
+    /// Audit the lease of holder device `holder` on `c` (spec §13.3): ask
+    /// for random pieces of what it promises, each under a fresh nonce, and
+    /// judge every answer ([`Self::check_piece`]). Broken on evidence;
+    /// unanswered when an ask got no answer that is evidence, or a version's
+    /// pieces could not be listed; kept otherwise. The verdict is kept with
+    /// the lease.
+    async fn audit(self: &Arc<Self>, c: &Name, holder: &Name) -> Audit {
+        let promised = self.promised(c, holder).await;
+        let mut all = promised.asks;
         let k = self.config.audit_pieces.min(all.len());
         let mut picked = Vec::with_capacity(k);
         for _ in 0..k {
             let i = self.draw(all.len());
             picked.push(all.swap_remove(i));
         }
-        let asked = picked.len() as u32;
-        let device = &device;
-        let answers: Vec<Option<Result<(), (Name, Breach)>>> = stream::iter(picked)
+        let answers: Vec<(Name, Asked)> = stream::iter(picked)
             .map(|a| async move {
-                let mut nonce = [0u8; wire::NONCE_LEN];
-                (self.config.entropy)(&mut nonce);
-                let name = audit_ask_name(
-                    device,
-                    &AuditAsk {
-                        nonce,
-                        piece: a.piece.clone(),
-                    },
-                );
-                let data = self.fetch(name.clone(), false).await?;
-                if *data.name != name {
-                    return None;
-                }
-                let signer = self.verify(&data).await.ok()?;
-                if device_of(signer.key()).as_ref() != Some(device) {
-                    return None;
-                }
-                let answer = data
-                    .content()
-                    .and_then(|b| wire::decode_audit_answer(b.clone()).ok());
-                Some(match answer {
-                    Some(AuditAnswer::Piece(w)) if wire::implicit_digest(&w) == a.digest => Ok(()),
-                    Some(AuditAnswer::Missing) => Err((a.piece, Breach::Missing)),
-                    _ => Err((a.piece, Breach::Wrong)),
-                })
+                let asked = self.check_piece(c, holder, &a.piece, &a.digest).await;
+                (a.piece, asked)
             })
             .buffer_unordered(self.config.window)
             .collect()
             .await;
-        let answered = answers.iter().filter(|a| matches!(a, Some(Ok(())))).count() as u32;
-        let breach = answers
+        let asked = answers.len() as u32 + promised.unverified;
+        let answered = answers
+            .iter()
+            .filter(|(_, a)| matches!(a, Asked::Piece(_)))
+            .count() as u32;
+        let unanswered =
+            promised.unverified > 0 || answers.iter().any(|(_, a)| matches!(a, Asked::Unanswered));
+        let breach = promised
+            .broken
             .into_iter()
-            .flatten()
-            .filter_map(Result::err)
+            .chain(answers.into_iter().filter_map(|(p, a)| match a {
+                Asked::Breach(b) => Some((p, b)),
+                _ => None,
+            }))
             .min_by(|a, b| a.0.cmp(&b.0));
         let audit = match breach {
             Some((piece, breach)) => Audit::Broken { piece, breach },
-            None if answered == asked => Audit::Kept { pieces: asked },
-            None => Audit::Unanswered { asked, answered },
+            None if unanswered => Audit::Unanswered { asked, answered },
+            None => Audit::Kept { pieces: answered },
         };
         if let Some(l) = self
             .st
@@ -4385,14 +5018,24 @@ impl Inner {
         {
             l.audit = audit.clone();
         }
-        tracing::debug!(collection = %c, holder = %device, ?audit, "audited");
+        tracing::debug!(collection = %c, %holder, ?audit, "audited");
         audit
     }
 
-    /// Ask `holder` to hold `c` under the hold record `record`; whether it
-    /// answered with a lease, which is then taken.
+    /// Ask holder device `holder` to hold `c` under the hold record
+    /// `record`, with this device's proof of asking; whether it answered
+    /// with a lease, which is then taken.
     async fn ask_hold(self: &Arc<Self>, holder: &Name, record: &Name) -> bool {
-        let name = hold_ask_name(holder, record);
+        let mut ask = HoldAsk {
+            record: record.clone(),
+            nonce: self.nonce(),
+            asker: Bytes::new(),
+        };
+        let Some(proof) = self.ask_proof(&ask.binding(holder)) else {
+            return false;
+        };
+        ask.asker = proof;
+        let name = hold_ask_name(holder, &ask);
         // The holder answers once it took what the record asks, which may
         // take it a first look and a fetch of every piece.
         let b = InterestBuilder::new(name.clone())
@@ -4417,32 +5060,74 @@ impl Inner {
         self.take_data(&lease_name, lease).await.is_ok()
     }
 
-    /// The leases of `c` this device counts (spec §13): not its own, not
-    /// refused, live by its clock.
-    fn live_leases(&self, st: &St, c: &Name) -> Vec<Writer> {
+    /// Whether holder device `holder` proves, to a fresh `whole` audit ask,
+    /// that it keeps every piece of the large version `v` (spec §13.3,
+    /// release): its signed proof is the one this device computes from its
+    /// own copy. Why not, if not.
+    async fn proves_kept(
+        &self,
+        holder: &Name,
+        v: &Name,
+        chunks: &ChunksBody,
+    ) -> Result<(), String> {
+        let Some((nonce, answer)) = self.ask_holder(holder, v, true).await else {
+            return Err(format!("{holder} did not answer"));
+        };
+        let proof = match answer {
+            Some(AuditAnswer::Proof(p)) => p,
+            Some(AuditAnswer::Missing) => {
+                return Err(format!("{holder} signed that it does not keep every piece"));
+            }
+            Some(AuditAnswer::PrunedBy(_) | AuditAnswer::RefusedBy(_)) => {
+                return Err(format!(
+                    "{holder} keeps none of it, naming a record that ends it"
+                ));
+            }
+            _ => return Err(format!("{holder} signed an answer that is no proof")),
+        };
+        let mut wires = Vec::new();
+        for n in std::iter::once(v.clone()).chain(piece_names(v, chunks)) {
+            match self.store.get(&n) {
+                Some(w) => wires.push(w),
+                None => {
+                    return Err("this device no longer holds every piece to check against".into());
+                }
+            }
+        }
+        if wire::version_proof(&nonce, wires.iter().map(|w| w.as_ref())) == proof {
+            Ok(())
+        } else {
+            Err(format!("{holder}'s proof is not of the version's pieces"))
+        }
+    }
+
+    /// The holder devices whose leases of `c` this device counts (spec
+    /// §13.2): not this device, live by its clock, answering a hold record
+    /// held here that names the device, and not refused. One per device.
+    fn live_leases(&self, st: &St, c: &Name) -> Vec<Name> {
         let now = (self.config.clock)();
         let Some(coll) = st.colls.get(c) else {
             return Vec::new();
         };
         coll.leases
             .iter()
-            .filter(|(h, l)| {
-                **h != self.writer && l.body.until > now && {
-                    let why = lease_refusal(coll, &l.body);
+            .filter(|(d, l)| {
+                **d != self.device && l.body.until > now && {
+                    let why = lease_refusal(coll, d, &l.body);
                     if let Some(why) = why {
                         tracing::debug!(lease = %l.name, "lease not counted: {why}");
                     }
                     why.is_none()
                 }
             })
-            .map(|(h, _)| h.clone())
+            .map(|(d, _)| d.clone())
             .collect()
     }
 
-    fn lease_of(&self, st: &St, c: &Name, holder: &Writer) -> Option<Lease> {
+    fn lease_of(&self, st: &St, c: &Name, holder: &Name) -> Option<Lease> {
         let l = st.colls.get(c)?.leases.get(holder)?;
         Some(Lease {
-            holder: holder.clone(),
+            holder: l.writer.clone(),
             name: l.name.clone(),
             prefix: c.clone(),
             holds: l.body.holds.clone(),
@@ -4452,14 +5137,50 @@ impl Inner {
     }
 }
 
-/// Why a reader does not count a lease (spec §13), if it does not: the
-/// owner's hold record it answers is not held, it promises past that
-/// record's date, or past the latest keep of the versions it holds (or that
+/// What a lease's audit asks for ([`Inner::promised`]).
+#[derive(Default)]
+struct Promised {
+    /// The pieces to draw from.
+    asks: Vec<Ask>,
+    /// Evidence found while listing them: a manifest node the holder signed
+    /// it does not hold, or that is not the node.
+    broken: Option<(Name, Breach)>,
+    /// Versions whose pieces no one could list: the audit cannot pass.
+    unverified: u32,
+}
+
+/// The id of the version named `name` of `coll`, if this device holds it in
+/// any state (applied, waiting, refused, locked).
+fn version_id(coll: &Coll, name: &Name) -> Option<VersionId> {
+    coll.versions
+        .values()
+        .chain(&coll.waiting)
+        .chain(&coll.outsiders)
+        .find(|hv| hv.version.name == *name)
+        .map(|hv| hv.version.id.clone())
+        .or_else(|| {
+            coll.locked
+                .iter()
+                .find(|l| l.name == *name)
+                .map(|l| VersionId {
+                    writer: l.writer.clone(),
+                    seq: Seq(l.seq),
+                })
+        })
+}
+
+/// Why a reader does not count holder device `holder`'s lease (spec
+/// §13.2), if it does not: the owner's hold record it answers is not held,
+/// does not name the device a holder, or is passed by the lease's date; or
+/// the lease promises past the latest keep of the versions it holds (or that
 /// keep is not known yet).
-fn lease_refusal(coll: &Coll, l: &LeaseBody) -> Option<&'static str> {
+fn lease_refusal(coll: &Coll, holder: &Name, l: &LeaseBody) -> Option<&'static str> {
     let Some((_, _, hold)) = coll.holds.values().find(|(_, n, _)| *n == l.hold) else {
         return Some("the owner's hold record it answers is not held here");
     };
+    if !hold.holders.contains(holder) {
+        return Some("the owner's hold record it answers does not name its device a holder");
+    }
     if l.until > hold.until {
         return Some("it promises past the date the owner asked for");
     }
@@ -4489,8 +5210,12 @@ fn reaches(coll: &Coll, holds: &Frontier, at: &Frontier) -> bool {
 
 /// The prune record known here that covers the version named `name` (a log
 /// entry), held or not: its writer's key, whose device the name starts
-/// with, pruned it.
+/// with, pruned it. A prune covers versions only: a record or snapshot held
+/// under the name is covered by none.
 fn pruned_name(st: &St, name: &Name) -> Option<Prune> {
+    if matches!(st.held.get(name), Some(Held::Record | Held::Snapshot(_))) {
+        return None;
+    }
     let l = parse_log_name(name)?;
     let coll = st.colls.get(l.subject.as_ref()?)?;
     coll.prunes
@@ -4716,6 +5441,13 @@ impl DataLayer for Device {
                 // Unsealed and inline whatever its size: no payload to build.
                 (None, false) => Bytes::new(),
             };
+            if payload.len() as u64 > wire::PAYLOAD_MAX {
+                return Err(DataError::TooLarge {
+                    collection: collection.clone(),
+                    size: payload.len() as u64,
+                    limit: wire::PAYLOAD_MAX,
+                });
+            }
             // A log collection's large payload travels in pieces (spec
             // §4.1); the record carries its size and manifest root.
             let (chunks, pieces) = if log && payload.len() > wire::INLINE_MAX {
@@ -4846,16 +5578,49 @@ impl DataLayer for Device {
                 collection: prefix.clone(),
             });
         }
+        // The holders are the owner's choice, in data: each copy is kept by
+        // a distinct holder device the record names (spec §13.2).
+        let mut holders = want.holders.clone();
+        holders.sort();
+        holders.dedup();
+        if let Some(h) = holders
+            .iter()
+            .find(|h| !wire::is_device_name(h) || **h == inner.device)
+        {
+            return Err(DataError::BadRequest {
+                name: prefix.clone(),
+                why: format!(
+                    "{h} cannot hold it for this device: a holder is another device, named \
+                     <namespace>/…/<device> without keyword components; name the devices that \
+                     keep it"
+                ),
+            });
+        }
+        if holders.len() < want.copies as usize {
+            return Err(DataError::BadRequest {
+                name: prefix.clone(),
+                why: format!(
+                    "{} copies asked of {} holders named; each copy is kept by a distinct holder \
+                     device, so name at least {} holders",
+                    want.copies,
+                    holders.len(),
+                    want.copies
+                ),
+            });
+        }
         inner.look(prefix).await?;
         // The custody policy, in data: the hold record this device signs,
-        // again only when what it asks changed (spec §13).
+        // again only when what it asks changed.
         let (record, at, signed) = {
             let mut st = inner.st.lock();
             let coll = st.colls.entry(prefix.clone()).or_default();
             let at = coll.at();
             match coll.holds.get(&inner.writer) {
                 Some((_, n, b))
-                    if b.copies == want.copies && b.until == want.until && b.at == at =>
+                    if b.copies == want.copies
+                        && b.until == want.until
+                        && b.at == at
+                        && b.holders == holders =>
                 {
                     (n.clone(), at, false)
                 }
@@ -4865,6 +5630,7 @@ impl DataLayer for Device {
                         copies: want.copies,
                         until: want.until,
                         at: at.clone(),
+                        holders: holders.clone(),
                     };
                     let (n, _) = inner.append(&mut st, Some(prefix), wire::encode_hold(&body))?;
                     (n, at, true)
@@ -4876,80 +5642,55 @@ impl DataLayer for Device {
         }
         // Audit every live lease.
         let live = inner.live_leases(&inner.st.lock(), prefix);
-        let mut broken = Vec::new();
-        for h in &live {
-            if !inner.audit(prefix, h).await.kept()
-                && let Some(l) = inner.lease_of(&inner.st.lock(), prefix, h)
-            {
-                broken.push(l);
-            }
-        }
-        // Repair: ask the holders that failed again (they fetch back what
-        // they lost), then the other devices of the namespace, in name
-        // order, until `copies` leases hold what was asked and are kept.
-        let holding = |st: &St, h: &Writer| -> bool {
+        let verdicts = futures::future::join_all(live.iter().map(|h| inner.audit(prefix, h))).await;
+        let broken: Vec<Lease> = live
+            .iter()
+            .zip(verdicts)
+            .filter(|(_, a)| !a.kept())
+            .filter_map(|(h, _)| inner.lease_of(&inner.st.lock(), prefix, h))
+            .collect();
+        // Repair: ask every named holder whose lease is not live, not kept
+        // or holds less than was asked (a holder asked again fetches back
+        // what it lost), at once, and audit what they answer.
+        let holding = |st: &St, h: &Name| -> bool {
             st.colls.get(prefix).is_some_and(|coll| {
                 coll.leases
                     .get(h)
                     .is_some_and(|l| l.audit.kept() && reaches(coll, &l.body.holds, &at))
             })
         };
-        let mut candidates: Vec<Name> = broken
-            .iter()
-            .filter_map(|l| device_of(l.holder.key()))
-            .collect();
-        // A first look: no device of the namespace heard yet, so none to
-        // ask. Wait, at most the first-look time, to hear one.
-        if broken.is_empty() {
-            inner
-                .wait_for(|st| inner.known_for(st, &ns).iter().any(|d| *d != inner.device))
-                .await;
-        }
-        let others: Vec<Name> = {
+        let ask: Vec<Name> = {
             let st = inner.st.lock();
             let counted: Vec<Name> = inner
                 .live_leases(&st, prefix)
                 .into_iter()
                 .filter(|h| holding(&st, h))
-                .filter_map(|h| device_of(h.key()))
                 .collect();
-            inner
-                .known_for(&st, &ns)
-                .into_iter()
-                .filter(|d| *d != inner.device && !counted.contains(d))
-                .collect()
-        };
-        for d in others {
-            if !candidates.contains(&d) {
-                candidates.push(d);
-            }
-        }
-        for d in candidates {
-            let kept = {
-                let st = inner.st.lock();
-                inner
-                    .live_leases(&st, prefix)
+            if counted.len() >= want.copies as usize {
+                Vec::new()
+            } else {
+                holders
                     .iter()
-                    .filter(|h| holding(&st, h))
-                    .count()
-            };
-            if kept >= want.copies as usize {
-                break;
+                    .filter(|d| !counted.contains(d))
+                    .cloned()
+                    .collect()
             }
-            if !inner.ask_hold(&d, &record).await {
-                continue;
-            }
-            let lease = {
-                let st = inner.st.lock();
-                inner
-                    .live_leases(&st, prefix)
-                    .into_iter()
-                    .find(|h| device_of(h.key()).as_ref() == Some(&d))
-            };
-            if let Some(h) = lease {
-                inner.audit(prefix, &h).await;
-            }
-        }
+        };
+        let answered: Vec<Name> = stream::iter(ask)
+            .map(|d| {
+                let record = &record;
+                async move { inner.ask_hold(&d, record).await.then_some(d) }
+            })
+            .buffer_unordered(inner.config.window)
+            .filter_map(|d| async move { d })
+            .collect()
+            .await;
+        let fresh: Vec<Name> = {
+            let st = inner.st.lock();
+            let live = inner.live_leases(&st, prefix);
+            answered.into_iter().filter(|d| live.contains(d)).collect()
+        };
+        futures::future::join_all(fresh.iter().map(|h| inner.audit(prefix, h))).await;
         let st = inner.st.lock();
         let live = inner.live_leases(&st, prefix);
         let leases = live
@@ -5035,9 +5776,19 @@ impl DataLayer for Device {
                 }
                 Some(Rule::Log) => {}
             }
-            if upto.get(&inner.writer).is_none() {
+            let Some(mine) = upto.get(&inner.writer) else {
                 // Up to nothing of this key: nothing to drop.
                 return Ok(());
+            };
+            if mine.0 > st.head {
+                return Err(DataError::BadRequest {
+                    name: prefix.clone(),
+                    why: format!(
+                        "a prune up to seq {} reaches past this device's newest entry, seq {}: it \
+                         would drop the versions it puts next; prune up to seq {} at most",
+                        mine.0, st.head, st.head
+                    ),
+                });
             }
             let body = PruneBody {
                 prefix: prefix.clone(),
@@ -5946,5 +6697,505 @@ mod tests {
         assert_eq!(st.head, 3);
         drop(st);
         again.shutdown();
+    }
+
+    // ---- custody, prune and erasure against crafted packets (the slice-3 review) -------------
+
+    /// Hand `dev` the log entry `seq` of `device` about `c` carrying
+    /// `record`, signed (unchecked) by `key`; why it is refused, if it is.
+    fn hand_as(
+        dev: &Device,
+        device: &Name,
+        key: &Name,
+        c: &Name,
+        seq: u64,
+        record: Record,
+    ) -> Option<Refusal> {
+        let name = log_name(device, Some(c), seq);
+        let content = wire::encode_record(&record);
+        let packet = DataBuilder::new(name.clone(), &content).sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(key),
+            |_| Bytes::from_static(&[0; 64]),
+        );
+        let mut st = dev.inner.st.lock();
+        dev.inner.take(
+            &mut st,
+            name.clone(),
+            packet,
+            Writer::new(key.clone()),
+            record,
+            false,
+        );
+        st.refused.get(&name).cloned()
+    }
+
+    fn upto(key: &str, seq: u64) -> Frontier {
+        [VersionId {
+            writer: Writer::new(n(key)),
+            seq: Seq(seq),
+        }]
+        .into_iter()
+        .collect()
+    }
+
+    /// A date no test reaches.
+    const LATER: Timestamp = Timestamp(u64::MAX / 2);
+
+    #[tokio::test]
+    async fn one_holder_device_counts_once_whatever_keys_sign_its_leases() {
+        let dev = device_in("/alice/phone", &["/alice"]).await;
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let (laptop, repo) = (n("/alice/laptop"), n("/alice/repo"));
+        // The laptop's record names the repo, and the phone too: a device
+        // still counts no lease of its own.
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 2,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![n("/alice/phone"), repo.clone()],
+        };
+        assert_eq!(hand(&dev, &laptop, &c, 1, Record::Hold(hold)), None);
+        let lease = || {
+            Record::Lease(LeaseBody {
+                collection: c.clone(),
+                hold: log_name(&laptop, Some(&c), 1),
+                until: LATER,
+                holds: Frontier::new(),
+            })
+        };
+        // The repo after a key rotation: its old key's lease still live.
+        hand_as(&dev, &repo, &n("/alice/repo/KEY/1"), &c, 3, lease());
+        hand_as(&dev, &repo, &n("/alice/repo/KEY/2"), &c, 4, lease());
+        // The phone itself, under a key it signed with before.
+        let phone = n("/alice/phone");
+        hand_as(&dev, &phone, &n("/alice/phone/KEY/0"), &c, 5, lease());
+        let st = dev.inner.st.lock();
+        let live = dev.inner.live_leases(&st, &c);
+        assert_eq!(
+            live.len(),
+            1,
+            "one holder device, two keys, and the owner device itself count as one copy: {live:?}"
+        );
+        assert_eq!(dev.inner.holders_of(&st, &c), vec![repo]);
+        drop(st);
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_prune_past_its_writers_head_is_refused_and_ignored() {
+        let dev = device_in("/alice/laptop", &["/alice"]).await;
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let head = dev.inner.st.lock().head;
+        let refused = dev.prune(&c, &upto("/alice/laptop/KEY/1", head + 3)).await;
+        assert!(
+            refused.is_err(),
+            "a prune up to past the log head would swallow the next puts: {refused:?}"
+        );
+        // Signed elsewhere: a prune at seq 5 reaching seq 9 covers nothing
+        // above 4, so the writer's next version stays.
+        let phone = n("/alice/phone");
+        let prune = PruneBody {
+            prefix: c.clone(),
+            upto: upto("/alice/phone/KEY/1", 9),
+        };
+        hand(&dev, &phone, &c, 5, Record::Prune(prune));
+        hand(&dev, &phone, &c, 6, Record::Version(version_body(&c, None)));
+        assert!(
+            matches!(
+                dev.inner.st.lock().held.get(&log_name(&phone, Some(&c), 6)),
+                Some(Held::Version(_))
+            ),
+            "a version written after the prune is not pruned by it"
+        );
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_epoch_key_is_destroyed_only_once_every_writer_left_the_epoch() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/alice")));
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/plan");
+        let person = |s: &str| Audience::Person(n(s));
+        let epoch_now = |dev: &Device| {
+            let st = dev.inner.st.lock();
+            let e = st.colls[&c]
+                .members
+                .as_ref()
+                .unwrap()
+                .epoch
+                .clone()
+                .unwrap();
+            let k = st.keys.key(&c, &e).unwrap();
+            (e, k)
+        };
+        dev.share(
+            &c,
+            share_of(
+                Rule::Log,
+                &["/alice"],
+                vec![person("/alice"), person("/bob")],
+            ),
+        )
+        .await
+        .unwrap();
+        let (first, first_key) = epoch_now(&dev);
+        let sealed = |device: &Name, seq: u64, e: &Epoch, k: &ContentKey| {
+            let name = log_name(device, Some(&c), seq);
+            Record::Version(version_body(
+                &c,
+                Some(SealedBody {
+                    epoch: e.clone(),
+                    ciphertext: seal::seal_payload(k, &name, &Content::new(), b""),
+                }),
+            ))
+        };
+        let (phone, tablet) = (n("/alice/phone"), n("/alice/tablet"));
+        assert_eq!(
+            hand(&dev, &phone, &c, 1, sealed(&phone, 1, &first, &first_key)),
+            None
+        );
+        assert_eq!(
+            hand(&dev, &tablet, &c, 1, sealed(&tablet, 1, &first, &first_key)),
+            None
+        );
+        // Bob removed: a new epoch.
+        dev.share(&c, share_of(Rule::Log, &["/alice"], vec![person("/alice")]))
+            .await
+            .unwrap();
+        let (second, second_key) = epoch_now(&dev);
+        // The phone moves on and prunes its version of the first epoch; the
+        // tablet, which has not heard of the second, prunes its own.
+        assert_eq!(
+            hand(&dev, &phone, &c, 2, sealed(&phone, 2, &second, &second_key)),
+            None
+        );
+        let prune = |key: &str, seq| {
+            Record::Prune(PruneBody {
+                prefix: c.clone(),
+                upto: upto(key, seq),
+            })
+        };
+        hand(&dev, &phone, &c, 3, prune("/alice/phone/KEY/1", 1));
+        hand(&dev, &tablet, &c, 2, prune("/alice/tablet/KEY/1", 1));
+        assert!(
+            dev.inner.st.lock().keys.key(&c, &first).is_some(),
+            "the tablet may still write in the first epoch: its erasure waits"
+        );
+        // It did, offline: its version opens.
+        assert_eq!(
+            hand(&dev, &tablet, &c, 3, sealed(&tablet, 3, &first, &first_key)),
+            None
+        );
+        assert!(matches!(
+            dev.inner
+                .st
+                .lock()
+                .held
+                .get(&log_name(&tablet, Some(&c), 3)),
+            Some(Held::Version(_))
+        ));
+        // It moves on and prunes that one too: now the epoch goes.
+        assert_eq!(
+            hand(
+                &dev,
+                &tablet,
+                &c,
+                4,
+                sealed(&tablet, 4, &second, &second_key)
+            ),
+            None
+        );
+        hand(&dev, &tablet, &c, 5, prune("/alice/tablet/KEY/1", 3));
+        assert!(
+            dev.inner.st.lock().keys.key(&c, &first).is_none(),
+            "every writer left the first epoch and pruned all of it"
+        );
+        // The erasure outlives a restart: the key, granted again, is refused.
+        dev.shutdown();
+        drop(dev);
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        {
+            let mut st = again.inner.st.lock();
+            assert!(st.colls[&c].erased.contains(&first));
+            assert!(!st.take_key(&c, &first, first_key.clone()));
+        }
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pruned_pieces_do_not_come_back_from_an_in_flight_walk() {
+        let device = n("/alice/repo");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/alice")));
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let phone = n("/alice/phone");
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 1,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![device.clone()],
+        };
+        assert_eq!(hand(&dev, &phone, &c, 1, Record::Hold(hold)), None);
+        // The repo holds the photos: its own lease, which a restart reads back.
+        let lease = LeaseBody {
+            collection: c.clone(),
+            hold: log_name(&phone, Some(&c), 1),
+            until: LATER,
+            holds: Frontier::new(),
+        };
+        assert_eq!(hand(&dev, &device, &c, 7, Record::Lease(lease)), None);
+        dev.inner.st.lock().holding.insert(
+            c.clone(),
+            Holding {
+                hold: log_name(&phone, Some(&c), 1),
+                until: LATER,
+                at: upto("/alice/phone/KEY/1", 2),
+                lease: None,
+            },
+        );
+        let v = log_name(&phone, Some(&c), 2);
+        let (pieces, chunks) = pieces::split(&v, &[7u8; 3 * wire::CHUNK]);
+        let mut body = version_body(&c, None);
+        body.chunks = Some(chunks);
+        assert_eq!(hand(&dev, &phone, &c, 2, Record::Version(body)), None);
+        for p in &pieces {
+            store.insert(p.name.clone(), p.wire.clone());
+        }
+        let prune = PruneBody {
+            prefix: v.clone(),
+            upto: upto("/alice/phone/KEY/1", 2),
+        };
+        hand(&dev, &phone, &c, 3, Record::Prune(prune));
+        assert!(
+            store.scan_under(&v, 0).is_empty(),
+            "the prune drops every piece"
+        );
+        // A walk that started before the prune stores two pieces after it.
+        for p in pieces.iter().take(2) {
+            store.insert(p.name.clone(), p.wire.clone());
+        }
+        dev.shutdown();
+        drop(dev);
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        for p in &pieces {
+            assert_eq!(
+                again.inner.packet_for(&p.name, false),
+                None,
+                "a pruned piece is never served: {}",
+                p.name
+            );
+        }
+        assert!(
+            store.scan_under(&v, 0).is_empty(),
+            "a restart drops the pieces of a pruned version"
+        );
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_audit_ask_from_no_owner_device_costs_the_holder_no_signature() {
+        let dev = device_in("/alice/repo", &["/alice", "/mallory"]).await;
+        let c = n("/alice/32=data/photos");
+        let phone = n("/alice/phone");
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 1,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![n("/alice/repo")],
+        };
+        assert_eq!(hand(&dev, &phone, &c, 1, Record::Hold(hold)), None);
+        dev.inner.st.lock().holding.insert(
+            c.clone(),
+            Holding {
+                hold: log_name(&phone, Some(&c), 1),
+                until: LATER,
+                at: Frontier::new(),
+                lease: None,
+            },
+        );
+        // An ask whose proof claims `key` signed it (its signature is
+        // zeros: it verifies for no one).
+        let ask_by = |key: &str| {
+            let mut ask = AuditAsk {
+                nonce: [3; wire::NONCE_LEN],
+                piece: log_name(&phone, Some(&c), 2),
+                whole: false,
+                asker: Bytes::new(),
+            };
+            let asker = device_of(&n(key)).unwrap();
+            ask.asker =
+                DataBuilder::new(wire::ask_name(&asker, &ask.binding(&n("/alice/repo"))), &[])
+                    .sign_sync(
+                        ndn_packet::SignatureType::SignatureEd25519,
+                        Some(&n(key)),
+                        |_| Bytes::from_static(&[0; 64]),
+                    );
+            (audit_ask_name(&n("/alice/repo"), &ask), ask)
+        };
+        let before = dev.signatures();
+        // A device no hold record held here names an auditor.
+        let (name, ask) = ask_by("/mallory/box/KEY/1");
+        assert_eq!(
+            dev.inner.audit_answer(&name, &ask).await,
+            None,
+            "a stranger's audit ask is not answered"
+        );
+        // The owner device's name, without its key.
+        let (name, ask) = ask_by("/alice/phone/KEY/1");
+        assert_eq!(
+            dev.inner.audit_answer(&name, &ask).await,
+            None,
+            "an ask whose proof does not verify is not answered"
+        );
+        assert_eq!(dev.signatures(), before, "nor signed for");
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_holder_stores_no_record_it_did_not_accept() {
+        let device = n("/alice/repo");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        for ns in ["/alice", "/mallory"] {
+            assert!(validator.adopt_context(context(ns)));
+        }
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/photos");
+        dev.inner.st.lock().holding.insert(
+            c.clone(),
+            Holding {
+                hold: log_name(&n("/alice/phone"), Some(&c), 1),
+                until: LATER,
+                at: upto("/alice/phone/KEY/1", 9),
+                lease: None,
+            },
+        );
+        // A hold record of Alice's photos, signed by a device of Mallory's.
+        let mallory = n("/mallory/box");
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 1,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![device.clone()],
+        };
+        hand(&dev, &mallory, &c, 1, Record::Hold(hold));
+        assert_eq!(
+            store.get(&log_name(&mallory, Some(&c), 1)),
+            None,
+            "a hold record no owner signed is not stored"
+        );
+        // A version while the collection's members record is unknown.
+        let phone = n("/alice/phone");
+        hand(&dev, &phone, &c, 2, Record::Version(version_body(&c, None)));
+        assert_eq!(
+            store.get(&log_name(&phone, Some(&c), 2)),
+            None,
+            "a version no members record admitted yet is not stored"
+        );
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_audit_lists_every_piece_of_a_version_whose_manifest_it_lacks() {
+        let dev = device_in("/alice/phone", &["/alice"]).await;
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let laptop = n("/alice/laptop");
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 1,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![n("/alice/repo")],
+        };
+        assert_eq!(hand(&dev, &laptop, &c, 1, Record::Hold(hold)), None);
+        let v = log_name(&laptop, Some(&c), 2);
+        let (_, chunks) = pieces::split(&v, &[7u8; 3 * wire::CHUNK]);
+        let mut body = version_body(&c, None);
+        body.chunks = Some(chunks);
+        assert_eq!(hand(&dev, &laptop, &c, 2, Record::Version(body)), None);
+        let repo = Writer::new(n("/alice/repo/KEY/1"));
+        let lease = LeaseBody {
+            collection: c.clone(),
+            hold: log_name(&laptop, Some(&c), 1),
+            until: LATER,
+            holds: upto("/alice/laptop/KEY/1", 2),
+        };
+        hand_as(
+            &dev,
+            &n("/alice/repo"),
+            repo.key(),
+            &c,
+            3,
+            Record::Lease(lease),
+        );
+        // Nothing answers: neither the writer nor the holder, asked through
+        // the audit itself, serves the manifest.
+        let promised = dev.inner.promised(&c, &n("/alice/repo")).await;
+        assert_eq!(
+            promised.unverified, 1,
+            "a version whose pieces no one lists leaves the audit unverified, not passed"
+        );
+        let audit = dev.inner.audit(&c, &n("/alice/repo")).await;
+        assert!(!audit.kept(), "{audit:?}");
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_lease_counts_only_from_a_holder_its_hold_record_names() {
+        let dev = device_in("/alice/phone", &["/alice", "/mallory"]).await;
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let laptop = n("/alice/laptop");
+        let hold = HoldBody {
+            collection: c.clone(),
+            copies: 2,
+            until: LATER,
+            at: Frontier::new(),
+            holders: vec![n("/alice/repo")],
+        };
+        assert_eq!(hand(&dev, &laptop, &c, 1, Record::Hold(hold)), None);
+        // A device with a valid certificate that nobody chose answers with a lease.
+        let lease = LeaseBody {
+            collection: c.clone(),
+            hold: log_name(&laptop, Some(&c), 1),
+            until: LATER,
+            holds: Frontier::new(),
+        };
+        hand(&dev, &n("/mallory/box"), &c, 1, Record::Lease(lease));
+        let st = dev.inner.st.lock();
+        assert!(
+            dev.inner.live_leases(&st, &c).is_empty(),
+            "a lease counts only from a holder the owner's hold record names"
+        );
+        assert!(dev.inner.holders_of(&st, &c).is_empty());
+        drop(st);
+        dev.shutdown();
     }
 }
