@@ -39,6 +39,8 @@ p256-ecdsa    = { package = "p256", version = "0.13", default-features = false, 
 pkcs8         = { version = "0.10", default-features = false, features = ["std", "alloc", "encryption", "pem"] }
 pkcs5         = { version = "0.7",  default-features = false, features = ["alloc", "pbes2"] }
 sha2          = { workspace = true }
+# HKDF-SHA256 for key derivation (`confidentiality::wrap_ck_to`'s KEK).
+hkdf          = { workspace = true }
 # Zeroize content-key material on drop (the `confidentiality` module).
 zeroize       = { version = "1", features = ["derive"] }
 # X25519 for per-recipient content-key wrap (`confidentiality::wrap_ck_to`);

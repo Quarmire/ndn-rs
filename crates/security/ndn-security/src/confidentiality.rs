@@ -35,9 +35,10 @@ use core::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use curve25519_dalek::montgomery::MontgomeryPoint;
+use hkdf::Hkdf;
 use ndn_crypto_core::{open_in_place, seal_in_place};
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of a content key, in bytes (ChaCha20-Poly1305 key = 256 bits).
@@ -249,10 +250,11 @@ impl RecipientKey {
 
 /// Wrap `ck` to the X25519 public key `recipient`: a fresh ephemeral key
 /// agrees a secret with it, a KEK is derived from that secret and both
-/// public keys (SHA-256, domain-separated), and the CK is wrapped under it
-/// binding `aad` ([`wrap_ck`]). Returns the ephemeral public key, which the
-/// recipient needs, and the wrapped key. Authenticity is the caller's: sign
-/// what carries them, and take `recipient` only from data its holder signed.
+/// public keys (HKDF-SHA256, domain-separated), and the CK is wrapped under
+/// it binding `aad` ([`wrap_ck`]). Returns the ephemeral public key, which
+/// the recipient needs, and the wrapped key. Authenticity is the caller's:
+/// sign what carries them, and take `recipient` only from data its holder
+/// signed.
 pub fn wrap_ck_to(
     recipient: &[u8; X25519_LEN],
     ck: &ContentKey,
@@ -265,21 +267,23 @@ pub fn wrap_ck_to(
     Ok((public, wrap_ck(&kek, ck, aad)))
 }
 
+/// The KEK of an X25519 agreement: HKDF-SHA256 with the shared secret as
+/// input key material, no salt, and `info` the domain label followed by the
+/// ephemeral and the recipient public keys.
 fn x25519_kek(
     shared: &MontgomeryPoint,
     ephemeral: &[u8; X25519_LEN],
     recipient: &[u8; X25519_LEN],
 ) -> Result<ContentKey, ConfidentialityError> {
-    let shared = shared.to_bytes();
-    if shared == [0u8; X25519_LEN] {
+    let shared = zeroize::Zeroizing::new(shared.to_bytes());
+    if *shared == [0u8; X25519_LEN] {
         return Err(ConfidentialityError::BadPublicKey);
     }
-    let mut h = Sha256::new();
-    h.update(X25519_KEK_LABEL);
-    h.update(shared);
-    h.update(ephemeral);
-    h.update(recipient);
-    Ok(ContentKey::from_bytes(h.finalize().into()))
+    let mut kek = zeroize::Zeroizing::new([0u8; CK_LEN]);
+    Hkdf::<Sha256>::new(None, shared.as_ref())
+        .expand_multi_info(&[X25519_KEK_LABEL, ephemeral, recipient], kek.as_mut())
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    Ok(ContentKey::from_bytes(*kek))
 }
 
 /// When to rotate a content key: after `max_age`, or after `max_uses` seals,

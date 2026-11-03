@@ -2078,6 +2078,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
+ "hkdf 0.13.0",
  "libc",
  "ndn-crypto-core",
  "ndn-foundation-types",
