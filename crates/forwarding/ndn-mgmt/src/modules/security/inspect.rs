@@ -149,8 +149,9 @@ async fn inspect_data(
 
 /// The verdict on `data`, why, and the certificate names walked. The verdict
 /// is the durable one the forwarder's validation stage reaches for Data
-/// ([`Validator::validate_durable`]): no clock decides it, and a key revoked
-/// with a cut still vouches for the Data its cut accepts.
+/// ([`Validator::validate_durable`]): no clock decides it (except for a key
+/// whose role needs a cut), and a key revoked with a cut still vouches for
+/// the Data its cut accepts (bound to its public key and manifest).
 async fn judge(
     data: &Data,
     validator: Option<&Validator>,
@@ -206,11 +207,20 @@ async fn judge(
             Vec::new(),
         ),
         // Pending, or still walking when the time ran out: name the first
-        // certificate the cached walk misses.
+        // certificate (or cut-manifest packet) the cached walk misses.
         Ok(ValidationResult::Pending) | Err(_) => {
             let (_, missing) = validator.validate_durable_cached(data).await;
             let timeout_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
             let detail = match missing {
+                Some(manifest) if ndn_security::is_full_name(&manifest) => Detail::new(
+                    detail_code::DATA_CHAIN_INCOMPLETE,
+                    format!(
+                        "the revocation cut of the Data's signer binds it to a manifest, and the \
+                         manifest packet {manifest} could not be had within {timeout_ms} ms; \
+                         ask the namespace's root or a node keeping the context to serve it"
+                    ),
+                )
+                .with("manifest", manifest),
                 Some(cert) => Detail::new(
                     detail_code::DATA_CHAIN_INCOMPLETE,
                     format!(

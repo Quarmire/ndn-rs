@@ -162,10 +162,16 @@ impl PendingQueue {
 ///
 /// Data is judged by the **durable** rule
 /// ([`Validator::validate_durable_cached`]): its verdict never depends on a
-/// clock — an expired certificate or anchor does not refuse it; a key's
-/// authority ends only by a revocation in the trust context, and a key
-/// revoked with a cut keeps the packets its cut accepts. (Signed Interests
-/// and commands stay live: they are judged elsewhere, against now.)
+/// clock — an expired certificate or anchor does not refuse it (unless the
+/// key's role is listed in DataRequiresCut); a key's authority ends by a
+/// revocation in the trust context, and a key revoked with a cut keeps the
+/// packets its cut accepts (bound to its public key and, with a manifest,
+/// to the listed bytes). (Signed Interests and commands stay live: they are
+/// judged elsewhere, against now.)
+///
+/// A cut-manifest packet the verdict needs is handled exactly as a missing
+/// certificate: the walk names it (its full name), the Data is parked and
+/// the packet fetched by full name.
 ///
 /// Validation on the pipeline is **cache-only**: awaiting a network cert
 /// fetch inline would stall the very pipeline that
@@ -223,17 +229,19 @@ impl ValidationStage {
         }
     }
 
-    /// Kick off a background fetch of `cert_name` through the validator's
-    /// fetcher, if one is attached: routed by the FIB and, where the fetcher
-    /// can, also asked of `in_face`, the neighbour that delivered the Data
-    /// waiting on it (a producer serves its own issuer chain). Never awaited
-    /// on the pipeline.
+    /// Kick off a background fetch of what a walk named missing — a
+    /// certificate, or a cut-manifest packet by its full name
+    /// ([`CertFetcher::fetch_missing`](ndn_security::CertFetcher::fetch_missing)) —
+    /// through the validator's fetcher, if one is attached: routed by the
+    /// FIB and, where the fetcher can, also asked of `in_face`, the
+    /// neighbour that delivered the Data waiting on it (a producer serves its
+    /// own issuer chain). Never awaited on the pipeline.
     fn request_cert(&self, validator: &Validator, cert_name: &Arc<Name>, in_face: FaceId) {
         if let Some(fetcher) = validator.cert_fetcher() {
             let fetcher = Arc::clone(fetcher);
             let cn = Arc::clone(cert_name);
             self.runtime.spawn(Box::pin(async move {
-                let _ = fetcher.fetch_from(&cn, Some(in_face.0)).await;
+                let _ = fetcher.fetch_missing(&cn, Some(in_face.0)).await;
             }));
         }
     }
@@ -747,5 +755,96 @@ mod tests {
         );
         assert_eq!(stage.stats().invalid.load(Ordering::Relaxed), 1);
         assert_eq!(fetches.load(Ordering::Relaxed), 1);
+    }
+
+    /// A key revoked with a cut bound to a manifest: in-range Data is parked
+    /// while the manifest is not held, the manifest is fetched by its full
+    /// name like a missing certificate, and the Data then validates; other
+    /// bytes at the same in-range name are refused as revoked.
+    #[tokio::test]
+    async fn in_cut_data_waits_for_the_cut_manifest_like_a_certificate() {
+        use ndn_security::{CertCache, Keyring, RevocationCut, SignedTrustContext};
+        let root = Ed25519Signer::from_seed(&[1; 32], n("/t/KEY/root"));
+        let leaf = Ed25519Signer::from_seed(&[3; 32], n("/t/leaf/KEY/l"));
+        let leaf_cert = ndn_security::encode_cert_data(
+            &n("/t/leaf/KEY/l/root/v=1"),
+            &leaf.public_key_bytes(),
+            &root,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let honest = signed_data("/t/leaf/log/seq=2", &leaf);
+        let honest_data = Data::decode(honest.clone()).unwrap();
+        let manifest = ndn_security::cut_manifest::build(
+            &n("/t"),
+            leaf.key_name(),
+            &[(n("/t/leaf/log"), 2, honest_data.implicit_digest())],
+        )
+        .unwrap();
+        let mut cut = RevocationCut::new(leaf.key_name().clone());
+        cut.add_run(&n("/t/leaf/log"), 1, 3);
+        cut.set_manifest(manifest.root.clone()).unwrap();
+        let ctx = SignedTrustContext::accept_all(n("/t"))
+            .with_version(1)
+            .with_revocation(leaf.key_name().clone())
+            .with_revocation_cut(cut);
+        assert!(ctx.add_anchor(Certificate {
+            name: Arc::new(root.key_name().clone()),
+            public_key: Bytes::copy_from_slice(&root.public_key_bytes()),
+            valid_from: 0,
+            valid_until: u64::MAX,
+            issuer: None,
+            signed_region: None,
+            sig_value: None,
+            sig_type: SignatureType::SignatureEd25519,
+        }));
+        let keyring = Arc::new(Keyring::new());
+        assert!(keyring.adopt(Arc::new(ctx)));
+        let cache = Arc::new(CertCache::new());
+        cache.insert(Certificate::decode(&Data::decode(leaf_cert).unwrap()).unwrap());
+        let served = HashMap::from([(manifest.root.clone(), manifest.packets[0].clone())]);
+        let fetch_fn: FetchFn = Arc::new(move |name: Name| {
+            let data = served.get(&name).map(|w| Data::decode(w.clone()).unwrap());
+            Box::pin(async move { data.ok_or(ndn_security::FetchMiss::Unanswered) })
+        });
+        let fetcher = Arc::new(CertFetcher::new(
+            Arc::clone(&cache),
+            fetch_fn,
+            Duration::from_secs(1),
+        ));
+        let validator = Arc::new(Validator::with_keyring(keyring, cache, Some(fetcher), 5));
+        let stage = ValidationStage::new(
+            Some(Arc::clone(&validator)),
+            PendingQueueConfig::default(),
+            ndn_runtime::default_runtime(),
+        );
+
+        assert!(matches!(
+            stage.process(ctx_for(honest)).await,
+            Action::Drop(DropReason::ValidationPending)
+        ));
+        let mut actions = Vec::new();
+        for _ in 0..200 {
+            actions = stage.drain_pending().await;
+            if !actions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            matches!(actions.as_slice(), [Action::Satisfy(ctx)] if ctx.verified),
+            "the in-cut Data validates once the manifest is held"
+        );
+        let thief = DataBuilder::new(n("/t/leaf/log/seq=2"), b"other bytes").sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(leaf.key_name()),
+            |region| leaf.sign_sync(region).unwrap(),
+        );
+        assert!(matches!(
+            stage.process(ctx_for(thief)).await,
+            Action::Refuse(_, Refusal::Revoked)
+        ));
     }
 }

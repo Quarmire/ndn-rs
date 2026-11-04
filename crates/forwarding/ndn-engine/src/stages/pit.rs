@@ -18,6 +18,12 @@ use ndn_security::{ReplayCheck, ReplayGuard};
 /// matches the typical NDN FreshnessPeriod default and ndn-cxx's PIT reaper.
 pub const MAX_PERSISTENT_LIFETIME_SECS: u32 = ndn_packet::MAX_PERSISTENT_LIFETIME_SECS;
 
+/// The longest InterestLifetime this forwarder honours: a longer one (up to
+/// what the TLV can carry) is clamped to it, so one Interest can hold a PIT
+/// entry — and keep the match stage hashing Data for a full name — for an
+/// hour at most.
+pub const MAX_INTEREST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Checks the PIT for a pending Interest:
 /// - duplicate nonce → `Drop(LoopDetected)`
 /// - same-name entry → aggregate as new in-record, `Drop(Suppressed)`
@@ -84,7 +90,7 @@ impl PitCheckStage {
         let now_ns = ctx.arrival;
         let lifetime_ms = interest
             .lifetime()
-            .map(|d| d.as_millis() as u64)
+            .map(|d| d.min(MAX_INTEREST_LIFETIME).as_millis() as u64)
             .unwrap_or(4_000);
 
         let nonce = interest.nonce().unwrap_or(0);
@@ -114,9 +120,11 @@ impl PitCheckStage {
         let name_hash = NameHashes::full_name_hash(&key_name);
         // An Interest by full name (`<N>/sha256digest=<d>`, exact retrieval of
         // one Data) is matched by the Data's computed full name: let the
-        // match stage know such an entry may be live (see `FULL_NAME_UNTIL`).
+        // match stage of this engine know such an entry may be live
+        // ([`Pit::note_full_name_interest`]).
         if !subscription_flavored && ends_in_implicit_digest(&key_name) {
-            note_full_name_interest(now_ns.saturating_add(lifetime_ms.saturating_mul(1_000_000)));
+            self.pit
+                .note_full_name_interest(now_ns.saturating_add(lifetime_ms * 1_000_000));
         }
         // Persistent (SubscriptionRequest) Interests occupy a distinct PIT
         // entry from classical Interests at the same logical name.
@@ -558,7 +566,7 @@ impl PitMatchStage {
         // Interests by full name: the Data's name plus its implicit digest
         // (SHA-256 of its wire), as NFD's findAllDataMatches matches them. The
         // digest is computed only while such an Interest may be pending.
-        if full_name_interests_may_be_pending(arrival)
+        if self.pit.full_name_interests_may_be_pending(arrival)
             && let DecodedPacket::Data(data) = &ctx.packet
         {
             let full = data_name
@@ -842,23 +850,6 @@ fn ends_in_implicit_digest(name: &ndn_packet::Name) -> bool {
     name.components()
         .last()
         .is_some_and(|c| c.typ == ndn_packet::tlv_type::IMPLICIT_SHA256)
-}
-
-/// The latest deadline (ns, the arrival clock of the engine that set it) of
-/// any Interest by full name a PIT check admitted in this process, so the
-/// match stage hashes a Data's wire for its full name only while such an
-/// entry may be live — not for every Data. Process-wide and only ever
-/// raised: it over-approximates (several engines, or several clocks under
-/// simulation, only make it hash more often), never under-approximates,
-/// since every full-name entry's deadline was noted here when it was set.
-static FULL_NAME_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn note_full_name_interest(deadline: u64) {
-    FULL_NAME_UNTIL.fetch_max(deadline, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn full_name_interests_may_be_pending(arrival: u64) -> bool {
-    arrival <= FULL_NAME_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1212,6 +1203,50 @@ mod n06_dead_nonce_engine_tests {
             _ => panic!("the Data with that digest must satisfy the Interest"),
         }
         assert!(pit.is_empty(), "satisfaction erases the entry");
+    }
+
+    /// An Interest by full name with a huge InterestLifetime makes its own
+    /// engine hash Data for its full name only up to the forwarder's
+    /// maximum InterestLifetime, and never another engine.
+    #[tokio::test]
+    async fn a_full_name_interest_makes_only_its_engine_hash_data_and_not_for_long() {
+        let pit = Arc::new(Pit::new());
+        let other_engine = Arc::new(Pit::new());
+        let check = PitCheckStage {
+            pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
+            dead_nonce_list: None,
+            validator: None,
+            replay_guard: None,
+        };
+        let hashes = |pit: &Pit, at: u64| pit.full_name_interests_may_be_pending(at);
+        let arrival: u64 = 1_000_000_000_000;
+        let full = "/audit/huge/seq=1"
+            .parse::<Name>()
+            .unwrap()
+            .append_implicit_digest([9; 32]);
+        let ten_years = std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+        let wire = InterestBuilder::new(full).lifetime(ten_years).build();
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(1), arrival);
+        ctx.name = Some(Arc::clone(&interest.name));
+        ctx.packet = DecodedPacket::Interest(Box::new(interest));
+        assert!(matches!(check.process(ctx).await, Action::Continue(_)));
+
+        let second = 1_000_000_000;
+        assert!(
+            hashes(&pit, arrival + second),
+            "while the entry may be live"
+        );
+        assert!(
+            !hashes(&other_engine, arrival + second),
+            "another engine's PIT holds no full-name entry"
+        );
+        let two_hours = 2 * 3600 * second;
+        assert!(
+            !hashes(&pit, arrival + two_hours),
+            "past the forwarder's maximum InterestLifetime"
+        );
     }
 
     fn data_ctx_of(wire: Bytes) -> PacketContext {

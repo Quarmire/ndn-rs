@@ -1,25 +1,30 @@
-//! Keep Data signed through a key that a newly adopted trust context revokes
-//! from being served out of the Content Store.
+//! Keep Data that a newly adopted trust context refuses from being served
+//! out of the Content Store.
 //!
 //! The Content Store answers Interests without validating again: Data is
 //! validated once, before it is admitted. When the node adopts a version of a
-//! trust context that revokes a key, Data that key signed may already sit in
-//! the CS, or be on its way there. After a revoking update, a cached Data
-//! is served only when its chain is *known clear* by the durable rule the
-//! validation stage applies to Data
-//! ([`Validator::validate_durable`](ndn_security::Validator::validate_durable)):
-//! its signer is not revoked, or revoked with a cut that accepts it
-//! ([`SignedTrustContext::refuses_data`]); its chain, followed from its
-//! KeyLocator through the validator's certificate cache, ends at an anchor
-//! (or a certificate with no issuer above it) without passing a revoked
-//! issuer or certificate; and it is no certificate the context revokes —
-//! except a certificate of a key revoked *with* a cut, kept because the Data
-//! the cut accepts needs it to verify. Data whose
-//! chain cannot be followed that far is not served either — after a restart
-//! the cache holds only this node's own certificates, not those of other
-//! devices or their CA — but evicted, so the next Interest fetches it and
-//! validation judges it afresh. A context that revokes nothing leaves every
-//! entry clear.
+//! trust context that refuses what the one before accepted — it revokes a
+//! key, a key's cut accepts less, or a role newly needs a cut
+//! ([`Keyring::on_revocation`](ndn_security::Keyring::on_revocation)) —
+//! Data it now refuses may already sit in the CS, or be on its way there.
+//! After such an update, a cached Data is served only when it is *known
+//! clear* by the durable rule the validation stage applies to Data
+//! ([`ndn_security::chain_clear`], the code
+//! [`Validator::validate_durable`](ndn_security::Validator::validate_durable)
+//! shares): its chain, followed from its KeyLocator through the validator's
+//! certificate cache — each hop through the cached certificate whose public
+//! key verifies it — ends at an anchor (or a certificate with no issuer
+//! above it) without passing a revoked issuer or certificate; its signer is
+//! not revoked, or revoked with a cut that accepts it (key digest, ranges,
+//! manifest, exact entries), and is no lapsed key whose role needs a cut;
+//! and it is no certificate the context revokes — except a certificate of a
+//! key revoked *with* a cut, kept because the Data the cut accepts needs it
+//! to verify. Data whose chain cannot be followed that far (or whose cut's
+//! manifest is not held) is not served either — after a restart the cache
+//! holds only this node's own certificates, not those of other devices or
+//! their CA — but evicted, so the next Interest fetches it and validation
+//! judges it afresh. A context that revokes nothing and lists no role
+//! needing a cut leaves every entry clear.
 //!
 //! Correctness rests on data, not on timing. Every entry `CsInsertStage`
 //! admits carries the keyring's
@@ -50,16 +55,12 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Waker};
 
 use bytes::Bytes;
-use ndn_packet::{Data, Name};
+use ndn_packet::Data;
 use ndn_runtime::Runtime;
 use ndn_security::{CertCache, SignedTrustContext, Validator};
 use ndn_store::{CsEntry, ErasedContentStore};
 
 use crate::observability::targets as t;
-
-/// How far up a cached entry's chain to look for a revoked certificate; a
-/// longer chain is not known clear.
-const MAX_CHAIN: usize = 8;
 
 /// Evict CS entries covered by each revocation `validator`'s keyring adopts.
 pub(crate) fn install(
@@ -131,69 +132,13 @@ pub(crate) async fn recheck(
     servable
 }
 
-/// Whether the Data in `wire` decodes and [`chain_clear`] holds for it.
+/// Whether the Data in `wire` decodes and the durable re-check
+/// ([`ndn_security::chain_clear`]) holds for it under `ctx`: the same rule
+/// the validation stage applies to its signer (cut, key digest, manifest,
+/// DataRequiresCut), each hop resolved to the cached certificate that
+/// verifies it.
 fn known_clear(ctx: &SignedTrustContext, certs: &CertCache, wire: &Bytes) -> bool {
-    Data::decode(wire.clone()).is_ok_and(|data| chain_clear(ctx, certs, &data))
-}
-
-/// Whether no revocation of `ctx` refuses `data`, as far as can be known:
-/// it is no revoked certificate (a certificate of a key revoked with a cut
-/// excepted), its signer is not revoked or is revoked with a cut that
-/// accepts it, and its chain followed through `certs` reaches an anchor of
-/// `ctx`, or a certificate with no other issuer, passing no revoked issuer
-/// or certificate. A chain `certs` cannot follow that far (a certificate not
-/// cached, a key-digest signer not cached, more than [`MAX_CHAIN`] hops) is
-/// not known clear.
-fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool {
-    use ndn_packet::KeyLocator;
-    use ndn_security::cert_name::{is_cert_name, is_reserved_non_cert, key_name_of};
-
-    if ctx.revocations().is_empty() {
-        return true;
-    }
-    if ctx.is_revoked(&data.name) {
-        let cut_key_certificate = is_cert_name(&data.name)
-            && !is_reserved_non_cert(&data.name)
-            && ctx.revocation_cut(&key_name_of(&data.name)).is_some();
-        if !cut_key_certificate {
-            return false;
-        }
-    }
-    // The packet's own signer (`depth` 0) is judged by the durable rule, its
-    // issuers by their revocation alone.
-    let refused = |name: &Name, depth: usize| {
-        ctx.is_revoked(name)
-            && (depth > 0 || ctx.refuses_data(name, &data.name, &data.implicit_digest()))
-    };
-    let mut key: Arc<Name> = match data.sig_info().and_then(|si| si.key_locator.as_ref()) {
-        Some(KeyLocator::Name(name)) => Arc::new(Name::clone(name)),
-        Some(KeyLocator::KeyDigest(digest)) => match certs.get_by_key_digest(digest) {
-            Some(cert) => Arc::new(cert.key_name()),
-            None => return false,
-        },
-        // No signing key (DigestSha256, or unsigned): nothing to revoke.
-        None => return true,
-    };
-    for depth in 0..MAX_CHAIN {
-        if refused(&key, depth) {
-            return false;
-        }
-        if ctx.anchor_for(&key).is_some() {
-            return true;
-        }
-        let Some(cert) = certs.get(&key) else {
-            return false;
-        };
-        if refused(&cert.name, depth) {
-            return false;
-        }
-        match cert.issuer {
-            Some(issuer) if key_name_of(&issuer) != cert.key_name() => key = issuer,
-            // Self-signed, or no issuer named: nothing above it to revoke.
-            _ => return true,
-        }
-    }
-    false
+    Data::decode(wire.clone()).is_ok_and(|data| ndn_security::chain_clear(ctx, certs, &data))
 }
 
 #[cfg(test)]
@@ -208,7 +153,7 @@ mod tests {
     use std::time::Duration;
 
     use ndn_packet::encode::{DataBuilder, InterestBuilder};
-    use ndn_packet::{Interest, SignatureType};
+    use ndn_packet::{Interest, Name, SignatureType};
     use ndn_security::{Certificate, Ed25519Signer, Keyring, Signer};
     use ndn_store::{
         AdmitAllPolicy, ContentStore, CsCapacity, CsEntryFilter, CsMeta, FjallCs, InsertResult,
@@ -665,6 +610,165 @@ mod tests {
         assert!(
             !known_clear(&revoking(None), &certs, &certificate),
             "the certificate of a key revoked without a cut is not"
+        );
+    }
+
+    /// A later version whose cut of the key accepts less (a shrunk run)
+    /// is a revoking update: the Data the old cut kept and the new one does
+    /// not is no longer served from the CS.
+    #[tokio::test]
+    async fn a_cut_that_shrinks_stops_serving_what_it_no_longer_accepts() {
+        const KEPT: &str = "/home/bob/member/d/notes/seq=1";
+        const DROPPED: &str = "/home/bob/member/d/notes/seq=2";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let ca = Key::new("/home/bob/CA/KEY/9", 11);
+        let d = Key::new("/home/bob/member/d/KEY/4", 12);
+        let keyring = Arc::new(Keyring::new());
+        let version = |v: u64, last: u64| {
+            let mut cut = ndn_security::RevocationCut::new(d.name.clone());
+            cut.add_run(&n("/home/bob/member/d/notes"), 1, last);
+            let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+                .with_ca_endpoint(n("/home/bob/CA"))
+                .with_version(v)
+                .with_revocation(d.name.clone())
+                .with_revocation_cut(cut);
+            assert!(ctx.add_anchor(root.anchor()));
+            Arc::new(ctx)
+        };
+        keyring.adopt(version(1, 3));
+        let certs = Arc::new(CertCache::new());
+        certs.insert(ca.certified_by(&root));
+        certs.insert(d.certified_by(&ca));
+        let node = Node::with_certs(
+            Arc::clone(&keyring),
+            Arc::new(LruCs::new(1 << 20)),
+            false,
+            certs,
+        );
+        node.receive(d.data(KEPT)).await;
+        node.receive(d.data(DROPPED)).await;
+        assert!(node.serves(KEPT).await && node.serves(DROPPED).await);
+
+        keyring.adopt_update(version(2, 1)).unwrap();
+        assert!(node.serves(KEPT).await, "still in the cut");
+        assert!(
+            !node.serves(DROPPED).await,
+            "Data the shrunk cut no longer accepts must not be served"
+        );
+    }
+
+    /// Two certificates name one key: an honest one from the current CA and
+    /// one a compromised old CA issued for the attacker's public key. Data
+    /// the attacker signed validated through the old CA; once the old CA is
+    /// revoked, the CS re-check follows the certificate that verifies the
+    /// Data (the old CA's), not the newest one of the key name, and stops
+    /// serving it.
+    #[tokio::test]
+    async fn the_recheck_follows_the_certificate_that_verifies_the_data() {
+        const FORGED: &str = "/home/bob/member/d/photo";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let old_ca = Key::new("/home/bob/CA/KEY/old", 11);
+        let new_ca = Key::new("/home/bob/CA/KEY/new", 13);
+        let honest = Key::new("/home/bob/member/d/KEY/4", 12);
+        let attacker = Key::new("/home/bob/member/d/KEY/4", 66);
+        // `<key>/<issuer-id>/v=1` of `subject`'s public key, signed by `issuer`.
+        let cert = |subject: &Key, issuer_id: &str, issuer: &Key| {
+            let wire = DataBuilder::new(
+                subject.name.clone().append(issuer_id).append_version(1),
+                &subject.signer.public_key_bytes(),
+            )
+            .sign_sync(
+                SignatureType::SignatureEd25519,
+                Some(&issuer.name),
+                |region| issuer.signer.sign_sync(region).unwrap(),
+            );
+            Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+        };
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(context(&[&root], 1, &[]));
+        let certs = Arc::new(CertCache::new());
+        certs.insert(old_ca.certified_by(&root));
+        certs.insert(new_ca.certified_by(&root));
+        // The honest certificate is the newest of the key name.
+        certs.insert(cert(&attacker, "a-old", &old_ca));
+        certs.insert(cert(&honest, "b-new", &new_ca));
+        let node = Node::with_certs(
+            Arc::clone(&keyring),
+            Arc::new(LruCs::new(1 << 20)),
+            false,
+            certs,
+        );
+        node.receive(attacker.data(FORGED)).await;
+        assert!(node.serves(FORGED).await);
+
+        keyring
+            .adopt_update(context(&[&root], 2, &[&old_ca]))
+            .unwrap();
+        assert!(
+            !node.serves(FORGED).await,
+            "Data verified only through the revoked CA must not be served"
+        );
+    }
+
+    /// The CS re-check applies the cut's manifest as validation does: after
+    /// a revoking update whose cut lists the honest bytes at an in-range
+    /// name, the honest packet is served and an in-range entry the manifest
+    /// does not list is not; without the manifest held, nothing in range is
+    /// known clear.
+    #[tokio::test]
+    async fn the_recheck_applies_the_cuts_manifest() {
+        const HONEST: &str = "/home/bob/member/d/notes/seq=2";
+        const UNLISTED: &str = "/home/bob/member/d/notes/seq=3";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let ca = Key::new("/home/bob/CA/KEY/9", 11);
+        let d = Key::new("/home/bob/member/d/KEY/4", 12);
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(context(&[&root], 1, &[]));
+        let certs = Arc::new(CertCache::new());
+        certs.insert(ca.certified_by(&root));
+        certs.insert(d.certified_by(&ca));
+        let node = Node::with_certs(
+            Arc::clone(&keyring),
+            Arc::new(LruCs::new(1 << 20)),
+            false,
+            Arc::clone(&certs),
+        );
+        let honest = d.data(HONEST);
+        let honest_wire = honest.raw_bytes.clone();
+        let honest_digest = Data::decode(honest_wire.clone()).unwrap().implicit_digest();
+        let manifest = ndn_security::cut_manifest::build(
+            &n("/home/bob"),
+            &d.name,
+            &[(n("/home/bob/member/d/notes"), 2, honest_digest)],
+        )
+        .unwrap();
+        node.receive(honest).await;
+        node.receive(d.data(UNLISTED)).await;
+
+        let mut cut = ndn_security::RevocationCut::new(d.name.clone());
+        cut.add_run(&n("/home/bob/member/d/notes"), 1, 3);
+        cut.set_manifest(manifest.root.clone()).unwrap();
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_ca_endpoint(n("/home/bob/CA"))
+            .with_version(2)
+            .with_revocation(d.name.clone())
+            .with_revocation_cut(cut);
+        assert!(ctx.add_anchor(root.anchor()));
+        keyring.adopt_update(Arc::new(ctx)).unwrap();
+        let held = keyring.context_for(&n(HONEST));
+        assert!(
+            !known_clear(&held, &certs, &honest_wire),
+            "not known clear while the manifest is not held"
+        );
+        certs
+            .cut_manifests()
+            .insert(&Data::decode(manifest.packets[0].clone()).unwrap())
+            .unwrap();
+        assert!(known_clear(&held, &certs, &honest_wire));
+        assert!(node.serves(HONEST).await, "the listed bytes are served");
+        assert!(
+            !node.serves(UNLISTED).await,
+            "an in-range entry not listed is not"
         );
     }
 }

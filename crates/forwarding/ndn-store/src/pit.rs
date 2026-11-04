@@ -503,6 +503,12 @@ pub struct Pit {
     next_expiry: AtomicU64,
     /// Woken when an insert lowers `next_expiry`.
     expiry_moved: Notify,
+    /// The latest deadline (ns, the arrival clock) of any Interest by full
+    /// name (`<N>/sha256digest=<d>`) admitted into this table, so Data is
+    /// hashed for its full name only while such an entry may be live
+    /// ([`Self::full_name_interests_may_be_pending`]). Only ever raised: it
+    /// over-approximates, never under-approximates.
+    full_name_until: AtomicU64,
 }
 
 impl Pit {
@@ -519,6 +525,7 @@ impl Pit {
             orphans: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_expiry: AtomicU64::new(u64::MAX),
             expiry_moved: Notify::new(),
+            full_name_until: AtomicU64::new(0),
         }
     }
 
@@ -565,6 +572,20 @@ impl Pit {
     /// until then. It may be early, never late.
     pub fn next_expiry(&self) -> u64 {
         self.next_expiry.load(Ordering::SeqCst)
+    }
+
+    /// An Interest by full name was admitted into this table, its entry
+    /// expiring at `deadline` (ns). The caller bounds `deadline` by the
+    /// forwarder's maximum InterestLifetime.
+    pub fn note_full_name_interest(&self, deadline: u64) {
+        self.full_name_until.fetch_max(deadline, Ordering::Relaxed);
+    }
+
+    /// Whether an Interest by full name admitted into this table may still
+    /// be pending at `at` (ns): the Data arriving then is matched by its
+    /// computed full name only while this holds.
+    pub fn full_name_interests_may_be_pending(&self, at: u64) -> bool {
+        at <= self.full_name_until.load(Ordering::Relaxed)
     }
 
     /// Resolves once an insert has lowered [`Self::next_expiry`] since the last time it did
