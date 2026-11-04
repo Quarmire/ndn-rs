@@ -5,10 +5,16 @@
 //! validated once, before it is admitted. When the node adopts a version of a
 //! trust context that revokes a key, Data that key signed may already sit in
 //! the CS, or be on its way there. After a revoking update, a cached Data
-//! is served only when its chain is *known clear*: it is no certificate the
-//! context revokes, and its chain, followed from its KeyLocator through the
-//! validator's certificate cache, ends at an anchor (or a certificate with no
-//! issuer above it) without passing a revoked key or certificate. Data whose
+//! is served only when its chain is *known clear* by the durable rule the
+//! validation stage applies to Data
+//! ([`Validator::validate_durable`](ndn_security::Validator::validate_durable)):
+//! its signer is not revoked, or revoked with a cut that accepts it
+//! ([`SignedTrustContext::refuses_data`]); its chain, followed from its
+//! KeyLocator through the validator's certificate cache, ends at an anchor
+//! (or a certificate with no issuer above it) without passing a revoked
+//! issuer or certificate; and it is no certificate the context revokes —
+//! except a certificate of a key revoked *with* a cut, kept because the Data
+//! the cut accepts needs it to verify. Data whose
 //! chain cannot be followed that far is not served either — after a restart
 //! the cache holds only this node's own certificates, not those of other
 //! devices or their CA — but evicted, so the next Interest fetches it and
@@ -130,22 +136,35 @@ fn known_clear(ctx: &SignedTrustContext, certs: &CertCache, wire: &Bytes) -> boo
     Data::decode(wire.clone()).is_ok_and(|data| chain_clear(ctx, certs, &data))
 }
 
-/// Whether no revocation of `ctx` covers `data`, as far as can be known: it
-/// is no revoked certificate, and its chain followed through `certs` reaches
-/// an anchor of `ctx`, or a certificate with no other issuer, passing no
-/// revoked key or certificate. A chain `certs` cannot follow that far (a
-/// certificate not cached, a key-digest signer not cached, more than
-/// [`MAX_CHAIN`] hops) is not known clear.
+/// Whether no revocation of `ctx` refuses `data`, as far as can be known:
+/// it is no revoked certificate (a certificate of a key revoked with a cut
+/// excepted), its signer is not revoked or is revoked with a cut that
+/// accepts it, and its chain followed through `certs` reaches an anchor of
+/// `ctx`, or a certificate with no other issuer, passing no revoked issuer
+/// or certificate. A chain `certs` cannot follow that far (a certificate not
+/// cached, a key-digest signer not cached, more than [`MAX_CHAIN`] hops) is
+/// not known clear.
 fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool {
     use ndn_packet::KeyLocator;
-    use ndn_security::cert_name::key_name_of;
+    use ndn_security::cert_name::{is_cert_name, is_reserved_non_cert, key_name_of};
 
     if ctx.revocations().is_empty() {
         return true;
     }
     if ctx.is_revoked(&data.name) {
-        return false;
+        let cut_key_certificate = is_cert_name(&data.name)
+            && !is_reserved_non_cert(&data.name)
+            && ctx.revocation_cut(&key_name_of(&data.name)).is_some();
+        if !cut_key_certificate {
+            return false;
+        }
     }
+    // The packet's own signer (`depth` 0) is judged by the durable rule, its
+    // issuers by their revocation alone.
+    let refused = |name: &Name, depth: usize| {
+        ctx.is_revoked(name)
+            && (depth > 0 || ctx.refuses_data(name, &data.name, &data.implicit_digest()))
+    };
     let mut key: Arc<Name> = match data.sig_info().and_then(|si| si.key_locator.as_ref()) {
         Some(KeyLocator::Name(name)) => Arc::new(Name::clone(name)),
         Some(KeyLocator::KeyDigest(digest)) => match certs.get_by_key_digest(digest) {
@@ -155,8 +174,8 @@ fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool
         // No signing key (DigestSha256, or unsigned): nothing to revoke.
         None => return true,
     };
-    for _ in 0..MAX_CHAIN {
-        if ctx.is_revoked(&key) {
+    for depth in 0..MAX_CHAIN {
+        if refused(&key, depth) {
             return false;
         }
         if ctx.anchor_for(&key).is_some() {
@@ -165,7 +184,7 @@ fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> bool
         let Some(cert) = certs.get(&key) else {
             return false;
         };
-        if ctx.is_revoked(&cert.name) {
+        if refused(&cert.name, depth) {
             return false;
         }
         match cert.issuer {
@@ -587,6 +606,65 @@ mod tests {
         assert!(
             node.serves(B_PHOTO).await,
             "persisted Data of an anchor not revoked is still served"
+        );
+    }
+
+    /// A key revoked with a cut keeps the Data its cut accepts — served from
+    /// the CS and validated anew — while the rest it signed is purged and
+    /// refused; its certificate stays, as in-cut Data needs it to verify.
+    #[tokio::test]
+    async fn a_cut_keeps_what_it_accepts_and_the_keys_certificate() {
+        const IN_CUT: &str = "/home/bob/member/d/notes/seq=2";
+        const OUT_OF_CUT: &str = "/home/bob/member/d/notes/seq=5";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let ca = Key::new("/home/bob/CA/KEY/9", 11);
+        let d = Key::new("/home/bob/member/d/KEY/4", 12);
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(context(&[&root], 1, &[]));
+        let certs = Arc::new(CertCache::new());
+        certs.insert(ca.certified_by(&root));
+        certs.insert(d.certified_by(&ca));
+        let node = Node::with_certs(
+            Arc::clone(&keyring),
+            Arc::new(LruCs::new(1 << 20)),
+            true,
+            Arc::clone(&certs),
+        );
+        node.receive(d.data(IN_CUT)).await;
+        node.receive(d.data(OUT_OF_CUT)).await;
+
+        let revoking = |cut: Option<ndn_security::RevocationCut>| {
+            let mut ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+                .with_ca_endpoint(n("/home/bob/CA"))
+                .with_version(2)
+                .with_revocation(d.name.clone());
+            if let Some(cut) = cut {
+                ctx = ctx.with_revocation_cut(cut);
+            }
+            assert!(ctx.add_anchor(root.anchor()));
+            ctx
+        };
+        let mut cut = ndn_security::RevocationCut::new(d.name.clone());
+        cut.add_run(&n("/home/bob/member/d/notes"), 1, 3);
+        keyring.adopt_update(Arc::new(revoking(Some(cut)))).unwrap();
+
+        assert!(node.serves(IN_CUT).await, "in-cut Data is still served");
+        assert!(!node.serves(OUT_OF_CUT).await, "out-of-cut Data is not");
+        node.validated(d.data(IN_CUT)).await;
+        assert!(matches!(
+            node.validation.process(d.data(OUT_OF_CUT)).await,
+            Action::Refuse(_, ndn_packet::Refusal::Revoked)
+        ));
+
+        let certificate = d.certified_by(&ca).data_wire().unwrap();
+        let with_cut = keyring.context_for(&n("/home/bob"));
+        assert!(
+            known_clear(&with_cut, &certs, &certificate),
+            "the certificate of a key revoked with a cut is kept"
+        );
+        assert!(
+            !known_clear(&revoking(None), &certs, &certificate),
+            "the certificate of a key revoked without a cut is not"
         );
     }
 }

@@ -147,7 +147,10 @@ async fn inspect_data(
     }
 }
 
-/// The verdict on `data`, why, and the certificate names walked.
+/// The verdict on `data`, why, and the certificate names walked. The verdict
+/// is the durable one the forwarder's validation stage reaches for Data
+/// ([`Validator::validate_durable`]): no clock decides it, and a key revoked
+/// with a cut still vouches for the Data its cut accepts.
 async fn judge(
     data: &Data,
     validator: Option<&Validator>,
@@ -166,7 +169,7 @@ async fn judge(
             Vec::new(),
         );
     };
-    match tokio::time::timeout_at(deadline, validator.validate_chain(data)).await {
+    match tokio::time::timeout_at(deadline, validator.validate_durable(data)).await {
         Ok(ValidationResult::Valid(safe)) => match safe.trust_path() {
             TrustPath::DigestSha256 => (
                 DataVerdict::Valid,
@@ -205,7 +208,7 @@ async fn judge(
         // Pending, or still walking when the time ran out: name the first
         // certificate the cached walk misses.
         Ok(ValidationResult::Pending) | Err(_) => {
-            let (_, missing) = validator.validate_chain_cached(data).await;
+            let (_, missing) = validator.validate_durable_cached(data).await;
             let timeout_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
             let detail = match missing {
                 Some(cert) => Detail::new(

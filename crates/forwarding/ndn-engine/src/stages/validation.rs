@@ -123,12 +123,12 @@ impl PendingQueue {
                 continue;
             }
 
-            // The KeyLocator names a key: the Data is ready once a currently
-            // valid certificate of it is cached (an expired one cached from
-            // before a renewal does not count — the fetch replaces it), or
-            // once the validator refused the certificate that answered the
-            // fetch (re-validating then yields that verdict, not a timeout).
-            if validator.can_resolve(&entry.needed_cert) {
+            // The KeyLocator names a key: the Data is ready once a
+            // certificate of it is cached — of any validity, as the durable
+            // walk takes it (`Validator::validate_durable_cached`) — or once
+            // the validator refused the certificate that answered the fetch
+            // (re-validating then yields that verdict, not a timeout).
+            if validator.can_resolve_durable(&entry.needed_cert) {
                 let entry = self.entries.remove(i).unwrap();
                 self.total_bytes -= entry.byte_size;
                 results.push(DrainResult::Ready(Box::new(entry.ctx), entry.deadline));
@@ -160,8 +160,15 @@ impl PendingQueue {
 
 /// Validates inbound Data against the engine [`Validator`].
 ///
-/// Validation on the pipeline is **cache-only** ([`Validator::validate_chain_cached`]):
-/// awaiting a network cert fetch inline would stall the very pipeline that
+/// Data is judged by the **durable** rule
+/// ([`Validator::validate_durable_cached`]): its verdict never depends on a
+/// clock — an expired certificate or anchor does not refuse it; a key's
+/// authority ends only by a revocation in the trust context, and a key
+/// revoked with a cut keeps the packets its cut accepts. (Signed Interests
+/// and commands stay live: they are judged elsewhere, against now.)
+///
+/// Validation on the pipeline is **cache-only**: awaiting a network cert
+/// fetch inline would stall the very pipeline that
 /// must deliver the cert's Data. A missing cert instead parks the Data in a
 /// bounded pending queue and spawns a fetch through the validator's
 /// [`CertFetcher`](ndn_security::CertFetcher) (attached after engine build, see
@@ -298,7 +305,7 @@ impl ValidationStage {
         // revoking update that the check below did not see moves it.
         let epoch = validator.keyring().revocation_epoch();
         let (result, missing) = validator
-            .validate_chain_cached(data)
+            .validate_durable_cached(data)
             .instrument(span.clone())
             .await;
         span.record("elapsed_us", started.elapsed().as_micros() as u64);
@@ -325,7 +332,7 @@ impl ValidationStage {
                 pending.push(ctx, cert_name, deadline);
                 Action::Drop(DropReason::ValidationPending)
             }
-            // `validate_chain_cached` names the missing certificate of every
+            // `validate_durable_cached` names the missing certificate of every
             // pending walk, so this never happens; were it to, the Data has
             // no verdict, and Data without a verdict is refused to nobody.
             (ValidationResult::Pending, None) => Action::Drop(DropReason::ValidationFailed),
@@ -371,7 +378,7 @@ impl ValidationStage {
                         }
                     };
                     let epoch = validator.keyring().revocation_epoch();
-                    match validator.validate_chain_cached(data).await {
+                    match validator.validate_durable_cached(data).await {
                         (ValidationResult::Valid(_), _) => {
                             self.stats.valid.fetch_add(1, Ordering::Relaxed);
                             trace!(target: t::SECURITY, name=%data.name, "validation: re-validated after cert fetch");

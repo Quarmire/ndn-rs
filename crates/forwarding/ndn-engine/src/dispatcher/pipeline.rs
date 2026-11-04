@@ -693,6 +693,11 @@ impl PacketDispatcher {
         }
         // Validate the announcement against trust anchors. No validator → no
         // install (an unverified announcement must never install a route).
+        // Live, not durable (`validate`, not `validate_durable`): the
+        // announcement is a routing command acted on now — it installs a
+        // route, it is not Data kept for later — so, as signed Interests and
+        // commands, it needs its signer's certificate (and anchor) valid now
+        // and its key unrevoked, whatever a revocation cut admits.
         let Some(validator) = self.validation.validator.as_ref() else {
             debug!(target: t::SECURITY, "self-learning: no validator, ignoring PrefixAnnouncement");
             return;
