@@ -395,30 +395,45 @@ impl<T: ContentStore> ErasedContentStore for T {
 }
 
 /// Policy controlling whether a Data packet is admitted to the CS.
+///
+/// Admission decides only WHETHER Data is cached. Whether a cached entry may
+/// answer an Interest is the lookup's job: a stale entry (its
+/// `FreshnessPeriod` elapsed, or 0) still satisfies an Interest without
+/// `MustBeFresh`, and never one with it.
 pub trait CsAdmissionPolicy: Send + Sync + 'static {
     fn should_admit(&self, data: &ndn_packet::Data) -> bool;
 }
 
-/// Admit only Data with a positive `FreshnessPeriod`. Matches NFD's default
-/// `admit` policy: caching `FreshnessPeriod=0` Data churns evictions without
-/// ever satisfying `MustBeFresh` Interests.
-pub struct DefaultAdmissionPolicy;
-
-impl CsAdmissionPolicy for DefaultAdmissionPolicy {
-    fn should_admit(&self, data: &ndn_packet::Data) -> bool {
-        matches!(
-            data.meta_info().and_then(|m| m.freshness_period),
-            Some(d) if !d.is_zero()
-        )
-    }
-}
-
-/// Admit every Data unconditionally.
+/// Admit every Data. NFD's default admission, and the engine's and
+/// `[cs] admission_policy`'s default.
+///
+/// `FreshnessPeriod` 0 (or absent) Data is cached too: it is stale at once,
+/// so it never answers `MustBeFresh`, but it answers every other Interest for
+/// its name. That is how immutable, versioned Data, fetched by exact name, is
+/// served from caches along the path.
 pub struct AdmitAllPolicy;
 
 impl CsAdmissionPolicy for AdmitAllPolicy {
     fn should_admit(&self, _: &ndn_packet::Data) -> bool {
         true
+    }
+}
+
+/// Admit only Data with a positive `FreshnessPeriod` (`[cs] admission_policy
+/// = "admit-fresh-only"`).
+///
+/// NOT NFD's default. It saves CS churn on short-lived Data at the cost of
+/// never caching immutable named Data, which producers publish with
+/// `FreshnessPeriod` 0 and consumers fetch by exact name: every such fetch
+/// reaches the producer.
+pub struct AdmitFreshOnlyPolicy;
+
+impl CsAdmissionPolicy for AdmitFreshOnlyPolicy {
+    fn should_admit(&self, data: &ndn_packet::Data) -> bool {
+        matches!(
+            data.meta_info().and_then(|m| m.freshness_period),
+            Some(d) if !d.is_zero()
+        )
     }
 }
 
@@ -444,5 +459,39 @@ impl ContentStore for NullCs {
     }
     fn variant_name(&self) -> &str {
         "null"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_packet::encode::DataBuilder;
+    use std::time::Duration;
+
+    fn data(freshness: Option<Duration>) -> ndn_packet::Data {
+        let mut b = DataBuilder::new(ndn_packet::name!("/admission/v1"), b"x");
+        if let Some(f) = freshness {
+            b = b.freshness(f);
+        }
+        ndn_packet::Data::decode(b.build()).unwrap()
+    }
+
+    /// NFD's default: Data with FreshnessPeriod 0 or none is cached too, so
+    /// immutable Data fetched by exact name is served from the CS.
+    #[test]
+    fn admit_all_admits_data_without_positive_freshness() {
+        for freshness in [None, Some(Duration::ZERO), Some(Duration::from_secs(1))] {
+            assert!(
+                AdmitAllPolicy.should_admit(&data(freshness)),
+                "admit-all must admit Data with FreshnessPeriod {freshness:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_fresh_only_admits_only_positive_freshness() {
+        assert!(!AdmitFreshOnlyPolicy.should_admit(&data(None)));
+        assert!(!AdmitFreshOnlyPolicy.should_admit(&data(Some(Duration::ZERO))));
+        assert!(AdmitFreshOnlyPolicy.should_admit(&data(Some(Duration::from_millis(1)))));
     }
 }

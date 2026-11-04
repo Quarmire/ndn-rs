@@ -256,8 +256,17 @@ fn security_profile(cfg: &ForwarderConfig) -> ndn_security::SecurityProfile {
 
 fn admission_policy(cfg: &ForwarderConfig) -> Arc<dyn ndn_store::CsAdmissionPolicy> {
     match cfg.cs.admission_policy.as_str() {
-        "admit-all" => Arc::new(ndn_store::AdmitAllPolicy),
-        _ => Arc::new(ndn_store::DefaultAdmissionPolicy),
+        "admit-all" | "default" => Arc::new(ndn_store::AdmitAllPolicy),
+        "admit-fresh-only" => Arc::new(ndn_store::AdmitFreshOnlyPolicy),
+        other => {
+            tracing::warn!(
+                target: "cs",
+                admission_policy = %other,
+                "unknown [cs] admission_policy; using \"admit-all\" (NFD's default). \
+                 Set \"admit-all\" or \"admit-fresh-only\"",
+            );
+            Arc::new(ndn_store::AdmitAllPolicy)
+        }
     }
 }
 
@@ -513,6 +522,28 @@ mod tests {
             ),
             "an unknown spelling falls back to full validation (and is logged)"
         );
+    }
+
+    /// The default `[cs] admission_policy`, and the `"default"` spelling,
+    /// cache FreshnessPeriod-0 Data as NFD does; only `admit-fresh-only`
+    /// refuses it.
+    #[test]
+    fn default_admission_caches_freshness_zero_data() {
+        let stale = ndn_packet::Data::decode(
+            ndn_packet::encode::DataBuilder::new(n("/immutable/v1"), b"x")
+                .freshness(std::time::Duration::ZERO)
+                .build(),
+        )
+        .unwrap();
+        let admits = |toml: &str| {
+            admission_policy(&toml.parse::<ForwarderConfig>().unwrap()).should_admit(&stale)
+        };
+
+        assert!(admits(""), "no [cs] table");
+        assert!(admits("[cs]\n"), "empty [cs] table");
+        assert!(admits("[cs]\nadmission_policy = \"default\"\n"));
+        assert!(admits("[cs]\nadmission_policy = \"admit-all\"\n"));
+        assert!(!admits("[cs]\nadmission_policy = \"admit-fresh-only\"\n"));
     }
 
     #[tokio::test]

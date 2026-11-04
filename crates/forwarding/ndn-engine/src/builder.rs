@@ -401,6 +401,9 @@ impl EngineBuilder {
         self
     }
 
+    /// Which Data the CS admits. Default [`ndn_store::AdmitAllPolicy`]
+    /// (NFD's default): every Data, stale ones answering only Interests
+    /// without `MustBeFresh`.
     pub fn admission_policy(mut self, policy: Arc<dyn CsAdmissionPolicy>) -> Self {
         self.admission = Some(policy);
         self
@@ -800,7 +803,7 @@ impl EngineBuilder {
                 cs: Arc::clone(&cs),
                 admission: self
                     .admission
-                    .unwrap_or_else(|| Arc::new(ndn_store::DefaultAdmissionPolicy)),
+                    .unwrap_or_else(|| Arc::new(ndn_store::AdmitAllPolicy)),
                 admit_unverified: self.config.cs_admit_unverified,
             },
             unsolicited_policy: self.config.unsolicited_data,

@@ -127,7 +127,19 @@ async fn cs_erase_removes_prefix_over_the_wire() {
         Some(2),
         "response must echo the erased count"
     );
-    assert_eq!(engine.cs().len(), 0, "both /app entries must be erased");
+    // By name, not `cs().len()`: the CS also caches the management response
+    // itself, as it caches every Data.
+    for leaf in ["a", "b"] {
+        let n: Name = format!("/app/{leaf}").parse().unwrap();
+        assert!(
+            engine
+                .cs()
+                .get_erased(&ndn_packet::Interest::new(n.clone()), 0)
+                .await
+                .is_none(),
+            "{n} must be erased"
+        );
+    }
 
     cancel.cancel();
     shutdown.shutdown().await;

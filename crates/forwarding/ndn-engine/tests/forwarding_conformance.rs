@@ -202,9 +202,6 @@ async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
     let _ = recv_timeout(&handle_b).await;
     handle_b
         .send(
-            // A positive FreshnessPeriod is required: DefaultAdmissionPolicy
-            // refuses FreshnessPeriod=0 Data, so without this the Data is
-            // never cached and the test would assert against an empty store.
             DataBuilder::new(ndn_packet::name!("/cshit/one"), b"cached")
                 .freshness(Duration::from_secs(60))
                 .sign_digest_sha256(),
@@ -243,6 +240,100 @@ async fn cs_hit_after_pit_insert_leaves_no_pit_entry() {
         pit_after_fetch,
         "a CS hit must erase the PIT entry it installed, or later Interests \
          aggregate onto an entry nothing will satisfy"
+    );
+
+    shutdown.shutdown().await;
+}
+
+/// The default admission caches Data whose FreshnessPeriod is 0, as NFD's
+/// does. Stale on arrival, it answers an exact-name Interest without
+/// MustBeFresh from the CS (how immutable versioned Data is served from
+/// caches), and never a MustBeFresh one, which goes to the producer.
+#[tokio::test]
+async fn default_admission_serves_freshness_zero_data_except_to_must_be_fresh() {
+    let (face_a, handle_a) = InProcFace::new(FaceId(FACE_A), 128);
+    let (face_b, handle_b) = InProcFace::new(FaceId(FACE_B), 128);
+    // No `admission_policy`: the engine's default is what is under test.
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig {
+        cs_admit_unverified: true,
+        ..EngineConfig::default()
+    })
+    .face(face_a)
+    .face(face_b)
+    .build()
+    .await
+    .expect("engine build");
+
+    let prefix: Name = "/immutable".parse().unwrap();
+    engine.fib().add_nexthop(&prefix, FaceId(FACE_B), 0);
+    let interest = |must_be_fresh: bool| {
+        let b = InterestBuilder::new(ndn_packet::name!("/immutable/v1"))
+            .lifetime(Duration::from_secs(2));
+        if must_be_fresh {
+            b.must_be_fresh().build()
+        } else {
+            b.build()
+        }
+    };
+
+    handle_a
+        .send(interest(false))
+        .await
+        .expect("inject interest");
+    assert!(
+        recv_timeout(&handle_b)
+            .await
+            .as_ref()
+            .is_some_and(is_forwarded_interest),
+        "the first Interest must reach the producer"
+    );
+    handle_b
+        .send(
+            DataBuilder::new(ndn_packet::name!("/immutable/v1"), b"immutable")
+                .freshness(Duration::ZERO)
+                .sign_digest_sha256(),
+        )
+        .await
+        .expect("inject data");
+    assert!(
+        recv_timeout(&handle_a)
+            .await
+            .as_ref()
+            .is_some_and(is_forwarded_data),
+        "the Data must reach the consumer"
+    );
+
+    handle_a
+        .send(interest(false))
+        .await
+        .expect("inject exact-name interest");
+    assert!(
+        recv_timeout(&handle_b).await.is_none(),
+        "FreshnessPeriod-0 Data must be cached: an exact-name Interest without \
+         MustBeFresh must not reach the producer again"
+    );
+    assert!(
+        recv_timeout(&handle_a)
+            .await
+            .as_ref()
+            .is_some_and(is_forwarded_data),
+        "an exact-name Interest without MustBeFresh must be answered from the CS"
+    );
+
+    handle_a
+        .send(interest(true))
+        .await
+        .expect("inject MustBeFresh interest");
+    assert!(
+        recv_timeout(&handle_b)
+            .await
+            .as_ref()
+            .is_some_and(is_forwarded_interest),
+        "stale cached Data must not answer MustBeFresh: the Interest goes to the producer"
+    );
+    assert!(
+        recv_timeout(&handle_a).await.is_none(),
+        "stale cached Data must not be returned to a MustBeFresh Interest"
     );
 
     shutdown.shutdown().await;

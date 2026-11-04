@@ -26,7 +26,7 @@ The pipeline shape (PacketContext by value, DashMap PIT,
 |---|---|
 | `pipeline_threads = 1` | No inter-task hop on the hot path. |
 | `tracing` filter `off` on hot targets | Removes per-packet log work. |
-| `[cs] admission_policy = "default"` | Only PIT-satisfying Data goes into CS (cache is hot for actual traffic). |
+| `[cs] admission_policy = "admit-fresh-only"` | Fewer CS inserts: Data with FreshnessPeriod 0 is not cached. Every exact-name fetch of immutable Data then reaches the producer, so it trades hits for insert work. |
 | Strategy choice | `BestRouteStrategy` is single-nexthop; `MulticastStrategy` fans out (higher load). |
 
 ## Diagnostic recipes

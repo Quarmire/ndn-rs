@@ -111,9 +111,12 @@ pub trait CsAdmissionPolicy: Send + Sync + 'static {
 }
 ```
 
-`DefaultAdmissionPolicy` admits only Data with a positive `FreshnessPeriod` —
-matching NFD, because caching `FreshnessPeriod=0` Data churns evictions without
-ever satisfying a `MustBeFresh` Interest. `AdmitAllPolicy` admits everything.
+`AdmitAllPolicy`, the default, admits every Data, as NFD's default does. Data
+with `FreshnessPeriod` 0 is stale on arrival: the CS's `get` must still return
+it for an Interest without `MustBeFresh` (immutable versions are fetched by
+exact name) and must not for a `MustBeFresh` one. `AdmitFreshOnlyPolicy`
+admits only Data with a positive `FreshnessPeriod`: less churn on short-lived
+Data, but immutable named Data is never cached.
 
 **Register it** with the engine:
 

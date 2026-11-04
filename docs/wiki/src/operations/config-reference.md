@@ -40,7 +40,7 @@ Absent file → defaults from `ndn-config`.
 | `variant` | `lru` | `lru`, `sharded-lru`, `null`. |
 | `capacity_mb` | 64 | Capacity in MiB. |
 | `shards` | (auto) | Number of LRU shards (sharded-lru only). |
-| `admission_policy` | `default` | `default` (PIT-bound) or `admit-all`. |
+| `admission_policy` | `admit-all` | Which Data the CS caches. `admit-all` (`default` means the same): every Data, as NFD's default; Data with FreshnessPeriod 0 is cached stale, so it answers Interests without `MustBeFresh` (immutable versions fetched by exact name) and never `MustBeFresh` ones. `admit-fresh-only`: only Data with FreshnessPeriod > 0; not NFD's default, it saves CS churn on short-lived Data at the cost of never caching immutable named Data. An unknown value is logged and read as `admit-all`. |
 | `unsolicited_policy` | `drop-all` | Caching of Data with no pending PIT entry: `drop-all`, `admit-local`, `admit-network`, `admit-all`. Use `admit-network` on a broadcast/ad-hoc bearer. |
 
 **Persistent backends (feature-gated).** For a CS that survives restarts, prefer

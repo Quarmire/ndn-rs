@@ -21,7 +21,11 @@ pipeline_channel_cap = 4096
 [cs]
 variant          = "lru"
 capacity_mb      = 64
-admission_policy = "default"
+# "admit-all" caches every Data, as NFD does: FreshnessPeriod-0 Data answers
+# Interests without MustBeFresh (immutable versions fetched by exact name).
+# "admit-fresh-only" caches only FreshnessPeriod > 0 Data: less CS churn on
+# short-lived Data, but immutable named Data is never cached.
+admission_policy = "admit-all"
 
 # ── Faces ──────────────────────────────────────────────────────────────────────
 

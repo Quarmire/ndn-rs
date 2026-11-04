@@ -1409,6 +1409,14 @@ pub struct CsConfig {
     /// Used only by `"sharded-lru"`.
     #[serde(default)]
     pub shards: Option<usize>,
+    /// Which Data the CS admits:
+    /// - `admit-all` (default; `default` means the same): every Data, as
+    ///   NFD's default admission. Data with `FreshnessPeriod` 0 is cached
+    ///   stale: it answers Interests without `MustBeFresh` (immutable Data
+    ///   fetched by exact name), never `MustBeFresh` ones.
+    /// - `admit-fresh-only`: only Data with `FreshnessPeriod > 0`. Not NFD's
+    ///   default; saves CS churn on short-lived Data at the cost of never
+    ///   caching immutable named Data.
     #[serde(default = "default_admission_policy")]
     pub admission_policy: String,
     /// Caching of **unsolicited** Data (Data with no matching PIT entry).
@@ -1440,7 +1448,7 @@ fn default_cs_capacity_mb() -> usize {
     64
 }
 fn default_admission_policy() -> String {
-    "default".to_string()
+    "admit-all".to_string()
 }
 fn default_unsolicited_policy() -> String {
     "drop-all".to_string()

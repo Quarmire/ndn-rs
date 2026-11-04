@@ -363,7 +363,8 @@ impl WasmEngineBuilder {
             .with_transit(Arc::clone(&transit)),
             cs_insert: CsInsertStage {
                 cs: Arc::clone(&cs),
-                admission: Arc::new(ndn_store::DefaultAdmissionPolicy),
+                // NFD's default, as `EngineBuilder`'s.
+                admission: Arc::new(ndn_store::AdmitAllPolicy),
                 // EngineConfig's default; the browser engine exposes no opt-in.
                 admit_unverified: false,
             },

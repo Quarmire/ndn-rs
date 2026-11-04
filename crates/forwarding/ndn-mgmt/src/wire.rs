@@ -51,7 +51,8 @@ pub(crate) fn build_mgmt_response_wire(
 ) -> bytes::Bytes {
     match signer {
         Some(s) => {
-            // FreshnessPeriod=0 keeps mgmt responses out of intermediate caches.
+            // FreshnessPeriod=0: a cached response is stale at once, so it
+            // never answers the MustBeFresh Interests management clients send.
             let key_name = s
                 .cert_name()
                 .cloned()

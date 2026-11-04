@@ -754,6 +754,10 @@ That comment is **factually wrong about NFD**, and the 2008 Mbps cache-served
 result is the proof: NFD cached the freshness-0 Data and served it. So NFD
 caches Data that ndn-fwd discards outright.
 
+**Resolved:** the default admission is now `AdmitAllPolicy`, which caches
+every Data as NFD does; the freshness-only rule survives as the opt-in
+`[cs] admission_policy = "admit-fresh-only"` (`AdmitFreshOnlyPolicy`).
+
 Why this matters for NDNSF specifically: its pattern re-requests Data.
 Prefetch runs ahead of production, Interests retransmit on a 500 ms lifetime,
 and FEC recovery re-fetches. On NFD those repeats are cache hits costing no

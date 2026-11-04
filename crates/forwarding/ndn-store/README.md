@@ -17,6 +17,8 @@ Forwarding-plane data structures for the ndn-rs engine: FIB, PIT, Content Store,
 | `NullCs` | No-op store for testing or cache-less deployments |
 | `ObservableCs` / `CsEvent` | Decorator emitting cache insert/evict events |
 | `CsAdmissionPolicy` | Trait controlling which Data packets are admitted to the cache |
+| `AdmitAllPolicy` | Admit every Data — NFD's default and ndn-rs's. FreshnessPeriod-0 Data is cached stale: it answers Interests without `MustBeFresh` (immutable Data fetched by exact name), never `MustBeFresh` ones |
+| `AdmitFreshOnlyPolicy` | Admit only Data with `FreshnessPeriod > 0` (`admit-fresh-only`). Not NFD's default: saves CS churn on short-lived Data at the cost of never caching immutable named Data |
 | `StrategyTable` | Prefix-to-strategy mapping (parallel trie alongside FIB) |
 
 ## Feature Flags
