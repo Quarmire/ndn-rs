@@ -1,6 +1,10 @@
 # Data layer: named, signed, versioned data
 
-- **Status:** Slices 1, 2 and 3 normative (slice 3: large payloads in
+- **Status:** Slices 1–4 normative (slice 4: signed blocks of small
+  entries carried inline, the one-key rule with its signed head, rollback
+  check and freshness bound, retention by expiry and listing by keep, range
+  reads by seq and by time, `put`'s batch, §4.1, §5.3, §5.4, §7, §14.1,
+  §14.2); slice 3: large payloads in
   pieces, hold records naming their holders, leases capped by keep, signed
   asks, audits, repair and release on whole proofs, `prune` of one's own
   writes and the erasure of fully pruned epochs, §13, §14);
@@ -59,14 +63,15 @@ Every implementation MUST hold all of these.
    collection's members; reading follows the seal; a cut ends both from a
    point on.
 7. **Retention is chosen at write.** Custody MUST NOT extend keep; prune
-   only narrows, and only over the pruner's own writes.
+   only narrows, and only over the pruner's own writes; every device drops
+   what has passed its keep, by its own clock (§14.1).
 8. **Nothing is lost by not understanding it.** A writer MUST keep every
    field it does not know.
 9. **Forward-only, said plainly.** Revocation and deletion stop future
    reads; an implementation MUST NOT claim to recall copies already made.
 
-No validity decision may read a wall clock. Dates are display and
-retention only.
+No validity decision may read a wall clock. Dates are display, indexing
+(range reads, §5.4) and retention (§14.1) only.
 
 ## 3. Names, devices, namespaces — slices 1, 2
 
@@ -88,7 +93,8 @@ retention only.
   that is none of these — no marker, nothing before it, nothing after it
   where a collection is asked for, or another keyword or digest component —
   answers `BadName`, saying which and how the name must be formed
-  (`NextStep::FixName`). `get` also takes log entry and state names (§11).
+  (`NextStep::FixName`). `get` also takes log entry and state names
+  (§11), and entry and range names (§4.1, §5.4).
 - A **device** `D` is the identity of one key: the key is named
   `<D>/KEY/<key-id>` (NDN key naming). `D` is the device's name in seals
   and the prefix it serves; it has no KeywordNameComponent or digest
@@ -121,7 +127,7 @@ retention only.
 - Every packet a device signs MUST be named under `D`, so any forwarder's
   hierarchical schema admits it and Interests for it route to the device.
 
-## 4. Version and log — slices 1, 2 (blocks: slice 4)
+## 4. Version and log — slices 1, 2, 4 (blocks)
 
 A version is an immutable record signed by one key. It carries
 `(writer, seq)`, parents, type, seal, keep, a date and a payload.
@@ -136,14 +142,16 @@ A version is an immutable record signed by one key. It carries
   the writer had applied when it wrote (§5.2).
 - The date is the writer's clock reading in milliseconds since the Unix
   epoch. A reader MUST NOT use it to accept or refuse anything.
-- The payload of a version is one entry: the fields the writer set (§10),
-  and the merge function's operation (§5.1) — empty under the log rule. A
-  block of entries under one signature is slice 4.
+- The payload of a version is one entry — the fields the writer set
+  (§10), and the merge function's operation (§5.1), empty under the log
+  rule — or, in a log or one-key collection, a **block**: many small
+  entries under the version's one signature (§4.1).
 - The seal a version carries is the collection's readers at the time of
   writing, as the writer declares it. In a sealed collection (§9) the
   payload travels encrypted (`Sealed`, §16.2) under the key of the epoch
   the writer's newest members record names; everything else in the record
-  stays readable. Keep is recorded; enforcing it is slices 3 and 4.
+  stays readable. Keep is recorded at write; leases are capped by it
+  (§13.2) and every device drops what has expired by it (§14.1).
 
 A version is the Data packet `<D>/32=log/<C>/seq=<n>` whose Content is a
 `VersionRecord` (§16.2), signed by the key `<D>/KEY/<id>`. A reader MUST
@@ -151,7 +159,61 @@ refuse (and MUST NOT apply) a log entry whose signature does not verify
 against its trust context, whose signing key is not a key of the `D` its
 name starts with, or whose record's collection is not the `C` in its name.
 
-## 5. Collection and rule — slices 1, 2 (one key: slice 4)
+### 4.1 Blocks — slice 4
+
+A **block** is one version whose payload is a list of small entries
+carried inline, in the version's own packet, under its one signature (model
+change M6).
+
+- **Format.** The `VersionRecord` of a block carries `Block` (§16.2) in
+  place of `Fields` and `MergeOp`: one or more `BlockEntry`, each an
+  `Offset` and that entry's `Fields`. A sealed block (§9) is sealed like any
+  payload: the `Block` TLV is the plaintext `Sealed` carries. A block is
+  always one packet: its `Block` encoding is at most 6,144 octets
+  (`INLINE_MAX`), so it is never in pieces (§13.1). Blocks are for log and
+  one-key collections; a merge collection carries one operation per version,
+  and a reader refuses a block in one (`NotInline`).
+- **Entry dates.** An entry's date is the version's `Dated` plus its
+  `Offset`, in milliseconds. The first offset MUST be 0 — the version's
+  `Dated` is its first entry's date — and offsets MUST NOT decrease along
+  the block; a reader MUST refuse a block that breaks either. A writer dates
+  the entries it puts into one collection under one key non-decreasing:
+  each entry gets the later of its clock reading and the last date it gave
+  in that collection. Dates stay display, indexing and retention: a reader
+  refuses nothing for the order of dates across versions (§4).
+- **Entry names.** Entry `i` (0-based) of block `V` is named
+  `<V>/32=entry/seg=<i>`. Like a state name it is local and never fetched:
+  `get` of it uses or fetches the block `V`, verifies it as any log entry
+  (§4) and answers that one entry (§15). An entry exists only inside the
+  signed packet, so no entry travels apart from the signature that covers
+  it: an entry altered, or spliced in from another block, breaks the block's
+  signature, and the block is refused — dropped and fetched elsewhere, as
+  from a poisoned cache (§17). So each entry is verifiable on its own,
+  through its block's signature.
+- **Batching.** `put` with `batch = d` (§15) puts the entry into the
+  device's open block for the collection, the entry's type and the
+  collection's seal epoch, and returns once the block carrying it is signed,
+  with that block's id. A block closes — is signed, applied and published
+  (§12) — at the earliest `arrival + d` of its entries; before an entry that
+  would make its `Block` encoding exceed `INLINE_MAX`; and before an entry
+  whose type, keep kind or seal epoch differs; and when the record naming
+  the seal epoch moves before the block is signed — every `put` waiting on
+  a block that cannot then be signed answers that error. So no entry waits
+  longer than the delay its producer accepted, and every block is one
+  packet. A `put` without `batch`, and an entry whose own payload exceeds
+  `INLINE_MAX`, first close the open block; the entry is then put alone,
+  the large one in pieces (§13.1), so seqs follow the order of `put`s.
+- **Keep of a block.** Entries kept `Until` a date make a block kept until
+  the latest of their dates: no entry is dropped before its own keep, and
+  none is kept more than the batch delay past it. Entries kept `Forever`,
+  or for the last `n`, share a block only with entries of the same keep.
+- `batch` on a merge collection answers `BadRequest` (next step
+  `FixRequest`: a merge collection carries one operation per version; put
+  without batch).
+- A single-entry version reads, wherever entries are listed (§5.4), as one
+  entry: index 0, dated its `Dated`.
+
+## 5. Collection and rule — slices 1, 2, 4 (one key)
 
 A collection is a named, growing set of versions with a rule and a members
 record. It exists when its first members record is signed (§6): `share`, or
@@ -161,7 +223,7 @@ writing and reading, sealed to it).
 
 | Rule | Meaning |
 |---|---|
-| one key | One key writes; the newest is its signed head with a freshness bound. Slice 4. |
+| one key | One key writes; the newest is what its signed head names, with a freshness bound (§5.3). `get` returns that version; range reads read the stream by seq or by time (§5.4). |
 | log | Each member key appends; the collection is the union of exactly its members' logs. `get` returns the newest version. |
 | merge | Member logs plus a named merge function every reader runs alike. `get` returns the merged state at a frontier. |
 
@@ -204,7 +266,9 @@ when
 1. every entry of `w` in `C` below `s` — as `w`'s summary (§7) lists them —
    is applied, unless it never applies: the record in force refuses it by
    its key (a cut that does not list it, §8), or it was held and refused for
-   what it carries (`Unsealed`, §9; an operation the rule refuses), and
+   what it carries (`Unsealed`, §9; an operation the rule refuses), or it
+   is pruned (§14), expired here (§14.1), or no longer listed by the
+   newest summary node of `w` the reader verified (§7), and
 2. for every `(y, t)` in `v`'s parents, the reader has applied `y`'s entries
    in `C` up to `t`.
 
@@ -215,6 +279,147 @@ A parent `(y, t)` that never applies is needed only up to the highest
 version of `y` below it that does (for a cut, the highest it accepts): a
 version written on top of refused work is not held back by it (what of the
 refused work its operation depended on, the merge function decides).
+
+### 5.3 One key — slice 4
+
+A one-key collection is written by exactly one key.
+
+- **Members.** Its members record has the rule one key (`RuleKind` 0) and
+  `Writers` of exactly one name, a key name `<D>/KEY/<id>`; admission (§6)
+  then admits exactly that key. `share(C, {rule: one key, writers: [w]})`
+  takes `w` as it is when it is a key name, and as this device's key when
+  it is this device's name; any other name, or not exactly one, answers
+  `BadRequest` (next step `FixRequest`: name the one key that writes,
+  `<D>/KEY/<id>`, or this device). A one-key record whose `Writers` is not
+  exactly one key name (signed elsewhere) admits by prefix as usual and
+  has no head: `get(C)` answers by the log rule, and a range read answers
+  `BadRequest` (`FixRequest`: the record names no single key).
+- **Log-like.** Otherwise a one-key collection is a log collection whose
+  one member is that key: sync, watch, summaries, custody, prune, pieces,
+  seals, blocks and expiry apply to it as to a log collection. Its newest
+  is the version of that key's highest seq in `C`.
+- **Head.** The writer's head of `C` is the Data packet
+  `<D>/32=summary/<C>/32=head/seq=<s>`, `D` the one key's device, signed by
+  that key, Content `HeadRecord` (§16.2): `Name` `C`; `Seq` `s`, the `Head`
+  of the writer's summary node of `C`; `Digest`, SHA-256 of that node's
+  whole packet `<D>/32=summary/<C>/seq=<s>`; and `Freshness`, in
+  milliseconds: the batch delay of the entries of the writer's newest
+  version in `C`, 0 when it was put without one — the writer holds an
+  entry unsigned that long anyway. The packet's FreshnessPeriod is
+  `Freshness`. A reader discovers it with `<D>/32=summary/<C>/32=head`
+  (CanBePrefix, MustBeFresh), which no node, page, root or other head
+  extends. A writer SHOULD sign a head only when one is asked for and its
+  node of `C` changed since its last head (as for the root, §7), keeps its
+  last head with what it holds, so a restart serves the same packet, and
+  MUST serve the node every head it signed names, as it serves the nodes
+  its roots list (§7).
+- **Reader checks.** A reader MUST verify a head as a log entry (§4) signed
+  by the one key of the record in force — a head signed by any other key is
+  refused, whatever device it names — whose subject is `C` and whose name's
+  seq is its `Seq`. It MUST refuse a head whose `Seq` is lower than one it
+  verified for `C`, or than the highest seq of that key it holds in `C`
+  (rollback, invariant 3); a head of the same `Seq` is taken again, which
+  renews its receipt. The highest `Seq` verified per collection is
+  durable, kept with what the reader holds, so a restarted reader refuses
+  the same rollback. It then fetches the node by name and refuses it unless
+  its digest is the head's `Digest`; the node is checked as §7 says.
+- **`get(C)`.** A reader answers `get(C)` from the head: head, node, the
+  version of the highest seq the node's `Entries` list, and that version —
+  from its store, else by name, else from the holders of live leases it
+  knows (`32=held`, §13.1). It answers `Got::Version` with
+  `Age::Newest { unconfirmed_for }`, `unconfirmed_for` being the time on
+  the reader's monotonic clock since it received that head, plus the head's
+  `Freshness`. When no head is reachable it answers the newest version of
+  the one key it holds (by seq), with `unconfirmed_for` measured from the
+  last head it received since it started, plus that head's `Freshness`. A
+  receipt time does not survive a restart — a monotonic clock does not —
+  so a reader that received no head of `C` since it started answers with
+  the age of a log collection (§15). Stale, never wrong (invariant 5).
+
+**The freshness bound.** No clock is trusted and none is compared across
+devices: the bound is a duration measured on the reader's monotonic clock
+plus the duration the writer stated. What it promises, and no more:
+
+- A head the reader received fresh was the writer's newest head — the node
+  it names the writer's newest node of `C`, its newest version the
+  collection's newest — at a moment no longer than `Freshness` before
+  receipt, *if* the one cache that answered honoured FreshnessPeriod. The
+  writer's own answer adds nothing; each further caching hop that honoured
+  it may add up to `Freshness` more. So `unconfirmed_for` bounds how long
+  ago the answer was last known to be the newest, under that proviso.
+- It never promises that nothing newer exists now: a partition, a cache
+  withholding newer heads and a writer that wrote nothing look alike to a
+  reader. Nor does it cover entries the writer holds unsigned in an open
+  block, which are at most the delay it accepted old (§4.1).
+- A cache or replayer that ignores FreshnessPeriod can serve as fresh any
+  old head it saw. The age then understates; the answer is still never
+  wrong: the head is never forged (it is signed by the one key) and never
+  older than one the reader verified (rollback is refused, also after a
+  restart). A reader that must know the writer is alive needs an answer
+  from the writer itself, which no name of this layer can force through a
+  cache that lies about freshness.
+
+### 5.4 Range reads — slice 4
+
+- **Names.** `get(<C>/32=range/<R>)`, `R` one GenericNameComponent whose
+  value is one TLV: `SeqRange` (low, high, inclusive) reads the versions of
+  the one key in `C` with those seqs, so by name; `TimeRange` (from, to,
+  `from < to`) reads the entries dated `from ≤ date < to` (§4.1). A range
+  name is local and never fetched. Range reads read one key's stream: of a
+  collection of another rule `get` answers `BadRequest` (next step
+  `FixRequest`); a range name that is malformed answers `BadName`
+  (`FixName`).
+- **Mapping to Interests.** There is no index and no new packet: the reader
+  reads the stream through the names it already has — the head (§5.3), the
+  node it names, and the versions, `<D>/32=log/<C>/seq=<n>`. The node's
+  `Entries` list every version of the stream still listed (§7), the
+  seq → name mapping. By seq, the reader fetches exactly the listed seqs in
+  the range. By time, it uses that each block states its own first and last
+  entry dates (its `Dated`, and `Dated` plus its last `Offset`): it searches
+  the listed seqs for the first version whose last date is at least `from`
+  and the last whose first date is below `to` — probing the first and the
+  last listed first, then, each round, interpolating on the dates of the
+  versions probed so far and bisecting in turn — fetching each probed
+  version, each immutable and cacheable anywhere, from its store first.
+  A probe no path answers is replaced by the nearest other seq in the
+  interval; when none of the interval answers, the whole interval is taken
+  into the range and its versions are reported `missing`. A version it
+  knows expired is placed by the dates its tombstone keeps (§14.1); a
+  version in pieces, by its `Dated`. It then fetches the versions between
+  and keeps the entries in range. The cost is the head, the node,
+  `O(log n)` probes (two or three for a steady stream, where interpolation
+  lands near the answer) and the versions in the range.
+- **Why not a prefix or an index.** Selecting by a prefix of dated names
+  would need range selectors NDN no longer has, and would put the writer's
+  clock into names readers must guess. A range index as named data would be
+  either signed by the producer — more signatures and state on the
+  constrained device, and a second structure to keep consistent with the
+  log — or built by a holder, which is untrusted: it could only omit or
+  misdirect, and every block must be verified anyway. The node already
+  lists every version; the blocks' own signed dates are the index.
+- **Answer.** `Got::Entries(Entries)`: the collection, the writer (the one
+  key), and
+  - `entries`, in (seq, index) order, each with its entry name
+    `<V>/32=entry/seg=<i>`, its version's id, its index, its date and its
+    content, every one from a version verified as a log entry of the one
+    key (§4); a single-entry version is one entry (§4.1);
+  - `missing`: versions listed within the bounds that no path answered;
+  - `expired`: versions within the bounds this device knows expired
+    (§14.1);
+  - `large`: versions in pieces within the bounds, read whole by name
+    (§13.1).
+
+  A pruned version within the bounds is in none of the lists (§14).
+
+  The age is that of `get(C)` (§5.3). The answer is complete exactly when
+  `missing` is empty, and complete relative to the head's node (invariant
+  4): what the writer signed after that node, it does not cover.
+- **Honest and date-disordered writers.** For a writer whose dates do not
+  decrease (§4.1), a time range returns exactly the entries dated in it of
+  the versions the node lists. A writer whose dates go back is held to its
+  own order: the search may miss entries it dated out of order, and never
+  returns an entry the writer did not sign or one dated outside the range.
+  No date decides validity.
 
 ## 6. Members — slices 1, 2
 
@@ -316,7 +521,7 @@ and, once the rule changed, where the current rule starts.
   later versions (§5.2) and never enter the new rule's state. A state of
   `C` after the change is named by a frontier covering `Since`.
 
-## 7. Summary — slice 1
+## 7. Summary — slice 1 (listing by keep: slice 4)
 
 A writer's summary of a namespace `O` is its own log's index over `O`: a
 tree of **nodes**, one per name under `O` the writer wrote into (and every
@@ -336,6 +541,8 @@ A node of name `X` carries:
 - `Head`: the writer's highest seq in the subtree of `X`;
 - `Entries`: the seqs of the writer's versions directly in `X`, as ranges —
   the seq → name mapping, since an entry's name is `<D>/32=log/<X>/seq=<n>`;
+  of a log or one-key collection, only those unexpired at the node's
+  reference date (listing by keep, below); of a merge collection, all;
 - `MembersEntries`: the seqs of its members records of `X`;
 - its children: for each next name component under `X` with entries in its
   subtree, the child's component, `Head` and the implicit digest (SHA-256 of
@@ -351,22 +558,41 @@ and pages are DigestSha256 packets; a reader MUST check each against the
 digest its parent lists. The **root**, the node of `O` itself, is the only
 signed one: `<D>/32=summary/<O>/32=root/seq=<head>`, signed by the device key,
 FreshnessPeriod 0 so that discovery always reaches the writer. A writer
-SHOULD sign a new root only when one is asked for and the tree changed.
+SHOULD sign a new root only when one is asked for and the tree changed. A
+one-key collection's node is also named by the collection's signed head
+(§5.3), one hop from the reader.
 
-A writer MUST serve every node and page that any root it signed lists, for
-as long as it holds the log entries that node lists — in slice 1 a writer
-never drops its own entries, so always, across its own restarts too (prune,
-slice 3, ends this only for what it prunes). Keeping them costs no storage:
-a node's content is fixed by the log up to its head, so a superseded node is
-rebuilt from the log when asked for; a writer MAY keep recently superseded
-packets ready. A writer MUST answer an Interest for a summary name that none
-of its roots listed with a Nack. Hence the time a reader's descent takes is
-bounded by the descent alone — its own fetches being answered — and never by
-how fast or how long the writer keeps putting.
+**Listing by keep (slice 4).** A writer's node of a log or one-key
+collection `X` lists in `Entries` only its versions unexpired (§14.1) at
+the node's **reference date** `E`: the `Dated` of the writer's newest
+version in `X` up to the node's head. A version kept `Until(t)` is listed
+when `t > E`; one kept for the last `n` while fewer than `n` of the writer's
+later versions in `X` lie at or below the head; one kept `Forever`, always.
+`E` and those counts are fixed by the log up to the head, so one node name
+still has one packet, and a constant stream's node stays bounded by its
+keep window: 30 days at one block a minute is 43,200 seqs, within the
+65,536 a node may list. A reader does not wait (§5.2) for an entry that the
+writer's newest node it verified no longer lists. The writer's own clock
+moves only its own listing: it decides the dates, hence `E`, and nothing
+else of any reader. A writer that stops writing leaves `E` where it was,
+the limit §14.1 states.
+
+A writer MUST serve every node and page that any root or head it signed
+lists, for as long as it holds the log entries that node lists — in slice 1
+a writer never drops its own entries, so always, across its own restarts
+too (prune, slice 3, and expiry, slice 4, drop entries, not nodes: the
+writer's tombstones keep each node's content, §14, §14.1). Keeping them
+costs no storage: a node's content is fixed by the log up to its head, so
+a superseded node is rebuilt from the log when asked for; a writer MAY
+keep recently superseded packets ready. A writer MUST answer an Interest
+for a summary name that none of its roots or heads listed with a Nack.
+Hence the time a reader's descent takes is bounded by the descent alone —
+its own fetches being answered — and never by how fast or how long the
+writer keeps putting.
 
 A reader:
 
-- discovers a writer's root with `<D>/32=summary/<O>` (CanBePrefix,
+- discovers a writer's root with `<D>/32=summary/<O>/32=root` (CanBePrefix,
   MustBeFresh), verifies it as a log entry is verified (§4), and checks
   that its subject is `O`, its writer field its signing key and its name's
   seq its `Head`;
@@ -641,10 +867,11 @@ publishes into from the members records it holds.
 
 A version's payload `P` — `Fields` and `MergeOp` as §16.2 encodes them, or
 its sealed ciphertext (§9) — of more than 6,144 octets (`INLINE_MAX`)
-travels in pieces, in a log collection only: a merge collection carries
-every operation inline, so `put` of a larger payload answers `TooLarge`
-(next step: put it into a log collection and refer to it by name), and a
-reader refuses a version in pieces of a merge collection (`NotInline`).
+travels in pieces, in a log or one-key collection only: a merge collection
+carries every operation inline, so `put` of a larger payload answers
+`TooLarge` (next step: put it into a log collection and refer to it by
+name), and a reader refuses a version in pieces, or a block, of a merge
+collection (`NotInline`). A block is never in pieces (§4.1).
 
 A payload carries at most 64 MiB (`PAYLOAD_MAX`, 67,108,864 octets), as a
 reader assembles it whole: `put` of more answers `TooLarge`, and a reader
@@ -665,9 +892,9 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
   its `SealEpoch`. So each piece verifies on its own from wherever it came,
   and a sealed payload stays sealed in pieces: holders see the size.
 - A reader lists such a version with `Payload::Large { size }` and reads it
-  whole on `get` of its name (or of the log collection's newest): each
-  piece from its store, else by name, else from each holder of a live lease
-  it knows (§13.2) by the Interest `<H>/32=held/<Name TLV>`, which the
+  whole on `get` of its name (or of a log or one-key collection's newest):
+  each piece from its store, else by name, else from each holder of a live
+  lease it knows (§13.2) by the Interest `<H>/32=held/<Name TLV>`, which the
   holder answers (DigestSha256) with the packet inside; a piece that is not
   the one its parent lists is dropped and fetched elsewhere.
 
@@ -698,8 +925,8 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
   the latest `Keep::Until` date of the versions inside `holds` when every
   one of them is kept until a date. A holder signs no lease that would end
   by its clock, and a reader does not count a lease that breaks either
-  bound (or whose hold record or versions it does not hold yet). Retention
-  by expiry — deleting at keep — is slice 4.
+  bound (or whose hold record or versions it does not hold yet). Every
+  device drops what has expired by its own clock (§14.1).
 - **Asking.** The owner device `A` asks each holder `H` its record names
   with the Interest `<H>/32=hold/<HoldAsk>`: the hold record's name, a
   fresh 16-octet `Nonce`, and `Asker`, `A`'s proof of asking — a Data
@@ -737,12 +964,13 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
 - Each `hold` audits every live lease: from the device's randomness it
   draws pieces (16 by default) uniformly from what the lease promises — the
   log entry of each version inside `holds` that applies and whose keep has
-  not passed, and each manifest node and chunk of it — and asks each with
-  the Interest `<H>/32=audit/<AuditAsk>` (`Nonce`, 16 fresh random octets,
-  the piece's name, and `Asker`, the auditor's proof binding `H` and the
-  ask as in §13.2). A manifest node the auditor lacks, needed to list the
-  chunks, it fetches from the writer or the holders, and at last asks of
-  the audited holder itself through an audit ask, judged like any other.
+  not passed by the auditor's clock (§14.1), and each manifest node and
+  chunk of it — and asks each with the Interest `<H>/32=audit/<AuditAsk>`
+  (`Nonce`, 16 fresh random octets, the piece's name, and `Asker`, the
+  auditor's proof binding `H` and the ask as in §13.2). A manifest node the
+  auditor lacks, needed to list the chunks, it fetches from the writer or
+  the holders, and at last asks of the audited holder itself through an
+  audit ask, judged like any other.
 - `H` answers only an ask about a collection it holds, from an owner device
   whose hold record held here names `H` (by the proof's key locator, before
   any signature is checked), with at most 64 audits of that asker in
@@ -750,8 +978,10 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
   signed by its device key, FreshnessPeriod 0, `AuditAnswer`: `Piece`, the
   piece's whole packet; `PrunedBy`, the packet of the prune record that
   ended the piece's version (§14); `RefusedBy`, the packet of the members
-  record of the revision in force there that refuses the version; or
-  `Missing`, it does not hold the piece and knows no record that ends it.
+  record of the revision in force there that refuses the version;
+  `Expired`, empty: the piece's version expired by the holder's clock and it
+  dropped it (§14.1); or `Missing`, it does not hold the piece and knows no
+  record that ends it.
   The same answer cache as §13.2 applies.
 - The auditor judges each answer:
   - `Piece` whose digest is the one the auditor holds (the version
@@ -767,6 +997,9 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
     in force at the auditor now refuses the version; when the auditor
     still admits it, the two views differ and it is no answer, never
     evidence.
+  - `Expired`: no answer, never evidence — the lease is unanswered for the
+    piece and repair may ask again. So an auditor whose clock is behind the
+    holder's cannot frame an honest holder that dropped at keep.
   - Nothing signed by `H`: no answer.
 - Verdict: **broken** on any evidence; else **unanswered** when an ask got
   no answer, or no device produced a manifest node a promised version's
@@ -834,7 +1067,9 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
   and owns. A holder that must not read is therefore enrolled outside the
   namespace it holds for.
 - It cannot keep its promise past keep and be counted, nor extend a lease
-  past the owner's date.
+  past the owner's date. Serving past keep (a slow clock, or on purpose)
+  makes no reader keep what it serves: each drops it by its own clock and
+  stores nothing expired (§14.1).
 - It can fetch an asked piece from elsewhere at audit time — a cache, or
   another holder — but not from the releaser during a release: an audit
   proves it can produce the data, not that it stored it. Two holders can
@@ -843,7 +1078,7 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
   starts, but nothing marks it broken without evidence. It sees which
   pieces are asked, and when.
 
-## 14. Prune — slices 2 (scope), 3
+## 14. Prune and expiry — slices 2 (scope), 3, 4 (expiry)
 
 A prune is an entry of the pruner's log about collection `C` (Content
 `PruneRecord`: the prefix — `C` or one of the pruner's version names in it
@@ -863,9 +1098,9 @@ A prune is an entry of the pruner's log about collection `C` (Content
   after it: `prune` answers `BadRequest` (next step: `FixRequest`) for an
   `upto` past the device's newest entry (the record takes the next seq),
   and a reader ignores a prune record whose `upto` reaches its own seq.
-  Prune applies to log collections: a merge collection's state is computed
-  from every version, so `prune` answers `NotPrunable` (next step: edit
-  instead).
+  Prune applies to log and one-key collections: a merge collection's state
+  is computed from every version, so `prune` answers `NotPrunable` (next
+  step: edit instead).
 - A reader that knows a prune MUST report `Pruned` for what it covers, not
   the data, drop its copies (record and pieces), tell its watchers
   (`Change::Pruned`) and serve none of it — by the prune records it holds,
@@ -903,17 +1138,113 @@ A prune is an entry of the pruner's log about collection `C` (Content
   cannot end another writer's data or another holder's promise for it, and
   it cannot recall copies already made.
 
-## 15. Verbs — slices 1–3, host surface slice 7
+### 14.1 Retention by expiry — slice 4
+
+Keep is chosen at write (invariant 7) and, from slice 4, enforced: every
+device drops what has expired, by its own clock. Expiry is local
+housekeeping; it never decides whether anything verifies.
+
+- **Scope.** Log and one-key collections. A merge collection's state needs
+  every operation: it is edited instead, as `prune` answers `NotPrunable`,
+  and its versions' keep is not enforced by expiry.
+- **When.** A version **expires at a device** when it is kept `Until(t)`
+  and `t` is at or before the device's own clock, or kept for the last `n`
+  and the device knows `n` newer versions of the same writer in `C` — held,
+  or listed by a summary node of that writer it verified. A version kept
+  `Forever` never expires. Keep was set at write; nothing extends it, and
+  custody neither (§13.2).
+- **What every device does.** Every device — writer, holder or reader —
+  MUST drop an expired version, record and pieces; MUST serve none of it,
+  by its own name, under `32=held` or in audit answers; MUST NOT store one
+  it fetches after it expired; keeps a durable tombstone (the version's
+  id, writer and keep, and its first and last entry dates, so the writer's
+  nodes stay rebuildable and a range read places it); reports it to its
+  watchers as `Change::Expired` (the version and its keep); and answers
+  `get` of its name, or of an entry name in it,
+  `Expired` (the name and the keep; next step `None`: nothing to do, and
+  asking again does not help). A range read lists it under `expired`
+  (§5.4). A device checks expiry on every access and sweeps at the earliest
+  keep it holds, reading its clock again when it wakes; a restart drops
+  what the store still keeps that has expired. Later versions do not wait
+  for an expired one (§5.2), and the writer's node stops listing it once
+  the node's reference date passes its keep (§7).
+- **A stopped writer.** When a writer stops writing into `X`, its newest
+  node's reference date stops moving, so that node keeps listing versions
+  whose keep has since passed by the holders' clocks. A reader that never
+  held such a version cannot fetch it — every honest holder dropped it —
+  and cannot tell from the node that it expired; a watch of `X` (§5.2) may
+  then stay incomplete, waiting on it, until the writer writes again and
+  its node stops listing it. `get(C)` and range reads do not wait: they
+  answer what they reach and list the rest `missing`. Stale, never wrong:
+  nothing wrong is delivered, and the gap is said.
+- **Custody.** Leases are capped by keep (§13.2); audits never ask a piece
+  whose keep has passed by the auditor's clock; a holder asked for a piece
+  it dropped as expired by its own clock answers `Expired`, which is no
+  answer and never evidence (§13.3).
+- **Clocks.** A slow — or lying — clock makes a device hold and serve
+  longer; readers with right clocks still answer `Expired` and store
+  nothing past keep. A fast clock makes a device drop early its own copy
+  only: its lease stops counting for what it dropped, and nothing of any
+  other device changes. A writer's clock moves only its own dates and its
+  own listing (§7).
+- **Forward-only.** Expiry deletes at the devices that keep this
+  specification; it recalls no copy (invariant 9). A cache, a device whose
+  clock is slow, or a reader that copied the data out of the layer keeps
+  what it has.
+
+### 14.2 What a producer, holder or reader can and cannot do — slice 4
+
+With blocks, heads and expiry:
+
+- **A producer** — the one key, or a writer of a log collection:
+  - can lie about its dates. That moves only its own order and indexing —
+    where its entries fall in time ranges (§5.4) and its own listing by keep
+    (§7) — never validity: a reader refuses nothing for a date;
+  - can equivocate: two different blocks at one `(writer, seq)` are, like
+    any two versions, evidence against its key, kept and reported
+    (invariant 2), entries and all;
+  - can set any keep, from a moment to forever, and change it only for
+    later writes; nothing it signs later extends what it wrote, and only its
+    own prune narrows it (§14);
+  - can delay its entries up to the batch delay it states, and go silent:
+    readers' age grows, and the bound promises no more (§5.3); a stream it
+    stops keeps its last node listing what has since expired, so a watch of
+    it may stay incomplete until it writes again — never wrong (§14.1);
+  - cannot make an entry outside a block's signature, nor a head of a key
+    the members record does not name.
+- **A holder**, cache or relay:
+  - can withhold blocks, nodes and heads: a range read lists what it lacks
+    under `missing`, `get` answers older verified data with its age, and the
+    reader fetches elsewhere;
+  - can replay old heads it saw, as fresh: they are never forged and never
+    older than one the reader verified (rollback, durable); the age then
+    understates (§5.3);
+  - can serve past keep: readers drop by their own clocks and store
+    nothing expired (§14.1);
+  - can answer `Expired` in an audit: no answer, never evidence. A holder
+    that lost what it promised can so escape evidence, never the count: an
+    unanswered lease counts for nothing and repair starts (§13.3);
+  - cannot forge an entry or splice one from another block: the block's
+    signature covers every entry (§4.1). It cannot alter which versions a
+    range read considers: the reader takes them from the node the signed
+    head names by digest, so a holder can only omit them.
+- **A reader** can cache and replay heads to others, as a cache can, and
+  keep copies past keep: nothing recalls copies already made (invariant 9).
+  It sees, of a sealed block, what §9 lists of any version — its date, keep
+  and size, not its entries, their number or their offsets — and of a head
+  its seq, digest and freshness, so the writer's batch delay.
+
+## 15. Verbs — slices 1–4, host surface slice 7
 
 | Verb | Shape | Slice |
 |---|---|---|
-| `get` | `get(name) → version or state + age` | 1 |
-| `put` | `put(collection, content, {type, keep}) → (writer, seq)` | 1 (`batch`: 4) |
+| `get` | `get(name) → version, state or entries + age` | 1 (entries, ranges: 4) |
+| `put` | `put(collection, content, {type, keep, batch}) → (writer, seq)` | 1 (`batch`: 4) |
 | `watch` | `watch(collection, since F) → summary, new versions…` | 1 |
 | `snapshot` | `snapshot(names \| collections) → snapshot` | 1 |
 | `hold` | `hold(prefix, {copies, until, holders}) → custody` | 3 |
 | `prune` | `prune(prefix, upto)` | 2 (refusing others' writes), 3 |
-| `share` | `share(collection, {rule, readers, writers})` | 1 (adding), 2 (removing, the rule) |
+| `share` | `share(collection, {rule, readers, writers})` | 1 (adding), 2 (removing, the rule), 4 (one key) |
 
 Code mostly uses `get`, `put` and `watch`. `hold`, `prune` and `share` run
 on host policy, or on the person's gesture. A function's answer is a `get` on
@@ -925,7 +1256,9 @@ that names the slice.
   state name, `at` and the value; of a log collection, its newest version
   (§5) — with `Age::Newest`: the time since the device last knew nothing
   newer was outstanding in `C`'s sync group (it heard the group with no
-  refresh pending, or finished one), measured on its monotonic clock. The
+  refresh pending, or finished one), measured on its monotonic clock. Of a
+  one-key collection it answers the newest version the writer's head names,
+  aged by the head's receipt and freshness (§5.3). The
   first `get` of a collection the device does not follow looks at what the
   devices known to write into its namespace hold first (§12); a reader of a
   sealed collection holding versions it has no key for yet waits as long
@@ -935,28 +1268,43 @@ that names the slice.
 - **`get(log entry name)`** answers the version or snapshot (`Age::Exact`),
   fetching it when not held; a members record is not a version
   (`NotFound`); a refused entry answers `Refused` with the reason; a
-  version sealed to an audience the device is not in, `Sealed`.
-- **`put(C, content, {type, keep})`** signs the next entry of the device's
-  log with parents = the state's `at`, applies it, and publishes it (§12).
+  version sealed to an audience the device is not in, `Sealed`; an expired
+  one, `Expired` (§14.1).
+- **`get(entry name)`** answers `Entries` with that one entry of its block
+  (`Age::Exact`), fetching the block when not held, as `get` of the block's
+  name would (§4.1); an index past the block's last entry, `NotFound`.
+- **`get(range name)`** of a one-key collection answers `Entries` (§5.4),
+  aged as `get(C)`; of another rule, `BadRequest` (next step `FixRequest`).
+- **`put(C, content, {type, keep, batch})`** signs the next entry of the
+  device's log with parents = the state's `at`, applies it, and publishes
+  it (§12).
   It requires a members record that lists the device's key among the
   writers; for a collection of another namespace the device first looks for
   one, and answers `Unavailable` when no device writing into that namespace
   was heard, else `NotAllowed`. In a sealed collection it seals the payload
   (§9), asking for the epoch key first if it lacks it: `Sealed` when it is
   not of the audience, `Unavailable` when no device granted the key.
+  With `batch = d` in a log or one-key collection it puts the entry into
+  the open block and returns once that block is signed, at most `d` later,
+  with the block's id (§4.1); in a merge collection, `BadRequest` (next
+  step `FixRequest`: put without batch).
 - **`watch(C, since F)`** reports every held version of `C` (or of the
   collections under folder `C`, which may be `<O>/32=data`) outside `F`,
   then every version applied later, the summaries of §7, each outside `F`,
-  and every version withdrawn (§8); it starts a refresh of every device
-  known to write into the namespace. The stream ends when the device stops.
+  and every version withdrawn (§8), pruned (§14) or expired (§14.1); it
+  starts a refresh of every device known to write into the namespace. The
+  stream ends when the device stops.
 - **`snapshot(names)`** pins, for each name, the current state name of a
-  merge collection or the exact name of a version or snapshot, and signs
-  the `SnapshotRecord`.
+  merge collection or the exact name of a version, snapshot or entry, and
+  signs the `SnapshotRecord`; a range name, which names no fixed set,
+  answers `BadRequest` (next step `FixRequest`).
 - **`share(C, {rule, writers, readers})`** signs the next members revision
   (`C` of the device's own namespace only, §3: else `NotOwner`), with the
   cuts, epoch and `Since` of §6. A collection sealed to a group moves to a
   new epoch when the group drops a reader, signed by a device of the
-  collection's own namespace (§6), whoever owns the group.
+  collection's own namespace (§6), whoever owns the group. With the rule
+  one key, `writers` names exactly the one key, or this device (§5.3): else
+  `BadRequest` (next step `FixRequest`).
 - **`hold(C, {copies, until, holders})`** (a device of `C`'s namespace,
   else `NotOwner`) names the holder devices, at least `copies` of them,
   none of them this device: else `BadRequest`, whose next step,
@@ -974,7 +1322,7 @@ that names the slice.
   it (§14).
 - A verb given a name it cannot take answers `BadName` (§3).
 
-## 16. Wire format — slices 1–3
+## 16. Wire format — slices 1–4
 
 ### 16.1 Names
 
@@ -992,12 +1340,15 @@ both from the NDN naming conventions.
 
 | Packet | Name | Signature |
 |---|---|---|
-| version, members record | `<D>/32=log/<C>/seq=<n>` | device key |
+| version, members record | `<D>/32=log/<C>/seq=<n>` (a block too, §4.1) | device key |
 | snapshot | `<D>/32=log/seq=<n>` | device key |
-| summary root of `O` | `<D>/32=summary/<O>/32=root/seq=<head>`, FreshnessPeriod 0; discovered by `<D>/32=summary/<O>/32=root` (CanBePrefix, MustBeFresh), which no node or page name extends, so only a root answers it | device key |
+| summary root of `O` | `<D>/32=summary/<O>/32=root/seq=<head>`, FreshnessPeriod 0; discovered by `<D>/32=summary/<O>/32=root` (CanBePrefix, MustBeFresh), which no node, page or head name extends, so only a root answers it | device key |
+| head of one-key collection `C` | `<D>/32=summary/<C>/32=head/seq=<s>`, Content `HeadRecord`, FreshnessPeriod = its `Freshness`; discovered by `<D>/32=summary/<C>/32=head` (CanBePrefix, MustBeFresh), which no node, page, root or other head extends (§5.3) | the one key |
 | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256 |
 | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256 |
 | state (never fetched) | `<C>/32=state/<Frontier TLV>` | — |
+| entry `i` of block `V` (never fetched) | `<V>/32=entry/seg=<i>` | — (the block's) |
+| range of `C` (never fetched) | `<C>/32=range/<SeqRange or TimeRange TLV>` | — |
 | sync group | `<O>/32=sync` (State Vector Sync Interests) | — |
 | seal key | `<D>/32=seal/<public key>`, Content `SealKey` | device key |
 | grant | `<G>/32=grant/<GrantAsk TLV>`, Content `Grant` | the granter's device key |
@@ -1027,15 +1378,23 @@ Every name parses one way, and a reader MUST refuse one that does not:
   (a snapshot) or a collection name.
 - **Summary.** `D` is the components before the first `32=summary`; a last
   `seq=` component is the head; a `32=page` then the next-to-last
-  component is the page. What remains is the subject: a namespace (the
-  root) or a folder or collection name. A root's subject is followed by
-  `32=root`, and only its discovery name
-  `<D>/32=summary/<O>/32=root` lacks the head — a namespace never ends in `seq=` —
-  so a node or page name always carries it, and the subject's own last
-  component is never read as the head. A subject without a marker is a
+  component is the page, and a `32=head` just before the last `seq=` makes
+  the name a one-key collection's head packet (§5.3). What remains is the
+  subject: a namespace (the root) or a folder or collection name (a head's
+  subject is a collection). A root's subject is followed by `32=root`, and
+  only the discovery names `<D>/32=summary/<O>/32=root` and
+  `<D>/32=summary/<C>/32=head` lack the head — a namespace never ends in
+  `seq=` — so a node or page name always carries it, and the subject's own
+  last component is never read as the head. A subject without a marker is a
   namespace, never a node under one.
 - **State.** `32=state` is the next-to-last component and the collection
   name precedes it.
+- **Entry.** The last component is `seg=<i>` (a SegmentNameComponent), the
+  next-to-last `32=entry`, and what precedes them is a log entry name with a
+  collection: the block.
+- **Range.** `32=range` is the next-to-last component and the collection
+  name precedes it; the last is one GenericNameComponent whose value is one
+  `SeqRange` (low ≤ high) or one `TimeRange` (from < to) TLV, nothing else.
 - **Seal key.** `D` is the components before the first `32=seal`; one
   GenericNameComponent of 32 octets follows, the X25519 public key, equal
   to the `SealKey` the packet carries.
@@ -1061,7 +1420,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 
 | Type | Name | Value |
 |---|---|---|
-| 0x0520 | VersionRecord | Name (collection), Frontier (parents), TypeId, Seal, Keep, Dated, then Fields, MergeOp — or, sealed, Sealed |
+| 0x0520 | VersionRecord | Name (collection), Frontier (parents), TypeId, Seal, Keep, Dated, then Fields, MergeOp — or Block (§4.1), or Chunks (§13.1) — or, sealed, Sealed |
 | 0x0522 | Frontier | FrontierEntry*, by writer |
 | 0x0524 | FrontierEntry | Name (writer key), Seq |
 | 0x0526 | Seq | NonNegativeInteger |
@@ -1118,7 +1477,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x052D | HoldAsk | Name (the hold record), Nonce, Asker |
 | 0x052F | AuditAsk | Nonce, Name (the piece; with Whole, the version's log entry), [Whole], Asker |
 | 0x0531 | Nonce | 16 octets, fresh random per ask |
-| 0x0533 | AuditAnswer | one of Piece, Missing, Proof, PrunedBy, RefusedBy |
+| 0x0533 | AuditAnswer | one of Piece, Missing, Proof, PrunedBy, RefusedBy, Expired |
 | 0x0535 | Piece | octets: the piece's whole Data packet |
 | 0x0537 | Missing | empty: the holder does not hold the piece and knows no record that ends it |
 | 0x0539 | Holders | Name* (the holder devices the owner chose), ascending; required in a HoldRecord |
@@ -1127,6 +1486,13 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x053F | Proof | 32 octets: SHA-256 over the Nonce, then each piece's length (8 octets, big-endian) and whole packet: the log entry, the manifest nodes in heap order, the chunks in order |
 | 0x0541 | PrunedBy | octets: the packet of the prune record that ended the piece's version |
 | 0x0543 | RefusedBy | octets: the packet of the members record that refuses the piece's version |
+| 0x0545 | Block | BlockEntry+, in a VersionRecord in place of Fields and MergeOp (sealed: the plaintext of Sealed), its encoding at most 6,144 octets (§4.1) |
+| 0x0547 | BlockEntry | Offset, Fields |
+| 0x0549 | Offset | NonNegativeInteger: ms after the version's Dated; the first 0, non-decreasing along the block |
+| 0x054B | HeadRecord | Name (collection), Seq (the Head of the writer's node of it), Digest (SHA-256 of that node's whole packet), Freshness (§5.3) |
+| 0x054D | Freshness | NonNegativeInteger: ms, the batch delay of the writer's newest version; the head's FreshnessPeriod |
+| 0x054F | TimeRange | Dated (from), Dated (to), from < to; in range names only (§5.4) |
+| 0x0551 | Expired | empty, an AuditAnswer: the piece's version expired by the holder's clock and it dropped it (§14.1) |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
@@ -1136,6 +1502,16 @@ the custody fields: a reader passing over `Holders` would count any
 device's lease, a holder passing over `Whole` would answer a release with
 one piece, and an auditor passing over `PrunedBy` would judge an honest
 holder broken. A hold record without `Holders` is refused.
+
+Slice 4's numbers are odd for the same reasons. A reader passing over
+`Block` would read a version with no payload, and one passing over
+`Offset` would date every entry at its block's date; a reader passing over
+a `HeadRecord` would take a head for nothing, and one passing over
+`Freshness` would take a cached head as just confirmed — an age that says
+fresher than it is. A range name with an unknown `TimeRange` read as some
+other range would answer the wrong entries. An auditor passing over
+`Expired` would read an empty answer as no `AuditAnswer` it knows, and
+must instead know it is no answer and never evidence.
 
 Names are the Name TLV (0x07). Inside a record, fields appear in the order
 the table lists them; lists are sorted as stated, so equal content encodes
@@ -1217,6 +1593,34 @@ to equal bytes and equal nodes have equal digests.
   revision of this format passes over them and merges concurrent records
   by intersection, as it did. The digest is of the parent's Content
   because the record in force may be a merge no packet carries (§6).
+- **Blocks carry their entries inline** — a deviation from the model's
+  first text, "a block with a digest per entry". Per-entry packets named
+  by digest in the signed block cost one Interest and about 160 octets of
+  packet (name, signature info, digest) per reading, for every reader, about
+  five times the bytes; inline entries cost about 35 octets per reading
+  and one Interest per block (1/60 of one per reading at a block a minute),
+  and leave nothing apart from the signature to splice or substitute. The
+  one signature per block is what model change M6 asked for; each entry
+  stays verifiable on its own through its block's signature, so the digest
+  per entry is not needed for it. `Block` reuses `Fields` for each entry, so
+  an entry reads like any version's payload, and `Offset` rather than a
+  `Dated` per entry keeps an entry's date to an octet or two.
+- **A head separate from the root.** The root has FreshnessPeriod 0 so
+  that discovery always reaches the writer (§7); a battery producer cannot
+  answer every reader. The head's FreshnessPeriod is the writer's batch
+  delay, so caches absorb readers for as long as the writer would have held
+  an entry unsigned anyway, and the head names the collection's node by
+  digest — one hop, where the root reaches it through every node from `O`
+  down. A `HeadRecord` rather than a second signed node keeps the node
+  DigestSha256 and fixed by the log, so heads and roots name the same
+  packets.
+- **Range reads use the log's own names** (§5.4): the head, the node's
+  `Entries` and the blocks' dates, with no index a producer would sign or a
+  holder could falsify. `SeqRange` is reused for ranges by seq; `TimeRange`
+  reuses `Dated`.
+- **`Expired` is an empty answer**, not a record: a holder's clock is
+  evidence of nothing, so the answer says only that it dropped the piece at
+  keep by its clock, and the auditor never judges by it.
 
 ## 17. Failure model
 
@@ -1225,7 +1629,7 @@ to equal bytes and equal nodes have equal digests.
 | Partition / offline | Reads and writes continue locally under each device's key; collections reconcile from summaries when a path returns. | §4, §7 |
 | Lost device | Its leases lapse; repair asks the other holders the hold record names; a cut ends its key at what others had seen. | §8, §13 |
 | Compromised key | The cut keeps what was signed before it and refuses the rest; sealed data re-keys forward. | §8, §9 |
-| Bad or lying clock | No effect on validity. | invariant 1 |
+| Bad or lying clock | No effect on validity. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing. | invariant 1, §14.1 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
 | Holder rolls back | A summary older than one already seen is refused, also by a reader that restarted since. | invariant 3, §7 |
@@ -1247,6 +1651,13 @@ to equal bytes and equal nodes have equal digests.
 | Stranger asks a holder | Dropped for the cost of a parse: only an owner device whose hold record names the holder may ask, and its asks are bounded. | §13.2, §13.3 |
 | Holder hears a prune first | Its audit answer names the prune; the auditor verifies and takes it, and the piece is excused. | §13.3, §14 |
 | Writer offline when an epoch is pruned | Erasure stays pending until it has left the epoch; a version it sealed in an erased epoch, arriving later, brings the key back. | §14 |
+| Replayed head | A cache or holder serving an old head as fresh: never forged; refused when older than one verified or than what the reader holds, also after a restart; otherwise the reader answers the verified version that head names, with an age that understates — stale, never wrong data. | invariant 3, §5.3 |
+| Forged or spliced entry | The block's signature fails; the block is dropped and fetched elsewhere; the entry is never returned. | invariant 1, §4.1 |
+| Holder serves past keep | Readers drop by their own clocks, answer `Expired` and store nothing expired. | §14.1 |
+| Holder claims `Expired` | No answer, never evidence: the lease does not count for the piece and repair may ask again. | §13.3, §14.1 |
+| Writer's dates go back | Its entries dated out of order may be missed by a time range; nothing it did not sign is returned. | §5.4 |
+| Battery producer, many readers | Caches answer its head for its batch delay; readers' age includes it. | §5.3 |
+| Writer stops, keep passes | Its newest node keeps listing what has since expired; a reader that never held it cannot fetch it, and a watch of that stream may stay incomplete until the writer writes again; `get` and range reads answer what they reach and list the rest missing. Nothing wrong is delivered. | §7, §14.1 |
 
 ## 18. Conformance
 
@@ -1291,3 +1702,19 @@ from the slice-3 security review h8 (a holder that keeps nothing and
 relays audits from the owner cannot make it release: the owner keeps its
 copy, saying why) and h9 (a prune the holder heard before its auditor does
 not frame it: its answer names the prune, and the audit passes).
+
+The slice-4 cases are c6 (a soil sensor puts a reading a second, batched
+by a minute, into a one-key collection whose one writer is the sensor's
+key: signatures grow with blocks, not readings, no reading waits longer
+than the delay accepted, every reading reaches the repo; signatures,
+Interests, bytes and energy per reading are recorded, batched and
+unbatched), s1 (a range read by time and by seq returns exactly the entries
+in the range, with far fewer Interests than the stream has blocks), s2 (an
+entry forged inside a block at the holder is never returned: the sensor
+offline, the reader reads from the holder, and the genuine entry arrives
+later), s3 (an entry spliced in from another block, likewise), s4 (after
+keep passes, the holder and the reader drop the data, `get` answers
+`Expired`, watch reports it, a range read lists it expired; a holder whose
+slow clock still serves it does not make a right-clock reader keep it) and
+s5 (a replayed old head, the sensor offline, does not make `get(C)` answer
+a version older than one already verified).
