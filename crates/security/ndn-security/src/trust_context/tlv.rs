@@ -19,9 +19,11 @@
 //!   [`SCHEMA_FORMAT`], [`SCHEMA_BODY`]. Without the anchors or schema a
 //!   context is meaningless, so a node that can't parse them must reject it.
 //! - Additive → **even**: [`CA_ENDPOINT`], [`ENROLLMENT_HINT`],
-//!   [`REVOCATION`], [`KEY_ROLE`], [`LINK_POLICY`], [`ADVERTISED_RELAY`]. An
-//!   old node skips an unknown one and still validates with the anchors +
-//!   schema it does understand.
+//!   [`REVOCATION`], [`KEY_ROLE`], [`LINK_POLICY`], [`ADVERTISED_RELAY`],
+//!   [`REVOCATION_CUT`]. An old node skips an unknown one and still
+//!   validates with the anchors + schema it does understand (an old node
+//!   that skips a [`REVOCATION_CUT`] keeps the all-or-nothing Revocation:
+//!   it refuses more, never less).
 //!
 //! (The design note's draft had the parity inverted for the must-understand
 //! fields; renumbered here per the note's own "verify criticality parity"
@@ -116,6 +118,28 @@ pub const RELAY_ENDPOINT: u64 = 0x0424;
 /// In [`ADVERTISED_RELAY`]: preference, a NonNegativeInteger (lower is
 /// preferred).
 pub const RELAY_PREFERENCE: u64 = 0x0426;
+
+/// Where a revoked key's authority over Data stopped
+/// ([`RevocationCut`](super::RevocationCut)), repeatable, at most one per
+/// key: the revoked key's `Name` (`0x07`), then [`CUT_RANGE`] and
+/// [`CUT_EXACT`] entries. Written right after the [`REVOCATION`] entries.
+/// Non-critical (even): an old node skips it and refuses everything the
+/// revoked key signed. A malformed one rejects the context.
+pub const REVOCATION_CUT: u64 = 0x0428;
+
+/// In [`REVOCATION_CUT`]: a prefix `Name` (`0x07`) and one or more
+/// [`CUT_RUN`]s — Data named the prefix plus one SequenceNum component in a
+/// run is accepted.
+pub const CUT_RANGE: u64 = 0x042A;
+
+/// In [`CUT_RANGE`]: two SequenceNumNameComponents (`0x3A`), the first and
+/// last sequence number of an inclusive run, first <= last.
+pub const CUT_RUN: u64 = 0x042C;
+
+/// In [`REVOCATION_CUT`]: one full `Name` (`0x07`) ending in an
+/// ImplicitSha256DigestComponent — exactly that Data is accepted
+/// (re-admission).
+pub const CUT_EXACT: u64 = 0x042E;
 
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;

@@ -677,6 +677,299 @@ fn nni(v: u64) -> Vec<u8> {
     }
 }
 
+/// One prefix of a [`RevocationCut`]: Data named `prefix` plus exactly one
+/// SequenceNumNameComponent whose value lies in one of `runs` is accepted.
+///
+/// In a cut, `runs` are inclusive `(first, last)` pairs, ascending, disjoint
+/// and non-adjacent (merged), never empty — the canonical form
+/// [`RevocationCut::add_run`] keeps and the wire carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutRange {
+    /// The prefix `P` (e.g. a data-layer collection log `<D>/32=log/<C>`).
+    pub prefix: Name,
+    /// Inclusive runs of accepted sequence numbers.
+    pub runs: Vec<(u64, u64)>,
+}
+
+impl CutRange {
+    /// Whether `seq` lies in one of the runs.
+    pub fn contains(&self, seq: u64) -> bool {
+        let i = self.runs.partition_point(|&(_, last)| last < seq);
+        self.runs.get(i).is_some_and(|&(first, _)| first <= seq)
+    }
+}
+
+/// Where a revoked key's authority over Data stopped ([`tlv::REVOCATION_CUT`]):
+/// the packets the key signed that stay accepted although a Revocation
+/// entry covers the key. Everything else the key signed is refused.
+///
+/// A cut accepts Data named `N` with implicit digest `d`
+/// ([`accepts`](Self::accepts)) iff some [`CutRange`] has a prefix `P` with
+/// `N` = `P` + one SequenceNumNameComponent (minimally encoded) whose value
+/// lies in a run, or some exact entry equals `N` + `d` (an
+/// ImplicitSha256DigestComponent). The producer (the namespace root) adds a
+/// cut in the version that revokes its key; later versions carry it
+/// verbatim and may only add exact entries ([`readmit`](Self::readmit)).
+/// Adopters do not enforce that rule: the anchor that signs the context is
+/// the authority over it.
+///
+/// Kept canonical: ranges by prefix (NDN canonical order), one per prefix,
+/// runs merged; exact entries in canonical order without duplicates. The
+/// same cut therefore always encodes to the same bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationCut {
+    key: Name,
+    ranges: Vec<CutRange>,
+    exact: Vec<Name>,
+}
+
+impl RevocationCut {
+    /// An empty cut for the revoked key `key` (`<id>/KEY/<k>`): it accepts
+    /// nothing until runs or exact names are added.
+    pub fn new(key: Name) -> Self {
+        Self {
+            key,
+            ranges: Vec::new(),
+            exact: Vec::new(),
+        }
+    }
+
+    /// Accept `prefix` + SequenceNum `seq`, merged into the runs of `prefix`.
+    pub fn add_seq(&mut self, prefix: &Name, seq: u64) {
+        self.add_run(prefix, seq, seq);
+    }
+
+    /// Accept `prefix` + SequenceNum `first..=last`, merged into the runs of
+    /// `prefix`. An inverted run (`first > last`) holds no sequence number
+    /// and adds nothing.
+    pub fn add_run(&mut self, prefix: &Name, first: u64, last: u64) {
+        if first > last {
+            return;
+        }
+        let i = match self.ranges.binary_search_by(|r| r.prefix.cmp(prefix)) {
+            Ok(i) => i,
+            Err(i) => {
+                self.ranges.insert(
+                    i,
+                    CutRange {
+                        prefix: prefix.clone(),
+                        runs: Vec::new(),
+                    },
+                );
+                i
+            }
+        };
+        let runs = &mut self.ranges[i].runs;
+        // Runs `lo..hi` overlap or touch `first..=last`; they merge into one.
+        let lo = runs.partition_point(|&(_, l)| l.saturating_add(1) < first);
+        let hi = runs.partition_point(|&(f, _)| f <= last.saturating_add(1));
+        if lo == hi {
+            runs.insert(lo, (first, last));
+        } else {
+            let merged = (first.min(runs[lo].0), last.max(runs[hi - 1].1));
+            runs.splice(lo..hi, std::iter::once(merged));
+        }
+    }
+
+    /// Accept exactly the Data `full_name` names: its name followed by its
+    /// ImplicitSha256DigestComponent (re-admission of one version). `Ok(false)`
+    /// when the cut already holds it. A name that does not end in a 32-octet
+    /// digest component is refused: a re-admission binds the bytes, never a
+    /// name alone.
+    pub fn readmit(&mut self, full_name: Name) -> Result<bool, SignedTrustContextError> {
+        if !ends_in_implicit_digest(&full_name) {
+            return Err(SignedTrustContextError::BadField(
+                "CutExact name (it must end in the ImplicitSha256DigestComponent of the Data, \
+                 32 octets: give the full name with its digest)",
+            ));
+        }
+        match self.exact.binary_search(&full_name) {
+            Ok(_) => Ok(false),
+            Err(i) => {
+                self.exact.insert(i, full_name);
+                Ok(true)
+            }
+        }
+    }
+
+    /// The revoked key this cut is for.
+    pub fn key(&self) -> &Name {
+        &self.key
+    }
+
+    /// The accepted ranges, by prefix in canonical order.
+    pub fn ranges(&self) -> &[CutRange] {
+        &self.ranges
+    }
+
+    /// The exactly re-admitted Data, full names in canonical order.
+    pub fn exact(&self) -> &[Name] {
+        &self.exact
+    }
+
+    /// Whether the cut accepts the Data named `name` whose implicit digest
+    /// (SHA-256 of its whole wire) is `digest`.
+    pub fn accepts(&self, name: &Name, digest: &[u8; 32]) -> bool {
+        if let Some((last, prefix)) = name.components().split_last()
+            && let Some(seq) = last.as_sequence_num()
+            // A non-minimal encoding names other Data than the one the
+            // producer counted.
+            && *last == NameComponent::sequence_num(seq)
+            && let Ok(i) = self
+                .ranges
+                .binary_search_by(|r| r.prefix.components().iter().cmp(prefix.iter()))
+            && self.ranges[i].contains(seq)
+        {
+            return true;
+        }
+        !self.exact.is_empty()
+            && self
+                .exact
+                .binary_search(&name.clone().append_implicit_digest(*digest))
+                .is_ok()
+    }
+
+    /// The cut as its [`tlv::REVOCATION_CUT`] TLV.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::REVOCATION_CUT, |w| self.write_value(w));
+        w.finish()
+    }
+
+    fn write_value(&self, w: &mut TlvWriter) {
+        w.write_raw(&self.key.encode_to_tlv());
+        for range in &self.ranges {
+            w.write_nested(tlv::CUT_RANGE, |w| {
+                w.write_raw(&range.prefix.encode_to_tlv());
+                for &(first, last) in &range.runs {
+                    w.write_nested(tlv::CUT_RUN, |w| {
+                        w.write_tlv(ndn_packet::tlv_type::SEQUENCE_NUM, &nni(first));
+                        w.write_tlv(ndn_packet::tlv_type::SEQUENCE_NUM, &nni(last));
+                    });
+                }
+            });
+        }
+        for name in &self.exact {
+            w.write_tlv(tlv::CUT_EXACT, &name.encode_to_tlv());
+        }
+    }
+
+    /// Decode one [`tlv::REVOCATION_CUT`] TLV (and nothing after it). Entries
+    /// may come in any order; overlapping or adjacent runs and repeated
+    /// prefixes or exact names are merged. Refused: a key or prefix that is
+    /// not a Name, a range without runs, a run that is not two
+    /// SequenceNumNameComponents with first <= last, an exact name not ending
+    /// in a 32-octet ImplicitSha256DigestComponent, an unknown critical
+    /// element. Unknown non-critical elements are skipped.
+    pub fn decode(wire: &[u8]) -> Result<Self, SignedTrustContextError> {
+        let (t, value, rest) = read_tlv(wire)?;
+        if t != tlv::REVOCATION_CUT {
+            return Err(SignedTrustContextError::BadField(
+                "RevocationCut (TLV-TYPE must be 0x0428)",
+            ));
+        }
+        if !rest.is_empty() {
+            return Err(SignedTrustContextError::BadField(
+                "RevocationCut (octets follow the TLV)",
+            ));
+        }
+        Self::decode_value(value)
+    }
+
+    fn decode_value(value: &[u8]) -> Result<Self, SignedTrustContextError> {
+        let (t, key, mut cur) = read_tlv(value)?;
+        if t != ndn_packet::tlv_type::NAME {
+            return Err(SignedTrustContextError::BadField(
+                "RevocationCut (it must start with the revoked key's Name)",
+            ));
+        }
+        let mut cut = Self::new(decode_name(key)?);
+        while !cur.is_empty() {
+            let (t, v, rest) = read_tlv(cur)?;
+            cur = rest;
+            match t {
+                tlv::CUT_RANGE => {
+                    let (pt, prefix, mut runs) = read_tlv(v)?;
+                    if pt != ndn_packet::tlv_type::NAME {
+                        return Err(SignedTrustContextError::BadField(
+                            "CutRange (it must start with its prefix Name)",
+                        ));
+                    }
+                    let prefix = decode_name(prefix)?;
+                    let mut any = false;
+                    while !runs.is_empty() {
+                        let (rt, rv, rest) = read_tlv(runs)?;
+                        runs = rest;
+                        match rt {
+                            tlv::CUT_RUN => {
+                                let (first, last) = decode_run(rv)?;
+                                cut.add_run(&prefix, first, last);
+                                any = true;
+                            }
+                            other if is_critical(other) => {
+                                return Err(SignedTrustContextError::UnknownCritical(other));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !any {
+                        return Err(SignedTrustContextError::BadField(
+                            "CutRange (it holds no CutRun)",
+                        ));
+                    }
+                }
+                tlv::CUT_EXACT => {
+                    let name = Name::decode_from_tlv(Bytes::copy_from_slice(v))
+                        .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?;
+                    cut.readmit(name)?;
+                }
+                other if is_critical(other) => {
+                    return Err(SignedTrustContextError::UnknownCritical(other));
+                }
+                _ => {}
+            }
+        }
+        Ok(cut)
+    }
+}
+
+/// The components of a Name TLV's value.
+fn decode_name(value: &[u8]) -> Result<Name, SignedTrustContextError> {
+    Name::decode(Bytes::copy_from_slice(value))
+        .map_err(|e| SignedTrustContextError::BadName(e.to_string()))
+}
+
+/// A [`tlv::CUT_RUN`] value: exactly two SequenceNumNameComponents, each a
+/// NonNegativeInteger (1, 2, 4 or 8 octets), first <= last.
+fn decode_run(value: &[u8]) -> Result<(u64, u64), SignedTrustContextError> {
+    let bad = || {
+        SignedTrustContextError::BadField(
+            "CutRun (it must be two SequenceNumNameComponents, first <= last)",
+        )
+    };
+    let mut seqs = [0u64; 2];
+    let mut cur = value;
+    for seq in &mut seqs {
+        let (t, v, rest) = read_tlv(cur).map_err(|_| bad())?;
+        cur = rest;
+        *seq = NameComponent::new(t, Bytes::copy_from_slice(v))
+            .as_sequence_num()
+            .ok_or_else(bad)?;
+    }
+    let [first, last] = seqs;
+    if !cur.is_empty() || first > last {
+        return Err(bad());
+    }
+    Ok((first, last))
+}
+
+/// Whether `name` ends in an ImplicitSha256DigestComponent of 32 octets.
+fn ends_in_implicit_digest(name: &Name) -> bool {
+    name.components()
+        .last()
+        .is_some_and(|c| c.typ == ndn_packet::tlv_type::IMPLICIT_SHA256 && c.value.len() == 32)
+}
+
 /// One anchor-rooted namespace relationship in a [`Keyring`](crate::Keyring).
 ///
 /// A context owns the anchor set and schema for its `namespace`. Hierarchical
@@ -703,6 +996,9 @@ pub struct SignedTrustContext {
     /// name `/<id>/KEY/<k>` covers each certificate of that key
     /// (`/<id>/KEY/<k>/<issuer>/<version>`), including ones issued later.
     revocations: Vec<Name>,
+    /// Where revoked keys' authority over Data stopped
+    /// ([`tlv::REVOCATION_CUT`]), at most one per key, sorted by key name.
+    revocation_cuts: Vec<RevocationCut>,
     /// Schema blobs to re-emit verbatim on encode (preserves a published LVS
     /// blob exactly), OR'd into the runtime schema; empty means derive a
     /// native-text blob from the runtime schema.
@@ -735,6 +1031,7 @@ impl SignedTrustContext {
             ca_endpoints: Vec::new(),
             enrollment_hint: None,
             revocations: Vec::new(),
+            revocation_cuts: Vec::new(),
             schema_blobs: Vec::new(),
             schema_authoritative: false,
             source_bundle_hash: None,
@@ -795,6 +1092,20 @@ impl SignedTrustContext {
     }
     pub fn with_revocation(mut self, name: Name) -> Self {
         self.revocations.push(name);
+        self
+    }
+    /// Add `cut` (where the revoked key `cut.key()` stopped), replacing a
+    /// cut this context holds for the same key. The key's Revocation entry
+    /// is added separately ([`with_revocation`](Self::with_revocation)): a
+    /// cut without one has no effect.
+    pub fn with_revocation_cut(mut self, cut: RevocationCut) -> Self {
+        match self
+            .revocation_cuts
+            .binary_search_by(|c| c.key.cmp(&cut.key))
+        {
+            Ok(i) => self.revocation_cuts[i] = cut,
+            Err(i) => self.revocation_cuts.insert(i, cut),
+        }
         self
     }
     /// Attach a schema blob to re-emit verbatim on `encode_content`
@@ -886,6 +1197,29 @@ impl SignedTrustContext {
     }
     pub fn revocations(&self) -> &[Name] {
         &self.revocations
+    }
+    /// Every revocation cut, by key name in canonical order.
+    pub fn revocation_cuts(&self) -> &[RevocationCut] {
+        &self.revocation_cuts
+    }
+    /// The cut for exactly the key `key` (a key name, not a certificate
+    /// name), if the context holds one.
+    pub fn revocation_cut(&self, key: &Name) -> Option<&RevocationCut> {
+        self.revocation_cuts
+            .binary_search_by(|c| c.key.cmp(key))
+            .ok()
+            .map(|i| &self.revocation_cuts[i])
+    }
+    /// Durable rule for Data named `name` with implicit digest `digest`
+    /// signed by `key` (a key or certificate name): `false` when no
+    /// Revocation entry covers `key`; otherwise `true` unless the cut of its
+    /// key ([`key_name_of`](crate::cert_name::key_name_of)) accepts the Data.
+    /// Says nothing about the issuers above `key`, nor about the signature.
+    pub fn refuses_data(&self, key: &Name, name: &Name, digest: &[u8; 32]) -> bool {
+        self.is_revoked(key)
+            && !self
+                .revocation_cut(&crate::cert_name::key_name_of(key))
+                .is_some_and(|cut| cut.accepts(name, digest))
     }
     /// The source trust-bundle's SHA-256 implicit digest, if this context was
     /// projected from one (the F9 provenance hint).
@@ -1098,9 +1432,10 @@ impl SignedTrustContext {
     /// Encode this context as the `Content` of its NDN object: a single
     /// `SignedTrustContext` (`0x0410`) TLV. The version lives in the *name* (RDR),
     /// not here. Anchors with no retained wire (test-only structs) are
-    /// skipped. Anchors (by certificate name) and Revocation entries are
-    /// written in canonical NDN name order, so the same context always
-    /// encodes to the same bytes.
+    /// skipped. Anchors (by certificate name), Revocation entries and
+    /// RevocationCut entries (by key name, each in its canonical form, see
+    /// [`RevocationCut`]) are written in canonical NDN name order, so the
+    /// same context always encodes to the same bytes.
     pub fn encode_content(&self) -> Bytes {
         let blobs = self.schema_blobs_or_derive();
         let mut anchors: Vec<(Arc<Name>, Bytes)> = self
@@ -1139,6 +1474,10 @@ impl SignedTrustContext {
             }
             for rev in revocations {
                 w.write_tlv(tlv::REVOCATION, &rev.encode_to_tlv());
+            }
+            // RevocationCut entries, by key (`with_revocation_cut`).
+            for cut in &self.revocation_cuts {
+                w.write_nested(tlv::REVOCATION_CUT, |w| cut.write_value(w));
             }
             // SourceBundleHash — non-critical provenance hint (F9).
             if let Some(digest) = &self.source_bundle_hash {
@@ -1252,6 +1591,7 @@ impl SignedTrustContext {
         let mut ca_endpoints: Vec<Name> = Vec::new();
         let mut enrollment_hint: Option<EnrollmentHint> = None;
         let mut revocations: Vec<Name> = Vec::new();
+        let mut revocation_cuts: Vec<RevocationCut> = Vec::new();
         let mut source_bundle_hash: Option<[u8; 32]> = None;
         let mut key_roles: Vec<(KeyRole, Name)> = Vec::new();
         let mut link_policy: Option<LinkPolicy> = None;
@@ -1363,6 +1703,20 @@ impl SignedTrustContext {
                             .map_err(|e| SignedTrustContextError::BadName(e.to_string()))?,
                     );
                 }
+                // A malformed cut rejects the context: skipping it would
+                // refuse what the root kept accepted, and guessing at it
+                // could accept what the root cut off.
+                tlv::REVOCATION_CUT => {
+                    let cut = RevocationCut::decode_value(fval)?;
+                    match revocation_cuts.binary_search_by(|c| c.key.cmp(&cut.key)) {
+                        Ok(_) => {
+                            return Err(SignedTrustContextError::DuplicateField(
+                                "RevocationCut for one key",
+                            ));
+                        }
+                        Err(i) => revocation_cuts.insert(i, cut),
+                    }
+                }
                 // A role byte, then the key's Name. A malformed entry is a
                 // hint lost, not a rejected context (non-critical).
                 tlv::KEY_ROLE if fval.len() > 1 => {
@@ -1411,6 +1765,7 @@ impl SignedTrustContext {
             ca_endpoints,
             enrollment_hint,
             revocations,
+            revocation_cuts,
             schema_blobs,
             schema_authoritative,
             source_bundle_hash,
@@ -2567,5 +2922,444 @@ mod tests {
         ));
         let key = typed.clone().append("k1");
         assert_eq!(key_identity(&key), key);
+    }
+
+    // ── RevocationCut ───────────────────────────────────────────────────────
+
+    const PHONE_KEY: &str = "/home/bob/member/phone/KEY/k1";
+
+    /// `/home/bob/member/phone/32=log`, then `extra` generic components.
+    fn log_prefix(extra: &[&str]) -> Name {
+        let mut name = n("/home/bob/member/phone")
+            .append_component(NameComponent::keyword(Bytes::from_static(b"log")));
+        for c in extra {
+            name = name.append(c);
+        }
+        name
+    }
+
+    fn digest(first: u8) -> [u8; 32] {
+        std::array::from_fn(|i| first.wrapping_add(i as u8))
+    }
+
+    /// The cut of trust-context.md §11 T8.
+    fn t8_cut() -> RevocationCut {
+        let mut cut = RevocationCut::new(n(PHONE_KEY));
+        let notes = log_prefix(&["notes"]);
+        cut.add_seq(&notes, 7);
+        cut.add_run(&notes, 1, 3);
+        cut.add_seq(&log_prefix(&[]), 1);
+        cut.readmit(
+            notes
+                .append_sequence_num(9)
+                .append_implicit_digest(digest(0)),
+        )
+        .unwrap();
+        cut
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn revocation_cut_tlv_types_are_non_critical() {
+        for t in [
+            tlv::REVOCATION_CUT,
+            tlv::CUT_RANGE,
+            tlv::CUT_RUN,
+            tlv::CUT_EXACT,
+        ] {
+            assert!(!is_critical(t), "{t:#06x} must be even (non-critical)");
+        }
+    }
+
+    #[test]
+    fn revocation_cuts_round_trip_and_carry_into_the_next_version() {
+        let cut = t8_cut();
+        assert_eq!(RevocationCut::decode(&cut.encode()).unwrap(), cut);
+
+        let other = {
+            let mut c = RevocationCut::new(n("/home/bob/member/tablet/KEY/t"));
+            c.add_run(&n("/home/bob/member/tablet/x"), 0, u64::MAX);
+            c
+        };
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n(PHONE_KEY))
+            .with_revocation(other.key().clone())
+            .with_revocation_cut(cut.clone())
+            .with_revocation_cut(other.clone());
+        let content = ctx.encode_content();
+        let next = SignedTrustContext::decode_content(&content, 2).unwrap();
+        assert_eq!(next.revocation_cuts(), [cut.clone(), other.clone()]);
+        assert_eq!(next.revocation_cut(&n(PHONE_KEY)), Some(&cut));
+        assert_eq!(
+            next.revocation_cut(&n("/home/bob/member/laptop/KEY/l")),
+            None
+        );
+        // Version N+1 made from N's content carries the cuts verbatim.
+        assert_eq!(next.with_version(3).encode_content(), content);
+
+        // A cut for the same key replaces the held one.
+        let replaced = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation_cut(cut)
+            .with_revocation_cut(RevocationCut::new(n(PHONE_KEY)));
+        assert_eq!(
+            replaced.revocation_cuts(),
+            [RevocationCut::new(n(PHONE_KEY))]
+        );
+    }
+
+    #[test]
+    fn cut_bytes_do_not_depend_on_insertion_order() {
+        let notes = log_prefix(&["notes"]);
+        let photos = log_prefix(&["photos"]);
+        let full = |seq: u64, d: u8| {
+            notes
+                .clone()
+                .append_sequence_num(seq)
+                .append_implicit_digest(digest(d))
+        };
+        let mut a = RevocationCut::new(n(PHONE_KEY));
+        for s in [1, 2, 3, 4, 9, 10] {
+            a.add_seq(&notes, s);
+        }
+        a.add_run(&photos, 5, 6);
+        a.readmit(full(20, 1)).unwrap();
+        a.readmit(full(21, 2)).unwrap();
+
+        let mut b = RevocationCut::new(n(PHONE_KEY));
+        b.add_seq(&photos, 6);
+        b.readmit(full(21, 2)).unwrap();
+        b.add_seq(&notes, 10);
+        b.add_run(&notes, 2, 3);
+        b.add_seq(&photos, 5);
+        b.add_seq(&notes, 9);
+        b.add_run(&notes, 1, 4);
+        assert!(b.readmit(full(20, 1)).unwrap());
+        assert!(!b.readmit(full(20, 1)).unwrap(), "already re-admitted");
+        assert_eq!(a.encode(), b.encode());
+        // Canonical form: one range per prefix, runs merged when they touch.
+        assert_eq!(b.ranges()[0].runs, [(1, 4), (9, 10)]);
+        assert_eq!(b.ranges()[1].runs, [(5, 6)]);
+
+        let tablet = RevocationCut::new(n("/home/bob/member/tablet/KEY/t"));
+        let one = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation_cut(tablet.clone())
+            .with_revocation_cut(a);
+        let two = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation_cut(b)
+            .with_revocation_cut(tablet);
+        assert_eq!(one.encode_content(), two.encode_content());
+
+        // A decoder accepts any order and overlapping runs, and keeps the
+        // canonical form.
+        let run = |a: u64, b: u64| {
+            let mut v = NameComponent::sequence_num(a).value.to_vec();
+            v.insert(0, v.len() as u8);
+            v.insert(0, 0x3A);
+            let mut last = NameComponent::sequence_num(b).value.to_vec();
+            last.insert(0, last.len() as u8);
+            last.insert(0, 0x3A);
+            v.extend(last);
+            tlv_bytes(tlv::CUT_RUN, &v).to_vec()
+        };
+        let range = |prefix: &Name, runs: &[Vec<u8>]| {
+            let mut v = prefix.encode_to_tlv().to_vec();
+            for r in runs {
+                v.extend_from_slice(r);
+            }
+            tlv_bytes(tlv::CUT_RANGE, &v).to_vec()
+        };
+        let mut value = n(PHONE_KEY).encode_to_tlv().to_vec();
+        value.extend(tlv_bytes(tlv::CUT_EXACT, &full(21, 2).encode_to_tlv()));
+        value.extend(range(&photos, &[run(5, 6)]));
+        value.extend(range(&notes, &[run(9, 10), run(2, 4), run(1, 3)]));
+        value.extend(tlv_bytes(tlv::CUT_EXACT, &full(20, 1).encode_to_tlv()));
+        let shuffled = RevocationCut::decode(&tlv_bytes(tlv::REVOCATION_CUT, &value)).unwrap();
+        assert_eq!(shuffled.encode(), one.revocation_cuts()[0].encode());
+    }
+
+    /// A context without cuts encodes as before: trust-context.md §11 T2,
+    /// byte for byte.
+    #[tokio::test]
+    async fn spec_vector_t2_is_unchanged() {
+        use crate::signer::Ed25519Signer;
+        let seed: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let root = Ed25519Signer::from_seed(&seed, n("/home/bob/KEY/root"));
+        let wire = crate::manager::encode_cert_data(
+            &n("/home/bob/KEY/root/self").append_version(1),
+            &root.public_key_bytes(),
+            &root,
+            1_700_000_000_000_000_000,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(1)
+            .with_schema_blob(SchemaBlob::native_text(
+                "/home/bob/shared/<**d> => /home/bob/admin/<dev>/KEY/<**k>",
+            ))
+            .unwrap()
+            .schema_authoritative()
+            .with_ca_endpoint(n("/home/bob/CA"))
+            .with_enrollment_hint(EnrollmentHint::namespace_default())
+            .with_revocation(n(PHONE_KEY))
+            .with_key_role(KeyRole::ROOT_DEVICE, n("/home/bob/CA/KEY/ca"))
+            .with_link_policy(LinkPolicy::default());
+        assert!(ctx.add_anchor(Certificate::decode(&Data::decode(wire).unwrap()).unwrap()));
+        let t2 = "fd0410fd01e3070b0804686f6d650803626f62fd0411f206f0071f0804686f6d\
+                  650803626f6208034b45590804726f6f74080473656c66360101141418080000\
+                  0000000000021908000000000036ee80152c302a300506032b657003210003a1\
+                  07bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b81647\
+                  1b01051c1807160804686f6d650803626f6208034b45590804726f6f74fd00fd\
+                  26fd00fe0f323032333131313454323231333230fd00ff0f3235353430373231\
+                  5432333334333317408179b8add1e2b0da55cc806f3d59c67e107814cde57b2a\
+                  253521216d52304e36229491d3b6c84ac5c5cd75e45c47c8a503576d7fba17b7\
+                  23f9cbfd20c7345b09fd041342fd04150101fd0417392f686f6d652f626f622f\
+                  7368617265642f3c2a2a643e203d3e202f686f6d652f626f622f61646d696e2f\
+                  3c6465763e2f4b45592f3c2a2a6b3efd041c00fd041411070f0804686f6d6508\
+                  03626f6208024341fd04162102746f6b656e2c6465766963652d617070726f76\
+                  616c3b61646d696e2c6e6f6465fd04182507230804686f6d650803626f620806\
+                  6d656d626572080570686f6e6508034b455908026b31fd041e1b020718080468\
+                  6f6d650803626f620802434108034b455908026361fd0412103b6e6f64653b65\
+                  6e726f6c6c6d656e74";
+        assert_eq!(hex(&ctx.encode_content()), t2);
+        let decoded = SignedTrustContext::decode_content(&ctx.encode_content(), 1).unwrap();
+        assert!(decoded.revocation_cuts().is_empty());
+        assert_eq!(hex(&decoded.encode_content()), t2);
+
+        // The same context with the T8 cut: the cut sits right after the
+        // Revocation entry, and nothing else moves.
+        let with_cut = decoded.with_revocation_cut(t8_cut());
+        let content = with_cut.encode_content();
+        let revocation = "fd04182507230804686f6d650803626f6208066d656d626572080570686f6e65\
+                          08034b455908026b31";
+        let at = t2.find(revocation).unwrap() + revocation.len();
+        let body = hex(&content);
+        assert_eq!(&body[body.len() - (t2.len() - at)..], &t2[at..]);
+        assert!(body.contains(&format!("{revocation}{}", hex(&t8_cut().encode()))));
+    }
+
+    /// The RevocationCut vector of trust-context.md §11 T8: key
+    /// `/home/bob/member/phone/KEY/k1`; CutRange `/home/bob/member/phone/32=log`
+    /// run 1–1; CutRange `/home/bob/member/phone/32=log/notes` runs 1–3 and
+    /// 7–7; CutExact `/home/bob/member/phone/32=log/notes/seq=9` with the
+    /// digest `000102…1f`.
+    #[test]
+    fn spec_vector_t8_revocation_cut() {
+        assert_eq!(
+            hex(&t8_cut().encode()),
+            "fd0428e507230804686f6d650803626f6208066d656d626572080570686f6e65\
+             08034b455908026b31fd042a2b071f0804686f6d650803626f6208066d656d62\
+             6572080570686f6e6520036c6f67fd042c063a01013a0101fd042a3c07260804\
+             686f6d650803626f6208066d656d626572080570686f6e6520036c6f6708056e\
+             6f746573fd042c063a01013a0103fd042c063a01073a0107fd042e4d074b0804\
+             686f6d650803626f6208066d656d626572080570686f6e6520036c6f6708056e\
+             6f7465733a01090120000102030405060708090a0b0c0d0e0f10111213141516\
+             1718191a1b1c1d1e1f"
+        );
+    }
+
+    #[test]
+    fn malformed_revocation_cuts_reject_the_context() {
+        let base = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n(PHONE_KEY))
+            .encode_content();
+        let key = n(PHONE_KEY).encode_to_tlv().to_vec();
+        let notes = log_prefix(&["notes"]).encode_to_tlv().to_vec();
+        let seq = |v: &[u8]| tlv_bytes(0x3A, v).to_vec();
+        let run = |parts: &[Vec<u8>]| tlv_bytes(tlv::CUT_RUN, &parts.concat()).to_vec();
+        let range = |parts: &[Vec<u8>]| tlv_bytes(tlv::CUT_RANGE, &parts.concat()).to_vec();
+        let exact = |name: Name| tlv_bytes(tlv::CUT_EXACT, &name.encode_to_tlv()).to_vec();
+        let cut = |parts: &[Vec<u8>]| tlv_bytes(tlv::REVOCATION_CUT, &parts.concat());
+        let good_run = run(&[seq(&[1]), seq(&[2])]);
+        let in_notes = |s: u64| log_prefix(&["notes"]).append_sequence_num(s);
+
+        let malformed: Vec<(&str, Vec<Bytes>)> = vec![
+            (
+                "run with first > last",
+                vec![cut(&[
+                    key.clone(),
+                    range(&[notes.clone(), run(&[seq(&[3]), seq(&[2])])]),
+                ])],
+            ),
+            (
+                "run with one component",
+                vec![cut(&[
+                    key.clone(),
+                    range(&[notes.clone(), run(&[seq(&[3])])]),
+                ])],
+            ),
+            (
+                "run with three components",
+                vec![cut(&[
+                    key.clone(),
+                    range(&[notes.clone(), run(&[seq(&[1]), seq(&[2]), seq(&[3])])]),
+                ])],
+            ),
+            (
+                "run of non-sequence components",
+                vec![cut(&[
+                    key.clone(),
+                    range(&[
+                        notes.clone(),
+                        run(&[tlv_bytes(0x32, &[1]).to_vec(), seq(&[2])]),
+                    ]),
+                ])],
+            ),
+            (
+                "sequence number not a NonNegativeInteger",
+                vec![cut(&[
+                    key.clone(),
+                    range(&[notes.clone(), run(&[seq(&[0, 0, 1]), seq(&[2])])]),
+                ])],
+            ),
+            (
+                "range without runs",
+                vec![cut(&[key.clone(), range(std::slice::from_ref(&notes))])],
+            ),
+            (
+                "range without a prefix Name",
+                vec![cut(&[key.clone(), range(std::slice::from_ref(&good_run))])],
+            ),
+            (
+                "exact name without a digest",
+                vec![cut(&[key.clone(), exact(in_notes(9))])],
+            ),
+            (
+                "exact name with a short digest",
+                vec![cut(&[
+                    key.clone(),
+                    exact(in_notes(9).append_component(NameComponent::new(
+                        ndn_packet::tlv_type::IMPLICIT_SHA256,
+                        Bytes::from_static(&[0; 31]),
+                    ))),
+                ])],
+            ),
+            (
+                "no key Name",
+                vec![cut(&[range(&[notes.clone(), good_run.clone()])])],
+            ),
+            ("empty cut", vec![cut(&[])]),
+            (
+                "malformed key Name",
+                vec![cut(&[tlv_bytes(0x07, &[0x08, 0x05, b'a']).to_vec()])],
+            ),
+            (
+                "unknown critical element",
+                vec![cut(&[key.clone(), tlv_bytes(0x0431, &[]).to_vec()])],
+            ),
+            (
+                "two cuts for one key",
+                vec![
+                    cut(std::slice::from_ref(&key)),
+                    cut(std::slice::from_ref(&key)),
+                ],
+            ),
+        ];
+        for (why, fields) in malformed {
+            assert!(
+                SignedTrustContext::decode_content(&with_fields(&base, &fields), 1).is_err(),
+                "{why}: the context must be refused"
+            );
+        }
+
+        // Well-formed, with an unknown non-critical element skipped.
+        let fine = cut(&[
+            key.clone(),
+            tlv_bytes(0x0430, b"later").to_vec(),
+            range(&[notes.clone(), good_run.clone()]),
+        ]);
+        let ctx = SignedTrustContext::decode_content(&with_fields(&base, &[fine]), 1).unwrap();
+        assert!(ctx.revocation_cut(&n(PHONE_KEY)).is_some());
+
+        // `readmit` refuses a name that does not end in a full digest.
+        let mut cut = RevocationCut::new(n(PHONE_KEY));
+        assert!(cut.readmit(in_notes(9)).is_err());
+        assert!(cut.exact().is_empty());
+    }
+
+    #[test]
+    fn a_cut_accepts_its_prefix_plus_one_sequence_number_in_a_run() {
+        let cut = t8_cut();
+        let notes = log_prefix(&["notes"]);
+        let d = digest(0x40);
+        let at = |prefix: &Name, seq: u64| prefix.clone().append_sequence_num(seq);
+
+        for seq in [1, 2, 3, 7] {
+            assert!(
+                cut.accepts(&at(&notes, seq), &d),
+                "notes seq {seq} is in a run"
+            );
+        }
+        assert!(cut.accepts(&at(&log_prefix(&[]), 1), &d), "snapshot 1");
+        for seq in [0, 4, 6, 8] {
+            assert!(
+                !cut.accepts(&at(&notes, seq), &d),
+                "notes seq {seq} is in a gap"
+            );
+        }
+        assert!(!cut.accepts(&at(&log_prefix(&[]), 2), &d));
+        // The same sequence number under another prefix.
+        assert!(!cut.accepts(&at(&log_prefix(&["photos"]), 2), &d));
+        assert!(!cut.accepts(&at(&n("/home/bob/member/laptop/x"), 2), &d));
+        // An extra component after (or before) the sequence number.
+        assert!(!cut.accepts(&at(&notes, 2).append("x"), &d));
+        assert!(!cut.accepts(&at(&notes.clone().append("x"), 2), &d));
+        assert!(!cut.accepts(&at(&notes, 2).append_segment(0), &d));
+        // The prefix itself, and another component type with the value.
+        assert!(!cut.accepts(&notes, &d));
+        assert!(!cut.accepts(&notes.clone().append_version(2), &d));
+        // A non-minimal encoding of an accepted number names other Data.
+        let padded = notes.clone().append_component(NameComponent::new(
+            ndn_packet::tlv_type::SEQUENCE_NUM,
+            Bytes::from_static(&[0, 2]),
+        ));
+        assert!(!cut.accepts(&padded, &d));
+
+        // CutExact: that name with exactly that digest.
+        assert!(cut.accepts(&at(&notes, 9), &digest(0)));
+        assert!(!cut.accepts(&at(&notes, 9), &digest(1)));
+        assert!(!cut.accepts(&at(&notes, 10), &digest(0)));
+        assert!(!cut.accepts(&at(&log_prefix(&["photos"]), 9), &digest(0)));
+    }
+
+    #[test]
+    fn refuses_data_is_the_revocation_minus_the_cut() {
+        let notes = log_prefix(&["notes"]);
+        let inside = notes.clone().append_sequence_num(2);
+        let outside = notes.clone().append_sequence_num(5);
+        let d = digest(9);
+        let cert = n(PHONE_KEY).append("NA").append_version(3);
+
+        let unrevoked = SignedTrustContext::hierarchical(n("/home/bob"));
+        assert!(!unrevoked.refuses_data(&n(PHONE_KEY), &outside, &d));
+
+        let uncut = SignedTrustContext::hierarchical(n("/home/bob")).with_revocation(n(PHONE_KEY));
+        for key in [n(PHONE_KEY), cert.clone()] {
+            assert!(uncut.refuses_data(&key, &inside, &d));
+        }
+
+        let cut = uncut.with_revocation_cut(t8_cut());
+        for key in [n(PHONE_KEY), cert.clone()] {
+            assert!(
+                !cut.refuses_data(&key, &inside, &d),
+                "{key}: inside the cut"
+            );
+            assert!(
+                cut.refuses_data(&key, &outside, &d),
+                "{key}: outside the cut"
+            );
+        }
+        // A cut of another key excuses nothing.
+        let tablet = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n("/home/bob/member/tablet/KEY/t"))
+            .with_revocation_cut(t8_cut());
+        assert!(tablet.refuses_data(&n("/home/bob/member/tablet/KEY/t"), &inside, &d));
+        // A cut without a revocation changes nothing.
+        let alone = SignedTrustContext::hierarchical(n("/home/bob")).with_revocation_cut(t8_cut());
+        assert!(!alone.refuses_data(&n(PHONE_KEY), &outside, &d));
     }
 }
