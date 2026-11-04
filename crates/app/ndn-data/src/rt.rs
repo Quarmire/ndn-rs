@@ -8,4 +8,4 @@ pub(crate) use tokio::time::Instant;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use web_time::Instant;
 
-pub(crate) use ndn_app::rt::{spawn, timeout};
+pub(crate) use ndn_app::rt::{sleep, spawn, timeout};

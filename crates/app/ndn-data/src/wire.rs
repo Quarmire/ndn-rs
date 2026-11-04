@@ -1740,11 +1740,7 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
             write_nni(w, tlv::REVISION, b.type_id.revision);
         });
         write_audiences(w, tlv::SEAL, &b.seal.any_of);
-        w.write_nested(tlv::KEEP, |w| match b.keep {
-            Keep::Until(t) => write_nni(w, tlv::KEEP_UNTIL, t.0),
-            Keep::LastN(n) => write_nni(w, tlv::KEEP_LAST_N, u64::from(n)),
-            Keep::Forever => w.write_tlv(tlv::KEEP_FOREVER, &[]),
-        });
+        write_keep(w, b.keep);
         write_nni(w, tlv::DATED, b.dated.0);
         match (&b.sealed, &b.chunks) {
             (Some(s), chunks) => {
@@ -1899,6 +1895,75 @@ pub fn decode_inline(bytes: Bytes) -> Result<Inline, WireError> {
         _ => Err(bad(
             "a sealed payload carries fields and a merge op, or a block",
         )),
+    }
+}
+
+fn write_keep(w: &mut TlvWriter, keep: Keep) {
+    w.write_nested(tlv::KEEP, |w| match keep {
+        Keep::Until(t) => write_nni(w, tlv::KEEP_UNTIL, t.0),
+        Keep::LastN(n) => write_nni(w, tlv::KEEP_LAST_N, u64::from(n)),
+        Keep::Forever => w.write_tlv(tlv::KEEP_FOREVER, &[]),
+    });
+}
+
+fn read_keep(v: Bytes) -> Result<Option<Keep>, WireError> {
+    let mut keep = None;
+    each(v, |t, v| {
+        keep = Some(match t {
+            tlv::KEEP_UNTIL => Keep::Until(Timestamp(read_nni(&v)?)),
+            tlv::KEEP_LAST_N => {
+                Keep::LastN(u32::try_from(read_nni(&v)?).map_err(|_| bad("last N fits 32 bits"))?)
+            }
+            tlv::KEEP_FOREVER => Keep::Forever,
+            _ => return Ok(false),
+        });
+        Ok(true)
+    })?;
+    Ok(keep)
+}
+
+/// What a device keeps of a version it dropped (pruned, or expired by its
+/// clock): its writer, its keep and the dates of its first and last entry,
+/// so its own summary goes on listing it as the log does, a `get` answers
+/// why, and a range read places it. A local value, never published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Tomb {
+    pub(crate) writer: Name,
+    pub(crate) keep: Keep,
+    pub(crate) first: Timestamp,
+    pub(crate) last: Timestamp,
+}
+
+pub(crate) fn encode_tomb(t: &Tomb) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::WRITER, |w| write_name(w, &t.writer));
+    write_keep(&mut w, t.keep);
+    write_nni(&mut w, tlv::DATED, t.first.0);
+    write_nni(&mut w, tlv::DATED, t.last.0);
+    w.finish()
+}
+
+/// A tombstone's value; `None` for one an earlier revision kept empty.
+pub(crate) fn decode_tomb(value: Bytes) -> Option<Tomb> {
+    let (mut writer, mut keep, mut dates) = (None, None, Vec::with_capacity(2));
+    each(value, |t, v| {
+        match t {
+            tlv::WRITER => writer = Some(read_writer(v)?),
+            tlv::KEEP => keep = read_keep(v)?,
+            tlv::DATED => dates.push(Timestamp(read_nni(&v)?)),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })
+    .ok()?;
+    match (writer, keep, dates.as_slice()) {
+        (Some(writer), Some(keep), &[first, last]) => Some(Tomb {
+            writer,
+            keep,
+            first,
+            last,
+        }),
+        _ => None,
     }
 }
 
@@ -2238,19 +2303,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                     any_of: read_audiences(v)?,
                 })
             }
-            tlv::KEEP => {
-                each(v, |t, v| {
-                    keep = Some(match t {
-                        tlv::KEEP_UNTIL => Keep::Until(Timestamp(read_nni(&v)?)),
-                        tlv::KEEP_LAST_N => Keep::LastN(
-                            u32::try_from(read_nni(&v)?).map_err(|_| bad("last N fits 32 bits"))?,
-                        ),
-                        tlv::KEEP_FOREVER => Keep::Forever,
-                        _ => return Ok(false),
-                    });
-                    Ok(true)
-                })?;
-            }
+            tlv::KEEP => keep = read_keep(v)?,
             tlv::DATED => dated = Some(Timestamp(read_nni(&v)?)),
             tlv::FIELDS => fields = Some(read_fields(v)?),
             tlv::MERGE_OP => op = Some(v),

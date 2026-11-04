@@ -19,6 +19,13 @@
 //! servable for as long as the log holds the entries it lists, so a descent
 //! never has to start over however fast the writer puts. Recently superseded
 //! packets are kept ready, so a reader a few roots behind costs no rebuild.
+//!
+//! A node of a log or one-key collection lists in `Entries` only the
+//! versions unexpired at its reference date `E`, the date of the writer's
+//! newest version in it (spec §7): `Keep::Until(t)` while `t > E`,
+//! `Keep::LastN(n)` while fewer than `n` later versions are listed there.
+//! Both are fixed by the log up to the node's head, so one name still has
+//! one packet, and a constant stream's node stays bounded by its keep window.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -26,6 +33,7 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::encode::DataBuilder;
 
+use crate::version::{Keep, Timestamp};
 use crate::wire::{
     Branches, ChildRef, NodeBody, PAGE_FANOUT, PageRef, bucket_of, encode_node, implicit_digest,
     node_name, page_name, ranges_of,
@@ -35,22 +43,61 @@ use crate::wire::{
 /// any superseded node or page is rebuilt from the log when asked for.
 const RECENT: usize = 4096;
 
+/// How a version is listed by keep: its keep and date, as its record
+/// carries them. A merge collection's versions are listed whatever their
+/// keep ([`Retain::ALWAYS`]): its state needs every operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Retain {
+    pub(crate) keep: Keep,
+    pub(crate) dated: Timestamp,
+}
+
+impl Retain {
+    /// Listed whatever comes later.
+    pub(crate) const ALWAYS: Retain = Retain {
+        keep: Keep::Forever,
+        dated: Timestamp(0),
+    };
+}
+
 /// What a log entry adds to a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Entry {
-    /// A version.
-    Version,
+pub(crate) enum Kind {
+    /// A version, listed by its keep.
+    Version(Retain),
     /// A record that is not a version: members, hold, lease or prune.
     Record,
 }
 
 #[derive(Default)]
 struct TNode {
-    entries: BTreeSet<u64>,
+    entries: BTreeMap<u64, Retain>,
     members: BTreeSet<u64>,
     children: BTreeMap<NameComponent, TNode>,
     head: u64,
     built: Option<Built>,
+}
+
+/// The versions of `entries` up to `h` that a node at head `h` lists: those
+/// unexpired at the date of the newest of them (spec §7).
+fn listed_at(entries: &BTreeMap<u64, Retain>, h: u64) -> Vec<u64> {
+    let upto = entries.range(..=h);
+    let Some((_, newest)) = upto.clone().next_back() else {
+        return Vec::new();
+    };
+    let e = newest.dated;
+    let mut out: Vec<u64> = upto
+        .rev()
+        .enumerate()
+        .filter(|(later, (_, r))| match r.keep {
+            Keep::Until(t) => t > e,
+            Keep::LastN(n) => (*later as u64) < u64::from(n),
+            Keep::Forever => true,
+        })
+        .map(|(_, (s, _))| *s)
+        .collect();
+    out.reverse();
+    out
 }
 
 /// A node's or page's packets, by page path.
@@ -88,7 +135,7 @@ impl Tree {
     }
 
     /// Record log entry `seq` about `subject` (under the tree's namespace).
-    pub(crate) fn add(&mut self, subject: &Name, seq: u64, entry: Entry) {
+    pub(crate) fn add(&mut self, subject: &Name, seq: u64, kind: Kind) {
         debug_assert!(subject.has_prefix(&self.ns));
         let rest = &subject.components()[self.ns.len()..];
         let mut node = &mut self.root;
@@ -100,9 +147,13 @@ impl Tree {
         }
         retire(node, &mut retired);
         node.head = node.head.max(seq);
-        match entry {
-            Entry::Version => node.entries.insert(seq),
-            Entry::Record => node.members.insert(seq),
+        match kind {
+            Kind::Version(r) => {
+                node.entries.insert(seq, r);
+            }
+            Kind::Record => {
+                node.members.insert(seq);
+            }
         };
         for (name, wire) in retired {
             self.remember(name, wire);
@@ -177,6 +228,18 @@ impl Tree {
         found
     }
 
+    /// `subject`'s node as it is now: its head and its packet.
+    pub(crate) fn current(
+        &mut self,
+        device: &Name,
+        writer: &Name,
+        subject: &Name,
+    ) -> Option<(u64, Bytes)> {
+        self.build(device, writer);
+        let node = self.node(subject)?;
+        Some((node.head, node.built.as_ref()?.wire.clone()))
+    }
+
     fn node(&self, subject: &Name) -> Option<&TNode> {
         if !subject.has_prefix(&self.ns) {
             return None;
@@ -211,7 +274,7 @@ fn assemble<'a>(
     writer: &Name,
     subject: &Name,
     head: u64,
-    entries: impl IntoIterator<Item = &'a u64>,
+    entries: &[u64],
     members: impl IntoIterator<Item = &'a u64>,
     refs: Vec<ChildRef>,
 ) -> Built {
@@ -261,7 +324,7 @@ fn build(node: &mut TNode, device: &Name, writer: &Name, subject: &Name) -> ([u8
         writer,
         subject,
         node.head,
-        &node.entries,
+        &listed_at(&node.entries, node.head),
         &node.members,
         refs,
     );
@@ -285,6 +348,7 @@ fn node_at(
         .entries
         .range(..=h)
         .next_back()
+        .map(|(s, _)| s)
         .into_iter()
         .chain(node.members.range(..=h).next_back())
         .copied()
@@ -295,7 +359,7 @@ fn node_at(
         writer,
         subject,
         head,
-        node.entries.range(..=h),
+        &listed_at(&node.entries, h),
         node.members.range(..=h),
         refs,
     );
@@ -434,16 +498,73 @@ mod tests {
         s.parse().unwrap()
     }
 
+    const V: Kind = Kind::Version(Retain::ALWAYS);
+
+    fn until(dated: u64, until: u64) -> Kind {
+        Kind::Version(Retain {
+            keep: Keep::Until(Timestamp(until)),
+            dated: Timestamp(dated),
+        })
+    }
+
+    fn entries_of(wire: &Bytes) -> Vec<u64> {
+        let body = decode_node(
+            Data::decode(wire.clone())
+                .unwrap()
+                .content()
+                .unwrap()
+                .clone(),
+        );
+        crate::wire::seqs_of(&body.unwrap().entries).collect()
+    }
+
+    #[test]
+    fn a_node_lists_by_keep_at_its_newest_date_one_packet_per_name() {
+        let (device, writer) = (n("/alice/sensor"), n("/alice/sensor/KEY/1"));
+        let temps = n("/alice/32=data/temps");
+        let last = n("/alice/32=data/last");
+        let mut tree = Tree::new(n("/alice"));
+        tree.add(&temps, 1, until(0, 100));
+        tree.add(&temps, 2, until(50, 150));
+        let (h2, at2) = tree.current(&device, &writer, &temps).unwrap();
+        assert_eq!((h2, entries_of(&at2)), (2, vec![1, 2]));
+        // The newest date moves past the first keep: no longer listed.
+        tree.add(&temps, 3, until(120, 220));
+        let (h3, at3) = tree.current(&device, &writer, &temps).unwrap();
+        assert_eq!((h3, entries_of(&at3)), (3, vec![2, 3]));
+        for kept in [2u64, 3] {
+            let lastn = Kind::Version(Retain {
+                keep: Keep::LastN(2),
+                dated: Timestamp(kept),
+            });
+            tree.add(&last, kept + 2, lastn);
+        }
+        tree.add(
+            &last,
+            6,
+            Kind::Version(Retain {
+                keep: Keep::LastN(2),
+                dated: Timestamp(6),
+            }),
+        );
+        let (_, l) = tree.current(&device, &writer, &last).unwrap();
+        assert_eq!(entries_of(&l), vec![5, 6], "the last 2 by count");
+        // Rebuilt from the log alone, the node at head 2 is the packet it was.
+        tree.recent.clear();
+        tree.recent_wire.clear();
+        let name = node_name(&device, &temps, 2);
+        assert_eq!(
+            tree.packet(&device, &writer, &temps, None, 2, &name),
+            Some(at2)
+        );
+    }
+
     #[test]
     fn a_change_moves_only_its_path_and_old_packets_stay_servable() {
         let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
         let mut tree = Tree::new(n("/alice"));
         for i in 0..200u64 {
-            tree.add(
-                &n(&format!("/alice/32=data/notes/n{i}")),
-                i + 1,
-                Entry::Version,
-            );
+            tree.add(&n(&format!("/alice/32=data/notes/n{i}")), i + 1, V);
         }
         tree.build(&device, &writer);
         let folder = tree.node(&n("/alice/32=data/notes")).unwrap();
@@ -463,7 +584,7 @@ mod tests {
         let old_name = before.name.clone();
         let old_digests: Vec<_> = pages.iter().map(|p| (p.bucket, p.digest)).collect();
 
-        tree.add(&n("/alice/32=data/notes/n7"), 201, Entry::Version);
+        tree.add(&n("/alice/32=data/notes/n7"), 201, V);
         tree.build(&device, &writer);
         let after = tree
             .node(&n("/alice/32=data/notes"))
@@ -556,15 +677,11 @@ mod tests {
     fn every_packet_a_root_listed_is_served_however_many_puts_follow() {
         let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
         let mut tree = Tree::new(n("/alice"));
-        tree.add(&n("/alice/32=data/todo"), 1, Entry::Record);
-        tree.add(&n("/alice/32=data/todo"), 2, Entry::Version);
+        tree.add(&n("/alice/32=data/todo"), 1, Kind::Record);
+        tree.add(&n("/alice/32=data/todo"), 2, V);
         // 1100 notes: the folder is paged and its fuller buckets sub-paged.
         for i in 0..1100u64 {
-            tree.add(
-                &n(&format!("/alice/32=data/notes/n{i}")),
-                i + 3,
-                Entry::Version,
-            );
+            tree.add(&n(&format!("/alice/32=data/notes/n{i}")), i + 3, V);
         }
         let then = listed(&mut tree, &device, &writer);
         assert!(
@@ -581,14 +698,10 @@ mod tests {
         for i in 0..600u64 {
             seq += 1;
             let note = if i % 2 == 0 { i * 7 % 1100 } else { 1100 + i };
-            tree.add(
-                &n(&format!("/alice/32=data/notes/n{note}")),
-                seq,
-                Entry::Version,
-            );
+            tree.add(&n(&format!("/alice/32=data/notes/n{note}")), seq, V);
             if i % 50 == 0 {
                 seq += 1;
-                tree.add(&n("/alice/32=data/todo"), seq, Entry::Version);
+                tree.add(&n("/alice/32=data/todo"), seq, V);
             }
             if i % 100 == 99 {
                 tree.build(&device, &writer);

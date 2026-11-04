@@ -31,7 +31,7 @@ pub struct PutOptions {
     /// signature in a block (model change M6, spec §4.1); `None` signs the
     /// version alone. A block closes at the earliest of its entries'
     /// arrival plus this delay, so no entry waits longer. Log and one-key
-    /// collections only. Filled by slice 4.
+    /// collections only.
     pub batch: Option<Duration>,
 }
 
@@ -101,7 +101,7 @@ pub enum Got {
     Snapshot(Snapshot),
     /// Entries of a one-key collection's blocks: a range read
     /// (`<C>/32=range/<R>`, [`crate::wire::range_name`]), or one entry by
-    /// its name. Filled by slice 4.
+    /// its name.
     Entries(Entries),
 }
 
@@ -158,7 +158,7 @@ pub enum Change {
     },
     /// A version delivered earlier expired by this device's clock (spec
     /// §14.1): the device dropped it, and a `get` of it answers
-    /// [`DataError::Expired`]. Filled by slice 4.
+    /// [`DataError::Expired`].
     Expired {
         /// The version.
         id: VersionId,

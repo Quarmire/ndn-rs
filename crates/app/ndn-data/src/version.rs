@@ -213,7 +213,7 @@ pub struct BlockEntry {
 /// A block's entries travel inside the block's own signed packet, so each
 /// entry verifies on its own exactly through the block's signature; the
 /// producer states the delay it accepts to fill one (model change M6,
-/// [`PutOptions::batch`](crate::PutOptions::batch)). Filled by slice 4.
+/// [`PutOptions::batch`](crate::PutOptions::batch)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Payload {
     /// A single entry.

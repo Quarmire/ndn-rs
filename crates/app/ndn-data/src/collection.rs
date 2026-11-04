@@ -16,8 +16,9 @@ use crate::wire;
 /// A writer is always one key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
-    /// A single key writes; the newest is its signed head, with a freshness
-    /// bound. Sensors, a service's answers. Filled by slice 4.
+    /// A single key writes — the one key its members record names — and
+    /// the newest is that key's signed head, with a freshness bound
+    /// (spec §5.3). Sensors, a service's answers.
     OneKey,
     /// Each member key appends; the collection is the union of exactly its
     /// members' logs. Chat, a photo library. Filled by slice 2.

@@ -53,16 +53,16 @@ pub enum Refusal {
     /// It does not verify: wrong signature, or bytes that do not match its
     /// name (a poisoned cache).
     BadSignature,
-    /// It is a summary or members record older than one already seen from
-    /// the same signer.
+    /// It is a summary, members record or one-key head older than one
+    /// already seen from the same signer.
     Rollback,
     /// It is not sealed, and the collection's members record seals the
     /// collection: its writer wrote it before hearing the record that sealed
     /// it. Versions inside the record's `since` (written before the seal)
     /// are not refused for this.
     Unsealed,
-    /// Its payload travels in pieces, and the collection's merge rule needs
-    /// every operation inline in its version (spec §4.1).
+    /// Its payload travels in pieces or as a block, and the collection's
+    /// merge rule needs one operation inline in each version (spec §4.1).
     NotInline,
 }
 
@@ -113,9 +113,10 @@ impl std::fmt::Display for Refusal {
                  writes it again, sealed",
             ),
             Refusal::NotInline => f.write_str(
-                "its payload travels in pieces, and the collection's merge rule needs every \
-                 operation inline; its writer writes it again inline, or puts the large value \
-                 into a log collection and refers to it by name",
+                "its payload travels in pieces or as a block, and the collection's merge rule \
+                 needs one operation inline in each version; its writer writes it again inline, \
+                 or puts the large value or the stream into a log collection and refers to it \
+                 by name",
             ),
         }
     }

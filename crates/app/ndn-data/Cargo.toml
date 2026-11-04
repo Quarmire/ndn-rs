@@ -37,7 +37,7 @@ ndn-packet = { workspace = true, features = ["std-wasm"] }
 tokio      = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 
 [lints]
 workspace = true

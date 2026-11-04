@@ -50,7 +50,7 @@
 //! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
 //! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule, `prune` refusing others' writes |
 //! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
-//! | 4 | signed blocks, one-key rule, retention by expiry |
+//! | 4 | signed blocks of small entries under a producer's delay, the one-key rule (a signed head with a freshness bound, rollback refused), retention by expiry (summaries listed by keep), range reads by seq and by time |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
 //! | 6 | named functions whose answers are sealed to their inputs' audience |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
