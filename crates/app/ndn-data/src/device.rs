@@ -433,17 +433,38 @@ struct SignedHead {
     wire: Bytes,
 }
 
-/// The newest head this device verified of another device's one-key
-/// collection.
+/// What this device verified of the heads of one key of another device's
+/// one-key collection (spec §5.3).
 struct SeenHead {
+    /// The highest seq of the key verified: a lower one is a rollback.
     seq: u64,
-    /// When it arrived, on this device's monotonic clock; `None` for one
-    /// restored from the store.
-    received: Option<Instant>,
-    /// What it states.
+    /// Whether `seq` was verified in this run, not restored from the store.
+    this_run: bool,
+    /// The last head of this run whose node checked out: its receipt, and
+    /// the seqs that node lists.
+    checked: Option<(Receipt, Vec<u64>)>,
+    /// The last head of this run whose newest listed version was
+    /// delivered: that version's seq and the head's receipt, from which
+    /// that version was last known the newest.
+    delivered: Option<(u64, Receipt)>,
+}
+
+/// When a head arrived, on this device's monotonic clock (a receipt does
+/// not survive a restart), and the freshness it states.
+#[derive(Clone, Copy)]
+struct Receipt {
+    at: Instant,
     freshness: Duration,
-    /// The seqs its node lists (empty for one restored).
-    listed: Vec<u64>,
+}
+
+impl Receipt {
+    /// The age of an answer this head confirmed the newest (spec §5.3):
+    /// the time since it arrived plus the freshness it states.
+    fn age(&self) -> Age {
+        Age::Newest {
+            unconfirmed_for: Instant::now().saturating_duration_since(self.at) + self.freshness,
+        }
+    }
 }
 
 /// A verified version whose payload is sealed and not opened.
@@ -2436,9 +2457,9 @@ impl Inner {
         // this device's own, so the same head is served again while its
         // node is unchanged.
         for (d, c, key, body, wire) in heads {
-            let freshness = Duration::from_millis(body.freshness);
             if d == self.device {
-                st.colls.entry(c.clone()).or_default().batch = freshness;
+                st.colls.entry(c.clone()).or_default().batch =
+                    Duration::from_millis(body.freshness);
                 st.heads.insert(
                     c,
                     SignedHead {
@@ -2452,9 +2473,9 @@ impl Inner {
                     (c, key),
                     SeenHead {
                         seq: body.seq,
-                        received: None,
-                        freshness,
-                        listed: Vec::new(),
+                        this_run: false,
+                        checked: None,
+                        delivered: None,
                     },
                 );
             }
@@ -4901,15 +4922,14 @@ impl Inner {
     /// its name's, and not lower than one of that key verified here or than
     /// a seq of that key known here (held, listed by a verified node, or
     /// tombstoned) — a rollback, refused also after a restart, as the
-    /// newest head of each key verified is kept in the store. Received at
-    /// `received`.
+    /// newest head of each key verified is kept in the store. Its receipt
+    /// counts only once the node it names checks out ([`Self::head_of`]).
     async fn accept_head(
         &self,
         c: &Name,
         key: &Writer,
         device: &Name,
         data: &Data,
-        received: Instant,
     ) -> Result<HeadBody, HeadRefusal> {
         let named = parse_head_name(&data.name);
         let Some((_, _, seq)) = named.filter(|(d, hc, _)| d == device && hc == c) else {
@@ -4947,32 +4967,31 @@ impl Inner {
             self.store
                 .insert(head_prefix(device, c), data.raw().clone());
         }
-        let listed = match st.seen.remove(&slot) {
-            Some(h) if h.seq == seq => h.listed,
-            _ => Vec::new(),
-        };
-        st.seen.insert(
-            slot,
-            SeenHead {
-                seq,
-                received: Some(received),
-                freshness: Duration::from_millis(body.freshness),
-                listed,
-            },
-        );
+        let h = st.seen.entry(slot).or_insert(SeenHead {
+            seq,
+            this_run: true,
+            checked: None,
+            delivered: None,
+        });
+        h.seq = seq;
+        h.this_run = true;
         Ok(body)
     }
 
     /// Fetch the head of `key`'s one-key collection `c` from its device
     /// (`<D>/32=summary/<C>/32=head`, MustBeFresh), take it
     /// ([`Self::accept_head`]), then fetch the node it names by name and
-    /// check it against the head's digest. The seqs the node lists.
-    async fn head_of(self: &Arc<Self>, c: &Name, key: &Writer, device: &Name) -> Option<Vec<u64>> {
+    /// check it against the head's digest. The seqs the node lists, and the
+    /// head's receipt, recorded only now that its node checked out.
+    async fn head_of(
+        self: &Arc<Self>,
+        c: &Name,
+        key: &Writer,
+        device: &Name,
+    ) -> Option<(Vec<u64>, Receipt)> {
         let data = self.fetch(head_prefix(device, c), true).await?;
-        let body = match self
-            .accept_head(c, key, device, &data, Instant::now())
-            .await
-        {
+        let at = Instant::now();
+        let body = match self.accept_head(c, key, device, &data).await {
             Ok(b) => b,
             Err(HeadRefusal::Rollback { seq, seen }) => {
                 tracing::warn!(collection = %c, seq, seen, "refused: a head older than one verified, or than a version held (rollback)");
@@ -4982,6 +5001,10 @@ impl Inner {
                 tracing::debug!(name = %data.name, ?why, "refused: a head of a one-key collection");
                 return None;
             }
+        };
+        let receipt = Receipt {
+            at,
+            freshness: Duration::from_millis(body.freshness),
         };
         let seq = body.seq;
         let node_name = node_name(device, c, seq);
@@ -5002,7 +5025,7 @@ impl Inner {
         if let Some(h) = st.seen.get_mut(&(c.clone(), key.clone()))
             && h.seq == seq
         {
-            h.listed = listed.clone();
+            h.checked = Some((receipt, listed.clone()));
         }
         let coll = st.colls.entry(c.clone()).or_default();
         coll.entries
@@ -5012,30 +5035,14 @@ impl Inner {
         st.unlisted(c, key, seq, &nb.entries);
         st.expire(c);
         st.apply_ready(c, &BTreeSet::new());
-        Some(listed)
-    }
-
-    /// How old an answer from the last head of `key` verified of `c` may be
-    /// (spec §5.3): the time since it arrived, on this device's monotonic
-    /// clock, plus the freshness it states; the sync-based age when none
-    /// arrived in this run.
-    fn head_age(&self, st: &St, c: &Name, key: &Writer) -> Age {
-        match st.seen.get(&(c.clone(), key.clone())) {
-            Some(SeenHead {
-                received: Some(at),
-                freshness,
-                ..
-            }) => Age::Newest {
-                unconfirmed_for: Instant::now().saturating_duration_since(*at) + *freshness,
-            },
-            _ => self.age(st, c),
-        }
+        Some((listed, receipt))
     }
 
     /// `get(C)` of a one-key collection (spec §5.3): its head, the node it
     /// names, the newest version that node lists — from the store, by
-    /// name, or from a holder. With no head (or no version) to be had, the
-    /// newest version held here: stale, never wrong.
+    /// name, or from a holder — aged from that head's receipt. With no head
+    /// (or no version) to be had, the newest version held here
+    /// ([`Self::newest_held`]): stale, never wrong.
     async fn newest_one_key(
         self: &Arc<Self>,
         c: &Name,
@@ -5051,11 +5058,8 @@ impl Inner {
                 },
             });
         }
-        if let Some(&newest) = self
-            .head_of(c, key, device)
-            .await
-            .as_ref()
-            .and_then(|l| l.last())
+        if let Some((listed, receipt)) = self.head_of(c, key, device).await
+            && let Some(&newest) = listed.last()
         {
             match self
                 .log_entry(&log_name(device, Some(c), newest), false)
@@ -5065,10 +5069,14 @@ impl Inner {
                     got: Got::Version(v),
                     ..
                 }) => {
-                    let age = self.head_age(&self.st.lock(), c, key);
+                    if let Some(h) = self.st.lock().seen.get_mut(&(c.clone(), key.clone()))
+                        && h.delivered.is_none_or(|(_, r)| r.at <= receipt.at)
+                    {
+                        h.delivered = Some((newest, receipt));
+                    }
                     return Ok(Answer {
                         got: Got::Version(v),
-                        age,
+                        age: receipt.age(),
                     });
                 }
                 Err(e @ DataError::Expired { .. }) => return Err(e),
@@ -5077,11 +5085,38 @@ impl Inner {
                 }
             }
         }
-        let st = self.st.lock();
-        let got = self.newest(&st, c)?;
+        self.newest_held(&self.st.lock(), c, key)
+    }
+
+    /// `get(C)` of `key`'s one-key collection `c` from the newest version
+    /// of the key held here (spec §5.3), its age how long ago it was last
+    /// known the newest: from the receipt of the last head of this run that
+    /// named it the newest and delivered it. A version no head of this run
+    /// named the newest, while a head of the key verified in this run went
+    /// past its seq, has no age this device can bound: `Unavailable` (ask
+    /// again later). With no such head, the age of a log collection.
+    fn newest_held(&self, st: &St, c: &Name, key: &Writer) -> Result<Answer, DataError> {
+        let got = self.newest(st, c)?;
+        let seq = match &got {
+            Got::Version(v) if v.id.writer == *key => Some(v.id.seq.0),
+            _ => None,
+        };
+        let seen = st.seen.get(&(c.clone(), key.clone()));
+        if let Some((s, receipt)) = seen.and_then(|h| h.delivered)
+            && Some(s) == seq
+        {
+            return Ok(Answer {
+                got,
+                age: receipt.age(),
+            });
+        }
+        if let Some(h) = seen.filter(|h| h.this_run && seq.is_none_or(|s| h.seq > s)) {
+            tracing::debug!(collection = %c, head = h.seq, held = ?seq, "a head verified in this run went past the newest version held, which no head of this run named the newest: its age is unknown");
+            return Err(DataError::Unavailable { name: c.clone() });
+        }
         Ok(Answer {
             got,
-            age: self.head_age(&st, c, key),
+            age: self.age(st, c),
         })
     }
 
@@ -5215,18 +5250,19 @@ impl Inner {
                         unconfirmed_for: Duration::ZERO,
                     },
                 ),
-                (false, Some(l)) => (l, self.head_age(&st, c, &key)),
-                // No head: what the last head of the one key verified
-                // listed, else every seq of the key known here.
-                (false, None) => {
-                    let l = st
-                        .seen
-                        .get(&(c.clone(), key.clone()))
-                        .filter(|h| !h.listed.is_empty())
-                        .map(|h| h.listed.clone())
-                        .unwrap_or_else(known);
-                    (l, self.head_age(&st, c, &key))
-                }
+                (false, Some((l, receipt))) => (l, receipt.age()),
+                // No head: what the last head of the one key checked in
+                // this run listed, aged from its receipt; else every seq of
+                // the key known here, with the age of a log collection.
+                (false, None) => match st
+                    .seen
+                    .get(&(c.clone(), key.clone()))
+                    .and_then(|h| h.checked.as_ref())
+                    .filter(|(_, l)| !l.is_empty())
+                {
+                    Some((receipt, l)) => (l.clone(), receipt.age()),
+                    None => (known(), self.age(&st, c)),
+                },
             }
         };
         // Blocks this device dropped as expired are no longer listed by the
@@ -9084,11 +9120,7 @@ mod tests {
                 one.clone(),
                 sensor.clone(),
             );
-            async move {
-                inner
-                    .accept_head(&c, &one, &sensor, &d, Instant::now())
-                    .await
-            }
+            async move { inner.accept_head(&c, &one, &sensor, &d).await }
         };
         accept(&first, head(&key, 5))
             .await
@@ -9153,11 +9185,7 @@ mod tests {
                 Writer::new(key.clone()),
                 device.clone(),
             );
-            async move {
-                inner
-                    .accept_head(&c, &one, &device, &d, Instant::now())
-                    .await
-            }
+            async move { inner.accept_head(&c, &one, &device, &d).await }
         };
         let first = start(&reader, &reader_keys, &validator, &store)
             .await
@@ -9224,6 +9252,113 @@ mod tests {
         .await
         .expect("the new key's same head is taken again");
         again.shutdown();
+    }
+
+    /// The members record of one-key collection `c` naming `key`, taken by
+    /// `dev` as its owner's.
+    fn one_key_record(dev: &Device, c: &Name, key: &Name) {
+        let body = MembersBody {
+            collection: c.clone(),
+            revision: 1,
+            rule: Rule::OneKey,
+            writers: vec![key.clone()],
+            readers: Vec::new(),
+            cuts: Vec::new(),
+            epoch: None,
+            key_check: None,
+            since: None,
+            parent: None,
+        };
+        let owner = Writer::new(n("/sam/owner/KEY/1"));
+        let mut st = dev.inner.st.lock();
+        st.accept_members(1, body, &owner, &dev.inner.config.rules, dev.inner.me());
+    }
+
+    #[tokio::test]
+    async fn an_older_version_never_takes_the_age_of_a_newer_head() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        assert!(validator.adopt_context(context("/rita")));
+        validator.cert_cache().insert(cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let one = Writer::new(key.clone());
+        one_key_record(&dev, &c, &key);
+        // Version 1 of the one key, held and applied.
+        hand(
+            &dev,
+            &sensor,
+            &c,
+            1,
+            Record::Version(version_body(&c, None)),
+        );
+        // A head of seq 5 arrives and verifies; the node it names, and
+        // version 5, are withheld.
+        let body = HeadBody {
+            collection: c.clone(),
+            seq: 5,
+            digest: [5; 32],
+            freshness: 60_000,
+        };
+        let (wire, _) = signed(
+            &sensor_keys,
+            &key,
+            &head_name(&sensor, &c, 5),
+            &wire::encode_head(&body),
+        );
+        dev.inner
+            .accept_head(&c, &one, &sensor, &Data::decode(wire).unwrap())
+            .await
+            .expect("the head is taken");
+        // Version 1 was never confirmed the newest in this run, and a head
+        // verified since says the log went past it: no age bounds it.
+        match dev.inner.newest_one_key(&c, &one, &sensor).await {
+            Ok(Answer {
+                got: Got::Version(v),
+                age,
+            }) if v.id.seq.0 < 5 => panic!(
+                "version {} answered with {age:?}, the age of a newer head",
+                v.id.seq.0
+            ),
+            Ok(other) => panic!("answered {other:?}"),
+            Err(e) => assert_eq!(e.next(), crate::NextStep::RetryLater, "{e}"),
+        }
+        // Had a head of this run named version 1 the newest and delivered
+        // it, version 1 is answered, aged from that head's receipt.
+        let confirmed = Receipt {
+            at: Instant::now(),
+            freshness: Duration::from_secs(1),
+        };
+        dev.inner
+            .st
+            .lock()
+            .seen
+            .get_mut(&(c.clone(), one.clone()))
+            .expect("the head is kept")
+            .delivered = Some((1, confirmed));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let since = confirmed.at.elapsed() + confirmed.freshness;
+        match dev.inner.newest_one_key(&c, &one, &sensor).await {
+            Ok(Answer {
+                got: Got::Version(v),
+                age: Age::Newest { unconfirmed_for },
+            }) => {
+                assert_eq!(v.id.seq.0, 1);
+                assert!(
+                    unconfirmed_for >= since,
+                    "aged from the head that named it the newest: {unconfirmed_for:?}"
+                );
+            }
+            other => panic!("a version confirmed the newest is answered: {other:?}"),
+        }
+        dev.shutdown();
     }
 
     /// A device of `/alice` whose wall clock reads `clock`, on a forwarder

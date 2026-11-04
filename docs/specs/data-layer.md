@@ -320,8 +320,9 @@ A one-key collection is written by exactly one key.
   the same key it verified for `C`, or than the highest seq of that key it
   knows in `C` — held, listed by a node of that key it verified, or kept by
   a tombstone (§14.1) — (rollback, invariant 3); a head of the same `Seq`
-  is taken again, which renews its receipt. The floor is the key's: each
-  key's device numbers its own log, so once the owner names another one key
+  is taken again, and renews its receipt once its node checks out. The
+  floor is the key's: each key's device numbers its own log, so once the
+  owner names another one key
   (a replaced sensor), that key's heads are not compared with the previous
   key's seqs, and a range read without a head uses only what a head of the
   current key listed. The highest `Seq` verified per collection and key is
@@ -334,12 +335,24 @@ A one-key collection is written by exactly one key.
   knows (`32=held`, §13.1). It answers `Got::Version` with
   `Age::Newest { unconfirmed_for }`, `unconfirmed_for` being the time on
   the reader's monotonic clock since it received that head, plus the head's
-  `Freshness`. When no head is reachable it answers the newest version of
-  the one key it holds (by seq), with `unconfirmed_for` measured from the
-  last head it received since it started, plus that head's `Freshness`. A
-  receipt time does not survive a restart — a monotonic clock does not —
-  so a reader that received no head of `C` since it started answers with
-  the age of a log collection (§15). Stale, never wrong (invariant 5).
+  `Freshness`. A head's receipt counts only once the node it names checked
+  out; a head whose node is withheld or does not match proves only that the
+  key's log reached its seq. When the newest version the node lists, or the
+  head, or its node, is not to be had, the reader answers the newest version
+  of the one key it holds (by seq), aged by how long ago that version was
+  last known the newest: `unconfirmed_for` measured from the receipt of the
+  last head, received since it started, that named that very version the
+  newest and delivered it, plus that head's `Freshness`. It never gives an
+  older version the receipt of a head that names a newer one. When no head
+  since it started named that version the newest, but a head of the key it
+  verified since it started has a higher seq — a newer version may exist,
+  and nothing bounds how long ago the held one was the newest — it answers
+  `Unavailable` (next step `RetryLater`) rather than an age it cannot bound
+  (§14.2: older verified data is answered only with its own age). A receipt
+  time does not survive a restart — a monotonic clock does not — so a
+  reader that verified no head of `C` above the version it holds since it
+  started answers with the age of a log collection (§15). Stale, never
+  wrong (invariant 5).
 
 **The freshness bound.** No clock is trusted and none is compared across
 devices: the bound is a duration measured on the reader's monotonic clock
@@ -1219,8 +1232,12 @@ With blocks, heads and expiry:
     the members record does not name.
 - **A holder**, cache or relay:
   - can withhold blocks, nodes and heads: a range read lists what it lacks
-    under `missing`, `get` answers older verified data with its age, and the
-    reader fetches elsewhere;
+    under `missing`; `get` answers older verified data with its own age —
+    how long ago that version was last known the newest, never the age of
+    a newer head whose node or version was withheld — or `Unavailable` when
+    a newer head was verified and the held version was never confirmed the
+    newest since the reader started (§5.3); and the reader fetches
+    elsewhere;
   - can replay old heads it saw, as fresh: they are never forged and never
     older than one the reader verified (rollback, durable); the age then
     understates (§5.3);
@@ -1656,7 +1673,8 @@ to equal bytes and equal nodes have equal digests.
 | Stranger asks a holder | Dropped for the cost of a parse: only an owner device whose hold record names the holder may ask, and its asks are bounded. | §13.2, §13.3 |
 | Holder hears a prune first | Its audit answer names the prune; the auditor verifies and takes it, and the piece is excused. | §13.3, §14 |
 | Writer offline when an epoch is pruned | Erasure stays pending until it has left the epoch; a version it sealed in an erased epoch, arriving later, brings the key back. | §14 |
-| Replayed head | A cache or holder serving an old head as fresh: never forged; refused when older than one verified or than what the reader holds, also after a restart; otherwise the reader answers the verified version that head names, with an age that understates — stale, never wrong data. | invariant 3, §5.3 |
+| Replayed head | A cache or holder serving an old head as fresh: never forged; refused when older than one of the same key verified or than what the reader knows of that key, also after a restart; otherwise the reader answers the verified version that head names, with an age that understates — stale, never wrong data. | invariant 3, §5.3 |
+| Head served, node or newest version withheld | The head raises its key's rollback floor, but its receipt does not count; `get` answers the held version aged from the last head that named it the newest, or `Unavailable` (`RetryLater`) when a newer head was verified and none named it the newest since the reader started. | invariant 5, §5.3 |
 | Forged or spliced entry | The block's signature fails; the block is dropped and fetched elsewhere; the entry is never returned. | invariant 1, §4.1 |
 | Holder serves past keep | Readers drop by their own clocks, answer `Expired` and store nothing expired. | §14.1 |
 | Holder claims `Expired` | No answer, never evidence: the lease does not count for the piece and repair may ask again. | §13.3, §14.1 |
