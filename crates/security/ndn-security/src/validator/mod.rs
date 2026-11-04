@@ -1,6 +1,8 @@
 mod chain;
+mod durable;
 mod expected;
 
+pub use durable::chain_clear;
 pub use expected::{AdmittedContext, ContextExpectation, ExpectContextError, ExpectationOutcome};
 
 use portable_atomic::AtomicU64;
@@ -325,6 +327,12 @@ impl Validator {
         Arc::clone(&self.cert_cache)
     }
 
+    /// The cut-manifest packets this validator holds
+    /// ([`CertCache::cut_manifests`]).
+    pub fn cut_manifests(&self) -> &crate::cut_manifest::CutManifests {
+        self.cert_cache.cut_manifests()
+    }
+
     /// Add an anchor to the ambient context (the flat-anchor compatibility
     /// path). Anchors for a *named* namespace belong on that context — see
     /// [`adopt_context`](Self::adopt_context) / [`SignedTrustContext::add_anchor`].
@@ -613,6 +621,7 @@ fn revoked_signer(
         .find(|n| ctx.is_revoked(n))
         .map(|n| TrustError::Revoked {
             name: n.to_string(),
+            why: TrustError::REVOKED,
         })
 }
 

@@ -181,6 +181,9 @@ pub struct CertCache {
     by_key: DashMap<Name, Vec<Arc<Name>>>,
     /// SHA-256 of a public key → the key name it is certified under.
     by_digest: DashMap<[u8; 32], Name>,
+    /// Cut-manifest packets, by full name: resolved and fetched like
+    /// certificates by a durable walk ([`crate::cut_manifest`]).
+    manifests: crate::cut_manifest::CutManifests,
 }
 
 impl CertCache {
@@ -189,7 +192,15 @@ impl CertCache {
             local: DashMap::new(),
             by_key: DashMap::new(),
             by_digest: DashMap::new(),
+            manifests: crate::cut_manifest::CutManifests::default(),
         }
+    }
+
+    /// The cut-manifest packets held beside the certificates (taken by the
+    /// [`CertFetcher`](crate::CertFetcher) when a durable walk named one
+    /// missing, or inserted by whoever holds them).
+    pub fn cut_manifests(&self) -> &crate::cut_manifest::CutManifests {
+        &self.manifests
     }
 
     /// The certificate `name` resolves to: among cached certificates of the

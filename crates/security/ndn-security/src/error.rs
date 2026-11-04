@@ -64,10 +64,33 @@ pub enum TrustError {
          {why}"
     )]
     NotPublicKeySignature { sig_type: String, why: &'static str },
-    #[error("certificate revoked in trust context: {name}")]
-    Revoked { name: String },
+    /// The trust context refuses what `name` (a key or certificate name)
+    /// signed: `why` says which rule (a revocation without a cut, outside
+    /// the key's cut, a lapsed key whose role needs a cut — see the
+    /// `REVOKED*` constants) and what to do.
+    #[error("refused by the trust context: {name} {why}")]
+    Revoked { name: String, why: &'static str },
     /// A trust context arrived for a namespace the validator expects one for
     /// (an adoption in progress) and failed the expectation.
     #[error("trust context for {namespace} refused while adopting it: {reason}")]
     ExpectedContextRefused { namespace: String, reason: String },
+}
+
+impl TrustError {
+    /// [`TrustError::Revoked`] `why`: a Revocation entry covers the name
+    /// and no cut excuses the packet.
+    pub const REVOKED: &'static str = "is revoked in the trust context; whatever it signed is \
+                                       refused (the owner may revoke it with a cut to keep what \
+                                       it signed before it was lost)";
+    /// [`TrustError::Revoked`] `why`: the key is revoked with a cut that
+    /// does not accept this packet (outside its ranges, not listed by its
+    /// manifest, not exactly re-admitted, or verified under another public
+    /// key than the cut's).
+    pub const REVOKED_OUTSIDE_CUT: &'static str = "is revoked with a cut that does not accept this packet; the owner can re-admit it by \
+         its full name (`ndn-fwd readmit`)";
+    /// [`TrustError::Revoked`] `why`: no Revocation covers the key, but its
+    /// device role is listed in DataRequiresCut and no certificate of the
+    /// key that verifies the packet is valid now.
+    pub const REVOKED_LAPSED: &'static str = "lapsed: its certificate expired and its role needs a cut (DataRequiresCut), so its Data \
+         waits for the owner to revoke the key with a cut that keeps what it signed";
 }

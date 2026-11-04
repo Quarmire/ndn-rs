@@ -20,10 +20,17 @@
 //!   context is meaningless, so a node that can't parse them must reject it.
 //! - Additive → **even**: [`CA_ENDPOINT`], [`ENROLLMENT_HINT`],
 //!   [`REVOCATION`], [`KEY_ROLE`], [`LINK_POLICY`], [`ADVERTISED_RELAY`],
-//!   [`REVOCATION_CUT`]. An old node skips an unknown one and still
+//!   [`REVOCATION_CUT`] (with [`CUT_KEY_DIGEST`] and [`CUT_MANIFEST`]),
+//!   [`DATA_REQUIRES_CUT`]. An old node skips an unknown one and still
 //!   validates with the anchors + schema it does understand (an old node
 //!   that skips a [`REVOCATION_CUT`] keeps the all-or-nothing Revocation:
-//!   it refuses more, never less).
+//!   it refuses more, never less; one that reads cuts but skips their key
+//!   digest or manifest reads them by name only, as cuts were first
+//!   defined, until it is updated).
+//!
+//! The cut-manifest content TLVs ([`MANIFEST_NODE`] … [`MANIFEST_BOUND`],
+//! `0x0436–0x043E`) live in their own self-certifying Data packets, not in
+//! the context ([`cut_manifest`](crate::cut_manifest)).
 //!
 //! (The design note's draft had the parity inverted for the must-understand
 //! fields; renumbered here per the note's own "verify criticality parity"
@@ -121,7 +128,8 @@ pub const RELAY_PREFERENCE: u64 = 0x0426;
 
 /// Where a revoked key's authority over Data stopped
 /// ([`RevocationCut`](super::RevocationCut)), repeatable, at most one per
-/// key: the revoked key's `Name` (`0x07`), then [`CUT_RANGE`] and
+/// key: the revoked key's `Name` (`0x07`), then at most one
+/// [`CUT_KEY_DIGEST`], at most one [`CUT_MANIFEST`], then [`CUT_RANGE`] and
 /// [`CUT_EXACT`] entries. Written right after the [`REVOCATION`] entries.
 /// Non-critical (even): an old node skips it and refuses everything the
 /// revoked key signed. A malformed one rejects the context.
@@ -140,6 +148,54 @@ pub const CUT_RUN: u64 = 0x042C;
 /// ImplicitSha256DigestComponent — exactly that Data is accepted
 /// (re-admission).
 pub const CUT_EXACT: u64 = 0x042E;
+
+/// In [`REVOCATION_CUT`], at most one: exactly 32 octets, the SHA-256 of
+/// the revoked key's public key as its certificate carries it
+/// ([`public_key_digest`](super::public_key_digest)). The cut excuses only
+/// Data verified under that public key. Non-critical (even): a node that
+/// skips it reads the cut without the binding, as cuts were before it.
+pub const CUT_KEY_DIGEST: u64 = 0x0430;
+
+/// In [`REVOCATION_CUT`], at most one: the full `Name` (`0x07`, ending in
+/// a 32-octet ImplicitSha256DigestComponent) of the root packet of the
+/// cut's manifest ([`cut_manifest`](crate::cut_manifest)), which lists the
+/// implicit digest of every entry the ranges accept: an in-range packet is
+/// accepted only when the manifest lists its bytes. Non-critical (even): a
+/// node that skips it reads the ranges by name only, as cuts were before it.
+pub const CUT_MANIFEST: u64 = 0x0432;
+
+/// A device role whose keys' Data needs a cut once their certificate
+/// lapsed, repeatable: the UTF-8 role name (the name component right after
+/// the namespace in a device identity `/<ns>/<role>/<device>`). Data signed
+/// by such a key is accepted by the durable rule only while a certificate
+/// of the key that verifies it is valid by the reader's clock, or once the
+/// key is revoked with a cut, which then decides alone. Written right
+/// after the [`REVOCATION_CUT`] entries, sorted, without duplicates.
+/// Non-critical (even): an old node skips it and accepts such Data as it
+/// did before. An empty or non-UTF-8 one rejects the context.
+pub const DATA_REQUIRES_CUT: u64 = 0x0434;
+
+/// The Content of a cut-manifest packet ([`cut_manifest`](crate::cut_manifest)):
+/// either [`MANIFEST_RANGE`]s (a leaf) or [`MANIFEST_CHILD`]ren (an
+/// interior node), never both.
+pub const MANIFEST_NODE: u64 = 0x0436;
+
+/// In a leaf [`MANIFEST_NODE`]: a CutRange prefix `Name` (`0x07`) and one
+/// or more [`MANIFEST_ENTRY`]s, ascending by sequence number.
+pub const MANIFEST_RANGE: u64 = 0x0438;
+
+/// In [`MANIFEST_RANGE`]: a SequenceNumNameComponent (`0x3A`) and the
+/// ImplicitSha256DigestComponent (`0x01`, 32 octets) of the Data named the
+/// range's prefix plus that sequence number.
+pub const MANIFEST_ENTRY: u64 = 0x043A;
+
+/// In an interior [`MANIFEST_NODE`]: two [`MANIFEST_BOUND`]s (the first
+/// and last entry the child covers) and the child packet's full `Name`.
+pub const MANIFEST_CHILD: u64 = 0x043C;
+
+/// In [`MANIFEST_CHILD`]: a prefix `Name` (`0x07`) and a
+/// SequenceNumNameComponent (`0x3A`).
+pub const MANIFEST_BOUND: u64 = 0x043E;
 
 /// `SchemaFormat` value: native ndn-rs text grammar (local authoring).
 pub const SCHEMA_FORMAT_NATIVE: u8 = 1;

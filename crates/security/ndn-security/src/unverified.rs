@@ -6,8 +6,11 @@
 //! you to resolve. A consumer that fetches a `Data` receives it as
 //! `Unverified<Data>`; to get a usable value out you must explicitly choose:
 //!
-//! - [`verify`](Unverified::verify) — validate against a [`Validator`], yielding
-//!   [`SafeData`] on success (the safe path); or
+//! - [`verify`](Unverified::verify) — validate against a [`Validator`] by the
+//!   durable rule Data is judged by everywhere (no clock, cuts honoured),
+//!   yielding [`SafeData`] on success (the safe path); for a live reply
+//!   whose freshness is the point (an RPC answer),
+//!   [`verify_live`](Unverified::verify_live); or
 //! - [`trust_unchecked`](Unverified::trust_unchecked) — accept the value
 //!   **without** verification, on purpose. The name is deliberately loud and
 //!   greppable so an audit can find every bypass; it is never the silent default.
@@ -39,8 +42,10 @@ pub enum VerifyError {
     /// Signature was cryptographically invalid, or the trust schema rejected it.
     #[error("verification failed: {0}")]
     Invalid(TrustError),
-    /// The signing certificate chain is not yet resolved (async fetch pending).
-    #[error("certificate chain not resolved")]
+    /// The signing certificate chain (or a cut-manifest packet it needs) is
+    /// not resolved yet: the validator has no fetcher, or the fetch failed.
+    /// Attach a [`CertFetcher`](crate::CertFetcher) or try again later.
+    #[error("certificate chain not resolved (no fetcher attached, or the fetch failed)")]
     Pending,
     /// The packet verified only as `DigestSha256` — integrity, not identity. It
     /// carries no authenticated signer, so [`verify`](Unverified::verify) rejects
@@ -72,15 +77,25 @@ impl<T> Unverified<T> {
 }
 
 impl Unverified<Data> {
-    /// Validate against `validator`, yielding [`SafeData`] for an
+    /// Validate against `validator` by the **durable** rule
+    /// ([`Validator::validate_durable`]), yielding [`SafeData`] for an
     /// **authenticated** packet. The safe path out of `Unverified<Data>`.
+    ///
+    /// Data is judged as the forwarder and the data layer judge it: the
+    /// whole chain to a trust anchor (missing certificates fetched when the
+    /// validator has a fetcher), revocations — a key revoked with a cut
+    /// keeps what its cut accepts — and never a certificate's validity
+    /// period against the reader's clock (except for a key whose role the
+    /// context lists in DataRequiresCut). Use [`verify_live`](Self::verify_live)
+    /// for a reply whose freshness is the point (an RPC answer).
     ///
     /// A packet that verifies only as `DigestSha256` (integrity, no identity) is
     /// **rejected** with [`VerifyError::UnauthenticatedDigest`] — a valid digest
     /// is not authentication. Use [`verify_allowing_digest`](Self::verify_allowing_digest)
     /// to accept integrity-only data deliberately.
     pub async fn verify(self, validator: &Validator) -> Result<SafeData, VerifyError> {
-        self.verify_inner(validator, false).await
+        let result = validator.validate_durable(&self.inner).await;
+        Self::resolve(result, false)
     }
 
     /// Like [`verify`](Self::verify) but also accepts a `DigestSha256`-only
@@ -91,19 +106,27 @@ impl Unverified<Data> {
         self,
         validator: &Validator,
     ) -> Result<SafeData, VerifyError> {
-        self.verify_inner(validator, true).await
+        let result = validator.validate_durable(&self.inner).await;
+        Self::resolve(result, true)
     }
 
-    async fn verify_inner(
-        self,
-        validator: &Validator,
-        allow_digest: bool,
-    ) -> Result<SafeData, VerifyError> {
-        match validator.validate(&self.inner).await {
+    /// Validate a **live** reply — one whose freshness is the point, such
+    /// as an RPC answer — by the single-hop live rule
+    /// ([`Validator::validate`]): its signer's cached certificate must be
+    /// valid now by the reader's clock, and any revocation of the signer
+    /// refuses it. Stored or forwarded Data takes [`verify`](Self::verify).
+    /// `DigestSha256`-only packets are rejected as by `verify`.
+    pub async fn verify_live(self, validator: &Validator) -> Result<SafeData, VerifyError> {
+        let result = validator.validate(&self.inner).await;
+        Self::resolve(result, false)
+    }
+
+    fn resolve(result: ValidationResult, allow_digest: bool) -> Result<SafeData, VerifyError> {
+        match result {
             ValidationResult::Valid(safe) => {
-                // `validate` honestly labels the trust path; the *consumer*
-                // policy is that digest-only (integrity, not identity) is not
-                // "verified" by default.
+                // The validator honestly labels the trust path; the
+                // *consumer* policy is that digest-only (integrity, not
+                // identity) is not "verified" by default.
                 if !allow_digest && matches!(safe.trust_path(), TrustPath::DigestSha256) {
                     return Err(VerifyError::UnauthenticatedDigest);
                 }
@@ -171,5 +194,93 @@ mod tests {
             .await
             .expect("opt-in accepts integrity-only data");
         assert_eq!(safe.data().name.to_string(), "/demo/thing");
+    }
+
+    /// `/home/bob`: root anchor, and the phone's key certified by the root
+    /// with an expired certificate; `edit` shapes the context.
+    async fn bob(
+        edit: impl FnOnce(crate::SignedTrustContext) -> crate::SignedTrustContext,
+    ) -> (Validator, crate::Ed25519Signer) {
+        use crate::{CertCache, Certificate, Ed25519Signer, Keyring, SignedTrustContext, Signer};
+        use std::sync::Arc;
+        let n = |s: &str| -> ndn_packet::Name { s.parse().unwrap() };
+        let root = Ed25519Signer::from_seed(&[1; 32], n("/home/bob/KEY/root"));
+        let phone = Ed25519Signer::from_seed(&[2; 32], n("/home/bob/member/phone/KEY/k1"));
+        let cert = |subject: &Ed25519Signer, issuer_id: &str, until: u64| {
+            let name = subject
+                .key_name()
+                .clone()
+                .append(issuer_id)
+                .append_version(1);
+            let pk = subject.public_key_bytes();
+            let root = &root;
+            async move {
+                let wire = crate::manager::encode_cert_data(&name, &pk, root, 0, until)
+                    .await
+                    .unwrap();
+                Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+            }
+        };
+        let anchor = cert(&root, "self", u64::MAX).await;
+        // NotAfter 2017-07-14: long expired.
+        let leaf = cert(&phone, "root", 1_500_000_000_000_000_000).await;
+        let ctx = edit(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
+        assert!(ctx.add_anchor(anchor));
+        let keyring = Arc::new(Keyring::new());
+        assert!(keyring.adopt(Arc::new(ctx)));
+        let cache = Arc::new(CertCache::new());
+        cache.insert(leaf);
+        (Validator::with_keyring(keyring, cache, None, 5), phone)
+    }
+
+    fn log_entry(seq: u64, by: &crate::Ed25519Signer) -> Data {
+        use crate::Signer;
+        let name: ndn_packet::Name = "/home/bob/member/phone/log/notes".parse().unwrap();
+        let wire = DataBuilder::new(name.append_sequence_num(seq), b"v").sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(by.key_name()),
+            |region| by.sign_sync(region).unwrap(),
+        );
+        Data::decode(wire).unwrap()
+    }
+
+    /// `verify` judges Data by the durable rule: a certificate expired by
+    /// the reader's clock does not refuse it, and a key revoked with a cut
+    /// keeps what its cut accepts.
+    #[tokio::test]
+    async fn verify_judges_data_by_the_durable_rule() {
+        let (validator, phone) = bob(|c| c).await;
+        let verdict = Unverified::new(log_entry(2, &phone))
+            .verify(&validator)
+            .await;
+        assert!(verdict.is_ok(), "expired certificate: {verdict:?}");
+
+        let key: ndn_packet::Name = "/home/bob/member/phone/KEY/k1".parse().unwrap();
+        let mut cut = crate::RevocationCut::new(key.clone());
+        cut.add_run(&"/home/bob/member/phone/log/notes".parse().unwrap(), 1, 3);
+        let (validator, phone) = bob(|c| c.with_revocation(key).with_revocation_cut(cut)).await;
+        let verdict = Unverified::new(log_entry(2, &phone))
+            .verify(&validator)
+            .await;
+        assert!(verdict.is_ok(), "in the cut: {verdict:?}");
+        assert!(matches!(
+            Unverified::new(log_entry(7, &phone))
+                .verify(&validator)
+                .await,
+            Err(VerifyError::Invalid(TrustError::Revoked { .. }))
+        ));
+    }
+
+    /// `verify_live` keeps the clock and the all-or-nothing revocation, for
+    /// replies whose freshness is the point.
+    #[tokio::test]
+    async fn verify_live_keeps_the_clock() {
+        let (validator, phone) = bob(|c| c).await;
+        assert!(matches!(
+            Unverified::new(log_entry(2, &phone))
+                .verify_live(&validator)
+                .await,
+            Err(VerifyError::Invalid(TrustError::CertNotFound { .. }))
+        ));
     }
 }

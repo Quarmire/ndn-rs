@@ -102,12 +102,24 @@ pub struct CertFetcher {
     fetch_fn: FetchFn,
     direct_fn: Option<DirectFetchFn>,
     in_flight: DashMap<FetchKey, broadcast::Sender<Option<Certificate>>>,
+    /// Cut-manifest packets being fetched by full name ([`Self::fetch_missing`]).
+    packets_in_flight: DashMap<FetchKey, broadcast::Sender<Option<()>>>,
     /// Fetches whose last attempt failed: until when re-fetching is
     /// suppressed, and whether the certificate is known absent. Bounded:
     /// pruned of expired entries once it exceeds [`NEGATIVE_CACHE_PRUNE_AT`].
     failed: DashMap<FetchKey, Failed>,
     timeout: Duration,
     negative_ttl: Duration,
+}
+
+/// Whether `name` is a full name: it ends in an ImplicitSha256DigestComponent
+/// of 32 octets, so it names exactly one packet (a cut-manifest packet a
+/// durable walk named missing, see [`CertFetcher::fetch_missing`]) rather
+/// than a key or certificate.
+pub fn is_full_name(name: &Name) -> bool {
+    name.components()
+        .last()
+        .is_some_and(|c| c.typ == ndn_packet::tlv_type::IMPLICIT_SHA256 && c.value.len() == 32)
 }
 
 /// A fetch that brought no certificate.
@@ -153,6 +165,7 @@ impl CertFetcher {
             fetch_fn,
             direct_fn: None,
             in_flight: DashMap::new(),
+            packets_in_flight: DashMap::new(),
             failed: DashMap::new(),
             timeout,
             negative_ttl: timeout,
@@ -218,11 +231,62 @@ impl CertFetcher {
         cert_name: &Arc<Name>,
         face: Option<u64>,
     ) -> Result<Certificate, TrustError> {
-        if let Some(cert) = self.cert_cache.get_valid(cert_name) {
-            return Ok(cert);
+        self.dedup(
+            &self.in_flight,
+            cert_name,
+            face,
+            || self.cert_cache.get_valid(cert_name),
+            |face| self.do_fetch(cert_name, face),
+        )
+        .await
+    }
+
+    /// Fetch what a validation named missing
+    /// ([`Validator::validate_durable_cached`](crate::Validator::validate_durable_cached)):
+    /// a certificate (a key or certificate name, as [`Self::fetch_from`]),
+    /// or a cut-manifest packet (a full name, [`is_full_name`]), taken into
+    /// the cache's [`cut_manifests`](CertCache::cut_manifests) only when its
+    /// bytes hash to the digest the name ends in. Deduplication, the failure
+    /// back-off and [`Self::known_absent`] work alike for both.
+    pub async fn fetch_missing(
+        &self,
+        name: &Arc<Name>,
+        face: Option<u64>,
+    ) -> Result<(), TrustError> {
+        if !is_full_name(name) {
+            return self.fetch_from(name, face).await.map(|_| ());
+        }
+        let manifests = self.cert_cache.cut_manifests();
+        self.dedup(
+            &self.packets_in_flight,
+            name,
+            face,
+            || manifests.contains(name).then_some(()),
+            |face| self.do_fetch_packet(name, face),
+        )
+        .await
+    }
+
+    /// One fetch of `name` (asking `face` too) per name and face at a time,
+    /// behind the failure back-off: `cached` answers without fetching, `run`
+    /// fetches (and caches) it.
+    async fn dedup<T, F>(
+        &self,
+        in_flight: &DashMap<FetchKey, broadcast::Sender<Option<T>>>,
+        name: &Arc<Name>,
+        face: Option<u64>,
+        cached: impl Fn() -> Option<T>,
+        run: impl FnOnce(Option<u64>) -> F,
+    ) -> Result<T, TrustError>
+    where
+        T: Clone,
+        F: Future<Output = Result<T, Miss>>,
+    {
+        if let Some(found) = cached() {
+            return Ok(found);
         }
         let face = face.filter(|_| self.direct_fn.is_some());
-        let key: FetchKey = (Arc::clone(cert_name), face);
+        let key: FetchKey = (Arc::clone(name), face);
 
         // Negative cache: a recent failure for this name short-circuits, so
         // Data signed by an unreachable key cannot drive a fetch per packet.
@@ -235,25 +299,23 @@ impl CertFetcher {
                     "recently failed"
                 };
                 return Err(TrustError::CertNotFound {
-                    name: format!("{why}: {cert_name}"),
+                    name: format!("{why}: {name}"),
                 });
             }
             self.failed.remove(&key);
         }
 
         // Atomic leader election: exactly one caller per key issues the fetch.
-        let tx = match self.in_flight.entry(key.clone()) {
+        let tx = match in_flight.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let mut rx = entry.get().subscribe();
                 drop(entry);
                 return match rx.recv().await {
-                    Ok(Some(cert)) => Ok(cert),
+                    Ok(Some(found)) => Ok(found),
                     // Closed before we subscribed in time: the leader may still
                     // have succeeded (it caches before publishing).
-                    _ => self.cert_cache.get_valid(cert_name).ok_or_else(|| {
-                        TrustError::CertNotFound {
-                            name: cert_name.to_string(),
-                        }
+                    _ => cached().ok_or_else(|| TrustError::CertNotFound {
+                        name: name.to_string(),
                     }),
                 };
             }
@@ -264,11 +326,11 @@ impl CertFetcher {
             }
         };
         let guard = InFlightGuard {
-            in_flight: &self.in_flight,
+            in_flight,
             key: key.clone(),
         };
 
-        let result = self.do_fetch(cert_name, face).await;
+        let result = run(face).await;
 
         if let Err(miss) = &result
             && !self.negative_ttl.is_zero()
@@ -286,20 +348,17 @@ impl CertFetcher {
             );
         }
 
-        let cert = result.as_ref().ok().cloned();
-        let _ = tx.send(cert);
+        let found = result.as_ref().ok().cloned();
+        let _ = tx.send(found);
         drop(guard);
 
         result.map_err(|miss| miss.error)
     }
 
-    async fn do_fetch(
-        &self,
-        cert_name: &Arc<Name>,
-        face: Option<u64>,
-    ) -> Result<Certificate, Miss> {
-        let name = cert_name.as_ref().clone();
-        let routed = (self.fetch_fn)(name.clone());
+    /// The Data the sources answer for `name` (asking `face` too).
+    async fn answer(&self, name: &Arc<Name>, face: Option<u64>) -> Result<Data, Miss> {
+        let wanted = name.as_ref().clone();
+        let routed = (self.fetch_fn)(wanted.clone());
         let answer = async {
             let (Some(face), Some(direct)) = (face, &self.direct_fn) else {
                 return routed.await;
@@ -318,47 +377,46 @@ impl CertFetcher {
                 // still serve one.
                 Ok(Err(miss)) => {
                     tokio::time::sleep_until(started + DIRECT_FETCH_AFTER).await;
-                    then_ask(miss, direct(name, face)).await
+                    then_ask(miss, direct(wanted, face)).await
                 }
-                Err(_) => first_answer(routed, direct(name, face)).await,
+                Err(_) => first_answer(routed, direct(wanted, face)).await,
             }
         };
 
-        let data = match tokio::time::timeout(self.timeout, answer).await {
-            Err(_) => {
-                return Err(TrustError::CertNotFound {
-                    name: format!("timeout fetching {}", cert_name),
-                }
-                .into());
+        match tokio::time::timeout(self.timeout, answer).await {
+            Err(_) => Err(TrustError::CertNotFound {
+                name: format!("timeout fetching {name}"),
             }
-            Ok(Err(FetchMiss::Unanswered | FetchMiss::NotAsked)) => {
-                return Err(TrustError::CertNotFound {
-                    name: cert_name.to_string(),
-                }
-                .into());
+            .into()),
+            Ok(Err(FetchMiss::Unanswered | FetchMiss::NotAsked)) => Err(TrustError::CertNotFound {
+                name: name.to_string(),
             }
-            Ok(Err(FetchMiss::Absent)) => {
-                return Err(Miss {
-                    error: TrustError::CertNotFound {
-                        name: format!("{cert_name}: none to be had where it was asked"),
-                    },
-                    absent: true,
-                });
-            }
-            Ok(Err(FetchMiss::Refused(refusal))) => {
-                return Err(Miss {
-                    error: TrustError::CertNotFound {
-                        name: format!(
-                            "{cert_name}: no source asked served an acceptable certificate (the \
-                             forwarder refused what answered: {refusal})"
-                        ),
-                    },
-                    absent: true,
-                });
-            }
-            Ok(Ok(data)) => data,
-        };
+            .into()),
+            Ok(Err(FetchMiss::Absent)) => Err(Miss {
+                error: TrustError::CertNotFound {
+                    name: format!("{name}: none to be had where it was asked"),
+                },
+                absent: true,
+            }),
+            Ok(Err(FetchMiss::Refused(refusal))) => Err(Miss {
+                error: TrustError::CertNotFound {
+                    name: format!(
+                        "{name}: no source asked served an acceptable packet (the forwarder \
+                         refused what answered: {refusal})"
+                    ),
+                },
+                absent: true,
+            }),
+            Ok(Ok(data)) => Ok(data),
+        }
+    }
 
+    async fn do_fetch(
+        &self,
+        cert_name: &Arc<Name>,
+        face: Option<u64>,
+    ) -> Result<Certificate, Miss> {
+        let data = self.answer(cert_name, face).await?;
         // The answer to a prefix Interest must be a certificate of the
         // requested key under the requested name — not other Data under it
         // (another key's certificate, an NDNCERT approval `<key>/ndncert-approve/<id>`,
@@ -378,6 +436,31 @@ impl CertFetcher {
         let cert = Certificate::decode(&data)?;
         self.cert_cache.insert(cert.clone());
         Ok(cert)
+    }
+
+    /// Fetch the cut-manifest packet `full_name` names: only a packet whose
+    /// name and implicit digest are exactly `full_name` is taken.
+    async fn do_fetch_packet(&self, full_name: &Arc<Name>, face: Option<u64>) -> Result<(), Miss> {
+        let data = self.answer(full_name, face).await?;
+        let got = data
+            .name
+            .as_ref()
+            .clone()
+            .append_implicit_digest(data.implicit_digest());
+        if got != **full_name {
+            return Err(TrustError::CertNotFound {
+                name: format!(
+                    "{} answered the fetch for {full_name} but its bytes are not the ones that \
+                     name stands for",
+                    data.name
+                ),
+            }
+            .into());
+        }
+        // A packet that is no manifest node is held all the same: it is
+        // what the root named, and it lists nothing.
+        let _ = self.cert_cache.cut_manifests().insert(&data);
+        Ok(())
     }
 }
 
@@ -413,12 +496,12 @@ where
 /// Drop-driven cleanup for `CertFetcher::in_flight`. Removes the per-key
 /// broadcast `Sender` on either normal exit or a panic during `do_fetch`,
 /// ensuring waiting followers see `RecvError::Closed` rather than hanging.
-struct InFlightGuard<'a> {
-    in_flight: &'a DashMap<FetchKey, broadcast::Sender<Option<Certificate>>>,
+struct InFlightGuard<'a, T> {
+    in_flight: &'a DashMap<FetchKey, broadcast::Sender<Option<T>>>,
     key: FetchKey,
 }
 
-impl Drop for InFlightGuard<'_> {
+impl<T> Drop for InFlightGuard<'_, T> {
     fn drop(&mut self) {
         self.in_flight.remove(&self.key);
     }

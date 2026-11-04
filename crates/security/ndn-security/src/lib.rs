@@ -25,6 +25,7 @@ pub mod confidentiality;
 #[cfg(feature = "custodian")]
 #[cfg_attr(docsrs, doc(cfg(feature = "custodian")))]
 pub mod custodian;
+pub mod cut_manifest;
 pub mod did;
 pub mod error;
 #[cfg(feature = "ndnsec-compat")]
@@ -62,11 +63,12 @@ pub mod yubikey;
 pub use active_signer::ActiveSigner;
 pub use capability::{Capability, CapabilityError};
 pub use cert_cache::{CertCache, Certificate};
-pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn, FetchMiss};
+pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn, FetchMiss, is_full_name};
 pub use cert_set::CertSet;
 pub use confidentiality::{
     ContentKey, EpochPolicy, RecipientKey, RotatingKey, Sealed, unwrap_ck, wrap_ck, wrap_ck_to,
 };
+pub use cut_manifest::{BuiltManifest, CutManifestError, CutManifests, ManifestLookup};
 pub use error::TrustError;
 pub use keychain::{KeyAlgorithm, KeyChain};
 pub use keyring::Keyring;
@@ -91,7 +93,7 @@ pub use trust_context::{
     AdvertisedRelay, ContextExplanation, CutRange, EnrollmentHint, KeyRole, LinkPolicy,
     OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SignedTrustContext,
     SignedTrustContextError, SigningPair, anchor_fingerprint, context_namespace_of, dryrun_orphans,
-    sync_group,
+    public_key_digest, sync_group,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaMatch, SchemaRule,
@@ -100,11 +102,11 @@ pub use trust_schema::{
 pub use unverified::{Unverified, VerifyError};
 pub use validator::{
     AdmittedContext, ContextExpectation, ExpectContextError, ExpectationOutcome,
-    InterestValidationOutcome, ValidationResult, Validator,
+    InterestValidationOutcome, ValidationResult, Validator, chain_clear,
 };
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519Verifier, Verifier, VerifyOutcome,
-    ed25519_verify_batch, verify_by_sig_type, verify_digest,
+    ed25519_verify_batch, verify_by_sig_type, verify_digest, verify_public_key_signature,
 };
 #[cfg(feature = "yubikey-piv")]
 pub use yubikey::{

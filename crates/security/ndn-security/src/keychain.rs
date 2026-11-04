@@ -254,11 +254,15 @@ impl KeyChain {
     /// Build a [`Validator`] pre-configured with this identity's trust
     /// anchors and [`TrustSchema::hierarchical`]. For looser policy, call
     /// [`Validator::set_schema`](crate::Validator::set_schema) with
-    /// [`TrustSchema::accept_all`] on the result.
+    /// [`TrustSchema::accept_all`] on the result. Each anchor is both a
+    /// trust anchor (a chain walk — the durable rule Data is judged by —
+    /// ends there) and a cached certificate (the single-hop live check finds
+    /// it).
     pub fn validator(&self) -> Validator {
         let v = Validator::new(TrustSchema::hierarchical());
         for anchor_name in self.mgr.trust_anchor_names() {
             if let Some(cert) = self.mgr.trust_anchor(&anchor_name) {
+                v.add_trust_anchor(cert.clone());
                 v.cert_cache().insert(cert);
             }
         }

@@ -18,9 +18,9 @@ use ndn_packet::Name;
 
 use crate::trust_context::SignedTrustContext;
 
-/// Called once a context is adopted that revokes names the version it
-/// replaces did not: the newly held context and those newly revoked names.
-/// See [`Keyring::on_revocation`].
+/// Called once a context is adopted that refuses what the version it
+/// replaces accepted: the newly held context and the names it refuses anew
+/// ([`newly_refused`]). See [`Keyring::on_revocation`].
 type RevocationListener = Arc<dyn Fn(&Arc<SignedTrustContext>, &[Name]) + Send + Sync>;
 
 /// Called once a context (a new namespace, or a newer version) is adopted.
@@ -38,7 +38,9 @@ pub struct Keyring {
     ambient: Arc<SignedTrustContext>,
     revocation_listeners: RwLock<Vec<RevocationListener>>,
     adoption_listeners: RwLock<Vec<AdoptionListener>>,
-    /// Bumped each time an adopted version newly revokes names; see
+    /// Bumped each time an adopted version refuses what the one it replaced
+    /// accepted (newly revoked names, a cut that accepts less, a role newly
+    /// needing a cut); see
     /// [`revocation_epoch`](Keyring::revocation_epoch).
     revocation_epoch: AtomicU64,
 }
@@ -52,13 +54,44 @@ impl std::fmt::Debug for Keyring {
     }
 }
 
-/// The names `new` revokes that `old` (the version it replaces, if any) did not.
-fn newly_revoked(old: Option<&SignedTrustContext>, new: &SignedTrustContext) -> Vec<Name> {
-    new.revocations()
+/// What `new` refuses that `old` (the version it replaces, if any) did
+/// not, as the names it concerns:
+///
+/// - each name `new` revokes that `old` did not;
+/// - the key of each cut of `old` whose key `new` still revokes and whose
+///   cut in `new` does not accept everything the old one did
+///   ([`RevocationCut::covers`](crate::RevocationCut::covers): the cut
+///   removed, a range or run shrunk, an exact entry dropped, its key digest
+///   or manifest changed, added or removed);
+/// - `/<ns>/<role>` for each DataRequiresCut role `new` lists that `old`
+///   did not (that role's lapsed keys now need a cut).
+///
+/// Producers only ever add to a cut, but adopters do not rely on that: a
+/// version that accepts less is revoking whatever its producer meant.
+fn newly_refused(old: Option<&SignedTrustContext>, new: &SignedTrustContext) -> Vec<Name> {
+    let mut names: Vec<Name> = new
+        .revocations()
         .iter()
         .filter(|r| old.is_none_or(|old| !old.revocations().contains(r)))
         .cloned()
-        .collect()
+        .collect();
+    if let Some(old) = old {
+        for cut in old.revocation_cuts() {
+            let key = cut.key();
+            if new.is_revoked(key)
+                && !new.revocation_cut(key).is_some_and(|now| now.covers(cut))
+                && !names.contains(key)
+            {
+                names.push(key.clone());
+            }
+        }
+    }
+    for role in new.data_requires_cut() {
+        if old.is_none_or(|old| !old.data_requires_cut().contains(role)) {
+            names.push(new.namespace().clone().append(role));
+        }
+    }
+    names
 }
 
 impl Default for Keyring {
@@ -115,12 +148,12 @@ impl Keyring {
                     return Arc::ptr_eq(held.get(), &ctx)
                         || held.get().encode_content() == ctx.encode_content();
                 }
-                let revoked = newly_revoked(Some(held.get().as_ref()), &ctx);
+                let revoked = newly_refused(Some(held.get().as_ref()), &ctx);
                 held.insert(Arc::clone(&ctx));
                 revoked
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
-                let revoked = newly_revoked(None, &ctx);
+                let revoked = newly_refused(None, &ctx);
                 slot.insert(Arc::clone(&ctx));
                 revoked
             }
@@ -140,7 +173,7 @@ impl Keyring {
             None => return Err(None),
             Some(held) if held.version() >= ctx.version() => return Err(Some(held.version())),
             Some(mut held) => {
-                let revoked = newly_revoked(Some(held.as_ref()), &ctx);
+                let revoked = newly_refused(Some(held.as_ref()), &ctx);
                 *held = Arc::clone(&ctx);
                 revoked
             }
@@ -169,7 +202,7 @@ impl Keyring {
                 return Err(Some(held.version()));
             }
             Some(mut held) => {
-                let revoked = newly_revoked(Some(held.as_ref()), &ctx);
+                let revoked = newly_refused(Some(held.as_ref()), &ctx);
                 *held = Arc::clone(&ctx);
                 revoked
             }
@@ -181,12 +214,15 @@ impl Keyring {
 
     /// Run `listener` whenever this keyring adopts a context (by
     /// [`adopt`](Self::adopt), [`adopt_update`](Self::adopt_update) or
-    /// [`adopt_update_from`](Self::adopt_update_from)) that
-    /// revokes names the version it replaces did not — e.g. so a forwarder
-    /// drops cached Data those keys signed. It runs synchronously on the
-    /// adopting thread after the new context is in force and the
-    /// [`revocation_epoch`](Self::revocation_epoch) is bumped, so it should
-    /// only schedule work.
+    /// [`adopt_update_from`](Self::adopt_update_from)) that refuses what
+    /// the version it replaces accepted — it revokes names that version did
+    /// not, a cut of a key it still revokes accepts less than before, or it
+    /// lists a DataRequiresCut role anew — e.g. so a forwarder drops cached
+    /// Data it no longer accepts. The listener gets those names: revoked
+    /// names, the keys whose cut accepts less, `/<ns>/<role>` for a role.
+    /// It runs synchronously on the adopting thread after the new context
+    /// is in force and the [`revocation_epoch`](Self::revocation_epoch) is
+    /// bumped, so it should only schedule work.
     pub fn on_revocation(
         &self,
         listener: impl Fn(&Arc<SignedTrustContext>, &[Name]) + Send + Sync + 'static,
@@ -221,12 +257,13 @@ impl Keyring {
         }
     }
 
-    /// How many adoptions so far newly revoked names. Read it before
-    /// validating a packet; if it reads the same later, no revocation was
-    /// adopted in between and the verdict still stands, and if it moved,
-    /// check the packet against the revocations held now. One atomic load.
-    /// It moves only on a revoking adoption, after the new context is in
-    /// force and before the revocation listeners run.
+    /// How many revoking adoptions so far ([`on_revocation`](Self::on_revocation)
+    /// says which are). Read it before validating a packet; if it reads the
+    /// same later, no revoking version was adopted in between and the
+    /// verdict still stands, and if it moved, check the packet against the
+    /// context held now. One atomic load. It moves only on a revoking
+    /// adoption, after the new context is in force and before the
+    /// revocation listeners run.
     pub fn revocation_epoch(&self) -> u64 {
         self.revocation_epoch.load(Ordering::SeqCst)
     }
@@ -459,5 +496,73 @@ mod tests {
                 .is_revoked(&n("/home/bob/member/x/KEY/k"))
         );
         assert_eq!(kr.revocation_epoch(), 0);
+    }
+
+    /// A version that accepts less of a revoked key than the version it
+    /// replaces — its cut removed, a run shrunk, an exact entry dropped —
+    /// is revoking: the epoch moves and the listeners hear that key. One
+    /// that only adds to a cut (re-admission) is not.
+    #[test]
+    fn a_version_whose_cut_accepts_less_is_revoking() {
+        use crate::RevocationCut;
+        let kr = Arc::new(keyring());
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        kr.on_revocation(move |ctx, revoked| {
+            sink.lock().unwrap().push((ctx.version(), revoked.to_vec()));
+        });
+        let key = n("/home/bob/member/phone/KEY/k1");
+        let log = n("/home/bob/member/phone/log/notes");
+        let exact = log
+            .clone()
+            .append_sequence_num(9)
+            .append_implicit_digest([7; 32]);
+        let cut = |last: u64, readmit: bool| {
+            let mut cut = RevocationCut::new(key.clone());
+            cut.add_run(&log, 1, last);
+            if readmit {
+                cut.readmit(exact.clone()).unwrap();
+            }
+            cut
+        };
+        let version = |v: u64, cut: Option<RevocationCut>| {
+            let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+                .with_version(v)
+                .with_revocation(key.clone());
+            Arc::new(match cut {
+                Some(cut) => ctx.with_revocation_cut(cut),
+                None => ctx,
+            })
+        };
+        kr.adopt(version(1, Some(cut(5, false))));
+        let epoch = kr.revocation_epoch();
+
+        // Re-admission only adds: not revoking.
+        kr.adopt_update(version(2, Some(cut(5, true)))).unwrap();
+        assert_eq!(kr.revocation_epoch(), epoch, "an added exact entry");
+        // Each of these accepts less than the version before it.
+        kr.adopt_update(version(3, Some(cut(5, false)))).unwrap();
+        assert_eq!(kr.revocation_epoch(), epoch + 1, "an exact entry dropped");
+        kr.adopt_update(version(4, Some(cut(3, false)))).unwrap();
+        assert_eq!(kr.revocation_epoch(), epoch + 2, "a run shrunk");
+        kr.adopt_update(version(5, None)).unwrap();
+        assert_eq!(kr.revocation_epoch(), epoch + 3, "the cut removed");
+        // A role newly listed in DataRequiresCut: its lapsed keys' Data is
+        // refused from now on.
+        let with_role = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(6)
+            .with_revocation(key.clone())
+            .with_data_requires_cut("guest");
+        kr.adopt_update(Arc::new(with_role)).unwrap();
+        assert_eq!(kr.revocation_epoch(), epoch + 4, "a role newly needs a cut");
+        let heard = heard.lock().unwrap();
+        let versions: Vec<u64> = heard.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions, [1, 3, 4, 5, 6]);
+        assert!(
+            heard[1..4]
+                .iter()
+                .all(|(_, names)| names == std::slice::from_ref(&key))
+        );
+        assert_eq!(heard[4].1, [n("/home/bob/guest")]);
     }
 }

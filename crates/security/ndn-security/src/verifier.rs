@@ -46,10 +46,21 @@ pub async fn verify_by_sig_type(
     sig_value: &[u8],
     public_key: &[u8],
 ) -> Result<VerifyOutcome, TrustError> {
+    verify_public_key_signature(sig_type, region, sig_value, public_key)
+}
+
+/// [`verify_by_sig_type`] without a future, for callers that cannot await
+/// (a content-store scan): the same algorithms, keys and refusals.
+pub fn verify_public_key_signature(
+    sig_type: SignatureType,
+    region: &[u8],
+    sig_value: &[u8],
+    public_key: &[u8],
+) -> Result<VerifyOutcome, TrustError> {
     match sig_type {
         SignatureType::SignatureEd25519 => {
             // Certificate Format v2 stores the public key as a 44-byte
-            // DER SubjectPublicKeyInfo envelope; `Ed25519Verifier` wants
+            // DER SubjectPublicKeyInfo envelope; Ed25519 verification wants
             // the raw 32-byte key. Strip here so callers can pass
             // `cert.public_key` directly.
             let raw = if crate::spki::is_ed25519_spki(public_key) {
@@ -59,17 +70,11 @@ pub async fn verify_by_sig_type(
             } else {
                 public_key.to_vec()
             };
-            Ed25519Verifier.verify(region, sig_value, &raw).await
+            ed25519_verify(region, sig_value, &raw)
         }
-        SignatureType::SignatureSha256WithRsa => {
-            RsaSha256Verifier
-                .verify(region, sig_value, public_key)
-                .await
-        }
+        SignatureType::SignatureSha256WithRsa => rsa_sha256_verify(region, sig_value, public_key),
         SignatureType::SignatureSha256WithEcdsa => {
-            EcdsaSha256Verifier
-                .verify(region, sig_value, public_key)
-                .await
+            ecdsa_sha256_verify(region, sig_value, public_key)
         }
         SignatureType::DigestSha256 => Err(not_public_key("DigestSha256 (0)", DIGEST_NO_SIGNER)),
         SignatureType::Other(c) if c == SIGNATURE_TYPE_DIGEST_BLAKE3_PLAIN => {
@@ -85,6 +90,68 @@ pub async fn verify_by_sig_type(
             code: c,
             name: format!("Other({c})"),
         }),
+    }
+}
+
+/// Ed25519 over `region` under the raw 32-byte `public_key`.
+fn ed25519_verify(
+    region: &[u8],
+    sig_value: &[u8],
+    public_key: &[u8],
+) -> Result<VerifyOutcome, TrustError> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+    let vk = VerifyingKey::from_bytes(public_key.try_into().map_err(|_| TrustError::InvalidKey)?)
+        .map_err(|_| TrustError::InvalidKey)?;
+    let sig_bytes: &[u8; 64] = sig_value
+        .try_into()
+        .map_err(|_| TrustError::InvalidSignature)?;
+    let sig = Signature::from_bytes(sig_bytes);
+    match vk.verify(region, &sig) {
+        Ok(()) => Ok(VerifyOutcome::Valid),
+        Err(_) => Ok(VerifyOutcome::Invalid),
+    }
+}
+
+/// RSA PKCS#1 v1.5 / SHA-256 under a DER SubjectPublicKeyInfo.
+fn rsa_sha256_verify(
+    region: &[u8],
+    sig_value: &[u8],
+    public_key: &[u8],
+) -> Result<VerifyOutcome, TrustError> {
+    use rsa::{
+        RsaPublicKey,
+        pkcs1v15::{Signature as RsaSig, VerifyingKey as RsaVk},
+        pkcs8::DecodePublicKey,
+        sha2::Sha256,
+        signature::Verifier as _,
+    };
+
+    let pk = RsaPublicKey::from_public_key_der(public_key).map_err(|_| TrustError::InvalidKey)?;
+    let vk = RsaVk::<Sha256>::new(pk);
+    let sig = RsaSig::try_from(sig_value).map_err(|_| TrustError::InvalidSignature)?;
+    match vk.verify(region, &sig) {
+        Ok(()) => Ok(VerifyOutcome::Valid),
+        Err(_) => Ok(VerifyOutcome::Invalid),
+    }
+}
+
+/// ECDSA / P-256 / SHA-256 under a DER SubjectPublicKeyInfo.
+fn ecdsa_sha256_verify(
+    region: &[u8],
+    sig_value: &[u8],
+    public_key: &[u8],
+) -> Result<VerifyOutcome, TrustError> {
+    use p256_ecdsa::{
+        ecdsa::{DerSignature, VerifyingKey, signature::Verifier as _},
+        pkcs8::DecodePublicKey,
+    };
+
+    let vk = VerifyingKey::from_public_key_der(public_key).map_err(|_| TrustError::InvalidKey)?;
+    let sig = DerSignature::try_from(sig_value).map_err(|_| TrustError::InvalidSignature)?;
+    match vk.verify(region, &sig) {
+        Ok(()) => Ok(VerifyOutcome::Valid),
+        Err(_) => Ok(VerifyOutcome::Invalid),
     }
 }
 
@@ -215,24 +282,7 @@ impl Verifier for Ed25519Verifier {
         sig_value: &'a [u8],
         public_key: &'a [u8],
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>> {
-        Box::pin(async move {
-            use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
-
-            let vk = VerifyingKey::from_bytes(
-                public_key.try_into().map_err(|_| TrustError::InvalidKey)?,
-            )
-            .map_err(|_| TrustError::InvalidKey)?;
-
-            let sig_bytes: &[u8; 64] = sig_value
-                .try_into()
-                .map_err(|_| TrustError::InvalidSignature)?;
-            let sig = Signature::from_bytes(sig_bytes);
-
-            match vk.verify(region, &sig) {
-                Ok(()) => Ok(VerifyOutcome::Valid),
-                Err(_) => Ok(VerifyOutcome::Invalid),
-            }
-        })
+        Box::pin(async move { ed25519_verify(region, sig_value, public_key) })
     }
 }
 
@@ -345,24 +395,7 @@ impl Verifier for RsaSha256Verifier {
         sig_value: &'a [u8],
         public_key: &'a [u8],
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>> {
-        Box::pin(async move {
-            use rsa::{
-                RsaPublicKey,
-                pkcs1v15::{Signature as RsaSig, VerifyingKey as RsaVk},
-                pkcs8::DecodePublicKey,
-                sha2::Sha256,
-                signature::Verifier as _,
-            };
-
-            let pk = RsaPublicKey::from_public_key_der(public_key)
-                .map_err(|_| TrustError::InvalidKey)?;
-            let vk = RsaVk::<Sha256>::new(pk);
-            let sig = RsaSig::try_from(sig_value).map_err(|_| TrustError::InvalidSignature)?;
-            match vk.verify(region, &sig) {
-                Ok(()) => Ok(VerifyOutcome::Valid),
-                Err(_) => Ok(VerifyOutcome::Invalid),
-            }
-        })
+        Box::pin(async move { rsa_sha256_verify(region, sig_value, public_key) })
     }
 }
 
@@ -376,21 +409,7 @@ impl Verifier for EcdsaSha256Verifier {
         sig_value: &'a [u8],
         public_key: &'a [u8],
     ) -> BoxFuture<'a, Result<VerifyOutcome, TrustError>> {
-        Box::pin(async move {
-            use p256_ecdsa::{
-                ecdsa::{DerSignature, VerifyingKey, signature::Verifier as _},
-                pkcs8::DecodePublicKey,
-            };
-
-            let vk = VerifyingKey::from_public_key_der(public_key)
-                .map_err(|_| TrustError::InvalidKey)?;
-            let sig =
-                DerSignature::try_from(sig_value).map_err(|_| TrustError::InvalidSignature)?;
-            match vk.verify(region, &sig) {
-                Ok(()) => Ok(VerifyOutcome::Valid),
-                Err(_) => Ok(VerifyOutcome::Invalid),
-            }
-        })
+        Box::pin(async move { ecdsa_sha256_verify(region, sig_value, public_key) })
     }
 }
 
