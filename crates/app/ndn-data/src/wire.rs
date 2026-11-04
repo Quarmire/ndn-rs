@@ -229,6 +229,11 @@ pub mod tlv {
     /// Empty, an audit answer: the piece's version's keep passed by the
     /// holder's clock, and the holder dropped it.
     pub const EXPIRED: u64 = 0x0551;
+    /// In a summary node of a log or one-key collection, a run of the
+    /// versions it lists kept until a date: `SeqRange+` (listed seqs),
+    /// `KeepUntil` (a date at or after each one's keep). A node's runs are
+    /// ascending and disjoint, at most [`EXPIRY_RUNS`](super::EXPIRY_RUNS).
+    pub const EXPIRY: u64 = 0x0553;
 }
 
 /// Keyword components of the layer's names.
@@ -275,6 +280,12 @@ pub const NODE_SEQS: usize = 65_536;
 /// are paged into 16 buckets by the first nibble of SHA-256 of the child's
 /// component, recursively.
 pub const PAGE_FANOUT: usize = 64;
+
+/// The most `Expiry` runs one summary node carries. Its listed versions kept
+/// `Until` a date form one run per group of them, in seq order, with one
+/// keep while those fit; beyond, they split in seq order into this many runs
+/// of equal count, each stating the latest keep in it (spec §7).
+pub const EXPIRY_RUNS: usize = 64;
 
 /// Why bytes do not decode.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1180,7 +1191,8 @@ pub enum AuditAnswer {
     /// record's packet, which the auditor verifies and takes.
     RefusedBy(Bytes),
     /// The holder dropped the piece as its version's keep passed by the
-    /// holder's own clock (spec §14.1): never evidence, no answer.
+    /// holder's own clock (spec §14.1): no answer, unless the writer's signed
+    /// keep proves it false beyond the auditor's clock skew (§13.3).
     Expired,
 }
 
@@ -2618,6 +2630,60 @@ fn check_ranges(ranges: &[(u64, u64)], head: u64, most: usize) -> Result<(), Wir
     Ok(())
 }
 
+/// Check a node's `Expiry` runs against the seqs it lists: at most
+/// [`EXPIRY_RUNS`], each with seqs, their seqs ascending and disjoint across
+/// all runs, every one listed in `entries` (checked ranges).
+fn check_expiry(runs: &[ExpiryRun], entries: &[(u64, u64)]) -> Result<(), WireError> {
+    if runs.len() > EXPIRY_RUNS {
+        return Err(bad(format!(
+            "a node states {} expiry runs; at most {EXPIRY_RUNS} are stated in one node",
+            runs.len()
+        )));
+    }
+    let mut prev: Option<u64> = None;
+    for run in runs {
+        if run.seqs.is_empty() {
+            return Err(bad("an expiry run names seqs"));
+        }
+        for &(lo, hi) in &run.seqs {
+            if prev.is_some_and(|p| lo <= p) {
+                return Err(bad("expiry runs are ascending and disjoint"));
+            }
+            if !all_listed(entries, lo, hi) {
+                return Err(bad(format!(
+                    "an expiry run names seqs {lo}–{hi}, which the node does not list"
+                )));
+            }
+            prev = Some(hi);
+        }
+    }
+    Ok(())
+}
+
+/// Whether every seq from `lo` to `hi` lies in `ranges` (ascending,
+/// disjoint).
+fn all_listed(ranges: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+    let mut i = ranges.partition_point(|(_, h)| *h < lo);
+    let mut from = lo;
+    while let Some(&(l, h)) = ranges.get(i) {
+        if l > from {
+            return false;
+        }
+        if h >= hi {
+            return true;
+        }
+        from = h + 1;
+        i += 1;
+    }
+    false
+}
+
+/// Whether `seq` lies in `ranges` (ascending, disjoint).
+pub(crate) fn in_ranges(ranges: &[(u64, u64)], seq: u64) -> bool {
+    let i = ranges.partition_point(|(_, hi)| *hi < seq);
+    ranges.get(i).is_some_and(|(lo, _)| *lo <= seq)
+}
+
 // ---- summaries --------------------------------------------------------------------------------
 
 /// A reference to a child summary node.
@@ -2651,6 +2717,17 @@ pub enum Branches {
     Pages(Vec<PageRef>),
 }
 
+/// A run of a summary node's listed versions kept until a date (spec §7):
+/// every seq of `seqs` is listed and kept `Until` a date at or before
+/// `until`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiryRun {
+    /// The run's seqs, as ascending, disjoint ranges.
+    pub seqs: Vec<(u64, u64)>,
+    /// A date no earlier than the keep of any of them.
+    pub until: Timestamp,
+}
+
 /// A summary node (or page).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBody {
@@ -2666,6 +2743,9 @@ pub struct NodeBody {
     pub entries: Vec<(u64, u64)>,
     /// The writer's members records of `subject`.
     pub members: Vec<(u64, u64)>,
+    /// The bounds of the keeps of the versions `entries` lists kept `Until`
+    /// a date, in runs (a log or one-key collection's node; spec §7).
+    pub expiry: Vec<ExpiryRun>,
     /// Sub-collections.
     pub branches: Branches,
 }
@@ -2682,6 +2762,17 @@ pub fn encode_node(b: &NodeBody) -> Bytes {
         }
         write_ranges(w, tlv::ENTRIES, &b.entries);
         write_ranges(w, tlv::MEMBERS_ENTRIES, &b.members);
+        for run in &b.expiry {
+            w.write_nested(tlv::EXPIRY, |w| {
+                for (lo, hi) in &run.seqs {
+                    w.write_nested(tlv::SEQ_RANGE, |w| {
+                        write_nni(w, tlv::SEQ, *lo);
+                        write_nni(w, tlv::SEQ, *hi);
+                    });
+                }
+                write_nni(w, tlv::KEEP_UNTIL, run.until.0);
+            });
+        }
         match &b.branches {
             Branches::Children(c) if c.is_empty() => {}
             Branches::Children(c) => w.write_nested(tlv::CHILDREN, |w| {
@@ -2720,6 +2811,7 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
     let mut page = None;
     let mut entries = Vec::new();
     let mut members = Vec::new();
+    let mut expiry = Vec::new();
     let mut branches = Branches::Children(Vec::new());
     each(value, |typ, v| {
         match typ {
@@ -2729,6 +2821,22 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
             tlv::PAGE_PATH => page = Some(v),
             tlv::ENTRIES => entries = read_ranges(v)?,
             tlv::MEMBERS_ENTRIES => members = read_ranges(v)?,
+            tlv::EXPIRY => {
+                let mut until = None;
+                each(v.clone(), |t, v| {
+                    match t {
+                        tlv::SEQ_RANGE => {}
+                        tlv::KEEP_UNTIL if until.is_none() => until = Some(read_nni(&v)?),
+                        tlv::KEEP_UNTIL => return Err(bad("an expiry run states one date")),
+                        _ => return Ok(false),
+                    }
+                    Ok(true)
+                })?;
+                expiry.push(ExpiryRun {
+                    seqs: read_ranges(v)?,
+                    until: Timestamp(until.ok_or_else(|| bad("an expiry run states a date"))?),
+                });
+            }
             tlv::CHILDREN => {
                 let mut list = Vec::new();
                 each(v, |t, v| {
@@ -2800,6 +2908,7 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
     let head = head.ok_or_else(|| missing("a head"))?;
     check_ranges(&entries, head, NODE_SEQS)?;
     check_ranges(&members, head, NODE_SEQS - seqs_in(&entries))?;
+    check_expiry(&expiry, &entries)?;
     Ok(NodeBody {
         subject: subject.ok_or_else(|| missing("a subject"))?,
         writer: writer.ok_or_else(|| missing("a writer"))?,
@@ -2807,6 +2916,7 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
         page,
         entries,
         members,
+        expiry,
         branches,
     })
 }
@@ -3072,6 +3182,7 @@ mod tests {
             page: None,
             entries,
             members: vec![(1, 1)],
+            expiry: Vec::new(),
             branches: Branches::Children(Vec::new()),
         };
         let ok = node(9, vec![(2, 4), (6, 9)]);
@@ -3088,6 +3199,70 @@ mod tests {
                 refused.as_ref().is_err_and(|e| e.0.contains(why)),
                 "{refused:?}, expected {why}"
             );
+        }
+    }
+
+    #[test]
+    fn a_node_whose_expiry_runs_are_out_of_order_unlisted_or_too_many_is_refused() {
+        let run = |seqs: Vec<(u64, u64)>, until: u64| ExpiryRun {
+            seqs,
+            until: Timestamp(until),
+        };
+        let node = |expiry: Vec<ExpiryRun>| NodeBody {
+            subject: n("/alice/32=data/soil"),
+            writer: n("/alice/sensor/KEY/1"),
+            head: 200,
+            page: None,
+            entries: vec![(2, 4), (5, 9), (20, 199)],
+            members: vec![(1, 1)],
+            expiry,
+            branches: Branches::Children(Vec::new()),
+        };
+        // A run may span ranges of `Entries` that touch, and skip listed
+        // seqs (kept otherwise) between its ranges.
+        let ok = node(vec![
+            run(vec![(2, 6)], 50),
+            run(vec![(8, 9), (20, 30)], 40),
+            run(vec![(31, 31)], 60),
+        ]);
+        assert_eq!(decode_node(encode_node(&ok)), Ok(ok));
+        for expiry in [
+            // Out of order, overlapping, empty.
+            vec![run(vec![(20, 30)], 5), run(vec![(2, 4)], 5)],
+            vec![run(vec![(2, 6)], 5), run(vec![(6, 9)], 5)],
+            vec![run(vec![(8, 9), (2, 4)], 5)],
+            vec![run(Vec::new(), 5)],
+            // A seq the node does not list.
+            vec![run(vec![(9, 20)], 5)],
+            vec![run(vec![(1, 2)], 5)],
+            vec![run(vec![(199, 200)], 5)],
+            // More runs than one node states.
+            (20..20 + EXPIRY_RUNS as u64 + 1)
+                .map(|s| run(vec![(s, s)], s))
+                .collect(),
+        ] {
+            let refused = decode_node(encode_node(&node(expiry.clone())));
+            assert!(refused.is_err(), "{expiry:?} taken: {refused:?}");
+        }
+        // A run without its date, or with two, is refused too.
+        for dates in [0, 2] {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv::SUMMARY_NODE, |w| {
+                write_name(w, &n("/alice/32=data/soil"));
+                w.write_nested(tlv::WRITER, |w| write_name(w, &n("/alice/sensor/KEY/1")));
+                write_nni(w, tlv::SEQ, 9);
+                write_ranges(w, tlv::ENTRIES, &[(2, 9)]);
+                w.write_nested(tlv::EXPIRY, |w| {
+                    w.write_nested(tlv::SEQ_RANGE, |w| {
+                        write_nni(w, tlv::SEQ, 2);
+                        write_nni(w, tlv::SEQ, 4);
+                    });
+                    for d in 0..dates {
+                        write_nni(w, tlv::KEEP_UNTIL, 10 + d);
+                    }
+                });
+            });
+            assert!(decode_node(w.finish()).is_err(), "{dates} dates taken");
         }
     }
 

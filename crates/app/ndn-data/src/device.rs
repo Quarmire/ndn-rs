@@ -71,14 +71,15 @@ use crate::version::{
     VersionId, Writer,
 };
 use crate::wire::{
-    self, AuditAnswer, AuditAsk, BlockEntryBody, Branches, ChunksBody, CutBody, GrantAsk, HeadBody,
-    HoldAsk, HoldBody, Inline, LeaseBody, MembersBody, NodeBody, PieceKind, PruneBody, Range,
-    Record, SealedBody, Tomb, VersionBody, audit_ask_name, device_of, entry_name, grant_name,
-    head_name, head_prefix, hold_ask_name, log_name, namespace_of, node_name, page_name,
-    parse_audit_ask_name, parse_entry_name, parse_grant_name, parse_head_name, parse_head_prefix,
-    parse_held_name, parse_hold_ask_name, parse_log_name, parse_piece_name, parse_range_name,
-    parse_seal_key_name, parse_state_name, parse_summary_name, piece_name, piece_names, root_name,
-    root_prefix, seal_key_name, seqs_of, state_name, subject_namespace,
+    self, AuditAnswer, AuditAsk, BlockEntryBody, Branches, ChunksBody, CutBody, ExpiryRun,
+    GrantAsk, HeadBody, HoldAsk, HoldBody, Inline, LeaseBody, MembersBody, NodeBody, PieceKind,
+    PruneBody, Range, Record, SealedBody, Tomb, VersionBody, audit_ask_name, device_of, entry_name,
+    grant_name, head_name, head_prefix, hold_ask_name, in_ranges, log_name, namespace_of,
+    node_name, page_name, parse_audit_ask_name, parse_entry_name, parse_grant_name,
+    parse_head_name, parse_head_prefix, parse_held_name, parse_hold_ask_name, parse_log_name,
+    parse_piece_name, parse_range_name, parse_seal_key_name, parse_state_name, parse_summary_name,
+    piece_name, piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name,
+    subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -277,6 +278,10 @@ struct Coll {
     /// sealed, or an operation the rule refuses): later versions do not wait
     /// for them.
     skipped: HashMap<Writer, BTreeSet<u64>>,
+    /// Per writer, its newest node of the collection verified here: what
+    /// it lists and the keep bounds it states decide which of the writer's
+    /// versions never apply here (spec §5.2, §7).
+    listings: HashMap<Writer, Listing>,
     /// Admitted, not yet applied.
     pending: BTreeSet<VersionId>,
     /// Held while no members record is known (or the rule is not one this
@@ -459,6 +464,46 @@ struct SeenHead {
     delivered: Option<(u64, Receipt)>,
 }
 
+/// A writer's newest node of a collection verified here (spec §5.2, §7):
+/// its head, the seqs it lists, and the keep bounds it states.
+struct Listing {
+    head: u64,
+    entries: Vec<(u64, u64)>,
+    expiry: Vec<ExpiryRun>,
+}
+
+impl Listing {
+    /// Whether the writer's version `seq`, when not held here, never
+    /// applies here by `now`, this device's clock: it is at or below the
+    /// node's head and the node does not list it, or lists it in a run
+    /// whose keep bound passed.
+    fn gone(&self, seq: u64, now: Timestamp) -> bool {
+        seq <= self.head
+            && (!in_ranges(&self.entries, seq) || self.bound(seq).is_some_and(|t| t <= now))
+    }
+
+    /// The keep bound the node states for `seq`, if a run of it lists it.
+    fn bound(&self, seq: u64) -> Option<Timestamp> {
+        let i = self
+            .expiry
+            .partition_point(|r| r.seqs.last().is_some_and(|(_, hi)| *hi < seq));
+        self.expiry
+            .get(i)
+            .filter(|r| in_ranges(&r.seqs, seq))
+            .map(|r| r.until)
+    }
+
+    /// The earliest keep bound it states after `now`: when more of what it
+    /// lists may stop being waited for.
+    fn next_bound(&self, now: Timestamp) -> Option<Timestamp> {
+        self.expiry
+            .iter()
+            .map(|r| r.until)
+            .filter(|t| *t > now)
+            .min()
+    }
+}
+
 /// When a head arrived, on this device's monotonic clock (a receipt does
 /// not survive a restart), and the freshness it states.
 #[derive(Clone, Copy)]
@@ -542,6 +587,45 @@ impl Coll {
                 .collect();
             self.skipped.entry(w.clone()).or_default().extend(covered);
         }
+    }
+
+    /// Mark every entry known here that its writer's newest node verified
+    /// here shows never applies by `now` ([`Listing::gone`]), and that is
+    /// not held, as one later versions need not wait for (spec §5.2).
+    /// Log-like collections only. Whether it marked any.
+    fn mark_gone(&mut self, now: Timestamp) -> bool {
+        if self.members.as_ref().is_none_or(|m| !log_like(&m.rule)) {
+            return false;
+        }
+        let mut gone: Vec<(Writer, Vec<u64>)> = Vec::new();
+        for (w, l) in &self.listings {
+            let Some(known) = self.entries.get(w) else {
+                continue;
+            };
+            let skipped = self.skipped.get(w);
+            let seqs: Vec<u64> = known
+                .range(..=l.head)
+                .copied()
+                .filter(|s| skipped.is_none_or(|k| !k.contains(s)) && l.gone(*s, now))
+                .filter(|s| {
+                    !holds_entry(
+                        self,
+                        &VersionId {
+                            writer: w.clone(),
+                            seq: Seq(*s),
+                        },
+                    )
+                })
+                .collect();
+            if !seqs.is_empty() {
+                gone.push((w.clone(), seqs));
+            }
+        }
+        let marked = !gone.is_empty();
+        for (w, seqs) in gone {
+            self.skipped.entry(w).or_default().extend(seqs);
+        }
+        marked
     }
 }
 
@@ -884,66 +968,80 @@ fn skipped_by(
             .is_some_and(|s| s.contains(&id.seq.0))
 }
 
+/// What a collection's versions wait for (spec §5.2): the entries known
+/// here, which of them never apply, and its writers' newest nodes.
+struct Waits<'a> {
+    members: Option<&'a Members>,
+    entries: &'a HashMap<Writer, BTreeSet<u64>>,
+    skipped: &'a HashMap<Writer, BTreeSet<u64>>,
+    listings: &'a HashMap<Writer, Listing>,
+    locked: &'a [Locked],
+}
+
+impl Waits<'_> {
+    /// Whether later versions of `id`'s writer, and versions naming `id` as
+    /// a parent, need not wait for it: [`skipped_by`]; or, in a log-like
+    /// collection, it is no entry known here though at or below the head of
+    /// its writer's newest node verified here (which lists none such: every
+    /// seq it lists is known), and it is not held.
+    fn never(&self, id: &VersionId) -> bool {
+        skipped_by(self.members, self.skipped, id)
+            || (self.members.is_some_and(|m| log_like(&m.rule))
+                && self
+                    .listings
+                    .get(&id.writer)
+                    .is_some_and(|l| id.seq.0 <= l.head)
+                && self
+                    .entries
+                    .get(&id.writer)
+                    .is_none_or(|e| !e.contains(&id.seq.0))
+                && !self
+                    .locked
+                    .iter()
+                    .any(|l| l.writer == id.writer && l.seq == id.seq.0))
+    }
+}
+
 /// The seq of `y` that a version naming `(y, t)` among its parents needs
 /// applied: `t`; or, when `(y, t)` never applies (a cut does not list it,
-/// or it was refused for what it carries), the highest version of `y` at or
+/// it was refused for what it carries, it expired, or its writer's newest
+/// node shows it never applies here), the highest version of `y` at or
 /// below `t` that does.
-fn needed(
-    members: Option<&Members>,
-    entries: &HashMap<Writer, BTreeSet<u64>>,
-    skipped: &HashMap<Writer, BTreeSet<u64>>,
-    y: &Writer,
-    t: u64,
-) -> u64 {
+fn needed(w: &Waits, y: &Writer, t: u64) -> u64 {
     let id = |s: u64| VersionId {
         writer: y.clone(),
         seq: Seq(s),
     };
-    if let Some(Refusal::OutsideCut(cut)) = members.and_then(|m| m.refusal(&id(t))) {
+    if let Some(Refusal::OutsideCut(cut)) = w.members.and_then(|m| m.refusal(&id(t))) {
         return cut.accept.highest_at_most(y, t).unwrap_or(0);
     }
-    if !skipped_by(members, skipped, &id(t)) {
+    if !w.never(&id(t)) {
         return t;
     }
-    entries
+    w.entries
         .get(y)
-        .and_then(|e| {
-            e.range(..t)
-                .rev()
-                .find(|s| !skipped_by(members, skipped, &id(**s)))
-                .copied()
-        })
+        .and_then(|e| e.range(..t).rev().find(|s| !w.never(&id(**s))).copied())
         .unwrap_or(0)
 }
 
 /// Whether a version is ready to apply: its writer's earlier entries here
 /// that apply at all, and its parents (as far as they apply), are applied.
-fn ready(
-    entries: &HashMap<Writer, BTreeSet<u64>>,
-    skipped: &HashMap<Writer, BTreeSet<u64>>,
-    applied: &BTreeMap<Writer, u64>,
-    members: Option<&Members>,
-    v: &Version,
-) -> bool {
-    let w = &v.id.writer;
-    let prev = entries.get(w).and_then(|e| {
+fn ready(w: &Waits, applied: &BTreeMap<Writer, u64>, v: &Version) -> bool {
+    let writer = &v.id.writer;
+    let prev = w.entries.get(writer).and_then(|e| {
         e.range(..v.id.seq.0)
             .rev()
             .find(|s| {
-                !skipped_by(
-                    members,
-                    skipped,
-                    &VersionId {
-                        writer: w.clone(),
-                        seq: Seq(**s),
-                    },
-                )
+                !w.never(&VersionId {
+                    writer: writer.clone(),
+                    seq: Seq(**s),
+                })
             })
             .copied()
     });
-    prev == applied.get(w).copied()
+    prev == applied.get(writer).copied()
         && v.parents.iter().all(|(y, t)| {
-            let need = needed(members, entries, skipped, y, t.0);
+            let need = needed(w, y, t.0);
             need == 0 || applied.get(y).is_some_and(|a| *a >= need)
         })
 }
@@ -1202,6 +1300,10 @@ impl St {
                 withdrawn.push((id, cut));
             }
         }
+        let now = (self.clock)();
+        if let Some(coll) = self.colls.get_mut(c) {
+            coll.mark_gone(now);
+        }
         self.apply_ready(c, &delivered);
         for (id, cut) in withdrawn {
             tracing::info!(?id, collection = %c, "withdrawn: a cut that arrived later refuses it");
@@ -1307,16 +1409,25 @@ impl St {
             applied,
             entries,
             skipped,
+            listings,
+            locked,
             pending,
             ..
         } = coll;
         let since = members.as_ref().and_then(|m| m.since.as_ref());
         let mut applied_now = Vec::new();
         loop {
+            let waits = Waits {
+                members: members.as_ref(),
+                entries,
+                skipped,
+                listings,
+                locked,
+            };
             let next = pending.iter().find(|id| {
-                versions.get(id).is_some_and(|hv| {
-                    ready(entries, skipped, applied, members.as_ref(), &hv.version)
-                })
+                versions
+                    .get(id)
+                    .is_some_and(|hv| ready(&waits, applied, &hv.version))
             });
             let Some(id) = next.cloned() else { break };
             pending.remove(&id);
@@ -1551,8 +1662,10 @@ impl St {
         if !ids.is_empty() {
             self.drop_expired(c, |id, _| ids.contains(id));
         }
-        let coll = self.colls.get(c)?;
-        coll.versions
+        let coll = self.colls.get_mut(c)?;
+        let marked = coll.mark_gone(now);
+        let held = coll
+            .versions
             .values()
             .map(|hv| hv.version.keep)
             .chain(coll.locked.iter().map(|l| l.body.keep))
@@ -1560,7 +1673,16 @@ impl St {
                 Keep::Until(t) => Some(t),
                 _ => None,
             })
-            .min()
+            .min();
+        let bound = coll
+            .listings
+            .values()
+            .filter_map(|l| l.next_bound(now))
+            .min();
+        if marked {
+            self.apply_ready(c, &BTreeSet::new());
+        }
+        held.into_iter().chain(bound).min()
     }
 
     /// Drop version `name` (a log entry, or a piece of one) now if it
@@ -1652,42 +1774,27 @@ impl St {
         }
     }
 
-    /// Let the writer's newest node of `c` this device verified, listing
-    /// `listed` up to `head`, decide what later versions wait for (spec
-    /// §5.2): an entry of `writer` at or below `head` it no longer lists
-    /// (expired at the writer's reference date) and not held here is not
-    /// waited for. Log-like collections only.
-    fn unlisted(&mut self, c: &Name, writer: &Writer, head: u64, listed: &[(u64, u64)]) {
-        let Some(coll) = self.colls.get_mut(c) else {
-            return;
-        };
-        if coll.members.as_ref().is_none_or(|m| !log_like(&m.rule)) {
-            return;
+    /// Take `body`, a node of `c` by `writer` verified here, as the
+    /// writer's newest unless one with a higher head was (spec §5.2, §7):
+    /// from now on, an entry of the writer at or below its head that it does
+    /// not list, or lists in a run whose keep bound passed by this device's
+    /// clock, is not waited for unless held — a seq never learned included.
+    /// The caller expires `c` next, which marks them. Returns the earliest
+    /// keep bound of the writer's newest node still ahead, for the sweeper.
+    fn listing(&mut self, c: &Name, writer: &Writer, body: &NodeBody) -> Option<Timestamp> {
+        let now = (self.clock)();
+        let coll = self.colls.get_mut(c)?;
+        if coll.listings.get(writer).is_none_or(|l| l.head < body.head) {
+            coll.listings.insert(
+                writer.clone(),
+                Listing {
+                    head: body.head,
+                    entries: body.entries.clone(),
+                    expiry: body.expiry.clone(),
+                },
+            );
         }
-        let Some(known) = coll.entries.get(writer) else {
-            return;
-        };
-        let is_listed = |s: u64| {
-            let i = listed.partition_point(|(_, hi)| *hi < s);
-            listed.get(i).is_some_and(|(lo, _)| *lo <= s)
-        };
-        let gone: Vec<u64> = known
-            .range(..=head)
-            .copied()
-            .filter(|s| !is_listed(*s))
-            .filter(|s| {
-                !holds_entry(
-                    coll,
-                    &VersionId {
-                        writer: writer.clone(),
-                        seq: Seq(*s),
-                    },
-                )
-            })
-            .collect();
-        if !gone.is_empty() {
-            coll.skipped.entry(writer.clone()).or_default().extend(gone);
-        }
+        coll.listings.get(writer)?.next_bound(now)
     }
 
     /// The merged value of `c` at exactly `at`, from held versions; `None`
@@ -1744,10 +1851,14 @@ impl St {
         while !left.is_empty() {
             let i = left.iter().position(|hv| {
                 ready(
-                    &entries,
-                    &coll.skipped,
+                    &Waits {
+                        members: Some(members),
+                        entries: &entries,
+                        skipped: &coll.skipped,
+                        listings: &coll.listings,
+                        locked: &coll.locked,
+                    },
                     &applied,
-                    Some(members),
                     &hv.version,
                 )
             })?;
@@ -3085,10 +3196,14 @@ impl Inner {
                     if inside {
                         versions.extend(seqs_of(&body.entries));
                     }
-                    // What the writer's newest node no longer lists is not
-                    // waited for, and what a newer entry ended is dropped.
-                    st.unlisted(&subject, writer, body.head, &body.entries);
+                    // What the writer's newest node no longer lists, or
+                    // lists with a keep bound passed, is not waited for, and
+                    // what a newer entry ended is dropped.
+                    let bound = st.listing(&subject, writer, &body);
                     st.expire(&subject);
+                    if let Some(t) = bound {
+                        self.arm_sweep(&mut st, Keep::Until(t));
+                    }
                     // Learned entries may make held versions ready.
                     st.apply_ready(&subject, &BTreeSet::new());
                 }
@@ -3159,6 +3274,7 @@ impl Inner {
                 .await;
             let versions: Vec<Name> = {
                 let st = self.st.lock();
+                let now = (st.clock)();
                 let coll = st.colls.get(&subject);
                 versions
                     .into_iter()
@@ -3167,7 +3283,12 @@ impl Inner {
                             writer: writer.clone(),
                             seq: Seq(*seq),
                         };
-                        coll.is_none_or(|c| c.pruned(&id).is_none())
+                        // Neither pruned nor shown by the writer's newest
+                        // node to have expired: a holder no longer has it.
+                        coll.is_none_or(|c| {
+                            c.pruned(&id).is_none()
+                                && c.listings.get(writer).is_none_or(|l| !l.gone(*seq, now))
+                        })
                     })
                     .map(|seq| log_name(device, Some(&subject), seq))
                     .filter(|name| !st.held.contains_key(name) && !st.refused.contains_key(name))
@@ -5076,8 +5197,11 @@ impl Inner {
             .entry(key.clone())
             .or_default()
             .extend(listed.iter().copied());
-        st.unlisted(c, key, seq, &nb.entries);
+        let bound = st.listing(c, key, &nb);
         st.expire(c);
+        if let Some(t) = bound {
+            self.arm_sweep(&mut st, Keep::Until(t));
+        }
         st.apply_ready(c, &BTreeSet::new());
         Some((listed, receipt))
     }
@@ -6413,7 +6537,8 @@ impl Inner {
         let mut st = self.st.lock();
         let version = strip_piece(&ask.piece);
         // Dropped as expired by this device's own clock: it says so, which
-        // is never evidence (spec §14.1).
+        // is evidence only if the version's signed keep proves it false
+        // (spec §13.3).
         if st.expire_named(&version) {
             return AuditAnswer::Expired;
         }
@@ -7770,6 +7895,7 @@ mod tests {
             page: None,
             entries: Vec::new(),
             members: Vec::new(),
+            expiry: Vec::new(),
             branches: Branches::Children(Vec::new()),
         };
         let signer = keys.get_signer_sync(key).unwrap();
@@ -9874,6 +10000,164 @@ mod tests {
             e.expired.iter().any(|id| id.seq.0 == 2),
             "listed expired: {e:?}"
         );
+        dev.shutdown();
+    }
+
+    /// `key`'s version `seq` of `c`, written by `device`, kept forever and
+    /// naming `parent` of its own writer, as a reader holds it.
+    fn held_at(
+        c: &Name,
+        device: &Name,
+        key: &Name,
+        seq: u64,
+        parent: Option<u64>,
+    ) -> Arc<HeldVersion> {
+        let writer = Writer::new(key.clone());
+        let parents = parent
+            .map(|p| VersionId {
+                writer: writer.clone(),
+                seq: Seq(p),
+            })
+            .into_iter()
+            .collect();
+        Arc::new(HeldVersion {
+            version: Version {
+                id: VersionId {
+                    writer,
+                    seq: Seq(seq),
+                },
+                name: log_name(device, Some(c), seq),
+                collection: c.clone(),
+                parents,
+                type_id: TypeId {
+                    name: n("/types/reading"),
+                    revision: 1,
+                },
+                seal: Seal { any_of: Vec::new() },
+                keep: Keep::Forever,
+                dated: Timestamp(0),
+                payload: Payload::Entry(Content::new()),
+            },
+            op: Bytes::new(),
+            wire: Bytes::new(),
+            sealed: false,
+            epoch: None,
+            chunks: None,
+        })
+    }
+
+    /// `key`'s node of `c` at `head`, listing `entries`, stating `expiry`.
+    fn node_of(
+        c: &Name,
+        key: &Name,
+        head: u64,
+        entries: Vec<(u64, u64)>,
+        expiry: Vec<ExpiryRun>,
+    ) -> NodeBody {
+        NodeBody {
+            subject: c.clone(),
+            writer: key.clone(),
+            head,
+            page: None,
+            entries,
+            members: Vec::new(),
+            expiry,
+            branches: Branches::Children(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_stops_waiting_for_listed_versions_it_never_held_once_their_keep_bound_passes()
+    {
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = device_at(&reader, &keys_of(&reader), &store, &clock).await;
+        let c = n("/sam/32=data/soil");
+        let key = sensor.clone().append("KEY").append("1");
+        one_key_record(&dev, &c, &key);
+        let writer = Writer::new(key.clone());
+        let last = VersionId {
+            writer: writer.clone(),
+            seq: Seq(7),
+        };
+        let bound = Timestamp(5_000);
+        {
+            let mut st = dev.inner.st.lock();
+            // The writer's newest node lists 2–6, kept until at most the
+            // bound, and 7, kept forever, naming 6; only 7 is held here.
+            st.colls
+                .get_mut(&c)
+                .expect("its record is held")
+                .entries
+                .entry(writer.clone())
+                .or_default()
+                .extend(2..=7);
+            let runs = vec![ExpiryRun {
+                seqs: vec![(2, 6)],
+                until: bound,
+            }];
+            st.listing(&c, &writer, &node_of(&c, &key, 7, vec![(2, 7)], runs));
+            let wake = st.expire(&c);
+            assert!(
+                wake.is_some_and(|t| t <= bound),
+                "the sweeper wakes by the bound: {wake:?}"
+            );
+            st.admit(held_at(&c, &sensor, &key, 7, Some(6)));
+            assert!(
+                !st.colls[&c].at().contains(&last),
+                "waits while the bound is ahead"
+            );
+        }
+        clock.store(bound.0, Ordering::Relaxed);
+        {
+            let mut st = dev.inner.st.lock();
+            st.expire(&c);
+            assert!(
+                st.colls[&c].at().contains(&last),
+                "applied once this device's clock passes the bound"
+            );
+        }
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_reader_does_not_wait_for_a_parent_its_writer_no_longer_lists_and_it_never_learned() {
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = device_at(&reader, &keys_of(&reader), &store, &clock).await;
+        let c = n("/sam/32=data/soil");
+        let key = sensor.clone().append("KEY").append("1");
+        one_key_record(&dev, &c, &key);
+        let writer = Writer::new(key.clone());
+        let id = |s: u64| VersionId {
+            writer: writer.clone(),
+            seq: Seq(s),
+        };
+        let mut st = dev.inner.st.lock();
+        // The writer's newest node, at 8, lists 7 and 8 only: 2–6 expired
+        // before it, and this reader never learned them.
+        st.colls
+            .get_mut(&c)
+            .expect("its record is held")
+            .entries
+            .entry(writer.clone())
+            .or_default()
+            .extend([7, 8]);
+        st.listing(&c, &writer, &node_of(&c, &key, 8, vec![(7, 8)], Vec::new()));
+        st.expire(&c);
+        st.admit(held_at(&c, &sensor, &key, 7, Some(6)));
+        assert!(st.colls[&c].at().contains(&id(7)), "7 does not wait for 6");
+        st.admit(held_at(&c, &sensor, &key, 8, Some(7)));
+        assert!(st.colls[&c].at().contains(&id(8)));
+        // A parent above the node's head may still come: it is waited for.
+        st.admit(held_at(&c, &sensor, &key, 10, Some(9)));
+        assert!(
+            !st.colls[&c].at().contains(&id(10)),
+            "10 waits for 9, above the newest node's head"
+        );
+        drop(st);
         dev.shutdown();
     }
 
