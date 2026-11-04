@@ -111,7 +111,7 @@ namespace (directly, or through a relay):
 
 ```sh
 ndn-fwd recover --kit words|yubikey|<kit-file> --old-root destroyed|compromised \
-    [--keep-kit <recovery-key-name>]… [--cut <file>]… [--namespace <ns>] [--device <name>] \
+    [--keep-kit <recovery-key-name>]… [--cut <file>]… [--lost <when>] [--recertify-cuts yes|no] [--namespace <ns>] [--device <name>] \
     [--kit-yubikey-serial <n>] [--kit-yubikey-slot <slot>] \
     [--root-store <store>] [--yubikey-serial <n>] [--yubikey-slot <slot>] [--replace-slot] \
     [-c <config>] [--from-held]
@@ -155,10 +155,14 @@ The daemon must use the PIB recovered into (`-c` with its config, or
      no recovery anchor of `N` is refused (listing them) before anything is
      written, and so is `--keep-kit` with `destroyed`;
    - the new CA and admin keys replace the old ones' `root-device` role;
-   - schema, CA endpoint (`<ns>/CA`, unchanged), earlier revocations and
-     their revocation cuts are carried over verbatim; with `compromised`,
-     each `--cut <file>` adds the cut of a key this recovery newly revokes
-     ([revocation cut](./revocation.md#revocation-cut)).
+   - schema, CA endpoint (`<ns>/CA`, unchanged), `DataRequiresCut` roles,
+     earlier revocations and their revocation cuts are carried over
+     verbatim, except that a cut whose key is no longer revoked, or which
+     lists a name outside its key's device log, is dropped and reported
+     (`dropped_cut = <key>: <reason>`; the old root may have signed it in
+     a thief's hands); with `compromised`, each `--cut <file>` adds the cut
+     of a key this recovery newly revokes, bounded by when the root was
+     lost ([revocation cut](./revocation.md#revocation-cut)).
 
    `recover` prints every anchor `N+1` keeps and every key it revokes, so a
    key nobody expects stands out. Then the new root signs `N+2`, the same
@@ -191,8 +195,8 @@ There is no default; `recover` refuses without it and says why both exist:
 | Old root | stays an anchor | removed and revoked |
 | Old CA key, old admin key | valid | revoked (the `root-device` keys of `N`) |
 | Recovery kits | all stay | the kit used and `--keep-kit` ones stay; the rest are removed and revoked |
-| Devices enrolled under the old CA | keep working; renew with the new CA | stop validating once a node holds `N+1`; enroll again |
-| Keys revoked with a cut | nothing changes | the new CA certifies each again from a certificate the PIB holds, so its in-cut Data keeps a chain (`recertified =`, `not_recertified =`; later: `ndn-fwd recertify`, [after a recovery](./revocation.md#after-a-recovery)) |
+| Devices enrolled under the old CA | keep working; renew with the new CA | stop validating once a node holds `N+1`, and data layers that held their entries withdraw them (also after a restart); enroll again |
+| Keys revoked with a cut | nothing changes | once you confirm (`[y/N]`, or `--recertify-cuts yes`), the new CA certifies each again from a certificate the PIB holds whose public key matches the cut's key digest, so its in-cut Data keeps a chain (`recertified =`, `not_recertified =`; later: `ndn-fwd recertify`, [after a recovery](./revocation.md#after-a-recovery)) |
 
 Keeping a compromised root valid would leave the namespace in its holder's
 hands; revoking a destroyed one would cut off every device for nothing.

@@ -19,6 +19,17 @@ Use the checked surfaces instead:
   except `.verify(&validator)` (yielding `SafeData`) or `.trust_unchecked()` (a
   deliberate, greppable bypass). You cannot use the data by accident.
 
+Both judge Data as stored data, the way the forwarder and the data layer do
+(`docs/specs/trust-context.md` §6.3): the whole certificate chain and the
+trust context's revocations and revocation cuts decide, not the reader's
+clock, so honest old Data stays valid after its certificate expires, and a
+revoked key's Data is accepted exactly where its cut accepts it. The one
+clock check is a refusal: a key of a role the context lists in
+`DataRequiresCut` (guests) is refused once its certificate lapsed, until
+its cut. For the reply to a request you just sent and act on at once (a
+remote call's answer), where the signer's certificate must be valid now,
+use `.verify_live(&validator)`.
+
 A full worked example is the `secure_fetch` integration test in `ndn-app`.
 
 ## Treating "signed" as "trusted"

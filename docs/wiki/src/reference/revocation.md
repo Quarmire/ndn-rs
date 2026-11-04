@@ -72,34 +72,122 @@ exactly those. It is part of the same signed version, beside the key's
 entry (`RevocationCut`, TLV `0x0428`): per data collection the key wrote
 into, the runs of its log entries that stay valid
 (`<device>/32=log/<collection>/seq=<n>`, and `<device>/32=log/seq=<n>` for
-snapshots). Every other packet of the key — a later entry, a backdated
-one, an entry at an accepted seq in another collection, its summaries —
-is refused.
+snapshots), the digest of the key's public key (`CutKeyDigest`), and the
+full name of a **manifest** (`CutManifest`) listing the implicit digest of
+every entry the runs cover. Every other packet of the key — a later entry,
+a backdated one, an entry at an accepted seq in another collection, other
+bytes at an accepted name, its summaries — is refused, and so is anything
+a certificate of the key's name with another public key would verify.
 
-The cut lists what the root device's data layer **holds verified** of the
-key, never what a summary only listed. Make it on the root device, then
-revoke with it:
+### When did you lose it?
 
-```sh
-# in the ndn-data host on the root device (ndn-tools)
-cut /home/rv/member/phone/KEY/4c60a77af0f3ce14 phone.cut
-# then
-ndn-fwd revoke /home/rv/member/phone/KEY/4c60a77af0f3ce14 --cut phone.cut -c root.toml
-```
+A thief with the key writes as the phone from the theft until the
+revocation, and the root device's data layer verifies and stores those
+writes like any others until then. So the cut lists what the root device's
+data layer **first verified before the moment you lost the device** —
+never what a summary only listed, and never what it first saw later.
 
-The file holds the cut's TLV (`ndn_data::Device::revocation_cut`). `revoke`
-prints it as `cut = <key>: <prefix> seq a..b,…; N exact packet(s)` (with
-`(already)` when the held version has it). A cut is added only in the
-version that revokes its key, and its runs never change afterwards; a cut
-for a key the version does not newly revoke, or one listing a name outside
-the key's device log `<device>/32=log`, is refused (`cut-refused`).
+1. As soon as you notice, mark the key suspected in the ndn-data host on
+   the root device. The root then takes no new entry of that key (entries
+   it holds stay), and the moment is recorded:
+
+   ```sh
+   suspect /home/rv/member/phone/KEY/4c60a77af0f3ce14
+   ```
+
+   `suspect <key> [<when>]` (`<when>`: RFC 3339 in UTC, or ms since the epoch;
+   default: now, by the device's clock); `unsuspect <key>` lifts the mark
+   if the phone turns up. The mark ends by itself once the root holds the
+   revoking version.
+2. Make the cut. Without `--held-before`, the bound is the time of the
+   suspect mark; with neither, the host refuses and asks you to say when
+   the device was lost:
+
+   ```sh
+   cut /home/rv/member/phone/KEY/4c60a77af0f3ce14 phone.cut [--held-before <when>] [--upto <collection>=<seq>]…
+   ```
+
+   An entry is in the cut when the root holds it verified, has not refused
+   it, first verified it (by its own clock) strictly before the bound, and,
+   with `--upto`, its seq in that collection is at most the one given.
+   `--upto` alone is refused: it gives no time to check against the loss.
+   The file holds the cut's TLV, the bound used, the manifest packets and
+   the entries **left out** (every entry of the key the root held that the
+   bound excludes, also those stored before first-verified times were
+   recorded), each by full name with its digest. The host's answer lists
+   the ranges, the bound and where it came from (`given` or `suspected`),
+   and the left-out names.
+3. Revoke with it:
+
+   ```sh
+   ndn-fwd revoke /home/rv/member/phone/KEY/4c60a77af0f3ce14 --cut phone.cut --lost <when> -c root.toml
+   ```
+
+   `revoke` asks "When did you lose it?" when run interactively and
+   `--lost` is not given, and refuses without either; `<when>` is RFC
+   3339, `<n><unit> ago` (`2h ago`, `3days ago`) or `now`. The admin TUI's
+   remove-device dialog has a "When did you lose it?" and a "Cut file"
+   field; with no cut file it asks for an explicit "Remove without a cut",
+   saying that everything the key signed will be refused. `revoke`
+   refuses a cut file made without a bound or bounded later than your
+   answer (`cut-refused`, `why` = `unbounded` or `after-loss`), prints the
+   cut as `cut = <key>: <prefix> seq a..b,…; N exact packet(s)` (with
+   `(already)` when the held version has it) and one `left_out = <full
+   name>` line per entry left out. Look at each left-out entry and re-admit
+   the honest ones one by one ([below](#re-admitting-a-version)).
+
+A thief's writes the root verified before the time you give stay valid,
+so give the earliest moment the phone may have been out of your hands.
+
+A cut is added only in the version that revokes its key, and its runs, key
+digest and manifest never change afterwards; a cut for a key the version
+does not newly revoke, one listing a name outside the key's device log
+`<device>/32=log`, a new cut without a key digest, or one with runs and no
+manifest is refused (`cut-refused`). The root device serves the manifest
+from the moment it publishes the version, and every node that keeps the
+trust context fetches and serves it too; a reader fetches the in-cut
+entries by full name from it, so only the honest bytes can answer.
 
 **Validity periods.** Data is judged without the validity period of any
 certificate: the certificate proves the key was authorized, the cut proves
-where that ended. So an expired certificate never refuses Data, and a key
-ends for Data only by a revocation. Revoke a lost or retired device's key
-even when its certificate has expired. Live uses — links, signed
-Interests, enrollment, renewal — still end at expiry.
+where that ended. So an expired certificate does not refuse Data, and a
+key ends for Data by a revocation — with one exception: a role the trust
+context lists in `DataRequiresCut` (`guest`, in every namespace `ndn-fwd
+init` makes) is refused once its certificate has lapsed, until its key is
+revoked with a cut. Revoke a lost or retired device's key even when its
+certificate has expired. Live uses — links, signed Interests, enrollment,
+renewal — still end at expiry.
+
+## Keys to end
+
+Two kinds of keys must be revoked although nobody lost them: a **lapsed**
+key (its role is listed in `DataRequiresCut` and its last certificate's
+NotAfter has passed: a guest whose invitation ended) and a **replaced** key
+(the CA enrolled a newer key for the same device name). The root device
+lists them — at the end of every root command, in `ndn-fwd status`, and
+under "Keys to end" in the admin TUI's root screen (key `e` opens the End
+keys dialog, one cut file per key):
+
+```text
+ending_key     = /home/rv/guest/ann/KEY/91c0… (lapsed at 2026-11-01T12:00:00Z)
+cut /home/rv/guest/ann/KEY/91c0… ann.cut --held-before 2026-11-01T12:00:00Z
+```
+
+Make each cut with the line shown (in the ndn-data host on the root
+device), then end them all in one version:
+
+```sh
+ndn-fwd end-keys --cut ann.cut [--cut …] [--namespace <ns>] [--yes] -c root.toml
+```
+
+`end-keys` revokes every key to end that has a cut bounded at its end (its
+NotAfter, or the replacement's first NotBefore), after one confirmation;
+a key without such a cut is listed and left alone — a key to end is never
+revoked without a cut. `--yes` skips the confirmation, for a timer, and is
+refused unless the root store opens without a secret (`os-keyring`,
+`file`): the daemon never unlocks the root by itself. Until a lapsed
+guest is ended its Data is refused anyway; a replaced key's Data is still
+accepted, so end it soon.
 
 ## Re-admitting a version
 
@@ -130,21 +218,37 @@ nothing to sign (`nothing-to-sign`).
 ## After a recovery
 
 A recovery from a compromised root (`ndn-fwd recover … --old-root
-compromised [--cut <file>]…`, [recovery kits](./recovery.md)) carries
-every cut and may add one for each key it newly revokes, printing
-`cut = …` per cut of the new version. It revokes the old CA key, an issuer
-no cut excuses, so the new CA certifies again each key revoked with a cut,
-from a certificate of it the PIB holds: `recertified = <cert>` per
-certificate, `not_recertified = <key>` per key whose certificate was not
-held (its in-cut Data stays refused). Such a certificate verifies the
-key's in-cut Data only; the key stays revoked for everything else. Once
-the missing certificates are found, `ndn-fwd recertify [<cert-file>]…
-[--namespace <ns>] [--pib <dir> | -c <config>]` certifies them; the CA
-records them in its store and serves them once its daemon restarts.
+compromised [--cut <file>]… [--lost <when>] [--recertify-cuts yes|no]`, [recovery
+kits](./recovery.md)) carries every cut and may add one for each key it
+newly revokes, printing `cut = …` per cut of the new version. The old root
+may have been in a thief's hands, so a carried cut whose key is no longer
+revoked, or which lists a name outside its key's device log, is dropped
+(`dropped_cut = <key>: <reason>`). It revokes the old CA key, an issuer no
+cut excuses, so the new CA must certify again each key revoked with a cut,
+from a certificate of it the PIB holds **whose public key matches the
+cut's key digest**. Once the daemon took `N+1`, `recover` shows the cuts
+and asks "Certify these keys again with the new CA? [y/N]"
+(`--recertify-cuts` when not interactive; with neither, nothing is
+certified, and it prints `recertified = not now (not confirmed)`). One
+`--lost` — when the old root device was lost — bounds every `--cut` file,
+as for `revoke`. Per key it prints `recertified = <cert>`, or
+`not_recertified = <key>` with why (`unheld`: no certificate of that
+public key held; `no_key_digest`: a cut made before key digests, never
+certified again). A certificate file carrying another public key under
+the key's name is never certified: the old CA may have issued it. Such a
+certificate verifies the key's in-cut Data only; the key stays revoked for
+everything else. Later — once the missing certificates are found, or if
+you declined — `ndn-fwd recertify [<cert-file>]… [--yes] [--namespace
+<ns>] [--pib <dir> | -c <config>]` prints the cuts (`cut = …`), asks
+"Certify these keys again with the CA? [y/N]" (without a terminal it
+refuses unless `--yes` is given), and certifies under the same rule; the
+CA records them in its store and serves them once its daemon restarts.
+The admin TUI's recovery never certifies again: it tells you to run
+`ndn-fwd recertify`.
 
 ## What `revoke` does
 
-`ndn-fwd revoke <name> [--cut <file>] [--pib <dir> | -c <config>]`, on the
+`ndn-fwd revoke <name> [--cut <file> [--lost <when>]] [--pib <dir> | -c <config>]`, on the
 root device.
 `<name>` is one of:
 
@@ -168,7 +272,9 @@ The command, before asking for any secret:
 3. Keys the held version revokes already are not added again; when it
    revokes all of them, nothing is signed and the command says so.
    With `--cut`, the file must hold one `RevocationCut` whose key is one of
-   the keys this version newly revokes (`cut-refused` otherwise).
+   the keys this version newly revokes, with a key digest, a complete
+   manifest when it has runs, and a bound no later than the loss time
+   answered (`cut-refused` otherwise, `why` saying which).
 4. When a daemon listens on the management socket, checks it uses the same
    PIB (`security/identity-status` `pib_path=`).
 
@@ -262,20 +368,28 @@ answers later Interests from the CS without validating again. A revocation
 still reaches what is cached, through a stamp on each entry:
 
 - The keyring counts the adoptions that revoke something
-  (`Keyring::revocation_epoch`, moved after the new version is in force). The
+  (`Keyring::revocation_epoch`, moved after the new version is in force).
+  A version revokes something when it revokes a new key name, and also
+  when it accepts less than the version before: a cut removed or shrunk, a
+  re-admitted name dropped, a cut's key digest or manifest added, removed
+  or changed, or a role newly listed in `DataRequiresCut`. The
   validation stage reads the count before it validates a Data packet, and the
   CS insert stage stores it with the entry.
 - On every CS hit, the lookup compares the entry's stamp with the current
   count: one atomic load. Only when they differ is the entry judged against
   the revocations held now. It is kept only when it is known clear: its chain,
-  followed from its KeyLocator through the node's certificate cache, reaches
+  followed from its KeyLocator through the node's certificate cache —
+  at each hop the cached certificate whose public key verifies that hop's
+  signature, not just the newest certificate of the name — reaches
   a trust anchor without passing a revoked key or certificate — except that
   the key that signed the entry itself may be revoked when the held
-  context's cut of that key accepts the entry (the durable rule,
-  `SignedTrustContext::refuses_data`) — and it is no certificate of a key
+  context's cut of that key accepts the entry (the same durable rule a
+  fresh validation applies, key digest and manifest included) — and it is
+  no certificate of a key
   revoked without a cut. Certificates of a key revoked with a cut are kept,
   for the in-cut Data. Validity periods are not checked: an expired
-  certificate does not refuse Data. A clear entry is stamped with the
+  certificate does not refuse Data, except for a role listed in
+  `DataRequiresCut`. A clear entry is stamped with the
   current count, so
   it is not judged again until the next revoking adoption. Otherwise it is
   evicted and the Interest goes on as a miss — also when the chain cannot be
@@ -344,8 +458,8 @@ and follows the stored context again when it next starts.
 | Part | Where |
 |---|---|
 | Revocation check in the chain walk (prefix match) | `ndn_security::SignedTrustContext::is_revoked`, `validator/chain.rs` |
-| Durable walk for Data (no validity periods; the signing key excused in its cut) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut}`; `ndn_security::{RevocationCut, CutRange}` |
-| Making a cut | `ndn_data::Device::revocation_cut`; refused versions to re-admit: `ndn_data::Device::refused_by_revocation` |
+| Durable walk for Data (no validity periods but `DataRequiresCut`'s refusal; the signing key excused in its cut when key digest and manifest agree) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut, data_requires_cut, requires_cut_for}`; `ndn_security::{RevocationCut, CutRange, public_key_digest, chain_clear}`; manifests `ndn_security::cut_manifest` (`CutManifests`, `build`, `lookup`); keys to end `ndn_cert::ending_keys`, `ndn_namespace::root::end_keys` |
+| Making a cut | `ndn_data::Device::{revocation_cut, suspect, unsuspect, suspected}`, `ndn_data::{CutBound, CutProposal}`; the cut file `ndn_cert::CutFile` (`ndn-cert/src/cut_file.rs`); host verbs `suspect`, `unsuspect`, `cut` (`ndn-tools/src/data.rs`); refused versions to re-admit: `ndn_data::Device::refused_by_revocation` |
 | Re-admission | `ndn_namespace::root::readmit::{plan, readmit}`; `ndn_cert::{readmissions_to_add, bump_context_readmitting, device_log_of, split_full_name}`; CLI `ndn-fwd readmit` |
 | Re-certifying cut keys after a recovery | `ndn_cert::{recertify_cut_keys, recertify_cut_keys_in_pib}`, `RecoveredNamespace::{recertified, record_recertified}`; `ndn_namespace::root::recover::recertify`; CLI `ndn-fwd recertify` |
 | Key name of a certificate name | `ndn_cert::key_name_of` |

@@ -21,12 +21,16 @@ that exact name.
 |---|---|---|
 | `/<ns>/32=trust-context/32=metadata` (CanBePrefix, MustBeFresh) | metadata Data `/<ns>/32=trust-context/32=metadata/v=<N>/seg=0`; Content = the Name `/<ns>/32=trust-context/v=<N>` of the newest version held, only; FreshnessPeriod 1 s | DigestSha256 |
 | `/<ns>/32=trust-context/v=<M>` (exact), for every version `M` the node held | the stored context Data, byte for byte as adopted | the key that made that version: the namespace root, or a recovery key (`/<ns>/KEY/…`) |
+| `/<ns>/32=trust-context/32=cut/<h>/seg=<i>`, by name or by full name, a packet of the manifest of a revocation cut the node holds | the stored manifest packet, byte for byte | DigestSha256: the cut names its root packet by full name, and each node its children ([revocation cut](./revocation.md#revocation-cut)) |
 | anything else under `/<ns>/32=trust-context` (a version not held, …) | Nack `NoRoute` | — |
 
 Older versions are served so a node holding one can follow the namespace
 version by version when the newest is not signed by an anchor of the version
 it holds (a recovery installed a new root in between; see
-[catching up](./context-updates.md#catching-up-across-versions)).
+[catching up](./context-updates.md#catching-up-across-versions)). A node
+keeping a version also fetches, stores and serves the manifest packets of
+its cuts (`ndn_namespace::cut_manifests`), so a reader can check an in-cut
+entry's bytes when the root device is offline.
 
 The metadata Content carries no segment fields: a context is one Data packet.
 `ndn_app::rdr::MetaData` encodes and decodes both this Name-only form and the
