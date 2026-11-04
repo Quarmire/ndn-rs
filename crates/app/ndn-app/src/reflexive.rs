@@ -138,7 +138,11 @@ impl Consumer {
     /// As [`pull_reflexive`](Self::pull_reflexive), but validate the pulled
     /// Data against `validator` and return [`SafeData`]. This is the
     /// authenticated reverse pull — e.g. a CA pulling a *signed* device
-    /// approval, where the validated signer identity is the evidence.
+    /// approval, where the validated signer identity is the evidence. A live
+    /// reply, so it is judged by the live rule ([`Validator::validate`]: the
+    /// signer's certificate valid now, any revocation refuses), as
+    /// [`Unverified::verify_live`](ndn_security::Unverified::verify_live)
+    /// does — not by the durable rule stored Data takes.
     pub async fn pull_reflexive_verified(
         &mut self,
         forward: &Interest,

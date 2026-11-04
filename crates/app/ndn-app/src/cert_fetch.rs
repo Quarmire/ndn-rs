@@ -46,7 +46,14 @@ const DIRECT_FACE_BUFFER: usize = 256;
 pub const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The cert Interest every fetch path expresses: see [`demux_fetch_fn`].
+/// A full name (a cut-manifest packet a durable walk named missing, see
+/// [`ndn_security::is_full_name`]) names exactly one immutable packet, so
+/// it is asked for exactly: no `CanBePrefix`, and no `MustBeFresh`, so a
+/// content store holding it answers.
 fn cert_interest(name: Name) -> InterestBuilder {
+    if ndn_security::is_full_name(&name) {
+        return InterestBuilder::new(name).lifetime(CERT_FETCH_TIMEOUT);
+    }
     InterestBuilder::new(name)
         .can_be_prefix()
         .must_be_fresh()
