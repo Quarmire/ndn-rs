@@ -269,13 +269,15 @@ async fn a_revocation_changes_only_the_namespace_of_the_name() {
     let secrets = Secrets::new(b"unused");
     let key = n("/a/member/phone/KEY/k");
 
-    let planned = revoke::plan(&pib, &key, None).unwrap();
+    let planned = revoke::plan(&pib, &key, None, None).unwrap();
     assert_eq!(planned.root.context.namespace(), &n("/a"));
-    let other = revoke::plan(&pib, &key, Some(&n("/c"))).err().unwrap();
+    let other = revoke::plan(&pib, &key, Some(&n("/c")), None)
+        .err()
+        .unwrap();
     assert_code(&other, code::REVOKE_OTHER_NAMESPACE);
     assert_eq!(other.param("namespace"), Some("/a"));
     assert_eq!(other.param("requested"), Some("/c"));
-    let outside = revoke::plan(&pib, &n("/b/member/x/KEY/k"), None)
+    let outside = revoke::plan(&pib, &n("/b/member/x/KEY/k"), None, None)
         .err()
         .unwrap();
     assert_code(&outside, code::REVOKE_OUTSIDE_NAMESPACE);
@@ -295,7 +297,7 @@ async fn a_revocation_changes_only_the_namespace_of_the_name() {
 
     // The running device refuses the version: nothing changed.
     let refused = revoke::revoke(
-        revoke::plan(&pib, &key, None).unwrap(),
+        revoke::plan(&pib, &key, None, None).unwrap(),
         &key,
         &pib,
         &Device::Refusing(pib.clone()),
@@ -313,7 +315,7 @@ async fn a_revocation_changes_only_the_namespace_of_the_name() {
 
     // No device runs: v2 of /a is kept for its next start; /c is untouched.
     let revoked = revoke::revoke(
-        revoke::plan(&pib, &key, None).unwrap(),
+        revoke::plan(&pib, &key, None, None).unwrap(),
         &key,
         &pib,
         &Device::NotRunning,
@@ -327,13 +329,89 @@ async fn a_revocation_changes_only_the_namespace_of_the_name() {
     assert!(matches!(revoked.handed_over, HandedOver::Stored { .. }));
     assert_eq!(versions(&pib), (2, 1));
 
-    let again = revoke::plan(&pib, &key, None).unwrap();
+    let again = revoke::plan(&pib, &key, None, None).unwrap();
     assert!(again.adding.is_empty());
     let nothing = revoke::revoke(again, &key, &pib, &Device::NotRunning, &secrets)
         .await
         .unwrap_err();
     assert_code(&nothing, code::NOTHING_TO_SIGN);
     assert!(secrets.asked().is_empty(), "plaintext roots need no secret");
+}
+
+/// A cut of a key the revocation adds is signed beside it; a cut of
+/// another key is `cut-refused` before anything is asked. A re-admission
+/// adds full names of the key's device log to that cut, and is refused by
+/// code for a key without a cut and a name outside its log; names the cut
+/// accepts already are `nothing-to-sign`.
+#[tokio::test]
+async fn a_revocation_with_a_cut_and_a_readmission_into_it() {
+    use ndn_packet::NameComponent;
+    use ndn_security::RevocationCut;
+
+    let (_dir, pib) = two_roots().await;
+    let secrets = Secrets::new(b"unused");
+    let key = n("/a/member/phone/KEY/k");
+    let log = ndn_cert::device_log_of(&key);
+    let mut cut = RevocationCut::new(key.clone());
+    cut.add_run(&log.clone().append("notes"), 1, 4);
+
+    let other = RevocationCut::new(n("/a/member/tablet/KEY/t"));
+    let refused = revoke::plan(&pib, &key, None, Some(other)).err().unwrap();
+    assert_code(&refused, code::CUT_REFUSED);
+
+    let planned = revoke::plan(&pib, &key, None, Some(cut.clone())).unwrap();
+    let revoked = revoke::revoke(planned, &key, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+    assert_eq!(revoked.cut.as_ref(), Some(&cut));
+    let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
+    assert_eq!(held.revocation_cut(&key), Some(&cut));
+
+    let full = |seq: u64| {
+        log.clone()
+            .append("notes")
+            .append_component(NameComponent::sequence_num(seq))
+            .append_component(NameComponent::new(
+                ndn_packet::tlv_type::IMPLICIT_SHA256,
+                bytes::Bytes::from(vec![seq as u8; 32]),
+            ))
+    };
+    let planned = readmit::plan(&pib, &key, &[full(7)], None).unwrap();
+    assert_eq!(planned.adding, vec![full(7)]);
+    let readmitted = readmit::readmit(planned, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+    assert_eq!((readmitted.held_version, readmitted.version), (2, 3));
+    let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
+    let readmitted_cut = held.revocation_cut(&key).unwrap();
+    assert_eq!(readmitted_cut.exact(), &[full(7)]);
+    assert_eq!(readmitted_cut.ranges(), cut.ranges());
+
+    for (asked, names, expected) in [
+        (
+            n("/a/member/tablet/KEY/t"),
+            vec![full(7)],
+            code::READMIT_NO_CUT,
+        ),
+        (
+            key.clone(),
+            vec![n("/a/member/phone/32=log/notes")],
+            code::READMIT_REFUSED,
+        ),
+    ] {
+        let refused = readmit::plan(&pib, &asked, &names, None).err().unwrap();
+        assert_code(&refused, expected);
+    }
+    let nothing = readmit::readmit(
+        readmit::plan(&pib, &key, &[full(7), full(2)], None).unwrap(),
+        &pib,
+        &Device::NotRunning,
+        &secrets,
+    )
+    .await
+    .unwrap_err();
+    assert_code(&nothing, code::NOTHING_TO_SIGN);
+    assert_eq!(versions(&pib), (3, 1));
 }
 
 #[tokio::test]
@@ -438,7 +516,7 @@ async fn moving_a_root_asks_its_secrets_and_leaves_the_other_root() {
 
     // Signing in /a now unlocks that root with its passphrase.
     let key = n("/a/member/phone/KEY/k");
-    let plan = revoke::plan(&pib, &key, None).unwrap();
+    let plan = revoke::plan(&pib, &key, None, None).unwrap();
     revoke::revoke(plan, &key, &pib, &Device::NotRunning, &secrets)
         .await
         .unwrap();
@@ -453,7 +531,7 @@ async fn moving_a_root_asks_its_secrets_and_leaves_the_other_root() {
     // A wrong passphrase signs nothing.
     let wrong = Secrets::new(b"wrong");
     let tablet = n("/a/member/tablet/KEY/k");
-    let plan = revoke::plan(&pib, &tablet, None).unwrap();
+    let plan = revoke::plan(&pib, &tablet, None, None).unwrap();
     let refused = revoke::revoke(plan, &tablet, &pib, &Device::NotRunning, &wrong)
         .await
         .unwrap_err();
@@ -489,6 +567,7 @@ async fn a_recovery_is_refused_only_where_the_namespace_root_is_held() {
         device: "spare".into(),
         old_root: OldRoot::Destroyed,
         kept_kits: Vec::new(),
+        cuts: Vec::new(),
         from_held: false,
         root: RootStoreChoice::File,
     };

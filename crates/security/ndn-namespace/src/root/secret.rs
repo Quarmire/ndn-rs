@@ -62,6 +62,8 @@ pub enum VersionChange {
     RevokeKit { key: Name },
     /// Updating the schema of `namespace`.
     UpdateSchema { namespace: Name },
+    /// Re-admitting single packets of the key `key`, revoked with a cut.
+    Readmit { key: Name },
 }
 
 /// What a secret is asked for.

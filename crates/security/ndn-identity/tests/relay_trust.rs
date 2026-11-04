@@ -277,6 +277,7 @@ async fn a_relay_never_serves_cached_data_of_a_key_revoked_by_an_update() {
         root.as_ref(),
         &ns.ns.init.context_data,
         std::slice::from_ref(&ns.ns.device_key),
+        None,
     )
     .await
     .unwrap()

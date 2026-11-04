@@ -223,6 +223,7 @@ async fn a_kit_that_is_not_a_recovery_anchor_cannot_recover() {
         "phone",
         OldRoot::Destroyed,
         &[],
+        &[],
         &NewRootStore::File,
     )
     .await
@@ -241,6 +242,7 @@ async fn a_kit_that_is_not_a_recovery_anchor_cannot_recover() {
             new_root_device_keys: &[],
             old_root: OldRoot::Destroyed,
             kept_kits: &[],
+            cuts: &[],
         },
     )
     .await
@@ -312,6 +314,7 @@ async fn recover(
         &seed.signer(&n("/home/bob")),
         "phone",
         old_root,
+        &[],
         &[],
         &NewRootStore::File,
     )
@@ -437,6 +440,7 @@ async fn a_compromised_recovery_keeps_no_kit_nobody_vouched_for() {
         "phone",
         OldRoot::Compromised,
         std::slice::from_ref(spare.key_name()),
+        &[],
         &NewRootStore::File,
     )
     .await
@@ -486,6 +490,7 @@ async fn a_kit_to_keep_that_is_no_recovery_anchor_is_refused_before_anything_is_
             "phone",
             old_root,
             &[kept],
+            &[],
             &NewRootStore::File,
         )
         .await
@@ -521,6 +526,7 @@ async fn revoking_a_kit_removes_its_power() {
         &kit,
         "phone",
         OldRoot::Destroyed,
+        &[],
         &[],
         &NewRootStore::File,
     )
@@ -636,7 +642,7 @@ async fn a_node_offline_across_a_recovery_catches_up_version_by_version() {
     let n1 = &recovered.version.bump.data;
     let n2 = &recovered.root_version.data;
     let revoked = n("/home/bob/member/phone/KEY/k1");
-    let n3 = bump_context_revoking(new_root.as_ref(), n2, std::slice::from_ref(&revoked))
+    let n3 = bump_context_revoking(new_root.as_ref(), n2, std::slice::from_ref(&revoked), None)
         .await
         .unwrap()
         .unwrap()

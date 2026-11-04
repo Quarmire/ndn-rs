@@ -622,6 +622,25 @@ pub mod code {
     /// The held version has everything asked already. Params: `version`.
     pub const NOTHING_TO_SIGN: RefusalCode =
         RefusalCode::new("nothing-to-sign", 409, false, NextStep::None);
+    /// The revocation cut does not go with this version: its key is not one
+    /// the version newly revokes (params `key`, `revoking`), that key is
+    /// revoked already (params `key`, `version`: a cut comes only with the
+    /// revocation of its key), it lists a name outside the key's device log
+    /// (params `key`, `name`, `log`), or a recovery gets cuts with the old
+    /// root destroyed or two cuts for one key. Params also `error`.
+    pub const CUT_REFUSED: RefusalCode =
+        RefusalCode::new("cut-refused", 400, false, NextStep::FixRequest);
+    /// The held version holds no cut for the key to re-admit packets into.
+    /// Params: `key`, `namespace`, `version`, `error` (not revoked: revoke it
+    /// with a cut first; revoked without one: nothing of it can be
+    /// re-admitted).
+    pub const READMIT_NO_CUT: RefusalCode =
+        RefusalCode::new("readmit-no-cut", 409, false, NextStep::FixRequest);
+    /// A name to re-admit is not a full name (ending in its 32-octet
+    /// implicit digest) of the key's device log `<device>/32=log`. Params:
+    /// `key`, `name`, `log` (when outside it), `error`.
+    pub const READMIT_REFUSED: RefusalCode =
+        RefusalCode::new("readmit-refused", 400, false, NextStep::FixRequest);
     /// The file is not a recovery kit. Params: `path`, `reason`.
     pub const NOT_A_KIT: RefusalCode =
         RefusalCode::new("not-a-kit", 400, false, NextStep::FixRequest);

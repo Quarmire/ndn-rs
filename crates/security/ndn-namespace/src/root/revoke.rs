@@ -1,30 +1,41 @@
 //! Revoking a device identity, key or certificate on the root device: a new
-//! version of the trust context listing the keys as revoked.
+//! version of the trust context listing the keys as revoked — and, given
+//! one, the revocation cut of one of them beside its revocation.
 //!
 //! [`plan`] checks, before anything is asked, that this is the root device
 //! of the namespace the name is in (of those whose root the PIB holds, the
 //! longest covering it; a namespace named must be that one), which keys the
 //! name designates (a key or certificate name: its key; a device identity:
 //! every key the namespace CA certified for it, read from that CA's store in
-//! the PIB), that none is the root's or the CA's, and which of them the held
-//! version does not revoke yet ([`ndn_cert::plan_revocation`]). [`revoke`]
+//! the PIB), that none is the root's or the CA's, which of them the held
+//! version does not revoke yet ([`ndn_cert::plan_revocation`]), and that a
+//! cut given is the cut of one of those, listing only its device's log
+//! ([`ndn_cert::check_cut`]: `cut-refused` otherwise). [`revoke`]
 //! then checks the running device uses the same PIB, unlocks that
 //! namespace's root to sign version `N+1`
 //! ([`ndn_cert::bump_context_revoking`]), drops the signer, and hands the
 //! version to the running device ([`super::device::hand_over`]). The other
 //! namespaces whose roots the PIB holds are not touched.
 //!
+//! Without a cut, every packet a revoked key signed is refused once a node
+//! holds the version. With one, the packets the cut accepts (the log
+//! entries the device published before, as the cut lists them) stay
+//! accepted, and the key's certificates stay served so they can be
+//! verified; everything else it signed is refused. Single packets are
+//! re-admitted later by their full names ([`super::readmit`]).
+//!
 //! The namespace CA follows the signed version
 //! ([`ndn_cert::CaState::follow_context`]) wherever its device holds it:
-//! it stops serving every certificate of a revoked key, and the device name
-//! is free for a new key. Every node's validator refuses a chain through a
-//! revoked key once it holds the version.
+//! it never certifies or renews a revoked key again, and the device name is
+//! free for a new key. Every node's validator refuses a chain through a
+//! revoked key once it holds the version (outside the key's cut).
 
 use std::path::Path;
 
 use ndn_cert::report::code;
 use ndn_cert::{RevocationPlan, bump_context_revoking};
 use ndn_packet::Name;
+use ndn_security::RevocationCut;
 
 use super::device::{check_device, hand_over, settle};
 use super::{RootError, RunningDevice, SecretSource, VersionChange, open_pib, unlock_root};
@@ -32,15 +43,19 @@ use crate::admin::HandedOver;
 
 /// Every check of revoking what `name` designates that needs no key, on the
 /// PIB at `pib_dir`. `namespace`, when named, must be the namespace the
-/// revocation is made in (`revoke-other-namespace` otherwise). `adding`
-/// empty: the held version revokes them all already, nothing to sign.
+/// revocation is made in (`revoke-other-namespace` otherwise). `cut`, when
+/// given, must be the revocation cut of one of the keys the version adds,
+/// listing only that key's device log (`cut-refused` otherwise); it is
+/// signed beside the revocation. `adding` empty: the held version revokes
+/// them all already, nothing to sign.
 pub fn plan(
     pib_dir: &Path,
     name: &Name,
     namespace: Option<&Name>,
+    cut: Option<RevocationCut>,
 ) -> Result<RevocationPlan, RootError> {
     let pib = open_pib(pib_dir)?;
-    let plan = ndn_cert::plan_revocation(&pib, name)?;
+    let plan = ndn_cert::plan_revocation(&pib, name, cut)?;
     let held = plan.root.context.namespace();
     if let Some(asked) = namespace
         && asked != held
@@ -67,6 +82,8 @@ pub struct Revoked {
     pub root_key: Name,
     /// The keys the new version revokes that the held one did not.
     pub revoked: Vec<Name>,
+    /// The revocation cut signed beside them, if any.
+    pub cut: Option<RevocationCut>,
     pub handed_over: HandedOver,
 }
 
@@ -83,7 +100,12 @@ pub async fn revoke(
     device: &dyn RunningDevice,
     secrets: &dyn SecretSource,
 ) -> Result<Revoked, RootError> {
-    let RevocationPlan { root, keys, adding } = planned;
+    let RevocationPlan {
+        root,
+        keys,
+        adding,
+        cut,
+    } = planned;
     let held_version = root.context.version();
     let nothing = || {
         RootError::new(
@@ -102,7 +124,7 @@ pub async fn revoke(
         VersionChange::Revoke { name: name.clone() },
     )
     .await?;
-    let bump = bump_context_revoking(signer.as_ref(), &root.data, &keys).await;
+    let bump = bump_context_revoking(signer.as_ref(), &root.data, &keys, cut.as_ref()).await;
     // The root signed its one version: drop it now (a software key is
     // zeroed). The running device gets only the signed version.
     drop(signer);
@@ -121,6 +143,7 @@ pub async fn revoke(
         version,
         root_key: root.store.key_name().clone(),
         revoked: bump.added,
+        cut,
         handed_over,
     })
 }

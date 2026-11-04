@@ -128,6 +128,7 @@ async fn a_root_operation_needs_the_unlock_and_a_wrong_one_changes_nothing() {
         signer.as_ref(),
         &out.init.context_data,
         std::slice::from_ref(&out.device_key),
+        None,
     )
     .await
     .unwrap()
@@ -220,7 +221,8 @@ async fn moving_a_file_root_seals_it_without_losing_it() {
         bump_context_revoking(
             signer.as_ref(),
             &out.init.context_data,
-            std::slice::from_ref(&out.device_key)
+            std::slice::from_ref(&out.device_key),
+            None,
         )
         .await
         .unwrap()
@@ -229,7 +231,7 @@ async fn moving_a_file_root_seals_it_without_losing_it() {
     // A key that is no anchor does not.
     let device = pib.get_signer(&out.device_key).unwrap();
     assert!(matches!(
-        bump_context_revoking(device.as_ref(), &out.init.context_data, &[]).await,
+        bump_context_revoking(device.as_ref(), &out.init.context_data, &[], None).await,
         Err(BumpError::NotAnAnchor { .. })
     ));
 }
@@ -346,6 +348,7 @@ async fn a_pib_holds_several_roots_beside_a_legacy_store() {
             signer.as_ref(),
             &own.init.context_data,
             std::slice::from_ref(&own.device_key),
+            None,
         )
         .await
         .unwrap()
@@ -353,7 +356,7 @@ async fn a_pib_holds_several_roots_beside_a_legacy_store() {
         let (ctx, _) = ndn_cert::open_signed_context(&bump.data).unwrap();
         assert_eq!(ctx.namespace(), own.init.context.namespace());
         assert!(matches!(
-            bump_context_revoking(signer.as_ref(), &other.init.context_data, &[]).await,
+            bump_context_revoking(signer.as_ref(), &other.init.context_data, &[], None).await,
             Err(BumpError::NotAnAnchor { .. })
         ));
     }

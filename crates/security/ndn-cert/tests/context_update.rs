@@ -47,7 +47,7 @@ async fn bump(
 ) -> Result<Option<ContextBump>, BumpError> {
     let store = RootStore::open(pib).unwrap().expect("a root device");
     let signer = store.signer(None).await.unwrap();
-    bump_context_revoking(signer.as_ref(), held, revoke).await
+    bump_context_revoking(signer.as_ref(), held, revoke, None).await
 }
 
 /// An in-memory upstream: answers an Interest whose name equals a
@@ -412,7 +412,8 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
         bump_context_revoking(
             device.as_ref(),
             held,
-            std::slice::from_ref(&root.device_key)
+            std::slice::from_ref(&root.device_key),
+            None,
         )
         .await,
         Err(BumpError::NotAnAnchor { .. })
@@ -424,7 +425,8 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
         bump_context_revoking(
             forged.as_ref(),
             held,
-            std::slice::from_ref(&root.device_key)
+            std::slice::from_ref(&root.device_key),
+            None,
         )
         .await,
         Err(BumpError::NotAnAnchor { .. })

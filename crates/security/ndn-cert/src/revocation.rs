@@ -8,7 +8,9 @@
 //! device certified for exactly that identity (read from its store,
 //! [`crate::namespace::ca_dir`]). Never the root's key (every key chains to
 //! it) nor the CA's, and nothing to sign when the held version revokes them
-//! all already ([`crate::revocations_to_add`]).
+//! all already ([`crate::revocations_to_add`]). A revocation cut given with
+//! it must be the cut of one of the keys it adds ([`crate::check_cut`]);
+//! without one, every packet those keys signed is refused.
 
 // Boxing the error variants would change the public API; these are cold control-plane results.
 #![allow(clippy::result_large_err)]
@@ -16,9 +18,9 @@
 use std::path::{Path, PathBuf};
 
 use ndn_packet::Name;
-use ndn_security::FilePib;
+use ndn_security::{FilePib, RevocationCut};
 
-use crate::context_update::{BumpError, key_name_of, revocations_to_add};
+use crate::context_update::{BumpError, check_cut, key_name_of, revocations_to_add};
 use crate::error::CertError;
 use crate::namespace::ca_dir;
 use crate::root_device::{RootDevice, RootDeviceError, root_device_covering};
@@ -56,7 +58,8 @@ pub enum RevocationError {
         .pib.display()
     )]
     NoneIssued { pib: PathBuf, name: Name },
-    /// A key that may not be revoked (not of the namespace, or an anchor's).
+    /// A key that may not be revoked (not of the namespace, or an anchor's),
+    /// or a cut that does not go with this revocation.
     #[error("{0}; nothing was signed")]
     Refused(BumpError),
 }
@@ -69,6 +72,8 @@ pub struct RevocationPlan {
     pub keys: Vec<Name>,
     /// Those the held version does not revoke yet; empty when it revokes all.
     pub adding: Vec<Name>,
+    /// The revocation cut signed beside them: the cut of one of `adding`.
+    pub cut: Option<RevocationCut>,
 }
 
 /// The key names `name` designates: itself (or the key of a certificate
@@ -116,8 +121,14 @@ pub fn keys_to_revoke(
 
 /// Every check of a revocation of `name` that needs no key: `pib` is the
 /// root device of a namespace containing `name`, and `name` designates
-/// keys that may be revoked — never the root's nor the CA's.
-pub fn plan_revocation(pib: &FilePib, name: &Name) -> Result<RevocationPlan, RevocationError> {
+/// keys that may be revoked — never the root's nor the CA's — and `cut`,
+/// when given, is the cut of one of the keys the revocation adds
+/// ([`check_cut`]).
+pub fn plan_revocation(
+    pib: &FilePib,
+    name: &Name,
+    cut: Option<RevocationCut>,
+) -> Result<RevocationPlan, RevocationError> {
     let Some(root) = root_device_covering(pib, name, "devices are revoked")? else {
         return Err(RevocationError::OutsideNamespace {
             name: name.clone(),
@@ -137,7 +148,15 @@ pub fn plan_revocation(pib: &FilePib, name: &Name) -> Result<RevocationPlan, Rev
     }
     let keys = keys_to_revoke(pib.root(), &namespace, name)?;
     let adding = revocations_to_add(&root.context, &keys).map_err(RevocationError::Refused)?;
-    Ok(RevocationPlan { root, keys, adding })
+    if let Some(cut) = &cut {
+        check_cut(&root.context, &adding, cut).map_err(RevocationError::Refused)?;
+    }
+    Ok(RevocationPlan {
+        root,
+        keys,
+        adding,
+        cut,
+    })
 }
 
 #[cfg(test)]
@@ -176,7 +195,7 @@ mod tests {
     fn a_device_identity_designates_the_keys_its_ca_certified() {
         let dir = tempfile::tempdir().unwrap();
         let (pib, out) = root_device_pib(dir.path());
-        let plan = plan_revocation(&pib, &out.device_identity).unwrap();
+        let plan = plan_revocation(&pib, &out.device_identity, None).unwrap();
         assert_eq!(plan.keys, vec![out.device_key.clone()]);
         assert_eq!(plan.adding, vec![out.device_key.clone()]);
         // A key name designates itself; a certificate name its key.
@@ -208,7 +227,10 @@ mod tests {
             ("/home/bob/member/tablet", "issued no certificate"),
             ("/home/alice/member/phone/KEY/k", "holds (/home/bob)"),
         ] {
-            let e = plan_revocation(&pib, &n(name)).err().unwrap().to_string();
+            let e = plan_revocation(&pib, &n(name), None)
+                .err()
+                .unwrap()
+                .to_string();
             assert!(e.contains(refused), "{name}: {e}");
             assert!(
                 e.to_lowercase().contains("nothing was signed"),
@@ -224,8 +246,34 @@ mod tests {
         let pib = FilePib::new(other.path()).unwrap();
         crate::persist_context(other.path(), &out.init.context, &out.init.context_data).unwrap();
         assert!(matches!(
-            plan_revocation(&pib, &out.device_identity),
+            plan_revocation(&pib, &out.device_identity, None),
             Err(RevocationError::RootDevice(RootDeviceError::NoRoot { .. }))
+        ));
+    }
+
+    /// A cut goes with the revocation of exactly its key and lists only
+    /// that key's device log; any other is refused before anything is
+    /// signed, and an accepted one travels in the plan.
+    #[test]
+    fn a_cut_is_planned_only_for_a_key_the_revocation_adds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pib, out) = root_device_pib(dir.path());
+        let log = crate::device_log_of(&out.device_key);
+        let mut cut = RevocationCut::new(out.device_key.clone());
+        cut.add_run(&log.clone().append("notes"), 1, 4);
+        let plan = plan_revocation(&pib, &out.device_identity, Some(cut.clone())).unwrap();
+        assert_eq!(plan.cut, Some(cut));
+
+        let other = RevocationCut::new(n("/home/bob/member/tablet/KEY/t"));
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, Some(other)),
+            Err(RevocationError::Refused(BumpError::CutOtherKey { .. }))
+        ));
+        let mut outside = RevocationCut::new(out.device_key.clone());
+        outside.add_run(&n("/home/bob/admin/elsewhere/32=log/notes"), 1, 1);
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, Some(outside)),
+            Err(RevocationError::Refused(BumpError::CutOutsideLog { .. }))
         ));
     }
 }

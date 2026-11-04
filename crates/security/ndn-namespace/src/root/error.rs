@@ -290,6 +290,8 @@ impl From<RecoveryError> for RootError {
         let e = match e {
             E::RootStore(e) => return e.into(),
             E::Init(e) => return e.into(),
+            E::RootDevice(e) => return (*e).into(),
+            E::Cut(bump) => return bump_refusal(&bump).caused_by(E::Cut(bump)),
             other => other,
         };
         let refused = match &e {
@@ -341,6 +343,24 @@ impl From<RecoveryError> for RootError {
                 code::KEPT_KITS_NEED_COMPROMISED,
                 "kits to keep are named only when the old root is compromised",
             ),
+            E::CutsNeedCompromised => RootError::new(
+                code::CUT_REFUSED,
+                "revocation cuts are given only when the old root is compromised",
+            )
+            .with("error", &e),
+            E::CutNotRevoked { key, revoking } => RootError::new(
+                code::CUT_REFUSED,
+                "the cut's key is not one the recovery newly revokes; nothing was signed",
+            )
+            .with("key", key)
+            .with("revoking", revoking.join(", "))
+            .with("error", &e),
+            E::DuplicateCut(key) => RootError::new(
+                code::CUT_REFUSED,
+                "two cuts are given for one key; nothing was signed",
+            )
+            .with("key", key)
+            .with("error", &e),
             E::AlreadyRootDevice {
                 pib,
                 namespace,
@@ -480,6 +500,65 @@ fn bump_refusal(e: &BumpError) -> RootError {
             version,
             dropped,
         } => narrowing(namespace, *version, "relays", dropped),
+        E::CutOtherKey { key, revoking } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut's key is not one this version revokes; nothing was signed",
+        )
+        .with("key", key)
+        .with("revoking", revoking.join(", "))
+        .with("error", e),
+        E::CutAfterRevocation {
+            key,
+            namespace,
+            version,
+        } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut's key is revoked already; a cut comes only with its revocation",
+        )
+        .with("key", key)
+        .with("namespace", namespace)
+        .with("version", version)
+        .with("error", e),
+        E::CutOutsideLog { key, name, log } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut lists a name outside its key's device log; nothing was signed",
+        )
+        .with("key", key)
+        .with("name", name)
+        .with("log", log)
+        .with("error", e),
+        E::ReadmitNoCut {
+            key,
+            namespace,
+            version,
+        }
+        | E::ReadmitRevokedWithoutCut {
+            key,
+            namespace,
+            version,
+        } => RootError::new(
+            code::READMIT_NO_CUT,
+            "the held version holds no cut for the key; nothing was signed",
+        )
+        .with("key", key)
+        .with("namespace", namespace)
+        .with("version", version)
+        .with("error", e),
+        E::ReadmitNotFullName { key, name } => RootError::new(
+            code::READMIT_REFUSED,
+            "the name is not a full name ending in its implicit digest; nothing was signed",
+        )
+        .with("key", key)
+        .with("name", name)
+        .with("error", e),
+        E::ReadmitOutsideLog { key, name, log } => RootError::new(
+            code::READMIT_REFUSED,
+            "the name is not in the key's device log; nothing was signed",
+        )
+        .with("key", key)
+        .with("name", name)
+        .with("log", log)
+        .with("error", e),
         other => RootError::new(
             code::ROOT_LOCAL_FAILURE,
             "a local failure stopped the operation",

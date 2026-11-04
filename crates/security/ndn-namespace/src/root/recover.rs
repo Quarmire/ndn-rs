@@ -22,15 +22,25 @@
 //!    of `N+1` removes what step 3 wrote. Once `N+2` is taken, the newest
 //!    version is signed by the new root, so its fingerprint is the
 //!    namespace's expected fingerprint again ([`Recovered::anchor_links`]).
+//!
+//! Both versions carry every revocation cut of `N`. With the old root
+//! compromised, `N+1` may add a cut for each key it newly revokes
+//! ([`RecoverRequest::cuts`]), and the new CA certifies again each key
+//! revoked with a cut whose certificate this PIB holds (the old CA's
+//! certificates no longer chain, and such a key cannot renew): recorded in
+//! the CA's store once `N+1` is taken, served from the CA's next start. A
+//! key of none held is listed; once its certificate is at hand,
+//! [`recertify`] certifies it.
 
 use std::path::{Path, PathBuf};
 
 use ndn_cert::report::code;
 use ndn_cert::{
-    NewRootStore, OldRoot, RecoveredNamespace, RootStore, anchor_fingerprint, kit_anchor,
-    read_stored_context, recover_namespace_in_pib,
+    CutKeyCertificates, NewRootStore, OldRoot, RecoveredNamespace, RootStore, anchor_fingerprint,
+    kit_anchor, read_stored_context, recertify_cut_keys_in_pib, recover_namespace_in_pib,
 };
 use ndn_packet::Name;
+use ndn_security::{Certificate, RevocationCut};
 use ndn_trust_envelope::TrustEnvelope;
 
 use super::device::{Newest, hand_over, not_taken, session_on};
@@ -51,6 +61,10 @@ pub struct RecoverRequest {
     pub old_root: OldRoot,
     /// With the old root compromised: the other kits to keep.
     pub kept_kits: Vec<Name>,
+    /// With the old root compromised: a revocation cut for some of the keys
+    /// `N+1` newly revokes (the old root's, the old root device's, the
+    /// kits not kept), at most one per key (`cut-refused` otherwise).
+    pub cuts: Vec<RevocationCut>,
     /// Nothing answers: the person vouches that no version newer than the
     /// held one exists.
     pub from_held: bool,
@@ -99,6 +113,10 @@ pub struct Recovered {
     pub anchors: Vec<(Name, AnchorKind)>,
     /// Every key `N+1` revokes.
     pub revoked: Vec<(Name, RevokedKind)>,
+    /// Recording the new CA's certificates of keys revoked with a cut
+    /// ([`RecoveredNamespace::recertified`]) in its store failed: they are
+    /// not served; [`recertify`] issues and records them again.
+    pub recertified_not_recorded: Option<RootError>,
 }
 
 impl Recovered {
@@ -155,6 +173,7 @@ pub async fn recover(
         device: device_name,
         old_root,
         kept_kits,
+        cuts,
         from_held,
         root: root_choice,
     } = request;
@@ -222,6 +241,7 @@ pub async fn recover(
         &device_name,
         old_root,
         &kept_kits,
+        &cuts,
         &root,
     )
     .await;
@@ -253,6 +273,9 @@ pub async fn recover(
     // N+1 is the namespace's from here on: nothing is undone any more. N+2
     // makes the new root the signer of the newest version.
     let root_handed = hand_over(device, &pib_dir, &recovered.root_version).await;
+    // N+1 is taken: the new CA's certificates of keys revoked with a cut
+    // are the namespace's too.
+    let recertified_not_recorded = recovered.record_recertified().err().map(RootError::from);
 
     let v = &recovered.version;
     let new_root = recovered.anchor.key_name();
@@ -306,5 +329,28 @@ pub async fn recover(
         recovered,
         handed,
         root_handed,
+        recertified_not_recorded,
     })
+}
+
+/// On the root device of `namespace` (else the only namespace whose root
+/// the PIB at `pib_dir` holds): certify again, with the namespace CA's key,
+/// every key the held version revokes with a cut that this CA has not
+/// certified yet, from a certificate of it in `certificates` (ones the
+/// operator vouches for, e.g. a device's certificate file) or stored in the
+/// PIB ([`ndn_cert::recertify_cut_keys_in_pib`]) — what a compromised
+/// recovery lists as held nowhere. Recorded in the CA's store: the CA serves
+/// them from its next start. Keys still without a certificate are listed in
+/// [`CutKeyCertificates::unheld`]. Signs no version; the root is not
+/// unlocked.
+pub async fn recertify(
+    pib_dir: &Path,
+    namespace: Option<&Name>,
+    certificates: &[Certificate],
+) -> Result<(Name, CutKeyCertificates), RootError> {
+    let pib = super::open_pib(pib_dir)?;
+    let root = ndn_cert::root_device(&pib, namespace, "keys are re-certified")?;
+    let namespace = root.context.namespace().clone();
+    let done = recertify_cut_keys_in_pib(&pib, &namespace, certificates).await?;
+    Ok((namespace, done))
 }

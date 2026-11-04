@@ -24,7 +24,9 @@
 //! Which certificate answers is [`ndn_security::CertSet`]'s rule. A
 //! certificate that a held trust context revokes (its key, or the
 //! certificate itself) is not served, and is withdrawn once a context
-//! version revoking it is adopted.
+//! version revoking it is adopted — unless the version revokes its key with
+//! a revocation cut: a reader verifies the packets the cut accepts with
+//! that certificate, so it stays served ([`stops_serving`]).
 
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -34,7 +36,7 @@ use ndn_engine::ForwarderEngine;
 use ndn_face::local::InProcFace;
 use ndn_packet::{Data, Interest, NackReason, Name};
 use ndn_security::cert_name::key_name_of;
-use ndn_security::{CertSet, Certificate, Keyring, SecurityManager};
+use ndn_security::{CertSet, Certificate, Keyring, SecurityManager, SignedTrustContext};
 use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
@@ -77,7 +79,7 @@ impl OwnCertificates {
             .unwrap_or_default();
         for wire in stored.into_iter().chain(running) {
             match Data::decode(wire.clone()) {
-                Ok(cert) if keyring.context_for(&cert.name).is_revoked(&cert.name) => {
+                Ok(cert) if stops_serving(&keyring.context_for(&cert.name), &cert.name) => {
                     tracing::info!(
                         target: "security",
                         certificate = %cert.name,
@@ -95,7 +97,7 @@ impl OwnCertificates {
         let weak = Arc::downgrade(&own);
         keyring.on_revocation(move |ctx, _| {
             if let Some(own) = weak.upgrade() {
-                own.withdraw_where(|name| ctx.is_revoked(name));
+                own.withdraw_where(|name| stops_serving(ctx, name));
             }
         });
         let served = Arc::downgrade(&own);
@@ -191,6 +193,14 @@ impl OwnCertificates {
     }
 }
 
+/// Whether a device stops serving the certificate `cert` once it holds
+/// `ctx`: `ctx` revokes it (its key, or the certificate itself) without a
+/// revocation cut for its key. A key revoked with a cut keeps its
+/// certificates served — they authorize only the packets the cut accepts.
+fn stops_serving(ctx: &SignedTrustContext, cert: &Name) -> bool {
+    ctx.is_revoked(cert) && ctx.revocation_cut(&key_name_of(cert)).is_none()
+}
+
 /// The certificate Data the engine's key store caches for `key`: every
 /// valid one (an ephemeral identity's self-signed certificate, or one
 /// issued for a kept key).
@@ -201,4 +211,43 @@ fn running_certificates(mgr: &SecurityManager, key: &Name) -> Vec<Bytes> {
         .filter(|cert| cert.is_valid_now())
         .filter_map(Certificate::data_wire)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndn_security::RevocationCut;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// A certificate of a key revoked with a cut stays served (readers
+    /// verify the packets the cut accepts with it); one of a key revoked
+    /// without a cut is withdrawn; an unrevoked one is served.
+    #[test]
+    fn certificates_of_a_key_revoked_with_a_cut_stay_served() {
+        let (cut_key, bare_key) = (
+            n("/home/bob/member/phone/KEY/k"),
+            n("/home/bob/member/tablet/KEY/t"),
+        );
+        let mut cut = RevocationCut::new(cut_key.clone());
+        cut.add_seq(&n("/home/bob/member/phone/32=log/notes"), 3);
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(cut_key.clone())
+            .with_revocation_cut(cut)
+            .with_revocation(bare_key.clone());
+        assert!(!stops_serving(
+            &ctx,
+            &cut_key.clone().append("NDNCERT").append("v1")
+        ));
+        assert!(stops_serving(
+            &ctx,
+            &bare_key.clone().append("NDNCERT").append("v1")
+        ));
+        assert!(!stops_serving(
+            &ctx,
+            &n("/home/bob/member/laptop/KEY/l/NDNCERT/v1")
+        ));
+    }
 }

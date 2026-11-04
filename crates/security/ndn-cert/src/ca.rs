@@ -119,6 +119,12 @@ pub struct CaState {
     /// certificate of a key revokes the key, so its other certificates (a
     /// renewal's included) are refused too and it is never certified again.
     revoked_keys: DashSet<String>,
+    /// Keys a followed trust context revokes WITH a revocation cut
+    /// (canonical URIs): their certificates stay served — a reader needs
+    /// one to verify the packets the cut accepts — while the key stays
+    /// revoked here for everything else (never certified or renewed again,
+    /// its device name free).
+    cut_keys: DashSet<String>,
     /// Issued cert wire bytes, served on the cert-fetch Interest — and the
     /// certificates of earlier CAs of this CA's identity that a renewal's
     /// chain went through ([`accept_earlier_ca_certificates`](Self::accept_earlier_ca_certificates)).
@@ -155,6 +161,7 @@ impl CaState {
             pending: DashMap::new(),
             revoked: DashSet::new(),
             revoked_keys: DashSet::new(),
+            cut_keys: DashSet::new(),
             served_certs: DashMap::new(),
             store: None,
             issuing: tokio::sync::Mutex::new(()),
@@ -570,30 +577,46 @@ impl CaState {
         }
     }
 
+    /// Whether `cert_name` (a certificate name, canonical URI) is served on
+    /// cert-fetch: not revoked, or of a key revoked with a cut
+    /// ([`follow_context`](Self::follow_context)).
+    fn serves(&self, cert_name: &str) -> bool {
+        !self.is_revoked(cert_name)
+            || cert_name.parse::<ndn_packet::Name>().is_ok_and(|n| {
+                self.cut_keys
+                    .contains(&ndn_security::cert_name::key_name_of(&n).to_string())
+            })
+    }
+
     /// Wire of the issued cert named exactly `cert_name` for cert-fetch;
-    /// `None` once it (or its key) is revoked.
+    /// `None` once it (or its key) is revoked — unless the key is revoked
+    /// with a cut, whose in-cut packets readers verify with it.
     pub fn get_served_cert(&self, cert_name: &str) -> Option<Vec<u8>> {
-        if self.is_revoked(cert_name) {
+        if !self.serves(cert_name) {
             return None;
         }
         self.served_certs.get(cert_name).map(|r| r.clone())
     }
 
     /// Wire of the certificate a `CanBePrefix` cert-fetch for `prefix` (a key
-    /// name, or a certificate name) is answered with: among the unrevoked
-    /// certificates this CA serves under `prefix`, the newest one valid now
-    /// (latest `valid_from`, then the later name). `None` when none is valid.
+    /// name, or a certificate name) is answered with: among the certificates
+    /// this CA serves under `prefix` (unrevoked, or of a key revoked with a
+    /// cut), the newest one valid now (latest `valid_from`, then the later
+    /// name) — for a key revoked with a cut, also one past its validity
+    /// (Data it signed is verified without a clock). `None` when none is.
     pub fn served_cert_under(&self, prefix: &ndn_packet::Name) -> Option<Vec<u8>> {
         self.served_certs
             .iter()
-            .filter(|e| !self.is_revoked(e.key()))
+            .filter(|e| self.serves(e.key()))
             .filter(|e| {
                 e.key()
                     .parse::<ndn_packet::Name>()
                     .is_ok_and(|n| n.has_prefix(prefix))
             })
             .filter_map(|e| Some((deserialize_cert(e.value())?, e.value().clone())))
-            .filter(|(cert, _)| cert.is_valid_now())
+            .filter(|(cert, _)| {
+                cert.is_valid_now() || self.cut_keys.contains(&cert.key_name().to_string())
+            })
             .max_by(|(a, _), (b, _)| (a.valid_from, &a.name).cmp(&(b.valid_from, &b.name)))
             .map(|(_, wire)| wire)
     }
@@ -1231,13 +1254,22 @@ impl CaState {
 
     /// Follow `ctx`, a version of a trust context the device running this
     /// CA holds now: when this is the CA of its namespace (identity
-    /// `<ns>/CA`), stop serving every certificate it issued that `ctx`
-    /// revokes, and record that in the store. Idempotent: certificates
-    /// revoked already are skipped, so following the same version again
-    /// changes nothing. `None` when this is not the CA of `ctx`'s namespace.
+    /// `<ns>/CA`), revoke here every certificate it issued that `ctx`
+    /// revokes, and record that in the store: never certified or renewed
+    /// again, device name free. Certificates of a key `ctx` revokes without
+    /// a cut are no longer served; those of a key it revokes with a cut stay
+    /// served (a reader verifies the packets the cut accepts with them).
+    /// Idempotent: certificates revoked already are skipped, so following
+    /// the same version again changes nothing. `None` when this is not the
+    /// CA of `ctx`'s namespace.
     pub fn follow_context(&self, ctx: &ndn_security::SignedTrustContext) -> Option<CaRevocation> {
         if !self.is_ca_of(ctx.namespace()) {
             return None;
+        }
+        // A cut is never withdrawn (later versions carry it), so the set
+        // only grows.
+        for cut in ctx.revocation_cuts() {
+            self.cut_keys.insert(cut.key().to_string());
         }
         let mut followed = CaRevocation::default();
         for revoked in ctx.revocations() {

@@ -70,9 +70,10 @@ pub use context_store::{
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
-    UpdateRefusal, VersionSource, bump_context_revoking, bump_context_schema, follow_versions,
-    key_name_of, link_narrowing, open_context_update, refresh_context, relay_narrowing,
-    revocations_to_add, schema_change,
+    UpdateRefusal, VersionSource, bump_context_readmitting, bump_context_revoking,
+    bump_context_schema, check_cut, device_log_of, follow_versions, key_name_of, link_narrowing,
+    open_context_update, readmissions_to_add, refresh_context, relay_narrowing, revocations_to_add,
+    schema_change, split_full_name,
 };
 pub use ecdh::{EcdhKeypair, SessionKey};
 pub use enroll_target::{EnrollTarget, EnrollTargetError};
@@ -110,10 +111,10 @@ pub use protocol::{
     NewResponse, ProbeResponse, RevokeRequest, RevokeResponse, RevokeStatus,
 };
 pub use recovery::{
-    FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError, RecoveryPlan, RecoverySeed,
-    RecoveryVersion, YubikeyKit, add_recovery_anchor, kit_anchor, recover_namespace_in_pib,
-    recovery_anchor, recovery_key_name, recovery_version, reissue_version, remove_recovery_anchor,
-    seal_file_kit,
+    CutKeyCertificates, FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError,
+    RecoveryPlan, RecoverySeed, RecoveryVersion, YubikeyKit, add_recovery_anchor, kit_anchor,
+    recertify_cut_keys, recertify_cut_keys_in_pib, recover_namespace_in_pib, recovery_anchor,
+    recovery_key_name, recovery_version, reissue_version, remove_recovery_anchor, seal_file_kit,
 };
 pub use renewal::{
     RENEWAL_CHALLENGE, RenewalError, issuing_ca_prefix, renew_certificate, renewal_proof_message,

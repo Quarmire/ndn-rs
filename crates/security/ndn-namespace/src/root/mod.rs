@@ -6,7 +6,10 @@
 //! - [`init`]: a new namespace on this device, its root in the store the
 //!   person picks ([`init::RootStoreChoice`]: the OS keychain, a
 //!   passphrase-sealed file, a YubiKey, or plaintext `file`).
-//! - [`revoke`]: a new version revoking a device, key or certificate.
+//! - [`revoke`]: a new version revoking a device, key or certificate (with
+//!   a revocation cut of one of its keys, or without).
+//! - [`readmit`]: a new version re-admitting single packets (full names) of
+//!   a key revoked with a cut.
 //! - [`kit`]: recovery kits — create (24 words, a sealed file, or a key on a
 //!   second YubiKey, listed as a recovery anchor by a new version), list,
 //!   check, revoke.
@@ -60,6 +63,7 @@ mod error;
 pub mod init;
 pub mod key;
 pub mod kit;
+pub mod readmit;
 pub mod recover;
 pub mod revoke;
 pub mod schema;

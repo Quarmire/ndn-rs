@@ -374,6 +374,7 @@ mod tests {
             "phone",
             ndn_cert::OldRoot::Destroyed,
             &[],
+            &[],
             &ndn_cert::NewRootStore::File,
         )
         .await

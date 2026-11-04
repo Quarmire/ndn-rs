@@ -42,7 +42,10 @@
 //! stops validating, and it keeps only the recovery anchors the operator
 //! vouches for (the signing kit and [`RecoveryPlan::kept_kits`]): whoever
 //! held the old root could have added one of their own, and the rest are
-//! removed and revoked. The new
+//! removed and revoked. Beside those revocations it may carry a revocation
+//! cut for each of the keys it newly revokes ([`RecoveryPlan::cuts`]), so
+//! what those keys published before the compromise stays accepted. Every
+//! version a recovery makes carries the held version's cuts verbatim. The new
 //! root then signs `N+2`, the same content ([`reissue_version`]), so the
 //! newest version is root-signed and the root's fingerprint is the expected
 //! fingerprint of anchor links and invites again. Every node holding
@@ -58,23 +61,28 @@ use ndn_packet::{Data, Name};
 use ndn_security::cert_name::{DEFAULT_ISSUER, NDNCERT_ISSUER, key_name_of, new_key_name};
 use ndn_security::safebag::SafeBag;
 use ndn_security::{
-    Certificate, Ed25519Signer, FilePib, KeyRole, OpenContextError, PibError, SecurityManager,
-    SignedTrustContext, SignedTrustContextError, Signer, TrustError,
+    Certificate, Ed25519Signer, FilePib, KeyRole, OpenContextError, PibError, RevocationCut,
+    SecurityManager, SignedTrustContext, SignedTrustContextError, Signer, TrustError,
 };
 use ndn_trust_envelope::{ANCHOR_FINGERPRINT_LEN, TrustEnvelope};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::ca::serialize_cert;
-use crate::context_update::{ContextBump, UpdateRefusal, open_context_update};
+use crate::ca::{deserialize_cert, serialize_cert};
+use crate::context_update::{
+    BumpError, ContextBump, UpdateRefusal, check_cut, open_context_update,
+};
+use crate::error::CertError;
 use crate::namespace::{
     ANCHOR_CERT_FILE, CA_CERT_FILE, CA_CERT_VALIDITY_MS, DEVICE_CERT_FILE, DEVICE_CERT_VALIDITY_MS,
     NamespaceInitError, ca_dir, ca_key_name, certify_new_key,
 };
 use crate::roles::{Role, RoleError, device_identity, validate_namespace};
+use crate::root_device::RootDeviceError;
 use crate::root_store::{
     NewRootStore, PendingRoot, RootSecret, RootStore, RootStoreError, SlotGuard, same_public_key,
 };
+use crate::store::{CaStore, FileCaStore};
 
 /// Environment variable a CLI reads a file kit's passphrase from.
 pub const KIT_PASSPHRASE_ENV: &str = "NDN_KIT_PASSPHRASE";
@@ -221,6 +229,36 @@ pub enum RecoveryError {
          or recover with the old root compromised"
     )]
     KeptKitsNeedCompromised,
+    #[error(
+        "revocation cuts are given only when the old root is compromised: with it destroyed, the \
+         recovery revokes no key, and a cut comes only with the revocation of its key. Give no \
+         cut, or recover with the old root compromised"
+    )]
+    CutsNeedCompromised,
+    #[error(
+        "the revocation cut is for {key}, which this recovery does not newly revoke (it revokes \
+         {}): a recovery carries cuts only for the keys it revokes. Leave that cut out; a key of \
+         the namespace that is not revoked yet is revoked with its cut on the new root device \
+         afterwards (`ndn-fwd revoke {key} --cut <file>`)",
+        .revoking.join(", ")
+    )]
+    CutNotRevoked {
+        key: String,
+        /// The keys the recovery newly revokes.
+        revoking: Vec<String>,
+    },
+    #[error("two revocation cuts are given for {0}: a key has one cut. Give each key's cut once")]
+    DuplicateCut(String),
+    #[error("{0}; nothing was signed")]
+    Cut(BumpError),
+    #[error("the CA store {}: {source}", .dir.display())]
+    CaStore {
+        dir: PathBuf,
+        #[source]
+        source: CertError,
+    },
+    #[error(transparent)]
+    RootDevice(Box<RootDeviceError>),
     #[error(
         "{pib} holds the root of {namespace} ({kind} root store): this already is a root \
          device of the namespace. Recover on a replacement device whose PIB holds no root of \
@@ -865,6 +903,13 @@ pub struct RecoveryPlan<'a> {
     /// every other one is removed and revoked. Must be empty for
     /// [`OldRoot::Destroyed`], which keeps every recovery anchor.
     pub kept_kits: &'a [Name],
+    /// [`OldRoot::Compromised`] only: a revocation cut for some of the keys
+    /// `N+1` newly revokes (at most one per key, each listing only its
+    /// key's device log, [`crate::check_cut`]), so what they published
+    /// before the compromise, as the cut lists it, stays accepted. Must be
+    /// empty for [`OldRoot::Destroyed`]. The cuts `N` holds are carried
+    /// over whatever this is.
+    pub cuts: &'a [RevocationCut],
 }
 
 /// Version `N+1` made by a recovery key.
@@ -952,6 +997,68 @@ fn split_anchors(
     })
 }
 
+/// The keys version `N+1` of a recovery revokes that `ctx` (version `N`)
+/// does not: with the old root compromised, the old root's anchor keys,
+/// the old root device's keys and the recovery anchors removed
+/// ([`AnchorSplit`]), in that order, each once; none with it destroyed.
+/// Also the old root device's keys, and whether `ctx` recorded none (then
+/// the CA key `ndn-fwd init` names stands for them).
+fn compromised_revocations(
+    ctx: &SignedTrustContext,
+    old_root: OldRoot,
+    split: &AnchorSplit,
+) -> (Vec<Name>, Vec<Name>, bool) {
+    if old_root == OldRoot::Destroyed {
+        return (Vec::new(), Vec::new(), false);
+    }
+    let mut device_keys: Vec<Name> = ctx.keys_with_role(KeyRole::ROOT_DEVICE).cloned().collect();
+    let unrecorded = device_keys.is_empty();
+    if unrecorded {
+        device_keys.push(ca_key_name(ctx.namespace()));
+    }
+    let mut newly: Vec<Name> = Vec::new();
+    for key in split
+        .old_root_keys
+        .iter()
+        .chain(&device_keys)
+        .chain(&split.removed_kits)
+    {
+        if !ctx.is_revoked(key) && !newly.contains(key) {
+            newly.push(key.clone());
+        }
+    }
+    (newly, device_keys, unrecorded)
+}
+
+/// Refuse the revocation cuts `cuts` of a recovery from `ctx` that newly
+/// revokes `newly` ([`compromised_revocations`]) unless each is the cut of
+/// one of `newly`, at most one per key, listing only that key's device log
+/// ([`crate::check_cut`]); any cut with the old root destroyed, which
+/// revokes nothing. Needs no key: checked before anything is written.
+fn check_recovery_cuts(
+    ctx: &SignedTrustContext,
+    old_root: OldRoot,
+    newly: &[Name],
+    cuts: &[RevocationCut],
+) -> Result<(), RecoveryError> {
+    if old_root == OldRoot::Destroyed && !cuts.is_empty() {
+        return Err(RecoveryError::CutsNeedCompromised);
+    }
+    for (i, cut) in cuts.iter().enumerate() {
+        if !newly.contains(cut.key()) {
+            return Err(RecoveryError::CutNotRevoked {
+                key: cut.key().to_string(),
+                revoking: newly.iter().map(Name::to_string).collect(),
+            });
+        }
+        if cuts[..i].iter().any(|c| c.key() == cut.key()) {
+            return Err(RecoveryError::DuplicateCut(cut.key().to_string()));
+        }
+        check_cut(ctx, newly, cut).map_err(RecoveryError::Cut)?;
+    }
+    Ok(())
+}
+
 /// Version `N+1` of `held`, signed by the recovery key `recovery` (a
 /// recovery anchor of `held`, else refused before anything is signed):
 /// anchors = the new root + the recovery anchors kept (+ the old root
@@ -960,8 +1067,11 @@ fn split_anchors(
 /// [`OldRoot::Compromised`], the old root, the old root device's keys and
 /// every recovery anchor other than the signing kit and
 /// [`RecoveryPlan::kept_kits`] are removed and revoked — nothing the old
-/// root could have installed keeps the power to sign the next version.
-/// Schema, CA endpoints and earlier revocations are carried over. Pure.
+/// root could have installed keeps the power to sign the next version —
+/// and [`RecoveryPlan::cuts`] are added beside those revocations (each the
+/// cut of a key revoked here, else refused before anything is signed).
+/// Schema, CA endpoints, earlier revocations and their cuts are carried
+/// over. Pure.
 pub async fn recovery_version(
     recovery: &dyn Signer,
     held: &Data,
@@ -972,11 +1082,15 @@ pub async fn recovery_version(
     let recovery_key = kit_anchor(&ctx, &recovery_pk)?;
     let (ctx, next) = open_next(recovery, held).await?;
 
+    let split = split_anchors(&ctx, &recovery_key, plan.old_root, plan.kept_kits)?;
+    let (newly, old_root_device_keys, root_device_keys_unrecorded) =
+        compromised_revocations(&ctx, plan.old_root, &split);
+    check_recovery_cuts(&ctx, plan.old_root, &newly, plan.cuts)?;
     let AnchorSplit {
         old_root_keys,
         kept_kits,
         removed_kits,
-    } = split_anchors(&ctx, &recovery_key, plan.old_root, plan.kept_kits)?;
+    } = split;
 
     let mut next = next.without_key_roles(|role, key| {
         role == KeyRole::ROOT_DEVICE
@@ -991,18 +1105,11 @@ pub async fn recovery_version(
         ));
     }
 
-    let mut old_root_device_keys = Vec::new();
-    let mut root_device_keys_unrecorded = false;
     if plan.old_root == OldRoot::Compromised {
         next.anchors().retain(|name, _| {
             let key = key_name_of(name);
             !old_root_keys.contains(&key) && !removed_kits.contains(&key)
         });
-        old_root_device_keys = ctx.keys_with_role(KeyRole::ROOT_DEVICE).cloned().collect();
-        if old_root_device_keys.is_empty() {
-            root_device_keys_unrecorded = true;
-            old_root_device_keys.push(ca_key_name(ctx.namespace()));
-        }
         for key in old_root_keys
             .iter()
             .chain(&old_root_device_keys)
@@ -1018,6 +1125,9 @@ pub async fn recovery_version(
                 next = next.with_revocation(key.clone());
             }
         }
+        for cut in plan.cuts {
+            next = next.with_revocation_cut(cut.clone());
+        }
     }
     let bump = finish(recovery, &ctx, next).await?;
     Ok(RecoveryVersion {
@@ -1029,6 +1139,173 @@ pub async fn recovery_version(
         kept_kits,
         removed_kits,
     })
+}
+
+// ── Re-certifying keys revoked with a cut ──────────────────────────────────
+
+/// Certificates issued for keys a context revokes with a cut
+/// ([`recertify_cut_keys`]).
+#[derive(Debug, Default)]
+pub struct CutKeyCertificates {
+    /// The new certificates: each for the same public key as a certificate
+    /// of its key that was held, named `<key>/NDNCERT/<version>`, issued by
+    /// the CA.
+    pub issued: Vec<Certificate>,
+    /// The keys revoked with a cut of which no certificate was held: the
+    /// packets their cuts accept stay refused wherever their old
+    /// certificates no longer chain, until a certificate of the key is given
+    /// and they are re-certified ([`recertify_cut_keys_in_pib`]).
+    pub unheld: Vec<Name>,
+}
+
+/// Issue, with `mgr`'s signer `ca_key`, a certificate for each of `keys`
+/// from the newest certificate of it in `held` (its public key); a key with
+/// none goes to [`CutKeyCertificates::unheld`].
+async fn certify_cut_keys<'a>(
+    mgr: &SecurityManager,
+    ca_key: &Name,
+    keys: impl Iterator<Item = &'a Name>,
+    held: &[Certificate],
+) -> Result<CutKeyCertificates, RecoveryError> {
+    let mut out = CutKeyCertificates::default();
+    for key in keys {
+        let newest = held
+            .iter()
+            .filter(|c| c.key_name() == *key)
+            .max_by_key(|c| (c.valid_from, c.name.to_string()));
+        let Some(cert) = newest else {
+            out.unheld.push(key.clone());
+            continue;
+        };
+        let issued = mgr
+            .certify_as(
+                key,
+                cert.public_key.clone(),
+                ca_key,
+                DEVICE_CERT_VALIDITY_MS,
+                NDNCERT_ISSUER,
+                None,
+            )
+            .await?;
+        out.issued.push(issued);
+    }
+    Ok(out)
+}
+
+/// A certificate, issued by the CA key `ca`, for every key `context`
+/// revokes with a revocation cut, from the newest certificate of that key
+/// in `held` (the same public key; a new certificate name). After a
+/// recovery with the old root compromised, the old root and CA are
+/// revoked, so a device certificate the old CA issued no longer chains; an
+/// honest device renews with the new CA, but a key revoked with a cut
+/// cannot, and the packets its cut accepts would be refused with no
+/// certificate to verify them by. This is the one case a revoked key is
+/// certified: the certificate authorizes nothing outside the cut (a
+/// validator excuses a revoked key only for the packet it signed itself,
+/// and only inside its cut), and the CA never enrolls or renews the key.
+/// `held` is what the operator vouches for (the recovering device's PIB,
+/// or certificates given by hand) — never certificates fetched from the
+/// network, which whoever held the old root could have forged. Keys of no
+/// certificate in `held` are listed in [`CutKeyCertificates::unheld`].
+/// Pure: nothing is stored or served.
+pub async fn recertify_cut_keys(
+    ca: Arc<dyn Signer>,
+    context: &SignedTrustContext,
+    held: &[Certificate],
+) -> Result<CutKeyCertificates, RecoveryError> {
+    let ca_key = ca.key_name().clone();
+    let mgr = SecurityManager::new();
+    mgr.register_signer(ca_key.clone(), ca);
+    let keys = context.revocation_cuts().iter().map(RevocationCut::key);
+    certify_cut_keys(&mgr, &ca_key, keys, held).await
+}
+
+/// Every certificate the PIB `pib` stores of the keys `ctx` revokes with a
+/// cut.
+fn pib_cut_key_certificates(
+    pib: &FilePib,
+    ctx: &SignedTrustContext,
+) -> Result<Vec<Certificate>, RecoveryError> {
+    let mut held = Vec::new();
+    for cut in ctx.revocation_cuts() {
+        held.extend(pib.certs(cut.key())?);
+    }
+    Ok(held)
+}
+
+/// Record `certs` in the CA store at `ca_dir` as issued certificates, so
+/// the namespace CA serves them from its next start.
+fn record_issued_in(ca_dir: &Path, certs: &[Certificate]) -> Result<(), RecoveryError> {
+    let failed = |source| RecoveryError::CaStore {
+        dir: ca_dir.to_path_buf(),
+        source,
+    };
+    let store = FileCaStore::open(ca_dir).map_err(failed)?;
+    for cert in certs {
+        store
+            .record_issued(&cert.name.to_string(), &serialize_cert(cert))
+            .map_err(failed)?;
+    }
+    Ok(())
+}
+
+/// On the root device of `namespace` (the PIB `pib`): re-certify, with the
+/// namespace CA's key, every key the held version revokes with a cut that
+/// this CA has not certified yet — from a certificate of it in `given`
+/// (certificates the operator vouches for) or stored in the PIB — and
+/// record the new certificates in the CA's store, so the CA serves them
+/// from its next start. What a recovery leaves in
+/// [`CutKeyCertificates::unheld`] is done this way once a certificate of
+/// the key is at hand. Keys still without one are listed as `unheld`.
+pub async fn recertify_cut_keys_in_pib(
+    pib: &FilePib,
+    namespace: &Name,
+    given: &[Certificate],
+) -> Result<CutKeyCertificates, RecoveryError> {
+    let root = crate::root_device::root_device(pib, Some(namespace), "keys are re-certified")
+        .map_err(|e| RecoveryError::RootDevice(Box::new(e)))?;
+    let ctx = &root.context;
+    let ca_dir = ca_dir(pib.root(), namespace);
+    let ca_cert_path = ca_dir.join(CA_CERT_FILE);
+    let ca_cert = std::fs::read(&ca_cert_path)
+        .map_err(|source| RecoveryError::Io {
+            path: ca_cert_path.clone(),
+            source,
+        })
+        .and_then(|wire| {
+            deserialize_cert(&wire).ok_or_else(|| RecoveryError::Io {
+                path: ca_cert_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "not a certificate"),
+            })
+        })?;
+    let ca_key = ca_cert.key_name();
+    let mgr = SecurityManager::new();
+    mgr.register_signer(ca_key.clone(), pib.get_signer(&ca_key)?);
+
+    // Keys this CA certified already (a recovery, or an earlier run).
+    let issued = FileCaStore::open(&ca_dir)
+        .and_then(|store| store.load())
+        .map_err(|source| RecoveryError::CaStore {
+            dir: ca_dir.clone(),
+            source,
+        })?
+        .issued;
+    let certified: Vec<Name> = issued
+        .iter()
+        .filter_map(|(_, wire)| deserialize_cert(wire))
+        .filter(|c| c.issuer.as_deref().map(key_name_of).as_ref() == Some(&ca_key))
+        .map(|c| c.key_name())
+        .collect();
+    let mut held = given.to_vec();
+    held.extend(pib_cut_key_certificates(pib, ctx)?);
+    let keys = ctx
+        .revocation_cuts()
+        .iter()
+        .map(RevocationCut::key)
+        .filter(|k| !certified.contains(k));
+    let out = certify_cut_keys(&mgr, &ca_key, keys, &held).await?;
+    record_issued_in(&ca_dir, &out.issued)?;
+    Ok(out)
 }
 
 // ── Recovering into a replacement device's PIB ─────────────────────────────
@@ -1065,6 +1342,12 @@ pub struct RecoveredNamespace {
     pub ca_cert_path: PathBuf,
     pub anchor_cert_path: PathBuf,
     pub device_cert_path: PathBuf,
+    /// With the old root compromised: certificates the new CA issued for
+    /// the keys `N+1` revokes with a cut, from certificates of them this
+    /// PIB holds ([`recertify_cut_keys`]), and the keys of none held —
+    /// returned, not stored: [`RecoveredNamespace::record_recertified`]
+    /// once `N+1` is taken.
+    pub recertified: CutKeyCertificates,
 }
 
 impl RecoveredNamespace {
@@ -1088,6 +1371,18 @@ impl RecoveredNamespace {
             ],
             &ca_dir,
         );
+    }
+
+    /// Record the certificates the new CA issued for keys revoked with a
+    /// cut ([`RecoveredNamespace::recertified`]) in its store, so it serves
+    /// them from its next start (beside every other certificate it issued;
+    /// the keys stay revoked for enrollment and renewal). Done once `N+1` is
+    /// taken, never before: a refused `N+1` leaves nothing to undo here.
+    pub fn record_recertified(&self) -> Result<(), RecoveryError> {
+        let Some(ca_dir) = self.ca_cert_path.parent() else {
+            return Ok(());
+        };
+        record_issued_in(ca_dir, &self.recertified.issued)
     }
 }
 
@@ -1126,9 +1421,10 @@ fn remove_recovered(
 ///
 /// 1. the kit's key must be a recovery anchor of `N` ([`kit_anchor`]), every
 ///    kit in `kept_kits` too (with the old root compromised; see
-///    [`RecoveryPlan::kept_kits`]), and the PIB must hold no root and no CA
-///    identity of the namespace (those of other namespaces may stay) —
-///    checked before anything is written or signed;
+///    [`RecoveryPlan::kept_kits`]), each of `cuts` the cut of a key `N+1`
+///    newly revokes ([`RecoveryPlan::cuts`]), and the PIB must hold no root
+///    and no CA identity of the namespace (those of other namespaces may
+///    stay) — checked before anything is written or signed;
 /// 2. a new root `<ns>/KEY/<id>` in the root store `root` (as `ndn-fwd
 ///    init` creates one), self-signed; a new CA key `<ns>/CA/KEY/<id>` with
 ///    a certificate by the new root; a new admin identity
@@ -1152,6 +1448,10 @@ fn remove_recovered(
 /// when no answer came: the daemon may still adopt it). A node that held
 /// `N` follows both (it keeps them and serves them by name, so the nodes
 /// behind it do too). A failure here removes whatever was written.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is one independent input of the recovery, named at the one call site of a host"
+)]
 pub async fn recover_namespace_in_pib(
     pib: &FilePib,
     held: &Data,
@@ -1159,13 +1459,16 @@ pub async fn recover_namespace_in_pib(
     device: &str,
     old_root: OldRoot,
     kept_kits: &[Name],
+    cuts: &[RevocationCut],
     root: &NewRootStore,
 ) -> Result<RecoveredNamespace, RecoveryError> {
     let (ctx, _) = SignedTrustContext::open_signed(held).await?;
     let namespace = ctx.namespace().clone();
     validate_namespace(&namespace)?;
     let recovery_key = kit_anchor(&ctx, &recovery.public_key().unwrap_or_default())?;
-    split_anchors(&ctx, &recovery_key, old_root, kept_kits)?;
+    let split = split_anchors(&ctx, &recovery_key, old_root, kept_kits)?;
+    let (newly, _, _) = compromised_revocations(&ctx, old_root, &split);
+    check_recovery_cuts(&ctx, old_root, &newly, cuts)?;
     if let Some(store) = RootStore::open_for(pib, &namespace)? {
         return Err(RecoveryError::AlreadyRootDevice {
             pib: pib.root().display().to_string(),
@@ -1221,10 +1524,24 @@ pub async fn recover_namespace_in_pib(
                 new_root_device_keys: &[ca_key.clone(), device_key.clone()],
                 old_root,
                 kept_kits,
+                cuts,
             },
         )
         .await?;
         let root_version = reissue_version(root_signer.as_ref(), &version.bump.data).await?;
+        // The old CA no longer chains (compromised): a key revoked with a
+        // cut cannot renew, so the new CA certifies it again for the
+        // packets its cut accepts (destroyed: the old root stays an anchor
+        // and its CA's certificates keep chaining).
+        let recertified = match old_root {
+            OldRoot::Compromised => {
+                let context = &version.bump.context;
+                let held = pib_cut_key_certificates(pib, context)?;
+                let keys = context.revocation_cuts().iter().map(RevocationCut::key);
+                certify_cut_keys(&mgr, &ca_key, keys, &held).await?
+            }
+            OldRoot::Destroyed => CutKeyCertificates::default(),
+        };
 
         let root_store = pending.commit(pib, &namespace, &anchor)?;
         pib.add_trust_anchor(&root_key, &anchor)?;
@@ -1252,12 +1569,22 @@ pub async fn recover_namespace_in_pib(
             ca_cert,
             device_cert,
             paths,
+            recertified,
         ))
     }
     .await;
 
     match built {
-        Ok((version, root_version, root_store, anchor, ca_cert, device_cert, paths)) => {
+        Ok((
+            version,
+            root_version,
+            root_store,
+            anchor,
+            ca_cert,
+            device_cert,
+            paths,
+            recertified,
+        )) => {
             let [ca_cert_path, anchor_cert_path, device_cert_path]: [PathBuf; 3] =
                 paths.try_into().expect("three certificate files");
             Ok(RecoveredNamespace {
@@ -1275,6 +1602,7 @@ pub async fn recover_namespace_in_pib(
                 ca_cert_path,
                 anchor_cert_path,
                 device_cert_path,
+                recertified,
             })
         }
         Err(e) => {

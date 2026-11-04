@@ -834,6 +834,34 @@ mod tests {
         assert_eq!(bodies(&held), bodies(&root.init.context));
     }
 
+    /// A version carrying a revocation cut is adopted from the group with
+    /// the cut as signed: the group relays the signed Data, never a
+    /// rebuilt context.
+    #[tokio::test]
+    async fn an_update_with_a_revocation_cut_is_adopted_with_its_cut() {
+        let root = Root::new();
+        let keyring = node_holding(&root);
+        let fetcher = MapFetcher::new();
+        let revoked = n("/home/bob/member/phone/KEY/k1");
+        let mut cut = ndn_security::RevocationCut::new(revoked.clone());
+        cut.add_run(&n("/home/bob/member/phone/32=log/notes"), 1, 5);
+        let content = root.init.context.encode_content();
+        let signer = root.mgr.get_signer_sync(&root.init.anchor_key).unwrap();
+        let v2 = SignedTrustContext::decode_content(&content, 2)
+            .unwrap()
+            .with_revocation(revoked.clone())
+            .with_revocation_cut(cut.clone())
+            .sign_into_data(signer.as_ref())
+            .unwrap();
+        fetcher.publish(2, &v2);
+        assert!(matches!(
+            process_update(&update_at(2), &fetcher, &keyring).await.outcome,
+            ContextSyncOutcome::Adopted(a) if a.context.version() == 2
+        ));
+        let held = keyring.context_for(&n("/home/bob"));
+        assert_eq!(held.revocation_cut(&revoked), Some(&cut));
+    }
+
     #[tokio::test]
     async fn an_update_not_signed_by_a_held_anchor_is_never_adopted() {
         let root = Root::new();
@@ -981,6 +1009,7 @@ mod tests {
             new_root_device_keys: &[],
             old_root: ndn_cert::OldRoot::Destroyed,
             kept_kits: &[],
+            cuts: &[],
         };
         let v3 = ndn_cert::recovery_version(recovery.as_ref(), &v2.data, &plan)
             .await
@@ -1072,6 +1101,7 @@ mod tests {
             new_root_device_keys: &[],
             old_root: ndn_cert::OldRoot::Destroyed,
             kept_kits: &[],
+            cuts: &[],
         };
         let v3 = ndn_cert::recovery_version(recovery.as_ref(), &v2.data, &plan)
             .await

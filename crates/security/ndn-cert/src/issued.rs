@@ -377,6 +377,32 @@ mod tests {
         );
     }
 
+    /// Following a version that revokes one key with a cut and one without:
+    /// both are revoked here (never renewed, device name free), the
+    /// certificate of the key revoked with a cut stays served (readers
+    /// verify the packets the cut accepts with it), the other is withdrawn.
+    #[tokio::test]
+    async fn a_key_revoked_with_a_cut_keeps_its_certificate_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, issued) = ca_with_store(dir.path()).await;
+        let (phone, tablet) = (&issued[0], &issued[2]);
+        let mut cut = ndn_security::RevocationCut::new(phone.key_name());
+        cut.add_seq(&n("/home/bob/member/phone/32=log/notes"), 1);
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(2)
+            .with_revocation(phone.key_name())
+            .with_revocation_cut(cut)
+            .with_revocation(tablet.key_name());
+        state.follow_context(&ctx).unwrap();
+
+        let (phone_name, tablet_name) = (phone.name.to_string(), tablet.name.to_string());
+        assert!(state.is_revoked(&phone_name) && state.is_revoked(&tablet_name));
+        assert!(state.get_served_cert(&phone_name).is_some());
+        assert!(state.served_cert_under(&phone.key_name()).is_some());
+        assert!(state.get_served_cert(&tablet_name).is_none());
+        assert!(state.served_cert_under(&tablet.key_name()).is_none());
+    }
+
     /// No CA, and a CA the host does not run, are refused with their codes;
     /// a CA is named by its namespace or prefix.
     #[tokio::test]

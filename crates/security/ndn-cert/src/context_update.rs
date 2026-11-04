@@ -1,10 +1,16 @@
 //! Changing a trust context after it was adopted.
 //!
 //! - **Bump** ([`bump_context_revoking`], root device only): version `N+1` of
-//!   the held context with keys added to its revocation list, signed by an
+//!   the held context with keys added to its revocation list — and, for one
+//!   of them, its revocation cut ([`check_cut`]) — signed by an
 //!   anchor key of the held version — the namespace root, unlocked from its
 //!   root store ([`crate::root_store`]). Nothing else changes: anchors,
-//!   schema, CA endpoints and earlier revocations are carried over verbatim.
+//!   schema, CA endpoints, earlier revocations and their cuts are carried
+//!   over verbatim.
+//! - **Re-admission** ([`bump_context_readmitting`], root device only):
+//!   version `N+1` adding exact packets (full names, ending in their
+//!   implicit digest) to the cut of a revoked key ([`readmissions_to_add`]);
+//!   everything else carried over verbatim.
 //! - **Schema update** ([`bump_context_schema`], root device only): version
 //!   `N+1` carrying a new schema (for a namespace made by `ndn-fwd init`, the
 //!   current generated one, [`crate::roles::namespace_schema`]) and the
@@ -59,11 +65,11 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ndn_packet::{Data, Name, NameComponent};
+use ndn_packet::{Data, Name, NameComponent, tlv_type};
 use ndn_security::{
     AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy,
-    LvsModel, OpenContextError, SchemaBlob, SchemaFormat, SchemaRule, SignedTrustContext,
-    SignedTrustContextError, Signer, Validator,
+    LvsModel, OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SchemaRule,
+    SignedTrustContext, SignedTrustContextError, Signer, Validator,
 };
 
 use crate::client::CaExchange;
@@ -92,8 +98,32 @@ pub fn key_name_of(name: &Name) -> Option<Name> {
     Some(Name::from_components(comps[..at + 2].iter().cloned()))
 }
 
-/// Why [`bump_context_revoking`] or [`bump_context_schema`] made no new
-/// version.
+/// The data-layer log of the device the key `key` (`<device>/KEY/<k>`)
+/// belongs to: `<device>/32=log`. Every packet a revocation cut or a
+/// re-admission names is under it (log entries `<device>/32=log/<C>/seq=<n>`
+/// and snapshots `<device>/32=log/seq=<n>`); every other packet the key
+/// signed stays refused once it is revoked.
+pub fn device_log_of(key: &Name) -> Name {
+    let comps = key.components();
+    let device = &comps[..comps.len().saturating_sub(2)];
+    Name::from_components(device.iter().cloned())
+        .append_component(NameComponent::keyword(Bytes::from_static(b"log")))
+}
+
+/// A full name — one whose last component is an implicit SHA-256 digest
+/// (32 octets) — as the packet's name and its digest; `None` for any other
+/// name.
+pub fn split_full_name(name: &Name) -> Option<(Name, [u8; 32])> {
+    let (last, packet) = name.components().split_last()?;
+    if last.typ != tlv_type::IMPLICIT_SHA256 {
+        return None;
+    }
+    let digest: [u8; 32] = last.value.as_ref().try_into().ok()?;
+    Some((Name::from_components(packet.iter().cloned()), digest))
+}
+
+/// Why [`bump_context_revoking`], [`bump_context_readmitting`] or
+/// [`bump_context_schema`] made no new version.
 #[derive(Debug, thiserror::Error)]
 pub enum BumpError {
     #[error("the held context is not a valid signed trust context: {0}")]
@@ -121,6 +151,74 @@ pub enum BumpError {
     },
     #[error("context version {0} cannot be bumped")]
     VersionExhausted(u64),
+    #[error(
+        "the revocation cut is for {key}, which this version does not revoke (it revokes {}): a \
+         cut is added in the version that revokes its key — pass the cut of one of those keys, \
+         or revoke {key} itself with it",
+        .revoking.join(", ")
+    )]
+    CutOtherKey {
+        key: String,
+        /// The keys the version revokes.
+        revoking: Vec<String>,
+    },
+    #[error(
+        "{key} is revoked already in v{version} of {namespace}: a cut is added only in the \
+         version that revokes its key, and never changes afterwards (it would accept packets \
+         every holder refused). Re-admit single packets of it by their full names \
+         (`ndn-fwd readmit {key} <full-name>`) if it has a cut; without one, its device \
+         publishes again under a new key"
+    )]
+    CutAfterRevocation {
+        key: String,
+        namespace: String,
+        version: u64,
+    },
+    #[error(
+        "the revocation cut of {key} names {name}, which is not in the key's device log {log}: \
+         a cut accepts only log entries its device published (`<device>/32=log/...`); make the \
+         cut again from what the device holds verified (the data layer's `cut` of the key)"
+    )]
+    CutOutsideLog {
+        key: String,
+        name: String,
+        log: String,
+    },
+    #[error(
+        "{key} is not revoked in v{version} of {namespace}, so it has no cut to re-admit packets \
+         into: revoke it with a cut first (`ndn-fwd revoke {key} --cut <file>`)"
+    )]
+    ReadmitNoCut {
+        key: String,
+        namespace: String,
+        version: u64,
+    },
+    #[error(
+        "{key} is revoked without a cut in v{version} of {namespace}: every packet it signed is \
+         refused, and a cut is added only with the revocation of its key, so nothing of it can \
+         be re-admitted. Its device publishes the data again under a new key"
+    )]
+    ReadmitRevokedWithoutCut {
+        key: String,
+        namespace: String,
+        version: u64,
+    },
+    #[error(
+        "{name} is not a full name: a re-admission names one exact packet, so the name must end \
+         in the packet's implicit SHA-256 digest component (32 octets) — give the full name the \
+         refusal of that packet reported"
+    )]
+    ReadmitNotFullName { key: String, name: String },
+    #[error(
+        "{name} is not a packet of {key}'s device log {log}: a key's cut re-admits only log \
+         entries of its own device (`<device>/32=log/...`); re-admit it with the cut of the key \
+         that signed it"
+    )]
+    ReadmitOutsideLog {
+        key: String,
+        name: String,
+        log: String,
+    },
     #[error(
         "refusing to narrow what devices of {namespace} may do: the new schema drops {} rule(s) \
          the held version (v{version}) grants — {}. A device relying on one would be refused \
@@ -179,7 +277,8 @@ pub struct ContextBump {
     pub context: SignedTrustContext,
     /// Its signed Data at `/<ns>/32=trust-context/v=<N+1>`.
     pub data: Data,
-    /// The revocation entries this version adds (none for a schema update).
+    /// The revocation entries this version adds (none for a schema update
+    /// or a re-admission).
     pub added: Vec<Name>,
 }
 
@@ -216,24 +315,72 @@ pub fn revocations_to_add(
     Ok(added)
 }
 
+/// Check the revocation cut `cut` against a version after `ctx` that adds
+/// `adding` to its revocations ([`revocations_to_add`]): its key must be
+/// one of `adding` (a cut comes with the revocation of exactly its key,
+/// never after it), and every name it lists (range prefixes, exact names)
+/// must be in that key's device log ([`device_log_of`]). Needs no key:
+/// a caller checks a cut with it before unlocking the root
+/// ([`bump_context_revoking`] applies the same checks).
+pub fn check_cut(
+    ctx: &SignedTrustContext,
+    adding: &[Name],
+    cut: &RevocationCut,
+) -> Result<(), BumpError> {
+    let key = cut.key();
+    if !adding.contains(key) {
+        if ctx.is_revoked(key) {
+            return Err(BumpError::CutAfterRevocation {
+                key: key.to_string(),
+                namespace: ctx.namespace().to_string(),
+                version: ctx.version(),
+            });
+        }
+        return Err(BumpError::CutOtherKey {
+            key: key.to_string(),
+            revoking: adding.iter().map(Name::to_string).collect(),
+        });
+    }
+    let log = device_log_of(key);
+    let listed = cut.ranges().iter().map(|r| &r.prefix).chain(cut.exact());
+    for name in listed {
+        if !name.has_prefix(&log) {
+            return Err(BumpError::CutOutsideLog {
+                key: key.to_string(),
+                name: name.to_string(),
+                log: log.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Version `N+1` of the held context `held` (its signed Data, version `N`)
-/// with the key names `revoke` added to its revocations, signed by `signer`
+/// with the key names `revoke` added to its revocations, and `cut`, when
+/// given, beside them ([`check_cut`]: the cut of one of the keys this
+/// version adds), signed by `signer`
 /// — the key of an anchor of `held` (the namespace root from its root store,
 /// or any other anchor the held version lists), through its async signing
-/// path, so hardware and custodian signers work. Every other field is carried
-/// over verbatim. The entries are checked as [`revocations_to_add`] does;
+/// path, so hardware and custodian signers work. Every other field — the
+/// cuts of earlier revocations too — is carried over verbatim. The entries
+/// are checked as [`revocations_to_add`] does;
 /// ones already revoked are not repeated, and `Ok(None)` when all of them are
-/// (no new version is needed, nothing is signed). Pure: nothing is adopted,
-/// stored or published.
+/// (no new version is needed, nothing is signed; a cut is then refused, as
+/// its key is revoked already). Pure: nothing is adopted, stored or
+/// published.
 pub async fn bump_context_revoking(
     signer: &dyn Signer,
     held: &Data,
     revoke: &[Name],
+    cut: Option<&RevocationCut>,
 ) -> Result<Option<ContextBump>, BumpError> {
     let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
     ensure_anchor(signer, &ctx)?;
 
     let added = revocations_to_add(&ctx, revoke)?;
+    if let Some(cut) = cut {
+        check_cut(&ctx, &added, cut)?;
+    }
     if added.is_empty() {
         return Ok(None);
     }
@@ -245,11 +392,129 @@ pub async fn bump_context_revoking(
     for name in &added {
         next = next.with_revocation(name.clone());
     }
+    if let Some(cut) = cut {
+        next = next.with_revocation_cut(cut.clone());
+    }
     let data = next.sign_into_data_async(signer).await?;
     Ok(Some(ContextBump {
         context: next,
         data,
         added,
+    }))
+}
+
+/// The cut of `key` in `ctx` and the names of `names` a version after `ctx`
+/// would add to it as exact entries: those it does not accept already,
+/// each once; empty when it accepts all of them. Refused when `key` is not
+/// a key name under the namespace, has no cut (not revoked, or revoked
+/// without one), or a name is not a full name (ending in its implicit
+/// digest) in the key's device log ([`device_log_of`]).
+fn readmission(
+    ctx: &SignedTrustContext,
+    key: &Name,
+    names: &[Name],
+) -> Result<(RevocationCut, Vec<Name>), BumpError> {
+    let namespace = ctx.namespace();
+    if !key.has_prefix(namespace) || key_name_of(key).as_ref() != Some(key) {
+        return Err(BumpError::NotAKeyOfNamespace {
+            name: key.to_string(),
+            namespace: namespace.to_string(),
+        });
+    }
+    let Some(cut) = ctx.revocation_cut(key) else {
+        let revoked = ctx.is_revoked(key);
+        let (key, namespace, version) = (key.to_string(), namespace.to_string(), ctx.version());
+        return Err(if revoked {
+            BumpError::ReadmitRevokedWithoutCut {
+                key,
+                namespace,
+                version,
+            }
+        } else {
+            BumpError::ReadmitNoCut {
+                key,
+                namespace,
+                version,
+            }
+        });
+    };
+    let log = device_log_of(key);
+    let mut added: Vec<Name> = Vec::new();
+    for name in names {
+        let Some((packet, digest)) = split_full_name(name) else {
+            return Err(BumpError::ReadmitNotFullName {
+                key: key.to_string(),
+                name: name.to_string(),
+            });
+        };
+        // The packet's name (without its digest) is an entry below the log.
+        if !packet.has_prefix(&log) || packet.len() <= log.len() {
+            return Err(BumpError::ReadmitOutsideLog {
+                key: key.to_string(),
+                name: name.to_string(),
+                log: log.to_string(),
+            });
+        }
+        if !cut.accepts(&packet, &digest) && !added.contains(name) {
+            added.push(name.clone());
+        }
+    }
+    Ok((cut.clone(), added))
+}
+
+/// The full names of `names` a version after `ctx` would add to the cut of
+/// the revoked key `key` as exact entries (re-admission) — those the cut
+/// does not accept already, each once; empty when it accepts all of them.
+/// Refused when `key` is not a key name under the namespace, has no cut
+/// (not revoked: revoke it with a cut first; revoked without one: nothing
+/// of it can be re-admitted), or a name is not a full name (ending in its
+/// 32-octet implicit digest) of the key's device log ([`device_log_of`]).
+/// Needs no key ([`bump_context_readmitting`] applies the same checks).
+pub fn readmissions_to_add(
+    ctx: &SignedTrustContext,
+    key: &Name,
+    names: &[Name],
+) -> Result<Vec<Name>, BumpError> {
+    readmission(ctx, key, names).map(|(_, added)| added)
+}
+
+/// Version `N+1` of the held context `held` with the full names `names`
+/// added to the cut of the revoked key `key` as exact entries
+/// (re-admission: each accepts one packet, by name and digest; never a
+/// range), signed by `signer`, an anchor key of `held`. Checked as
+/// [`readmissions_to_add`] does; `Ok(None)` when the cut accepts all of
+/// them already (nothing is signed). Every other field — the cut's ranges
+/// and earlier exact entries, the other cuts — is carried over verbatim.
+/// Pure: nothing is adopted, stored or published.
+pub async fn bump_context_readmitting(
+    signer: &dyn Signer,
+    held: &Data,
+    key: &Name,
+    names: &[Name],
+) -> Result<Option<ContextBump>, BumpError> {
+    let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
+    ensure_anchor(signer, &ctx)?;
+    let (mut cut, added) = readmission(&ctx, key, names)?;
+    if added.is_empty() {
+        return Ok(None);
+    }
+    for name in added {
+        cut.readmit(name.clone())
+            .map_err(|_| BumpError::ReadmitNotFullName {
+                key: key.to_string(),
+                name: name.to_string(),
+            })?;
+    }
+
+    let version = next_version(&ctx)?;
+    // `held` verified above, so its Content is present and decodes.
+    let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
+    let next = SignedTrustContext::decode_content(content, version)?.with_revocation_cut(cut);
+    let data = next.sign_into_data_async(signer).await?;
+    Ok(Some(ContextBump {
+        context: next,
+        data,
+        added: Vec::new(),
     }))
 }
 
