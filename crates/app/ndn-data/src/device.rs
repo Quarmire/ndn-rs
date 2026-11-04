@@ -5060,7 +5060,22 @@ impl Inner {
         index: u32,
     ) -> Result<Answer, DataError> {
         let a = self.log_entry(version, false).await;
-        let Got::Version(v) = self.whole(a).await?.got else {
+        // An error about the block names what was asked for: the entry.
+        let asked = |e: DataError| match e {
+            DataError::Expired { keep, .. } => DataError::Expired {
+                name: name.clone(),
+                keep,
+            },
+            DataError::Pruned { by, .. } => DataError::Pruned {
+                name: name.clone(),
+                by,
+            },
+            DataError::NotFound { .. } => DataError::NotFound { name: name.clone() },
+            DataError::Unavailable { .. } => DataError::Unavailable { name: name.clone() },
+            DataError::Sealed { .. } => DataError::Sealed { name: name.clone() },
+            other => other,
+        };
+        let Got::Version(v) = self.whole(a).await.map_err(asked)?.got else {
             return Err(DataError::NotFound { name: name.clone() });
         };
         let entry = entries_of(&v)
