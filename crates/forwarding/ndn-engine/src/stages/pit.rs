@@ -112,6 +112,12 @@ impl PitCheckStage {
             (*interest.name).clone()
         };
         let name_hash = NameHashes::full_name_hash(&key_name);
+        // An Interest by full name (`<N>/sha256digest=<d>`, exact retrieval of
+        // one Data) is matched by the Data's computed full name: let the
+        // match stage know such an entry may be live (see `FULL_NAME_UNTIL`).
+        if !subscription_flavored && ends_in_implicit_digest(&key_name) {
+            note_full_name_interest(now_ns.saturating_add(lifetime_ms.saturating_mul(1_000_000)));
+        }
         // Persistent (SubscriptionRequest) Interests occupy a distinct PIT
         // entry from classical Interests at the same logical name.
         let discriminator = if persistent.is_some() {
@@ -549,6 +555,32 @@ impl PitMatchStage {
                 arrival,
             );
         }
+        // Interests by full name: the Data's name plus its implicit digest
+        // (SHA-256 of its wire), as NFD's findAllDataMatches matches them. The
+        // digest is computed only while such an Interest may be pending.
+        if full_name_interests_may_be_pending(arrival)
+            && let DecodedPacket::Data(data) = &ctx.packet
+        {
+            let full = data_name
+                .as_ref()
+                .clone()
+                .append_implicit_digest(data.implicit_digest());
+            let full_token = PitToken::from_name_hash_keyed(
+                NameHashes::full_name_hash(&full),
+                None,
+                PitKeyDiscriminator::Classical,
+            );
+            self.consume_entry(
+                &full_token,
+                false,
+                &mut faces,
+                &mut tokens,
+                &mut seen,
+                &mut fan_out,
+                record.then_some(&mut interests),
+                arrival,
+            );
+        }
 
         // CanBePrefix walk: at each shorter prefix only CanBePrefix in-records
         // participate.
@@ -803,6 +835,30 @@ fn strip_digest_components(name: &ndn_packet::Name) -> ndn_packet::Name {
     } else {
         name.clone()
     }
+}
+
+/// Whether `name` ends in an ImplicitSha256DigestComponent (0x01).
+fn ends_in_implicit_digest(name: &ndn_packet::Name) -> bool {
+    name.components()
+        .last()
+        .is_some_and(|c| c.typ == ndn_packet::tlv_type::IMPLICIT_SHA256)
+}
+
+/// The latest deadline (ns, the arrival clock of the engine that set it) of
+/// any Interest by full name a PIT check admitted in this process, so the
+/// match stage hashes a Data's wire for its full name only while such an
+/// entry may be live — not for every Data. Process-wide and only ever
+/// raised: it over-approximates (several engines, or several clocks under
+/// simulation, only make it hash more often), never under-approximates,
+/// since every full-name entry's deadline was noted here when it was set.
+static FULL_NAME_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_full_name_interest(deadline: u64) {
+    FULL_NAME_UNTIL.fetch_max(deadline, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn full_name_interests_may_be_pending(arrival: u64) -> bool {
+    arrival <= FULL_NAME_UNTIL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1116,6 +1172,53 @@ mod n06_dead_nonce_engine_tests {
             matches!(replay, Action::Drop(DropReason::LoopDetected)),
             "same name+nonce after PIT erasure must hit the DeadNonceList"
         );
+    }
+
+    /// An Interest by full name (`<N>/<implicit digest>`) is satisfied by the
+    /// Data whose wire hashes to that digest, and only by it.
+    #[tokio::test]
+    async fn an_interest_by_full_name_is_satisfied_by_exactly_that_data() {
+        let pit = Arc::new(Pit::new());
+        let check = PitCheckStage {
+            pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
+            dead_nonce_list: None,
+            validator: None,
+            replay_guard: None,
+        };
+        let match_stage = PitMatchStage {
+            pit: Arc::clone(&pit),
+            dead_nonce_list: None,
+        };
+        let name: Name = "/audit/full-name/seq=3".parse().unwrap();
+        let wanted = encode_data_unsigned(&name, b"honest");
+        let digest = Data::decode(wanted.clone()).unwrap().implicit_digest();
+        let full = name.clone().append_implicit_digest(digest);
+        let interest_wire = InterestBuilder::new(full).build();
+        assert!(matches!(
+            check.process(interest_ctx(interest_wire, FaceId(1))).await,
+            Action::Continue(_)
+        ));
+
+        let other = match_stage.process(data_ctx_of(encode_data_unsigned(&name, b"other")));
+        assert!(
+            !matches!(&other, Action::Continue(c) if !c.out_faces.is_empty()),
+            "other bytes at the same name do not satisfy it"
+        );
+        assert!(!pit.is_empty(), "the entry still waits");
+
+        match match_stage.process(data_ctx_of(wanted)) {
+            Action::Continue(ctx) => assert_eq!(ctx.out_faces.as_slice(), [FaceId(1)]),
+            _ => panic!("the Data with that digest must satisfy the Interest"),
+        }
+        assert!(pit.is_empty(), "satisfaction erases the entry");
+    }
+
+    fn data_ctx_of(wire: Bytes) -> PacketContext {
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(99), 0);
+        ctx.packet = DecodedPacket::Data(Box::new(data));
+        ctx
     }
 }
 
