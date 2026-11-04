@@ -5478,11 +5478,30 @@ fn judge(answer: Option<Option<AuditAnswer>>, digest: &[u8; 32]) -> Judged {
 impl Inner {
     // ---- large payloads -----------------------------------------------------------------------
 
-    /// The holder devices whose live leases this device counts for `c`
-    /// ([`Self::live_leases`]), by name: where pieces are fetched from by
-    /// forwarding hint when their writer no longer serves them.
+    /// The holder devices to fetch `c`'s packets from by `32=held` when
+    /// their writer does not answer: every other device whose lease answers
+    /// a hold record held here that names it, live by its own signed date
+    /// (capped by keep by its holder) on this device's clock. Unlike the
+    /// leases counted for custody ([`Self::live_leases`]) this needs no
+    /// version's keep known here: a reader that holds little of `c` (a
+    /// range read, a one-key `get`) still finds the holders, and everything
+    /// fetched from them is verified as from anywhere else.
     fn holders_of(&self, st: &St, c: &Name) -> Vec<Name> {
-        self.live_leases(st, c)
+        let now = (self.config.clock)();
+        let Some(coll) = st.colls.get(c) else {
+            return Vec::new();
+        };
+        coll.leases
+            .iter()
+            .filter(|(d, l)| {
+                **d != self.device
+                    && l.body.until > now
+                    && coll.holds.values().any(|(_, n, h)| {
+                        *n == l.body.hold && h.holders.contains(d) && l.body.until <= h.until
+                    })
+            })
+            .map(|(d, _)| d.clone())
+            .collect()
     }
 
     /// Fetch `name`, another device's packet, from `holder`, which keeps
