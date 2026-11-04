@@ -16,7 +16,9 @@ pub mod challenge;
 pub mod client;
 pub mod context_store;
 pub mod context_update;
+pub mod cut_file;
 pub mod ecdh;
+pub mod ending;
 pub mod enroll_target;
 pub mod error;
 pub mod invite;
@@ -63,19 +65,23 @@ pub use challenge::yubikey::YubikeyHotpChallenge;
 pub use challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState};
 pub use client::{CaExchange, ChallengeExchange, ChallengeRound, EnrollmentSession};
 pub use context_store::{
-    ContextStoreError, adopt_envelope_into_store, context_file_path, context_version_path,
-    context_versions_dir, load_persisted_contexts, persist_context, read_stored_context,
+    ContextStoreError, StoredCutManifestPacket, adopt_envelope_into_store, context_file_path,
+    context_version_path, context_versions_dir, cut_manifests_dir, load_persisted_contexts,
+    persist_context, persist_cut_manifest_packet, read_cut_manifest_packets, read_stored_context,
     read_stored_contexts, read_stored_versions, remove_stored_context,
 };
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
-    UpdateRefusal, VersionSource, bump_context_readmitting, bump_context_revoking,
-    bump_context_schema, check_cut, device_log_of, follow_versions, key_name_of, link_narrowing,
-    open_context_update, readmissions_to_add, refresh_context, relay_narrowing, revocations_to_add,
-    schema_change, split_full_name,
+    UpdateRefusal, VersionSource, bump_context_data_requires_cut, bump_context_readmitting,
+    bump_context_revoking, bump_context_schema, check_cut, check_cuts, device_log_of,
+    follow_versions, key_name_of, link_narrowing, open_context_update, orphan_cuts,
+    readmissions_to_add, refresh_context, relay_narrowing, revocations_to_add, schema_change,
+    split_full_name,
 };
+pub use cut_file::{CutFile, CutFileError};
 pub use ecdh::{EcdhKeypair, SessionKey};
+pub use ending::{Ending, EndingKey, ending_keys};
 pub use enroll_target::{EnrollTarget, EnrollTargetError};
 pub use error::CertError;
 pub use invite::{
@@ -111,7 +117,7 @@ pub use protocol::{
     NewResponse, ProbeResponse, RevokeRequest, RevokeResponse, RevokeStatus,
 };
 pub use recovery::{
-    CutKeyCertificates, FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError,
+    CutKeyCertificates, DroppedCut, FileKit, KitFormat, OldRoot, RecoveredNamespace, RecoveryError,
     RecoveryPlan, RecoverySeed, RecoveryVersion, YubikeyKit, add_recovery_anchor, kit_anchor,
     recertify_cut_keys, recertify_cut_keys_in_pib, recover_namespace_in_pib, recovery_anchor,
     recovery_key_name, recovery_version, reissue_version, remove_recovery_anchor, seal_file_kit,
@@ -119,7 +125,7 @@ pub use recovery::{
 pub use renewal::{
     RENEWAL_CHALLENGE, RenewalError, issuing_ca_prefix, renew_certificate, renewal_proof_message,
 };
-pub use revocation::{RevocationError, RevocationPlan, keys_to_revoke, plan_revocation};
+pub use revocation::{GivenCut, RevocationError, RevocationPlan, keys_to_revoke, plan_revocation};
 pub use roles::{NamespaceSchema, Role, RoleError, namespace_schema};
 pub use root_device::{
     RootDevice, RootDeviceError, held_context, kit_namespace, root_device, root_device_covering,

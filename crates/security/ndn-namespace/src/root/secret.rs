@@ -64,6 +64,11 @@ pub enum VersionChange {
     UpdateSchema { namespace: Name },
     /// Re-admitting single packets of the key `key`, revoked with a cut.
     Readmit { key: Name },
+    /// Ending the keys of `namespace` whose authority over Data ended.
+    EndKeys { namespace: Name },
+    /// Setting which device roles of `namespace` sign Data accepted only
+    /// while a certificate is valid, or under a cut (DataRequiresCut).
+    DataRequiresCut { namespace: Name },
 }
 
 /// What a secret is asked for.

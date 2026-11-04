@@ -72,6 +72,7 @@
 pub mod admin;
 pub mod approval_wait;
 pub mod approver;
+pub mod cut_manifests;
 pub mod enroll;
 mod events;
 pub mod host;

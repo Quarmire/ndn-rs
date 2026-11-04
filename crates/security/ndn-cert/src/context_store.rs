@@ -5,7 +5,14 @@
 //! ```text
 //! <pib_root>/contexts/<hex(namespace URI)>.tc               # the newest version held
 //! <pib_root>/contexts/<hex(namespace URI)>.versions/<N>.tc  # every version held, by version
+//! <pib_root>/contexts/<hex(namespace URI)>.cuts/<hex(d)>.data  # cut manifest packets, by digest
 //! ```
+//!
+//! The cut manifest packets are those of the namespace's revocation cuts
+//! (each cut names its manifest's root packet by full name): kept and
+//! served by every node that keeps the namespace's contexts, so a reader can
+//! fetch them by full name. They are self-certifying: a file whose bytes do
+//! not hash to its name is refused ([`read_cut_manifest_packets`]).
 //!
 //! Each file is the SIGNED context Data wire exactly as it was verified on
 //! adoption. The newest file is what a node loads into its keyring at start
@@ -141,8 +148,9 @@ pub fn persist_context(
 }
 
 /// Forget everything stored for `namespace` under `pib_root`: its newest
-/// file and every version (`ndn-fwd init --force` replacing a namespace
-/// with a new root). Nothing stored is not an error.
+/// file, every version and the cut manifest packets (`ndn-fwd init
+/// --force` replacing a namespace with a new root). Nothing stored is not
+/// an error.
 pub fn remove_stored_context(pib_root: &Path, namespace: &Name) -> Result<(), ContextStoreError> {
     let io = |path: PathBuf| move |source| ContextStoreError::Io { path, source };
     let newest = context_file_path(pib_root, namespace);
@@ -150,11 +158,116 @@ pub fn remove_stored_context(pib_root: &Path, namespace: &Name) -> Result<(), Co
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(newest)(e)),
         _ => {}
     }
-    let versions = context_versions_dir(pib_root, namespace);
-    match std::fs::remove_dir_all(&versions) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(versions)(e)),
-        _ => Ok(()),
+    for dir in [
+        context_versions_dir(pib_root, namespace),
+        cut_manifests_dir(pib_root, namespace),
+    ] {
+        match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(dir)(e)),
+            _ => {}
+        }
     }
+    Ok(())
+}
+
+/// `<pib_root>/contexts/<hex of the namespace URI>.cuts`: the packets of
+/// the cut manifests of the namespace's revocation cuts, one file each,
+/// named by the hex of the packet's implicit digest (SHA-256 of its wire).
+pub fn cut_manifests_dir(pib_root: &Path, namespace: &Name) -> PathBuf {
+    let stem = namespace_hex(namespace);
+    pib_root
+        .join(CONTEXTS_DIR)
+        .join(format!("{stem}.{CUT_MANIFESTS_DIR_EXT}"))
+}
+
+/// Extension of the directory beside a namespace's newest file that holds
+/// its cut manifest packets.
+pub const CUT_MANIFESTS_DIR_EXT: &str = "cuts";
+
+/// Keep the cut manifest packet `wire` (a Data wire) of `namespace` under
+/// `pib_root`, named by its implicit digest; storing it again changes
+/// nothing. Atomic and owner-only like the context files. Returns where it
+/// is kept.
+pub fn persist_cut_manifest_packet(
+    pib_root: &Path,
+    namespace: &Name,
+    wire: &Bytes,
+) -> Result<PathBuf, ContextStoreError> {
+    let dir = cut_manifests_dir(pib_root, namespace);
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ContextStoreError::Io { path, source }
+    };
+    Data::decode(wire.clone()).map_err(|e| ContextStoreError::BadData {
+        path: dir.clone(),
+        reason: e.to_string(),
+    })?;
+    ndn_security::secure_fs::create_private_dir_all(&dir).map_err(io(&dir))?;
+    let path = dir.join(format!("{}.data", digest_hex(wire)));
+    if !path.exists() {
+        ndn_security::secure_fs::write_private(&path, wire).map_err(io(&path))?;
+    }
+    Ok(path)
+}
+
+/// One stored cut manifest packet: its file, and its bytes or why that
+/// file is refused ([`read_cut_manifest_packets`]).
+pub type StoredCutManifestPacket = (PathBuf, Result<Bytes, ContextStoreError>);
+
+/// Every cut manifest packet stored for `namespace` under `pib_root`, each
+/// with its file, or why that file is refused (not a Data packet, or its
+/// bytes do not hash to its name). A missing directory holds none.
+pub fn read_cut_manifest_packets(
+    pib_root: &Path,
+    namespace: &Name,
+) -> Result<Vec<StoredCutManifestPacket>, ContextStoreError> {
+    let dir = cut_manifests_dir(pib_root, namespace);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ContextStoreError::Io { path: dir, source }),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "data"))
+        .collect();
+    paths.sort();
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let read = std::fs::read(&path)
+                .map_err(|source| ContextStoreError::Io {
+                    path: path.clone(),
+                    source,
+                })
+                .and_then(|wire| {
+                    let wire = Bytes::from(wire);
+                    let named =
+                        path.file_stem().and_then(|s| s.to_str()) == Some(&digest_hex(&wire));
+                    match Data::decode(wire.clone()) {
+                        Ok(_) if named => Ok(wire),
+                        Ok(_) => Err(ContextStoreError::BadData {
+                            path: path.clone(),
+                            reason: "its bytes do not hash to its file name".to_owned(),
+                        }),
+                        Err(e) => Err(ContextStoreError::BadData {
+                            path: path.clone(),
+                            reason: e.to_string(),
+                        }),
+                    }
+                });
+            (path, read)
+        })
+        .collect())
+}
+
+/// Lowercase hex of the SHA-256 of `wire` (a packet's implicit digest).
+fn digest_hex(wire: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(wire)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// One persisted context file adopted, or why it was refused.

@@ -47,7 +47,7 @@ async fn bump(
 ) -> Result<Option<ContextBump>, BumpError> {
     let store = RootStore::open(pib).unwrap().expect("a root device");
     let signer = store.signer(None).await.unwrap();
-    bump_context_revoking(signer.as_ref(), held, revoke, None).await
+    bump_context_revoking(signer.as_ref(), held, revoke, &[]).await
 }
 
 /// An in-memory upstream: answers an Interest whose name equals a
@@ -194,7 +194,7 @@ async fn revoked_key_is_refused_once_the_bumped_context_is_held() {
     // Old and new Data of the revoked key are refused now; nothing else is.
     for suffix in ["before", "after"] {
         match validate(&relay_validator, &device_data(&pib, &root, suffix)) {
-            ValidationResult::Invalid(TrustError::Revoked { name }) => {
+            ValidationResult::Invalid(TrustError::Revoked { name, .. }) => {
                 assert_eq!(name, root.device_key.to_string())
             }
             other => panic!("revoked key's Data accepted: {other:?}"),
@@ -413,7 +413,7 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
             device.as_ref(),
             held,
             std::slice::from_ref(&root.device_key),
-            None,
+            &[],
         )
         .await,
         Err(BumpError::NotAnAnchor { .. })
@@ -426,7 +426,7 @@ async fn only_the_root_key_bumps_and_never_against_the_root() {
             forged.as_ref(),
             held,
             std::slice::from_ref(&root.device_key),
-            None,
+            &[],
         )
         .await,
         Err(BumpError::NotAnAnchor { .. })

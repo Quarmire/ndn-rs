@@ -740,6 +740,16 @@ mod tests {
         fn holds_root_key(&self, ctx: &SignedTrustContext) -> bool {
             self.inner.holds_root_key(ctx)
         }
+        fn persist_cut_manifest(
+            &self,
+            namespace: &Name,
+            wire: &bytes::Bytes,
+        ) -> Result<String, String> {
+            self.inner.persist_cut_manifest(namespace, wire)
+        }
+        fn stored_cut_manifests(&self, namespace: &Name) -> Result<Vec<bytes::Bytes>, String> {
+            self.inner.stored_cut_manifests(namespace)
+        }
     }
 
     fn store(dir: &std::path::Path, refuse: bool) -> CountingStore {

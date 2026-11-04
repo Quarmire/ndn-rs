@@ -51,6 +51,15 @@ pub trait ContextStore: Send + Sync {
     /// versions are made, and never fetches them. Public keys only; the
     /// root key stays locked.
     fn holds_root_key(&self, ctx: &SignedTrustContext) -> bool;
+
+    /// Keep the cut manifest packet `wire` (a Data wire, self-certifying:
+    /// fetched by its full name) of `namespace`'s revocation cuts, so the
+    /// device serves it with the versions it keeps. Storing it again
+    /// changes nothing. Returns where it is kept.
+    fn persist_cut_manifest(&self, namespace: &Name, wire: &Bytes) -> Result<String, String>;
+
+    /// Every cut manifest packet kept for `namespace` (Data wires).
+    fn stored_cut_manifests(&self, namespace: &Name) -> Result<Vec<Bytes>, String>;
 }
 
 /// A [`ContextStore`] beside a PIB: `<pib>/contexts/`
@@ -122,6 +131,32 @@ impl ContextStore for PibContextStore {
             return false;
         };
         RootStore::any_holds_anchor_of(&pib, ctx).unwrap_or(false)
+    }
+
+    fn persist_cut_manifest(&self, namespace: &Name, wire: &Bytes) -> Result<String, String> {
+        ndn_cert::persist_cut_manifest_packet(&self.root, namespace, wire)
+            .map(|path| path.display().to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    fn stored_cut_manifests(&self, namespace: &Name) -> Result<Vec<Bytes>, String> {
+        let read = ndn_cert::read_cut_manifest_packets(&self.root, namespace)
+            .map_err(|e| e.to_string())?;
+        Ok(read
+            .into_iter()
+            .filter_map(|(path, packet)| match packet {
+                Ok(wire) => Some(wire),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "security",
+                        path = %path.display(),
+                        error = %e,
+                        "not serving stored cut manifest packet"
+                    );
+                    None
+                }
+            })
+            .collect())
     }
 }
 

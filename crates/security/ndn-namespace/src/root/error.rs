@@ -527,6 +527,69 @@ fn bump_refusal(e: &BumpError) -> RootError {
         .with("name", name)
         .with("log", log)
         .with("error", e),
+        E::CutWithoutManifest { key } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut lists ranges but no manifest of their entries' digests; nothing was signed",
+        )
+        .with("key", key)
+        .with("why", "no-manifest")
+        .with("error", e),
+        E::CutWithoutKeyDigest { key } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut names no public key (CutKeyDigest); nothing was signed",
+        )
+        .with("key", key)
+        .with("why", "no-key-digest")
+        .with("error", e),
+        E::DuplicateCut { key } => RootError::new(
+            code::CUT_REFUSED,
+            "two cuts are given for one key; nothing was signed",
+        )
+        .with("key", key)
+        .with("why", "duplicate")
+        .with("error", e),
+        E::OrphanCut {
+            key,
+            namespace,
+            version,
+        } => RootError::new(
+            code::CUT_REFUSED,
+            "the held version holds a cut for the key that no revocation names; revoke it with \
+             its own cut. Nothing was signed",
+        )
+        .with("key", key)
+        .with("namespace", namespace)
+        .with("version", version)
+        .with("why", "orphan-cut")
+        .with("error", e),
+        E::CutUnbounded { key } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut file records no time bound; nothing was signed",
+        )
+        .with("key", key)
+        .with("why", "unbounded")
+        .with("error", e),
+        E::CutAfterLoss {
+            key,
+            held_before,
+            lost,
+        } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut file keeps entries first verified after the loss time; nothing was signed",
+        )
+        .with("key", key)
+        .with("held_before", held_before)
+        .with("lost", lost)
+        .with("why", "after-loss")
+        .with("error", e),
+        E::CutManifestIncomplete { key, reason } => RootError::new(
+            code::CUT_REFUSED,
+            "the cut file does not carry the cut's whole manifest; nothing was signed",
+        )
+        .with("key", key)
+        .with("reason", reason)
+        .with("why", "manifest-incomplete")
+        .with("error", e),
         E::ReadmitNoCut {
             key,
             namespace,

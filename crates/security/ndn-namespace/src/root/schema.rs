@@ -14,14 +14,20 @@
 //!   does: a revocation or a recovery kit carries the schema over verbatim.
 //!   It never narrows silently: a rule of the held schema missing from the
 //!   new one is refused (`schema-narrowing`) unless narrowing is accepted.
+//! - [`parse_data_requires_cut`] / [`plan_data_requires_cut`] /
+//!   [`set_data_requires_cut`]: version `N+1` listing exactly the device
+//!   roles given in DataRequiresCut
+//!   ([`ndn_cert::bump_context_data_requires_cut`]): Data a key of a listed
+//!   role signs is accepted only while a certificate of the key is valid by
+//!   the reader's clock, or once the key is revoked with a cut.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ndn_cert::report::code;
 use ndn_cert::{
-    ApprovalPolicy, PolicyInput, RootDevice, SchemaChange, SchemaPlanError, SchemaUpdatePlan,
-    bump_context_schema, load_persisted_contexts,
+    ApprovalPolicy, PolicyInput, Role, RootDevice, SchemaChange, SchemaPlanError, SchemaUpdatePlan,
+    bump_context_data_requires_cut, bump_context_schema, load_persisted_contexts,
 };
 use ndn_packet::Name;
 use ndn_security::{
@@ -360,6 +366,146 @@ pub async fn update(
         root_key: root.store.key_name().clone(),
         change: signed.change,
         policy: plan.policy,
+        handed_over,
+    })
+}
+
+/// The device roles `text` names for DataRequiresCut: comma-separated role
+/// names (`guest`, `guest,member`), or `none` for no role
+/// (`root-bad-request`, params `role` and `error`, for a name that is no
+/// device role).
+pub fn parse_data_requires_cut(text: &str) -> Result<Vec<Role>, RootError> {
+    let text = text.trim();
+    if text == "none" {
+        return Ok(Vec::new());
+    }
+    let mut roles: Vec<Role> = Vec::new();
+    for word in text.split(',').map(str::trim) {
+        let role: Role = word.parse().map_err(|e: ndn_cert::RoleError| {
+            RootError::new(
+                code::ROOT_BAD_REQUEST,
+                "that is no device role: name roles among admin, member, node and guest, \
+                 separated by commas, or `none`",
+            )
+            .with("role", word)
+            .with("error", e)
+        })?;
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    Ok(roles)
+}
+
+/// What setting the DataRequiresCut roles of a namespace signs, decided
+/// before the root is unlocked ([`plan_data_requires_cut`]).
+pub struct DataRequiresCutPlan {
+    pub root: RootDevice,
+    /// The roles the next version lists.
+    pub roles: Vec<Role>,
+    /// The roles the held version lists, sorted.
+    pub before: Vec<String>,
+    /// The roles the next version lists, sorted.
+    pub after: Vec<String>,
+}
+
+impl DataRequiresCutPlan {
+    /// Whether the next version would list the same roles: nothing to sign.
+    pub fn is_unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
+/// Plan listing exactly `roles` in the DataRequiresCut of the namespace
+/// whose root device is `root` ([`root_of`]). A key of a listed role signs
+/// Data accepted only while a certificate of the key is valid by the
+/// reader's clock, or once the key is revoked with a cut that accepts it;
+/// a listed role's lapsed keys are ended by the root ([`super::end_keys`]).
+pub fn plan_data_requires_cut(root: RootDevice, roles: &[Role]) -> DataRequiresCutPlan {
+    let before = root.context.data_requires_cut().to_vec();
+    let mut after: Vec<String> = roles.iter().map(|r| r.as_str().to_string()).collect();
+    after.sort();
+    after.dedup();
+    DataRequiresCutPlan {
+        root,
+        roles: roles.to_vec(),
+        before,
+        after,
+    }
+}
+
+/// DataRequiresCut set in a version signed and handed over.
+pub struct DataRequiresCutSet {
+    pub namespace: Name,
+    pub held_version: u64,
+    pub version: u64,
+    pub root_key: Name,
+    /// The roles the held version listed.
+    pub before: Vec<String>,
+    /// The roles the new version lists.
+    pub after: Vec<String>,
+    pub handed_over: HandedOver,
+}
+
+/// Sign and hand over the DataRequiresCut roles `plan` lists (on the PIB at
+/// `pib_dir`) with [`ndn_cert::bump_context_data_requires_cut`]. Refusals:
+/// `nothing-to-sign` (the held version lists those roles already), the
+/// running device's (before the root is unlocked), the secret's and
+/// `root-not-unlocked`, `signer-not-an-anchor`, `version-not-taken`,
+/// `hand-over-unknown` (param `namespace`).
+pub async fn set_data_requires_cut(
+    plan: DataRequiresCutPlan,
+    pib_dir: &Path,
+    device: &dyn RunningDevice,
+    secrets: &dyn SecretSource,
+) -> Result<DataRequiresCutSet, RootError> {
+    let DataRequiresCutPlan {
+        root,
+        roles,
+        before,
+        after,
+    } = plan;
+    let held_version = root.context.version();
+    let namespace = root.context.namespace().clone();
+    let nothing = || {
+        RootError::new(
+            code::NOTHING_TO_SIGN,
+            "the held trust context lists these roles in DataRequiresCut already; nothing was \
+             signed",
+        )
+        .with("version", held_version)
+        .with("roles", after.join(","))
+    };
+    if before == after {
+        return Err(nothing());
+    }
+    check_device(device, pib_dir).await?;
+    let signer = unlock_root(
+        &root.store,
+        secrets,
+        VersionChange::DataRequiresCut {
+            namespace: namespace.clone(),
+        },
+    )
+    .await?;
+    let bump = bump_context_data_requires_cut(signer.as_ref(), &root.data, &roles).await;
+    // The root signed its one version: drop it now.
+    drop(signer);
+    let bump = bump?.ok_or_else(nothing)?;
+    let version = bump.context.version();
+    let handed_over = settle(
+        hand_over(device, pib_dir, &bump).await,
+        version,
+        held_version,
+        &[("namespace", namespace.to_string())],
+    )?;
+    Ok(DataRequiresCutSet {
+        namespace,
+        held_version,
+        version,
+        root_key: root.store.key_name().clone(),
+        before,
+        after,
         handed_over,
     })
 }

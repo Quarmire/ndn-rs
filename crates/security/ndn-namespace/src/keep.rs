@@ -167,14 +167,14 @@ pub fn keep(
     let ca = p
         .ca_for(ctx.namespace())
         .and_then(|ca| ca.follow_context(ctx));
-    // The version holds for this run whether or not it is stored: the host
-    // is told of it, and of what it changes about the device's membership,
-    // now.
+    // Stored first, then told: a host that follows the stored versions on
+    // the `context-updated` event finds the version on disk when it is told
+    // of it. The version holds for this run whether or not it is stored:
+    // the host is told of it, and of what it changes about the device's
+    // membership, either way.
+    let stored = store_and_publish(p, ctx, data);
     crate::membership::kept(p, ctx, how);
-    Ok(Kept {
-        stored: store_and_publish(p, ctx, data),
-        ca,
-    })
+    Ok(Kept { stored, ca })
 }
 
 /// Store and publish `ctx` (signed Data `data`), a version this device went
@@ -217,6 +217,9 @@ fn store_and_publish(
     if let Some(sync) = p.sync() {
         sync.kept(ctx, data);
     }
+    // The manifests of its cuts: served from the store, the missing ones
+    // fetched by full name.
+    crate::cut_manifests::keep(p.engine(), &p.store, p.publisher(), ctx);
     Ok(stored)
 }
 

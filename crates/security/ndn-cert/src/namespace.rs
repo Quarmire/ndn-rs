@@ -194,6 +194,9 @@ async fn build_namespace(
     for key in root_device_keys {
         context = context.with_key_role(KeyRole::ROOT_DEVICE, key.clone());
     }
+    for role in Role::DATA_REQUIRES_CUT {
+        context = context.with_data_requires_cut(role.as_str());
+    }
     context.add_anchor(anchor.clone());
     let context_data = context.sign_into_data_async(signer.as_ref()).await?;
     let context = Arc::new(context);

@@ -642,7 +642,7 @@ async fn a_node_offline_across_a_recovery_catches_up_version_by_version() {
     let n1 = &recovered.version.bump.data;
     let n2 = &recovered.root_version.data;
     let revoked = n("/home/bob/member/phone/KEY/k1");
-    let n3 = bump_context_revoking(new_root.as_ref(), n2, std::slice::from_ref(&revoked), None)
+    let n3 = bump_context_revoking(new_root.as_ref(), n2, std::slice::from_ref(&revoked), &[])
         .await
         .unwrap()
         .unwrap()

@@ -79,6 +79,18 @@ pub enum Role {
 impl Role {
     pub const ALL: [Role; 4] = [Role::Admin, Role::Member, Role::Node, Role::Guest];
 
+    /// The roles a namespace `ndn-fwd init` makes lists in its trust
+    /// context's `DataRequiresCut`: Data a key of such a role signs is
+    /// accepted only while a certificate of the key is valid by the
+    /// reader's clock, or once the key is revoked with a cut that accepts
+    /// it. `guest` only: a guest does not renew, and its short certificate
+    /// is what ends its access (the root then ends its key with a cut,
+    /// [`crate::ending_keys`]). `admin`, `member` and `node` renew before
+    /// their certificates expire, so their Data never waits for a cut; an
+    /// owner may list any role (`ndn-fwd schema data-requires-cut`,
+    /// [`crate::bump_context_data_requires_cut`]).
+    pub const DATA_REQUIRES_CUT: [Role; 1] = [Role::Guest];
+
     /// The name component naming this role (`admin`, `member`, …).
     pub fn as_str(self) -> &'static str {
         match self {

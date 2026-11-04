@@ -28,6 +28,9 @@ ndn-mgmt-wire = { workspace = true }
 ndn-ipc       = { workspace = true }
 serde_json    = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
+# When an owner says a key was lost (`root::revoke::parse_when`): RFC 3339
+# or "<duration> ago", as every host reads it.
+humantime     = "2"
 tokio         = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util    = { workspace = true }
 tracing       = { workspace = true }

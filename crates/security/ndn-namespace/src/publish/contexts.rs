@@ -64,6 +64,9 @@ struct Published {
     metadata: Bytes,
     /// Every version held, by version: the stored signed Data, verbatim.
     versions: BTreeMap<u64, Bytes>,
+    /// The cut manifest packets of the namespace's cuts, by full name
+    /// (name + implicit digest), verbatim.
+    manifests: HashMap<Name, Bytes>,
 }
 
 impl Published {
@@ -74,6 +77,7 @@ impl Published {
             newest: ctx.version(),
             metadata: metadata_data(ctx.namespace(), &ctx.rdr_name(), ctx.version()),
             versions: BTreeMap::from([(ctx.version(), data.raw().clone())]),
+            manifests: HashMap::new(),
         }
     }
 
@@ -85,6 +89,23 @@ impl Published {
             self.newest = ctx.version();
             self.metadata = metadata_data(ctx.namespace(), &ctx.rdr_name(), ctx.version());
         }
+    }
+
+    /// Serve the cut manifest packet `wire` too, by its name and by its
+    /// full name; one under another prefix than the namespace's
+    /// trust-context prefix, or not a Data packet, is not served.
+    fn add_manifest(&mut self, wire: &Bytes) -> bool {
+        let Ok(data) = Data::decode(wire.clone()) else {
+            return false;
+        };
+        if !data.name.has_prefix(&self.prefix) {
+            return false;
+        }
+        let full = (*data.name)
+            .clone()
+            .append_implicit_digest(data.implicit_digest());
+        self.manifests.insert(full, wire.clone());
+        true
     }
 
     /// `<ns>/32=trust-context/v=<newest>`.
@@ -147,6 +168,14 @@ pub fn prepare(store: &dyn ContextStore, face_id: FaceId) -> (InProcFace, Contex
             }
             Err(e) => not_published(&store.location(), &e),
         }
+        match store.stored_cut_manifests(ctx.namespace()) {
+            Ok(packets) => {
+                for wire in &packets {
+                    published.add_manifest(wire);
+                }
+            }
+            Err(e) => not_published(&store.location(), &e),
+        }
         contexts.push(published);
     }
     if contexts.is_empty() {
@@ -201,10 +230,24 @@ fn answer<'a>(contexts: &'a [Published], name: &Name) -> Option<&'a Bytes> {
         if *name == c.metadata_name {
             return Some(&c.metadata);
         }
+        if !name.has_prefix(&c.prefix) {
+            return None;
+        }
+        // A cut manifest packet, by full name, or by name.
+        if let Some(wire) = c.manifests.get(name) {
+            return Some(wire);
+        }
+        if let Some((_, wire)) = c
+            .manifests
+            .iter()
+            .find(|(full, _)| full.len() == name.len() + 1 && full.has_prefix(name))
+        {
+            return Some(wire);
+        }
         // Exactly `<ns>/32=trust-context/v=<N>`, the version in canonical
         // (shortest) form: the stored Data's name, never a different
         // encoding of the same number.
-        if name.len() != c.prefix.len() + 1 || !name.has_prefix(&c.prefix) {
+        if name.len() != c.prefix.len() + 1 {
             return None;
         }
         let last = name.components().last()?;
@@ -338,6 +381,30 @@ impl PublishedContexts {
         if newest_changed {
             forget_cached_metadata(&self.engine, ctx.namespace());
         }
+    }
+
+    /// Serve the cut manifest packets `packets` (Data wires) of
+    /// `namespace`, by name and by full name, beside its versions. Nothing
+    /// is served for a namespace this publisher does not publish (its
+    /// packets are served once a version of it is, from the store).
+    /// Returns how many packets are newly served.
+    pub fn publish_cut_manifests(&self, namespace: &Name, packets: &[Bytes]) -> usize {
+        let prefix = ndn_cert::rdr_prefix(namespace);
+        let mut list = self
+            .list
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = list.to_vec();
+        let Some(entry) = next.iter_mut().find(|c| c.prefix == prefix) else {
+            return 0;
+        };
+        let before = entry.manifests.len();
+        for wire in packets {
+            entry.add_manifest(wire);
+        }
+        let added = entry.manifests.len() - before;
+        *list = Arc::new(next);
+        added
     }
 
     /// While the returned guard lives, Interests under `namespace`'s

@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use ndn_packet::Name;
 use ndn_security::{FilePib, RevocationCut};
 
-use crate::context_update::{BumpError, check_cut, key_name_of, revocations_to_add};
+use crate::context_update::{BumpError, check_cuts, key_name_of, revocations_to_add};
+use crate::cut_file::CutFile;
 use crate::error::CertError;
 use crate::namespace::ca_dir;
 use crate::root_device::{RootDevice, RootDeviceError, root_device_covering};
@@ -72,8 +73,20 @@ pub struct RevocationPlan {
     pub keys: Vec<Name>,
     /// Those the held version does not revoke yet; empty when it revokes all.
     pub adding: Vec<Name>,
-    /// The revocation cut signed beside them: the cut of one of `adding`.
-    pub cut: Option<RevocationCut>,
+    /// The revocation cut signed beside them (the cut of one of `adding`),
+    /// as its device wrote it: with its bound, the entries it left out and
+    /// the cut manifest's packets, which the root publishes with the
+    /// version.
+    pub cut: Option<CutFile>,
+}
+
+/// A cut file given with a revocation, and when the owner says the key was
+/// lost (ms since the Unix epoch): the cut may hold only entries its device
+/// first verified before then ([`CutFile::check_bound`]).
+#[derive(Debug, Clone)]
+pub struct GivenCut {
+    pub file: CutFile,
+    pub lost: u64,
 }
 
 /// The key names `name` designates: itself (or the key of a certificate
@@ -122,12 +135,15 @@ pub fn keys_to_revoke(
 /// Every check of a revocation of `name` that needs no key: `pib` is the
 /// root device of a namespace containing `name`, and `name` designates
 /// keys that may be revoked — never the root's nor the CA's — and `cut`,
-/// when given, is the cut of one of the keys the revocation adds
-/// ([`check_cut`]).
+/// when given, is bounded at or before the loss time
+/// ([`CutFile::check_bound`]), carries its whole manifest
+/// ([`CutFile::check_manifest`]) and is the cut of one of the keys the
+/// revocation adds ([`check_cuts`]; also: a key the held version holds an
+/// orphan cut for is revoked only with its own cut).
 pub fn plan_revocation(
     pib: &FilePib,
     name: &Name,
-    cut: Option<RevocationCut>,
+    cut: Option<GivenCut>,
 ) -> Result<RevocationPlan, RevocationError> {
     let Some(root) = root_device_covering(pib, name, "devices are revoked")? else {
         return Err(RevocationError::OutsideNamespace {
@@ -148,14 +164,20 @@ pub fn plan_revocation(
     }
     let keys = keys_to_revoke(pib.root(), &namespace, name)?;
     let adding = revocations_to_add(&root.context, &keys).map_err(RevocationError::Refused)?;
-    if let Some(cut) = &cut {
-        check_cut(&root.context, &adding, cut).map_err(RevocationError::Refused)?;
+    if let Some(given) = &cut {
+        given
+            .file
+            .check_bound(given.lost)
+            .and_then(|()| given.file.check_manifest())
+            .map_err(RevocationError::Refused)?;
     }
+    let cuts: Vec<RevocationCut> = cut.iter().map(|g| g.file.cut.clone()).collect();
+    check_cuts(&root.context, &adding, &cuts).map_err(RevocationError::Refused)?;
     Ok(RevocationPlan {
         root,
         keys,
         adding,
-        cut,
+        cut: cut.map(|g| g.file),
     })
 }
 
@@ -251,29 +273,118 @@ mod tests {
         ));
     }
 
-    /// A cut goes with the revocation of exactly its key and lists only
-    /// that key's device log; any other is refused before anything is
-    /// signed, and an accepted one travels in the plan.
+    /// A bounded cut file of `key` accepting `seqs` of `prefix`, with its
+    /// key digest and whole manifest, first verified before 1000 ms.
+    fn bounded(key: &Name, prefix: &Name, seqs: &[u64]) -> CutFile {
+        let entries: Vec<(Name, u64, [u8; 32])> = seqs
+            .iter()
+            .map(|s| (prefix.clone(), *s, [*s as u8; 32]))
+            .collect();
+        let built = ndn_security::cut_manifest::build(&n("/home/bob"), key, &entries).unwrap();
+        let mut cut = RevocationCut::new(key.clone());
+        for s in seqs {
+            cut.add_seq(prefix, *s);
+        }
+        cut.set_key_digest([9; 32]);
+        cut.set_manifest(built.root).unwrap();
+        let mut file = CutFile::new(cut);
+        file.held_before = Some(1_000);
+        file.manifest = built.packets;
+        file
+    }
+
+    fn given(file: CutFile, lost: u64) -> Option<GivenCut> {
+        Some(GivenCut { file, lost })
+    }
+
+    /// A cut goes with the revocation of exactly its key, lists only that
+    /// key's device log, names its public key and carries its manifest;
+    /// any other is refused before anything is signed, and an accepted one
+    /// travels in the plan.
     #[test]
     fn a_cut_is_planned_only_for_a_key_the_revocation_adds() {
         let dir = tempfile::tempdir().unwrap();
         let (pib, out) = root_device_pib(dir.path());
-        let log = crate::device_log_of(&out.device_key);
-        let mut cut = RevocationCut::new(out.device_key.clone());
-        cut.add_run(&log.clone().append("notes"), 1, 4);
-        let plan = plan_revocation(&pib, &out.device_identity, Some(cut.clone())).unwrap();
-        assert_eq!(plan.cut, Some(cut));
+        let notes = crate::device_log_of(&out.device_key).append("notes");
+        let file = bounded(&out.device_key, &notes, &[1, 2, 3, 4]);
+        let plan = plan_revocation(&pib, &out.device_identity, given(file.clone(), 1_000)).unwrap();
+        assert_eq!(plan.cut, Some(file.clone()));
 
-        let other = RevocationCut::new(n("/home/bob/member/tablet/KEY/t"));
+        let tablet = n("/home/bob/member/tablet/KEY/t");
+        let other = bounded(
+            &tablet,
+            &crate::device_log_of(&tablet).append("notes"),
+            &[1],
+        );
         assert!(matches!(
-            plan_revocation(&pib, &out.device_identity, Some(other)),
+            plan_revocation(&pib, &out.device_identity, given(other, 1_000)),
             Err(RevocationError::Refused(BumpError::CutOtherKey { .. }))
         ));
-        let mut outside = RevocationCut::new(out.device_key.clone());
-        outside.add_run(&n("/home/bob/admin/elsewhere/32=log/notes"), 1, 1);
+        let outside = bounded(
+            &out.device_key,
+            &n("/home/bob/admin/elsewhere/32=log/notes"),
+            &[1],
+        );
         assert!(matches!(
-            plan_revocation(&pib, &out.device_identity, Some(outside)),
+            plan_revocation(&pib, &out.device_identity, given(outside, 1_000)),
             Err(RevocationError::Refused(BumpError::CutOutsideLog { .. }))
         ));
+        let mut no_digest = file.clone();
+        no_digest.cut = RevocationCut::new(out.device_key.clone());
+        no_digest.cut.add_run(&notes, 1, 4);
+        no_digest
+            .cut
+            .set_manifest(file.cut.manifest().unwrap().clone())
+            .unwrap();
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, given(no_digest, 1_000)),
+            Err(RevocationError::Refused(
+                BumpError::CutWithoutKeyDigest { .. }
+            ))
+        ));
+        let mut no_manifest = file.clone();
+        no_manifest.cut = RevocationCut::new(out.device_key.clone());
+        no_manifest.cut.add_run(&notes, 1, 4);
+        no_manifest.cut.set_key_digest([9; 32]);
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, given(no_manifest, 1_000)),
+            Err(RevocationError::Refused(
+                BumpError::CutWithoutManifest { .. }
+            ))
+        ));
+    }
+
+    /// S5-01: the cut is bounded by the root's own observation. A cut file
+    /// without a time bound, or bounded after the loss time the owner
+    /// gives, may hold what a thief wrote after the loss: refused before
+    /// anything is signed. So is a file missing a manifest packet the
+    /// root must publish (S5-03).
+    #[test]
+    fn a_cut_is_refused_unless_bounded_at_or_before_the_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pib, out) = root_device_pib(dir.path());
+        let notes = crate::device_log_of(&out.device_key).append("notes");
+        let file = bounded(&out.device_key, &notes, &[1, 2]);
+
+        let mut unbounded = file.clone();
+        unbounded.held_before = None;
+        unbounded.upto.insert(notes.clone(), 2);
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, given(unbounded, 5_000)),
+            Err(RevocationError::Refused(BumpError::CutUnbounded { .. }))
+        ));
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, given(file.clone(), 999)),
+            Err(RevocationError::Refused(BumpError::CutAfterLoss { .. }))
+        ));
+        let mut torn = file.clone();
+        torn.manifest.truncate(0);
+        assert!(matches!(
+            plan_revocation(&pib, &out.device_identity, given(torn, 1_000)),
+            Err(RevocationError::Refused(
+                BumpError::CutManifestIncomplete { .. }
+            ))
+        ));
+        assert!(plan_revocation(&pib, &out.device_identity, given(file, 1_000)).is_ok());
     }
 }

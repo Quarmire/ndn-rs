@@ -338,13 +338,15 @@ async fn a_revocation_changes_only_the_namespace_of_the_name() {
     assert!(secrets.asked().is_empty(), "plaintext roots need no secret");
 }
 
-/// A cut of a key the revocation adds is signed beside it; a cut of
-/// another key is `cut-refused` before anything is asked. A re-admission
-/// adds full names of the key's device log to that cut, and is refused by
-/// code for a key without a cut and a name outside its log; names the cut
-/// accepts already are `nothing-to-sign`.
+/// A cut of a key the revocation adds is signed beside it, and its
+/// manifest packets are stored beside the contexts (the running device
+/// serves them); a cut of another key is `cut-refused` before anything is
+/// asked. A re-admission adds full names of the key's device log to that
+/// cut, and is refused by code for a key without a cut and a name outside
+/// its log; names the cut accepts already are `nothing-to-sign`.
 #[tokio::test]
 async fn a_revocation_with_a_cut_and_a_readmission_into_it() {
+    use ndn_cert::{CutFile, GivenCut};
     use ndn_packet::NameComponent;
     use ndn_security::RevocationCut;
 
@@ -352,20 +354,41 @@ async fn a_revocation_with_a_cut_and_a_readmission_into_it() {
     let secrets = Secrets::new(b"unused");
     let key = n("/a/member/phone/KEY/k");
     let log = ndn_cert::device_log_of(&key);
-    let mut cut = RevocationCut::new(key.clone());
-    cut.add_run(&log.clone().append("notes"), 1, 4);
+    let bounded = |key: &Name| {
+        let notes = ndn_cert::device_log_of(key).append("notes");
+        let entries: Vec<(Name, u64, [u8; 32])> =
+            (1..=4).map(|s| (notes.clone(), s, [s as u8; 32])).collect();
+        let built = ndn_security::cut_manifest::build(&n("/a"), key, &entries).unwrap();
+        let mut cut = RevocationCut::new(key.clone());
+        cut.add_run(&notes, 1, 4);
+        cut.set_key_digest([3; 32]);
+        cut.set_manifest(built.root).unwrap();
+        let mut file = CutFile::new(cut);
+        file.held_before = Some(1_000);
+        file.manifest = built.packets;
+        GivenCut { file, lost: 1_000 }
+    };
+    let given = bounded(&key);
+    let cut = given.file.cut.clone();
 
-    let other = RevocationCut::new(n("/a/member/tablet/KEY/t"));
+    let other = bounded(&n("/a/member/tablet/KEY/t"));
     let refused = revoke::plan(&pib, &key, None, Some(other)).err().unwrap();
     assert_code(&refused, code::CUT_REFUSED);
 
-    let planned = revoke::plan(&pib, &key, None, Some(cut.clone())).unwrap();
+    let planned = revoke::plan(&pib, &key, None, Some(given.clone())).unwrap();
     let revoked = revoke::revoke(planned, &key, &pib, &Device::NotRunning, &secrets)
         .await
         .unwrap();
-    assert_eq!(revoked.cut.as_ref(), Some(&cut));
+    assert_eq!(revoked.cut.as_ref(), Some(&given.file));
     let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
     assert_eq!(held.revocation_cut(&key), Some(&cut));
+    let stored: Vec<_> = ndn_cert::read_cut_manifest_packets(&pib, &n("/a"))
+        .unwrap()
+        .into_iter()
+        .map(|(_, wire)| wire.unwrap())
+        .collect();
+    assert_eq!(stored.len(), given.file.manifest.len());
+    assert!(given.file.manifest.iter().all(|p| stored.contains(p)));
 
     let full = |seq: u64| {
         log.clone()
@@ -570,6 +593,7 @@ async fn a_recovery_is_refused_only_where_the_namespace_root_is_held() {
         cuts: Vec::new(),
         from_held: false,
         root: RootStoreChoice::File,
+        recertify: recover::Recertify::No,
     };
     let here = recover::recover(request("/a"), &Device::NotRunning, &secrets)
         .await

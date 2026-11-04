@@ -185,6 +185,56 @@ pub enum BumpError {
         log: String,
     },
     #[error(
+        "the revocation cut of {key} lists sequence-number ranges but no cut manifest: a range \
+         names entries, not their bytes, so a thief could put other bytes at an accepted name. \
+         Make the cut again with a current data layer (its `cut` writes the manifest of every \
+         entry the ranges accept, with their digests)"
+    )]
+    CutWithoutManifest { key: String },
+    #[error(
+        "the revocation cut of {key} carries no key digest (CutKeyDigest): a new cut must name \
+         the public key that signed the entries it accepts, so no other key certified under the \
+         same name is ever excused by it. Make the cut again with a current data layer"
+    )]
+    CutWithoutKeyDigest { key: String },
+    #[error("two revocation cuts are given for {key}: give one cut per key")]
+    DuplicateCut { key: String },
+    #[error(
+        "v{version} of {namespace} holds a revocation cut for {key}, which no revocation names: \
+         an honest root never signs one (a cut comes only with its key's revocation), so it may \
+         have been planted. Revoking {key} now would let that cut decide which of its packets \
+         stay accepted — give {key}'s cut made from what this device holds verified (`--cut \
+         <file>`, the data layer's `cut` of the key)"
+    )]
+    OrphanCut {
+        key: String,
+        namespace: String,
+        version: u64,
+    },
+    #[error(
+        "the cut file of {key} records no time bound: the device that wrote it did not say \
+         which entries it held before the key was lost, so it may accept what a thief wrote. \
+         Write the cut again with the loss time (the data layer's `cut {key} <file> \
+         --held-before <when>`)"
+    )]
+    CutUnbounded { key: String },
+    #[error(
+        "the cut file of {key} keeps entries first verified up to {held_before} ms since the \
+         epoch, later than the loss time given ({lost} ms): entries a thief wrote after the loss \
+         could be in it. Write the cut again with `--held-before` at or before the loss time"
+    )]
+    CutAfterLoss {
+        key: String,
+        held_before: u64,
+        lost: u64,
+    },
+    #[error(
+        "the cut file of {key} does not carry its cut manifest ({reason}): the root publishes \
+         the manifest with the version, so readers can check the bytes of every entry the cut \
+         accepts. Write the cut file again with the data layer's `cut`"
+    )]
+    CutManifestIncomplete { key: String, reason: String },
+    #[error(
         "{key} is not revoked in v{version} of {namespace}, so it has no cut to re-admit packets \
          into: revoke it with a cut first (`ndn-fwd revoke {key} --cut <file>`)"
     )]
@@ -318,10 +368,12 @@ pub fn revocations_to_add(
 /// Check the revocation cut `cut` against a version after `ctx` that adds
 /// `adding` to its revocations ([`revocations_to_add`]): its key must be
 /// one of `adding` (a cut comes with the revocation of exactly its key,
-/// never after it), and every name it lists (range prefixes, exact names)
-/// must be in that key's device log ([`device_log_of`]). Needs no key:
-/// a caller checks a cut with it before unlocking the root
-/// ([`bump_context_revoking`] applies the same checks).
+/// never after it), every name it lists (range prefixes, exact names)
+/// must be in that key's device log ([`device_log_of`]), it must name the
+/// public key that signed what it accepts (CutKeyDigest), and a cut with
+/// ranges must carry its manifest (CutManifest: the digest of every entry
+/// the ranges accept). Needs no key: a caller checks a cut with it before
+/// unlocking the root ([`bump_context_revoking`] applies the same checks).
 pub fn check_cut(
     ctx: &SignedTrustContext,
     adding: &[Name],
@@ -341,6 +393,24 @@ pub fn check_cut(
             revoking: adding.iter().map(Name::to_string).collect(),
         });
     }
+    check_cut_names(cut)?;
+    if cut.key_digest().is_none() {
+        return Err(BumpError::CutWithoutKeyDigest {
+            key: key.to_string(),
+        });
+    }
+    if !cut.ranges().is_empty() && cut.manifest().is_none() {
+        return Err(BumpError::CutWithoutManifest {
+            key: key.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse `cut` unless every name it lists (range prefixes, exact names)
+/// is in its key's device log ([`device_log_of`]).
+pub(crate) fn check_cut_names(cut: &RevocationCut) -> Result<(), BumpError> {
+    let key = cut.key();
     let log = device_log_of(key);
     let listed = cut.ranges().iter().map(|r| &r.prefix).chain(cut.exact());
     for name in listed {
@@ -355,14 +425,59 @@ pub fn check_cut(
     Ok(())
 }
 
+/// The keys of the cuts `ctx` holds that no revocation of it names
+/// (orphan cuts). An honest root never signs one — a cut is added only in
+/// the version that revokes its key — so one may have been planted (by
+/// whoever held a compromised root) to take effect the day its key is
+/// revoked. Versions made from `ctx` do not carry them.
+pub fn orphan_cuts(ctx: &SignedTrustContext) -> Vec<Name> {
+    ctx.revocation_cuts()
+        .iter()
+        .filter(|c| !ctx.revocations().contains(c.key()))
+        .map(|c| c.key().clone())
+        .collect()
+}
+
+/// Check the cuts `cuts` of a version after `ctx` that adds `adding` to
+/// its revocations: each as [`check_cut`] does, at most one per key; and a
+/// key of `adding` that `ctx` holds an orphan cut for ([`orphan_cuts`])
+/// must be given its cut here (the orphan is never what decides).
+pub fn check_cuts(
+    ctx: &SignedTrustContext,
+    adding: &[Name],
+    cuts: &[RevocationCut],
+) -> Result<(), BumpError> {
+    for (i, cut) in cuts.iter().enumerate() {
+        if cuts[..i].iter().any(|c| c.key() == cut.key()) {
+            return Err(BumpError::DuplicateCut {
+                key: cut.key().to_string(),
+            });
+        }
+        check_cut(ctx, adding, cut)?;
+    }
+    let orphans = orphan_cuts(ctx);
+    if let Some(key) = adding
+        .iter()
+        .find(|k| orphans.contains(k) && !cuts.iter().any(|c| c.key() == *k))
+    {
+        return Err(BumpError::OrphanCut {
+            key: key.to_string(),
+            namespace: ctx.namespace().to_string(),
+            version: ctx.version(),
+        });
+    }
+    Ok(())
+}
+
 /// Version `N+1` of the held context `held` (its signed Data, version `N`)
-/// with the key names `revoke` added to its revocations, and `cut`, when
-/// given, beside them ([`check_cut`]: the cut of one of the keys this
-/// version adds), signed by `signer`
+/// with the key names `revoke` added to its revocations, and `cuts` beside
+/// them ([`check_cuts`]: each the cut of one of the keys this version
+/// adds), signed by `signer`
 /// — the key of an anchor of `held` (the namespace root from its root store,
 /// or any other anchor the held version lists), through its async signing
 /// path, so hardware and custodian signers work. Every other field — the
-/// cuts of earlier revocations too — is carried over verbatim. The entries
+/// cuts of earlier revocations too — is carried over verbatim, except
+/// orphan cuts ([`orphan_cuts`]), which are dropped. The entries
 /// are checked as [`revocations_to_add`] does;
 /// ones already revoked are not repeated, and `Ok(None)` when all of them are
 /// (no new version is needed, nothing is signed; a cut is then refused, as
@@ -372,15 +487,13 @@ pub async fn bump_context_revoking(
     signer: &dyn Signer,
     held: &Data,
     revoke: &[Name],
-    cut: Option<&RevocationCut>,
+    cuts: &[RevocationCut],
 ) -> Result<Option<ContextBump>, BumpError> {
     let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
     ensure_anchor(signer, &ctx)?;
 
     let added = revocations_to_add(&ctx, revoke)?;
-    if let Some(cut) = cut {
-        check_cut(&ctx, &added, cut)?;
-    }
+    check_cuts(&ctx, &added, cuts)?;
     if added.is_empty() {
         return Ok(None);
     }
@@ -388,11 +501,13 @@ pub async fn bump_context_revoking(
     let version = next_version(&ctx)?;
     // `held` verified above, so its Content is present and decodes.
     let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
-    let mut next = SignedTrustContext::decode_content(content, version)?;
+    let orphans = orphan_cuts(&ctx);
+    let mut next = SignedTrustContext::decode_content(content, version)?
+        .without_revocation_cuts(|c| orphans.contains(c.key()));
     for name in &added {
         next = next.with_revocation(name.clone());
     }
-    if let Some(cut) = cut {
+    for cut in cuts {
         next = next.with_revocation_cut(cut.clone());
     }
     let data = next.sign_into_data_async(signer).await?;
@@ -455,7 +570,10 @@ fn readmission(
                 log: log.to_string(),
             });
         }
-        if !cut.accepts(&packet, &digest) && !added.contains(name) {
+        // A name inside a range is decided by the range (with a manifest:
+        // only the bytes it lists), never by a re-admission of other bytes.
+        let in_range = cut.range_seq(&packet).is_some();
+        if !in_range && !cut.accepts(&packet, &digest) && !added.contains(name) {
             added.push(name.clone());
         }
     }
@@ -510,6 +628,44 @@ pub async fn bump_context_readmitting(
     // `held` verified above, so its Content is present and decodes.
     let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
     let next = SignedTrustContext::decode_content(content, version)?.with_revocation_cut(cut);
+    let data = next.sign_into_data_async(signer).await?;
+    Ok(Some(ContextBump {
+        context: next,
+        data,
+        added: Vec::new(),
+    }))
+}
+
+/// Version `N+1` of the held context `held` listing exactly `roles` in
+/// DataRequiresCut (0x0434; empty: none), signed by `signer`, an anchor key
+/// of `held`. Data a key of a listed role signs is accepted only while a
+/// certificate of the key is valid by the reader's clock, or once the key
+/// is revoked with a cut that accepts it. `Ok(None)` when `held` lists
+/// exactly these roles already (nothing is signed). Every other field is
+/// carried over verbatim. Pure: nothing is adopted, stored or published.
+pub async fn bump_context_data_requires_cut(
+    signer: &dyn Signer,
+    held: &Data,
+    roles: &[crate::roles::Role],
+) -> Result<Option<ContextBump>, BumpError> {
+    let (ctx, _signed_by) = SignedTrustContext::open_signed(held).await?;
+    ensure_anchor(signer, &ctx)?;
+    let mut wanted: Vec<String> = roles.iter().map(|r| r.as_str().to_string()).collect();
+    wanted.sort();
+    wanted.dedup();
+    if ctx.data_requires_cut() == wanted.as_slice() {
+        return Ok(None);
+    }
+    let version = next_version(&ctx)?;
+    // `held` verified above, so its Content is present and decodes.
+    let content = held.content().map(|c| c.as_ref()).unwrap_or_default();
+    let mut next = SignedTrustContext::decode_content(content, version)?;
+    for role in ctx.data_requires_cut() {
+        next = next.without_data_requires_cut(role);
+    }
+    for role in wanted {
+        next = next.with_data_requires_cut(role);
+    }
     let data = next.sign_into_data_async(signer).await?;
     Ok(Some(ContextBump {
         context: next,

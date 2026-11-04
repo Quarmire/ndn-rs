@@ -10,6 +10,8 @@
 //!   a revocation cut of one of its keys, or without).
 //! - [`readmit`]: a new version re-admitting single packets (full names) of
 //!   a key revoked with a cut.
+//! - [`end_keys`]: a new version ending, each with its cut, the keys whose
+//!   authority over Data ended (lapsed guests, replaced keys).
 //! - [`kit`]: recovery kits — create (24 words, a sealed file, or a key on a
 //!   second YubiKey, listed as a recovery anchor by a new version), list,
 //!   check, revoke.
@@ -59,6 +61,7 @@
 
 pub mod daemon;
 pub mod device;
+pub mod end_keys;
 mod error;
 pub mod init;
 pub mod key;

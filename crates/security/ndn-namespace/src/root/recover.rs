@@ -23,21 +23,30 @@
 //!    version is signed by the new root, so its fingerprint is the
 //!    namespace's expected fingerprint again ([`Recovered::anchor_links`]).
 //!
-//! Both versions carry every revocation cut of `N`. With the old root
+//! Both versions carry every revocation cut of `N`, except orphan cuts and
+//! cuts naming packets outside their key's device log, which `N` (perhaps
+//! signed by whoever held a compromised root) may hold and `N+1` drops
+//! ([`ndn_cert::RecoveryVersion::dropped_cuts`]). With the old root
 //! compromised, `N+1` may add a cut for each key it newly revokes
-//! ([`RecoverRequest::cuts`]), and the new CA certifies again each key
-//! revoked with a cut whose certificate this PIB holds (the old CA's
-//! certificates no longer chain, and such a key cannot renew): recorded in
-//! the CA's store once `N+1` is taken, served from the CA's next start. A
-//! key of none held is listed; once its certificate is at hand,
-//! [`recertify`] certifies it.
+//! ([`RecoverRequest::cuts`]): each from a cut file bounded at or before
+//! the time the person says the key was lost and carrying its whole
+//! manifest, checked before anything is asked; its manifest packets are
+//! stored beside the contexts before `N+1` is handed over, so the running
+//! device serves them with it. Then, only once the person has seen the cuts
+//! carried and confirmed ([`RecoverRequest::recertify`]), the new CA
+//! certifies again each key revoked with a cut whose certificate with the
+//! public key the cut names this PIB holds (the old CA's certificates no
+//! longer chain, and such a key cannot renew), recorded in the CA's store
+//! and served from the CA's next start. A key of none held is listed; once
+//! such a certificate is at hand, [`recertify`] certifies it.
 
 use std::path::{Path, PathBuf};
 
 use ndn_cert::report::code;
 use ndn_cert::{
-    CutKeyCertificates, NewRootStore, OldRoot, RecoveredNamespace, RootStore, anchor_fingerprint,
-    kit_anchor, read_stored_context, recertify_cut_keys_in_pib, recover_namespace_in_pib,
+    CutFile, CutKeyCertificates, GivenCut, NewRootStore, OldRoot, RecoveredNamespace, RootStore,
+    anchor_fingerprint, kit_anchor, read_stored_context, recertify_cut_keys_in_pib,
+    recover_namespace_in_pib,
 };
 use ndn_packet::Name;
 use ndn_security::{Certificate, RevocationCut};
@@ -61,14 +70,35 @@ pub struct RecoverRequest {
     pub old_root: OldRoot,
     /// With the old root compromised: the other kits to keep.
     pub kept_kits: Vec<Name>,
-    /// With the old root compromised: a revocation cut for some of the keys
-    /// `N+1` newly revokes (the old root's, the old root device's, the
-    /// kits not kept), at most one per key (`cut-refused` otherwise).
-    pub cuts: Vec<RevocationCut>,
+    /// With the old root compromised: the cut files of some of the keys
+    /// `N+1` newly revokes (the old root's, the old root device's, the kits
+    /// not kept), at most one per key, each with when the person says the
+    /// key was lost: it must be bounded at or before then and carry its
+    /// whole manifest ([`ndn_cert::CutFile::check_bound`],
+    /// [`ndn_cert::CutFile::check_manifest`]; `cut-refused` otherwise).
+    pub cuts: Vec<GivenCut>,
     /// Nothing answers: the person vouches that no version newer than the
     /// held one exists.
     pub from_held: bool,
     pub root: RootStoreChoice,
+    /// With the old root compromised: whether the keys `N+1` revokes with a
+    /// cut are certified again by the new CA, asked once `N+1` is taken.
+    pub recertify: Recertify,
+}
+
+/// The question a compromised recovery asks before certifying the keys
+/// revoked with a cut again: shown the cuts `N+1` carries, `true` certifies.
+pub type AskRecertify = Box<dyn Fn(&[RevocationCut]) -> bool + Send + Sync>;
+
+/// Whether a compromised recovery certifies the keys revoked with a cut
+/// again ([`RecoverRequest::recertify`]).
+pub enum Recertify {
+    /// Not now (`ndn-fwd recertify` does it later).
+    No,
+    /// Yes, without asking (the person said so beforehand).
+    Yes,
+    /// Ask the person ([`AskRecertify`]).
+    Ask(AskRecertify),
 }
 
 /// What an anchor of `N+1` is.
@@ -113,10 +143,14 @@ pub struct Recovered {
     pub anchors: Vec<(Name, AnchorKind)>,
     /// Every key `N+1` revokes.
     pub revoked: Vec<(Name, RevokedKind)>,
-    /// Recording the new CA's certificates of keys revoked with a cut
-    /// ([`RecoveredNamespace::recertified`]) in its store failed: they are
-    /// not served; [`recertify`] issues and records them again.
-    pub recertified_not_recorded: Option<RootError>,
+    /// The cut files `N+1` signed the cuts of, as given: with the bound
+    /// each used and the entries it left out (refused with the rest; a
+    /// genuine one is re-admitted by its full name, [`super::readmit`]).
+    pub cuts: Vec<CutFile>,
+    /// With the old root compromised: the keys revoked with a cut certified
+    /// again by the new CA (recorded in its store), or why not — `None`
+    /// when the person did not confirm it (or the old root was destroyed).
+    pub recertified: Option<Result<CutKeyCertificates, RootError>>,
 }
 
 impl Recovered {
@@ -156,11 +190,14 @@ fn no_root_here(
 }
 
 /// Recover the namespace of `request` onto this device (see the
-/// [module docs](self)). Refusals: the anti-fork ones of
-/// [`crate::admin::NewestRefusal`], the kit's, the running device's,
-/// `version-not-taken` (`N+1` refused: everything written was removed) and
-/// `hand-over-unknown` (whether `N+1` was taken is not known; nothing was
-/// removed — params `root_key`, `ca_key`, `device_key`).
+/// [module docs](self)). Refusals: `cut-refused` (a cut file unbounded,
+/// bounded after its loss time, without its whole manifest, or not the cut
+/// of a key `N+1` newly revokes; its manifest packets cannot be stored),
+/// the anti-fork ones of [`crate::admin::NewestRefusal`], the kit's, the
+/// running device's, `version-not-taken` (`N+1` refused: everything
+/// written was removed) and `hand-over-unknown` (whether `N+1` was taken is
+/// not known; nothing was removed — params `root_key`, `ca_key`,
+/// `device_key`).
 pub async fn recover(
     request: RecoverRequest,
     device: &dyn RunningDevice,
@@ -176,7 +213,19 @@ pub async fn recover(
         cuts,
         from_held,
         root: root_choice,
+        recertify: recertify_choice,
     } = request;
+    // A cut file is checked before anything is asked: bounded at or before
+    // the loss time, so it cannot accept what a thief wrote after it, and
+    // carrying the whole manifest the cut names.
+    for given in &cuts {
+        given
+            .file
+            .check_bound(given.lost)
+            .and_then(|()| given.file.check_manifest())?;
+    }
+    let cut_files: Vec<CutFile> = cuts.into_iter().map(|given| given.file).collect();
+    let cuts: Vec<RevocationCut> = cut_files.iter().map(|file| file.cut.clone()).collect();
     let namespace = kit_namespace(namespace.as_ref(), Some(&kit), &pib_dir)?;
     let kit_fingerprint = match &kit {
         KitSpec::File(path) => ndn_cert::FileKit::read(path)?.fingerprint,
@@ -249,6 +298,14 @@ pub async fn recover(
     drop(root);
     drop(opened);
     let recovered = recovered?;
+    // The cuts' manifest packets go beside the contexts before N+1 is
+    // handed over, so the running device serves them with it.
+    for file in &cut_files {
+        if let Err(e) = super::revoke::store_manifest(&pib_dir, &namespace, file) {
+            recovered.undo(&pib);
+            return Err(e);
+        }
+    }
 
     // 4. Hand N+1, then N+2. Only the running device's refusal of N+1
     //    undoes step 3: without an answer it may still adopt N+1, which
@@ -273,9 +330,26 @@ pub async fn recover(
     // N+1 is the namespace's from here on: nothing is undone any more. N+2
     // makes the new root the signer of the newest version.
     let root_handed = hand_over(device, &pib_dir, &recovered.root_version).await;
-    // N+1 is taken: the new CA's certificates of keys revoked with a cut
-    // are the namespace's too.
-    let recertified_not_recorded = recovered.record_recertified().err().map(RootError::from);
+    // N+1 is taken: with the old root compromised, the keys it revokes with
+    // a cut are certified again by the new CA — once the person has seen
+    // the cuts carried and confirmed.
+    let cut_keys = v_cuts(&recovered);
+    let confirmed = old_root == OldRoot::Compromised
+        && !cut_keys.is_empty()
+        && match &recertify_choice {
+            Recertify::No => false,
+            Recertify::Yes => true,
+            Recertify::Ask(ask) => ask(&cut_keys),
+        };
+    let recertified = if confirmed {
+        Some(
+            recertify_cut_keys_in_pib(&pib, &namespace, &[])
+                .await
+                .map_err(RootError::from),
+        )
+    } else {
+        None
+    };
 
     let v = &recovered.version;
     let new_root = recovered.anchor.key_name();
@@ -325,24 +399,37 @@ pub async fn recover(
         anchor_fingerprint: anchor_fingerprint(&recovered.anchor),
         pib_abs: absolute(&pib_dir),
         anchors,
+        cuts: cut_files,
         revoked,
         recovered,
         handed,
         root_handed,
-        recertified_not_recorded,
+        recertified,
     })
+}
+
+/// The cuts of keys `N+1` revokes (what re-certification considers).
+fn v_cuts(recovered: &RecoveredNamespace) -> Vec<RevocationCut> {
+    let ctx = &recovered.version.bump.context;
+    ctx.revocation_cuts()
+        .iter()
+        .filter(|c| ctx.revocations().contains(c.key()))
+        .cloned()
+        .collect()
 }
 
 /// On the root device of `namespace` (else the only namespace whose root
 /// the PIB at `pib_dir` holds): certify again, with the namespace CA's key,
-/// every key the held version revokes with a cut that this CA has not
-/// certified yet, from a certificate of it in `certificates` (ones the
-/// operator vouches for, e.g. a device's certificate file) or stored in the
-/// PIB ([`ndn_cert::recertify_cut_keys_in_pib`]) — what a compromised
+/// every key the held version revokes with a cut naming its public key
+/// (CutKeyDigest) that this CA has not certified for it yet, from a
+/// certificate of it with exactly that public key in `certificates` (ones
+/// the operator vouches for, e.g. a device's certificate file) or stored in
+/// the PIB ([`ndn_cert::recertify_cut_keys_in_pib`]) — what a compromised
 /// recovery lists as held nowhere. Recorded in the CA's store: the CA serves
-/// them from its next start. Keys still without a certificate are listed in
-/// [`CutKeyCertificates::unheld`]. Signs no version; the root is not
-/// unlocked.
+/// them from its next start. Keys still without such a certificate are
+/// listed in [`CutKeyCertificates::unheld`], cuts naming no public key in
+/// [`CutKeyCertificates::no_key_digest`]. Signs no version; the root is not
+/// unlocked. A host shows the cuts ([`cut_keys`]) and asks before calling it.
 pub async fn recertify(
     pib_dir: &Path,
     namespace: Option<&Name>,
@@ -353,4 +440,24 @@ pub async fn recertify(
     let namespace = root.context.namespace().clone();
     let done = recertify_cut_keys_in_pib(&pib, &namespace, certificates).await?;
     Ok((namespace, done))
+}
+
+/// The cuts re-certification on the root device of `namespace` (else the
+/// only namespace whose root the PIB at `pib_dir` holds) considers — those
+/// of keys the held version revokes — for a host to show before it asks to
+/// [`recertify`]; with the namespace.
+pub fn cut_keys(
+    pib_dir: &Path,
+    namespace: Option<&Name>,
+) -> Result<(Name, Vec<RevocationCut>), RootError> {
+    let pib = super::open_pib(pib_dir)?;
+    let root = ndn_cert::root_device(&pib, namespace, "keys are re-certified")?;
+    let ctx = &root.context;
+    let cuts = ctx
+        .revocation_cuts()
+        .iter()
+        .filter(|c| ctx.revocations().contains(c.key()))
+        .cloned()
+        .collect();
+    Ok((ctx.namespace().clone(), cuts))
 }
