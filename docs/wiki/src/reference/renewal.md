@@ -21,10 +21,16 @@ per role, and renewal keeps every renewable device enrolled.
 - **Verifiers find it by key name.** KeyLocators name the key; a verifier
   fetches it with CanBePrefix + MustBeFresh and takes the newest currently
   valid certificate. A cached certificate that has expired triggers a
-  re-fetch, which is how the renewed one is found.
+  re-fetch, which is how the renewed one is found. When it judges Data, a
+  verifier compares no validity period with its clock (any certificate of
+  the key that verifies will do), so Data signed under the old certificate
+  stays valid after it expires: the device's data simply continues
+  ([revocation](./revocation.md#revocation-cut)).
 - **Per-role terms.** `[ca] cert_validity_days` sets each role's lifetime;
   `[ca] renewable_roles` says which roles renew. Guests do not by default:
-  guest access simply ends at expiry.
+  guest access — links, signed Interests, renewal — ends at expiry. Data a
+  guest's key signs is not ended by expiry; to end it, revoke the key (with
+  a cut to keep what it wrote while invited).
 
 ## What the CA refuses
 

@@ -111,7 +111,7 @@ namespace (directly, or through a relay):
 
 ```sh
 ndn-fwd recover --kit words|yubikey|<kit-file> --old-root destroyed|compromised \
-    [--keep-kit <recovery-key-name>]… [--namespace <ns>] [--device <name>] \
+    [--keep-kit <recovery-key-name>]… [--cut <file>]… [--namespace <ns>] [--device <name>] \
     [--kit-yubikey-serial <n>] [--kit-yubikey-slot <slot>] \
     [--root-store <store>] [--yubikey-serial <n>] [--yubikey-slot <slot>] [--replace-slot] \
     [-c <config>] [--from-held]
@@ -155,8 +155,10 @@ The daemon must use the PIB recovered into (`-c` with its config, or
      no recovery anchor of `N` is refused (listing them) before anything is
      written, and so is `--keep-kit` with `destroyed`;
    - the new CA and admin keys replace the old ones' `root-device` role;
-   - schema, CA endpoint (`<ns>/CA`, unchanged) and earlier revocations are
-     carried over.
+   - schema, CA endpoint (`<ns>/CA`, unchanged), earlier revocations and
+     their revocation cuts are carried over verbatim; with `compromised`,
+     each `--cut <file>` adds the cut of a key this recovery newly revokes
+     ([revocation cut](./revocation.md#revocation-cut)).
 
    `recover` prints every anchor `N+1` keeps and every key it revokes, so a
    key nobody expects stands out. Then the new root signs `N+2`, the same
@@ -190,6 +192,7 @@ There is no default; `recover` refuses without it and says why both exist:
 | Old CA key, old admin key | valid | revoked (the `root-device` keys of `N`) |
 | Recovery kits | all stay | the kit used and `--keep-kit` ones stay; the rest are removed and revoked |
 | Devices enrolled under the old CA | keep working; renew with the new CA | stop validating once a node holds `N+1`; enroll again |
+| Keys revoked with a cut | nothing changes | the new CA certifies each again from a certificate the PIB holds, so its in-cut Data keeps a chain (`recertified =`, `not_recertified =`; later: `ndn-fwd recertify`, [after a recovery](./revocation.md#after-a-recovery)) |
 
 Keeping a compromised root valid would leave the namespace in its holder's
 hands; revoking a destroyed one would cut off every device for nothing.
@@ -271,6 +274,7 @@ is not taken, `recover` prints no link at all.
 | `the kit's key … is not a recovery anchor of the trust context … held here (vN)` | a kit never added, revoked since, or of another namespace; nothing signed | use a kit that `ndn-fwd recovery-kit list` shows |
 | `… is not a recovery anchor … (its recovery anchors: …)` | a `--keep-kit` names no recovery anchor of `N`; nothing written | name kits from the list |
 | `kits to keep are named only when the old root is compromised …` | `--keep-kit` with `--old-root destroyed`, which keeps every kit | drop `--keep-kit` |
+| a revocation cut is refused (`cut-refused`) | a cut with `--old-root destroyed` (nothing is revoked), a cut of a key this recovery does not newly revoke, a name outside the key's device log, or two cuts for one key; nothing signed | give cuts only for keys the compromised recovery revokes |
 | `these recovery words are refused: …` | a word outside the BIP39 list (named by its position only), not 24 words, or a checksum mismatch (a mistyped or swapped word); nothing signed | type the words again |
 | `the kit passphrase does not open …` | wrong passphrase; nothing signed | retry with the kit's passphrase |
 | `… holds the root of … this already is a root device` | this PIB already holds a namespace root | recover on a replacement device whose PIB holds no root |

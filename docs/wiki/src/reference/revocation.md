@@ -9,8 +9,8 @@ context — and two parties act on it:
 
 | Who | Effect | When it takes effect |
 |---|---|---|
-| Every validator | refuses a chain through the key | on each node once it holds version `N+1`, which lists the key name as revoked; other nodes fetch it at their next refresh ([context updates](./context-updates.md)) |
-| The namespace CA | stops serving the key's certificates, never certifies that key again, and the device name is free for a new key | as soon as the daemon running the CA holds `N+1`: at once on the root device |
+| Every validator | refuses a chain through the key, and the Data the key signed — except, when the version carries the key's **revocation cut**, the Data the cut accepts | on each node once it holds version `N+1`, which lists the key name as revoked; other nodes fetch it at their next refresh ([context updates](./context-updates.md)) |
+| The namespace CA | never certifies that key again, and the device name is free for a new key; stops serving the key's certificates, unless it was revoked with a cut (then they stay served for its in-cut Data) | as soon as the daemon running the CA holds `N+1`: at once on the root device |
 
 The CA side alone would not be enough: a node that already has the
 certificate (fetched earlier, or carried in a KeyLocator chain) would keep
@@ -19,7 +19,9 @@ root key can add one. The CA acts on that signed entry, never on a separate
 request ([the CA follows the trust context](#the-ca-follows-the-trust-context)).
 
 Design: `docs/specs/personal-namespace.md`, flows F4 (lose a member device)
-and F5 (lose an admin device).
+and F5 (lose an admin device); the cut and how Data is judged:
+`docs/specs/trust-context.md` §3.3.12 and §6.3, `docs/specs/data-layer.md`
+§8.
 
 ## Unlocking the root
 
@@ -53,16 +55,97 @@ covers:
   (a renewed certificate is a new one under the same key), whether a
   KeyLocator names the key or a full certificate name;
 - certificates of that key issued later;
-- Data signed by any key whose chain passes through it.
+- Data signed by any key whose chain passes through it, except Data the
+  key signed itself that the key's revocation cut accepts
+  ([below](#revocation-cut)).
 
 The identity itself is never an entry, so the same device name can enroll
 again with a new key: `ndn-fwd enroll <invite> --device <same name>` works
 without `--force`, because the "already enrolled" check skips keys the held
 context revokes.
 
+## Revocation cut
+
+A revocation alone refuses everything the key ever signed: also the notes
+a lost phone wrote honestly before it was lost. A **revocation cut** keeps
+exactly those. It is part of the same signed version, beside the key's
+entry (`RevocationCut`, TLV `0x0428`): per data collection the key wrote
+into, the runs of its log entries that stay valid
+(`<device>/32=log/<collection>/seq=<n>`, and `<device>/32=log/seq=<n>` for
+snapshots). Every other packet of the key — a later entry, a backdated
+one, an entry at an accepted seq in another collection, its summaries —
+is refused.
+
+The cut lists what the root device's data layer **holds verified** of the
+key, never what a summary only listed. Make it on the root device, then
+revoke with it:
+
+```sh
+# in the ndn-data host on the root device (ndn-tools)
+cut /home/rv/member/phone/KEY/4c60a77af0f3ce14 phone.cut
+# then
+ndn-fwd revoke /home/rv/member/phone/KEY/4c60a77af0f3ce14 --cut phone.cut -c root.toml
+```
+
+The file holds the cut's TLV (`ndn_data::Device::revocation_cut`). `revoke`
+prints it as `cut = <key>: <prefix> seq a..b,…; N exact packet(s)` (with
+`(already)` when the held version has it). A cut is added only in the
+version that revokes its key, and its runs never change afterwards; a cut
+for a key the version does not newly revoke, or one listing a name outside
+the key's device log `<device>/32=log`, is refused (`cut-refused`).
+
+**Validity periods.** Data is judged without the validity period of any
+certificate: the certificate proves the key was authorized, the cut proves
+where that ended. So an expired certificate never refuses Data, and a key
+ends for Data only by a revocation. Revoke a lost or retired device's key
+even when its certificate has expired. Live uses — links, signed
+Interests, enrollment, renewal — still end at expiry.
+
+## Re-admitting a version
+
+Honest work the cut left out — offline edits nobody had seen — is
+refused, and the devices that refused it report each such version with
+its full name, ending in its implicit digest. After looking at it, the
+owner re-admits exact versions on the root device:
+
+```sh
+ndn-fwd readmit /home/rv/member/phone/KEY/4c60a77af0f3ce14 \
+  /home/rv/member/phone/32=log/home/rv/32=data/notes/seq=312/sha256digest=… -c root.toml
+```
+
+`ndn-fwd readmit <key> <full-name>… [--namespace <ns>] [--pib <dir> | -c
+<config>] [--passphrase-file <path> | --pin-file <path>]` unlocks the root
+as `revoke` does and prints `namespace`, `key`, one `readmitted = <name>`
+per name (`(already)` for one the cut holds), `trust_context = vN -> vN+1`
+and `handed_over`. It signs `N+1` adding those names, digest included, to
+the key's cut (`ndn_cert::bump_context_readmitting`).
+Only those bytes at those names come back: never a range, a neighbouring
+seq or other bytes at the name. Every device that holds or follows them
+then applies them. Refused: a key revoked without a cut
+(`readmit-no-cut`: revoke it with a cut first — which is possible only in
+the version that revokes it), a name without a 32-octet digest or outside
+the key's device log (`readmit-refused`); names already in the cut are
+nothing to sign (`nothing-to-sign`).
+
+## After a recovery
+
+A recovery from a compromised root (`ndn-fwd recover … --old-root
+compromised [--cut <file>]…`, [recovery kits](./recovery.md)) carries
+every cut and may add one for each key it newly revokes, printing
+`cut = …` per cut of the new version. It revokes the old CA key, an issuer
+no cut excuses, so the new CA certifies again each key revoked with a cut,
+from a certificate of it the PIB holds: `recertified = <cert>` per
+certificate, `not_recertified = <key>` per key whose certificate was not
+held (its in-cut Data stays refused). Such a certificate verifies the
+key's in-cut Data only; the key stays revoked for everything else. Once
+the missing certificates are found, `ndn-fwd recertify [<cert-file>]…
+[--namespace <ns>] [--pib <dir> | -c <config>]` certifies them; the CA
+records them in its store and serves them once its daemon restarts.
+
 ## What `revoke` does
 
-`ndn-fwd revoke <name> [--pib <dir> | -c <config>]`, on the root device.
+`ndn-fwd revoke <name> [--cut <file>] [--pib <dir> | -c <config>]`, on the
+root device.
 `<name>` is one of:
 
 - a device identity, e.g. `/home/bob/member/phone`: every key the namespace
@@ -84,13 +167,16 @@ The command, before asking for any secret:
    anchor are refused (`ndn_cert::revocations_to_add`).
 3. Keys the held version revokes already are not added again; when it
    revokes all of them, nothing is signed and the command says so.
+   With `--cut`, the file must hold one `RevocationCut` whose key is one of
+   the keys this version newly revokes (`cut-refused` otherwise).
 4. When a daemon listens on the management socket, checks it uses the same
    PIB (`security/identity-status` `pib_path=`).
 
 Then it unlocks the root, makes version `N+1`
 (`ndn_cert::bump_context_revoking`: the held Content decoded verbatim —
-anchors, schema blobs, CA endpoints, earlier revocations — plus the new
-entries, signed with the root key) and hands it to the daemon with
+anchors, schema blobs, CA endpoints, earlier revocations and their cuts —
+plus the new entries and the cut given, signed with the root key) and hands
+it to the daemon with
 `security/context-update`, as `ndn-fwd recovery-kit` does
 ([versions made on this device](./context-updates.md#versions-made-on-this-device-securitycontext-update)):
 the daemon adopts it under the continuity rule (signed by an anchor of the
@@ -115,9 +201,13 @@ fetched by a refresh, adopted by link — and the node runs the CA of that
 namespace (`[ca]` with identity `<ns>/CA`), the CA follows the version
 (`TrustAdmin::keep` → `revoke::ca_follow`): every certificate it issued under
 a name the version revokes is recorded in `revoked/` of the CA's directory (kept
-across restarts) and dropped from its certificate cache
-(`CaState::revoke_issued_under`): no longer served, that key is never
-certified again, and the device name is free for a new key. When the CA
+across restarts): that key is never certified again (no enrollment, no
+renewal), and the device name is free for a new key. A certificate of a key
+revoked without a cut is also dropped from its certificate cache
+(`CaState::revoke_issued_under`) and no longer served. A certificate of a key
+revoked **with** a cut stays served: Data the cut accepts needs it to
+verify. It serves nothing else — a revoked key admits no link, enrollment
+or renewal, whichever certificate it shows. When the CA
 starts, it follows the versions loaded from `<pib_path>/contexts/` the same
 way (`revoke::ca_follow_held`), which covers a version stored for the next
 start and a revocation its store could not record. Following a version
@@ -158,7 +248,8 @@ handed_over    = the daemon at <management socket> adopted v2 (signed by /home/r
 ```
 
 Data the revoked key signed is refused wherever v2 is held, the root device
-included:
+included — all of it without a cut, and with a cut whatever the cut does not
+accept:
 
 ```text
 WARN security: validation: REFUSED — certificate revoked in trust context name=/home/rv/member/phone/data/note/v=…/seg=0 error=certificate revoked in trust context: /home/rv/member/phone/KEY/4c60a77af0f3ce14 in_face=face#2
@@ -176,10 +267,16 @@ still reaches what is cached, through a stamp on each entry:
   CS insert stage stores it with the entry.
 - On every CS hit, the lookup compares the entry's stamp with the current
   count: one atomic load. Only when they differ is the entry judged against
-  the revocations held now. It is kept only when it is known clear: it is no
-  revoked certificate, and its chain, followed from its KeyLocator through
-  the node's certificate cache, reaches a trust anchor without passing a
-  revoked key or certificate. Then it is stamped with the current count, so
+  the revocations held now. It is kept only when it is known clear: its chain,
+  followed from its KeyLocator through the node's certificate cache, reaches
+  a trust anchor without passing a revoked key or certificate — except that
+  the key that signed the entry itself may be revoked when the held
+  context's cut of that key accepts the entry (the durable rule,
+  `SignedTrustContext::refuses_data`) — and it is no certificate of a key
+  revoked without a cut. Certificates of a key revoked with a cut are kept,
+  for the in-cut Data. Validity periods are not checked: an expired
+  certificate does not refuse Data. A clear entry is stamped with the
+  current count, so
   it is not judged again until the next revoking adoption. Otherwise it is
   evicted and the Interest goes on as a miss — also when the chain cannot be
   followed that far, as after a restart, when the certificate cache holds
@@ -187,8 +284,9 @@ still reaches what is cached, through a stamp on each entry:
   afresh. Under a context that revokes nothing, every entry is clear.
 
 So once a node has adopted a revoking version, it never serves from its CS
-Data that the version's revocations cover, whether that Data was cached before
-the adoption, validated before it and cached after, or cached while it ran.
+Data that the version refuses, whether that Data was cached before
+the adoption, validated before it and cached after, or cached while it ran;
+the in-cut Data of a revoked key it keeps serving.
 A persistent CS (`fjall`, `sqlite`) keeps its entries across restarts, but the
 count starts again at 0 in each process. Each open of the store takes a new
 generation, stored with every stamp, so an entry stamped by an earlier
@@ -205,7 +303,7 @@ signed … evicted=<n>`. Serving does not depend on it.
 
 A node that has not yet adopted the new version still serves what it cached,
 but a downstream node that holds the new version refuses it. The node also
-stops serving its own certificate for a revoked key. Data validated before
+stops serving its own certificate for a key revoked without a cut. Data validated before
 the adoption that reaches the CS after it is still forwarded to the faces
 whose Interests were waiting for it, since it was valid when it arrived; the
 first hit on its cached copy evicts it.
@@ -223,6 +321,9 @@ Before the root is unlocked (nothing is asked, nothing signed):
 | the name is not a key name under the namespace, or covers a root anchor | revoke a device key, never the root |
 | the CA issued no certificate for that identity | pass the identity as enrolled (`/<ns>/<role>/<device>`) or a key name |
 | the daemon on the socket uses another PIB | pass `-c` with that daemon's config, or `--pib` with its PIB |
+| `--cut`: the cut's key is not one this version newly revokes, or the held version revokes it already (`cut-refused`) | give the cut with the revocation of its key; a key already revoked keeps the cut it has, and single versions come back with `ndn-fwd readmit` |
+| `readmit`: the held version holds no cut for the key (`readmit-no-cut`) | a key not yet revoked: revoke it with a cut first (`ndn-fwd revoke <key> --cut <file>`); a key revoked without a cut has none to add to — a cut comes only with the revocation of its key — so its Data stays refused |
+| `readmit`: a name does not end in its 32-octet implicit digest, or is not under the key's device log `<device>/32=log` (`readmit-refused`) | pass the full name a device reported, digest included |
 
 Unlocking: a wrong passphrase, a refused PIN, or an unreachable OS keychain
 fails before anything is signed; retry with the right one (or unlock the
@@ -243,6 +344,10 @@ and follows the stored context again when it next starts.
 | Part | Where |
 |---|---|
 | Revocation check in the chain walk (prefix match) | `ndn_security::SignedTrustContext::is_revoked`, `validator/chain.rs` |
+| Durable walk for Data (no validity periods; the signing key excused in its cut) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut}`; `ndn_security::{RevocationCut, CutRange}` |
+| Making a cut | `ndn_data::Device::revocation_cut`; refused versions to re-admit: `ndn_data::Device::refused_by_revocation` |
+| Re-admission | `ndn_namespace::root::readmit::{plan, readmit}`; `ndn_cert::{readmissions_to_add, bump_context_readmitting, device_log_of, split_full_name}`; CLI `ndn-fwd readmit` |
+| Re-certifying cut keys after a recovery | `ndn_cert::{recertify_cut_keys, recertify_cut_keys_in_pib}`, `RecoveredNamespace::{recertified, record_recertified}`; `ndn_namespace::root::recover::recertify`; CLI `ndn-fwd recertify` |
 | Key name of a certificate name | `ndn_cert::key_name_of` |
 | New version with revocations | `ndn_cert::bump_context_revoking` (`ndn-cert/src/context_update.rs`) |
 | Strictly-newer adoption | `ndn_security::Keyring::adopt_update` |
@@ -250,7 +355,7 @@ and follows the stored context again when it next starts.
 | Entry stamp; hit-time re-check | `CsInsertStage`, `CsLookupStage` (`ndn-engine` `stages/cs.rs`); `revocation_purge::recheck` |
 | Stamp storage | `ndn_store::{CsEntry::revocation_epoch, ContentStore::restamp, EARLIER_PROCESS_EPOCH}`; store generation in `ndn-store` `cs_keycodec.rs` |
 | CS eviction on adoption | `ndn-engine` `revocation_purge.rs` (`install`) |
-| Checks before signing | `ndn_cert::revocations_to_add` |
+| Checks before signing | `ndn_cert::{revocations_to_add, check_cut}` |
 | CA following the context | `ndn-fwd` `revoke.rs` (`ca_follow`, `ca_follow_held`), called from `TrustAdmin::keep` (`context_adopt.rs`) and the CA's start (`ca.rs`); `ndn_cert::CaState::{issued_under, revoke_issued_under}` |
 | Stored context | `ndn_cert::read_stored_context` |
 | Hand-over | `security/context-update` (`ndn-ipc` `MgmtClient::security_context_update`; daemon `context_refresh::apply_update`) |
