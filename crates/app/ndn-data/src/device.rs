@@ -5565,13 +5565,15 @@ impl Inner {
     /// `pred` (monotone along the stream for an honest writer), searched by
     /// probing blocks: interpolation on `target` between the nearest known
     /// dates, alternating with bisection so a skewed stream costs at most
-    /// twice the bisection's probes. Each round probes at once the window's
-    /// worth of indices nearest the guess not probed yet
-    /// ([`Self::probe_all`]) and takes the nearest that answers. When none
+    /// twice the bisection's probes. Each round probes the guess alone; only
+    /// when it does not answer does the round widen, probing at once the
+    /// window's worth of indices nearest it not probed yet
+    /// ([`Self::probe_all`]), and take the nearest that answers. When none
     /// answers, the rest of `lo..hi` is not probed: it is counted missing,
-    /// and the caller takes it in whole — so blocks withheld cost a round of
-    /// one window, not a probe each, and `deadline` bounds the whole.
-    /// Returns `(lo, hi)` narrowed: equal when found.
+    /// and the caller takes it in whole — so a round costs one probe while
+    /// probes answer, withheld blocks cost one window more, not a probe
+    /// each, and `deadline` bounds the whole. Returns `(lo, hi)` narrowed:
+    /// equal when found.
     #[allow(clippy::too_many_arguments)]
     async fn search(
         self: &Arc<Self>,
@@ -5603,14 +5605,21 @@ impl Inner {
                 }
                 _ => lo + (hi - lo) / 2,
             };
-            // The guess, or the nearest index in the interval that answers.
+            // The guess; on a miss, the nearest indices in the interval, a
+            // window of them at once.
             let order = || (guess..hi).chain((lo..guess).rev());
-            let batch: Vec<u64> = order()
-                .map(|i| seqs[i])
-                .filter(|s| !probes.contains_key(s))
-                .take(window)
-                .collect();
-            self.probe_all(c, device, batch, probes, deadline).await;
+            if !probes.contains_key(&seqs[guess]) {
+                self.probe_all(c, device, vec![seqs[guess]], probes, deadline)
+                    .await;
+            }
+            if known(guess, probes).is_none() {
+                let batch: Vec<u64> = order()
+                    .map(|i| seqs[i])
+                    .filter(|s| !probes.contains_key(s))
+                    .take(window)
+                    .collect();
+                self.probe_all(c, device, batch, probes, deadline).await;
+            }
             let Some((i, d)) = order().find_map(|i| known(i, probes).map(|d| (i, d))) else {
                 for s in &seqs[lo..hi] {
                     probes.entry(*s).or_insert(Probe::Missing);

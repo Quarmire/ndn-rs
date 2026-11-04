@@ -423,9 +423,10 @@ plus the duration the writer stated. What it promises, and no more:
   last listed first, then, each round, interpolating on the dates of the
   versions probed so far and bisecting in turn — fetching each probed
   version, each immutable and cacheable anywhere, from its store first.
-  Each round probes at once the seq it guessed and the nearest others of
-  the interval not yet probed, up to the reader's fetch window, and goes on
-  from the nearest that answers; when none of them answers, the rest of the
+  Each round probes the seq it guessed; only when that probe is not
+  answered does the round probe at once the nearest others of the interval
+  not yet probed, up to the reader's fetch window, and go on from the
+  nearest that answers; when none of them answers, the rest of the
   interval is not probed: it is taken into the range and its versions are
   reported `missing`. A version it knows expired is placed by the dates its
   tombstone keeps (§14.1); a version in pieces, by its `Dated`. It then
@@ -434,9 +435,9 @@ plus the duration the writer stated. What it promises, and no more:
   looks in this implementation): versions it has not reached by then
   are reported `missing`, so withheld or unreachable blocks cost it time,
   never more than the bound. The cost is the head, the node, `O(log n)`
-  probe rounds (two or three for a steady stream, where interpolation lands
-  near the answer) when probes answer — at most a window of probes per
-  round, run at once — and the versions in the range.
+  probes (two or three for a steady stream, where interpolation lands near
+  the answer) when probes answer — a probe that is not answered adds at
+  most one window of probes, run at once — and the versions in the range.
 - **Why not a prefix or an index.** Selecting by a prefix of dated names
   would need range selectors NDN no longer has, and would put the writer's
   clock into names readers must guess. A range index as named data would be
