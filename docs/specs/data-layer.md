@@ -1203,7 +1203,10 @@ housekeeping; it never decides whether anything verifies.
   by its own name, under `32=held` or in audit answers; MUST NOT store one
   it fetches after it expired; keeps a durable tombstone (the version's
   id, writer and keep, and its first and last entry dates, so the writer's
-  nodes stay rebuildable and a range read places it); reports it to its
+  nodes stay rebuildable and a range read places it — of a sealed block
+  dropped before it was opened, the last date is unknown and kept as such,
+  and a range read takes the block as reaching any date from its first on,
+  so lists it under `expired` wherever it may overlap); reports it to its
   watchers as `Change::Expired` (the version and its keep); and answers
   `get` of its name, or of an entry name in it,
   `Expired` (the name and the keep; next step `None`: nothing to do, and

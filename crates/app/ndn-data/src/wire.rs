@@ -1931,15 +1931,21 @@ pub(crate) struct Tomb {
     pub(crate) writer: Name,
     pub(crate) keep: Keep,
     pub(crate) first: Timestamp,
-    pub(crate) last: Timestamp,
+    /// `None` when unknown: a sealed block dropped before it was opened,
+    /// whose entries' offsets this device never read.
+    pub(crate) last: Option<Timestamp>,
 }
 
+/// A tombstone's value: its writer, keep and first date, then its last
+/// date when known (one `Dated` for a sealed block dropped unopened).
 pub(crate) fn encode_tomb(t: &Tomb) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv::WRITER, |w| write_name(w, &t.writer));
     write_keep(&mut w, t.keep);
     write_nni(&mut w, tlv::DATED, t.first.0);
-    write_nni(&mut w, tlv::DATED, t.last.0);
+    if let Some(last) = t.last {
+        write_nni(&mut w, tlv::DATED, last.0);
+    }
     w.finish()
 }
 
@@ -1956,15 +1962,17 @@ pub(crate) fn decode_tomb(value: Bytes) -> Option<Tomb> {
         Ok(true)
     })
     .ok()?;
-    match (writer, keep, dates.as_slice()) {
-        (Some(writer), Some(keep), &[first, last]) => Some(Tomb {
-            writer,
-            keep,
-            first,
-            last,
-        }),
-        _ => None,
-    }
+    let (first, last) = match *dates.as_slice() {
+        [first] => (first, None),
+        [first, last] => (first, Some(last)),
+        _ => return None,
+    };
+    Some(Tomb {
+        writer: writer?,
+        keep: keep?,
+        first,
+        last,
+    })
 }
 
 /// The content of a one-key collection's head (spec §5.3).

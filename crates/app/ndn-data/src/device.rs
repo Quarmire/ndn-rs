@@ -374,7 +374,7 @@ fn tomb_of(v: &Version) -> Tomb {
         writer: v.id.writer.key().clone(),
         keep: v.keep,
         first: v.dated,
-        last: last_dated(v),
+        last: Some(last_dated(v)),
     }
 }
 
@@ -3445,13 +3445,16 @@ impl Inner {
                 lastn_cutoff(coll, &id.writer, n)
             })
         {
-            let last = body
-                .block
-                .as_ref()
-                .and_then(|b| b.last())
-                .map_or(body.dated, |e| {
-                    Timestamp(body.dated.0.saturating_add(e.offset))
-                });
+            // A sealed payload is not opened to drop it: whether it is a
+            // block, and its last entry's date, stay unknown.
+            let last = body.sealed.is_none().then(|| {
+                body.block
+                    .as_ref()
+                    .and_then(|b| b.last())
+                    .map_or(body.dated, |e| {
+                        Timestamp(body.dated.0.saturating_add(e.offset))
+                    })
+            });
             let tomb = Tomb {
                 writer: writer.key().clone(),
                 keep: r.keep,
@@ -5521,8 +5524,9 @@ enum Probe {
     Read(Version),
     /// A version in pieces, and its date: read it by name.
     Large(VersionId, Timestamp),
-    /// Expired here: the dates of its first and last entry.
-    Expired(Timestamp, Timestamp),
+    /// Expired here: the dates of its first and last entry (`None`: a
+    /// sealed block dropped unopened, its last date unknown).
+    Expired(Timestamp, Option<Timestamp>),
     /// Pruned by its writer.
     Pruned,
     /// No path answered with it, verified.
@@ -5530,12 +5534,15 @@ enum Probe {
 }
 
 impl Probe {
-    /// The dates of its first and last entry, if known.
+    /// The dates of its first and last entry, if known. An expired block
+    /// whose last date is unknown may reach any later date: a time search
+    /// takes it as overlapping every range from its first entry on, so a
+    /// range read lists it under `expired`.
     fn dates(&self) -> Option<(Timestamp, Timestamp)> {
         match self {
             Probe::Read(v) => Some((v.dated, last_dated(v))),
             Probe::Large(_, d) => Some((*d, *d)),
-            Probe::Expired(a, b) => Some((*a, *b)),
+            Probe::Expired(a, b) => Some((*a, b.unwrap_or(Timestamp(u64::MAX)))),
             Probe::Pruned | Probe::Missing => None,
         }
     }
@@ -6993,11 +7000,12 @@ fn take_out(
         if !gone(&id, l.body.keep) {
             return true;
         }
+        // Sealed and never opened: its last entry's date is unknown.
         let tomb = Tomb {
             writer: l.writer.key().clone(),
             keep: l.body.keep,
             first: l.body.dated,
-            last: l.body.dated,
+            last: None,
         };
         out.push((id, l.name.clone(), tomb, Some(l.epoch().clone())));
         false
@@ -9797,6 +9805,75 @@ mod tests {
         let missing: BTreeSet<u64> = e.missing.iter().map(|id| id.seq.0).collect();
         assert_eq!(missing, listed, "what it did not reach is missing");
         assert!(e.entries.is_empty() && e.expired.is_empty() && e.large.is_empty());
+        dev.shutdown();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sealed_block_expired_unopened_is_listed_expired_where_it_may_overlap() {
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/rita")));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let key = sensor.clone().append("KEY").append("1");
+        one_key_record(&dev, &c, &key);
+        // A sealed block expires while locked: its last date is unknown.
+        let mut coll = Coll::default();
+        coll.locked.push(Locked {
+            name: log_name(&sensor, Some(&c), 2),
+            wire: Bytes::new(),
+            writer: Writer::new(key.clone()),
+            seq: 2,
+            body: VersionBody {
+                dated: Timestamp(200),
+                ..version_body(
+                    &c,
+                    Some(SealedBody {
+                        epoch: Epoch {
+                            creator: n("/sam/owner"),
+                            seq: Seq(1),
+                        },
+                        ciphertext: Bytes::new(),
+                    }),
+                )
+            },
+        });
+        let (_, _, locked, _) = take_out(&mut coll, |_, _| true).remove(0);
+        assert_eq!(locked.last, None, "a locked block's last date is unknown");
+        let tomb = |first: u64, last: Option<u64>| Tomb {
+            writer: key.clone(),
+            keep: Keep::Until(Timestamp(1)),
+            first: Timestamp(first),
+            last: last.map(Timestamp),
+        };
+        {
+            let mut st = dev.inner.st.lock();
+            for (seq, t) in [
+                (1, tomb(100, Some(150))),
+                (2, locked),
+                (3, tomb(900, Some(950))),
+            ] {
+                st.held
+                    .insert(log_name(&sensor, Some(&c), seq), Held::Expired(t));
+            }
+            st.colls
+                .get_mut(&c)
+                .expect("its record is held")
+                .entries
+                .insert(Writer::new(key.clone()), [1, 2, 3].into());
+        }
+        // From after its first date: it may still overlap the range.
+        let name = wire::range_name(&c, &Range::Times(Timestamp(300), Timestamp(800)));
+        let Got::Entries(e) = dev.get(&name).await.unwrap().got else {
+            panic!("a range read answers entries");
+        };
+        assert!(
+            e.expired.iter().any(|id| id.seq.0 == 2),
+            "listed expired: {e:?}"
+        );
         dev.shutdown();
     }
 
