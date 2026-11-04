@@ -123,6 +123,12 @@ pub struct Config {
     pub hold_for: Vec<Name>,
     /// How many random pieces an audit asks each holder for.
     pub audit_pieces: usize,
+    /// How far ahead of this device's clock another device's may run, as
+    /// this device judges it: a holder's signed `Expired` audit answer for a
+    /// version its writer kept until `t` is evidence of a broken lease only
+    /// when `t` is more than this past this device's clock (spec §14.1), so
+    /// a holder whose fast clock dropped the piece early is not framed.
+    pub clock_skew: Duration,
     /// Where audits draw their randomness.
     pub entropy: Entropy,
 }
@@ -130,7 +136,8 @@ pub struct Config {
 impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
     /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
-    /// not a holder, 16 pieces an audit, the operating system's randomness.
+    /// not a holder, 16 pieces an audit, a day of clock skew, the operating
+    /// system's randomness.
     pub fn new() -> Self {
         Self {
             svs: SvsConfig::default(),
@@ -146,6 +153,7 @@ impl Config {
             window: 32,
             hold_for: Vec::new(),
             audit_pieces: 16,
+            clock_skew: Duration::from_secs(24 * 60 * 60),
             entropy: Arc::new(|buf| {
                 getrandom::getrandom(buf).expect("the operating system provides randomness")
             }),
@@ -169,6 +177,7 @@ impl std::fmt::Debug for Config {
             .field("window", &self.window)
             .field("hold_for", &self.hold_for)
             .field("audit_pieces", &self.audit_pieces)
+            .field("clock_skew", &self.clock_skew)
             .finish_non_exhaustive()
     }
 }
@@ -5529,10 +5538,12 @@ impl Probe {
     }
 }
 
-/// How an audit checks one piece: the digest the holder's answer must have.
+/// How an audit checks one piece: the digest the holder's answer must have,
+/// and the keep its version's writer signed.
 struct Ask {
     piece: Name,
     digest: [u8; 32],
+    keep: Keep,
 }
 
 /// One ask of an asker device a holder is working on ([`Inner::ask_slot`]).
@@ -5574,16 +5585,27 @@ enum Judged {
     RefusedBy(Bytes),
 }
 
-/// Judge a holder's signed answer to an ask for a piece whose packet's
-/// digest is `digest` (`None`: no signed answer came back; `Some(None)`:
-/// one that is no answer) (spec §13.3). A piece that is not the piece, or a
-/// signed `Missing`, is evidence; `Expired` — the holder dropped it by its
-/// own clock — never is: an honest holder is not framed by an auditor
-/// whose clock is behind (spec §14.1).
-fn judge(answer: Option<Option<AuditAnswer>>, digest: &[u8; 32]) -> Judged {
+/// Judge a holder's signed answer to `ask` (`None`: no signed answer came
+/// back; `Some(None)`: one that is no answer) (spec §13.3) by this device's
+/// clock `now`. A piece that is not the piece, or a signed `Missing`, is
+/// evidence. `Expired` — the holder dropped it by its own clock — is
+/// evidence only when the keep its writer signed proves it false: kept
+/// `Forever`, or `Until(t)` with `t` more than `skew` past `now`. Within the
+/// skew, or kept for the last `n` (the holder may know newer versions), it
+/// is no answer: an honest holder is not framed by an auditor whose clock is
+/// behind (spec §14.1).
+fn judge(answer: Option<Option<AuditAnswer>>, ask: &Ask, now: Timestamp, skew: Duration) -> Judged {
+    let unexpired = match ask.keep {
+        Keep::Forever => true,
+        Keep::Until(t) => {
+            t.0.saturating_sub(now.0) > u64::try_from(skew.as_millis()).unwrap_or(u64::MAX)
+        }
+        Keep::LastN(_) => false,
+    };
     Judged::Done(match answer {
+        Some(Some(AuditAnswer::Expired)) if unexpired => Asked::Breach(Breach::Expired),
         None | Some(Some(AuditAnswer::Expired)) => Asked::Unanswered,
-        Some(Some(AuditAnswer::Piece(w))) if wire::implicit_digest(&w) == *digest => {
+        Some(Some(AuditAnswer::Piece(w))) if wire::implicit_digest(&w) == ask.digest => {
             Asked::Piece(w)
         }
         Some(Some(AuditAnswer::Missing)) => Asked::Breach(Breach::Missing),
@@ -6473,7 +6495,7 @@ impl Inner {
     async fn promised(self: &Arc<Self>, c: &Name, holder: &Name) -> Promised {
         let now = (self.config.clock)();
         let mut out = Promised::default();
-        let versions: Vec<(Name, [u8; 32], Option<ChunksBody>)> = {
+        let versions: Vec<(Name, [u8; 32], Option<ChunksBody>, Keep)> = {
             let st = self.st.lock();
             let Some(coll) = st.colls.get(c) else {
                 return out;
@@ -6519,16 +6541,17 @@ impl Inner {
                     if matches!(keep, Keep::Until(t) if t <= now) {
                         continue;
                     }
-                    list.push((name, wire::implicit_digest(&w), chunks));
+                    list.push((name, wire::implicit_digest(&w), chunks, keep));
                 }
             }
             list
         };
-        'versions: for (name, digest, chunks) in versions {
+        'versions: for (name, digest, chunks, keep) in versions {
             let Some(chunks) = chunks else {
                 out.asks.push(Ask {
                     piece: name,
                     digest,
+                    keep,
                 });
                 continue;
             };
@@ -6541,9 +6564,14 @@ impl Inner {
                     continue 'versions;
                 };
                 let node = piece_name(&name, kind);
+                let ask = Ask {
+                    piece: node.clone(),
+                    digest: expected,
+                    keep,
+                };
                 let w = match self.get_piece(c, &node, &expected).await {
                     Some(w) => w,
-                    None => match self.check_piece(c, holder, &node, &expected).await {
+                    None => match self.check_piece(c, holder, &ask).await {
                         Asked::Piece(w) => w,
                         Asked::Breach(breach) => {
                             out.broken.get_or_insert((node, breach));
@@ -6573,12 +6601,14 @@ impl Inner {
             out.asks.push(Ask {
                 piece: name.clone(),
                 digest,
+                keep,
             });
             let mut pieces: Vec<(PieceKind, [u8; 32])> = digests.into_iter().collect();
             pieces.sort();
             out.asks.extend(pieces.into_iter().map(|(k, d)| Ask {
                 piece: piece_name(&name, k),
                 digest: d,
+                keep,
             }));
         }
         out
@@ -6617,25 +6647,23 @@ impl Inner {
         Some((ask.nonce, answer))
     }
 
-    /// Ask `holder` for `piece` of `c`, whose packet's digest this device
-    /// holds as `digest`, and judge the answer (spec §13.3): the piece; a
-    /// signed `Missing`, or bytes that are not the piece — evidence, as this
-    /// device's records say the piece should be there; a record the holder
-    /// names as ending the piece's version, which this device verifies and
-    /// takes: excused when it does end it, evidence when a verified prune
-    /// does not; or nothing that is evidence.
-    async fn check_piece(
-        self: &Arc<Self>,
-        c: &Name,
-        holder: &Name,
-        piece: &Name,
-        digest: &[u8; 32],
-    ) -> Asked {
-        let answer = self.ask_holder(holder, piece, false).await.map(|(_, a)| a);
-        match judge(answer, digest) {
+    /// Ask `holder` for the piece of `c` that `ask` names, and judge the
+    /// answer (spec §13.3): the piece; a signed `Missing`, bytes that are
+    /// not the piece, or `Expired` that the piece's keep proves false —
+    /// evidence, as this device's records say the piece should be there; a
+    /// record the holder names as ending the piece's version, which this
+    /// device verifies and takes: excused when it does end it, evidence when
+    /// a verified prune does not; or nothing that is evidence.
+    async fn check_piece(self: &Arc<Self>, c: &Name, holder: &Name, ask: &Ask) -> Asked {
+        let answer = self
+            .ask_holder(holder, &ask.piece, false)
+            .await
+            .map(|(_, a)| a);
+        let now = (self.config.clock)();
+        match judge(answer, ask, now, self.config.clock_skew) {
             Judged::Done(asked) => asked,
-            Judged::PrunedBy(w) => self.excused_by_prune(c, piece, w).await,
-            Judged::RefusedBy(w) => self.excused_by_members(c, piece, w).await,
+            Judged::PrunedBy(w) => self.excused_by_prune(c, &ask.piece, w).await,
+            Judged::RefusedBy(w) => self.excused_by_members(c, &ask.piece, w).await,
         }
     }
 
@@ -6713,7 +6741,7 @@ impl Inner {
         }
         let answers: Vec<(Name, Asked)> = stream::iter(picked)
             .map(|a| async move {
-                let asked = self.check_piece(c, holder, &a.piece, &a.digest).await;
+                let asked = self.check_piece(c, holder, &a).await;
                 (a.piece, asked)
             })
             .buffer_unordered(self.config.window)
@@ -9790,16 +9818,40 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_audit_answer_is_never_evidence() {
-        let digest = [7; 32];
+    fn an_expired_audit_answer_is_evidence_only_when_its_keep_proves_it_false() {
+        let now = Timestamp(1_000_000_000);
+        let skew = Config::new().clock_skew;
+        let ask = |keep: Keep| Ask {
+            piece: n("/sam/sensor/32=log/sam/32=data/temps/seq=1"),
+            digest: [7; 32],
+            keep,
+        };
+        let expired = |keep: Keep| judge(Some(Some(AuditAnswer::Expired)), &ask(keep), now, skew);
+        let far = Timestamp(now.0 + 2 * skew.as_millis() as u64);
+        for keep in [Keep::Forever, Keep::Until(far)] {
+            assert!(
+                matches!(expired(keep), Judged::Done(Asked::Breach(_))),
+                "{keep:?}: no clock skew explains it"
+            );
+        }
+        // A holder whose clock runs ahead by less than the skew, or one
+        // that may know newer versions, is not framed.
+        let near = Timestamp(now.0 + skew.as_millis() as u64 / 2);
+        for keep in [Keep::Until(near), Keep::Until(now), Keep::LastN(3)] {
+            assert!(
+                matches!(expired(keep), Judged::Done(Asked::Unanswered)),
+                "{keep:?}"
+            );
+        }
+        // A holder that signs it lost the piece broke its lease.
         assert!(matches!(
-            judge(Some(Some(AuditAnswer::Expired)), &digest),
-            Judged::Done(Asked::Unanswered)
-        ));
-        // A holder that signs it lost the piece, by contrast, broke its lease.
-        assert!(matches!(
-            judge(Some(Some(AuditAnswer::Missing)), &digest),
-            Judged::Done(Asked::Breach(Breach::Missing))
+            judge(
+                Some(Some(AuditAnswer::Missing)),
+                &ask(Keep::Forever),
+                now,
+                skew
+            ),
+            Judged::Done(Asked::Breach(_))
         ));
     }
 }

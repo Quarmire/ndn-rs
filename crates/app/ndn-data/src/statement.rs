@@ -96,6 +96,10 @@ pub enum Breach {
     Missing,
     /// It signed bytes that are not the piece.
     Wrong,
+    /// It signed that the piece expired while its writer's signed keep
+    /// shows it has not: kept forever, or until a date further past the
+    /// auditor's clock than any clock skew it allows.
+    Expired,
 }
 
 /// The custody of one collection after a [`hold`](crate::DataLayer::hold):

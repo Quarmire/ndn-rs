@@ -1031,9 +1031,15 @@ refuses, when it decodes the record, a `Chunks` whose `Size` is above it
     in force at the auditor now refuses the version; when the auditor
     still admits it, the two views differ and it is no answer, never
     evidence.
-  - `Expired`: no answer, never evidence — the lease is unanswered for the
-    piece and repair may ask again. So an auditor whose clock is behind the
-    holder's cannot frame an honest holder that dropped at keep.
+  - `Expired`: the auditor checks it against the keep the version's writer
+    signed. Kept `Forever`, or `Until(t)` with `t` later than the auditor's
+    clock plus the clock skew it allows (a day by default): signed evidence
+    of a breach, as no clock explains it — the holder dropped what it
+    promised and claims expiry. Otherwise — `t` within the skew, or kept for
+    the last `n`, as the holder may know newer versions the auditor does not
+    — no answer, never evidence: the lease is unanswered for the piece and
+    repair may ask again. So an auditor whose clock is behind the holder's
+    cannot frame an honest holder that dropped at keep.
   - Nothing signed by `H`: no answer.
 - Verdict: **broken** on any evidence; else **unanswered** when an ask got
   no answer, or no device produced a manifest node a promised version's
@@ -1214,13 +1220,18 @@ housekeeping; it never decides whether anything verifies.
 - **Custody.** Leases are capped by keep (§13.2); audits never ask a piece
   whose keep has passed by the auditor's clock; a holder asked for a piece
   it dropped as expired by its own clock answers `Expired`, which is no
-  answer and never evidence (§13.3).
+  answer and not evidence — unless the writer's signed keep proves it false
+  beyond any clock skew the auditor allows (kept `Forever`, or until a date
+  more than that skew past the auditor's clock), which is evidence of a
+  broken lease (§13.3).
 - **Clocks.** A slow — or lying — clock makes a device hold and serve
   longer; readers with right clocks still answer `Expired` and store
   nothing past keep. A fast clock makes a device drop early its own copy
-  only: its lease stops counting for what it dropped, and nothing of any
-  other device changes. A writer's clock moves only its own dates and its
-  own listing (§7).
+  only: its lease stops counting for what it dropped — and a holder whose
+  clock runs ahead of its auditor's by more than the skew the auditor
+  allows is judged broken for it — and nothing of any other device
+  changes. A writer's clock moves only its own dates and its own listing
+  (§7).
 - **Forward-only.** Expiry deletes at the devices that keep this
   specification; it recalls no copy (invariant 9). A cache, a device whose
   clock is slow, or a reader that copied the data out of the layer keeps
@@ -1259,9 +1270,13 @@ With blocks, heads and expiry:
     understates (§5.3);
   - can serve past keep: readers drop by their own clocks and store
     nothing expired (§14.1);
-  - can answer `Expired` in an audit: no answer, never evidence. A holder
-    that lost what it promised can so escape evidence, never the count: an
-    unanswered lease counts for nothing and repair starts (§13.3);
+  - can answer `Expired` in an audit: no answer, not evidence, within the
+    clock skew the auditor allows or for a version kept for the last `n`;
+    for a version whose writer-signed keep proves it has not expired (kept
+    `Forever`, or until beyond the skew) it is evidence, and the lease is
+    broken. A holder that lost what it promised can so escape evidence only
+    within that skew, never the count: an unanswered lease counts for
+    nothing and repair starts (§13.3);
   - cannot forge an entry or splice one from another block: the block's
     signature covers every entry (§4.1). It cannot alter which versions a
     range read considers: the reader takes them from the node the signed
@@ -1549,7 +1564,7 @@ a `HeadRecord` would take a head for nothing, and one passing over
 fresher than it is. A range name with an unknown `TimeRange` read as some
 other range would answer the wrong entries. An auditor passing over
 `Expired` would read an empty answer as no `AuditAnswer` it knows, and
-must instead know it is no answer and never evidence.
+must instead judge it against the piece's keep (§13.3).
 
 Names are the Name TLV (0x07). Inside a record, fields appear in the order
 the table lists them; lists are sorted as stated, so equal content encodes
@@ -1694,7 +1709,7 @@ to equal bytes and equal nodes have equal digests.
 | Head served, node or newest version withheld | The head raises its key's rollback floor, but its receipt does not count; `get` answers the held version aged from the last head that named it the newest, or `Unavailable` (`RetryLater`) when a newer head was verified and none named it the newest since the reader started. | invariant 5, §5.3 |
 | Forged or spliced entry | The block's signature fails; the block is dropped and fetched elsewhere; the entry is never returned. | invariant 1, §4.1 |
 | Holder serves past keep | Readers drop by their own clocks, answer `Expired` and store nothing expired. | §14.1 |
-| Holder claims `Expired` | No answer, never evidence: the lease does not count for the piece and repair may ask again. | §13.3, §14.1 |
+| Holder claims `Expired` | Within the auditor's clock skew, or for a version kept for the last `n`: no answer, not evidence — the lease does not count for the piece and repair may ask again. For a version its writer kept `Forever`, or until beyond that skew: evidence, the lease is broken (`Breach::Expired`). | §13.3, §14.1 |
 | Writer's dates go back | Its entries dated out of order may be missed by a time range; nothing it did not sign is returned. | §5.4 |
 | Battery producer, many readers | Caches answer its head for its batch delay; readers' age includes it. | §5.3 |
 | Writer stops, keep passes | Its newest node keeps listing what has since expired; a reader that never held it cannot fetch it, and a watch of that stream may stay incomplete until the writer writes again; `get` and range reads answer what they reach and list the rest missing. Nothing wrong is delivered. | §7, §14.1 |
