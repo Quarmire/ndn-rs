@@ -54,7 +54,7 @@ impl Validator {
     /// its issuer's key, until a trust anchor terminates the walk. Missing
     /// certificates are fetched via the `CertFetcher` if configured.
     pub async fn validate_chain(&self, data: &Data) -> ValidationResult {
-        let (result, _missing) = self.validate_chain_inner(data, true).await;
+        let (result, _missing) = self.validate_chain_inner(data, true, false).await;
         self.bump_for_result(&result);
         result
     }
@@ -70,7 +70,51 @@ impl Validator {
         &self,
         data: &Data,
     ) -> (ValidationResult, Option<Arc<Name>>) {
-        let (result, missing) = self.validate_chain_inner(data, false).await;
+        let (result, missing) = self.validate_chain_inner(data, false, false).await;
+        self.bump_for_result(&result);
+        (result, missing)
+    }
+
+    /// Validate Data by the **durable** rule (`docs/specs/trust-context.md`
+    /// §6.3): its verdict never depends on a clock. The same walk as
+    /// [`Self::validate_chain`] — signatures, schema and hierarchy,
+    /// certificate authorization, anchors, revocations — except that:
+    ///
+    /// - no ValidityPeriod is checked, of an anchor or of a certificate: a
+    ///   key's certificate proves the key was authorized, and its authority
+    ///   over Data ends only by a revocation in the trust context. A key's
+    ///   certificate is any one of it, cached or fetched, that verifies the
+    ///   signature, the newest NotBefore first;
+    /// - the key that signed the packet itself (depth 0: its KeyLocator, and
+    ///   the certificate that resolves to) is excused a revocation when the
+    ///   selected context holds a [`RevocationCut`](crate::RevocationCut)
+    ///   for exactly that key accepting the packet's name and implicit
+    ///   digest ([`SignedTrustContext::refuses_data`](crate::SignedTrustContext::refuses_data)).
+    ///   Revoked keys higher in the chain (issuers) are refused as by
+    ///   [`Self::validate_chain`].
+    ///
+    /// A packet whose signer is revoked outside its cut is refused with
+    /// [`TrustError::Revoked`] only once its signature and chain check out
+    /// (an authentic packet of that key); a forgery naming a revoked key
+    /// gets the verdict its signature or chain earns.
+    ///
+    /// For Data only: signed Interests, commands and trust-context adoption
+    /// stay live ([`Self::validate_interest_chain`], [`Self::validate_chain`]).
+    pub async fn validate_durable(&self, data: &Data) -> ValidationResult {
+        let (result, _missing) = self.validate_chain_inner(data, true, true).await;
+        self.bump_for_result(&result);
+        result
+    }
+
+    /// [`Self::validate_durable`] using only certificates already cached, as
+    /// [`Self::validate_chain_cached`] does: `(Pending, Some(missing))` names
+    /// the certificate to fetch before validating again
+    /// ([`Self::can_resolve_durable`]).
+    pub async fn validate_durable_cached(
+        &self,
+        data: &Data,
+    ) -> (ValidationResult, Option<Arc<Name>>) {
+        let (result, missing) = self.validate_chain_inner(data, false, true).await;
         self.bump_for_result(&result);
         (result, missing)
     }
@@ -87,6 +131,7 @@ impl Validator {
         &self,
         data: &Data,
         fetch: bool,
+        durable: bool,
     ) -> (ValidationResult, Option<Arc<Name>>) {
         let result = |r: ValidationResult| (r, None);
         // An adoption in progress decides its own context Data (and nothing
@@ -144,6 +189,7 @@ impl Validator {
                 sig_info.sig_type,
                 fetch,
                 Some(data),
+                durable,
             )
             .await
         {
@@ -225,6 +271,7 @@ impl Validator {
                 sig_info.sig_type,
                 true,
                 None,
+                false,
             )
             .await
         {
@@ -257,6 +304,12 @@ impl Validator {
     /// refused for any reason is remembered for its key
     /// ([`Self::refused_certs`]) by the Data validation that refused it.
     ///
+    /// `durable` (Data only, see [`Self::validate_durable`]): no
+    /// ValidityPeriod is checked, a key resolves to any of its certificates
+    /// that verifies the signature (the newest NotBefore first), and a
+    /// revocation of the packet's own signer is excused by its key's cut, or
+    /// else reported once the rest of the chain checks out.
+    ///
     /// [`SignedTrustContext::authorizes_hop`]: crate::SignedTrustContext::authorizes_hop
     #[allow(clippy::too_many_arguments)]
     async fn walk_to_anchor(
@@ -268,11 +321,25 @@ impl Validator {
         first_sig_type: SignatureType,
         fetch: bool,
         packet: Option<&Data>,
+        durable: bool,
     ) -> WalkOutcome {
         let ctx = self.keyring.context_for(context_name);
         let authoritative = ctx.schema_is_authoritative();
+        // Durable walks are for Data; a walk without a packet is live.
+        let durable = durable && packet.is_some();
 
         let now = now_ns();
+        // Durable: the revocation of the packet's own signer that its cut
+        // does not excuse, reported only if the chain otherwise checks out
+        // (so the refusal is about an authentic packet of that key).
+        let mut revoked_signer: Option<TrustError> = None;
+        // The packet, while the walk is at its own signer (depth 0) of a
+        // durable walk: the revocation refusal [`revocation_refusal`] judges.
+        let signed_packet = |depth: usize| packet.filter(|_| durable && depth == 0);
+        let trusted = |chain_names: Vec<Name>, revoked: Option<TrustError>| match revoked {
+            Some(refused) => WalkOutcome::Invalid(refused),
+            None => WalkOutcome::Trusted(chain_names),
+        };
         let mut chain_names: Vec<Name> = Vec::new();
         let mut seen: HashSet<Arc<Name>> = HashSet::new();
 
@@ -345,17 +412,22 @@ impl Validator {
 
             // A chain that passes through a key revoked by the selected context
             // is rejected — how an issuing-CA compromise is contained by a pulled
-            // context bump (no re-bootstrap).
-            if ctx.is_revoked(&current_key_name) {
-                return WalkOutcome::Invalid(TrustError::Revoked {
-                    name: current_key_name.to_string(),
-                });
+            // context bump (no re-bootstrap). A durable walk excuses the
+            // packet's own signer when its cut accepts the packet, and defers
+            // its refusal otherwise.
+            if let Some(refused) = revocation_refusal(&ctx, &current_key_name, signed_packet(depth))
+            {
+                if signed_packet(depth).is_none() {
+                    return WalkOutcome::Invalid(refused);
+                }
+                revoked_signer.get_or_insert(refused);
             }
 
             // Anchors match by key: a KeyLocator naming the anchor's key or any
-            // certificate of it terminates the chain there.
+            // certificate of it terminates the chain there. A durable walk
+            // does not judge the anchor's ValidityPeriod.
             if let Some(anchor) = ctx.anchor_for(&current_key_name) {
-                if !anchor.is_valid_at(now) {
+                if !durable && !anchor.is_valid_at(now) {
                     return WalkOutcome::Invalid(TrustError::CertNotFound {
                         name: format!("expired trust anchor: {}", current_key_name),
                     });
@@ -373,7 +445,7 @@ impl Validator {
                 {
                     Ok(VerifyOutcome::Valid) => {
                         chain_names.push(current_key_name.as_ref().clone());
-                        WalkOutcome::Trusted(chain_names)
+                        trusted(chain_names, revoked_signer)
                     }
                     Ok(VerifyOutcome::Invalid) => {
                         WalkOutcome::Invalid(TrustError::InvalidSignature)
@@ -382,7 +454,25 @@ impl Validator {
                 };
             }
 
-            let cached = self.cert_cache.get_valid(&current_key_name);
+            // Live: the key's newest certificate valid now. Durable: its
+            // newest certificate of any validity that verifies the signature
+            // (`cached_verified`).
+            let (cached, cached_verified) = if durable {
+                match self
+                    .durable_cached(
+                        &current_key_name,
+                        current_signed_region,
+                        current_sig_value,
+                        current_sig_type,
+                    )
+                    .await
+                {
+                    Ok(cached) => (cached, true),
+                    Err(e) => return WalkOutcome::Invalid(e),
+                }
+            } else {
+                (self.cert_cache.get_valid(&current_key_name), false)
+            };
             // The packet certifies the key that signed it (self-signed): a
             // certificate of the KeyLocator's key, or a legacy key-named
             // certificate whose KeyLocator names itself.
@@ -397,15 +487,20 @@ impl Validator {
                 }
                 _ => None,
             };
+            let resolved = match cached {
+                Some(c) => Some((c, cached_verified)),
+                None => own.map(|c| (c, false)),
+            };
             // `verified`: the certificate already verified the current signature.
-            let (cert, verified) = match cached.or(own) {
-                Some(c) => (c, false),
+            let (cert, verified) = match resolved {
+                Some(resolved) => resolved,
                 None => match self
                     .refused_signer(
                         &current_key_name,
                         current_signed_region,
                         current_sig_value,
                         current_sig_type,
+                        durable,
                     )
                     .await
                 {
@@ -426,17 +521,19 @@ impl Validator {
                 },
             };
 
-            if !cert.is_valid_at(now) {
+            if !durable && !cert.is_valid_at(now) {
                 return WalkOutcome::Invalid(TrustError::CertNotFound {
                     name: format!("expired or not-yet-valid: {}", cert.name),
                 });
             }
             // A KeyLocator naming the key resolves to one of its certificates;
-            // a revocation naming that certificate refuses it too.
-            if ctx.is_revoked(&cert.name) {
-                return WalkOutcome::Invalid(TrustError::Revoked {
-                    name: cert.name.to_string(),
-                });
+            // a revocation naming that certificate refuses it too (excused or
+            // deferred as the key's own revocation above).
+            if let Some(refused) = revocation_refusal(&ctx, &cert.name, signed_packet(depth)) {
+                if signed_packet(depth).is_none() {
+                    return WalkOutcome::Invalid(refused);
+                }
+                revoked_signer.get_or_insert(refused);
             }
             // Data that merely shares the certificate name shape is no
             // certificate (an admin's NDNCERT decision
@@ -474,7 +571,7 @@ impl Validator {
 
             chain_names.push(current_key_name.as_ref().clone());
             if !self.require_anchor {
-                return WalkOutcome::Trusted(chain_names);
+                return trusted(chain_names, revoked_signer);
             }
 
             let Some(issuer) = &cert.issuer else {
@@ -672,18 +769,28 @@ impl Validator {
     /// recently (the validator's refused-certificate memory). The forwarder's validation stage
     /// re-validates Data parked for `name` once this holds.
     pub fn can_resolve(&self, name: &Name) -> bool {
-        self.cert_cache.get_valid(name).is_some() || self.refused_cert(name).is_some()
+        self.cert_cache.get_valid(name).is_some() || self.refused_cert(name, false).is_some()
     }
 
-    /// The refused certificate answering for `name`, while it does.
-    fn refused_cert(&self, name: &Name) -> Option<Certificate> {
+    /// [`Self::can_resolve`] for a durable walk ([`Self::validate_durable_cached`]):
+    /// a certificate of any validity is cached under `name`, or one was
+    /// refused recently. An expired certificate a fetch brought in resolves
+    /// the key, as the durable walk takes it.
+    pub fn can_resolve_durable(&self, name: &Name) -> bool {
+        !self.cert_cache.all(name).is_empty() || self.refused_cert(name, true).is_some()
+    }
+
+    /// The refused certificate answering for `name`, while it does. A live
+    /// walk (`durable` unset) takes it only while it is valid now.
+    fn refused_cert(&self, name: &Name, durable: bool) -> Option<Certificate> {
         if self.refused_certs.is_empty() {
             return None;
         }
         let entry = self.refused_certs.get(&key_name_of(name))?;
         let (cert, until) = entry.value();
         let now = now_ns();
-        (now < *until && cert.is_valid_at(now) && cert.name.has_prefix(name)).then(|| cert.clone())
+        (now < *until && (durable || cert.is_valid_at(now)) && cert.name.has_prefix(name))
+            .then(|| cert.clone())
     }
 
     /// The refused certificate answering for `key`, if it verifies the
@@ -696,12 +803,48 @@ impl Validator {
         signed_region: &[u8],
         sig_value: &[u8],
         sig_type: SignatureType,
+        durable: bool,
     ) -> Option<Certificate> {
-        let cert = self.refused_cert(key)?;
+        let cert = self.refused_cert(key, durable)?;
         match verify_by_sig_type(sig_type, signed_region, sig_value, &cert.public_key).await {
             Ok(VerifyOutcome::Valid) => Some(cert),
             _ => None,
         }
+    }
+
+    /// A durable walk's certificate for `key` from the cache: of the cached
+    /// certificates `key` resolves to, valid now or not, the newest
+    /// (NotBefore, then name) whose public key verifies the current
+    /// signature. `Ok(None)` when none is cached (resolve it otherwise);
+    /// an error when some are cached and none verifies, as a live walk
+    /// refuses a signature its cached certificate does not verify.
+    async fn durable_cached(
+        &self,
+        key: &Name,
+        signed_region: &[u8],
+        sig_value: &[u8],
+        sig_type: SignatureType,
+    ) -> Result<Option<Certificate>, TrustError> {
+        let mut certs = self.cert_cache.all(key);
+        if certs.is_empty() {
+            return Ok(None);
+        }
+        certs.sort_by(|a, b| (b.valid_from, b.name.as_ref()).cmp(&(a.valid_from, a.name.as_ref())));
+        let mut failure = TrustError::InvalidSignature;
+        let mut tried: Vec<&bytes::Bytes> = Vec::new();
+        for cert in &certs {
+            // Certificates of one key usually certify one public key.
+            if tried.contains(&&cert.public_key) {
+                continue;
+            }
+            tried.push(&cert.public_key);
+            match verify_by_sig_type(sig_type, signed_region, sig_value, &cert.public_key).await {
+                Ok(VerifyOutcome::Valid) => return Ok(Some(cert.clone())),
+                Ok(VerifyOutcome::Invalid) => {}
+                Err(e) => failure = e,
+            }
+        }
+        Err(failure)
     }
 
     /// Remember `cert`, a certificate packet just refused with a final
@@ -722,6 +865,29 @@ impl Validator {
         let until = now.saturating_add(u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX));
         self.refused_certs.insert(cert.key_name(), (cert, until));
     }
+}
+
+/// The refusal for a chain hop through `name` (a key or certificate name)
+/// that `ctx` revokes, or `None` when no Revocation covers it. `durable_packet`
+/// is the Data of a durable walk while the walk is at the packet's own
+/// signer: then the cut of the signer's key excuses the revocation when it
+/// accepts the packet ([`SignedTrustContext::refuses_data`](crate::SignedTrustContext::refuses_data)).
+fn revocation_refusal(
+    ctx: &crate::SignedTrustContext,
+    name: &Name,
+    durable_packet: Option<&Data>,
+) -> Option<TrustError> {
+    if !ctx.is_revoked(name) {
+        return None;
+    }
+    if let Some(p) = durable_packet
+        && !ctx.refuses_data(name, &p.name, &p.implicit_digest())
+    {
+        return None;
+    }
+    Some(TrustError::Revoked {
+        name: name.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -2015,5 +2181,295 @@ mod tests {
             validator.validate_interest(&interest).await,
             crate::InterestValidationOutcome::Valid
         ));
+    }
+
+    // ── durable (Data) validation ───────────────────────────────────────────
+
+    mod durable {
+        use super::*;
+        use crate::cert_cache::CertCache;
+        use crate::{Keyring, RevocationCut, SignedTrustContext};
+
+        /// 2001-09-09, a NotBefore long past.
+        const PAST: u64 = 1_000_000_000_000_000_000;
+        /// 2017-07-14, a NotAfter long past.
+        const EXPIRED: u64 = 1_500_000_000_000_000_000;
+        /// 2286-11-20, a NotBefore not reached yet.
+        const FUTURE: u64 = 10_000_000_000_000_000_000;
+
+        const PHONE: &str = "/home/bob/member/phone/KEY/k1";
+        const CA: &str = "/home/bob/CA/KEY/ca";
+
+        fn signer(name: &str, seed: u8) -> Ed25519Signer {
+            Ed25519Signer::from_seed(&[seed; 32], n(name))
+        }
+
+        /// The certificate `<key>/<issuer-id>/v=1` of `subject`, issued by
+        /// `issuer`, valid `from..=until`.
+        async fn cert(
+            subject: &Ed25519Signer,
+            issuer: &Ed25519Signer,
+            issuer_id: &str,
+            from: u64,
+            until: u64,
+        ) -> Bytes {
+            crate::manager::encode_cert_data(
+                &subject
+                    .key_name()
+                    .clone()
+                    .append(issuer_id)
+                    .append_version(1),
+                &subject.public_key_bytes(),
+                issuer,
+                from,
+                until,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn decoded(wire: &Bytes) -> Certificate {
+            Certificate::decode(&Data::decode(wire.clone()).unwrap()).unwrap()
+        }
+
+        /// `/home/bob/member/phone/32=log/<collection>/seq=<seq>`.
+        fn log_name(collection: &str, seq: u64) -> Name {
+            log_prefix(collection).append_sequence_num(seq)
+        }
+
+        fn log_prefix(collection: &str) -> Name {
+            n("/home/bob/member/phone")
+                .append_component(NameComponent::keyword(Bytes::from_static(b"log")))
+                .append(collection)
+        }
+
+        fn signed(name: Name, content: &[u8], by: &Ed25519Signer) -> Data {
+            let wire = ndn_packet::encode::DataBuilder::new(name, content).sign_sync(
+                SignatureType::SignatureEd25519,
+                Some(by.key_name()),
+                |region| by.sign_sync(region).unwrap(),
+            );
+            Data::decode(wire).unwrap()
+        }
+
+        /// The namespace `/home/bob`: root `/home/bob/KEY/root` (anchor valid
+        /// until `anchor_until`), CA `/home/bob/CA/KEY/ca` certified by the
+        /// root, and the phone's key certified by the CA, valid
+        /// `leaf_from..=leaf_until`. `edit` shapes the context (revocations,
+        /// cuts). The phone's certificate is cached unless `cache_leaf` is
+        /// unset (it is then served by a fetcher).
+        struct Bob {
+            validator: Validator,
+            phone: Ed25519Signer,
+            leaf: Bytes,
+        }
+
+        async fn bob(
+            anchor_until: u64,
+            (leaf_from, leaf_until): (u64, u64),
+            cache_leaf: bool,
+            edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
+        ) -> Bob {
+            let root = signer("/home/bob/KEY/root", 70);
+            let ca = signer(CA, 71);
+            let phone = signer(PHONE, 72);
+            let anchor = decoded(&cert(&root, &root, "self", PAST, anchor_until).await);
+            let ca_cert = decoded(&cert(&ca, &root, "root", PAST, u64::MAX).await);
+            let leaf = cert(&phone, &ca, "CA", leaf_from, leaf_until).await;
+
+            let ctx = edit(
+                SignedTrustContext::hierarchical(n("/home/bob"))
+                    .with_ca_endpoint(n("/home/bob/CA"))
+                    .with_version(1),
+            );
+            // Inserted directly: `add_anchor` refuses an anchor expired now.
+            ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
+            let keyring = Arc::new(Keyring::new());
+            assert!(keyring.adopt(Arc::new(ctx)));
+            let cache = Arc::new(CertCache::new());
+            cache.insert(ca_cert);
+            if cache_leaf {
+                cache.insert(decoded(&leaf));
+            }
+            Bob {
+                validator: Validator::with_keyring(keyring, cache, None, 5),
+                phone,
+                leaf,
+            }
+        }
+
+        fn valid(result: &ValidationResult) -> bool {
+            matches!(result, ValidationResult::Valid(_))
+        }
+
+        /// The key a `Revoked` refusal names, if that is the refusal.
+        fn revoked_key(result: &ValidationResult) -> Option<Name> {
+            match result {
+                ValidationResult::Invalid(TrustError::Revoked { name }) => {
+                    Some(key_name_of(&name.parse().unwrap()))
+                }
+                _ => None,
+            }
+        }
+
+        fn phone_cut() -> RevocationCut {
+            let mut cut = RevocationCut::new(n(PHONE));
+            cut.add_run(&log_prefix("notes"), 1, 3);
+            cut
+        }
+
+        #[tokio::test]
+        async fn expired_certificates_and_anchors_do_not_refuse_data() {
+            let cases = [
+                ("expired leaf", u64::MAX, (PAST, EXPIRED)),
+                ("leaf not yet valid", u64::MAX, (FUTURE, u64::MAX)),
+                ("expired anchor", EXPIRED, (PAST, u64::MAX)),
+            ];
+            for (why, anchor_until, leaf) in cases {
+                let bob = bob(anchor_until, leaf, true, |c| c).await;
+                let data = signed(log_name("notes", 2), b"v", &bob.phone);
+                assert!(
+                    valid(&bob.validator.validate_durable(&data).await),
+                    "{why}: durable"
+                );
+                assert!(
+                    valid(&bob.validator.validate_durable_cached(&data).await.0),
+                    "{why}: durable, cache only"
+                );
+                assert!(
+                    matches!(
+                        bob.validator.validate_chain(&data).await,
+                        ValidationResult::Invalid(_)
+                    ),
+                    "{why}: live stays refused"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_revoked_key_without_a_cut_signs_nothing() {
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(PHONE))
+            })
+            .await;
+            let data = signed(log_name("notes", 2), b"v", &bob.phone);
+            let result = bob.validator.validate_durable(&data).await;
+            assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+        }
+
+        #[tokio::test]
+        async fn a_cut_admits_exactly_what_it_lists_whatever_the_dates() {
+            for leaf in [(PAST, u64::MAX), (PAST, EXPIRED), (FUTURE, u64::MAX)] {
+                let bob = bob(u64::MAX, leaf, true, |c| {
+                    c.with_revocation(n(PHONE)).with_revocation_cut(phone_cut())
+                })
+                .await;
+                let inside = signed(log_name("notes", 3), b"v", &bob.phone);
+                assert!(valid(&bob.validator.validate_durable(&inside).await));
+                assert!(valid(
+                    &bob.validator.validate_durable_cached(&inside).await.0
+                ));
+                // Live walks ignore cuts: the key stays revoked for them.
+                assert!(revoked_key(&bob.validator.validate_chain(&inside).await).is_some());
+
+                for outside in [
+                    log_name("notes", 4),
+                    log_name("photos", 2),
+                    log_name("notes", 2).append("x"),
+                    log_prefix("notes"),
+                ] {
+                    let data = signed(outside.clone(), b"v", &bob.phone);
+                    let result = bob.validator.validate_durable(&data).await;
+                    assert_eq!(
+                        revoked_key(&result),
+                        Some(n(PHONE)),
+                        "{outside}: {result:?}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn an_exact_readmission_binds_the_bytes() {
+            let phone = signer(PHONE, 72);
+            let kept = signed(log_name("notes", 9), b"honest", &phone);
+            let mut cut = phone_cut();
+            cut.readmit(
+                kept.name
+                    .as_ref()
+                    .clone()
+                    .append_implicit_digest(kept.implicit_digest()),
+            )
+            .unwrap();
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(PHONE)).with_revocation_cut(cut)
+            })
+            .await;
+            assert!(valid(&bob.validator.validate_durable(&kept).await));
+            let other = signed(log_name("notes", 9), b"thief", &bob.phone);
+            let result = bob.validator.validate_durable(&other).await;
+            assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+        }
+
+        #[tokio::test]
+        async fn a_forgery_naming_a_revoked_key_is_not_reported_revoked() {
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(PHONE)).with_revocation_cut(phone_cut())
+            })
+            .await;
+            let thief = signer(PHONE, 99);
+            for name in [log_name("notes", 2), log_name("notes", 7)] {
+                let forged = signed(name.clone(), b"v", &thief);
+                let result = bob.validator.validate_durable(&forged).await;
+                assert!(
+                    matches!(
+                        result,
+                        ValidationResult::Invalid(TrustError::InvalidSignature)
+                    ),
+                    "{name}: {result:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_revoked_issuer_is_refused_even_with_a_cut() {
+            let mut ca_cut = RevocationCut::new(n(CA));
+            ca_cut.add_run(&log_prefix("notes"), 0, u64::MAX);
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(CA)).with_revocation_cut(ca_cut)
+            })
+            .await;
+            let data = signed(log_name("notes", 2), b"v", &bob.phone);
+            let result = bob.validator.validate_durable(&data).await;
+            assert_eq!(revoked_key(&result), Some(n(CA)), "{result:?}");
+        }
+
+        /// D11: the certificate of a key revoked with a cut still resolves —
+        /// fetched by a reader that caches none — and verifies in-cut Data.
+        #[tokio::test]
+        async fn a_cut_keys_certificate_is_fetched_and_verifies_in_cut_data() {
+            let bob = bob(u64::MAX, (PAST, EXPIRED), false, |c| {
+                c.with_revocation(n(PHONE)).with_revocation_cut(phone_cut())
+            })
+            .await;
+            let inside = signed(log_name("notes", 1), b"v", &bob.phone);
+
+            // Cache only: the certificate is named missing, then resolves
+            // once a fetch brought it in, although it expired.
+            let (pending, missing) = bob.validator.validate_durable_cached(&inside).await;
+            assert!(matches!(pending, ValidationResult::Pending));
+            let missing = missing.expect("the missing certificate is named");
+            assert_eq!(key_name_of(&missing), n(PHONE));
+            assert!(!bob.validator.can_resolve_durable(&missing));
+
+            let fetches = serve_on_fetch(&bob.validator, bob.leaf.clone());
+            assert!(valid(&bob.validator.validate_durable(&inside).await));
+            assert_eq!(fetch_count(&fetches), 1);
+            assert!(bob.validator.can_resolve_durable(&missing));
+            assert!(!bob.validator.can_resolve(&missing), "live: expired");
+            assert!(valid(
+                &bob.validator.validate_durable_cached(&inside).await.0
+            ));
+        }
     }
 }
