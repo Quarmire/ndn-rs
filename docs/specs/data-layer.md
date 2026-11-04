@@ -316,10 +316,15 @@ A one-key collection is written by exactly one key.
 - **Reader checks.** A reader MUST verify a head as a log entry (§4) signed
   by the one key of the record in force — a head signed by any other key is
   refused, whatever device it names — whose subject is `C` and whose name's
-  seq is its `Seq`. It MUST refuse a head whose `Seq` is lower than one it
-  verified for `C`, or than the highest seq of that key it holds in `C`
-  (rollback, invariant 3); a head of the same `Seq` is taken again, which
-  renews its receipt. The highest `Seq` verified per collection is
+  seq is its `Seq`. It MUST refuse a head whose `Seq` is lower than one of
+  the same key it verified for `C`, or than the highest seq of that key it
+  knows in `C` — held, listed by a node of that key it verified, or kept by
+  a tombstone (§14.1) — (rollback, invariant 3); a head of the same `Seq`
+  is taken again, which renews its receipt. The floor is the key's: each
+  key's device numbers its own log, so once the owner names another one key
+  (a replaced sensor), that key's heads are not compared with the previous
+  key's seqs, and a range read without a head uses only what a head of the
+  current key listed. The highest `Seq` verified per collection and key is
   durable, kept with what the reader holds, so a restarted reader refuses
   the same rollback. It then fetches the node by name and refuses it unless
   its digest is the head's `Digest`; the node is checked as §7 says.

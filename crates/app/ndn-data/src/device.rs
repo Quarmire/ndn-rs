@@ -745,9 +745,11 @@ struct St {
     open: HashMap<Name, OpenBlock>,
     /// Own signed heads, by one-key collection.
     heads: HashMap<Name, SignedHead>,
-    /// Heads verified of others' one-key collections, by collection: a
-    /// lower one is a rollback (kept in the store across restarts).
-    seen: HashMap<Name, SeenHead>,
+    /// Heads verified of others' one-key collections, by collection and
+    /// one key: a lower one of the same key is a rollback (kept in the
+    /// store across restarts). Each key's device numbers its own log, so a
+    /// key that takes over a collection has a floor of its own.
+    seen: HashMap<(Name, Writer), SeenHead>,
     /// The earliest `Keep::Until` date the sweeper is armed for.
     sweep_at: Option<Timestamp>,
 }
@@ -2302,13 +2304,16 @@ impl Inner {
                 continue;
             }
             if let Some((d, c)) = parse_head_prefix(&name) {
-                let body = Data::decode(wire.clone()).ok().and_then(|data| {
+                // Its signer, the one key it was verified as.
+                let head = Data::decode(wire.clone()).ok().and_then(|data| {
                     let (hd, hc, s) = parse_head_name(&data.name)?;
+                    let key = data.sig_info()?.key_locator_name()?;
                     let body = wire::decode_head(data.content()?.clone()).ok()?;
-                    (hd == d && hc == c && body.seq == s && body.collection == c).then_some(body)
+                    (hd == d && hc == c && body.seq == s && body.collection == c)
+                        .then(|| (Writer::new((*key).clone()), body))
                 });
-                if let Some(body) = body {
-                    heads.push((d, c, body, wire));
+                if let Some((key, body)) = head {
+                    heads.push((d, c, key, body, wire));
                 }
                 continue;
             }
@@ -2427,9 +2432,10 @@ impl Inner {
             coll.mark_pruned();
         }
         // The newest head verified of each other device's one-key
-        // collection, so a rolled-back one is still refused; this device's
-        // own, so the same head is served again while its node is unchanged.
-        for (d, c, body, wire) in heads {
+        // collection, by its key, so a rolled-back one is still refused;
+        // this device's own, so the same head is served again while its
+        // node is unchanged.
+        for (d, c, key, body, wire) in heads {
             let freshness = Duration::from_millis(body.freshness);
             if d == self.device {
                 st.colls.entry(c.clone()).or_default().batch = freshness;
@@ -2443,7 +2449,7 @@ impl Inner {
                 );
             } else {
                 st.seen.insert(
-                    c,
+                    (c, key),
                     SeenHead {
                         seq: body.seq,
                         received: None,
@@ -4892,9 +4898,11 @@ impl Inner {
 
     /// Take `data` as the head of `key`'s one-key collection `c` of device
     /// `device` (spec §5.3): signed by exactly the one key, for `c`, its seq
-    /// its name's, and not lower than one verified here or than a seq of
-    /// the key held here — a rollback, refused also after a restart, as the
-    /// newest head verified is kept in the store. Received at `received`.
+    /// its name's, and not lower than one of that key verified here or than
+    /// a seq of that key known here (held, listed by a verified node, or
+    /// tombstoned) — a rollback, refused also after a restart, as the
+    /// newest head of each key verified is kept in the store. Received at
+    /// `received`.
     async fn accept_head(
         &self,
         c: &Name,
@@ -4920,28 +4928,31 @@ impl Inner {
             .filter(|b| b.collection == *c && b.seq == seq)
             .ok_or(HeadRefusal::NotItsName)?;
         let mut st = self.st.lock();
-        let verified = st.seen.get(c).map_or(0, |h| h.seq);
-        let held = st
-            .colls
-            .get(c)
-            .and_then(|x| x.versions.keys().rfind(|id| id.writer == *key))
-            .map_or(0, |id| id.seq.0);
-        if seq < verified.max(held) {
-            return Err(HeadRefusal::Rollback {
-                seq,
-                seen: verified.max(held),
-            });
+        let slot = (c.clone(), key.clone());
+        let verified = st.seen.get(&slot).map(|h| h.seq);
+        let known = st.colls.get(c).map_or(0, |x| {
+            let listed = x.entries.get(key).and_then(|s| s.last().copied());
+            let held = x
+                .versions
+                .keys()
+                .rfind(|id| id.writer == *key)
+                .map(|id| id.seq.0);
+            listed.max(held).unwrap_or(0)
+        });
+        let floor = verified.unwrap_or(0).max(known);
+        if seq < floor {
+            return Err(HeadRefusal::Rollback { seq, seen: floor });
         }
-        if seq > verified || !st.seen.contains_key(c) {
+        if verified.is_none_or(|v| seq > v) {
             self.store
                 .insert(head_prefix(device, c), data.raw().clone());
         }
-        let listed = match st.seen.remove(c) {
+        let listed = match st.seen.remove(&slot) {
             Some(h) if h.seq == seq => h.listed,
             _ => Vec::new(),
         };
         st.seen.insert(
-            c.clone(),
+            slot,
             SeenHead {
                 seq,
                 received: Some(received),
@@ -4988,7 +4999,7 @@ impl Inner {
         }
         let listed: Vec<u64> = seqs_of(&nb.entries).collect();
         let mut st = self.st.lock();
-        if let Some(h) = st.seen.get_mut(c)
+        if let Some(h) = st.seen.get_mut(&(c.clone(), key.clone()))
             && h.seq == seq
         {
             h.listed = listed.clone();
@@ -5004,12 +5015,12 @@ impl Inner {
         Some(listed)
     }
 
-    /// How old an answer from the last head verified of `c` may be (spec
-    /// §5.3): the time since it arrived, on this device's monotonic clock,
-    /// plus the freshness it states; the sync-based age when none arrived
-    /// in this run.
-    fn head_age(&self, st: &St, c: &Name) -> Age {
-        match st.seen.get(c) {
+    /// How old an answer from the last head of `key` verified of `c` may be
+    /// (spec §5.3): the time since it arrived, on this device's monotonic
+    /// clock, plus the freshness it states; the sync-based age when none
+    /// arrived in this run.
+    fn head_age(&self, st: &St, c: &Name, key: &Writer) -> Age {
+        match st.seen.get(&(c.clone(), key.clone())) {
             Some(SeenHead {
                 received: Some(at),
                 freshness,
@@ -5054,7 +5065,7 @@ impl Inner {
                     got: Got::Version(v),
                     ..
                 }) => {
-                    let age = self.head_age(&self.st.lock(), c);
+                    let age = self.head_age(&self.st.lock(), c, key);
                     return Ok(Answer {
                         got: Got::Version(v),
                         age,
@@ -5070,7 +5081,7 @@ impl Inner {
         let got = self.newest(&st, c)?;
         Ok(Answer {
             got,
-            age: self.head_age(&st, c),
+            age: self.head_age(&st, c, key),
         })
     }
 
@@ -5204,17 +5215,17 @@ impl Inner {
                         unconfirmed_for: Duration::ZERO,
                     },
                 ),
-                (false, Some(l)) => (l, self.head_age(&st, c)),
-                // No head: what the last head verified listed, else every
-                // seq of the key known here.
+                (false, Some(l)) => (l, self.head_age(&st, c, &key)),
+                // No head: what the last head of the one key verified
+                // listed, else every seq of the key known here.
                 (false, None) => {
                     let l = st
                         .seen
-                        .get(c)
+                        .get(&(c.clone(), key.clone()))
                         .filter(|h| !h.listed.is_empty())
                         .map(|h| h.listed.clone())
                         .unwrap_or_else(known);
-                    (l, self.head_age(&st, c))
+                    (l, self.head_age(&st, c, &key))
                 }
             }
         };
@@ -9106,6 +9117,112 @@ mod tests {
         accept(&again, head(&key, 8))
             .await
             .expect("a newer head is taken");
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_heads_rollback_floor_is_its_own_keys() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (old, spare, reader) = (n("/sam/sensor"), n("/sam/spare"), n("/rita/phone"));
+        let (old_keys, old_key, old_cert) = device_key(&authority, &issuer, &old).await;
+        let (spare_keys, spare_key, spare_cert) = device_key(&authority, &issuer, &spare).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        assert!(validator.adopt_context(context("/rita")));
+        validator.cert_cache().insert(old_cert);
+        validator.cert_cache().insert(spare_cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let reader_keys = keys_of(&reader);
+        let c = n("/sam/32=data/temps");
+        let head = |keys: &SecurityManager, key: &Name, device: &Name, seq: u64| {
+            let body = HeadBody {
+                collection: c.clone(),
+                seq,
+                digest: [seq as u8; 32],
+                freshness: 60_000,
+            };
+            let name = head_name(device, &c, seq);
+            let (wire, _) = signed(keys, key, &name, &wire::encode_head(&body));
+            Data::decode(wire).unwrap()
+        };
+        let accept = |dev: &Device, key: &Name, device: &Name, d: Data| {
+            let (inner, c, one, device) = (
+                Arc::clone(&dev.inner),
+                c.clone(),
+                Writer::new(key.clone()),
+                device.clone(),
+            );
+            async move {
+                inner
+                    .accept_head(&c, &one, &device, &d, Instant::now())
+                    .await
+            }
+        };
+        let first = start(&reader, &reader_keys, &validator, &store)
+            .await
+            .unwrap();
+        accept(&first, &old_key, &old, head(&old_keys, &old_key, &old, 50))
+            .await
+            .expect("the first one key's head is taken");
+        // The owner hands the collection to a spare sensor, whose log is
+        // numbered from its own start.
+        accept(
+            &first,
+            &spare_key,
+            &spare,
+            head(&spare_keys, &spare_key, &spare, 3),
+        )
+        .await
+        .expect("a head of the new one key is not held below the old key's seqs");
+        // A seq of the key known here (a verified node, version or
+        // tombstone) is a floor for its heads.
+        first
+            .inner
+            .st
+            .lock()
+            .colls
+            .entry(c.clone())
+            .or_default()
+            .entries
+            .entry(Writer::new(spare_key.clone()))
+            .or_default()
+            .insert(7);
+        let refused = accept(
+            &first,
+            &spare_key,
+            &spare,
+            head(&spare_keys, &spare_key, &spare, 6),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(HeadRefusal::Rollback { .. })),
+            "a head below a seq of its key known here is a rollback: {refused:?}"
+        );
+        first.shutdown();
+        drop(first);
+
+        let again = start(&reader, &reader_keys, &validator, &store)
+            .await
+            .unwrap();
+        for (keys, key, device, seq) in [
+            (&old_keys, &old_key, &old, 49),
+            (&spare_keys, &spare_key, &spare, 2),
+        ] {
+            let refused = accept(&again, key, device, head(keys, key, device, seq)).await;
+            assert!(
+                matches!(refused, Err(HeadRefusal::Rollback { .. })),
+                "each key's floor survives a restart: {key} {refused:?}"
+            );
+        }
+        accept(
+            &again,
+            &spare_key,
+            &spare,
+            head(&spare_keys, &spare_key, &spare, 3),
+        )
+        .await
+        .expect("the new key's same head is taken again");
         again.shutdown();
     }
 
