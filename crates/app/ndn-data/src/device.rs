@@ -635,6 +635,11 @@ const ASKS_VERIFYING: usize = 8;
 const HOLDS_PER_ASKER: usize = 1;
 /// Audit asks of one owner device a holder answers at once.
 const AUDITS_PER_ASKER: usize = 64;
+/// How long a range read takes at most, in first looks
+/// ([`Config::first_look`]): what withheld or unreachable blocks can cost a
+/// reader before the blocks it did not reach are answered `missing` (spec
+/// §5.4).
+const RANGE_LOOKS: u32 = 8;
 
 /// Why this device owes a collection a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5215,13 +5220,16 @@ impl Inner {
     /// alternating with bisection) for the first block whose last entry is
     /// `≥ from` and the last whose first is `< to`, each probe a block
     /// fetched and verified, then the blocks between. Only those blocks
-    /// are fetched: the collection is not followed.
+    /// are fetched: the collection is not followed. It answers within
+    /// [`RANGE_LOOKS`] first looks: what was not probed by then is missing.
     async fn get_range(
         self: &Arc<Self>,
         name: &Name,
         c: &Name,
         range: Range,
     ) -> Result<Answer, DataError> {
+        let deadline =
+            Instant::now().checked_add(self.config.first_look.saturating_mul(RANGE_LOOKS));
         self.peek(c).await?;
         let (key, device) = {
             let st = self.st.lock();
@@ -5312,38 +5320,44 @@ impl Inner {
                 let n = seqs.len();
                 if n > 0 {
                     // Anchors for interpolation: the first and the last.
-                    for i in [0, n - 1] {
-                        if let std::collections::hash_map::Entry::Vacant(slot) =
-                            probes.entry(seqs[i])
-                        {
-                            slot.insert(self.probe(c, &device, seqs[i]).await);
-                        }
-                    }
+                    let anchors: BTreeSet<u64> = [seqs[0], seqs[n - 1]].into();
+                    self.probe_all(
+                        c,
+                        &device,
+                        anchors.into_iter().collect(),
+                        &mut probes,
+                        deadline,
+                    )
+                    .await;
                 }
                 let (lo, _) = self
-                    .search(c, &device, &seqs, &mut probes, 0, n, from, |b| b.1 >= from)
+                    .search(
+                        c,
+                        &device,
+                        &seqs,
+                        &mut probes,
+                        (0, n),
+                        from,
+                        deadline,
+                        |b| b.1 >= from,
+                    )
                     .await;
                 let (_, hi) = self
-                    .search(c, &device, &seqs, &mut probes, lo, n, to, |b| b.0 >= to)
+                    .search(c, &device, &seqs, &mut probes, (lo, n), to, deadline, |b| {
+                        b.0 >= to
+                    })
                     .await;
                 seqs[lo..hi].to_vec()
             }
         };
-        let window = self.config.window;
         let todo: Vec<u64> = picked
             .iter()
             .copied()
             .filter(|s| !probes.contains_key(s))
             .collect();
-        let fetched: Vec<(u64, Probe)> = stream::iter(todo)
-            .map(|s| {
-                let device = &device;
-                async move { (s, self.probe(c, device, s).await) }
-            })
-            .buffer_unordered(window)
-            .collect()
+        // What the deadline leaves unprobed is missing.
+        self.probe_all(c, &device, todo, &mut probes, deadline)
             .await;
-        probes.extend(fetched);
         let id = |s: u64| VersionId {
             writer: key.clone(),
             seq: Seq(s),
@@ -5379,13 +5393,46 @@ impl Inner {
         })
     }
 
+    /// Probe the listed blocks `todo` of a range read (spec §5.4), the
+    /// configured window of them at once, into `probes`, until `deadline`
+    /// (`None`: none this device's clock can hold). Whether every one was
+    /// probed by then.
+    async fn probe_all(
+        self: &Arc<Self>,
+        c: &Name,
+        device: &Name,
+        todo: Vec<u64>,
+        probes: &mut HashMap<u64, Probe>,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let mut fetching = stream::iter(todo)
+            .map(|s| async move { (s, self.probe(c, device, s).await) })
+            .buffer_unordered(self.config.window.max(1));
+        loop {
+            let left = deadline.map_or(Duration::MAX, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            match rt::timeout(left, fetching.next()).await {
+                Ok(Some((s, p))) => {
+                    probes.insert(s, p);
+                }
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
     /// The first index in `lo..hi` of `seqs` whose block's dates satisfy
     /// `pred` (monotone along the stream for an honest writer), searched by
     /// probing blocks: interpolation on `target` between the nearest known
     /// dates, alternating with bisection so a skewed stream costs at most
-    /// twice the bisection's probes. Returns `(lo, hi)` narrowed: equal
-    /// when found; otherwise every index left between failed its probe
-    /// (no path answered), and the caller counts them in.
+    /// twice the bisection's probes. Each round probes at once the window's
+    /// worth of indices nearest the guess not probed yet
+    /// ([`Self::probe_all`]) and takes the nearest that answers. When none
+    /// answers, the rest of `lo..hi` is not probed: it is counted missing,
+    /// and the caller takes it in whole — so blocks withheld cost a round of
+    /// one window, not a probe each, and `deadline` bounds the whole.
+    /// Returns `(lo, hi)` narrowed: equal when found.
     #[allow(clippy::too_many_arguments)]
     async fn search(
         self: &Arc<Self>,
@@ -5393,11 +5440,12 @@ impl Inner {
         device: &Name,
         seqs: &[u64],
         probes: &mut HashMap<u64, Probe>,
-        mut lo: usize,
-        mut hi: usize,
+        (mut lo, mut hi): (usize, usize),
         target: Timestamp,
+        deadline: Option<Instant>,
         pred: impl Fn((Timestamp, Timestamp)) -> bool,
     ) -> (usize, usize) {
+        let window = self.config.window.max(1);
         let mut round = 0usize;
         while lo < hi {
             round += 1;
@@ -5416,19 +5464,18 @@ impl Inner {
                 }
                 _ => lo + (hi - lo) / 2,
             };
-            // The guess, or the nearest index in the window that answers.
-            let order = (guess..hi).chain((lo..guess).rev());
-            let mut found = None;
-            for i in order {
-                if let std::collections::hash_map::Entry::Vacant(slot) = probes.entry(seqs[i]) {
-                    slot.insert(self.probe(c, device, seqs[i]).await);
+            // The guess, or the nearest index in the interval that answers.
+            let order = || (guess..hi).chain((lo..guess).rev());
+            let batch: Vec<u64> = order()
+                .map(|i| seqs[i])
+                .filter(|s| !probes.contains_key(s))
+                .take(window)
+                .collect();
+            self.probe_all(c, device, batch, probes, deadline).await;
+            let Some((i, d)) = order().find_map(|i| known(i, probes).map(|d| (i, d))) else {
+                for s in &seqs[lo..hi] {
+                    probes.entry(*s).or_insert(Probe::Missing);
                 }
-                if let Some(d) = probes[&seqs[i]].dates() {
-                    found = Some((i, d));
-                    break;
-                }
-            }
-            let Some((i, d)) = found else {
                 return (lo, hi);
             };
             if pred(d) {
@@ -9660,6 +9707,45 @@ mod tests {
             dev.get(&bad).await,
             Err(DataError::BadName { .. })
         ));
+        dev.shutdown();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_range_read_of_withheld_blocks_answers_within_its_bound() {
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/rita")));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let key = sensor.clone().append("KEY").append("1");
+        one_key_record(&dev, &c, &key);
+        // A node of the sensor listed these blocks; the sensor sleeps, and
+        // every path withholds them.
+        let listed: BTreeSet<u64> = (1..=64).collect();
+        dev.inner
+            .st
+            .lock()
+            .colls
+            .get_mut(&c)
+            .expect("its record is held")
+            .entries
+            .insert(Writer::new(key.clone()), listed.clone());
+        let t0 = Instant::now();
+        let name = wire::range_name(&c, &Range::Times(Timestamp(0), Timestamp(u64::MAX)));
+        let Got::Entries(e) = dev.get(&name).await.unwrap().got else {
+            panic!("a range read answers entries");
+        };
+        let took = t0.elapsed();
+        assert!(
+            took <= dev.inner.config.first_look * RANGE_LOOKS,
+            "a range read answers within its bound: {took:?}"
+        );
+        let missing: BTreeSet<u64> = e.missing.iter().map(|id| id.seq.0).collect();
+        assert_eq!(missing, listed, "what it did not reach is missing");
+        assert!(e.entries.is_empty() && e.expired.is_empty() && e.large.is_empty());
         dev.shutdown();
     }
 

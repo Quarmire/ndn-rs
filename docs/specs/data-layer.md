@@ -409,14 +409,20 @@ plus the duration the writer stated. What it promises, and no more:
   last listed first, then, each round, interpolating on the dates of the
   versions probed so far and bisecting in turn — fetching each probed
   version, each immutable and cacheable anywhere, from its store first.
-  A probe no path answers is replaced by the nearest other seq in the
-  interval; when none of the interval answers, the whole interval is taken
-  into the range and its versions are reported `missing`. A version it
-  knows expired is placed by the dates its tombstone keeps (§14.1); a
-  version in pieces, by its `Dated`. It then fetches the versions between
-  and keeps the entries in range. The cost is the head, the node,
-  `O(log n)` probes (two or three for a steady stream, where interpolation
-  lands near the answer) and the versions in the range.
+  Each round probes at once the seq it guessed and the nearest others of
+  the interval not yet probed, up to the reader's fetch window, and goes on
+  from the nearest that answers; when none of them answers, the rest of the
+  interval is not probed: it is taken into the range and its versions are
+  reported `missing`. A version it knows expired is placed by the dates its
+  tombstone keeps (§14.1); a version in pieces, by its `Dated`. It then
+  fetches the versions between, a window at once, and keeps the entries in
+  range. A range read answers within a bound the reader sets (eight first
+  looks in this implementation): versions it has not reached by then
+  are reported `missing`, so withheld or unreachable blocks cost it time,
+  never more than the bound. The cost is the head, the node, `O(log n)`
+  probe rounds (two or three for a steady stream, where interpolation lands
+  near the answer) when probes answer — at most a window of probes per
+  round, run at once — and the versions in the range.
 - **Why not a prefix or an index.** Selecting by a prefix of dated names
   would need range selectors NDN no longer has, and would put the writer's
   clock into names readers must guess. A range index as named data would be
@@ -1664,6 +1670,7 @@ to equal bytes and equal nodes have equal digests.
 | Bad or lying clock | No effect on validity. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing. | invariant 1, §14.1 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
+| Holder withholds a range's blocks | A time search probes a window at once and stops a round none of whose probes answers; the read answers within its bound, listing what it did not reach `missing`. | invariant 4, §5.4 |
 | Holder rolls back | A summary older than one already seen is refused, also by a reader that restarted since. | invariant 3, §7 |
 | Writer never pauses | Each descent finishes against the root it started from, whose nodes the writer keeps serving; the reader then continues from there and keeps up. | §7 |
 | Writer equivocates | Both versions are kept and reported. | invariant 2 |
