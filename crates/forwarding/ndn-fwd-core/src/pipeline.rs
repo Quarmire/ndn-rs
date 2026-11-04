@@ -318,7 +318,7 @@ mod tests {
         admitted: bool,
     }
     impl CsStore for RecCs {
-        fn lookup(&self, _: &[&[u8]], _: u32) -> Option<&[u8]> {
+        fn lookup(&self, _: &[&[u8]], _: bool, _: u32) -> Option<&[u8]> {
             None
         }
         fn admit(&mut self, _: &[&[u8]], _: &[u8], _: u32, _: u32) {

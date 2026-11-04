@@ -62,9 +62,11 @@ pub trait PitStore {
 
 /// Content Store surface, keyed (like the PIT) by name component byte-slices.
 pub trait CsStore {
-    /// Fresh cached Data wire for `components` at `now_ms`, or `None` on a miss
-    /// or a stale entry.
-    fn lookup(&self, components: &[&[u8]], now_ms: u32) -> Option<&[u8]>;
+    /// Cached Data wire for `components` at `now_ms`, or `None` on a miss.
+    /// Staleness matters only to an Interest with `must_be_fresh`: a stale
+    /// entry still answers one without it (as NFD's CS does; immutable Data
+    /// is fetched by exact name), and never one with it.
+    fn lookup(&self, components: &[&[u8]], must_be_fresh: bool, now_ms: u32) -> Option<&[u8]>;
 
     /// Admit a Data's wire bytes to the cache. `freshness_ms` is the Data's
     /// FreshnessPeriod (0 = immediately stale); `now_ms` stamps the insert.
@@ -88,7 +90,7 @@ pub trait CsStore {
 pub struct NoCs;
 
 impl CsStore for NoCs {
-    fn lookup(&self, _components: &[&[u8]], _now_ms: u32) -> Option<&[u8]> {
+    fn lookup(&self, _components: &[&[u8]], _must_be_fresh: bool, _now_ms: u32) -> Option<&[u8]> {
         None
     }
     fn admit(&mut self, _components: &[&[u8]], _wire: &[u8], _freshness_ms: u32, _now_ms: u32) {}
@@ -199,8 +201,8 @@ impl<C, O> ObservedCs<C, O> {
 }
 
 impl<C: CsStore, O: NameTableObserver> CsStore for ObservedCs<C, O> {
-    fn lookup(&self, components: &[&[u8]], now_ms: u32) -> Option<&[u8]> {
-        self.inner.lookup(components, now_ms)
+    fn lookup(&self, components: &[&[u8]], must_be_fresh: bool, now_ms: u32) -> Option<&[u8]> {
+        self.inner.lookup(components, must_be_fresh, now_ms)
     }
 
     fn admit(&mut self, components: &[&[u8]], wire: &[u8], freshness_ms: u32, now_ms: u32) {
