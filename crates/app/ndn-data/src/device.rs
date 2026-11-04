@@ -4822,6 +4822,27 @@ impl Inner {
         if !taken {
             return Err(failed);
         }
+        // The entry came, but no members record of its collection is held:
+        // ask its writer's own summary for the records (it answered, so a
+        // path to it exists), whether or not it was heard in a group.
+        if let Some(c) = &parsed.subject
+            && self
+                .st
+                .lock()
+                .colls
+                .get(c)
+                .is_none_or(|x| x.members.is_none())
+            && let Some(ns) = namespace_of(c)
+        {
+            {
+                let mut st = self.st.lock();
+                if let Some(peer) = st.peers.get_mut(&(parsed.device.clone(), ns.clone())) {
+                    peer.root = None;
+                    peer.nodes.retain(|(s, _), _| !c.has_prefix(s));
+                }
+            }
+            let _ = rt::timeout(self.config.first_look, self.refresh(&ns, &parsed.device)).await;
+        }
         if let Some(c) = &parsed.subject {
             let c = c.clone();
             self.wait_for(|st| {
@@ -4836,16 +4857,18 @@ impl Inner {
 
     /// Take the records of `c` without following its versions (spec
     /// §5.3): its members record is what a one-key read needs, and a range
-    /// read fetches only the blocks it asks for. The first time, look at
-    /// what every device known to write into its namespace holds of it, for
-    /// at most the first-look time.
+    /// read fetches only the blocks it asks for. The first time, and again
+    /// for as long as no members record of it is held (its writers may have
+    /// been unreachable before), look at what every device known to write
+    /// into its namespace holds of it, for at most the first-look time.
     async fn peek(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
         check_collection(c)?;
         let ns = namespace_of(c).expect("checked above");
-        let new = {
+        let look = {
             let mut st = self.st.lock();
             let new = !st.inside(c) && st.peeks.insert(c.clone());
-            if new {
+            let unknown = st.colls.get(c).is_none_or(|x| x.members.is_none());
+            if new || unknown {
                 for ((_, pns), peer) in st.peers.iter_mut() {
                     if *pns == ns {
                         peer.root = None;
@@ -4853,10 +4876,10 @@ impl Inner {
                     }
                 }
             }
-            new
+            new || unknown
         };
         self.join(&ns).await?;
-        if new {
+        if look {
             let devices = self.known_for(&self.st.lock(), &ns);
             let all = futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d)));
             let _ = rt::timeout(self.config.first_look, all).await;
