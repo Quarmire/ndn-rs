@@ -910,10 +910,17 @@ authorization, anchors, revocation — with two differences:
    the Data as before: a cut never excuses an issuer.
 
 A revoked key with no cut, and one whose cut does not accept the packet,
-are refused alike (ndn-rs: `TrustError::Revoked`). That refusal is given
-only once the packet's signature and its key's chain check out; a forgery
-under a revoked key's name is refused for what it is (a bad signature, an
-unreachable or unauthorized chain).
+are refused alike (ndn-rs: `TrustError::Revoked`). A key revoked with no
+cut is refused at once, before any signature is checked, as before cuts:
+nothing it signed is accepted, so there is nothing to wait for (and a
+chain through issuers that are no longer served would otherwise end
+unverifiable instead of revoked). A key revoked with a cut that does not
+accept the packet is refused only once the packet's signature and its
+key's chain check out, so a forgery under that key's name is refused for
+what it is (a bad signature, an unreachable or unauthorized chain) and an
+out-of-cut refusal proves the packet authentic. A data-layer reader
+therefore keeps a refusal against a name (for re-admission) only for a
+key revoked with a cut.
 
 **Why Data ignores the clock.** A judgement "valid when it was signed" can
 use only the date the signer writes, and a stolen key writes any date, or
