@@ -20,12 +20,18 @@
 //! Keys over time (spec §8): an entry's validity never depends on a clock.
 //! The validator checks no certificate's validity period for it; a key
 //! ends only by a revocation in its namespace's trust context, whose cut
-//! accepts exactly the entries the owner's device held verified (and those
-//! the owner re-admits by name and digest). An entry its cut does not
-//! accept is refused and kept refused, with its full name and digest
-//! ([`Device::refused_by_revocation`]); a trust context adopted later
-//! withdraws what it refuses and admits what it re-admits; the cut a device
-//! can vouch for is [`Device::revocation_cut`].
+//! accepts exactly the entries the owner's device held verified before the
+//! device was lost — bound to their bytes by the cut's manifest and to the
+//! public key that verified them — and those the owner re-admits by name and
+//! digest. An entry its cut does not accept is refused and kept refused,
+//! with its full name and digest ([`Device::refused_by_revocation`]); a
+//! trust context adopted later withdraws what it refuses (by a cut, or for
+//! the chain above an entry's key, judging held entries again by the
+//! durable rule) and admits what it re-admits. The cut a device can vouch
+//! for is [`Device::revocation_cut`], bounded by when it first verified each
+//! entry; a key the owner fears lost is marked suspected
+//! ([`Device::suspect`]) and no new entry of it is taken until its
+//! revocation.
 //!
 //! Sealed collections (spec §9) carry their payloads encrypted under an
 //! epoch key; the device asks for the keys it may hold (`seal`), and serves
@@ -45,7 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -58,11 +64,12 @@ use ndn_app::{Connection, Consumer, Node, Responder, ServeGuard};
 use ndn_foundation_types::Hash;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest, NackReason, Name};
-use ndn_security::cert_name::key_name_of;
+use ndn_security::cert_name::{is_key_name, key_name_of};
 use ndn_security::safe_data::TrustPath;
+use ndn_security::verifier::{VerifyOutcome, verify_by_sig_type};
 use ndn_security::{
-    Keyring, RevocationCut, SecurityManager, SignedTrustContext, Signer, TrustError,
-    ValidationResult, Validator, sync_group,
+    Keyring, ManifestLookup, RevocationCut, SecurityManager, SignedTrustContext, Signer,
+    TrustError, ValidationResult, Validator, cut_manifest, public_key_digest, sync_group,
 };
 use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
@@ -210,6 +217,37 @@ pub struct Released {
     /// The versions kept here, as too few holders proved they keep them,
     /// each with why.
     pub kept: Vec<(Name, String)>,
+}
+
+/// What bounds the revocation cut a device vouches for
+/// ([`Device::revocation_cut`]): the owner's own observation, never
+/// anything the revoked key signed. At least one is given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CutBound {
+    /// Keep only entries this device first verified strictly before this
+    /// time, by its own clock: when the device was lost (by default, when
+    /// its key was marked suspected, [`Device::suspected`]).
+    pub held_before: Option<Timestamp>,
+    /// Keep, per collection, only entries at or below this seq; when given,
+    /// a collection it does not name, and snapshots, keep nothing.
+    pub upto: BTreeMap<Name, u64>,
+}
+
+/// A revocation cut a device vouches for ([`Device::revocation_cut`]).
+#[derive(Clone, Debug)]
+pub struct CutProposal {
+    /// The cut, with the digest of the public key that verified its
+    /// entries and the full name of its manifest's root.
+    pub cut: RevocationCut,
+    /// The manifest's packets, root first: self-certifying Data listing
+    /// the implicit digest of every entry the cut's ranges accept, to be
+    /// published beside the trust context. Empty when the cut keeps
+    /// nothing.
+    pub manifest: Vec<Bytes>,
+    /// The entries of the key held here that the bound leaves out, each by
+    /// its full name ending in its implicit digest (sorted): the owner may
+    /// re-admit them one by one.
+    pub left_out: Vec<Name>,
 }
 
 /// How a device reaches its forwarder: a [`Node`] for fetching and serving,
@@ -770,6 +808,18 @@ const READMIT_TRIES: u32 = 8;
 /// The first pause before a re-admitted entry is asked for again; each
 /// next pause doubles it.
 const READMIT_PAUSE: Duration = Duration::from_millis(500);
+/// How far beyond the last seq this device wrote an entry under its own
+/// name, signed by a copy of its key, is still taken — as every other
+/// reader takes it, evidence of the copy, never this device's own; one
+/// further ahead is refused ([`Refusal::BeyondOwnLog`]). The device numbers
+/// its log itself and records every entry it writes as it signs it, so
+/// none of its own lies above its head: the margin only keeps a thief's
+/// next entries visible here as they are elsewhere, while one at a seq
+/// such as `u64::MAX` is not held at all.
+const OWN_AHEAD: u64 = 64;
+/// The most cut manifest packets one look for an entry's listed digest
+/// fetches (spec §8): a manifest is a tree of a few levels.
+const MANIFEST_LOOKS: usize = 16;
 
 /// Why this device owes a collection a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -800,20 +850,46 @@ enum Held {
     Expired(Tomb),
 }
 
-/// A log entry refused because the trust context governing its name revokes
-/// its key and that key's cut does not accept it (spec §8): kept against its
-/// name with its implicit digest, so a host can hand its full name to the
-/// namespace owner, who may re-admit exactly it.
+/// A log entry refused by the trust context governing its name, kept
+/// against its name with its implicit digest (spec §8): its key is revoked
+/// and that key's cut does not accept it, so a host can hand its full name
+/// to the namespace owner, who may re-admit exactly it; or a key above its
+/// signer is refused ([`Refusal::Untrusted`]), which no cut excuses, and it
+/// is taken back only if its chain verifies again.
 struct OutOfCut {
     /// The key that signed it, as its packet names it.
     writer: Writer,
     /// Its implicit digest.
     digest: [u8; 32],
-    /// The packet, when it was refused as it arrived (never taken): a
-    /// re-admission takes it from here.
+    /// The packet, when it was refused as it arrived (never taken), or
+    /// withdrawn for its chain: a re-admission or a new judgement takes it
+    /// from here.
     wire: Option<Bytes>,
-    /// The cut that refuses it.
-    cut: Cut,
+    /// Why: [`Refusal::OutsideCut`] with the cut that refuses it, or
+    /// [`Refusal::Untrusted`].
+    why: Refusal,
+}
+
+impl OutOfCut {
+    /// Whether a cut refuses it (and an exact re-admission may let it in).
+    fn by_cut(&self) -> bool {
+        matches!(self.why, Refusal::OutsideCut(_))
+    }
+}
+
+/// When this device first verified a held log entry, by its own clock,
+/// and which public key verified it (spec §8): what a revocation cut it
+/// vouches for is bounded by ([`Device::revocation_cut`]). Kept in the
+/// store beside the entry ([`verified_name`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Verified {
+    /// `None` for an own entry kept before times were recorded.
+    at: Option<Timestamp>,
+    /// SHA-256 of the public key, as its certificate stores it, that
+    /// verified the entry; `None` when not known.
+    key: Option<[u8; 32]>,
+    /// This device wrote it ([`written_name`]).
+    own: bool,
 }
 
 /// An entry a newer trust context lets in (spec §8): refused here by a
@@ -946,6 +1022,15 @@ struct St {
     seen: HashMap<(Name, Writer), SeenHead>,
     /// The earliest `Keep::Until` date the sweeper is armed for.
     sweep_at: Option<Timestamp>,
+    /// When each held log entry was first verified here, and by which
+    /// public key ([`Verified`]).
+    verified: HashMap<Name, Verified>,
+    /// Keys marked suspected here, and since when ([`Device::suspect`]):
+    /// no new entry of one is taken while no trust context revokes it.
+    suspected: BTreeMap<Name, Timestamp>,
+    /// The trust context last taken of each namespace, so an adoption that
+    /// refuses more than it did re-judges what is held ([`Inner::adopted`]).
+    contexts: HashMap<Name, Arc<SignedTrustContext>>,
 }
 
 struct Inner {
@@ -971,6 +1056,52 @@ struct Inner {
     signatures: AtomicU64,
     started: Instant,
     serving: Mutex<Option<ServeGuard>>,
+    /// Set by [`Device::shutdown`]: trust contexts adopted from then on are
+    /// not taken (a restart judges what is held again).
+    stopped: AtomicBool,
+    /// The digest of the device key's public key, as its certificate
+    /// stores it ([`Verified::key`] of its own entries).
+    own_key: Option<[u8; 32]>,
+}
+
+/// What [`Inner::rejudge`] judges again.
+enum Rejudge {
+    /// Every entry held (a restart).
+    All,
+    /// Every entry held under the trust context of this namespace (one
+    /// adopted that may refuse more), and those withdrawn for their chain.
+    Namespace(Name),
+    /// The entries withdrawn for their chain: of this key, or every one.
+    Withdrawn(Option<Name>),
+    /// These entries (what waited for a certificate or manifest packet).
+    Names(Vec<Name>),
+}
+
+/// What the durable rule, run again, means for a held entry.
+enum Verdict {
+    Accepted,
+    /// Its key's revocation cut does not accept it.
+    Cut(Cut),
+    /// Its chain is refused, for this reason.
+    Chain(String),
+    /// It waits for this certificate or cut manifest packet.
+    Pending(Name),
+    /// Nothing signed decides it either way now.
+    Undecided,
+}
+
+/// The key that signed the held log entry `name`, if held as an entry.
+fn held_signer<'a>(st: &'a St, name: &Name, held: &'a Held) -> Option<&'a Writer> {
+    match held {
+        Held::Version(id) => Some(&id.writer),
+        Held::Snapshot(s) => Some(&s.id.writer),
+        Held::Record { writer, .. } => Some(writer),
+        Held::Locked => parse_log_name(name)
+            .and_then(|l| st.colls.get(&l.subject?))
+            .and_then(|coll| coll.locked.iter().find(|l| l.name == *name))
+            .map(|l| &l.writer),
+        Held::Pruned(_) | Held::Expired(_) => None,
+    }
 }
 
 /// Why a one-key collection's head was not taken (spec §5.3).
@@ -1234,6 +1365,18 @@ impl St {
         }
     }
 
+    /// Deliver `v` again to every watcher of its collection it was
+    /// delivered to before (its frontier holds it): it was withdrawn, and
+    /// is taken back. The others had it delivered as it applied.
+    fn tell_again(&mut self, v: &Version) {
+        self.watchers.retain(|w| !w.tx.is_closed());
+        for w in &self.watchers {
+            if v.collection.has_prefix(&w.target) && w.since.contains(&v.id) {
+                let _ = w.tx.send(Ok(Change::Version(v.clone())));
+            }
+        }
+    }
+
     /// Tell every watcher of collection `c`, whatever its frontier.
     fn tell(&mut self, c: &Name, change: &Change) {
         self.watchers.retain(|w| !w.tx.is_closed());
@@ -1396,8 +1539,9 @@ impl St {
     /// §8): every version held is admitted or refused anew and the state is
     /// rebuilt from the admitted ones. A version applied before that is now
     /// refused outside a cut — the record's, or a revocation's
-    /// ([`St::cut_out`]) — is withdrawn and reported to the watchers; one
-    /// applied before and still admitted is not delivered again.
+    /// ([`St::cut_out`]) — or for its chain ([`Refusal::Untrusted`]) is
+    /// withdrawn and reported to the watchers; one applied before and still
+    /// admitted is not delivered again.
     fn reread(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
         // Entries refused by a revocation as they arrived, never taken:
         // later versions do not wait for them.
@@ -1448,9 +1592,10 @@ impl St {
             self.refused.remove(&name);
             self.admit_one(hv);
             if delivered.contains(&id)
-                && let Some(Refusal::OutsideCut(cut)) = self.refused.get(&name)
+                && let Some(why) = self.refused.get(&name)
+                && matches!(why, Refusal::OutsideCut(_) | Refusal::Untrusted { .. })
             {
-                withdrawn.push((id, cut.clone()));
+                withdrawn.push((id, why.clone()));
             }
         }
         let now = (self.clock)();
@@ -1458,29 +1603,27 @@ impl St {
             coll.mark_gone(now);
         }
         self.apply_ready(c, &delivered);
-        for (id, cut) in withdrawn {
-            tracing::info!(?id, collection = %c, "withdrawn: a cut that arrived later refuses it");
-            self.tell(c, &Change::Withdrawn { id, cut });
+        for (id, why) in withdrawn {
+            tracing::info!(?id, collection = %c, %why, "withdrawn");
+            self.tell(c, &Change::Withdrawn { id, why });
         }
     }
 
     /// Admit a verified, opened version, or hold it: until the members
     /// record is known (and its rule is one this device runs), or as
-    /// refused by it, or by a revocation ([`St::cut_out`]) whatever the
-    /// record says. Returns whether it was queued to apply.
+    /// refused by it, or by the trust context ([`St::cut_out`]) whatever
+    /// the record says. Returns whether it was queued to apply.
     fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
         let coll = self.colls.entry(c.clone()).or_default();
         if let Some(out) = self.cut_out.get(&hv.version.name) {
-            tracing::debug!(id = ?hv.version.id, "refused in {c}: its key is revoked and the cut does not accept it");
+            tracing::debug!(id = ?hv.version.id, why = %out.why, "refused in {c} by the trust context");
             coll.skipped
                 .entry(hv.version.id.writer.clone())
                 .or_default()
                 .insert(hv.version.id.seq.0);
-            self.refused.insert(
-                hv.version.name.clone(),
-                Refusal::OutsideCut(out.cut.clone()),
-            );
+            self.refused
+                .insert(hv.version.name.clone(), out.why.clone());
             coll.outsiders.push(hv);
             return false;
         }
@@ -2120,6 +2263,11 @@ impl Device {
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
         let clock = Arc::clone(&config.clock);
+        let contexts = contexts_by_namespace(validator.keyring());
+        let own_key = identity
+            .signer
+            .public_key()
+            .map(|pk| public_key_digest(&pk));
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -2167,6 +2315,9 @@ impl Device {
                 heads: HashMap::new(),
                 seen: HashMap::new(),
                 sweep_at: None,
+                verified: HashMap::new(),
+                suspected: BTreeMap::new(),
+                contexts,
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -2175,6 +2326,8 @@ impl Device {
             signatures: AtomicU64::new(0),
             started: Instant::now(),
             serving: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+            own_key,
         });
         // A trust context adopted later may revoke keys whose entries are
         // held here, or re-admit entries refused here (spec §8): the
@@ -2186,10 +2339,17 @@ impl Device {
             let _ = adopted_tx.send(Arc::clone(ctx));
         });
         inner.restore();
+        // Every entry held is judged again by the durable rule against the
+        // trust contexts held now (spec §8): a key above its signer may
+        // have been revoked while the device was off.
+        inner.rejudge(Rejudge::All).await;
         let weak = Arc::downgrade(&inner);
         rt::spawn(async move {
             while let Some(ctx) = adopted_rx.recv().await {
                 let Some(inner) = weak.upgrade() else { break };
+                if inner.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
                 inner.adopted(&ctx).await;
             }
         });
@@ -2290,38 +2450,216 @@ impl Device {
 
     /// The cut this device can vouch for if `key` (a key name
     /// `<id>/KEY/<k>`, or one of its certificate names) is revoked now (spec
-    /// §8): every log entry `key` signed that this device holds verified and
-    /// has neither refused nor withdrawn — versions (opened or still
-    /// sealed), members, hold, lease and prune records, as runs of seqs per
-    /// collection log `<D>/32=log/<C>`, and snapshots, under `<D>/32=log`.
-    /// What it only heard listed, and what was pruned or expired here, is
-    /// not in it. The namespace owner signs it into the trust context with
-    /// the revocation (its TLV: [`RevocationCut::encode`]).
-    pub fn revocation_cut(&self, key: &Name) -> RevocationCut {
+    /// §8), bounded by this device's own observation, never by anything
+    /// the key signed: every log entry `key` signed that this device holds
+    /// verified and has neither refused nor withdrawn — versions (opened or
+    /// still sealed), members, hold, lease and prune records, as runs of
+    /// seqs per collection log `<D>/32=log/<C>`, and snapshots, under
+    /// `<D>/32=log` — that it first verified strictly before
+    /// `bound.held_before` (when set) and whose seq is at most
+    /// `bound.upto` of its collection (when `upto` is given; a collection
+    /// it does not name, and snapshots, are then left out). An entry whose
+    /// first verification time or verifying public key is not known here
+    /// (held before this was recorded) is left out. Every entry left out is
+    /// listed in [`CutProposal::left_out`] by its full name, for the owner
+    /// to re-admit one by one.
+    ///
+    /// The cut carries the digest of the public key that verified its
+    /// entries (`CutKeyDigest`) and the full name of its manifest's root
+    /// (`CutManifest`), the self-certifying packets of which, listing the
+    /// implicit digest of every entry in the cut, are
+    /// [`CutProposal::manifest`]: the namespace owner signs the cut into the
+    /// trust context with the revocation (its TLV:
+    /// [`RevocationCut::encode`]) and publishes the manifest.
+    ///
+    /// Refused ([`DataError::BadRequest`]) when neither bound is given (say
+    /// when the device was lost: [`Self::suspected`] is when its key was
+    /// marked suspected), when the entries it would keep were verified by
+    /// two different public keys under the key's name, and when no public
+    /// key of the key can be named.
+    pub fn revocation_cut(&self, key: &Name, bound: &CutBound) -> Result<CutProposal, DataError> {
         let key = key_name_of(key);
-        let mut cut = RevocationCut::new(key.clone());
-        let st = self.inner.st.lock();
-        for (name, held) in &st.held {
-            if st.refused.contains_key(name) {
-                continue;
-            }
-            let signer = match held {
-                Held::Version(id) => Some(&id.writer),
-                Held::Snapshot(s) => Some(&s.id.writer),
-                Held::Record { writer, .. } => Some(writer),
-                Held::Locked => parse_log_name(name)
-                    .and_then(|l| st.colls.get(&l.subject?))
-                    .and_then(|coll| coll.locked.iter().find(|l| l.name == *name))
-                    .map(|l| &l.writer),
-                Held::Pruned(_) | Held::Expired(_) => None,
-            };
-            if signer.is_some_and(|w| key_name_of(w.key()) == key)
-                && let Some(l) = parse_log_name(name)
-            {
-                cut.add_seq(&log_prefix(name), l.seq);
+        let inner = &self.inner;
+        if bound.held_before.is_none() && bound.upto.is_empty() {
+            let since = inner.st.lock().suspected.get(&key).copied();
+            return Err(DataError::BadRequest {
+                name: key,
+                why: format!(
+                    "a revocation cut keeps what this device held of the key before it was \
+                     lost, so say when that was: give held_before (the time the device was \
+                     lost{}) or upto (the last seq to keep per collection); every entry first \
+                     verified here later, or above upto, is left out and listed, for the owner \
+                     to re-admit one by one",
+                    match since {
+                        Some(t) => format!("; its key is marked suspected here since {}", t.0),
+                        None => String::new(),
+                    }
+                ),
+            });
+        }
+        let ctx = inner.validator.keyring().context_for(&key);
+        if ctx.namespace().is_empty() {
+            return Err(DataError::BadRequest {
+                name: key,
+                why: "no trust context held here governs the key, so it cannot be revoked in \
+                      one; adopt its namespace's trust context first"
+                    .to_string(),
+            });
+        }
+        let mut entries: Vec<(Name, u64, [u8; 32])> = Vec::new();
+        let mut left_out = Vec::new();
+        let mut public: BTreeSet<[u8; 32]> = BTreeSet::new();
+        {
+            let st = inner.st.lock();
+            for (name, held) in &st.held {
+                if st.refused.contains_key(name) {
+                    continue;
+                }
+                if held_signer(&st, name, held).is_none_or(|w| key_name_of(w.key()) != key) {
+                    continue;
+                }
+                let Some(l) = parse_log_name(name) else {
+                    continue;
+                };
+                let digest = match held {
+                    Held::Record { digest, .. } => Some(*digest),
+                    _ => held_wire(&st, name)
+                        .or_else(|| inner.store.get(name))
+                        .map(|w| wire::implicit_digest(&w)),
+                };
+                let Some(digest) = digest else {
+                    tracing::warn!(%name, "held without its packet: left out of the cut");
+                    continue;
+                };
+                let seen = st.verified.get(name);
+                let in_time = bound
+                    .held_before
+                    .is_none_or(|t| seen.and_then(|v| v.at).is_some_and(|at| at < t));
+                let in_seq = bound.upto.is_empty()
+                    || l.subject
+                        .as_ref()
+                        .and_then(|c| bound.upto.get(c))
+                        .is_some_and(|upto| l.seq <= *upto);
+                match seen.and_then(|v| v.key) {
+                    Some(pk) if in_time && in_seq => {
+                        public.insert(pk);
+                        entries.push((log_prefix(name), l.seq, digest));
+                    }
+                    _ => left_out.push(name.clone().append_implicit_digest(digest)),
+                }
             }
         }
-        cut
+        if public.len() > 1 {
+            return Err(DataError::BadRequest {
+                name: key,
+                why: "the entries this device would keep of the key were verified by two \
+                      different public keys certified under the key's name, so a cut cannot \
+                      say which one wrote the honest work; revoke the key without a cut, and \
+                      have the CA's operator find which certificate is genuine"
+                    .to_string(),
+            });
+        }
+        let key_digest = match public.into_iter().next() {
+            Some(d) => d,
+            None => {
+                let mut held: BTreeSet<[u8; 32]> = inner
+                    .validator
+                    .cert_cache()
+                    .all(&key)
+                    .iter()
+                    .map(|c| public_key_digest(&c.public_key))
+                    .collect();
+                held.extend(
+                    ctx.anchor_for(&key)
+                        .map(|a| public_key_digest(&a.public_key)),
+                );
+                match (held.len(), held.into_iter().next()) {
+                    (1, Some(d)) => d,
+                    _ => {
+                        return Err(DataError::BadRequest {
+                            name: key,
+                            why: "no entry of the key that this device would keep names the \
+                                  public key that verified it, and the certificates held of the \
+                                  key do not name exactly one; revoke the key without a cut"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        };
+        let mut cut = RevocationCut::new(key.clone());
+        for (prefix, seq, _) in &entries {
+            cut.add_seq(prefix, *seq);
+        }
+        cut.set_key_digest(key_digest);
+        let manifest = if entries.is_empty() {
+            Vec::new()
+        } else {
+            let built = cut_manifest::build(ctx.namespace(), &key, &entries)
+                .map_err(|e| local(format!("the cut's manifest of {key} is not made: {e}")))?;
+            cut.set_manifest(built.root)
+                .map_err(|e| local(format!("the cut's manifest of {key} is not named: {e}")))?;
+            // This device judges its own held entries by it once the cut is
+            // adopted, without fetching what it made.
+            for p in &built.packets {
+                if let Ok(d) = Data::decode(p.clone()) {
+                    let _ = inner.validator.cut_manifests().insert(&d);
+                }
+            }
+            built.packets
+        };
+        left_out.sort();
+        Ok(CutProposal {
+            cut,
+            manifest,
+            left_out,
+        })
+    }
+
+    /// Mark `key` (a key name `<id>/KEY/<k>`, or one of its certificate
+    /// names) suspected since `since`, by this device's clock, as the owner
+    /// says when the device was lost (spec §8): from now on this device
+    /// takes no new log entry of the key — none is fetched, applied or
+    /// stored, and a `get` of one answers [`Refusal::Suspected`] — while
+    /// the entries it held before stay. Kept across restarts. The mark ends
+    /// with [`Self::unsuspect`], or once a trust context this device adopts
+    /// revokes the key (its cut decides from then on). `since` is the
+    /// default bound of the key's cut ([`CutBound::held_before`]).
+    pub fn suspect(&self, key: &Name, since: Timestamp) -> Result<(), DataError> {
+        let key = key_name_of(key);
+        if !is_key_name(&key) {
+            return Err(DataError::BadRequest {
+                name: key,
+                why: "this is no key name: a key is named <id>/KEY/<k> (or by one of its \
+                      certificates); give the lost device's key"
+                    .to_string(),
+            });
+        }
+        self.inner.store.insert(
+            suspected_name(&key),
+            Bytes::copy_from_slice(&since.0.to_be_bytes()),
+        );
+        self.inner.st.lock().suspected.insert(key, since);
+        Ok(())
+    }
+
+    /// Lift the suspected mark of `key` ([`Self::suspect`]): new entries of
+    /// it are taken again. Whether it was marked.
+    pub fn unsuspect(&self, key: &Name) -> bool {
+        let key = key_name_of(key);
+        self.inner.store.remove(&suspected_name(&key));
+        self.inner.st.lock().suspected.remove(&key).is_some()
+    }
+
+    /// Since when `key` (a key or certificate name) is marked suspected
+    /// here ([`Self::suspect`]), if it is.
+    pub fn suspected(&self, key: &Name) -> Option<Timestamp> {
+        self.inner
+            .st
+            .lock()
+            .suspected
+            .get(&key_name_of(key))
+            .copied()
     }
 
     /// The log entries this device holds refused because `key` (a key or
@@ -2337,15 +2675,18 @@ impl Device {
         let mut out: Vec<Name> = st
             .cut_out
             .iter()
-            .filter(|(_, o)| key_name_of(o.writer.key()) == key)
+            .filter(|(_, o)| o.by_cut() && key_name_of(o.writer.key()) == key)
             .map(|(n, o)| n.clone().append_implicit_digest(o.digest))
             .collect();
         out.sort();
         out
     }
 
-    /// Stop serving and syncing. Watch streams end.
+    /// Stop serving and syncing. Watch streams end, and trust contexts
+    /// adopted from now on are not taken (a restart judges what is held
+    /// against them).
     pub fn shutdown(&self) {
+        self.inner.stopped.store(true, Ordering::Relaxed);
         self.inner.serving.lock().take();
         self.inner.svs.shutdown();
         let mut st = self.inner.st.lock();
@@ -2601,6 +2942,121 @@ fn unexpired(name: &Name) -> Option<Name> {
     over(&expired_prefix(), name)
 }
 
+/// Where the store keeps when this device first verified each log entry it
+/// holds, by its clock, and the digest of the public key that verified it
+/// (`/localhost/ndn-data/verified/<log entry name>`, its value the time as
+/// 8 octets big-endian, then the 32-octet digest when known): what bounds
+/// a cut it vouches for (spec §8). An entry stored without one was held
+/// before this was recorded: its time is not known.
+fn verified_prefix() -> Name {
+    "/localhost/ndn-data/verified"
+        .parse()
+        .expect("a valid name")
+}
+
+fn verified_name(entry: &Name) -> Name {
+    under(&verified_prefix(), entry)
+}
+
+/// A [`verified_name`] record of the entry first verified `at` by the
+/// public key whose digest is `key`.
+fn encode_verified(at: Timestamp, key: Option<&[u8; 32]>) -> Bytes {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(&at.0.to_be_bytes());
+    if let Some(k) = key {
+        out.extend_from_slice(k);
+    }
+    Bytes::from(out)
+}
+
+/// A [`verified_name`] record: its time and key digest.
+fn decode_verified(value: &[u8]) -> Option<(Timestamp, Option<[u8; 32]>)> {
+    let at = Timestamp(u64::from_be_bytes(value.get(..8)?.try_into().ok()?));
+    match value.len() {
+        8 => Some((at, None)),
+        40 => Some((at, Some(value[8..].try_into().ok()?))),
+        _ => None,
+    }
+}
+
+/// Where the store keeps, for each log entry this device signed, the
+/// implicit digest of what it signed (`/localhost/ndn-data/written/<log
+/// entry name>`): only an entry stored under its name with exactly that
+/// digest is restored as its own and moves its log head; what a copy of
+/// its key signed under its name is restored as another writer's.
+fn written_prefix() -> Name {
+    "/localhost/ndn-data/written".parse().expect("a valid name")
+}
+
+fn written_name(entry: &Name) -> Name {
+    under(&written_prefix(), entry)
+}
+
+/// Where the store keeps the keys marked suspected here
+/// (`/localhost/ndn-data/suspected/<key name>`, its value since when, 8
+/// octets big-endian; [`Device::suspect`]).
+fn suspected_prefix() -> Name {
+    "/localhost/ndn-data/suspected"
+        .parse()
+        .expect("a valid name")
+}
+
+fn suspected_name(key: &Name) -> Name {
+    under(&suspected_prefix(), key)
+}
+
+/// Where the store keeps a marker for each log entry withdrawn because the
+/// trust context refuses its chain (`/localhost/ndn-data/untrusted/<log
+/// entry name>`, its value the verdict in UTF-8; [`Refusal::Untrusted`]):
+/// it stays withdrawn across a restart until its chain verifies again.
+fn untrusted_prefix() -> Name {
+    "/localhost/ndn-data/untrusted"
+        .parse()
+        .expect("a valid name")
+}
+
+fn untrusted_name(entry: &Name) -> Name {
+    under(&untrusted_prefix(), entry)
+}
+
+/// The trust contexts `keyring` holds, by namespace.
+fn contexts_by_namespace(keyring: &Keyring) -> HashMap<Name, Arc<SignedTrustContext>> {
+    keyring
+        .contexts()
+        .into_iter()
+        .map(|c| (c.namespace().clone(), c))
+        .collect()
+}
+
+/// Whether a trust context `new` taken after `old` (of the same namespace)
+/// may refuse an entry `old` accepted (spec §8): it revokes a name `old`
+/// did not, has a revocation cut accept less than `old`'s did (dropped,
+/// shrunk, or bound to another manifest or key), lists a role whose Data
+/// requires a cut that `old` did not, or drops a trust anchor. `None` (no
+/// context before): it may.
+fn refuses_more(old: Option<&SignedTrustContext>, new: &SignedTrustContext) -> bool {
+    let Some(old) = old else {
+        return true;
+    };
+    let revokes = new
+        .revocations()
+        .iter()
+        .any(|r| !old.revocations().contains(r));
+    let shrinks = old.revocation_cuts().iter().any(|was| {
+        new.revocation_cut(was.key())
+            .is_none_or(|now| !now.covers(was))
+    });
+    let lapses = new
+        .data_requires_cut()
+        .iter()
+        .any(|role| !old.data_requires_cut().contains(role));
+    let anchors = old
+        .anchors()
+        .iter()
+        .any(|a| !new.anchors().contains_key(a.key()));
+    revokes || shrinks || lapses || anchors
+}
+
 /// `name` under the local `prefix`.
 fn under(prefix: &Name, name: &Name) -> Name {
     Name::from_components(prefix.components().iter().chain(name.components()).cloned())
@@ -2674,6 +3130,14 @@ impl Inner {
     /// stay refused; and any piece or record of a version a prune covers
     /// (stored by a walk that was under way when the prune arrived) is
     /// dropped.
+    ///
+    /// Only an entry this device signed — stored under its name with the
+    /// digest it recorded as it signed ([`written_name`]) — is its own and
+    /// moves its log head; an entry under its name that a copy of its key
+    /// signed comes back as another writer's. Each entry keeps the time it
+    /// was first verified here ([`verified_name`]); the keys marked
+    /// suspected stay marked, and entries withdrawn for their chain stay
+    /// withdrawn until judged again ([`Self::rejudge`]).
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
@@ -2683,7 +3147,34 @@ impl Inner {
         let mut heads = Vec::new();
         let mut erased = Vec::new();
         let mut pieces = Vec::new();
+        let mut seen: HashMap<Name, (Timestamp, Option<[u8; 32]>)> = HashMap::new();
+        let mut written: HashMap<Name, Bytes> = HashMap::new();
+        let mut suspected = BTreeMap::new();
+        let mut untrusted: HashMap<Name, String> = HashMap::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
+            if let Some(entry) = over(&verified_prefix(), &name) {
+                match decode_verified(&wire) {
+                    Some(v) => {
+                        seen.insert(entry, v);
+                    }
+                    None => self.store.remove(&name),
+                }
+                continue;
+            }
+            if let Some(entry) = over(&written_prefix(), &name) {
+                written.insert(entry, wire);
+                continue;
+            }
+            if let Some(key) = over(&suspected_prefix(), &name) {
+                if let Some(since) = wire.get(..8).and_then(|b| b.try_into().ok()) {
+                    suspected.insert(key, Timestamp(u64::from_be_bytes(since)));
+                }
+                continue;
+            }
+            if let Some(entry) = over(&untrusted_prefix(), &name) {
+                untrusted.insert(entry, String::from_utf8_lossy(&wire).into_owned());
+                continue;
+            }
             if let Some((_, ask)) = parse_grant_name(&name) {
                 if parse_seal_key_name(&ask.seal_key).is_some_and(|(d, _)| d == self.device)
                     && let Ok(data) = Data::decode(wire)
@@ -2752,6 +3243,7 @@ impl Inner {
             else {
                 continue;
             };
+            // Own by name for now; by what it wrote once all is read.
             let mine = parsed.device == self.device;
             entries.push((
                 name,
@@ -2762,6 +3254,24 @@ impl Inner {
                 mine,
             ));
         }
+        // A store kept before this device recorded what it writes: its
+        // entries under its name are taken as its own, as they were, and
+        // recorded so from now on.
+        let legacy = written.is_empty();
+        for (name, wire, _, _, _, mine) in entries.iter_mut() {
+            if !*mine {
+                continue;
+            }
+            let digest = wire::implicit_digest(wire);
+            if legacy {
+                self.store
+                    .insert(written_name(name), Bytes::copy_from_slice(&digest));
+            } else if written.get(name).map(|d| d.as_ref()) != Some(digest.as_slice()) {
+                tracing::warn!(%name, "an entry under this device's name that it did not write (a copy of its key signed it): restored as another writer's");
+                *mine = false;
+            }
+        }
+        let wrote = |entry: &Name| legacy || written.contains_key(entry);
         // Members records first, by revision; then the other records (hold
         // records, then leases, then prunes), so that what they say is known
         // as the versions come back; then versions and snapshots.
@@ -2776,31 +3286,64 @@ impl Inner {
             entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
         );
         let mut st = self.st.lock();
-        // What a held trust context revokes outside its cut stays refused
-        // across a restart (spec §8): records are not taken, versions held
-        // as refused.
+        // What the trust context refused for its chain stays withdrawn
+        // until judged again ([`Self::rejudge`]); what a held trust context
+        // revokes outside its cut stays refused across a restart (spec §8):
+        // records are not taken, versions held as refused.
         for (name, wire, _, writer, _, _) in entries.iter().chain(&rest) {
-            if let Some((digest, cut)) = self.cut_refusing(name, writer, wire) {
-                st.refused
-                    .insert(name.clone(), Refusal::OutsideCut(cut.clone()));
+            let digest = wire::implicit_digest(wire);
+            let why = match untrusted.remove(name) {
+                Some(why) => Some(Refusal::Untrusted { why }),
+                None => self
+                    .cut_refusing(name, writer, wire)
+                    .map(|(_, cut)| Refusal::OutsideCut(cut)),
+            };
+            if let Some(why) = why {
+                st.refused.insert(name.clone(), why.clone());
                 st.cut_out.insert(
                     name.clone(),
                     OutOfCut {
                         writer: writer.clone(),
                         digest,
                         wire: None,
-                        cut,
+                        why,
                     },
                 );
             }
         }
+        // Markers of entries no longer stored.
+        for name in untrusted.keys() {
+            self.store.remove(&untrusted_name(name));
+        }
+        for (name, _, _, _, _, mine) in entries.iter().chain(&rest) {
+            // An own entry kept before times were recorded has none.
+            let (at, key) = match seen.remove(name) {
+                Some((at, key)) => (Some(at), key),
+                None if *mine => (None, None),
+                None => continue,
+            };
+            st.verified.insert(
+                name.clone(),
+                Verified {
+                    at,
+                    key,
+                    own: *mine,
+                },
+            );
+        }
+        // Times of entries no longer stored: taken again, they are verified
+        // again, later.
+        for name in seen.keys() {
+            self.store.remove(&verified_name(name));
+        }
+        st.suspected = suspected;
         for (c, e) in erased {
             st.colls.entry(c).or_default().erased.insert(e);
         }
         // What expired here comes back first, so none of it is taken again.
         for (entry, c, l, tomb) in expired {
             let writer = Writer::new(tomb.writer.clone());
-            if l.device == self.device {
+            if l.device == self.device && wrote(&entry) {
                 st.head = st.head.max(l.seq);
                 let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
                 st.trees
@@ -2826,9 +3369,12 @@ impl Inner {
             }
             st.held.insert(entry, Held::Expired(tomb));
         }
+        // An own entry moves the log head, refused or not: this device
+        // signed that seq. (In a store kept before own entries were
+        // recorded, a refused one does not: it may be a copy's.)
         let take_all = |st: &mut St, list: Vec<(Name, Bytes, Record, Writer, u64, bool)>| {
             for (name, wire, record, writer, seq, mine) in list {
-                if mine {
+                if mine && !(legacy && st.cut_out.contains_key(&name)) {
                     st.head = st.head.max(seq);
                 }
                 let _ = self.take(st, name, wire, writer, record, mine);
@@ -2846,6 +3392,9 @@ impl Inner {
         }
         take_all(&mut st, rest);
         for (c, seq, tomb) in tombs {
+            if !wrote(&log_name(&self.device, Some(&c), seq)) {
+                continue;
+            }
             st.head = st.head.max(seq);
             let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
             // A tombstone an earlier revision kept empty lists its version
@@ -3368,7 +3917,7 @@ impl Inner {
                 Ok(Writer::new((*key).clone()))
             }
             // The signing key itself (not an issuer above it) is revoked.
-            ValidationResult::Invalid(TrustError::Revoked { name })
+            ValidationResult::Invalid(TrustError::Revoked { name, .. })
                 if name
                     .parse::<Name>()
                     .is_ok_and(|n| key_name_of(&n) == key_name_of(&key)) =>
@@ -3387,6 +3936,50 @@ impl Inner {
                 Err(Refusal::BadSignature)
             }
         }
+    }
+
+    /// [`Self::verify`], with the digest of the public key that verified
+    /// the packet ([`Self::verifying_key`]).
+    async fn verify_keyed(&self, data: &Data) -> Result<(Writer, Option<[u8; 32]>), Refusal> {
+        let writer = self.verify(data).await?;
+        let public = self.verifying_key(data, writer.key()).await;
+        Ok((writer, public))
+    }
+
+    /// The digest of the public key, as its certificate stores it, that
+    /// verifies `data`'s signature: of the certificates of `key` (its
+    /// KeyLocator) the validator holds, or of the anchor `key` names. A
+    /// cut binds the public key that verified the entries it keeps
+    /// (`CutKeyDigest`), so it is checked, not assumed. `None` when none
+    /// held verifies it.
+    async fn verifying_key(&self, data: &Data, key: &Name) -> Option<[u8; 32]> {
+        let sig_type = data.sig_info()?.sig_type;
+        let mut keys: Vec<Bytes> = Vec::new();
+        let anchor = self
+            .validator
+            .keyring()
+            .context_for(&data.name)
+            .anchor_for(key);
+        for pk in self
+            .validator
+            .cert_cache()
+            .all(key)
+            .into_iter()
+            .map(|c| c.public_key)
+            .chain(anchor.map(|a| a.public_key))
+        {
+            if !keys.contains(&pk) {
+                keys.push(pk);
+            }
+        }
+        for pk in &keys {
+            if let Ok(VerifyOutcome::Valid) =
+                verify_by_sig_type(sig_type, data.signed_region(), data.sig_value(), pk).await
+            {
+                return Some(public_key_digest(pk));
+            }
+        }
+        None
     }
 
     /// Take `data` as `device`'s signed summary root of `ns`: verify it,
@@ -3678,8 +4271,13 @@ impl Inner {
     }
 
     /// Fetch, verify and take one log entry; whether it is now held or
-    /// refused.
+    /// refused. The log of a device whose key is suspected here is not
+    /// fetched ([`Device::suspect`]).
     async fn take_fetched(self: &Arc<Self>, name: Name) -> bool {
+        if parse_log_name(&name).is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device)) {
+            tracing::debug!(%name, "not fetched: its device's key is suspected here");
+            return false;
+        }
         let Some(data) = self.fetch(name.clone(), false).await else {
             return false;
         };
@@ -3690,6 +4288,20 @@ impl Inner {
         }
     }
 
+    /// Since when `key` (a key or certificate name) is suspected here, if
+    /// it is and no trust context held revokes it (its cut decides then).
+    fn suspected_key(&self, st: &St, key: &Name) -> Option<Timestamp> {
+        let since = st.suspected.get(&key_name_of(key)).copied()?;
+        (!self.validator.keyring().context_for(key).is_revoked(key)).then_some(since)
+    }
+
+    /// Whether a key of `device` is suspected here ([`Self::suspected_key`]).
+    fn suspects_device(&self, st: &St, device: &Name) -> bool {
+        st.suspected
+            .keys()
+            .any(|k| device_of(k).as_ref() == Some(device) && self.suspected_key(st, k).is_some())
+    }
+
     /// Verify and take a fetched log entry named `name`. A packet that is
     /// not its name's writer's — a signature that fails, a signer of
     /// another device (checked before the chain walk), a record that does
@@ -3698,17 +4310,53 @@ impl Inner {
     /// make such a packet, and the genuine copy may still come from another
     /// source. Only what the genuine writer signed is decided against the
     /// name ([`Self::take`]); so is a packet its key signed that a
-    /// revocation refuses ([`Self::refuse_outside_cut`]).
+    /// revocation refuses ([`Self::refuse_outside_cut`]). A new entry of a
+    /// key suspected here is not taken ([`Refusal::Suspected`]), nor one
+    /// under this device's own name far beyond its log head
+    /// ([`Refusal::BeyondOwnLog`]). The time an entry is first verified
+    /// here is kept with it ([`Self::note_verified`]); an entry that
+    /// verifies makes the entries of its key withdrawn for their chain be
+    /// judged again ([`Self::rejudge`]).
     async fn take_data(self: &Arc<Self>, name: &Name, data: Data) -> Result<(), Refusal> {
+        self.take_entry(name, data, true).await
+    }
+
+    /// [`Self::take_data`]; `wake`: judge again what is withdrawn of its
+    /// key for its chain (not when taking back such an entry, which the
+    /// judgement under way does).
+    async fn take_entry(
+        self: &Arc<Self>,
+        name: &Name,
+        data: Data,
+        wake: bool,
+    ) -> Result<(), Refusal> {
         let parsed = parse_log_name(name).ok_or(Refusal::BadSignature)?;
         if *data.name != *name {
             return Err(Refusal::BadSignature);
         }
-        let named = data.sig_info().and_then(|s| s.key_locator_name());
-        if named.and_then(|k| device_of(&k)).as_ref() != Some(&parsed.device) {
+        let named = data
+            .sig_info()
+            .and_then(|s| s.key_locator_name())
+            .ok_or(Refusal::BadSignature)?;
+        if device_of(&named).as_ref() != Some(&parsed.device) {
             return Err(Refusal::BadSignature);
         }
-        let writer = match self.verify(&data).await {
+        {
+            let st = self.st.lock();
+            if !st.held.contains_key(name)
+                && let Some(since) = self.suspected_key(&st, &named)
+            {
+                return Err(Refusal::Suspected {
+                    key: key_name_of(&named),
+                    since,
+                });
+            }
+            if parsed.device == self.device && parsed.seq > st.head.saturating_add(OWN_AHEAD) {
+                tracing::warn!(%name, head = st.head, "refused: under this device's name, far beyond the last seq it wrote; a copy of its key signed it");
+                return Err(Refusal::BeyondOwnLog { head: st.head });
+            }
+        }
+        let (writer, public) = match self.verify_keyed(&data).await {
             Ok(w) => w,
             Err(Refusal::OutsideCut(cut)) => {
                 self.refuse_outside_cut(name, &data, cut.clone());
@@ -3726,9 +4374,10 @@ impl Inner {
         else {
             return Err(Refusal::BadSignature);
         };
-        let (chase, fetch) = {
+        let (chase, fetch, withdrawn) = {
             let mut st = self.st.lock();
             let members = matches!(record, Record::Members(_));
+            let key = key_name_of(writer.key());
             let fetch = self.take(
                 &mut st,
                 name.clone(),
@@ -3737,6 +4386,13 @@ impl Inner {
                 record,
                 false,
             );
+            if st.held.contains_key(name) {
+                self.note_verified(&mut st, name, public);
+            }
+            let withdrawn = st
+                .cut_out
+                .values()
+                .any(|o| !o.by_cut() && key_name_of(o.writer.key()) == key);
             // A group's record decides who reads the collections sealed to
             // it: their keys may be asked for now.
             let mut chase = Vec::new();
@@ -3746,13 +4402,21 @@ impl Inner {
                 }
                 chase.push(c);
             }
-            (chase, fetch)
+            (chase, fetch, (wake && withdrawn).then_some(key))
         };
         for c in chase {
             self.chase_keys(&c);
         }
         if let Some((v, chunks)) = fetch {
             self.spawn_pieces(v, chunks);
+        }
+        // Its key verifies again: what was withdrawn of it for its chain
+        // may verify too (a new certificate of the key).
+        if let Some(key) = withdrawn {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                inner.rejudge(Rejudge::Withdrawn(Some(key))).await;
+            });
         }
         self.settle().await;
         Ok(())
@@ -4183,7 +4847,8 @@ impl Inner {
     /// Whether the trust context governing `name` revokes `writer`'s key
     /// and that key's cut does not accept the entry `name` with the implicit
     /// digest `digest` gives (asked only of a revoked key): its digest and
-    /// the cut that refuses it.
+    /// the cut that refuses it ([`Self::cut_verdict`]; not refused while
+    /// undecided).
     fn refusing(
         &self,
         name: &Name,
@@ -4195,13 +4860,112 @@ impl Inner {
             return None;
         }
         let digest = digest()?;
-        ctx.refuses_data(writer.key(), name, &digest)
+        (self.cut_verdict(&ctx, name, writer, &digest) == Some(true))
             .then(|| (digest, revocation_cut_for(&ctx, writer, &log_prefix(name))))
+    }
+
+    /// Whether `ctx` refuses the entry `name` with implicit digest `digest`
+    /// signed by `writer` for its key's revocation: no revocation, or its
+    /// cut accepts it — `Some(false)`; revoked without a cut, or its cut
+    /// does not accept it — `Some(true)`. An entry in a range of a cut bound
+    /// to a manifest is accepted only with the digest the manifest lists for
+    /// it; while the manifest is not held here the verdict is `None`
+    /// (undecided: it stays as it is, and is judged again once the manifest
+    /// is fetched, [`Self::rejudge`]).
+    fn cut_verdict(
+        &self,
+        ctx: &SignedTrustContext,
+        name: &Name,
+        writer: &Writer,
+        digest: &[u8; 32],
+    ) -> Option<bool> {
+        if !ctx.is_revoked(writer.key()) {
+            return Some(false);
+        }
+        Some(match ctx.revocation_cut(&key_name_of(writer.key())) {
+            None => true,
+            Some(cut) if cut.accepts(name, digest) => false,
+            Some(cut) => match (cut.manifest(), cut.range_seq(name)) {
+                (Some(root), Some((range, seq))) => {
+                    match self
+                        .validator
+                        .cut_manifests()
+                        .lookup(root, &range.prefix, seq)
+                    {
+                        ManifestLookup::Listed(listed) => listed != *digest,
+                        ManifestLookup::NotListed => true,
+                        ManifestLookup::Missing(_) => return None,
+                    }
+                }
+                _ => true,
+            },
+        })
     }
 
     /// [`Self::refusing`] for the entry whose packet is `packet`.
     fn cut_refusing(&self, name: &Name, writer: &Writer, packet: &[u8]) -> Option<([u8; 32], Cut)> {
         self.refusing(name, writer, || Some(wire::implicit_digest(packet)))
+    }
+
+    /// What the manifest of the revocation cut binding the log entry `name`
+    /// of `writer` lists for it, when the trust context governing it
+    /// revokes the key with a cut bound to a manifest whose ranges take
+    /// `name`; `None` when no such cut binds it (an old cut binds names
+    /// only).
+    fn listed_digest(&self, name: &Name, writer: &Writer) -> Option<ManifestLookup> {
+        let ctx = self.validator.keyring().context_for(name);
+        let cut = ctx.revocation_cut(&key_name_of(writer.key()))?;
+        let (Some(root), Some((range, seq))) = (cut.manifest(), cut.range_seq(name)) else {
+            return None;
+        };
+        Some(
+            self.validator
+                .cut_manifests()
+                .lookup(root, &range.prefix, seq),
+        )
+    }
+
+    /// Fetch the cut manifest packet `full` (a full name ending in its
+    /// implicit digest) and hold it with the validator's manifests; whether
+    /// it is held now.
+    async fn fetch_manifest(&self, full: &Name) -> bool {
+        if self.validator.cut_manifests().contains(full) {
+            return true;
+        }
+        let Some(data) = self.fetch(full.clone(), false).await else {
+            tracing::debug!(%full, "a cut manifest packet not to be had now");
+            return false;
+        };
+        match self.validator.cut_manifests().insert(&data) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(%full, "a cut manifest packet refused: {e}");
+                false
+            }
+        }
+    }
+
+    /// The digest to fetch the log entry `name` of `writer` by, which a
+    /// revocation cut accepts: `Some(Some(d))` exactly the bytes its cut's
+    /// manifest lists (its manifest packets fetched as needed);
+    /// `Some(None)` by name, the cut binding no bytes; `None` when it is
+    /// not to be fetched (the manifest lists nothing there, or cannot be
+    /// had now).
+    async fn cut_digest(&self, name: &Name, writer: &Writer) -> Option<Option<[u8; 32]>> {
+        // A manifest is a tree a few levels deep; each look fetches one.
+        for _ in 0..MANIFEST_LOOKS {
+            match self.listed_digest(name, writer) {
+                None => return Some(None),
+                Some(ManifestLookup::Listed(d)) => return Some(Some(d)),
+                Some(ManifestLookup::NotListed) => return None,
+                Some(ManifestLookup::Missing(full)) => {
+                    if !self.fetch_manifest(&full).await {
+                        return None;
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Keep the refusal of `data`, the log entry `name`, by `cut`: its key
@@ -4213,9 +4977,10 @@ impl Inner {
     /// authentic; a key revoked without a cut is refused before any
     /// signature check, and such a packet is refused as a packet only (it
     /// may be a forgery, and nothing of it can be re-admitted). Not kept
-    /// either when the context re-admits other bytes at that name (they may
-    /// still come from another source), nor when an accepted entry holds the
-    /// name.
+    /// either when the context re-admits other bytes at that name, or its
+    /// cut's manifest binds the name to bytes (other bytes than these: the
+    /// listed ones may still come from another source), nor when an
+    /// accepted entry holds the name.
     fn refuse_outside_cut(&self, name: &Name, data: &Data, cut: Cut) {
         let Some(key) = data.sig_info().and_then(|s| s.key_locator_name()) else {
             return;
@@ -4231,9 +4996,10 @@ impl Inner {
         let other_bytes = held_cut
             .exact()
             .iter()
-            .any(|e| e.len() == name.len() + 1 && e.has_prefix(name));
+            .any(|e| e.len() == name.len() + 1 && e.has_prefix(name))
+            || (held_cut.manifest().is_some() && held_cut.range_seq(name).is_some());
         if other_bytes {
-            tracing::debug!(%name, "refused as a packet: other bytes at this name are re-admitted");
+            tracing::debug!(%name, "refused as a packet: other bytes at this name are accepted");
             return;
         }
         let writer = Writer::new((*key).clone());
@@ -4249,7 +5015,7 @@ impl Inner {
                 writer: writer.clone(),
                 digest: wire::implicit_digest(data.raw()),
                 wire: Some(data.raw().clone()),
-                cut: cut.clone(),
+                why: Refusal::OutsideCut(cut.clone()),
             },
         );
         if let Some(c) = parsed.subject {
@@ -4316,16 +5082,35 @@ impl Inner {
         }
     }
 
-    /// Take a trust context this device's keyring adopted (spec §8): every
+    /// Take a trust context this device's keyring adopted (spec §8): a key
+    /// it revokes is no longer only suspected here (its cut decides); every
     /// held log entry that a revocation now refuses outside its key's cut
     /// is withdrawn ([`Self::withdraw_revoked`]); every entry refused here
     /// that the contexts no longer refuse, or that a cut re-admits exactly,
     /// is taken — fetched by its full name if not held — and delivered like
-    /// a newly arrived one; then what the cuts accept of the collections
-    /// this device follows is fetched.
+    /// a newly arrived one; what is held is judged again by the durable rule
+    /// — every entry of its namespace when the context may refuse more than
+    /// the one before it ([`refuses_more`]), else those withdrawn for their
+    /// chain ([`Self::rejudge`]); then what the cuts accept of the
+    /// collections this device follows is fetched.
     async fn adopted(self: &Arc<Self>, ctx: &Arc<SignedTrustContext>) {
-        let readmit = {
+        let ns = ctx.namespace().clone();
+        let (readmit, more) = {
             let mut st = self.st.lock();
+            let more = refuses_more(st.contexts.get(&ns).map(|c| &**c), ctx);
+            st.contexts.insert(ns.clone(), Arc::clone(ctx));
+            let keyring = self.validator.keyring();
+            let revoked: Vec<Name> = st
+                .suspected
+                .keys()
+                .filter(|k| keyring.context_for(k).is_revoked(k))
+                .cloned()
+                .collect();
+            for key in revoked {
+                tracing::info!(%key, "no longer suspected: a trust context revokes it");
+                st.suspected.remove(&key);
+                self.store.remove(&suspected_name(&key));
+            }
             self.note_revoked(&mut st);
             self.withdraw_revoked(&mut st);
             let readmit = self.readmissions(&mut st, ctx);
@@ -4334,26 +5119,23 @@ impl Inner {
             for c in colls {
                 st.apply_ready(&c, &BTreeSet::new());
             }
-            readmit
+            (readmit, more)
         };
         futures::future::join_all(readmit.into_iter().map(|r| self.readmit(r))).await;
+        self.rejudge(match more {
+            true => Rejudge::Namespace(ns),
+            false => Rejudge::Withdrawn(None),
+        })
+        .await;
         self.fetch_cut_runs();
         self.settle().await;
         self.progress.notify_waiters();
     }
 
     /// Withdraw every held log entry whose key the trust context governing
-    /// it revokes and whose cut does not accept it, as a members record that
-    /// arrived later withdraws what its cut refuses: it is kept as refused
-    /// ([`Refusal::OutsideCut`]); a version leaves the state, which is
-    /// rebuilt, and one delivered before is reported to every watcher of
-    /// its collection whatever its frontier ([`Change::Withdrawn`]); a
-    /// members record stops counting and the record in force is made again
-    /// from the others; a hold, lease or prune record stops counting (what
-    /// the prune dropped may be fetched again). This device's own entries
-    /// too.
+    /// it revokes and whose cut does not accept it ([`Self::withdraw`]).
     fn withdraw_revoked(&self, st: &mut St) {
-        let mut found: Vec<(Name, Writer, [u8; 32], Cut)> = Vec::new();
+        let mut found: Vec<(Name, Writer, [u8; 32], Refusal)> = Vec::new();
         for coll in st.colls.values() {
             let versions = coll
                 .versions
@@ -4366,7 +5148,12 @@ impl Inner {
                 if !st.cut_out.contains_key(name)
                     && let Some((digest, cut)) = self.cut_refusing(name, writer, packet)
                 {
-                    found.push((name.clone(), writer.clone(), digest, cut));
+                    found.push((
+                        name.clone(),
+                        writer.clone(),
+                        digest,
+                        Refusal::OutsideCut(cut),
+                    ));
                 }
             }
         }
@@ -4386,22 +5173,49 @@ impl Inner {
                 _ => None,
             };
             if let Some((writer, (digest, cut))) = refused {
-                found.push((name.clone(), writer.clone(), digest, cut));
+                found.push((
+                    name.clone(),
+                    writer.clone(),
+                    digest,
+                    Refusal::OutsideCut(cut),
+                ));
             }
         }
+        self.withdraw(st, found);
+    }
+
+    /// Withdraw each held log entry `found` lists — its name, the key that
+    /// signed it, its implicit digest, and why the trust context refuses it
+    /// now ([`Refusal::OutsideCut`] by its key's cut, or
+    /// [`Refusal::Untrusted`] for its chain) — as a members record that
+    /// arrived later withdraws what its cut refuses: it is kept as refused
+    /// ([`St::cut_out`]); a version leaves the state, which is rebuilt, and
+    /// one delivered before is reported to every watcher of its collection
+    /// whatever its frontier ([`Change::Withdrawn`]); a members record
+    /// stops counting and the record in force is made again from the
+    /// others; a hold, lease or prune record stops counting (what the prune
+    /// dropped may be fetched again). This device's own entries too. Its
+    /// packet stays in the store; one refused for its chain is marked so
+    /// there ([`untrusted_name`]), for a restart.
+    fn withdraw(&self, st: &mut St, found: Vec<(Name, Writer, [u8; 32], Refusal)>) {
         let mut reread = BTreeSet::new();
         let mut rebuild = BTreeMap::new();
         // Per collection, its frontier before, and the versions a refused
         // prune had dropped.
         let mut back: BTreeMap<Name, (Frontier, Vec<Name>)> = BTreeMap::new();
-        for (name, writer, digest, cut) in found {
-            tracing::info!(%name, key = %cut.of, "withdrawn: a trust context adopted later revokes its key, and the cut does not accept it");
+        for (name, writer, digest, why) in found {
+            tracing::info!(%name, %why, "withdrawn: a trust context adopted later refuses it");
             let record = matches!(st.held.get(&name), Some(Held::Record { .. }));
             // A version admitted is refused as its collection is read again
             // ([`St::admit_one`]), which reports it if it was delivered.
             if !matches!(st.held.get(&name), Some(Held::Version(_))) {
-                st.refused
-                    .insert(name.clone(), Refusal::OutsideCut(cut.clone()));
+                st.refused.insert(name.clone(), why.clone());
+            }
+            if let Refusal::Untrusted { why } = &why {
+                self.store.insert(
+                    untrusted_name(&name),
+                    Bytes::copy_from_slice(why.as_bytes()),
+                );
             }
             st.cut_out.insert(
                 name.clone(),
@@ -4409,7 +5223,7 @@ impl Inner {
                     writer,
                     digest,
                     wire: None,
-                    cut: cut.clone(),
+                    why: why.clone(),
                 },
             );
             let Some(c) = parse_log_name(&name).and_then(|l| l.subject) else {
@@ -4448,13 +5262,13 @@ impl Inner {
                     .and_then(|d| wire::decode_record(d.content()?.clone()).ok())
                     .is_some_and(|r| matches!(r, Record::Members(_)));
                 if members {
-                    rebuild.entry(c.clone()).or_insert(cut);
+                    rebuild.entry(c.clone()).or_insert(why);
                 }
             }
             reread.insert(c);
         }
-        for (c, cut) in rebuild {
-            self.rebuild_members(st, &c, &cut);
+        for (c, why) in rebuild {
+            self.rebuild_members(st, &c, &why);
         }
         // What the refused prune dropped comes back where its bytes stayed
         // (this device's own versions, [`Coll::foreign_prunes`]); others'
@@ -4472,7 +5286,7 @@ impl Inner {
                 }) else {
                     continue;
                 };
-                let mine = parse_log_name(name).is_some_and(|l| l.device == self.device);
+                let mine = st.verified.get(name).is_some_and(|v| v.own);
                 tracing::info!(%name, "back: the prune that dropped it is refused by a cut");
                 let _ = self.take(st, name.clone(), packet, Writer::new(key), record, mine);
             }
@@ -4496,24 +5310,254 @@ impl Inner {
             }
         }
         // A version of a collection no record is known of yet: refused too.
-        let waiting: Vec<(Name, Cut)> = st
+        let waiting: Vec<(Name, Refusal)> = st
             .cut_out
             .iter()
             .filter(|(n, _)| !st.refused.contains_key(*n))
-            .map(|(n, o)| (n.clone(), o.cut.clone()))
+            .map(|(n, o)| (n.clone(), o.why.clone()))
             .collect();
-        for (name, cut) in waiting {
-            st.refused.insert(name, Refusal::OutsideCut(cut));
+        for (name, why) in waiting {
+            st.refused.insert(name, why);
+        }
+    }
+
+    /// Judge held log entries again by the durable rule, on their packets,
+    /// against the trust contexts and certificates held now (spec §8): the
+    /// same rule a fresh fetch gets (`validate_durable_cached`), so a key
+    /// above an entry's signer that a context revokes, a cut bound to other
+    /// bytes or another public key, or a lapse a cut must end, refuses it
+    /// as it would refuse it fetched. What [`Rejudge`] names is judged:
+    ///
+    /// - accepted: it stays; one withdrawn for its chain before is taken
+    ///   back and delivered again;
+    /// - refused by its key's own revocation: withdrawn by the cut
+    ///   ([`Refusal::OutsideCut`], re-admitted only exactly);
+    /// - refused for its chain: withdrawn ([`Refusal::Untrusted`]), its
+    ///   packet kept, taken back once the chain verifies (a new certificate
+    ///   of its key from an issuer still trusted);
+    /// - pending (a certificate or cut manifest packet not held): it stays
+    ///   as it is; the missing piece is fetched, once for every entry
+    ///   waiting for it, and those entries are judged again.
+    ///
+    /// A verdict no signed data decides (a signature that no longer checks
+    /// against what is cached) leaves the entry as it is. This device's own
+    /// entries are not judged: it signed them.
+    fn rejudge<'a>(self: &'a Arc<Self>, which: Rejudge) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let list = self.to_rejudge(&which);
+            if list.is_empty() {
+                return;
+            }
+            let mut found = Vec::new();
+            let mut back = Vec::new();
+            let mut waiting: BTreeMap<Name, Vec<(Name, Data)>> = BTreeMap::new();
+            for (name, writer, wire, withdrawn) in list {
+                let Ok(data) = Data::decode(wire.clone()) else {
+                    continue;
+                };
+                let (result, missing) = self.validator.validate_durable_cached(&data).await;
+                match self.verdict(&name, &writer, result, missing) {
+                    Verdict::Accepted if withdrawn => back.push((name, data)),
+                    Verdict::Cut(cut) if !withdrawn => found.push((
+                        name,
+                        writer,
+                        wire::implicit_digest(&wire),
+                        Refusal::OutsideCut(cut),
+                    )),
+                    Verdict::Chain(why) if !withdrawn => found.push((
+                        name,
+                        writer,
+                        wire::implicit_digest(&wire),
+                        Refusal::Untrusted { why },
+                    )),
+                    Verdict::Pending(missing) => {
+                        waiting.entry(missing).or_default().push((name, data));
+                    }
+                    _ => {}
+                }
+            }
+            if !found.is_empty() {
+                let mut st = self.st.lock();
+                self.withdraw(&mut st, found);
+                let colls: Vec<Name> = st.colls.keys().cloned().collect();
+                for c in colls {
+                    st.apply_ready(&c, &BTreeSet::new());
+                }
+            }
+            // Taken back below newer entries applied meanwhile: their
+            // collections are read again, in order.
+            let mut taken = Vec::new();
+            for (name, data) in back {
+                if self.take_back(&name, data).await {
+                    taken.push(name);
+                }
+            }
+            if !taken.is_empty() {
+                let mut st = self.st.lock();
+                let colls: BTreeSet<Name> = taken
+                    .iter()
+                    .filter_map(|n| parse_log_name(n)?.subject)
+                    .collect();
+                for c in &colls {
+                    st.reread(c, &self.config.rules, self.me());
+                }
+                for name in &taken {
+                    let again = parse_log_name(name).and_then(|l| l.subject).and_then(|c| {
+                        let coll = st.colls.get(&c)?;
+                        let hv = coll.versions.values().find(|hv| hv.version.name == *name)?;
+                        let id = &hv.version.id;
+                        coll.applied
+                            .get(&id.writer)
+                            .is_some_and(|a| *a >= id.seq.0)
+                            .then(|| hv.version.clone())
+                    });
+                    if let Some(v) = again {
+                        st.tell_again(&v);
+                    }
+                }
+            }
+            for (missing, entries) in waiting {
+                let inner = Arc::clone(self);
+                rt::spawn(async move {
+                    if inner.resolve(&missing, &entries[0].1).await {
+                        let names = entries.into_iter().map(|(n, _)| n).collect();
+                        inner.rejudge(Rejudge::Names(names)).await;
+                    }
+                });
+            }
+            self.progress.notify_waiters();
+        })
+    }
+
+    /// The held log entries [`Rejudge`] names, not this device's own:
+    /// each with its signer, its packet, and whether it is withdrawn for
+    /// its chain now.
+    fn to_rejudge(&self, which: &Rejudge) -> Vec<(Name, Writer, Bytes, bool)> {
+        let st = self.st.lock();
+        let keyring = self.validator.keyring();
+        let packet = |name: &Name, o: Option<&OutOfCut>| {
+            o.and_then(|o| o.wire.clone())
+                .or_else(|| held_wire(&st, name))
+                .or_else(|| self.store.get(name))
+        };
+        let mut out = Vec::new();
+        for (name, held) in &st.held {
+            if st.verified.get(name).is_some_and(|v| v.own) {
+                continue;
+            }
+            let out_of = st.cut_out.get(name);
+            let withdrawn = out_of.is_some_and(|o| !o.by_cut());
+            if out_of.is_some_and(|o| o.by_cut()) {
+                continue;
+            }
+            let wanted = match which {
+                Rejudge::All => true,
+                Rejudge::Namespace(ns) => withdrawn || keyring.context_for(name).namespace() == ns,
+                Rejudge::Withdrawn(None) => withdrawn,
+                Rejudge::Withdrawn(Some(key)) => {
+                    withdrawn && out_of.is_some_and(|o| key_name_of(o.writer.key()) == *key)
+                }
+                Rejudge::Names(names) => names.contains(name),
+            };
+            if !wanted {
+                continue;
+            }
+            let Some(writer) = held_signer(&st, name, held) else {
+                continue;
+            };
+            if let Some(wire) = packet(name, out_of) {
+                out.push((name.clone(), writer.clone(), wire, withdrawn));
+            }
+        }
+        out
+    }
+
+    /// What the durable rule's `result` (with the certificate or manifest
+    /// packet `missing` it waits for) on the held log entry `name` of
+    /// `writer` means for it ([`Self::rejudge`]).
+    fn verdict(
+        &self,
+        name: &Name,
+        writer: &Writer,
+        result: ValidationResult,
+        missing: Option<Arc<Name>>,
+    ) -> Verdict {
+        let e = match result {
+            ValidationResult::Valid(_) => return Verdict::Accepted,
+            ValidationResult::Pending => {
+                return match missing {
+                    Some(m) => Verdict::Pending((*m).clone()),
+                    None => Verdict::Undecided,
+                };
+            }
+            ValidationResult::Invalid(e) => e,
+        };
+        match &e {
+            // The signing key itself: its revocation's cut decides.
+            TrustError::Revoked { name: refused, .. }
+                if refused
+                    .parse::<Name>()
+                    .is_ok_and(|n| key_name_of(&n) == key_name_of(writer.key())) =>
+            {
+                let ctx = self.validator.keyring().context_for(name);
+                if ctx.is_revoked(writer.key()) {
+                    Verdict::Cut(revocation_cut_for(&ctx, writer, &log_prefix(name)))
+                } else {
+                    // Its key lapsed where Data of its role needs a cut.
+                    Verdict::Chain(e.to_string())
+                }
+            }
+            TrustError::Revoked { .. }
+            | TrustError::CertNotAuthorized { .. }
+            | TrustError::SchemaMismatch
+            | TrustError::UntrustedSelfSigned { .. }
+            | TrustError::NoTrustAnchors { .. } => Verdict::Chain(e.to_string()),
+            _ => {
+                tracing::debug!(%name, "judged again, undecided: {e}");
+                Verdict::Undecided
+            }
+        }
+    }
+
+    /// Fetch `missing`, the certificate or cut manifest packet a durable
+    /// judgement of `data` waits for; whether it may decide now.
+    async fn resolve(&self, missing: &Name, data: &Data) -> bool {
+        if ndn_security::is_full_name(missing) {
+            return self.fetch_manifest(missing).await;
+        }
+        // The validator's fetcher brings the certificate in.
+        !matches!(
+            self.validator.validate_durable(data).await,
+            ValidationResult::Pending
+        )
+    }
+
+    /// Take back the log entry `name`, withdrawn for its chain, whose
+    /// packet `data` the durable rule accepts again: it is taken like a
+    /// newly arrived entry. Whether it was taken.
+    async fn take_back(self: &Arc<Self>, name: &Name, data: Data) -> bool {
+        {
+            let mut st = self.st.lock();
+            st.forget(name);
+            self.store.remove(&untrusted_name(name));
+        }
+        tracing::info!(%name, "taken back: its chain verifies again");
+        match self.take_entry(name, data, false).await {
+            Ok(()) => true,
+            Err(why) => {
+                tracing::debug!(%name, "judged again and accepted, yet not taken: {why}");
+                false
+            }
         }
     }
 
     /// Make collection `c`'s record in force again from the owner-signed
-    /// members records held that no revocation refuses, after `cut`
-    /// refused one (spec §6, §8). A version delivered before that the new
-    /// record refuses is reported withdrawn by the cut that refused it, or
-    /// by `cut` (the record that admitted it no longer counts); with no
-    /// record left, every version waits for one.
-    fn rebuild_members(&self, st: &mut St, c: &Name, cut: &Cut) {
+    /// members records held that the trust context does not refuse, after
+    /// it refused one for `why` (spec §6, §8). A version delivered before
+    /// that the new record refuses is reported withdrawn by the refusal
+    /// that refused it, or by `why` (the record that admitted it no longer
+    /// counts); with no record left, every version waits for one.
+    fn rebuild_members(&self, st: &mut St, c: &Name, why: &Refusal) {
         let Some(ns) = namespace_of(c) else {
             return;
         };
@@ -4572,18 +5616,21 @@ impl Inner {
             coll.waiting.extend(versions.into_values());
         }
         for (id, name) in delivered {
-            let told = matches!(st.refused.get(&name), Some(Refusal::OutsideCut(_)));
+            let told = matches!(
+                st.refused.get(&name),
+                Some(Refusal::OutsideCut(_) | Refusal::Untrusted { .. })
+            );
             let admitted = st
                 .colls
                 .get(c)
                 .is_some_and(|x| x.versions.contains_key(&id));
             if !told && !admitted {
-                tracing::info!(?id, collection = %c, "withdrawn: the members record that admitted it is revoked");
+                tracing::info!(?id, collection = %c, "withdrawn: the members record that admitted it is refused");
                 st.tell(
                     c,
                     &Change::Withdrawn {
                         id,
-                        cut: cut.clone(),
+                        why: why.clone(),
                     },
                 );
             }
@@ -4598,17 +5645,20 @@ impl Inner {
     /// not hold though it follows its collection. What was held of each is
     /// forgotten, so each is taken anew ([`Self::readmit`]).
     fn readmissions(&self, st: &mut St, ctx: &SignedTrustContext) -> Vec<Readmit> {
+        let keyring = self.validator.keyring();
         let released: Vec<(Name, Bytes)> = st
             .cut_out
             .iter()
+            .filter(|(_, o)| o.by_cut())
             .filter_map(|(name, o)| {
                 let packet = o
                     .wire
                     .clone()
                     .or_else(|| held_wire(st, name))
                     .or_else(|| self.store.get(name))?;
+                let governing = keyring.context_for(name);
                 (wire::implicit_digest(&packet) == o.digest
-                    && self.cut_refusing(name, &o.writer, &packet).is_none())
+                    && self.cut_verdict(&governing, name, &o.writer, &o.digest) == Some(false))
                 .then(|| (name.clone(), packet))
             })
             .collect();
@@ -4779,9 +5829,12 @@ impl Inner {
     /// follows that a held revocation cut accepts and that it neither holds
     /// nor refused (spec §8): the revoked key's summaries are refused, so
     /// its cut is the listing of what stays. The entries become known as
-    /// the key's, so later ones wait for them in order.
+    /// the key's, so later ones wait for them in order. An entry of a cut
+    /// bound to a manifest is fetched by its full name, exactly the bytes
+    /// the manifest lists ([`Self::cut_digest`]): other bytes a thief signed
+    /// at that name are never asked for.
     fn fetch_cut_runs(self: &Arc<Self>) {
-        let names: Vec<Name> = {
+        let names: Vec<(Name, Writer, Option<[u8; 32]>)> = {
             let keyring = self.validator.keyring();
             let mut st = self.st.lock();
             let mut out = Vec::new();
@@ -4836,9 +5889,38 @@ impl Inner {
                                     continue;
                                 }
                                 cut_fetching.insert(name.clone());
-                                out.push(name);
+                                out.push((name, writer.clone(), None));
                             }
                         }
+                    }
+                    // What the cut re-admits exactly, in a collection
+                    // followed now (perhaps only since the adoption), is
+                    // fetched by its full name.
+                    for full in cut.exact() {
+                        if out.len() >= CUT_FETCHES {
+                            break 'all;
+                        }
+                        let Some((last, bare)) = full.components().split_last() else {
+                            continue;
+                        };
+                        let Ok(digest) = <[u8; 32]>::try_from(last.value.as_ref()) else {
+                            continue;
+                        };
+                        let name = Name::from_components(bare.iter().cloned());
+                        let in_followed = parse_log_name(&name)
+                            .filter(|l| l.device == device)
+                            .and_then(|l| l.subject)
+                            .is_some_and(|c| st.inside(&c));
+                        if last.typ != ndn_packet::tlv_type::IMPLICIT_SHA256
+                            || !in_followed
+                            || keyring.context_for(&name).namespace() != ctx.namespace()
+                            || st.held.contains_key(&name)
+                            || st.refused.contains_key(&name)
+                            || !st.cut_fetching.insert(name.clone())
+                        {
+                            continue;
+                        }
+                        out.push((name, writer.clone(), Some(digest)));
                     }
                 }
             }
@@ -4852,8 +5934,16 @@ impl Inner {
         rt::spawn(async move {
             let inner = &inner;
             stream::iter(names)
-                .map(|name| async move {
-                    if let Some(d) = inner.fetch_entry(&name, None).await
+                .map(|(name, writer, exact)| async move {
+                    // Exactly the bytes re-admitted, or those the cut's
+                    // manifest lists, by full name: other bytes at the
+                    // name are not asked for.
+                    let digest = match exact {
+                        Some(d) => Some(Some(d)),
+                        None => inner.cut_digest(&name, &writer).await,
+                    };
+                    if let Some(digest) = digest
+                        && let Some(d) = inner.fetch_entry(&name, digest).await
                         && let Err(why) = inner.take_data(&name, d).await
                     {
                         tracing::debug!(%name, "an entry its revocation cut accepts is refused: {why}");
@@ -4892,6 +5982,61 @@ impl Inner {
         Ok(wire)
     }
 
+    /// The seq of the next entry of the own log: one past its head. Refused
+    /// once the head is the last seq a log can number.
+    fn next_seq(&self, st: &St) -> Result<u64, DataError> {
+        st.head.checked_add(1).ok_or_else(|| {
+            local(format!(
+                "{} has written the last seq its log can number ({}), so it writes nothing more \
+                 under this name; enroll the device again under a new name",
+                self.device, st.head
+            ))
+        })
+    }
+
+    /// Record that this device signed `wire`, its log entry `name`, now:
+    /// a restart takes it as its own ([`written_name`]), and it was first
+    /// verified now, by the device's own public key ([`verified_name`]).
+    fn note_written(&self, st: &mut St, name: &Name, wire: &Bytes) {
+        self.store.insert(
+            written_name(name),
+            Bytes::copy_from_slice(&wire::implicit_digest(wire)),
+        );
+        let at = (self.config.clock)();
+        self.store.insert(
+            verified_name(name),
+            encode_verified(at, self.own_key.as_ref()),
+        );
+        st.verified.insert(
+            name.clone(),
+            Verified {
+                at: Some(at),
+                key: self.own_key,
+                own: true,
+            },
+        );
+    }
+
+    /// Note that this device verified the log entry `name` of another
+    /// writer now, by the public key whose digest is `key` — unless it was
+    /// verified before: the first time is what a cut is bounded by.
+    fn note_verified(&self, st: &mut St, name: &Name, key: Option<[u8; 32]>) {
+        if st.verified.contains_key(name) {
+            return;
+        }
+        let at = (self.config.clock)();
+        self.store
+            .insert(verified_name(name), encode_verified(at, key.as_ref()));
+        st.verified.insert(
+            name.clone(),
+            Verified {
+                at: Some(at),
+                key,
+                own: false,
+            },
+        );
+    }
+
     /// Append an entry about `subject` to the own log: sign, store, take.
     fn append(
         &self,
@@ -4900,10 +6045,11 @@ impl Inner {
         content: Bytes,
     ) -> Result<(Name, u64), DataError> {
         let record = wire::decode_record(content.clone()).map_err(|e| local(e.to_string()))?;
-        let seq = st.head + 1;
+        let seq = self.next_seq(st)?;
         let name = log_name(&self.device, subject, seq);
         let wire = self.sign(DataBuilder::new(name.clone(), &content))?;
         st.head = seq;
+        self.note_written(st, &name, &wire);
         self.take(st, name.clone(), wire, self.writer.clone(), record, true);
         Ok((name, seq))
     }
@@ -4982,6 +6128,8 @@ impl Inner {
         draft: Draft,
         batch: Duration,
     ) -> Result<VersionId, DataError> {
+        // Refused before the edit touches the state.
+        let seq = self.next_seq(st)?;
         let log = st.colls[c]
             .members
             .as_ref()
@@ -5026,7 +6174,6 @@ impl Inner {
             }
             Rule::Log | Rule::OneKey => Bytes::new(),
         };
-        let seq = st.head + 1;
         let name = log_name(&self.device, Some(c), seq);
         let payload = match (key, &block) {
             (Some((_, k)), Some(b)) => seal::seal_bytes(k, &name, &wire::encode_block(b)),
@@ -5085,6 +6232,7 @@ impl Inner {
         let version = version_of(&name, &self.writer, seq, body);
         let id = version.id.clone();
         self.store.insert(name.clone(), wire.clone());
+        self.note_written(st, &name, &wire);
         st.held.insert(name, Held::Version(id.clone()));
         let retain = match log {
             true => Retain { keep, dated },
@@ -5332,7 +6480,9 @@ impl Inner {
         readers: Vec<Audience>,
         new_epoch: bool,
     ) -> (MembersBody, Option<ContentKey>) {
-        let seq = st.head + 1;
+        // The seq it is written at, if the log can number one
+        // ([`Self::next_seq`] refuses it otherwise).
+        let seq = st.head.saturating_add(1);
         let coll = st.colls.get(c);
         let covered = |of: &Name| writers.iter().any(|p| of.has_prefix(p));
         let mut cuts: Vec<CutBody> = current
@@ -8561,7 +9711,7 @@ impl DataLayer for Device {
                         }
                     });
                 }
-                let record = inner.default_members(collection, st.head + 1);
+                let record = inner.default_members(collection, st.head.saturating_add(1));
                 inner.append_members(&mut st, collection, record)?;
             }
         }
@@ -9153,6 +10303,34 @@ mod tests {
             Arc::clone(validator),
             Arc::clone(store),
             Config::new(),
+        )
+        .await
+    }
+
+    /// Start `device` on a forwarder that delivers nothing, its wall clock
+    /// reading `clock`.
+    async fn start_at(
+        device: &Name,
+        keys: &Arc<SecurityManager>,
+        validator: &Arc<Validator>,
+        store: &Arc<dyn DataStore>,
+        clock: &Arc<AtomicU64>,
+    ) -> Result<Device, DataError> {
+        let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+        let read = Arc::clone(clock);
+        Device::start(
+            Transport {
+                node: Node::from_connection(Arc::clone(&conn)),
+                sync: conn,
+            },
+            device.clone(),
+            Arc::clone(keys),
+            Arc::clone(validator),
+            Arc::clone(store),
+            Config {
+                clock: Arc::new(move || Timestamp(read.load(Ordering::Relaxed))),
+                ..Config::new()
+            },
         )
         .await
     }
@@ -11464,6 +12642,8 @@ mod tests {
         phone_keys: Arc<SecurityManager>,
         key: Name,
         c: Name,
+        /// The reader's wall clock.
+        clock: Arc<AtomicU64>,
     }
 
     impl Revoking {
@@ -11491,7 +12671,10 @@ mod tests {
             let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
             let tab = n("/rita/tab");
             let tab_keys = keys_of(&tab);
-            let dev = start(&tab, &tab_keys, &validator, &store).await.unwrap();
+            let clock = Arc::new(AtomicU64::new(1_000));
+            let dev = start_at(&tab, &tab_keys, &validator, &store, &clock)
+                .await
+                .unwrap();
             let c = n("/rita/32=data/notes");
             dev.share(&c, share_of(Rule::Log, &["/rita", "/sam"], Vec::new()))
                 .await
@@ -11507,6 +12690,7 @@ mod tests {
                 phone_keys,
                 key,
                 c,
+                clock,
             }
         }
 
@@ -11651,7 +12835,7 @@ mod tests {
             .expect("the stream is open")
             .unwrap();
         assert!(
-            matches!(&change, Change::Withdrawn { id, cut } if *id == r.id(3) && cut.of == r.key),
+            matches!(&change, Change::Withdrawn { id, why: Refusal::OutsideCut(cut) } if *id == r.id(3) && cut.of == r.key),
             "{change:?}"
         );
         assert!(outside_cut(r.dev.get(&three).await));
@@ -11777,17 +12961,38 @@ mod tests {
         expected.add_run(&prefix(&r.c), 1, 2);
         expected.add_seq(&prefix(&r.c), 4);
         expected.add_seq(&prefix(&photos), 3);
-        assert_eq!(r.dev.revocation_cut(&r.key), expected);
+        let bound = CutBound {
+            held_before: Some(LATER),
+            ..CutBound::default()
+        };
+        let proposal = r.dev.revocation_cut(&r.key, &bound).unwrap();
+        assert_eq!(proposal.cut.ranges(), expected.ranges());
+        assert!(proposal.left_out.is_empty());
         assert_eq!(
-            r.dev.revocation_cut(&r.cert.name),
-            expected,
+            proposal.cut.key_digest(),
+            Some(&public_key_digest(&r.cert.public_key)),
+            "bound to the public key that verified its entries"
+        );
+        assert!(proposal.cut.manifest().is_some() && !proposal.manifest.is_empty());
+        assert_eq!(
+            r.dev
+                .revocation_cut(&r.cert.name, &bound)
+                .unwrap()
+                .cut
+                .ranges(),
+            expected.ranges(),
             "by a certificate name"
         );
+        let nothing = r.dev.revocation_cut(&n("/sam/laptop/KEY/1"), &bound);
         assert!(
-            r.dev
-                .revocation_cut(&n("/sam/laptop/KEY/1"))
-                .ranges()
-                .is_empty()
+            matches!(nothing, Err(DataError::BadRequest { .. })),
+            "no entry, no certificate held: no public key to bind"
+        );
+        let unbounded = r.dev.revocation_cut(&r.key, &CutBound::default());
+        assert_eq!(
+            unbounded.map(|_| ()).unwrap_err().next(),
+            crate::NextStep::FixRequest,
+            "say when the device was lost"
         );
         r.dev.shutdown();
     }
@@ -11935,5 +13140,464 @@ mod tests {
         drop(st);
         assert!(r.dev.refused_by_revocation(&r.key).is_empty());
         r.dev.shutdown();
+    }
+
+    // ---- slice 5 review: keys over time ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_exact_re_admission_is_fetched_once_its_collection_is_followed() {
+        let r = Revoking::new(VALIDITY_MS).await;
+        let photos = n("/rita/32=data/photos");
+        let (three, d3) = r.version_of(&photos, 3, 3);
+        let full = three
+            .clone()
+            .append_implicit_digest(wire::implicit_digest(d3.raw()));
+        r.revoke(2, r.cut(1, 1, std::slice::from_ref(&full)));
+        until(&r.dev, |st| st.contexts.values().any(|c| c.version() == 2)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!r.dev.inner.st.lock().cut_fetching.contains(&three));
+        // Followed only after the adoption.
+        r.dev.inner.st.lock().follows.insert(photos.clone());
+        r.dev.inner.fetch_cut_runs();
+        assert!(
+            r.dev.inner.st.lock().cut_fetching.contains(&three),
+            "asked for by its full name"
+        );
+        r.dev.shutdown();
+    }
+
+    /// The same packet again.
+    fn copy(d: &Data) -> Data {
+        Data::decode(d.raw().clone()).unwrap()
+    }
+
+    /// Whether a range of `cut` lists the log entry `name`.
+    fn ranged(cut: &RevocationCut, name: &Name) -> bool {
+        let seq = parse_log_name(name).unwrap().seq;
+        cut.ranges().iter().any(|r| {
+            r.prefix == log_prefix(name) && r.runs.iter().any(|&(a, b)| a <= seq && seq <= b)
+        })
+    }
+
+    #[tokio::test]
+    async fn a_thiefs_entry_first_verified_after_the_loss_is_left_out_of_the_cut_and_listed() {
+        let r = Revoking::new(VALIDITY_MS).await;
+        let mut names = Vec::new();
+        for seq in 1..=2 {
+            let (name, data) = r.version(seq, seq);
+            r.dev.inner.take_data(&name, data).await.unwrap();
+            names.push(name);
+        }
+        // The phone is lost at 2_000; what its key signs from then on is
+        // first verified here at 3_000, whatever date it claims.
+        r.clock.store(3_000, Ordering::Relaxed);
+        let (three, d3) = r.version(3, 1);
+        let full = three
+            .clone()
+            .append_implicit_digest(wire::implicit_digest(d3.raw()));
+        r.dev.inner.take_data(&three, d3).await.unwrap();
+        let lost = CutBound {
+            held_before: Some(Timestamp(2_000)),
+            ..CutBound::default()
+        };
+        let proposal = r.dev.revocation_cut(&r.key, &lost).unwrap();
+        assert!(ranged(&proposal.cut, &names[0]) && ranged(&proposal.cut, &names[1]));
+        assert!(
+            !ranged(&proposal.cut, &three),
+            "first verified after the loss"
+        );
+        assert_eq!(proposal.left_out, vec![full.clone()], "listed to re-admit");
+        // Bounded by seq instead: the same.
+        let upto = CutBound {
+            upto: [(r.c.clone(), 2)].into_iter().collect(),
+            ..CutBound::default()
+        };
+        let by_seq = r.dev.revocation_cut(&r.key, &upto).unwrap();
+        assert_eq!(by_seq.cut.ranges(), proposal.cut.ranges());
+        // The times are kept across a restart; an entry held without one
+        // (kept before times were recorded) is left out.
+        r.dev.shutdown();
+        r.store.remove(&verified_name(&names[0]));
+        let tab = n("/rita/tab");
+        let again = start_at(&tab, &r.tab_keys, &r.validator, &r.store, &r.clock)
+            .await
+            .unwrap();
+        let after = again.revocation_cut(&r.key, &lost).unwrap();
+        assert!(ranged(&after.cut, &names[1]) && !ranged(&after.cut, &three));
+        assert!(!ranged(&after.cut, &names[0]), "its time is not known");
+        assert_eq!(after.left_out.len(), 2);
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_suspected_keys_new_entries_are_not_taken_until_its_revocation() {
+        let r = Revoking::new(VALIDITY_MS).await;
+        let (one, d1) = r.version(1, 1);
+        r.dev.inner.take_data(&one, d1).await.unwrap();
+        r.dev.suspect(&r.key, Timestamp(2_000)).unwrap();
+        assert_eq!(r.dev.suspected(&r.cert.name), Some(Timestamp(2_000)));
+        let (two, d2) = r.version(2, 2);
+        let refused = r.dev.inner.take_data(&two, copy(&d2)).await;
+        assert!(
+            matches!(refused, Err(Refusal::Suspected { .. })),
+            "{refused:?}"
+        );
+        assert!(!r.dev.inner.st.lock().held.contains_key(&two));
+        assert!(r.store.get(&two).is_none(), "not stored");
+        assert!(r.dev.get(&one).await.is_ok(), "what was held stays");
+        // Kept across a restart.
+        r.dev.shutdown();
+        let tab = n("/rita/tab");
+        let again = start_at(&tab, &r.tab_keys, &r.validator, &r.store, &r.clock)
+            .await
+            .unwrap();
+        assert_eq!(again.suspected(&r.key), Some(Timestamp(2_000)));
+        let refused = again.inner.take_data(&two, copy(&d2)).await;
+        assert!(
+            matches!(refused, Err(Refusal::Suspected { .. })),
+            "{refused:?}"
+        );
+        // Its cut, bounded by when it was suspected, then revokes it: the
+        // mark ends, and the cut decides.
+        let lost = CutBound {
+            held_before: again.suspected(&r.key),
+            ..CutBound::default()
+        };
+        let proposal = again.revocation_cut(&r.key, &lost).unwrap();
+        assert!(ranged(&proposal.cut, &one));
+        r.revoke(2, proposal.cut);
+        until(&again, |st| st.suspected.is_empty()).await;
+        assert_eq!(again.suspected(&r.key), None);
+        let refused = again.inner.take_data(&two, d2).await;
+        assert!(
+            matches!(refused, Err(Refusal::OutsideCut(_))),
+            "{refused:?}"
+        );
+        assert!(again.get(&one).await.is_ok(), "inside the cut");
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn other_bytes_at_a_name_the_cut_lists_are_refused_once_bound_to_its_manifest() {
+        let r = Revoking::new(VALIDITY_MS).await;
+        let mut honest = Vec::new();
+        for seq in 1..=2 {
+            let (name, data) = r.version(seq, seq);
+            r.dev.inner.take_data(&name, copy(&data)).await.unwrap();
+            honest.push((name, data));
+        }
+        let lost = CutBound {
+            held_before: Some(Timestamp(2_000)),
+            ..CutBound::default()
+        };
+        let proposal = r.dev.revocation_cut(&r.key, &lost).unwrap();
+        r.revoke(2, proposal.cut);
+        // A reader that holds none of it, its validator holding the
+        // manifest.
+        let pad = n("/rita/pad");
+        let pad_store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let late = start_at(&pad, &keys_of(&pad), &r.validator, &pad_store, &r.clock)
+            .await
+            .unwrap();
+        // The thief's other bytes at seq 2, which the cut's range takes.
+        let (two, forged) = r.version(2, 99);
+        let refused = late.inner.take_data(&two, forged).await;
+        assert!(refused.is_err(), "other bytes than the manifest lists");
+        {
+            let st = late.inner.st.lock();
+            assert!(
+                !st.held.contains_key(&two) && !st.refused.contains_key(&two),
+                "the name stays open for the listed bytes"
+            );
+        }
+        // It asks for exactly the listed bytes, by full name.
+        assert_eq!(
+            late.inner.cut_digest(&two, &r.writer()).await,
+            Some(Some(wire::implicit_digest(honest[1].1.raw())))
+        );
+        late.inner
+            .take_data(&two, copy(&honest[1].1))
+            .await
+            .expect("the bytes the manifest lists");
+        late.shutdown();
+        r.dev.shutdown();
+    }
+
+    /// `/sam/phone`, its key certified by `/sam`'s namespace key, writing
+    /// into its log collection `/sam/32=data/notes`.
+    struct OwnLog {
+        dev: Device,
+        keys: Arc<SecurityManager>,
+        key: Name,
+        validator: Arc<Validator>,
+        store: Arc<dyn DataStore>,
+        phone: Name,
+        c: Name,
+    }
+
+    impl OwnLog {
+        async fn new() -> Self {
+            let (authority, issuer, anchor) = authority(&n("/sam")).await;
+            let phone = n("/sam/phone");
+            let (keys, key, cert) = device_key(&authority, &issuer, &phone).await;
+            let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+            assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+            validator.cert_cache().insert(cert);
+            let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+            let dev = start(&phone, &keys, &validator, &store).await.unwrap();
+            let c = n("/sam/32=data/notes");
+            dev.share(&c, share_of(Rule::Log, &["/sam"], Vec::new()))
+                .await
+                .unwrap();
+            Self {
+                dev,
+                keys,
+                key,
+                validator,
+                store,
+                phone,
+                c,
+            }
+        }
+
+        /// A version at `seq` of the collection under the device's name,
+        /// signed by a copy of its key: its name and packet.
+        fn copy_writes(&self, seq: u64) -> (Name, Bytes) {
+            let name = log_name(&self.phone, Some(&self.c), seq);
+            let (packet, _) = signed(
+                &self.keys,
+                &self.key,
+                &name,
+                &wire::encode_record(&Record::Version(version_body(&self.c, None))),
+            );
+            (name, packet)
+        }
+
+        async fn restart(self) -> Device {
+            self.dev.shutdown();
+            drop(self.dev);
+            start(&self.phone, &self.keys, &self.validator, &self.store)
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_version_a_copy_of_its_key_wrote_under_its_name_is_not_restored_as_its_own() {
+        let own = OwnLog::new().await;
+        for t in 1..=2 {
+            own.dev
+                .put(&own.c, reading(t), options(None))
+                .await
+                .unwrap();
+        }
+        let head = own.dev.inner.st.lock().head;
+        let (thief, packet) = own.copy_writes(head + 1);
+        let _ = own
+            .dev
+            .inner
+            .take_data(&thief, Data::decode(packet.clone()).unwrap())
+            .await;
+        // Kept in the store, as an applied version of another writer is.
+        own.store.insert(thief.clone(), packet);
+        let c = own.c.clone();
+        let again = own.restart().await;
+        let st = again.inner.st.lock();
+        assert_eq!(st.head, head, "the log head is what this device wrote");
+        let ns = namespace_of(&c).unwrap();
+        assert_eq!(
+            st.trees.get(&ns).map(Tree::head),
+            Some(head),
+            "its summary lists only what it wrote"
+        );
+        drop(st);
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_store_kept_before_own_entries_were_recorded_keeps_its_log_head() {
+        let own = OwnLog::new().await;
+        for t in 1..=2 {
+            own.dev
+                .put(&own.c, reading(t), options(None))
+                .await
+                .unwrap();
+        }
+        let head = own.dev.inner.st.lock().head;
+        // As an earlier release kept it: no record of what it wrote.
+        for (n, _) in own.store.scan_under(&written_prefix(), 0) {
+            own.store.remove(&n);
+        }
+        let c = own.c.clone();
+        let again = own.restart().await;
+        assert_eq!(again.inner.st.lock().head, head);
+        let id = again.put(&c, reading(3), options(None)).await.unwrap();
+        assert_eq!(id.seq.0, head + 1, "it never signs a seq it used");
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_entry_at_the_last_seq_under_its_name_never_makes_its_next_write_wrap() {
+        let own = OwnLog::new().await;
+        own.dev
+            .put(&own.c, reading(1), options(None))
+            .await
+            .unwrap();
+        let head = own.dev.inner.st.lock().head;
+        let (thief, packet) = own.copy_writes(u64::MAX);
+        let live = own
+            .dev
+            .inner
+            .take_data(&thief, Data::decode(packet.clone()).unwrap())
+            .await;
+        assert!(
+            matches!(live, Err(Refusal::BeyondOwnLog { .. })),
+            "far beyond what it wrote: {live:?}"
+        );
+        // A store that kept it all the same (as an earlier run did).
+        own.store.insert(thief.clone(), packet);
+        let c = own.c.clone();
+        let again = own.restart().await;
+        assert_eq!(again.inner.st.lock().head, head);
+        let id = again.put(&c, reading(2), options(None)).await.unwrap();
+        assert_eq!(id.seq.0, head + 1, "the next write follows its own head");
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn entries_under_a_revoked_issuer_are_withdrawn_on_adoption_and_after_a_restart() {
+        let (authority, issuer, anchor) = authority(&n("/sam")).await;
+        // `/sam/admin`'s key, certified by the namespace key, certifies the
+        // phone's key.
+        let admin = n("/sam/admin");
+        let (admin_keys, admin_key, admin_cert) = device_key(&authority, &issuer, &admin).await;
+        let phone = n("/sam/admin/phone");
+        let (phone_keys, phone_key, phone_cert) = device_key(&admin_keys, &admin_key, &phone).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/rita")));
+        assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+        validator.cert_cache().insert(admin_cert);
+        validator.cert_cache().insert(phone_cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let tab = n("/rita/tab");
+        let tab_keys = keys_of(&tab);
+        let dev = start(&tab, &tab_keys, &validator, &store).await.unwrap();
+        let c = n("/rita/32=data/notes");
+        dev.share(&c, share_of(Rule::Log, &["/rita", "/sam"], Vec::new()))
+            .await
+            .unwrap();
+        let writer = Writer::new(phone_key.clone());
+        let mut names = Vec::new();
+        for seq in 1..=2 {
+            let name = log_name(&phone, Some(&c), seq);
+            let (packet, _) = signed(
+                &phone_keys,
+                &phone_key,
+                &name,
+                &wire::encode_record(&Record::Version(version_body(&c, None))),
+            );
+            dev.inner
+                .take_data(&name, Data::decode(packet).unwrap())
+                .await
+                .unwrap();
+            names.push(name);
+        }
+        let applied = |dev: &Device| dev.inner.st.lock().colls[&c].applied.get(&writer).copied();
+        assert_eq!(applied(&dev), Some(2));
+        let mut changes = dev
+            .watch(&c, &upto("/sam/admin/phone/KEY/1", 2))
+            .await
+            .unwrap();
+        // The issuer's key is revoked: nothing it certified signs Data.
+        let ctx = SignedTrustContext::hierarchical(n("/sam"))
+            .with_version(2)
+            .with_revocation(admin_key.clone());
+        assert!(ctx.add_anchor(anchor.clone()));
+        validator.keyring().adopt_update(Arc::new(ctx)).unwrap();
+        until(&dev, |st| names.iter().all(|n| st.refused.contains_key(n))).await;
+        let change = tokio::time::timeout(Duration::from_secs(5), changes.next())
+            .await
+            .expect("the watcher is told")
+            .expect("the stream is open")
+            .unwrap();
+        assert!(
+            matches!(&change, Change::Withdrawn { id, why: Refusal::Untrusted { .. } } if id.writer == writer),
+            "withdrawn for its chain, by no cut: {change:?}"
+        );
+        assert!(matches!(
+            dev.get(&names[0]).await,
+            Err(DataError::Refused {
+                why: Refusal::Untrusted { .. },
+                ..
+            })
+        ));
+        assert!(
+            dev.refused_by_revocation(&phone_key).is_empty(),
+            "nothing to re-admit by name and digest"
+        );
+        assert_eq!(applied(&dev), None);
+        // A restart keeps them withdrawn.
+        dev.shutdown();
+        drop(dev);
+        let again = start(&tab, &tab_keys, &validator, &store).await.unwrap();
+        for name in &names {
+            assert!(
+                matches!(
+                    again.get(name).await,
+                    Err(DataError::Refused {
+                        why: Refusal::Untrusted { .. },
+                        ..
+                    })
+                ),
+                "{name} after a restart"
+            );
+        }
+        assert_eq!(applied(&again), None);
+        // The namespace key certifies the phone's key anew: what it wrote
+        // verifies again, and comes back as its next entry arrives.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let public = phone_keys
+            .get_signer_sync(&phone_key)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let renewed = authority
+            .certify(&phone_key, public, &issuer, VALIDITY_MS)
+            .await
+            .unwrap();
+        validator.cert_cache().insert(renewed);
+        let mut changes = again
+            .watch(&c, &upto("/sam/admin/phone/KEY/1", 2))
+            .await
+            .unwrap();
+        let three = log_name(&phone, Some(&c), 3);
+        let (packet, _) = signed(
+            &phone_keys,
+            &phone_key,
+            &three,
+            &wire::encode_record(&Record::Version(version_body(&c, None))),
+        );
+        again
+            .inner
+            .take_data(&three, Data::decode(packet).unwrap())
+            .await
+            .unwrap();
+        until(&again, |st| {
+            names.iter().all(|n| !st.refused.contains_key(n))
+                && st.colls[&c].applied.get(&writer) == Some(&3)
+        })
+        .await;
+        assert!(again.get(&names[0]).await.is_ok(), "taken back");
+        let mut delivered = BTreeSet::new();
+        while delivered.len() < 3 {
+            match tokio::time::timeout(Duration::from_secs(5), changes.next()).await {
+                Ok(Some(Ok(Change::Version(v)))) => {
+                    delivered.insert(v.id.seq.0);
+                }
+                Ok(Some(Ok(_))) => {}
+                other => panic!("every version is delivered again: {other:?}"),
+            }
+        }
+        again.shutdown();
     }
 }

@@ -75,7 +75,7 @@ pub mod version;
 pub mod wire;
 
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
-pub use device::{Clock, Config, Device, Entropy, Released, Transport};
+pub use device::{Clock, Config, CutBound, CutProposal, Device, Entropy, Released, Transport};
 pub use error::{DataError, NextStep, Refusal};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions,

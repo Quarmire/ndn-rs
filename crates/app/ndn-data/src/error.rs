@@ -10,7 +10,7 @@ use ndn_foundation_types::Name;
 
 use crate::collection::Cut;
 use crate::statement::Prune;
-use crate::version::{Keep, VersionId, Writer};
+use crate::version::{Keep, Timestamp, VersionId, Writer};
 
 /// What the caller can do about an error, by class. A host words the step
 /// itself.
@@ -64,6 +64,31 @@ pub enum Refusal {
     /// Its payload travels in pieces or as a block, and the collection's
     /// merge rule needs one operation inline in each version (spec §4.1).
     NotInline,
+    /// Its key is marked suspected on this device (it may be in a thief's
+    /// hands, [`Device::suspect`](crate::Device::suspect)): no new entry of
+    /// it is taken while the mark stands; the entries held from before stay.
+    Suspected {
+        /// The key, `<id>/KEY/<k>`.
+        key: Name,
+        /// Since when, by this device's clock, as the owner said.
+        since: Timestamp,
+    },
+    /// The durable rule, run again on its packet against the trust contexts
+    /// held now, refuses it for a reason no cut can excuse: a key above its
+    /// signer (an issuer in its certificate chain) is revoked, or the chain
+    /// is no longer authorized. Withdrawn, not re-admitted by name and
+    /// digest; taken back only if its key's chain verifies again (a new
+    /// certificate of the key from an issuer still trusted).
+    Untrusted {
+        /// The validator's verdict.
+        why: String,
+    },
+    /// It is under this device's own name at a seq far beyond the last one
+    /// this device wrote: a copy of its key signed it.
+    BeyondOwnLog {
+        /// The last seq this device wrote.
+        head: u64,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -120,6 +145,27 @@ impl std::fmt::Display for Refusal {
                  needs one operation inline in each version; its writer writes it again inline, \
                  or puts the large value or the stream into a log collection and refers to it \
                  by name",
+            ),
+            Refusal::Suspected { key, since } => write!(
+                f,
+                "its key {key} is marked suspected on this device since {} (it may be in a \
+                 thief's hands), so no new entry of it is taken; finish the key's revocation \
+                 (the owner revokes it with a cut bounded by when it was lost), or unsuspect \
+                 the key if it is safe",
+                since.0
+            ),
+            Refusal::Untrusted { why } => write!(
+                f,
+                "the trust context held now no longer lets its signer's certificate chain \
+                 sign it ({why}), which no cut excuses; it is taken back only once its key has \
+                 a certificate from an issuer still trusted (ask the namespace owner to \
+                 certify the writer again)"
+            ),
+            Refusal::BeyondOwnLog { head } => write!(
+                f,
+                "it is under this device's own name at a seq far beyond the last one this \
+                 device wrote ({head}): a copy of this device's key signed it; mark the key \
+                 suspected and have the owner revoke it with a cut"
             ),
         }
     }
@@ -277,7 +323,11 @@ impl DataError {
             }
             DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
-                Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
+                Refusal::OutsideCut(_)
+                | Refusal::NotMember
+                | Refusal::Suspected { .. }
+                | Refusal::Untrusted { .. }
+                | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
                 Refusal::Unsealed | Refusal::NotInline => NextStep::None,
             },

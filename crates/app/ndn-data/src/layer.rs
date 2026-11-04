@@ -13,8 +13,8 @@ use std::time::Duration;
 use futures_core::Stream;
 use ndn_foundation_types::Name;
 
-use crate::collection::{Cut, Rule, Summary};
-use crate::error::DataError;
+use crate::collection::{Rule, Summary};
+use crate::error::{DataError, Refusal};
 use crate::statement::{Custody, Prune, Snapshot};
 use crate::version::{
     Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
@@ -145,15 +145,21 @@ pub enum Change {
     Summary(Summary),
     /// A verified version beyond the watched frontier.
     Version(Version),
-    /// A version delivered earlier is no longer accepted: a cut that arrived
-    /// later refuses it (open item "before a cut arrives") — a members
+    /// A version delivered earlier is no longer accepted (open item "before
+    /// a cut arrives"): a cut that arrived later refuses it — a members
     /// record that removed its writer, or a trust context that revoked its
-    /// key. Sent to every watcher of the collection, whatever its frontier.
+    /// key — or a trust context adopted later refuses its signer's
+    /// certificate chain (an issuer above its key revoked). Sent to every
+    /// watcher of the collection, whatever its frontier.
     Withdrawn {
         /// The version.
         id: VersionId,
-        /// The cut that refuses it.
-        cut: Cut,
+        /// Why, as a `get` of it now answers: [`Refusal::OutsideCut`] with
+        /// the cut that refuses it, or [`Refusal::Untrusted`] when its
+        /// chain is refused (no cut excuses that, and no re-admission by
+        /// name and digest applies; it comes back as a version if its key's
+        /// chain verifies again).
+        why: Refusal,
     },
     /// A version delivered earlier was pruned by its writer: the reader
     /// dropped it, and a `get` of it answers [`DataError::Pruned`]. Filled
@@ -295,7 +301,7 @@ pub trait DataLayer: Send + Sync {
     /// `share(collection, {readers, writers})`.
     ///
     /// Sign a new members record. Adding grants reading keys or write
-    /// membership; removing a writer is a [`Cut`] at what this device had
+    /// membership; removing a writer is a [`Cut`](crate::Cut) at what this device had
     /// seen of it — inside stays, the rest is refused — and removing a reader
     /// moves reading to a new epoch. Only the owner's key may do it. Filled
     /// by slice 2.
