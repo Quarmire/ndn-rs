@@ -282,8 +282,11 @@ when
    is applied, unless it never applies: the record in force refuses it by
    its key (a cut that does not list it, §8), or it was held and refused for
    what it carries (`Unsealed`, §9; an operation the rule refuses), or it
-   is pruned (§14), expired here (§14.1), or no longer listed by the
-   newest summary node of `w` the reader verified (§7), and
+   is pruned (§14), expired here (§14.1), or — in a log or one-key
+   collection, and not held here — shown by the newest node of `w` for `C`
+   the reader verified to have expired (§7): at or below that node's `Head`
+   and not listed by it, or listed in an `Expiry` run whose date this
+   device's clock has reached, and
 2. for every `(y, t)` in `v`'s parents, the reader has applied `y`'s entries
    in `C` up to `t`.
 
@@ -293,7 +296,13 @@ is applied, so `at` names exactly the versions the value is computed from.
 A parent `(y, t)` that never applies is needed only up to the highest
 version of `y` below it that does (for a cut, the highest it accepts): a
 version written on top of refused work is not held back by it (what of the
-refused work its operation depended on, the merge function decides).
+refused work its operation depended on, the merge function decides). This
+holds for seqs the reader never learned as well: a seq of `y` at or below
+the `Head` of `y`'s newest node it verified that the node does not list,
+and that the reader does not hold, never applies, so a reader that started
+after older versions expired is not held back by a parent naming them.
+When the reader's clock reaches an `Expiry` date of that node, it reads
+again what waits and applies what became ready.
 
 ### 5.3 One key — slice 4
 
@@ -582,6 +591,10 @@ A node of name `X` carries:
   the seq → name mapping, since an entry's name is `<D>/32=log/<X>/seq=<n>`;
   of a log or one-key collection, only those unexpired at the node's
   reference date (listing by keep, below); of a merge collection, all;
+- `Expiry` (slice 4): of a log or one-key collection, bounds of the keeps of
+  the listed versions kept `Until` a date, in at most 64 runs, each a list
+  of seq ranges and a date no earlier than the keep of any version in it
+  (listing by keep, below);
 - `MembersEntries`: the seqs of its members records of `X`;
 - its children: for each next name component under `X` with entries in its
   subtree, the child's component, `Head` and the implicit digest (SHA-256 of
@@ -610,11 +623,35 @@ later versions in `X` lie at or below the head; one kept `Forever`, always.
 `E` and those counts are fixed by the log up to the head, so one node name
 still has one packet, and a constant stream's node stays bounded by its
 keep window: 30 days at one block a minute is 43,200 seqs, within the
-65,536 a node may list. A reader does not wait (§5.2) for an entry that the
-writer's newest node it verified no longer lists. The writer's own clock
-moves only its own listing: it decides the dates, hence `E`, and nothing
-else of any reader. A writer that stops writing leaves `E` where it was,
-the limit §14.1 states.
+65,536 a node may list. The writer's own clock moves only its own listing:
+it decides the dates, hence `E`, and nothing else of any reader.
+
+**Keep bounds (slice 4).** A writer that stops writing leaves `E` where it
+was, so its newest node keeps listing versions kept `Until` a date that has
+since passed by every holder's clock: the holders dropped them, and a reader
+that never held them could fetch them from no one and could not tell from
+the node that they expired. So the node also states, in `Expiry`, a bound
+of each such version's keep. The writer takes the listed versions kept
+`Until` a date in seq order; while the groups of consecutive ones with one
+keep number at most 64, each group is a run stating that keep, exact;
+beyond, they split in seq order into 64 runs of equal count (the last may
+hold fewer), each stating the latest keep in it. A version kept `Forever`
+or for the last `n` is in no run: the last-`n` listing already matches what
+holders keep, since a stopped writer writes no newer versions to end them.
+The runs are fixed by the log up to the head (the writer's tombstones keep
+each dropped version's keep, §14.1), so one node name still has one packet.
+
+A reader keeps, per collection and writer, the newest node it verified —
+its `Head`, `Entries` and `Expiry` — and does not wait (§5.2) for a seq of
+that writer at or below the `Head` that it does not hold and that either
+the node does not list (whether or not the reader ever learned the seq) or
+the node lists in a run whose date its own clock has reached. It does not
+fetch such versions. It reads again what waits when its clock reaches the
+earliest such date still ahead, with the expiry sweep of §14.1, and applies
+what became ready. A run's date is an upper bound: the reader stops waiting
+at most one run's span (its latest keep minus its earliest) after a
+version's own keep, and never before it, so nothing it applied or skipped
+depends on a date it was not given.
 
 A writer MUST serve every node and page that any root or head it signed
 lists, for as long as it holds the log entries that node lists — in slice 1
@@ -659,7 +696,12 @@ A reader:
   are not ascending and disjoint, reach above its `Head`, or list more than
   65,536 seqs together: a node lists no entry its head does not cover, and
   one node never makes a reader expand an unbounded list;
-- fetches the entries the visited nodes list that it does not hold.
+- MUST refuse a node (or page) with more than 64 `Expiry` runs, a run with
+  no seqs or not exactly one date, runs whose seqs are not ascending and
+  disjoint across all of them, or a run naming a seq the node does not
+  list in `Entries`: a bound covers only what the node lists;
+- fetches the entries the visited nodes list that it does not hold, except
+  those its newest node of their writer shows expired (keep bounds, above).
 
 `watch` reports a `Summary` for each verified node of the watched name or
 below it that it descends into: the collection, the signing writer,
@@ -1212,19 +1254,28 @@ housekeeping; it never decides whether anything verifies.
   `Expired` (the name and the keep; next step `None`: nothing to do, and
   asking again does not help). A range read lists it under `expired`
   (§5.4). A device checks expiry on every access and sweeps at the earliest
-  keep it holds, reading its clock again when it wakes; a restart drops
-  what the store still keeps that has expired. Later versions do not wait
-  for an expired one (§5.2), and the writer's node stops listing it once
-  the node's reference date passes its keep (§7).
+  keep it holds, or keep bound its writers' newest nodes state (§7),
+  reading its clock again when it wakes; a restart drops what the store
+  still keeps that has expired. Later versions do not wait for an expired
+  one (§5.2), and the writer's node stops listing it once the node's
+  reference date passes its keep (§7).
 - **A stopped writer.** When a writer stops writing into `X`, its newest
   node's reference date stops moving, so that node keeps listing versions
-  whose keep has since passed by the holders' clocks. A reader that never
-  held such a version cannot fetch it — every honest holder dropped it —
-  and cannot tell from the node that it expired; a watch of `X` (§5.2) may
-  then stay incomplete, waiting on it, until the writer writes again and
-  its node stops listing it. `get(C)` and range reads do not wait: they
-  answer what they reach and list the rest `missing`. Stale, never wrong:
-  nothing wrong is delivered, and the gap is said.
+  whose keep has since passed by the holders' clocks; every honest holder
+  dropped them, and a reader that never held them cannot fetch them. The
+  node states a bound of each listed `Until` keep (`Expiry`, §7), so the
+  reader sees by its own clock that they expired: it does not fetch them,
+  and a watch of `X` stops waiting on them (§5.2) and applies what the
+  writer wrote after them, without the writer writing again. Precision: a
+  run's date is the latest keep in it, so the reader stops waiting at most
+  one run's span after a version's own keep (none while the node's groups
+  of one keep fit its 64 runs), never before it. When the writer does write
+  again, a seq its new node no longer lists is not waited for either, even
+  one the reader never learned. Versions kept for the last `n` need no
+  bound: a stopped writer writes nothing newer that would end them, so
+  holders keep them. Nothing wrong is delivered: the reader skips only
+  what its own clock, against the bound in the writer's node (verified
+  through its signed root or head), says expired.
 - **Custody.** Leases are capped by keep (§13.2); audits never ask a piece
   whose keep has passed by the auditor's clock; a holder asked for a piece
   it dropped as expired by its own clock answers `Expired`, which is no
@@ -1239,7 +1290,9 @@ housekeeping; it never decides whether anything verifies.
   clock runs ahead of its auditor's by more than the skew the auditor
   allows is judged broken for it — and nothing of any other device
   changes. A writer's clock moves only its own dates and its own listing
-  (§7).
+  (§7). A reader's clock moves only what it waits for: a slow one waits
+  longer on a stopped writer's expired versions, a fast one stops waiting
+  earlier for versions it would itself drop as expired anyway.
 - **Forward-only.** Expiry deletes at the devices that keep this
   specification; it recalls no copy (invariant 9). A cache, a device whose
   clock is slow, or a reader that copied the data out of the layer keeps
@@ -1261,8 +1314,12 @@ With blocks, heads and expiry:
     own prune narrows it (§14);
   - can delay its entries up to the batch delay it states, and go silent:
     readers' age grows, and the bound promises no more (§5.3); a stream it
-    stops keeps its last node listing what has since expired, so a watch of
-    it may stay incomplete until it writes again — never wrong (§14.1);
+    stops keeps its last node listing what has since expired, with the keep
+    bounds that let a watch stop waiting on it (§7, §14.1);
+  - can state keep bounds other than its versions' keeps: too early, and
+    readers that never held those versions skip them sooner; too late, and
+    they wait longer. That moves only what readers wait for of its own
+    stream, as choosing the keep itself does; nothing is delivered wrong;
   - cannot make an entry outside a block's signature, nor a head of a key
     the members record does not name.
 - **A holder**, cache or relay:
@@ -1507,7 +1564,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x054C | Writers | Name* (key-name prefixes) |
 | 0x054E | Readers | Audience* |
 | 0x0550 | SnapshotRecord | Name* (pins) |
-| 0x0552 | SummaryNode | Name (subject), Writer, Seq (head), [PagePath], [Entries], [MembersEntries], [Children \| Pages] |
+| 0x0552 | SummaryNode | Name (subject), Writer, Seq (head), [PagePath], [Entries], [MembersEntries], [Expiry*], [Children \| Pages] |
 | 0x0554 | Entries | SeqRange* |
 | 0x0556 | MembersEntries | SeqRange* |
 | 0x0558 | SeqRange | Seq (low), Seq (high), low ≤ high; a list of them is ascending and disjoint, and a summary node's lie at or below its Head and hold at most 65,536 seqs together (§7) |
@@ -1555,6 +1612,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x054D | Freshness | NonNegativeInteger: ms, the batch delay of the writer's newest version; the head's FreshnessPeriod |
 | 0x054F | TimeRange | Dated (from), Dated (to), from < to; in range names only (§5.4) |
 | 0x0551 | Expired | empty, an AuditAnswer: the piece's version expired by the holder's clock and it dropped it (§14.1) |
+| 0x0553 | Expiry | SeqRange+ (seqs the node lists in Entries), KeepUntil (a date at or after each one's keep); in a SummaryNode, at most 64, their seqs ascending and disjoint across all of them (§7) |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
@@ -1573,7 +1631,10 @@ a `HeadRecord` would take a head for nothing, and one passing over
 fresher than it is. A range name with an unknown `TimeRange` read as some
 other range would answer the wrong entries. An auditor passing over
 `Expired` would read an empty answer as no `AuditAnswer` it knows, and
-must instead judge it against the piece's keep (§13.3).
+must instead judge it against the piece's keep (§13.3). A reader passing
+over `Expiry` would wait without end on a stopped writer's expired versions
+and could not say why; refusing the node says that its format is newer
+than the reader.
 
 Names are the Name TLV (0x07). Inside a record, fields appear in the order
 the table lists them; lists are sorted as stated, so equal content encodes
@@ -1680,9 +1741,22 @@ to equal bytes and equal nodes have equal digests.
   `Entries` and the blocks' dates, with no index a producer would sign or a
   holder could falsify. `SeqRange` is reused for ranges by seq; `TimeRange`
   reuses `Dated`.
+- **Keep bounds in runs** (§7), not a keep per listed version: a node
+  stays bounded however many versions it lists — at most 64 dates, and no
+  more seq ranges than seqs it lists — and needs no new number for seqs or
+  dates (the runs reuse `SeqRange` and `KeepUntil`). Versions sharing a
+  keep, as a stream kept to one date does, take one exact run. Past 64
+  groups — a stream whose every block is kept a fixed time after its date
+  — equal-count runs in seq order keep each run's span (its latest keep
+  minus its earliest) to about a 64th of the listed keeps' spread: 30 days
+  of keep, about 11 hours, the most later than a version's own keep that a
+  reader may stop waiting for it, and only once the writer has stopped. A
+  bound rather than the keep itself is enough: a reader needs only to know
+  that a version expired, never before it did.
 - **`Expired` is an empty answer**, not a record: a holder's clock is
   evidence of nothing, so the answer says only that it dropped the piece at
-  keep by its clock, and the auditor never judges by it.
+  keep by its clock; the auditor judges it only against the writer's signed
+  keep and its own clock with the skew it allows (§13.3, §14.1).
 
 ## 17. Failure model
 
@@ -1721,7 +1795,7 @@ to equal bytes and equal nodes have equal digests.
 | Holder claims `Expired` | Within the auditor's clock skew, or for a version kept for the last `n`: no answer, not evidence — the lease does not count for the piece and repair may ask again. For a version its writer kept `Forever`, or until beyond that skew: evidence, the lease is broken (`Breach::Expired`). | §13.3, §14.1 |
 | Writer's dates go back | Its entries dated out of order may be missed by a time range; nothing it did not sign is returned. | §5.4 |
 | Battery producer, many readers | Caches answer its head for its batch delay; readers' age includes it. | §5.3 |
-| Writer stops, keep passes | Its newest node keeps listing what has since expired; a reader that never held it cannot fetch it, and a watch of that stream may stay incomplete until the writer writes again; `get` and range reads answer what they reach and list the rest missing. Nothing wrong is delivered. | §7, §14.1 |
+| Writer stops, keep passes | Its newest node keeps listing what has since expired, with a bound of each `Until` keep (`Expiry`); a reader that never held such a version does not fetch it, and once its own clock passes the bound its watch stops waiting on it and applies what the writer wrote after it, without the writer writing again — at most one run's span after the keep. A seq the writer's newer node no longer lists is not waited for even if the reader never learned it. Nothing wrong is delivered. | §5.2, §7, §14.1 |
 
 ## 18. Conformance
 
@@ -1779,6 +1853,11 @@ offline, the reader reads from the holder, and the genuine entry arrives
 later), s3 (an entry spliced in from another block, likewise), s4 (after
 keep passes, the holder and the reader drop the data, `get` answers
 `Expired`, watch reports it, a range read lists it expired; a holder whose
-slow clock still serves it does not make a right-clock reader keep it) and
+slow clock still serves it does not make a right-clock reader keep it),
 s5 (a replayed old head, the sensor offline, does not make `get(C)` answer
-a version older than one already verified).
+a version older than one already verified) and s6 (a stopped stream: the
+sensor writes readings kept until a date, then one kept forever, and never
+writes again; after the keep passes and the sensor, the repo and the
+caches dropped the expired blocks, a phone that never held the stream
+starts watching it and reports the reading kept forever within a bounded
+time, reporting and storing none of the expired blocks).
