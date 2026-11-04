@@ -3351,9 +3351,11 @@ impl Inner {
     /// kept as refused: the same name may verify when fetched from another
     /// holder, or once a certificate arrives. One its own key signed whose
     /// key the trust context governing its name revokes, and whose cut does
-    /// not accept it, is [`Refusal::OutsideCut`] by that cut: authentic
-    /// (signature and chain verified), and refused by signed data, so a
-    /// caller may keep the decision ([`Self::take_data`]).
+    /// not accept it, is [`Refusal::OutsideCut`] by that cut, refused by
+    /// signed data. When the context holds a cut for the key, the validator
+    /// verified the signature and chain first, so the packet is authentic
+    /// and a caller may keep the decision ([`Self::refuse_outside_cut`]); a
+    /// key revoked without a cut is refused unverified.
     async fn verify(&self, data: &Data) -> Result<Writer, Refusal> {
         let key = data
             .sig_info()
@@ -4205,9 +4207,15 @@ impl Inner {
     /// Keep the refusal of `data`, the log entry `name`, by `cut`: its key
     /// is revoked and the cut does not accept it ([`Self::verify`]). The
     /// packet is kept with it, so a re-admission of exactly it needs no
-    /// fetch, and later entries do not wait for it. Not kept when the
-    /// context re-admits other bytes at that name (they may still come from
-    /// another source), nor when an accepted entry holds the name.
+    /// fetch, and later entries do not wait for it. Kept only when the
+    /// context holds a cut for the key: only then did the validator verify
+    /// the packet's signature and chain before refusing it, so it is
+    /// authentic; a key revoked without a cut is refused before any
+    /// signature check, and such a packet is refused as a packet only (it
+    /// may be a forgery, and nothing of it can be re-admitted). Not kept
+    /// either when the context re-admits other bytes at that name (they may
+    /// still come from another source), nor when an accepted entry holds the
+    /// name.
     fn refuse_outside_cut(&self, name: &Name, data: &Data, cut: Cut) {
         let Some(key) = data.sig_info().and_then(|s| s.key_locator_name()) else {
             return;
@@ -4216,11 +4224,14 @@ impl Inner {
             return;
         };
         let ctx = self.validator.keyring().context_for(name);
-        let other_bytes = ctx.revocation_cut(&cut.of).is_some_and(|c| {
-            c.exact()
-                .iter()
-                .any(|e| e.len() == name.len() + 1 && e.has_prefix(name))
-        });
+        let Some(held_cut) = ctx.revocation_cut(&cut.of) else {
+            tracing::debug!(%name, "refused as a packet: its key is revoked without a cut, so every packet it signs is refused unverified");
+            return;
+        };
+        let other_bytes = held_cut
+            .exact()
+            .iter()
+            .any(|e| e.len() == name.len() + 1 && e.has_prefix(name));
         if other_bytes {
             tracing::debug!(%name, "refused as a packet: other bytes at this name are re-admitted");
             return;
@@ -11886,5 +11897,43 @@ mod tests {
         );
         assert_eq!(dev.inner.packet_for(&name, false), Some(served));
         dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_packet_of_a_key_revoked_without_a_cut_is_refused_without_refusing_its_name() {
+        let r = Revoking::new(VALIDITY_MS).await;
+        let ctx = SignedTrustContext::hierarchical(n("/sam"))
+            .with_version(2)
+            .with_revocation(r.key.clone());
+        assert!(ctx.add_anchor(r.anchor.clone()));
+        r.validator.keyring().adopt_update(Arc::new(ctx)).unwrap();
+        // Unchecked bytes under the revoked key: whoever answers may make them.
+        let (one, _) = r.version(1, 1);
+        let forged = DataBuilder::new(
+            one.clone(),
+            &wire::encode_record(&Record::Version(version_body(&r.c, None))),
+        )
+        .sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(&r.key),
+            |_| Bytes::from_static(&[0; 64]),
+        );
+        let refused = r
+            .dev
+            .inner
+            .take_data(&one, Data::decode(forged).unwrap())
+            .await;
+        assert!(
+            matches!(refused, Err(Refusal::OutsideCut(_))),
+            "{refused:?}"
+        );
+        let st = r.dev.inner.st.lock();
+        assert!(
+            !st.refused.contains_key(&one) && !st.cut_out.contains_key(&one),
+            "the packet is refused, not the name"
+        );
+        drop(st);
+        assert!(r.dev.refused_by_revocation(&r.key).is_empty());
+        r.dev.shutdown();
     }
 }
