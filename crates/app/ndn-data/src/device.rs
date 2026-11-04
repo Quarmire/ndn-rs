@@ -1413,9 +1413,18 @@ impl St {
             // record alone is admitted now.
             if body.chunks.is_none() {
                 let Some(opened) = seal::open_payload(&key, &name, &sealed.ciphertext) else {
+                    // Its writer signed what does not open: later versions
+                    // do not wait for it.
                     tracing::debug!(%name, "refused: its payload does not open under its epoch's key");
                     self.held.remove(&name);
                     self.refused.insert(name, Refusal::BadSignature);
+                    self.colls
+                        .get_mut(c)
+                        .expect("held")
+                        .skipped
+                        .entry(writer)
+                        .or_default()
+                        .insert(seq);
                     continue;
                 };
                 open_into(&mut body, opened);
@@ -3227,32 +3236,36 @@ impl Inner {
         self.take_data(&name, data).await.is_ok()
     }
 
-    /// Verify and take a fetched log entry named `name`.
+    /// Verify and take a fetched log entry named `name`. A packet that is
+    /// not its name's writer's — a signature that fails, a signer of
+    /// another device (checked before the chain walk), a record that does
+    /// not decode or is about another collection — is refused as a packet
+    /// and nothing is kept against the name: whoever answers an Interest can
+    /// make such a packet, and the genuine copy may still come from another
+    /// source. Only what the genuine writer signed is decided against the
+    /// name ([`Self::take`]).
     async fn take_data(self: &Arc<Self>, name: &Name, data: Data) -> Result<(), Refusal> {
-        let refuse = |st: &mut St, why: Refusal| {
-            st.refused.insert(name.clone(), why.clone());
-            Err(why)
-        };
         let parsed = parse_log_name(name).ok_or(Refusal::BadSignature)?;
         if *data.name != *name {
             return Err(Refusal::BadSignature);
         }
-        let writer = match self.verify(&data).await {
-            Ok(w) => w,
-            Err(why) => return Err(why),
-        };
-        let record = data
+        let named = data.sig_info().and_then(|s| s.key_locator_name());
+        if named.and_then(|k| device_of(&k)).as_ref() != Some(&parsed.device) {
+            return Err(Refusal::BadSignature);
+        }
+        let writer = self.verify(&data).await?;
+        if device_of(writer.key()).as_ref() != Some(&parsed.device) {
+            return Err(Refusal::BadSignature);
+        }
+        let Some(record) = data
             .content()
-            .and_then(|c| wire::decode_record(c.clone()).ok());
+            .and_then(|c| wire::decode_record(c.clone()).ok())
+            .filter(|r| r.subject() == parsed.subject)
+        else {
+            return Err(Refusal::BadSignature);
+        };
         let (chase, fetch) = {
             let mut st = self.st.lock();
-            let Some(record) = record else {
-                return refuse(&mut st, Refusal::BadSignature);
-            };
-            let subject_ok = record.subject() == parsed.subject;
-            if device_of(writer.key()).as_ref() != Some(&parsed.device) || !subject_ok {
-                return refuse(&mut st, Refusal::BadSignature);
-            }
             let members = matches!(record, Record::Members(_));
             let fetch = self.take(
                 &mut st,
@@ -3495,8 +3508,17 @@ impl Inner {
                     // A payload in pieces opens when it is read.
                     if body.chunks.is_none() {
                         let Some(opened) = seal::open_payload(&key, &name, &s.ciphertext) else {
+                            // Its writer signed what does not open: later
+                            // versions do not wait for it.
                             tracing::debug!(%name, "refused: its payload does not open under its epoch's key");
                             st.refused.insert(name, Refusal::BadSignature);
+                            st.colls
+                                .entry(c)
+                                .or_default()
+                                .skipped
+                                .entry(writer)
+                                .or_default()
+                                .insert(seq);
                             return None;
                         };
                         open_into(&mut body, opened);
@@ -4756,10 +4778,12 @@ impl Inner {
 
     /// The log entry named `name`, verified, not read whole: held here, or
     /// fetched — by name (its writer, or a cache), else from each holder of
-    /// a live lease on its collection (`32=held`). A packet that does not
-    /// verify (a forged or spliced block) is dropped and the next source
-    /// asked. `follow`: follow its collection first; else only peek at it,
-    /// taking its records (spec §5.3).
+    /// a live lease on its collection (`32=held`). A packet that is not its
+    /// writer's (a forged or spliced block, another signer's, one that does
+    /// not decode) is dropped and the next source asked
+    /// ([`Self::take_data`]); a refusal kept against the name is a decision
+    /// on the genuine writer's own packet. `follow`: follow its collection
+    /// first; else only peek at it, taking its records (spec §5.3).
     async fn log_entry(self: &Arc<Self>, name: &Name, follow: bool) -> Result<Answer, DataError> {
         let answer = |st: &mut St| -> Option<Result<Answer, DataError>> {
             // A version whose keep passed is dropped as it is asked for.
@@ -9358,6 +9382,46 @@ mod tests {
             }
             other => panic!("a version confirmed the newest is answered: {other:?}"),
         }
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_packet_from_the_wrong_signer_does_not_refuse_its_name() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        assert!(validator.adopt_context(context("/rita")));
+        validator.cert_cache().insert(cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let a = log_name(&sensor, Some(&c), 4);
+        let content = wire::encode_version(&block(&c, &["20.5"]));
+        // A key the trust schema accepts for the name, yet not the
+        // sensor's: whoever answers the Interest signs that exact name.
+        let (impostor, _) = signed(&authority, &issuer, &a, &content);
+        let taken = dev
+            .inner
+            .take_data(&a, Data::decode(impostor).unwrap())
+            .await;
+        assert!(taken.is_err(), "a packet its name's device did not sign");
+        assert!(
+            !dev.inner.st.lock().refused.contains_key(&a),
+            "the packet is refused, not the name"
+        );
+        let (genuine, _) = signed(&sensor_keys, &key, &a, &content);
+        dev.inner
+            .take_data(&a, Data::decode(genuine).unwrap())
+            .await
+            .expect("the genuine copy, from the next source, is taken");
+        let st = dev.inner.st.lock();
+        assert!(st.held.contains_key(&a) && !st.refused.contains_key(&a));
+        drop(st);
         dev.shutdown();
     }
 

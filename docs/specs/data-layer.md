@@ -158,6 +158,16 @@ A version is the Data packet `<D>/32=log/<C>/seq=<n>` whose Content is a
 refuse (and MUST NOT apply) a log entry whose signature does not verify
 against its trust context, whose signing key is not a key of the `D` its
 name starts with, or whose record's collection is not the `C` in its name.
+Such a refusal is of that packet, not of the name: whoever answers an
+Interest — a cache, an on-path node, a holder under `32=held` — can make a
+packet of any name, signed by any key the trust context accepts for it, so
+the reader drops it, keeps nothing against the name, and asks the next
+source; the genuine copy is taken when it comes. A reader SHOULD check that
+the key locator names a key of `D` before walking the certificate chain.
+Only a decision on the genuine writer's own packet — refused by the members
+record (§6, §8), unsealed in a sealed collection, or a sealed payload that
+does not open (§9) — is kept against the name, and later versions of that
+writer do not wait for a version so refused (§5.2).
 
 ### 4.1 Blocks — slice 4
 
@@ -1658,7 +1668,7 @@ to equal bytes and equal nodes have equal digests.
 | Writer never pauses | Each descent finishes against the root it started from, whose nodes the writer keeps serving; the reader then continues from there and keeps up. | §7 |
 | Writer equivocates | Both versions are kept and reported. | invariant 2 |
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
-| Poisoned cache | Verification fails; the version is dropped and fetched elsewhere. | invariant 1, §4 |
+| Poisoned cache | Verification fails, or the packet is signed by another device's key or does not decode: that packet is dropped, nothing is kept against its name, and it is fetched elsewhere; the genuine copy is taken. | invariant 1, §4 |
 | Stranger in a sync group | Costs a root fetch; its entries are refused `NotMember`. | §6, §12 |
 | Removed reader | Refused every grant; the key of the epoch its removal starts did not exist before it, so the new epoch's versions stay closed to it; what it opened before it keeps. | §9 |
 | Owner's devices edit members at once | Records of one revision merge against the parent they name, keeping every addition and removal, removals winning (by intersection when the parent is not held); a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. | §6 |
