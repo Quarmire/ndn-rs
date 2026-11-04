@@ -619,7 +619,10 @@ Data under a name. The device fetches it like any app on it: one Interest
 answers when it holds one and the FIB forwards it otherwise. It validates
 the Data that answered with its validator — dispatched to the held trust
 context whose namespace covers the name — walking the certificate chain to
-a trust anchor and fetching the certificates it misses. The fetch and the
+a trust anchor and fetching the certificates it misses. The verdict is the
+one Data gets ([trust-context.md](trust-context.md) §6.3): no validity
+period is compared with the clock, and a revoked signer's Data is valid
+where the key's revocation cut accepts it. The fetch and the
 validation share the time the command gives. Read only, but the device
 expresses Interests and fetches certificates on the caller's behalf, so the
 verb is no public read: it goes through the command gate (a local operator
@@ -698,9 +701,11 @@ error chains shows it, one that words codes ignores it).
 | operation | library | does |
 |---|---|---|
 | init | `root::init::init` | a new namespace: its root in the chosen root store, its CA and admin identity, version 1 |
-| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates |
+| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates, with the revocation cut of a key when one is given (trust-context.md §3.3.12) |
+| readmit | `root::readmit::plan`, `readmit` | version `N+1` adding exact versions (full names ending in their implicit digest) to the revocation cut of a revoked key |
 | recovery kits | `root::kit::create`, `list`, `check`, `revoke` | a recovery key listed as a recovery anchor by `N+1` (24 words, a sealed file, a key on a second YubiKey); the kits held; a kit opened against the held version; `N+1` without it |
-| recover | `root::recover::recover` | a replacement device becomes the root device with a kit: `N+1` signed by the kit, `N+2` by the new root |
+| recover | `root::recover::recover` | a replacement device becomes the root device with a kit: `N+1` signed by the kit, `N+2` by the new root, both carrying every revocation cut, and a cut for a key it newly revokes when one is given; with the old root compromised, the new CA certifies again every key revoked with a cut, from a certificate of it the PIB holds, so its in-cut Data keeps a chain |
+| recertify | `root::recover::recertify` | the new CA certifies the keys revoked with a cut that it has not certified yet, from certificates given or held in the PIB (the recovery's re-certification, run again once the missing certificates are found) |
 | root key | `root::key::open`, `HeldRoots::status`, `move_to` | where each root key lives; moving one to another store |
 | schema | `root::schema::load`, `view`, `Adopted::explain`, `root_of`, `plan_update`, `update` | the held schema as data; why a key may sign a name; `N+1` carrying the current generated schema |
 
@@ -778,6 +783,9 @@ params too; a param shown `?` is set only when it applies.
 | `revoke-none-issued` | 404 | no | fix-request | `pib`, `name` | the namespace CA issued no certificate under that device name |
 | `revoke-refused` | 403 | no | fix-request | `name`, `error` | the key may not be revoked (not of the namespace, or it covers an anchor) |
 | `nothing-to-sign` | 409 | no | none | `version` | the held version has everything asked already |
+| `cut-refused` | 400 | no | fix-request | `key`; `revoking` (`, `-separated), `version`, or `name` and `log` | the revocation cut is refused: its key is not one this version newly revokes (`revoking`: the keys it does revoke), or the held `version` revokes that key already, or it lists a `name` outside the key's device log `log`; in a recovery also a cut while the old root is destroyed (nothing is revoked) or two cuts for one key. A cut is added only in the version that revokes its key; single versions are re-admitted with readmit |
+| `readmit-no-cut` | 409 | no | fix-request | `key`, `namespace`, `version` | the held version holds no revocation cut for the key: a key not yet revoked is revoked with a cut first; a key revoked without one has none to add to (a cut is added only with its key's revocation), so its Data stays refused |
+| `readmit-refused` | 400 | no | fix-request | `key`, `name`, `log`, `error` | a name to re-admit is not a full name ending in its implicit digest (32 octets), or is not under the key's device log `log` (`<device>/32=log`) |
 | `not-a-kit` | 400 | no | fix-request | `path`, `reason` | the file is not a recovery kit |
 | `kit-other-namespace` | 400 | no | fix-request | `kit`, `namespace`, `path`? | the kit recovers another namespace |
 | `kit-not-an-anchor` | 403 | no | fix-request | `key`, `namespace`, `version` | the kit's key is no recovery anchor of the held version |
@@ -807,7 +815,7 @@ params too; a param shown `?` is set only when it applies.
 | `hand-over-unanswered` | 504 | yes | wait | `version`, `waits` | the device never answered; it may still take the version |
 | `version-not-stored` | 500 | no | fix-local | `error` | no device runs, and the version could not be kept for its next start |
 | `version-not-taken` | 409 | no | other | `version`, `held_version`; cause | the signed version was not taken: nothing changed (what was made for it is undone) |
-| `hand-over-unknown` | 504 | yes | wait | `version`, `held_version`; cause; the operation's: `keys` and `name` (revoke), `key` (kit), `namespace` (schema), `root_key`, `ca_key`, `device_key`, `pib` (recover) | whether the device took the version is not known; it may still. Asking again once it is idle settles it |
+| `hand-over-unknown` | 504 | yes | wait | `version`, `held_version`; cause; the operation's: `keys` and `name` (revoke), `key` and `names` (readmit), `key` (kit), `namespace` (schema), `root_key`, `ca_key`, `device_key`, `pib` (recover) | whether the device took the version is not known; it may still. Asking again once it is idle settles it |
 | `schema-not-generated` | 500 | no | fix-local | `namespace`, `error` | the namespace's schema could not be generated |
 | `schema-narrowing` | 409 | no | fix-request | `namespace`, `version`, `what` (`rules`, `link`, `relays`), `removed` (`; `-separated) | the update narrows what devices may do; it is signed only with consent to narrow |
 | `schema-unreadable` | 500 | no | fix-local | `blob`, `format` (`lvs`, `native`), `error` | a schema blob of the held context cannot be read (one of the blobs of a schema view) |

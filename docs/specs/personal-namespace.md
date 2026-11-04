@@ -118,7 +118,14 @@ unattended. A relay never holds the root.
   request waits in a durable record, the CA answers `/<ns>/CA/APPROVAL`
   pushes and admin-signed `/<ns>/CA/PENDING` listings).
 - **Revocation** — context revocation list (authoritative, root-signed) and
-  CA revocation set (immediate, CA-signed REVOKE).
+  CA revocation set (immediate, CA-signed REVOKE). Beside a revoked key, the
+  context may carry its **revocation cut** (TLV `RevocationCut`, 0x0428,
+  **have**, slice 5): the exact log entries of the key that stay valid as
+  Data, plus later exact re-admissions (name and implicit digest)
+  (trust-context.md §3.3.12, data-layer.md §8.1, §8.2). Data is judged by
+  revocations and cuts, never by a certificate's validity period; live
+  uses (links, signed Interests, enrollment, renewal) keep validity
+  periods (trust-context.md §6.3).
 - **Recovery kit** — a separate recovery key whose anchor the context lists
   with role `recovery-anchor` (context TLV `KeyRole`, 0x041E); file kits are
   an `ndn-trust://bag` envelope that also names the namespace and its
@@ -279,8 +286,15 @@ Each flow lists steps, what is stored where, failure handling, and status
 Gap: the request/sign round trip.
 
 ### F4 Lose a member device
-On the root device: `ndn-fwd revoke /<ns>/<role>/<dev>` (or a key or
-certificate name) (**have**; see `docs/wiki/src/reference/revocation.md`):
+On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]` (or
+a key or certificate name) (**have**; see `docs/wiki/src/reference/revocation.md`):
+0. Cut (slice 5): `<file>` holds the key's revocation cut, the log entries
+   of that key the root device's data layer holds verified, per collection
+   (`ndn_data::Device::revocation_cut`; the `ndn-data` host's `cut <key>
+   <file>`). Without a cut, every packet the key signed is refused; with
+   one, exactly the entries it lists stay valid and everything else the key
+   signed — later entries, backdated ones, its summaries — is refused
+   (data-layer.md §8.1).
 1. Context bump, in the CLI: version `N+1` lists the device's key names as
    revoked, signed by the root key unlocked there for that one signature,
    and is handed to the daemon of the same PIB (`security/context-update`,
@@ -289,15 +303,29 @@ certificate name) (**have**; see `docs/wiki/src/reference/revocation.md`):
    refresh and republishes for the nodes behind it (`context_refresh_secs`,
    default 300 s, or `ndn-fwd context refresh`). A node that adopts the
    revoking version evicts from its Content Store the Data the revoked key
-   signed (and that key's certificate) at once, so it never serves them from
-   cache afterwards; a node still on the old version may, but every node
-   holding the new version refuses that Data.
+   signed that the version refuses — all of it without a cut, what the cut
+   does not accept with one — and, for a key revoked without a cut, that
+   key's certificate, at once, so it never serves them from cache
+   afterwards; a node still on the old version may, but every node holding
+   the new version refuses that Data. Data the key signed that its cut
+   accepts is kept and forwarded, and so are the certificates of a key
+   revoked with a cut, which in-cut Data needs to verify; a reader that
+   applied a version the cut refuses withdraws it (data-layer.md §8.3).
 2. CA, following the signed version: whenever a node running the namespace
    CA keeps a version (handed over, refreshed, adopted) and when the CA
    starts, the CA marks every certificate it issued that the version revokes
-   (`revoked/` in the CA's directory, `<pib>/ca/<hex>/`): no longer served, the key is never certified
-   again, the device name is free to enroll with a new key. The CA acts on
-   the signed version only, never on a separate request.
+   (`revoked/` in the CA's directory, `<pib>/ca/<hex>/`): the key is never
+   certified (enrolled, renewed) again and the device name is free to
+   enroll with a new key. The certificates of a key revoked without a cut
+   are no longer served; those of a key revoked with a cut stay served,
+   because they verify its in-cut Data — and only that: a revoked key's
+   certificate admits no link, enrollment or renewal. The CA acts on the
+   signed version only, never on a separate request.
+3. Re-admit (slice 5, **have**): honest work the cut left out (offline
+   edits nobody had seen) is reported by the devices that refused it with
+   its full name and digest; the owner runs `ndn-fwd readmit <key>
+   <full-name>…`, which signs `N+1` adding those exact names to the cut.
+   Never a range: a neighbouring seq or other bytes at that name stay out.
 Gap: revoking from an admin device other than the root device (the root key
 signs the bump, so the command runs where the root key is).
 
@@ -352,8 +380,8 @@ offline.
 ### F8 Restore after losing the root device (**have**)
 On a replacement device whose daemon holds the namespace's context (linked
 through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
---old-root destroyed|compromised [--keep-kit <key>]… [--root-store …]
-[--device <name>]`.
+--old-root destroyed|compromised [--keep-kit <key>]… [--cut <file>]…
+[--root-store …] [--device <name>]`.
 1. The daemon fetches the newest version by name (as `context refresh`); a
    device holding none adopts it with a file kit's expected fingerprint, or
    is told to adopt first (a context with nothing to check it against could
@@ -382,6 +410,23 @@ through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
    `--keep-kit` — and removes and revokes the rest: whoever held the old root
    could have added a kit of their own, and a kit is root-equivalent.
    `destroyed` keeps every recovery anchor.
+   Cuts (slice 5): `N+1` and `N+2` carry every revocation cut of `N`
+   verbatim. With `compromised`, `--cut <file>` adds the cut of a key the
+   recovery newly revokes (the old admin device's key, say: its entries up
+   to the compromise stay valid), made by this device's data layer from
+   what it holds verified (data-layer.md §8.4); a cut of any other key, a
+   cut with `destroyed`, or two cuts for one key are refused
+   (`cut-refused`). Since `compromised` revokes the old CA key, an
+   issuer no cut excuses, the new CA re-certifies every key the recovered
+   context revokes with a cut, from a certificate of it this PIB holds, so
+   the in-cut entries keep a chain to the new root; that certificate
+   authorizes nothing outside the cut. A cut key whose certificate is not
+   held is reported, and its entries stay refused until the owner
+   re-certifies it: `recover` prints `recertified = <cert>` per certificate
+   made and `not_recertified = <key>` per key left, and `ndn-fwd recertify
+   [<cert-file>]…` runs the re-certification again later, from the
+   certificates given or now in the PIB (recorded in the CA's store and
+   served once the daemon restarts).
 4. `N+1`, then `N+2`, go to the daemon, which adopts, stores and publishes
    each; every node holding `N` adopts both by the continuity rule (`N+1`
    signed by an anchor of `N`, `N+2` by an anchor of `N+1`). A node that
@@ -402,7 +447,11 @@ kept serves only the versions held since.
    kind and `ndn_security::Capability`).
 2. Reading private data requires content keys: guests receive keys only for
    the shared scope (confidentiality module; ABE optional).
-3. Expiry needs no action; early end = F4.
+3. Expiry needs no action for the live uses: the guest's links, signed
+   Interests and renewal end with its certificate. Data the guest's key
+   signs is judged without validity periods (trust-context.md §6.3), so it
+   stays accepted after expiry until the owner revokes the key — with a cut
+   to keep what it wrote while invited (F4). Early end = F4.
 
 ### F10 Rotate keys
 Device certificates renew before expiry without an invite (**have**:
@@ -417,10 +466,16 @@ earlier CA's certificate — `ndn-fwd` keeps the chain in `<pib>/issuers/`, a
 phone persists `NdnEnrolledIdentity::issuers` and passes it back to
 `renew_certificate`; the `ndn-fwd` renewal timer `[security] renew_before`
 and `ndn-fwd renew`; mobile `NdnEngine::renew_certificate` /
-`certificate_validity`; see the wiki's reference/renewal.md). Rotating to a
-new device key is a new enrollment (invite or admin approval) (**gap**: no
-rotation-by-renewal). Root rotation = new root signs a context that lists both
-roots for one version, then drops the old one (**gap**).
+`certificate_validity`; see the wiki's reference/renewal.md). Renewal keeps
+the key, so the device's data continues: what it signed under the old
+certificate and under the new one verifies alike, also after the old one
+expired, since Data is judged without validity periods (data-layer.md
+§8.4). Rotating to a new device key is a new enrollment (invite or admin
+approval) (**gap**: no rotation-by-renewal): the new key is a new writer,
+and the old key ends only when the owner revokes it with a cut (F4);
+until then it stays valid for Data. Root rotation = new root signs a
+context that lists both roots for one version, then drops the old one
+(**gap**).
 
 ### F11 Travel / carrier-grade NAT
 Devices dial out to a relay — a QUIC link from `[[peer]] device =
