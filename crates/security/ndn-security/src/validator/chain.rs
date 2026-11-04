@@ -93,10 +93,12 @@ impl Validator {
     ///   Revoked keys higher in the chain (issuers) are refused as by
     ///   [`Self::validate_chain`].
     ///
-    /// A packet whose signer is revoked outside its cut is refused with
-    /// [`TrustError::Revoked`] only once its signature and chain check out
-    /// (an authentic packet of that key); a forgery naming a revoked key
-    /// gets the verdict its signature or chain earns.
+    /// A packet whose signer is revoked with a cut that does not accept it is
+    /// refused with [`TrustError::Revoked`] only once its signature and chain
+    /// check out (an authentic packet of that key); a forgery naming such a
+    /// key gets the verdict its signature or chain earns. A packet whose
+    /// signer is revoked without a cut is refused at once, as every packet
+    /// of that key is.
     ///
     /// For Data only: signed Interests, commands and trust-context adoption
     /// stay live ([`Self::validate_interest_chain`], [`Self::validate_chain`]).
@@ -308,7 +310,8 @@ impl Validator {
     /// ValidityPeriod is checked, a key resolves to any of its certificates
     /// that verifies the signature (the newest NotBefore first), and a
     /// revocation of the packet's own signer is excused by its key's cut, or
-    /// else reported once the rest of the chain checks out.
+    /// else, for a key with a cut, reported once the rest of the chain checks
+    /// out ([`revocation_of`]).
     ///
     /// [`SignedTrustContext::authorizes_hop`]: crate::SignedTrustContext::authorizes_hop
     #[allow(clippy::too_many_arguments)]
@@ -331,10 +334,10 @@ impl Validator {
         let now = now_ns();
         // Durable: the revocation of the packet's own signer that its cut
         // does not excuse, reported only if the chain otherwise checks out
-        // (so the refusal is about an authentic packet of that key).
+        // (so a cut key's refusal is about an authentic packet of that key).
         let mut revoked_signer: Option<TrustError> = None;
         // The packet, while the walk is at its own signer (depth 0) of a
-        // durable walk: the revocation refusal [`revocation_refusal`] judges.
+        // durable walk: the revocation [`revocation_of`] judges.
         let signed_packet = |depth: usize| packet.filter(|_| durable && depth == 0);
         let trusted = |chain_names: Vec<Name>, revoked: Option<TrustError>| match revoked {
             Some(refused) => WalkOutcome::Invalid(refused),
@@ -414,13 +417,13 @@ impl Validator {
             // is rejected — how an issuing-CA compromise is contained by a pulled
             // context bump (no re-bootstrap). A durable walk excuses the
             // packet's own signer when its cut accepts the packet, and defers
-            // its refusal otherwise.
-            if let Some(refused) = revocation_refusal(&ctx, &current_key_name, signed_packet(depth))
-            {
-                if signed_packet(depth).is_none() {
-                    return WalkOutcome::Invalid(refused);
+            // the refusal of a cut key that does not.
+            match revocation_of(&ctx, &current_key_name, signed_packet(depth)) {
+                Revocation::Clear => {}
+                Revocation::Refused(refused) => return WalkOutcome::Invalid(refused),
+                Revocation::Deferred(refused) => {
+                    revoked_signer.get_or_insert(refused);
                 }
-                revoked_signer.get_or_insert(refused);
             }
 
             // Anchors match by key: a KeyLocator naming the anchor's key or any
@@ -529,11 +532,12 @@ impl Validator {
             // A KeyLocator naming the key resolves to one of its certificates;
             // a revocation naming that certificate refuses it too (excused or
             // deferred as the key's own revocation above).
-            if let Some(refused) = revocation_refusal(&ctx, &cert.name, signed_packet(depth)) {
-                if signed_packet(depth).is_none() {
-                    return WalkOutcome::Invalid(refused);
+            match revocation_of(&ctx, &cert.name, signed_packet(depth)) {
+                Revocation::Clear => {}
+                Revocation::Refused(refused) => return WalkOutcome::Invalid(refused),
+                Revocation::Deferred(refused) => {
+                    revoked_signer.get_or_insert(refused);
                 }
-                revoked_signer.get_or_insert(refused);
             }
             // Data that merely shares the certificate name shape is no
             // certificate (an admin's NDNCERT decision
@@ -867,27 +871,53 @@ impl Validator {
     }
 }
 
-/// The refusal for a chain hop through `name` (a key or certificate name)
-/// that `ctx` revokes, or `None` when no Revocation covers it. `durable_packet`
-/// is the Data of a durable walk while the walk is at the packet's own
-/// signer: then the cut of the signer's key excuses the revocation when it
-/// accepts the packet ([`SignedTrustContext::refuses_data`](crate::SignedTrustContext::refuses_data)).
-fn revocation_refusal(
+/// How a chain hop through `name` (a key or certificate name) stands with
+/// the revocations of its context ([`revocation_of`]).
+enum Revocation {
+    /// No Revocation covers it, or its key's cut accepts the packet.
+    Clear,
+    /// Refused at once.
+    Refused(TrustError),
+    /// Refused once the rest of the walk checks out: the packet's own signer
+    /// in a durable walk, revoked with a cut that does not accept the packet.
+    Deferred(TrustError),
+}
+
+/// The [`Revocation`] of a chain hop through `name` under `ctx`.
+/// `durable_packet` is the Data of a durable walk while the walk is at the
+/// packet's own signer: then the cut of the signer's key excuses the
+/// revocation when it accepts the packet
+/// ([`SignedTrustContext::refuses_data`](crate::SignedTrustContext::refuses_data)),
+/// and when it does not, the refusal waits for the signature and chain to
+/// check out, so that only an authentic packet of the key is reported
+/// outside its cut (a forgery at a name the cut lists exactly, under other
+/// bytes, is refused as the forgery it is). A key revoked without a cut is
+/// refused at once, as before cuts existed: every packet it signed is
+/// refused whatever its bytes, and the certificates of such a key and of its
+/// issuers are usually withdrawn, so waiting for them would leave the packet
+/// unverifiable instead of revoked.
+fn revocation_of(
     ctx: &crate::SignedTrustContext,
     name: &Name,
     durable_packet: Option<&Data>,
-) -> Option<TrustError> {
+) -> Revocation {
     if !ctx.is_revoked(name) {
-        return None;
+        return Revocation::Clear;
     }
-    if let Some(p) = durable_packet
-        && !ctx.refuses_data(name, &p.name, &p.implicit_digest())
-    {
-        return None;
-    }
-    Some(TrustError::Revoked {
+    let refused = TrustError::Revoked {
         name: name.to_string(),
-    })
+    };
+    let Some(p) = durable_packet else {
+        return Revocation::Refused(refused);
+    };
+    if ctx.revocation_cut(&key_name_of(name)).is_none() {
+        return Revocation::Refused(refused);
+    }
+    if ctx.refuses_data(name, &p.name, &p.implicit_digest()) {
+        Revocation::Deferred(refused)
+    } else {
+        Revocation::Clear
+    }
 }
 
 #[cfg(test)]
@@ -2470,6 +2500,34 @@ mod tests {
             assert!(valid(
                 &bob.validator.validate_durable_cached(&inside).await.0
             ));
+        }
+
+        /// A compromised-root recovery revokes the old CA without a cut and
+        /// its certificate is no longer served. A member's certificate
+        /// issued by that CA, and the member's Data under it, are refused as
+        /// revoked — a final verdict — not left waiting for the withdrawn
+        /// CA certificate.
+        #[tokio::test]
+        async fn under_an_issuer_revoked_without_a_cut_data_is_revoked_not_unverifiable() {
+            let bob = bob(u64::MAX, (PAST, u64::MAX), false, |c| {
+                c.with_revocation(n(CA))
+            })
+            .await;
+            assert!(bob.validator.cert_cache().remove(&n(CA)).is_some());
+
+            // The member's certificate packet, as the forwarder's fetch
+            // brings it in: its signer is the revoked CA.
+            let leaf = Data::decode(bob.leaf.clone()).unwrap();
+            let (result, missing) = bob.validator.validate_durable_cached(&leaf).await;
+            assert_eq!(revoked_key(&result), Some(n(CA)), "{result:?}");
+            assert!(missing.is_none());
+
+            // The member's Data waiting for that certificate resolves through
+            // the refusal, and gets the same final verdict.
+            let data = signed(log_name("notes", 2), b"v", &bob.phone);
+            assert!(bob.validator.can_resolve_durable(&n(PHONE)));
+            let (result, _) = bob.validator.validate_durable_cached(&data).await;
+            assert_eq!(revoked_key(&result), Some(n(CA)), "{result:?}");
         }
     }
 }
