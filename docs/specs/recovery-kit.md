@@ -464,9 +464,12 @@ hex>` from 8 random bytes, all GenericNameComponents.
   `NDNCERT`).
 
 `N+1` starts as the content of `N`: anchors, schema, CA endpoints,
-enrollment hint, revocations, revocation cuts, link policy and key roles.
-Every revocation cut of `N` is carried verbatim, its ranges and re-admitted
-names alike ([trust-context.md](trust-context.md) §3.3.12). Then:
+enrollment hint, revocations, revocation cuts, DataRequiresCut roles, link
+policy and key roles. Every revocation cut of `N` whose key a revocation
+covers is carried verbatim, its key digest, manifest, ranges and
+re-admitted names alike ([trust-context.md](trust-context.md) §3.3.12); an
+orphan cut, whose key no revocation covers, has no effect and is dropped.
+Then:
 
 1. Remove every `root-device` (2) KeyRole entry.
 2. Add `root-device` entries for the new CA key, then the new admin device
@@ -495,26 +498,45 @@ refused, and so MUST a revocation cut: this recovery revokes no key.
    certificate name. Revocation entries are encoded in canonical name
    order ([trust-context.md](trust-context.md) §3.2), so the order in which
    they are added does not matter.
-9. A revocation cut the operator gives (`--cut <file>`, the
-   `RevocationCut` TLV `0x0428`) is added for its key. The recovery MUST
-   refuse the whole recovery if the cut's key is not one this step 8 newly
-   revokes (a key `N` revokes already keeps the cut `N` has, or none), or
-   if two cuts name one key. The cut lists what the recovering device holds
-   verified of that key ([data-layer.md](data-layer.md) §8.1, §8.4).
-10. The old CA key is revoked (step 8), and a cut never excuses a revoked
+9. The cuts carried from `N` were signed by the old root, which a thief may
+   have held. The recovery MUST check each of them again — its key revoked
+   by `N+1`, its names inside the key's device log — and MUST drop any cut
+   that fails, reporting it with why (ndn-rs: `dropped_cut = <key>:
+   <reason>`).
+10. A revocation cut the operator gives (`--cut <file>`, the
+   `RevocationCut` TLV `0x0428` with its manifest) is added for its key.
+   The recovery MUST refuse the whole recovery if the cut's key is not one
+   step 8 newly revokes (a key `N` revokes already keeps the cut `N` has,
+   or none), if two cuts name one key, or if the cut has no key digest, or
+   has ranges and no manifest. The cut lists what the recovering device
+   first verified of that key before the old root was lost
+   ([data-layer.md](data-layer.md) §8.1, §8.4).
+11. The old CA key is revoked (step 8), and a cut never excuses a revoked
    issuer (trust-context.md §6.3). So for every key `N+1` revokes with a cut
-   — carried from `N` or added in step 9 — the new CA key certifies that key
-   again, from a certificate of it the recovering device's PIB holds, so
-   its in-cut Data keeps a chain to the new root. Such a certificate
-   authorizes nothing outside the cut: the key stays revoked, excused only
-   for its own packets the cut accepts. A cut key whose certificate the PIB
-   does not hold is reported to the operator, and its Data stays refused
-   until the owner certifies the key again. ndn-rs records the certificates
-   made in the new CA's store (`ndn_cert::recertify_cut_keys_in_pib`), the
-   CLI prints `recertified = <cert>` and `not_recertified = <key>`, and
-   `ndn-fwd recertify [<cert-file>]…` (`ndn_namespace::root::recover::recertify`)
-   certifies later the cut keys the new CA has not certified yet, from
-   certificates given or found in the PIB.
+   — carried from `N` or added in step 10 — the new CA key must certify
+   that key again, from a certificate of it the recovering device's PIB
+   holds whose public key has the digest the cut's CutKeyDigest names, so
+   its in-cut Data keeps a chain to the new root. A certificate of that key
+   name with another public key MUST NOT be certified again: the old CA
+   may have issued it, and the cut excuses only the key it names by
+   digest. A cut without a CutKeyDigest (made before the field) is not
+   certified again at all. Such a certificate authorizes nothing outside
+   the cut: the key stays revoked, excused only for its own packets the
+   cut accepts. The recovery MUST show the operator the cuts and certify
+   only on their confirmation. ndn-rs does this once the daemon has taken
+   `N+1`: it asks "Certify these keys again with the new CA? [y/N]"
+   (`--recertify-cuts yes|no` when not interactive; with neither, nothing
+   is certified, and the CLI says so). A cut key not certified again is
+   reported to the operator with why — `unheld` (no certificate of that
+   public key held) or `no_key_digest` — and its Data stays refused until
+   the owner certifies the key again. ndn-rs records the certificates made
+   in the new CA's store (`ndn_cert::recertify_cut_keys_in_pib`), the CLI
+   prints `recertified = <cert>` and `not_recertified = <key>`, and
+   `ndn-fwd recertify [<cert-file>]… [--yes]`
+   (`ndn_namespace::root::recover::recertify`; without a terminal it
+   refuses unless `--yes`) shows the cuts, asks, and
+   certifies the cut keys the new CA has not certified yet, from
+   certificates given or found in the PIB, under the same key-digest rule.
 
 Then:
 

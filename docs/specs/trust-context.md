@@ -105,17 +105,29 @@ evolvability rule: a type is *critical* iff `type <= 31` or `type` is odd.
 | `0x042A` | CutRange | no | in RevocationCut | 0..n | a complete Name TLV (a prefix) + 1..n CutRun |
 | `0x042C` | CutRun | no | in CutRange | 1..n | two SequenceNumNameComponents (`0x3A`): first, last |
 | `0x042E` | CutExact | no | in RevocationCut | 0..n | a complete Name TLV whose last component is an ImplicitSha256DigestComponent |
+| `0x0430` | CutKeyDigest | no | in RevocationCut | 0..1 (REQUIRED in a new cut) | 32 octets: SHA-256 of the revoked key's public key (§3.3.12) |
+| `0x0432` | CutManifest | no | in RevocationCut | 0..1 (REQUIRED in a new cut with a CutRange) | a complete Name TLV ending in an ImplicitSha256DigestComponent: the cut manifest's root packet (§3.3.12) |
+| `0x0434` | DataRequiresCut | no | in TrustContext | 0..n | UTF-8 role name (§3.3.13) |
+| `0x0436` | CutManifestNode | (outer) | a cut manifest's Data Content | 1 | ManifestRange entries (a leaf) or ManifestChild entries (an interior node) (§3.3.12) |
+| `0x0438` | ManifestRange | no | in CutManifestNode | 0..n | a complete Name TLV (a CutRange prefix) + 1..n ManifestEntry |
+| `0x043A` | ManifestEntry | no | in ManifestRange | 1..n | a SequenceNumNameComponent and an ImplicitSha256DigestComponent |
+| `0x043C` | ManifestChild | no | in CutManifestNode | 0..n | two ManifestBound + the child's full name (a complete Name TLV) |
+| `0x043E` | ManifestBound | no | in ManifestChild | 2 | a complete Name TLV (a prefix) and a SequenceNumNameComponent |
 
 `0x0419`, `0x041B`, `0x041D` and `0x041F` are unassigned. Every even number
 of `0x0410–0x041F` being taken, the block continues at `0x0420–0x042F`,
-whose even numbers are now taken too; its odd numbers are unassigned.
+whose even numbers are taken too, and then at `0x0430–0x043F`: `0x0430`,
+`0x0432` and `0x0434` above, and `0x0436–0x043E` for the content of a cut
+manifest, which is a Data of its own, not part of the TrustContext
+(§3.3.12). The odd numbers of both later blocks are unassigned.
 `0x0403–0x040F` is left free below the block. The block is provisional and
 has not been submitted to the NDN TLV registry.
 
 The value encodings differ in one place that implementers must notice. The
 namespace Name is written *directly* as a `0x07` child of TrustContext. The
 values of CaEndpoint, Revocation, KeyRole, AdvertisedRelay, RevocationCut,
-CutRange and CutExact *contain* a full `0x07` Name TLV, header included.
+CutRange, CutExact and CutManifest *contain* a full `0x07` Name TLV, header
+included.
 
 ### 3.2 Structure and producer order
 
@@ -129,6 +141,7 @@ TrustContext   = 0x0410 TLV-LENGTH
                    [EnrollmentHint]
                    *Revocation
                    *RevocationCut
+                   *DataRequiresCut
                    [SourceBundleHash]
                    *KeyRole
                    [LinkPolicy]
@@ -141,11 +154,15 @@ SchemaAuthoritative = 0x041C 0
 CaEndpoint     = 0x0414 TLV-LENGTH Name
 EnrollmentHint = 0x0416 TLV-LENGTH Flags *OCTET
 Revocation     = 0x0418 TLV-LENGTH Name
-RevocationCut  = 0x0428 TLV-LENGTH Name *CutRange *CutExact   ; Name = the revoked key
+RevocationCut  = 0x0428 TLV-LENGTH Name [CutKeyDigest] [CutManifest] *CutRange *CutExact
+                                                              ; Name = the revoked key
+CutKeyDigest   = 0x0430 32 32OCTET                            ; SHA-256 of the key's public key
+CutManifest    = 0x0432 TLV-LENGTH Name                       ; ends in an ImplicitSha256DigestComponent
 CutRange       = 0x042A TLV-LENGTH Name 1*CutRun              ; Name = a prefix
 CutRun         = 0x042C TLV-LENGTH SequenceNumNameComponent SequenceNumNameComponent
                                                               ; first, last; first <= last
 CutExact       = 0x042E TLV-LENGTH Name                       ; ends in an ImplicitSha256DigestComponent
+DataRequiresCut = 0x0434 TLV-LENGTH 1*OCTET                   ; UTF-8 role name
 SequenceNumNameComponent = 0x3A TLV-LENGTH NonNegativeInteger
 SourceBundleHash = 0x041A 32 32OCTET
 KeyRole        = 0x041E TLV-LENGTH RoleCode Name
@@ -164,7 +181,8 @@ component: TLV-TYPE, then TLV-LENGTH, then the octets; a prefix sorts
 first). So the same context always encodes to the same bytes, whatever
 order its anchors and revocations were added in. RevocationCut entries are
 written in canonical order of their key Names, each written canonically
-(§3.3.12). AdvertisedRelay entries are written in canonical order too: by
+(§3.3.12), and DataRequiresCut entries in ascending octet order of their
+values, without repeats (§3.3.13). AdvertisedRelay entries are written in canonical order too: by
 RelayPreference, then by device Name in canonical order, then entries
 without a RelayKey before those with
 one (RelayKey octets compared), then the endpoint lists compared entry by
@@ -485,10 +503,12 @@ encrypts it); see [ndn-link.md](ndn-link.md).
 #### 3.3.12 RevocationCut (`0x0428`)
 
 ```
-value    = Name *CutRange *CutExact
-CutRange = 0x042A TLV-LENGTH Name 1*CutRun
-CutRun   = 0x042C TLV-LENGTH SequenceNumNameComponent SequenceNumNameComponent
-CutExact = 0x042E TLV-LENGTH Name
+value        = Name [CutKeyDigest] [CutManifest] *CutRange *CutExact
+CutKeyDigest = 0x0430 32 32OCTET
+CutManifest  = 0x0432 TLV-LENGTH Name
+CutRange     = 0x042A TLV-LENGTH Name 1*CutRun
+CutRun       = 0x042C TLV-LENGTH SequenceNumNameComponent SequenceNumNameComponent
+CutExact     = 0x042E TLV-LENGTH Name
 ```
 
 A revocation cut is the root's signed statement of where a revoked key's
@@ -498,6 +518,18 @@ most one entry per key.
 
 - **Name** (a complete `0x07` TLV): the revoked key's name,
   `<identity>/KEY/<k>`.
+- **CutKeyDigest** (`0x0430`): 32 octets, the SHA-256 of the public key the
+  cut is about: for an Ed25519 key its 32 raw octets (the certificate's
+  SubjectPublicKeyInfo unwrapped), for any other algorithm the
+  certificate's Content (the SubjectPublicKeyInfo DER) as it is. It binds the cut to
+  that key material: the walk excuses the key only through a certificate
+  whose public key has this digest (§6.3), so a certificate issued later
+  under the same key name for another public key admits nothing through the
+  cut. At most one.
+- **CutManifest** (`0x0432`): a complete `0x07` TLV, the full name of the
+  root packet of the cut's manifest, ending in its ImplicitSha256DigestComponent
+  (TLV-TYPE `0x01`, 32 octets). The manifest lists the digest of every
+  packet the ranges accept ([below](#cut-manifest)). At most one.
 - **CutRange** (`0x042A`): a prefix `P` (a complete `0x07` TLV) and one or
   more runs. **CutRun** (`0x042C`): two SequenceNumNameComponent TLVs
   (TLV-TYPE `0x3A`, value a NonNegativeInteger, §1), the first and the last
@@ -513,18 +545,72 @@ digest). The cut **accepts** `X` iff either:
 - some CutRange has a prefix `P` (which may be empty) such that `N` is `P`
   followed by exactly one component, that component is a
   SequenceNumNameComponent whose NonNegativeInteger is in its shortest form
-  (§1), and its value lies in one of that CutRange's runs; or
+  (§1), its value `s` lies in one of that CutRange's runs, and, when the cut
+  has a CutManifest, the manifest lists exactly `(s, d)` under `P`; or
 - some CutExact equals `N` followed by the ImplicitSha256DigestComponent of
   `d`.
 
 Nothing else is accepted: not a longer or shorter name under `P`, not a
 sequence number outside the runs, not a sequence number written in a
 longer form (`seq=` with value `00 02` is another name than `seq=2`), not
-other bytes at an exact name. A range
-binds names, not bytes; an exact entry binds both (§10). The cut never reads
-a date, a sequence number's meaning or a validity period; which names a
-range lists is the producer's business (the data layer's is in
-[data-layer.md](data-layer.md) §8).
+other bytes at an exact name, and, under a manifest, not other bytes at a
+name a range lists. A range with a manifest binds names and bytes, as an
+exact entry does; a range of a cut without a manifest (one made before
+manifests) binds names only (§10). While a reader does not hold every
+manifest packet it needs to look `(s, d)` up, the packet is neither accepted
+nor refused: it is pending, as for a missing certificate (§6.3). A manifest
+packet that does not decode lists nothing, so the packets it would list
+are refused. The cut never reads a date, a sequence number's meaning or a
+validity period; which names a range lists is the producer's business
+(the data layer bounds them by the root's own observation,
+[data-layer.md](data-layer.md) §8.1).
+
+<a id="cut-manifest"></a>**Cut manifest.** A cut's ranges can list
+thousands of packets, and a digest each does not fit the one Data a context
+is. The manifest carries them beside the context, as a tree of Data the cut
+binds by digest:
+
+```
+Name     = /<ns>/32=trust-context/32=cut/<h>/seg=<i>
+                 ; <h>: GenericNameComponent, SHA-256 of the revoked key's Name TLV (header included)
+                 ; seg=0 the root; the other nodes seg=1, 2, … bottom-up
+MetaInfo = ContentType BLOB, FreshnessPeriod 3600000 (ms)
+Content  = CutManifestNode
+Signature= DigestSha256 (SignatureType 0, no KeyLocator)
+
+CutManifestNode = 0x0436 TLV-LENGTH ( *ManifestRange / 1*ManifestChild )
+                                     ; a leaf (ranges) or an interior node (children), never both
+ManifestRange   = 0x0438 TLV-LENGTH Name 1*ManifestEntry    ; Name = a CutRange prefix
+ManifestEntry   = 0x043A TLV-LENGTH SequenceNumNameComponent ImplicitSha256DigestComponent
+ManifestChild   = 0x043C TLV-LENGTH ManifestBound ManifestBound Name
+                                     ; first and last (prefix, seq) the child covers; the child's full name
+ManifestBound   = 0x043E TLV-LENGTH Name SequenceNumNameComponent
+```
+
+- **Self-certifying.** The manifest is signed with DigestSha256 only. The
+  root-signed cut names the root packet by its full name, and every
+  interior node names its children by full name, so each packet is bound,
+  through the context, to its exact bytes. Whoever holds a packet may serve
+  it.
+- **Order.** In a leaf, ManifestRange entries are in canonical order of
+  their prefixes (§3.2), one per prefix per node, and the entries of a
+  range in strictly ascending seq. In an interior node, children are in
+  strictly ascending order of their bounds — (prefix in canonical order,
+  then seq) — each first ≤ last, never overlapping. A node that breaks
+  these rules, or holds an unknown critical (odd) child, does not decode
+  and lists nothing; an unknown even child is skipped.
+- **Size.** ndn-rs fills each packet greedily up to 8000 octets for the
+  whole packet, splitting a leaf between entries, and adds interior levels
+  until one root remains; the tree is at most 8 levels deep.
+- **Lookup.** To find the digest of `(P, s)`: in a leaf, the entry `s` of
+  the range `P`; in an interior node, the child whose bounds contain
+  `(P, s)`, fetched by its full name. No such entry or child means the
+  manifest does not list `(P, s)`.
+
+A reader fetches the manifest packets by full name, from the context's
+publisher (§7.1) or any holder, exactly as it fetches a missing certificate
+(§6.3). A node that keeps contexts keeps and serves the manifest packets of
+every cut it holds (§7.3).
 
 **Producer (root device).** A producer:
 
@@ -534,20 +620,38 @@ range lists is the producer's business (the data layer's is in
    version names.
 2. MUST carry every cut of version `N` into every later version verbatim,
    except that a later version MAY add CutExact entries to it
-   (**re-admission**, §5.3). It MUST NOT change, add or remove a CutRange or
-   a run, remove a CutExact entry, or drop a cut. Re-admission is by exact
+   (**re-admission**, §5.3). It MUST NOT change, add or remove a CutRange,
+   a run, the CutKeyDigest or the CutManifest, remove a CutExact entry, or
+   drop a cut whose key a Revocation entry covers. Re-admission is by exact
    name and digest only, never by range: a range added later would admit
-   whatever the key's thief signed at those names.
+   whatever the key's thief signed at those names. A cut whose key no
+   Revocation entry covers (an orphan, which has no effect) is not carried.
 3. MUST write each cut canonically: CutRange entries in canonical order of
    their prefixes (§3.2), one per prefix; inside each, runs ascending,
    disjoint and not adjacent (runs `a..b` and `b+1..c` are written as one
    run `a..c`); CutExact entries in canonical order of their names, without
    duplicates; NonNegativeIntegers in their shortest form.
+4. MUST give every new cut a CutKeyDigest, computed from the certificate
+   whose public key verified the packets the cut lists, and MUST refuse to
+   make the cut when those packets verify under two different public keys
+   of the one key name. MUST give every new cut that has a CutRange a
+   CutManifest listing exactly the `(seq, digest)` of every packet its
+   ranges list, and MUST serve the manifest packets from the moment the
+   version is published (§7.3). A cut without a CutKeyDigest, or with ranges
+   and no CutManifest, is one made before these fields: it is carried as it
+   is (rule 2), never made anew.
 
-A node adopting a version does not check rules 1 and 2 against the version
-it held: the cuts are whatever an anchor signed, as is every other field,
-and the anchor is the authority (§5.2). ndn-rs enforces them where versions
-are made (`ndn_namespace::root`, `ndn_cert`).
+Which packets a range lists is not judged here; the data layer's producer
+lists only packets the root itself verified before the moment the owner
+gives as the loss of the key ([data-layer.md](data-layer.md) §8.1), so that
+a thief's writes after the theft are not in the cut.
+
+A node adopting a version does not check rules 1, 2 and 4 against the
+version it held: the cuts are whatever an anchor signed, as is every other
+field, and the anchor is the authority (§5.2). ndn-rs enforces them where
+versions are made (`ndn_namespace::root`, `ndn_cert`). An adopter does
+notice when a version accepts less than the one it replaces, and treats it
+as revoking (§5.1).
 
 **Decoding.** A decoder MUST reject the whole context, not only the entry,
 when a RevocationCut is malformed:
@@ -559,6 +663,9 @@ when a RevocationCut is malformed:
   of 1, 2, 4 or 8 octets (§1), or its first exceeds its last;
 - a CutExact name does not end in an ImplicitSha256DigestComponent of 32
   octets;
+- a CutKeyDigest is not exactly 32 octets, or a cut has two;
+- a CutManifest is not one Name TLV ending in an ImplicitSha256DigestComponent
+  of 32 octets, or a cut has two;
 - a RevocationCut or CutRange holds an unknown critical child (`<= 31` or
   odd, a second Name included); an unknown non-critical (even) child is
   skipped;
@@ -575,16 +682,99 @@ kept and has no effect (§6.3). Unlike a malformed AdvertisedRelay
 valid, so two decoders must never read one cut differently, and the root's
 error is shown at once on every node instead of half-applied.
 
-**Older nodes.** A decoder that predates this field skips it (even type,
-§3.4) and keeps the Revocation entry: it refuses every packet of the key,
-the in-cut ones included. That is the meaning the entry had before, so an
-older node fails safe: it loses the in-cut Data until it is updated, and
-accepts nothing the cut refuses.
+**Older nodes.** A decoder that predates cuts skips them (even type, §3.4)
+and keeps the Revocation entry: it refuses every packet of the key, the
+in-cut ones included. That is the meaning the entry had before, so it fails
+safe: it loses the in-cut Data until it is updated, and accepts nothing the
+cut refuses.
+
+A decoder that knows cuts but predates CutKeyDigest and CutManifest skips
+those two (even, so non-critical inside the cut) and reads the cut as one
+made before them: its ranges accept any bytes at a listed name, under any
+certificate of the key. Such a node keeps the residuals of §10 for that
+cut until it is updated; every updated node closes them. The two fields are
+even on purpose: an odd (critical) type would make that node reject the
+whole version, so it would miss the revocation itself and go on accepting
+everything the key signs.
 
 **Size.** A context is one Data packet (§7.2). A cut over a log is a few
 runs per prefix, one per stretch of consecutive sequence numbers; each
-CutExact costs its name and 34 octets. This is why ranges name packets
-without a digest each (§10).
+CutExact costs its name and 34 octets, the CutKeyDigest 34 and the
+CutManifest its name. The digest of each packet a range lists is in the
+manifest, outside the context, so the context stays one packet however
+long the key's log was.
+
+#### 3.3.13 DataRequiresCut (`0x0434`)
+
+```
+value = 1*OCTET      ; UTF-8, a role name
+```
+
+Repeatable, one role per entry. A device key's **role** is the component
+right after the namespace of the selected context (§6.1) in its name,
+`/<ns>/<role>/<dev>/KEY/<k>`, for a key whose identity has at least two
+components after the namespace. Any other key — the root or a recovery
+key, `/<ns>/KEY/<k>`, or `/<ns>/<x>/KEY/<k>` — has no role, and no entry
+applies to it.
+
+For a key whose role the context lists, Data the key signs is accepted
+under the durable rule (§6.3) only:
+
+1. while some certificate of the key that the node holds, with the same
+   public key as the certificate that verifies the Data, is inside its
+   ValidityPeriod by the reader's clock; or
+2. once the context revokes the key with a cut (§3.3.12): the cut then
+   decides alone, whatever the clock says.
+
+Otherwise the Data is refused as a key revoked without a cut would be
+(ndn-rs: `TrustError::Revoked`, saying that the key's certificate lapsed,
+that its role needs a cut, and that the owner's revocation with a cut is
+awaited). Only the signing key's own certificates (depth 0) are compared
+with the clock; issuers' validity periods are still not, as §6.3 says.
+
+The clock here can only refuse. Data that case 1 lets through, the durable
+rule accepts anyway; a revocation or a cut refuses what it refuses whatever
+the clock says. A reader whose clock runs fast refuses a listed key's Data
+early, until it holds the cut; one whose clock runs slow accepts it a
+little longer, as a reader that has not yet adopted a revocation does.
+
+**Why.** Without this field, Data ignores expiry entirely (§6.3), so a key
+keeps its authority over Data until the owner revokes it. That is right for
+a key that renews: its certificate is replaced before it lapses, and a
+device that misses a renewal must not lose its honest Data because a
+reader's clock passed a date. It is wrong for a key whose certificate is
+short-lived precisely to end access, as a guest's is: after its expiry the
+guest's links and signed Interests end, and with this field its Data
+authority ends too. A listed key whose certificate lapsed fails closed
+until the root signs its revocation with a cut; the cut then keeps what the
+key wrote while it was trusted ([personal-namespace.md](personal-namespace.md)
+F9; the owner ends it with `ndn-fwd end-keys`, with a cut bounded at the
+certificate's NotAfter, §5.3).
+
+**Per-role defaults.** A context made by `ndn-fwd init` lists:
+
+| Role | Listed | Why |
+|---|---|---|
+| `guest` | yes | a guest does not renew by default (`[ca] renewable_roles`); its certificate's end is the end of the invitation |
+| `member` | no | renews before expiry; listed, a late renewal or a fast reader clock would refuse its honest Data until a cut, and a cut ends the key |
+| `admin` | no | as `member` |
+| `node`, `relay` | no | as `member`; their keys renew with the node |
+
+An owner MAY list any role by a schema or policy update (§5.3), and SHOULD
+list every role whose renewal it turns off. A producer carries the entries
+into every later version verbatim unless the owner changes them. An entry
+added for a role makes the version refuse more Data than the one before
+(§5.1).
+
+**Decoding.** A decoder MUST reject the context when an entry's value is
+empty or not UTF-8: skipping it would make the node refuse less than the
+root stated. It reads the entries as a set (order and repeats carry no
+meaning); a producer writes them in ascending octet order, without
+repeats.
+
+**Older nodes.** A decoder that predates this field skips it (even type)
+and accepts a lapsed key's Data as §6.3 says, until it holds the key's
+revocation; it is as open as every node was before the field.
 
 ### 3.4 Decoder rules
 
@@ -595,15 +785,15 @@ A decoder:
 2. MUST reject a TrustContext in which Name, AnchorSet, SchemaAuthoritative,
    EnrollmentHint, SourceBundleHash or LinkPolicy appears more than once,
    whether or not the copies are well formed. CaEndpoint, Revocation,
-   RevocationCut, KeyRole, AdvertisedRelay and TrustSchemaBlob are
-   repeatable and accumulate (at most one RevocationCut per key,
-   §3.3.12).
+   RevocationCut, DataRequiresCut, KeyRole, AdvertisedRelay and
+   TrustSchemaBlob are repeatable and accumulate (at most one RevocationCut
+   per key, §3.3.12).
 3. MUST reject an unknown critical child type (`<= 31` or odd), and MUST
    skip an unknown non-critical one (even). A KeyRole or SourceBundleHash
    that fails its length check is skipped as non-critical (it still counts
    as the one SourceBundleHash for rule 2), and so is a malformed
-   AdvertisedRelay (§3.3.11). A malformed RevocationCut is not skipped: it
-   rejects the context (§3.3.12).
+   AdvertisedRelay (§3.3.11). A malformed RevocationCut or DataRequiresCut
+   is not skipped: it rejects the context (§3.3.12, §3.3.13).
 4. MUST reject the context when the namespace is missing, no
    TrustSchemaBlob is present, no blob is in a format the decoder
    understands (§3.3.3), or the schema does not import (LVS error,
@@ -730,15 +920,29 @@ two rules:
   adoption changed it meanwhile, nothing is adopted and the next refresh
   starts from the new held version.
 
-When an adoption adds revocations that the replaced version did not have,
-or adds a revocation cut or re-admissions, the node SHOULD purge cached Data
-that the adopted version refuses: Data signed by a newly revoked key that
-its cut does not accept (all of it when there is no cut), and Data whose
-chain passes through a revoked issuer (§6.3). It SHOULD keep, and serve,
-the certificates of a key revoked with a cut: the in-cut Data needs them to
-verify, and they serve no other use, since every live use refuses a
-revoked key (§6.3). The certificates of a key revoked without a cut are
-purged with its Data.
+An adopted version is **revoking** when it may refuse Data the replaced one
+accepted. That is the case when it revokes a name the replaced version did
+not; when, for a key the replaced version holds a cut of, the new cut does
+not contain the old one — the cut is removed, a run of the old cut is not
+covered by the new one, a CutExact entry is dropped, or the CutKeyDigest
+or CutManifest is added, removed or changed (a new manifest may list other
+bytes); and when it lists a role in DataRequiresCut (§3.3.13) that the
+replaced version did not. The producer rules forbid shrinking a cut
+(§3.3.12), but an adopter does not enforce them, and a version made by a
+tool that predates cuts drops them all, so the adopter compares. ndn-rs
+(`Keyring`) moves its revocation epoch on every revoking adoption and tells
+its revocation listeners which names it concerns (the keys, and for a role
+newly listed the prefix `/<ns>/<role>`), so cached Data is judged again
+(§6.3).
+
+On a revoking adoption the node SHOULD purge cached Data that the adopted
+version refuses: Data signed by a key it revokes that its cut does not
+accept (all of it when there is no cut), and Data whose chain passes
+through a revoked issuer (§6.3). It SHOULD keep, and serve, the
+certificates of a key revoked with a cut, and the packets of its cut's
+manifest: the in-cut Data needs them to verify, and the certificates serve
+no other use, since every live use refuses a revoked key (§6.3). The
+certificates of a key revoked without a cut are purged with its Data.
 
 ### 5.2 Continuity rule
 
@@ -763,23 +967,45 @@ certificate has expired still authorizes the version that re-issues it.
 The continuity rule carries every authority change. The recovery and kit
 procedures are specified in [recovery-kit.md](recovery-kit.md). Every
 version below is made from `N` with all of `N`'s revocation cuts carried
-verbatim (§3.3.12 rule 2); only a revocation bump and a recovery add a cut,
-and only a re-admission bump adds to one.
+verbatim (§3.3.12 rule 2; an orphan cut, whose key no Revocation entry
+covers, is dropped), and its DataRequiresCut entries (§3.3.13) carried
+unless the owner changes them; only a revocation bump and a recovery add a
+cut, and only a re-admission bump adds to one.
 
 - **Revocation bump (F4–F6):** `N+1` is `N` plus new Revocation entries,
   signed by an anchor of `N`, and, when the operator gives one, the
-  revocation cut of a key it newly revokes (§3.3.12). Everything else is
-  carried over verbatim.
+  revocation cut of a key it newly revokes (§3.3.12), with its key digest
+  and, when it has ranges, its manifest, which the root device then serves.
+  Everything else is carried over verbatim. ndn-rs refuses a new cut
+  without a key digest, or with ranges and no manifest.
+- **Ending a key without a renewal:** two kinds of keys must end although
+  nobody lost them. A key of a role the context lists in DataRequiresCut
+  (a guest's) whose last certificate reached its NotAfter is **lapsed**;
+  the key of a device identity for which the CA enrolled a newer key (one
+  key per device) is **replaced**. The root ends each with a revocation
+  bump and a cut bounded at that moment (the last NotAfter of the key's
+  certificates, or the first NotBefore of the replacement's): what the
+  root verified before it stays valid, nothing later. ndn-rs never revokes
+  such a key without a cut, and its daemon never unlocks the root: the
+  owner runs `ndn-fwd end-keys`, which signs one version ending every such
+  key that has a cut made with that bound, after one confirmation, or
+  without one (`--yes`, for a timer) when the root store opens without a
+  secret. Until then every root command, `ndn-fwd status` and the admin
+  TUI list the keys to end, with the data-host command that makes each
+  cut. Meanwhile a lapsed guest's Data already fails closed (§3.3.13); a
+  replaced key's does not, so it should be ended soon.
 - **Re-admission bump:** `N+1` is `N` with CutExact entries added to the cut
   of a key `N` revokes with a cut, signed by an anchor of `N`. Nothing else
   changes. A key revoked without a cut gets none this way: its cut can only
   be added with its revocation.
 - **Schema update:** `N+1` carries new blobs, the EnrollmentHint, the
   SchemaAuthoritative flag, and optionally a new LinkPolicy or new
-  AdvertisedRelay entries (otherwise both are carried verbatim). It is
-  signed by an anchor of `N`. ndn-rs refuses a narrowing — a rule, a link
-  permission, a direct pair or an advertised relay dropped — unless the
-  operator consents, but that is a producer-side check only.
+  AdvertisedRelay entries (otherwise each is carried verbatim, and so are
+  the DataRequiresCut entries, which ndn-rs changes only in a version of
+  their own, `ndn-fwd schema data-requires-cut`). It is signed by an anchor of `N`. ndn-rs refuses a
+  narrowing — a rule, a link permission, a direct pair or an advertised
+  relay dropped — unless the operator consents, but that is a producer-side
+  check only.
 - **Recovery anchor added or removed (F7):**
   - When a recovery key is added, `N+1` gains the new anchor and a KeyRole
     `1` entry, signed by the root.
@@ -791,16 +1017,25 @@ and only a re-admission bump adds to one.
   - With `--old-root compromised`, it also removes and revokes the old root,
     the old root-device keys, and the recovery anchors nobody vouched for,
     and MAY add a cut for any key it newly revokes (the old admin device's
-    key, for one: its Data up to the compromise stays valid). A cut never
-    excuses a revoked issuer (§6.3), and this recovery revokes the old CA
-    key, so ndn-rs's recovery has the new CA re-certify every key the
-    recovered context revokes with a cut, from a certificate of it the
-    recovering device holds; the in-cut Data then chains to the new root.
-    Such a certificate authorizes nothing outside the cut: the key stays
-    revoked, excused only for its own in-cut packets. A cut key whose
-    certificate is not held is reported, and its Data stays refused until
-    the owner re-certifies it.
-  - `N+1` carries every cut of `N`, and so does `N+2`.
+    key, for one: its Data up to the compromise stays valid). The cuts it
+    carries were signed by a root that may have been in a thief's hands, so
+    the recovery checks each carried cut again and drops the orphans and
+    any cut listing a name outside its key's device log, reporting each
+    cut it drops. A cut never excuses a revoked issuer (§6.3), and this
+    recovery revokes the old CA key, so the new CA must certify again every
+    key the recovered context revokes with a cut, from a certificate of it
+    the recovering device holds whose public key has the cut's
+    CutKeyDigest; the in-cut Data then chains to the new root. ndn-rs does
+    this once `N+1` is taken, after showing the operator the cuts and
+    asking for confirmation; without it nothing is certified and the
+    operator can do it later. A certificate with another public key is
+    never certified again, and neither is the key of a cut without a
+    CutKeyDigest: whatever key a certificate file carries, the new CA
+    vouches only for the key the cut names by digest. Such a certificate
+    authorizes nothing outside the cut: the key stays revoked, excused only
+    for its own in-cut packets. A cut key not certified again is reported
+    with why, and its Data stays refused until the owner certifies it.
+  - `N+1` carries every cut of `N` but those dropped, and so does `N+2`.
   - The new root then re-issues the same content as `N+2`, signed by itself
     as an anchor of `N+1`.
 
@@ -890,24 +1125,51 @@ exchanges whose freshness is the point; a refusal is retried, never stored,
 so a wrong clock there denies service, loudly, and decides nothing about
 stored data.
 
-**Data** is durable: a Data packet judged as data — on a forwarder's data
-path (validation, the content store's re-check, the purge on adoption, §5.1)
-and in the data layer ([data-layer.md](data-layer.md) §8). Its walk is the
-same — signatures, the schema and hierarchy floor (§6.4), certificate
-authorization, anchors, revocation — with two differences:
+**Data** is durable. A Data packet is judged as data on every path that
+keeps, forwards or hands it to an application:
 
-1. **No clock.** No anchor's or certificate's ValidityPeriod is compared
-   with a clock. Any certificate of the key that verifies serves (ndn-rs
-   prefers the newest NotBefore). A key's authority over Data ends only by
-   signed data: a Revocation entry, with or without a cut.
+- a forwarder's data path: validation of arriving Data, including Data
+  parked while a certificate or a manifest packet is fetched; the content
+  store's re-check after a revoking adoption; the purge on adoption (§5.1);
+- the data layer ([data-layer.md](data-layer.md) §8): every entry taken,
+  re-judged on a revoking adoption and on restore;
+- an application's verified fetch through ndn-app (`Consumer::fetch_verified`,
+  the verified segmented fetch, `object(..).verify(..)`), which all verify
+  through `Unverified::verify`.
+
+One kind of Data stays live: the answer to a request a node just sent and
+acts on at once, such as a remote procedure call's reply, for which the
+application opts in by name (ndn-rs: `Unverified::verify_live`; the
+reflexive-forwarding replies use it). Such a
+reply is not kept; refusing it is a retried exchange.
+
+The durable walk is the same as the live one — signatures, the schema and
+hierarchy floor (§6.4), certificate authorization, anchors, revocation —
+with these differences:
+
+1. **No clock, except to refuse.** No anchor's or certificate's
+   ValidityPeriod is compared with a clock, with one exception that can
+   only refuse: the certificate of a key whose role the context lists in
+   DataRequiresCut (§3.3.13). Any certificate of the key that verifies
+   serves (ndn-rs prefers the newest NotBefore). A key's authority over
+   Data ends by signed data: a Revocation entry, with or without a cut, or,
+   for a listed role, the lapse of its certificate until the cut decides.
 2. **The cut.** At depth 0 only — the key that signed the Data itself,
    whether the KeyLocator names the key or one of its certificates — a
    Revocation entry covering that key is excused iff the selected context
-   (§6.1) holds a RevocationCut for exactly that key's name and the cut
-   accepts the Data (§3.3.12). The key's certificate must still verify,
-   chain to an anchor and be authorized as for any Data. Every other
-   revoked name met in the walk — an issuer's key or certificate — refuses
-   the Data as before: a cut never excuses an issuer.
+   (§6.1) holds a RevocationCut for exactly that key's name, the cut
+   accepts the Data (§3.3.12), and, when the cut has a CutKeyDigest, the
+   certificate whose public key verifies the Data has a public key of that
+   digest. The key's certificate must still verify, chain to an anchor and
+   be authorized as for any Data. Every other revoked name met in the walk
+   — an issuer's key or certificate — refuses the Data as before: a cut
+   never excuses an issuer.
+3. **The manifest.** When the cut has a CutManifest and the Data's name is
+   one a range lists, the walk needs the manifest packets that hold that
+   name's digest. Until it has them, by full name, the verdict is pending,
+   as for a missing certificate: the forwarder's validation stage parks the
+   Data and fetches them as it fetches certificates, and gives the Data up
+   if they do not come in time.
 
 A revoked key with no cut, and one whose cut does not accept the packet,
 are refused alike (ndn-rs: `TrustError::Revoked`). A key revoked with no
@@ -922,6 +1184,17 @@ out-of-cut refusal proves the packet authentic. A data-layer reader
 therefore keeps a refusal against a name (for re-admission) only for a
 key revoked with a cut.
 
+**Re-checking what is held.** A node that holds Data judged under an
+earlier version judges it again after a revoking adoption (§5.1) with the
+same walk, not with the signing key alone: Data whose issuer the new
+version revokes is refused too. The content store's re-check resolves
+every hop of the chain to the cached certificate, of any validity, whose
+public key verifies that hop's signature (the newest NotBefore first),
+never merely the newest certificate of the name; a hop with none is not
+clear, and the Data is fetched and validated afresh. At depth 0 it applies
+the same cut rule as the walk. So a certificate with another public key
+under the same name cannot keep a packet it did not verify.
+
 **Why Data ignores the clock.** A judgement "valid when it was signed" can
 use only the date the signer writes, and a stolen key writes any date, or
 the reader's clock, which refuses honest old Data once its certificate
@@ -929,12 +1202,16 @@ lapses and lets whoever sets that clock decide. Instead, the certificate,
 signed by its issuer, proves the key was authorized, and the cut, signed by
 the root, proves where that authority stopped. Renewing a certificate of the
 same key therefore continues everything the key signs; ending a key is a
-revocation. The residual — a leaked key whose certificate expired and that
-nobody revoked still signs Data that is accepted — is in §10.
+revocation. DataRequiresCut lets a context use the clock for one thing
+only, refusing a lapsed key of a role that does not renew until its cut is
+signed; it never makes a clock accept anything. The residual — a key of
+a role not listed, whose certificate expired and that nobody revoked,
+still signs Data that is accepted — is in §10.
 
 **Old contexts.** A context without cuts refuses every Data packet of a
 revoked key, as it always did. What changed for every context is only that
-an expired certificate or anchor no longer refuses Data.
+an expired certificate or anchor no longer refuses Data, except for a role
+the context lists in DataRequiresCut.
 
 ndn-rs: `Validator::validate_durable` and `validate_durable_cached` judge
 Data; `validate`, `validate_chain` and `validate_chain_cached` keep the live
@@ -988,10 +1265,12 @@ Per namespace, the publisher registers the prefix
 |---|---|
 | `/<ns>/32=trust-context/32=metadata` | the current metadata Data (§7.2) |
 | `/<ns>/32=trust-context/v=<N>`, `N` held | the stored signed context Data of version `N`, **byte-identical** to what was verified on adoption, never re-signed |
+| `/<ns>/32=trust-context/32=cut/<h>/seg=<i>`, with or without its ImplicitSha256DigestComponent, a packet of a held cut's manifest | that stored manifest packet, byte-identical (§3.3.12) |
 | anything else under the prefix | Nack, reason NoRoute (150) |
 
-"Anything else" includes a version that is not held, `…/32=metadata/v=…`,
-and the bare prefix. Matching is on the Interest name only:
+"Anything else" includes a version that is not held, a manifest packet not
+held, `…/32=metadata/v=…`, and the bare prefix. Matching is on the
+Interest name only:
 
 - the metadata answer requires the name to equal the metadata name exactly;
 - a versioned answer requires exactly one component after the prefix,
@@ -1028,6 +1307,18 @@ A consumer MUST NOT trust the metadata beyond the confinement in §8.1.
 
 - A node MUST serve every version it holds or held (stored newest plus
   stored version history), so that walks succeed (§5.4).
+- A node MUST also keep and serve the manifest packets of every cut of a
+  version it keeps (§3.3.12). It fetches the ones it does not hold by full
+  name when it keeps the version — from the forwarders that serve the
+  namespace, not from its own publisher — checks each against the digest
+  that names it, and stores and serves it, so that the manifest stays
+  available when the root device is not. ndn-rs asks for a missing packet
+  up to 5 times (waiting 2 s, then doubling) and then waits for the next
+  version; it holds at most 4096 packets for one cut. The root device
+  stores the packets of the cut file it signed before it hands the version
+  over, and serves them from the moment it publishes the version. A reader
+  that needs a packet nobody near holds fetches it as it fetches a missing
+  certificate (§6.3).
 - The metadata names the highest version held. Adding an older version, for
   example one walked through, does not change it.
 - When the newest version changes, the publisher SHOULD evict
@@ -1262,34 +1553,85 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   to anyone who asks by name, so they are visible beyond the namespace's
   members (§3.3.11). Direct-path addresses are never in the context; they
   go only to devices the LinkPolicy's pairs allow (§3.3.10).
-- A revocation cut binds names, not bytes. Whoever holds the revoked key
-  (its thief) can sign other bytes at a name a CutRange accepts: an
-  equivocation at an accepted name. A node that holds the honest packet
-  keeps both and reports the equivocation (the data layer does,
-  [data-layer.md](data-layer.md) invariant 2); a node holding neither may
-  take whichever answers first. Ranges carry no digest per packet because a
-  digest per packet does not fit the one Data a context is; CutExact entries
-  bind both name and digest. A producer therefore puts in ranges only the
-  names whose honest packets it holds verified (the data layer's rule,
-  data-layer.md §8), so every holder of those packets detects a substitute.
+- A cut keeps what its producer lists, so what it lists decides what a
+  thief keeps. Whoever holds a stolen key writes as that key until the
+  revocation; a producer that listed everything it held would make those
+  writes valid for good. The data layer's producer therefore lists only
+  entries the root device itself first verified before the moment the
+  owner gives as the loss, and stops taking new entries of a key the owner
+  marks suspected ([data-layer.md](data-layer.md) §8.1). Residual: a
+  thief's writes the root verified before that moment stay accepted, so
+  the moment should be the earliest the owner can name. That moment and
+  the times of first verification are both read on the root device's own
+  clock, never from a date the key wrote; a wrong root clock moves which
+  entries are listed, and the producer prints every entry it leaves out.
+- A cut with a manifest binds names and bytes (§3.3.12): whoever holds the
+  revoked key cannot have other bytes accepted at a name a range lists,
+  neither by a reader that holds the honest packet nor by one that holds
+  neither, nor by a forwarder that met the thief's copy first. A cut made
+  before manifests binds names only: there, a node that holds the honest
+  packet keeps both and reports the equivocation (the data layer does,
+  [data-layer.md](data-layer.md) invariant 2), and a node holding neither
+  may take whichever answers first; that residual remains for such cuts
+  only. Withholding manifest packets delays acceptance (the packet stays
+  pending) and never makes a node accept other bytes.
+- A cut with a CutKeyDigest excuses the key only through a certificate of
+  that public key (§6.3). A certificate issued later under the key's name
+  for another public key — by a compromised CA, or by a recovery fed a
+  forged certificate file — admits nothing through the cut, and a
+  recovery re-certifies a cut key only for that digest (§5.3). A cut made
+  before the field is bound to the key name only, and a recovery does not
+  re-certify its key.
 - Re-admission is exact (§3.3.12): one name with one digest. It admits no
   neighbouring sequence number, no packet under another prefix and no other
   bytes at that name, so it cannot be turned into a range.
-- Data ignores validity periods (§6.3). A key whose certificate expired is
-  therefore not ended for Data: if it leaked and nobody revoked it, whoever
-  holds it signs Data that is accepted. Ending a key is the owner's
-  revocation, with a cut, never the calendar. Its live uses (links, signed
-  Interests, renewal) do end at expiry.
-- No clock decides whether Data is valid. A signer's lying clock moves only
-  the dates it writes; a reader's lying clock can make it refuse live
-  exchanges (an anchor or certificate "not yet valid" or "expired"), which is
-  loud and retried, and never makes it accept or refuse stored Data.
+- Data ignores validity periods (§6.3), except that a role listed in
+  DataRequiresCut (§3.3.13) is refused once its certificate lapsed until
+  its cut is held. A guest's authority over Data therefore ends at its
+  expiry by default, and the owner's root device then revokes it with a
+  cut bounded at its NotAfter (§5.3); a key replaced by a new enrollment
+  is ended the same way, and both are listed as keys to end until then (a
+  replaced key's Data is accepted meanwhile). Residual: a key of a role
+  not listed (member, admin, node, relay), never replaced, whose
+  certificate expired and that nobody revoked, still signs Data that is
+  accepted if it leaked; nothing lists it, and ending it is the owner's
+  revocation, with a cut. Live uses (links, signed Interests, renewal) end
+  at expiry for every role.
+- No clock makes a node accept Data that signed data refuses. A signer's
+  lying clock moves only the dates it writes. A reader's lying clock can
+  make it refuse live exchanges (an anchor or certificate "not yet valid"
+  or "expired"), which is loud and retried; and, for a role listed in
+  DataRequiresCut, refuse that role's Data early (fast clock) or accept a
+  lapsed key's Data a while longer (slow clock), as a node that has not yet
+  adopted a revocation does, until it holds the key's cut.
+- A version that accepts less than the one before — a cut removed or
+  shrunk, a manifest or key digest changed, a role added to DataRequiresCut
+  — is revoking (§5.1): caches judge their Data again, so a version made by
+  a tool that drops cuts cannot leave refused Data servable from a cache.
+- Held Data is judged again with the whole walk (§6.3): Data under an
+  issuer a later version revokes is refused on re-check, in the content
+  store and in the data layer, as a fresh fetch would refuse it. The
+  content store's re-check follows, hop by hop, the certificate whose
+  public key verifies the cached packet.
+- Fetching by full name (a manifest packet, an in-cut entry) makes the
+  forwarder match Data by implicit digest, which costs a hash of every
+  Data while such an Interest is pending. ndn-rs bounds it per forwarder:
+  the deadline is kept per PIT (per engine), not per process, and the
+  InterestLifetime it uses, for PIT expiry too, is clamped to one hour, so
+  one Interest cannot make a forwarder hash every Data for longer than
+  that.
+- Every path that keeps or hands Data to an application judges it as Data
+  (§6.3), the ndn-app verified fetch included, so an application refuses
+  and accepts exactly what the forwarder and the data layer do.
 - A version's cuts are its anchor's word: an adopter does not check that a
   later version kept a cut's ranges (§3.3.12). A root can widen a cut as it
   can drop a revocation; a root in a thief's hands is a namespace in a
-  thief's hands, which recovery ([recovery-kit.md](recovery-kit.md)) answers.
+  thief's hands, which recovery ([recovery-kit.md](recovery-kit.md)) answers,
+  checking again every cut it carries.
 - A node that predates cuts refuses every packet of a revoked key, the
-  in-cut ones too (§3.3.12): it fails safe.
+  in-cut ones too (§3.3.12): it fails safe. A node that knows cuts but
+  predates CutKeyDigest, CutManifest and DataRequiresCut keeps the
+  residuals those fields close, for its own judgements, until updated.
 
 ## 11. Test vectors
 
@@ -1569,6 +1911,71 @@ not accept `…/notes/seq=4`, `…/32=log/seq=2`, or another packet at
 right after its Revocation entry; nothing else moves, and only the outer
 length changes.
 
+### T9 RevocationCut with key digest and manifest (379 octets)
+
+The T8 cut with a CutKeyDigest of the octets `0x40` through `0x5f` (a
+stand-in: in a real cut it is the SHA-256 of the key's public key,
+§3.3.12) and a CutManifest naming the T10 root packet. The two fields come
+right after the key Name, before the ranges (§3.2); the rest is T8's:
+
+```
+fd0428fd017507230804686f6d650803626f6208066d656d626572080570686f
+6e6508034b455908026b31fd043020404142434445464748494a4b4c4d4e4f50
+5152535455565758595a5b5c5d5e5ffd04326807660804686f6d650803626f62
+200d74727573742d636f6e7465787420036375740820b016d8ea2979c8cb799a
+1819b433608c13e16299ae0a35e53c87f659c2490a60320100012094f6b9944d
+ec675aec156eded41ba373d407e9f35ea6ac4168e8618a9357710afd042a2b07
+1f0804686f6d650803626f6208066d656d626572080570686f6e6520036c6f67
+fd042c063a01013a0101fd042a3c07260804686f6d650803626f6208066d656d
+626572080570686f6e6520036c6f6708056e6f746573fd042c063a01013a0103
+fd042c063a01073a0107fd042e4d074b0804686f6d650803626f6208066d656d
+626572080570686f6e6520036c6f6708056e6f7465733a010901200001020304
+05060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+```
+
+Under this cut, `…/notes/seq=2` is accepted only with the digest T10 lists
+for it, no longer with any bytes. The T8 bytes, which have neither field,
+still decode, as a cut made before them whose ranges bind names only.
+
+### T10 Cut manifest packet (417 octets)
+
+`ndn_security::cut_manifest::build(/home/bob, /home/bob/member/phone/KEY/k1,
+entries)` with the entries of T8's ranges: `…/32=log/notes` seqs 1, 2, 3
+and 7, and `…/32=log` seq 1, each with the stand-in digest of the 32
+octets `s, s+1, …` for seq `s`. They fit one packet, a leaf, so it is the
+root: `/home/bob/32=trust-context/32=cut/<h>/seg=0`, `<h>` the SHA-256 of
+the key's Name TLV, FreshnessPeriod 3600000, DigestSha256:
+
+```
+06fd019d07440804686f6d650803626f62200d74727573742d636f6e74657874
+20036375740820b016d8ea2979c8cb799a1819b433608c13e16299ae0a35e53c
+87f659c2490a60320100140619040036ee8015fd0124fd0436fd011efd04384a
+071f0804686f6d650803626f6208066d656d626572080570686f6e6520036c6f
+67fd043a253a010101200102030405060708090a0b0c0d0e0f10111213141516
+1718191a1b1c1d1e1f20fd0438cc07260804686f6d650803626f6208066d656d
+626572080570686f6e6520036c6f6708056e6f746573fd043a253a0101012001
+02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20fd
+043a253a0102012002030405060708090a0b0c0d0e0f10111213141516171819
+1a1b1c1d1e1f2021fd043a253a01030120030405060708090a0b0c0d0e0f1011
+12131415161718191a1b1c1d1e1f202122fd043a253a010701200708090a0b0c
+0d0e0f101112131415161718191a1b1c1d1e1f2021222324252616031b010017
+208b88bc33ba60b31453c9457f2a9561713450540ef8c118be605d8b755f8009
+05
+```
+
+Its full name, the value of T9's CutManifest:
+
+```
+07660804686f6d650803626f62200d74727573742d636f6e7465787420036375
+740820b016d8ea2979c8cb799a1819b433608c13e16299ae0a35e53c87f659c2
+490a60320100012094f6b9944dec675aec156eded41ba373d407e9f35ea6ac41
+68e8618a9357710a
+```
+
+**DataRequiresCut.** The entry for `guest` is `fd0434056775657374`; a
+context listing `guest` and `relay` writes them in that order, after its
+RevocationCut entries (§3.2). T2 lists no role and is unchanged.
+
 ### Generated namespace structure (not a byte vector)
 
 `ndn_cert::init_namespace(/home/bob)` gives a context Data of 1944 octets
@@ -1581,7 +1988,13 @@ Its TrustContext children are, in order:
 - `0x0413` native (500-octet body);
 - `0x041C` (0 octets);
 - `0x0416` (33 octets);
+- `0x0434` (5 octets, `guest`);
 - `0x0412` (16 octets).
+
+The octet counts above were measured before DataRequiresCut. Since then
+`build_namespace` also writes the `guest` entry (9 octets with its
+header), which adds 9 octets to the Content and to the Data and changes
+no other child; the totals have not been measured again.
 
 The in-memory `init_namespace` adds no CaEndpoint and no KeyRole.
 `init_namespace_in_pib`, the path `ndn-fwd init` uses, adds `/<ns>/CA` and
@@ -1616,6 +2029,15 @@ asserts what the same cut accepts and refuses (those named in T8, and a
 padded seq encoding, the prefix itself and longer names refused);
 `spec_vector_t2_is_unchanged` checks that T2 encodes as before and that T2
 with this cut differs only by the inserted cut and the outer length.
+
+T9 and T10 are tests in the same file:
+`spec_vector_t9_cut_with_key_digest_and_manifest` and
+`spec_vector_t10_manifest_packet` build them with the helpers `t9_cut()`
+and `t10_manifest()` (`RevocationCut::{set_key_digest, set_manifest}`,
+`cut_manifest::build`) and compare the hex above;
+`t8_bytes_decode_as_an_old_form_cut` checks that T8 still decodes without
+the two fields; `data_requires_cut_round_trips_in_canonical_order` checks
+the DataRequiresCut encoding and its order.
 
 ## 12. Decisions
 
@@ -1715,6 +2137,45 @@ is open.
   partial reading would accept something another decoder refuses. The live
   uses keep the clock (§6.3) because their freshness is the point and their
   failure is retried, never stored.
+- **Q16 Cut manifest.** A range of a new cut is bound to bytes by a
+  manifest beside the context, not inside it: a digest per packet does not
+  fit one Data, and a context that grew past one packet would break every
+  fetch and walk of §5.4 and §8. The manifest is self-certifying
+  (DigestSha256) because the root-signed context names its root packet by
+  full name: no second signature is needed, any holder may serve it, and a
+  reader fetches it as it fetches a certificate (pending until held). Cuts
+  made before it keep name-only ranges rather than being rejected, since
+  rejecting a version that already holds a revocation would undo the
+  revocation on every node; producers refuse to make a new one without a
+  manifest.
+- **Q17 Cut key digest.** A cut names a key, and a key name can be
+  certified again for another public key (by a compromised CA, or by a
+  recovery fed the wrong certificate file). The cut therefore carries the
+  digest of the public key whose packets it lists, and the walk excuses
+  depth 0 only through a certificate of that key. It is the digest of the
+  public key, not of a certificate, so a renewed or re-certified
+  certificate of the same key still serves.
+- **Q18 DataRequiresCut.** Ending a key's authority over Data by expiry
+  needs a clock, which §6.3 keeps out of Data because a clock can refuse
+  honest old Data and lets whoever sets it decide. The field allows the
+  clock in one direction only — refusing — and only for roles the owner
+  lists, by default `guest`, which does not renew: an honest guest's Data
+  is refused after its expiry only until the root's cut, which keeps what
+  it wrote while invited. Renewable roles are not listed, since a late
+  renewal or a fast reader clock would otherwise refuse honest Data. It is
+  a context field rather than a CA setting because every validator must
+  apply it alike, and it is even (skippable) because a node that cannot
+  read it then behaves as before rather than rejecting the version.
+- **Q19 Shrinking is revoking.** An adopter treats any version that
+  accepts less than the one it replaces as revoking (§5.1), although the
+  producer rules forbid shrinking a cut: adopters do not enforce producer
+  rules, and a cache that kept serving what the held version refuses would
+  fail open where validators fail safe.
+- **Q20 Every Data path is durable.** The ndn-app verified fetch judges
+  Data as the forwarder and the data layer do (§6.3); only replies an
+  application opts into as live keep the clock. Otherwise an application
+  would refuse honest old Data and in-cut Data that the rest of the node
+  accepts.
 
 ## Appendix A. Code references (non-normative)
 
@@ -1735,7 +2196,11 @@ may move.
 - `mod.rs:942-1112` decode_content: `:947-950` outer type; `:959-966` single-valued fields at most once; `:973-979` namespace; `:980-996` AnchorSet (skip non-Data `:985-987`); `:998-1037` blob (SchemaFormat one octet, no repeats `:1006-1023`; unknown critical inner → reject `:1025-1028`; missing fields `:1033-1035`); `:1038-1041` authoritative; `:1042-1047` CaEndpoint; `:1048-1051` hint; `:1055-1058` SourceBundleHash length 32; `:1059-1064` Revocation; `:1067-1071` KeyRole; `:1074-1077` LinkPolicy; `:1079-1081` unknown critical → reject; `:1086-1090` required fields; `:1101` floor unless authoritative.
 - `mod.rs:1116-1128` derived native blob; `:1135-1138` anchor_fingerprint; `:1142-1156` context_namespace_of; `:1193-1236` open_signed (name equality `:1203`, signer must be own anchor `:1212-1215`, public-key sig types `:1219-1224`); `:1238-1254` open_received (signer valid now `:1250`); `:1302-1304` is_critical; `:1307-1319` read_tlv (trailing bytes ignored); `:1321-1332` key_identity (generic `KEY` only).
 - Revocation cuts (by symbol; the line numbers above predate them): `tlv.rs` REVOCATION_CUT 0x0428, CUT_RANGE 0x042A, CUT_RUN 0x042C, CUT_EXACT 0x042E; `RevocationCut::{new, add_seq, add_run, readmit, accepts, encode, decode}`, `CutRange`; `SignedTrustContext::{with_revocation_cut, revocation_cuts, revocation_cut, refuses_data}`; encode_content writes the cuts after the Revocation entries; decode_content rejects a malformed cut and a second cut for one key; tests `spec_vector_t8_revocation_cut`, `spec_vector_t2_is_unchanged`.
-- `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods; the depth-0 revocation excused in the key's cut, §6.3).
+- Cut key digest, manifest and DataRequiresCut (by symbol): `tlv.rs` CUT_KEY_DIGEST 0x0430, CUT_MANIFEST 0x0432, DATA_REQUIRES_CUT 0x0434, MANIFEST_NODE 0x0436 and the MANIFEST_* children 0x0438–0x043E; `RevocationCut::{set_key_digest, key_digest, set_manifest, manifest, range_seq, accepts_exactly, covers}` (`accepts` admits a range only when the cut has no manifest: fails closed); `ndn_security::public_key_digest` (SHA-256 of `Certificate::public_key` as stored); `SignedTrustContext::{with_data_requires_cut, without_data_requires_cut, data_requires_cut, role_of, requires_cut_for, without_revocation_cuts}`.
+- `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
+- `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT, REVOKED_LAPSED}`; `Unverified::{verify, verify_live}` (`unverified.rs`).
+- `ndn-rs/crates/security/ndn-security/src/keyring.rs`: the revocation epoch moves, and listeners are told, when a version revokes a new name, when a held cut is not `covers`-ed by the new one (the key's name), or when a DataRequiresCut role is added (`/<ns>/<role>`).
+- `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs`: InterestLifetime clamped to one hour for PIT expiry and the per-PIT full-name deadline.
 
 **Supporting library code**
 

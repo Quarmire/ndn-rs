@@ -2,9 +2,11 @@
 
 - **Status:** Slices 1–5 normative (slice 5: a revoked key's versions kept
   exactly where the root's revocation cut in the trust context accepts
-  them, Data judged without clocks or validity periods, re-admission of
-  exact versions, late revocation withdrawn, renewal, rotation and
-  recovery, §8.1–§8.6); slice 4: signed blocks of small
+  them, the cut bounded by when the owner says the key was lost and bound
+  to the key and to each version's bytes, Data judged without clocks or
+  validity periods except that a lapsed guest fails closed until its cut,
+  re-admission of exact versions, late revocation withdrawn, issuers
+  re-checked, renewal, rotation and recovery, §8.1–§8.6); slice 4: signed blocks of small
   entries carried inline, the one-key rule with its signed head, rollback
   check and freshness bound, retention by expiry and listing by keep, range
   reads by seq and by time, `put`'s batch, §4.1, §5.3, §5.4, §7, §14.1,
@@ -51,7 +53,8 @@ MUST NOT depend on any forwarder, cache, repository or relay.
 Every implementation MUST hold all of these.
 
 1. **Checkable anywhere.** Any version verifies from its bytes, its name,
-   the trust context and the cuts — never from a server or a clock.
+   the trust context and the cuts — never from a server, and never
+   accepted because of a clock (below).
 2. **Immutable per writer.** One `(writer, seq)` has one set of bytes. Two
    different versions with the same `(writer, seq)` are proof of
    misbehaviour attributable to that key; a reader MUST keep both and report
@@ -74,9 +77,13 @@ Every implementation MUST hold all of these.
 9. **Forward-only, said plainly.** Revocation and deletion stop future
    reads; an implementation MUST NOT claim to recall copies already made.
 
-No validity decision may read a wall clock, nor compare a certificate's
-validity period with one (§8.5). Dates are display, indexing (range reads,
-§5.4) and retention (§14.1) only.
+No validity decision may accept anything because of a wall clock, nor
+compare a certificate's validity period with one, with one exception that
+can only refuse: a key of a role the trust context lists in DataRequiresCut
+(a guest's, by default) whose certificate lapsed is refused until its
+revocation cut is held (§8.5). Dates are display, indexing (range reads,
+§5.4) and retention (§14.1) only. The root device's own clock also bounds
+which entries it puts in a cut it makes (§8.1); a reader never reads it.
 
 ## 3. Names, devices, namespaces — slices 1, 2
 
@@ -731,7 +738,8 @@ key, signed with it by the namespace's root (§8.1).
   limit, a removed writer could sign a new entry at a seq of such a gap
   below it — a new name, so no equivocation — and be admitted. Under a list
   that entry is outside. The list is what the cut's signer held verified:
-  an entry a summary only listed is not in it.
+  an entry a summary only listed is not in it; and, for a revocation cut,
+  only what it first verified before the key was lost (§8.1).
 - A cut replaces clock-based signing-time validity: no date in a version,
   and no certificate's validity period, decides whether it is inside
   (§8.5).
@@ -778,41 +786,98 @@ always did.
   reader).
 - **The cut is the listing.** `K`'s summary roots and heads are refused
   once the cut is held, so a reader following `C` learns `K`'s entries in
-  `C` from the cut: it fetches by exact name every `<D>/32=log/<C>/seq=<n>`
-  the CutRange of `C` lists that it neither holds nor has refused, when it
-  adopts the context and when it starts following `C`. Holders and caches
-  may answer those names. Snapshots under `<D>/32=log` are fetched only
-  when asked for by name. Nodes of `K`'s summary verified before the reader
-  held the cut stay verified (they still say which seqs exist, §5.2), but
-  none is taken after it. An entry of `K` in `C` that the cut neither
-  accepts nor re-admits never applies, so `K`'s later entries and other
-  writers' versions naming it as a parent do not wait for it (§5.2).
-- **Produced from what the producer holds verified.** A cut lists exactly
-  the log entries of `K` the producing device — the root device, or the
-  device recovering the namespace (§8.4) — holds verified and has not
-  withdrawn or refused, never entries a summary only listed. The device's
-  data layer fetches what `K`'s verified summary roots list in the
-  collections it follows, so the cut is what `K`'s summaries showed it,
-  filled. Entries of collections the producer does not follow, or did not
-  hold yet, fall outside; the owner re-admits them (§8.2). ndn-data:
-  `Device::revocation_cut(&self, key: &Name) -> ndn_security::RevocationCut`;
-  the root takes it as a file holding the `RevocationCut` TLV
-  (`ndn-fwd revoke <name> --cut <file>`, which refuses a cut whose key the
-  version does not newly revoke, `cut-refused`,
-  [mgmt-trust.md](mgmt-trust.md)).
+  `C` from the cut: when it adopts the context and when it starts following
+  `C`, it fetches every entry of `C` the cut accepts that it neither holds
+  nor has refused. When the cut has a manifest (trust-context.md §3.3.12),
+  the reader first fetches the manifest packets by full name, then each
+  entry by its full name, digest included, as the manifest lists it: only
+  the honest bytes can answer, whoever serves them. A cut made before
+  manifests lists names only; its entries are fetched by name, and the
+  first answer that verifies is taken (§8.6). Holders and caches may
+  answer either. Snapshots under `<D>/32=log` are fetched only when asked
+  for by name. Nodes of `K`'s summary verified before the reader held the
+  cut stay verified (they still say which seqs exist, §5.2), but none is
+  taken after it. An entry of `K` in `C` that the cut neither accepts nor
+  re-admits never applies, so `K`'s later entries and other writers'
+  versions naming it as a parent do not wait for it (§5.2).
+- **Produced from what the root saw before the loss.** A thief holding `K`
+  writes as `K` from the theft until the revocation, and the producer's
+  data layer verifies and stores those writes like any other until then. A
+  cut that listed everything held would make them valid for good. So a cut
+  lists exactly the log entries of `K` that the producing device — the root
+  device, or the device recovering the namespace (§8.4) — holds verified,
+  has not withdrawn or refused, and **first verified before the loss of
+  the key**, as the owner states it; never entries a summary only listed.
+  - *First verified.* Every device records, with each log entry it holds,
+    the time by its own clock at which it first verified it (for its own
+    entries, when it wrote them), never a date the entry carries, with the
+    digest of the public key that verified it. The record is stored with
+    the entry and survives a restart; an entry restored keeps its time. An
+    entry stored before devices recorded this has no time; it counts as
+    unknown.
+  - *The bound.* `held_before` (a time) admits only entries first verified
+    strictly before it; `upto` (a seq per collection) admits only entries
+    of the collections it names whose seq is at most the one named (other
+    collections and snapshots are left out). At least one MUST be
+    given: a producer MUST refuse an unbounded cut, saying to state when
+    the device was lost. The owner answers "when did you lose it?"; the
+    default is the time the key was marked suspected (below).
+  - *Left out.* Every entry of `K` the device holds verified that the bound
+    leaves out — first verified at or after `held_before`, past `upto`, or
+    of unknown time — is listed by its full name with its digest, so the
+    owner can look at each and re-admit the honest ones one by one (§8.2).
+  - *Key and bytes.* The producer gives the cut the digest of the public
+    key whose certificate verified the entries it lists (refusing when
+    they verify under two public keys of the one key name), and a manifest
+    listing the seq and implicit digest of every entry its ranges list
+    (trust-context.md §3.3.12).
+
+  Entries of collections the producer does not follow, or did not hold
+  yet, fall outside; the owner re-admits them (§8.2). ndn-data:
+  `Device::revocation_cut(&self, key: &Name, bound: &CutBound) ->
+  Result<CutProposal, DataError>`, with `CutBound { held_before:
+  Option<Timestamp>, upto: BTreeMap<Name, u64> }` (collection to seq) and
+  `CutProposal { cut: RevocationCut, manifest: Vec<Bytes>, left_out:
+  Vec<Name> }`. The root takes the cut as a file
+  ([personal-namespace.md](personal-namespace.md) F4): `ndn-fwd revoke
+  <name> --cut <file>`, which refuses a cut whose key the version does not
+  newly revoke (`cut-refused`, [mgmt-trust.md](mgmt-trust.md)), a cut made
+  without a bound, and one bounded later than the loss time the owner
+  answered, and prints the entries left out.
+- **Suspected.** Between noticing the loss and signing the revocation, the
+  owner marks `K` **suspected** on the producing device (ndn-data:
+  `Device::suspect(&self, key: &Name, since: Timestamp) -> Result<(),
+  DataError>`, `Device::unsuspect(&self, key: &Name) -> bool`,
+  `Device::suspected(&self, key: &Name) -> Option<Timestamp>`). The mark is stored and survives
+  a restart. It ends when the device adopts a version that revokes `K`, and
+  is ignored while a held version revokes `K`: the cut then decides. While
+  it holds, the device takes no new log entry of `K` — it does not fetch
+  the log entries of `K`'s device, and does not apply or store one of `K`
+  — and entries it already holds stay. An entry of `K` offered to it is
+  refused `Suspected` (the key and since when; next step: finish the
+  revocation, or lift the mark if the key was not lost). The default
+  `held_before` of a cut of `K` is the mark's `since`.
+  So what the root verifies of a thief's writes stops at once, and the
+  owner's answer and the root's view describe the same moment.
 - **Checking.** A reader verifies every entry under the trust context's
   durable rule (trust-context.md §6.3), never by date: an entry of a revoked
   key outside its cut is refused `OutsideCut`, the cut stated as the key, the
   runs of the collection's CutRange (as for that writer, accepted) and the
-  context's anchor key that signed it, next step: ask the owner. The refusal
-  is decided by signed data, so it is kept: the entry is not fetched again
-  from another source as an entry failing its signature is (§17, poisoned
-  cache). A members record refused this way does not count for the record
-  in force, which is computed from the others; a hold, lease or prune
-  record refused this way stops counting. An in-cut entry still needs a
-  certificate of `K` to verify: the namespace CA keeps serving the
-  certificates of a key revoked with a cut, and forwarders and validators
-  keep them, for that use only (trust-context.md §5.1, §6.3).
+  context's anchor key that signed it, next step: ask the owner. Under a
+  cut with a manifest, an entry at a name a range lists is accepted only
+  with the bytes the manifest lists; while the manifest packet that lists
+  it is not held, the entry is pending, neither applied nor refused, and
+  the packet is fetched as a missing certificate is. Under a cut with a
+  key digest, an entry is accepted only through a certificate of that
+  public key. The refusal is decided by signed data, so it is kept: the
+  entry is not fetched again from another source as an entry failing its
+  signature is (§17, poisoned cache). A members record refused this way
+  does not count for the record in force, which is computed from the
+  others; a hold, lease or prune record refused this way stops counting.
+  An in-cut entry still needs a certificate of `K` to verify: the
+  namespace CA keeps serving the certificates of a key revoked with a cut,
+  and forwarders and validators keep them and the cut's manifest, for that
+  use only (trust-context.md §5.1, §6.3).
 
 ### 8.2 Re-admission — slice 5
 
@@ -823,13 +888,15 @@ entries to `K`'s cut, each the full name of one entry, ending in its
 implicit digest (trust-context.md §3.3.12, §5.3). It never adds a range,
 and nothing about it is in the members record.
 
-- **Finding them.** A device that refused an entry by a cut reports it with
-  its full name and digest (ndn-data: `Device::refused_by_revocation(&self,
-  key: &Name) -> Vec<Name>`), so the owner can look at it and hand the names
-  to the root (`ndn-fwd readmit <key> <full-name>…`). The root refuses a key
-  its held version revokes without a cut (`readmit-no-cut`) and a name that
-  does not end in a 32-octet digest or lies outside `K`'s device log
-  `<D>/32=log` (`readmit-refused`).
+- **Finding them.** The producer prints, with the cut, every entry of `K`
+  it held that the bound left out (§8.1). A device that refused an entry by
+  a cut reports it with its full name and digest (ndn-data:
+  `Device::refused_by_revocation(&self, key: &Name) -> Vec<Name>`). The
+  owner looks at each and hands the honest ones to the root (`ndn-fwd
+  readmit <key> <full-name>…`). The root refuses a key its held version
+  revokes without a cut (`readmit-no-cut`) and a name that does not end in
+  a 32-octet digest or lies outside `K`'s device log `<D>/32=log`
+  (`readmit-refused`).
 - **Admitting.** When a device adopts a version, it admits every CutExact
   that names an entry it holds refused, or an entry of a collection it
   follows that it does not hold: it fetches it by its full name (digest
@@ -840,22 +907,79 @@ and nothing about it is in the members record.
   entry at the same seq in another collection, and no other bytes at the
   name it lists.
 
-### 8.3 Late revocation — slice 5
+### 8.3 Late revocation and re-checking — slice 5
 
 A reader that has not yet adopted the revoking version accepts what `K`
 signs, as a reader not holding a removal cut does (§8). When a device
-adopts any newer trust context, it MUST check again every entry it holds of
-every key the context revokes, under the durable rule (§8.1). An entry it
-had applied that the context now refuses is **withdrawn**, exactly as for a
-removal cut: it leaves the state, every watcher of its collection is told
-`Withdrawn` (the version and the cut) whatever its frontier, and `get` of it
-answers `Refused` (`OutsideCut`, next step: ask the owner). An entry applied
-before and still accepted is not delivered again. The writer's own device
-does the same with its own entries. A refusal and a withdrawal survive a
-restart: a device restoring its store checks the stored entries against
-the contexts it holds. Withdrawing is forward-only (invariant 9).
+adopts a trust-context version that may refuse more than the one it held
+(trust-context.md §5.1: it revokes a name, drops, shrinks or changes a cut,
+drops an anchor, or lists a new role in DataRequiresCut; and the first
+version of a namespace it adopts), it MUST judge again every entry it
+holds with the whole durable walk a fresh fetch gets (trust-context.md
+§6.3), run again on the stored packet: signature, chain, issuers, schema,
+revocation, cut, manifest and key digest. Checking only whether the
+entry's own signing key is revoked is not enough: a version can revoke an
+issuer, such as the old CA a compromised-root recovery revokes, and every
+key that issuer certified then loses its authority.
 
-### 8.4 Renewal, rotation and recovery — slice 5
+- An entry whose verdict is pending (a certificate or manifest packet not
+  held) stays held as it was; the missing packet is fetched, and the entry
+  judged again once it is resolved.
+- An entry it had applied that the walk now refuses is **withdrawn**,
+  exactly as for a removal cut: it leaves the state, every watcher of its
+  collection is told `Withdrawn` whatever its frontier, with the version
+  and why (ndn-data: `Change::Withdrawn { id: VersionId, why: Refusal }`),
+  and `get` of it answers `Refused` with the same reason. The why
+  is either the key's revocation cut (`OutsideCut`, next step: ask the
+  owner, who can re-admit it by exact name, §8.2), or the chain above or
+  beside the cut (`Untrusted`, with the reason: a revoked or unauthorized
+  issuer, a lapsed key of a role listed in DataRequiresCut waiting for its
+  cut). No re-admission applies to the second kind, since a cut never
+  excuses an issuer; the device keeps the stored packet, judges it again
+  on restore, on the next adoption that may refuse more, and whenever a
+  packet of that key verifies again (after the key is certified by a new
+  CA, say), and takes it back, delivered as a new version, once the walk
+  accepts it.
+- An entry applied before and still accepted is not delivered again.
+- The writer's own device does the same with its own entries for its own
+  key's cut (`OutsideCut`). Its own entries are not judged again by the
+  whole walk: the device trusts what it signed itself.
+- The clock withdraws nothing by itself: an entry of a key of a role listed
+  in DataRequiresCut that a reader accepted before the key's certificate
+  lapsed stays applied until the next re-check (an adoption that may
+  refuse more, a restart, the key's packets verifying again); a re-check
+  after the lapse withdraws it (`Untrusted`) until the key's cut arrives,
+  which then decides.
+
+**Restore.** A refusal and a withdrawal survive a restart: a device
+restoring its store judges every stored entry again with the same walk,
+against the contexts it holds, as on adoption; pending entries stay held.
+Withdrawing is forward-only (invariant 9).
+
+**A device's own log at restore.** An entry under the device's own name is
+its own only if the device wrote it. A copy of the device key in other
+hands — a thief's, before the revocation reaches the device — can write
+under that name too, and the device takes such an entry live as it takes
+any writer's. So:
+
+- the device keeps a record of the entries it wrote itself (ndn-data: the
+  implicit digest of each, stored locally beside the log); at restore, an
+  entry under its name whose stored bytes the record does not list is
+  restored as another writer's, never as its own;
+- its log head moves only for entries it wrote, never for a refused or
+  foreign entry;
+- its next seq is the head plus one, computed without overflow: a write
+  past the largest seq is refused, never wrapped;
+- a live entry under its own name that it did not write, with a seq more
+  than 64 above its head, is refused (`BeyondOwnLog`, stating the head);
+  within that margin it is taken as another writer's.
+
+A store written before devices kept this record is migrated once, at its
+first restore, with the earlier rule (every entry under the device's name
+counts as its own); entries a thief had placed in such a store before the
+update are taken as the device's own by that migration (residual).
+
+### 8.4 Renewal, rotation, expiry and recovery — slice 5
 
 - **Renewal** re-certifies the same key (personal-namespace.md F10). Since
   Data is judged without validity periods (§8.5), the device keeps
@@ -864,28 +988,56 @@ the contexts it holds. Withdrawing is forward-only (invariant 9).
   expired. Nothing else is needed.
 - **Rotation** to a new key is a new enrollment: the new key is a new
   writer (§4), admitted where a members record's writer prefix covers it.
-  The old key ends only when the owner revokes it, with a cut; until then it
-  stays valid for Data (§8.6, the leaked expired key).
+  When the CA enrolls a new key for a device identity that already has
+  one, the old key is **replaced**, and the owner ends it with a
+  revocation and a cut bounded at the replacement's enrollment
+  (`held_before` = the first NotBefore of the new key's certificates).
+  Until that is signed, the old key stays valid for Data; the root's
+  tools list it as a key to end, with the cut to make.
+- **Expiry of a guest.** A key of a role the trust context lists in
+  DataRequiresCut — `guest`, by default — fails closed once its
+  certificate lapsed by the reader's clock (§8.5), and is ended the same
+  way, with a cut bounded at its certificate's NotAfter. Its entries the
+  root verified before that stay valid; the rest the owner re-admits one
+  by one (§8.2).
+- **Ending them.** The root device makes each cut in its data layer with
+  that bound (§8.1) and signs one version ending every such key that has
+  one (`ndn-fwd end-keys`, after one confirmation, or unattended from a
+  timer when the root store opens without a secret). A key to end is never
+  revoked without a cut. Until then `ndn-fwd status`, the root's other
+  commands and its admin TUI list it ([personal-namespace.md](personal-namespace.md)
+  F9, F10).
 - **Recovery** after losing the root device (recovery-kit.md §6) carries
-  every cut into `N+1` and `N+2`. A recovery from a compromised root MAY add
+  every cut into `N+1` and `N+2`, except orphan cuts (whose key no
+  revocation covers) and cuts listing a name outside their key's device
+  log, which it drops and reports: the old root, which signed them, may
+  have been in a thief's hands. A recovery from a compromised root MAY add
   a cut for each key it newly revokes — the old root device's admin key,
   say — produced as §8.1 says by the recovering device from what it holds
-  verified. Such a recovery revokes the old CA key, an issuer, and a cut
-  never excuses an issuer (trust-context.md §6.3); so the new CA
-  re-certifies every key the recovered context revokes with a cut, from a
-  certificate of it the recovering device holds, and the in-cut versions
-  keep a chain to the new root. That certificate authorizes nothing
-  outside the cut: the revocation of the key stands, excused only for the
-  key's own in-cut packets. A cut key whose certificate the recovering
-  device does not hold is reported, and its versions stay refused until
-  the owner re-certifies it. Devices that are not revoked renew with the
-  new CA as before.
+  verified, bounded by when the root was lost. Such a recovery revokes the
+  old CA key, an issuer, and a cut never excuses an issuer
+  (trust-context.md §6.3); so the new CA certifies again every key the
+  recovered context revokes with a cut, from a certificate of it the
+  recovering device holds, and the in-cut versions keep a chain to the new
+  root. It does so once `N+1` is taken, after showing the cuts to the
+  operator and on their confirmation, and only for a certificate whose
+  public key has the cut's key digest: a certificate carrying another
+  public key under the key's name is never certified, and the key of a
+  cut made before key digests is not certified again at all (reported).
+  That certificate authorizes nothing outside the cut: the revocation of
+  the key stands, excused only for the key's own in-cut packets. A cut key
+  not certified again is reported with why, and its versions stay refused
+  until the owner certifies it. Devices whose key was not revoked enroll
+  again or renew with the new CA (personal-namespace.md F8); their
+  versions withdrawn because the old CA was revoked come back once their
+  key is certified by the new CA (§8.3).
 
 ### 8.5 Time — slice 5
 
-No validity decision reads a clock (invariant 1). For Data this now holds
-of the certificate chain too: a version is judged without the validity
-period of any certificate or anchor (trust-context.md §6.3).
+No validity decision accepts because of a clock (invariant 1). For Data
+this now holds of the certificate chain too: a version is judged without
+the validity period of any certificate or anchor (trust-context.md §6.3),
+with one exception that can only refuse (below).
 
 **What "valid when it signed" became.** The study's first text asked that
 a version be accepted if its key was valid when it signed it. That needs a
@@ -899,10 +1051,36 @@ authorized; the **cut**, signed by the root, proves where that authority
 ended, as names in the key's log rather than as a moment. This decides
 what "valid when it signed" was meant to decide — was this version signed
 while the key was trusted — and it is the plan's "the validator checks
-cuts, not `now()`". The residual: a key without a revocation has no end.
-A leaked key whose certificate expired and that nobody revoked still signs
-data that is accepted; ending a key is the owner's revocation with a cut,
-never the calendar.
+cuts, not `now()`". The residual: a key without a revocation has no end
+by itself. A leaked key of a role that renews, whose certificate expired
+and that nobody revoked, still signs data that is accepted; ending it is
+the owner's revocation with a cut.
+
+**What the clock does now: DataRequiresCut.** Some keys are meant to end by
+the calendar. A guest's certificate is short-lived to end the invitation,
+and guests do not renew. For a role the trust context lists in
+DataRequiresCut (trust-context.md §3.3.13; `guest` in every context
+`ndn-fwd init` makes), a version signed by such a key is accepted only
+while a certificate of that key is valid by the reader's clock, or once
+the key is revoked with a cut, which then decides alone. In between it is
+refused, fail-closed, as revoked without a cut: the key's certificate
+lapsed and the owner's cut is awaited. The owner's root device makes that
+cut bounded at the certificate's NotAfter and signs it (§8.4), and it
+accepts what the guest wrote while invited, as far as the root saw it.
+The clock can only refuse here: a fast
+reader clock refuses a guest's versions early until the cut arrives; a
+slow one accepts them a little longer, as a reader that has not adopted a
+revocation does; neither makes a reader accept what a cut refuses. Roles
+that renew (member, admin, node, relay) are not listed by default:
+listing them would refuse a device's honest versions whenever its renewal
+is late or a reader's clock runs fast.
+
+**What the root's clock does: the bound of a cut.** The producer of a cut
+reads its own clock twice: when it first verifies an entry, and when the
+owner marks a key suspected or answers when it was lost (§8.1). Both are
+the root's own observations, never a date the key wrote. A wrong root
+clock moves which entries a cut lists; the producer prints what it leaves
+out, and readers never read that clock.
 
 **What still uses a clock, and why that is safe.**
 
@@ -911,7 +1089,10 @@ never the calendar.
   §7), the one-key head's freshness and the age `get` reports (§5.3), the
   batch delay (§4.1) and the audit's clock skew (§13.3). None decides
   whether a version is valid; a wrong clock moves only its own device's
-  retention, listing and waiting.
+  retention, listing and waiting. The root's clock bounds the cuts it makes
+  (above).
+- The reader's clock refuses, never accepts, the versions of a lapsed key
+  of a role listed in DataRequiresCut (above).
 - Outside it, the live exchanges keep the clock: signed and command
   Interests (management authorization), adopting a trust context (its
   signing anchor valid now), enrollment, renewal and NDNCERT, link
@@ -927,23 +1108,35 @@ never the calendar.
 
 - *Can*, before a reader holds the revoking version: write as `K` and have
   it accepted there, until that reader adopts the version and withdraws it
-  (§8.3). After it: sign other bytes at a name the cut's ranges accept (the
-  residual below); use `K` for live exchanges until its certificate expires
-  or a node holds the revocation (links close on adoption).
+  (§8.3). Keep for good the writes the root first verified before the loss
+  time the owner stated: the cut lists them (§8.1), and nothing in them
+  tells them from the owner's. So the owner should state the earliest
+  moment the key may have been out of their hands, and mark it suspected
+  as soon as they notice. Use `K` for live exchanges until its certificate
+  expires or a node holds the revocation (links close on adoption).
 - *Cannot*, at a reader holding the revoking version: have any new name
   accepted — a seq after the cut, a seq in a gap below it, an accepted seq
   under another collection, or a backdated version (dates decide nothing);
-  have a summary, head, seal key, grant or audit answer accepted; be
-  re-admitted by a range (re-admission is by exact name and digest, so its
-  other bytes at a re-admitted name stay out); make a reader withdraw an
-  in-cut version (the cut is the root's).
-- *Residual: equivocation at an accepted name.* The cut's ranges bind
-  names, not bytes: a digest per version does not fit the one Data a trust
-  context is (exact re-admissions do bind bytes). A reader holding the
-  honest version keeps both and reports the equivocation (invariant 2); a
-  reader holding neither may take whichever answers first. Ranges list
-  only what the root held verified, so the honest bytes of every accepted
-  name exist at the root and at every holder that had them.
+  have accepted what it wrote after the stated loss time, even if the root
+  verified it; have a summary, head, seal key, grant or audit answer
+  accepted; have other bytes accepted at a name a range of a cut with a
+  manifest lists, by any reader, a late joiner included, or by a forwarder
+  on its path; be re-admitted by a range (re-admission is by exact name
+  and digest, so its other bytes at a re-admitted name stay out); make a
+  reader withdraw an in-cut version (the cut is the root's); have a new
+  certificate of `K`'s name for another public key excuse anything (the
+  cut's key digest), or have one made in a recovery (§8.4).
+- *Residual, old cuts only: equivocation at an accepted name.* A cut made
+  before manifests binds names, not bytes. Under such a cut a reader
+  holding the honest version keeps both and reports the equivocation
+  (invariant 2); a reader holding neither may take whichever answers
+  first. Every cut made now carries a manifest, which closes this.
+
+**A thief holding a copy of a device's own key, before the device holds
+the revocation.** It can write under that device's name, and the device
+takes such an entry as another writer's. It cannot make the device take
+it as its own at restore, raise the device's log head, or make the
+device's next seq wrap around and sign over seqs it used (§8.3).
 
 **A lying clock.**
 
@@ -952,27 +1145,40 @@ never the calendar.
   cannot make a version valid or invalid; a stolen key's backdated version
   is outside the cut.
 - *The reader's* moves only its own retention, waiting and reported ages
-  (§5.3, §14.1), and its live exchanges (a context whose anchor it thinks
-  expired is not adopted, loudly). It makes no stored Data valid or
-  invalid: it cannot refuse honest old Data, nor accept what a cut refuses.
+  (§5.3, §14.1), its live exchanges (a context whose anchor it thinks
+  expired is not adopted, loudly), and when it starts refusing a lapsed
+  key of a role listed in DataRequiresCut (early when fast, late when
+  slow, until the key's cut). It cannot refuse honest old Data of any
+  other role, nor accept what a cut refuses.
+- *The root's* moves which entries a cut it makes lists (§8.1); the
+  producer prints the entries it leaves out. Nobody else reads it.
 
 **A malicious holder** (a repository, cache or relay).
 
 - *Cannot* forge or alter a version, make a reader accept one the cut
   refuses, or make it withdraw one the cut accepts: both are decided by the
   root-signed context. It cannot serve an older context in place of a newer
-  one held (anti-rollback, trust-context.md §5.1).
+  one held (anti-rollback, trust-context.md §5.1), nor other bytes than
+  the manifest lists.
 - *Can* withhold: in-cut versions (the reader knows what is missing from
-  the cut's runs and fetches them elsewhere), and newer trust contexts,
-  which delays a revocation until the reader gets the version by another
-  path (refresh, sync); what it accepted meanwhile is withdrawn then
-  (§8.3). It can serve a thief's other bytes at an accepted name to a reader
-  holding neither (the residual above).
+  the cut's runs and fetches them elsewhere), manifest packets (the
+  versions they list stay pending, never accepted with other bytes), and
+  newer trust contexts, which delays a revocation until the reader gets the
+  version by another path (refresh, sync); what it accepted meanwhile is
+  withdrawn then (§8.3). Under a cut made before manifests, it can serve a
+  thief's other bytes at an accepted name to a reader holding neither (the
+  residual above).
 
-**A leaked, expired, unrevoked key.** Data ignores validity periods, so its
-thief signs data that is accepted until the owner revokes the key. This is
-the price of not trusting clocks for Data; the remedy is revocation with a
-cut.
+**A leaked, expired, unrevoked key.** For a role the context lists in
+DataRequiresCut (guests, by default), its versions are refused once its
+certificate lapsed, until the root's cut. A key replaced by a new
+enrollment stays valid for Data until the owner ends it with a cut; the
+root lists it until then (§8.4). For any other key — a
+member's, admin's, node's or relay's, never replaced — Data ignores
+validity periods, so its thief signs data that is accepted until the
+owner revokes the key: the price of not trusting clocks for that Data;
+the remedy is revocation with a cut. Nothing lists such a key: the root's
+list of keys to end holds lapsed keys of listed roles and replaced keys.
 
 ## 9. Seal — slice 2
 
@@ -2005,18 +2211,24 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Failure | Required behaviour | Rests on |
 |---|---|---|
 | Partition / offline | Reads and writes continue locally under each device's key; collections reconcile from summaries when a path returns. | §4, §7 |
-| Lost device | Its leases lapse; repair asks the other holders the hold record names; the owner revokes its key with a cut of what the root held verified, and re-admits by exact name and digest any honest version the cut left out. | §8.1, §8.2, §13 |
-| Compromised key | The revocation cut keeps exactly the versions it lists and refuses the rest, whatever dates they claim; the key's summaries, heads, seal keys and grants are refused; sealed data re-keys forward. | §8.1, §9 |
-| Bad or lying clock | No effect on validity: Data is judged without certificate validity periods, and the cut, not a date, ends a key. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing. A wrong clock refuses live exchanges only (adoption, links, signed Interests), loudly. | invariant 1, §8.5, §14.1 |
+| Lost device | Its leases lapse; repair asks the other holders the hold record names; the owner marks its key suspected on the root device, says when it was lost, and revokes it with a cut of what the root first verified before then; the entries left out are printed, and any honest one is re-admitted by exact name and digest. | §8.1, §8.2, §13 |
+| Compromised key | The revocation cut keeps exactly the versions it lists, with the bytes its manifest lists, and refuses the rest, whatever dates they claim; the key's summaries, heads, seal keys and grants are refused; sealed data re-keys forward. | §8.1, §9 |
+| Bad or lying clock | Never makes a version accepted: Data is judged without certificate validity periods, and the cut, not a date, ends a key; for a role listed in DataRequiresCut (guest) a reader's clock only decides when a lapsed key's versions start being refused until its cut. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing; the root's clock moves only which entries the cuts it makes list, and it prints those left out. A wrong clock refuses live exchanges, loudly. | invariant 1, §8.1, §8.5, §14.1 |
+| Thief writes between the theft and the revocation | Writes the root first verified before the loss time the owner states stay accepted (residual); later ones are left out of the cut and refused everywhere; once the key is marked suspected, the root takes none. | §8.1, §8.6 |
 | Thief backdates or fills a gap with a revoked key | Refused wherever the revoking version is held: the cut lists names, and no date or seq outside it counts. | §8.1 |
 | Thief reuses an accepted seq in another collection | Refused: the cut's ranges are per collection prefix. | §8.1 |
-| Thief signs other bytes at an accepted name | A reader holding the honest version keeps both and reports the equivocation; one holding neither may take whichever answers first (residual: the cut binds names, not bytes). | invariant 2, §8.6 |
+| Thief signs other bytes at an accepted name | Refused by every reader and forwarder under a cut with a manifest: only the bytes it lists are accepted, and in-cut versions are fetched by full name. Under a cut made before manifests, a reader holding the honest version keeps both and reports the equivocation; one holding neither may take whichever answers first (residual of old cuts). | invariant 2, §8.1, §8.6 |
+| Manifest packets withheld | The versions they list stay pending, never accepted with other bytes; they are fetched from another holder. | §8.1 |
 | Revocation arrives after a thief's version was accepted | On adopting the revoking context the reader withdraws it and tells every watcher; in-cut versions stay. | §8.3 |
+| Issuer revoked after its keys' versions were held | On adopting the revoking context, and on restore, every held version is judged again with the whole walk; those whose chain passes the revoked issuer are withdrawn, saying an issuer refuses them (no re-admission). | §8.3 |
 | Honest work outside the cut | Refused and reported with its full name and digest; the root re-admits it by exact name and digest, and every device holding or following it then applies it; no neighbour seq and no other bytes come with it. | §8.2 |
-| Certificate renewed, or expired | The key's versions verify alike under the old and the new certificate, before and after either expires; the log continues. | §8.4, §8.5 |
-| Leaked key, certificate expired, never revoked | Its thief's versions are accepted (residual): expiry does not end a key for Data, revocation with a cut does. | §8.5, §8.6 |
-| Root compromised | The recovery's versions carry every cut, may cut the keys they revoke, and the new CA re-certifies cut keys so their in-cut versions keep a chain. | §8.4 |
-| Node that predates cuts | Refuses every version of a revoked key, the in-cut ones too: safe, and fixed by updating. | trust-context.md §3.3.12 |
+| Certificate renewed, or expired | The key's versions verify alike under the old and the new certificate, before and after either expires; the log continues. A role listed in DataRequiresCut (guest) is the exception: lapsed, its versions are refused until its cut. | §8.4, §8.5 |
+| Guest's certificate lapses | Its versions are refused, fail-closed, until the root's revocation with a cut bounded at the NotAfter, which keeps what it wrote while invited. | §8.4, §8.5 |
+| Device key replaced by a new enrollment | Its versions stay accepted until the owner ends it: the root's tools list it with the cut to make (bounded at the replacement's enrollment), and `ndn-fwd end-keys` revokes it with that cut. | §8.4 |
+| Leaked key, certificate expired, never revoked | For a role not listed in DataRequiresCut, never replaced, its thief's versions are accepted (residual), and nothing lists it: revocation with a cut ends it. | §8.5, §8.6 |
+| Copy of the device's own key writes under its name | The device takes such an entry as another writer's, never as its own at restore; its log head moves only for what it wrote, its seqs never wrap, and an entry far above its head is refused. | §8.3 |
+| Root compromised | The recovery's versions carry every cut but orphans and cuts naming entries outside their key's log, may cut the keys they revoke, and, on the operator's confirmation, the new CA certifies a cut key again only for the public key its cut's digest names, so its in-cut versions keep a chain and nothing else gains one. | §8.4 |
+| Node that predates cuts | Refuses every version of a revoked key, the in-cut ones too: safe, and fixed by updating. A node that knows cuts but predates manifests, key digests and DataRequiresCut keeps those residuals until updated. | trust-context.md §3.3.12 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
 | Holder withholds a range's blocks | A time search probes a window at once and stops a round none of whose probes answers; the read answers within its bound, listing what it did not reach `missing`. | invariant 4, §5.4 |
@@ -2117,8 +2329,8 @@ The slice-5 cases are c3 (a stolen phone's key: the revocation cut keeps
 the phone's versions from before the theft and refuses the thief's, dated
 last week or not), o2 (the owner re-admits one exact version by a
 root-signed trust-context version adding its name and digest), k1 (an
-expired, unrevoked key's old data still verifies at a reader whose clock
-is a year ahead), k2 (a revoked key's backdated version is refused
+expired, unrevoked member key's old data still verifies at a reader whose
+clock is a year ahead), k2 (a revoked key's backdated version is refused
 everywhere, by a reader that joins after the revocation too, while the
 versions before the cut stay readable), k3 (a re-admission by exact name
 and digest admits neither a neighbouring seq nor a thief's version at the
@@ -2126,4 +2338,23 @@ same seq in another collection), k4 (a late revocation withdraws a thief's
 version a reader accepted before the cut reached it, and keeps the in-cut
 ones), k5 (a renewed certificate continues the log: old versions stay
 valid after the old certificate expired) and k6 (a recovery after the
-root's compromise carries the cut).
+root's compromise carries the cut); c3, k2–k6 and o2 revoke with a stated
+loss time (a bounded cut). The slice-5 security review adds k7, cut
+bounded by the loss (the owner marks the stolen key suspected and states
+the loss time; the thief's writes between the theft and the report, which
+the root held before revoking, stay out of the cut, are refused at every
+honest device and withdrawn where held, and the honest entries the root
+first saw after the loss time are listed and re-admitted one by one); k8,
+lapsed guest key (data its key signs after its certificate lapsed is
+refused by readers whose clock says it lapsed; after the root's
+revocation with a cut, its data from before expiry is accepted even at a
+reader a year ahead, and its data after expiry stays out); k9, other
+bytes at a name in the cut (a late joiner gets the honest bytes at an
+in-cut name through the manifest, and the thief's other bytes at the same
+name are refused, also when a forwarder on the path saw the thief's copy
+first); and k10, issuer revoked later (entries of a key the old CA
+certified before a compromised-root recovery, held by readers, are
+withdrawn on adoption and after a restart, and an honest device's entry
+from before the recovery comes back once its key is certified by the new
+CA). Their features are `BoundedCut`, `GuestExpiry`, `CutManifest` and
+`IssuerRecheck`.

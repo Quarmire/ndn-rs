@@ -701,13 +701,15 @@ error chains shows it, one that words codes ignores it).
 | operation | library | does |
 |---|---|---|
 | init | `root::init::init` | a new namespace: its root in the chosen root store, its CA and admin identity, version 1 |
-| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates, with the revocation cut of a key when one is given (trust-context.md §3.3.12) |
+| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates, with the revocation cut of a key when one is given (trust-context.md §3.3.12): a cut file bounded no later than the loss time the owner gives, with its key digest and manifest, whose left-out entries are reported |
+| end keys | `root::end_keys::pending`, `pending_all`, `plan`, `end` | the keys to end — lapsed keys of a role listed in DataRequiresCut and keys replaced by a newer key of their device — and one version `N+1` revoking every one of them that has a cut bounded at its end (trust-context.md §5.3); never a key without a cut |
 | readmit | `root::readmit::plan`, `readmit` | version `N+1` adding exact versions (full names ending in their implicit digest) to the revocation cut of a revoked key |
 | recovery kits | `root::kit::create`, `list`, `check`, `revoke` | a recovery key listed as a recovery anchor by `N+1` (24 words, a sealed file, a key on a second YubiKey); the kits held; a kit opened against the held version; `N+1` without it |
-| recover | `root::recover::recover` | a replacement device becomes the root device with a kit: `N+1` signed by the kit, `N+2` by the new root, both carrying every revocation cut, and a cut for a key it newly revokes when one is given; with the old root compromised, the new CA certifies again every key revoked with a cut, from a certificate of it the PIB holds, so its in-cut Data keeps a chain |
-| recertify | `root::recover::recertify` | the new CA certifies the keys revoked with a cut that it has not certified yet, from certificates given or held in the PIB (the recovery's re-certification, run again once the missing certificates are found) |
+| recover | `root::recover::recover` | a replacement device becomes the root device with a kit: `N+1` signed by the kit, `N+2` by the new root, both carrying every revocation cut but those it drops (orphans, names outside the key's log), and a cut for a key it newly revokes when one is given; with the old root compromised and on the operator's confirmation, the new CA certifies again every key revoked with a cut, from a certificate of it the PIB holds whose public key has the cut's key digest, so its in-cut Data keeps a chain |
+| recertify | `root::recover::recertify` | the new CA certifies the keys revoked with a cut that it has not certified yet, from certificates given or held in the PIB whose public key has the cut's key digest (the recovery's re-certification, run again once the missing certificates are found or the operator confirms) |
 | root key | `root::key::open`, `HeldRoots::status`, `move_to` | where each root key lives; moving one to another store |
 | schema | `root::schema::load`, `view`, `Adopted::explain`, `root_of`, `plan_update`, `update` | the held schema as data; why a key may sign a name; `N+1` carrying the current generated schema |
+| data requires cut | `root::schema::parse_data_requires_cut`, `plan_data_requires_cut`, `set_data_requires_cut` (`ndn_cert::bump_context_data_requires_cut`) | version `N+1` changing only the roles listed in DataRequiresCut (trust-context.md §3.3.13; CLI `ndn-fwd schema data-requires-cut <role>[,<role>…]` or `none`, printing `data_requires_cut = <before> -> <after>`); a bad role name is `root-bad-request` (`role`, `error`), the same set as held `nothing-to-sign` |
 
 **Namespaces.** A PIB can hold the roots of several namespaces, one root store
 each. Every operation acts on one namespace and changes only its root, held
@@ -783,7 +785,7 @@ params too; a param shown `?` is set only when it applies.
 | `revoke-none-issued` | 404 | no | fix-request | `pib`, `name` | the namespace CA issued no certificate under that device name |
 | `revoke-refused` | 403 | no | fix-request | `name`, `error` | the key may not be revoked (not of the namespace, or it covers an anchor) |
 | `nothing-to-sign` | 409 | no | none | `version` | the held version has everything asked already |
-| `cut-refused` | 400 | no | fix-request | `key`; `revoking` (`, `-separated), `version`, or `name` and `log` | the revocation cut is refused: its key is not one this version newly revokes (`revoking`: the keys it does revoke), or the held `version` revokes that key already, or it lists a `name` outside the key's device log `log`; in a recovery also a cut while the old root is destroyed (nothing is revoked) or two cuts for one key. A cut is added only in the version that revokes its key; single versions are re-admitted with readmit |
+| `cut-refused` | 400 | no | fix-request | `key`, `error`, `why`; for `why`: `revoking` (`, `-separated), `version`, or `name` and `log`; `held_before` and `lost` (`after-loss`, ms since the epoch); `reason` (`manifest-incomplete`); `namespace` and `version` (`orphan-cut`) | the revocation cut is refused, `why`: `unbounded` (the cut file carries no time bound: say when the device was lost and make the cut again), `after-loss` (bounded later than the loss time answered, or, for `end-keys`, later than the key's end, given as `lost`), `no-key-digest` or `no-manifest` (made by a tool that predates them, or with runs and no manifest), `manifest-incomplete` (the file's manifest packets do not form the whole tree its CutManifest names: a node missing, a packet that does not decode or does not match its digest), `duplicate` (two cuts for one key), `orphan-cut` (its key is not revoked), `not-ending` (`end-keys`: the cut's key is no unrevoked lapsed or replaced key); or its key is not one this version newly revokes (`revoking`: the keys it does revoke), or the held `version` revokes that key already, or it lists a `name` outside the key's device log `log`; in a recovery also a cut while the old root is destroyed (nothing is revoked). A cut is added only in the version that revokes its key; single versions are re-admitted with readmit |
 | `readmit-no-cut` | 409 | no | fix-request | `key`, `namespace`, `version` | the held version holds no revocation cut for the key: a key not yet revoked is revoked with a cut first; a key revoked without one has none to add to (a cut is added only with its key's revocation), so its Data stays refused |
 | `readmit-refused` | 400 | no | fix-request | `key`, `name`, `log`, `error` | a name to re-admit is not a full name ending in its implicit digest (32 octets), or is not under the key's device log `log` (`<device>/32=log`) |
 | `not-a-kit` | 400 | no | fix-request | `path`, `reason` | the file is not a recovery kit |
@@ -856,7 +858,12 @@ approval store's and invite store's observers and its issuance observer,
 change is published once, by the code that made it: a version kept is told
 by the keeping (whichever way it came), an enrollment by the installation of
 its certificate, a request ended by what ended it (the CA's answer, its
-expiry, a failed issuance).
+expiry, a failed issuance). A version is stored in the PIB before its
+`context-updated` is published, so a subscriber on the same host (the
+ndn-data host follows trust contexts this way, without polling the PIB)
+reads the stored version once on the event; a version the daemon could
+not store is not there, and the next event or resync brings the
+subscriber up to date.
 
 ### Sequence numbers, ring and resync
 
