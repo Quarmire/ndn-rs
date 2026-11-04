@@ -146,7 +146,9 @@ pub enum Change {
     /// A verified version beyond the watched frontier.
     Version(Version),
     /// A version delivered earlier is no longer accepted: a cut that arrived
-    /// later refuses it (open item "before a cut arrives"). Filled by slice 2.
+    /// later refuses it (open item "before a cut arrives") — a members
+    /// record that removed its writer, or a trust context that revoked its
+    /// key. Sent to every watcher of the collection, whatever its frontier.
     Withdrawn {
         /// The version.
         id: VersionId,
@@ -209,8 +211,6 @@ pub struct Share {
     pub writers: Vec<Name>,
     /// Who may read.
     pub readers: Vec<Audience>,
-    /// Versions outside a cut the owner signs back in. Filled by slice 5.
-    pub readmit: Vec<VersionId>,
 }
 
 /// One device's data layer: the seven verbs, signing with this device's

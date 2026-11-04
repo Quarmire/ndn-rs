@@ -82,12 +82,6 @@ pub struct Members {
     /// The record in force at its signer when it signed this one; `None`
     /// for revision 1 (and for a record from a signer that named none).
     pub parent: Option<Parent>,
-    /// Versions outside a cut that the owner signed back in.
-    ///
-    /// This answers the open item "a cut can drop honest work": a stolen
-    /// device's offline edits that nobody had seen fall outside its cut, and
-    /// the owner may re-admit specific ones. Filled by slice 5.
-    pub readmitted: Vec<VersionId>,
 }
 
 impl Members {
@@ -281,7 +275,6 @@ impl Members {
             key_check: sealing.key_check,
             since: ruling.since.clone(),
             parent: shared,
-            readmitted: Vec::new(),
         };
         Some((merged, resolve))
     }
@@ -435,8 +428,11 @@ impl FromIterator<VersionId> for Accepted {
 /// refused, whatever date or seq it claims. It replaces clock-based
 /// signing-time validity. A reader that receives a cut re-checks everything
 /// it already accepted from those keys against it (open item "before a cut
-/// arrives"). Cuts on removal are filled by slice 2, revocation cuts by
-/// slice 5.
+/// arrives"). Two kinds: a writer's removal, in the collection's members
+/// record; and a key's revocation, in its namespace's trust context (spec
+/// §8), where [`of`](Self::of) is the revoked key, [`accept`](Self::accept)
+/// the key's runs for the collection, and [`signer`](Self::signer) the
+/// context's anchor key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Cut {
     /// The key, or the prefix of a member's keys, being ended.
@@ -564,7 +560,6 @@ mod tests {
             key_check: None,
             since: None,
             parent: None,
-            readmitted: Vec::new(),
         };
         assert_eq!(m.refusal(&id("/alice/phone/KEY/1", 7)), None);
         assert_eq!(m.refusal(&id("/bob/phone/KEY/1", 41)), None);
@@ -613,7 +608,6 @@ mod tests {
             key_check: Some([seq as u8; 32]),
             since: None,
             parent: None,
-            readmitted: Vec::new(),
         }
     }
 

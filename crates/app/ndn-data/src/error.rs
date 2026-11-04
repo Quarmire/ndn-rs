@@ -86,10 +86,13 @@ impl std::fmt::Display for Refusal {
                     .collect::<Vec<_>>();
                 write!(
                     f,
-                    "its key lies under {}, which the collection's owner removed, and the cut \
+                    "its key lies under {}, which {} cut (a writer the collection's owner \
+                     removed, or a key its namespace's trust context revoked), and the cut \
                      accepts exactly {}, which this version is not, whatever date or seq it \
-                     claims; ask the owner",
+                     claims; ask the owner (who may write the member back in, or re-admit this \
+                     exact version of a revoked key)",
                     cut.of,
+                    cut.signer.key(),
                     if accepted.is_empty() {
                         "nothing of it".to_owned()
                     } else {
