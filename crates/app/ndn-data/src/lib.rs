@@ -77,11 +77,13 @@ pub mod wire;
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{Clock, Config, Device, Entropy, Released, Transport};
 pub use error::{DataError, NextStep, Refusal};
-pub use layer::{Age, Answer, Change, Changes, DataLayer, Got, Hold, PutOptions, Share, State};
+pub use layer::{
+    Age, Answer, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions, Share, State,
+};
 pub use merge::{MergeError, MergeRule, MergeRules, MergeState, Yrs};
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{
-    Audience, Content, Frontier, Keep, Payload, Seal, Seq, Timestamp, TypeId, Version, VersionId,
-    Writer,
+    Audience, BlockEntry, Content, Frontier, Keep, Payload, Seal, Seq, Timestamp, TypeId, Version,
+    VersionId, Writer,
 };

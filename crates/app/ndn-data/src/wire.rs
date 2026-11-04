@@ -18,12 +18,15 @@
 //! | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256; its parent lists its digest |
 //! | seal key | `<D>/32=seal/<X25519 public key>` | the device key |
 //! | grant | `<G>/32=grant/<GrantAsk TLV>` | the granter's device key |
+//! | head of one-key collection `C` | `<D>/32=summary/<C>/32=head/seq=<head>` | the device key |
 //!
 //! `X` is a name of the tree from `O` to a collection: `O/32=data` (the
-//! root's one child) or `O/32=data/<path>`, a folder or collection. Two
+//! root's one child) or `O/32=data/<path>`, a folder or collection. Some
 //! names are never fetched: the state name
 //! `<C>/32=state/<F>` (the merged value at frontier `F`, computed by every
-//! reader) and the sync group `<O>/32=sync` (State Vector Sync Interests,
+//! reader), an entry of a block `<V>/32=entry/seg=<i>` and a range read
+//! `<C>/32=range/<Range TLV>` (answered from the blocks), and the sync
+//! group `<O>/32=sync` (State Vector Sync Interests,
 //! notifications only), [`ndn_security::sync_group`]: the one definition the
 //! forwarder's trust and link libraries route and multicast it by.
 //!
@@ -202,6 +205,30 @@ pub mod tlv {
     pub const PRUNED_BY: u64 = 0x0541;
     /// Octets: the members record's packet that refuses the piece's version.
     pub const REFUSED_BY: u64 = 0x0543;
+
+    // Slice 4: odd numbers, critical.
+
+    /// A block of small entries under the version's one signature, in a
+    /// version record in place of `Fields` and `MergeOp` (sealed: the
+    /// plaintext of `Sealed`): `BlockEntry+`.
+    pub const BLOCK: u64 = 0x0545;
+    /// One entry of a block: `Offset`, `Fields`.
+    pub const BLOCK_ENTRY: u64 = 0x0547;
+    /// NonNegativeInteger: an entry's milliseconds after its version's
+    /// `Dated`; non-decreasing along the block, the first 0.
+    pub const OFFSET: u64 = 0x0549;
+    /// The Content of a one-key collection's head packet: `Name`
+    /// (collection), `Seq` (its summary node's head), `Digest` (of that
+    /// node's packet), `Freshness`.
+    pub const HEAD_RECORD: u64 = 0x054B;
+    /// NonNegativeInteger: milliseconds, the batch delay of the newest
+    /// version's entries (0 unbatched).
+    pub const FRESHNESS: u64 = 0x054D;
+    /// In a range name: `Dated` (from), `Dated` (to), from < to.
+    pub const TIME_RANGE: u64 = 0x054F;
+    /// Empty, an audit answer: the piece's version's keep passed by the
+    /// holder's clock, and the holder dropped it.
+    pub const EXPIRED: u64 = 0x0551;
 }
 
 /// Keyword components of the layer's names.
@@ -218,6 +245,9 @@ const AUDIT: &[u8] = b"audit";
 const HELD: &[u8] = b"held";
 const ROOT: &[u8] = b"root";
 const ASK: &[u8] = b"ask";
+const HEAD: &[u8] = b"head";
+const ENTRY: &[u8] = b"entry";
+const RANGE: &[u8] = b"range";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces (log rule) or is refused (merge rule).
@@ -904,6 +934,150 @@ pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
     Some((name_of(&comps[..at]), read_name(value).ok()?))
 }
 
+// ---- slice 4: heads, entries, range reads -------------------------------------------------------
+
+/// `<device>/32=summary/<collection>/32=head`: the discovery name of the head
+/// of `device`'s one-key collection `collection` (CanBePrefix, MustBeFresh;
+/// spec §5.3). It ends in `32=head`, which no node, page or root name, nor
+/// the head name of a collection nested under `collection`, extends: only a
+/// head of exactly that collection answers it.
+pub fn head_prefix(device: &Name, collection: &Name) -> Name {
+    summary_prefix(device, collection).append_component(kw(HEAD))
+}
+
+/// A head's name: `<device>/32=summary/<collection>/32=head/seq=<seq>`,
+/// `seq` the writer's highest seq in the collection (its node's head).
+pub fn head_name(device: &Name, collection: &Name, seq: u64) -> Name {
+    head_prefix(device, collection).append_sequence_num(seq)
+}
+
+/// Parse `<device>/32=summary/<collection>/32=head/seq=<seq>`: the device,
+/// the collection and the seq.
+pub fn parse_head_name(name: &Name) -> Option<(Name, Name, u64)> {
+    let (last, rest) = name.components().split_last()?;
+    let seq = last.as_sequence_num()?;
+    let (device, collection) = parse_head_comps(rest)?;
+    Some((device, collection, seq))
+}
+
+/// Parse a head's discovery name `<device>/32=summary/<collection>/32=head`
+/// ([`head_prefix`]): the device and the collection.
+pub fn parse_head_prefix(name: &Name) -> Option<(Name, Name)> {
+    parse_head_comps(name.components())
+}
+
+fn parse_head_comps(comps: &[NameComponent]) -> Option<(Name, Name)> {
+    let at = comps.iter().position(|c| is_kw(c, SUMMARY))?;
+    let (marker, subject) = comps.get(at + 1..)?.split_last()?;
+    if !is_kw(marker, HEAD) || !is_device_comps(&comps[..at]) {
+        return None;
+    }
+    let collection = name_of(subject);
+    is_collection_name(&collection).then(|| (name_of(&comps[..at]), collection))
+}
+
+/// The name of entry `index` (0-based) of the block named `version`:
+/// `<version>/32=entry/seg=<index>` (spec §4.1). A local name, never
+/// fetched: a `get` of it reads the block and answers that one entry.
+pub fn entry_name(version: &Name, index: u32) -> Name {
+    version
+        .clone()
+        .append_component(kw(ENTRY))
+        .append_segment(u64::from(index))
+}
+
+/// Parse `<version>/32=entry/seg=<index>`, `version` a version's log entry
+/// name (with a collection): the version's name and the index.
+pub fn parse_entry_name(name: &Name) -> Option<(Name, u32)> {
+    let (last, rest) = name.components().split_last()?;
+    let index = u32::try_from(last.as_segment()?).ok()?;
+    let (marker, version) = rest.split_last()?;
+    if !is_kw(marker, ENTRY) {
+        return None;
+    }
+    let version = name_of(version);
+    parse_log_name(&version)?.subject?;
+    Some((version, index))
+}
+
+/// What a range read of a one-key collection asks for (spec §5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Range {
+    /// The blocks whose seqs lie in `low..=high` (by name).
+    Seqs(u64, u64),
+    /// The entries dated `from ≤ dated < to`.
+    Times(Timestamp, Timestamp),
+}
+
+/// A range read's name: `<collection>/32=range/<SeqRange|TimeRange TLV>`.
+/// A local name, never fetched.
+pub fn range_name(collection: &Name, range: &Range) -> Name {
+    let mut w = TlvWriter::new();
+    match range {
+        Range::Seqs(lo, hi) => w.write_nested(tlv::SEQ_RANGE, |w| {
+            write_nni(w, tlv::SEQ, *lo);
+            write_nni(w, tlv::SEQ, *hi);
+        }),
+        Range::Times(from, to) => w.write_nested(tlv::TIME_RANGE, |w| {
+            write_nni(w, tlv::DATED, from.0);
+            write_nni(w, tlv::DATED, to.0);
+        }),
+    }
+    collection
+        .clone()
+        .append_component(kw(RANGE))
+        .append_component(NameComponent::generic(w.finish()))
+}
+
+/// Parse `<collection>/32=range/<SeqRange|TimeRange TLV>`. `None` when the
+/// name has no `32=range` component (it is no range name); an error saying
+/// how a range name is formed when it has one but is malformed: no
+/// collection before it, not exactly one TLV after it, a seq range with
+/// low > high, or a time range with from ≥ to.
+pub fn parse_range_name(name: &Name) -> Option<Result<(Name, Range), WireError>> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, RANGE))?;
+    let form = "a range name is <collection>/32=range/<range>, the range one SeqRange (low, \
+                high: blocks by seq, low ≤ high) or TimeRange (from, to: entries dated from ≤ \
+                dated < to, from < to) TLV";
+    let parsed = (|| {
+        let collection = name_of(&comps[..at]);
+        if !is_collection_name(&collection)
+            || at + 2 != comps.len()
+            || comps[at + 1].typ != tlv_type::GENERIC_NAME_COMPONENT
+        {
+            return Err(bad(form));
+        }
+        let mut r = TlvReader::new(comps[at + 1].value.clone());
+        let (typ, value) = r.read_tlv().map_err(|_| bad(form))?;
+        if !r.is_empty() {
+            return Err(bad(form));
+        }
+        let end = match typ {
+            tlv::SEQ_RANGE => tlv::SEQ,
+            tlv::TIME_RANGE => tlv::DATED,
+            _ => return Err(bad(form)),
+        };
+        let mut ends = Vec::with_capacity(2);
+        each(value, |t, v| {
+            if t != end {
+                return Ok(false);
+            }
+            ends.push(read_nni(&v)?);
+            Ok(true)
+        })?;
+        let range = match (typ, ends.as_slice()) {
+            (tlv::SEQ_RANGE, &[lo, hi]) if lo <= hi => Range::Seqs(lo, hi),
+            (tlv::TIME_RANGE, &[from, to]) if from < to => {
+                Range::Times(Timestamp(from), Timestamp(to))
+            }
+            _ => return Err(bad(form)),
+        };
+        Ok((collection, range))
+    })();
+    Some(parsed)
+}
+
 /// What an audit asks a holder for: one piece, or a proof over every piece
 /// of a version (`whole`), under a fresh nonce, proved to come from an owner
 /// device.
@@ -1005,6 +1179,9 @@ pub enum AuditAnswer {
     /// The holder never kept it as a members record refuses its version: the
     /// record's packet, which the auditor verifies and takes.
     RefusedBy(Bytes),
+    /// The holder dropped the piece as its version's keep passed by the
+    /// holder's own clock (spec §14.1): never evidence, no answer.
+    Expired,
 }
 
 /// Encode an audit answer (the Content of the holder's signed reply).
@@ -1016,6 +1193,7 @@ pub fn encode_audit_answer(a: &AuditAnswer) -> Bytes {
         AuditAnswer::Proof(d) => w.write_tlv(tlv::PROOF, d),
         AuditAnswer::PrunedBy(wire) => w.write_tlv(tlv::PRUNED_BY, wire),
         AuditAnswer::RefusedBy(wire) => w.write_tlv(tlv::REFUSED_BY, wire),
+        AuditAnswer::Expired => w.write_tlv(tlv::EXPIRED, &[]),
     });
     w.finish()
 }
@@ -1035,6 +1213,7 @@ pub fn decode_audit_answer(content: Bytes) -> Result<AuditAnswer, WireError> {
             tlv::PROOF => answer = Some(AuditAnswer::Proof(read_digest(&v)?)),
             tlv::PRUNED_BY => answer = Some(AuditAnswer::PrunedBy(v)),
             tlv::REFUSED_BY => answer = Some(AuditAnswer::RefusedBy(v)),
+            tlv::EXPIRED => answer = Some(AuditAnswer::Expired),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1377,6 +1556,21 @@ pub struct VersionBody {
     /// payload — sealed or not — travels in them, and neither `Fields` nor
     /// `MergeOp` nor the sealed `Ciphertext` stands in the record.
     pub chunks: Option<ChunksBody>,
+    /// The payload a block of small entries (spec §4.1): when present and
+    /// not sealed, it stands in the record in place of `Fields` and
+    /// `MergeOp`; sealed, it is the ciphertext's plaintext (and `None`
+    /// while not opened).
+    pub block: Option<Vec<BlockEntryBody>>,
+}
+
+/// One entry of a block: its date's offset from the version's `Dated`, and
+/// its fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEntryBody {
+    /// Milliseconds after the version's `Dated`.
+    pub offset: u64,
+    /// The fields.
+    pub fields: Content,
 }
 
 /// A sealed payload: the epoch whose key seals it, and the ciphertext of
@@ -1565,13 +1759,21 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
                 }
             }
             (None, Some(c)) => write_chunks(w, c),
-            (None, None) => write_payload(w, &b.fields, &b.op),
+            (None, None) => match &b.block {
+                Some(entries) => write_block(w, entries),
+                None => write_payload(w, &b.fields, &b.op),
+            },
         }
     });
     w.finish()
 }
 
 fn write_payload(w: &mut TlvWriter, fields: &Content, op: &[u8]) {
+    write_fields(w, fields);
+    w.write_tlv(tlv::MERGE_OP, op);
+}
+
+fn write_fields(w: &mut TlvWriter, fields: &Content) {
     w.write_nested(tlv::FIELDS, |w| {
         for (name, value) in fields.fields() {
             w.write_nested(tlv::FIELD, |w| {
@@ -1580,7 +1782,6 @@ fn write_payload(w: &mut TlvWriter, fields: &Content, op: &[u8]) {
             });
         }
     });
-    w.write_tlv(tlv::MERGE_OP, op);
 }
 
 fn write_chunks(w: &mut TlvWriter, c: &ChunksBody) {
@@ -1612,6 +1813,150 @@ pub fn decode_payload(bytes: Bytes) -> Result<(Content, Bytes), WireError> {
     match (fields, op) {
         (Some(f), Some(o)) => Ok((f, o)),
         _ => Err(bad("a sealed payload carries fields and a merge op")),
+    }
+}
+
+fn write_block(w: &mut TlvWriter, entries: &[BlockEntryBody]) {
+    w.write_nested(tlv::BLOCK, |w| {
+        for e in entries {
+            w.write_nested(tlv::BLOCK_ENTRY, |w| {
+                write_nni(w, tlv::OFFSET, e.offset);
+                write_fields(w, &e.fields);
+            });
+        }
+    });
+}
+
+/// A block's `Block` TLV: what a version record carries in place of its
+/// `Fields` and `MergeOp`, and what a sealed block's ciphertext carries.
+pub fn encode_block(entries: &[BlockEntryBody]) -> Bytes {
+    let mut w = TlvWriter::new();
+    write_block(&mut w, entries);
+    w.finish()
+}
+
+/// The value of a `Block` TLV: at least one entry, each with an offset and
+/// fields, offsets non-decreasing and the first 0.
+fn read_block(value: Bytes) -> Result<Vec<BlockEntryBody>, WireError> {
+    let mut out: Vec<BlockEntryBody> = Vec::new();
+    each(value, |t, v| {
+        if t != tlv::BLOCK_ENTRY {
+            return Ok(false);
+        }
+        let (mut offset, mut fields) = (None, None);
+        each(v, |t, v| {
+            match t {
+                tlv::OFFSET => offset = Some(read_nni(&v)?),
+                tlv::FIELDS => fields = Some(read_fields(v)?),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        let (Some(offset), Some(fields)) = (offset, fields) else {
+            return Err(bad("a block entry has an offset and fields"));
+        };
+        match out.last() {
+            None if offset != 0 => return Err(bad("a block's first entry has offset 0")),
+            Some(prev) if offset < prev.offset => {
+                return Err(bad("a block's offsets are non-decreasing"));
+            }
+            _ => {}
+        }
+        out.push(BlockEntryBody { offset, fields });
+        Ok(true)
+    })?;
+    if out.is_empty() {
+        return Err(bad("a block has at least one entry"));
+    }
+    Ok(out)
+}
+
+/// A version's payload as it travels inline (sealed: once opened).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inline {
+    /// One entry's fields and the merge function's operation.
+    Fields(Content, Bytes),
+    /// A block of entries.
+    Block(Vec<BlockEntryBody>),
+}
+
+/// Decode an opened sealed payload: `Fields` and `MergeOp`
+/// ([`encode_payload`]), or a `Block` ([`encode_block`]).
+pub fn decode_inline(bytes: Bytes) -> Result<Inline, WireError> {
+    let (mut fields, mut op, mut block) = (None, None, None);
+    each(bytes, |typ, v| {
+        match typ {
+            tlv::FIELDS => fields = Some(read_fields(v)?),
+            tlv::MERGE_OP => op = Some(v),
+            tlv::BLOCK => block = Some(read_block(v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (fields, op, block) {
+        (Some(f), Some(o), None) => Ok(Inline::Fields(f, o)),
+        (None, None, Some(b)) => Ok(Inline::Block(b)),
+        _ => Err(bad(
+            "a sealed payload carries fields and a merge op, or a block",
+        )),
+    }
+}
+
+/// The content of a one-key collection's head (spec §5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadBody {
+    /// The collection.
+    pub collection: Name,
+    /// The writer's highest seq in it: its summary node's head.
+    pub seq: u64,
+    /// SHA-256 of the writer's summary node packet of the collection at
+    /// `seq`.
+    pub digest: [u8; 32],
+    /// Milliseconds: the batch delay of the newest version's entries (0
+    /// unbatched); also the head packet's FreshnessPeriod.
+    pub freshness: u64,
+}
+
+/// Encode a head record.
+pub fn encode_head(b: &HeadBody) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::HEAD_RECORD, |w| {
+        write_name(w, &b.collection);
+        write_nni(w, tlv::SEQ, b.seq);
+        w.write_tlv(tlv::DIGEST, &b.digest);
+        write_nni(w, tlv::FRESHNESS, b.freshness);
+    });
+    w.finish()
+}
+
+/// Decode a head record.
+pub fn decode_head(content: Bytes) -> Result<HeadBody, WireError> {
+    let mut r = TlvReader::new(content);
+    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if typ != tlv::HEAD_RECORD || !r.is_empty() {
+        return Err(bad("a head packet carries one head record"));
+    }
+    let (mut collection, mut seq, mut digest, mut freshness) = (None, None, None, None);
+    each(value, |t, v| {
+        match t {
+            tlv_type::NAME => collection = Some(read_name(v)?),
+            tlv::SEQ => seq = Some(read_nni(&v)?),
+            tlv::DIGEST => digest = Some(read_digest(&v)?),
+            tlv::FRESHNESS => freshness = Some(read_nni(&v)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    match (collection, seq, digest, freshness) {
+        (Some(collection), Some(seq), Some(digest), Some(freshness)) => Ok(HeadBody {
+            collection,
+            seq,
+            digest,
+            freshness,
+        }),
+        _ => Err(bad(
+            "a head record names a collection, a seq, a node digest and a freshness",
+        )),
     }
 }
 
@@ -1868,6 +2213,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut op = None;
     let mut sealed = None;
     let mut chunks = None;
+    let mut block = None;
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
@@ -1949,6 +2295,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                 }
                 chunks = Some(ChunksBody { size, root });
             }
+            tlv::BLOCK => block = Some(read_block(v)?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1966,12 +2313,19 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
             return Err(bad("a payload in pieces has no ciphertext in its record"));
         }
     };
-    let (fields, op) = match (fields, op, sealed.is_some() || chunks.is_some()) {
+    if block.is_some() && (sealed.is_some() || chunks.is_some()) {
+        return Err(bad(
+            "a block stands in its record unsealed, and in its ciphertext sealed; never in \
+             pieces",
+        ));
+    }
+    let elsewhere = sealed.is_some() || chunks.is_some() || block.is_some();
+    let (fields, op) = match (fields, op, elsewhere) {
         (None, None, true) => (Content::new(), Bytes::new()),
         (Some(f), Some(o), false) => (f, o),
         (_, _, true) => {
             return Err(bad(
-                "a sealed version, or one in pieces, carries its fields only there",
+                "a sealed version, one in pieces or a block carries its fields only there",
             ));
         }
         (None, _, false) => return Err(missing("fields")),
@@ -1988,6 +2342,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         op,
         sealed,
         chunks,
+        block,
     })
 }
 
@@ -2700,6 +3055,7 @@ mod tests {
                 ciphertext: Bytes::from_static(b"opaque"),
             }),
             chunks: None,
+            block: None,
         };
         assert_eq!(
             decode_record(encode_version(&body)),
@@ -2745,6 +3101,7 @@ mod tests {
             fields: Content::new(),
             op: Bytes::new(),
             sealed: None,
+            block: None,
             chunks: Some(ChunksBody {
                 size,
                 root: [1; 32],
@@ -2757,5 +3114,99 @@ mod tests {
         );
         // A terabyte claimed: a reader would reserve it whole to read it.
         assert!(decode_record(encode_version(&body(1 << 40))).is_err());
+    }
+
+    #[test]
+    fn heads_entries_ranges_and_blocks_parse_back() {
+        let d = n("/alice/sensor");
+        let c = n("/alice/32=data/temps");
+        let head = head_name(&d, &c, 9);
+        assert_eq!(parse_head_name(&head), Some((d.clone(), c.clone(), 9)));
+        assert_eq!(
+            parse_head_prefix(&head_prefix(&d, &c)),
+            Some((d.clone(), c.clone()))
+        );
+        // A head is no summary node, and a nested collection's head does not
+        // extend the discovery name of its parent's.
+        assert_eq!(parse_summary_name(&head), None);
+        let nested = head_name(&d, &n("/alice/32=data/temps/kitchen"), 3);
+        assert!(!nested.has_prefix(&head_prefix(&d, &c)));
+        assert!(!node_name(&d, &c, 9).has_prefix(&head_prefix(&d, &c)));
+
+        let v = log_name(&d, Some(&c), 4);
+        assert_eq!(parse_entry_name(&entry_name(&v, 7)), Some((v.clone(), 7)));
+        assert_eq!(parse_piece_name(&entry_name(&v, 7)), None);
+        assert_eq!(parse_log_name(&entry_name(&v, 7)), None);
+
+        for r in [
+            Range::Seqs(2, 5),
+            Range::Times(Timestamp(10), Timestamp(20)),
+        ] {
+            assert_eq!(
+                parse_range_name(&range_name(&c, &r)),
+                Some(Ok((c.clone(), r)))
+            );
+        }
+        assert_eq!(parse_range_name(&c), None);
+        // Bounds out of order are malformed, not empty.
+        assert!(matches!(
+            parse_range_name(&range_name(&c, &Range::Seqs(5, 2))),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_range_name(&range_name(&c, &Range::Times(Timestamp(9), Timestamp(9)))),
+            Some(Err(_))
+        ));
+
+        let entries = vec![
+            BlockEntryBody {
+                offset: 0,
+                fields: Content::new().with("t", &b"20.5"[..]),
+            },
+            BlockEntryBody {
+                offset: 60_000,
+                fields: Content::new().with("t", &b"20.7"[..]),
+            },
+        ];
+        let body = VersionBody {
+            collection: c.clone(),
+            parents: Frontier::new(),
+            type_id: TypeId {
+                name: n("/types/reading"),
+                revision: 1,
+            },
+            seal: Seal { any_of: Vec::new() },
+            keep: Keep::Until(Timestamp(1_000_000)),
+            dated: Timestamp(5),
+            fields: Content::new(),
+            op: Bytes::new(),
+            sealed: None,
+            chunks: None,
+            block: Some(entries.clone()),
+        };
+        assert_eq!(
+            decode_record(encode_version(&body)),
+            Ok(Record::Version(body))
+        );
+        assert_eq!(
+            decode_inline(encode_block(&entries)),
+            Ok(Inline::Block(entries.clone()))
+        );
+        // Offsets go back, or the first is not 0: refused.
+        let mut back = entries.clone();
+        back.swap(0, 1);
+        assert!(decode_inline(encode_block(&back)).is_err());
+
+        let h = HeadBody {
+            collection: c,
+            seq: 9,
+            digest: [3; 32],
+            freshness: 60_000,
+        };
+        assert_eq!(decode_head(encode_head(&h)), Ok(h));
+        assert_eq!(
+            decode_audit_answer(encode_audit_answer(&AuditAnswer::Expired)),
+            Ok(AuditAnswer::Expired)
+        );
     }
 }

@@ -16,7 +16,9 @@ use ndn_foundation_types::Name;
 use crate::collection::{Cut, Rule, Summary};
 use crate::error::DataError;
 use crate::statement::{Custody, Prune, Snapshot};
-use crate::version::{Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId};
+use crate::version::{
+    Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
+};
 
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -26,8 +28,10 @@ pub struct PutOptions {
     /// The retention chosen now, at write.
     pub keep: Keep,
     /// The delay this producer accepts so that several entries share one
-    /// signature in a block (model change M6); `None` signs the version
-    /// alone. Filled by slice 4.
+    /// signature in a block (model change M6, spec §4.1); `None` signs the
+    /// version alone. A block closes at the earliest of its entries'
+    /// arrival plus this delay, so no entry waits longer. Log and one-key
+    /// collections only. Filled by slice 4.
     pub batch: Option<Duration>,
 }
 
@@ -46,6 +50,45 @@ pub struct State {
     pub value: Content,
 }
 
+/// One entry of a block (or the one entry of a version that is no block),
+/// verified through its block's signature (spec §4.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Entry {
+    /// Its name, `<V>/32=entry/seg=<index>` ([`crate::wire::entry_name`]).
+    pub name: Name,
+    /// The block (version) carrying it.
+    pub id: VersionId,
+    /// Its 0-based index in the block.
+    pub index: u32,
+    /// Its date: the block's plus its offset. Display and indexing only.
+    pub dated: Timestamp,
+    /// The content.
+    pub content: Content,
+}
+
+/// The entries a range read (or an entry's name) found, from one key's
+/// stream (spec §5.4).
+///
+/// Complete exactly when `missing` is empty: relative to the summary node
+/// the one key's head named, every block it lists within the bounds is
+/// accounted for — read, expired here, or in pieces.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Entries {
+    /// The collection.
+    pub collection: Name,
+    /// The one key that writes it.
+    pub writer: Writer,
+    /// The entries in the bounds, in (seq, index) order, each from a block
+    /// of `writer` verified here.
+    pub entries: Vec<Entry>,
+    /// Listed blocks within the bounds that no path answered.
+    pub missing: Vec<VersionId>,
+    /// Blocks within the bounds this device knows expired.
+    pub expired: Vec<VersionId>,
+    /// Versions within the bounds that travel in pieces: read them by name.
+    pub large: Vec<VersionId>,
+}
+
 /// What a [`get`](DataLayer::get) found.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Got {
@@ -56,6 +99,10 @@ pub enum Got {
     State(State),
     /// A snapshot, asked by its name.
     Snapshot(Snapshot),
+    /// Entries of a one-key collection's blocks: a range read
+    /// (`<C>/32=range/<R>`, [`crate::wire::range_name`]), or one entry by
+    /// its name. Filled by slice 4.
+    Entries(Entries),
 }
 
 /// How old an answer may be (model invariant 5, "stale, never wrong").
@@ -108,6 +155,15 @@ pub enum Change {
         id: VersionId,
         /// The prune record that covers it.
         by: Prune,
+    },
+    /// A version delivered earlier expired by this device's clock (spec
+    /// §14.1): the device dropped it, and a `get` of it answers
+    /// [`DataError::Expired`]. Filled by slice 4.
+    Expired {
+        /// The version.
+        id: VersionId,
+        /// Its keep.
+        keep: Keep,
     },
     /// Two different versions with one `(writer, seq)`: evidence against that
     /// key (model invariant 2). Readers keep both and report.

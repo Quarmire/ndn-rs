@@ -4905,6 +4905,10 @@ impl Inner {
             Some((_, Some(AuditAnswer::RefusedBy(w)))) => {
                 self.excused_by_members(c, piece, w).await
             }
+            // Dropped by the holder's own clock: never evidence, so an
+            // honest holder is not framed by an auditor whose clock is
+            // behind (spec §14.1).
+            Some((_, Some(AuditAnswer::Expired))) => Asked::Unanswered,
             Some(_) => Asked::Breach(Breach::Wrong),
         }
     }
@@ -5082,6 +5086,9 @@ impl Inner {
                 return Err(format!(
                     "{holder} keeps none of it, naming a record that ends it"
                 ));
+            }
+            Some(AuditAnswer::Expired) => {
+                return Err(format!("{holder} dropped it as expired by its clock"));
             }
             _ => return Err(format!("{holder} signed an answer that is no proof")),
         };
@@ -5479,6 +5486,7 @@ impl DataLayer for Device {
                 op: op.clone(),
                 sealed,
                 chunks,
+                block: None,
             };
             let wire = inner.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
             st.head = seq;
@@ -5553,6 +5561,17 @@ impl DataLayer for Device {
                 Got::State(s) => s.name,
                 Got::Version(v) => v.name,
                 Got::Snapshot(s) => s.name,
+                // An entry's name is immutable, so it pins as it is; a
+                // range read's answer grows with the stream.
+                Got::Entries(_) if wire::parse_entry_name(name).is_some() => name.clone(),
+                Got::Entries(_) => {
+                    return Err(DataError::BadRequest {
+                        name: name.clone(),
+                        why: "a range read's answer grows with its stream, so a snapshot cannot \
+                              pin it; pin the blocks it read, by their names"
+                            .into(),
+                    });
+                }
             };
             pins.push(pin);
         }
@@ -6233,6 +6252,7 @@ mod tests {
             op: Bytes::new(),
             sealed,
             chunks: None,
+            block: None,
         }
     }
 

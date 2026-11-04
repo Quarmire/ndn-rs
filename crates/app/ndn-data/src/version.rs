@@ -197,21 +197,33 @@ impl Content {
     }
 }
 
+/// One small entry of a block (model change M6, spec §4.1): its date (the
+/// block's `dated` plus the entry's offset) and its content.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlockEntry {
+    /// When its writer took it; display and indexing only.
+    pub dated: Timestamp,
+    /// The content.
+    pub content: Content,
+}
+
 /// What a version carries: one entry, a block of many small entries under
 /// one signature, or a large entry carried in pieces.
 ///
-/// A block carries a digest per entry so each entry verifies on its own; the
-/// producer states the delay it accepts to fill one (model change M6). Blocks
-/// are filled by slice 4.
+/// A block's entries travel inside the block's own signed packet, so each
+/// entry verifies on its own exactly through the block's signature; the
+/// producer states the delay it accepts to fill one (model change M6,
+/// [`PutOptions::batch`](crate::PutOptions::batch)). Filled by slice 4.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Payload {
     /// A single entry.
     Entry(Content),
-    /// Several entries under one signature, in order.
-    Block(Vec<Content>),
+    /// Several entries under one signature, in order, their dates
+    /// non-decreasing; the first is dated the version's `dated`.
+    Block(Vec<BlockEntry>),
     /// A single entry too large to carry in the version's own packet: it
     /// travels in pieces, each verified against the version's signed
-    /// manifest (spec §4.1). Listing and watching report its size; a `get`
+    /// manifest (spec §13.1). Listing and watching report its size; a `get`
     /// of the version's name reads it whole, as an [`Entry`](Self::Entry).
     Large {
         /// The payload's octets, as carried (sealed: the ciphertext's).

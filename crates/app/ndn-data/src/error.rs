@@ -10,7 +10,7 @@ use ndn_foundation_types::Name;
 
 use crate::collection::Cut;
 use crate::statement::Prune;
-use crate::version::{VersionId, Writer};
+use crate::version::{Keep, VersionId, Writer};
 
 /// What the caller can do about an error, by class. A host words the step
 /// itself.
@@ -153,6 +153,15 @@ pub enum DataError {
         /// The prune record that covers it.
         by: Prune,
     },
+    /// The data's keep passed by this device's clock (spec §14.1): it
+    /// dropped it and keeps none of it, whoever else may still hold it.
+    #[error("{name} expired: its keep {keep:?} passed by this device's clock")]
+    Expired {
+        /// The name asked for.
+        name: Name,
+        /// The keep its writer chose.
+        keep: Keep,
+    },
     /// The version is refused.
     #[error("version {} of {} is refused: {why}", id.seq.0, id.writer.key())]
     Refused {
@@ -256,7 +265,9 @@ impl DataError {
     pub fn next(&self) -> NextStep {
         match self {
             DataError::Unavailable { .. } => NextStep::RetryLater,
-            DataError::NotFound { .. } | DataError::Pruned { .. } => NextStep::None,
+            DataError::NotFound { .. } | DataError::Pruned { .. } | DataError::Expired { .. } => {
+                NextStep::None
+            }
             DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_) | Refusal::NotMember => NextStep::AskOwner,
