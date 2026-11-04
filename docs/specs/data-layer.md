@@ -220,6 +220,11 @@ change M6).
 - `batch` on a merge collection answers `BadRequest` (next step
   `FixRequest`: a merge collection carries one operation per version; put
   without batch).
+- `batch` is at most a day (`BATCH_MAX`): an entry waits unsigned no
+  longer, and a one-key head states the delay as the `Freshness` every
+  reader adds to an answer's age (§5.3). A longer one answers `BadRequest`
+  (next step `FixRequest`: put with a batch of at most a day, or without
+  batch), before anything is written.
 - A single-entry version reads, wherever entries are listed (§5.4), as one
   entry: index 0, dated its `Dated`.
 
@@ -1339,8 +1344,9 @@ that names the slice.
   not of the audience, `Unavailable` when no device granted the key.
   With `batch = d` in a log or one-key collection it puts the entry into
   the open block and returns once that block is signed, at most `d` later,
-  with the block's id (§4.1); in a merge collection, `BadRequest` (next
-  step `FixRequest`: put without batch).
+  with the block's id (§4.1); in a merge collection, or with `d` longer
+  than a day, `BadRequest` (next step `FixRequest`: put without batch, or
+  with a batch of at most a day).
 - **`watch(C, since F)`** reports every held version of `C` (or of the
   collections under folder `C`, which may be `<O>/32=data`) outside `F`,
   then every version applied later, the summaries of §7, each outside `F`,

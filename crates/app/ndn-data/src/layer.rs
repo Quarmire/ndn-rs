@@ -20,6 +20,12 @@ use crate::version::{
     Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
 };
 
+/// The longest batch delay a [`put`](DataLayer::put) accepts (spec §4.1):
+/// an entry waits unsigned at most this long, and a one-key head states its
+/// writer's delay as the freshness readers add to every answer's age
+/// (spec §5.3). A day.
+pub const BATCH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PutOptions {
@@ -31,7 +37,7 @@ pub struct PutOptions {
     /// signature in a block (model change M6, spec §4.1); `None` signs the
     /// version alone. A block closes at the earliest of its entries'
     /// arrival plus this delay, so no entry waits longer. Log and one-key
-    /// collections only.
+    /// collections only; at most [`BATCH_MAX`].
     pub batch: Option<Duration>,
 }
 

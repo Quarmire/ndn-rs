@@ -57,7 +57,8 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::collection::{Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{
-    Age, Answer, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions, State,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions,
+    State,
 };
 use crate::merge::{MergeRule, MergeRules, MergeState};
 use crate::pieces::{self, Shape};
@@ -3941,7 +3942,9 @@ impl Inner {
     /// from its, or when the entry would make its `Block` encoding exceed
     /// [`wire::INLINE_MAX`]. The receiver of the block's id once signed;
     /// whether a block closed; and the deadline to arm a timer for, when
-    /// this entry moves the block's close earlier (its arrival plus `delay`).
+    /// this entry moves the block's close earlier (`deadline`: its arrival
+    /// plus `delay`, the caller's to compute, as only it can refuse one the
+    /// clock cannot hold).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn add_to_block(
@@ -3953,6 +3956,7 @@ impl Inner {
         keep: Keep,
         epoch: Option<Epoch>,
         delay: Duration,
+        deadline: Instant,
     ) -> (
         oneshot::Receiver<Result<VersionId, DataError>>,
         bool,
@@ -3973,7 +3977,6 @@ impl Inner {
             }
         }
         let (tx, rx) = oneshot::channel();
-        let deadline = Instant::now() + delay;
         let arm = match st.open.get_mut(c) {
             Some(open) => {
                 open.entries.push(BlockEntryBody {
@@ -7228,6 +7231,16 @@ impl DataLayer for Device {
     ) -> Result<VersionId, DataError> {
         let inner = &self.inner;
         check_collection(collection)?;
+        if let Some(delay) = options.batch.filter(|d| *d > BATCH_MAX) {
+            return Err(DataError::BadRequest {
+                name: collection.clone(),
+                why: format!(
+                    "a batch delay of {delay:?} is longer than the {BATCH_MAX:?} an entry may wait \
+                     unsigned (a one-key head states it as the freshness readers add to every \
+                     answer's age); put with a batch of at most {BATCH_MAX:?}, or without batch"
+                ),
+            });
+        }
         let ns = namespace_of(collection).expect("checked above");
         inner.look(collection).await?;
         if ns != inner.ns {
@@ -7294,9 +7307,19 @@ impl DataLayer for Device {
                     });
                 }
                 Some(delay) if !alone(&content) => {
+                    let Some(deadline) = Instant::now().checked_add(delay) else {
+                        return Err(DataError::BadRequest {
+                            name: collection.clone(),
+                            why: format!(
+                                "this device's clock cannot hold a deadline {delay:?} from now; \
+                                 put with a shorter batch, or without batch"
+                            ),
+                        });
+                    };
                     let epoch = key.as_ref().map(|(e, _)| e.clone());
-                    let (rx, closed, arm) = inner
-                        .add_to_block(&mut st, collection, content, type_id, keep, epoch, delay);
+                    let (rx, closed, arm) = inner.add_to_block(
+                        &mut st, collection, content, type_id, keep, epoch, delay, deadline,
+                    );
                     Err((rx, arm, closed))
                 }
                 _ => {
@@ -9814,6 +9837,31 @@ mod tests {
         let v = &st.colls[&c].versions[&second].version;
         assert!(matches!(&v.payload, Payload::Block(e) if e.len() == 2));
         drop(st);
+        dev.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_batch_delay_beyond_the_maximum_is_refused_saying_how() {
+        let sensor = n("/sam/sensor");
+        let clock = Arc::new(AtomicU64::new(100));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = device_at(&sensor, &keys_of(&sensor), &store, &clock).await;
+        let c = n("/sam/32=data/temps");
+        dev.share(&c, share_of(Rule::OneKey, &["/sam/sensor"], Vec::new()))
+            .await
+            .unwrap();
+        for batch in [BATCH_MAX + Duration::from_millis(1), Duration::MAX] {
+            let Err(e @ DataError::BadRequest { .. }) =
+                dev.put(&c, reading(1), options(Some(batch))).await
+            else {
+                panic!("a batch of {batch:?} is refused");
+            };
+            assert_eq!(e.next(), crate::NextStep::FixRequest);
+        }
+        // Nothing was left half done: the device still writes.
+        dev.put(&c, reading(2), options(None))
+            .await
+            .expect("a put after a refused one");
         dev.shutdown();
     }
 
