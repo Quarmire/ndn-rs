@@ -5180,6 +5180,22 @@ impl Inner {
                 }
             }
         };
+        // Blocks this device dropped as expired are no longer listed by the
+        // writer's node (listing by keep), yet a range read reports them in
+        // `expired`: their tombstones place them by seq and by dates.
+        let seqs: Vec<u64> = {
+            let st = self.st.lock();
+            let mut all: BTreeSet<u64> = seqs.into_iter().collect();
+            if let Some(known) = st.colls.get(c).and_then(|x| x.entries.get(&key)) {
+                all.extend(known.iter().copied().filter(|s| {
+                    matches!(
+                        st.held.get(&log_name(&device, Some(c), *s)),
+                        Some(Held::Expired(_))
+                    )
+                }));
+            }
+            all.into_iter().collect()
+        };
         let mut probes: HashMap<u64, Probe> = HashMap::new();
         let picked: Vec<u64> = match range {
             Range::Seqs(lo, hi) => seqs.into_iter().filter(|s| (lo..=hi).contains(s)).collect(),

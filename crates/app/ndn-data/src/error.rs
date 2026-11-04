@@ -172,7 +172,10 @@ pub enum DataError {
         why: Refusal,
     },
     /// This device's key may not write into the collection.
-    #[error("{writer:?} may not write into {collection}")]
+    #[error(
+        "the key {} may not write into {collection}; ask its owner to add it as a writer",
+        writer.key()
+    )]
     NotAllowed {
         /// The collection.
         collection: Name,
