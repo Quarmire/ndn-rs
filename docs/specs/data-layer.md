@@ -432,14 +432,27 @@ state for it and says so.
   state of `C` under any other rule, `/merge/yrs` included.
 
 **The rule interface — slice 6.** A rule makes, per merge collection, a
-state for the local writer (ndn-data: `MergeRule::start`, `MergeState`).
-The layer hands the state each operation as an `Op`: the version's id
+state for the local writer (ndn-data: `MergeRule::start(collection,
+local)`, `MergeState`); the layer passes the collection's name, so the
+state knows whose collection it is. The layer hands the state each
+operation as an `Op`: the version's id
 `(w, s)` — its writer, one key, and its seq —, the implicit digest of its
 packet (SHA-256 of the whole Data packet: the version's content address),
 its parents, its **past** and the `MergeOp` octets. The past is exactly
 `down(P(v))` (§5.2): the rule asks it whether a version id lies inside it,
 and which version of `C` inside it, held here, has a given implicit digest.
 
+- **Owners** (ndn-data: `merge::owns(collection, writer)`). A writer `w`
+  (key `<D>/KEY/<k>`) is an **owner device** of `C` exactly when `D` lies
+  under `C`'s namespace, the components before its marker (§3). It depends
+  on the two names alone, so every member answers alike in any order; the
+  layer's owner rule (§3) asks this same test, together with the trust
+  context governing the record. A device of a longer held namespace (§3:
+  a `/home/bob` device for `/home/32=data/x`) is not distinguishable from
+  names alone: `owns` answers the name half — what a reader holding `C`'s
+  namespace and none longer under it concludes. A revoked owner device,
+  or one outside a cut, needs no handling by a rule: its versions refused
+  by their key never reach apply (§5.2, §8).
 - **Edit** (`put` with fields) makes the local writer's edit into an
   operation; the layer then checks and applies that operation as any other.
   A rule whose edit already changed its state MUST make that apply
@@ -474,11 +487,23 @@ and which version of `C` inside it, held here, has a given implicit digest.
   for good (`Refusal::OtherRule`, next step `None`: its writer, once it has
   the record naming the new rule, writes the change again under it). A
   stale writer's operation is never read under a rule it was not made for.
-- **Now counted** lists the versions it answered not counted that count
-  since it was last asked; the layer asks after every apply.
+- **Counting is a function of the applied set.** Whether a version
+  counts MUST be a pure function of the set of versions of `C` that passed
+  check and were applied (each with its past), never of their arrival
+  order: two devices holding the same applied set count the same versions,
+  with the same reasons. As the set grows a version's counting may start
+  or stop (a lock arriving after a write made apart from it). **Counting
+  changed** (ndn-data: `counting_changed`) lists, since it was last asked,
+  every applied version other than the one just applied whose counting
+  changed, with how it counts now; the layer asks after every apply and
+  tells each change (`Change::Counted`, `Change::NotCounted` with the
+  rule's reason unchanged), and the state's `not_counted` follows.
 - **Value** is the merged value, typed by the rule: named fields (what
   `/merge/yrs` merges into), or the rule's own encoding, which the program
-  defining the rule decodes.
+  defining the rule decodes. The layer passes the applied versions it holds
+  back (members of a group waiting on another member, §5.5); the value
+  leaves them out, while the rule's counting of every version still sees
+  them (the layer's holding back never feeds back into the rule).
 - **Determinism.** The layer applies parents first (§5.2), and versions
   concurrent to each other arrive in different orders on different
   devices. A rule MUST answer the same value, the same versions not counted
@@ -883,11 +908,18 @@ in any arrival order.
   never counts.
 - A device holding a member of an incomplete group follows the member's
   folder (its parent name, §12), so that the others arrive.
-- A rule's not counted on one member does not hold the others back: they
-  count, and that member is shown not counted (§5.2); so does a member
-  whose apply fails. A rule that must keep a whole group out refuses its
-  member in its check, from the operation and its past, which refuses the
-  group.
+- **A group counts only while every member counts.** While a member
+  applied here is not counted — its rule's answer, or an apply that failed
+  — every other applied member is not counted either: applied (later
+  versions do not wait for it), held, shown, left out of its collection's
+  value and newest, and reported not counted with the reason "group
+  waiting on `<member>`: `<that member's reason>`", naming the first such
+  member by seq. A member its rule does not count keeps its own reason.
+  When every member counts, every member is reported counted. The rule
+  computes counting over the whole applied set, waiting groups included,
+  and the layer's holding back never feeds back into it, so the judgement
+  is one pass and the same at every reader in any order. Refusal for good
+  still withdraws the group (above).
 - Groups work in merge, log and one-key collections alike: counted means
   applied, delivered, and a candidate for the newest.
 
@@ -3347,14 +3379,23 @@ The slice-6 cases are b1 (a custom rule on two devices: both compute the
 same rule-typed value; a third device without the rule holds every version
 and reports the collection unreadable, `RuleUnknown`, computing nothing),
 b2 (an operation whose basis lies outside its causal past is refused at
-every reader, and later versions do not wait for it), b3 (a version the
-rule does not count is kept, shown with why, and later reported counted),
+every reader, and later versions do not wait for it), b3 (a non-owner's
+edit of a setting the owner locked, made with the lock in view, is kept
+and shown with why and never counts, even once unlocked), b6 (two owner
+devices: a lock set from one holds for the other, whose own later write
+counts; a non-owner's edit made with the lock in view is not counted on
+every member; one made apart from the lock waits and counts once an owner
+writes over it), b7 (a write and a lock concurrent to it, received in
+either order, give the same counting on every member: counting stops when
+the lock arrives after the write, and starts on unlock),
 b4 (a 20 KiB operation and a 100 KiB checkpoint in one merge collection,
 in pieces, read and applied at another device; versions the checkpoint
 covers are not fetched), b5 (releasing merge pieces without a covering
 checkpoint proved held by audited holders is refused, saying why), g1 (a
 group counted all or none on arrival, and withdrawn whole when one member
-is refused), g2 (`put_group` refuses a group that could not complete,
+is refused), g6 (a group with one member under a lock waits whole, each
+other member not counted with a reason naming that member and its
+reason, then counts whole once unlocked), g2 (`put_group` refuses a group that could not complete,
 writing nothing), g3 (a group judged the same at every reader despite a
 concurrent narrowing of one of its collections), g4 (a copy of a
 writer's device signs seqs it already used in other collections: entries
