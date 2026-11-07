@@ -13,7 +13,7 @@
 //! rule ([`DataError::RuleUnknown`](crate::DataError::RuleUnknown)). This
 //! module ships one: [`Yrs`], named `/merge/yrs`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -60,7 +60,8 @@ pub enum Counting {
     Counted,
     /// Applied (inside the state's frontier, so later versions do not wait
     /// for it), stored and shown, but not in the value, for this reason. The
-    /// rule may count it later ([`MergeState::now_counted`]).
+    /// rule may count it later, as it may stop counting a version it counted
+    /// ([`MergeState::counting_changed`]).
     NotCounted(String),
 }
 
@@ -113,8 +114,34 @@ pub trait MergeRule: Send + Sync {
     /// never by prefix. A change of meaning is a new name.
     fn function(&self) -> &Name;
 
-    /// An empty state, in which `local` (this device's writer) may edit.
-    fn start(&self, local: &Writer) -> Box<dyn MergeState>;
+    /// An empty state of `collection`, in which `local` (this device's
+    /// writer) may edit. The collection's name says whose it is: its owner
+    /// devices are those [`owns`] answers for.
+    fn start(&self, collection: &Name, local: &Writer) -> Box<dyn MergeState>;
+}
+
+/// Whether `writer` is an owner device of `collection`: its device — the
+/// key name `<D>/KEY/<key-id>` without `KEY/<key-id>` — lies under the
+/// collection's namespace, the components before its `32=data` marker
+/// (spec §3). Alice's laptop and phone both own `/alice/32=data/notes`;
+/// Bob's laptop does not. It depends on the two names alone, never on what
+/// a device holds, so every member judges a writer alike in any arrival
+/// order; the layer judges its owner rule by this same test.
+///
+/// The owner rule also asks which held trust context governs the device:
+/// a device of a longer namespace held beside the collection's (a
+/// `/home/bob` device, for `/home/32=data/x`) is that namespace's device,
+/// not an owner. Names alone cannot tell that, and a rule's answer may not
+/// depend on the contexts one member holds, so `owns` answers the name
+/// half: whether `D` lies under the namespace — what a reader holding the
+/// collection's namespace and no longer one under it concludes.
+///
+/// A revoked owner device, or one outside a cut, needs no handling here:
+/// its versions the layer refuses never reach [`MergeState::apply`].
+pub fn owns(collection: &Name, writer: &Writer) -> bool {
+    let key = writer.key();
+    crate::wire::device_len(key)
+        .is_some_and(|n| crate::wire::device_owns(collection, &key.components()[..n]))
 }
 
 /// One collection's state under a merge rule.
@@ -143,12 +170,15 @@ pub trait MergeState: Send {
     /// its writer's earlier ones and its parents (an edit), or once every
     /// version of its past is held (a checkpoint). `NotCounted`: stored,
     /// shown, not in the value — what an exclusion that depends on the
-    /// state (on other writers' versions) answers; the rule may count it
-    /// later. Err: it does not apply to the state met here; the state MUST
-    /// be left unchanged, and the layer keeps the version applied and not
-    /// counted with this reason (never refused: the state is others' doing,
-    /// so nothing apply answers withdraws a version or its group). An own
-    /// operation that errs is not written.
+    /// state (on other writers' versions) answers. Whether a version counts
+    /// MUST be a function of the set of versions applied (each with its
+    /// past), never of the order they arrived in: two states holding the
+    /// same applied versions count the same ones. Err: it does not apply to
+    /// the state met here; the state MUST be left unchanged, and the layer
+    /// keeps the version applied and not counted with this reason (never
+    /// refused: the state is others' doing, so nothing apply answers
+    /// withdraws a version or its group). An own operation that errs is not
+    /// written.
     ///
     /// A checkpoint's application yields the state of its past and itself,
     /// plus whatever concurrent versions were applied, whichever subset of
@@ -156,14 +186,22 @@ pub trait MergeState: Send {
     /// parents is held here as the very packet it names (spec §5.2).
     fn apply(&mut self, op: &Op<'_>) -> Result<Counting, MergeError>;
 
-    /// Versions earlier answered `NotCounted` that now count, since last
-    /// asked. The layer asks after every apply.
-    fn now_counted(&mut self) -> Vec<VersionId> {
+    /// The applied versions, other than the one `apply` just answered for,
+    /// whose counting changed since last asked, each with how it counts
+    /// now: `Counted` for one that starts counting, `NotCounted` with why
+    /// for one that stops, or whose reason changed. Counting moves both
+    /// ways as the applied set grows (a lock arriving after a write made
+    /// apart from it). The layer asks after every apply and tells the
+    /// watchers each change.
+    fn counting_changed(&mut self) -> Vec<(VersionId, Counting)> {
         Vec::new()
     }
 
-    /// The merged value.
-    fn value(&self) -> Value;
+    /// The merged value, leaving out `excluded`: applied versions the
+    /// layer holds back (members of a group waiting on another member,
+    /// spec §5.5). They stay applied — the rule's counting of every other
+    /// version still sees them — and are only kept out of what is shown.
+    fn value(&self, excluded: &BTreeSet<VersionId>) -> Value;
 }
 
 /// The merge rules a device knows, by function name.
@@ -208,6 +246,13 @@ impl std::fmt::Debug for MergeRules {
 /// content under its writer's client id, and may place its items against,
 /// and delete, only content inside its past: for each other client, below
 /// the clock that client's writer had reached in the operation's past.
+///
+/// Every operation counts. The state keeps each applied update, so that it
+/// can show the value without the versions the layer holds back
+/// ([`MergeState::value`]): those are left out by integrating every other
+/// update into a document of its own, in which an update placed against
+/// content left out is not integrated either (Yjs integrates an update only
+/// once what it builds on is there).
 pub struct Yrs {
     function: Name,
 }
@@ -242,13 +287,14 @@ impl MergeRule for Yrs {
         &self.function
     }
 
-    fn start(&self, local: &Writer) -> Box<dyn MergeState> {
+    fn start(&self, _collection: &Name, local: &Writer) -> Box<dyn MergeState> {
         let doc = yrs::Doc::with_client_id(yrs_client(local));
         let fields = doc.get_or_insert_map(FIELDS);
         Box::new(YrsState {
             doc,
             fields,
             clocks: HashMap::new(),
+            updates: Vec::new(),
         })
     }
 }
@@ -260,6 +306,9 @@ struct YrsState {
     /// that writer's versions applied, by seq: what an operation's past
     /// holds of each client.
     clocks: HashMap<u64, (Writer, BTreeMap<u64, u32>)>,
+    /// Each applied version's update, in the order applied: what the value
+    /// without held-back versions is made from.
+    updates: Vec<(VersionId, Bytes)>,
 }
 
 /// What a Yjs update reaches, read as yrs reads it (lib0 v1): the clock
@@ -387,6 +436,8 @@ impl MergeState for YrsState {
             .or_insert_with(|| (op.id.writer.clone(), BTreeMap::new()))
             .1
             .insert(op.id.seq.0, clock);
+        self.updates
+            .push((op.id.clone(), Bytes::copy_from_slice(op.bytes)));
         Ok(Counting::Counted)
     }
 
@@ -424,22 +475,45 @@ impl MergeState for YrsState {
         Ok(OpKind::Edit)
     }
 
-    fn value(&self) -> Value {
-        use yrs::{Map, Out, Transact};
-        let txn = self.doc.transact();
-        let mut c = Content::new();
-        for (name, value) in self.fields.iter(&txn) {
-            let bytes = match value {
-                Out::Any(yrs::Any::Buffer(b)) => Bytes::copy_from_slice(&b),
-                Out::Any(yrs::Any::String(s)) => Bytes::copy_from_slice(s.as_bytes()),
-                // A Yjs peer may store other shapes; they are not fields of
-                // this layer's content and are kept in the document untouched.
-                _ => continue,
-            };
-            c = c.with(name, bytes);
+    fn value(&self, excluded: &BTreeSet<VersionId>) -> Value {
+        use yrs::Transact;
+        use yrs::updates::decoder::Decode;
+        if excluded.is_empty() || !self.updates.iter().any(|(id, _)| excluded.contains(id)) {
+            return fields_of(&self.doc, &self.fields);
         }
-        Value::Fields(c)
+        // Every update but those held back, into a document of its own.
+        let doc = yrs::Doc::new();
+        let fields = doc.get_or_insert_map(FIELDS);
+        {
+            let mut txn = doc.transact_mut();
+            for (_, bytes) in self.updates.iter().filter(|(id, _)| !excluded.contains(id)) {
+                // Each applied to the live document once, so each decodes
+                // and applies here too; one that does not is left out.
+                if let Ok(update) = yrs::Update::decode_v1(bytes) {
+                    let _ = txn.apply_update(update);
+                }
+            }
+        }
+        fields_of(&doc, &fields)
     }
+}
+
+/// The fields `fields`, the root map of `doc`, holds.
+fn fields_of(doc: &yrs::Doc, fields: &yrs::MapRef) -> Value {
+    use yrs::{Map, Out, Transact};
+    let txn = doc.transact();
+    let mut c = Content::new();
+    for (name, value) in fields.iter(&txn) {
+        let bytes = match value {
+            Out::Any(yrs::Any::Buffer(b)) => Bytes::copy_from_slice(&b),
+            Out::Any(yrs::Any::String(s)) => Bytes::copy_from_slice(s.as_bytes()),
+            // A Yjs peer may store other shapes; they are not fields of
+            // this layer's content and are kept in the document untouched.
+            _ => continue,
+        };
+        c = c.with(name, bytes);
+    }
+    Value::Fields(c)
 }
 
 #[cfg(test)]
@@ -485,35 +559,42 @@ mod tests {
         }
     }
 
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn concurrent_edits_merge_alike_in_any_order() {
         let (laptop, phone) = (w("/alice/laptop/KEY/1"), w("/alice/phone/KEY/1"));
+        let c = n("/alice/32=data/trip");
         let none = Frontier::new();
+        let shown = BTreeSet::new();
         let rule = Yrs::new();
-        let mut a = rule.start(&laptop);
+        let mut a = rule.start(&c, &laptop);
         let base = a
             .edit(&text(&[("text", "day 1"), ("tags", "trip")]))
             .unwrap();
         let base_id = id(&laptop, 1);
         // Applying its own edit again changes nothing.
-        let before = a.value();
+        let before = a.value(&shown);
         assert_eq!(
             a.apply(&op(&base_id, &base, &none)).unwrap(),
             Counting::Counted
         );
-        assert_eq!(a.value(), before);
-        let mut b = rule.start(&phone);
+        assert_eq!(a.value(&shown), before);
+        let mut b = rule.start(&c, &phone);
         b.apply(&op(&base_id, &base, &none)).unwrap();
         let plane = a.edit(&text(&[("text", "on the plane")])).unwrap();
         let taxi = b
             .edit(&text(&[("text", "in the taxi"), ("tags", "")]))
             .unwrap();
         let (plane_id, taxi_id) = (id(&laptop, 2), id(&phone, 1));
+        a.apply(&op(&plane_id, &plane, &none)).unwrap();
         a.apply(&op(&taxi_id, &taxi, &none)).unwrap();
         b.apply(&op(&plane_id, &plane, &none)).unwrap();
-        assert_eq!(a.value(), b.value());
+        assert_eq!(a.value(&shown), b.value(&shown));
         assert_eq!(
-            a.value().fields().and_then(|f| f.get("tags")),
+            a.value(&shown).fields().and_then(|f| f.get("tags")),
             None,
             "the phone removed the tags"
         );
@@ -526,5 +607,73 @@ mod tests {
             a.check(&op(&id(&laptop, 3), &taxi, &over_base)).is_err(),
             "an op is its writer's own"
         );
+    }
+
+    /// A version the layer holds back stays applied and out of the value,
+    /// on every state alike, and is shown again once it is not held back.
+    #[test]
+    fn a_held_back_version_is_left_out_of_the_value_alike() {
+        let (laptop, phone) = (w("/alice/laptop/KEY/1"), w("/alice/phone/KEY/1"));
+        let c = n("/alice/32=data/trip");
+        let none = Frontier::new();
+        let rule = Yrs::new();
+        let mut a = rule.start(&c, &laptop);
+        let base = a.edit(&text(&[("text", "day 1")])).unwrap();
+        let base_id = id(&laptop, 1);
+        a.apply(&op(&base_id, &base, &none)).unwrap();
+        let mut b = rule.start(&c, &phone);
+        b.apply(&op(&base_id, &base, &none)).unwrap();
+        let tags = b.edit(&text(&[("tags", "trip")])).unwrap();
+        let tags_id = id(&phone, 1);
+        b.apply(&op(&tags_id, &tags, &none)).unwrap();
+        a.apply(&op(&tags_id, &tags, &none)).unwrap();
+        let held: BTreeSet<VersionId> = [tags_id.clone()].into();
+        let without = a.value(&held);
+        assert_eq!(without, b.value(&held));
+        assert_eq!(without.fields().and_then(|f| f.get("tags")), None);
+        assert!(without.fields().and_then(|f| f.get("text")).is_some());
+        assert!(
+            a.value(&BTreeSet::new())
+                .fields()
+                .and_then(|f| f.get("tags"))
+                .is_some(),
+            "held back is not dropped"
+        );
+    }
+
+    #[test]
+    fn owns_is_a_device_of_the_collections_namespace() {
+        let notes = n("/alice/32=data/notes/p1");
+        // Every device of the namespace owns it, the namespace's own key too.
+        for key in [
+            "/alice/laptop/KEY/1",
+            "/alice/phone/KEY/7",
+            "/alice/member/tablet/KEY/2",
+            "/alice/KEY/1",
+        ] {
+            assert!(owns(&notes, &w(key)), "{key} owns {notes}");
+        }
+        // Another namespace's device, one whose name only starts alike, and
+        // a name that is no key name do not.
+        for key in [
+            "/bob/laptop/KEY/1",
+            "/alicia/laptop/KEY/1",
+            "/alice/laptop",
+            "/alice/laptop/KEY",
+        ] {
+            assert!(!owns(&notes, &w(key)), "{key} does not own {notes}");
+        }
+        // The namespace ends at the marker, however many components it has:
+        // the folder and every collection under it alike.
+        let home = n("/home/bob/32=data/x");
+        assert!(owns(&home, &w("/home/bob/member/laptop/KEY/1")));
+        assert!(!owns(&home, &w("/home/member/hub/KEY/1")));
+        assert!(owns(
+            &n("/home/32=data/x"),
+            &w("/home/bob/member/laptop/KEY/1")
+        ));
+        assert!(owns(&n("/alice/32=data"), &w("/alice/laptop/KEY/1")));
+        // A name that is no data name has no owner.
+        assert!(!owns(&n("/alice/notes"), &w("/alice/laptop/KEY/1")));
     }
 }

@@ -54,7 +54,8 @@ async fn a_state_another_writer_made_never_refuses_a_version_nor_withdraws_its_g
     };
     // Carol notes "a" first; Bob's group claims "a" in the plan and adds
     // "b" to the budget. His claim meets a state Carol made: it does not
-    // count, and refuses nothing of his.
+    // count, and refuses nothing of his; his group waits on it whole,
+    // withdrawn nowhere.
     let carol = made_in(
         &plan,
         "/carol/laptop",
@@ -67,16 +68,21 @@ async fn a_state_another_writer_made_never_refuses_a_version_nor_withdraws_its_g
         give(&dev, m);
     }
     assert!(
-        notes_of(&dev, &budget).await.contains(&"b".to_owned()),
-        "the group's other member counts"
+        !notes_of(&dev, &budget).await.contains(&"b".to_owned()),
+        "the group's other member waits with it"
     );
     let st = dev.inner.st.lock();
     assert!(
-        !st.refused.contains_key(&claim.name),
+        !st.refused.contains_key(&claim.name) && !st.refused.contains_key(&other.name),
         "{:?}",
         st.refused.get(&claim.name)
     );
     assert!(st.colls[&plan].not_counted.contains_key(&claim.id()));
+    let waits = &st.colls[&budget].group_held[&other.id()].1;
+    assert!(
+        st.colls[&budget].at().contains(&other.id()) && waits.contains(&claim.name.to_string()),
+        "applied, held back by its group, naming the member it waits on: {waits:?}"
+    );
     drop(st);
     dev.shutdown();
 }
@@ -300,7 +306,7 @@ async fn a_yjs_update_reaching_outside_its_past_is_refused() {
             .state
             .as_ref()
             .unwrap()
-            .value()
+            .value(&BTreeSet::new())
             .fields()
             .unwrap()
             .get("a")

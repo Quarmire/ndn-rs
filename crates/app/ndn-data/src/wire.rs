@@ -469,12 +469,27 @@ pub fn subject_namespace(subject: &Name) -> Option<Name> {
 
 /// The device a key belongs to: the key name without `KEY/<key-id>`.
 pub fn device_of(key: &Name) -> Option<Name> {
+    device_len(key).map(|n| name_of(&key.components()[..n]))
+}
+
+/// How many leading components of key name `key` (`<D>/KEY/<key-id>`) name
+/// its device `D`; `None` for a name that is no key name.
+pub(crate) fn device_len(key: &Name) -> Option<usize> {
     let comps = key.components();
-    let n = comps.len();
-    (n >= 3
-        && comps[n - 2].typ == tlv_type::GENERIC_NAME_COMPONENT
-        && comps[n - 2].value.as_ref() == b"KEY")
-        .then(|| name_of(&comps[..n - 2]))
+    let d = comps.len().checked_sub(2)?;
+    (d >= 1
+        && comps[d].typ == tlv_type::GENERIC_NAME_COMPONENT
+        && comps[d].value.as_ref() == b"KEY")
+        .then_some(d)
+}
+
+/// Whether the device named by `device` lies under the namespace of
+/// `collection` (the components before its `32=data` marker): the name
+/// half of the owner rule (spec §3), shared by the layer's judgement of
+/// members and hold records and by [`crate::merge::owns`].
+pub(crate) fn device_owns(collection: &Name, device: &[NameComponent]) -> bool {
+    data_marker(collection)
+        .is_ok_and(|at| device.len() >= at && device[..at] == collection.components()[..at])
 }
 
 /// A log entry's name: `<device>/32=log[/<subject>]/seq=<seq>`.

@@ -83,7 +83,7 @@ pub use layer::{
     PutOptions, Share, State,
 };
 pub use merge::{
-    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
+    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs, owns,
 };
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};

@@ -417,6 +417,96 @@ async fn an_edit_made_over_a_withdrawn_member_by_its_digest_stays_counted() {
     dev.shutdown();
 }
 
+/// The state of merge collection `c` at `dev`.
+async fn state_of(dev: &Device, c: &Name) -> State {
+    match dev.get(c).await.unwrap().got {
+        Got::State(s) => s,
+        other => panic!("not a state: {other:?}"),
+    }
+}
+
+/// Why `s` holds `id` without counting it, if it does.
+fn why_not<'s>(s: &'s State, id: &VersionId) -> Option<&'s str> {
+    s.not_counted
+        .iter()
+        .find(|(v, _)| v == id)
+        .map(|(_, why)| why.as_str())
+}
+
+/// A group counts only while every member counts (spec §5.5): a member its
+/// rule does not count holds every other member back — applied, not
+/// counted with a reason naming that member and carrying its rule's reason,
+/// out of the value — and once it counts, the whole group counts.
+#[tokio::test]
+async fn a_member_its_rule_does_not_count_holds_its_whole_group_back() {
+    use super::merge_tests::{RULE, edit, hold, notes, pair, rules};
+    let dev = device_with(
+        rules(),
+        Share {
+            rule: Rule::Merge { function: n(RULE) },
+            ..log_share()
+        },
+    )
+    .await;
+    let mut changes = dev
+        .watch(&n("/alice/32=data/trip"), &Frontier::new())
+        .await
+        .unwrap();
+    let held = op_version("/bob/laptop", &plan(), 10, &[], Some(PAIR), hold("w"));
+    let other = op_version(
+        "/bob/laptop",
+        &budget(),
+        11,
+        &[],
+        Some(PAIR),
+        edit(None, "b"),
+    );
+    give(&dev, &held);
+    give(&dev, &other);
+    let (held_id, other_id) = (id_of(&held), id_of(&other));
+    let (plan_state, budget_state) = (
+        state_of(&dev, &plan()).await,
+        state_of(&dev, &budget()).await,
+    );
+    let own = why_not(&plan_state, &held_id).expect("its rule does not count it");
+    let waits = why_not(&budget_state, &other_id).expect("held back by its group");
+    assert!(
+        waits.contains(&held.name.to_string()) && waits.contains(own),
+        "the reason names the member it waits on, with that member's reason: {waits:?}"
+    );
+    assert!(budget_state.at.contains(&other_id), "applied");
+    assert!(!notes(&budget_state).contains(&"b".to_owned()), "not shown");
+    let seen = drain(&mut changes).await;
+    assert!(seen.iter().any(
+        |c| matches!(c, Change::NotCounted { id, why, .. } if *id == other_id && why == waits)
+    ));
+    assert!(
+        !seen
+            .iter()
+            .any(|c| matches!(c, Change::Counted { id, .. } if *id == other_id)),
+        "never told counted while held back"
+    );
+    // The held member's pair arrives: it counts, and so does its group.
+    let p = op_version("/carol/laptop", &plan(), 5, &[], None, pair("w"));
+    give(&dev, &p);
+    let (plan_state, budget_state) = (
+        state_of(&dev, &plan()).await,
+        state_of(&dev, &budget()).await,
+    );
+    assert!(plan_state.not_counted.is_empty() && budget_state.not_counted.is_empty());
+    assert!(notes(&plan_state).contains(&"w".to_owned()));
+    assert!(notes(&budget_state).contains(&"b".to_owned()));
+    let seen = drain(&mut changes).await;
+    for id in [&held_id, &other_id] {
+        assert!(
+            seen.iter()
+                .any(|c| matches!(c, Change::Counted { id: v, .. } if v == id)),
+            "{id:?} told counted: {seen:?}"
+        );
+    }
+    dev.shutdown();
+}
+
 fn id_of(m: &Made) -> VersionId {
     VersionId {
         writer: Writer::new(m.key.clone()),
@@ -536,7 +626,7 @@ fn sealed_edit(
 ) -> Made {
     let bob = Writer::new(key("/bob/laptop"));
     let op = crate::merge::Yrs::new()
-        .start(&bob)
+        .start(c, &bob)
         .edit(&Content::new().with(format!("f{seq}"), "v"))
         .unwrap();
     let name = log_name(&n("/bob/laptop"), Some(c), seq);

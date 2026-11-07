@@ -500,7 +500,8 @@ struct Coll {
     /// The merge state, once the rule is known and this device runs it.
     state: Option<Box<dyn MergeState>>,
     /// Versions of the collection held here that are not in the state's
-    /// value, with why, by id: the rule's `NotCounted` answers (each inside
+    /// value, with why, by id: the rule's `NotCounted` answers, as its
+    /// `counting_changed` moves them, and applies that failed (each inside
     /// the state's frontier). Rebuilt with the state.
     not_counted: BTreeMap<VersionId, String>,
     /// What the rule's check made of each version it checked
@@ -523,6 +524,15 @@ struct Coll {
     /// The members held here of groups not counted yet, with why: the group
     /// is incomplete or not readable here.
     group_waits: BTreeMap<VersionId, String>,
+    /// The applied members held here of groups (with each one's group id)
+    /// that were last told not counted, with why: their own rule's reason,
+    /// or the group waiting on another member ([`St::regroup`]). Kept
+    /// across a rebuild of the state, so that only changes are told.
+    group_held: BTreeMap<VersionId, (u64, String)>,
+    /// The applied members held back only by their group: left out of the
+    /// value ([`MergeState::value`]) and of the newest, while the rule
+    /// still sees them.
+    excluded: BTreeSet<VersionId>,
     /// Every admitted version held, applied or waiting for its parents (or,
     /// under a merge rule this device does not know, held and never
     /// applied).
@@ -831,13 +841,28 @@ impl Coll {
     }
 
     /// Its versions held that are not in the state's value, with why,
-    /// by id: the rule's `NotCounted` and members of groups not counted.
+    /// by id: the rule's `NotCounted`, applies that failed, and members of
+    /// groups not counted.
     fn not_counted_list(&self) -> Vec<(VersionId, String)> {
         let mut all: BTreeMap<&VersionId, &String> = self.group_waits.iter().collect();
+        all.extend(self.group_held.iter().map(|(id, (_, why))| (id, why)));
         all.extend(self.not_counted.iter());
         all.into_iter()
             .map(|(id, why)| (id.clone(), why.clone()))
             .collect()
+    }
+
+    /// Whether `id` is applied here: admitted, no longer pending, and —
+    /// under a merge rule — run by a state this device holds (under a rule
+    /// it does not know a version is delivered and never applied).
+    fn applied_member(&self, id: &VersionId) -> bool {
+        let merge = self
+            .members
+            .as_ref()
+            .is_some_and(|m| matches!(m.rule, Rule::Merge { .. }));
+        self.versions.contains_key(id)
+            && !self.pending.contains(id)
+            && !(merge && self.state.is_none())
     }
 
     fn at(&self) -> Frontier {
@@ -1589,14 +1614,17 @@ fn frontier_of(writer: &Writer, head: u64) -> Frontier {
 }
 
 /// Whether the members record named `entry` (`<D>/32=log/<C>/seq=<n>`, its
-/// signature verified) is signed by a device of `C`'s namespace `ns`, so its
-/// owner (spec §3): the trust context governing the record's name — the one
-/// the validator verified it under, the held context whose namespace is the
-/// longest prefix of it — is `ns`'s own. The device `D` then lies under
-/// `ns`; a device under `ns` that a longer held namespace governs (a
-/// `/home/bob` device, for `/home`) is that namespace's device, not `ns`'s.
-fn owner_signed(keyring: &Keyring, entry: &Name, ns: &Name) -> bool {
-    entry.has_prefix(ns) && keyring.context_for(entry).namespace() == ns
+/// signature by `writer`, a key of `D`, verified) about collection `c` is
+/// signed by a device of `c`'s namespace, so its owner (spec §3): `D` lies
+/// under the namespace ([`crate::merge::owns`], the test a merge rule asks
+/// too), and the trust context governing the record's name — the one the
+/// validator verified it under, the held context whose namespace is the
+/// longest prefix of it — is the namespace's own. A device under the
+/// namespace that a longer held namespace governs (a `/home/bob` device,
+/// for `/home`) is that namespace's device, not an owner.
+fn owner_signed(keyring: &Keyring, entry: &Name, c: &Name, writer: &Writer) -> bool {
+    crate::merge::owns(c, writer)
+        && namespace_of(c).is_some_and(|ns| *keyring.context_for(entry).namespace() == ns)
 }
 
 /// Whether later versions of `id`'s writer, and versions naming `id` as a
@@ -1905,8 +1933,8 @@ struct Signed {
 struct Ruled {
     kind: OpKind,
     counting: Counting,
-    /// Versions earlier not counted that count now.
-    now: Vec<VersionId>,
+    /// Other versions whose counting changed, each with how it counts now.
+    changed: Vec<(VersionId, Counting)>,
 }
 
 /// `state`'s ruling on `held`, opened, against `past`: checked, and with
@@ -1929,14 +1957,14 @@ fn rule_on(
         return Ok(Ruled {
             kind,
             counting: Counting::Counted,
-            now: Vec::new(),
+            changed: Vec::new(),
         });
     }
     let counting = state.apply(&op)?;
     Ok(Ruled {
         kind,
         counting,
-        now: state.now_counted(),
+        changed: state.counting_changed(),
     })
 }
 
@@ -2113,8 +2141,9 @@ enum Ran {
     /// Refused for good — by the rule, or its payload in pieces does not
     /// open — and taken out of the admitted versions.
     Refused(Arc<HeldVersion>, Refusal),
-    /// Reported `NotCounted` earlier, and counts now.
-    Counted(VersionId),
+    /// Applied earlier, and its counting changed: it counts now, or no
+    /// longer (or for another reason), as the rule reports.
+    Counting(VersionId, Counting),
 }
 
 /// What [`Run::take`] did with one version.
@@ -2501,12 +2530,16 @@ impl Run<'_> {
         let a = self.applied.entry(id.writer.clone()).or_insert(0);
         *a = (*a).max(id.seq.0);
         self.out.push(Ran::Applied(id.clone(), counting));
-        let now = self
+        let changed = self
             .state
             .as_deref_mut()
             .expect("a merge run")
-            .now_counted();
-        self.out.extend(now.into_iter().map(Ran::Counted));
+            .counting_changed();
+        self.out.extend(
+            changed
+                .into_iter()
+                .map(|(id, counting)| Ran::Counting(id, counting)),
+        );
         if kind == OpKind::Checkpoint {
             self.cover();
         }
@@ -3084,12 +3117,19 @@ impl St {
         }
         coll.mark_pruned();
         coll.state = match &members.rule {
-            Rule::Merge { function } => rules.get(function).map(|r| r.start(me)),
+            Rule::Merge { function } => rules.get(function).map(|r| r.start(c, me)),
             _ => None,
         };
         coll.kinds.clear();
         coll.unwhole.clear();
         let not_counted = std::mem::take(&mut coll.not_counted);
+        // The groups of members told not counted: judged again once the
+        // state is rebuilt, whether or not their members apply again.
+        let held_groups: BTreeSet<(Writer, u64)> = coll
+            .group_held
+            .iter()
+            .map(|(id, (g, _))| (id.writer.clone(), *g))
+            .collect();
         let names: Vec<(VersionId, Name, bool)> = all
             .iter()
             .filter(|hv| delivered.contains(&hv.version.id))
@@ -3110,6 +3150,7 @@ impl St {
             coll.mark_gone(now);
         }
         self.apply_ready(c, &delivered);
+        self.regroup(held_groups);
         // A member of a group withdrawn is withdrawn with its group: the
         // refused member itself names its own refusal (spec §5.5).
         let withdrawn: Vec<(VersionId, Refusal)> = names
@@ -3131,12 +3172,18 @@ impl St {
             .collect();
         // What the rule counts changed only as the rebuilt state says:
         // `apply_ready` told what was not delivered before; the rest is
-        // told here as it differs.
+        // told here as it differs. A group member's counting is its
+        // group's, told by [`Self::regroup`].
         let mut told = Vec::new();
         if let Some(coll) = self.colls.get(c) {
             let at = coll.at();
+            let single = |id: &VersionId| {
+                coll.versions
+                    .get(id)
+                    .is_some_and(|hv| hv.version.group.is_none())
+            };
             for (id, why) in &coll.not_counted {
-                if delivered.contains(id) && not_counted.get(id) != Some(why) {
+                if delivered.contains(id) && single(id) && not_counted.get(id) != Some(why) {
                     told.push(Change::NotCounted {
                         collection: c.clone(),
                         id: id.clone(),
@@ -3145,10 +3192,7 @@ impl St {
                 }
             }
             for id in not_counted.keys() {
-                if !coll.not_counted.contains_key(id)
-                    && at.contains(id)
-                    && coll.versions.contains_key(id)
-                {
+                if !coll.not_counted.contains_key(id) && at.contains(id) && single(id) {
                     told.push(Change::Counted {
                         collection: c.clone(),
                         id: id.clone(),
@@ -3258,12 +3302,14 @@ impl St {
     /// (spec §5.5): a complete group's members apply together, in seq order,
     /// all within this call; a refused group's members never apply, and
     /// those applied before are withdrawn, in every collection of the group.
-    /// `quiet` lists what `c` delivered before.
+    /// `quiet` lists what `c` delivered before. Then every group whose
+    /// members' counting may have moved is judged again ([`Self::regroup`]).
     fn apply_ready(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
         let none = BTreeSet::new();
         let mut todo = VecDeque::from([c.clone()]);
         let mut queued = BTreeSet::from([c.clone()]);
         let mut rounds = 0usize;
+        let mut touched = BTreeSet::new();
         while let Some(x) = todo.pop_front() {
             queued.remove(&x);
             rounds += 1;
@@ -3271,7 +3317,7 @@ impl St {
                 tracing::warn!(collection = %c, "groups still moving after {APPLY_ROUNDS} rounds; the rest applies on the next arrival");
                 break;
             }
-            self.apply_one(&x, if x == *c { quiet } else { &none });
+            touched.extend(self.apply_one(&x, if x == *c { quiet } else { &none }));
             let active: Vec<(Writer, u64)> = self
                 .colls
                 .get(&x)
@@ -3343,15 +3389,19 @@ impl St {
                 }
             }
         }
+        self.regroup(touched);
     }
 
     /// Apply every pending version of `c` that is ready ([`Run`]), as its
     /// group lets it, store it, and deliver it to the watchers unless
-    /// `quiet` lists it (delivered before), with what the rule and the
-    /// groups count. Under a merge rule this device does not know, every
-    /// pending version is stored and delivered and none applied: no state
-    /// is read under another rule.
-    fn apply_one(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
+    /// `quiet` lists it (delivered before), with what the rule counts.
+    /// Under a merge rule this device does not know, every pending version
+    /// is stored and delivered and none applied: no state is read under
+    /// another rule. The groups whose members applied, or whose counting
+    /// moved, are returned: a group member's counting is told by
+    /// [`Self::regroup`], once every collection of the group has run.
+    fn apply_one(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) -> BTreeSet<(Writer, u64)> {
+        let mut touched = BTreeSet::new();
         let gates = self.gates(c);
         // A member held of a group not counted: its folder is followed, so
         // that the others arrive (spec §5.5).
@@ -3371,13 +3421,14 @@ impl St {
             ..
         } = self;
         let Some(coll) = colls.get_mut(c) else {
-            return;
+            return touched;
         };
         let Coll {
             members,
             state,
             not_counted,
             group_waits,
+            group_held,
             kinds,
             by_digest,
             versions,
@@ -3393,7 +3444,13 @@ impl St {
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
-            return;
+            return touched;
+        };
+        let group_of = |versions: &BTreeMap<VersionId, Arc<HeldVersion>>, id: &VersionId| {
+            versions
+                .get(id)
+                .and_then(|hv| hv.version.group)
+                .map(|g| g.id)
         };
         // Each change, and the version whose delivery it follows (`None`:
         // every watcher of the collection is told).
@@ -3442,9 +3499,13 @@ impl St {
                 match r {
                     Ran::Applied(id, counting) => {
                         deliver(&versions[&id], &mut changes);
+                        let group = group_of(versions, &id);
+                        if let Some(g) = group {
+                            touched.insert((id.writer.clone(), g));
+                        }
                         if let Counting::NotCounted(why) = counting {
                             not_counted.insert(id.clone(), why.clone());
-                            if !quiet.contains(&id) {
+                            if group.is_none() && !quiet.contains(&id) {
                                 changes.push((
                                     Change::NotCounted {
                                         collection: c.clone(),
@@ -3456,7 +3517,12 @@ impl St {
                             }
                         }
                     }
-                    Ran::Covered(id) => deliver(&versions[&id], &mut changes),
+                    Ran::Covered(id) => {
+                        deliver(&versions[&id], &mut changes);
+                        if let Some(g) = group_of(versions, &id) {
+                            touched.insert((id.writer.clone(), g));
+                        }
+                    }
                     Ran::Refused(hv, why) => {
                         tracing::debug!(id = ?hv.version.id, collection = %c, %why, "refused");
                         let id = hv.version.id.clone();
@@ -3472,15 +3538,39 @@ impl St {
                         }
                         refused.insert(hv.version.name.clone(), why);
                     }
-                    Ran::Counted(id) => {
-                        if not_counted.remove(&id).is_some() && !quiet.contains(&id) {
-                            changes.push((
-                                Change::Counted {
-                                    collection: c.clone(),
-                                    id,
-                                },
-                                None,
-                            ));
+                    Ran::Counting(id, counting) => {
+                        let group = group_of(versions, &id);
+                        if let Some(g) = group {
+                            touched.insert((id.writer.clone(), g));
+                        }
+                        let tell = group.is_none() && !quiet.contains(&id);
+                        match counting {
+                            Counting::Counted => {
+                                if not_counted.remove(&id).is_some() && tell {
+                                    changes.push((
+                                        Change::Counted {
+                                            collection: c.clone(),
+                                            id,
+                                        },
+                                        None,
+                                    ));
+                                }
+                            }
+                            Counting::NotCounted(why) => {
+                                if not_counted.get(&id) != Some(&why) {
+                                    not_counted.insert(id.clone(), why.clone());
+                                    if tell {
+                                        changes.push((
+                                            Change::NotCounted {
+                                                collection: c.clone(),
+                                                id: id.clone(),
+                                                why,
+                                            },
+                                            Some(id),
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3516,17 +3606,14 @@ impl St {
             .cloned()
             .collect();
         for id in gone {
-            group_waits.remove(&id);
-            let counted = versions.contains_key(&id)
+            let why = group_waits.remove(&id);
+            let applied_here = versions.contains_key(&id)
                 && applied.get(&id.writer).is_some_and(|a| *a >= id.seq.0);
-            if counted {
-                changes.push((
-                    Change::Counted {
-                        collection: c.clone(),
-                        id,
-                    },
-                    None,
-                ));
+            // Told not counted while it waited; applied now, its group
+            // judges whether it counts ([`St::regroup`]).
+            if applied_here && let (Some(why), Some(g)) = (why, group_of(versions, &id)) {
+                group_held.entry(id.clone()).or_insert((g, why));
+                touched.insert((id.writer.clone(), g));
             }
         }
         watchers.retain(|w| !w.tx.is_closed());
@@ -3539,6 +3626,7 @@ impl St {
                 }
             }
         }
+        touched
     }
 
     /// Note `id`, of `c`, kept `keep`, as a member of group `g` of its
@@ -3560,6 +3648,88 @@ impl St {
             });
         }
         self.colls.entry(c.clone()).or_default().txns.insert(key);
+    }
+
+    /// Judge again whether each group of `keys` counts (spec §5.5): a group
+    /// counts only while every member applied here counts. While one does
+    /// not — its rule does not count it, or its apply failed — every other
+    /// applied member is held back: not counted, with "group waiting on
+    /// <member>: <that member's reason>", and left out of its collection's
+    /// value and newest. The rule still sees it: it is applied, and the
+    /// rule's counting of every version is the rule's alone (the layer's
+    /// holding back never feeds back into it). A member its rule does not
+    /// count keeps its own reason. Each member is told as what it was last
+    /// told changes: not counted with why, or counted again.
+    fn regroup(&mut self, keys: BTreeSet<(Writer, u64)>) {
+        for key in keys {
+            let members: Vec<(VersionId, Name)> = self
+                .txns
+                .get(&key)
+                .map(|m| {
+                    m.iter()
+                        .flat_map(|(s, ms)| {
+                            ms.iter().map(|m| {
+                                let id = VersionId {
+                                    writer: key.0.clone(),
+                                    seq: Seq(*s),
+                                };
+                                (id, m.collection.clone())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The first member, in seq order, that does not count.
+            let blocker = members.iter().find_map(|(id, c)| {
+                let coll = self.colls.get(c)?;
+                let why = coll.not_counted.get(id)?;
+                coll.applied_member(id)
+                    .then(|| format!("group waiting on {}: {why}", coll.versions[id].version.name))
+            });
+            let mut told: Vec<(Name, Change, VersionId)> = Vec::new();
+            for (id, c) in &members {
+                let Some(coll) = self.colls.get_mut(c) else {
+                    continue;
+                };
+                if !coll.applied_member(id) {
+                    // Waiting, refused or withdrawn: told so elsewhere.
+                    coll.group_held.remove(id);
+                    coll.excluded.remove(id);
+                    continue;
+                }
+                let own = coll.not_counted.get(id).cloned();
+                if own.is_none() && blocker.is_some() {
+                    coll.excluded.insert(id.clone());
+                } else {
+                    coll.excluded.remove(id);
+                }
+                match own.or_else(|| blocker.clone()) {
+                    Some(why) if coll.group_held.get(id).map(|(_, w)| w) != Some(&why) => {
+                        coll.group_held.insert(id.clone(), (key.1, why.clone()));
+                        let change = Change::NotCounted {
+                            collection: c.clone(),
+                            id: id.clone(),
+                            why,
+                        };
+                        told.push((c.clone(), change, id.clone()));
+                    }
+                    None if coll.group_held.remove(id).is_some() => {
+                        let change = Change::Counted {
+                            collection: c.clone(),
+                            id: id.clone(),
+                        };
+                        told.push((c.clone(), change, id.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            for (c, change, id) in told {
+                match change {
+                    Change::NotCounted { .. } => self.emit(&c, &change, &id.writer, id.seq.0),
+                    _ => self.tell(&c, &change),
+                }
+            }
+        }
     }
 
     /// Note the log entry `name`, signed by `writer` at `seq`: a key's log
@@ -4528,9 +4698,9 @@ impl St {
             return coll
                 .state
                 .as_ref()
-                .map(|s| (s.value(), coll.not_counted_list()));
+                .map(|s| (s.value(&coll.excluded), coll.not_counted_list()));
         }
-        let mut state = rules.get(function)?.start(me);
+        let mut state = rules.get(function)?.start(c, me);
         let mut versions = coll.versions.clone();
         let mut pending: BTreeSet<VersionId> = versions
             .keys()
@@ -4542,7 +4712,8 @@ impl St {
         let mut kinds = HashMap::new();
         let mut outsiders = coll.outsiders.clone();
         // A group's members inside `at` count as the group does now: all of
-        // a complete one, none of a refused one.
+        // a complete one, none of a refused one, and none held back while
+        // another member does not count ([`St::regroup`]).
         let gates: HashMap<VersionId, Gate> = pending
             .iter()
             .filter_map(|id| {
@@ -4592,16 +4763,28 @@ impl St {
         let mut not_counted = BTreeMap::new();
         for r in ran {
             match r {
-                Ran::Applied(id, Counting::NotCounted(why)) => {
+                Ran::Applied(id, Counting::NotCounted(why))
+                | Ran::Counting(id, Counting::NotCounted(why)) => {
                     not_counted.insert(id, why);
                 }
-                Ran::Counted(id) => {
+                Ran::Counting(id, Counting::Counted) => {
                     not_counted.remove(&id);
                 }
                 _ => {}
             }
         }
-        Some((state.value(), not_counted.into_iter().collect()))
+        let excluded: BTreeSet<VersionId> = coll
+            .excluded
+            .iter()
+            .filter(|id| at.contains(id))
+            .cloned()
+            .collect();
+        for id in &excluded {
+            if let Some((_, why)) = coll.group_held.get(id) {
+                not_counted.entry(id.clone()).or_insert_with(|| why.clone());
+            }
+        }
+        Some((state.value(&excluded), not_counted.into_iter().collect()))
     }
 
     /// The devices, besides its writer's, whose versions of `c` held here
@@ -7883,8 +8066,7 @@ impl Inner {
                     },
                 );
                 let c = body.collection.clone();
-                let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
-                if owner_signed(self.validator.keyring(), &name, &ns) {
+                if owner_signed(self.validator.keyring(), &name, &c, &writer) {
                     self.store.insert(name.clone(), wire);
                     st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
                     // The rule may now be the log rule, which prune applies to.
@@ -8010,8 +8192,7 @@ impl Inner {
                     },
                 );
                 let c = body.collection.clone();
-                let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
-                if !owner_signed(self.validator.keyring(), &name, &ns) {
+                if !owner_signed(self.validator.keyring(), &name, &c, &writer) {
                     tracing::debug!(collection = %c, signer = ?writer, "hold record not signed by a device of the collection's namespace; ignored");
                     return None;
                 }
@@ -8876,17 +9057,20 @@ impl Inner {
     /// that refused it, or by `why` (the record that admitted it no longer
     /// counts); with no record left, every version waits for one.
     fn rebuild_members(&self, st: &mut St, c: &Name, why: &Refusal) {
-        let Some(ns) = namespace_of(c) else {
+        if !wire::is_data_name(c) {
             return;
-        };
+        }
         let keyring = self.validator.keyring();
         let mut records: Vec<(u64, u64, MembersBody, Writer)> = st
             .held
             .iter()
-            .filter(|(n, h)| matches!(h, Held::Record { .. }) && !st.cut_out.contains_key(*n))
-            .filter_map(|(n, _)| {
+            .filter(|(n, _)| !st.cut_out.contains_key(*n))
+            .filter_map(|(n, h)| {
+                let Held::Record { writer, .. } = h else {
+                    return None;
+                };
                 let l = parse_log_name(n)?;
-                if l.subject.as_ref() != Some(c) || !owner_signed(keyring, n, &ns) {
+                if l.subject.as_ref() != Some(c) || !owner_signed(keyring, n, c, writer) {
                     return None;
                 }
                 let data = Data::decode(self.store.get(n)?).ok()?;
@@ -9668,7 +9852,7 @@ impl Inner {
                 rule: function,
             });
         };
-        let mut temp = rule.start(self.me());
+        let mut temp = rule.start(c, self.me());
         let key = body.epoch.clone().zip(made.cloned());
         let under = Under {
             readers: body.readers.clone(),
@@ -9991,29 +10175,64 @@ impl Inner {
         let version = held.version.clone();
         let id = version.id.clone();
         let name = version.name.clone();
-        let mut told = Vec::new();
+        // Each change of counting, with the version it is about; a group
+        // member's is its group's ([`St::regroup`]).
+        let mut told: Vec<(Change, VersionId)> = Vec::new();
+        let mut touched = BTreeSet::new();
+        if let Some(g) = version.group {
+            touched.insert((id.writer.clone(), g.id));
+        }
         if let Some(Ruled {
             kind,
             counting,
-            now,
+            changed,
         }) = judged
         {
             let coll = st.colls.get_mut(&c).expect("members known");
             coll.kinds.insert(id.clone(), kind);
             if let Counting::NotCounted(why) = counting {
                 coll.not_counted.insert(id.clone(), why.clone());
-                told.push(Change::NotCounted {
-                    collection: c.clone(),
-                    id: id.clone(),
-                    why,
-                });
-            }
-            for n in now {
-                if coll.not_counted.remove(&n).is_some() {
-                    told.push(Change::Counted {
+                if version.group.is_none() {
+                    let change = Change::NotCounted {
                         collection: c.clone(),
-                        id: n,
-                    });
+                        id: id.clone(),
+                        why,
+                    };
+                    told.push((change, id.clone()));
+                }
+            }
+            for (other, counting) in changed {
+                let group = coll
+                    .versions
+                    .get(&other)
+                    .and_then(|hv| hv.version.group)
+                    .map(|g| g.id);
+                if let Some(g) = group {
+                    touched.insert((other.writer.clone(), g));
+                }
+                let change = match counting {
+                    Counting::Counted => {
+                        coll.not_counted
+                            .remove(&other)
+                            .is_some()
+                            .then(|| Change::Counted {
+                                collection: c.clone(),
+                                id: other.clone(),
+                            })
+                    }
+                    Counting::NotCounted(why) => {
+                        (coll.not_counted.get(&other) != Some(&why)).then(|| {
+                            coll.not_counted.insert(other.clone(), why.clone());
+                            Change::NotCounted {
+                                collection: c.clone(),
+                                id: other.clone(),
+                                why,
+                            }
+                        })
+                    }
+                };
+                if let Some(change) = change.filter(|_| group.is_none()) {
+                    told.push((change, other));
                 }
             }
         }
@@ -10063,12 +10282,13 @@ impl Inner {
         };
         coll.versions.insert(id.clone(), Arc::new(held));
         st.emit(&c, &Change::Version(version), &id.writer, seq);
-        for change in told {
+        for (change, about) in told {
             match &change {
-                Change::NotCounted { .. } => st.emit(&c, &change, &id.writer, seq),
+                Change::NotCounted { .. } => st.emit(&c, &change, &about.writer, about.seq.0),
                 _ => st.tell(&c, &change),
             }
         }
+        st.regroup(touched);
         self.arm_sweep(st, keep);
         // A newer version may end older ones' last N (spec §14.1).
         if matches!(keep, Keep::LastN(_)) {
@@ -10995,17 +11215,19 @@ impl Inner {
                     name: state_name(c, &at),
                     collection: c.clone(),
                     at,
-                    value: state.value(),
+                    value: state.value(&coll.excluded),
                     not_counted: coll.not_counted_list(),
                 }))
             }
             Rule::Log => {
                 let since = members.since.as_ref();
+                // A member its group holds back is not the newest.
                 let applied: Vec<&Version> = coll
                     .versions
                     .values()
                     .map(|hv| &hv.version)
                     .filter(|v| at.contains(&v.id) && !since.is_some_and(|s| s.contains(&v.id)))
+                    .filter(|v| !coll.excluded.contains(&v.id))
                     .collect();
                 applied
                     .iter()
@@ -11028,6 +11250,7 @@ impl Inner {
                     .map(|hv| &hv.version)
                     .filter(|v| !since.is_some_and(|s| s.contains(&v.id)))
                     .filter(|v| v.group.is_none() || !coll.pending.contains(&v.id))
+                    .filter(|v| !coll.excluded.contains(&v.id))
                     .max_by(|a, b| a.id.seq.cmp(&b.id.seq))
                     .map(|v| Got::Version(v.clone()))
                     .ok_or_else(|| DataError::Unavailable { name: c.clone() })
@@ -14308,11 +14531,11 @@ impl DataLayer for Device {
         {
             let mut st = inner.st.lock();
             // Each collection under the target, in order: what it holds
-            // applied, each with why when the rule does not count it, and
-            // the group members waiting for their group, as not counted. A
-            // version not applied yet is delivered once it applies, as it
-            // would have been had the watch begun earlier, so none is
-            // delivered twice.
+            // applied, each with why when it does not count (its rule's
+            // reason, or its group's), and the group members waiting for
+            // their group, as not counted. A version not applied yet is
+            // delivered once it applies, as it would have been had the
+            // watch begun earlier, so none is delivered twice.
             let mut listed: Vec<(&Name, &VersionId, Change)> = Vec::new();
             for (c, coll) in st.colls.iter().filter(|(c, _)| c.has_prefix(collection)) {
                 for hv in coll.versions.values() {
@@ -14321,7 +14544,11 @@ impl DataLayer for Device {
                         continue;
                     }
                     listed.push((c, &v.id, Change::Version(v.clone())));
-                    if let Some(why) = coll.not_counted.get(&v.id) {
+                    let why = coll
+                        .not_counted
+                        .get(&v.id)
+                        .or_else(|| coll.group_held.get(&v.id).map(|(_, why)| why));
+                    if let Some(why) = why {
                         listed.push((
                             c,
                             &v.id,
@@ -15059,49 +15286,33 @@ mod tests {
 
     #[test]
     fn a_members_record_is_the_owners_by_the_longest_held_namespace() {
-        let record = |device: &str, collection: &str| log_name(&n(device), Some(&n(collection)), 1);
-        let (bob, home) = (n("/home/bob"), n("/home"));
+        // Whether `device` (its key `<device>/KEY/1`) signing a members
+        // record about `collection` is an owner, by `keyring`.
+        let signed = |keyring: &Keyring, device: &str, collection: &str| {
+            let c = n(collection);
+            let entry = log_name(&n(device), Some(&c), 1);
+            let writer = Writer::new(n(device).append("KEY").append("1"));
+            owner_signed(keyring, &entry, &c, &writer)
+        };
         let both = Keyring::new();
         both.adopt(context("/home"));
         both.adopt(context("/home/bob"));
         // A /home/bob device lies under /home, but /home/bob governs it.
         let laptop = "/home/bob/member/laptop";
-        assert!(!owner_signed(
-            &both,
-            &record(laptop, "/home/32=data/x"),
-            &home
-        ));
-        assert!(owner_signed(
-            &both,
-            &record(laptop, "/home/bob/32=data/x"),
-            &bob
-        ));
+        assert!(!signed(&both, laptop, "/home/32=data/x"));
+        assert!(signed(&both, laptop, "/home/bob/32=data/x"));
         let hub = "/home/member/hub";
-        assert!(owner_signed(&both, &record(hub, "/home/32=data/x"), &home));
-        assert!(!owner_signed(
-            &both,
-            &record(hub, "/home/bob/32=data/x"),
-            &bob
-        ));
+        assert!(signed(&both, hub, "/home/32=data/x"));
+        assert!(!signed(&both, hub, "/home/bob/32=data/x"));
+        // A device of another namespace is no owner, whatever is held.
+        assert!(!signed(&both, "/alice/laptop", "/home/32=data/x"));
         // Held alone, /home governs every device under it.
         let only_home = Keyring::new();
         only_home.adopt(context("/home"));
-        assert!(owner_signed(
-            &only_home,
-            &record(laptop, "/home/32=data/x"),
-            &home
-        ));
-        assert!(!owner_signed(
-            &only_home,
-            &record(laptop, "/home/bob/32=data/x"),
-            &bob
-        ));
+        assert!(signed(&only_home, laptop, "/home/32=data/x"));
+        assert!(!signed(&only_home, laptop, "/home/bob/32=data/x"));
         // No context held: nobody owns anything.
-        assert!(!owner_signed(
-            &Keyring::new(),
-            &record(hub, "/home/32=data/x"),
-            &home
-        ));
+        assert!(!signed(&Keyring::new(), hub, "/home/32=data/x"));
     }
 
     #[tokio::test]

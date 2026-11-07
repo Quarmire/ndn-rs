@@ -320,7 +320,7 @@ async fn a_refused_edit_leaves_the_merge_state_as_it_was() {
             .state
             .as_ref()
             .unwrap()
-            .value()
+            .value(&BTreeSet::new())
     };
     let (before, head) = (value(&dev), dev.inner.st.lock().head);
     // Fields and operation together pass the most a version carries.

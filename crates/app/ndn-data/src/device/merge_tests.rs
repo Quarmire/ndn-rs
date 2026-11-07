@@ -38,9 +38,10 @@ pub(super) fn c() -> Name {
 
 /// Notes: an edit (`E`) names its basis by digest (all zero: none) and adds
 /// a note; a checkpoint (`C`) replaces the notes of its past by its own,
-/// keeping those of versions concurrent to it; a held note (`W`) is not
-/// counted until its pair (`P`) applies; a follow-up (`B`) is checked
-/// against the notes applied: its first line must be one.
+/// keeping those of versions concurrent to it; a held note (`W`) counts
+/// while its pair (`P`) is applied and no unpairing (`U`) of it is — so it
+/// may start and stop counting as versions arrive; a follow-up (`B`) is
+/// checked against the notes applied: its first line must be one.
 pub(super) struct Notes {
     pub(super) function: Name,
 }
@@ -50,7 +51,7 @@ impl MergeRule for Notes {
         &self.function
     }
 
-    fn start(&self, _local: &Writer) -> Box<dyn MergeState> {
+    fn start(&self, _collection: &Name, _local: &Writer) -> Box<dyn MergeState> {
         Box::new(NotesState::default())
     }
 }
@@ -59,9 +60,26 @@ impl MergeRule for Notes {
 struct NotesState {
     /// Each note in the value, with the version that wrote it.
     notes: Vec<(VersionId, String)>,
-    held: BTreeMap<String, VersionId>,
+    /// Each held note, with the version that wrote it.
+    held: Vec<(VersionId, String)>,
     paired: BTreeSet<String>,
-    counted: Vec<VersionId>,
+    unpaired: BTreeSet<String>,
+    /// Whether each held note was last answered counted.
+    told: BTreeMap<VersionId, bool>,
+}
+
+impl NotesState {
+    /// Whether the held note `t` counts, from the versions applied.
+    fn counts(&self, t: &str) -> bool {
+        self.paired.contains(t) && !self.unpaired.contains(t)
+    }
+
+    fn counting(&self, t: &str) -> Counting {
+        match self.counts(t) {
+            true => Counting::Counted,
+            false => Counting::NotCounted("waits for its pair".into()),
+        }
+    }
 }
 
 fn text(op: &Op<'_>, from: usize) -> Result<String, MergeError> {
@@ -86,7 +104,7 @@ impl MergeState for NotesState {
                 Ok(OpKind::Edit)
             }
             Some(b'C') => Ok(OpKind::Checkpoint),
-            Some(b'W' | b'P' | b'X') => Ok(OpKind::Edit),
+            Some(b'W' | b'P' | b'U' | b'X') => Ok(OpKind::Edit),
             Some(b'B') => {
                 let t = text(op, 1)?;
                 let basis = t.lines().next().unwrap_or_default();
@@ -114,19 +132,17 @@ impl MergeState for NotesState {
             }
             Some(b'W') => {
                 let t = text(op, 1)?;
-                if !self.paired.contains(&t) {
-                    self.held.insert(t, op.id.clone());
-                    return Ok(Counting::NotCounted("waits for its pair".into()));
-                }
-                self.notes.push((op.id.clone(), t));
+                let counting = self.counting(&t);
+                self.told
+                    .insert(op.id.clone(), counting == Counting::Counted);
+                self.held.push((op.id.clone(), t));
+                return Ok(counting);
             }
             Some(b'P') => {
-                let t = text(op, 1)?;
-                self.paired.insert(t.clone());
-                if let Some(id) = self.held.remove(&t) {
-                    self.notes.push((id.clone(), t));
-                    self.counted.push(id);
-                }
+                self.paired.insert(text(op, 1)?);
+            }
+            Some(b'U') => {
+                self.unpaired.insert(text(op, 1)?);
             }
             // A note claimed only if no one noted it yet: the rule's apply
             // answers from the state, which others' versions make.
@@ -143,12 +159,25 @@ impl MergeState for NotesState {
         Ok(Counting::Counted)
     }
 
-    fn now_counted(&mut self) -> Vec<VersionId> {
-        std::mem::take(&mut self.counted)
+    fn counting_changed(&mut self) -> Vec<(VersionId, Counting)> {
+        let mut out = Vec::new();
+        for (id, t) in &self.held {
+            let now = self.counts(t);
+            if self.told.insert(id.clone(), now) != Some(now) {
+                out.push((id.clone(), self.counting(t)));
+            }
+        }
+        out
     }
 
-    fn value(&self) -> Value {
-        let notes: BTreeSet<&str> = self.notes.iter().map(|(_, n)| n.as_str()).collect();
+    fn value(&self, excluded: &BTreeSet<VersionId>) -> Value {
+        let notes: BTreeSet<&str> = self
+            .notes
+            .iter()
+            .chain(self.held.iter().filter(|(_, t)| self.counts(t)))
+            .filter(|(id, _)| !excluded.contains(id))
+            .map(|(_, n)| n.as_str())
+            .collect();
         Value::Rule(Bytes::from(
             notes.into_iter().collect::<Vec<_>>().join("\n"),
         ))
@@ -166,11 +195,15 @@ pub(super) fn checkpoint(notes: &[&str]) -> Bytes {
     Bytes::from([b"C".as_slice(), notes.join("\n").as_bytes()].concat())
 }
 
-fn hold(note: &str) -> Bytes {
+pub(super) fn hold(note: &str) -> Bytes {
     Bytes::from([b"W".as_slice(), note.as_bytes()].concat())
 }
 
-fn pair(note: &str) -> Bytes {
+pub(super) fn unpair(note: &str) -> Bytes {
+    Bytes::from([b"U".as_slice(), note.as_bytes()].concat())
+}
+
+pub(super) fn pair(note: &str) -> Bytes {
     Bytes::from([b"P".as_slice(), note.as_bytes()].concat())
 }
 
@@ -532,6 +565,48 @@ async fn a_version_its_rule_does_not_count_is_applied_shown_and_counted_later() 
             .any(|ch| matches!(ch, Change::Counted { id, .. } if *id == w.id()))
     );
     dev.shutdown();
+}
+
+/// A version's counting is a function of the versions applied: one that
+/// counted stops counting when a version that holds it back arrives — told
+/// as `NotCounted`, listed in the state's `not_counted`, out of the value —
+/// and a device receiving the same versions in another order ends alike.
+#[tokio::test]
+async fn a_version_that_counted_stops_counting_alike_in_any_order() {
+    let w = version("/carol/laptop", 5, &[], hold("w"));
+    let p = version("/bob/laptop", 10, &[], pair("w"));
+    let u = version("/bob/laptop", 11, &[tip(&p)], unpair("w"));
+    // First the note and its pair: it counts; then the unpairing.
+    let early = device(rules()).await;
+    let mut changes = early.watch(&c(), &Frontier::new()).await.unwrap();
+    give(&early, &w);
+    give(&early, &p);
+    assert!(notes(&state(&early).await).contains(&"w".to_owned()));
+    let seen = drain(&mut changes).await;
+    assert!(
+        seen.iter()
+            .any(|ch| matches!(ch, Change::Counted { id, .. } if *id == w.id()))
+    );
+    give(&early, &u);
+    let seen = drain(&mut changes).await;
+    assert!(
+        seen.iter()
+            .any(|ch| matches!(ch, Change::NotCounted { id, why, .. } if *id == w.id() && !why.is_empty())),
+        "it stops counting, and is told so: {seen:?}"
+    );
+    // The pair and its unpairing first: it never counts.
+    let late = device(rules()).await;
+    give(&late, &p);
+    give(&late, &u);
+    give(&late, &w);
+    let (a, b) = (state(&early).await, state(&late).await);
+    assert_eq!(a.at, b.at);
+    assert_eq!(a.value, b.value);
+    assert_eq!(a.not_counted, b.not_counted);
+    assert!(a.not_counted.iter().any(|(id, _)| *id == w.id()));
+    assert!(!notes(&a).contains(&"w".to_owned()));
+    early.shutdown();
+    late.shutdown();
 }
 
 #[tokio::test]
