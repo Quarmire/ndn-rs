@@ -1680,7 +1680,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
- "bip39",
  "bytes",
  "dashmap",
  "futures",
@@ -2258,10 +2257,12 @@ name = "ndn-trust-envelope"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bip39",
  "bytes",
  "ndn-tlv",
  "qrcode",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

@@ -17,6 +17,10 @@ thiserror = { workspace = true }
 # `qr`: the one QR renderer configuration (level M, byte mode). No default
 # features: no image dependency.
 qrcode    = { version = "0.14", default-features = false }
+# `words`: 32 octets as 24 BIP39 English words, whose checksum catches a
+# mistyped word (recovery kits, introduction codes).
+bip39     = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+zeroize   = "1"
 
 [dev-dependencies]
 # the `emit` helper's `qr` mode writes an SVG

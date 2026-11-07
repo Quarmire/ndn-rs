@@ -105,8 +105,9 @@ pub const KIT_PIN_ENV: &str = "NDN_KIT_PIN";
 /// Management"). The kit goes on a token of its own: generating it on the
 /// root's token is refused ([`SlotGuard`]).
 pub const DEFAULT_KIT_SLOT: &str = "9d";
-/// Words in a word kit: 256 bits of seed plus an 8-bit checksum.
-pub const KIT_WORD_COUNT: usize = 24;
+/// Words in a word kit: 256 bits of seed plus an 8-bit checksum
+/// ([`ndn_trust_envelope::words`]).
+pub const KIT_WORD_COUNT: usize = ndn_trust_envelope::words::WORD_COUNT;
 
 /// A kit format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,59 +362,21 @@ impl RecoverySeed {
     /// not matter; a word outside the list, a wrong count or a checksum
     /// mismatch (a mistyped or swapped word) is refused.
     pub fn from_words(words: &str) -> Result<Self, RecoveryError> {
-        let mut normalized = Zeroizing::new(String::with_capacity(words.len()));
-        let mut count = 0;
-        for word in words.split_whitespace() {
-            if count > 0 {
-                normalized.push(' ');
-            }
-            normalized.extend(word.chars().flat_map(char::to_lowercase));
-            count += 1;
-        }
-        if count != KIT_WORD_COUNT {
-            return Err(RecoveryError::BadWords(format!(
-                "{count} words; a recovery kit has {KIT_WORD_COUNT}"
-            )));
-        }
-        // A refusal names the position only: a mistyped word is usually one
-        // edit from the real one, and the error reaches terminals and logs.
-        let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &normalized)
-            .map_err(|e| {
-                RecoveryError::BadWords(match e {
-                    bip39::Error::UnknownWord(i) => {
-                        format!("word {} is not a BIP39 English word", i + 1)
-                    }
-                    bip39::Error::InvalidChecksum => {
-                        "the checksum does not match: a word is mistyped, or two are swapped".into()
-                    }
-                    other => other.to_string(),
-                })
-            })?;
-        let (mut entropy, len) = mnemonic.to_entropy_array();
-        let mut seed = Zeroizing::new([0u8; 32]);
-        let ok = len == 32;
-        if ok {
-            seed.copy_from_slice(&entropy[..32]);
-        }
-        zeroize::Zeroize::zeroize(&mut entropy);
-        if !ok {
-            return Err(RecoveryError::BadWords(format!(
-                "{len} bytes of seed, not 32"
-            )));
-        }
+        use ndn_trust_envelope::words::{WordsError, decode};
+        let seed = decode(words).map_err(|e| {
+            RecoveryError::BadWords(match e {
+                WordsError::Count(count) => {
+                    format!("{count} words; a recovery kit has {KIT_WORD_COUNT}")
+                }
+                other => other.to_string(),
+            })
+        })?;
         Ok(Self(seed))
     }
 
     /// The seed as 24 BIP39 English words, space-separated.
     pub fn to_words(&self) -> Zeroizing<String> {
-        use std::fmt::Write as _;
-        let mnemonic =
-            bip39::Mnemonic::from_entropy(&self.0[..]).expect("32 bytes of entropy always encode");
-        // Room for 24 of the longest (8-letter) words and their spaces, so
-        // the string never reallocates and leaves no unwiped copy behind.
-        let mut words = Zeroizing::new(String::with_capacity(KIT_WORD_COUNT * 9));
-        write!(words, "{mnemonic}").expect("writing to a String cannot fail");
-        words
+        ndn_trust_envelope::words::encode(&self.0)
     }
 
     /// The recovery key of `namespace` this seed makes, named

@@ -53,10 +53,6 @@ sha2         = { workspace = true }
 toml         = "0.8"
 zeroize      = "1"
 keyring      = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
-# Recovery kits (`recovery`): a recovery key's 32-byte seed shown as 24
-# BIP39 English words, whose checksum catches a mistyped word; `zeroize`
-# wipes the `Mnemonic` (which encodes the whole seed) when it is dropped.
-bip39        = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 # A file kit's passphrase is sealed in Unicode NFC, so the same text typed
 # through an input method that produces NFD still opens it.
 unicode-normalization = "0.1"

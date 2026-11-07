@@ -13,6 +13,7 @@
 //! | [`recovery`](TrustKind::Recovery) | in | restore from a recovery bundle |
 //! | [`bag`](TrustKind::Bag) | in | migrate a SafeBag (custody layer) |
 //! | [`capability`](TrustKind::Capability) | out | grant ephemeral scoped authority (pairing) |
+//! | [`intro`](TrustKind::Intro) | in | join a folder by a one-use offer (data layer) |
 //!
 //! This crate is the *authority layer*: it never names a host, link, session, or
 //! address. It only carries names (as strings), anchor fingerprints, and
@@ -57,6 +58,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 use thiserror::Error;
 
 pub mod qr;
+pub mod words;
 
 // ── TLV codes (fresh range, clear of SignedTrustContext's 0x0410–0x041F) ─────
 const T_ENVELOPE: u64 = 0x0470;
@@ -64,6 +66,9 @@ const T_FORMAT_VERSION: u64 = 0x0471;
 const T_KIND: u64 = 0x0472;
 const T_BODY: u64 = 0x0473;
 const T_DEVICE_NAME: u64 = 0x0474; // invite: the device name the inviter suggests (a hint)
+const T_OFFER: u64 = 0x0475; // intro: the offer record's name
+const T_RELAY_HINT: u64 = 0x0476; // intro: a relay that reaches the inviter (repeatable)
+const T_SECRET: u64 = 0x0477; // intro: the offer's secret
 
 const T_U64_VERSION: u64 = 0x0481; // anchor: context version
 const T_WIRE: u64 = 0x0482; // primary signed-Data blob (delegation / bundle / safebag); anchor: legacy unsigned context Content
@@ -91,6 +96,14 @@ pub const FORMAT_VERSION: u8 = 1;
 /// request (trust-envelope.md §4.4). Producers draw it from the system RNG.
 pub const CAPABILITY_NONCE_LEN: usize = 16;
 
+/// Length of an introduction's secret: 128 bits from the system RNG
+/// (data-layer.md §19).
+pub const INTRO_SECRET_LEN: usize = 16;
+
+/// How many octets of the anchor fingerprint an introduction's words form
+/// carries (the first half: 128-bit second-preimage resistance).
+pub const INTRO_WORDS_FINGERPRINT_LEN: usize = 16;
+
 const SCHEME: &str = "ndn-trust://";
 const MIRROR_SCHEME: &str = "https://";
 const LEGACY_ANCHOR_TAG: &str = "ndn-ctx:1:";
@@ -110,6 +123,8 @@ pub enum TrustKind {
     Bag,
     /// An ephemeral, scoped, expiring capability (pairing).
     Capability,
+    /// A one-use offer of a folder: join it (data layer).
+    Intro,
 }
 
 impl TrustKind {
@@ -121,6 +136,7 @@ impl TrustKind {
             TrustKind::Recovery => 4,
             TrustKind::Bag => 5,
             TrustKind::Capability => 6,
+            TrustKind::Intro => 7,
         }
     }
 
@@ -132,6 +148,7 @@ impl TrustKind {
             4 => TrustKind::Recovery,
             5 => TrustKind::Bag,
             6 => TrustKind::Capability,
+            7 => TrustKind::Intro,
             other => return Err(EnvelopeError::UnknownKind(other)),
         })
     }
@@ -145,6 +162,7 @@ impl TrustKind {
             TrustKind::Recovery => "recovery",
             TrustKind::Bag => "bag",
             TrustKind::Capability => "capability",
+            TrustKind::Intro => "intro",
         }
     }
 
@@ -177,6 +195,13 @@ impl TrustKind {
                 T_TTL_SECS,
                 T_NONCE,
                 T_GRANT,
+            ],
+            TrustKind::Intro => &[
+                T_NAMESPACE,
+                T_ANCHOR_FINGERPRINT,
+                T_OFFER,
+                T_SECRET,
+                T_RELAY_HINT,
             ],
         }
     }
@@ -226,6 +251,100 @@ pub struct Capability {
     /// on a `Grant`). The bearer decodes it as a `Certificate` to learn and
     /// verify the operator's key.
     pub grant: Option<Bytes>,
+}
+
+/// A one-use offer of a folder, as its code carries it (data-layer.md §19):
+/// what the holder needs to join. The secret is the whole of what makes the
+/// code worth stealing; [`Debug`] never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Introduction {
+    /// The inviter's namespace, as an NDN URI (e.g. `/home/alice`).
+    pub namespace: Option<String>,
+    /// SHA-256 of the inviter's root anchor public key: the anchor the
+    /// answer's trust context must be signed by.
+    pub fingerprint: [u8; ANCHOR_FINGERPRINT_LEN],
+    /// The offer record's name, as an NDN URI
+    /// (`<device>/32=log/<folder>/seq=<n>`).
+    pub offer: String,
+    /// The offer's secret.
+    pub secret: [u8; INTRO_SECRET_LEN],
+    /// Device names of relays that reach the inviter (the ones its trust
+    /// context advertises): reachability hints, not trusted for anything
+    /// else.
+    pub relays: Vec<String>,
+}
+
+impl std::fmt::Debug for Introduction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Introduction")
+            .field("namespace", &self.namespace)
+            .field("fingerprint", &self.fingerprint)
+            .field("offer", &self.offer)
+            .field("secret", &"<secret>")
+            .field("relays", &self.relays)
+            .finish()
+    }
+}
+
+/// What an introduction's words form carries ([`Introduction::to_words`]):
+/// the offer's name, its secret and the first half of the anchor
+/// fingerprint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IntroWords {
+    /// The offer record's name, as an NDN URI.
+    pub offer: String,
+    /// The offer's secret.
+    pub secret: [u8; INTRO_SECRET_LEN],
+    /// The first [`INTRO_WORDS_FINGERPRINT_LEN`] octets of the anchor
+    /// fingerprint.
+    pub fingerprint: [u8; INTRO_WORDS_FINGERPRINT_LEN],
+}
+
+impl std::fmt::Debug for IntroWords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntroWords")
+            .field("offer", &self.offer)
+            .field("secret", &"<secret>")
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+impl Introduction {
+    /// The words form: the offer's name, then [`words::WORD_COUNT`] words
+    /// encoding the secret followed by the fingerprint's first half.
+    pub fn to_words(&self) -> zeroize::Zeroizing<String> {
+        let mut octets = zeroize::Zeroizing::new([0u8; 32]);
+        octets[..INTRO_SECRET_LEN].copy_from_slice(&self.secret);
+        octets[INTRO_SECRET_LEN..]
+            .copy_from_slice(&self.fingerprint[..INTRO_WORDS_FINGERPRINT_LEN]);
+        let words = words::encode(&octets);
+        let mut text =
+            zeroize::Zeroizing::new(String::with_capacity(self.offer.len() + 1 + words.len()));
+        text.push_str(&self.offer);
+        text.push(' ');
+        text.push_str(&words);
+        text
+    }
+}
+
+impl IntroWords {
+    /// Read the words form: an offer name (an NDN URI, starting with `/`),
+    /// then the words.
+    pub fn parse(text: &str) -> Result<Self, words::WordsError> {
+        let text = text.trim();
+        let (offer, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        let octets = words::decode(rest)?;
+        let mut secret = [0u8; INTRO_SECRET_LEN];
+        secret.copy_from_slice(&octets[..INTRO_SECRET_LEN]);
+        let mut fingerprint = [0u8; INTRO_WORDS_FINGERPRINT_LEN];
+        fingerprint.copy_from_slice(&octets[INTRO_SECRET_LEN..]);
+        Ok(Self {
+            offer: offer.to_owned(),
+            secret,
+            fingerprint,
+        })
+    }
 }
 
 /// A decoded `ndn-trust://` envelope.
@@ -285,6 +404,8 @@ pub enum TrustEnvelope {
     },
     /// An ephemeral scoped capability (pairing).
     Capability(Capability),
+    /// A one-use offer of a folder (data layer).
+    Intro(Introduction),
 }
 
 impl TrustEnvelope {
@@ -297,6 +418,7 @@ impl TrustEnvelope {
             TrustEnvelope::Recovery { .. } => TrustKind::Recovery,
             TrustEnvelope::Bag { .. } => TrustKind::Bag,
             TrustEnvelope::Capability(_) => TrustKind::Capability,
+            TrustEnvelope::Intro(_) => TrustKind::Intro,
         }
     }
 
@@ -397,6 +519,17 @@ impl TrustEnvelope {
                     w.write_tlv(T_GRANT, g);
                 }
             }
+            TrustEnvelope::Intro(i) => {
+                if let Some(ns) = &i.namespace {
+                    w.write_tlv(T_NAMESPACE, ns.as_bytes());
+                }
+                w.write_tlv(T_ANCHOR_FINGERPRINT, &i.fingerprint);
+                w.write_tlv(T_OFFER, i.offer.as_bytes());
+                w.write_tlv(T_SECRET, &i.secret);
+                for r in &i.relays {
+                    w.write_tlv(T_RELAY_HINT, r.as_bytes());
+                }
+            }
         }
     }
 
@@ -460,6 +593,9 @@ impl TrustEnvelope {
         let mut fingerprint: Option<[u8; ANCHOR_FINGERPRINT_LEN]> = None;
         let mut context_data: Option<Bytes> = None;
         let mut device: Option<String> = None;
+        let mut offer: Option<String> = None;
+        let mut secret: Option<[u8; INTRO_SECRET_LEN]> = None;
+        let mut relays: Vec<String> = Vec::new();
 
         let fields = kind.body_fields();
         let mut r = TlvReader::new(body);
@@ -497,6 +633,14 @@ impl TrustEnvelope {
                         .map_err(|_| EnvelopeError::Malformed("anchor fingerprint length"))?,
                 )?,
                 T_DEVICE_NAME => set_once(&mut device, read_str(&v)?)?,
+                T_OFFER => set_once(&mut offer, read_str(&v)?)?,
+                T_SECRET => set_once(
+                    &mut secret,
+                    v.as_ref()
+                        .try_into()
+                        .map_err(|_| EnvelopeError::Malformed("introduction secret length"))?,
+                )?,
+                T_RELAY_HINT => relays.push(read_str(&v)?),
                 _ => unreachable!("every type in body_fields() has an arm"),
             }
         }
@@ -544,6 +688,13 @@ impl TrustEnvelope {
                 nonce: nonce.unwrap_or_default(),
                 grant,
             }),
+            TrustKind::Intro => TrustEnvelope::Intro(Introduction {
+                namespace,
+                fingerprint: fingerprint.ok_or(need("anchor fingerprint"))?,
+                offer: offer.ok_or(need("offer"))?,
+                secret: secret.ok_or(need("secret"))?,
+                relays,
+            }),
         })
     }
 
@@ -569,31 +720,41 @@ impl TrustEnvelope {
     /// The URI to show as one QR code ([`qr::encode`]): [`to_uri`](Self::to_uri)
     /// when it fits [`qr::MAX_TEXT_LEN`]; for an inline anchor that does not,
     /// the same anchor by reference (namespace, expected fingerprint and
-    /// version, no context: the adopting device fetches the context by name).
-    /// `None` when neither fits.
+    /// version, no context: the adopting device fetches the context by name);
+    /// for an introduction that does not, the same with as many of its
+    /// relay hints, in order, as fit. `None` when none fits.
     pub fn qr_uri(&self) -> Option<String> {
         let uri = self.to_uri();
         if uri.len() <= qr::MAX_TEXT_LEN {
             return Some(uri);
         }
-        let TrustEnvelope::Anchor {
-            namespace: Some(namespace),
-            fingerprint: Some(fingerprint),
-            version,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        let by_reference = TrustEnvelope::Anchor {
-            namespace: Some(namespace.clone()),
-            fingerprint: Some(*fingerprint),
-            version: *version,
-            context_data: None,
-            context_content: None,
+        match self {
+            TrustEnvelope::Anchor {
+                namespace: Some(namespace),
+                fingerprint: Some(fingerprint),
+                version,
+                ..
+            } => {
+                let by_reference = TrustEnvelope::Anchor {
+                    namespace: Some(namespace.clone()),
+                    fingerprint: Some(*fingerprint),
+                    version: *version,
+                    context_data: None,
+                    context_content: None,
+                }
+                .to_uri();
+                (by_reference.len() <= qr::MAX_TEXT_LEN).then_some(by_reference)
+            }
+            TrustEnvelope::Intro(intro) => (0..intro.relays.len()).rev().find_map(|keep| {
+                let fewer = TrustEnvelope::Intro(Introduction {
+                    relays: intro.relays[..keep].to_vec(),
+                    ..intro.clone()
+                })
+                .to_uri();
+                (fewer.len() <= qr::MAX_TEXT_LEN).then_some(fewer)
+            }),
+            _ => None,
         }
-        .to_uri();
-        (by_reference.len() <= qr::MAX_TEXT_LEN).then_some(by_reference)
     }
 
     /// Parse any supported carriage: the `ndn-trust://<kind>/` scheme, the
@@ -1189,5 +1350,103 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn intro(relays: usize) -> Introduction {
+        Introduction {
+            namespace: Some("/home/alice".into()),
+            fingerprint: [0xA5; ANCHOR_FINGERPRINT_LEN],
+            offer: "/home/alice/laptop/32=log/home/alice/32=data/notes/seq=12".into(),
+            secret: [0x3C; INTRO_SECRET_LEN],
+            relays: (0..relays)
+                .map(|i| format!("/community/node/relay-{i:04}"))
+                .collect(),
+        }
+    }
+
+    /// An introduction round-trips as a link; its words carry the offer, the
+    /// whole secret and the fingerprint's first half; its Debug hides the
+    /// secret.
+    #[test]
+    fn an_introduction_round_trips_as_a_link_and_as_words() {
+        let i = intro(2);
+        round_trip(&TrustEnvelope::Intro(i.clone()));
+        round_trip(&TrustEnvelope::Intro(Introduction {
+            namespace: None,
+            relays: Vec::new(),
+            ..i.clone()
+        }));
+        let words = IntroWords::parse(&i.to_words()).unwrap();
+        assert_eq!(words.offer, i.offer);
+        assert_eq!(words.secret, i.secret);
+        assert_eq!(
+            words.fingerprint[..],
+            i.fingerprint[..INTRO_WORDS_FINGERPRINT_LEN]
+        );
+        assert!(!format!("{:?}", TrustEnvelope::Intro(i.clone())).contains("60, 60"));
+        assert!(!format!("{words:?}").contains("60, 60"));
+    }
+
+    /// An introduction without its secret or offer, or with a secret of
+    /// another length, is refused.
+    #[test]
+    fn an_introduction_missing_a_field_is_refused() {
+        let full = TrustEnvelope::Intro(intro(0)).encode();
+        let mut r = TlvReader::new(full);
+        let (_, envelope) = r.read_tlv().unwrap();
+        let mut parts = TlvReader::new(envelope);
+        let mut body = None;
+        while !parts.is_empty() {
+            let (t, v) = parts.read_tlv().unwrap();
+            if t == T_BODY {
+                body = Some(v);
+            }
+        }
+        let body = body.unwrap();
+        for (drop, why) in [(T_SECRET, "secret"), (T_OFFER, "offer")] {
+            let mut w = TlvWriter::new();
+            let mut fields = TlvReader::new(body.clone());
+            while !fields.is_empty() {
+                let (t, v) = fields.read_tlv().unwrap();
+                if t != drop {
+                    w.write_tlv(t, &v);
+                }
+            }
+            let without = w.finish();
+            assert_eq!(
+                TrustEnvelope::decode_body(TrustKind::Intro, without),
+                Err(EnvelopeError::MissingField(why))
+            );
+        }
+        let mut w = TlvWriter::new();
+        w.write_tlv(T_ANCHOR_FINGERPRINT, &[0xA5; ANCHOR_FINGERPRINT_LEN]);
+        w.write_tlv(T_OFFER, b"/a/32=log/a/32=data/f/seq=1");
+        w.write_tlv(T_SECRET, &[1; INTRO_SECRET_LEN - 1]);
+        assert_eq!(
+            TrustEnvelope::decode_body(TrustKind::Intro, w.finish()),
+            Err(EnvelopeError::Malformed("introduction secret length"))
+        );
+    }
+
+    /// An introduction too long for one QR keeps the relay hints that fit,
+    /// in order; its secret, offer and fingerprint are never dropped.
+    #[test]
+    fn an_introduction_too_long_for_one_qr_drops_relay_hints_only() {
+        let many = TrustEnvelope::Intro(intro(200));
+        assert!(many.to_uri().len() > qr::MAX_TEXT_LEN);
+        let shown = many.qr_uri().unwrap();
+        assert!(shown.len() <= qr::MAX_TEXT_LEN);
+        let TrustEnvelope::Intro(kept) = TrustEnvelope::from_uri(&shown).unwrap() else {
+            panic!("an introduction");
+        };
+        assert!(!kept.relays.is_empty() && kept.relays.len() < 200);
+        assert_eq!(kept.relays[..], intro(200).relays[..kept.relays.len()]);
+        assert_eq!(
+            Introduction {
+                relays: Vec::new(),
+                ..kept
+            },
+            intro(0)
+        );
     }
 }
