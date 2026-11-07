@@ -389,6 +389,15 @@ pub enum DataError {
         /// The rule its members record names.
         rule: Name,
     },
+    /// An introduction was refused (spec §19): `why` says why and what to
+    /// do.
+    #[error("joining by the offer {offer} is refused: {why}")]
+    Introduction {
+        /// The offer the code names.
+        offer: Name,
+        /// Why.
+        why: crate::intro::IntroRefusal,
+    },
 }
 
 impl DataError {
@@ -398,6 +407,9 @@ impl DataError {
             DataError::Unavailable { .. } | DataError::NotReady { .. } => true,
             DataError::Refused { why, .. } => {
                 matches!(why, Refusal::BadSignature | Refusal::Rollback)
+            }
+            DataError::Introduction { why, .. } => {
+                matches!(why, crate::intro::IntroRefusal::Forged)
             }
             _ => false,
         }
@@ -432,6 +444,15 @@ impl DataError {
             DataError::BadRequest { .. } => NextStep::FixRequest,
             DataError::Local { .. } => NextStep::FixLocal,
             DataError::RuleUnknown { .. } => NextStep::UpdateProgram,
+            DataError::Introduction { why, .. } => match why {
+                crate::intro::IntroRefusal::WrongProof { .. } => NextStep::FixRequest,
+                crate::intro::IntroRefusal::Forged => NextStep::RetryLater,
+                crate::intro::IntroRefusal::Conflict => NextStep::FixLocal,
+                crate::intro::IntroRefusal::Unknown
+                | crate::intro::IntroRefusal::Used
+                | crate::intro::IntroRefusal::Expired
+                | crate::intro::IntroRefusal::Closed => NextStep::AskOwner,
+            },
         }
     }
 }

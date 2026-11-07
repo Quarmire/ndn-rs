@@ -263,6 +263,36 @@ pub mod tlv {
     /// one sequence across its collections, so a seq is accepted only in
     /// the collection it lists it under (spec §6.1, §8).
     pub const CUT_IN: u64 = 0x055F;
+
+    // The introduction exchange (spec §19): odd numbers, critical.
+
+    /// A log record: a one-use offer of a folder — `Name` (the folder),
+    /// `Role`, `KeepUntil` (its expiry), `Tries`, `Digest` (the commitment
+    /// to its secret), `SealKey` (the offering device's).
+    pub const INTRO_OFFER: u64 = 0x0561;
+    /// A log record: an offer used — `Name` (the offer), then `Writer` and
+    /// `Digest` (the asker key it was used by) — or, without them, closed
+    /// after too many wrong tries.
+    pub const INTRO_USED: u64 = 0x0563;
+    /// An ask, in its Interest's name: `EphemeralKey`, `Ciphertext` (a
+    /// content key wrapped to the offer's seal key), `Ciphertext` (the ask's
+    /// fields, sealed under it).
+    pub const INTRO_ASK: u64 = 0x0565;
+    /// An answer: `Name` (offer), `Writer`, `Digest` (the asker key), then
+    /// `Name` (folder), `Role`, `Credentials`, `Asker` — or `IntroRefused` —
+    /// then `Proof`.
+    pub const INTRO_ANSWER: u64 = 0x0567;
+    /// NonNegativeInteger: 0 reader, 1 writer.
+    pub const ROLE: u64 = 0x0569;
+    /// NonNegativeInteger: wrong tries (allowed, in an offer; left, in a
+    /// refusal).
+    pub const TRIES: u64 = 0x056B;
+    /// NonNegativeInteger (1 unknown, 2 used, 3 expired, 4 closed, 5 wrong
+    /// proof), then `Tries` (left) for a wrong proof.
+    pub const INTRO_REFUSED: u64 = 0x056D;
+    /// Data packets, each whole: a signed trust context, then certificates
+    /// of its signer key's chain.
+    pub const CREDENTIALS: u64 = 0x056F;
 }
 
 /// Keyword components of the layer's names.
@@ -321,19 +351,19 @@ pub const EXPIRY_RUNS: usize = 64;
 #[error("malformed data-layer record: {0}")]
 pub struct WireError(pub String);
 
-fn bad(what: impl Into<String>) -> WireError {
+pub(crate) fn bad(what: impl Into<String>) -> WireError {
     WireError(what.into())
 }
 
-fn kw(word: &'static [u8]) -> NameComponent {
+pub(crate) fn kw(word: &'static [u8]) -> NameComponent {
     NameComponent::keyword(Bytes::from_static(word))
 }
 
-fn is_kw(c: &NameComponent, word: &[u8]) -> bool {
+pub(crate) fn is_kw(c: &NameComponent, word: &[u8]) -> bool {
     c.typ == tlv_type::KEYWORD && c.value.as_ref() == word
 }
 
-fn name_of(comps: &[NameComponent]) -> Name {
+pub(crate) fn name_of(comps: &[NameComponent]) -> Name {
     Name::from_components(comps.iter().cloned())
 }
 
@@ -366,7 +396,7 @@ pub fn is_device_name(name: &Name) -> bool {
     is_device_comps(name.components())
 }
 
-fn is_device_comps(comps: &[NameComponent]) -> bool {
+pub(crate) fn is_device_comps(comps: &[NameComponent]) -> bool {
     !comps.is_empty() && comps.iter().all(is_plain)
 }
 
@@ -960,7 +990,7 @@ pub fn parse_hold_ask_name(name: &Name) -> Option<(Name, HoldAsk)> {
     ))
 }
 
-fn read_nonce(v: &[u8]) -> Result<[u8; NONCE_LEN], WireError> {
+pub(crate) fn read_nonce(v: &[u8]) -> Result<[u8; NONCE_LEN], WireError> {
     <[u8; NONCE_LEN]>::try_from(v).map_err(|_| bad("a nonce is 16 octets"))
 }
 
@@ -1399,7 +1429,7 @@ pub fn decode_grant(content: Bytes) -> Result<([u8; 32], Bytes), WireError> {
 
 // ---- primitives -------------------------------------------------------------------------------
 
-fn write_nni(w: &mut TlvWriter, typ: u64, v: u64) {
+pub(crate) fn write_nni(w: &mut TlvWriter, typ: u64, v: u64) {
     let b = v.to_be_bytes();
     let s = match v {
         0..=0xFF => &b[7..],
@@ -1410,7 +1440,7 @@ fn write_nni(w: &mut TlvWriter, typ: u64, v: u64) {
     w.write_tlv(typ, s);
 }
 
-fn read_nni(v: &[u8]) -> Result<u64, WireError> {
+pub(crate) fn read_nni(v: &[u8]) -> Result<u64, WireError> {
     Ok(match v.len() {
         1 => u64::from(v[0]),
         2 => u64::from(u16::from_be_bytes([v[0], v[1]])),
@@ -1420,7 +1450,7 @@ fn read_nni(v: &[u8]) -> Result<u64, WireError> {
     })
 }
 
-fn write_name(w: &mut TlvWriter, name: &Name) {
+pub(crate) fn write_name(w: &mut TlvWriter, name: &Name) {
     w.write_nested(tlv_type::NAME, |w| {
         for c in name.components() {
             w.write_tlv(c.typ, &c.value);
@@ -1428,14 +1458,14 @@ fn write_name(w: &mut TlvWriter, name: &Name) {
     });
 }
 
-fn read_name(value: Bytes) -> Result<Name, WireError> {
+pub(crate) fn read_name(value: Bytes) -> Result<Name, WireError> {
     Name::decode(value).map_err(|e| bad(format!("bad name: {e:?}")))
 }
 
 /// Iterate the TLVs of `value`, handing each known one to `f`; skip unknown
 /// even types and refuse unknown odd (critical) ones. `f` returns whether it
 /// knew the type.
-fn each(
+pub(crate) fn each(
     value: Bytes,
     mut f: impl FnMut(u64, Bytes) -> Result<bool, WireError>,
 ) -> Result<(), WireError> {
@@ -1650,7 +1680,7 @@ pub(crate) fn ranges_of<'a>(seqs: impl IntoIterator<Item = &'a u64>) -> Vec<(u64
     out
 }
 
-fn read_digest(v: &[u8]) -> Result<[u8; 32], WireError> {
+pub(crate) fn read_digest(v: &[u8]) -> Result<[u8; 32], WireError> {
     <[u8; 32]>::try_from(v).map_err(|_| bad("a digest is 32 octets"))
 }
 
@@ -1847,6 +1877,8 @@ pub enum Record {
     Lease(LeaseBody),
     /// A prune record.
     Prune(PruneBody),
+    /// An introduction's offer or use mark (spec §19).
+    Intro(crate::intro::IntroRecord),
 }
 
 impl Record {
@@ -1863,6 +1895,7 @@ impl Record {
                 Some(l) => l.subject,
                 None => Some(b.prefix.clone()),
             },
+            Record::Intro(r) => r.subject(),
         }
     }
 }
@@ -2300,6 +2333,7 @@ pub fn encode_record(r: &Record) -> Bytes {
         Record::Hold(b) => encode_hold(b),
         Record::Lease(b) => encode_lease(b),
         Record::Prune(b) => encode_prune(b),
+        Record::Intro(r) => r.encode(),
     }
 }
 
@@ -2327,6 +2361,9 @@ pub fn decode_record(content: Bytes) -> Result<Record, WireError> {
         tlv::HOLD_RECORD => decode_hold(value).map(Record::Hold),
         tlv::LEASE_RECORD => decode_lease(value).map(Record::Lease),
         tlv::PRUNE_RECORD => decode_prune(value).map(Record::Prune),
+        tlv::INTRO_OFFER | tlv::INTRO_USED => {
+            crate::intro::IntroRecord::decode(typ, value).map(Record::Intro)
+        }
         other => Err(bad(format!("{other:#x} is not a log record"))),
     }
 }
@@ -2871,7 +2908,7 @@ fn read_cut(value: Bytes, subject: &Name, folder: bool) -> Result<CutBody, WireE
 }
 
 /// Read a `Writer` TLV's value: one Name, a key.
-fn read_writer(v: Bytes) -> Result<Name, WireError> {
+pub(crate) fn read_writer(v: Bytes) -> Result<Name, WireError> {
     let mut r = TlvReader::new(v);
     let (t, v) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
     if t != tlv_type::NAME || !r.is_empty() {

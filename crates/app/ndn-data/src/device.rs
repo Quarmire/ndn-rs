@@ -154,15 +154,20 @@ pub struct Config {
     /// when `t` is more than this past this device's clock (spec §14.1), so
     /// a holder whose fast clock dropped the piece early is not framed.
     pub clock_skew: Duration,
-    /// Where audits draw their randomness.
+    /// Where audits draw their randomness, and introductions their secrets
+    /// and nonces (spec §19).
     pub entropy: Entropy,
+    /// What the host does for introductions (spec §19): give this device's
+    /// anchor and adopt another person's. `None`: [`Device::offer`] and
+    /// [`Device::join`] answer [`DataError::Local`] naming this setting.
+    pub introducer: Option<Arc<dyn crate::intro::Introducer>>,
 }
 
 impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
     /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
     /// not a holder, 16 pieces an audit, a day of clock skew, the operating
-    /// system's randomness.
+    /// system's randomness, no introducer.
     pub fn new() -> Self {
         Self {
             svs: SvsConfig::default(),
@@ -182,6 +187,7 @@ impl Config {
             entropy: Arc::new(|buf| {
                 getrandom::getrandom(buf).expect("the operating system provides randomness")
             }),
+            introducer: None,
         }
     }
 }
@@ -203,6 +209,7 @@ impl std::fmt::Debug for Config {
             .field("hold_for", &self.hold_for)
             .field("audit_pieces", &self.audit_pieces)
             .field("clock_skew", &self.clock_skew)
+            .field("introducer", &self.introducer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1488,6 +1495,8 @@ struct St {
     /// The trust context last taken of each namespace, so an adoption that
     /// refuses more than it did re-judges what is held ([`Inner::adopted`]).
     contexts: HashMap<Name, Arc<SignedTrustContext>>,
+    /// Introductions: offers, use marks and answers (spec §19).
+    intro: intro::Intros,
 }
 
 struct Inner {
@@ -5012,6 +5021,7 @@ impl Device {
                 verified: HashMap::new(),
                 suspected: BTreeMap::new(),
                 contexts,
+                intro: intro::Intros::new(),
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -6250,6 +6260,7 @@ impl Inner {
             Record::Hold(_) => (1, 0, *seq),
             Record::Lease(_) => (1, 1, *seq),
             Record::Prune(_) => (1, 2, *seq),
+            Record::Intro(_) => (1, 3, *seq),
             Record::Version(_) | Record::Snapshot(_) => (2, 0, *seq),
         });
         let rest = entries.split_off(
@@ -8257,6 +8268,10 @@ impl Inner {
                         },
                     );
                 }
+                None
+            }
+            Record::Intro(body) => {
+                self.take_intro(st, name, &parsed, wire, writer, body, digest);
                 None
             }
             Record::Prune(body) => {
@@ -10664,6 +10679,17 @@ impl Inner {
             // and the collection: its own task.
             rt::spawn(async move {
                 let reply = self.accept_hold(&name, ask).await;
+                self.reply(&name, responder, reply).await;
+            });
+            return;
+        }
+        if let Some((offering, ask)) = crate::intro::parse_intro_name(&name)
+            && offering == self.device
+        {
+            // Answering an ask verifies the asker, writes durably and has
+            // the host adopt the asker's anchor (spec §19.4): its own task.
+            rt::spawn(async move {
+                let reply = self.answer_intro(&name, ask).await;
                 self.reply(&name, responder, reply).await;
             });
             return;
@@ -18904,3 +18930,5 @@ mod durability_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod watch_tests;
+
+mod intro;
