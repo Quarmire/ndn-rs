@@ -618,9 +618,46 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
 - The rule MUST make applying `CP` yield the state of `down(P(CP))` with
   `CP`, plus the versions concurrent to it already applied, whichever
   subset of `down(P(CP))` it applied before.
+- **Newest first; what it covers counts as it counts.** In each pass a
+  reader first applies, if one is pending and its past is held, the newest
+  checkpoint (by its writer's seq), then what became ready; so a
+  collection read anew from its versions applies its newest checkpoint and
+  what came after it, whatever order they were held in. A version inside
+  the cover of a checkpoint applied here (the join of their `P(CP)`) counts
+  as its checkpoint counts: it leaves `not_counted` when the checkpoint
+  applies (`Change::Counted` if it was told not counted), and what the
+  rule later says of it is not told. The state, value and `not_counted`
+  are then the same whether a covered version was applied before its
+  checkpoint or never.
 - A reader MUST NOT fetch the pieces (§13.1) of a version covered by a
   checkpoint it holds whole and checked. Release (§13.3) counts only a
   checkpoint applied here.
+
+**Merge state across restarts: built lazily — slice 6.** At start a
+device restores only what it needs to publish and judge: its log and
+summaries, heads, records (members, holds, leases, prunes, cuts,
+introductions), groups, refusals, equivocation evidence, and per merge
+collection the index of the versions its store holds (ndn-data:
+`Coll::dormant`, each writer's seqs and the writers their parents name).
+A merge collection's state is not built then. It is built on the first
+need: a `get` of the collection, of a state name, version or entry of it;
+a `watch` of it; a `watch` of a folder over it, only when the collection
+holds a version past the watch's `since` (one to list — a collection
+wholly inside `since` stays unbuilt, and what arrives later builds it);
+`put`, `put_op` or `put_group` into it; `hold` or `release` of it; a
+version arriving for it; a group with a member in it being judged; a new
+members record over it; a revocation of a key that wrote in it. The build
+loads its versions from the store and applies them by the rules above —
+its newest checkpoint first, then the versions after it — so its state,
+frontier, value, `not_counted` and every verdict are those it had before
+the restart: each a function of the signed versions held, never of
+timing. Nothing else is persisted for it: the store holds, of other
+writers, only versions applied here (stored as they apply), and of this
+device every version it wrote; a check's verdict is a function of the
+operation alone, so refused versions, not stored, are fetched and refused
+again alike. Until built, the collection serves what its store holds of
+it as applied (§13.1). A collection nobody touches costs its index
+entries only.
 - **The past every reader sees.** `down(P)` holds the versions at or
   below `P` not refused by their key (a cut that does not list them, a key
   no writer, a revocation, an issuer no longer trusted): `Past::contains`
@@ -808,13 +845,25 @@ in any arrival order.
 
 - **Format.** A version of a group carries `Group` (§16.2): the group's
   `id`, the seq in its writer's log of the group's first version, and its
-  `count`, `1 ≤ count ≤ 1,024` (`GROUP_MAX`). The group `(w, id)` is
+  `count`, `1 ≤ count ≤ 65,536` (`GROUP_MAX`, as many seqs as a summary
+  node lists, §7; a chosen bound, not a limit of the design). The group `(w, id)` is
   exactly `w`'s versions at seqs `id` to `id + count − 1`, consecutive, one
   per collection and one per seq, all in collections of one folder — the
   same parent name, every component but the last — all declaring one
   `Seal`, and all kept `Forever` (until pruned): a member that expired
   would leave a reader that never held it unable to tell the group
   complete (§14.1).
+- **A reader's memory.** While a group waits — incomplete, or for a key, an
+  audience or a keep — a reader keeps each member it holds whole in its
+  store, not in memory (ndn-data: under
+  `/localhost/ndn-data/parked/<log entry name>`), and in memory only what
+  judging the group reads of it: its id, name, keep, declared seal and
+  epoch. The member is listed not counted with why as before. Once the
+  group is complete or refused its members are loaded and applied, or
+  refused, together. A stalled group of 65,536 members so costs a reader
+  no memory per member. A parked member is not applied, so it is not kept
+  across a restart: it is fetched again as any version not held. A member
+  in pieces not held whole stays in memory while its pieces are fetched.
 - **Writing.** `put_group` (§15) signs its items under one lock at
   consecutive seqs of the device's log, each carrying the group; no other
   entry of that log comes between them. It refuses, and writes nothing — no
@@ -2988,7 +3037,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0553 | Expiry | SeqRange+ (seqs the node lists in Entries), KeepUntil (a date at or after each one's keep); in a SummaryNode, at most 64, their seqs ascending and disjoint across all of them (§7) |
 | 0x0555 | Folder | empty; in a MembersRecord right after its Name: the record governs the folder Name and every collection strictly under it (§6.1) |
 | 0x0557 | Group | Seq (the group's id: the seq of its first version), GroupCount; in a VersionRecord right after Dated (§5.5) |
-| 0x0559 | GroupCount | NonNegativeInteger 1–1024 (`GROUP_MAX`): the number of versions in the group |
+| 0x0559 | GroupCount | NonNegativeInteger 1–65,536 (`GROUP_MAX`): the number of versions in the group |
 | 0x055F | CutIn | Name (a collection strictly under the folder), then per key it keeps versions of in that collection, by key: Writer, Entries (exactly those seqs); in a folder record's Cut only, once per collection (§6.1, §8) |
 | 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
 | 0x0563 | IntroUsed | Name (the offer), then Writer and Digest (the asker key it was used by and its public key's digest) when used, neither when closed; a log record (§19.1) |
@@ -3457,6 +3506,23 @@ drops keeps its earlier versions, cut at what the owner held, and a seal
 keeps what was written unsealed before readable, at every reader). Their
 features are `RuleByName`, `AppOps`, `MergePieces`, `Groups` and
 `FolderMembers`.
+
+The large-group case is g5 (one folder of 2,000 element collections; a
+writer puts one edit into each as a single group, above the former bound
+of 1,024; another member holds no member counted until all 2,000 are
+held, then counts all of them, and a reader holding only some keeps them
+in its store, not in memory, listed not counted with "group incomplete").
+The lazy-state case is l1 (a note collection with edits, a checkpoint and
+edits after it, beside collections nobody touches after a restart; the
+device stops and starts again from its store: no merge state is built at
+start, the first `get` builds the note's state from its newest checkpoint
+— the checkpoint and the versions after it applied, none before — and its
+frontier, value and `not_counted` equal those before the restart; the
+untouched collections stay unbuilt, costing index entries only). ndn-data
+carries l1 as a unit test, its rule counting starts and applies
+(`device/lazy_tests.rs`), with a folder watch that builds only the
+collections holding versions past its `since`, and the parking of an
+incomplete group's members.
 
 The folder-watch case is w1 (a note of 1,000 paragraphs, one element
 collection each, under one folder shared by `share_folder` with a second
