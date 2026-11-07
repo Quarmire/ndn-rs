@@ -23,7 +23,7 @@ define the bytes on the wire:
 
 | Spec | Covers |
 |---|---|
-| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals and types and the seven verbs; slices 1–4 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, seals, large payloads, custody leases and audits, prune; signed blocks, the one-key rule's head and freshness bound, retention by expiry with summary keep bounds, range reads; TLV 0x0520–0x057F), later slices skeleton |
+| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals and types and the seven verbs; slices 1–6 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, seals, large payloads, custody leases and audits, prune; signed blocks, the one-key rule's head and freshness bound, retention by expiry with summary keep bounds, range reads; revocation cuts; merge rules by versioned name, operations the application builds, checkpoints, merge pieces, groups of versions, folder members records; TLV 0x0520–0x057F), later slices skeleton |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
 | [ndnsf-invariants.md](ndnsf-invariants.md) | NDNSF security-invariant witnesses |
@@ -51,4 +51,4 @@ here before using it.
 | 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) |
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
 | 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
-| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553) |
+| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553; slice 6's folder flag of a members record, a version's group and its count, 0x0555–0x0559) |
