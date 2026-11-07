@@ -153,12 +153,19 @@ pub struct Answer {
 }
 
 /// One item of a [`watch`](DataLayer::watch).
+///
+/// Every change names the collection it is about
+/// ([`collection`](Change::collection)), so one watch of a folder is one
+/// stream for every collection under it, those created after the watch
+/// began included, each change tagged (spec §15).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Change {
-    /// A verified summary of the collection, or of a child whose digest
-    /// changed.
+    /// A verified summary of the watched collection or folder, or of a
+    /// node below it (a sub-folder or a collection) whose digest changed.
+    /// Its tag is the node it summarises.
     Summary(Summary),
-    /// A verified version beyond the watched frontier.
+    /// A verified version beyond the watched frontier. Its tag is its
+    /// collection.
     Version(Version),
     /// A version delivered earlier is no longer accepted (open item "before
     /// a cut arrives"): a cut that arrived later refuses it — a members
@@ -167,6 +174,8 @@ pub enum Change {
     /// certificate chain (an issuer above its key revoked). Sent to every
     /// watcher of the collection, whatever its frontier.
     Withdrawn {
+        /// The version's collection.
+        collection: Name,
         /// The version.
         id: VersionId,
         /// Why, as a `get` of it now answers: [`Refusal::OutsideCut`] with
@@ -180,6 +189,8 @@ pub enum Change {
     /// dropped it, and a `get` of it answers [`DataError::Pruned`]. Filled
     /// by slice 3.
     Pruned {
+        /// The version's collection.
+        collection: Name,
         /// The version.
         id: VersionId,
         /// The prune record that covers it.
@@ -189,14 +200,20 @@ pub enum Change {
     /// §14.1): the device dropped it, and a `get` of it answers
     /// [`DataError::Expired`].
     Expired {
+        /// The version's collection.
+        collection: Name,
         /// The version.
         id: VersionId,
         /// Its keep.
         keep: Keep,
     },
     /// Two different versions with one `(writer, seq)`: evidence against that
-    /// key (model invariant 2). Readers keep both and report.
+    /// key (model invariant 2). Readers keep both and report. Told once for
+    /// each collection the two versions are in: when they are in two
+    /// collections, a watcher of both is told twice, once tagged with each.
     Equivocation {
+        /// The collection it is told for: `first`'s or `second`'s.
+        collection: Name,
         /// The version seen first.
         first: Box<Version>,
         /// The conflicting version.
@@ -206,6 +223,8 @@ pub enum Change {
     /// [`NotCounted`](crate::merge::Counting::NotCounted), or its group is
     /// incomplete or not readable here. Shown, never dropped.
     NotCounted {
+        /// The version's collection.
+        collection: Name,
         /// The version.
         id: VersionId,
         /// Why it is not in the state.
@@ -213,9 +232,30 @@ pub enum Change {
     },
     /// A version reported [`NotCounted`](Change::NotCounted) now counts.
     Counted {
+        /// The version's collection.
+        collection: Name,
         /// The version.
         id: VersionId,
     },
+}
+
+impl Change {
+    /// The collection the change is about — for a
+    /// [`Summary`](Change::Summary), the node it summarises (the watched
+    /// name or a name below it): the tag that tells apart the collections of
+    /// one folder watch.
+    pub fn collection(&self) -> &Name {
+        match self {
+            Change::Summary(s) => &s.collection,
+            Change::Version(v) => &v.collection,
+            Change::Withdrawn { collection, .. }
+            | Change::Pruned { collection, .. }
+            | Change::Expired { collection, .. }
+            | Change::Equivocation { collection, .. }
+            | Change::NotCounted { collection, .. }
+            | Change::Counted { collection, .. } => collection,
+        }
+    }
 }
 
 /// The stream a [`watch`](DataLayer::watch) returns. It ends only when the
@@ -323,10 +363,16 @@ pub trait DataLayer: Send + Sync {
         options: PutOptions,
     ) -> Result<Vec<VersionId>, DataError>;
 
-    /// `watch(collection, since F) → summary, new versions…`.
+    /// `watch(collection | folder, since F) → summary, new versions…`.
     ///
     /// Listing, history and live updates in one: what the collection holds
-    /// beyond `since`, then everything new. Nested summaries let it descend
+    /// beyond `since`, then everything new. Given a folder, one stream for
+    /// every collection under it, those created after the watch began
+    /// included, by any writer, every change tagged with its collection
+    /// ([`Change::collection`]); `since` filters each collection alike. The
+    /// listing shows what is applied (with [`Change::NotCounted`] for what
+    /// is held but not counted); a version not applied yet comes once it
+    /// applies, so no version comes twice. Nested summaries let it descend
     /// only into children that changed. Filled by slice 1.
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError>;
 

@@ -3138,6 +3138,7 @@ impl St {
             for (id, why) in &coll.not_counted {
                 if delivered.contains(id) && not_counted.get(id) != Some(why) {
                     told.push(Change::NotCounted {
+                        collection: c.clone(),
                         id: id.clone(),
                         why: why.clone(),
                     });
@@ -3148,7 +3149,10 @@ impl St {
                     && at.contains(id)
                     && coll.versions.contains_key(id)
                 {
-                    told.push(Change::Counted { id: id.clone() });
+                    told.push(Change::Counted {
+                        collection: c.clone(),
+                        id: id.clone(),
+                    });
                 }
             }
         }
@@ -3157,7 +3161,14 @@ impl St {
         }
         for (id, why) in withdrawn {
             tracing::info!(?id, collection = %c, %why, "withdrawn");
-            self.tell(c, &Change::Withdrawn { id, why });
+            self.tell(
+                c,
+                &Change::Withdrawn {
+                    collection: c.clone(),
+                    id,
+                    why,
+                },
+            );
         }
     }
 
@@ -3436,6 +3447,7 @@ impl St {
                             if !quiet.contains(&id) {
                                 changes.push((
                                     Change::NotCounted {
+                                        collection: c.clone(),
                                         id: id.clone(),
                                         why,
                                     },
@@ -3451,6 +3463,7 @@ impl St {
                         if matches!(why, Refusal::Group { .. }) && !quiet.contains(&id) {
                             changes.push((
                                 Change::NotCounted {
+                                    collection: c.clone(),
                                     id,
                                     why: format!("group refused: {why}"),
                                 },
@@ -3461,7 +3474,13 @@ impl St {
                     }
                     Ran::Counted(id) => {
                         if not_counted.remove(&id).is_some() && !quiet.contains(&id) {
-                            changes.push((Change::Counted { id }, None));
+                            changes.push((
+                                Change::Counted {
+                                    collection: c.clone(),
+                                    id,
+                                },
+                                None,
+                            ));
                         }
                     }
                 }
@@ -3483,6 +3502,7 @@ impl St {
                 group_waits.insert(id.clone(), why.clone());
                 changes.push((
                     Change::NotCounted {
+                        collection: c.clone(),
                         id: id.clone(),
                         why: why.clone(),
                     },
@@ -3500,7 +3520,13 @@ impl St {
             let counted = versions.contains_key(&id)
                 && applied.get(&id.writer).is_some_and(|a| *a >= id.seq.0);
             if counted {
-                changes.push((Change::Counted { id }, None));
+                changes.push((
+                    Change::Counted {
+                        collection: c.clone(),
+                        id,
+                    },
+                    None,
+                ));
             }
         }
         watchers.retain(|w| !w.tx.is_closed());
@@ -3567,13 +3593,19 @@ impl St {
         if let Record::Version(body) = record
             && let Some(v) = self.held_version(&first)
         {
-            let change = Change::Equivocation {
-                first: Box::new(v.clone()),
-                second: Box::new(version_of(name, writer, seq, body.clone())),
-            };
-            self.tell(&body.collection, &change);
+            let first = Box::new(v.clone());
+            let second = Box::new(version_of(name, writer, seq, body.clone()));
+            let mut told = vec![body.collection.clone()];
             if v.collection != body.collection {
-                self.tell(&v.collection, &change);
+                told.push(v.collection.clone());
+            }
+            for c in told {
+                let change = Change::Equivocation {
+                    collection: c.clone(),
+                    first: first.clone(),
+                    second: second.clone(),
+                };
+                self.tell(&c, &change);
             }
         }
         true
@@ -4262,6 +4294,7 @@ impl St {
                 for w in watchers.iter() {
                     if c.has_prefix(&w.target) {
                         let _ = w.tx.send(Ok(Change::Pruned {
+                            collection: c.clone(),
                             id: id.clone(),
                             by: by.clone(),
                         }));
@@ -4419,6 +4452,7 @@ impl St {
                 for w in watchers.iter() {
                     if c.has_prefix(&w.target) {
                         let _ = w.tx.send(Ok(Change::Expired {
+                            collection: c.clone(),
                             id: id.clone(),
                             keep: tomb.keep,
                         }));
@@ -7703,6 +7737,7 @@ impl Inner {
                 && first.wire != wire
             {
                 let change = Change::Equivocation {
+                    collection: body.collection.clone(),
                     first: Box::new(first.version.clone()),
                     second: Box::new(version_of(&name, &writer, id.seq.0, body.clone())),
                 };
@@ -8932,6 +8967,7 @@ impl Inner {
                 st.tell(
                     &x,
                     &Change::Withdrawn {
+                        collection: x.clone(),
                         id,
                         why: why.clone(),
                     },
@@ -9967,13 +10003,17 @@ impl Inner {
             if let Counting::NotCounted(why) = counting {
                 coll.not_counted.insert(id.clone(), why.clone());
                 told.push(Change::NotCounted {
+                    collection: c.clone(),
                     id: id.clone(),
                     why,
                 });
             }
             for n in now {
                 if coll.not_counted.remove(&n).is_some() {
-                    told.push(Change::Counted { id: n });
+                    told.push(Change::Counted {
+                        collection: c.clone(),
+                        id: n,
+                    });
                 }
             }
         }
@@ -14267,22 +14307,52 @@ impl DataLayer for Device {
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
             let mut st = inner.st.lock();
-            let mut held: Vec<&Version> = st
-                .colls
-                .iter()
-                .filter(|(c, _)| c.has_prefix(collection))
-                // A member of a group is shown once its group counts.
-                .flat_map(|(_, coll)| {
-                    coll.versions
-                        .values()
-                        .map(|hv| &hv.version)
-                        .filter(|v| v.group.is_none() || !coll.pending.contains(&v.id))
-                })
-                .filter(|v| !since.contains(&v.id))
-                .collect();
-            held.sort_by(|a, b| (&a.collection, &a.id).cmp(&(&b.collection, &b.id)));
-            for v in held {
-                let _ = tx.send(Ok(Change::Version(v.clone())));
+            // Each collection under the target, in order: what it holds
+            // applied, each with why when the rule does not count it, and
+            // the group members waiting for their group, as not counted. A
+            // version not applied yet is delivered once it applies, as it
+            // would have been had the watch begun earlier, so none is
+            // delivered twice.
+            let mut listed: Vec<(&Name, &VersionId, Change)> = Vec::new();
+            for (c, coll) in st.colls.iter().filter(|(c, _)| c.has_prefix(collection)) {
+                for hv in coll.versions.values() {
+                    let v = &hv.version;
+                    if since.contains(&v.id) || coll.pending.contains(&v.id) {
+                        continue;
+                    }
+                    listed.push((c, &v.id, Change::Version(v.clone())));
+                    if let Some(why) = coll.not_counted.get(&v.id) {
+                        listed.push((
+                            c,
+                            &v.id,
+                            Change::NotCounted {
+                                collection: c.clone(),
+                                id: v.id.clone(),
+                                why: why.clone(),
+                            },
+                        ));
+                    }
+                }
+                for (id, why) in coll
+                    .group_waits
+                    .iter()
+                    .filter(|(id, _)| !since.contains(id))
+                {
+                    listed.push((
+                        c,
+                        id,
+                        Change::NotCounted {
+                            collection: c.clone(),
+                            id: id.clone(),
+                            why: why.clone(),
+                        },
+                    ));
+                }
+            }
+            // Stable: a version comes before why it is not counted.
+            listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, _, change) in listed {
+                let _ = tx.send(Ok(change));
             }
             st.watchers.push(Watcher {
                 target: collection.clone(),
@@ -16659,7 +16729,7 @@ mod tests {
         };
         assert!(
             seen.iter()
-                .any(|ch| matches!(ch, Change::Expired { id: i, .. } if *i == id)),
+                .any(|ch| matches!(ch, Change::Expired { collection, id: i, .. } if *i == id && *collection == c)),
             "its watcher is told: {seen:?}"
         );
 
@@ -17426,7 +17496,7 @@ mod tests {
             .expect("the stream is open")
             .unwrap();
         assert!(
-            matches!(&change, Change::Withdrawn { id, why: Refusal::OutsideCut(cut) } if *id == r.id(3) && cut.of == r.key),
+            matches!(&change, Change::Withdrawn { collection, id, why: Refusal::OutsideCut(cut) } if *collection == r.c && *id == r.id(3) && cut.of == r.key),
             "{change:?}"
         );
         assert!(outside_cut(r.dev.get(&three).await));
@@ -18112,7 +18182,7 @@ mod tests {
             .expect("the stream is open")
             .unwrap();
         assert!(
-            matches!(&change, Change::Withdrawn { id, why: Refusal::Untrusted { .. } } if id.writer == writer),
+            matches!(&change, Change::Withdrawn { id, why: Refusal::Untrusted { .. }, .. } if id.writer == writer),
             "withdrawn for its chain, by no cut: {change:?}"
         );
         assert!(matches!(
@@ -18620,3 +18690,6 @@ mod admission_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod durability_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod watch_tests;

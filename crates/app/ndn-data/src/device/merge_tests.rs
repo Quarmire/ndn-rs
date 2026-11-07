@@ -529,7 +529,7 @@ async fn a_version_its_rule_does_not_count_is_applied_shown_and_counted_later() 
     let seen = drain(&mut changes).await;
     assert!(
         seen.iter()
-            .any(|ch| matches!(ch, Change::Counted { id } if *id == w.id()))
+            .any(|ch| matches!(ch, Change::Counted { id, .. } if *id == w.id()))
     );
     dev.shutdown();
 }

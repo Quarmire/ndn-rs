@@ -253,7 +253,7 @@ async fn a_group_counts_all_or_none_in_either_arrival_order() {
         let seen = drain(&mut changes).await;
         assert!(
             seen.iter()
-                .any(|c| matches!(c, Change::Counted { id } if *id == first))
+                .any(|c| matches!(c, Change::Counted { collection, id } if *id == first && *collection == first_c))
         );
         dev.shutdown();
     }
@@ -319,7 +319,7 @@ async fn a_cut_refusing_one_member_withdraws_the_whole_group_and_spares_others_w
     let seen = drain(&mut changes).await;
     assert!(seen.iter().any(|c| matches!(
         c,
-        Change::Withdrawn { id, why: Refusal::Group { .. } } if *id == id_of(&a)
+        Change::Withdrawn { collection, id, why: Refusal::Group { .. } } if *id == id_of(&a) && *collection == plan()
     )));
     assert!(matches!(
         dev.get(&a.name).await,
