@@ -727,26 +727,21 @@ in any arrival order.
   - **Malformed** — refused for good: a member's seq outside `id` to
     `id + count − 1`, members disagreeing on `count`, members in
     collections of different parents, two members in one collection,
-    members whose declared `Seal`s differ as sets, a member kept otherwise
-    than `Forever`, sealed and unsealed members together, two entries of
-    `w` at one seq of the group in collections of its folder
-    (equivocation, §4), or a seq of the group missing for good (below).
-    An entry of `w` at a seq counts here when it is held kept `Forever`,
-    or listed by `w`'s node and covered by `w`'s prune record (the node
-    keeps listing what was pruned), or listed by `w`'s node of a merge
-    collection (which lists every entry): what every reader following the
-    folder learns from `w`'s signed nodes and fetches. An entry outside
-    the folder, or kept for its last `n` or until a date — which leaves
-    `w`'s listing, so a reader starting later never learns of it — is not
-    evidence against the group; cuts accept a seq only in its collection
-    (§6.1, §8), so such an entry gains its writer nothing. A seq is
-    **missing for good** when `w`'s node of the folder reaches it and
-    lists its children — itself, or through pages (§7) every one of
-    which whose head reaches the seq is held —, and `w`'s node of every
-    child whose subtree reaches the seq is held, reaches it, and lists no
-    entry there: a member that expired at its writer's before a reader
-    started is refused there, as at the readers that held it. While such
-    a node or page is not held, the group waits.
+    members whose declared `Seal`s differ as sets, sealed and unsealed
+    members together, or two entries of `w` at one seq of the group in
+    collections of its folder (equivocation, §4). An entry of `w` at a seq
+    counts here when it is held kept `Forever`, or known (held, or listed
+    by a node of `w` the reader verified, ever) and covered by `w`'s prune
+    record, or known in a merge collection (whose nodes list every entry):
+    what every reader following the folder learns from `w`'s signed nodes
+    and fetches. Evidence once taken is kept: a node that later stops
+    listing an entry — its writer's store lost it, say — takes nothing
+    back. An entry outside the folder, or kept for its last `n` or until a
+    date — which leaves `w`'s listing, so a reader starting later never
+    learns of it — is not evidence against the group; cuts accept a seq
+    only in its collection (§6.1, §8), so such an entry gains its writer
+    nothing. An absent listing is never evidence: what an honest writer's
+    node stops listing may be listed, and fetched, again (§7).
   - **Refused** — a member is refused for good: by the record in force of
     its collection (`NotMember`, `OutsideCut`, §6, §8), by a revocation cut
     or an untrusted chain (§8.1, §8.3), `Unsealed` (§9), by its rule's
@@ -775,6 +770,14 @@ in any arrival order.
     counts, at every reader alike, once records admitting them are held
     and the keys granted. The requirement comes from the epochs used,
     never from the seal the writer declares.
+  - **Never counted** — a member is kept otherwise than `Forever`: no
+    member counts and none is refused, at any reader; each waits, reported
+    not counted ("group never counts: … kept …"), and versions that depend
+    on a member — its writer's later versions in those collections among
+    them — wait. A reader that never learns of that member (it left its
+    writer's listing) finds the group incomplete and waits alike, so no
+    reader applies what follows it and no honest writer builds on it: only
+    the misbehaving writer's own later versions are held back.
   - **Unreadable here** — a member is held sealed and this device cannot
     open it: no member is shown — none delivered as a version, none in a
     value — each is reported not counted ("group not readable here"), and
@@ -794,7 +797,8 @@ in any arrival order.
   listing what it pruned. The group counts once every other member is
   present, and nothing counted is uncounted by a prune. Expiry has no such
   evidence for a reader that never held the member — the writer's node
-  stops listing it — which is why group members never expire.
+  stops listing it — which is why a group with a member that may expire
+  never counts.
 - A device holding a member of an incomplete group follows the member's
   folder (its parent name, §12), so that the others arrive.
 - A rule's not counted on one member does not hold the others back: they
@@ -1131,13 +1135,17 @@ everywhere once the owner admits them to every epoch.
 date would vanish from its writer's listing once expired, and a reader
 starting later could never learn it had existed, while readers that held
 it counted the group and built on it. Group members are therefore kept
-until pruned: `put_group` refuses another keep, and readers refuse a group
-with such a member (§5.5). A writer that signs one anyway, letting it
-expire, gains no split either: a reader that never held it finds the
-group's seq missing for good from the writer's signed nodes of the folder
-and refuses the group too. A prune leaves signed evidence every reader
-fetches — the prune record, and the writer's summary still listing the
-entry — so a pruned member counts as present alike everywhere.
+until pruned: `put_group` refuses another keep. A writer that signs one
+anyway gains no split: a reader holding it never counts the group and
+refuses none of it, and a reader that never learns of it finds the group
+incomplete — both wait, so no reader applies the writer's later versions
+there and no honest writer builds on them; only the misbehaving writer
+is held back. Nothing is refused for a listing that is absent: an honest
+writer's node may stop listing an entry its store lost and list it again
+once found, and the group then counts everywhere. A prune leaves signed
+evidence every reader fetches — the prune record, and the writer's
+summary still listing the entry — so a pruned member counts as present
+alike everywhere.
 
 **Folder-level widening attempts.** `share` refuses to widen a
 collection under a folder; a record that widens anyway — signed by older
@@ -3100,7 +3108,8 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Group whose members' epochs admit different readers, whatever seal it declares | No reader counts it until every member's epoch admits every reader another member's epoch lists; sealed and unsealed members together make it malformed. | §5.5, §6.2 |
 | `put_group` that cannot complete | Refused before anything is signed, saying which item and why — also for a keep other than `Forever`. | §5.5 |
 | Group member pruned | It counts as present for its group's verdict, alike at every reader (the prune record and the writer's summary say so): the group counts once every other member is present, and nothing counted is uncounted by the prune. | §5.5, §14 |
-| Group member that may expire | The group is malformed: no reader counts it, so none builds on a member a later reader could never learn of; a reader that never held it finds its seq missing for good from the writer's nodes and refuses the group too. | §5.5, §6.2, §14.1 |
+| Group member that may expire | The group never counts and nothing of it is refused, at every reader: one holding the member and one that never learns of it both wait, so no reader applies the writer's later versions there and no honest writer builds on them. | §5.5, §6.2, §14.1 |
+| Group member its writer's node stops listing (store loss) | Nothing is refused: the group waits, and counts everywhere — with versions made over the member — once the node lists it again and it is fetched. | §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back. | §5, §6.1 |
