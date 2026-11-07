@@ -142,7 +142,12 @@ pub(crate) async fn run_face_reader(
     }
 
     match kind {
-        FaceKind::App | FaceKind::Internal => {}
+        // The engine's own internal faces live as long as the engine. An app
+        // face that closed is gone with its app, and is cleaned up below like
+        // any other local face: its routes kept, Interests under its prefixes
+        // would go to a dead face instead of to the app that registers them
+        // next (one started again).
+        FaceKind::Internal => {}
         _ => match persistency {
             FacePersistency::Permanent => {
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "face reader stopped (permanent face retained)");

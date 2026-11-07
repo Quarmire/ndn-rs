@@ -11,6 +11,8 @@
 
 #[path = "broadcast_data_parity.rs"]
 mod broadcast_data_parity;
+#[path = "closed_app_face.rs"]
+mod closed_app_face;
 #[path = "congestion_feedback.rs"]
 mod congestion_feedback;
 #[path = "default_profile_without_manager.rs"]
