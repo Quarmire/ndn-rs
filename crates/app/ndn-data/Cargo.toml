@@ -30,7 +30,8 @@ yrs          = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
-tokio      = { workspace = true, features = ["sync", "time"] }
+# `rt`: the store's flush runs on the blocking pool (`spawn_blocking`).
+tokio      = { workspace = true, features = ["sync", "time", "rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ndn-packet = { workspace = true, features = ["std-wasm"] }
@@ -38,6 +39,10 @@ tokio      = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+# The durability conformance case (`device/durability_tests.rs`) restarts a
+# device on both on-disk engines after a simulated power loss.
+ndn-sync = { workspace = true, features = ["store-fjall", "store-redb"] }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -570,9 +570,12 @@ struct Coll {
     /// The date of this device's newest entry here: its next is dated no
     /// earlier (spec §4.1), so a time range finds its entries in order.
     last_dated: Option<Timestamp>,
-    /// The batch delay of this device's newest version here (zero
-    /// unbatched): the freshness its head states (spec §5.3).
-    batch: Duration,
+    /// The batch delay of each of this device's versions here (zero
+    /// unbatched) by seq, from the newest its head may state on: the
+    /// freshness a head states is its newest version's (spec §5.3), and a
+    /// head lists only the durable log (spec §4.2), so the versions after
+    /// the durable head and the newest before it are kept.
+    batches: BTreeMap<u64, Duration>,
     /// The revocation cuts of the revoked keys that write here, or that a
     /// version held here names as a parent, by key (spec §8): each accepts
     /// that key's runs for this collection's log. An entry of such a key
@@ -1171,6 +1174,15 @@ const REFRESH_PAUSE_MAX: Duration = Duration::from_secs(64);
 /// How many times a device not reached is asked again.
 const REFRESH_TRIES: u32 = 16;
 
+/// How long the committer waits before it asks the store again for a flush
+/// that failed ([`Inner::commit_rounds`]); doubled each time up to
+/// [`COMMIT_RETRY_MAX`]. Nothing written since the last flush is published
+/// meanwhile.
+const COMMIT_RETRY: Duration = Duration::from_millis(100);
+
+/// The longest pause between two flushes asked of a store that failed.
+const COMMIT_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// Why this device owes a collection (or folder) a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owed {
@@ -1305,8 +1317,9 @@ struct Peer {
 struct SyncGroup {
     /// The group's publish channel, once joined.
     tx: Option<mpsc::Sender<(Name, Option<Bytes>)>>,
-    /// Publications made before the join completed.
-    owed: u64,
+    /// An announcement is wanted: the next commit round makes it, once
+    /// what it announces is durable ([`Inner::commit_rounds`]).
+    pending: bool,
     /// Devices heard in the group.
     members: BTreeSet<Name>,
     /// Devices being refreshed, and whether to refresh again after.
@@ -1334,7 +1347,21 @@ struct SignedRoot {
 struct St {
     /// This device's namespace.
     ns: Name,
+    /// The own log's head: the seq of the newest entry this device signed.
     head: u64,
+    /// The own log's durable head: every own entry up to it is behind the
+    /// store's barrier ([`DataStore::sync`] returned after it was stored).
+    /// Only those are published — served, listed in a summary or head,
+    /// announced (spec §4.2): what a power loss can take is above it, and
+    /// nobody saw it.
+    durable: u64,
+    /// Commit rounds begun, and the newest whose flush returned
+    /// ([`Inner::commit_rounds`]).
+    round: u64,
+    round_done: u64,
+    /// A flush is wanted though no own entry or announcement waits for one
+    /// ([`Inner::barrier`]).
+    flush_wanted: bool,
     trees: HashMap<Name, Tree>,
     roots: HashMap<Name, SignedRoot>,
     colls: HashMap<Name, Coll>,
@@ -1455,6 +1482,11 @@ struct Inner {
     /// Wakes the expiry sweeper: a version kept until earlier than it is
     /// armed for arrived.
     sweep: Arc<Notify>,
+    /// Wakes the committer ([`Inner::commit_rounds`]): something was written that
+    /// waits for the barrier, or an announcement is wanted.
+    commit_wake: Arc<Notify>,
+    /// Told after each commit round that moved [`St::durable`].
+    committed: Notify,
     slots: Semaphore,
     /// Asker proofs being verified ([`ASKS_VERIFYING`]).
     verifying: Semaphore,
@@ -4715,6 +4747,10 @@ impl Device {
             st: Mutex::new(St {
                 ns: ns.clone(),
                 head: 0,
+                durable: 0,
+                round: 0,
+                round_done: 0,
+                flush_wanted: false,
                 trees: HashMap::new(),
                 roots: HashMap::new(),
                 colls: HashMap::new(),
@@ -4762,6 +4798,8 @@ impl Device {
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
+            commit_wake: Arc::new(Notify::new()),
+            committed: Notify::new(),
             slots: Semaphore::new(window),
             verifying: Semaphore::new(ASKS_VERIFYING),
             signatures: AtomicU64::new(0),
@@ -4786,6 +4824,22 @@ impl Device {
         // trust contexts held now (spec §8): a key above its signer may
         // have been revoked while the device was off.
         inner.rejudge(Rejudge::All).await;
+        // What the store holds may be only in the operating system's
+        // buffers (an earlier run was killed before its flush): it is made
+        // durable before any of it is published, or a power loss now could
+        // take entries peers are about to see (spec §4.2).
+        if let Err(e) = inner.flush().await {
+            return Err(local(format!(
+                "the store did not make what it holds durable ({e}); {device} publishes only \
+                 what is on disk, so it does not start: check the disk or filesystem the store \
+                 is on, and start it again"
+            )));
+        }
+        {
+            let mut st = inner.st.lock();
+            st.durable = st.head;
+        }
+        inner.spawn_committer();
         let weak = Arc::downgrade(&inner);
         rt::spawn(async move {
             while let Some(ctx) = adopted_rx.recv().await {
@@ -4846,14 +4900,14 @@ impl Device {
         // announced now, without waiting for a new write.
         for g in inner.restored_groups() {
             inner.join(&g).await?;
-            inner.publish(&g).await;
+            inner.publish(&g);
         }
         // A holder makes itself heard in the groups of the namespaces it
         // holds for, so their owners' devices know to ask it (spec §13),
         // and takes up again what its leases promise.
         for hns in inner.config.hold_for.clone() {
             inner.join(&hns).await?;
-            inner.publish(&hns).await;
+            inner.publish(&hns);
         }
         let held: Vec<Name> = inner.st.lock().holding.keys().cloned().collect();
         for c in held {
@@ -5156,9 +5210,14 @@ impl Device {
         self.inner.stopped.store(true, Ordering::Relaxed);
         self.inner.serving.lock().take();
         self.inner.svs.shutdown();
-        let mut st = self.inner.st.lock();
-        st.watchers.clear();
-        st.groups.clear();
+        {
+            let mut st = self.inner.st.lock();
+            st.watchers.clear();
+            st.groups.clear();
+        }
+        // The committer stops, and whatever waits for the barrier is let go.
+        self.inner.commit_wake.notify_one();
+        self.inner.committed.notify_waiters();
     }
 
     /// Drop this device's own copies of the chunks of the large versions
@@ -5604,6 +5663,33 @@ fn written_name(entry: &Name) -> Name {
     under(&written_prefix(), entry)
 }
 
+/// Where the store keeps, for each one-key collection this device writes,
+/// the seq and batch delay of its newest version
+/// (`/localhost/ndn-data/batched/<collection>`, 16 octets: the seq and the
+/// delay in milliseconds, big-endian), written with the version: the
+/// freshness its head states at that seq is the same after a restart
+/// (spec §5.3, §4.2).
+fn batched_prefix() -> Name {
+    "/localhost/ndn-data/batched".parse().expect("a valid name")
+}
+
+fn batched_name(c: &Name) -> Name {
+    under(&batched_prefix(), c)
+}
+
+fn encode_batched(seq: u64, batch: Duration) -> Bytes {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&(batch.as_millis() as u64).to_be_bytes());
+    Bytes::from(out)
+}
+
+fn decode_batched(value: &[u8]) -> Option<(u64, Duration)> {
+    let seq = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
+    let ms = u64::from_be_bytes(value.get(8..16)?.try_into().ok()?);
+    Some((seq, Duration::from_millis(ms)))
+}
+
 /// Where the store keeps the keys marked suspected here
 /// (`/localhost/ndn-data/suspected/<key name>`, its value since when, 8
 /// octets big-endian; [`Device::suspect`]).
@@ -5803,6 +5889,7 @@ impl Inner {
         let mut written: HashMap<Name, Bytes> = HashMap::new();
         let mut suspected = BTreeMap::new();
         let mut untrusted: HashMap<Name, String> = HashMap::new();
+        let mut batched = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if let Some(entry) = over(&verified_prefix(), &name) {
                 match decode_verified(&wire) {
@@ -5810,6 +5897,12 @@ impl Inner {
                         seen.insert(entry, v);
                     }
                     None => self.store.remove(&name),
+                }
+                continue;
+            }
+            if let Some(c) = over(&batched_prefix(), &name) {
+                if let Some((seq, batch)) = decode_batched(&wire) {
+                    batched.push((c, seq, batch));
                 }
                 continue;
             }
@@ -6083,8 +6176,11 @@ impl Inner {
         // node is unchanged.
         for (d, c, key, body, wire) in heads {
             if d == self.device {
-                st.colls.entry(c.clone()).or_default().batch =
-                    Duration::from_millis(body.freshness);
+                st.colls
+                    .entry(c.clone())
+                    .or_default()
+                    .batches
+                    .insert(body.seq, Duration::from_millis(body.freshness));
                 st.heads.insert(
                     c,
                     SignedHead {
@@ -6103,6 +6199,13 @@ impl Inner {
                         delivered: None,
                     },
                 );
+            }
+        }
+        // The batch delay of the newest own version of each one-key
+        // collection, stored with it: its head states it again.
+        for (c, seq, batch) in batched {
+            if seq <= st.head {
+                st.colls.entry(c).or_default().batches.insert(seq, batch);
             }
         }
         for (device, ns, head) in roots {
@@ -6163,18 +6266,19 @@ impl Inner {
                 return Ok(());
             }
             // Above anything an earlier run announced: a peer takes a counter
-            // only above the highest it heard of this device.
+            // only above the highest it heard of this device. Of the log,
+            // only its durable head: the counter is published at once.
             let announced = self
                 .store
                 .get(&announced_name(ns))
                 .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
                 .map_or(0, u64::from_be_bytes);
-            let local_seq = st.head.max(announced);
+            let local_seq = st.durable.max(announced);
             st.groups.insert(
                 ns.clone(),
                 SyncGroup {
                     tx: None,
-                    owed: 0,
+                    pending: false,
                     members: BTreeSet::new(),
                     busy: HashMap::new(),
                     confirmed: None,
@@ -6191,31 +6295,22 @@ impl Inner {
         let cfg = SvsConfig {
             // The group's counter only says "moved": it starts above every
             // announcement an earlier run made ([`announced_name`]) and
-            // every entry of the log.
+            // every durable entry of the log.
             local_seq,
             ..self.config.svs.clone()
         };
         let Some(mut handle) = self.svs.join(group.clone(), cfg).await else {
             return Err(local(format!("the sync driver did not join {group}")));
         };
-        let tx = handle.tx.clone();
-        let owed = {
+        let pending = {
             let mut st = self.st.lock();
             let g = st.groups.get_mut(ns).expect("inserted above");
-            g.tx = Some(tx.clone());
-            let owed = std::mem::take(&mut g.owed);
-            g.announced += owed;
-            let announced = g.announced;
-            if owed > 0 {
-                self.store.insert(
-                    announced_name(ns),
-                    Bytes::copy_from_slice(&announced.to_be_bytes()),
-                );
-            }
-            owed
+            g.tx = Some(handle.tx.clone());
+            g.pending
         };
-        for _ in 0..owed {
-            let _ = tx.send((group.clone(), None)).await;
+        // What was published before the join completed is announced now.
+        if pending {
+            self.commit_wake.notify_one();
         }
         let weak = Arc::downgrade(self);
         let ns = ns.clone();
@@ -6399,7 +6494,7 @@ impl Inner {
         }
         for ns in groups {
             self.join(&ns).await?;
-            self.publish(&ns).await;
+            self.publish(&ns);
         }
         Ok(())
     }
@@ -6570,26 +6665,193 @@ impl Inner {
         });
     }
 
-    /// Publish one change into `ns`'s group. The counter it announces is
-    /// kept in the store first ([`announced_name`]).
-    async fn publish(&self, ns: &Name) {
-        let tx = {
-            let mut st = self.st.lock();
-            let Some(g) = st.groups.get_mut(ns) else {
-                return;
-            };
-            let Some(tx) = g.tx.clone() else {
-                g.owed += 1;
-                return;
-            };
-            g.announced += 1;
-            self.store.insert(
-                announced_name(ns),
-                Bytes::copy_from_slice(&g.announced.to_be_bytes()),
-            );
-            tx
+    /// Publish a change into `ns`'s group: the next commit round announces
+    /// it, once what it announces is durable ([`Self::commit_rounds`]).
+    fn publish(&self, ns: &Name) {
+        let mut st = self.st.lock();
+        let Some(g) = st.groups.get_mut(ns) else {
+            return;
         };
-        let _ = tx.send((sync_group(ns), None)).await;
+        g.pending = true;
+        if g.tx.is_some() {
+            self.commit_wake.notify_one();
+        }
+    }
+
+    // ---- the durability barrier ---------------------------------------------------------------
+
+    /// Start the committer: one task making what this device wrote durable
+    /// in rounds, then publishing it ([`Self::commit_rounds`]).
+    fn spawn_committer(self: &Arc<Self>) {
+        let wake = Arc::clone(&self.commit_wake);
+        let weak = Arc::downgrade(self);
+        rt::spawn(async move {
+            loop {
+                wake.notified().await;
+                let Some(inner) = weak.upgrade() else { break };
+                if inner.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                inner.commit_rounds().await;
+            }
+        });
+    }
+
+    /// Commit rounds until nothing waits (spec §4.2). A round writes the
+    /// counters of the announcements wanted, makes everything stored so
+    /// far durable in one flush of the store ([`DataStore::sync`]) —
+    /// however many puts came since the last round: a group commit — and
+    /// only then publishes: the durable head moves to the log head as the
+    /// round began (its entries are served, listed in summaries and heads)
+    /// and the announcements go out. Puts made during a flush wait for the
+    /// next round, so an entry is published at most two flushes after its
+    /// put. A flush that fails publishes nothing and is tried again, later,
+    /// until it succeeds or the device stops.
+    async fn commit_rounds(&self) {
+        let mut pause = COMMIT_RETRY;
+        loop {
+            let (target, round, announce) = {
+                let mut st = self.st.lock();
+                let mut announce = Vec::new();
+                for (ns, g) in st.groups.iter_mut() {
+                    let Some(tx) = g.tx.clone().filter(|_| g.pending) else {
+                        continue;
+                    };
+                    g.pending = false;
+                    g.announced += 1;
+                    self.store.insert(
+                        announced_name(ns),
+                        Bytes::copy_from_slice(&g.announced.to_be_bytes()),
+                    );
+                    announce.push((ns.clone(), tx));
+                }
+                if announce.is_empty() && st.durable >= st.head && !st.flush_wanted {
+                    return;
+                }
+                st.flush_wanted = false;
+                st.round += 1;
+                (st.head, st.round, announce)
+            };
+            match self.flush().await {
+                Ok(()) => {
+                    {
+                        let mut st = self.st.lock();
+                        st.durable = st.durable.max(target);
+                        st.round_done = st.round_done.max(round);
+                    }
+                    self.committed.notify_waiters();
+                    self.progress.notify_waiters();
+                    for (ns, tx) in announce {
+                        let _ = tx.send((sync_group(&ns), None)).await;
+                    }
+                    pause = COMMIT_RETRY;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        device = %self.device,
+                        "the store did not make this device's writes durable ({e}): nothing \
+                         written since its last flush is published until it does; check the disk \
+                         or filesystem the store is on"
+                    );
+                    {
+                        let mut st = self.st.lock();
+                        st.flush_wanted = true;
+                        for (ns, _) in &announce {
+                            if let Some(g) = st.groups.get_mut(ns) {
+                                g.pending = true;
+                            }
+                        }
+                    }
+                    if self.stopped.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    rt::sleep(pause).await;
+                    pause = (pause * 2).min(COMMIT_RETRY_MAX);
+                }
+            }
+        }
+    }
+
+    /// The store's barrier ([`DataStore::sync`]), on a blocking thread: a
+    /// flush takes as long as the disk does. A store whose flush returns at
+    /// once ([`DataStore::sync_is_immediate`]) is flushed inline.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn flush(&self) -> std::io::Result<()> {
+        if self.store.sync_is_immediate() {
+            return self.store.sync();
+        }
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.sync())
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "the flush did not finish ({e})"
+                )))
+            })
+    }
+
+    /// The store's barrier ([`DataStore::sync`]). A browser store commits
+    /// each write durably (an IndexedDB transaction is durable when it
+    /// completes), so this returns at once there.
+    #[cfg(target_arch = "wasm32")]
+    async fn flush(&self) -> std::io::Result<()> {
+        self.store.sync()
+    }
+
+    /// Wait until the own entry at `seq` is durable, and so published;
+    /// `false` if the device stopped first.
+    async fn published(&self, seq: u64) -> bool {
+        loop {
+            let notified = self.committed.notified();
+            if self.st.lock().durable >= seq {
+                return true;
+            }
+            if self.stopped.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.commit_wake.notify_one();
+            notified.await;
+        }
+    }
+
+    /// Wait until everything stored so far is durable: a commit round
+    /// begun after now has flushed. `false` if the device stopped first.
+    async fn barrier(&self) -> bool {
+        let need = {
+            let mut st = self.st.lock();
+            st.flush_wanted = true;
+            st.round + 1
+        };
+        loop {
+            let notified = self.committed.notified();
+            if self.st.lock().round_done >= need {
+                return true;
+            }
+            if self.stopped.load(Ordering::Relaxed) {
+                return false;
+            }
+            self.commit_wake.notify_one();
+            notified.await;
+        }
+    }
+
+    /// Wait until everything written so far is durable and every
+    /// announcement wanted so far went out.
+    #[cfg(test)]
+    async fn flushed(&self) {
+        let head = self.st.lock().head;
+        loop {
+            let notified = self.committed.notified();
+            {
+                let st = self.st.lock();
+                let pending = st.groups.values().any(|g| g.pending && g.tx.is_some());
+                if st.durable >= head && !pending {
+                    return;
+                }
+            }
+            self.commit_wake.notify_one();
+            notified.await;
+        }
     }
 
     /// Start following `target`: join its namespace's group, and forget
@@ -9063,6 +9325,9 @@ impl Inner {
                 .entry((self.writer.clone(), l.seq))
                 .or_insert_with(|| name.clone());
         }
+        // Published once durable: the next commit round, which reads the
+        // log head under the lock held here, so after the entry is stored.
+        self.commit_wake.notify_one();
     }
 
     /// Note that this device verified the log entry `name` of another
@@ -9739,7 +10004,17 @@ impl Inner {
         if log {
             coll.last_dated = Some(last_dated(&version));
         }
-        coll.batch = batch;
+        coll.batches.insert(seq, batch);
+        // Stored with the version, so the head of a one-key collection
+        // states the same freshness at the same seq after a restart.
+        if coll
+            .members
+            .as_ref()
+            .is_some_and(|m| matches!(m.rule, Rule::OneKey))
+        {
+            self.store
+                .insert(batched_name(&c), encode_batched(seq, batch));
+        }
         coll.by_digest.insert(held.digest, id.clone());
         // An own operation in pieces is not kept in memory once applied.
         let held = match held.unloaded() {
@@ -10200,6 +10475,11 @@ impl Inner {
                 return None;
             }
             if parsed.device == self.device {
+                // Published once durable (spec §4.2): above the durable
+                // head, a power loss could take it after a peer saw it.
+                if parsed.seq > st.durable {
+                    return None;
+                }
                 let quarantined = version != *name && st.quarantine.contains(&version);
                 return (!quarantined).then(|| self.store.get(name)).flatten();
             }
@@ -10233,11 +10513,12 @@ impl Inner {
                 if s.head.is_none() && !can_be_prefix {
                     return None;
                 }
-                let root = self.root(&mut st, &ns)?;
-                let head = st.trees.get(&ns).map_or(0, Tree::head);
+                let (head, root) = self.root(&mut st, &ns)?;
                 return s.head.is_none_or(|h| h == head).then_some(root);
             }
-            let head = s.head?;
+            // A node or page lists the log up to its head, so one above the
+            // durable head lists what is not durable yet.
+            let head = s.head.filter(|h| *h <= st.durable)?;
             let tree = st.trees.get_mut(&ns)?;
             return tree.packet(
                 &self.device,
@@ -10267,19 +10548,20 @@ impl Inner {
         None
     }
 
-    /// The signed root of the own summary of `ns`, signing a new one only
-    /// when it changed since the last.
-    fn root(&self, st: &mut St, ns: &Name) -> Option<Bytes> {
+    /// The signed root of the own summary of `ns` as the log up to its
+    /// durable head fixes it (spec §4.2), signing a new one only when it
+    /// changed since the last: its head and packet.
+    fn root(&self, st: &mut St, ns: &Name) -> Option<(u64, Bytes)> {
+        let durable = st.durable;
         let tree = st
             .trees
             .entry(ns.clone())
             .or_insert_with(|| Tree::new(ns.clone()));
-        let content = tree.build(&self.device, self.writer.key());
-        let head = tree.head();
+        let (head, content) = tree.root_at(&self.device, self.writer.key(), durable);
         if let Some(r) = st.roots.get(ns)
             && r.content == content
         {
-            return Some(r.wire.clone());
+            return Some((head, r.wire.clone()));
         }
         let builder =
             DataBuilder::new(root_name(&self.device, ns, head), &content).freshness(ROOT_FRESHNESS);
@@ -10291,12 +10573,13 @@ impl Inner {
                 wire: wire.clone(),
             },
         );
-        Some(wire)
+        Some((head, wire))
     }
 
     /// The signed head of one-key collection `c`, if this device's key is
-    /// its one key (spec §5.3): its node's head and digest, and the batch
-    /// delay of its newest version as freshness (also the packet's
+    /// its one key (spec §5.3): its node's head and digest as the log up to
+    /// its durable head fixes them (spec §4.2), and the batch delay of the
+    /// newest version that node lists as freshness (also the packet's
     /// FreshnessPeriod). Signed only when asked for and the node changed;
     /// the head's seq and packet.
     fn head(&self, st: &mut St, c: &Name) -> Option<(u64, Bytes)> {
@@ -10305,12 +10588,22 @@ impl Inner {
         if key != self.writer {
             return None;
         }
-        let freshness = coll.batch;
         let ns = namespace_of(c)?;
-        let (seq, node) = st
-            .trees
-            .get_mut(&ns)?
-            .current(&self.device, self.writer.key(), c)?;
+        let durable = st.durable;
+        let (seq, node) =
+            st.trees
+                .get_mut(&ns)?
+                .node_at(&self.device, self.writer.key(), c, durable)?;
+        let coll = st.colls.get_mut(c)?;
+        // What the head states of the newest version it lists; the delays
+        // of older versions are no longer stated by any head.
+        let freshness = match coll.batches.range(..=seq).next_back() {
+            Some((&s, &batch)) => {
+                coll.batches = coll.batches.split_off(&s);
+                batch
+            }
+            None => Duration::ZERO,
+        };
         let digest = wire::implicit_digest(&node);
         if let Some(h) = st.heads.get(c)
             && h.seq == seq
@@ -10444,6 +10737,12 @@ impl Inner {
         asker_ns: &Name,
     ) -> Option<ContentKey> {
         if !self.may_hold(st, c, e, asker, asker_ns) {
+            return None;
+        }
+        // An epoch this device started is granted once the record starting
+        // it is durable (spec §4.2): before, a power loss could take the
+        // record and its key, and the seq go to a record with another key.
+        if e.creator == self.device && e.seq.0 > st.durable {
             return None;
         }
         st.keys.key(c, e)
@@ -12412,6 +12711,15 @@ impl Inner {
         if new && let Err(e) = self.publish_about(&c, &[]).await {
             tracing::debug!(collection = %c, "the lease is not announced: {e}");
         }
+        // The lease is an own log entry, and what it says is held is in the
+        // store: answered once both are durable (spec §4.2).
+        let seq = Data::decode(lease.clone())
+            .ok()
+            .and_then(|d| parse_log_name(&d.name))?
+            .seq;
+        if !self.published(seq).await {
+            return None;
+        }
         let reply = DataBuilder::new(name.clone(), &lease).sign_digest_sha256();
         self.st.lock().answers.insert(name.clone(), reply.clone());
         Some(reply)
@@ -12454,6 +12762,12 @@ impl Inner {
             .await
         {
             tracing::debug!(collection = %c, %asker, "audit refused: the asker's proof does not verify");
+            return None;
+        }
+        // What the answer proves held is answered once the store holds it
+        // durably (spec §4.2): a power loss does not take what a holder
+        // just proved it keeps.
+        if !self.barrier().await {
             return None;
         }
         let answer = self.audit_content(&c, ask);
@@ -12871,6 +13185,14 @@ impl Inner {
     /// `record`, with this device's proof of asking; whether it answered
     /// with a lease, which is then taken.
     async fn ask_hold(self: &Arc<Self>, holder: &Name, record: &Name) -> bool {
+        // The holder fetches the record from this device, which serves it
+        // once it is durable (spec §4.2).
+        if let Some(l) = parse_log_name(record)
+            && l.device == self.device
+            && !self.published(l.seq).await
+        {
+            return false;
+        }
         let mut ask = HoldAsk {
             record: record.clone(),
             nonce: self.nonce(),
@@ -14854,6 +15176,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // A key is granted once the record starting its epoch is durable.
+        dev.inner.flushed().await;
         let (first, future) = {
             let st = dev.inner.st.lock();
             let first = st.colls[&c]
@@ -14899,6 +15223,7 @@ mod tests {
         )
         .await
         .unwrap();
+        dev.inner.flushed().await;
         let second = dev.inner.st.lock().colls[&c]
             .members
             .as_ref()
@@ -18196,7 +18521,8 @@ mod tests {
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
         // A run announces more often than it appends to its log.
         for _ in 0..5 {
-            dev.inner.publish(&ns).await;
+            dev.inner.publish(&ns);
+            dev.inner.flushed().await;
         }
         let (head, before) = {
             let st = dev.inner.st.lock();
@@ -18205,7 +18531,8 @@ mod tests {
         assert!(before > head);
         dev.shutdown();
         let again = start(&device, &keys, &validator, &store).await.unwrap();
-        again.inner.publish(&ns).await;
+        again.inner.publish(&ns);
+        again.inner.flushed().await;
         let after = again.inner.st.lock().groups[&ns].announced;
         assert!(
             after > before,
@@ -18233,10 +18560,12 @@ mod tests {
         .await
         .unwrap();
         dev.put(&c, reading(1), options(None)).await.unwrap();
+        dev.inner.flushed().await;
         let bob = n("/bob");
         let before = dev.inner.st.lock().groups[&bob].announced;
         dev.shutdown();
         let again = start(&device, &keys, &validator, &store).await.unwrap();
+        again.inner.flushed().await;
         let after = again.inner.st.lock().groups.get(&bob).map(|g| g.announced);
         assert!(
             after.is_some_and(|a| a > before),
@@ -18288,3 +18617,6 @@ mod folder_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod admission_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod durability_tests;

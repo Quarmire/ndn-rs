@@ -166,6 +166,7 @@ impl Tree {
     }
 
     /// The writer's highest seq in the namespace.
+    #[cfg(test)]
     pub(crate) fn head(&self) -> u64 {
         self.root.head
     }
@@ -264,16 +265,55 @@ impl Tree {
         found
     }
 
-    /// `subject`'s node as it is now: its head and its packet.
-    pub(crate) fn current(
+    /// The root as the log up to `h` fixes it: its head and content (to
+    /// sign). The current root when nothing above `h` was added; an empty
+    /// root when nothing up to `h` was.
+    pub(crate) fn root_at(&mut self, device: &Name, writer: &Name, h: u64) -> (u64, Bytes) {
+        let current = self.build(device, writer);
+        if self.root.head <= h {
+            return (self.root.head, current);
+        }
+        let ns = self.ns.clone();
+        match node_at(&self.root, h, device, writer, &ns) {
+            Some((b, head)) => {
+                let content = b.content.clone();
+                self.remember_built(b);
+                (head, content)
+            }
+            None => {
+                let empty = assemble(device, writer, &ns, 0, &BTreeMap::new(), 0, &[], Vec::new());
+                (0, empty.content)
+            }
+        }
+    }
+
+    /// Keep a rebuilt node's packets ready: a reader descending the root
+    /// that lists it asks for them next.
+    fn remember_built(&mut self, b: Built) {
+        for (_, (name, wire, _)) in b.pages {
+            self.remember(name, wire);
+        }
+        self.remember(b.name, b.wire);
+    }
+
+    /// `subject`'s node as the log up to `h` fixes it: its head and its
+    /// packet; `None` if it had no entry by then.
+    pub(crate) fn node_at(
         &mut self,
         device: &Name,
         writer: &Name,
         subject: &Name,
+        h: u64,
     ) -> Option<(u64, Bytes)> {
         self.build(device, writer);
         let node = self.node(subject)?;
-        Some((node.head, node.built.as_ref()?.wire.clone()))
+        if node.head <= h {
+            return Some((node.head, node.built.as_ref()?.wire.clone()));
+        }
+        let (b, head) = node_at(node, h, device, writer, subject)?;
+        let wire = b.wire.clone();
+        self.remember_built(b);
+        Some((head, wire))
     }
 
     fn node(&self, subject: &Name) -> Option<&TNode> {
@@ -570,11 +610,11 @@ mod tests {
         let mut tree = Tree::new(n("/alice"));
         tree.add(&temps, 1, until(0, 100));
         tree.add(&temps, 2, until(50, 150));
-        let (h2, at2) = tree.current(&device, &writer, &temps).unwrap();
+        let (h2, at2) = tree.node_at(&device, &writer, &temps, u64::MAX).unwrap();
         assert_eq!((h2, entries_of(&at2)), (2, vec![1, 2]));
         // The newest date moves past the first keep: no longer listed.
         tree.add(&temps, 3, until(120, 220));
-        let (h3, at3) = tree.current(&device, &writer, &temps).unwrap();
+        let (h3, at3) = tree.node_at(&device, &writer, &temps, u64::MAX).unwrap();
         assert_eq!((h3, entries_of(&at3)), (3, vec![2, 3]));
         for kept in [2u64, 3] {
             let lastn = Kind::Version(Retain {
@@ -591,7 +631,7 @@ mod tests {
                 dated: Timestamp(6),
             }),
         );
-        let (_, l) = tree.current(&device, &writer, &last).unwrap();
+        let (_, l) = tree.node_at(&device, &writer, &last, u64::MAX).unwrap();
         assert_eq!(entries_of(&l), vec![5, 6], "the last 2 by count");
         // Rebuilt from the log alone, the node at head 2 is the packet it was.
         tree.recent.clear();
@@ -642,7 +682,7 @@ mod tests {
             }
         }
         for (c, exact) in [(&soil, false), (&air, true)] {
-            let (head, wire) = tree.current(&device, &writer, c).unwrap();
+            let (head, wire) = tree.node_at(&device, &writer, c, u64::MAX).unwrap();
             let body = node_of(&wire);
             assert!(
                 body.expiry.len() <= EXPIRY_RUNS,
@@ -736,6 +776,36 @@ mod tests {
             )
             .is_some(),
             "the superseded node is still served by its name"
+        );
+    }
+
+    #[test]
+    fn a_root_at_a_head_is_the_root_the_log_up_to_it_made() {
+        let (device, writer) = (n("/alice/phone"), n("/alice/phone/KEY/1"));
+        let mut tree = Tree::new(n("/alice"));
+        assert_eq!(
+            tree.root_at(&device, &writer, 0),
+            (0, Tree::new(n("/alice")).build(&device, &writer)),
+            "nothing written: the empty root"
+        );
+        for i in 1..=150u64 {
+            tree.add(&n(&format!("/alice/32=data/notes/n{}", i % 40)), i, V);
+        }
+        let then = tree.build(&device, &writer);
+        for i in 151..=170u64 {
+            tree.add(&n(&format!("/alice/32=data/notes/n{}", i % 7)), i, V);
+        }
+        tree.add(&n("/alice/32=data/other"), 171, V);
+        assert_eq!(
+            tree.root_at(&device, &writer, 150),
+            (150, then),
+            "the root up to a head is the one the log up to it made, whatever came after"
+        );
+        let now = tree.build(&device, &writer);
+        assert_eq!(tree.root_at(&device, &writer, 171), (171, now));
+        assert_eq!(
+            tree.root_at(&device, &writer, 0),
+            (0, Tree::new(n("/alice")).build(&device, &writer))
         );
     }
 

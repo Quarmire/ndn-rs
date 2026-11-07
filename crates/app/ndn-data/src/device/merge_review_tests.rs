@@ -421,6 +421,12 @@ impl DataStore for Counting {
     fn remove(&self, name: &Name) {
         self.inner.remove(name);
     }
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+    fn sync_is_immediate(&self) -> bool {
+        self.inner.sync_is_immediate()
+    }
 }
 
 #[tokio::test]

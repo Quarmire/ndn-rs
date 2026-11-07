@@ -251,6 +251,8 @@ async fn a_group_sealed_for_fewer_readers_than_it_declares_counts_nowhere_until_
     give(&carol, &newest(&owner, &a));
     owner.share(&b, share(&["/alice"])).await.unwrap();
     give(&carol, &newest(&owner, &b));
+    // A key is granted once the record starting its epoch is durable.
+    owner.inner.flushed().await;
     let key_of = |c: &Name| {
         let st = owner.inner.st.lock();
         let e = st.colls[c].members.as_ref().unwrap().epoch.clone().unwrap();
