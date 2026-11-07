@@ -1,6 +1,7 @@
 # Data layer: named, signed, versioned data
 
-- **Status:** Slices 1–6 normative (slice 6, the substrate for ndf-rs, B
+- **Status:** Slices 1–6 normative, with the durability barrier (§4.2:
+  nothing published before it is on disk) (slice 6, the substrate for ndf-rs, B
   and C: merge rules by exact versioned name and the rule interface,
   operations the application builds, versions held but not counted,
   checkpoints covering by frontier, pieces in merge collections and the
@@ -67,8 +68,9 @@ Every implementation MUST hold all of these.
    misbehaviour attributable to that key; a reader MUST keep both and report
    them.
 3. **Monotonic.** A writer's sequence and a collection's summary never go
-   back. A reader MUST refuse a summary or members record older than one it
-   has seen from the same signer, also after the reader restarts.
+   back, a power loss included: a device publishes only what is durable
+   (§4.2). A reader MUST refuse a summary or members record older than one
+   it has seen from the same signer, also after the reader restarts.
 4. **Completeness is relative.** "I have everything" always means
    "everything in this signed summary".
 5. **Stale, never wrong.** Failures MUST degrade to older verified data, and
@@ -263,6 +265,84 @@ change M6).
   batch), before anything is written.
 - A single-entry version reads, wherever entries are listed (§5.4), as one
   entry: index 0, dated its `Dated`.
+
+### 4.2 Durability before publication — durability barrier
+
+A device publishes only what is on disk. Otherwise a power loss takes an
+entry its peers already hold, the device signs again at that seq after it
+restarts, and an honest writer has equivocated (invariant 2).
+
+- **The store's barrier.** A device keeps its log in a store with a
+  durability barrier (`DataStore::sync`): it returns once every write that
+  returned before it survives a power loss, or with the error saying why it
+  may not. Each store instance keeps, on its own: a write that returned
+  survives the process being killed; a write before a returned barrier
+  survives a power loss; after a power loss the store opens at a whole
+  state at or after its last returned barrier — never part of a write —
+  and a torn tail rolls back without error and without refusing to open.
+  A process may open several stores (a device's, and a program's own local
+  one); nothing ties one to another.
+- **The durable head.** A device's durable head is the highest seq `h` such
+  that every entry of its own log up to `h` was stored before a barrier
+  that returned. A device MUST NOT publish what names or lists anything of
+  its own log above its durable head. It MUST NOT:
+  - serve an own log entry, or a piece of an own version, above it;
+  - serve a summary root, node or page, or a one-key head, listing
+    anything above it: what it serves of its summary and heads is what the
+    log up to its durable head fixes (§5.3, §7);
+  - announce in a sync group (§12) before the entries the announcement
+    covers are durable; the counter it announces is itself stored before,
+    and durable when it goes out;
+  - grant the key of an epoch it started before the record starting the
+    epoch is durable (§9);
+  - ask a holder to hold under a hold record that is not durable, answer a
+    hold ask with a lease before the lease is durable, or answer an audit
+    ask before what it answers from is durable (§13.2, §13.3).
+- **Local application is immediate.** `put`, `put_op` and `put_group` return
+  once the entry is signed, stored and applied; the device reads its own
+  writes at once and refuses nothing for the disk. Only publication waits.
+- **Group commit, bounded delay.** A device flushes its store once per
+  round for everything written since the last round began, so many puts
+  share one flush; an entry is published at most two flushes after its
+  `put` returned. A flush that fails publishes nothing: the device says why,
+  keeps reading and writing locally, and asks again later, until the flush
+  succeeds or the device stops.
+- **At start.** What the store holds may be only in the operating system's
+  buffers (a run killed before its flush). The device makes it durable
+  before publishing any of it; a store that cannot refuses the start
+  (`Local`, `FixLocal`), saying why.
+- **Positions after a restart.** The log head after a restart is the
+  highest own entry the store holds (§8.3), at or above the durable head of
+  the run before, so a restarted device never signs again at a seq it
+  published. A one-key head states the batch delay of the newest version it
+  lists, stored with that version, so one head name is one packet across a
+  restart (§5.3); a summary's content is fixed by the log up to its head
+  (§7); a group counter is durable before it is announced (§12).
+
+Why this suffices: each engine recovers to a prefix of its writes (fjall
+replays its journal to its last whole batch; each redb write is its own
+transaction, committed with fsync), so after a power loss the store is as
+it was at some moment at or after its last returned barrier, and a device
+restarted on it is that device stopped at that moment — which restore
+already handles (§8.3). Everything it published was at or below the
+durable head, so behind the barrier, so held.
+
+**Threat notes.**
+
+- A disk or filesystem that acknowledges a flush it did not make (a write
+  cache without power-loss protection, a virtual disk with unsafe caching,
+  some removable media) defeats the barrier: a power loss can then still
+  make an honest device equivocate. Readers treat that as any equivocation
+  (invariant 2, `Change::Equivocation`); it is a residual of such hardware.
+- A store that keeps nothing across a restart (an in-memory store) reports
+  every write durable at once, and keeps nothing: a device on one starts
+  again with an empty log and signs from seq 1 under the same key. It is
+  for tests and identities that never restart.
+- A process killed without a power loss loses nothing that returned; the
+  restarted device flushes it before publishing it.
+- A program's own unsigned state (an editor's transaction log) belongs in a
+  store of its own, not the device's: the device serves from its store
+  only, so nothing in another store reaches the network by a naming slip.
 
 ## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name, groups)
 
@@ -1978,8 +2058,12 @@ reader looks at for a namespace `O` (its first look, a watch, a key) are
 those it heard in `O`'s group and those it heard in any group that write
 into `O` by the same rule. Sync Interests are unsigned; a stranger in a
 group costs a reader a root fetch, never a wrong answer. A device's
-counter in a group starts at its log head when it joins, so it stays above
-anything an earlier run of the same key announced.
+counter in a group starts, when it joins, above its durable log head and
+above every counter it announced there before, which it keeps; a counter
+is kept, and durable, before it is announced, and an announcement goes
+out only once the entries it announces are durable (§4.2). So it stays
+above anything an earlier run of the same key announced, a power loss
+included.
 
 The group needs no configuration, and no forwarder treats its name
 specially: a forwarder carries it with an ordinary strategy choice and
@@ -3057,6 +3141,10 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Device key replaced by a new enrollment | Its versions stay accepted until the owner ends it: the root's tools list it with the cut to make (bounded at the replacement's enrollment), and `ndn-fwd end-keys` revokes it with that cut. | §8.4 |
 | Leaked key, certificate expired, never revoked | For a role not listed in DataRequiresCut, never replaced, its thief's versions are accepted (residual), and nothing lists it: revocation with a cut ends it. | §8.5, §8.6 |
 | Copy of the device's own key writes under its name | The device takes such an entry as another writer's, never as its own at restore; its log head moves only for what it wrote, its seqs never wrap, and an entry far above its head is refused. | §8.3 |
+| Power loss | The device loses only what it had not published: its store opens at a whole state at or after its last flush, a torn tail rolled back without error; its log head is at or above every seq it served, listed or announced, so it never signs a different entry at a seq a peer holds; local writes since the flush are gone, nobody saw them. | invariant 2, §4.2 |
+| Process killed (no power loss) | Every write that returned is kept; the restarted device flushes the store before it publishes any of it. | §4.2 |
+| Disk flush fails | Nothing written since the last flush is published; local reads and writes go on; the device says why and asks again later; a device whose store cannot flush does not start. | §4.2 |
+| Disk acknowledges a flush it did not make | Residual: a power loss can then make an honest device equivocate, and readers report it as any equivocation. | §4.2 |
 | Root compromised | The recovery's versions carry every cut but orphans and cuts naming entries outside their key's log, may cut the keys they revoke, and, on the operator's confirmation, the new CA certifies a cut key again only for the public key its cut's digest names, so its in-cut versions keep a chain and nothing else gains one. | §8.4 |
 | Node that predates cuts | Refuses every version of a revoked key, the in-cut ones too: safe, and fixed by updating. A node that knows cuts but predates manifests, key digests and DataRequiresCut keeps those residuals until updated. | trust-context.md §3.3.12 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
@@ -3246,3 +3334,16 @@ drops keeps its earlier versions, cut at what the owner held, and a seal
 keeps what was written unsealed before readable, at every reader). Their
 features are `RuleByName`, `AppOps`, `MergePieces`, `Groups` and
 `FolderMembers`.
+
+The storage durability cases (§4.2) run as cargo tests against both
+on-disk engines, fjall and redb, killing processes for real, not in the
+conformance runner: d1 (a write that returned survives `kill -9`, for two
+store instances in one process) and d2 (after a simulated power loss —
+every write not fsynced dropped, torn and zero-filled tails — the store
+opens without error at a whole commit at or after its last flush) are in
+`ndn-sync`'s `tests/durability.rs`; d3 (a device killed between a put and
+its flush, after a power loss that takes everything not durable, never
+serves a different entry or root at a name a peer was served) is in
+`ndn-data`'s `device/durability_tests.rs`, with the in-process checks that
+nothing is served, listed or announced before its flush returns and that
+each store instance has its own barrier.
