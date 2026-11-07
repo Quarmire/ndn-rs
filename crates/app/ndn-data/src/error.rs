@@ -98,6 +98,14 @@ pub enum Refusal {
         /// The rule's reason.
         why: String,
     },
+    /// A version of its group is refused for good, or the group is
+    /// malformed, so no version of the group counts (spec §5.5).
+    Group {
+        /// The member refused (or that makes the group malformed).
+        member: Name,
+        /// Why.
+        why: String,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -158,6 +166,12 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the collection's merge rule refuses its operation ({why}); its writer writes \
                  an operation the rule takes"
+            ),
+            Refusal::Group { member, why } => write!(
+                f,
+                "it was signed in one group with {member}, which is refused ({why}), so no \
+                 version of the group counts; its writer writes the group again without what is \
+                 refused"
             ),
             Refusal::Suspected { key, since } => write!(
                 f,
@@ -353,7 +367,10 @@ impl DataError {
                 | Refusal::Untrusted { .. }
                 | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
-                Refusal::Unsealed | Refusal::NotInline | Refusal::Rule { .. } => NextStep::None,
+                Refusal::Unsealed
+                | Refusal::NotInline
+                | Refusal::Rule { .. }
+                | Refusal::Group { .. } => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,

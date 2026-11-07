@@ -27,6 +27,16 @@ use crate::version::{
 /// (spec §5.3). A day.
 pub const BATCH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// One version of a [`put_group`](DataLayer::put_group).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Edit {
+    /// Fields, as [`put`](DataLayer::put) takes them.
+    Fields(Content),
+    /// The operation the app built, as [`put_op`](DataLayer::put_op) takes
+    /// it (merge collections only).
+    Op(bytes::Bytes),
+}
+
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PutOptions {
@@ -294,6 +304,24 @@ pub trait DataLayer: Send + Sync {
         op: bytes::Bytes,
         options: PutOptions,
     ) -> Result<VersionId, DataError>;
+
+    /// `put` several versions as one group, counted all or none (spec
+    /// §5.5): one version per item, each in its own collection, all
+    /// collections of one folder (the same parent name), signed under one
+    /// lock at consecutive seqs of this device's log. A reader counts them
+    /// only once it holds and reads all of them, and none of them when any
+    /// is refused. Refused — with nothing written — when there are no items
+    /// or more than [`GROUP_MAX`](crate::GROUP_MAX), a collection comes
+    /// twice, the collections are not of one folder, their records in force
+    /// list different readers, `options.batch` is set, or an item's rule
+    /// refuses its operation ([`DataError::BadRequest`]); an item's rule
+    /// unknown here ([`DataError::RuleUnknown`]); a collection not writable
+    /// here (that collection's own error). The ids, in item order.
+    async fn put_group(
+        &self,
+        items: Vec<(Name, Edit)>,
+        options: PutOptions,
+    ) -> Result<Vec<VersionId>, DataError>;
 
     /// `watch(collection, since F) → summary, new versions…`.
     ///

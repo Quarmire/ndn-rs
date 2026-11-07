@@ -30,7 +30,7 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-const RULE: &str = "/test/merge/notes/v=1";
+pub(super) const RULE: &str = "/test/merge/notes/v=1";
 
 fn c() -> Name {
     n("/alice/32=data/notes")
@@ -129,7 +129,7 @@ impl MergeState for NotesState {
     }
 }
 
-fn edit(basis: Option<[u8; 32]>, note: &str) -> Bytes {
+pub(super) fn edit(basis: Option<[u8; 32]>, note: &str) -> Bytes {
     let mut b = vec![b'E'];
     b.extend_from_slice(&basis.unwrap_or([0; 32]));
     b.extend_from_slice(note.as_bytes());
@@ -148,7 +148,7 @@ fn pair(note: &str) -> Bytes {
     Bytes::from([b"P".as_slice(), note.as_bytes()].concat())
 }
 
-fn rules() -> MergeRules {
+pub(super) fn rules() -> MergeRules {
     MergeRules::standard().with(Arc::new(Notes { function: n(RULE) }))
 }
 
@@ -256,6 +256,7 @@ fn body(parents: &[(&str, u64)], op: Bytes) -> VersionBody {
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
         dated: Timestamp(1),
+        group: None,
         fields: Content::new(),
         op,
         sealed: None,

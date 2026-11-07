@@ -78,8 +78,8 @@ pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary}
 pub use device::{Clock, Config, CutBound, CutProposal, Device, Entropy, Released, Transport};
 pub use error::{DataError, NextStep, Refusal};
 pub use layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions,
-    Share, State,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Got, Hold,
+    PutOptions, Share, State,
 };
 pub use merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
@@ -87,6 +87,6 @@ pub use merge::{
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{
-    Audience, BlockEntry, Content, Frontier, Keep, Payload, Seal, Seq, Timestamp, TypeId, Version,
-    VersionId, Writer,
+    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Payload, Seal, Seq, Timestamp,
+    TypeId, Version, VersionId, Writer,
 };

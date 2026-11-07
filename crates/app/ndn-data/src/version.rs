@@ -253,6 +253,23 @@ pub struct Version {
     pub keep: Keep,
     /// The date its writer's clock showed; display only.
     pub dated: Timestamp,
+    /// The group it belongs to, if its writer signed it as one of several
+    /// versions counted all or none (spec §5.5).
+    pub group: Option<Group>,
     /// The content.
     pub payload: Payload,
+}
+
+/// The most versions one group holds (spec §5.5).
+pub const GROUP_MAX: u32 = 1024;
+
+/// A group of versions one writer signs to be counted all or none (spec
+/// §5.5): its writer's versions at the consecutive seqs `id .. id + count`,
+/// one per collection, all in collections of one folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Group {
+    /// The seq of the group's first version in its writer's log.
+    pub id: u64,
+    /// How many versions the group holds, `1 ..= GROUP_MAX`.
+    pub count: u32,
 }

@@ -78,8 +78,8 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions,
-    State,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Got, Hold,
+    PutOptions, State,
 };
 use crate::merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value,
@@ -90,8 +90,8 @@ use crate::seal::{self, Keys};
 use crate::statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 use crate::tree::{Kind, Retain, Tree};
 use crate::version::{
-    Audience, BlockEntry, Content, Frontier, Keep, Payload, Seal, Seq, Timestamp, TypeId, Version,
-    VersionId, Writer,
+    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Payload, Seal, Seq, Timestamp,
+    TypeId, Version, VersionId, Writer,
 };
 use crate::wire::{
     self, AuditAnswer, AuditAsk, BlockEntryBody, Branches, ChunksBody, CutBody, ExpiryRun,
@@ -474,6 +474,13 @@ struct Coll {
     /// digest of their packet, for [`Past::by_digest`]. An entry whose
     /// version is no longer held is checked away on lookup.
     by_digest: HashMap<[u8; 32], VersionId>,
+    /// The groups with a member held here not yet settled — neither every
+    /// member counted, nor the group refused with none counted — which
+    /// every application here judges again (spec §5.5).
+    txns: BTreeSet<(Writer, u64)>,
+    /// The members held here of groups not counted yet, with why: the group
+    /// is incomplete or not readable here.
+    group_waits: BTreeMap<VersionId, String>,
     /// Every admitted version held, applied or waiting for its parents (or,
     /// under a merge rule this device does not know, held and never
     /// applied).
@@ -764,6 +771,29 @@ impl Locked {
 }
 
 impl Coll {
+    /// What its versions wait for ([`Waits`]).
+    fn waits(&self) -> Waits<'_> {
+        Waits {
+            members: self.members.as_ref(),
+            entries: &self.entries,
+            skipped: &self.skipped,
+            listings: &self.listings,
+            locked: &self.locked,
+            revoked: &self.revoked,
+            admitted: &self.versions,
+        }
+    }
+
+    /// Its versions held that are not in the state's value, with why,
+    /// by id: the rule's `NotCounted` and members of groups not counted.
+    fn not_counted_list(&self) -> Vec<(VersionId, String)> {
+        let mut all: BTreeMap<&VersionId, &String> = self.group_waits.iter().collect();
+        all.extend(self.not_counted.iter());
+        all.into_iter()
+            .map(|(id, why)| (id.clone(), why.clone()))
+            .collect()
+    }
+
     fn at(&self) -> Frontier {
         self.applied
             .iter()
@@ -979,6 +1009,23 @@ const OWN_AHEAD: u64 = 64;
 /// fetches (spec §8): a manifest is a tree of a few levels.
 const MANIFEST_LOOKS: usize = 16;
 
+/// The most collections one application carries its groups to before it
+/// leaves the rest to the next arrival ([`St::apply_ready`]): a bound on
+/// work, never on what is counted.
+const APPLY_ROUNDS: usize = 1 << 16;
+
+/// How long a device not reached is left before it is asked again, while
+/// a member of a group held here waits for the others ([`Inner::schedule`]);
+/// doubled each time up to [`REFRESH_PAUSE_MAX`], for [`REFRESH_TRIES`]
+/// times. Liveness only: what counts is decided by the versions held.
+const REFRESH_PAUSE: Duration = Duration::from_secs(2);
+
+/// The longest pause between two asks of a device not reached.
+const REFRESH_PAUSE_MAX: Duration = Duration::from_secs(64);
+
+/// How many times a device not reached is asked again.
+const REFRESH_TRIES: u32 = 16;
+
 /// Why this device owes a collection (or folder) a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owed {
@@ -1098,7 +1145,8 @@ struct Peer {
     nodes: HashMap<(Name, Option<Bytes>), [u8; 32]>,
 }
 
-struct Group {
+/// A namespace's sync group as this device takes part in it.
+struct SyncGroup {
     /// The group's publish channel, once joined.
     tx: Option<mpsc::Sender<(Name, Option<Bytes>)>>,
     /// Publications made before the join completed.
@@ -1109,6 +1157,10 @@ struct Group {
     busy: HashMap<Name, bool>,
     /// When the device last knew nothing newer was outstanding.
     confirmed: Option<Instant>,
+    /// The group counter of this device's latest announcement in the group
+    /// (from the join on): kept in the store before each announcement goes
+    /// out ([`announced_name`]), so a restart starts above it.
+    announced: u64,
 }
 
 struct Watcher {
@@ -1134,7 +1186,7 @@ struct St {
     folders: HashMap<Name, Folder>,
     held: HashMap<Name, Held>,
     peers: HashMap<(Name, Name), Peer>,
-    groups: HashMap<Name, Group>,
+    groups: HashMap<Name, SyncGroup>,
     follows: BTreeSet<Name>,
     watchers: Vec<Watcher>,
     refused: HashMap<Name, Refusal>,
@@ -1173,6 +1225,13 @@ struct St {
     /// Merge versions in pieces a fetch found whole: not fetched again
     /// while they wait to open (for their epoch's key, or to apply).
     walked: BTreeSet<Name>,
+    /// Every group of versions a member of which is held here (in any
+    /// state), by writer and id: its members by seq (spec §5.5).
+    txns: HashMap<(Writer, u64), BTreeMap<u64, Member>>,
+    /// The merge rules this device runs ([`Config::rules`]).
+    rules: MergeRules,
+    /// This device's writer.
+    me: Writer,
     /// Own large versions whose pieces this device serves to no one while a
     /// release audits their holders (spec §13.3): an answer relayed from
     /// this device proves nothing.
@@ -1526,11 +1585,14 @@ fn past_frontier(v: &Version) -> Frontier {
 
 /// The past of a version as its rule sees it: down([`past_frontier`]), and
 /// the versions of its collection held here inside it, by the implicit
-/// digest of their packet.
+/// digest of their packet — admitted, held sealed, or held and refused (a
+/// version withdrawn after another was made over it is still what that one
+/// was made over).
 struct PastOf<'a> {
     within: Frontier,
     versions: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
     locked: &'a [Locked],
+    outsiders: &'a [Arc<HeldVersion>],
     by_digest: &'a HashMap<[u8; 32], VersionId>,
 }
 
@@ -1539,12 +1601,14 @@ impl<'a> PastOf<'a> {
         v: &Version,
         versions: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
         locked: &'a [Locked],
+        outsiders: &'a [Arc<HeldVersion>],
         by_digest: &'a HashMap<[u8; 32], VersionId>,
     ) -> Self {
         PastOf {
             within: past_frontier(v),
             versions,
             locked,
+            outsiders,
             by_digest,
         }
     }
@@ -1556,15 +1620,85 @@ impl Past for PastOf<'_> {
     }
 
     fn by_digest(&self, digest: &[u8; 32]) -> Option<VersionId> {
-        let id = self.by_digest.get(digest)?;
-        let held = self.versions.get(id).is_some_and(|hv| hv.digest == *digest)
-            || self.locked.iter().any(|l| {
-                l.writer == id.writer
-                    && l.seq == id.seq.0
-                    && wire::implicit_digest(&l.wire) == *digest
-            });
-        (held && self.within.contains(id)).then(|| id.clone())
+        if let Some(id) = self.by_digest.get(digest) {
+            let held = self.versions.get(id).is_some_and(|hv| hv.digest == *digest)
+                || self.locked.iter().any(|l| {
+                    l.writer == id.writer
+                        && l.seq == id.seq.0
+                        && wire::implicit_digest(&l.wire) == *digest
+                });
+            if held && self.within.contains(id) {
+                return Some(id.clone());
+            }
+        }
+        self.outsiders
+            .iter()
+            .find(|hv| hv.digest == *digest && self.within.contains(&hv.version.id))
+            .map(|hv| hv.version.id.clone())
     }
+}
+
+/// What an own version is written under: its collection's record in force
+/// (or the one about to be signed for it), and the state's frontier.
+struct Under {
+    /// The record's readers: the version's declared seal.
+    readers: Vec<Audience>,
+    /// The merge rule's name; `None` under the log rule.
+    function: Option<Name>,
+    /// The version's parents.
+    parents: Frontier,
+}
+
+/// An own version signed and not yet kept ([`Inner::sign_version`]).
+struct Signed {
+    c: Name,
+    seq: u64,
+    held: HeldVersion,
+    pieces: Vec<pieces::Piece>,
+    /// Whether its collection is log-like.
+    log: bool,
+    keep: Keep,
+    dated: Timestamp,
+    function: Option<Name>,
+}
+
+/// What a merge rule made of an own version.
+struct Ruled {
+    kind: OpKind,
+    counting: Counting,
+    /// Versions earlier not counted that count now.
+    now: Vec<VersionId>,
+}
+
+/// `state`'s ruling on `held`, opened, against `past`: checked, and with
+/// `apply`, applied (else `Counted` is assumed).
+fn rule_on(
+    state: &mut (dyn MergeState + 'static),
+    held: &HeldVersion,
+    past: &PastOf<'_>,
+    apply: bool,
+) -> Result<Ruled, MergeError> {
+    let op = Op {
+        id: &held.version.id,
+        digest: &held.digest,
+        parents: &held.version.parents,
+        past,
+        bytes: &held.op,
+    };
+    let kind = state.check(&op)?;
+    if !apply {
+        return Ok(Ruled {
+            kind,
+            counting: Counting::Counted,
+            now: Vec::new(),
+        });
+    }
+    let counting = state.apply(&op)?;
+    Ok(Ruled {
+        kind,
+        counting,
+        now: state.now_counted(),
+    })
 }
 
 /// What opening a version in pieces found.
@@ -1610,6 +1744,84 @@ fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
     Opening::Opened(op)
 }
 
+/// One member of a group, as its signed record says.
+struct Member {
+    collection: Name,
+    /// The count its own `Group` states.
+    count: u32,
+}
+
+/// What a reader makes of a group, from its own signed versions and their
+/// admission (spec §5.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GroupVerdict {
+    /// Refused for good — malformed, or a member refused — with the member
+    /// and why: no member ever applies.
+    Refused { member: Name, why: String },
+    /// A member is held sealed and cannot be opened here, or its
+    /// collection's rule is unknown here.
+    Unreadable,
+    /// Fewer than all members present.
+    Incomplete { present: u32, count: u32 },
+    /// Every member present. `next`: the lowest seq of a held member
+    /// waiting to apply, once every such member is ready.
+    Complete { next: Option<u64> },
+}
+
+impl GroupVerdict {
+    /// What it says of its member at `seq`, waiting here.
+    fn gate(&self, seq: u64) -> Gate {
+        match self {
+            GroupVerdict::Refused { member, why } => Gate::Stop(Refusal::Group {
+                member: member.clone(),
+                why: why.clone(),
+            }),
+            GroupVerdict::Unreadable => Gate::Wait(Some("group not readable here".into())),
+            GroupVerdict::Incomplete { present, count } => {
+                Gate::Wait(Some(format!("group incomplete: {present} of {count}")))
+            }
+            GroupVerdict::Complete { next, .. } if *next == Some(seq) => Gate::Go,
+            GroupVerdict::Complete { .. } => Gate::Wait(None),
+        }
+    }
+}
+
+/// A group member as held here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MemberState {
+    /// Applied: counted.
+    Counted,
+    /// Admitted, whole and opened, waiting to apply.
+    Waiting,
+    /// Not held as it must be to count: not held, not whole, or waiting for
+    /// its collection's members record.
+    Missing,
+    /// Held sealed and not opened here, or under a rule unknown here.
+    Unreadable,
+    /// Refused for good, for this reason.
+    Refused(Refusal),
+    /// Refused only because its group was: held, and present.
+    GroupRefused,
+    /// Pruned or expired: present for its group (spec §5.5).
+    Dropped,
+}
+
+/// What a group lets its member waiting to apply do ([`Run`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Apply when ready.
+    Go,
+    /// Wait; with why it is not counted, if that is to be shown.
+    Wait(Option<String>),
+    /// Never apply: refused for this reason.
+    Stop(Refusal),
+}
+
+/// The folder a collection is in: its name but the last component.
+fn folder_of(c: &Name) -> Name {
+    Name::from_components(c.components()[..c.len().saturating_sub(1)].iter().cloned())
+}
+
 /// What a [`Run`] did with one version, in order.
 enum Ran {
     /// Applied: by the rule, with what it made of it; or, under the log
@@ -1636,8 +1848,9 @@ enum Took {
 /// each applied once its writer's earlier versions and its parents are; a
 /// merge version only once whole and opened, and only if its rule's check
 /// passes against its past; a checkpoint as soon as its past is held,
-/// moving the frontier past what it covers. Under the log rule (`state`
-/// `None`) versions apply without a rule. The live state and
+/// moving the frontier past what it covers. A member of a group applies
+/// only as its group's verdict lets it ([`Gate`], spec §5.5). Under the log
+/// rule (`state` `None`) versions apply without a rule. The live state and
 /// [`St::value_at`] run the same procedure.
 struct Run<'a> {
     members: &'a Members,
@@ -1648,12 +1861,16 @@ struct Run<'a> {
     by_digest: &'a HashMap<[u8; 32], VersionId>,
     store: &'a dyn DataStore,
     keys: &'a Keys,
+    /// What each group member's group lets it do.
+    gates: &'a HashMap<VersionId, Gate>,
     state: Option<&'a mut (dyn MergeState + 'static)>,
     versions: &'a mut BTreeMap<VersionId, Arc<HeldVersion>>,
     skipped: &'a mut HashMap<Writer, BTreeSet<u64>>,
     applied: &'a mut BTreeMap<Writer, u64>,
     pending: &'a mut BTreeSet<VersionId>,
     kinds: &'a mut HashMap<VersionId, OpKind>,
+    /// The versions held and refused: those refused in this run join them.
+    outsiders: &'a mut Vec<Arc<HeldVersion>>,
     /// Versions found not whole in this run: not tried again in it.
     unwhole: BTreeSet<VersionId>,
     out: Vec<Ran>,
@@ -1676,9 +1893,18 @@ impl Run<'_> {
         self.members.since.as_ref().is_some_and(|s| s.contains(id))
     }
 
+    /// Whether `id`'s group, if it is of one, lets it apply now.
+    fn gated(&self, id: &VersionId) -> bool {
+        self.versions
+            .get(id)
+            .is_some_and(|hv| hv.version.group.is_none())
+            || self.gates.get(id) == Some(&Gate::Go)
+    }
+
     fn is_ready(&self, id: &VersionId) -> bool {
         self.pending.contains(id)
             && !self.unwhole.contains(id)
+            && self.gated(id)
             && self
                 .versions
                 .get(id)
@@ -1687,6 +1913,18 @@ impl Run<'_> {
 
     /// Apply everything that is ready; what was done, in order.
     fn run(mut self) -> Vec<Ran> {
+        // A member of a group refused never applies.
+        let stopped: Vec<(VersionId, Refusal)> = self
+            .pending
+            .iter()
+            .filter_map(|id| match self.gates.get(id) {
+                Some(Gate::Stop(why)) => Some((id.clone(), why.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, why) in stopped {
+            self.refuse(&id, why);
+        }
         let merge = self.state.is_some();
         if merge {
             self.cover();
@@ -1742,6 +1980,7 @@ impl Run<'_> {
             .or_default()
             .insert(id.seq.0);
         if let Some(hv) = self.versions.remove(id) {
+            self.outsiders.push(Arc::clone(&hv));
             self.out.push(Ran::Refused(hv, why));
         }
     }
@@ -1783,7 +2022,13 @@ impl Run<'_> {
     /// The rule's check of `id`, opened, against its past.
     fn check(&self, id: &VersionId) -> Result<OpKind, MergeError> {
         let hv = &self.versions[id];
-        let past = PastOf::new(&hv.version, self.versions, self.locked, self.by_digest);
+        let past = PastOf::new(
+            &hv.version,
+            self.versions,
+            self.locked,
+            self.outsiders,
+            self.by_digest,
+        );
         let op = Op {
             id,
             digest: &hv.digest,
@@ -1822,7 +2067,13 @@ impl Run<'_> {
         self.kinds.insert(id.clone(), kind);
         let hv = Arc::clone(&self.versions[id]);
         let done = {
-            let past = PastOf::new(&hv.version, self.versions, self.locked, self.by_digest);
+            let past = PastOf::new(
+                &hv.version,
+                self.versions,
+                self.locked,
+                self.outsiders,
+                self.by_digest,
+            );
             let op = Op {
                 id,
                 digest: &hv.digest,
@@ -1874,6 +2125,7 @@ impl Run<'_> {
                 !self.unwhole.contains(id)
                     && self.kinds.get(id) != Some(&OpKind::Edit)
                     && !self.history(id)
+                    && self.gated(id)
             })
             .cloned()
             .collect();
@@ -2294,9 +2546,10 @@ impl St {
     /// §8): every version held is admitted or refused anew and the state is
     /// rebuilt from the admitted ones. A version applied before that is now
     /// refused outside a cut — the record's, or a revocation's
-    /// ([`St::cut_out`]) — or for its chain ([`Refusal::Untrusted`]) is
-    /// withdrawn and reported to the watchers; one applied before and still
-    /// admitted is not delivered again.
+    /// ([`St::cut_out`]) — for its chain ([`Refusal::Untrusted`]), or for its
+    /// group ([`Refusal::Group`]) is withdrawn and reported to the
+    /// watchers; one applied before and still admitted is not delivered
+    /// again.
     fn reread(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
         // Entries refused by a revocation as they arrived, never taken:
         // later versions do not wait for them.
@@ -2344,24 +2597,45 @@ impl St {
         };
         coll.kinds.clear();
         let not_counted = std::mem::take(&mut coll.not_counted);
-        let mut withdrawn = Vec::new();
+        let names: Vec<(VersionId, Name, bool)> = all
+            .iter()
+            .filter(|hv| delivered.contains(&hv.version.id))
+            .map(|hv| {
+                (
+                    hv.version.id.clone(),
+                    hv.version.name.clone(),
+                    hv.version.group.is_some(),
+                )
+            })
+            .collect();
         for hv in all {
-            let id = hv.version.id.clone();
-            let name = hv.version.name.clone();
-            self.refused.remove(&name);
+            self.refused.remove(&hv.version.name);
             self.admit_one(hv);
-            if delivered.contains(&id)
-                && let Some(why) = self.refused.get(&name)
-                && matches!(why, Refusal::OutsideCut(_) | Refusal::Untrusted { .. })
-            {
-                withdrawn.push((id, why.clone()));
-            }
         }
         let now = (self.clock)();
         if let Some(coll) = self.colls.get_mut(c) {
             coll.mark_gone(now);
         }
         self.apply_ready(c, &delivered);
+        // A member of a group withdrawn is withdrawn with its group: the
+        // refused member itself names its own refusal (spec §5.5).
+        let withdrawn: Vec<(VersionId, Refusal)> = names
+            .into_iter()
+            .filter_map(|(id, name, grouped)| match self.refused.get(&name) {
+                Some(why @ Refusal::Group { .. }) => Some((id, why.clone())),
+                Some(why @ (Refusal::OutsideCut(_) | Refusal::Untrusted { .. })) if grouped => {
+                    let why = Refusal::Group {
+                        member: name.clone(),
+                        why: why.to_string(),
+                    };
+                    Some((id, why))
+                }
+                Some(why @ (Refusal::OutsideCut(_) | Refusal::Untrusted { .. })) => {
+                    Some((id, why.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         // What the rule counts changed only as the rebuilt state says:
         // `apply_ready` told what was not delivered before; the rest is
         // told here as it differs.
@@ -2401,6 +2675,9 @@ impl St {
     /// whether it was queued to apply.
     fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
+        if let Some(g) = hv.version.group {
+            self.note_member(&c, &hv.version.id, g);
+        }
         let coll = self.colls.entry(c.clone()).or_default();
         if let Some(out) = self.cut_out.get(&hv.version.name) {
             tracing::debug!(id = ?hv.version.id, why = %out.why, "refused in {c} by the trust context");
@@ -2461,20 +2738,121 @@ impl St {
         true
     }
 
-    /// Admit a verified, opened version and apply what became ready.
+    /// Admit a verified, opened version and apply what became ready. A
+    /// member of a group refused as it arrives refuses its group: that is
+    /// carried to its other members too.
     fn admit(&mut self, hv: Arc<HeldVersion>) {
         let c = hv.version.collection.clone();
-        if self.admit_one(hv) {
+        let grouped = hv.version.group.is_some();
+        if self.admit_one(hv) || grouped {
             self.apply_ready(&c, &BTreeSet::new());
         }
     }
 
-    /// Apply every pending version of `c` that is ready ([`Run`]), store
-    /// it, and deliver it to the watchers unless `quiet` lists it
-    /// (delivered before), with what the rule counts. Under a merge rule
-    /// this device does not know, every pending version is stored and
-    /// delivered and none applied: no state is read under another rule.
+    /// Apply every pending version of `c` that is ready ([`Self::apply_one`]),
+    /// and carry what that changes of its groups to their other collections
+    /// (spec §5.5): a complete group's members apply together, in seq order,
+    /// all within this call; a refused group's members never apply, and
+    /// those applied before are withdrawn, in every collection of the group.
+    /// `quiet` lists what `c` delivered before.
     fn apply_ready(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
+        let none = BTreeSet::new();
+        let mut todo = VecDeque::from([c.clone()]);
+        let mut queued = BTreeSet::from([c.clone()]);
+        let mut rounds = 0usize;
+        while let Some(x) = todo.pop_front() {
+            queued.remove(&x);
+            rounds += 1;
+            if rounds > APPLY_ROUNDS {
+                tracing::warn!(collection = %c, "groups still moving after {APPLY_ROUNDS} rounds; the rest applies on the next arrival");
+                break;
+            }
+            self.apply_one(&x, if x == *c { quiet } else { &none });
+            let active: Vec<(Writer, u64)> = self
+                .colls
+                .get(&x)
+                .map(|k| k.txns.iter().cloned().collect())
+                .unwrap_or_default();
+            for key in active {
+                let verdict = self.verdict(&key);
+                let refused = matches!(verdict, GroupVerdict::Refused { .. });
+                let members: Vec<(u64, Name)> = self
+                    .txns
+                    .get(&key)
+                    .map(|m| m.iter().map(|(s, m)| (*s, m.collection.clone())).collect())
+                    .unwrap_or_default();
+                let mut settled = true;
+                for (seq, y) in members {
+                    let id = VersionId {
+                        writer: key.0.clone(),
+                        seq: Seq(seq),
+                    };
+                    match self.member_state(&y, &id) {
+                        // Applied before its group was refused: withdrawn.
+                        MemberState::Counted if refused => {
+                            settled = false;
+                            let (rules, me) = (self.rules.clone(), self.me.clone());
+                            self.reread(&y, &rules, &me);
+                        }
+                        // Refused for a group no longer refused: admitted again.
+                        MemberState::GroupRefused if !refused => {
+                            settled = false;
+                            let (rules, me) = (self.rules.clone(), self.me.clone());
+                            self.reread(&y, &rules, &me);
+                        }
+                        state @ (MemberState::Waiting | MemberState::Unreadable) => {
+                            if !refused || state == MemberState::Waiting {
+                                settled = false;
+                            }
+                            // Only a member waiting in its collection —
+                            // pending, or held sealed, under a record known
+                            // — is acted on there.
+                            let here = self.colls.get(&y).is_some_and(|k| {
+                                k.members.is_some()
+                                    && k.txns.contains(&key)
+                                    && (k.pending.contains(&id)
+                                        || k.locked
+                                            .iter()
+                                            .any(|l| l.writer == id.writer && l.seq == seq))
+                            });
+                            let told = self.colls.get(&y).and_then(|k| k.group_waits.get(&id));
+                            let moves = here
+                                && match verdict.gate(seq) {
+                                    Gate::Go | Gate::Stop(_) => state == MemberState::Waiting,
+                                    Gate::Wait(Some(why)) => told != Some(&why),
+                                    Gate::Wait(None) => false,
+                                };
+                            if moves && queued.insert(y.clone()) {
+                                todo.push_back(y);
+                            }
+                        }
+                        MemberState::Missing if !refused => settled = false,
+                        _ => {}
+                    }
+                }
+                if settled && let Some(coll) = self.colls.get_mut(&x) {
+                    coll.txns.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Apply every pending version of `c` that is ready ([`Run`]), as its
+    /// group lets it, store it, and deliver it to the watchers unless
+    /// `quiet` lists it (delivered before), with what the rule and the
+    /// groups count. Under a merge rule this device does not know, every
+    /// pending version is stored and delivered and none applied: no state
+    /// is read under another rule.
+    fn apply_one(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
+        let gates = self.gates(c);
+        // A member held of a group not counted: its folder is followed, so
+        // that the others arrive (spec §5.5).
+        if gates.values().any(|g| matches!(g, Gate::Wait(Some(_)))) {
+            let folder = folder_of(c);
+            if !self.inside(&folder) {
+                self.to_follow.insert(folder);
+            }
+        }
         let St {
             colls,
             watchers,
@@ -2490,6 +2868,7 @@ impl St {
             members,
             state,
             not_counted,
+            group_waits,
             kinds,
             by_digest,
             versions,
@@ -2534,12 +2913,14 @@ impl St {
                 by_digest,
                 store: &**store,
                 keys,
+                gates: &gates,
                 state: state.as_deref_mut(),
                 versions,
                 skipped,
                 applied,
                 pending,
                 kinds,
+                outsiders,
                 unwhole: BTreeSet::new(),
                 out: Vec::new(),
             }
@@ -2564,8 +2945,17 @@ impl St {
                     Ran::Covered(id) => deliver(&versions[&id], &mut changes),
                     Ran::Refused(hv, why) => {
                         tracing::debug!(id = ?hv.version.id, collection = %c, %why, "refused");
+                        let id = hv.version.id.clone();
+                        if matches!(why, Refusal::Group { .. }) && !quiet.contains(&id) {
+                            changes.push((
+                                Change::NotCounted {
+                                    id,
+                                    why: format!("group refused: {why}"),
+                                },
+                                None,
+                            ));
+                        }
                         refused.insert(hv.version.name.clone(), why);
-                        outsiders.push(hv);
                     }
                     Ran::Counted(id) => {
                         if not_counted.remove(&id).is_some() && !quiet.contains(&id) {
@@ -2573,6 +2963,42 @@ impl St {
                         }
                     }
                 }
+            }
+        }
+        // Why each member of a group not counted waits, told when it
+        // changes; counted once it applies.
+        let waits = |id: &VersionId| {
+            pending.contains(id)
+                || locked
+                    .iter()
+                    .any(|l| l.writer == id.writer && l.seq == id.seq.0)
+        };
+        for (id, gate) in &gates {
+            if let Gate::Wait(Some(why)) = gate
+                && waits(id)
+                && group_waits.get(id) != Some(why)
+            {
+                group_waits.insert(id.clone(), why.clone());
+                changes.push((
+                    Change::NotCounted {
+                        id: id.clone(),
+                        why: why.clone(),
+                    },
+                    Some(id.clone()),
+                ));
+            }
+        }
+        let gone: Vec<VersionId> = group_waits
+            .keys()
+            .filter(|id| !waits(id))
+            .cloned()
+            .collect();
+        for id in gone {
+            group_waits.remove(&id);
+            let counted = versions.contains_key(&id)
+                && applied.get(&id.writer).is_some_and(|a| *a >= id.seq.0);
+            if counted {
+                changes.push((Change::Counted { id }, None));
             }
         }
         watchers.retain(|w| !w.tx.is_closed());
@@ -2585,6 +3011,261 @@ impl St {
                 }
             }
         }
+    }
+
+    /// Note `id`, of `c`, as a member of group `g` of its writer.
+    fn note_member(&mut self, c: &Name, id: &VersionId, g: Group) {
+        let key = (id.writer.clone(), g.id);
+        self.txns.entry(key.clone()).or_default().insert(
+            id.seq.0,
+            Member {
+                collection: c.clone(),
+                count: g.count,
+            },
+        );
+        self.colls.entry(c.clone()).or_default().txns.insert(key);
+    }
+
+    /// Whether `id`, a version of `c` this device knows of, was pruned or
+    /// expired here: present for its group (spec §5.5).
+    fn dropped(&self, c: &Name, id: &VersionId) -> bool {
+        let Some(device) = device_of(id.writer.key()) else {
+            return false;
+        };
+        if matches!(
+            self.held.get(&log_name(&device, Some(c), id.seq.0)),
+            Some(Held::Pruned(_) | Held::Expired(_))
+        ) {
+            return true;
+        }
+        self.colls.get(c).is_some_and(|coll| {
+            coll.entries
+                .get(&id.writer)
+                .is_some_and(|e| e.contains(&id.seq.0))
+                && coll.pruned(id).is_some()
+        })
+    }
+
+    /// How group member `id` of `c` is held here.
+    fn member_state(&self, c: &Name, id: &VersionId) -> MemberState {
+        let Some(coll) = self.colls.get(c) else {
+            return MemberState::Missing;
+        };
+        let merge = coll
+            .members
+            .as_ref()
+            .is_some_and(|m| matches!(m.rule, Rule::Merge { .. }));
+        if let Some(hv) = coll.versions.get(id) {
+            if merge && coll.state.is_none() {
+                return MemberState::Unreadable;
+            }
+            if !coll.pending.contains(id) {
+                return MemberState::Counted;
+            }
+            if merge && !hv.opened {
+                let sealed_off = hv
+                    .epoch
+                    .as_ref()
+                    .is_some_and(|e| self.keys.key(c, e).is_none());
+                return match sealed_off {
+                    true => MemberState::Unreadable,
+                    false => MemberState::Missing,
+                };
+            }
+            return MemberState::Waiting;
+        }
+        if let Some(hv) = coll.outsiders.iter().find(|hv| hv.version.id == *id) {
+            return match self.refused.get(&hv.version.name) {
+                Some(Refusal::Group { .. }) => MemberState::GroupRefused,
+                Some(why) => MemberState::Refused(why.clone()),
+                None => MemberState::Missing,
+            };
+        }
+        if coll
+            .locked
+            .iter()
+            .any(|l| l.writer == id.writer && l.seq == id.seq.0)
+        {
+            return MemberState::Unreadable;
+        }
+        // Taken and refused for what it carries (a payload that does not
+        // open), not held.
+        if let Some(device) = device_of(id.writer.key())
+            && let Some(why) = self.refused.get(&log_name(&device, Some(c), id.seq.0))
+        {
+            return match why {
+                Refusal::Group { .. } => MemberState::GroupRefused,
+                why => MemberState::Refused(why.clone()),
+            };
+        }
+        if self.dropped(c, id) {
+            return MemberState::Dropped;
+        }
+        MemberState::Missing
+    }
+
+    /// The seal group member `id` of `c` declares, if it is held.
+    fn declared_seal(&self, c: &Name, id: &VersionId) -> Option<BTreeSet<Audience>> {
+        let coll = self.colls.get(c)?;
+        let seal = coll
+            .versions
+            .get(id)
+            .or_else(|| {
+                coll.outsiders
+                    .iter()
+                    .chain(&coll.waiting)
+                    .find(|hv| hv.version.id == *id)
+            })
+            .map(|hv| &hv.version.seal)
+            .or_else(|| {
+                coll.locked
+                    .iter()
+                    .find(|l| l.writer == id.writer && l.seq == id.seq.0)
+                    .map(|l| &l.body.seal)
+            })?;
+        Some(seal.any_of.iter().cloned().collect())
+    }
+
+    /// The verdict on group `key` (its writer and id), from its own signed
+    /// versions and their admission alone (spec §5.5).
+    fn verdict(&self, key: &(Writer, u64)) -> GroupVerdict {
+        let (w, gid) = key;
+        let Some(members) = self.txns.get(key) else {
+            return GroupVerdict::Incomplete {
+                present: 0,
+                count: 0,
+            };
+        };
+        let id = |seq: u64| VersionId {
+            writer: w.clone(),
+            seq: Seq(seq),
+        };
+        let name_of = |c: &Name, seq: u64| match device_of(w.key()) {
+            Some(d) => log_name(&d, Some(c), seq),
+            None => c.clone(),
+        };
+        let count = members.values().next().map_or(0, |m| m.count);
+        let mut folders = BTreeSet::new();
+        let mut colls = BTreeSet::new();
+        let mut seals: Option<BTreeSet<Audience>> = None;
+        for (seq, m) in members {
+            let malformed = |why: &str| GroupVerdict::Refused {
+                member: name_of(&m.collection, *seq),
+                why: format!("its group is malformed: {why}"),
+            };
+            if *seq < *gid || *seq - gid >= u64::from(m.count) {
+                return malformed("a member's seq lies outside the group");
+            }
+            if m.count != count {
+                return malformed("its members disagree on the group's count");
+            }
+            folders.insert(folder_of(&m.collection));
+            if folders.len() > 1 {
+                return malformed("its members lie in collections of different folders");
+            }
+            if !colls.insert(m.collection.clone()) {
+                return malformed("two of its members are in one collection");
+            }
+            if let Some(seal) = self.declared_seal(&m.collection, &id(*seq)) {
+                match &seals {
+                    Some(s) if *s != seal => {
+                        return malformed("its members declare different seals");
+                    }
+                    Some(_) => {}
+                    None => seals = Some(seal),
+                }
+            }
+        }
+        let mut states = BTreeMap::new();
+        for (seq, m) in members {
+            let state = self.member_state(&m.collection, &id(*seq));
+            if let MemberState::Refused(why) = &state {
+                return GroupVerdict::Refused {
+                    member: name_of(&m.collection, *seq),
+                    why: why.to_string(),
+                };
+            }
+            states.insert(*seq, state);
+        }
+        if states.values().any(|s| *s == MemberState::Unreadable) {
+            return GroupVerdict::Unreadable;
+        }
+        let folder = folders.into_iter().next().expect("a member is held");
+        let mut present = 0;
+        let mut all_ready = true;
+        let mut next = None;
+        for s in *gid..gid.saturating_add(u64::from(count)) {
+            match states.get(&s) {
+                Some(MemberState::Counted | MemberState::Dropped) => present += 1,
+                Some(MemberState::Waiting) => {
+                    present += 1;
+                    let coll = &self.colls[&members[&s].collection];
+                    let is_ready = coll
+                        .versions
+                        .get(&id(s))
+                        .is_some_and(|hv| ready(&coll.waits(), &coll.applied, &hv.version));
+                    if !is_ready {
+                        all_ready = false;
+                    } else if next.is_none() {
+                        next = Some(s);
+                    }
+                }
+                Some(MemberState::GroupRefused) => {
+                    present += 1;
+                    all_ready = false;
+                }
+                Some(_) => {}
+                None => {
+                    // Not held as a member: pruned or expired here, in a
+                    // collection of the folder, it is present.
+                    let dropped = self
+                        .colls
+                        .keys()
+                        .any(|c| folder_of(c) == folder && self.dropped(c, &id(s)));
+                    if dropped {
+                        present += 1;
+                    }
+                }
+            }
+        }
+        if present < count {
+            return GroupVerdict::Incomplete { present, count };
+        }
+        GroupVerdict::Complete {
+            next: next.filter(|_| all_ready),
+        }
+    }
+
+    /// What its group lets each group member of `c` waiting here — pending,
+    /// or held sealed — do ([`Run`]).
+    fn gates(&self, c: &Name) -> HashMap<VersionId, Gate> {
+        let mut out = HashMap::new();
+        let Some(coll) = self.colls.get(c) else {
+            return out;
+        };
+        for key in &coll.txns {
+            let Some(members) = self.txns.get(key) else {
+                continue;
+            };
+            let mut verdict = None;
+            for (seq, _) in members.iter().filter(|(_, m)| m.collection == *c) {
+                let id = VersionId {
+                    writer: key.0.clone(),
+                    seq: Seq(*seq),
+                };
+                let waits = coll.pending.contains(&id)
+                    || coll
+                        .locked
+                        .iter()
+                        .any(|l| l.writer == id.writer && l.seq == id.seq.0);
+                if !waits {
+                    continue;
+                }
+                let v = verdict.get_or_insert_with(|| self.verdict(key));
+                out.insert(id, v.gate(*seq));
+            }
+        }
+        out
     }
 
     /// Hold `key` as the key of epoch `e` of `c` if it matches the key
@@ -2979,12 +3660,10 @@ impl St {
             return None;
         };
         if *at == coll.at() {
-            let not_counted = coll
-                .not_counted
-                .iter()
-                .map(|(id, why)| (id.clone(), why.clone()))
-                .collect();
-            return coll.state.as_ref().map(|s| (s.value(), not_counted));
+            return coll
+                .state
+                .as_ref()
+                .map(|s| (s.value(), coll.not_counted_list()));
         }
         let mut state = rules.get(function)?.start(me);
         let mut versions = coll.versions.clone();
@@ -2996,6 +3675,23 @@ impl St {
         let mut skipped = coll.skipped.clone();
         let mut applied = BTreeMap::new();
         let mut kinds = HashMap::new();
+        let mut outsiders = coll.outsiders.clone();
+        // A group's members inside `at` count as the group does now: all of
+        // a complete one, none of a refused one.
+        let gates: HashMap<VersionId, Gate> = pending
+            .iter()
+            .filter_map(|id| {
+                let g = versions.get(id)?.version.group?;
+                let gate = match self.verdict(&(id.writer.clone(), g.id)) {
+                    GroupVerdict::Complete { .. } => Gate::Go,
+                    GroupVerdict::Refused { member, why } => {
+                        Gate::Stop(Refusal::Group { member, why })
+                    }
+                    _ => Gate::Wait(None),
+                };
+                Some((id.clone(), gate))
+            })
+            .collect();
         let ran = Run {
             members,
             entries: &coll.entries,
@@ -3005,12 +3701,14 @@ impl St {
             by_digest: &coll.by_digest,
             store: &*self.store,
             keys: &self.keys,
+            gates: &gates,
             state: Some(&mut *state),
             versions: &mut versions,
             skipped: &mut skipped,
             applied: &mut applied,
             pending: &mut pending,
             kinds: &mut kinds,
+            outsiders: &mut outsiders,
             unwhole: BTreeSet::new(),
             out: Vec::new(),
         }
@@ -3144,6 +3842,7 @@ impl Device {
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
         let clock = Arc::clone(&config.clock);
+        let rules = config.rules.clone();
         let contexts = contexts_by_namespace(validator.keyring());
         let own_key = identity
             .signer
@@ -3189,6 +3888,9 @@ impl Device {
                 holding: BTreeMap::new(),
                 fetching: BTreeSet::new(),
                 walked: BTreeSet::new(),
+                txns: HashMap::new(),
+                rules,
+                me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
                 asks: HashMap::new(),
                 answers: Kept::new(ANSWERS_KEPT),
@@ -3974,6 +4676,19 @@ fn suspected_name(key: &Name) -> Name {
     under(&suspected_prefix(), key)
 }
 
+/// Where the store keeps the group counter of this device's latest
+/// announcement in each namespace's sync group
+/// (`/localhost/ndn-data/announced/<namespace>`, 8 octets big-endian): a
+/// peer takes a counter only above the highest it heard, and a run may
+/// announce more often than it appends to its log, so a restart starts at
+/// the higher of this and its log head ([`Inner::join`]).
+fn announced_name(ns: &Name) -> Name {
+    let prefix: Name = "/localhost/ndn-data/announced"
+        .parse()
+        .expect("a valid name");
+    under(&prefix, ns)
+}
+
 /// Where the store keeps a marker for each log entry withdrawn because the
 /// trust context refuses its chain (`/localhost/ndn-data/untrusted/<log
 /// entry name>`, its value the verdict in UTF-8; [`Refusal::Untrusted`]):
@@ -4456,17 +5171,26 @@ impl Inner {
             if st.groups.contains_key(ns) {
                 return Ok(());
             }
+            // Above anything an earlier run announced: a peer takes a counter
+            // only above the highest it heard of this device.
+            let announced = self
+                .store
+                .get(&announced_name(ns))
+                .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
+                .map_or(0, u64::from_be_bytes);
+            let local_seq = st.head.max(announced);
             st.groups.insert(
                 ns.clone(),
-                Group {
+                SyncGroup {
                     tx: None,
                     owed: 0,
                     members: BTreeSet::new(),
                     busy: HashMap::new(),
                     confirmed: None,
+                    announced: local_seq,
                 },
             );
-            st.head
+            local_seq
         };
         let group = sync_group(ns);
         self.sync
@@ -4474,8 +5198,9 @@ impl Inner {
             .await
             .map_err(|e| local(format!("cannot receive {group}: {e}")))?;
         let cfg = SvsConfig {
-            // The group's counter only says "moved"; starting at the log head
-            // keeps it above anything an earlier run announced.
+            // The group's counter only says "moved": it starts above every
+            // announcement an earlier run made ([`announced_name`]) and
+            // every entry of the log.
             local_seq,
             ..self.config.svs.clone()
         };
@@ -4487,7 +5212,16 @@ impl Inner {
             let mut st = self.st.lock();
             let g = st.groups.get_mut(ns).expect("inserted above");
             g.tx = Some(tx.clone());
-            std::mem::take(&mut g.owed)
+            let owed = std::mem::take(&mut g.owed);
+            g.announced += owed;
+            let announced = g.announced;
+            if owed > 0 {
+                self.store.insert(
+                    announced_name(ns),
+                    Bytes::copy_from_slice(&announced.to_be_bytes()),
+                );
+            }
+            owed
         };
         for _ in 0..owed {
             let _ = tx.send((group.clone(), None)).await;
@@ -4757,20 +5491,47 @@ impl Inner {
         }
         let inner = Arc::clone(self);
         rt::spawn(async move {
+            let mut pause = REFRESH_PAUSE;
+            let mut tries = 0;
             loop {
                 let ok = inner.refresh(&ns, &device).await;
-                let mut st = inner.st.lock();
-                let Some(g) = st.groups.get_mut(&ns) else {
-                    break;
+                // Again now; again later; or done.
+                let next: Option<bool> = {
+                    let mut st = inner.st.lock();
+                    // A member of a group held here waits for others: a
+                    // device not reached now (offline, a holder away) is
+                    // asked again, later, so that they arrive when it is
+                    // back (spec §5.5).
+                    let waits = !ok
+                        && tries < REFRESH_TRIES
+                        && st.colls.iter().any(|(c, k)| {
+                            !k.group_waits.is_empty() && namespace_of(c).as_ref() == Some(&ns)
+                        });
+                    match st.groups.get_mut(&ns) {
+                        None => None,
+                        Some(g) => match g.busy.get_mut(&device) {
+                            Some(again) if *again => {
+                                *again = false;
+                                Some(false)
+                            }
+                            Some(_) if waits => Some(true),
+                            _ => {
+                                g.busy.remove(&device);
+                                if ok && g.busy.is_empty() {
+                                    g.confirmed = Some(Instant::now());
+                                }
+                                None
+                            }
+                        },
+                    }
                 };
-                match g.busy.get_mut(&device) {
-                    Some(again) if *again => *again = false,
-                    _ => {
-                        g.busy.remove(&device);
-                        if ok && g.busy.is_empty() {
-                            g.confirmed = Some(Instant::now());
-                        }
-                        break;
+                match next {
+                    None => break,
+                    Some(false) => {}
+                    Some(true) => {
+                        tries += 1;
+                        rt::sleep(pause).await;
+                        pause = (pause * 2).min(REFRESH_PAUSE_MAX);
                     }
                 }
             }
@@ -4781,20 +5542,24 @@ impl Inner {
         });
     }
 
-    /// Publish one change into `ns`'s group.
+    /// Publish one change into `ns`'s group. The counter it announces is
+    /// kept in the store first ([`announced_name`]).
     async fn publish(&self, ns: &Name) {
         let tx = {
             let mut st = self.st.lock();
             let Some(g) = st.groups.get_mut(ns) else {
                 return;
             };
-            match &g.tx {
-                Some(tx) => tx.clone(),
-                None => {
-                    g.owed += 1;
-                    return;
-                }
-            }
+            let Some(tx) = g.tx.clone() else {
+                g.owed += 1;
+                return;
+            };
+            g.announced += 1;
+            self.store.insert(
+                announced_name(ns),
+                Bytes::copy_from_slice(&g.announced.to_be_bytes()),
+            );
+            tx
         };
         let _ = tx.send((sync_group(ns), None)).await;
     }
@@ -5280,15 +6045,16 @@ impl Inner {
         })
     }
 
-    /// Fetch, verify and take one log entry; whether it is now held or
-    /// refused. The log of a device whose key is suspected here is not
-    /// fetched ([`Device::suspect`]).
+    /// Fetch, verify and take one log entry — by its name, else from each
+    /// holder of a live lease on its collection ([`Self::fetch_entry`]);
+    /// whether it is now held or refused. The log of a device whose key is
+    /// suspected here is not fetched ([`Device::suspect`]).
     async fn take_fetched(self: &Arc<Self>, name: Name) -> bool {
         if parse_log_name(&name).is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device)) {
             tracing::debug!(%name, "not fetched: its device's key is suspected here");
             return false;
         }
-        let Some(data) = self.fetch(name.clone(), false).await else {
+        let Some(data) = self.fetch_entry(&name, None).await else {
             return false;
         };
         match self.take_data(&name, data).await {
@@ -5384,7 +6150,13 @@ impl Inner {
         else {
             return Err(Refusal::BadSignature);
         };
-        let (chase, fetch, withdrawn) = {
+        // A lease names a holder a missing member of a group may be fetched
+        // from.
+        let leased = match &record {
+            Record::Lease(b) => Some(b.collection.clone()),
+            _ => None,
+        };
+        let (chase, fetch, withdrawn, again) = {
             let mut st = self.st.lock();
             let members = matches!(record, Record::Members(_));
             let key = key_name_of(writer.key());
@@ -5441,13 +6213,35 @@ impl Inner {
             chase.sort();
             chase.dedup();
             let fetch: Vec<(Name, ChunksBody)> = fetch.into_iter().chain(wanted).collect();
-            (chase, fetch, (wake && withdrawn).then_some(key))
+            // Members of groups held here wait for others: what every
+            // device writing into the namespace lists is looked at again,
+            // now that a holder may serve what their writers no longer do.
+            let again = leased
+                .filter(|c| {
+                    // A member waits in the folder: the one missing may be
+                    // in the leased collection.
+                    let folder = folder_of(c);
+                    st.colls
+                        .iter()
+                        .any(|(x, k)| folder_of(x) == folder && !k.group_waits.is_empty())
+                })
+                .and_then(|c| namespace_of(&c))
+                .map(|ns| {
+                    let devices = self.known_for(&st, &ns);
+                    (ns, devices)
+                });
+            (chase, fetch, (wake && withdrawn).then_some(key), again)
         };
         for c in chase {
             self.chase_keys(&c);
         }
         for (v, chunks) in fetch {
             self.spawn_pieces(v, chunks);
+        }
+        if let Some((ns, devices)) = again {
+            for d in devices {
+                self.schedule(ns.clone(), d);
+            }
         }
         // Its key verifies again: what was withdrawn of it for its chain
         // may verify too (a new certificate of the key).
@@ -5680,14 +6474,18 @@ impl Inner {
                 let keep = body.keep;
                 let sealed = body.sealed.is_some();
                 let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
+                let group = body.group;
+                if let Some(g) = group {
+                    st.note_member(&c, &id, g);
+                }
                 let fetch = keeps
                     .then(|| body.chunks.map(|ch| (name.clone(), ch)))
                     .flatten();
                 if let Some(s) = body.sealed.clone() {
                     let Some(key) = st.keys.key(&c, &s.epoch) else {
                         st.held.insert(name.clone(), Held::Locked);
-                        let coll = st.colls.entry(c).or_default();
-                        coll.by_digest.insert(digest, id);
+                        let coll = st.colls.entry(c.clone()).or_default();
+                        coll.by_digest.insert(digest, id.clone());
                         coll.locked.push(Locked {
                             name,
                             wire,
@@ -5695,6 +6493,10 @@ impl Inner {
                             seq,
                             body,
                         });
+                        if group.is_some() {
+                            // Its group is not readable here, until it opens.
+                            st.apply_ready(&c, &BTreeSet::new());
+                        }
                         return fetch;
                     };
                     // A payload in pieces opens when it is read, or, of a
@@ -5706,12 +6508,16 @@ impl Inner {
                             tracing::debug!(%name, "refused: its payload does not open under its epoch's key");
                             st.refused.insert(name, Refusal::BadSignature);
                             st.colls
-                                .entry(c)
+                                .entry(c.clone())
                                 .or_default()
                                 .skipped
                                 .entry(writer)
                                 .or_default()
                                 .insert(seq);
+                            if group.is_some() {
+                                // Its group is refused with it.
+                                st.apply_ready(&c, &BTreeSet::new());
+                            }
                             return None;
                         };
                         open_into(&mut body, opened);
@@ -7196,34 +8002,82 @@ impl Inner {
     ) -> Result<VersionId, DataError> {
         // Refused before the edit touches the state.
         let seq = self.next_seq(st)?;
+        let signed = self.sign_in(st, c, seq, key, type_id, keep, draft, None)?;
+        let judged = self.judge_own(st, &signed, true)?;
+        Ok(self.commit(st, ns, signed, batch, judged))
+    }
+
+    /// Sign `draft` as the own version at `seq` of `c`, under its record in
+    /// force and with its state ([`Self::sign_version`]); nothing is kept.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_in(
+        &self,
+        st: &mut St,
+        c: &Name,
+        seq: u64,
+        key: Option<&(Epoch, ContentKey)>,
+        type_id: TypeId,
+        keep: Keep,
+        draft: Draft,
+        group: Option<Group>,
+    ) -> Result<Signed, DataError> {
         let log = st.colls[c]
             .members
             .as_ref()
             .is_some_and(|m| log_like(&m.rule));
-        let (dated, content, block, built) = match draft {
-            Draft::Entry(content) => {
-                let dated = match log {
-                    true => self.date(st, c),
-                    false => (self.config.clock)(),
-                };
-                (dated, content, None, None)
-            }
-            Draft::Op(op) => ((self.config.clock)(), Content::new(), None, Some(op)),
-            Draft::Block { first, entries } => (first, Content::new(), Some(entries), None),
+        let dated = match (&draft, log) {
+            (Draft::Block { first, .. }, _) => *first,
+            (_, true) => self.date(st, c),
+            (_, false) => (self.config.clock)(),
         };
         let coll = st.colls.get_mut(c).expect("members known");
         let members = coll.members.as_ref().expect("members known");
-        let seal = Seal {
-            any_of: members.readers.clone(),
+        let under = Under {
+            readers: members.readers.clone(),
+            function: match &members.rule {
+                Rule::Merge { function } => Some(function.clone()),
+                Rule::Log | Rule::OneKey => None,
+            },
+            parents: coll.at(),
         };
-        let parents = coll.at();
-        let function = match &members.rule {
-            Rule::Merge { function } => Some(function.clone()),
-            Rule::Log | Rule::OneKey => None,
+        self.sign_version(
+            c,
+            seq,
+            under,
+            coll.state.as_deref_mut(),
+            key,
+            (type_id, keep, dated),
+            draft,
+            group,
+        )
+    }
+
+    /// Sign `draft` as the own version at `seq` of `c`, written `under`
+    /// a record, sealed with `key`: a merge collection's entry as the
+    /// operation `state` makes of its fields (or the one the app built); a
+    /// payload larger than [`wire::INLINE_MAX`] in pieces. Nothing is kept:
+    /// the version is [`Self::commit`]ted once judged, or dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_version(
+        &self,
+        c: &Name,
+        seq: u64,
+        under: Under,
+        state: Option<&mut (dyn MergeState + 'static)>,
+        key: Option<&(Epoch, ContentKey)>,
+        (type_id, keep, dated): (TypeId, Keep, Timestamp),
+        draft: Draft,
+        group: Option<Group>,
+    ) -> Result<Signed, DataError> {
+        let (content, block, built) = match draft {
+            Draft::Entry(content) => (content, None, None),
+            Draft::Op(op) => (Content::new(), None, Some(op)),
+            Draft::Block { entries, .. } => (Content::new(), Some(entries), None),
         };
-        let op = match &function {
+        let log = under.function.is_none();
+        let op = match &under.function {
             Some(function) => {
-                let Some(state) = coll.state.as_mut() else {
+                let Some(state) = state else {
                     return Err(DataError::RuleUnknown {
                         collection: c.clone(),
                         rule: function.clone(),
@@ -7279,11 +8133,14 @@ impl Inner {
         };
         let body = VersionBody {
             collection: c.clone(),
-            parents,
+            parents: under.parents,
             type_id,
-            seal,
+            seal: Seal {
+                any_of: under.readers,
+            },
             keep,
             dated,
+            group,
             fields,
             op: record_op,
             sealed,
@@ -7293,42 +8150,97 @@ impl Inner {
         let wire = self.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
         let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
         let version = version_of(&name, &self.writer, seq, body);
-        let id = version.id.clone();
         let held = HeldVersion {
             opened: true,
-            ..HeldVersion::new(
-                version.clone(),
-                op,
-                wire.clone(),
-                key.is_some(),
-                epoch,
-                chunks,
-            )
+            ..HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks)
         };
-        // The rule judges the operation as every reader will: against its
-        // past, here the state's frontier (and this writer's earlier log).
+        Ok(Signed {
+            c: c.clone(),
+            seq,
+            held,
+            pieces,
+            log,
+            keep,
+            dated,
+            function: under.function,
+        })
+    }
+
+    /// The rule's judgement of `signed`, an own version of a merge
+    /// collection, against its past — here the state's frontier and this
+    /// writer's earlier log, as every reader will judge it — by the
+    /// collection's state: checked, and with `apply`, applied. One the rule
+    /// refuses is [`DataError::BadRequest`]. `None` under the log rule.
+    fn judge_own(
+        &self,
+        st: &mut St,
+        signed: &Signed,
+        apply: bool,
+    ) -> Result<Option<Ruled>, DataError> {
+        let Some(function) = &signed.function else {
+            return Ok(None);
+        };
+        let c = &signed.c;
+        let coll = st.colls.get_mut(c).expect("members known");
+        let Some(state) = coll.state.as_deref_mut() else {
+            return Err(DataError::RuleUnknown {
+                collection: c.clone(),
+                rule: function.clone(),
+            });
+        };
+        let judged = rule_on(
+            state,
+            &signed.held,
+            &PastOf::new(
+                &signed.held.version,
+                &coll.versions,
+                &coll.locked,
+                &coll.outsiders,
+                &coll.by_digest,
+            ),
+            apply,
+        );
+        judged.map(Some).map_err(|e| DataError::BadRequest {
+            name: c.clone(),
+            why: format!(
+                "{c} merges with {function}, whose rule refuses this operation ({e}); nothing \
+                 was written: put an operation the rule takes"
+            ),
+        })
+    }
+
+    /// Keep `signed`, an own version judged (`judged`, under a merge rule):
+    /// its seq is the log's head, it and its pieces are stored, listed in
+    /// the summary, applied, and delivered. Its id.
+    fn commit(
+        &self,
+        st: &mut St,
+        ns: &Name,
+        signed: Signed,
+        batch: Duration,
+        judged: Option<Ruled>,
+    ) -> VersionId {
+        let Signed {
+            c,
+            seq,
+            held,
+            pieces,
+            log,
+            keep,
+            dated,
+            ..
+        } = signed;
+        let version = held.version.clone();
+        let id = version.id.clone();
+        let name = version.name.clone();
         let mut told = Vec::new();
-        if let Some(function) = &function {
-            let coll = st.colls.get_mut(c).expect("members known");
-            let refused = |e: MergeError| DataError::BadRequest {
-                name: c.clone(),
-                why: format!(
-                    "{c} merges with {function}, whose rule refuses this operation ({e}); nothing \
-                     was written: put an operation the rule takes"
-                ),
-            };
-            let past = PastOf::new(&version, &coll.versions, &coll.locked, &coll.by_digest);
-            let op = Op {
-                id: &id,
-                digest: &held.digest,
-                parents: &version.parents,
-                past: &past,
-                bytes: &held.op,
-            };
-            let state = coll.state.as_mut().expect("the rule is known");
-            let kind = state.check(&op).map_err(refused)?;
-            let counting = state.apply(&op).map_err(refused)?;
-            let now = state.now_counted();
+        if let Some(Ruled {
+            kind,
+            counting,
+            now,
+        }) = judged
+        {
+            let coll = st.colls.get_mut(&c).expect("members known");
             coll.kinds.insert(id.clone(), kind);
             if let Counting::NotCounted(why) = counting {
                 coll.not_counted.insert(id.clone(), why.clone());
@@ -7343,12 +8255,12 @@ impl Inner {
                 }
             }
         }
-        st.head = seq;
+        st.head = st.head.max(seq);
         for p in pieces {
             self.store.insert(p.name, p.wire);
         }
-        self.store.insert(name.clone(), wire.clone());
-        self.note_written(st, &name, &wire);
+        self.store.insert(name.clone(), held.wire.clone());
+        self.note_written(st, &name, &held.wire);
         st.held.insert(name, Held::Version(id.clone()));
         let retain = match log {
             true => Retain { keep, dated },
@@ -7357,8 +8269,11 @@ impl Inner {
         st.trees
             .entry(ns.clone())
             .or_insert_with(|| Tree::new(ns.clone()))
-            .add(c, seq, Kind::Version(retain));
-        let coll = st.colls.get_mut(c).expect("members known");
+            .add(&c, seq, Kind::Version(retain));
+        if let Some(g) = version.group {
+            st.note_member(&c, &id, g);
+        }
+        let coll = st.colls.get_mut(&c).expect("members known");
         coll.entries
             .entry(id.writer.clone())
             .or_default()
@@ -7370,19 +8285,19 @@ impl Inner {
         coll.batch = batch;
         coll.by_digest.insert(held.digest, id.clone());
         coll.versions.insert(id.clone(), Arc::new(held));
-        st.emit(c, &Change::Version(version), &id.writer, seq);
+        st.emit(&c, &Change::Version(version), &id.writer, seq);
         for change in told {
             match &change {
-                Change::NotCounted { .. } => st.emit(c, &change, &id.writer, seq),
-                _ => st.tell(c, &change),
+                Change::NotCounted { .. } => st.emit(&c, &change, &id.writer, seq),
+                _ => st.tell(&c, &change),
             }
         }
         self.arm_sweep(st, keep);
         // A newer version may end older ones' last N (spec §14.1).
         if matches!(keep, Keep::LastN(_)) {
-            st.expire(c);
+            st.expire(&c);
         }
-        Ok(id)
+        id
     }
 
     /// Add an entry to the open block of `c` (spec §4.1), closing the open
@@ -8183,8 +9098,10 @@ impl Inner {
         }
         self.st.lock().asking.remove(&(c.clone(), e.clone()));
         if got {
-            // Merge versions in pieces it unlocked wait for them.
+            // Merge versions in pieces it unlocked wait for them; a group
+            // member it opened may make its folder followed.
             self.fetch_wanted();
+            self.settle().await;
         } else {
             tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key");
         }
@@ -8268,11 +9185,7 @@ impl Inner {
                     collection: c.clone(),
                     at,
                     value: state.value(),
-                    not_counted: coll
-                        .not_counted
-                        .iter()
-                        .map(|(id, why)| (id.clone(), why.clone()))
-                        .collect(),
+                    not_counted: coll.not_counted_list(),
                 }))
             }
             Rule::Log => {
@@ -8298,10 +9211,12 @@ impl Inner {
             // head would name, as of the last one this device verified.
             Rule::OneKey => {
                 let since = members.since.as_ref();
+                // A member of a group counts once its group does.
                 coll.versions
                     .values()
                     .map(|hv| &hv.version)
                     .filter(|v| !since.is_some_and(|s| s.contains(&v.id)))
+                    .filter(|v| v.group.is_none() || !coll.pending.contains(&v.id))
                     .max_by(|a, b| a.id.seq.cmp(&b.id.seq))
                     .map(|v| Got::Version(v.clone()))
                     .ok_or_else(|| DataError::Unavailable { name: c.clone() })
@@ -10774,6 +11689,7 @@ fn version_of(name: &Name, writer: &Writer, seq: u64, body: VersionBody) -> Vers
         seal: body.seal,
         keep: body.keep,
         dated: body.dated,
+        group: body.group,
         payload: match (body.chunks, body.block) {
             (Some(c), _) => Payload::Large { size: c.size },
             (None, Some(entries)) => Payload::Block(
@@ -10802,6 +11718,331 @@ fn check_collection(c: &Name) -> Result<(), DataError> {
 }
 
 impl Device {
+    /// [`DataLayer::put_group`]: every check first — the items, then each
+    /// collection's record in force (looked at, and its key obtained), then
+    /// each item's operation by its rule — and only once all pass, under
+    /// one lock: the records this namespace's collections without one need
+    /// ([`Inner::default_members`]), then the group, at consecutive seqs.
+    /// Refused, nothing is written: no seq taken, nothing stored or
+    /// published (spec §5.5).
+    async fn put_items(
+        &self,
+        items: Vec<(Name, Edit)>,
+        options: PutOptions,
+    ) -> Result<Vec<VersionId>, DataError> {
+        let inner = &self.inner;
+        let refuse = |name: &Name, why: String| DataError::BadRequest {
+            name: name.clone(),
+            why,
+        };
+        let Some((first, _)) = items.first() else {
+            return Err(refuse(
+                &inner.device,
+                "a group holds at least one version, and put_group was given none; put_group \
+                 with one item or more"
+                    .into(),
+            ));
+        };
+        let count = match u32::try_from(items.len()) {
+            Ok(n) if n <= GROUP_MAX => n,
+            _ => {
+                return Err(refuse(
+                    first,
+                    format!(
+                        "a group holds at most {GROUP_MAX} versions, and put_group was given {}; \
+                         split it into groups a reader may count apart",
+                        items.len()
+                    ),
+                ));
+            }
+        };
+        if options.batch.is_some() {
+            return Err(refuse(
+                first,
+                "a group is signed at once, never batched into blocks; put_group without batch"
+                    .into(),
+            ));
+        }
+        let folder = folder_of(first);
+        let mut seen = BTreeSet::new();
+        for (c, _) in &items {
+            check_collection(c)?;
+            if !seen.insert(c.clone()) {
+                return Err(refuse(
+                    c,
+                    format!(
+                        "{c} comes twice in the group, which holds one version per collection; \
+                         merge the two items into one"
+                    ),
+                ));
+            }
+            if folder_of(c) != folder {
+                return Err(refuse(
+                    c,
+                    format!(
+                        "{c} is not in {folder}, where {first} is: a group's collections are all \
+                         of one folder; put the items of other folders in groups of their own"
+                    ),
+                ));
+            }
+        }
+        // Each collection's record in force, looked at as `put` looks; a
+        // collection of this namespace with none gets the host's default,
+        // signed only once everything passes.
+        let mut fresh = BTreeSet::new();
+        let mut keys = Vec::with_capacity(items.len());
+        for (c, _) in &items {
+            let ns = namespace_of(c).expect("checked above");
+            inner.look(c).await?;
+            inner.st.lock().ensure(c, &inner.config.rules, inner.me());
+            if ns != inner.ns {
+                let c = c.clone();
+                inner
+                    .wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
+                    .await;
+            }
+            let has = {
+                let mut st = inner.st.lock();
+                st.ensure(c, &inner.config.rules, inner.me());
+                st.colls.get(c).is_some_and(|x| x.members.is_some())
+            };
+            if has {
+                keys.push(inner.write_key(c).await?);
+                continue;
+            }
+            if ns != inner.ns {
+                let heard = !inner.known_for(&inner.st.lock(), &ns).is_empty();
+                return Err(if heard {
+                    DataError::NotAllowed {
+                        collection: c.clone(),
+                        writer: inner.writer.clone(),
+                    }
+                } else {
+                    DataError::Unavailable { name: c.clone() }
+                });
+            }
+            fresh.insert(c.clone());
+            keys.push(None);
+        }
+        let PutOptions { type_id, keep, .. } = options;
+        let ids = self.sign_group(&items, &keys, &fresh, type_id, keep, count)?;
+        for (c, _) in &items {
+            inner.publish_about(c, &[]).await?;
+        }
+        Ok(ids)
+    }
+
+    /// The locked part of [`Self::put_items`]: check every item against its
+    /// collection's record in force (`keys`: their epoch keys; `fresh`: the
+    /// collections of this namespace with no record yet), then sign and
+    /// judge the group, and keep it only if every item passes.
+    fn sign_group(
+        &self,
+        items: &[(Name, Edit)],
+        keys: &[Option<(Epoch, ContentKey)>],
+        fresh: &BTreeSet<Name>,
+        type_id: TypeId,
+        keep: Keep,
+        count: u32,
+    ) -> Result<Vec<VersionId>, DataError> {
+        let inner = &self.inner;
+        let refuse = |name: &Name, why: String| DataError::BadRequest {
+            name: name.clone(),
+            why,
+        };
+        let first = &items[0].0;
+        let yrs = crate::merge::Yrs::new().function().clone();
+        let mut st = inner.st.lock();
+        // What each collection is written under, as it stands now.
+        let mut audiences: Vec<BTreeSet<Audience>> = Vec::with_capacity(items.len());
+        for ((c, edit), key) in items.iter().zip(keys) {
+            if fresh.contains(c) {
+                if st.colls.get(c).is_some_and(|x| x.members.is_some()) {
+                    // A record arrived meanwhile: put_group again under it.
+                    return Err(DataError::Unavailable { name: c.clone() });
+                }
+                audiences.push([Audience::Person(inner.ns.clone())].into_iter().collect());
+                continue;
+            }
+            inner.writable(&st, c, key.as_ref().map(|(e, _)| e))?;
+            let coll = &st.colls[c];
+            let members = coll.members.as_ref().expect("members known");
+            match (&members.rule, edit) {
+                (Rule::Merge { function }, _) if coll.state.is_none() => {
+                    return Err(DataError::RuleUnknown {
+                        collection: c.clone(),
+                        rule: function.clone(),
+                    });
+                }
+                (Rule::Log | Rule::OneKey, Edit::Op(_)) => {
+                    return Err(refuse(
+                        c,
+                        format!(
+                            "{c} is a log collection: its versions carry fields, not a merge \
+                             rule's operation; give its item as fields"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            audiences.push(members.readers.iter().cloned().collect());
+        }
+        if let Some(i) = audiences.iter().position(|a| *a != audiences[0]) {
+            return Err(refuse(
+                &items[i].0,
+                format!(
+                    "{} is read by another audience than {first} (one was narrowed, say), so a \
+                     reader of one could never count the group; share them alike, or put them \
+                     in separate groups",
+                    items[i].0
+                ),
+            ));
+        }
+        // What is open closes first: dates and seqs stay in order.
+        for (c, _) in items {
+            if !fresh.contains(c) {
+                inner.close_block(&mut st, c);
+            }
+        }
+        // The seqs to come: the records needed, then the group.
+        let base = inner.next_seq(&st)?;
+        let records: Vec<(Name, (MembersBody, Option<ContentKey>))> = fresh
+            .iter()
+            .zip(base..)
+            .map(|(c, seq)| (c.clone(), inner.default_members(c, seq)))
+            .collect();
+        let gid = base + records.len() as u64;
+        if gid.checked_add(u64::from(count)).is_none() {
+            return Err(local(format!(
+                "{} has too few seqs left in its log for a group of {count}; enroll the device \
+                 again under a new name",
+                inner.device
+            )));
+        }
+        let group = Group { id: gid, count };
+        let no_versions = BTreeMap::new();
+        let no_index = HashMap::new();
+        // Signed and judged; nothing kept yet. A collection whose state an
+        // edit or an application changed is read again if the group is
+        // refused.
+        let mut temps: HashMap<Name, Box<dyn MergeState>> = HashMap::new();
+        let mut touched = Vec::new();
+        let mut signed = Vec::with_capacity(items.len());
+        let restore = |st: &mut St, touched: &[Name]| {
+            for c in touched {
+                st.reread(c, &inner.config.rules, inner.me());
+            }
+        };
+        for (i, ((c, edit), key)) in items.iter().zip(keys).enumerate() {
+            let seq = gid + i as u64;
+            let draft = match edit {
+                Edit::Fields(content) => Draft::Entry(content.clone()),
+                Edit::Op(op) => Draft::Op(op.clone()),
+            };
+            let made = match records.iter().find(|(r, _)| r == c) {
+                Some((_, (body, made_key))) => {
+                    let Some(rule) = inner.config.rules.get(&yrs) else {
+                        return Err(DataError::RuleUnknown {
+                            collection: c.clone(),
+                            rule: yrs,
+                        });
+                    };
+                    let mut temp = rule.start(inner.me());
+                    let epoch_key = body.epoch.clone().zip(made_key.clone());
+                    let under = Under {
+                        readers: body.readers.clone(),
+                        function: Some(yrs.clone()),
+                        parents: Frontier::new(),
+                    };
+                    let made = inner.sign_version(
+                        c,
+                        seq,
+                        under,
+                        Some(&mut *temp),
+                        epoch_key.as_ref(),
+                        (type_id.clone(), keep, (inner.config.clock)()),
+                        draft,
+                        Some(group),
+                    );
+                    temps.insert(c.clone(), temp);
+                    made
+                }
+                None => {
+                    touched.push(c.clone());
+                    inner.sign_in(
+                        &mut st,
+                        c,
+                        seq,
+                        key.as_ref(),
+                        type_id.clone(),
+                        keep,
+                        draft,
+                        Some(group),
+                    )
+                }
+            };
+            match made {
+                Ok(s) => signed.push(s),
+                Err(e) => {
+                    restore(&mut st, &touched);
+                    return Err(e);
+                }
+            }
+        }
+        // Every operation checked before any is applied, then applied:
+        // what a rule refuses refuses the group.
+        let mut ruled = Vec::with_capacity(signed.len());
+        for apply in [false, true] {
+            ruled.clear();
+            for (i, s) in signed.iter().enumerate() {
+                let r = match temps.get_mut(&s.c) {
+                    Some(temp) => rule_on(
+                        &mut **temp,
+                        &s.held,
+                        &PastOf::new(&s.held.version, &no_versions, &[], &[], &no_index),
+                        apply,
+                    )
+                    .map(Some)
+                    .map_err(|e| {
+                        refuse(
+                            &s.c,
+                            format!(
+                                "item {i} of the group: {}'s rule refuses its operation ({e}); \
+                                 nothing was written: put an operation the rule takes",
+                                s.c
+                            ),
+                        )
+                    }),
+                    None => inner.judge_own(&mut st, s, apply),
+                };
+                match r {
+                    Ok(r) => ruled.push(r),
+                    Err(e) => {
+                        restore(&mut st, &touched);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // Written: the records, then the group.
+        for (c, record) in records {
+            inner.append_members(&mut st, &c, record)?;
+        }
+        debug_assert_eq!(st.head + 1, gid);
+        let mut ids = Vec::with_capacity(signed.len());
+        for (s, r) in signed.into_iter().zip(ruled) {
+            // A fresh collection's state starts with its record: the
+            // operation, judged on a state alike, applies to it the same.
+            let r = match temps.contains_key(&s.c) {
+                true => inner.judge_own(&mut st, &s, true)?,
+                false => r,
+            };
+            let ns = namespace_of(&s.c).expect("checked above");
+            ids.push(inner.commit(&mut st, &ns, s, Duration::ZERO, r));
+        }
+        Ok(ids)
+    }
+
     /// [`DataLayer::put`] and [`DataLayer::put_op`]: sign `draft` into
     /// `collection` (its record first, for a collection of this namespace
     /// that has none), batched into a block when asked and the rule allows.
@@ -11069,6 +12310,14 @@ impl DataLayer for Device {
         self.put_draft(collection, Draft::Op(op), options).await
     }
 
+    async fn put_group(
+        &self,
+        items: Vec<(Name, Edit)>,
+        options: PutOptions,
+    ) -> Result<Vec<VersionId>, DataError> {
+        self.put_items(items, options).await
+    }
+
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError> {
         let inner = &self.inner;
         inner.follow(collection).await?;
@@ -11079,7 +12328,13 @@ impl DataLayer for Device {
                 .colls
                 .iter()
                 .filter(|(c, _)| c.has_prefix(collection))
-                .flat_map(|(_, coll)| coll.versions.values().map(|hv| &hv.version))
+                // A member of a group is shown once its group counts.
+                .flat_map(|(_, coll)| {
+                    coll.versions
+                        .values()
+                        .map(|hv| &hv.version)
+                        .filter(|v| v.group.is_none() || !coll.pending.contains(&v.id))
+                })
                 .filter(|v| !since.contains(&v.id))
                 .collect();
             held.sort_by(|a, b| (&a.collection, &a.id).cmp(&(&b.collection, &b.id)));
@@ -11902,6 +13157,7 @@ mod tests {
             seal: Seal { any_of: Vec::new() },
             keep: crate::Keep::Forever,
             dated: Timestamp(1),
+            group: None,
             fields: Content::new(),
             op: Bytes::new(),
             sealed,
@@ -13722,6 +14978,7 @@ mod tests {
                 seal: Seal { any_of: Vec::new() },
                 keep: Keep::Forever,
                 dated: Timestamp(0),
+                group: None,
                 payload: Payload::Entry(Content::new()),
             },
             Bytes::new(),
@@ -15269,7 +16526,39 @@ mod tests {
         drop(st);
         dev.shutdown();
     }
+
+    #[tokio::test]
+    async fn a_restarted_device_announces_above_everything_its_earlier_run_announced() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.adopt_context(context("/alice")));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let keys = keys_of(&device);
+        let ns = n("/alice");
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        // A run announces more often than it appends to its log.
+        for _ in 0..5 {
+            dev.inner.publish(&ns).await;
+        }
+        let (head, before) = {
+            let st = dev.inner.st.lock();
+            (st.head, st.groups[&ns].announced)
+        };
+        assert!(before > head);
+        dev.shutdown();
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        again.inner.publish(&ns).await;
+        let after = again.inner.st.lock().groups[&ns].announced;
+        assert!(
+            after > before,
+            "its first announcement after the restart is above every earlier one"
+        );
+        again.shutdown();
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod merge_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod group_tests;
