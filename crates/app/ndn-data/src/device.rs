@@ -584,10 +584,6 @@ struct Coll {
     /// as pruned, yet their bytes stay, and no epoch key is destroyed for
     /// them, so they come back if a cut refuses the prune (spec §8).
     foreign_prunes: BTreeSet<Name>,
-    /// Per writer and page path, the newest page node of the writer's node
-    /// of this name verified here (spec §7): with the node's own listing,
-    /// which subtrees may hold a seq.
-    pages: HashMap<(Writer, Bytes), Listing>,
 }
 
 /// Whether a rule makes a collection log-like: every member key appends,
@@ -744,12 +740,6 @@ struct Listing {
     head: u64,
     entries: Vec<(u64, u64)>,
     expiry: Vec<ExpiryRun>,
-    /// Its children and the writer's head in each, when the node lists
-    /// them itself (`None` on pages): which subtrees may hold a seq.
-    children: Option<Vec<(ndn_packet::NameComponent, u64)>>,
-    /// Its pages and the writer's head in each, when it lists pages
-    /// instead of children (spec §7).
-    pages: Option<Vec<(u8, u64)>>,
 }
 
 impl Listing {
@@ -1985,6 +1975,9 @@ enum GroupVerdict {
     /// A member is held sealed and cannot be opened here, or its
     /// collection's rule is unknown here.
     Unreadable,
+    /// A member is kept otherwise than until pruned: the group never
+    /// counts, and nothing of it is refused (spec §5.5).
+    Kept { member: Name, keep: Keep },
     /// A member is sealed in an epoch whose audience, as the records held
     /// here name it, does not admit every reader the group declares: the
     /// member, its epoch and the readers left out.
@@ -2009,6 +2002,11 @@ impl GroupVerdict {
                 why: why.clone(),
             }),
             GroupVerdict::Unreadable => Gate::Wait(Some("group not readable here".into())),
+            GroupVerdict::Kept { member, keep } => Gate::Wait(Some(format!(
+                "group never counts: its member {member} is kept {keep:?}, and a group's \
+                 versions are kept until pruned, so that every reader judges it alike; its \
+                 writer puts the items again as a group kept until pruned"
+            ))),
             GroupVerdict::Uncovered { member, epoch, out } => {
                 let out: Vec<String> = out
                     .iter()
@@ -3750,12 +3748,13 @@ impl St {
 
     /// Whether `w` signed an entry at `seq` in collection `x`, as every
     /// reader following `x` learns alike (spec §5.5): held here kept until
-    /// pruned, or listed by `w`'s node and pruned by `w`'s prune record, or
-    /// listed by `w`'s node of a merge collection (whose nodes list every
-    /// entry). An entry kept for its last `n` or until a date may leave
-    /// `w`'s listing, so a reader starting later would never learn of it:
-    /// it is no evidence; nor is one the trust context refuses (a copy of a
-    /// revoked key wrote it, spec §8.1).
+    /// pruned, or known (held, or listed by a node of `w` verified here,
+    /// ever) and pruned by `w`'s prune record, or known in a merge
+    /// collection (whose nodes list every entry). What was once known stays
+    /// known: a node that later stops listing it takes nothing back. An
+    /// entry kept for its last `n` or until a date may leave `w`'s listing
+    /// before a later reader learns of it: it is no evidence; nor is one
+    /// the trust context refuses (a copy of a revoked key wrote it, §8.1).
     fn signed_at(&self, x: &Name, w: &Writer, seq: u64) -> bool {
         let Some(coll) = self.colls.get(x) else {
             return false;
@@ -3782,81 +3781,13 @@ impl St {
         if held {
             return true;
         }
-        let listed = coll
-            .listings
-            .get(w)
-            .is_some_and(|l| in_ranges(&l.entries, seq));
-        let known = listed || coll.entries.get(w).is_some_and(|e| e.contains(&seq));
-        (known && coll.pruned(&id).is_some())
-            || (listed
-                && coll
+        let known = coll.entries.get(w).is_some_and(|e| e.contains(&seq));
+        known
+            && (coll.pruned(&id).is_some()
+                || coll
                     .members
                     .as_ref()
                     .is_some_and(|m| matches!(m.rule, Rule::Merge { .. })))
-    }
-
-    /// Whether `w` provably signed no entry at `seq` in any collection of
-    /// `folder`, from its signed nodes alone (spec §5.5): its node of the
-    /// folder reaches `seq`; every child it lists — itself or through the
-    /// pages whose head reaches `seq`, each page node held and reaching it
-    /// — whose subtree reaches `seq` has its node held, reaching `seq` and
-    /// listing no entry there; and none is held there.
-    fn missing_for_good(&self, folder: &Name, w: &Writer, seq: u64) -> bool {
-        let Some(fc) = self.colls.get(folder) else {
-            return false;
-        };
-        let Some(f) = fc.listings.get(w).filter(|f| f.head >= seq) else {
-            return false;
-        };
-        // The children whose subtree reaches `seq`, through the pages.
-        let mut reaching = Vec::new();
-        let mut todo: Vec<(&Listing, Vec<u8>)> = vec![(f, Vec::new())];
-        while let Some((node, path)) = todo.pop() {
-            match (&node.children, &node.pages) {
-                (Some(children), _) => reaching.extend(
-                    children
-                        .iter()
-                        .filter(|(_, head)| *head >= seq)
-                        .map(|(comp, _)| comp),
-                ),
-                (None, Some(pages)) => {
-                    for (bucket, _) in pages.iter().filter(|(_, head)| *head >= seq) {
-                        let mut sub = path.clone();
-                        sub.push(*bucket);
-                        let Some(page) = fc
-                            .pages
-                            .get(&(w.clone(), Bytes::from(sub.clone())))
-                            .filter(|p| p.head >= seq)
-                        else {
-                            return false;
-                        };
-                        todo.push((page, sub));
-                    }
-                }
-                (None, None) => return false,
-            }
-        }
-        let id = VersionId {
-            writer: w.clone(),
-            seq: Seq(seq),
-        };
-        reaching.into_iter().all(|comp| {
-            let x = folder.clone().append_component(comp.clone());
-            let Some(coll) = self.colls.get(&x) else {
-                return false;
-            };
-            coll.listings
-                .get(w)
-                .is_some_and(|l| l.head >= seq && !in_ranges(&l.entries, seq))
-                && !coll.entries.get(w).is_some_and(|e| e.contains(&seq))
-                && !coll.versions.contains_key(&id)
-                && !coll
-                    .waiting
-                    .iter()
-                    .chain(&coll.outsiders)
-                    .any(|hv| hv.version.id == id)
-                && !coll.locked.iter().any(|l| l.writer == *w && l.seq == seq)
-        })
     }
 
     /// The verdict on group `key` (its writer and id), from what every
@@ -3889,6 +3820,7 @@ impl St {
         let mut folders = BTreeSet::new();
         let mut colls = BTreeSet::new();
         let mut seals: Option<BTreeSet<Audience>> = None;
+        let mut expiring: Option<(Name, Keep)> = None;
         for (seq, ms) in members {
             if let [a, b, ..] = &ms[..] {
                 return malformed(
@@ -3907,15 +3839,8 @@ impl St {
                 if m.count != count {
                     return malformed(member(), "its members disagree on the group's count");
                 }
-                if m.keep != Keep::Forever {
-                    return malformed(
-                        member(),
-                        &format!(
-                            "its member at seq {seq} is kept {:?}, and a group's versions are \
-                             kept until pruned, so that every reader can tell it complete",
-                            m.keep
-                        ),
-                    );
+                if m.keep != Keep::Forever && expiring.is_none() {
+                    expiring = Some((member(), m.keep));
                 }
                 folders.insert(folder_of(&m.collection));
                 if folders.len() > 1 {
@@ -3973,6 +3898,12 @@ impl St {
                 };
             }
             states.insert(*seq, state);
+        }
+        // A member kept otherwise than until pruned: the group never counts,
+        // and nothing of it is refused — a reader that never learns of that
+        // member (it left its writer's listing) waits alike (spec §5.5).
+        if let Some((member, keep)) = expiring {
+            return GroupVerdict::Kept { member, keep };
         }
         // The members' epochs: all sealed or none, and each epoch's
         // audience admitting every reader any member's epoch lists — taken
@@ -4051,21 +3982,9 @@ impl St {
                 Some(_) => {}
                 None => {
                     // Not held as a member: pruned here, in a collection
-                    // of the folder, it is present; listed nowhere under
-                    // the folder by its writer's nodes that reach it, it
-                    // is missing for good.
-                    let dropped = under.iter().any(|c| self.dropped(c, &id(s)));
-                    if dropped {
+                    // of the folder, it is present.
+                    if under.iter().any(|c| self.dropped(c, &id(s))) {
                         present += 1;
-                    } else if self.missing_for_good(&folder, w, s) {
-                        return malformed(
-                            name_of(&folder, s),
-                            &format!(
-                                "its member at seq {s} is missing for good: its writer's nodes \
-                                 of every collection of the folder reach that seq and list no \
-                                 entry there"
-                            ),
-                        );
                     }
                 }
             }
@@ -4491,36 +4410,19 @@ impl St {
     fn listing(&mut self, c: &Name, writer: &Writer, body: &NodeBody) -> Option<Timestamp> {
         let now = (self.clock)();
         let coll = self.colls.get_mut(c)?;
-        let (children, pages) = match &body.branches {
-            wire::Branches::Children(cs) => (
-                Some(cs.iter().map(|c| (c.component.clone(), c.head)).collect()),
-                None,
-            ),
-            wire::Branches::Pages(ps) => {
-                (None, Some(ps.iter().map(|p| (p.bucket, p.head)).collect()))
-            }
-        };
-        let listing = Listing {
-            head: body.head,
-            entries: body.entries.clone(),
-            expiry: body.expiry.clone(),
-            children,
-            pages,
-        };
-        // A page node: kept by its path, for what lies under it.
-        if let Some(path) = &body.page {
-            let key = (writer.clone(), path.clone());
-            if coll.pages.get(&key).is_none_or(|l| l.head <= body.head) {
-                coll.pages.insert(key, listing);
-            }
-            return None;
-        }
         if coll
             .listings
             .get(writer)
             .is_none_or(|l| l.head <= body.head)
         {
-            coll.listings.insert(writer.clone(), listing);
+            coll.listings.insert(
+                writer.clone(),
+                Listing {
+                    head: body.head,
+                    entries: body.entries.clone(),
+                    expiry: body.expiry.clone(),
+                },
+            );
         }
         coll.listings.get(writer)?.next_bound(now)
     }
@@ -7068,13 +6970,6 @@ impl Inner {
                 let inside = st.inside(&subject);
                 // A collection peeked at: its records only (spec §5.3).
                 let peeked = !inside && st.peeks.contains(&subject);
-                // A page of a followed name's node: what it lists may settle
-                // the writer's groups there (spec §5.5, §7).
-                if body.page.is_some() && inside {
-                    st.colls.entry(subject.clone()).or_default();
-                    st.listing(&subject, writer, &body);
-                    st.regroup_under(writer, &subject);
-                }
                 if body.page.is_none() && (inside || peeked) {
                     let coll = st.colls.entry(subject.clone()).or_default();
                     coll.entries

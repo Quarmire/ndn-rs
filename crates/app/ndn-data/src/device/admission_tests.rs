@@ -348,20 +348,31 @@ async fn a_group_member_that_may_expire_counts_at_no_reader_and_is_never_written
     let a = kept(10, Keep::Forever, &plan(), Some(PAIR));
     let b = kept(11, Keep::LastN(1), &budget(), Some(PAIR));
     let newer = kept(12, Keep::LastN(1), &budget(), None);
+    // Bob's later version in the plan, over his member there.
+    let Record::Version(body) =
+        version("/bob/laptop", &plan(), 13, &[("/bob/laptop", 10)], None).record
+    else {
+        unreachable!("a version")
+    };
+    let later = made("/bob/laptop", &plan(), 13, Record::Version(body));
     // An early reader holds both members, then the newer version that ends
     // the member's last 1; a late reader never held the member.
     let early = device().await;
-    for m in [&a, &b, &newer] {
+    for m in [&a, &b, &newer, &later] {
         give(&early, m);
     }
     let late = device().await;
-    for m in [&a, &newer] {
+    for m in [&a, &newer, &later] {
         give(&late, m);
     }
     for (who, dev) in [("early", &early), ("late", &late)] {
         assert!(!counts(dev, &plan(), &id("/bob/laptop", 10)), "{who}");
+        assert_eq!(refusal(dev, &a.name), None, "{who}: waiting, never refused");
+        assert!(
+            !counts(dev, &plan(), &id("/bob/laptop", 13)),
+            "{who}: Bob's later version waits for his member, alike everywhere"
+        );
     }
-    assert!(group_refused(refusal(&early, &a.name)));
     early.shutdown();
     late.shutdown();
 }
@@ -506,98 +517,52 @@ fn node(c: &Name, head: u64, entries: Vec<(u64, u64)>, children: &[(&str, u64)])
     }
 }
 
-/// FixReview 3: a late reader that never saw a group's member — it expired
-/// at its writer's before the reader started — reaches the early readers'
-/// verdict, refused, from its writer's signed nodes: the folder's node and
-/// those of each of its collections reach the member's seq and list it
-/// nowhere. While a collection's node that reaches it is not held, the
-/// group only waits.
+/// A group member its writer's newer node stops listing — its store lost
+/// it, say — refuses nothing: an absent listing is no evidence, so the
+/// group waits. Once the node lists it again and it is fetched, the whole
+/// group counts, and a version made over the member counts with it.
 #[tokio::test]
-async fn a_member_no_node_of_its_folder_lists_refuses_its_group_at_a_late_reader() {
-    let late = device().await;
+async fn a_member_its_writers_node_stops_listing_keeps_its_group_waiting_until_it_is_back() {
+    let dev = device().await;
     let trip = n("/alice/32=data/trip");
     let a = version("/bob/laptop", &plan(), 10, &[], Some(PAIR));
-    let later = version("/bob/laptop", &plan(), 12, &[("/bob/laptop", 10)], None);
-    give(&late, &a);
-    give(&late, &later);
+    let b = version("/bob/laptop", &budget(), 11, &[], Some(PAIR));
+    let over = version("/carol/laptop", &plan(), 5, &[("/bob/laptop", 10)], None);
+    give(&dev, &a);
+    give(&dev, &over);
     let bob = Writer::new(key("/bob/laptop"));
-    let judge = |nodes: &[NodeBody]| {
-        let mut st = late.inner.st.lock();
+    let nodes = |list: &[NodeBody]| {
+        let mut st = dev.inner.st.lock();
         st.colls.entry(trip.clone()).or_default();
-        for b in nodes {
-            st.listing(&b.subject, &bob, b);
+        for body in list {
+            st.listing(&body.subject, &bob, body);
         }
         st.apply_ready(&plan(), &BTreeSet::new());
     };
-    judge(&[
-        node(&trip, 12, Vec::new(), &[("plan", 12), ("budget", 11)]),
-        node(&plan(), 12, vec![(10, 10), (12, 12)], &[]),
-    ]);
-    assert_eq!(
-        refusal(&late, &a.name),
-        None,
-        "the budget's node is not held: the member may be there"
-    );
-    judge(&[node(&budget(), 11, Vec::new(), &[])]);
-    assert!(
-        group_refused(refusal(&late, &a.name)),
-        "{:?}",
-        refusal(&late, &a.name)
-    );
-    assert!(!counts(&late, &plan(), &id("/bob/laptop", 10)));
-    assert!(
-        counts(&late, &plan(), &id("/bob/laptop", 12)),
-        "the writer's later version no longer waits for the refused member"
-    );
-    late.shutdown();
-}
-
-/// The same through pages: the writer's node of the folder lists pages
-/// instead of children. While the page reaching the member's seq is not
-/// held the group waits; once it is, and no node it leads to lists the
-/// seq, the group is refused.
-#[tokio::test]
-async fn a_member_no_page_of_its_folder_leads_to_refuses_its_group_at_a_late_reader() {
-    let late = device().await;
-    let trip = n("/alice/32=data/trip");
-    let a = version("/bob/laptop", &plan(), 10, &[], Some(PAIR));
-    give(&late, &a);
-    let bob = Writer::new(key("/bob/laptop"));
-    let judge = |nodes: &[NodeBody]| {
-        let mut st = late.inner.st.lock();
-        st.colls.entry(trip.clone()).or_default();
-        for b in nodes {
-            st.listing(&b.subject, &bob, b);
-        }
-        st.apply_ready(&plan(), &BTreeSet::new());
-    };
-    let paged = NodeBody {
-        branches: wire::Branches::Pages(vec![wire::PageRef {
-            bucket: 3,
-            head: 12,
-            digest: [0; 32],
-        }]),
-        ..node(&trip, 12, Vec::new(), &[])
-    };
-    judge(&[
-        paged,
-        node(&plan(), 12, vec![(10, 10), (12, 12)], &[]),
+    // Bob's nodes after his store lost the budget's member: the folder's
+    // reaches seq 11, and no node lists it.
+    nodes(&[
+        node(&trip, 11, Vec::new(), &[("plan", 10), ("budget", 11)]),
+        node(&plan(), 10, vec![(10, 10)], &[]),
         node(&budget(), 11, Vec::new(), &[]),
     ]);
     assert_eq!(
-        refusal(&late, &a.name),
+        refusal(&dev, &a.name),
         None,
-        "the page is not held: the member may be under it"
+        "an absent listing refuses nothing"
     );
-    let page = NodeBody {
-        page: Some(Bytes::from_static(&[3])),
-        ..node(&trip, 12, Vec::new(), &[("plan", 12), ("budget", 11)])
-    };
-    judge(&[page]);
     assert!(
-        group_refused(refusal(&late, &a.name)),
-        "{:?}",
-        refusal(&late, &a.name)
+        !counts(&dev, &plan(), &id("/bob/laptop", 10)),
+        "the group waits"
     );
-    late.shutdown();
+    // His store found it again: his node lists it, and it is fetched.
+    nodes(&[node(&budget(), 11, vec![(11, 11)], &[])]);
+    give(&dev, &b);
+    assert!(counts(&dev, &plan(), &id("/bob/laptop", 10)));
+    assert!(counts(&dev, &budget(), &id("/bob/laptop", 11)));
+    assert!(
+        counts(&dev, &plan(), &id("/carol/laptop", 5)),
+        "a version made over the member counts with it"
+    );
+    dev.shutdown();
 }
