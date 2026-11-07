@@ -518,6 +518,40 @@ pub fn decrement_hop_limit_in_place(wire: &mut [u8]) -> Option<u8> {
     None
 }
 
+/// The Interest wire `raw` without its `ForwardingHint`, as a forwarder
+/// sends it on once the hint has reached a producer region (NFD
+/// `onIncomingInterest`): from there the Interest is forwarded by its name.
+/// The hint is outside what a signed Interest's signature and its
+/// `ParametersSha256DigestComponent` cover, so both stay valid. `None` when
+/// `raw` carries no `ForwardingHint` (or is not a well-formed TLV).
+pub fn strip_forwarding_hint(raw: &Bytes) -> Option<Bytes> {
+    let (typ, type_len) = ndn_tlv::read_varu64(raw).ok()?;
+    let (len, len_len) = ndn_tlv::read_varu64(raw.get(type_len..)?).ok()?;
+    let header_len = type_len + len_len;
+    let body = raw.get(header_len..header_len + usize::try_from(len).ok()?)?;
+    let mut pos = 0;
+    while pos < body.len() {
+        let rest = &body[pos..];
+        let (t, t_len) = ndn_tlv::read_varu64(rest).ok()?;
+        let (l, l_len) = ndn_tlv::read_varu64(rest.get(t_len..)?).ok()?;
+        let end = pos + t_len + l_len + usize::try_from(l).ok()?;
+        if end > body.len() {
+            return None;
+        }
+        if t == tlv_type::FORWARDING_HINT {
+            let new_len = body.len() - (end - pos);
+            let mut w = ndn_tlv::TlvWriter::with_capacity(raw.len());
+            w.write_varu64(typ);
+            w.write_varu64(new_len as u64);
+            w.write_raw(&body[..pos]);
+            w.write_raw(&body[end..]);
+            return Some(w.finish());
+        }
+        pos = end;
+    }
+    None
+}
+
 fn decode_hop_limit(raw: &Bytes) -> Result<Option<u8>, PacketError> {
     if raw.is_empty() {
         return Ok(None);
@@ -858,6 +892,31 @@ mod tests {
         let raw = build_interest(&[b"test"], None, None, false, false);
         let i = Interest::decode(raw).unwrap();
         assert!(i.forwarding_hint().is_none());
+    }
+
+    /// Stripping the hint keeps every other element of the Interest as it
+    /// was (its name with the parameters digest, nonce, lifetime, hop
+    /// limit, parameters): it still decodes, the digest still matches.
+    /// An Interest without a hint has nothing to strip.
+    #[test]
+    fn strip_forwarding_hint_keeps_the_rest() {
+        let raw = crate::encode::InterestBuilder::new("/app/x".parse::<Name>().unwrap())
+            .lifetime(Duration::from_millis(1500))
+            .hop_limit(9)
+            .app_parameters(b"ask".to_vec())
+            .forwarding_hint(vec!["/relay/node/r".parse().unwrap()])
+            .build();
+        let before = Interest::decode(raw.clone()).unwrap();
+        assert!(before.forwarding_hint().is_some());
+        let stripped = strip_forwarding_hint(&raw).expect("a hint to strip");
+        let after = Interest::decode(stripped.clone()).unwrap();
+        assert!(after.forwarding_hint().is_none());
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.nonce(), before.nonce());
+        assert_eq!(after.lifetime(), before.lifetime());
+        assert_eq!(after.hop_limit(), before.hop_limit());
+        assert_eq!(after.app_parameters(), before.app_parameters());
+        assert!(strip_forwarding_hint(&stripped).is_none());
     }
 
     #[test]

@@ -96,6 +96,15 @@ impl NetworkRegionTable {
             regions.push(region);
         }
     }
+
+    /// Take a producer region this forwarder no longer hosts (a name the
+    /// node no longer holds). Returns whether it was there.
+    pub fn remove_region(&self, region: &Name) -> bool {
+        let mut regions = self.regions.write().unwrap();
+        let before = regions.len();
+        regions.retain(|r| r != region);
+        regions.len() != before
+    }
 }
 
 /// Host part of a face's remote URI — the URI with scheme and port removed, so
@@ -153,28 +162,44 @@ pub struct StrategyStage {
 }
 
 impl StrategyStage {
-    /// NDNLPv2 ForwardingHint: the FIB lookup name. Normally the Interest name,
-    /// but when the Interest carries a forwarding hint that has not yet reached
-    /// a producer region, forward toward the hint's delegation name instead
-    /// (NFD `onIncomingInterest`). The PIT still keys on the Interest name.
-    fn fib_lookup_name(&self, ctx: &PacketContext, interest_name: &Name) -> Name {
-        let DecodedPacket::Interest(i) = &ctx.packet else {
-            return interest_name.clone();
-        };
-        let Some(hint) = i.forwarding_hint() else {
-            return interest_name.clone();
-        };
-        if hint.is_empty() || self.network_region.is_in_producer_region(hint) {
-            return interest_name.clone();
-        }
-        // Forward toward the first delegation that resolves in the FIB; if none
-        // do, use the first delegation (the lookup misses → NoRoute).
-        for deleg in hint {
-            if self.fib.lpm(deleg).is_some() {
-                return deleg.as_ref().clone();
+    /// NDNLPv2 ForwardingHint: the FIB lookup name (NFD `onIncomingInterest`
+    /// and `Strategy::lookupFib`). Normally the Interest name. An Interest
+    /// whose hint has reached a producer region of this forwarder loses the
+    /// hint (`ctx`'s wire and decoded packet): it is forwarded by its name
+    /// from here on, by this forwarder and every one after it. One whose
+    /// hint has not is forwarded toward the first delegation the FIB
+    /// resolves. The PIT still keys on the Interest name.
+    fn fib_lookup_name(&self, ctx: &mut PacketContext, interest_name: &Name) -> Name {
+        let delegation = {
+            let DecodedPacket::Interest(i) = &ctx.packet else {
+                return interest_name.clone();
+            };
+            let Some(hint) = i.forwarding_hint().filter(|h| !h.is_empty()) else {
+                return interest_name.clone();
+            };
+            if self.network_region.is_in_producer_region(hint) {
+                None
+            } else {
+                // The first delegation that resolves in the FIB; if none
+                // do, the first one (the lookup misses → NoRoute).
+                let deleg = hint
+                    .iter()
+                    .find(|d| self.fib.lpm(d).is_some())
+                    .unwrap_or(&hint[0]);
+                Some(deleg.as_ref().clone())
             }
+        };
+        if let Some(deleg) = delegation {
+            return deleg;
         }
-        hint[0].as_ref().clone()
+        if let Some(wire) = ndn_packet::interest::strip_forwarding_hint(&ctx.raw_bytes)
+            && let Ok(stripped) = ndn_packet::Interest::decode(wire.clone())
+        {
+            trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%interest_name, "forwarding hint reached a producer region: stripped");
+            ctx.raw_bytes = wire;
+            ctx.packet = DecodedPacket::Interest(Box::new(stripped));
+        }
+        interest_name.clone()
     }
 }
 
@@ -206,7 +231,7 @@ impl StrategyStage {
 
         // ForwardingHint: FIB lookup may target the hint's delegation rather
         // than the Interest name (the PIT still keys on the Interest name).
-        let fib_name = self.fib_lookup_name(&ctx, &name);
+        let fib_name = self.fib_lookup_name(&mut ctx, &name);
         let fib_lookup = self.fib.lpm_with_depth(&fib_name);
         let fib_entry_arc = fib_lookup.as_ref().map(|(_, e)| Arc::clone(e));
         let fib_entry_ref = fib_entry_arc.as_deref();
