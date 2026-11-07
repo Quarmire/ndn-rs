@@ -234,6 +234,13 @@ pub mod tlv {
     /// `KeepUntil` (a date at or after each one's keep). A node's runs are
     /// ascending and disjoint, at most [`EXPIRY_RUNS`](super::EXPIRY_RUNS).
     pub const EXPIRY: u64 = 0x0553;
+
+    // Slice 6: odd numbers, critical.
+
+    /// Empty, in a members record right after its `Name`: the record is a
+    /// folder's — it governs the folder that `Name` names and every
+    /// collection under it (spec §6).
+    pub const FOLDER: u64 = 0x0555;
 }
 
 /// Keyword components of the layer's names.
@@ -255,7 +262,7 @@ const ENTRY: &[u8] = b"entry";
 const RANGE: &[u8] = b"range";
 
 /// The most payload octets a version carries in its own packet; a larger
-/// payload travels in pieces (log rule) or is refused (merge rule).
+/// payload travels in pieces, whatever the collection's rule (a block never).
 pub const INLINE_MAX: usize = 6144;
 
 /// The most payload octets a version carries at all (64 MiB): a reader
@@ -1658,8 +1665,10 @@ pub struct CutBody {
 /// The body of a members log entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MembersBody {
-    /// The collection governed.
+    /// The collection governed; of a folder record, the folder.
     pub collection: Name,
+    /// A folder's record (`Folder`), not a collection's.
+    pub folder: bool,
     /// The record's revision.
     pub revision: u64,
     /// The collection's rule.
@@ -1686,6 +1695,7 @@ impl From<&Members> for MembersBody {
     fn from(m: &Members) -> Self {
         Self {
             collection: m.collection.clone(),
+            folder: m.folder,
             revision: m.revision.0,
             rule: m.rule.clone(),
             writers: m.writers.clone(),
@@ -2050,6 +2060,9 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv::MEMBERS_RECORD, |w| {
         write_name(w, &b.collection);
+        if b.folder {
+            w.write_tlv(tlv::FOLDER, &[]);
+        }
         write_nni(w, tlv::REVISION, b.revision);
         w.write_nested(tlv::RULE, |w| match &b.rule {
             Rule::OneKey => write_nni(w, tlv::RULE_KIND, 0),
@@ -2449,6 +2462,7 @@ fn read_fields(v: Bytes) -> Result<Content, WireError> {
 
 fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     let mut collection = None;
+    let mut folder = false;
     let mut revision = None;
     let mut rule = None;
     let mut writers = None;
@@ -2461,6 +2475,20 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     each(value, |typ, v| {
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
+            tlv::FOLDER => {
+                let first = collection.is_some()
+                    && !folder
+                    && revision.is_none()
+                    && rule.is_none()
+                    && writers.is_none()
+                    && readers.is_none();
+                if !first || !v.is_empty() {
+                    return Err(bad(
+                        "a members record's Folder is empty and comes once, right after its Name",
+                    ));
+                }
+                folder = true;
+            }
             tlv::REVISION => revision = Some(read_nni(&v)?),
             tlv::RULE => {
                 let (mut kind, mut function) = (None, None);
@@ -2542,6 +2570,7 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     };
     Ok(MembersBody {
         collection: collection.ok_or_else(|| missing("a collection"))?,
+        folder,
         revision,
         rule: rule.ok_or_else(|| missing("a rule"))?,
         writers: writers.ok_or_else(|| missing("writers"))?,
@@ -3086,6 +3115,7 @@ mod tests {
     fn unknown_even_fields_are_skipped_and_odd_ones_refused() {
         let body = MembersBody {
             collection: n("/alice/32=data/notes"),
+            folder: false,
             revision: 1,
             rule: Rule::Merge {
                 function: n("/merge/yrs"),
@@ -3169,6 +3199,68 @@ mod tests {
             let (_, inner) = r.read_tlv().unwrap();
             w.write_raw(&inner);
             write_epoch(w, unchecked.epoch.as_ref().unwrap());
+        });
+        assert!(decode_record(w.finish()).is_err());
+    }
+
+    #[test]
+    fn a_folder_record_parses_back_and_a_reader_that_does_not_know_folder_refuses_it() {
+        let body = MembersBody {
+            collection: n("/alice/32=data/photos"),
+            folder: true,
+            revision: 1,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: vec![Audience::Person(n("/alice"))],
+            cuts: Vec::new(),
+            epoch: Some(Epoch {
+                creator: n("/alice/laptop"),
+                seq: Seq(3),
+            }),
+            key_check: Some([3; 32]),
+            since: None,
+            parent: None,
+        };
+        let wire = encode_members(&body);
+        assert_eq!(
+            decode_record(wire.clone()),
+            Ok(Record::Members(body.clone()))
+        );
+        // The same record of the collection is another record.
+        let collection = MembersBody {
+            folder: false,
+            ..body.clone()
+        };
+        assert_ne!(encode_members(&collection), wire);
+        // A reader of the shape before folders knows every field but
+        // `Folder`, which is critical: it refuses the record rather than
+        // take it as the collection's.
+        let mut r = TlvReader::new(wire.clone());
+        let (_, inner) = r.read_tlv().unwrap();
+        assert!(each(inner.clone(), |t, _| Ok(t != tlv::FOLDER)).is_err());
+        // `Folder` comes once, empty, right after the Name.
+        let with = |extra: &dyn Fn(&mut TlvWriter)| {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv::MEMBERS_RECORD, |w| {
+                w.write_raw(&inner);
+                extra(w);
+            });
+            w.finish()
+        };
+        assert!(decode_record(with(&|w| w.write_tlv(tlv::FOLDER, &[]))).is_err());
+        let unplaced = encode_members(&collection);
+        let mut r = TlvReader::new(unplaced);
+        let (_, plain) = r.read_tlv().unwrap();
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::MEMBERS_RECORD, |w| {
+            w.write_raw(&plain);
+            w.write_tlv(tlv::FOLDER, &[]);
+        });
+        assert!(decode_record(w.finish()).is_err());
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::MEMBERS_RECORD, |w| {
+            write_name(w, &body.collection);
+            w.write_tlv(tlv::FOLDER, b"x");
         });
         assert!(decode_record(w.finish()).is_err());
     }

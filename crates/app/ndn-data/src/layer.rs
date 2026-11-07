@@ -15,6 +15,7 @@ use ndn_foundation_types::Name;
 
 use crate::collection::{Rule, Summary};
 use crate::error::{DataError, Refusal};
+use crate::merge::Value;
 use crate::statement::{Custody, Prune, Snapshot};
 use crate::version::{
     Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
@@ -41,7 +42,7 @@ pub struct PutOptions {
     pub batch: Option<Duration>,
 }
 
-/// A merged value at a frontier, for a collection with the merge rule (model
+/// A merged value at a frontier, for a collection with a merge rule (model
 /// change M10). Filled by slice 1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -52,8 +53,12 @@ pub struct State {
     pub collection: Name,
     /// The versions the state is computed from.
     pub at: Frontier,
-    /// The merged value.
-    pub value: Content,
+    /// The merged value, as the collection's rule defines it.
+    pub value: Value,
+    /// Versions of the collection held here that are not in `value`, with
+    /// why (sorted by id): the rule's `NotCounted` (inside `at`) and members
+    /// of incomplete or unreadable groups.
+    pub not_counted: Vec<(VersionId, String)>,
 }
 
 /// One entry of a block (or the one entry of a version that is no block),
@@ -187,6 +192,20 @@ pub enum Change {
         /// The conflicting version.
         second: Box<Version>,
     },
+    /// A held, verified version that is not in the state: the rule's
+    /// [`NotCounted`](crate::merge::Counting::NotCounted), or its group is
+    /// incomplete or not readable here. Shown, never dropped.
+    NotCounted {
+        /// The version.
+        id: VersionId,
+        /// Why it is not in the state.
+        why: String,
+    },
+    /// A version reported [`NotCounted`](Change::NotCounted) now counts.
+    Counted {
+        /// The version.
+        id: VersionId,
+    },
 }
 
 /// The stream a [`watch`](DataLayer::watch) returns. It ends only when the
@@ -240,7 +259,9 @@ pub trait DataLayer: Send + Sync {
     /// function's answer is a `get` on its name (slice 6). Readers that know
     /// a prune covering the name answer [`DataError::Pruned`]. When no path
     /// answers, older verified data is returned with its [`Age`] rather than
-    /// an error. Filled by slice 1.
+    /// an error. A merge collection whose rule this device does not know
+    /// is held and answered [`DataError::RuleUnknown`], never read under
+    /// another rule. Filled by slice 1.
     async fn get(&self, name: &Name) -> Result<Answer, DataError>;
 
     /// `put(collection, content, {type, keep}) → (writer, seq)`.
@@ -250,11 +271,27 @@ pub trait DataLayer: Send + Sync {
     /// schema decide whether this key may write; the collection's seal
     /// applies. Fields of the current state that `options.type_id` does not
     /// know are kept. With `options.batch`, the call returns once the block
-    /// carrying the entry is signed, with that block's id. Filled by slice 1.
+    /// carrying the entry is signed, with that block's id. In a merge
+    /// collection the rule makes the operation of the fields and checks and
+    /// applies it, as [`put_op`](Self::put_op) does. Filled by slice 1.
     async fn put(
         &self,
         collection: &Name,
         content: Content,
+        options: PutOptions,
+    ) -> Result<VersionId, DataError>;
+
+    /// `put`, with the operation the app built: a new version of the merge
+    /// collection `collection` carrying `op` as its `MergeOp`, its parents
+    /// the state's frontier. The collection's rule checks and applies it
+    /// first; one it refuses is [`DataError::BadRequest`] with the rule's
+    /// reason, and nothing is signed into the log. Merge collections whose
+    /// rule this device knows only ([`DataError::RuleUnknown`] otherwise; a
+    /// log or one-key collection is [`DataError::BadRequest`]).
+    async fn put_op(
+        &self,
+        collection: &Name,
+        op: bytes::Bytes,
         options: PutOptions,
     ) -> Result<VersionId, DataError>;
 
@@ -303,7 +340,24 @@ pub trait DataLayer: Send + Sync {
     /// Sign a new members record. Adding grants reading keys or write
     /// membership; removing a writer is a [`Cut`](crate::Cut) at what this device had
     /// seen of it — inside stays, the rest is refused — and removing a reader
-    /// moves reading to a new epoch. Only the owner's key may do it. Filled
-    /// by slice 2.
+    /// moves reading to a new epoch. Only the owner's key may do it. Under a
+    /// folder whose record is in force, a record that would widen it — a
+    /// writer its writers do not cover, a reader its readers do not admit —
+    /// is refused with [`DataError::BadRequest`]: share the folder instead.
+    /// Filled by slice 2.
     async fn share(&self, collection: &Name, members: Share) -> Result<(), DataError>;
+
+    /// `share_folder(folder, {readers, writers})`.
+    ///
+    /// Sign a new members record of `folder` (a name with at least one
+    /// component after `32=data`), which governs every collection under it
+    /// (spec §6): a collection writes and reads by its own record narrowed
+    /// by every folder's above it, and one with no own writers or readers
+    /// takes the folder's (sealed in the folder's epoch, one key for every
+    /// collection that inherits it). Removing a writer cuts it at exactly
+    /// the versions of its keys this device holds verified in every
+    /// collection under the folder; removing a reader moves the folder to a
+    /// new epoch. Only the owner's devices may do it
+    /// ([`DataError::NotOwner`]).
+    async fn share_folder(&self, folder: &Name, members: Share) -> Result<(), DataError>;
 }

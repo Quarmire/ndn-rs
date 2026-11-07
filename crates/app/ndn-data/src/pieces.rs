@@ -12,6 +12,8 @@
 //! `k·FANOUT + 1 …`. A node at the bottom level lists chunks; one above it
 //! lists nodes.
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
@@ -182,6 +184,37 @@ pub(crate) fn open_chunk(shape: &Shape, i: u64, wire: &[u8], expected: &[u8; 32]
     let data = ndn_packet::Data::decode(Bytes::copy_from_slice(wire)).ok()?;
     let content = data.content()?.clone();
     (content.len() == shape.chunk_len(i)).then_some(content)
+}
+
+/// The payload of the version named `version` from its pieces as `get`
+/// finds them, every manifest node and chunk checked against the digest its
+/// parent lists, the root against `chunks.root`; `None` when a piece is
+/// missing or not the one listed.
+pub(crate) fn assemble(
+    version: &Name,
+    chunks: &ChunksBody,
+    get: impl Fn(&Name) -> Option<Bytes>,
+) -> Option<Vec<u8>> {
+    let shape = Shape::of(chunks.size);
+    let mut digests: HashMap<PieceKind, [u8; 32]> = HashMap::new();
+    digests.insert(PieceKind::Manifest(0), chunks.root);
+    for k in shape.manifests() {
+        let kind = PieceKind::Manifest(k);
+        let expected = *digests.get(&kind)?;
+        let w = get(&piece_name(version, kind))?;
+        let listed = open_node(&shape, k, &w, &expected)?;
+        for (kid, d) in shape.children(k)?.into_iter().zip(listed) {
+            digests.insert(kid, d);
+        }
+    }
+    let mut out = Vec::with_capacity(chunks.size as usize);
+    for i in 0..shape.chunks {
+        let kind = PieceKind::Chunk(i);
+        let d = *digests.get(&kind)?;
+        let w = get(&piece_name(version, kind))?;
+        out.extend_from_slice(&open_chunk(&shape, i, &w, &d)?);
+    }
+    Some(out)
 }
 
 #[cfg(test)]

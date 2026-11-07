@@ -81,7 +81,9 @@ pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Got, Hold, PutOptions,
     Share, State,
 };
-pub use merge::{MergeError, MergeRule, MergeRules, MergeState, Yrs};
+pub use merge::{
+    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
+};
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{

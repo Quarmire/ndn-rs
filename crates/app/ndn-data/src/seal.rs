@@ -50,8 +50,9 @@ pub(crate) struct Keys {
     /// This device's recipient key: grants are wrapped to its public half.
     pub(crate) recipient: RecipientKey,
     /// Epoch keys this device made or was granted, each checked against the
-    /// record naming its epoch, by collection and epoch.
-    held: HashMap<(Name, Epoch), ContentKey>,
+    /// record naming its epoch, by epoch and the collection or folder whose
+    /// record names it.
+    held: HashMap<Epoch, Vec<(Name, ContentKey)>>,
 }
 
 impl Keys {
@@ -63,21 +64,41 @@ impl Keys {
         }
     }
 
-    /// The content key of `epoch` of `c`, if held.
+    /// The content key of `epoch` of `c`, if held: `c`'s own, or that of a
+    /// folder above `c` whose epoch it is (spec §6: one key per folder
+    /// epoch opens every collection under the folder that reads in it).
     pub(crate) fn key(&self, c: &Name, epoch: &Epoch) -> Option<ContentKey> {
-        self.held.get(&(c.clone(), epoch.clone())).cloned()
+        self.held
+            .get(epoch)?
+            .iter()
+            .filter(|(at, _)| c.has_prefix(at))
+            .max_by_key(|(at, _)| at.len())
+            .map(|(_, k)| k.clone())
     }
 
     /// Hold `key` as the content key of `epoch` of `c` (checked by the
     /// caller).
     pub(crate) fn hold(&mut self, c: Name, epoch: Epoch, key: ContentKey) {
-        self.held.insert((c, epoch), key);
+        let held = self.held.entry(epoch).or_default();
+        match held.iter_mut().find(|(at, _)| *at == c) {
+            Some((_, k)) => *k = key,
+            None => held.push((c, key)),
+        }
     }
 
     /// Destroy the content key of `epoch` of `c`: the held copy is dropped
     /// (and zeroed, [`ContentKey`] is `ZeroizeOnDrop`). Whether one was held.
     pub(crate) fn forget(&mut self, c: &Name, epoch: &Epoch) -> bool {
-        self.held.remove(&(c.clone(), epoch.clone())).is_some()
+        let Some(held) = self.held.get_mut(epoch) else {
+            return false;
+        };
+        let before = held.len();
+        held.retain(|(at, _)| at != c);
+        let forgot = held.len() < before;
+        if held.is_empty() {
+            self.held.remove(epoch);
+        }
+        forgot
     }
 }
 

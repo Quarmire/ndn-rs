@@ -3,7 +3,7 @@
 //! [`Epoch`] their seal is read in, and the signed, nested [`Summary`] of
 //! what they hold.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ndn_foundation_types::{Hash, Name};
 use sha2::{Digest, Sha256};
@@ -49,8 +49,14 @@ pub enum Rule {
 /// share: every addition and every removal is kept, and removals win.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Members {
-    /// The collection this record governs.
+    /// The collection this record governs; of a folder record, the folder.
     pub collection: Name,
+    /// Whether this is a folder's record (spec §6, wire `Folder`): it
+    /// governs the folder named by [`collection`](Self::collection) and
+    /// every collection strictly under it, not a collection of that name.
+    /// A name's folder records and its collection records are two separate
+    /// lines: revisions, parents and merges count records of one kind only.
+    pub folder: bool,
     /// The owner's key, which signs this record (of a merge: the highest
     /// signer key among the records merged).
     pub owner: Writer,
@@ -265,6 +271,8 @@ impl Members {
         };
         let merged = Members {
             collection: top.collection.clone(),
+            // One line: every record merged is of one kind.
+            folder: top.folder,
             owner: top.owner.clone(),
             revision: top.revision,
             rule: ruling.rule.clone(),
@@ -278,6 +286,145 @@ impl Members {
         };
         Some((merged, resolve))
     }
+}
+
+/// The record in force over a subject (spec §6, its effective record):
+/// `own`, the subject's own record in force (a collection's, or a
+/// folder's), narrowed by `folders`, the folder records in force of every
+/// proper prefix of `subject`, nearest first. With no folder it is `own`.
+/// Otherwise, of the levels `own` (if any) and `folders`:
+/// - writers: a key writes iff every level admits it (the intersection of
+///   the prefix sets); a level listing no writers takes those of the levels
+///   above it;
+/// - cuts: every level's prefix, each accepting exactly the versions of its
+///   keys that every level admits — so a version is refused iff a level
+///   refuses it, as outside a cut wherever a level cuts its key;
+/// - readers: those of the nearest level listing readers, in its epoch and
+///   with its key check, less any that an outer level listing readers does
+///   not admit ([`admitted`]): widening has no effect; no level lists
+///   readers: not sealed;
+/// - rule, `since`, owner, revision and parent: `own`'s, else the nearest
+///   folder's.
+pub(crate) fn effective(
+    subject: &Name,
+    own: Option<&Members>,
+    folders: &[&Members],
+) -> Option<Members> {
+    if folders.is_empty() {
+        return own.cloned();
+    }
+    let levels: Vec<&Members> = own.into_iter().chain(folders.iter().copied()).collect();
+    let base = levels[0];
+    // Each level's writers, outermost first — a level listing none takes
+    // those of the levels above it — and the keys every level admits.
+    let mut writers: Vec<Vec<Name>> = Vec::with_capacity(levels.len());
+    let mut above: Option<Vec<Name>> = None;
+    for m in levels.iter().rev() {
+        if m.writers.is_empty() {
+            writers.push(above.clone().unwrap_or_default());
+            continue;
+        }
+        writers.push(m.writers.clone());
+        above = Some(match above {
+            None => m.writers.clone(),
+            Some(a) => intersect(&a, &m.writers),
+        });
+    }
+    writers.reverse();
+    let admitted_by_all = above.unwrap_or_default();
+    // Per key a cut lists, the versions every level admits: by its writers,
+    // or by the first of its cuts over the key, as `Members::refusal` reads.
+    let keys: BTreeSet<&Writer> = levels
+        .iter()
+        .flat_map(|m| m.cuts.iter())
+        .flat_map(|c| c.accept.iter().map(|(w, _)| w))
+        .collect();
+    let mut accepted = Accepted::new();
+    for w in keys {
+        let mut kept: Option<Accepted> = None;
+        for (m, ws) in levels.iter().zip(&writers) {
+            if ws.iter().any(|p| w.key().has_prefix(p)) {
+                continue;
+            }
+            let level = m
+                .cuts
+                .iter()
+                .find(|c| w.key().has_prefix(&c.of))
+                .map(|c| c.accept.of_key(w))
+                .unwrap_or_default();
+            kept = Some(match kept {
+                None => level,
+                Some(k) => k.intersection(&level),
+            });
+        }
+        if let Some(k) = kept {
+            accepted.add(&k);
+        }
+    }
+    let mut cuts: BTreeMap<Name, Cut> = BTreeMap::new();
+    for c in levels.iter().flat_map(|m| m.cuts.iter()) {
+        cuts.entry(c.of.clone()).or_insert_with(|| Cut {
+            of: c.of.clone(),
+            accept: accepted.under(&c.of),
+            signer: c.signer.clone(),
+        });
+    }
+    let (readers, epoch, key_check) = match levels.iter().position(|m| !m.readers.is_empty()) {
+        None => (Vec::new(), None, None),
+        Some(i) => {
+            let m = levels[i];
+            let outer: Vec<&Members> = levels[i + 1..]
+                .iter()
+                .copied()
+                .filter(|o| !o.readers.is_empty())
+                .collect();
+            let readers = m
+                .readers
+                .iter()
+                .filter(|r| outer.iter().all(|o| admitted(r, &o.readers)))
+                .cloned()
+                .collect();
+            (readers, m.epoch.clone(), m.key_check)
+        }
+    };
+    Some(Members {
+        collection: subject.clone(),
+        folder: own.is_some_and(|m| m.folder),
+        owner: base.owner.clone(),
+        revision: base.revision,
+        rule: base.rule.clone(),
+        writers: admitted_by_all,
+        readers,
+        cuts: cuts.into_values().collect(),
+        epoch,
+        key_check,
+        since: base.since.clone(),
+        parent: base.parent,
+    })
+}
+
+/// The prefixes whose keys both `a` and `b` admit, broadest only.
+pub(crate) fn intersect(a: &[Name], b: &[Name]) -> Vec<Name> {
+    let mut both: Vec<Name> = a
+        .iter()
+        .filter(|p| b.iter().any(|q| p.has_prefix(q)))
+        .chain(b.iter().filter(|q| a.iter().any(|p| q.has_prefix(p))))
+        .cloned()
+        .collect();
+    both.sort();
+    both.dedup();
+    both.iter()
+        .filter(|p| !both.iter().any(|q| q != *p && p.has_prefix(q)))
+        .cloned()
+        .collect()
+}
+
+/// Whether reader `r` is of the audience `by` lists: listed itself, or a
+/// device of a person listed.
+pub(crate) fn admitted(r: &Audience, by: &[Audience]) -> bool {
+    by.contains(r)
+        || matches!(r, Audience::Device(d)
+            if by.iter().any(|a| matches!(a, Audience::Person(p) if d.has_prefix(p))))
 }
 
 /// The record a members record was signed from (spec §6): the record in
@@ -383,6 +530,37 @@ impl Accepted {
     /// Whether nothing is accepted.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// What it accepts of key `w`.
+    pub(crate) fn of_key(&self, w: &Writer) -> Accepted {
+        Accepted(
+            self.0
+                .get_key_value(w)
+                .map(|(w, r)| (w.clone(), r.clone()))
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// What it accepts of the keys under `prefix`.
+    pub(crate) fn under(&self, prefix: &Name) -> Accepted {
+        Accepted(
+            self.0
+                .iter()
+                .filter(|(w, _)| w.key().has_prefix(prefix))
+                .map(|(w, r)| (w.clone(), r.clone()))
+                .collect(),
+        )
+    }
+
+    /// Accept also what `other` accepts.
+    pub(crate) fn add(&mut self, other: &Accepted) {
+        for (w, ranges) in &other.0 {
+            for (lo, hi) in ranges {
+                self.insert_range(w, *lo, *hi);
+            }
+        }
     }
 
     /// What both accept.
@@ -550,6 +728,7 @@ mod tests {
         };
         let mut m = Members {
             collection: "/alice/32=data/docs/plan".parse().unwrap(),
+            folder: false,
             owner: alice,
             revision: Seq(2),
             rule: Rule::Log,
@@ -595,6 +774,7 @@ mod tests {
     ) -> Members {
         Members {
             collection: n("/alice/32=data/docs/plan"),
+            folder: false,
             owner: Writer::new(n(&format!("{signer}/KEY/1"))),
             revision: Seq(2),
             rule: Rule::Log,
@@ -824,5 +1004,90 @@ mod tests {
         assert!(!older.covers(&f));
         assert!(f.contains(&id("/b/KEY/1", 1)));
         assert!(!f.contains(&id("/c/KEY/1", 1)));
+    }
+
+    /// A folder record of `/alice/32=data/docs`.
+    fn folder(writers: &[&str], readers: &[&str], cuts: Vec<Cut>) -> Members {
+        Members {
+            collection: n("/alice/32=data/docs"),
+            folder: true,
+            ..record("/alice/laptop", 3, writers, readers, cuts)
+        }
+    }
+
+    #[test]
+    fn a_collection_under_a_folder_inherits_what_it_leaves_empty_and_is_narrowed_by_every_level() {
+        let c = n("/alice/32=data/docs/plan");
+        let f = folder(&["/alice", "/bob"], &["/alice", "/bob"], Vec::new());
+        let bob = id("/bob/phone/KEY/1", 1);
+        let carol = id("/carol/phone/KEY/1", 1);
+        // No own record, or one listing no writers and no readers: the
+        // folder's writers, readers and epoch.
+        let empty = Members {
+            epoch: None,
+            key_check: None,
+            ..record("/alice/phone", 9, &[], &[], Vec::new())
+        };
+        for own in [None, Some(&empty)] {
+            let e = effective(&c, own, &[&f]).unwrap();
+            assert_eq!(e.refusal(&bob), None);
+            assert_eq!(e.refusal(&carol), Some(Refusal::NotMember));
+            assert_eq!((&e.readers, &e.epoch), (&f.readers, &f.epoch));
+            assert!(!e.folder);
+        }
+        // Narrowed: its own writers and readers, in its own epoch.
+        let narrow = record("/alice/phone", 9, &["/alice"], &["/alice"], Vec::new());
+        let e = effective(&c, Some(&narrow), &[&f]).unwrap();
+        assert_eq!(e.refusal(&bob), Some(Refusal::NotMember));
+        assert_eq!(e.refusal(&id("/alice/phone/KEY/1", 4)), None);
+        assert_eq!((&e.readers, &e.epoch), (&narrow.readers, &narrow.epoch));
+        // Widened: what the folder does not admit has no effect.
+        let wide = record(
+            "/alice/phone",
+            9,
+            &["/alice", "/carol"],
+            &["/alice", "/carol"],
+            Vec::new(),
+        );
+        let e = effective(&c, Some(&wide), &[&f]).unwrap();
+        assert!(e.refusal(&carol).is_some());
+        assert!(!e.readers.contains(&person("/carol")));
+        assert_eq!(e.epoch, wide.epoch);
+    }
+
+    #[test]
+    fn a_version_is_admitted_under_a_folder_iff_every_level_admits_it() {
+        let c = n("/alice/32=data/docs/plan");
+        let bob = |s| id("/bob/phone/KEY/1", s);
+        // Bob removed at folder level: his versions the cut kept stay, his
+        // later ones are refused, whatever the collection's own record lists.
+        let removed = folder(&["/alice"], &["/alice"], vec![cut("/bob", &[1, 2])]);
+        let listing = record("/alice/phone", 9, &["/alice", "/bob"], &[], Vec::new());
+        for own in [None, Some(&listing)] {
+            let e = effective(&c, own, &[&removed]).unwrap();
+            assert_eq!(e.refusal(&bob(2)), None);
+            assert!(matches!(e.refusal(&bob(3)), Some(Refusal::OutsideCut(_))));
+        }
+        // A version an own cut keeps, of a key the folder does not admit at
+        // all, is refused.
+        let only_alice = folder(&["/alice"], &[], Vec::new());
+        let kept = record("/alice/phone", 9, &["/alice"], &[], vec![cut("/bob", &[1])]);
+        let e = effective(&c, Some(&kept), &[&only_alice]).unwrap();
+        assert!(e.refusal(&bob(1)).is_some());
+        // Cuts of both levels: exactly what both keep.
+        let both = folder(&["/alice"], &[], vec![cut("/bob", &[1, 2, 3])]);
+        let own = record(
+            "/alice/phone",
+            9,
+            &["/alice"],
+            &[],
+            vec![cut("/bob/phone", &[2, 3, 4])],
+        );
+        let e = effective(&c, Some(&own), &[&both]).unwrap();
+        for (s, admitted) in [(1, false), (2, true), (3, true), (4, false)] {
+            assert_eq!(e.refusal(&bob(s)).is_none(), admitted, "seq {s}");
+        }
+        // With no folder, the own record stands as it is.
+        assert_eq!(effective(&c, Some(&own), &[]), Some(own.clone()));
     }
 }

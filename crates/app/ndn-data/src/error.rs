@@ -39,6 +39,9 @@ pub enum NextStep {
     /// Ask again as the error says: the request, as given, asks for
     /// something no device does (a prune past the log, too few holders).
     FixRequest,
+    /// Run a program that knows the named merge rule: this one holds the
+    /// collection's versions and reads them under no other rule.
+    UpdateProgram,
 }
 
 /// Why a version was refused. A refused version is never served as data.
@@ -61,8 +64,8 @@ pub enum Refusal {
     /// it. Versions inside the record's `since` (written before the seal)
     /// are not refused for this.
     Unsealed,
-    /// Its payload travels in pieces or as a block, and the collection's
-    /// merge rule needs one operation inline in each version (spec §4.1).
+    /// Its payload is a block, and the collection's merge rule needs one
+    /// operation per version (spec §4.1).
     NotInline,
     /// Its key is marked suspected on this device (it may be in a thief's
     /// hands, [`Device::suspect`](crate::Device::suspect)): no new entry of
@@ -88,6 +91,12 @@ pub enum Refusal {
     BeyondOwnLog {
         /// The last seq this device wrote.
         head: u64,
+    },
+    /// The collection's merge rule refuses its operation: its check or its
+    /// application failed, for good.
+    Rule {
+        /// The rule's reason.
+        why: String,
     },
 }
 
@@ -141,10 +150,14 @@ impl std::fmt::Display for Refusal {
                  writes it again, sealed",
             ),
             Refusal::NotInline => f.write_str(
-                "its payload travels in pieces or as a block, and the collection's merge rule \
-                 needs one operation inline in each version; its writer writes it again inline, \
-                 or puts the large value or the stream into a log collection and refers to it \
-                 by name",
+                "its payload is a block of entries, and the collection's merge rule needs one \
+                 operation per version; its writer writes each entry as its own version, or puts \
+                 the stream into a log collection and refers to it by name",
+            ),
+            Refusal::Rule { why } => write!(
+                f,
+                "the collection's merge rule refuses its operation ({why}); its writer writes \
+                 an operation the rule takes"
             ),
             Refusal::Suspected { key, since } => write!(
                 f,
@@ -249,14 +262,12 @@ pub enum DataError {
         /// The name asked for.
         name: Name,
     },
-    /// The payload is too large for the collection's rule: a merge
-    /// collection carries every operation inline (spec §4.1); a log
-    /// collection, in pieces, up to [`PAYLOAD_MAX`](crate::wire::PAYLOAD_MAX).
+    /// The payload is too large: a version carries at most
+    /// [`PAYLOAD_MAX`](crate::wire::PAYLOAD_MAX) octets, in pieces.
     #[error(
-        "a payload of {size} octets is larger than the {limit} a version of {collection} carries \
-         (inline in a merge collection, in pieces in a log collection); put a large value into a \
-         log collection, where it travels in pieces, split one larger than that, and refer to it \
-         by name"
+        "a payload of {size} octets is larger than the {limit} a version of {collection} carries; \
+         split it into several versions, or put it into a log collection in parts, and refer to \
+         them by name"
     )]
     TooLarge {
         /// The collection.
@@ -300,6 +311,19 @@ pub enum DataError {
         /// What failed.
         reason: String,
     },
+    /// The collection's members record names a merge rule this program
+    /// does not know.
+    #[error(
+        "{collection} merges with {rule}, which this program does not know: it is held here \
+         unreadable and never read under another rule; update the program to one that knows \
+         {rule}"
+    )]
+    RuleUnknown {
+        /// The collection.
+        collection: Name,
+        /// The rule its members record names.
+        rule: Name,
+    },
 }
 
 impl DataError {
@@ -329,7 +353,7 @@ impl DataError {
                 | Refusal::Untrusted { .. }
                 | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
-                Refusal::Unsealed | Refusal::NotInline => NextStep::None,
+                Refusal::Unsealed | Refusal::NotInline | Refusal::Rule { .. } => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,
@@ -337,6 +361,7 @@ impl DataError {
             DataError::NotHeld { .. } => NextStep::HoldFirst,
             DataError::BadRequest { .. } => NextStep::FixRequest,
             DataError::Local { .. } => NextStep::FixLocal,
+            DataError::RuleUnknown { .. } => NextStep::UpdateProgram,
         }
     }
 }
