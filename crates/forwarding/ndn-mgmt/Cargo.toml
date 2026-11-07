@@ -86,6 +86,12 @@ parking_lot      = { workspace = true }
 name = "suite"
 path = "tests/suite.rs"
 
+# Counts this process's open file descriptors, so it runs alone in its own
+# binary: tests alongside it in `suite` would open and close descriptors too.
+[[test]]
+name = "app_face_fds"
+path = "tests/app_face_fds.rs"
+
 [lints]
 workspace = true
 

@@ -53,7 +53,7 @@ pub use activity::NameActivityObserver;
 pub use builder::{EngineBuilder, EngineConfig};
 pub use compose::ComposedStrategy;
 pub use discovery_context::EngineDiscoveryContext;
-pub use dispatcher::DataPlane;
+pub use dispatcher::{APP_FACE_DRAIN, DataPlane};
 pub use egress::{
     DeficitRoundRobinScheduler, EgressClassifier, EgressScheduler, EgressSchedulerFactory,
     PrefixClassifier, PriorityScheduler, TrafficClass,

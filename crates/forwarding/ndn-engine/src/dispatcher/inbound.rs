@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -22,6 +23,17 @@ pub(crate) fn inbound_meta_from_face_addr(
         None => ndn_discovery_core::InboundMeta::none(),
     }
 }
+
+/// How long an app face that stopped sending stays in the face table before
+/// it is removed.
+///
+/// An app face stops sending when its app is gone (its end dropped, its
+/// socket closed) or stopped (its cancel token fired). Its routes go at once;
+/// the face itself stays this long so the Data of Interests the app sent just
+/// before it stopped — still queued in the pipeline — can go back to an app
+/// that only half-closed. Nothing relies on the drain for correctness: an app
+/// that still waits for Data keeps its sending end open while it waits.
+pub const APP_FACE_DRAIN: Duration = Duration::from_secs(1);
 
 pub(crate) async fn run_face_reader(
     face: Arc<ndn_transport::Face>,
@@ -145,14 +157,37 @@ pub(crate) async fn run_face_reader(
         // The engine's own internal faces live as long as the engine.
         FaceKind::Internal => {}
         // An app face that stopped sending can no longer answer an Interest:
-        // its routes go, so Interests under its prefixes reach the app that
-        // registers them next (one started again) instead of a dead face.
-        // The face itself stays: an app done sending may still be waiting for
-        // the Data of what it asked.
+        // its routes go at once, so Interests under its prefixes reach the app
+        // that registers them next (one started again) instead of a dead face.
+        // Then the face goes, with whatever routes or PIT entries the pipeline
+        // still made for it, so a gone app holds no face, socket or task. An
+        // app that closed its sending end may still read: its face stays for
+        // `APP_FACE_DRAIN` first. A stopped one (its cancel token fired) has
+        // no sender left to drain.
         FaceKind::App => {
             rib.handle_face_down(face_id, &fib);
             fib.remove_face(face_id);
             debug!(target: t::FACE_SYSTEM, face=%face_id, "app face stopped sending: its routes removed");
+            if errored {
+                drop(tx);
+                drop(face);
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = runtime.sleep(APP_FACE_DRAIN) => {}
+                }
+            }
+            discovery.on_face_down(face_id, &*discovery_ctx);
+            if let Some(sink) = face_lifecycle_sink.as_ref() {
+                sink.on_down(face_id);
+            }
+            if let Some((_, state)) = face_states.remove(&face_id) {
+                state.cancel.cancel();
+            }
+            rib.handle_face_down(face_id, &fib);
+            fib.remove_face(face_id);
+            face_table.remove(face_id);
+            pit.remove_face(face_id.0);
+            debug!(target: t::FACE_SYSTEM, face=%face_id, "app face removed");
         }
         _ => match persistency {
             FacePersistency::Permanent => {

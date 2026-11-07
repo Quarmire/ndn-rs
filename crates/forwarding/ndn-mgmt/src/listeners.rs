@@ -25,6 +25,9 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
 /// management trust — privileged verbs then go through signed-command auth, not
 /// face-kind. (`FaceKind::App` is `FaceScope::Local`, so `/localhost` prefixes
 /// stay reachable and congestion uses the app-face backpressure policy.)
+///
+/// A client that disconnects leaves nothing behind: its face, socket and tasks
+/// are removed (an `App` face after `ndn_engine::APP_FACE_DRAIN`).
 pub async fn run_face_listener_as(
     path: &str,
     kind: FaceKind,

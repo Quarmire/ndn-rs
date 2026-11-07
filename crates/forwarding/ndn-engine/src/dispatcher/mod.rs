@@ -23,6 +23,7 @@ use crate::stages::{
     ValidationStage,
 };
 
+pub use inbound::APP_FACE_DRAIN;
 pub(crate) use inbound::run_face_reader;
 
 pub(crate) struct FaceRunnerCtx {
@@ -120,6 +121,12 @@ impl PacketDispatcher {
 
         for face_id in dispatcher.face_table.face_ids() {
             if let Some(face) = dispatcher.face_table.get(face_id) {
+                // The face's own token, a child of the engine's: removing the
+                // face stops its sender and reader, not the engine.
+                let face_cancel = match dispatcher.face_states.get(&face_id) {
+                    Some(state) => state.cancel.clone(),
+                    None => cancel.child_token(),
+                };
                 if !dispatcher.face_states.contains_key(&face_id) {
                     let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
                     let persistency = FacePersistency::Permanent;
@@ -129,7 +136,7 @@ impl PacketDispatcher {
                     // rejects outright. Default OFF on all faces to preserve
                     // cross-impl interop; opt in explicitly to enable.
                     let state = FaceState::new(
-                        cancel.child_token(),
+                        face_cancel.clone(),
                         persistency,
                         send_tx,
                         congestion_policy,
@@ -137,7 +144,7 @@ impl PacketDispatcher {
                     );
                     dispatcher.face_states.insert(face_id, state);
                     let send_face = Arc::clone(&face);
-                    let send_cancel = cancel.clone();
+                    let send_cancel = face_cancel.clone();
                     let fs = Arc::clone(&dispatcher.face_states);
                     let ft = Arc::clone(&dispatcher.face_table);
                     let fib = Arc::clone(&dispatcher.strategy.fib);
@@ -175,7 +182,7 @@ impl PacketDispatcher {
                 let pit = Arc::clone(&dispatcher.pit_check.pit);
                 let reader_ctx = FaceRunnerCtx {
                     face_id,
-                    cancel: cancel.clone(),
+                    cancel: face_cancel,
                     face_table: Arc::clone(&dispatcher.face_table),
                     fib: Arc::clone(&dispatcher.strategy.fib),
                     rib: Arc::clone(&dispatcher.rib),

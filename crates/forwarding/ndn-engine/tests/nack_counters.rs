@@ -54,6 +54,9 @@ async fn in_and_out_nacks_are_counted() {
         1,
         "a NoRoute Nack sent back must increment NOutNacks"
     );
+    // Release the face-state guard first: shutdown removes the stopped app
+    // face, which takes the same map entry.
+    drop(s);
 
     shutdown.shutdown().await;
 }

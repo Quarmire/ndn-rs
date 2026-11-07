@@ -98,6 +98,15 @@ the browser kinds. `FacePersistency` is a separate axis —
 `OnDemand`, `Persistent`, or `Permanent` — supplied when you wire the
 face into the engine, not returned from the transport.
 
+An `App` face lives as long as its app sends. When its reader stops — the
+app dropped its end, closed its socket, or its cancel token fired — the
+face's routes go at once, so Interests under its prefixes reach the next app
+that registers them. The face itself is removed with its socket and tasks:
+at once when it was cancelled, or after `ndn_engine::APP_FACE_DRAIN` when the
+app closed its end, so the Data of Interests still in the pipeline can reach
+an app that only half-closed. An app that waits for Data keeps its sending end
+open until the Data arrives; it does not rely on the drain.
+
 ## Picking a LinkService
 
 | LinkService | When to use |

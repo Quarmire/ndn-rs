@@ -630,6 +630,11 @@ impl ForwarderEngine {
         persistency: FacePersistency,
     ) {
         let face_id = erased.id();
+        // The face's own token, a child of the caller's: removing the face
+        // (its connection closed, `remove_face`, `faces/destroy`) cancels this
+        // face's tasks only, never a token the caller shares with other faces
+        // or tasks; cancelling the caller's token still stops the face.
+        let cancel = cancel.child_token();
         let scope = erased.scope();
         let congestion_policy = CongestionPolicy::default_for_scope(scope);
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
@@ -746,6 +751,8 @@ impl ForwarderEngine {
         cancel: CancellationToken,
     ) {
         let face_id = face.id();
+        // Its own token, a child of the caller's (see `wire_face`).
+        let cancel = cancel.child_token();
         let congestion_policy = CongestionPolicy::default_for_scope(face.scope());
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let state = FaceState::new(
