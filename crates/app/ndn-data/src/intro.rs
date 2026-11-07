@@ -423,53 +423,75 @@ impl AskBody {
     }
 }
 
-/// An ask's name: `<device>/32=intro/<IntroAsk TLV>`.
-pub fn intro_name(device: &Name, ask: &IntroAsk) -> Name {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::INTRO_ASK, |w| {
-        w.write_tlv(tlv::EPHEMERAL_KEY, &ask.ephemeral);
-        w.write_tlv(tlv::CIPHERTEXT, &ask.key);
-        w.write_tlv(tlv::CIPHERTEXT, &ask.sealed);
-    });
-    intro_prefix(device).append_component(NameComponent::generic(w.finish()))
+impl IntroAsk {
+    /// Its `IntroAsk` TLV: an ask Interest's ApplicationParameters.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::INTRO_ASK, |w| {
+            w.write_tlv(tlv::EPHEMERAL_KEY, &self.ephemeral);
+            w.write_tlv(tlv::CIPHERTEXT, &self.key);
+            w.write_tlv(tlv::CIPHERTEXT, &self.sealed);
+        });
+        w.finish()
+    }
+
+    /// Read an ask Interest's ApplicationParameters: one `IntroAsk`.
+    pub fn decode(params: Bytes) -> Result<Self, WireError> {
+        let mut r = TlvReader::new(params);
+        let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+        if typ != tlv::INTRO_ASK || !r.is_empty() {
+            return Err(bad("an ask's parameters are one IntroAsk"));
+        }
+        let (mut ephemeral, mut texts) = (None, Vec::new());
+        each(value, |t, v| {
+            match t {
+                tlv::EPHEMERAL_KEY => ephemeral = Some(read_digest(&v)?),
+                tlv::CIPHERTEXT => texts.push(v),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        let [key, sealed]: [Bytes; 2] = texts
+            .try_into()
+            .map_err(|_| bad("an ask carries two ciphertexts"))?;
+        Ok(Self {
+            ephemeral: ephemeral.ok_or_else(|| bad("an ask carries its ephemeral key"))?,
+            key,
+            sealed,
+        })
+    }
 }
 
-/// `<device>/32=intro`: what an ask's sealing binds as associated data.
+/// An ask's name: `<device>/32=intro/<ParametersSha256Digest>`, the digest
+/// over the ApplicationParameters TLV that carries `params` (the
+/// [`IntroAsk`] TLV), as the Interest carries it and its answer is named.
+/// The ask travels in the parameters, not the name: its credentials take a
+/// few KB, and a link reads an Interest's name from its first fragment.
+pub fn intro_name(device: &Name, params: &[u8]) -> Name {
+    let mut w = TlvWriter::new();
+    w.write_tlv(ndn_packet::tlv_type::APP_PARAMETERS, params);
+    let digest = Sha256::digest(w.finish());
+    intro_prefix(device).append_component(NameComponent::new(
+        tlv_type::PARAMETERS_SHA256,
+        Bytes::copy_from_slice(&digest),
+    ))
+}
+
+/// `<device>/32=intro`: an ask Interest's name before its parameters
+/// digest, and what an ask's sealing binds as associated data.
 pub fn intro_prefix(device: &Name) -> Name {
     device.clone().append_component(kw(INTRO))
 }
 
-/// Parse `<device>/32=intro/<IntroAsk TLV>`.
-pub fn parse_intro_name(name: &Name) -> Option<(Name, IntroAsk)> {
+/// The device `<device>/32=intro/<ParametersSha256Digest>` asks.
+pub fn parse_intro_name(name: &Name) -> Option<Name> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, INTRO))?;
-    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
-        return None;
-    }
-    let mut r = TlvReader::new(comps[at + 1].value.clone());
-    let (typ, value) = r.read_tlv().ok()?;
-    if typ != tlv::INTRO_ASK || !r.is_empty() {
-        return None;
-    }
-    let (mut ephemeral, mut texts) = (None, Vec::new());
-    each(value, |t, v| {
-        match t {
-            tlv::EPHEMERAL_KEY => ephemeral = Some(read_digest(&v)?),
-            tlv::CIPHERTEXT => texts.push(v),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })
-    .ok()?;
-    let [key, sealed]: [Bytes; 2] = texts.try_into().ok()?;
-    Some((
-        name_of(&comps[..at]),
-        IntroAsk {
-            ephemeral: ephemeral?,
-            key,
-            sealed,
-        },
-    ))
+    (is_device_comps(&comps[..at])
+        && at + 2 == comps.len()
+        && comps[at + 1].typ == tlv_type::PARAMETERS_SHA256
+        && comps[at + 1].value.len() == 32)
+        .then(|| name_of(&comps[..at]))
 }
 
 // ---- the answer -------------------------------------------------------------------------------
@@ -807,8 +829,10 @@ mod tests {
         assert!(decode_record(IntroRecord::Offer(none).encode()).is_err());
     }
 
-    /// An ask's name round-trips; its body round-trips, and the asker's
-    /// binding changes with every field it covers.
+    /// An ask round-trips through an Interest's parameters, and the name
+    /// `intro_name` computes is the one the Interest carries (its answer is
+    /// named so); its body round-trips, and the asker's binding changes
+    /// with every field it covers.
     #[test]
     fn an_ask_round_trips_and_its_binding_covers_its_fields() {
         let ask = IntroAsk {
@@ -816,8 +840,19 @@ mod tests {
             key: Bytes::from_static(&[2; 60]),
             sealed: Bytes::from_static(&[3; 90]),
         };
-        let name = intro_name(&n("/alice/laptop"), &ask);
-        assert_eq!(parse_intro_name(&name), Some((n("/alice/laptop"), ask)));
+        let device = n("/alice/laptop");
+        let params = ask.encode();
+        let wire = ndn_packet::encode::InterestBuilder::new(intro_prefix(&device))
+            .app_parameters(params.to_vec())
+            .build();
+        let interest = ndn_packet::Interest::decode(wire).unwrap();
+        assert_eq!(*interest.name, intro_name(&device, &params));
+        assert_eq!(parse_intro_name(&interest.name), Some(device.clone()));
+        assert_eq!(
+            IntroAsk::decode(interest.app_parameters().unwrap().clone()).unwrap(),
+            ask
+        );
+        assert_eq!(parse_intro_name(&intro_prefix(&device)), None);
         let body = AskBody {
             offer: offer_name(),
             nonce: [6; NONCE_LEN],

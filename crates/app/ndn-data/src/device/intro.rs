@@ -385,12 +385,22 @@ impl Inner {
             .collect()
     }
 
-    /// Fetch `name` with the forwarding hint `hints` (none: by name).
-    async fn fetch_hinted(&self, name: Name, hints: &[Name]) -> Option<Data> {
+    /// Fetch `name` with the forwarding hint `hints` (none: by name), and
+    /// `params` as its ApplicationParameters (`name` then gains their
+    /// digest).
+    async fn fetch_hinted(
+        &self,
+        name: Name,
+        hints: &[Name],
+        params: Option<&Bytes>,
+    ) -> Option<Data> {
         let _slot = self.slots.acquire().await.ok()?;
         let mut b = InterestBuilder::new(name).lifetime(self.config.lifetime);
         if !hints.is_empty() {
             b = b.forwarding_hint(hints.to_vec());
+        }
+        if let Some(p) = params {
+            b = b.app_parameters(p.to_vec());
         }
         match Consumer::new(self.node.connection()).fetch_with(b).await {
             Ok(d) => Some(d),
@@ -516,11 +526,14 @@ impl Inner {
     pub(super) async fn answer_intro(
         self: &Arc<Self>,
         name: &Name,
-        ask: IntroAsk,
+        params: Option<Bytes>,
     ) -> Option<Bytes> {
         if let Some(r) = self.st.lock().answers.get(name) {
             return Some(r.clone());
         }
+        // The name's digest binds the parameters: an ask is its parameters.
+        let params = params.filter(|p| intro_name(&self.device, p) == *name)?;
+        let ask = IntroAsk::decode(params).ok()?;
         let aad = intro_prefix(&self.device).encode_to_tlv();
         let plain = {
             let st = self.st.lock();
@@ -858,7 +871,7 @@ impl Device {
         let held = wire::held_name(&device, &offer);
         let mut wrapped = None;
         for _ in 0..OFFER_TRIES {
-            wrapped = inner.fetch_hinted(held.clone(), &hints).await;
+            wrapped = inner.fetch_hinted(held.clone(), &hints, None).await;
             if wrapped.is_some() {
                 break;
             }
@@ -902,15 +915,19 @@ impl Device {
         let ck = ContentKey::generate();
         let (ephemeral, key) = wrap_ck_to(&ob.seal_key, &ck, &aad)
             .map_err(|e| local(format!("the ask could not be sealed: {e}")))?;
-        let ask = IntroAsk {
+        let params = IntroAsk {
             ephemeral,
             key: key.to_bytes(),
             sealed: ck.seal(&body.encode(), &aad).to_bytes(),
-        };
-        let name = intro_name(&device, &ask);
+        }
+        .encode();
+        let name = intro_name(&device, &params);
+        let prefix = intro_prefix(&device);
         let mut answered = None;
         for _ in 0..ASK_TRIES {
-            answered = inner.fetch_hinted(name.clone(), &hints).await;
+            answered = inner
+                .fetch_hinted(prefix.clone(), &hints, Some(&params))
+                .await;
             if answered.is_some() {
                 break;
             }

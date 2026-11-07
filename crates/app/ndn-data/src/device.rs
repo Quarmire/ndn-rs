@@ -10683,13 +10683,12 @@ impl Inner {
             });
             return;
         }
-        if let Some((offering, ask)) = crate::intro::parse_intro_name(&name)
-            && offering == self.device
-        {
+        if crate::intro::parse_intro_name(&name).is_some_and(|d| d == self.device) {
             // Answering an ask verifies the asker, writes durably and has
             // the host adopt the asker's anchor (spec §19.4): its own task.
+            let params = interest.app_parameters().cloned();
             rt::spawn(async move {
-                let reply = self.answer_intro(&name, ask).await;
+                let reply = self.answer_intro(&name, params).await;
                 self.reply(&name, responder, reply).await;
             });
             return;

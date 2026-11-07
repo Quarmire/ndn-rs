@@ -2839,7 +2839,7 @@ both from the NDN naming conventions.
 | audit ask and answer | `<H>/32=audit/<AuditAsk TLV>`, Content `AuditAnswer`, FreshnessPeriod 0 | the holder's device key |
 | asker's proof (inside a hold, audit or introduction ask or answer, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
 | offer, use mark (§19.1) | `<D>/32=log/<F>/seq=<n>` | device key |
-| introduction ask and answer (§19) | `<D>/32=intro/<IntroAsk TLV>`, Content `IntroAnswer` | DigestSha256 (the answer carries the offering device's proof inside) |
+| introduction ask and answer (§19) | Interest `<D>/32=intro/<ParametersSha256Digest>`, ApplicationParameters `IntroAsk`; answer named the same, Content `IntroAnswer` | DigestSha256 (the answer carries the offering device's proof inside) |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
 from the node, one octet (0–15) each. Log entries are named after the
@@ -2894,9 +2894,13 @@ Every name parses one way, and a reader MUST refuse one that does not:
   followed by the ask's fields before its `Asker`, or of the answer's
   fields before its `Asker` (§19.3).
 - **Introduction ask.** `D` is the components before the first
-  `32=intro`, a device name; exactly one GenericNameComponent follows
-  whose value is one `IntroAsk` TLV: one `EphemeralKey` and two
-  `Ciphertext`, the wrapped content key, then the sealed `AskBody`.
+  `32=intro`, a device name; exactly one ParametersSha256DigestComponent
+  follows, the SHA-256 of the Interest's ApplicationParameters TLV, whose
+  value is one `IntroAsk` TLV: one `EphemeralKey` and two `Ciphertext`, the
+  wrapped content key, then the sealed `AskBody`. The ask travels in the
+  parameters, not the name: its credentials take a few KB, and a link reads
+  an Interest's name from its first fragment. An ask whose digest is not
+  its parameters' is no ask.
 
 ### 16.2 TLV-TYPE numbers
 
@@ -2988,7 +2992,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x055F | CutIn | Name (a collection strictly under the folder), then per key it keeps versions of in that collection, by key: Writer, Entries (exactly those seqs); in a folder record's Cut only, once per collection (§6.1, §8) |
 | 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
 | 0x0563 | IntroUsed | Name (the offer), then Writer and Digest (the asker key it was used by and its public key's digest) when used, neither when closed; a log record (§19.1) |
-| 0x0565 | IntroAsk | EphemeralKey, Ciphertext (a content key wrapped to the offer's SealKey), Ciphertext (the AskBody — Name (offer), Nonce, Proof, Credentials, Asker — sealed under it); in an ask's name only (§19.3) |
+| 0x0565 | IntroAsk | EphemeralKey, Ciphertext (a content key wrapped to the offer's SealKey), Ciphertext (the AskBody — Name (offer), Nonce, Proof, Credentials, Asker — sealed under it); an ask Interest's ApplicationParameters (§19.3) |
 | 0x0567 | IntroAnswer | Name (offer), Writer (the asker key), Digest (its public key's digest), then Name (folder), Role, Credentials, Asker (the offering device's proof), Proof — or IntroRefused, with no Proof; an answer's Content (§19.3, §19.4) |
 | 0x0569 | Role | NonNegativeInteger: 0 reader, 1 writer |
 | 0x056B | Tries | NonNegativeInteger: in an offer, the wrong tries that close it (≥ 1); in a refusal, those left |
@@ -3581,7 +3585,8 @@ a mistyped word).
    device. No answer after its retries: `NotReady` (`RetryLater`): the
    inviter is offline or unreachable, and the offer waits until its
    expiry. A held packet that is not the offer's record: `Unknown`.
-2. Sends the ask `<D>/32=intro/<IntroAsk>`: `AskBody` — the offer, a fresh
+2. Sends the ask, the Interest `<D>/32=intro/<ParametersSha256Digest>`
+   whose ApplicationParameters are one `IntroAsk`: `AskBody` — the offer, a fresh
    nonce, the ask proof (§19.6) bound to its own key and its digest, its
    credentials (its namespace's signed trust context, as its host gives
    it, then its key's certificates up to that context's anchor) and its
@@ -3624,9 +3629,9 @@ the one before), keeping each answer by the ask's name: the same ask asked
 again gets the same answer while it is kept, and a refusal or an answer is
 never computed twice for one ask. It checks, in this order:
 
-1. **It opens**: the content key unwraps with its recipient key and the
-   body decodes, under `<D>/32=intro`. Else no answer (a Nack): nothing to
-   address a refusal to.
+1. **It opens**: the name's digest is its parameters', the content key
+   unwraps with its recipient key and the body decodes, under
+   `<D>/32=intro`. Else no answer (a Nack): nothing to address a refusal to.
 2. **Its credentials parse**: a trust-context Data whose signature
    verifies under one of the context's own anchors, valid now
    (`SignedTrustContext::open_received`), then certificates (at most 8);
