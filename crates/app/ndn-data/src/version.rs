@@ -344,8 +344,10 @@ pub struct Version {
     pub payload: Payload,
 }
 
-/// The most versions one group holds (spec §5.5).
-pub const GROUP_MAX: u32 = 1024;
+/// The most versions one group holds (spec §5.5): as many seqs as a summary
+/// node lists. A reader keeps an incomplete group's members in its store,
+/// not in memory, so a stalled group costs it no memory per member.
+pub const GROUP_MAX: u32 = 65_536;
 
 /// A group of versions one writer signs to be counted all or none (spec
 /// §5.5): its writer's versions at the consecutive seqs `id .. id + count`,

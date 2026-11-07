@@ -604,6 +604,51 @@ struct Coll {
     /// as pruned, yet their bytes stay, and no epoch key is destroyed for
     /// them, so they come back if a cut refuses the prune (spec §8).
     foreign_prunes: BTreeSet<Name>,
+    /// A merge collection whose state is not built yet (spec §5.2, lazy
+    /// state): what the store holds of it as applied when this device last
+    /// stopped, as an index only. Its versions are loaded from the store,
+    /// and its state built from them, on the first need ([`St::wake`]).
+    dormant: Option<Dormant>,
+    /// Per writer, the highest seq inside the cover of a checkpoint applied
+    /// here (the join of their `P(CP)`, spec §5.2): a version inside it
+    /// counts as its checkpoint counts, and the rule's word on it is not
+    /// told. Cleared with the state.
+    covered: BTreeMap<Writer, u64>,
+    /// The members held here of groups not yet complete, kept in the store
+    /// (under [`parked_name`]) rather than in memory until their group is
+    /// complete or refused (spec §5.5): what judging the group needs of
+    /// each, by id.
+    parked: BTreeMap<VersionId, Parked>,
+}
+
+/// A merge collection's versions the store holds as applied, not loaded
+/// ([`Coll::dormant`]).
+#[derive(Default)]
+struct Dormant {
+    /// Per writer, the seqs of its versions held.
+    held: BTreeMap<Writer, BTreeSet<u64>>,
+    /// The writers those versions name among their parents, whose
+    /// revocation cuts the collection notes ([`Inner::note_revoked`]).
+    parents: BTreeSet<Writer>,
+}
+
+impl Dormant {
+    fn holds(&self, id: &VersionId) -> bool {
+        self.held
+            .get(&id.writer)
+            .is_some_and(|s| s.contains(&id.seq.0))
+    }
+}
+
+/// A group member parked in the store while its group is incomplete
+/// ([`Coll::parked`]): its name, and what judging its group reads of it.
+struct Parked {
+    name: Name,
+    keep: Keep,
+    /// The seal it declares.
+    seal: BTreeSet<Audience>,
+    /// The epoch it is sealed in.
+    epoch: Option<Epoch>,
 }
 
 /// Whether a rule makes a collection log-like: every member key appends,
@@ -1190,8 +1235,9 @@ const MANIFEST_LOOKS: usize = 16;
 
 /// The most collections one application carries its groups to before it
 /// leaves the rest to the next arrival ([`St::apply_ready`]): a bound on
-/// work, never on what is counted.
-const APPLY_ROUNDS: usize = 1 << 16;
+/// work, never on what is counted. A complete group's members apply one
+/// round each, in seq order, so the largest group completes within one.
+const APPLY_ROUNDS: usize = 4 * GROUP_MAX as usize;
 
 /// How long a device whose announced change was not taken (not reached, or
 /// its summary not processed in full) is left before it is asked again
@@ -1497,6 +1543,17 @@ struct St {
     contexts: HashMap<Name, Arc<SignedTrustContext>>,
     /// Introductions: offers, use marks and answers (spec §19).
     intro: intro::Intros,
+    /// Whether the store is being read back at start ([`Inner::restore`]):
+    /// a merge collection's versions are then only indexed, its state not
+    /// built ([`Coll::dormant`]).
+    restoring: bool,
+    /// The versions of each collection loaded from the store since it last
+    /// ran ([`St::wake`]): delivered before the device stopped, so not
+    /// delivered again as they apply.
+    woken: HashMap<Name, BTreeSet<VersionId>>,
+    /// Collections loaded from the store while another applied, to run in
+    /// the same application ([`St::apply_ready`]).
+    to_apply: Vec<Name>,
 }
 
 struct Inner {
@@ -2195,6 +2252,8 @@ struct Run<'a> {
     /// Pending versions found not whole ([`Coll::unwhole`]): not looked
     /// for again until their pieces arrive.
     unwhole: &'a mut BTreeSet<VersionId>,
+    /// The join of the covers of the checkpoints applied ([`Coll::covered`]).
+    covered: &'a mut BTreeMap<Writer, u64>,
     out: Vec<Ran>,
 }
 
@@ -2234,7 +2293,12 @@ impl Run<'_> {
                 .is_some_and(|hv| ready(&self.waits(), self.applied, &hv.version))
     }
 
-    /// Apply everything that is ready; what was done, in order.
+    /// Apply everything that is ready; what was done, in order. Each round
+    /// first applies the newest checkpoint whose past is held, if there is
+    /// one ([`Self::checkpoint`]): it stands for everything it covers, which
+    /// is then never applied to the rule (spec §5.2) — so a collection read
+    /// from its versions anew applies its newest checkpoint and what came
+    /// after, whatever the order the versions were held in.
     fn run(mut self) -> Vec<Ran> {
         // A member of a group refused never applies.
         let stopped: Vec<(VersionId, Refusal)> = self
@@ -2254,6 +2318,9 @@ impl Run<'_> {
             self.cover();
         }
         loop {
+            if merge && self.checkpoint() {
+                continue;
+            }
             let ready_now: Vec<VersionId> = self
                 .pending
                 .iter()
@@ -2274,8 +2341,7 @@ impl Run<'_> {
                     Took::Waits => {}
                 }
             }
-            let progressed = moved || (merge && self.checkpoint());
-            if !progressed {
+            if !moved {
                 break;
             }
         }
@@ -2535,6 +2601,12 @@ impl Run<'_> {
                 let a = self.applied.entry(t.writer).or_insert(0);
                 *a = (*a).max(t.seq.0);
             }
+            // What it covers counts as it counts, whether or not some of it
+            // was applied before.
+            for (w, s) in past_frontier(&hv.version).iter() {
+                let c = self.covered.entry(w.clone()).or_insert(0);
+                *c = (*c).max(s.0);
+            }
         }
         let a = self.applied.entry(id.writer.clone()).or_insert(0);
         *a = (*a).max(id.seq.0);
@@ -2555,8 +2627,9 @@ impl Run<'_> {
         Took::Applied(kind)
     }
 
-    /// Apply a checkpoint whose past is held, if one is pending: each
-    /// pending version whose past is held is checked (once) to learn what
+    /// Apply the newest checkpoint whose past is held, if one is pending:
+    /// the pending versions are looked at newest first (by each writer's
+    /// seq), and each whose past is held is checked (once) to learn what
     /// it is. A check that fails before the version is ready refuses
     /// nothing: its rule judges it against its past applied, when it is
     /// ready (spec §5.2). Whether anything changed.
@@ -2572,7 +2645,7 @@ impl Run<'_> {
             })
             .cloned()
             .collect();
-        for id in candidates {
+        for id in candidates.into_iter().rev() {
             let held = self
                 .versions
                 .get(&id)
@@ -2676,6 +2749,10 @@ impl St {
         coll.waiting.retain(|hv| hv.version.name != *name);
         coll.outsiders.retain(|hv| hv.version.name != *name);
         coll.locked.retain(|lk| lk.name != *name);
+        if coll.parked.values().any(|p| p.name == *name) {
+            coll.parked.retain(|_, p| p.name != *name);
+            self.store.remove(&parked_name(name));
+        }
         let ids: Vec<VersionId> = coll
             .versions
             .iter()
@@ -2967,8 +3044,14 @@ impl St {
     /// with no record of its own that a folder governs takes the folder's
     /// (spec §6), so that what arrives for it is read, and what is put in
     /// it written, under that. Known from now on, a folder record taken
-    /// later sets it too ([`Self::refold_under`]).
+    /// later sets it too ([`Self::refold_under`]). Once the device runs, a
+    /// merge collection's state is built here if it was not yet
+    /// ([`Self::awaken`]): what arrives for it, or is put in it, is judged
+    /// against it.
     fn ensure(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
+        if !self.restoring {
+            self.awaken(c);
+        }
         let coll = self.colls.entry(c.clone()).or_default();
         if coll.members.is_none() && !self.folders_above(c).is_empty() {
             self.refold(c, rules, me);
@@ -2983,6 +3066,11 @@ impl St {
     /// own record lists (spec §6).
     fn refold(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
         let new = self.effective(c);
+        if self.colls.get(c).is_some_and(|x| x.members == new) {
+            return;
+        }
+        // Its versions are read again under the new record: loaded first.
+        self.wake(c);
         let coll = self.colls.entry(c.clone()).or_default();
         if coll.members == new {
             return;
@@ -3096,6 +3184,24 @@ impl St {
                 (l.subject.as_ref() == Some(c)).then(|| (o.writer.clone(), l.seq))
             })
             .collect();
+        // At start a merge collection is only indexed: its state is built
+        // on the first need (spec §5.2, [`Self::wake`]).
+        if self.restoring && self.may_sleep(c) {
+            let coll = self.colls.get_mut(c).expect("may_sleep: held");
+            coll.state = None;
+            coll.dormant.get_or_insert_with(Dormant::default);
+            return;
+        }
+        // Its versions not loaded yet, and those parked, are read again
+        // with the rest; the loaded ones were delivered before.
+        self.wake(c);
+        let woken = self.woken.remove(c).unwrap_or_default();
+        let parked: Vec<VersionId> = self
+            .colls
+            .get(c)
+            .map(|x| x.parked.keys().cloned().collect())
+            .unwrap_or_default();
+        let unparked = self.unpark(c, &parked);
         let Some(coll) = self.colls.get_mut(c) else {
             return;
         };
@@ -3104,7 +3210,7 @@ impl St {
         };
         // What was delivered: applied or covered (under a rule this device
         // does not know, held), and not refused since.
-        let delivered: BTreeSet<VersionId> = coll
+        let mut delivered: BTreeSet<VersionId> = coll
             .versions
             .iter()
             .filter(|(id, hv)| {
@@ -3112,10 +3218,12 @@ impl St {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        delivered.extend(woken);
         let mut all: Vec<Arc<HeldVersion>> = std::mem::take(&mut coll.versions)
             .into_values()
             .chain(std::mem::take(&mut coll.waiting))
             .chain(std::mem::take(&mut coll.outsiders))
+            .chain(unparked)
             .collect();
         all.sort_by(|a, b| a.version.id.cmp(&b.version.id));
         coll.pending.clear();
@@ -3130,6 +3238,7 @@ impl St {
             _ => None,
         };
         coll.kinds.clear();
+        coll.covered.clear();
         coll.unwhole.clear();
         let not_counted = std::mem::take(&mut coll.not_counted);
         // The groups of members told not counted: judged again once the
@@ -3232,6 +3341,9 @@ impl St {
     /// whether it was queued to apply.
     fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
+        // A version arriving in a collection whose state is not built yet
+        // is judged against it: built now.
+        self.wake(&c);
         if let Some(g) = hv.version.group {
             self.note_member(&c, &hv.version.id, g, hv.version.keep);
         }
@@ -3297,13 +3409,268 @@ impl St {
 
     /// Admit a verified, opened version and apply what became ready. A
     /// member of a group refused as it arrives refuses its group: that is
-    /// carried to its other members too.
+    /// carried to its other members too. A member of a group not complete
+    /// yet is parked in the store until it is ([`Self::park`]).
     fn admit(&mut self, hv: Arc<HeldVersion>) {
         let c = hv.version.collection.clone();
         let grouped = hv.version.group.is_some();
-        if self.admit_one(hv) || grouped {
+        let id = hv.version.id.clone();
+        let queued = self.admit_one(hv);
+        if grouped {
+            self.park(&c, &id);
+        }
+        if queued || grouped {
             self.apply_ready(&c, &BTreeSet::new());
         }
+    }
+
+    /// Whether merge collection `c`, being read back at start, may stay
+    /// unbuilt ([`Coll::dormant`]): its rule known here, nothing of it in
+    /// memory, and not held here for its owner (a holder keeps exactly what
+    /// it holds in view, spec §13.2).
+    fn may_sleep(&self, c: &Name) -> bool {
+        let Some(coll) = self.colls.get(c) else {
+            return false;
+        };
+        let known = matches!(
+            coll.members.as_ref().map(|m| &m.rule),
+            Some(Rule::Merge { function }) if self.rules.get(function).is_some()
+        );
+        known
+            && !self.holding.contains_key(c)
+            && coll.versions.is_empty()
+            && coll.waiting.is_empty()
+            && coll.outsiders.is_empty()
+            && coll.locked.is_empty()
+            && coll.parked.is_empty()
+    }
+
+    /// Load dormant collection `c`'s versions from the store and admit
+    /// them, its state started empty (spec §5.2): applied as any held
+    /// versions are ([`Run`]) — its newest checkpoint first, then what came
+    /// after — by whoever applies `c` next. Each was delivered before the
+    /// device stopped, so is not delivered again ([`St::woken`]). Whether
+    /// `c` was dormant.
+    fn wake(&mut self, c: &Name) -> bool {
+        let Some(dormant) = self.colls.get_mut(c).and_then(|x| x.dormant.take()) else {
+            return false;
+        };
+        let coll = self.colls.get_mut(c).expect("held above");
+        if let Some(Rule::Merge { function }) = coll.members.as_ref().map(|m| &m.rule) {
+            coll.state = self.rules.get(function).map(|r| r.start(c, &self.me));
+        }
+        tracing::debug!(collection = %c, "its merge state is built from the versions stored");
+        let mut woken = BTreeSet::new();
+        for (w, seqs) in dormant.held {
+            let Some(device) = device_of(w.key()) else {
+                continue;
+            };
+            for s in seqs {
+                let name = log_name(&device, Some(c), s);
+                let id = VersionId {
+                    writer: w.clone(),
+                    seq: Seq(s),
+                };
+                let still = match self.held.get(&name) {
+                    Some(Held::Version(h)) => *h == id,
+                    Some(Held::Locked) => true,
+                    _ => false,
+                };
+                if !still {
+                    continue;
+                }
+                let wire = self.store.get(&name);
+                match wire.and_then(|wire| self.reload(&name, wire)) {
+                    Some(Ok(hv)) => {
+                        self.held.insert(name, Held::Version(id.clone()));
+                        woken.insert(id);
+                        self.admit_one(Arc::new(hv));
+                    }
+                    Some(Err(locked)) => self.hold_locked(c, locked),
+                    None => {
+                        tracing::warn!(%name, "a version the store held is gone or no longer reads; fetched again when listed");
+                        self.held.remove(&name);
+                    }
+                }
+            }
+        }
+        self.woken.entry(c.clone()).or_default().extend(woken);
+        true
+    }
+
+    /// Build dormant collection `c`'s state now ([`Self::wake`]) and apply
+    /// its versions.
+    fn awaken(&mut self, c: &Name) {
+        if self.wake(c) {
+            self.apply_ready(c, &BTreeSet::new());
+        }
+    }
+
+    /// Load ([`Self::wake`]) every dormant collection holding a member of
+    /// a group of `keys`: judging a group reads each member's state. The
+    /// collections loaded.
+    fn wake_groups(&mut self, keys: impl IntoIterator<Item = (Writer, u64)>) -> Vec<Name> {
+        let colls: BTreeSet<Name> = keys
+            .into_iter()
+            .filter_map(|k| self.txns.get(&k))
+            .flat_map(|m| m.values().flatten().map(|m| m.collection.clone()))
+            .filter(|y| self.colls.get(y).is_some_and(|x| x.dormant.is_some()))
+            .collect();
+        colls.into_iter().filter(|y| self.wake(y)).collect()
+    }
+
+    /// The version the store holds at log entry `name` (`wire`), as held:
+    /// opened (or in pieces), or sealed in an epoch whose key is not held
+    /// here (`Err`). `None` when `wire` is no version.
+    fn reload(&self, name: &Name, wire: Bytes) -> Option<Result<HeldVersion, Locked>> {
+        let data = Data::decode(wire.clone()).ok()?;
+        let writer = Writer::new((*data.sig_info()?.key_locator_name()?).clone());
+        let Record::Version(mut body) = wire::decode_record(data.content()?.clone()).ok()? else {
+            return None;
+        };
+        let seq = parse_log_name(name)?.seq;
+        let sealed = body.sealed.is_some();
+        let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
+        if let Some(s) = body.sealed.clone() {
+            let Some(key) = self.keys.key(&body.collection, &s.epoch) else {
+                return Some(Err(Locked {
+                    name: name.clone(),
+                    wire,
+                    writer,
+                    seq,
+                    body,
+                }));
+            };
+            if body.chunks.is_none() {
+                open_into(&mut body, seal::open_payload(&key, name, &s.ciphertext)?);
+            }
+        }
+        let op = body.op.clone();
+        let chunks = body.chunks;
+        let version = version_of(name, &writer, seq, body);
+        Some(Ok(HeldVersion::new(
+            version, op, wire, sealed, epoch, chunks,
+        )))
+    }
+
+    /// Hold `locked`, a version of `c` sealed in an epoch whose key is not
+    /// held here.
+    fn hold_locked(&mut self, c: &Name, locked: Locked) {
+        self.held.insert(locked.name.clone(), Held::Locked);
+        let coll = self.colls.entry(c.clone()).or_default();
+        coll.by_digest.insert(
+            wire::implicit_digest(&locked.wire),
+            VersionId {
+                writer: locked.writer.clone(),
+                seq: Seq(locked.seq),
+            },
+        );
+        coll.locked.push(locked);
+    }
+
+    /// Park group member `id` of `c`, admitted and waiting, in the store
+    /// while its group waits — incomplete, or for a key, an audience or a
+    /// keep (spec §5.5): only what judging its group reads of it stays in
+    /// memory ([`Parked`]). It is loaded again once the group is complete or
+    /// refused ([`Self::unpark_group`]).
+    fn park(&mut self, c: &Name, id: &VersionId) {
+        // A member in pieces not held whole stays: its pieces are fetched
+        // as it waits ([`Self::wanted_pieces`]).
+        let Some(g) = self.colls.get(c).and_then(|x| {
+            let hv = x.versions.get(id).filter(|hv| hv.opened)?;
+            x.pending.contains(id).then_some(hv.version.group).flatten()
+        }) else {
+            return;
+        };
+        // Judged with every member's collection built.
+        let key = (id.writer.clone(), g.id);
+        let woken = self.wake_groups([key.clone()]);
+        self.to_apply.extend(woken);
+        if matches!(
+            self.verdict(&key),
+            GroupVerdict::Complete { .. } | GroupVerdict::Refused { .. }
+        ) {
+            return;
+        }
+        let coll = self.colls.get_mut(c).expect("held above");
+        let Some(hv) = coll.versions.remove(id) else {
+            return;
+        };
+        coll.pending.remove(id);
+        coll.unwhole.remove(id);
+        self.store
+            .insert(parked_name(&hv.version.name), hv.wire.clone());
+        coll.parked.insert(
+            id.clone(),
+            Parked {
+                name: hv.version.name.clone(),
+                keep: hv.version.keep,
+                seal: hv.version.seal.any_of.iter().cloned().collect(),
+                epoch: hv.epoch.clone(),
+            },
+        );
+    }
+
+    /// Load the members `ids` of `c` parked in the store ([`Self::park`]),
+    /// to be admitted again; one sealed in an epoch whose key is no longer
+    /// held is held locked, and one the store lost is let go, to be
+    /// fetched again.
+    fn unpark(&mut self, c: &Name, ids: &[VersionId]) -> Vec<Arc<HeldVersion>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(p) = self.colls.get_mut(c).and_then(|x| x.parked.remove(id)) else {
+                continue;
+            };
+            let at = parked_name(&p.name);
+            let wire = self.store.get(&at);
+            self.store.remove(&at);
+            match wire.and_then(|w| self.reload(&p.name, w)) {
+                Some(Ok(hv)) => out.push(Arc::new(hv)),
+                Some(Err(locked)) => self.hold_locked(c, locked),
+                None => {
+                    tracing::warn!(name = %p.name, "a parked group member the store lost; fetched again when listed");
+                    self.held.remove(&p.name);
+                }
+            }
+        }
+        out
+    }
+
+    /// Unpark every parked member of group `key` and admit it: the group
+    /// is no longer incomplete. Whether any was.
+    fn unpark_group(&mut self, key: &(Writer, u64)) -> bool {
+        let members: Vec<(Name, VersionId)> = self
+            .txns
+            .get(key)
+            .map(|m| {
+                m.iter()
+                    .flat_map(|(s, ms)| {
+                        ms.iter().map(|m| {
+                            let id = VersionId {
+                                writer: key.0.clone(),
+                                seq: Seq(*s),
+                            };
+                            (m.collection.clone(), id)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut any = false;
+        for (y, id) in members {
+            if !self
+                .colls
+                .get(&y)
+                .is_some_and(|x| x.parked.contains_key(&id))
+            {
+                continue;
+            }
+            for hv in self.unpark(&y, std::slice::from_ref(&id)) {
+                any = true;
+                self.admit_one(hv);
+            }
+        }
+        any
     }
 
     /// Apply every pending version of `c` that is ready ([`Self::apply_one`]),
@@ -3327,13 +3694,32 @@ impl St {
                 break;
             }
             touched.extend(self.apply_one(&x, if x == *c { quiet } else { &none }));
+            // Collections loaded from the store to judge a group run in
+            // this application too.
+            for y in std::mem::take(&mut self.to_apply) {
+                if queued.insert(y.clone()) {
+                    todo.push_back(y);
+                }
+            }
+            if self.colls.get(&x).is_none_or(|k| k.dormant.is_some()) {
+                continue;
+            }
             let active: Vec<(Writer, u64)> = self
                 .colls
                 .get(&x)
                 .map(|k| k.txns.iter().cloned().collect())
                 .unwrap_or_default();
             for key in active {
-                let verdict = self.verdict(&key);
+                let mut verdict = self.verdict(&key);
+                // Complete or refused: its members parked in the store are
+                // loaded, and the group judged with them in memory.
+                if matches!(
+                    verdict,
+                    GroupVerdict::Complete { .. } | GroupVerdict::Refused { .. }
+                ) && self.unpark_group(&key)
+                {
+                    verdict = self.verdict(&key);
+                }
                 let refused = matches!(verdict, GroupVerdict::Refused { .. });
                 let members: Vec<(u64, Name)> = self
                     .txns
@@ -3411,6 +3797,26 @@ impl St {
     /// [`Self::regroup`], once every collection of the group has run.
     fn apply_one(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) -> BTreeSet<(Writer, u64)> {
         let mut touched = BTreeSet::new();
+        // Not built yet: nothing of it waits (what arrives builds it,
+        // [`Self::admit_one`]).
+        if self.colls.get(c).is_none_or(|x| x.dormant.is_some()) {
+            return touched;
+        }
+        // Its groups are judged from every member's state: the collections
+        // holding one that are not built yet are loaded, and run in this
+        // application ([`St::to_apply`]).
+        let keys: Vec<(Writer, u64)> = self.colls[c].txns.iter().cloned().collect();
+        let woken = self.wake_groups(keys);
+        self.to_apply.extend(woken);
+        // What was loaded from the store was delivered before.
+        let merged: BTreeSet<VersionId>;
+        let quiet = match self.woken.remove(c) {
+            Some(r) if !r.is_empty() => {
+                merged = quiet.union(&r).cloned().collect();
+                &merged
+            }
+            _ => quiet,
+        };
         let gates = self.gates(c);
         // A member held of a group not counted: its folder is followed, so
         // that the others arrive (spec §5.5).
@@ -3450,6 +3856,8 @@ impl St {
             revoked,
             outsiders,
             unwhole,
+            covered,
+            parked,
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
@@ -3465,7 +3873,10 @@ impl St {
         // every watcher of the collection is told).
         let mut changes: Vec<(Change, Option<VersionId>)> = Vec::new();
         let deliver = |hv: &HeldVersion, changes: &mut Vec<(Change, Option<VersionId>)>| {
-            store.insert(hv.version.name.clone(), hv.wire.clone());
+            // What was delivered before is stored already.
+            if !quiet.contains(&hv.version.id) {
+                store.insert(hv.version.name.clone(), hv.wire.clone());
+            }
             if !quiet.contains(&hv.version.id) {
                 changes.push((
                     Change::Version(hv.version.clone()),
@@ -3499,11 +3910,17 @@ impl St {
                 kinds,
                 outsiders,
                 unwhole,
+                covered,
                 out: Vec::new(),
             }
             .run();
             // Only what still waits is remembered not whole.
             unwhole.retain(|id| pending.contains(id));
+            // A version a checkpoint applied covers counts as the
+            // checkpoint counts: what the rule says of it is not told, and
+            // it leaves `not_counted` (spec §5.2) — so the state is the same
+            // whether it was applied before the checkpoint or never.
+            let inside = |id: &VersionId| covered.get(&id.writer).is_some_and(|s| *s >= id.seq.0);
             for r in ran {
                 match r {
                     Ran::Applied(id, counting) => {
@@ -3512,7 +3929,9 @@ impl St {
                         if let Some(g) = group {
                             touched.insert((id.writer.clone(), g));
                         }
-                        if let Counting::NotCounted(why) = counting {
+                        if let Counting::NotCounted(why) = counting
+                            && !inside(&id)
+                        {
                             not_counted.insert(id.clone(), why.clone());
                             if group.is_none() && !quiet.contains(&id) {
                                 changes.push((
@@ -3566,7 +3985,7 @@ impl St {
                                 }
                             }
                             Counting::NotCounted(why) => {
-                                if not_counted.get(&id) != Some(&why) {
+                                if not_counted.get(&id) != Some(&why) && !inside(&id) {
                                     not_counted.insert(id.clone(), why.clone());
                                     if tell {
                                         changes.push((
@@ -3584,11 +4003,33 @@ impl St {
                     }
                 }
             }
+            let now_covered: Vec<VersionId> = not_counted
+                .keys()
+                .filter(|id| inside(id))
+                .cloned()
+                .collect();
+            for id in now_covered {
+                not_counted.remove(&id);
+                match group_of(versions, &id) {
+                    Some(g) => {
+                        touched.insert((id.writer.clone(), g));
+                    }
+                    None if !quiet.contains(&id) => changes.push((
+                        Change::Counted {
+                            collection: c.clone(),
+                            id,
+                        },
+                        None,
+                    )),
+                    None => {}
+                }
+            }
         }
         // Why each member of a group not counted waits, told when it
         // changes; counted once it applies.
         let waits = |id: &VersionId| {
             pending.contains(id)
+                || parked.contains_key(id)
                 || locked
                     .iter()
                     .any(|l| l.writer == id.writer && l.seq == id.seq.0)
@@ -3668,8 +4109,12 @@ impl St {
     /// rule's counting of every version is the rule's alone (the layer's
     /// holding back never feeds back into it). A member its rule does not
     /// count keeps its own reason. Each member is told as what it was last
-    /// told changes: not counted with why, or counted again.
+    /// told changes: not counted with why, or counted again. A member's
+    /// collection whose state is not built yet is built first.
     fn regroup(&mut self, keys: BTreeSet<(Writer, u64)>) {
+        for y in self.wake_groups(keys.iter().cloned()) {
+            self.apply_ready(&y, &BTreeSet::new());
+        }
         for key in keys {
             let members: Vec<(VersionId, Name)> = self
                 .txns
@@ -3856,7 +4301,8 @@ impl St {
         }
     }
 
-    /// The version held here under `name`, opened or sealed.
+    /// The version held here under `name`, opened or sealed (or parked in
+    /// the store, [`Coll::parked`]).
     fn held_version(&self, name: &Name) -> Option<Version> {
         let l = parse_log_name(name)?;
         let coll = self.colls.get(l.subject.as_ref()?)?;
@@ -3871,6 +4317,19 @@ impl St {
                     .iter()
                     .find(|lk| lk.name == *name)
                     .map(|lk| version_of(name, &lk.writer, lk.seq, lk.body.clone()))
+            })
+            .or_else(|| {
+                // Parked while its group waits, or of a collection not
+                // built yet: read from the store.
+                let at = match coll.parked.values().any(|p| p.name == *name) {
+                    true => parked_name(name),
+                    false if coll.dormant.is_some() => name.clone(),
+                    false => return None,
+                };
+                match self.reload(name, self.store.get(&at)?)? {
+                    Ok(hv) => Some(hv.version),
+                    Err(lk) => Some(version_of(name, &lk.writer, lk.seq, lk.body)),
+                }
             })
     }
 
@@ -3924,6 +4383,13 @@ impl St {
             }
             return MemberState::Waiting;
         }
+        // Parked in the store while its group waits: held whole, waiting.
+        if coll.parked.contains_key(id) {
+            return match merge && coll.state.is_none() {
+                true => MemberState::Unreadable,
+                false => MemberState::Waiting,
+            };
+        }
         if let Some(hv) = coll.outsiders.iter().find(|hv| hv.version.id == *id) {
             return match self.refused.get(&hv.version.name) {
                 Some(Refusal::Group { .. }) => MemberState::GroupRefused,
@@ -3966,14 +4432,25 @@ impl St {
                     .chain(&coll.waiting)
                     .find(|hv| hv.version.id == *id)
             })
-            .map(|hv| (&hv.version.seal, hv.epoch.clone()))
+            .map(|hv| {
+                (
+                    hv.version.seal.any_of.iter().cloned().collect(),
+                    hv.epoch.clone(),
+                )
+            })
             .or_else(|| {
                 coll.locked
                     .iter()
                     .find(|l| l.writer == id.writer && l.seq == id.seq.0)
-                    .map(|l| (&l.body.seal, Some(l.epoch().clone())))
+                    .map(|l| {
+                        let seal = l.body.seal.any_of.iter().cloned().collect();
+                        (seal, Some(l.epoch().clone()))
+                    })
             })
-            .map(|(seal, epoch)| (seal.any_of.iter().cloned().collect(), epoch))
+            .or_else(|| {
+                let p = coll.parked.get(id)?;
+                Some((p.seal.clone(), p.epoch.clone()))
+            })
     }
 
     /// The readers of epoch `e` that a version of `c` is sealed in, as the
@@ -4020,7 +4497,11 @@ impl St {
             .any(|hv| hv.version.keep == Keep::Forever && ours(&hv.version.name))
             || coll.locked.iter().any(|l| {
                 l.writer == *w && l.seq == seq && l.body.keep == Keep::Forever && ours(&l.name)
-            });
+            })
+            || coll
+                .parked
+                .get(&id)
+                .is_some_and(|p| p.keep == Keep::Forever && ours(&p.name));
         if held {
             return true;
         }
@@ -4031,6 +4512,48 @@ impl St {
                     .members
                     .as_ref()
                     .is_some_and(|m| matches!(m.rule, Rule::Merge { .. })))
+    }
+
+    /// The seqs in `span` at which `w` signed an entry in collection `x`
+    /// ([`Self::signed_at`]), found from what `x` holds and knows of `w`
+    /// in that span alone.
+    fn signed_in(&self, x: &Name, w: &Writer, span: &std::ops::Range<u64>) -> Vec<u64> {
+        let Some(coll) = self.colls.get(x) else {
+            return Vec::new();
+        };
+        let at = |s: u64| VersionId {
+            writer: w.clone(),
+            seq: Seq(s),
+        };
+        let inside = |s: &u64| span.contains(s);
+        let mut seqs: BTreeSet<u64> = coll
+            .entries
+            .get(w)
+            .map(|e| e.range(span.clone()).copied().collect())
+            .unwrap_or_default();
+        if !span.is_empty() {
+            let ids = at(span.start)..at(span.end);
+            seqs.extend(coll.versions.range(ids.clone()).map(|(id, _)| id.seq.0));
+            seqs.extend(coll.parked.range(ids).map(|(id, _)| id.seq.0));
+        }
+        seqs.extend(
+            coll.waiting
+                .iter()
+                .chain(&coll.outsiders)
+                .filter(|hv| hv.version.id.writer == *w)
+                .map(|hv| hv.version.id.seq.0)
+                .filter(inside),
+        );
+        seqs.extend(
+            coll.locked
+                .iter()
+                .filter(|l| l.writer == *w)
+                .map(|l| l.seq)
+                .filter(inside),
+        );
+        seqs.into_iter()
+            .filter(|s| self.signed_at(x, w, *s))
+            .collect()
     }
 
     /// The verdict on group `key` (its writer and id), from what every
@@ -4116,17 +4639,26 @@ impl St {
             .keys()
             .filter(|c| folder_of(c) == folder)
             .collect();
-        for s in span.clone() {
-            let at: Vec<&&Name> = under.iter().filter(|x| self.signed_at(x, w, s)).collect();
-            if let [a, b, ..] = at[..] {
-                return malformed(
-                    name_of(a, s),
-                    &format!(
-                        "its writer signed two entries at seq {s}, in {a} and {b}, though a \
-                         key's log is one sequence across its collections"
-                    ),
-                );
+        // Found per collection from what it holds of the writer in the
+        // group's span, so judging a group costs its members and the
+        // folder's collections, not their product.
+        let mut signers: BTreeMap<u64, Vec<&Name>> = BTreeMap::new();
+        for x in &under {
+            for s in self.signed_in(x, w, &span) {
+                signers.entry(s).or_default().push(*x);
             }
+        }
+        if let Some((s, at)) = signers.iter().find(|(_, at)| at.len() > 1) {
+            let mut at = at.clone();
+            at.sort();
+            let (a, b) = (at[0], at[1]);
+            return malformed(
+                name_of(a, *s),
+                &format!(
+                    "its writer signed two entries at seq {s}, in {a} and {b}, though a key's \
+                     log is one sequence across its collections"
+                ),
+            );
         }
         let mut states = BTreeMap::new();
         for (seq, m) in members
@@ -4198,6 +4730,12 @@ impl St {
         if states.values().any(|s| *s == MemberState::Unreadable) {
             return GroupVerdict::Unreadable;
         }
+        // Only a collection where the writer pruned can hold one of its
+        // members dropped.
+        let pruning: Vec<&&Name> = under
+            .iter()
+            .filter(|x| self.colls[**x].prunes.iter().any(|p| p.id.writer == *w))
+            .collect();
         let mut present = 0;
         let mut all_ready = true;
         let mut next = None;
@@ -4226,7 +4764,7 @@ impl St {
                 None => {
                     // Not held as a member: pruned here, in a collection
                     // of the folder, it is present.
-                    if under.iter().any(|c| self.dropped(c, &id(s))) {
+                    if pruning.iter().any(|c| self.dropped(c, &id(s))) {
                         present += 1;
                     }
                 }
@@ -4241,7 +4779,7 @@ impl St {
     }
 
     /// What its group lets each group member of `c` waiting here — pending,
-    /// or held sealed — do ([`Run`]).
+    /// parked, or held sealed — do ([`Run`]).
     fn gates(&self, c: &Name) -> HashMap<VersionId, Gate> {
         let mut out = HashMap::new();
         let Some(coll) = self.colls.get(c) else {
@@ -4261,6 +4799,7 @@ impl St {
                     seq: Seq(*seq),
                 };
                 let waits = coll.pending.contains(&id)
+                    || coll.parked.contains_key(&id)
                     || coll
                         .locked
                         .iter()
@@ -4719,6 +5258,7 @@ impl St {
         let mut skipped = coll.skipped.clone();
         let mut applied = BTreeMap::new();
         let mut kinds = HashMap::new();
+        let mut covered = BTreeMap::new();
         let mut outsiders = coll.outsiders.clone();
         // A group's members inside `at` count as the group does now: all of
         // a complete one, none of a refused one, and none held back while
@@ -4756,6 +5296,7 @@ impl St {
             kinds: &mut kinds,
             outsiders: &mut outsiders,
             unwhole: &mut BTreeSet::new(),
+            covered: &mut covered,
             out: Vec::new(),
         }
         .run();
@@ -4782,6 +5323,8 @@ impl St {
                 _ => {}
             }
         }
+        // What a checkpoint covers counts as it counts (spec §5.2).
+        not_counted.retain(|id, _| covered.get(&id.writer).is_none_or(|s| *s < id.seq.0));
         let excluded: BTreeSet<VersionId> = coll
             .excluded
             .iter()
@@ -5022,6 +5565,9 @@ impl Device {
                 suspected: BTreeMap::new(),
                 contexts,
                 intro: intro::Intros::new(),
+                restoring: false,
+                woken: HashMap::new(),
+                to_apply: Vec::new(),
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -5480,7 +6026,9 @@ impl Device {
         // a version held whole here, what each proof is checked against,
         // with the named holders whose live leases hold it).
         let (targets, provings, merge, copies) = {
-            let st = inner.st.lock();
+            let mut st = inner.st.lock();
+            st.awaken(&c);
+            let st = st;
             let Some(coll) = st.colls.get(&c) else {
                 return Err(DataError::Unavailable { name: name.clone() });
             };
@@ -5840,6 +6388,19 @@ fn unexpired(name: &Name) -> Option<Name> {
     over(&expired_prefix(), name)
 }
 
+/// Where the store keeps a group member held while its group is incomplete
+/// (`/localhost/ndn-data/parked/<log entry name>`, its value the packet):
+/// on disk, not in memory, until the group is complete or refused (spec
+/// §5.5). Not applied, so not stored under its own name; dropped at a
+/// restart, after which it is fetched again as any version not held.
+fn parked_prefix() -> Name {
+    "/localhost/ndn-data/parked".parse().expect("a valid name")
+}
+
+fn parked_name(entry: &Name) -> Name {
+    under(&parked_prefix(), entry)
+}
+
 /// Where the store keeps when this device first verified each log entry it
 /// holds, by its clock, and the digest of the public key that verified it
 /// (`/localhost/ndn-data/verified/<log entry name>`, its value the time as
@@ -6117,6 +6678,7 @@ impl Inner {
         let mut suspected = BTreeMap::new();
         let mut untrusted: HashMap<Name, String> = HashMap::new();
         let mut batched = Vec::new();
+        let mut writers: HashMap<Name, Writer> = HashMap::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if let Some(entry) = over(&verified_prefix(), &name) {
                 match decode_verified(&wire) {
@@ -6125,6 +6687,12 @@ impl Inner {
                     }
                     None => self.store.remove(&name),
                 }
+                continue;
+            }
+            // A group member parked while its group waited: not applied,
+            // so not held across a restart; fetched again when listed.
+            if over(&parked_prefix(), &name).is_some() {
+                self.store.remove(&name);
                 continue;
             }
             if let Some(c) = over(&batched_prefix(), &name) {
@@ -6223,16 +6791,20 @@ impl Inner {
             else {
                 continue;
             };
+            // One writer per key, shared by its entries (a name read from
+            // one packet, not one per entry).
+            let key: &Name = &key;
+            let writer = match writers.get(key) {
+                Some(w) => w.clone(),
+                None => {
+                    let w = Writer::new(key.clone());
+                    writers.insert(key.clone(), w.clone());
+                    w
+                }
+            };
             // Own by name for now; by what it wrote once all is read.
             let mine = parsed.device == self.device;
-            entries.push((
-                name,
-                wire,
-                record,
-                Writer::new((*key).clone()),
-                parsed.seq,
-                mine,
-            ));
+            entries.push((name, wire, record, writer, parsed.seq, mine));
         }
         // A store kept before this device recorded what it writes: its
         // entries under its name are taken as its own, as they were, and
@@ -6267,12 +6839,14 @@ impl Inner {
             entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
         );
         let mut st = self.st.lock();
+        // A merge collection read back is indexed, its state built on the
+        // first need (spec §5.2): from here until everything is read.
+        st.restoring = true;
         // What the trust context refused for its chain stays withdrawn
         // until judged again ([`Self::rejudge`]); what a held trust context
         // revokes outside its cut stays refused across a restart (spec §8):
         // records are not taken, versions held as refused.
         for (name, wire, _, writer, _, _) in entries.iter().chain(&rest) {
-            let digest = wire::implicit_digest(wire);
             let why = match untrusted.remove(name) {
                 Some(why) => Some(Refusal::Untrusted { why }),
                 None => self
@@ -6285,7 +6859,7 @@ impl Inner {
                     name.clone(),
                     OutOfCut {
                         writer: writer.clone(),
-                        digest,
+                        digest: wire::implicit_digest(wire),
                         wire: None,
                         why,
                     },
@@ -6470,6 +7044,7 @@ impl Inner {
                 self.store.remove(&n);
             }
         }
+        st.restoring = false;
         // What expired while the device was off.
         let colls: Vec<Name> = st.colls.keys().cloned().collect();
         for c in colls {
@@ -7084,12 +7659,15 @@ impl Inner {
 
     /// Start following `target`: join its namespace's group, and forget
     /// which summaries on the way to it were processed (they were processed
-    /// without it). Returns whether it is new.
+    /// without it). Returns whether it is new. A merge collection followed
+    /// — read, written, held or watched — has its state built now if it was
+    /// not yet (spec §5.2).
     async fn follow(self: &Arc<Self>, target: &Name) -> Result<bool, DataError> {
         wire::data_marker(target).map_err(|why| bad_name(target, why))?;
         let ns = namespace_of(target).expect("a data name has a namespace");
         let new = {
             let mut st = self.st.lock();
+            st.awaken(target);
             let new = st.follows.insert(target.clone());
             if new {
                 for ((_, pns), peer) in st.peers.iter_mut() {
@@ -7923,19 +8501,16 @@ impl Inner {
         mine: bool,
     ) -> Option<(Name, ChunksBody)> {
         if let Some(Held::Version(id)) = st.held.get(&name) {
+            let seq = id.seq.0;
             if let Record::Version(body) = &record
-                && let Some(first) = st
-                    .colls
-                    .get(&body.collection)
-                    .and_then(|c| c.versions.get(id))
-                && first.wire != wire
+                && held_wire(st, &name).is_some_and(|first| first != wire)
+                && let Some(first) = st.held_version(&name)
             {
                 let change = Change::Equivocation {
                     collection: body.collection.clone(),
-                    first: Box::new(first.version.clone()),
-                    second: Box::new(version_of(&name, &writer, id.seq.0, body.clone())),
+                    first: Box::new(first),
+                    second: Box::new(version_of(&name, &writer, seq, body.clone())),
                 };
-                let seq = id.seq.0;
                 st.emit(&body.collection, &change, &writer, seq.saturating_sub(1));
             }
             return None;
@@ -8054,9 +8629,11 @@ impl Inner {
             }
             return None;
         }
-        if mine
-            || matches!(record, Record::Snapshot(_))
-            || (keeps && matches!(record, Record::Version(_)))
+        // Read back from the store at start, it is stored already.
+        if !st.restoring
+            && (mine
+                || matches!(record, Record::Snapshot(_))
+                || (keeps && matches!(record, Record::Version(_))))
         {
             self.store.insert(name.clone(), wire.clone());
         }
@@ -8094,12 +8671,6 @@ impl Inner {
                 // Under a folder in force with no record of its own, it is
                 // read under the folder's (spec §6).
                 st.ensure(&c, &self.config.rules, self.me());
-                // Of a revoked key, its entries outside its cut never apply:
-                // this version's and its parents' (spec §5.2, §8).
-                let writers: Vec<Writer> = std::iter::once(writer.clone())
-                    .chain(body.parents.iter().map(|(y, _)| y.clone()))
-                    .collect();
-                self.note_revoked_in(st, &c, writers);
                 let seq = parsed.seq;
                 let keep = body.keep;
                 let sealed = body.sealed.is_some();
@@ -8108,6 +8679,40 @@ impl Inner {
                 if let Some(g) = group {
                     st.note_member(&c, &id, g, keep);
                 }
+                // Read back at start into a merge collection not built yet:
+                // indexed only, its state built from the store on the first
+                // need (spec §5.2, [`St::wake`]). The store holds what was
+                // applied here, so the index is what applies.
+                let dormant = st.restoring
+                    && !second
+                    && !st.holding.contains_key(&c)
+                    && st.colls.get(&c).is_some_and(|x| x.dormant.is_some());
+                if dormant {
+                    let locked = body
+                        .sealed
+                        .as_ref()
+                        .is_some_and(|s| st.keys.key(&c, &s.epoch).is_none());
+                    let coll = st.colls.get_mut(&c).expect("dormant above");
+                    coll.entries.entry(writer.clone()).or_default().insert(seq);
+                    let d = coll.dormant.as_mut().expect("dormant above");
+                    d.held.entry(writer).or_default().insert(seq);
+                    // Their revocation cuts are noted once all is read
+                    // ([`Self::note_revoked`]).
+                    d.parents
+                        .extend(body.parents.iter().map(|(y, _)| y.clone()));
+                    let held = match locked {
+                        true => Held::Locked,
+                        false => Held::Version(id),
+                    };
+                    st.held.insert(name, held);
+                    return None;
+                }
+                // Of a revoked key, its entries outside its cut never apply:
+                // this version's and its parents' (spec §5.2, §8).
+                let writers: Vec<Writer> = std::iter::once(writer.clone())
+                    .chain(body.parents.iter().map(|(y, _)| y.clone()))
+                    .collect();
+                self.note_revoked_in(st, &c, writers);
                 let fetch = keeps
                     .then(|| body.chunks.map(|ch| (name.clone(), ch)))
                     .flatten();
@@ -8586,6 +9191,9 @@ impl Inner {
                     ws.extend(hv.version.parents.iter().map(|(y, _)| y.clone()));
                 }
                 ws.extend(coll.locked.iter().map(|l| l.writer.clone()));
+                if let Some(d) = &coll.dormant {
+                    ws.extend(d.parents.iter().cloned());
+                }
                 (c.clone(), ws)
             })
             .collect();
@@ -8647,6 +9255,21 @@ impl Inner {
     /// Withdraw every held log entry whose key the trust context governing
     /// it revokes and whose cut does not accept it ([`Self::withdraw`]).
     fn withdraw_revoked(&self, st: &mut St) {
+        // A collection not built yet holding a revoked key's versions is
+        // built first: its versions are judged here as held ones are.
+        let revoked: Vec<Name> = st
+            .colls
+            .iter()
+            .filter(|(_, x)| {
+                x.dormant
+                    .as_ref()
+                    .is_some_and(|d| d.held.keys().any(|w| x.revoked.contains_key(w)))
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        for c in revoked {
+            st.awaken(&c);
+        }
         let mut found: Vec<(Name, Writer, [u8; 32], Refusal)> = Vec::new();
         for coll in st.colls.values() {
             let versions = coll
@@ -10236,7 +10859,11 @@ impl Inner {
                             })
                     }
                     Counting::NotCounted(why) => {
-                        (coll.not_counted.get(&other) != Some(&why)).then(|| {
+                        let inside = coll
+                            .covered
+                            .get(&other.writer)
+                            .is_some_and(|s| *s >= other.seq.0);
+                        (!inside && coll.not_counted.get(&other) != Some(&why)).then(|| {
                             coll.not_counted.insert(other.clone(), why.clone());
                             Change::NotCounted {
                                 collection: c.clone(),
@@ -10248,6 +10875,35 @@ impl Inner {
                 };
                 if let Some(change) = change.filter(|_| group.is_none()) {
                     told.push((change, other));
+                }
+            }
+            // An own checkpoint covers its past as any does (spec §5.2):
+            // what it covers counts as it counts.
+            if kind == OpKind::Checkpoint {
+                for (w, s) in past_frontier(&version).iter() {
+                    let x = coll.covered.entry(w.clone()).or_insert(0);
+                    *x = (*x).max(s.0);
+                }
+                let inside: Vec<VersionId> = coll
+                    .not_counted
+                    .keys()
+                    .filter(|o| coll.covered.get(&o.writer).is_some_and(|s| *s >= o.seq.0))
+                    .cloned()
+                    .collect();
+                for other in inside {
+                    coll.not_counted.remove(&other);
+                    match coll.versions.get(&other).and_then(|hv| hv.version.group) {
+                        Some(g) => {
+                            touched.insert((other.writer.clone(), g.id));
+                        }
+                        None => told.push((
+                            Change::Counted {
+                                collection: c.clone(),
+                                id: other.clone(),
+                            },
+                            other,
+                        )),
+                    }
                 }
             }
         }
@@ -10768,10 +11424,17 @@ impl Inner {
                 let quarantined = version != *name && st.quarantine.contains(&version);
                 return (!quarantined).then(|| self.store.get(name)).flatten();
             }
+            // Of a collection not built yet, what the store holds of it was
+            // applied (and not refused since).
+            let applied = |coll: &Coll, id: &VersionId| {
+                coll.applies(id)
+                    || (coll.dormant.as_ref().is_some_and(|d| d.holds(id))
+                        && !st.cut_out.contains_key(&version))
+            };
             let held = parsed.subject.as_ref().is_some_and(|c| {
                 st.holding.contains_key(c)
                     || matches!(st.held.get(&version), Some(Held::Version(id))
-                        if st.colls.get(c).is_some_and(|coll| coll.applies(id)))
+                        if st.colls.get(c).is_some_and(|coll| applied(coll, id)))
             });
             return held.then(|| self.store.get(name)).flatten();
         }
@@ -13840,7 +14503,9 @@ fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) 
     }
 }
 
-/// The packet of the log entry `name` held here, opened or sealed.
+/// The packet of the log entry `name` held here, opened or sealed — parked
+/// in the store while its group waits, or in a collection not built yet,
+/// read from the store.
 fn held_wire(st: &St, name: &Name) -> Option<Bytes> {
     let coll = st.colls.get(&parse_log_name(name)?.subject?)?;
     coll.versions
@@ -13854,6 +14519,16 @@ fn held_wire(st: &St, name: &Name) -> Option<Bytes> {
                 .iter()
                 .find(|l| l.name == *name)
                 .map(|l| l.wire.clone())
+        })
+        .or_else(|| {
+            coll.parked.values().find(|p| p.name == *name)?;
+            st.store.get(&parked_name(name))
+        })
+        .or_else(|| {
+            coll.dormant.as_ref()?;
+            matches!(st.held.get(name), Some(Held::Version(_) | Held::Locked))
+                .then(|| st.store.get(name))
+                .flatten()
         })
 }
 
@@ -14434,6 +15109,15 @@ impl Device {
 impl DataLayer for Device {
     async fn get(&self, name: &Name) -> Result<Answer, DataError> {
         let inner = &self.inner;
+        // A version or entry of a merge collection whose state is not built
+        // yet is read from it: built now (spec §5.2). A collection or state
+        // name is followed, which builds it ([`Inner::follow`]).
+        let of = parse_entry_name(name)
+            .and_then(|(v, _)| parse_log_name(&v)?.subject)
+            .or_else(|| parse_log_name(name)?.subject);
+        if let Some(c) = of {
+            inner.st.lock().awaken(&c);
+        }
         if let Some((c, at)) = parse_state_name(name) {
             inner.look(&c).await?;
             let rules = inner.config.rules.clone();
@@ -14555,6 +15239,27 @@ impl DataLayer for Device {
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
             let mut st = inner.st.lock();
+            // A collection under the target not built yet is built only if
+            // it holds a version past `since` — one to list; the rest stay
+            // unbuilt until something else needs them (spec §5.2, §15):
+            // what arrives later builds its collection as it applies.
+            let past_since: Vec<Name> = st
+                .colls
+                .iter()
+                .filter(|(c, x)| {
+                    c.has_prefix(collection)
+                        && x.dormant.as_ref().is_some_and(|d| {
+                            d.held.iter().any(|(w, seqs)| {
+                                seqs.last()
+                                    .is_some_and(|top| since.get(w).is_none_or(|s| s.0 < *top))
+                            })
+                        })
+                })
+                .map(|(c, _)| c.clone())
+                .collect();
+            for c in past_since {
+                st.awaken(&c);
+            }
             // Each collection under the target, in order: what it holds
             // applied, each with why when it does not count (its rule's
             // reason, or its group's), and the group members waiting for
@@ -18929,5 +19634,8 @@ mod durability_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod watch_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lazy_tests;
 
 mod intro;
