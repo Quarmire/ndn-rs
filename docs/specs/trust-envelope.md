@@ -2,13 +2,14 @@
 
 > **Status:** Draft.
 > **Scope:** the out-of-band container that hands NDN trust material to a device outside NDN:
-> by QR code, deep link, clipboard paste or file. It covers the six envelope kinds, the
+> by QR code, deep link, clipboard paste or file. It covers the seven envelope kinds, the
 > TLV encoding (types `0x0470`–`0x048F`), the text forms (the `ndn-trust://` URI, the `https`
 > mirror and the legacy `ndn-ctx:1:` form), base64url, QR parameters and size limits, the
-> file and paste forms, and the checks a parser runs. Most payloads are opaque at this layer:
+> file and paste forms, the words form, and the checks a parser runs. Most payloads are opaque at this layer:
 > trust contexts, certificates, SafeBags and delegations are specified elsewhere.
 > **Reference implementation:** `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs`
-> (codec). Consumers: `ndn-rs/crates/security/ndn-cert` (anchor and invite links, file kits)
+> (codec). Consumers: `ndn-rs/crates/security/ndn-cert` (anchor and invite links, file kits),
+> `ndn-rs/crates/app/ndn-data` (introduction codes, `Device::join`)
 > and `ndn-mobile/crates/ndn-boltffi/src/trust.rs` (mobile parser). For file:line references
 > see [Appendix A](#appendix-a-code-references-non-normative).
 
@@ -25,6 +26,7 @@ Related specs:
 - [recovery-kit.md](recovery-kit.md): the file recovery kit, which is a `bag` envelope.
 - [ndn-link.md](ndn-link.md): links. A device usually needs one before it can fetch a context
   that an envelope only points to.
+- [data-layer.md](data-layer.md) §19: the introduction an `intro` envelope carries the code of.
 - [local-refusal.md](local-refusal.md): refusals a device may see while adopting.
 - The design and flows (F1 create, F2 add a device, F7/F8 recovery kit, F9 share) are in
   [personal-namespace.md](personal-namespace.md).
@@ -33,8 +35,8 @@ Related specs:
 
 - **Envelope**: one encoded value of this spec. It is a single TLV element of type
   `0x0470` (§4), or one of the text forms of that element (§5).
-- **Kind**: what the envelope transfers: `anchor`, `invite`, `delegation`, `recovery`, `bag`
-  or `capability` (§3).
+- **Kind**: what the envelope transfers: `anchor`, `invite`, `delegation`, `recovery`, `bag`,
+  `capability` or `intro` (§3).
 - **Namespace**: an NDN name prefix `/<ns>` owned by one root key. A **root device** holds
   that key.
 - **Trust context**: the root-signed Data `/<ns>/32=trust-context/v=<N>`. It lists the
@@ -80,9 +82,10 @@ in a URI is a routing hint that MUST match the `Kind` TLV (§5.2); the TLV is au
 | `recovery` | `4` | in | A recovery bundle (public history, no private keys) | restore (mobile) |
 | `bag` | `5` | in | A password-encrypted SafeBag and its key name; for a recovery kit also the namespace and expected fingerprint | key migration; file recovery kit (F7, F8) |
 | `capability` | `6` | out | A scoped, expiring capability request or grant | pairing (F9) |
+| `intro` | `7` | in | The inviter's namespace and expected fingerprint, a one-use offer's name and secret, relay hints | join a folder by a code ([data-layer.md](data-layer.md) §19) |
 
 The kind token is the lowercase ASCII string in the first column. The code is the one-byte
-value of the `Kind` TLV (§4.2). Codes `0` and `7`–`255` are unassigned. A parser MUST reject
+value of the `Kind` TLV (§4.2). Codes `0` and `8`–`255` are unassigned. A parser MUST reject
 an unassigned code (§6.2).
 
 ## 4. TLV encoding
@@ -110,7 +113,10 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0472` | Kind | in Envelope | 1 byte: kind code (§3) | all |
 | `0x0473` | Body | in Envelope | nested: the body fields below | all |
 | `0x0474` | DeviceName | in Body | UTF-8 device name (one name component) | invite (optional): the device name the inviter suggests, a hint and not a constraint. Even type, so a reader that does not know it skips it. |
-| `0x0475`–`0x0480` | — | — | unassigned | — |
+| `0x0475` | Offer | in Body | NDN name string: the offer record's name, `<D>/32=log/<F>/seq=<n>` | intro |
+| `0x0476` | RelayHint | in Body, repeatable | NDN name string: the device name of a relay that reaches the inviter | intro (optional) |
+| `0x0477` | Secret | in Body | exactly 16 bytes: the offer's secret | intro |
+| `0x0478`–`0x0480` | — | — | unassigned | — |
 | `0x0481` | Version | in Body | u64 (§4.4) | anchor: context version |
 | `0x0482` | Wire | in Body | opaque bytes | anchor: legacy unsigned context Content; delegation: signed delegation; recovery: bundle; bag: SafeBag |
 | `0x0483` | CaPrefix | in Body | NDN name string (§4.4) | invite |
@@ -119,12 +125,12 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0486` | TtlSecs | in Body | u64 | invite (optional), capability (required) |
 | `0x0487` | PrincipalPubkey | in Body | opaque bytes | delegation |
 | `0x0488` | KeyName | in Body | NDN name string | bag |
-| `0x0489` | Namespace | in Body | NDN name string | anchor, bag, capability |
+| `0x0489` | Namespace | in Body | NDN name string | anchor, bag, capability, intro |
 | `0x048A` | ScopePattern | in Body, repeatable | UTF-8 string | capability |
 | `0x048B` | Nonce | in Body | opaque bytes | capability |
 | `0x048C` | Grant | in Body | opaque bytes (NDN Data wire of a certificate) | capability |
 | `0x048D` | Direction | in Body | 1 byte: `00` request, `01` grant | capability |
-| `0x048E` | AnchorFingerprint | in Body | exactly 32 bytes | anchor, invite, bag |
+| `0x048E` | AnchorFingerprint | in Body | exactly 32 bytes | anchor, invite, bag, intro |
 | `0x048F` | ContextData | in Body | full NDN Data wire of the signed trust context | anchor |
 
 ### 4.3 Structure and canonical order
@@ -149,6 +155,7 @@ and `*` a field that repeats zero or more times.
 | recovery | Wire |
 | bag | KeyName, Wire, Namespace?, AnchorFingerprint? |
 | capability | Direction, Namespace, ScopePattern*, TtlSecs, Nonce?, Grant? |
+| intro | Namespace?, AnchorFingerprint, Offer, Secret, RelayHint* |
 
 Further producer rules:
 - **anchor.** A producer MUST include at least one of AnchorFingerprint, ContextData or Wire.
@@ -160,8 +167,11 @@ Further producer rules:
   - A request MUST carry a Nonce of 16 bytes (`CAPABILITY_NONCE_LEN`) from a
     cryptographically secure RNG, fresh for every request.
   - A grant SHOULD carry the Nonce of the request it answers.
+- **intro.** A producer SHOULD include Namespace. The Secret is 16 bytes from a
+  cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). RelayHint elements
+  keep their order: the relays the inviter's trust context advertises, in its order.
 - **No other fields.** A producer MUST NOT emit fields not listed for the kind, and MUST NOT
-  emit a field twice, ScopePattern excepted.
+  emit a field twice, ScopePattern and RelayHint excepted.
 
 ### 4.4 Value encodings
 
@@ -170,7 +180,7 @@ Further producer rules:
     `2` is `00 00 00 00 00 00 00 02`.
   - A parser MUST accept any length from 1 to 8 bytes, left-padded with zeros. It MUST reject
     length 0 and lengths above 8.
-- **NDN name string (CaPrefix, IdentityNamespace, KeyName, Namespace).** The UTF-8 NDN URI
+- **NDN name string (CaPrefix, IdentityNamespace, KeyName, Namespace, Offer, RelayHint).** The UTF-8 NDN URI
   form of a Name, for example `/home/bob`. The envelope layer only requires valid UTF-8.
   Consumers parse the string as an NDN URI (§7) and compare Names, never strings.
   - A producer MUST emit the canonical URI form: the string ndn-rs `Name` displays for the
@@ -203,6 +213,8 @@ Further producer rules:
 - **PrincipalPubkey.** The principal's public key bytes as returned by the signer, opaque here.
 - **Grant.** The granting operator's certificate as NDN Data wire.
 - **Nonce.** Opaque bytes chosen by the requester: 16 fresh random bytes in a request (§4.3).
+- **Secret.** Exactly 16 bytes, the whole of what makes an `intro` code worth stealing. A
+  parser and its debug output MUST NOT log or display it.
 - **TtlSecs, capability.** A lifetime in seconds, counted from when the consumer decodes the
   envelope. The envelope carries no issuance time. The consumer MUST treat it as a ceiling: it
   does not act on the capability, or keep what it granted, past that time.
@@ -228,6 +240,7 @@ Emitted forms:
 trust-uri     = "ndn-trust://" kind-token "/" payload
 mirror-url    = "https://" domain "/t/" kind-token "#" payload
 kind-token    = "anchor" / "invite" / "delegation" / "recovery" / "bag" / "capability"
+              / "intro"
 payload       = b64url                         ; base64url(Envelope TLV), §5.1
 domain        = 1*( ALPHA / DIGIT / "-" / "." ) [ ":" 1*DIGIT ] ; issuer's host, optional port
 b64url        = *( 4b64 ) [ b64 b64-tail2 / 2b64 b64-tail3 ]
@@ -328,8 +341,14 @@ Producer rules:
   - no ContextData and no Wire.
 
   The consumer then fetches the context by name. That needs a link and a route to a node
-  that serves the context ([ndn-link.md](ndn-link.md)). Other kinds have no fallback: the
-  producer refuses to render them.
+  that serves the context ([ndn-link.md](ndn-link.md)).
+- **Long introductions.** If the `trust-uri` of an `intro` exceeds the limit, the producer
+  MUST drop RelayHint elements from the end, keeping the longest prefix of them that fits
+  (`TrustEnvelope::qr_uri`); Namespace, AnchorFingerprint, Offer and Secret are never dropped.
+  A joiner without hints reaches the inviter through its own namespace's relays
+  ([data-layer.md](data-layer.md) §19.3).
+- Other kinds have no fallback: the producer refuses to render them, as it refuses an
+  `intro` that does not fit without relay hints.
 
 Parser rules: a parser MUST accept any version, error-correction level and mode a standard
 decoder produces.
@@ -379,6 +398,21 @@ Typical sizes:
   Surrounding whitespace is ignored.
 - **NFC.** The `trust-uri` text. The NDEF record type is not specified (§10, Q13).
 
+### 5.8 Words
+
+Thirty-two octets are shown as 24 words of the BIP39 English list (`ndn_trust_envelope::words`):
+the octets are BIP39 entropy, the last word carrying its 8-bit checksum, so a word off the list
+is refused by its position and a mistyped or swapped word by the checksum. Case and spacing do
+not matter on reading. A recovery kit's seed uses this codec ([recovery-kit.md](recovery-kit.md)).
+
+An `intro` envelope has a **words form** too, for reading out or typing: its Offer (the NDN URI,
+starting with `/`), one space, then the 24 words of Secret ‖ the first 16 octets of
+AnchorFingerprint (`Introduction::to_words`, `IntroWords::parse`). It carries no Namespace and
+no RelayHint, and half the fingerprint: a consumer matches the first 16 octets of the anchor
+fingerprint it is shown against them (128 bits of second-preimage resistance). It is not an
+envelope: a parser of the forms of §5.2 refuses it, and a consumer that takes a code reads a
+text starting with `/` as words.
+
 ## 6. Decoding and validation
 
 A parser MUST behave as follows. The error names are the reference implementation's. A parser
@@ -413,7 +447,7 @@ types.
      format is refused as such and not by one of its new children.
    - An unrecognized critical child: UnknownCritical(type).
    - Kind absent: MissingField("kind").
-   - Kind not in 1–6: UnknownKind.
+   - Kind not in 1–7: UnknownKind.
    - Body absent: MissingField("body").
 
 ### 6.3 Body fields
@@ -423,12 +457,13 @@ The body is decoded in two passes.
 **Pass 1** reads every body field in wire order. Any malformed field gives Truncated. A field
 that the Kind defines (§4.3) is validated as it is read, and the first failure is returned:
 - Version, TtlSecs: 1–8 bytes, else Malformed("u64 field length").
-- CaPrefix, IdentityNamespace, Token, KeyName, Namespace, ScopePattern: valid UTF-8, else
-  Malformed("non-utf8 string field").
+- CaPrefix, IdentityNamespace, Token, KeyName, Namespace, ScopePattern, Offer, RelayHint: valid
+  UTF-8, else Malformed("non-utf8 string field").
 - AnchorFingerprint: exactly 32 bytes, else Malformed("anchor fingerprint length").
 - Direction: exactly 1 byte, else Malformed("capability direction length").
-- A second occurrence of any field but ScopePattern: Malformed("repeated field").
-  ScopePattern accumulates in order.
+- Secret: exactly 16 bytes, else Malformed("introduction secret length").
+- A second occurrence of any field but ScopePattern and RelayHint: Malformed("repeated field").
+  ScopePattern and RelayHint accumulate in order.
 
 A field that the Kind does not define is unrecognized, whether its type is unassigned or
 defined for another kind (evolvability rule). For example:
@@ -445,6 +480,7 @@ defined for another kind (evolvability rule). For example:
 | recovery | Wire present (may be empty) | MissingField("recovery bundle") |
 | bag | KeyName, Wire present | MissingField("key name" / "safebag") |
 | capability | Direction present and `00` or `01`; Namespace, TtlSecs present | MissingField("direction") / Malformed("capability direction") / MissingField("capability namespace" / "capability ttl") |
+| intro | AnchorFingerprint, Offer, Secret present | MissingField("anchor fingerprint" / "offer" / "secret") |
 
 An `anchor` that carries both ContextData and Wire decodes with both fields set. Consumers
 use ContextData (§7.1).
@@ -527,6 +563,24 @@ The envelope layer adds no checks for these kinds:
 - `recovery`: the bundle is consumed by the restore flow.
 
 These payload formats are outside this spec (§10, Q14).
+
+### 7.5 `intro` (join a folder by a code)
+
+`ndn_data::Device::join` applies the following, then the exchange of
+[data-layer.md](data-layer.md) §19.3:
+
+1. Offer MUST parse as an NDN Name that is a data-layer log entry of a folder,
+   `<D>/32=log/<F>/seq=<n>`; `D` is the device it asks. An offer of the joiner's own namespace
+   is refused.
+2. Namespace, when present, MUST parse as a Name; the inviter's trust context the answer
+   carries MUST root exactly it, and in any case a prefix of `D`.
+3. AnchorFingerprint is the expected fingerprint: the inviter's context MUST be signed by an
+   anchor whose fingerprint equals it (in the words form, whose first 16 octets equal the 16
+   given, §5.8). The consumer adopts that context through its host only once the answer proves
+   the Secret and is signed by `D` under that anchor.
+4. Secret is used only to derive the offer's proof key; it is never sent, logged or kept.
+5. RelayHint elements are reachability hints: the joiner's Interests carry them as their
+   ForwardingHint, and nothing they say is trusted.
 
 ## 8. Test vectors
 

@@ -23,7 +23,7 @@ define the bytes on the wire:
 
 | Spec | Covers |
 |---|---|
-| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals and types and the seven verbs; slices 1–6 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, seals, large payloads, custody leases and audits, prune; signed blocks, the one-key rule's head and freshness bound, retention by expiry with summary keep bounds, range reads; revocation cuts; merge rules by versioned name, operations the application builds, checkpoints, merge pieces, groups of versions, folder members records; TLV 0x0520–0x057F), later slices skeleton |
+| [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, snapshots, custody, prune, seals and types and the seven verbs; slices 1–6 normative (versions, members, merge rule `/merge/yrs`, nested summaries, snapshots, sync notice, seals, large payloads, custody leases and audits, prune; signed blocks, the one-key rule's head and freshness bound, retention by expiry with summary keep bounds, range reads; revocation cuts; merge rules by versioned name, operations the application builds, checkpoints, merge pieces, groups of versions, folder members records, introductions (joining a folder by a code); TLV 0x0520–0x057F), later slices skeleton |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
 | [ndnsf-invariants.md](ndnsf-invariants.md) | NDNSF security-invariant witnesses |
@@ -48,7 +48,7 @@ here before using it.
 | 0x0403–0x040F | free (left below the trust-context block) |
 | 0x0410–0x042F | [trust-context.md](trust-context.md) |
 | 0x0440–0x046C | [ndn-link.md](ndn-link.md) (hello/verdict, punch) |
-| 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) |
+| 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) (the `intro` kind's offer, relay hint and secret: 0x0475–0x0477) |
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
 | 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
-| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553; slice 6's folder flag of a members record, a version's group and its count, 0x0555–0x0559, and a folder cut's list per collection (CutIn), 0x055F; slice 6 reuses, in a version record, FrontierEntry 0x0524 with Digest 0x055E — each parent bound to its tip's packet — and Rule 0x0548, the merge rule an operation was made for) |
+| 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553; slice 6's folder flag of a members record, a version's group and its count, 0x0555–0x0559, and a folder cut's list per collection (CutIn), 0x055F; slice 6 reuses, in a version record, FrontierEntry 0x0524 with Digest 0x055E — each parent bound to its tip's packet — and Rule 0x0548, the merge rule an operation was made for; the introduction's offer and use-mark records, ask, answer, role, tries, refusal and credentials, 0x0561–0x056F, §19) |

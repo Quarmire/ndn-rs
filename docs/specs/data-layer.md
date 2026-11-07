@@ -7,8 +7,9 @@
   checkpoints covering by frontier, pieces in merge collections and the
   release of merge pieces only on an audited covering checkpoint, groups
   of versions counted all or none, folder members records narrowing every
-  collection under a folder with one seal epoch per folder epoch, §5.1,
-  §5.2, §5.5, §6.1, §6.2, §9, §13, §15, §16); slice 5: a revoked key's versions kept
+  collection under a folder with one seal epoch per folder epoch, and
+  joining a folder by a code (introductions, §19), §5.1,
+  §5.2, §5.5, §6.1, §6.2, §9, §13, §15, §16, §19); slice 5: a revoked key's versions kept
   exactly where the root's revocation cut in the trust context accepts
   them, the cut bounded by when the owner says the key was lost and bound
   to the key and to each version's bytes, Data judged without clocks or
@@ -2643,7 +2644,10 @@ With blocks, heads and expiry:
 gesture. A function's answer is a `get` on its name (a later slice).
 Exposure over forwarder management and the mobile FFI is slice 7. A device
 answers a verb or option of a later slice with an error that names the
-slice.
+slice. Beside the verbs, a `Device` makes and takes introductions (§19):
+`offer(folder, {role, until, tries}) → code` on an owner device, and
+`join(code) → {folder, role, inviter}` on the joiner's; the joiner then
+uses the folder with the verbs as any member.
 
 - **`get(C)`** of a merge collection answers its state now — `State` with a
   state name, `at`, the value (typed by the rule, §5.1) and `not_counted`:
@@ -2831,9 +2835,11 @@ both from the NDN naming conventions.
 | chunk of version `V` | `<V>/seg=<i>` | DigestSha256 |
 | manifest node of `V` | `<V>/32=manifest/seg=<k>`, Content `Digest*` | DigestSha256 |
 | hold ask (answer: the lease's packet) | `<H>/32=hold/<HoldAsk TLV>` | DigestSha256 |
-| held packet (answer: the packet) | `<H>/32=held/<Name TLV>` | DigestSha256 |
+| held packet (answer: the packet) | `<H>/32=held/<Name TLV>` (also a joiner's fetch of an offer from its device, §19.3) | DigestSha256 |
 | audit ask and answer | `<H>/32=audit/<AuditAsk TLV>`, Content `AuditAnswer`, FreshnessPeriod 0 | the holder's device key |
-| asker's proof (inside a hold or audit ask, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
+| asker's proof (inside a hold, audit or introduction ask or answer, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
+| offer, use mark (§19.1) | `<D>/32=log/<F>/seq=<n>` | device key |
+| introduction ask and answer (§19) | `<D>/32=intro/<IntroAsk TLV>`, Content `IntroAnswer` | DigestSha256 (the answer carries the offering device's proof inside) |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
 from the node, one octet (0–15) each. Log entries are named after the
@@ -2884,7 +2890,13 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Asker's proof.** `A` is the components before the first `32=ask`, a
   device name; one GenericNameComponent of 32 octets follows, the binding:
   SHA-256 of the holder's Name TLV followed by the ask's TLV without its
-  `Asker` (§13.2).
+  `Asker` (§13.2); in an introduction, of the offering device's Name TLV
+  followed by the ask's fields before its `Asker`, or of the answer's
+  fields before its `Asker` (§19.3).
+- **Introduction ask.** `D` is the components before the first
+  `32=intro`, a device name; exactly one GenericNameComponent follows
+  whose value is one `IntroAsk` TLV: one `EphemeralKey` and two
+  `Ciphertext`, the wrapped content key, then the sealed `AskBody`.
 
 ### 16.2 TLV-TYPE numbers
 
@@ -2974,6 +2986,14 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0557 | Group | Seq (the group's id: the seq of its first version), GroupCount; in a VersionRecord right after Dated (§5.5) |
 | 0x0559 | GroupCount | NonNegativeInteger 1–1024 (`GROUP_MAX`): the number of versions in the group |
 | 0x055F | CutIn | Name (a collection strictly under the folder), then per key it keeps versions of in that collection, by key: Writer, Entries (exactly those seqs); in a folder record's Cut only, once per collection (§6.1, §8) |
+| 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
+| 0x0563 | IntroUsed | Name (the offer), then Writer and Digest (the asker key it was used by and its public key's digest) when used, neither when closed; a log record (§19.1) |
+| 0x0565 | IntroAsk | EphemeralKey, Ciphertext (a content key wrapped to the offer's SealKey), Ciphertext (the AskBody — Name (offer), Nonce, Proof, Credentials, Asker — sealed under it); in an ask's name only (§19.3) |
+| 0x0567 | IntroAnswer | Name (offer), Writer (the asker key), Digest (its public key's digest), then Name (folder), Role, Credentials, Asker (the offering device's proof), Proof — or IntroRefused, with no Proof; an answer's Content (§19.3, §19.4) |
+| 0x0569 | Role | NonNegativeInteger: 0 reader, 1 writer |
+| 0x056B | Tries | NonNegativeInteger: in an offer, the wrong tries that close it (≥ 1); in a refusal, those left |
+| 0x056D | IntroRefused | NonNegativeInteger: 1 unknown, 2 used, 3 expired, 4 closed, 5 wrong proof (then Tries, left), 6 conflict |
+| 0x056F | Credentials | octets: whole Data packets, a signed trust context then the certificates of its signer key's chain to that context's anchor, at most 8 |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
@@ -3008,6 +3028,18 @@ passing over `CutIn` would read a folder cut as accepting nothing, and
 withdraw every version it kept — wrong, not stale; one reading its seqs
 as valid in every collection would admit a removed writer's re-signed
 seqs.
+
+The introduction's numbers (§19) are odd for the same reasons: a reader
+passing over `IntroOffer` or `IntroUsed` would take a record of the log
+for nothing and could not say whether an offer is used; one passing over
+`Role` would admit a reader as a writer, or `Tries` close an offer at the
+wrong count; one passing over `IntroRefused` would read a refusal as an
+admission without its fields; `IntroAsk`, `IntroAnswer` and `Credentials`
+are read only by a device that implements §19. In them `Proof` (0x053F)
+is an HMAC-SHA256 and `Asker` (0x053B) the signer's proof packet; `Nonce`,
+`Ciphertext`, `EphemeralKey`, `SealKey`, `KeepUntil`, `Writer` and
+`Digest` are reused as elsewhere.
+
 Refusing them, an older reader drops such a record as one it cannot decode
 and waits (§4): stale, until it is updated. The one residual is a
 collection whose own record such a reader holds: it applies that record
@@ -3275,6 +3307,16 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Version listed by a watch while it waits (for an earlier version, its group, its key, its pieces) | Not listed: it comes once it applies, so no watch is handed a version twice; a group member waiting is listed `NotCounted` with why. | §15 |
 | Folder watch resumed from a frontier joined across its collections | May skip a version of another collection still to come: a writer's versions come in seq order within a collection only. A host resumes a whole folder from the empty frontier (the listing is local) or each collection from its own frontier. | §15 |
 | Reader that predates slice 6 | Refuses folder records and group members (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
+| Code stolen or forwarded | Admits whoever presents it first within its expiry, with its role; then one key only: every other is refused `Used` and gains nothing; the owner sees and removes the joiner as any member. | §19.4, §19.7 |
+| Ask replayed | Answered from the answer kept for it, bound to the asker's key: admits nobody new. | §19.4, §19.7 |
+| Ask without the secret, or guessing | Refused `WrongProof`, counted durably; at the offer's tries it closes for good, even to the right secret, across restarts. | §19.4 |
+| Two keys present one code at once | Asks are judged one at a time: exactly one is admitted, the other refused `Used`. | §19.4 |
+| Inviter offline or unreachable | `NotReady` (`RetryLater`); nothing is used or counted; the offer waits until its expiry. | §19.3 |
+| Inviter's device loses power while answering | The use mark, a counted try and a closing mark are durable before any answer says so; a retry by the same key is answered again. | §4.2, §19.4 |
+| Party answering for the inviter | Fails the secret's proof or the anchor the code names: `Forged`, nothing adopted; a forged refusal only denies. | §19.3, §19.7 |
+| Asker claims a namespace the inviter knows under another anchor, or overlapping the inviter's | Refused `Conflict`; nothing adopted. | §19.4 |
+| Offer asked of another device of the inviter | `Unknown`: only the offering device holds its proof key; its use mark is seen by every device of the inviter. | §19.7 |
+| Lying relay hint | Fails to reach; nothing it says is trusted. | §19.7 |
 
 ## 18. Conformance
 
@@ -3442,3 +3484,268 @@ serves a different entry or root at a name a peer was served) is in
 `ndn-data`'s `device/durability_tests.rs`, with the in-process checks that
 nothing is served, listed or announced before its flush returns and that
 each store instance has its own barrier.
+
+The introduction cases (§19) are run among strangers — each device's
+forwarder holds its own person's trust context and certificates only,
+until an introduction adopts another's: i1 (Alice offers her notebook
+folder as a writer; Bob, given only the code's link, joins, and each then
+reads what the other writes, with no further gesture; Carol joins a second
+offer by its words as a reader, reads, and her own write is refused
+`NotAllowed`; the time from code to member is measured), i2 (a used code:
+another key presenting it, as a link or as words, is refused `Used`
+(`AskOwner`) and reads nothing; the key that used it, asking again, is
+answered again), i3 (a code past its expiry by the offering device's
+clock is refused `Expired`; a new code admits), i4 (an offer closing at
+two wrong tries: the first is refused `WrongProof` with one left
+(`FixRequest`); the offering device restarts; the second is refused
+`Closed`, and so is the right code afterwards — the count survived the
+restart), i5 (two keys presenting one code at once: exactly one is
+admitted, the other refused `Used`, also when it asks again, and only the
+admitted one reads), i6 (an ask with a guessed secret is refused
+`WrongProof`, counted, and grants nothing; the real code, within its
+tries, still admits) and i7 (the offering device offline: the join is
+refused `NotReady` (`RetryLater`) and spends nothing; once it is back the
+same code admits, and each reads what the other writes). Their feature is
+`Introduction`. `ndn-data`'s `intro.rs` unit tests check the records, asks
+and answers round-trip, that malformed ones are refused, and that each
+proof binds every field it covers (another offer, key, digest, nonce or
+secret fails it).
+
+## 19. Introductions — slice 6
+
+A stranger who holds only a code joins a folder: no second gesture by the
+owner, no prior trust either way. The owner's device makes a one-use
+**offer** and shows its **code**; the joiner's device sends an **ask**
+sealed to the offering device, proving the code's secret bound to its own
+key; the offering device **answers**, admitting the asker into the
+folder's members record, and each side's host adopts the other's anchor.
+Records are log entries (§4); the ask and the answer are packets named
+under the offering device (§16.1).
+
+### 19.1 Records
+
+An **offer** (`IntroOffer`) is an entry in the offering device's log about
+the folder `F` it offers, `<D>/32=log/<F>/seq=<n>` — the offer's name. It
+carries `F`; the `Role` it grants (0 reader, 1 writer); its expiry
+(`KeepUntil`, judged by the offering device's clock); `Tries`, the number
+of wrong tries that close it (at least 1); the commitment to its secret
+(`Digest`, §19.6); and the offering device's `SealKey` (§9), to which asks
+are sealed. `F` MUST be a folder of the offering device's namespace (the
+device signs its members records, §6). Nothing secret is in it: the
+secret is in the code only.
+
+A **use mark** (`IntroUsed`) is an entry in the offering device's log
+about the same folder naming the offer and either the key the offer was
+used by and its public key's digest (`Writer`, `Digest`) — the offer is
+used — or neither — the offer is closed after its wrong tries. The first
+mark of an offer stands; a device signs no second one. Only the offering
+device marks its offer: a reader takes an offer or a mark only when a
+device of the folder's own namespace signed it, and a mark only when the
+device that signed it is the offer's.
+
+The offering device keeps the offer's proof key (§19.6) in its store,
+wrapped to its own recipient key (§9) under a local name no device serves,
+and the count of wrong tries under another; it keeps no secret.
+
+### 19.2 Offering
+
+`offer(F, {role, until, tries})` on a device of `F`'s namespace whose
+members record of `F` is held:
+
+1. MUST refuse `F` of another namespace (`NotOwner`), `tries` = 0 or an
+   expiry already past by its clock (`BadRequest`), a folder without a
+   held members record (`BadRequest`: share it first), and a host without
+   an introducer (`Local`, naming the setting).
+2. Draws a fresh 16-octet secret from the device's entropy, wraps the
+   proof key into its store, signs the offer into its log.
+3. Returns the code only once the offer and the wrapped proof key are
+   durable (§4.2): before, a power loss could take the record and give its
+   seq to another.
+
+The **code** is a trust-envelope `intro` link
+([trust-envelope.md](trust-envelope.md)): the inviter's namespace, its
+anchor fingerprint (SHA-256 of its root anchor's public key), the offer's
+name, the secret, and as many relay hints — the relays the inviter's trust
+context advertises, by device name — as keep the link within one QR code;
+the secret, the offer and the fingerprint are never dropped. The same code
+as **words**: the offer's name, then 24 BIP39 English words encoding the
+secret followed by the fingerprint's first 16 octets (its checksum catches
+a mistyped word).
+
+### 19.3 Joining
+
+`join(code)`, the link (or its https mirror) or the words:
+
+1. Fetches the offer as `<D>/32=held/<offer>` (§16.1; DigestSha256, so the
+   joiner's forwarder needs no trust of the inviter), `D` the offer name's
+   device. No answer after its retries: `NotReady` (`RetryLater`): the
+   inviter is offline or unreachable, and the offer waits until its
+   expiry. A held packet that is not the offer's record: `Unknown`.
+2. Sends the ask `<D>/32=intro/<IntroAsk>`: `AskBody` — the offer, a fresh
+   nonce, the ask proof (§19.6) bound to its own key and its digest, its
+   credentials (its namespace's signed trust context, as its host gives
+   it, then its key's certificates up to that context's anchor) and its
+   proof packet `<J>/32=ask/<binding>` signed by its key, the binding
+   SHA-256 of `D`'s Name TLV and the body's fields before it — sealed:
+   a fresh content key wrapped to the offer's `SealKey` and the body sealed
+   under it, both binding `<D>/32=intro` (its Name TLV) as associated data
+   (§9's primitives). Before sending, the joiner checks that its own
+   credentials verify its proof packet (else `Local`: its enrollment is
+   broken). It sends the same Interest again on no answer, then answers
+   `NotReady` as in 1.
+3. Takes the answer, a DigestSha256 Data of the ask's name whose Content is
+   an `IntroAnswer`. A refusal is reported as it is (§19.5). An acceptance
+   MUST pass every check, else the join answers `Forged` (`RetryLater`) and
+   adopts nothing: it names the offer, this device's key and its digest;
+   its `Proof` verifies under the proof key the code's secret yields; its
+   credentials open (§19.4, step 5) to a context whose anchor fingerprint
+   is the code's (whole, or its first half for words), whose namespace is
+   the code's (when it names one) and a prefix of `D`; the inviter's proof
+   packet `<D>/32=ask/<binding>`, the binding SHA-256 of the answer's
+   fields before it, and the offer record are both signed by a key of `D`
+   that chains to that anchor through those certificates; the offer's
+   commitment is the code's secret's; the folder and role are the offer's.
+4. Has its host adopt the inviter's anchor (an inline anchor link of the
+   context the answer carried, `Introducer::adopt`); a refusal is `Local`
+   (fix the host and join again with the same code: the same key asking
+   again is answered again). Takes the inviter's certificates into its
+   validator, follows `F` (§15, `watch`'s first look), and returns the
+   folder, the role and the inviter's namespace.
+
+The joiner's Interests carry a ForwardingHint: the relays the code names,
+else those its own namespace's trust context advertises; none, routed by
+name. Hints only reach (§19.7).
+
+### 19.4 Answering
+
+The offering device answers an ask of its own name in its own task, one
+ask at a time (so a use mark, a counted try and a closing mark each see
+the one before), keeping each answer by the ask's name: the same ask asked
+again gets the same answer while it is kept, and a refusal or an answer is
+never computed twice for one ask. It checks, in this order:
+
+1. **It opens**: the content key unwraps with its recipient key and the
+   body decodes, under `<D>/32=intro`. Else no answer (a Nack): nothing to
+   address a refusal to.
+2. **Its credentials parse**: a trust-context Data whose signature
+   verifies under one of the context's own anchors, valid now
+   (`SignedTrustContext::open_received`), then certificates (at most 8);
+   the claimed key — the proof packet's KeyLocator — has a certificate
+   among them. Else no answer.
+3. **The offer is its own and known**: named under this device, an offer
+   record it holds, its proof key in its store. Else `Unknown`.
+4. **Not closed**: no closing mark, and fewer wrong tries counted than its
+   `Tries`. Else `Closed`.
+5. **Not expired**: its expiry is after this device's clock now. Else
+   `Expired`.
+6. **The asker's key chains to the anchor it sent**: the proof packet,
+   named `<J>/32=ask/<binding>` for this ask, verifies by a validator that
+   holds the presented context alone and the presented certificates (the
+   hierarchical schema and certificate validity checked), signed by a key
+   of `J`. Else no answer: a forgery, or a broken enrollment the joiner's
+   own check (§19.3, step 2) reports.
+7. **The proof is right** (§19.6), for that key and its public key's
+   digest. Else the wrong try is counted, the count made durable before
+   the answer; at `Tries` the device signs the closing mark, durable before
+   the answer, and answers `Closed`; below, `WrongProof { left }`, the
+   wrong tries left before it closes.
+8. **The asker's namespace is no other's**: not the inviter's own, not
+   under or over it, a prefix of `J`, and not a namespace this device
+   already trusts under another anchor. Else `Conflict` (`FixLocal`).
+9. **Not used by another key**: a use mark naming another key or digest is
+   `Used`. Unused, the device signs the use mark naming this key and
+   digest and answers only once it is durable; used by this key, it
+   answers again.
+
+Then it has its host adopt the asker's anchor (an inline anchor link of
+the presented context), takes the presented certificates into its
+validator, and signs the folder's next members record adding the asker's
+namespace as a writer (a writer's role) and as a reader (when the folder is
+sealed), unless the record in force already admits it so (`share_folder`,
+§6.1). If either fails, no answer: the joiner's retry, same key, comes
+back through step 9 and runs both again. The acceptance names the offer,
+the asker's key and digest, the folder, the role, the inviter's
+credentials and the inviter's proof packet, and carries the answer proof.
+
+### 19.5 Refusals
+
+`DataError::Introduction { offer, why }`:
+
+| `why` | When | Next | Retry |
+|---|---|---|---|
+| `Unknown` | the offering device holds no such offer | `AskOwner` (a new code) | no |
+| `Used` | another key joined with this offer | `AskOwner` | no |
+| `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
+| `Closed` | its wrong tries are spent: refused for good, even to the right secret | `AskOwner` | no |
+| `WrongProof { left }` | the proof of the secret is wrong; counted | `FixRequest` (check the code) | no |
+| `Conflict` | the asker's namespace overlaps the inviter's, or one the inviter trusts under another anchor | `FixLocal` | no |
+| `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
+
+The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the
+offer waits. A code that does not parse is `BadRequest`; a host without an
+introducer, or one that refuses an adoption, is `Local`.
+
+### 19.6 Cryptography
+
+Audited RustCrypto primitives only. The secret is 16 octets from the
+device's entropy (the operating system's by default). The commitment is
+SHA-256(`ndn-data/intro/commit/1` ‖ secret). The proof key is
+HKDF-SHA256 with the secret as input keying material, no salt, and as
+info `ndn-data/intro/proof/1` ‖ the offer's Name TLV: an offer's key opens
+no other offer. The ask proof is HMAC-SHA256 under it over
+`ndn-data/intro/ask/1` ‖ the offer's Name TLV ‖ the asker key's Name TLV ‖
+its public key digest ‖ the nonce; the answer proof, over
+`ndn-data/intro/answer/1` ‖ every field of the acceptance before `Proof`.
+Proofs are compared in constant time. Asks are sealed with §9's
+X25519-to-ChaCha20-Poly1305 wrap.
+
+### 19.7 Threat notes
+
+- **Code theft.** The code is a bearer secret until used: whoever presents
+  it first, within its expiry, joins with its role. One use binds it to one
+  key (step 9); the owner sees who joined in the folder's members record
+  and removes them as any member (§6). Keep expiries short.
+- **Replay.** An ask replayed by anyone gets the answer kept for it: bound
+  to the asker's key and digest, it admits only the asker's namespace,
+  which the record already admits; it shows the replayer the folder's name,
+  the role and the inviter's public credentials (the answer is not sealed).
+  A replay after the inviter's device dropped the kept answer is judged
+  again: at worst it counts as a wrong try again (when it was one), closing
+  the offer sooner.
+- **Forged asks.** An ask without the secret fails step 7 and is counted;
+  it cannot be turned into another key's membership: the proof binds the
+  offer, the key, its digest and the nonce. One without valid credentials
+  costs one signature check and gets no answer.
+- **Offline guessing.** The offer and its commitment are public; the
+  secret has 128 bits, so neither the commitment nor an observed proof can
+  be searched for it.
+- **Tries brute force.** Online guesses are bounded by `Tries`, counted
+  durably across restarts; past them the offer closes for good, even to the
+  right secret. Anyone who knows the offer's name can thus close it — a
+  denial, never an admission; the owner makes a new code.
+- **Inviter impersonation.** An acceptance must prove the secret and be
+  signed by the offering device under the anchor whose fingerprint the code
+  carries (128 bits of it in the words form); a party that served a
+  substituted offer and opened the ask learns the joiner's public
+  credentials, cannot answer as the inviter, and can at most relay the ask
+  to the real inviter — whose answer admits exactly the joiner. A refusal
+  is not authenticated: a forged one denies, never admits, and an on-path
+  party can deny anyway.
+- **Joiner impersonation.** The asker's key must chain to the anchor it
+  presents, and a namespace already trusted under another anchor, or one
+  overlapping the inviter's, is refused (`Conflict`): a joiner cannot speak
+  for a namespace the inviter knows, nor shadow names of the inviter's own.
+  A joiner can claim any namespace nobody the inviter trusts holds — that
+  is what a stranger is; the owner sees which one joined.
+- **Reuse across the inviter's devices.** An offer is answered only by the
+  device that made it, which alone holds its proof key; another device of
+  the inviter answers `Unknown`. The use mark is in that device's log, so
+  every device of the inviter sees the offer used.
+- **Clock.** Expiry is judged by the offering device's clock alone: a slow
+  one keeps an offer open longer, a fast one closes it early; no other
+  decision reads a clock, and certificate validity in the credentials is
+  checked as a live exchange (§8.5).
+- **Unauthenticated hints.** Relay hints in the code, or the joiner's own
+  namespace's relays, are reachability only: a lying hint fails to reach,
+  and nothing a relay carries is trusted — the offer, the ask and the
+  answer are judged by the checks above.
