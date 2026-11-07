@@ -1014,10 +1014,11 @@ const MANIFEST_LOOKS: usize = 16;
 /// work, never on what is counted.
 const APPLY_ROUNDS: usize = 1 << 16;
 
-/// How long a device not reached is left before it is asked again, while
-/// a member of a group held here waits for the others ([`Inner::schedule`]);
-/// doubled each time up to [`REFRESH_PAUSE_MAX`], for [`REFRESH_TRIES`]
-/// times. Liveness only: what counts is decided by the versions held.
+/// How long a device whose announced change was not taken (not reached, or
+/// its summary not processed in full) is left before it is asked again
+/// ([`Inner::schedule`]); doubled each time up to [`REFRESH_PAUSE_MAX`], for
+/// [`REFRESH_TRIES`] times. Liveness only: what counts is decided by the
+/// versions held.
 const REFRESH_PAUSE: Duration = Duration::from_secs(2);
 
 /// The longest pause between two asks of a device not reached.
@@ -1225,6 +1226,13 @@ struct St {
     /// Merge versions in pieces a fetch found whole: not fetched again
     /// while they wait to open (for their epoch's key, or to apply).
     walked: BTreeSet<Name>,
+    /// Merge versions in pieces a fetch did not find whole (yet): they no
+    /// longer hold back the pieces of the versions in their past
+    /// ([`St::wanted_pieces`]).
+    unfound: BTreeSet<Name>,
+    /// Descents of summaries under way ([`Descending`]): the pieces of the
+    /// merge versions they bring are fetched once none is.
+    descents: usize,
     /// Every group of versions a member of which is held here (in any
     /// state), by writer and id: its members by seq (spec §5.5).
     txns: HashMap<(Writer, u64), BTreeMap<u64, Member>>,
@@ -2116,7 +2124,9 @@ impl Run<'_> {
 
     /// Apply a checkpoint whose past is held, if one is pending: each
     /// pending version whose past is held is checked (once) to learn what
-    /// it is. Whether anything changed.
+    /// it is. A check that fails before the version is ready refuses
+    /// nothing: its rule judges it against its past applied, when it is
+    /// ready (spec §5.2). Whether anything changed.
     fn checkpoint(&mut self) -> bool {
         let candidates: Vec<VersionId> = self
             .pending
@@ -2147,11 +2157,13 @@ impl Run<'_> {
                     Ok(k) => {
                         self.kinds.insert(id.clone(), k);
                     }
-                    Err(e) => {
+                    Err(e) if self.is_ready(&id) => {
                         tracing::debug!(?id, "refused by its rule's check: {e}");
                         self.refuse(&id, Refusal::Rule { why: e.0 });
                         return true;
                     }
+                    // Not ready: not a checkpoint now; its own turn decides.
+                    Err(_) => {}
                 }
             }
             if self.kinds.get(&id) == Some(&OpKind::Checkpoint)
@@ -3606,7 +3618,9 @@ impl St {
     }
 
     /// Take `body`, a node of `c` by `writer` verified here, as the
-    /// writer's newest unless one with a higher head was (spec §5.2, §7):
+    /// writer's newest unless one with a higher head was (spec §5.2, §7);
+    /// of the same head, the one verified last stands (a writer whose store
+    /// came back with entries it had lost lists them again at its head):
     /// from now on, an entry of the writer at or below its head that it does
     /// not list, or lists in a run whose keep bound passed by this device's
     /// clock, is not waited for unless held — a seq never learned included.
@@ -3615,7 +3629,11 @@ impl St {
     fn listing(&mut self, c: &Name, writer: &Writer, body: &NodeBody) -> Option<Timestamp> {
         let now = (self.clock)();
         let coll = self.colls.get_mut(c)?;
-        if coll.listings.get(writer).is_none_or(|l| l.head < body.head) {
+        if coll
+            .listings
+            .get(writer)
+            .is_none_or(|l| l.head <= body.head)
+        {
             coll.listings.insert(
                 writer.clone(),
                 Listing {
@@ -3741,8 +3759,11 @@ impl St {
     /// The versions of merge collection `c` in pieces this device is to
     /// fetch (spec §4.1): pending — admitted and neither applied nor
     /// covered by a checkpoint — not opened, and neither being fetched nor
-    /// found whole already. Under a rule this device does not know, none:
-    /// it applies nothing.
+    /// found whole already. A version in the past of another such version
+    /// whose pieces are yet to be found waits for that one's: it may be a
+    /// checkpoint covering it (spec §5.2), which opens and applies as soon
+    /// as it is whole, and what a checkpoint covers is never fetched. Under
+    /// a rule this device does not know, none: it applies nothing.
     fn wanted_pieces(&self, c: &Name) -> Vec<(Name, ChunksBody)> {
         let Some(coll) = self.colls.get(c) else {
             return Vec::new();
@@ -3750,13 +3771,32 @@ impl St {
         if coll.state.is_none() {
             return Vec::new();
         }
-        coll.pending
+        let unopened: Vec<&HeldVersion> = coll
+            .pending
             .iter()
             .filter_map(|id| coll.versions.get(id))
+            .filter(|hv| !hv.opened && hv.chunks.is_some())
+            .map(|hv| hv.as_ref())
+            .collect();
+        // In the past of a later unopened version (spec §5.2: its parents
+        // and its writer's earlier entries) whose pieces are neither found
+        // whole nor found missing yet.
+        let later_unopened = |v: &VersionId| {
+            unopened.iter().any(|w| {
+                w.version.id != *v
+                    && !self.walked.contains(&w.version.name)
+                    && !self.unfound.contains(&w.version.name)
+                    && (w.version.parents.contains(v)
+                        || (w.version.id.writer == v.writer && v.seq < w.version.id.seq))
+            })
+        };
+        unopened
+            .iter()
             .filter(|hv| {
-                !hv.opened
-                    && !self.fetching.contains(&hv.version.name)
+                !self.fetching.contains(&hv.version.name)
                     && !self.walked.contains(&hv.version.name)
+                    && !self.unfound.contains(&hv.version.name)
+                    && !later_unopened(&hv.version.id)
             })
             .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
             .collect()
@@ -3888,6 +3928,8 @@ impl Device {
                 holding: BTreeMap::new(),
                 fetching: BTreeSet::new(),
                 walked: BTreeSet::new(),
+                unfound: BTreeSet::new(),
+                descents: 0,
                 txns: HashMap::new(),
                 rules,
                 me: Writer::new(identity.key.clone()),
@@ -3982,6 +4024,16 @@ impl Device {
         inner.join(&ns).await?;
         // What the restored records owe: resolving merges, following groups.
         inner.settle().await;
+        // Back in every group a change about what this device wrote or
+        // owns is published into ([`Inner::groups_of`]): a peer hears it
+        // only where it listens (a reader of this namespace's collection,
+        // in its own namespace's group), and one that missed what this
+        // device announced before the restart catches up from the counter
+        // announced now, without waiting for a new write.
+        for g in inner.restored_groups() {
+            inner.join(&g).await?;
+            inner.publish(&g).await;
+        }
         // A holder makes itself heard in the groups of the namespaces it
         // holds for, so their owners' devices know to ask it (spec §13),
         // and takes up again what its leases promise.
@@ -4002,7 +4054,7 @@ impl Device {
             });
         }
         // Merge versions in pieces held from before wait for them.
-        inner.fetch_wanted();
+        inner.fetch_wanted(true);
         inner.spawn_sweeper();
         Ok(Device { inner })
     }
@@ -4487,6 +4539,37 @@ impl Device {
             });
         }
         Ok(out)
+    }
+}
+
+/// A descent under way ([`Inner::refresh`]): counted in [`St::descents`]
+/// while it lasts, whether it ends or is dropped, so the pieces it defers
+/// are fetched once no descent is under way.
+struct Descending<'a> {
+    st: &'a Mutex<St>,
+    ended: bool,
+}
+
+impl<'a> Descending<'a> {
+    fn new(st: &'a Mutex<St>) -> Self {
+        st.lock().descents += 1;
+        Self { st, ended: false }
+    }
+
+    /// End it; whether it was the last descent under way.
+    fn end(mut self) -> bool {
+        self.ended = true;
+        let mut st = self.st.lock();
+        st.descents -= 1;
+        st.descents == 0
+    }
+}
+
+impl Drop for Descending<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.st.lock().descents -= 1;
+        }
     }
 }
 
@@ -5336,6 +5419,37 @@ impl Inner {
         out.into_iter().collect()
     }
 
+    /// The groups changes about what this device holds of its own are
+    /// published into ([`Self::groups_of`]): of every collection and folder
+    /// of its namespace with a record held, and of every collection it
+    /// wrote into. Its own namespace's group first.
+    fn restored_groups(&self) -> Vec<Name> {
+        let st = self.st.lock();
+        let mine = |c: &Name| namespace_of(c).as_ref() == Some(&self.ns);
+        let subjects = st
+            .colls
+            .iter()
+            .filter(|(c, x)| {
+                (mine(c) && x.members.is_some()) || x.entries.contains_key(&self.writer)
+            })
+            .map(|(c, _)| c)
+            .chain(
+                st.folders
+                    .iter()
+                    .filter(|(f, x)| mine(f) && x.members.is_some())
+                    .map(|(f, _)| f),
+            );
+        let mut out = vec![self.ns.clone()];
+        for c in subjects {
+            for g in self.groups_of(&st, c) {
+                if !out.contains(&g) {
+                    out.push(g);
+                }
+            }
+        }
+        out
+    }
+
     /// The namespaces whose groups a change about `c` is published into:
     /// `c`'s own, and every namespace held here that its members record —
     /// its collection's or its folder's (spec §6) — names among the writers
@@ -5498,15 +5612,14 @@ impl Inner {
                 // Again now; again later; or done.
                 let next: Option<bool> = {
                     let mut st = inner.st.lock();
-                    // A member of a group held here waits for others: a
-                    // device not reached now (offline, a holder away) is
-                    // asked again, later, so that they arrive when it is
-                    // back (spec §5.5).
-                    let waits = !ok
-                        && tries < REFRESH_TRIES
-                        && st.colls.iter().any(|(c, k)| {
-                            !k.group_waits.is_empty() && namespace_of(c).as_ref() == Some(&ns)
-                        });
+                    // A device whose announced change was not taken in full
+                    // (not reached now: offline, restarted with its routes
+                    // not yet back, a holder away) is asked again, later:
+                    // its group counter will not move again for what it
+                    // already announced, so nothing else would ask (spec
+                    // §12); and a member of a group held here waits for it
+                    // (spec §5.5).
+                    let waits = !ok && tries < REFRESH_TRIES;
                     match st.groups.get_mut(&ns) {
                         None => None,
                         Some(g) => match g.busy.get_mut(&device) {
@@ -5817,7 +5930,15 @@ impl Inner {
         if self.st.lock().peers.get(&key).and_then(|p| p.root) == Some(digest) {
             return true;
         }
-        if !self.descend(device, ns, &writer, body).await {
+        // The pieces of merge versions it brings are fetched once it took
+        // everything it lists: a checkpoint among them may cover the others
+        // (spec §5.2), and what it covers is never fetched.
+        let descending = Descending::new(&self.st);
+        let whole = self.descend(device, ns, &writer, body).await;
+        if descending.end() {
+            self.fetch_wanted(true);
+        }
+        if !whole {
             return false;
         }
         self.st.lock().peers.entry(key).or_default().root = Some(digest);
@@ -6009,8 +6130,12 @@ impl Inner {
             .map(|(name, key, digest, head)| async move {
                 // The writer serves every node any root it signed lists
                 // (§7): a miss is the network's, and what was processed
-                // is kept for the next descent.
-                let data = self.fetch(name.clone(), false).await?;
+                // is kept for the next descent. Asked for by the digest its
+                // parent lists: no cache answers with another packet of the
+                // name (a writer whose store came back with entries it had
+                // lost signs a node of the same head anew).
+                let exact = name.clone().append_implicit_digest(digest);
+                let data = self.fetch(exact, false).await?;
                 if wire::implicit_digest(data.raw()) != digest {
                     tracing::debug!(%name, "not the packet its parent lists; ignored");
                     return None;
@@ -6175,14 +6300,13 @@ impl Inner {
                 .cut_out
                 .values()
                 .any(|o| !o.by_cut() && key_name_of(o.writer.key()) == key);
-            // A merge version in pieces waits for them: fetched now (a
-            // checkpoint's covered versions are never pending, so never
-            // fetched).
-            let wanted = parsed
-                .subject
-                .as_ref()
-                .map(|c| st.wanted_pieces(c))
-                .unwrap_or_default();
+            // A merge version in pieces waits for them: fetched now, unless
+            // a descent is under way — it fetches them once it took all it
+            // lists, a checkpoint among them covering what it covers.
+            let wanted = match (&parsed.subject, st.descents) {
+                (Some(c), 0) => st.wanted_pieces(c),
+                _ => Vec::new(),
+            };
             // A group's record decides who reads the collections sealed to
             // it: their keys may be asked for now.
             let mut chase = Vec::new();
@@ -9100,7 +9224,7 @@ impl Inner {
         if got {
             // Merge versions in pieces it unlocked wait for them; a group
             // member it opened may make its folder followed.
-            self.fetch_wanted();
+            self.fetch_wanted(true);
             self.settle().await;
         } else {
             tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key");
@@ -10301,10 +10425,19 @@ impl Inner {
     }
 
     /// Fetch, in the background, the pieces every merge version held here
-    /// waits for ([`St::wanted_pieces`]).
-    fn fetch_wanted(self: &Arc<Self>) {
+    /// waits for ([`St::wanted_pieces`]) — not while a descent is under
+    /// way: it fetches them when it ends, once what it brought is taken.
+    /// `retry`: also those whose pieces a fetch did not find (asked again
+    /// on what may have changed since: a descent, a key, a start).
+    fn fetch_wanted(self: &Arc<Self>, retry: bool) {
         let wanted: Vec<(Name, ChunksBody)> = {
-            let st = self.st.lock();
+            let mut st = self.st.lock();
+            if st.descents > 0 {
+                return;
+            }
+            if retry {
+                st.unfound.clear();
+            }
             st.colls.keys().flat_map(|c| st.wanted_pieces(c)).collect()
         };
         for (v, chunks) in wanted {
@@ -10331,13 +10464,20 @@ impl Inner {
                 let mut st = inner.st.lock();
                 st.fetching.remove(&v);
                 match (&c, whole) {
-                    (Some(c), true) => st.pieces_arrived(c, &v),
+                    (Some(c), true) => {
+                        st.unfound.remove(&v);
+                        st.pieces_arrived(c, &v);
+                    }
                     _ => {
                         tracing::debug!(name = %v, "not every piece of a held version is to be had yet");
+                        st.unfound.insert(v.clone());
                     }
                 }
             }
             inner.progress.notify_waiters();
+            // What it opened (a checkpoint, maybe, covering older versions)
+            // or did not find decides which pieces are fetched next.
+            inner.fetch_wanted(false);
             inner.renew().await;
         });
     }
@@ -16554,6 +16694,65 @@ mod tests {
             "its first announcement after the restart is above every earlier one"
         );
         again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_device_announces_again_in_every_group_its_records_publish_into() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        for ns in ["/alice", "/bob"] {
+            assert!(validator.adopt_context(context(ns)));
+        }
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let keys = keys_of(&device);
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let f = n("/alice/32=data/notebook");
+        let c = f.clone().append("cover");
+        dev.share_folder(
+            &f,
+            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]),
+        )
+        .await
+        .unwrap();
+        dev.put(&c, reading(1), options(None)).await.unwrap();
+        let bob = n("/bob");
+        let before = dev.inner.st.lock().groups[&bob].announced;
+        dev.shutdown();
+        let again = start(&device, &keys, &validator, &store).await.unwrap();
+        let after = again.inner.st.lock().groups.get(&bob).map(|g| g.announced);
+        assert!(
+            after.is_some_and(|a| a > before),
+            "back in the reader's group, above what it announced there before"
+        );
+        again.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_entry_a_writers_node_of_the_same_head_lists_again_is_wanted_again() {
+        let dev = device_in("/bob/phone", &["/alice", "/bob"]).await;
+        let c = n("/alice/32=data/notebook/page1");
+        let writer = Writer::new(n("/alice/laptop/KEY/1"));
+        let node = |entries: Vec<(u64, u64)>| NodeBody {
+            subject: c.clone(),
+            writer: writer.key().clone(),
+            head: 6,
+            page: None,
+            entries,
+            members: Vec::new(),
+            expiry: Vec::new(),
+            branches: Branches::Children(Vec::new()),
+        };
+        let mut st = dev.inner.st.lock();
+        st.colls.entry(c.clone()).or_default();
+        let now = (st.clock)();
+        // Its store lost seq 4: the node it signed at head 6 lists only 6.
+        st.listing(&c, &writer, &node(vec![(6, 6)]));
+        assert!(st.colls[&c].listings[&writer].gone(4, now));
+        // Back, a node of the same head lists it again.
+        st.listing(&c, &writer, &node(vec![(4, 4), (6, 6)]));
+        assert!(!st.colls[&c].listings[&writer].gone(4, now));
+        drop(st);
+        dev.shutdown();
     }
 }
 

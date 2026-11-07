@@ -38,7 +38,8 @@ fn c() -> Name {
 
 /// Notes: an edit (`E`) names its basis by digest (all zero: none) and adds
 /// a note; a checkpoint (`C`) carries every note of its past; a held note
-/// (`W`) is not counted until its pair (`P`) applies.
+/// (`W`) is not counted until its pair (`P`) applies; a follow-up (`B`)
+/// is checked against the notes applied: its first line must be one.
 struct Notes {
     function: Name,
 }
@@ -84,6 +85,14 @@ impl MergeState for NotesState {
             }
             Some(b'C') => Ok(OpKind::Checkpoint),
             Some(b'W' | b'P') => Ok(OpKind::Edit),
+            Some(b'B') => {
+                let t = text(op, 1)?;
+                let basis = t.lines().next().unwrap_or_default();
+                match self.notes.contains(basis) {
+                    true => Ok(OpKind::Edit),
+                    false => Err(MergeError(format!("{basis} is not applied"))),
+                }
+            }
             _ => Err(MergeError("not an operation of this rule".into())),
         }
     }
@@ -114,6 +123,7 @@ impl MergeState for NotesState {
                     self.counted.push(id);
                 }
             }
+            Some(b'B') => {}
             _ => return Err(MergeError("not an operation of this rule".into())),
         }
         Ok(Counting::Counted)
@@ -614,6 +624,97 @@ async fn a_merge_operation_in_pieces_waits_for_them_then_applies() {
             .is_some()
     );
     assert!(notes(&state(&dev).await).contains(&"q".repeat(3 * wire::INLINE_MAX)));
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_version_a_checkpoint_covers_is_never_fetched_when_both_arrive_in_one_descent() {
+    let dev = device(rules()).await;
+    let big = "e".repeat(3 * wire::INLINE_MAX);
+    let (covered, _) = in_pieces("/bob/laptop", 10, &[], edit(None, &big));
+    let (cp, cp_pieces) = in_pieces(
+        "/bob/laptop",
+        11,
+        &[("/bob/laptop", 10)],
+        checkpoint(&[&big]),
+    );
+    // One descent brings both: nothing is fetched while it lasts.
+    let descending = Descending::new(&dev.inner.st);
+    give(&dev, &covered);
+    give(&dev, &cp);
+    dev.inner.fetch_wanted(true);
+    assert!(dev.inner.st.lock().fetching.is_empty());
+    // It ends: the newest version's pieces are fetched first, not those of
+    // what it may cover.
+    assert!(descending.end());
+    dev.inner.fetch_wanted(true);
+    {
+        let st = dev.inner.st.lock();
+        assert!(!st.fetching.contains(&covered.name));
+        assert!(st.fetching.contains(&cp.name));
+    }
+    // Whole, the checkpoint applies and covers the other, whose pieces are
+    // never wanted.
+    for p in cp_pieces {
+        dev.inner.store.insert(p.name, p.wire);
+    }
+    dev.inner.st.lock().pieces_arrived(&c(), &cp.name);
+    let st = dev.inner.st.lock();
+    assert!(st.colls[&c()].at().contains(&covered.id()));
+    assert!(st.wanted_pieces(&c()).is_empty());
+    assert!(!st.fetching.contains(&covered.name));
+    drop(st);
+    assert!(
+        dev.inner
+            .store
+            .scan_under(&covered.name, 0)
+            .iter()
+            .all(|(n, _)| *n == covered.name),
+        "none of the covered version's pieces is stored"
+    );
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_version_whose_past_is_held_but_not_applied_is_checked_only_once_it_is_ready() {
+    let dev = device(rules()).await;
+    // Carol's version waits for its pieces; Bob's note "x" waits for it.
+    let (carol, carol_pieces) = in_pieces(
+        "/carol/phone",
+        1,
+        &[],
+        edit(None, &"c".repeat(3 * wire::INLINE_MAX)),
+    );
+    let x = version("/bob/laptop", 10, &[("/carol/phone", 1)], edit(None, "x"));
+    // Bob's follow-up of "x", in pieces and whole: its past is held, its
+    // rule judges it against "x" applied.
+    let op = Bytes::from(format!("Bx\n{}", "b".repeat(3 * wire::INLINE_MAX)));
+    let (follow, follow_pieces) = in_pieces("/bob/laptop", 11, &[("/bob/laptop", 10)], op);
+    for p in follow_pieces {
+        dev.inner.store.insert(p.name, p.wire);
+    }
+    give(&dev, &carol);
+    give(&dev, &x);
+    give(&dev, &follow);
+    {
+        let st = dev.inner.st.lock();
+        assert!(
+            !st.refused.contains_key(&follow.name),
+            "not refused before its past applied"
+        );
+        assert!(st.colls[&c()].pending.contains(&follow.id()));
+    }
+    for p in carol_pieces {
+        dev.inner.store.insert(p.name, p.wire);
+    }
+    dev.inner.st.lock().pieces_arrived(&c(), &carol.name);
+    let st = dev.inner.st.lock();
+    assert!(!st.refused.contains_key(&follow.name));
+    assert!(
+        st.colls[&c()].at().contains(&follow.id()),
+        "applied in turn"
+    );
+    drop(st);
     dev.shutdown();
 }
 
