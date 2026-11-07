@@ -67,6 +67,16 @@ wasm-bindgen-futures = "0.4"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest = { workspace = true }
+# The durability conformance test (tests/durability.rs) runs `BackendStore`
+# over both on-disk engines in every `cargo test`, without feature flags: the
+# crate's own store features plus the engines they bridge to.
+ndn-sync = { path = ".", features = ["store-fjall", "store-redb"] }
+ndn-storage = { workspace = true, features = ["sync", "named", "fjall", "redb"] }
+tempfile = "3"
+# The power-loss case mirrors renames through an LD_PRELOAD shim, which sees
+# only calls made through libc; rustix (under tempfile, which fjall uses to
+# replace its metadata files) otherwise makes raw syscalls.
+rustix = { version = "1", features = ["use-libc"] }
 
 [lints]
 workspace = true

@@ -226,7 +226,11 @@ parking_lot = "0.12"
 yrs = { version = "0.28", default-features = false }
 
 # Persistent storage
-fjall = "3"
+# 3.1.8 at least: from there its lsm-tree (~3.1.8) fsyncs each version file
+# before `current` names it. 3.1.5 did not, so a power loss could leave
+# `current` naming a torn version and the store refusing to open
+# (crates/protocols/ndn-sync/tests/durability.rs found it).
+fjall = "3.1.8"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

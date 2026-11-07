@@ -523,6 +523,14 @@ impl<F: NorFlash + Send> SyncBackend for FlashLogBackend<F> {
     fn name(&self) -> &'static str {
         "flash"
     }
+    /// Nothing left to flush: each write returned only after its record was
+    /// programmed through `NorFlash::write`, which is done when it returns (the
+    /// trait has no write cache to flush). A torn last record is dropped on
+    /// [`mount`](FlashLogBackend::mount); compaction switches halves only once
+    /// the new half's superblock is written.
+    fn sync(&self) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -145,7 +145,8 @@ which is what makes prefix scans the primitive for `CanBePrefix` lookups and
   `get` / `put` / `delete` / `scan_prefix` / `first_under` / `write_batch` /
   `name`.
 - `SyncBackend` — the **synchronous** core, `no_std + alloc`, with borrowed
-  `&[u8]` keys. Blocking engines implement this directly.
+  `&[u8]` keys. Blocking engines implement this directly. Its `sync` (the
+  durability barrier) has no default: every engine states its own answer.
 
 **The idiom for a blocking engine:** implement `SyncBackend` with direct calls,
 then make the async `Backend` a thin `spawn_blocking` wrapper over it — one
@@ -156,6 +157,7 @@ examples; here is the shape from `FjallBackend`:
 impl SyncBackend for MyEngine {
     fn get(&self, key: &[u8]) -> StorageResult<Option<Bytes>> { /* blocking */ }
     // put / delete / scan_prefix / write_batch ...
+    fn sync(&self) -> StorageResult<()> { /* fsync whatever writes left in OS buffers */ }
 }
 
 #[async_trait]
@@ -175,6 +177,16 @@ Notes:
   an engine error into "miss" — `StorageError` surfaces it.
 - **`write_batch` should be atomic** where the engine supports a transaction; the
   default applies ops sequentially (not atomic), so override it.
+- **Durability is two promises** (the `# Durability` section of `SyncBackend`):
+  a write that returned is out of the process (a `kill -9` keeps it), and every
+  write before a returned `sync` survives a power loss — after which the engine
+  opens at a whole earlier state, never refusing to open for a torn tail. fjall
+  fsyncs its journal in `sync`; redb commits (and fsyncs) every write, so its
+  `sync` returns `Ok`; the flash log returns `Ok` because each record is
+  programmed when its write returns, the in-memory engines because they keep
+  nothing across a restart. `ndn-sync`'s `tests/durability.rs` checks both
+  promises against a real kill and simulated power losses; add a new on-disk
+  engine to its `Engine` list.
 - A non-blocking sync engine (in-memory, embedded flash) needs no async impl at
   all: `SyncAsAsync` bridges any `SyncBackend` into `Backend` inline. Wrap any
   `Backend` in `Instrumented` for per-op `tracing` spans.

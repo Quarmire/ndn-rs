@@ -115,6 +115,24 @@ fn recover_seq(store: &dyn DataStore, data_prefix: &Name) -> u64 {
 }
 
 /// Pluggable storage for published Data, keyed by full Data name.
+///
+/// # Durability
+///
+/// Two guarantees, each per store instance (a process may open several — a
+/// device's published store and a separate local one — and each keeps both
+/// on its own):
+///
+/// - **A write that returned survives the process being killed.** Once
+///   [`insert`](Self::insert) or [`remove`](Self::remove) returns, the
+///   change is in the engine's journal or file as the operating system holds
+///   it: a `kill -9` straight after loses nothing.
+/// - **A write before a returned [`sync`](Self::sync) survives a power
+///   loss.** Writes after it may be lost to one; the store then opens at a
+///   whole earlier state, never part of a write, and never refuses to open
+///   for a torn tail.
+///
+/// Nothing may be published from a store before it is behind the barrier:
+/// what a power loss can take must be what nobody else saw.
 pub trait DataStore: Send + Sync {
     /// Store the encoded Data `wire` under `name`.
     fn insert(&self, name: Name, wire: Bytes);
@@ -150,6 +168,24 @@ pub trait DataStore: Send + Sync {
     /// is. Used by stores that drop data on purpose: a pruned entry, a
     /// payload the device released to a holder, an erased epoch key.
     fn remove(&self, name: &Name);
+    /// The durability barrier: returns once everything this store accepted
+    /// before the call — every [`insert`](Self::insert) and
+    /// [`remove`](Self::remove) that returned — is durable (kept across a
+    /// power loss), or with the error saying why it may not be. A store
+    /// coalesces calls made while one is under way into one flush (group
+    /// commit), so calling it often costs one disk flush per round, not per
+    /// call. A store that keeps nothing across a restart ([`MemoryStore`])
+    /// returns at once: it has nothing to make durable, and says so in its
+    /// own documentation.
+    fn sync(&self) -> std::io::Result<()>;
+    /// Whether [`sync`](Self::sync) returns at once, touching no disk — a
+    /// store that keeps nothing across a restart ([`MemoryStore`]). A caller
+    /// on an async runtime then calls it inline rather than on a blocking
+    /// thread, which would make a virtual-time run depend on real thread
+    /// timing. `false` unless a store says otherwise.
+    fn sync_is_immediate(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory [`DataStore`]. The default; persistent stores (e.g. an
@@ -213,6 +249,19 @@ impl DataStore for MemoryStore {
 
     fn remove(&self, name: &Name) {
         self.map.write().expect("MemoryStore poisoned").remove(name);
+    }
+
+    /// Returns `Ok` at once. A memory store keeps nothing across a restart,
+    /// so this is "durable" only in the sense that there is nothing a power
+    /// loss could take that a restart would not: everything it holds is gone
+    /// either way.
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Nothing to flush: a memory store keeps nothing across a restart.
+    fn sync_is_immediate(&self) -> bool {
+        true
     }
 }
 

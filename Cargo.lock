@@ -1000,9 +1000,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fjall"
-version = "3.1.5"
+version = "3.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038acd422d607e0eca09e093f299f9eccf9bd097554343d93746afff81a45113"
+checksum = "6e98f7212d748b723dcfbd43d5f166958945ad2c05ad4537fb99bcda42ad8a96"
 dependencies = [
  "byteorder-lite",
  "byteview",
@@ -1550,9 +1550,9 @@ dependencies = [
 
 [[package]]
 name = "lsm-tree"
-version = "3.1.5"
+version = "3.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ef86c3c797c10eefcc73407c43ae48c19d4df686131a8334b2895a513e91df4"
+checksum = "5498808f4d41cf785079d3ef3f28716f1b4364af1b512f3097bfb651bded1b3e"
 dependencies = [
  "byteorder-lite",
  "byteview",
@@ -1760,6 +1760,7 @@ dependencies = [
  "ndn-tlv",
  "parking_lot",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -2202,10 +2203,13 @@ dependencies = [
  "ndn-packet",
  "ndn-storage",
  "ndn-svs-core",
+ "ndn-sync",
  "ndn-tlv",
  "portable-atomic",
  "proptest",
+ "rustix",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

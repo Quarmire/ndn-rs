@@ -418,7 +418,7 @@ impl<B: Backend> Backend for Instrumented<B> {
 /// no tokio — so it can underpin both the async engines (which wrap it in
 /// `spawn_blocking`) and an embedded MCU (no thread pool, no `std::sync`).
 mod sync {
-    use super::{Bytes, Vec, WriteOp};
+    use super::{Bytes, StorageResult, Vec, WriteOp};
 
     /// An ordered byte key→value store, **synchronous**. The local sync core: fjall
     /// and redb implement this directly (they block underneath), and the async
@@ -428,8 +428,18 @@ mod sync {
     ///
     /// Keys are **borrowed** (`&[u8]`) — there is no thread-hop boundary to own them
     /// across, so the sync core avoids the per-call allocation the async trait needs.
-    use super::StorageResult;
-
+    ///
+    /// # Durability
+    ///
+    /// - A write ([`put`](Self::put), [`delete`](Self::delete),
+    ///   [`write_batch`](Self::write_batch)) that returned `Ok` is out of the
+    ///   process — in the engine's file as the operating system holds it — so it
+    ///   survives the process being killed.
+    /// - Every write that returned before a returned [`sync`](Self::sync) survives
+    ///   a power loss. After one, the engine opens at a whole earlier state at
+    ///   least as new as the last `sync`: never part of a write (an engine's
+    ///   atomic [`write_batch`](Self::write_batch) lands whole or not at all), and
+    ///   never refusing to open for a torn tail.
     pub trait SyncBackend: Send + Sync {
         /// Fetch the value stored under `key`. `Ok(None)` is a genuine miss; `Err` is an
         /// engine failure.
@@ -466,6 +476,10 @@ mod sync {
         fn name(&self) -> &'static str {
             "sync-backend"
         }
+        /// The durability barrier: returns `Ok` once every write that returned
+        /// before the call survives a power loss, or the error saying why it may
+        /// not. Required — each engine states its own answer (see the impls).
+        fn sync(&self) -> StorageResult<()>;
     }
 
     /// In-memory [`SyncBackend`] — a `BTreeMap` behind a mutex, no allocator beyond
@@ -577,6 +591,11 @@ mod sync {
         }
         fn name(&self) -> &'static str {
             "sync-memory"
+        }
+        /// Nothing to make durable: this engine keeps nothing across a restart,
+        /// so `Ok` here promises only what the process itself still holds.
+        fn sync(&self) -> StorageResult<()> {
+            Ok(())
         }
     }
 
@@ -957,6 +976,9 @@ mod fjall_backend {
     pub struct FjallBackend {
         keyspace: fjall::Keyspace,
         db: fjall::Database,
+        /// The database's directory, where fjall keeps its journal files
+        /// (`<id>.jnl`), fsynced by [`sync`](SyncBackend::sync).
+        path: std::sync::Arc<std::path::PathBuf>,
     }
 
     impl FjallBackend {
@@ -967,9 +989,13 @@ mod fjall_backend {
             path: impl AsRef<std::path::Path>,
             keyspace: &str,
         ) -> fjall::Result<Self> {
-            let db = fjall::Database::builder(path).open()?;
+            let db = fjall::Database::builder(path.as_ref()).open()?;
             let keyspace = db.keyspace(keyspace, fjall::KeyspaceCreateOptions::default)?;
-            Ok(Self { keyspace, db })
+            Ok(Self {
+                keyspace,
+                db,
+                path: std::sync::Arc::new(path.as_ref().to_path_buf()),
+            })
         }
     }
 
@@ -1018,6 +1044,40 @@ mod fjall_backend {
         }
         fn name(&self) -> &'static str {
             "fjall"
+        }
+        /// Make every write that returned durable: hand fjall's buffered journal
+        /// bytes to the OS (`PersistMode::Buffer`, under fjall's journal lock — a
+        /// copy, no disk wait), then fsync the journal files **outside** that lock,
+        /// so writers keep appending while the disk works (group commit: a write
+        /// never waits for another's flush). Each write already reached the OS
+        /// when it returned (fjall's default `Buffer` flush), so a `kill -9` keeps
+        /// it; this fsync keeps it across a power loss. A journal fjall rotated
+        /// meanwhile was fsynced by the rotation itself (`SyncAll`), and one it
+        /// deleted was flushed into segments first. After a power loss fjall's
+        /// recovery drops a torn tail and replays whole batches.
+        fn sync(&self) -> StorageResult<()> {
+            let failed = |e: &dyn core::fmt::Display| {
+                StorageError::backend(format_args!(
+                    "fjall journal fsync failed ({e}); writes since the last sync may be \
+                     lost to a power loss: check the disk, then reopen the store"
+                ))
+            };
+            self.db
+                .persist(fjall::PersistMode::Buffer)
+                .map_err(|e| failed(&e))?;
+            for entry in std::fs::read_dir(&*self.path).map_err(|e| failed(&e))? {
+                let path = entry.map_err(|e| failed(&e))?.path();
+                if path.extension().is_none_or(|x| x != "jnl") {
+                    continue;
+                }
+                match std::fs::File::open(&path) {
+                    Ok(file) => file.sync_data().map_err(|e| failed(&e))?,
+                    // Flushed into segments and deleted since it was listed.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(failed(&e)),
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1078,13 +1138,15 @@ mod fjall_backend {
     /// multi-partition atomicity.)
     pub struct FjallDb {
         db: fjall::Database,
+        path: std::sync::Arc<std::path::PathBuf>,
     }
 
     impl FjallDb {
         /// Open (or create) the shared keyspace at `path`.
         pub fn open(path: impl AsRef<std::path::Path>) -> fjall::Result<Self> {
             Ok(Self {
-                db: fjall::Database::builder(path).open()?,
+                db: fjall::Database::builder(path.as_ref()).open()?,
+                path: std::sync::Arc::new(path.as_ref().to_path_buf()),
             })
         }
 
@@ -1098,6 +1160,7 @@ mod fjall_backend {
             Ok(FjallBackend {
                 keyspace,
                 db: self.db.clone(),
+                path: self.path.clone(),
             })
         }
 
@@ -1190,6 +1253,34 @@ mod redb_backend {
         redb::TableDefinition::new(name)
     }
 
+    /// Open (or create) the redb file at `path`, then fsync its directory so a
+    /// file created here is still named there after a power loss — redb fsyncs
+    /// the file's content on every commit, never the directory entry.
+    fn create(path: &std::path::Path) -> std::io::Result<redb::Database> {
+        let db = redb::Database::create(path).map_err(std::io::Error::other)?;
+        #[cfg(unix)]
+        {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "redb file {} opened, but fsync of its directory {} failed ({e}); \
+                             a new store could vanish in a power loss: check the disk",
+                            path.display(),
+                            dir.display()
+                        ),
+                    )
+                })?;
+        }
+        Ok(db)
+    }
+
     /// On-disk [`Backend`] backed by [redb](https://docs.rs/redb) — a pure-Rust
     /// embedded B-tree with **real ACID transactions**. Use it (over fjall) where
     /// point-read latency or **atomic multi-key writes** matter.
@@ -1222,7 +1313,7 @@ mod redb_backend {
             path: impl AsRef<std::path::Path>,
             table_name: &str,
         ) -> std::io::Result<Self> {
-            let db = redb::Database::create(path).map_err(std::io::Error::other)?;
+            let db = create(path.as_ref())?;
             // Ensure the table exists (an empty write txn creates it).
             let w = db.begin_write().map_err(std::io::Error::other)?;
             {
@@ -1302,6 +1393,15 @@ mod redb_backend {
         fn name(&self) -> &'static str {
             "redb"
         }
+        /// Nothing left to flush: every `put`/`delete`/`write_batch` is its own
+        /// `Durability::Immediate` transaction, so redb fsynced it before the call
+        /// returned (and [`open`](RedbBackend::open) fsynced the file's directory).
+        /// Writes are deliberately not `Durability::None` with the fsync deferred to
+        /// here: redb does not make a `None` commit visible to a later open until an
+        /// `Immediate` one follows, so a returned write would not survive `kill -9`.
+        fn sync(&self) -> StorageResult<()> {
+            Ok(())
+        }
     }
 
     // The async surface: a thin `spawn_blocking` wrapper over the sync core.
@@ -1359,7 +1459,7 @@ mod redb_backend {
     impl RedbDb {
         /// Open (or create) the shared database file at `path`.
         pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-            let db = redb::Database::create(path).map_err(std::io::Error::other)?;
+            let db = create(path.as_ref())?;
             Ok(Self { db: Arc::new(db) })
         }
 

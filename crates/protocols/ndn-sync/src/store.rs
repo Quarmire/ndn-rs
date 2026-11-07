@@ -13,6 +13,23 @@
 //! LSM/B-tree lookup — acceptable here, unlike the router's content store which
 //! is async precisely because it sits on the packet path.
 //!
+//! # Durability
+//!
+//! An `insert`/`remove` returns once the backend write returned, so it is in
+//! the engine's file as the OS holds it and survives `kill -9` (fjall flushes
+//! each write to the OS; redb commits each with an fsync).
+//! [`DataStore::sync`](crate::svsync::DataStore::sync) is a group commit over
+//! the backend's [`SyncBackend::sync`](ndn_storage::SyncBackend::sync): the
+//! store counts the writes it accepted and the writes known durable; a
+//! `sync` whose writes are already durable returns at once, otherwise one
+//! caller (the leader) flushes for everything accepted so far while the
+//! others wait and then find their writes covered — one disk flush per round,
+//! however many callers. A failed write or flush is sticky: from then on
+//! every `sync` of the store fails, naming it, because a change the store
+//! accepted may be gone and nothing it holds can be promised durable. Writes
+//! made directly on [`backend`](crate::store::BackendStore::backend) are not
+//! counted; make them durable with the backend's own `sync`.
+//!
 //! ```no_run
 //! # #[cfg(feature = "store-fjall")]
 //! # fn main() -> std::io::Result<()> {
@@ -29,6 +46,9 @@
 //! # fn main() {}
 //! ```
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_storage::{SyncBackend, name_key};
@@ -39,20 +59,69 @@ use crate::svsync::DataStore;
 /// ([`SyncMemoryBackend`](ndn_storage::SyncMemoryBackend), `FjallBackend`,
 /// `RedbBackend`). Names are encoded to storage keys with [`name_key`], so a
 /// publication name is a byte-prefix of its segments and `CanBePrefix`
-/// (`find_under`) is a prefix scan.
+/// (`find_under`) is a prefix scan. See the [module docs](self) for what it
+/// keeps across a kill and a power loss.
 pub struct BackendStore<S> {
     backend: S,
+    /// Writes accepted: bumped after each backend write returned `Ok`.
+    accepted: AtomicU64,
+    /// Every accepted write up to this count is known durable.
+    durable: AtomicU64,
+    /// Held by the one `sync` flushing (the leader); callers arriving
+    /// meanwhile wait here and then usually find their writes covered.
+    leader: Mutex<()>,
+    /// The first write or flush that failed. Once set, every `sync` fails.
+    failed: OnceLock<String>,
 }
 
 impl<S: SyncBackend> BackendStore<S> {
     /// Wrap an already-open backend.
     pub fn new(backend: S) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            accepted: AtomicU64::new(0),
+            durable: AtomicU64::new(0),
+            leader: Mutex::new(()),
+            failed: OnceLock::new(),
+        }
     }
 
     /// The underlying backend.
     pub fn backend(&self) -> &S {
         &self.backend
+    }
+
+    /// Record a lost write or flush; the first one is kept and reported by
+    /// every later `sync`.
+    fn fail(&self, what: String) {
+        tracing::warn!(
+            error = %what,
+            "BackendStore: a change may be lost; every later sync of this store fails"
+        );
+        let _ = self.failed.set(what);
+    }
+
+    /// `Err` once any write or flush failed.
+    fn check(&self) -> std::io::Result<()> {
+        match self.failed.get() {
+            None => Ok(()),
+            Some(what) => Err(std::io::Error::other(format!(
+                "BackendStore ({}): {what}, so a change this store accepted may not be kept \
+                 and none can be promised durable any more; restart on a working store (free \
+                 space, or fix the disk or its permissions)",
+                self.backend.name()
+            ))),
+        }
+    }
+
+    /// Count a write that returned, or record why it failed.
+    fn record(&self, result: ndn_storage::StorageResult<()>, what: impl FnOnce() -> String) {
+        match result {
+            Ok(()) => {
+                self.accepted.fetch_add(1, Ordering::Release);
+            }
+            Err(e) => self.fail(format!("{} failed ({e})", what())),
+        }
     }
 }
 
@@ -86,12 +155,10 @@ impl BackendStore<ndn_storage::RedbBackend> {
 
 impl<S: SyncBackend> DataStore for BackendStore<S> {
     fn insert(&self, name: Name, wire: Bytes) {
-        // Fire-and-forget per the `DataStore` contract; a backend write error is
-        // logged, not surfaced (the trait returns unit). A dropped write re-heals
-        // on the next publish/ingest of the same name.
-        if let Err(e) = self.backend.put(&name_key(&name), wire) {
-            tracing::warn!(%name, error = %e, "BackendStore: put failed");
-        }
+        // The trait returns unit: a failed write is logged and made sticky,
+        // so the next `sync` reports it rather than promising it durable.
+        let result = self.backend.put(&name_key(&name), wire);
+        self.record(result, || format!("the insert of {name}"));
     }
 
     fn get(&self, name: &Name) -> Option<Bytes> {
@@ -118,15 +185,37 @@ impl<S: SyncBackend> DataStore for BackendStore<S> {
     }
 
     fn remove(&self, name: &Name) {
-        if let Err(e) = self.backend.delete(&name_key(name)) {
-            tracing::warn!(%name, error = %e, "BackendStore: delete failed");
+        let result = self.backend.delete(&name_key(name));
+        self.record(result, || format!("the removal of {name}"));
+    }
+
+    /// Group commit: returns at once when every write accepted before the
+    /// call is already durable; otherwise the leader flushes the backend for
+    /// everything accepted so far, and callers that waited on it re-check.
+    fn sync(&self) -> std::io::Result<()> {
+        self.check()?;
+        let target = self.accepted.load(Ordering::Acquire);
+        if self.durable.load(Ordering::Acquire) >= target {
+            return Ok(());
         }
+        let _leader = self.leader.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.durable.load(Ordering::Acquire) < target {
+            // Every write counted here returned before this flush starts.
+            let upto = self.accepted.load(Ordering::Acquire);
+            if let Err(e) = self.backend.sync() {
+                self.fail(format!("a flush to disk failed ({e})"));
+            } else {
+                self.durable.fetch_max(upto, Ordering::Release);
+            }
+        }
+        self.check()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn n(s: &str) -> Name {
         s.parse().unwrap()
@@ -154,5 +243,110 @@ mod tests {
             vec![n("/a/g/1"), n("/a/g/2")],
             "scan is prefix-scoped and ordered"
         );
+    }
+
+    /// A backend that tells which writes a flush covered, and fails on cue.
+    #[derive(Default)]
+    struct Ledger {
+        inner: ndn_storage::SyncMemoryBackend,
+        /// Keys in the order their writes returned, and how many of them the
+        /// last flush covered.
+        log: Mutex<(Vec<Vec<u8>>, usize)>,
+        fail_put: AtomicBool,
+        fail_sync: AtomicBool,
+    }
+
+    impl Ledger {
+        fn is_durable(&self, key: &[u8]) -> bool {
+            let log = self.log.lock().unwrap();
+            log.0[..log.1].iter().any(|k| k == key)
+        }
+    }
+
+    impl SyncBackend for Ledger {
+        fn get(&self, key: &[u8]) -> ndn_storage::StorageResult<Option<Bytes>> {
+            self.inner.get(key)
+        }
+        fn put(&self, key: &[u8], value: Bytes) -> ndn_storage::StorageResult<()> {
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(ndn_storage::StorageError::backend("disk full"));
+            }
+            self.inner.put(key, value)?;
+            self.log.lock().unwrap().0.push(key.to_vec());
+            Ok(())
+        }
+        fn delete(&self, key: &[u8]) -> ndn_storage::StorageResult<()> {
+            self.inner.delete(key)?;
+            self.log.lock().unwrap().0.push(key.to_vec());
+            Ok(())
+        }
+        fn scan_prefix(
+            &self,
+            prefix: &[u8],
+            limit: usize,
+        ) -> ndn_storage::StorageResult<Vec<(Bytes, Bytes)>> {
+            self.inner.scan_prefix(prefix, limit)
+        }
+        fn sync(&self) -> ndn_storage::StorageResult<()> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                return Err(ndn_storage::StorageError::backend("EIO"));
+            }
+            let mut log = self.log.lock().unwrap();
+            log.1 = log.0.len();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_returned_sync_covers_every_write_before_it_under_concurrency() {
+        let store = BackendStore::new(Ledger::default());
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let store = &store;
+                s.spawn(move || {
+                    for i in 0..200 {
+                        let name = n(&format!("/t/{t}/{i}"));
+                        if i % 3 == 2 {
+                            store.remove(&n(&format!("/t/{t}/{}", i - 1)));
+                        }
+                        store.insert(name.clone(), Bytes::from_static(b"v"));
+                        store.sync().expect("sync");
+                        assert!(
+                            store.backend().is_durable(&name_key(&name)),
+                            "{name} was inserted before a sync that returned Ok, yet no \
+                             flush covered it"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn a_failed_write_fails_every_later_sync() {
+        let store = BackendStore::new(Ledger::default());
+        store.insert(n("/a/1"), Bytes::from_static(b"one"));
+        store.sync().expect("nothing failed yet");
+        store.backend().fail_put.store(true, Ordering::SeqCst);
+        store.insert(n("/a/2"), Bytes::from_static(b"two"));
+        store.backend().fail_put.store(false, Ordering::SeqCst);
+        store.insert(n("/a/3"), Bytes::from_static(b"three"));
+        for _ in 0..2 {
+            let e = store.sync().expect_err("a write was lost");
+            assert!(e.to_string().contains("/a/2"), "names the lost write: {e}");
+        }
+    }
+
+    #[test]
+    fn a_failed_flush_fails_every_later_sync() {
+        let store = BackendStore::new(Ledger::default());
+        store.insert(n("/a/1"), Bytes::from_static(b"one"));
+        store.backend().fail_sync.store(true, Ordering::SeqCst);
+        store.sync().expect_err("the flush failed");
+        store.backend().fail_sync.store(false, Ordering::SeqCst);
+        // A later flush succeeding does not bring back what the failed one
+        // may have dropped (an fsync error can discard dirty pages).
+        store.insert(n("/a/2"), Bytes::from_static(b"two"));
+        store.sync().expect_err("still failed");
     }
 }
