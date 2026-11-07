@@ -90,8 +90,8 @@ use crate::seal::{self, Keys};
 use crate::statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 use crate::tree::{Kind, Retain, Tree};
 use crate::version::{
-    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Payload, Seal, Seq, Timestamp,
-    TypeId, Version, VersionId, Writer,
+    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Payload, Seal, Seq,
+    Timestamp, TypeId, Version, VersionId, Writer,
 };
 use crate::wire::{
     self, AuditAnswer, AuditAsk, BlockEntryBody, Branches, ChunksBody, CutBody, ExpiryRun,
@@ -282,7 +282,9 @@ struct HeldVersion {
     /// Its payload in pieces, when it travels so (spec §4.1).
     chunks: Option<ChunksBody>,
     /// Whether `op` is its operation: inline, or in pieces held whole and
-    /// opened ([`open_held`]). A merge version applies only opened.
+    /// opened ([`open_held`]). A merge version applies only opened; once
+    /// applied, an operation in pieces is let go ([`Self::unloaded`]) and
+    /// read again from the pieces when needed.
     opened: bool,
 }
 
@@ -306,6 +308,23 @@ impl HeldVersion {
             opened: chunks.is_none(),
             chunks,
         }
+    }
+
+    /// This version without its operation in memory, when that travels in
+    /// pieces (up to 64 MiB) and is in memory: what is applied needs no
+    /// operation until the state is computed anew, which opens it again
+    /// from the pieces. `None` when there is nothing to let go.
+    fn unloaded(&self) -> Option<Self> {
+        (self.chunks.is_some() && self.opened).then(|| HeldVersion {
+            version: self.version.clone(),
+            op: Bytes::new(),
+            wire: self.wire.clone(),
+            digest: self.digest,
+            sealed: self.sealed,
+            epoch: self.epoch.clone(),
+            chunks: self.chunks,
+            opened: false,
+        })
     }
 }
 
@@ -362,6 +381,9 @@ struct Folder {
     /// Its record in force: its own, narrowed by the folders above it
     /// ([`collection::effective`]).
     members: Option<Members>,
+    /// The epochs of its records whose key this device destroyed (spec
+    /// §14): a key granted again for one is refused.
+    erased: BTreeSet<Epoch>,
 }
 
 impl Line {
@@ -435,20 +457,35 @@ impl Line {
     }
 }
 
-/// Whether a subject whose own record is `own` owes a record in a new
-/// epoch as its record in force moved from `old` to `new` (spec §6): it
-/// seals in its own epoch, and a folder above dropped a reader it lists
-/// that read it before.
-fn owes_epoch(own: Option<&Members>, old: Option<&Members>, new: Option<&Members>) -> bool {
-    let (Some(own), Some(old), Some(new)) = (own, old, new) else {
+/// Whether a subject whose own record is `own`, whose record in force is
+/// `new` and whose records name `epochs` owes a record in a new epoch
+/// (spec §6.1): it seals in its own epoch, and that epoch outgrew its
+/// audience ([`outgrown`]) — a folder above dropped a reader it lists.
+fn owes_epoch(
+    own: Option<&Members>,
+    new: Option<&Members>,
+    epochs: &BTreeMap<Epoch, Named>,
+) -> bool {
+    let (Some(own), Some(new)) = (own, new) else {
         return false;
     };
-    !own.readers.is_empty()
-        && new.epoch == own.epoch
-        && own
-            .readers
-            .iter()
-            .any(|r| old.readers.contains(r) && !new.readers.contains(r))
+    !own.readers.is_empty() && new.epoch == own.epoch && outgrown(new, epochs)
+}
+
+/// Whether `m`, a record in force, keeps an epoch whose key a reader it no
+/// longer admits may hold: a held record naming the epoch (`epochs`) lists
+/// a reader `m`'s readers do not admit (spec §6.1, §9). Nothing is sealed
+/// in such an epoch.
+fn outgrown(m: &Members, epochs: &BTreeMap<Epoch, Named>) -> bool {
+    m.epoch
+        .as_ref()
+        .and_then(|e| epochs.get(e))
+        .is_some_and(|named| {
+            named
+                .readers
+                .iter()
+                .any(|r| !collection::admitted(r, &m.readers))
+        })
 }
 
 /// One collection as this device knows it.
@@ -472,8 +509,13 @@ struct Coll {
     kinds: HashMap<VersionId, OpKind>,
     /// Admitted versions (and sealed ones held locked) by the implicit
     /// digest of their packet, for [`Past::by_digest`]. An entry whose
-    /// version is no longer held is checked away on lookup.
+    /// version is no longer held, or is refused, is checked away on lookup.
     by_digest: HashMap<[u8; 32], VersionId>,
+    /// Pending versions in pieces found not whole: not looked for again
+    /// until their pieces arrive ([`St::pieces_arrived`]) or the state is
+    /// rebuilt, so an arrival costs no scan of every waiting version's
+    /// pieces.
+    unwhole: BTreeSet<VersionId>,
     /// The groups with a member held here not yet settled — neither every
     /// member counted, nor the group refused with none counted — which
     /// every application here judges again (spec §5.5).
@@ -542,6 +584,10 @@ struct Coll {
     /// as pruned, yet their bytes stay, and no epoch key is destroyed for
     /// them, so they come back if a cut refuses the prune (spec §8).
     foreign_prunes: BTreeSet<Name>,
+    /// Per writer and page path, the newest page node of the writer's node
+    /// of this name verified here (spec §7): with the node's own listing,
+    /// which subtrees may hold a seq.
+    pages: HashMap<(Writer, Bytes), Listing>,
 }
 
 /// Whether a rule makes a collection log-like: every member key appends,
@@ -698,6 +744,12 @@ struct Listing {
     head: u64,
     entries: Vec<(u64, u64)>,
     expiry: Vec<ExpiryRun>,
+    /// Its children and the writer's head in each, when the node lists
+    /// them itself (`None` on pages): which subtrees may hold a seq.
+    children: Option<Vec<(ndn_packet::NameComponent, u64)>>,
+    /// Its pages and the writer's head in each, when it lists pages
+    /// instead of children (spec §7).
+    pages: Option<Vec<(u8, u64)>>,
 }
 
 impl Listing {
@@ -771,9 +823,10 @@ impl Locked {
 }
 
 impl Coll {
-    /// What its versions wait for ([`Waits`]).
-    fn waits(&self) -> Waits<'_> {
+    /// What its versions wait for ([`Waits`]); `c` is its name.
+    fn waits<'a>(&'a self, c: &'a Name) -> Waits<'a> {
         Waits {
+            collection: c,
             members: self.members.as_ref(),
             entries: &self.entries,
             skipped: &self.skipped,
@@ -804,6 +857,39 @@ impl Coll {
             .collect()
     }
 
+    /// Its state's frontier as an own version's parents (spec §4): each
+    /// tip with the implicit digest of its packet held here. In a merge
+    /// collection every tip is held (applied, or covered by a checkpoint
+    /// that applied only once each of its parents was held as the packet it
+    /// names); under the log rule a tip whose version expired goes without.
+    fn parents(&self) -> Parents {
+        self.applied
+            .iter()
+            .map(|(w, s)| {
+                let id = VersionId {
+                    writer: w.clone(),
+                    seq: Seq(*s),
+                };
+                let digest = self.versions.get(&id).map(|hv| hv.digest).or_else(|| {
+                    self.locked
+                        .iter()
+                        .find(|l| l.writer == *w && l.seq == *s)
+                        .map(|l| wire::implicit_digest(&l.wire))
+                });
+                (id, digest)
+            })
+            .collect()
+    }
+
+    /// Whether `id` is a version this device applied under the collection's
+    /// merge rule: admitted, no longer waiting, inside the state's frontier.
+    fn applies(&self, id: &VersionId) -> bool {
+        self.state.is_some()
+            && self.versions.contains_key(id)
+            && !self.pending.contains(id)
+            && self.applied.get(&id.writer).is_some_and(|a| *a >= id.seq.0)
+    }
+
     /// Whether later versions of `id`'s writer need not wait for `id`
     /// ([`skipped_by`]).
     fn skips(&self, id: &VersionId) -> bool {
@@ -813,6 +899,74 @@ impl Coll {
     /// The prune record that covers `id`, if one is known.
     fn pruned(&self, id: &VersionId) -> Option<&Prune> {
         self.prunes.iter().find(|p| covers(p, id))
+    }
+
+    /// The epoch version `id` is sealed in (`None`: unsealed), if it is
+    /// held here — admitted, locked, waiting or outside.
+    fn epoch_of(&self, id: &VersionId) -> Option<Option<Epoch>> {
+        if let Some(hv) = self.versions.get(id) {
+            return Some(hv.epoch.clone());
+        }
+        if let Some(l) = self
+            .locked
+            .iter()
+            .find(|l| l.writer == id.writer && l.seq == id.seq.0)
+        {
+            return Some(Some(l.epoch().clone()));
+        }
+        self.waiting
+            .iter()
+            .chain(&self.outsiders)
+            .find(|hv| hv.version.id == *id)
+            .map(|hv| hv.epoch.clone())
+    }
+
+    /// Whether a version sealed in epoch `e` was pruned here.
+    fn pruned_in(&self, e: &Epoch) -> bool {
+        self.pruned_keeps
+            .values()
+            .any(|(_, ep)| ep.as_ref() == Some(e))
+    }
+
+    /// Whether this collection is done with epoch `e` for its erasure (spec
+    /// §14): every writer known to write into it left `e` (`moved_on`, of
+    /// the writer and its seqs here), and every version of it known here
+    /// is pruned, held and of another epoch (or unsealed), or not held and
+    /// never applying. A version only a prune a copy of this device's key
+    /// signed covers ([`Coll::foreign_prunes`]) counts as not pruned.
+    fn left(&self, e: &Epoch, moved_on: impl Fn(&Writer, &BTreeSet<u64>) -> bool) -> bool {
+        for (w, seqs) in &self.entries {
+            if !moved_on(w, seqs) {
+                tracing::debug!(epoch = ?e, writer = ?w, "erasure pending: a writer may still write in the epoch");
+                return false;
+            }
+            for s in seqs {
+                let id = VersionId {
+                    writer: w.clone(),
+                    seq: Seq(*s),
+                };
+                if let Some((_, ep)) = self.pruned_keeps.get(&id) {
+                    // Pruned only by a copy of this device's key: its bytes
+                    // are kept, and so is its epoch's key.
+                    let foreign = self
+                        .prunes
+                        .iter()
+                        .filter(|p| covers(p, &id))
+                        .all(|p| self.foreign_prunes.contains(&p.name));
+                    if foreign && ep.as_ref() == Some(e) {
+                        return false;
+                    }
+                    continue;
+                }
+                match self.epoch_of(&id) {
+                    Some(Some(x)) if x == *e => return false,
+                    Some(_) => {}
+                    None if self.skips(&id) => {}
+                    None => return false,
+                }
+            }
+        }
+        true
     }
 
     /// Mark every known entry a prune covers as one later versions need
@@ -1038,6 +1192,10 @@ enum Owed {
     /// A folder above it dropped a reader its own record lists: its record
     /// moves to a new epoch without that reader (spec §6).
     Folder,
+    /// A prune here dropped a version sealed in its folder epoch in force:
+    /// the folder moves to a new epoch, so the pruned one can be erased
+    /// (spec §14).
+    Erase,
 }
 
 /// Whose members records: a collection's, or a folder's (spec §6). A name
@@ -1142,6 +1300,13 @@ struct Peer {
     kept: u64,
     /// The root last processed in full.
     root: Option<[u8; 32]>,
+    /// The head of the root last processed in full, in this run or an
+    /// earlier one (kept in the store, [`walked_name`]).
+    walked: u64,
+    /// What this device followed or peeked at in the namespace when it
+    /// walked that root: the walk took the folder records above these
+    /// only, and the versions under them.
+    toward: BTreeSet<Name>,
     /// Nodes and pages processed in full, by subject and page path.
     nodes: HashMap<(Name, Option<Bytes>), [u8; 32]>,
 }
@@ -1234,8 +1399,15 @@ struct St {
     /// merge versions they bring are fetched once none is.
     descents: usize,
     /// Every group of versions a member of which is held here (in any
-    /// state), by writer and id: its members by seq (spec §5.5).
-    txns: HashMap<(Writer, u64), BTreeMap<u64, Member>>,
+    /// state), by writer and id: its members by seq — more than one at a
+    /// seq only when its writer equivocated there (spec §5.5).
+    txns: HashMap<(Writer, u64), BTreeMap<u64, Vec<Member>>>,
+    /// The first log entry taken here at each seq of each key, of any
+    /// collection and any kind: a key's log is one sequence (spec §4).
+    seqs: HashMap<(Writer, u64), Name>,
+    /// Every seq at which a key signed more than one entry, with the names
+    /// of those entries: equivocation, its evidence kept (spec §4, §5.5).
+    equivocal: HashMap<Writer, BTreeMap<u64, Vec<Name>>>,
     /// The merge rules this device runs ([`Config::rules`]).
     rules: MergeRules,
     /// This device's writer.
@@ -1422,7 +1594,10 @@ fn skipped_by(
 
 /// What a collection's versions wait for (spec §5.2): the entries known
 /// here, which of them never apply, and its writers' newest nodes.
+#[derive(Clone, Copy)]
 struct Waits<'a> {
+    /// The collection: cuts accept versions per collection.
+    collection: &'a Name,
     members: Option<&'a Members>,
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
     skipped: &'a HashMap<Writer, BTreeSet<u64>>,
@@ -1464,8 +1639,19 @@ impl Waits<'_> {
     fn outside_cut(&self, id: &VersionId) -> bool {
         self.revoked
             .get(&id.writer)
-            .is_some_and(|cut| !cut.accept.contains(id))
+            .is_some_and(|cut| !cut.accept.contains(self.collection, id))
             && !self.admitted.contains_key(id)
+    }
+
+    /// The implicit digest of the packet held here at `id`: admitted, or
+    /// held sealed and locked.
+    fn digest_of(&self, id: &VersionId) -> Option<[u8; 32]> {
+        self.admitted.get(id).map(|hv| hv.digest).or_else(|| {
+            self.locked
+                .iter()
+                .find(|l| l.writer == id.writer && l.seq == id.seq.0)
+                .map(|l| wire::implicit_digest(&l.wire))
+        })
     }
 }
 
@@ -1481,7 +1667,7 @@ fn needed(w: &Waits, y: &Writer, t: u64) -> u64 {
         seq: Seq(s),
     };
     if let Some(Refusal::OutsideCut(cut)) = w.members.and_then(|m| m.refusal(&id(t))) {
-        return cut.accept.highest_at_most(y, t).unwrap_or(0);
+        return cut.accept.highest_at_most(w.collection, y, t).unwrap_or(0);
     }
     if let Some(cut) = w.revoked.get(y)
         && w.outside_cut(&id(t))
@@ -1493,7 +1679,7 @@ fn needed(w: &Waits, y: &Writer, t: u64) -> u64 {
             .map(|(v, _)| v.seq.0);
         return cut
             .accept
-            .highest_at_most(y, t)
+            .highest_at_most(w.collection, y, t)
             .max(readmitted)
             .unwrap_or(0);
     }
@@ -1557,19 +1743,19 @@ fn tips(w: &Waits, id: &VersionId, parents: &Frontier) -> Vec<VersionId> {
 /// each with its own past held, down to what `applied` holds.
 fn past_held(w: &Waits, applied: &BTreeMap<Writer, u64>, v: &Version) -> bool {
     let mut seen = BTreeSet::new();
-    let mut todo = tips(w, &v.id, &v.parents);
+    let mut todo = tips(w, &v.id, v.parents.frontier());
     while let Some(t) = todo.pop() {
         if applied.get(&t.writer).is_some_and(|a| *a >= t.seq.0) || !seen.insert(t.clone()) {
             continue;
         }
         if let Some(hv) = w.admitted.get(&t) {
-            todo.extend(tips(w, &t, &hv.version.parents));
+            todo.extend(tips(w, &t, hv.version.parents.frontier()));
         } else if let Some(l) = w
             .locked
             .iter()
             .find(|l| l.writer == t.writer && l.seq == t.seq.0)
         {
-            todo.extend(tips(w, &t, &l.body.parents));
+            todo.extend(tips(w, &t, l.body.parents.frontier()));
         } else {
             return false;
         }
@@ -1581,7 +1767,7 @@ fn past_held(w: &Waits, applied: &BTreeMap<Writer, u64>, v: &Version) -> bool {
 /// seq − 1). down(P) is what it was made over — for a checkpoint, what it
 /// covers.
 fn past_frontier(v: &Version) -> Frontier {
-    let mut within = v.parents.clone();
+    let mut within = v.parents.frontier().clone();
     if let Some(before) = v.id.seq.0.checked_sub(1).filter(|s| *s > 0) {
         within.include(&VersionId {
             writer: v.id.writer.clone(),
@@ -1591,57 +1777,71 @@ fn past_frontier(v: &Version) -> Frontier {
     within
 }
 
-/// The past of a version as its rule sees it: down([`past_frontier`]), and
-/// the versions of its collection held here inside it, by the implicit
-/// digest of their packet — admitted, held sealed, or held and refused (a
-/// version withdrawn after another was made over it is still what that one
-/// was made over).
+/// The past of a version as its rule sees it (spec §5.2): down
+/// ([`past_frontier`]) — the versions inside it not refused by their key —
+/// and, of those, the ones held here by the implicit digest of their packet:
+/// admitted, held sealed, or held and refused for what they carry or for
+/// their group (a version withdrawn after another was made over it is still
+/// what that one was made over). Every reader holds those before it judges
+/// a version over them: a parent that applies is applied first, and one
+/// refused for what it carries is held to be refused. A version refused by
+/// its key — a cut that does not list it, a key no writer, a revocation,
+/// an issuer no longer trusted — is in no past, whether this device holds
+/// it or not (a late reader never fetches it), so every reader answers
+/// alike.
 struct PastOf<'a> {
     within: Frontier,
-    versions: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
-    locked: &'a [Locked],
-    outsiders: &'a [Arc<HeldVersion>],
+    waits: Waits<'a>,
     by_digest: &'a HashMap<[u8; 32], VersionId>,
+    /// The versions held and refused.
+    outsiders: &'a [Arc<HeldVersion>],
+    /// The entries a trust context refuses ([`St::cut_out`]).
+    cut_out: &'a HashMap<Name, OutOfCut>,
 }
 
 impl<'a> PastOf<'a> {
     fn new(
         v: &Version,
-        versions: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
-        locked: &'a [Locked],
-        outsiders: &'a [Arc<HeldVersion>],
+        waits: Waits<'a>,
         by_digest: &'a HashMap<[u8; 32], VersionId>,
+        outsiders: &'a [Arc<HeldVersion>],
+        cut_out: &'a HashMap<Name, OutOfCut>,
     ) -> Self {
         PastOf {
             within: past_frontier(v),
-            versions,
-            locked,
-            outsiders,
+            waits,
             by_digest,
+            outsiders,
+            cut_out,
         }
+    }
+
+    /// Whether `id` is refused by its key: by the record in force, or a
+    /// revocation whose cut does not accept it.
+    fn key_refused(&self, id: &VersionId) -> bool {
+        self.waits.members.is_some_and(|m| m.refusal(id).is_some()) || self.waits.outside_cut(id)
     }
 }
 
 impl Past for PastOf<'_> {
     fn contains(&self, id: &VersionId) -> bool {
-        self.within.contains(id)
+        self.within.contains(id) && !self.key_refused(id)
     }
 
     fn by_digest(&self, digest: &[u8; 32]) -> Option<VersionId> {
-        if let Some(id) = self.by_digest.get(digest) {
-            let held = self.versions.get(id).is_some_and(|hv| hv.digest == *digest)
-                || self.locked.iter().any(|l| {
-                    l.writer == id.writer
-                        && l.seq == id.seq.0
-                        && wire::implicit_digest(&l.wire) == *digest
-                });
-            if held && self.within.contains(id) {
-                return Some(id.clone());
-            }
+        if let Some(id) = self.by_digest.get(digest)
+            && self.waits.digest_of(id) == Some(*digest)
+            && self.contains(id)
+        {
+            return Some(id.clone());
         }
         self.outsiders
             .iter()
-            .find(|hv| hv.digest == *digest && self.within.contains(&hv.version.id))
+            .find(|hv| {
+                hv.digest == *digest
+                    && self.contains(&hv.version.id)
+                    && !self.cut_out.contains_key(&hv.version.name)
+            })
             .map(|hv| hv.version.id.clone())
     }
 }
@@ -1653,8 +1853,17 @@ struct Under {
     readers: Vec<Audience>,
     /// The merge rule's name; `None` under the log rule.
     function: Option<Name>,
-    /// The version's parents.
-    parents: Frontier,
+    /// The version's parents: the state's frontier, each tip with its
+    /// packet's digest.
+    parents: Parents,
+}
+
+/// An own log entry signed and not yet kept ([`Inner::sign_entry`]).
+struct LogEntry {
+    name: Name,
+    seq: u64,
+    wire: Bytes,
+    record: Record,
 }
 
 /// An own version signed and not yet kept ([`Inner::sign_version`]).
@@ -1689,7 +1898,7 @@ fn rule_on(
     let op = Op {
         id: &held.version.id,
         digest: &held.digest,
-        parents: &held.version.parents,
+        parents: held.version.parents.frontier(),
         past,
         bytes: &held.op,
     };
@@ -1713,8 +1922,10 @@ fn rule_on(
 enum Opening {
     /// Whole and opened: its operation.
     Opened(Bytes),
-    /// A piece is not held yet, or the key of its epoch.
-    NotWhole,
+    /// The key of its epoch is not held (yet).
+    NoKey,
+    /// A piece is not held yet.
+    Missing,
     /// Whole, and its payload does not open: its writer signed what does
     /// not decode.
     Bad,
@@ -1722,28 +1933,31 @@ enum Opening {
 
 /// Open `hv`, a version whose payload travels in pieces, from the pieces
 /// `store` holds (spec §4.1): assembled, each piece checked against its
-/// manifest, and unsealed under its epoch's key from `keys`.
+/// manifest, and unsealed under its epoch's key from `keys` (looked for
+/// first: it costs no read of the pieces).
 fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
     let Some(chunks) = hv.chunks else {
-        return Opening::NotWhole;
+        return Opening::Missing;
+    };
+    let key = match &hv.epoch {
+        Some(e) => match keys.key(&hv.version.collection, e) {
+            Some(key) => Some(key),
+            None => return Opening::NoKey,
+        },
+        None => None,
     };
     let name = &hv.version.name;
     if !piece_names(name, &chunks).all(|p| store.contains(&p)) {
-        return Opening::NotWhole;
+        return Opening::Missing;
     }
     let Some(payload) = pieces::assemble(name, &chunks, |p| store.get(p)) else {
-        return Opening::NotWhole;
+        return Opening::Missing;
     };
-    let op = match &hv.epoch {
-        Some(e) => {
-            let Some(key) = keys.key(&hv.version.collection, e) else {
-                return Opening::NotWhole;
-            };
-            match seal::open_payload(&key, name, &payload) {
-                Some(Inline::Fields(_, op)) => op,
-                _ => return Opening::Bad,
-            }
-        }
+    let op = match key {
+        Some(key) => match seal::open_payload(&key, name, &payload) {
+            Some(Inline::Fields(_, op)) => op,
+            _ => return Opening::Bad,
+        },
         None => match wire::decode_payload(Bytes::from(payload)) {
             Ok((_, op)) => op,
             Err(_) => return Opening::Bad,
@@ -1757,6 +1971,8 @@ struct Member {
     collection: Name,
     /// The count its own `Group` states.
     count: u32,
+    /// Its keep: a group's versions are kept until pruned (spec §5.5).
+    keep: Keep,
 }
 
 /// What a reader makes of a group, from its own signed versions and their
@@ -1769,6 +1985,14 @@ enum GroupVerdict {
     /// A member is held sealed and cannot be opened here, or its
     /// collection's rule is unknown here.
     Unreadable,
+    /// A member is sealed in an epoch whose audience, as the records held
+    /// here name it, does not admit every reader the group declares: the
+    /// member, its epoch and the readers left out.
+    Uncovered {
+        member: Name,
+        epoch: Epoch,
+        out: Vec<Audience>,
+    },
     /// Fewer than all members present.
     Incomplete { present: u32, count: u32 },
     /// Every member present. `next`: the lowest seq of a held member
@@ -1785,6 +2009,24 @@ impl GroupVerdict {
                 why: why.clone(),
             }),
             GroupVerdict::Unreadable => Gate::Wait(Some("group not readable here".into())),
+            GroupVerdict::Uncovered { member, epoch, out } => {
+                let out: Vec<String> = out
+                    .iter()
+                    .map(|a| match a {
+                        Audience::Person(n) => format!("person {n}"),
+                        Audience::Device(n) => format!("device {n}"),
+                        Audience::Group(n) => format!("group {n}"),
+                    })
+                    .collect();
+                Gate::Wait(Some(format!(
+                    "group waits: its member {member} is sealed in the epoch {} started at seq \
+                     {}, whose readers do not include {}, whom its group declares; it counts \
+                     once the owner adds them to that epoch, at every reader alike",
+                    epoch.creator,
+                    epoch.seq.0,
+                    out.join(", ")
+                )))
+            }
             GroupVerdict::Incomplete { present, count } => {
                 Gate::Wait(Some(format!("group incomplete: {present} of {count}")))
             }
@@ -1810,7 +2052,7 @@ enum MemberState {
     Refused(Refusal),
     /// Refused only because its group was: held, and present.
     GroupRefused,
-    /// Pruned or expired: present for its group (spec §5.5).
+    /// Pruned by its writer: present for its group (spec §5.5).
     Dropped,
 }
 
@@ -1854,12 +2096,13 @@ enum Took {
 
 /// One collection's pending versions run through its rule (spec §5.2):
 /// each applied once its writer's earlier versions and its parents are; a
-/// merge version only once whole and opened, and only if its rule's check
-/// passes against its past; a checkpoint as soon as its past is held,
-/// moving the frontier past what it covers. A member of a group applies
-/// only as its group's verdict lets it ([`Gate`], spec §5.5). Under the log
-/// rule (`state` `None`) versions apply without a rule. The live state and
-/// [`St::value_at`] run the same procedure.
+/// merge version only once whole and opened, only if it was made for the
+/// rule in force, only over the very packets its parents name, and only if
+/// its rule's check passes against its past; a checkpoint as soon as its
+/// past is held, moving the frontier past what it covers. A member of a
+/// group applies only as its group's verdict lets it ([`Gate`], spec
+/// §5.5). Under the log rule (`state` `None`) versions apply without a
+/// rule. The live state and [`St::value_at`] run the same procedure.
 struct Run<'a> {
     members: &'a Members,
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
@@ -1867,6 +2110,8 @@ struct Run<'a> {
     locked: &'a [Locked],
     revoked: &'a HashMap<Writer, Cut>,
     by_digest: &'a HashMap<[u8; 32], VersionId>,
+    /// The entries a trust context refuses ([`St::cut_out`]).
+    cut_out: &'a HashMap<Name, OutOfCut>,
     store: &'a dyn DataStore,
     keys: &'a Keys,
     /// What each group member's group lets it do.
@@ -1879,14 +2124,16 @@ struct Run<'a> {
     kinds: &'a mut HashMap<VersionId, OpKind>,
     /// The versions held and refused: those refused in this run join them.
     outsiders: &'a mut Vec<Arc<HeldVersion>>,
-    /// Versions found not whole in this run: not tried again in it.
-    unwhole: BTreeSet<VersionId>,
+    /// Pending versions found not whole ([`Coll::unwhole`]): not looked
+    /// for again until their pieces arrive.
+    unwhole: &'a mut BTreeSet<VersionId>,
     out: Vec<Ran>,
 }
 
 impl Run<'_> {
     fn waits(&self) -> Waits<'_> {
         Waits {
+            collection: &self.members.collection,
             members: Some(self.members),
             entries: self.entries,
             skipped: self.skipped,
@@ -1935,6 +2182,7 @@ impl Run<'_> {
         }
         let merge = self.state.is_some();
         if merge {
+            self.other_rule();
             self.cover();
         }
         loop {
@@ -1964,6 +2212,89 @@ impl Run<'_> {
             }
         }
         self.out
+    }
+
+    /// Every pending version made for another rule than the one in force
+    /// is refused (spec §5.1): what it carries is read only under its own.
+    /// Versions inside the record's `since` are its history, taken without
+    /// a rule.
+    fn other_rule(&mut self) {
+        let Rule::Merge { function } = &self.members.rule else {
+            return;
+        };
+        let other: Vec<(VersionId, Refusal)> = self
+            .pending
+            .iter()
+            .filter(|id| !self.history(id))
+            .filter_map(|id| {
+                let made_for = &self.versions.get(id)?.version.rule;
+                (made_for.as_ref() != Some(function)).then(|| {
+                    let why = Refusal::OtherRule {
+                        made_for: made_for.clone(),
+                        in_force: function.clone(),
+                    };
+                    (id.clone(), why)
+                })
+            })
+            .collect();
+        for (id, why) in other {
+            tracing::debug!(?id, %why, "refused");
+            self.refuse(&id, why);
+        }
+    }
+
+    /// Whether each parent of `id`, of `kind`, is held here as the very
+    /// packet it names (spec §5.2): `Ok(false)` while a parent that applies
+    /// is not held yet. A parent that never applies is no tip of an edit's
+    /// (it waits for what applies below it); a checkpoint cannot stand for
+    /// one. Refused for good when a parent carries no digest, names another
+    /// packet than the one held at its writer and seq, or — of a checkpoint
+    /// — never applies: every reader holding the same packets decides alike,
+    /// whatever order they arrived in.
+    fn parents_hold(&self, id: &VersionId, kind: OpKind) -> Result<bool, Refusal> {
+        let Some(hv) = self.versions.get(id) else {
+            return Ok(false);
+        };
+        let w = self.waits();
+        for (y, t, digest) in hv.version.parents.tips() {
+            let parent = VersionId {
+                writer: y.clone(),
+                seq: t,
+            };
+            let Some(digest) = digest else {
+                return Err(Refusal::Parent {
+                    parent,
+                    why: "it carries no digest of that packet, and a merge version binds each \
+                          parent to the packet it was made over"
+                        .into(),
+                });
+            };
+            if needed(&w, y, t.0) != t.0 {
+                if kind == OpKind::Checkpoint {
+                    return Err(Refusal::Parent {
+                        parent,
+                        why: "that version never applies here, and a checkpoint stands only \
+                              for versions that apply"
+                            .into(),
+                    });
+                }
+                continue;
+            }
+            match w.digest_of(&parent) {
+                None => return Ok(false),
+                Some(held) if held != *digest => {
+                    return Err(Refusal::Parent {
+                        parent,
+                        why: "the packet held there has another digest (its writer named a \
+                              packet that does not exist, or that key signed two packets at one \
+                              seq)"
+                            .into(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(true)
     }
 
     /// Every pending version inside the frontier is covered by a
@@ -2015,10 +2346,11 @@ impl Run<'_> {
                 self.versions.insert(id.clone(), Arc::new(opened));
                 Some(true)
             }
-            Opening::NotWhole => {
+            Opening::Missing => {
                 self.unwhole.insert(id.clone());
                 None
             }
+            Opening::NoKey => None,
             Opening::Bad => {
                 tracing::debug!(?id, "refused: its payload in pieces does not open");
                 self.refuse(id, Refusal::BadSignature);
@@ -2032,15 +2364,15 @@ impl Run<'_> {
         let hv = &self.versions[id];
         let past = PastOf::new(
             &hv.version,
-            self.versions,
-            self.locked,
-            self.outsiders,
+            self.waits(),
             self.by_digest,
+            self.outsiders,
+            self.cut_out,
         );
         let op = Op {
             id,
             digest: &hv.digest,
-            parents: &hv.version.parents,
+            parents: hv.version.parents.frontier(),
             past: &past,
             bytes: &hv.op,
         };
@@ -2073,36 +2405,65 @@ impl Run<'_> {
             }
         };
         self.kinds.insert(id.clone(), kind);
+        match self.parents_hold(id, kind) {
+            Ok(true) => {}
+            Ok(false) => return Took::Waits,
+            Err(why) => {
+                tracing::debug!(?id, %why, "refused");
+                self.refuse(id, why);
+                return Took::Refused;
+            }
+        }
         let hv = Arc::clone(&self.versions[id]);
         let done = {
+            // Its past, from the fields, while the state is borrowed.
+            let waits = Waits {
+                collection: &self.members.collection,
+                members: Some(self.members),
+                entries: self.entries,
+                skipped: self.skipped,
+                listings: self.listings,
+                locked: self.locked,
+                revoked: self.revoked,
+                admitted: self.versions,
+            };
             let past = PastOf::new(
                 &hv.version,
-                self.versions,
-                self.locked,
-                self.outsiders,
+                waits,
                 self.by_digest,
+                self.outsiders,
+                self.cut_out,
             );
             let op = Op {
                 id,
                 digest: &hv.digest,
-                parents: &hv.version.parents,
+                parents: hv.version.parents.frontier(),
                 past: &past,
                 bytes: &hv.op,
             };
             self.state.as_deref_mut().expect("a merge run").apply(&op)
         };
-        let counting = match done {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(?id, "refused by its rule: {e}");
-                self.refuse(id, Refusal::Rule { why: e.0 });
-                return Took::Refused;
-            }
-        };
+        // What the operation itself makes unacceptable its check refused,
+        // from the operation and its past alone; apply meets the state,
+        // which other writers' versions make, so what it answers never
+        // refuses a version nor withdraws its group (spec §5.1): the
+        // version is applied, not counted, with the reason.
+        let counting = done.unwrap_or_else(|e| {
+            tracing::debug!(?id, "not counted: its rule does not apply it here: {e}");
+            Counting::NotCounted(format!(
+                "its rule does not apply it to the state here: {}",
+                e.0
+            ))
+        });
         self.pending.remove(id);
+        // Applied, an operation in pieces is not kept in memory.
+        if let Some(unloaded) = hv.unloaded() {
+            self.versions.insert(id.clone(), Arc::new(unloaded));
+        }
         if kind == OpKind::Checkpoint {
-            // The frontier moves past everything the checkpoint covers.
-            for t in tips(&self.waits(), id, &hv.version.parents) {
+            // The frontier moves past everything the checkpoint covers:
+            // each of its parents, held as the packet it names.
+            for t in tips(&self.waits(), id, hv.version.parents.frontier()) {
                 let a = self.applied.entry(t.writer).or_insert(0);
                 *a = (*a).max(t.seq.0);
             }
@@ -2399,6 +2760,92 @@ impl St {
         collection::effective(c, own, &self.folders_above(c))
     }
 
+    /// Whether a version of a collection under folder `f` that reads in
+    /// `f`'s epoch in force was pruned in that epoch, by any writer: a
+    /// prune asking for its erasure, so the folder moves to a new epoch
+    /// first (spec §14).
+    fn folder_epoch_pruned(&self, f: &Name) -> bool {
+        let Some(e) = self
+            .folders
+            .get(f)
+            .and_then(|x| x.members.as_ref())
+            .and_then(|m| m.epoch.as_ref())
+        else {
+            return false;
+        };
+        self.colls.iter().any(|(c, x)| {
+            c.has_prefix(f)
+                && c != f
+                && x.members
+                    .as_ref()
+                    .is_some_and(|m| m.epoch.as_ref() == Some(e))
+                && x.pruned_in(e)
+        })
+    }
+
+    /// Owe, from the records and prunes held alone, what namespace `ns`'s
+    /// collections and folders need signed (spec §6.1, §14): a new epoch of
+    /// one sealed in its own epoch that outgrew its audience, and of a
+    /// folder whose epoch in force a prune dropped a version of.
+    fn owe_from_held(&mut self, ns: &Name) {
+        let mine = |n: &Name| namespace_of(n).as_ref() == Some(ns);
+        let mut owed: Vec<(Subject, Owed)> = self
+            .colls
+            .iter()
+            .filter(|(c, x)| {
+                mine(c) && owes_epoch(x.line.own.as_ref(), x.members.as_ref(), &x.line.epochs)
+            })
+            .map(|(c, _)| {
+                let s = Subject {
+                    name: c.clone(),
+                    folder: false,
+                };
+                (s, Owed::Folder)
+            })
+            .collect();
+        for (f, x) in &self.folders {
+            if !mine(f) {
+                continue;
+            }
+            let why = if owes_epoch(x.line.own.as_ref(), x.members.as_ref(), &x.line.epochs) {
+                Owed::Folder
+            } else if self.folder_epoch_pruned(f) {
+                Owed::Erase
+            } else {
+                continue;
+            };
+            let s = Subject {
+                name: f.clone(),
+                folder: true,
+            };
+            owed.push((s, why));
+        }
+        for (s, why) in owed {
+            self.owed.entry(s).or_insert(why);
+        }
+    }
+
+    /// The writer prefixes that the record in force over subject `c` — its
+    /// own record `current` narrowed by the folders above, or theirs alone
+    /// — admits and that a record of `c` listing `writers` would not cover
+    /// (listing none, it takes the folders' writers): each is removed by
+    /// that record, with a cut (spec §6.1, §8).
+    fn removing(&self, c: &Name, current: Option<&Members>, writers: &[Name]) -> Vec<Name> {
+        let above = self.folders_above(c);
+        let inherited = match writers.is_empty() {
+            true => collection::effective(c, None, &above)
+                .map(|m| m.writers)
+                .unwrap_or_default(),
+            false => Vec::new(),
+        };
+        collection::effective(c, current, &above)
+            .map(|m| m.writers)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !writers.iter().chain(&inherited).any(|w| p.has_prefix(w)))
+            .collect()
+    }
+
     /// Whose record names epoch `e` that a version of `c`, or an ask
     /// naming `c`, is sealed in: `c`'s collection records, else those of the
     /// nearest folder at or above `c` (spec §6: a collection that inherits
@@ -2469,7 +2916,7 @@ impl St {
             return;
         }
         let old = std::mem::replace(&mut coll.members, new.clone());
-        let owes = owes_epoch(coll.line.own.as_ref(), old.as_ref(), new.as_ref());
+        let owes = owes_epoch(coll.line.own.as_ref(), new.as_ref(), &coll.line.epochs);
         let dropped = old.as_ref().is_some_and(|o| {
             o.readers
                 .iter()
@@ -2528,9 +2975,12 @@ impl St {
             let own = self.folders.get(&n).and_then(|x| x.line.own.as_ref());
             let new = collection::effective(&n, own, &self.folders_above(&n));
             let folder = self.folders.get_mut(&n).expect("listed above");
-            let old = std::mem::replace(&mut folder.members, new.clone());
-            if owes_epoch(folder.line.own.as_ref(), old.as_ref(), new.as_ref())
-                && namespace_of(&n).as_ref() == Some(&self.ns)
+            folder.members = new;
+            if owes_epoch(
+                folder.line.own.as_ref(),
+                folder.members.as_ref(),
+                &folder.line.epochs,
+            ) && namespace_of(&n).as_ref() == Some(&self.ns)
             {
                 self.owed.insert(
                     Subject {
@@ -2608,6 +3058,7 @@ impl St {
             _ => None,
         };
         coll.kinds.clear();
+        coll.unwhole.clear();
         let not_counted = std::mem::take(&mut coll.not_counted);
         let names: Vec<(VersionId, Name, bool)> = all
             .iter()
@@ -2688,7 +3139,7 @@ impl St {
     fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
         if let Some(g) = hv.version.group {
-            self.note_member(&c, &hv.version.id, g);
+            self.note_member(&c, &hv.version.id, g, hv.version.keep);
         }
         let coll = self.colls.entry(c.clone()).or_default();
         if let Some(out) = self.cut_out.get(&hv.version.name) {
@@ -2791,7 +3242,11 @@ impl St {
                 let members: Vec<(u64, Name)> = self
                     .txns
                     .get(&key)
-                    .map(|m| m.iter().map(|(s, m)| (*s, m.collection.clone())).collect())
+                    .map(|m| {
+                        m.iter()
+                            .flat_map(|(s, ms)| ms.iter().map(|m| (*s, m.collection.clone())))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let mut settled = true;
                 for (seq, y) in members {
@@ -2871,6 +3326,7 @@ impl St {
             refused,
             store,
             keys,
+            cut_out,
             ..
         } = self;
         let Some(coll) = colls.get_mut(c) else {
@@ -2892,6 +3348,7 @@ impl St {
             pending,
             revoked,
             outsiders,
+            unwhole,
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
@@ -2923,6 +3380,7 @@ impl St {
                 locked,
                 revoked,
                 by_digest,
+                cut_out,
                 store: &**store,
                 keys,
                 gates: &gates,
@@ -2933,10 +3391,12 @@ impl St {
                 pending,
                 kinds,
                 outsiders,
-                unwhole: BTreeSet::new(),
+                unwhole,
                 out: Vec::new(),
             }
             .run();
+            // Only what still waits is remembered not whole.
+            unwhole.retain(|id| pending.contains(id));
             for r in ran {
                 match r {
                     Ran::Applied(id, counting) => {
@@ -3025,28 +3485,165 @@ impl St {
         }
     }
 
-    /// Note `id`, of `c`, as a member of group `g` of its writer.
-    fn note_member(&mut self, c: &Name, id: &VersionId, g: Group) {
+    /// Note `id`, of `c`, kept `keep`, as a member of group `g` of its
+    /// writer. A second entry its writer signed at that seq, in another
+    /// collection, is noted beside it: the group is then malformed.
+    fn note_member(&mut self, c: &Name, id: &VersionId, g: Group, keep: Keep) {
         let key = (id.writer.clone(), g.id);
-        self.txns.entry(key.clone()).or_default().insert(
-            id.seq.0,
-            Member {
+        let at = self
+            .txns
+            .entry(key.clone())
+            .or_default()
+            .entry(id.seq.0)
+            .or_default();
+        if !at.iter().any(|m| m.collection == *c) {
+            at.push(Member {
                 collection: c.clone(),
                 count: g.count,
-            },
-        );
+                keep,
+            });
+        }
         self.colls.entry(c.clone()).or_default().txns.insert(key);
     }
 
-    /// Whether `id`, a version of `c` this device knows of, was pruned or
-    /// expired here: present for its group (spec §5.5).
+    /// Note the log entry `name`, signed by `writer` at `seq`: a key's log
+    /// is one sequence across its collections and entry kinds (spec §4),
+    /// so a second entry at a seq it already used, under another name, is
+    /// equivocation. Both are kept, and it is reported to the watchers of
+    /// both collections where both are versions. Whether it is such a
+    /// second entry: once it is taken, the writer's groups over that seq
+    /// are judged again ([`Self::regroup_seq`]).
+    fn note_seq(&mut self, name: &Name, writer: &Writer, seq: u64, record: &Record) -> bool {
+        let key = (writer.clone(), seq);
+        let first = match self.seqs.get(&key) {
+            None => {
+                self.seqs.insert(key, name.clone());
+                return false;
+            }
+            Some(first) if first == name => return false,
+            Some(first) => first.clone(),
+        };
+        let names = self
+            .equivocal
+            .entry(writer.clone())
+            .or_default()
+            .entry(seq)
+            .or_insert_with(|| vec![first.clone()]);
+        if names.contains(name) {
+            return false;
+        }
+        names.push(name.clone());
+        tracing::warn!(%first, second = %name, "two log entries of one key at one seq: equivocation");
+        if let Record::Version(body) = record
+            && let Some(v) = self.held_version(&first)
+        {
+            let change = Change::Equivocation {
+                first: Box::new(v.clone()),
+                second: Box::new(version_of(name, writer, seq, body.clone())),
+            };
+            self.tell(&body.collection, &change);
+            if v.collection != body.collection {
+                self.tell(&v.collection, &change);
+            }
+        }
+        true
+    }
+
+    /// Judge again every group of `writer` over `seq` (spec §5.5): a second
+    /// entry at that seq was taken.
+    fn regroup_seq(&mut self, writer: &Writer, seq: u64) {
+        let groups: Vec<((Writer, u64), Vec<Name>)> = self
+            .txns
+            .iter()
+            .filter(|((w, gid), ms)| {
+                w == writer
+                    && seq >= *gid
+                    && ms
+                        .values()
+                        .flatten()
+                        .any(|m| seq - gid < u64::from(m.count))
+            })
+            .map(|(k, ms)| {
+                let colls = ms.values().flatten().map(|m| m.collection.clone());
+                (k.clone(), colls.collect())
+            })
+            .collect();
+        for (key, colls) in groups {
+            for c in &colls {
+                self.colls
+                    .entry(c.clone())
+                    .or_default()
+                    .txns
+                    .insert(key.clone());
+            }
+            if let Some(c) = colls.first() {
+                self.apply_ready(c, &BTreeSet::new());
+            }
+        }
+    }
+
+    /// Judge again every group of `writer` with a member in a collection
+    /// of `folder` (spec §5.5): a node of the writer there was verified,
+    /// and what it lists, or does not, may settle such a group.
+    fn regroup_under(&mut self, writer: &Writer, folder: &Name) {
+        let groups: Vec<((Writer, u64), Vec<Name>)> = self
+            .txns
+            .iter()
+            .filter(|((w, _), ms)| {
+                w == writer
+                    && ms
+                        .values()
+                        .flatten()
+                        .any(|m| folder_of(&m.collection) == *folder)
+            })
+            .map(|(k, ms)| {
+                let colls = ms.values().flatten().map(|m| m.collection.clone());
+                (k.clone(), colls.collect())
+            })
+            .collect();
+        for (key, colls) in groups {
+            for c in &colls {
+                self.colls
+                    .entry(c.clone())
+                    .or_default()
+                    .txns
+                    .insert(key.clone());
+            }
+            if let Some(c) = colls.first() {
+                self.apply_ready(c, &BTreeSet::new());
+            }
+        }
+    }
+
+    /// The version held here under `name`, opened or sealed.
+    fn held_version(&self, name: &Name) -> Option<Version> {
+        let l = parse_log_name(name)?;
+        let coll = self.colls.get(l.subject.as_ref()?)?;
+        coll.versions
+            .values()
+            .chain(&coll.waiting)
+            .chain(&coll.outsiders)
+            .find(|hv| hv.version.name == *name)
+            .map(|hv| hv.version.clone())
+            .or_else(|| {
+                coll.locked
+                    .iter()
+                    .find(|lk| lk.name == *name)
+                    .map(|lk| version_of(name, &lk.writer, lk.seq, lk.body.clone()))
+            })
+    }
+
+    /// Whether `id`, a version of `c` this device knows of, was pruned by
+    /// its writer: present for its group (spec §5.5). A prune is a signed
+    /// record every reader of `c` fetches, and the writer's summary keeps
+    /// listing what it pruned, so every reader knows it alike.
     fn dropped(&self, c: &Name, id: &VersionId) -> bool {
         let Some(device) = device_of(id.writer.key()) else {
             return false;
         };
         if matches!(
             self.held.get(&log_name(&device, Some(c), id.seq.0)),
-            Some(Held::Pruned(_) | Held::Expired(_))
+            Some(Held::Pruned(_))
         ) {
             return true;
         }
@@ -3116,11 +3713,11 @@ impl St {
         MemberState::Missing
     }
 
-    /// The seal group member `id` of `c` declares, if it is held.
-    fn declared_seal(&self, c: &Name, id: &VersionId) -> Option<BTreeSet<Audience>> {
+    /// The seal group member `id` of `c` declares, and the epoch it is
+    /// sealed in, if it is held.
+    fn sealing(&self, c: &Name, id: &VersionId) -> Option<(BTreeSet<Audience>, Option<Epoch>)> {
         let coll = self.colls.get(c)?;
-        let seal = coll
-            .versions
+        coll.versions
             .get(id)
             .or_else(|| {
                 coll.outsiders
@@ -3128,18 +3725,145 @@ impl St {
                     .chain(&coll.waiting)
                     .find(|hv| hv.version.id == *id)
             })
-            .map(|hv| &hv.version.seal)
+            .map(|hv| (&hv.version.seal, hv.epoch.clone()))
             .or_else(|| {
                 coll.locked
                     .iter()
                     .find(|l| l.writer == id.writer && l.seq == id.seq.0)
-                    .map(|l| &l.body.seal)
-            })?;
-        Some(seal.any_of.iter().cloned().collect())
+                    .map(|l| (&l.body.seal, Some(l.epoch().clone())))
+            })
+            .map(|(seal, epoch)| (seal.any_of.iter().cloned().collect(), epoch))
     }
 
-    /// The verdict on group `key` (its writer and id), from its own signed
-    /// versions and their admission alone (spec §5.5).
+    /// The readers of epoch `e` that a version of `c` is sealed in, as the
+    /// records held here name it (spec §9): every reader a held record
+    /// naming it lists (its audience is these and the device that started
+    /// it). Records that only add readers keep an epoch, so it only grows
+    /// as records arrive.
+    fn epoch_readers(&self, c: &Name, e: &Epoch) -> Vec<Audience> {
+        let s = self.seal_subject(c, e);
+        self.line_of(&s)
+            .and_then(|(epochs, _)| epochs.get(e))
+            .map(|named| named.readers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `w` signed an entry at `seq` in collection `x`, as every
+    /// reader following `x` learns alike (spec §5.5): held here kept until
+    /// pruned, or listed by `w`'s node and pruned by `w`'s prune record, or
+    /// listed by `w`'s node of a merge collection (whose nodes list every
+    /// entry). An entry kept for its last `n` or until a date may leave
+    /// `w`'s listing, so a reader starting later would never learn of it:
+    /// it is no evidence; nor is one the trust context refuses (a copy of a
+    /// revoked key wrote it, spec §8.1).
+    fn signed_at(&self, x: &Name, w: &Writer, seq: u64) -> bool {
+        let Some(coll) = self.colls.get(x) else {
+            return false;
+        };
+        let id = VersionId {
+            writer: w.clone(),
+            seq: Seq(seq),
+        };
+        let ours = |name: &Name| !self.cut_out.contains_key(name);
+        let held = coll
+            .versions
+            .get(&id)
+            .into_iter()
+            .chain(
+                coll.waiting
+                    .iter()
+                    .chain(&coll.outsiders)
+                    .filter(|hv| hv.version.id == id),
+            )
+            .any(|hv| hv.version.keep == Keep::Forever && ours(&hv.version.name))
+            || coll.locked.iter().any(|l| {
+                l.writer == *w && l.seq == seq && l.body.keep == Keep::Forever && ours(&l.name)
+            });
+        if held {
+            return true;
+        }
+        let listed = coll
+            .listings
+            .get(w)
+            .is_some_and(|l| in_ranges(&l.entries, seq));
+        let known = listed || coll.entries.get(w).is_some_and(|e| e.contains(&seq));
+        (known && coll.pruned(&id).is_some())
+            || (listed
+                && coll
+                    .members
+                    .as_ref()
+                    .is_some_and(|m| matches!(m.rule, Rule::Merge { .. })))
+    }
+
+    /// Whether `w` provably signed no entry at `seq` in any collection of
+    /// `folder`, from its signed nodes alone (spec §5.5): its node of the
+    /// folder reaches `seq`; every child it lists — itself or through the
+    /// pages whose head reaches `seq`, each page node held and reaching it
+    /// — whose subtree reaches `seq` has its node held, reaching `seq` and
+    /// listing no entry there; and none is held there.
+    fn missing_for_good(&self, folder: &Name, w: &Writer, seq: u64) -> bool {
+        let Some(fc) = self.colls.get(folder) else {
+            return false;
+        };
+        let Some(f) = fc.listings.get(w).filter(|f| f.head >= seq) else {
+            return false;
+        };
+        // The children whose subtree reaches `seq`, through the pages.
+        let mut reaching = Vec::new();
+        let mut todo: Vec<(&Listing, Vec<u8>)> = vec![(f, Vec::new())];
+        while let Some((node, path)) = todo.pop() {
+            match (&node.children, &node.pages) {
+                (Some(children), _) => reaching.extend(
+                    children
+                        .iter()
+                        .filter(|(_, head)| *head >= seq)
+                        .map(|(comp, _)| comp),
+                ),
+                (None, Some(pages)) => {
+                    for (bucket, _) in pages.iter().filter(|(_, head)| *head >= seq) {
+                        let mut sub = path.clone();
+                        sub.push(*bucket);
+                        let Some(page) = fc
+                            .pages
+                            .get(&(w.clone(), Bytes::from(sub.clone())))
+                            .filter(|p| p.head >= seq)
+                        else {
+                            return false;
+                        };
+                        todo.push((page, sub));
+                    }
+                }
+                (None, None) => return false,
+            }
+        }
+        let id = VersionId {
+            writer: w.clone(),
+            seq: Seq(seq),
+        };
+        reaching.into_iter().all(|comp| {
+            let x = folder.clone().append_component(comp.clone());
+            let Some(coll) = self.colls.get(&x) else {
+                return false;
+            };
+            coll.listings
+                .get(w)
+                .is_some_and(|l| l.head >= seq && !in_ranges(&l.entries, seq))
+                && !coll.entries.get(w).is_some_and(|e| e.contains(&seq))
+                && !coll.versions.contains_key(&id)
+                && !coll
+                    .waiting
+                    .iter()
+                    .chain(&coll.outsiders)
+                    .any(|hv| hv.version.id == id)
+                && !coll.locked.iter().any(|l| l.writer == *w && l.seq == seq)
+        })
+    }
+
+    /// The verdict on group `key` (its writer and id), from what every
+    /// reader of its folder holds alike: its own signed versions and their
+    /// admission, its writer's signed entries and listings under the
+    /// folder, and the audiences of the epochs its members are sealed in
+    /// (spec §5.5).
     fn verdict(&self, key: &(Writer, u64)) -> GroupVerdict {
         let (w, gid) = key;
         let Some(members) = self.txns.get(key) else {
@@ -3156,40 +3880,91 @@ impl St {
             Some(d) => log_name(&d, Some(c), seq),
             None => c.clone(),
         };
-        let count = members.values().next().map_or(0, |m| m.count);
+        let count = members.values().flatten().next().map_or(0, |m| m.count);
+        let malformed = |member: Name, why: &str| GroupVerdict::Refused {
+            member,
+            why: format!("its group is malformed: {why}"),
+        };
+        let span = *gid..gid.saturating_add(u64::from(count));
         let mut folders = BTreeSet::new();
         let mut colls = BTreeSet::new();
         let mut seals: Option<BTreeSet<Audience>> = None;
-        for (seq, m) in members {
-            let malformed = |why: &str| GroupVerdict::Refused {
-                member: name_of(&m.collection, *seq),
-                why: format!("its group is malformed: {why}"),
-            };
-            if *seq < *gid || *seq - gid >= u64::from(m.count) {
-                return malformed("a member's seq lies outside the group");
+        for (seq, ms) in members {
+            if let [a, b, ..] = &ms[..] {
+                return malformed(
+                    name_of(&a.collection, *seq),
+                    &format!(
+                        "its writer signed two members at seq {seq}, in {} and {}",
+                        a.collection, b.collection
+                    ),
+                );
             }
-            if m.count != count {
-                return malformed("its members disagree on the group's count");
-            }
-            folders.insert(folder_of(&m.collection));
-            if folders.len() > 1 {
-                return malformed("its members lie in collections of different folders");
-            }
-            if !colls.insert(m.collection.clone()) {
-                return malformed("two of its members are in one collection");
-            }
-            if let Some(seal) = self.declared_seal(&m.collection, &id(*seq)) {
-                match &seals {
-                    Some(s) if *s != seal => {
-                        return malformed("its members declare different seals");
+            for m in ms {
+                let member = || name_of(&m.collection, *seq);
+                if *seq < *gid || *seq - gid >= u64::from(m.count) {
+                    return malformed(member(), "a member's seq lies outside the group");
+                }
+                if m.count != count {
+                    return malformed(member(), "its members disagree on the group's count");
+                }
+                if m.keep != Keep::Forever {
+                    return malformed(
+                        member(),
+                        &format!(
+                            "its member at seq {seq} is kept {:?}, and a group's versions are \
+                             kept until pruned, so that every reader can tell it complete",
+                            m.keep
+                        ),
+                    );
+                }
+                folders.insert(folder_of(&m.collection));
+                if folders.len() > 1 {
+                    return malformed(
+                        member(),
+                        "its members lie in collections of different folders",
+                    );
+                }
+                if !colls.insert(m.collection.clone()) {
+                    return malformed(member(), "two of its members are in one collection");
+                }
+                if let Some((seal, _)) = self.sealing(&m.collection, &id(*seq)) {
+                    match &seals {
+                        Some(s) if *s != seal => {
+                            return malformed(member(), "its members declare different seals");
+                        }
+                        Some(_) => {}
+                        None => seals = Some(seal),
                     }
-                    Some(_) => {}
-                    None => seals = Some(seal),
                 }
             }
         }
+        let folder = folders.into_iter().next().expect("a member is held");
+        // Its writer signed two entries at one of its seqs in collections
+        // of its folder, as every reader of the folder learns alike from
+        // the writer's own signed entries and listings there: no reader
+        // could tell which one counts.
+        let under: Vec<&Name> = self
+            .colls
+            .keys()
+            .filter(|c| folder_of(c) == folder)
+            .collect();
+        for s in span.clone() {
+            let at: Vec<&&Name> = under.iter().filter(|x| self.signed_at(x, w, s)).collect();
+            if let [a, b, ..] = at[..] {
+                return malformed(
+                    name_of(a, s),
+                    &format!(
+                        "its writer signed two entries at seq {s}, in {a} and {b}, though a \
+                         key's log is one sequence across its collections"
+                    ),
+                );
+            }
+        }
         let mut states = BTreeMap::new();
-        for (seq, m) in members {
+        for (seq, m) in members
+            .iter()
+            .flat_map(|(s, ms)| ms.iter().map(move |m| (s, m)))
+        {
             let state = self.member_state(&m.collection, &id(*seq));
             if let MemberState::Refused(why) = &state {
                 return GroupVerdict::Refused {
@@ -3199,10 +3974,56 @@ impl St {
             }
             states.insert(*seq, state);
         }
+        // The members' epochs: all sealed or none, and each epoch's
+        // audience admitting every reader any member's epoch lists — taken
+        // from the epochs used, never from the seal a writer declares —
+        // else a reader could open some members and never others.
+        // Audiences only grow, so this waits.
+        let sealed: Vec<(Name, u64, Option<Epoch>)> = members
+            .iter()
+            .flat_map(|(s, ms)| ms.iter().map(move |m| (s, m)))
+            .filter_map(|(s, m)| {
+                let (_, e) = self.sealing(&m.collection, &id(*s))?;
+                Some((m.collection.clone(), *s, e))
+            })
+            .collect();
+        if let (Some(a), Some(b)) = (
+            sealed.iter().find(|(_, _, e)| e.is_some()),
+            sealed.iter().find(|(_, _, e)| e.is_none()),
+        ) {
+            return malformed(
+                name_of(&b.0, b.1),
+                &format!(
+                    "its member in {} is sealed and its member in {} is not",
+                    a.0, b.0
+                ),
+            );
+        }
+        let wanted: BTreeSet<Audience> = sealed
+            .iter()
+            .filter_map(|(c, _, e)| Some(self.epoch_readers(c, e.as_ref()?)))
+            .flatten()
+            .collect();
+        for (c, s, e) in &sealed {
+            let Some(e) = e else { continue };
+            let mut audience = self.epoch_readers(c, e);
+            audience.push(Audience::Device(e.creator.clone()));
+            let out: Vec<Audience> = wanted
+                .iter()
+                .filter(|r| !collection::admitted(r, &audience))
+                .cloned()
+                .collect();
+            if !out.is_empty() {
+                return GroupVerdict::Uncovered {
+                    member: name_of(c, *s),
+                    epoch: e.clone(),
+                    out,
+                };
+            }
+        }
         if states.values().any(|s| *s == MemberState::Unreadable) {
             return GroupVerdict::Unreadable;
         }
-        let folder = folders.into_iter().next().expect("a member is held");
         let mut present = 0;
         let mut all_ready = true;
         let mut next = None;
@@ -3211,11 +4032,12 @@ impl St {
                 Some(MemberState::Counted | MemberState::Dropped) => present += 1,
                 Some(MemberState::Waiting) => {
                     present += 1;
-                    let coll = &self.colls[&members[&s].collection];
+                    let c = &members[&s][0].collection;
+                    let coll = &self.colls[c];
                     let is_ready = coll
                         .versions
                         .get(&id(s))
-                        .is_some_and(|hv| ready(&coll.waits(), &coll.applied, &hv.version));
+                        .is_some_and(|hv| ready(&coll.waits(c), &coll.applied, &hv.version));
                     if !is_ready {
                         all_ready = false;
                     } else if next.is_none() {
@@ -3228,14 +4050,22 @@ impl St {
                 }
                 Some(_) => {}
                 None => {
-                    // Not held as a member: pruned or expired here, in a
-                    // collection of the folder, it is present.
-                    let dropped = self
-                        .colls
-                        .keys()
-                        .any(|c| folder_of(c) == folder && self.dropped(c, &id(s)));
+                    // Not held as a member: pruned here, in a collection
+                    // of the folder, it is present; listed nowhere under
+                    // the folder by its writer's nodes that reach it, it
+                    // is missing for good.
+                    let dropped = under.iter().any(|c| self.dropped(c, &id(s)));
                     if dropped {
                         present += 1;
+                    } else if self.missing_for_good(&folder, w, s) {
+                        return malformed(
+                            name_of(&folder, s),
+                            &format!(
+                                "its member at seq {s} is missing for good: its writer's nodes \
+                                 of every collection of the folder reach that seq and list no \
+                                 entry there"
+                            ),
+                        );
                     }
                 }
             }
@@ -3260,7 +4090,10 @@ impl St {
                 continue;
             };
             let mut verdict = None;
-            for (seq, _) in members.iter().filter(|(_, m)| m.collection == *c) {
+            for (seq, _) in members
+                .iter()
+                .filter(|(_, ms)| ms.iter().any(|m| m.collection == *c))
+            {
                 let id = VersionId {
                     writer: key.0.clone(),
                     seq: Seq(*seq),
@@ -3285,22 +4118,51 @@ impl St {
     /// it unlocks. Whether it matched. An epoch of folder `c`'s records is
     /// one key for every collection under it that reads in it (spec §6):
     /// it opens what each holds locked. The key of an epoch this device
-    /// erased is refused, unless a version sealed in it that no prune covers
-    /// is held locked here: a writer this device had not heard of wrote in
-    /// the epoch, so its erasure was early, and the key is taken again
-    /// (spec §14).
+    /// erased — a collection's or a folder's — is refused, unless a version
+    /// sealed in it that no prune covers is held locked here (under the
+    /// folder): a writer this device had not heard of wrote in the epoch,
+    /// so its erasure was early, and the key is taken again (spec §14).
     fn take_key(&mut self, c: &Name, e: &Epoch, key: ContentKey) -> bool {
         if let Some(named) = self.folders.get(c).and_then(|f| f.line.epochs.get(e)) {
             if seal::key_check(&key, c, e) != named.check {
                 return false;
             }
-            self.keys.hold(c.clone(), e.clone(), key);
             let under: Vec<Name> = self
                 .colls
                 .keys()
                 .filter(|x| x.has_prefix(c) && *x != c)
                 .cloned()
                 .collect();
+            if self.folders[c].erased.contains(e) {
+                // Taken again only for a version sealed in it, under it,
+                // that no prune covers and its record in force admits.
+                let live = under.iter().any(|x| {
+                    let coll = &self.colls[x];
+                    coll.locked.iter().any(|l| {
+                        let id = VersionId {
+                            writer: l.writer.clone(),
+                            seq: Seq(l.seq),
+                        };
+                        l.epoch() == e
+                            && coll.pruned(&id).is_none()
+                            && coll
+                                .members
+                                .as_ref()
+                                .is_some_and(|m| m.refusal(&id).is_none())
+                    })
+                });
+                if !live {
+                    return false;
+                }
+                tracing::info!(folder = %c, epoch = ?e, "an erased folder epoch's key taken again: a version sealed in it that no prune covers arrived");
+                self.folders
+                    .get_mut(c)
+                    .expect("held above")
+                    .erased
+                    .remove(e);
+                self.store.remove(&erased_folder_name(c, e));
+            }
+            self.keys.hold(c.clone(), e.clone(), key);
             for x in under {
                 self.unlock(&x);
                 self.apply_ready(&x, &BTreeSet::new());
@@ -3629,19 +4491,36 @@ impl St {
     fn listing(&mut self, c: &Name, writer: &Writer, body: &NodeBody) -> Option<Timestamp> {
         let now = (self.clock)();
         let coll = self.colls.get_mut(c)?;
+        let (children, pages) = match &body.branches {
+            wire::Branches::Children(cs) => (
+                Some(cs.iter().map(|c| (c.component.clone(), c.head)).collect()),
+                None,
+            ),
+            wire::Branches::Pages(ps) => {
+                (None, Some(ps.iter().map(|p| (p.bucket, p.head)).collect()))
+            }
+        };
+        let listing = Listing {
+            head: body.head,
+            entries: body.entries.clone(),
+            expiry: body.expiry.clone(),
+            children,
+            pages,
+        };
+        // A page node: kept by its path, for what lies under it.
+        if let Some(path) = &body.page {
+            let key = (writer.clone(), path.clone());
+            if coll.pages.get(&key).is_none_or(|l| l.head <= body.head) {
+                coll.pages.insert(key, listing);
+            }
+            return None;
+        }
         if coll
             .listings
             .get(writer)
             .is_none_or(|l| l.head <= body.head)
         {
-            coll.listings.insert(
-                writer.clone(),
-                Listing {
-                    head: body.head,
-                    entries: body.entries.clone(),
-                    expiry: body.expiry.clone(),
-                },
-            );
+            coll.listings.insert(writer.clone(), listing);
         }
         coll.listings.get(writer)?.next_bound(now)
     }
@@ -3717,6 +4596,7 @@ impl St {
             locked: &coll.locked,
             revoked: &coll.revoked,
             by_digest: &coll.by_digest,
+            cut_out: &self.cut_out,
             store: &*self.store,
             keys: &self.keys,
             gates: &gates,
@@ -3727,7 +4607,7 @@ impl St {
             pending: &mut pending,
             kinds: &mut kinds,
             outsiders: &mut outsiders,
-            unwhole: BTreeSet::new(),
+            unwhole: &mut BTreeSet::new(),
             out: Vec::new(),
         }
         .run();
@@ -3754,6 +4634,32 @@ impl St {
             }
         }
         Some((state.value(), not_counted.into_iter().collect()))
+    }
+
+    /// The devices, besides its writer's, whose versions of `c` held here
+    /// are made over the version named `v` (their parents include it): each
+    /// applied it, so holds its pieces and serves them under its own name
+    /// ([`Inner::packet_for`]). A reader asks them when the writer does not
+    /// answer, so a writer serving its pieces to one device only does not
+    /// stall what others build over it (spec §13.1). By name.
+    fn appliers(&self, c: &Name, v: &Name) -> Vec<Name> {
+        let Some(coll) = self.colls.get(c) else {
+            return Vec::new();
+        };
+        let Some(Held::Version(target)) = self.held.get(v) else {
+            return Vec::new();
+        };
+        let writer = parse_log_name(v).map(|l| l.device);
+        let devices: BTreeSet<Name> = coll
+            .versions
+            .values()
+            .filter(|hv| {
+                hv.version.id.writer != target.writer && hv.version.parents.contains(target)
+            })
+            .filter_map(|hv| parse_log_name(&hv.version.name).map(|l| l.device))
+            .filter(|d| Some(d) != writer.as_ref())
+            .collect();
+        devices.into_iter().collect()
     }
 
     /// The versions of merge collection `c` in pieces this device is to
@@ -3810,6 +4716,10 @@ impl St {
             return;
         }
         self.walked.insert(v.clone());
+        if let Some(coll) = self.colls.get_mut(c) {
+            coll.unwhole
+                .retain(|id| coll.versions.get(id).is_none_or(|hv| hv.version.name != *v));
+        }
         self.apply_ready(c, &BTreeSet::new());
         // Remembered only while it waits unopened.
         let waits = self.colls.get(c).is_some_and(|x| {
@@ -3931,6 +4841,8 @@ impl Device {
                 unfound: BTreeSet::new(),
                 descents: 0,
                 txns: HashMap::new(),
+                seqs: HashMap::new(),
+                equivocal: HashMap::new(),
                 rules,
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
@@ -4401,12 +5313,17 @@ impl Device {
                 .members
                 .as_ref()
                 .is_some_and(|m| matches!(m.rule, Rule::Merge { .. }));
-            // The checkpoints checked and held whole here, with what each
-            // covers.
+            // The checkpoints applied here and held whole, with what each
+            // covers: applied only once each of their parents was held as
+            // the packet it names (spec §5.2), so they stand for exactly
+            // what their writers applied. One checked and not applied — its
+            // past not held yet, or refused — stands for nothing.
             let checkpoints: Vec<(&HeldVersion, Frontier)> = coll
                 .kinds
                 .iter()
-                .filter(|(id, k)| **k == OpKind::Checkpoint && inner.keeps(coll, id))
+                .filter(|(id, k)| {
+                    **k == OpKind::Checkpoint && coll.applies(id) && inner.keeps(coll, id)
+                })
                 .filter_map(|(id, _)| coll.versions.get(id))
                 .map(|hv| (hv.as_ref(), past_frontier(&hv.version)))
                 .collect();
@@ -4611,6 +5528,45 @@ fn kept_root(key: &Name, wire: &Bytes) -> Option<(Name, Name, u64)> {
         return None;
     }
     Some((s.device, s.subject, s.head?))
+}
+
+/// Where the store keeps, per device `D` and namespace `O`, how far this
+/// device walked `D`'s summary of `O` in full
+/// (`/localhost/ndn-data/walked/<D>/32=summary/<O>`; [`encode_walked`]),
+/// so a restart knows how far each device was walked, and toward what
+/// (spec §5).
+fn walked_prefix() -> Name {
+    "/localhost/ndn-data/walked".parse().expect("a valid name")
+}
+
+fn walked_name(device: &Name, ns: &Name) -> Name {
+    under(&walked_prefix(), &root_prefix(device, ns))
+}
+
+/// A walked marker's value: the head walked (8 octets, big-endian), then
+/// the `Name` TLV of each name it was walked toward — what this device
+/// followed or peeked at in the namespace then, whose folder records above
+/// the walk took (spec §7).
+fn encode_walked(head: u64, toward: &BTreeSet<Name>) -> Bytes {
+    let mut out = head.to_be_bytes().to_vec();
+    for t in toward {
+        out.extend_from_slice(&t.encode_to_tlv());
+    }
+    Bytes::from(out)
+}
+
+/// `(D, O, head, toward)` of a walked marker ([`walked_name`],
+/// [`encode_walked`]).
+fn parse_walked(name: &Name, value: &Bytes) -> Option<(Name, Name, u64, BTreeSet<Name>)> {
+    let k = parse_summary_name(&over(&walked_prefix(), name)?)?;
+    let head = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
+    let mut r = ndn_tlv::TlvReader::new(value.slice(8..));
+    let mut toward = BTreeSet::new();
+    while !r.is_empty() {
+        let (_, inner) = r.read_tlv().ok()?;
+        toward.insert(Name::decode(inner).ok()?);
+    }
+    Some((k.device, k.subject, head, toward))
 }
 
 /// The name the key store keeps this device's recipient secret under.
@@ -4856,6 +5812,31 @@ fn parse_erased_name(name: &Name) -> Option<(Name, Epoch)> {
     wire::decode_epoch_of(name.components()[prefix.len()].value.clone())
 }
 
+/// Where the store keeps a marker for each epoch of a folder's records
+/// whose key this device destroyed
+/// (`/localhost/ndn-data/erased-folder/<epoch>`): apart from collections'
+/// markers, since a name may be both a folder and a collection (spec §6.1,
+/// §14).
+fn erased_folder_prefix() -> Name {
+    "/localhost/ndn-data/erased-folder"
+        .parse()
+        .expect("a valid name")
+}
+
+fn erased_folder_name(f: &Name, e: &Epoch) -> Name {
+    erased_folder_prefix().append_component(ndn_packet::NameComponent::generic(
+        wire::encode_epoch_of(f, e),
+    ))
+}
+
+fn parse_erased_folder_name(name: &Name) -> Option<(Name, Epoch)> {
+    let prefix = erased_folder_prefix();
+    if !name.has_prefix(&prefix) || name.len() != prefix.len() + 1 {
+        return None;
+    }
+    wire::decode_epoch_of(name.components()[prefix.len()].value.clone())
+}
+
 /// The key a grant's Content (or a made key's stored value) carries,
 /// opened with `recipient` under `name`; `None` if it is not wrapped to it
 /// under that name.
@@ -4908,11 +5889,13 @@ impl Inner {
     fn restore(&self) {
         let mut entries: Vec<(Name, Bytes, Record, Writer, u64, bool)> = Vec::new();
         let mut roots = Vec::new();
+        let mut walked = Vec::new();
         let mut keys = Vec::new();
         let mut tombs = Vec::new();
         let mut expired = Vec::new();
         let mut heads = Vec::new();
         let mut erased = Vec::new();
+        let mut erased_folders = Vec::new();
         let mut pieces = Vec::new();
         let mut seen: HashMap<Name, (Timestamp, Option<[u8; 32]>)> = HashMap::new();
         let mut written: HashMap<Name, Bytes> = HashMap::new();
@@ -4977,6 +5960,10 @@ impl Inner {
                 erased.push(ce);
                 continue;
             }
+            if let Some(fe) = parse_erased_folder_name(&name) {
+                erased_folders.push(fe);
+                continue;
+            }
             if let Some((d, c)) = parse_head_prefix(&name) {
                 // Its signer, the one key it was verified as.
                 let head = Data::decode(wire.clone()).ok().and_then(|data| {
@@ -4989,6 +5976,10 @@ impl Inner {
                 if let Some((key, body)) = head {
                     heads.push((d, c, key, body, wire));
                 }
+                continue;
+            }
+            if let Some(w) = parse_walked(&name, &wire) {
+                walked.push(w);
                 continue;
             }
             let Some(parsed) = parse_log_name(&name) else {
@@ -5107,6 +6098,9 @@ impl Inner {
         for (c, e) in erased {
             st.colls.entry(c).or_default().erased.insert(e);
         }
+        for (f, e) in erased_folders {
+            st.folders.entry(f).or_default().erased.insert(e);
+        }
         // What expired here comes back first, so none of it is taken again.
         for (entry, c, l, tomb) in expired {
             let writer = Writer::new(tomb.writer.clone());
@@ -5216,6 +6210,15 @@ impl Inner {
                 peer.kept = peer.kept.max(head);
             }
         }
+        for (device, ns, head, toward) in walked {
+            if device != self.device {
+                let peer = st.peers.entry((device, ns)).or_default();
+                if head >= peer.walked {
+                    peer.walked = head;
+                    peer.toward = toward;
+                }
+            }
+        }
         // What a prune covers that the store still keeps: pieces a walk
         // stored after the prune dropped their version, and their records.
         for (name, version) in pieces {
@@ -5241,7 +6244,10 @@ impl Inner {
         }
         // A group's reader dropped in the log re-read is history: the
         // records that moved its collections on are held too.
+        // What the held records and prunes owe now is owed again, whatever
+        // was owed when the device stopped (spec §6.1, §14).
         st.owed.retain(|_, why| *why == Owed::Merge);
+        st.owe_from_held(&self.ns);
         self.note_revoked(&mut st);
     }
 
@@ -5509,6 +6515,8 @@ impl Inner {
         let mut signed = Vec::new();
         let follow = {
             let mut st = self.st.lock();
+            // What could not be signed stays owed, for the next settle.
+            let mut failed = Vec::new();
             // Signing takes records, which may owe more; a few rounds settle
             // any chain of groups.
             for _ in 0..8 {
@@ -5533,7 +6541,8 @@ impl Inner {
                     let new_epoch = match (why, line.resolve) {
                         (Owed::Merge, Resolve::Nothing) => continue,
                         (Owed::Merge, Resolve::Readers) => false,
-                        (Owed::Merge, Resolve::Epoch) | (Owed::Group | Owed::Folder, _) => true,
+                        (Owed::Merge, Resolve::Epoch)
+                        | (Owed::Group | Owed::Folder | Owed::Erase, _) => true,
                     };
                     let c = &s.name;
                     let reads = in_force
@@ -5567,10 +6576,14 @@ impl Inner {
                             signed.push(c.clone());
                         }
                         Err(e) => {
-                            tracing::warn!(subject = %c, "the record owed was not signed: {e}")
+                            tracing::warn!(subject = %c, "the record owed was not signed, and stays owed: {e}");
+                            failed.push((s, why));
                         }
                     }
                 }
+            }
+            for (s, why) in failed {
+                st.owed.entry(s).or_insert(why);
             }
             std::mem::take(&mut st.to_follow)
         };
@@ -5717,6 +6730,66 @@ impl Inner {
         let all = futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d)));
         let _ = rt::timeout(self.config.first_look, all).await;
         Ok(())
+    }
+
+    /// The devices known to write into namespace `ns` that `relevant`
+    /// picks — heard in a group this run, or whose summary root this
+    /// device verified before, also in an earlier run ([`Peer::kept`]) —
+    /// whose summary of `ns` this device has not walked for what is asked:
+    /// neither in full since it last followed something new in `ns`
+    /// ([`Self::follow`]), nor in full up to the newest head it knows of
+    /// that device, in this run or an earlier one ([`Peer::walked`]), while
+    /// following a name `covers` accepts ([`Peer::toward`]: a walk takes
+    /// the folder records above what it goes toward only). A device merely
+    /// offline since such a walk does not hold anything back, nor does one
+    /// ended here — a key of it suspected, or revoked by the trust context
+    /// governing it ([`Self::ended`]): what it holds is not taken anyway.
+    /// Empty: what each of them lists of what is asked — a folder record
+    /// above a collection, a version under a folder — is held here, or
+    /// refused (spec §6.1).
+    fn not_walked(
+        &self,
+        st: &St,
+        ns: &Name,
+        relevant: impl Fn(&Name) -> bool,
+        covers: impl Fn(&Name) -> bool,
+    ) -> Vec<Name> {
+        let mut known: BTreeSet<Name> = self.known_for(st, ns).into_iter().collect();
+        known.extend(
+            st.peers
+                .iter()
+                .filter(|((_, n), p)| n == ns && p.kept > 0)
+                .map(|((d, _), _)| d.clone()),
+        );
+        let walked = |p: &Peer| {
+            p.root.is_some() || (p.walked > 0 && p.walked >= p.head && p.toward.iter().any(&covers))
+        };
+        known
+            .into_iter()
+            .filter(|d| *d != self.device && relevant(d) && !self.ended(st, d))
+            .filter(|d| {
+                st.peers
+                    .get(&(d.clone(), ns.clone()))
+                    .is_none_or(|p| !walked(p))
+            })
+            .collect()
+    }
+
+    /// [`Self::not_walked`], after refreshing each device it names once
+    /// more, for at most the first-look time.
+    async fn unsynced(
+        self: &Arc<Self>,
+        ns: &Name,
+        relevant: impl Fn(&Name) -> bool,
+        covers: impl Fn(&Name) -> bool,
+    ) -> Vec<Name> {
+        let missing = self.not_walked(&self.st.lock(), ns, &relevant, &covers);
+        if missing.is_empty() {
+            return missing;
+        }
+        let all = futures::future::join_all(missing.iter().map(|d| self.refresh(ns, d)));
+        let _ = rt::timeout(self.config.first_look, all).await;
+        self.not_walked(&self.st.lock(), ns, &relevant, &covers)
     }
 
     /// Wait until `done` holds or the first-look time passes.
@@ -5934,6 +7007,18 @@ impl Inner {
         // everything it lists: a checkpoint among them may cover the others
         // (spec §5.2), and what it covers is never fetched.
         let descending = Descending::new(&self.st);
+        let head = body.head;
+        // What the descent goes toward: what is followed or peeked at in
+        // `ns` as it starts.
+        let toward: BTreeSet<Name> = {
+            let st = self.st.lock();
+            st.follows
+                .iter()
+                .chain(&st.peeks)
+                .filter(|t| namespace_of(t).as_ref() == Some(ns))
+                .cloned()
+                .collect()
+        };
         let whole = self.descend(device, ns, &writer, body).await;
         if descending.end() {
             self.fetch_wanted(true);
@@ -5941,7 +7026,21 @@ impl Inner {
         if !whole {
             return false;
         }
-        self.st.lock().peers.entry(key).or_default().root = Some(digest);
+        let mut st = self.st.lock();
+        let peer = st.peers.entry(key).or_default();
+        peer.root = Some(digest);
+        // What it was walked toward, at this head: more of the same head
+        // adds to it.
+        let wider = !toward.is_subset(&peer.toward);
+        if head > peer.walked || (head == peer.walked && wider) {
+            if head > peer.walked {
+                peer.toward.clear();
+            }
+            peer.walked = head;
+            peer.toward.extend(toward);
+            self.store
+                .insert(walked_name(device, ns), encode_walked(head, &peer.toward));
+        }
         true
     }
 
@@ -5969,6 +7068,13 @@ impl Inner {
                 let inside = st.inside(&subject);
                 // A collection peeked at: its records only (spec §5.3).
                 let peeked = !inside && st.peeks.contains(&subject);
+                // A page of a followed name's node: what it lists may settle
+                // the writer's groups there (spec §5.5, §7).
+                if body.page.is_some() && inside {
+                    st.colls.entry(subject.clone()).or_default();
+                    st.listing(&subject, writer, &body);
+                    st.regroup_under(writer, &subject);
+                }
                 if body.page.is_none() && (inside || peeked) {
                     let coll = st.colls.entry(subject.clone()).or_default();
                     coll.entries
@@ -5995,6 +7101,10 @@ impl Inner {
                     }
                     // Learned entries may make held versions ready.
                     st.apply_ready(&subject, &BTreeSet::new());
+                    // What the writer's node lists, or does not, may settle
+                    // its groups in this folder or under it (spec §5.5).
+                    st.regroup_under(writer, &folder_of(&subject));
+                    st.regroup_under(writer, &subject);
                 } else if body.page.is_none()
                     && st.toward(&subject)
                     && wire::check_collection_name(&subject).is_ok()
@@ -6455,6 +7565,11 @@ impl Inner {
             writer: writer.clone(),
             seq: Seq(parsed.seq),
         };
+        // A key's log is one sequence across its collections and entry
+        // kinds (spec §4): another entry at a seq it used is equivocation.
+        // An entry the trust context refuses is a thief's (spec §8.1).
+        let second =
+            !st.cut_out.contains_key(&name) && st.note_seq(&name, &writer, parsed.seq, &record);
         if let (Record::Version(_), Some(c)) = (&record, &parsed.subject)
             && let Some(p) = st.colls.get(c).and_then(|x| x.pruned(&id)).cloned()
         {
@@ -6545,6 +7660,12 @@ impl Inner {
             self.store
                 .insert(expired_name(&name), wire::encode_tomb(&tomb));
             st.held.insert(name, Held::Expired(tomb));
+            // A member of a group that expired: its keep, which no group
+            // member may have, refuses its group (spec §5.5).
+            if let Some(g) = body.group {
+                st.note_member(c, &id, g, r.keep);
+                st.apply_ready(c, &BTreeSet::new());
+            }
             return None;
         }
         if mine
@@ -6600,7 +7721,7 @@ impl Inner {
                 let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
                 let group = body.group;
                 if let Some(g) = group {
-                    st.note_member(&c, &id, g);
+                    st.note_member(&c, &id, g, keep);
                 }
                 let fetch = keeps
                     .then(|| body.chunks.map(|ch| (name.clone(), ch)))
@@ -6620,6 +7741,9 @@ impl Inner {
                         if group.is_some() {
                             // Its group is not readable here, until it opens.
                             st.apply_ready(&c, &BTreeSet::new());
+                        }
+                        if second {
+                            st.regroup_seq(&id.writer, seq);
                         }
                         return fetch;
                     };
@@ -6652,13 +7776,22 @@ impl Inner {
                 let version = version_of(&name, &writer, seq, body);
                 st.held
                     .insert(name.clone(), Held::Version(version.id.clone()));
+                let in_folder_epoch = epoch
+                    .as_ref()
+                    .is_some_and(|e| st.seal_subject(&c, e).folder);
                 st.admit(Arc::new(HeldVersion::new(
                     version, op, wire, sealed, epoch, chunks,
                 )));
+                if second {
+                    st.regroup_seq(&id.writer, seq);
+                }
                 // A writer's version in a newer epoch may be what a pending
-                // erasure waited for.
+                // erasure waited for: of the collection's own epochs, or of
+                // the folder's it is sealed in.
                 if st.colls.get(&c).is_some_and(|x| !x.pruned_keeps.is_empty()) {
                     self.erase(st, &c);
+                } else if in_folder_epoch {
+                    self.erase_folders(st, &c);
                 }
                 // A newer version may end older ones' last N (spec §14.1).
                 if matches!(keep, Keep::LastN(_)) {
@@ -6799,6 +7932,27 @@ impl Inner {
                 let dropped = st.drop_pruned(&c);
                 self.entomb(&dropped);
                 self.erase(st, &c);
+                // A prune in the epoch in force of a folder of this
+                // namespace asks for its erasure: the folder moves to a new
+                // epoch first, whoever pruned (spec §14).
+                let folders: Vec<Name> = st
+                    .folders
+                    .keys()
+                    .filter(|f| {
+                        c.has_prefix(f) && *f != &c && namespace_of(f).as_ref() == Some(&self.ns)
+                    })
+                    .cloned()
+                    .collect();
+                for f in folders {
+                    if st.folder_epoch_pruned(&f) {
+                        st.owed
+                            .entry(Subject {
+                                name: f,
+                                folder: true,
+                            })
+                            .or_insert(Owed::Erase);
+                    }
+                }
                 None
             }
         }
@@ -8007,6 +9161,13 @@ impl Inner {
                 own: true,
             },
         );
+        // A key's log is one sequence (spec §4): what a copy of this key
+        // signs at a seq this device used is equivocation here too.
+        if let Some(l) = parse_log_name(name) {
+            st.seqs
+                .entry((self.writer.clone(), l.seq))
+                .or_insert_with(|| name.clone());
+        }
     }
 
     /// Note that this device verified the log entry `name` of another
@@ -8036,14 +9197,43 @@ impl Inner {
         subject: Option<&Name>,
         content: Bytes,
     ) -> Result<(Name, u64), DataError> {
-        let record = wire::decode_record(content.clone()).map_err(|e| local(e.to_string()))?;
         let seq = self.next_seq(st)?;
+        let entry = self.sign_entry(subject, seq, content)?;
+        Ok(self.keep_entry(st, entry))
+    }
+
+    /// Sign `content`, an entry about `subject`, as the own log's entry at
+    /// `seq`. Nothing is kept: [`Self::keep_entry`] keeps it, or it is
+    /// dropped.
+    fn sign_entry(
+        &self,
+        subject: Option<&Name>,
+        seq: u64,
+        content: Bytes,
+    ) -> Result<LogEntry, DataError> {
+        let record = wire::decode_record(content.clone()).map_err(|e| local(e.to_string()))?;
         let name = log_name(&self.device, subject, seq);
         let wire = self.sign(DataBuilder::new(name.clone(), &content))?;
+        Ok(LogEntry {
+            name,
+            seq,
+            wire,
+            record,
+        })
+    }
+
+    /// Keep `entry`, an own entry signed: the log's head, stored, taken.
+    fn keep_entry(&self, st: &mut St, entry: LogEntry) -> (Name, u64) {
+        let LogEntry {
+            name,
+            seq,
+            wire,
+            record,
+        } = entry;
         st.head = seq;
         self.note_written(st, &name, &wire);
         self.take(st, name.clone(), wire, self.writer.clone(), record, true);
-        Ok((name, seq))
+        (name, seq)
     }
 
     /// Sign `record` (a members record of `c` [`Self::next_members`] or
@@ -8053,19 +9243,47 @@ impl Inner {
         &self,
         st: &mut St,
         c: &Name,
-        (body, key): (MembersBody, Option<ContentKey>),
+        record: (MembersBody, Option<ContentKey>),
     ) -> Result<(), DataError> {
-        let epoch = body.epoch.clone();
-        self.append(st, Some(c), wire::encode_members(&body))?;
-        if let (Some(e), Some(key)) = (epoch, key) {
+        let seq = self.next_seq(st)?;
+        let signed = self.sign_members(c, seq, record)?;
+        self.keep_members(st, c, signed);
+        Ok(())
+    }
+
+    /// Sign `record`, a members record of `c`, as the own log's entry at
+    /// `seq`, with the key of the epoch it starts; nothing is kept.
+    fn sign_members(
+        &self,
+        c: &Name,
+        seq: u64,
+        (body, key): (MembersBody, Option<ContentKey>),
+    ) -> Result<(LogEntry, Option<(Epoch, ContentKey)>), DataError> {
+        let entry = self.sign_entry(Some(c), seq, wire::encode_members(&body))?;
+        Ok((entry, body.epoch.zip(key)))
+    }
+
+    /// Keep a members record of `c` [`Self::sign_members`] signed, and the
+    /// key of the epoch it starts.
+    fn keep_members(
+        &self,
+        st: &mut St,
+        c: &Name,
+        (entry, made): (LogEntry, Option<(Epoch, ContentKey)>),
+    ) {
+        self.keep_entry(st, entry);
+        if let Some((e, key)) = made {
             self.keep_made_key(st, c, e, key);
         }
-        Ok(())
     }
 
     /// Whether this device may write into `c` now, sealed in `epoch`: its
     /// key is a writer by the record in force, and that record's epoch is
-    /// `epoch` (else it moved while the key was asked for: ask again).
+    /// `epoch` (else it moved while the key was asked for: ask again), one
+    /// that has not outgrown its audience ([`outgrown`]: a reader the
+    /// record in force no longer admits may hold its key, so nothing is
+    /// sealed in it until a device of the audience moves `c` to a new
+    /// epoch; ask again then, spec §6.1).
     fn writable(&self, st: &St, c: &Name, epoch: Option<&Epoch>) -> Result<(), DataError> {
         let Some(members) = st.colls.get(c).and_then(|x| x.members.as_ref()) else {
             return Err(DataError::Unavailable { name: c.clone() });
@@ -8082,6 +9300,20 @@ impl Inner {
         }
         if epoch != members.epoch.as_ref() {
             return Err(DataError::Unavailable { name: c.clone() });
+        }
+        if let Some(e) = epoch
+            && st
+                .line_of(&st.seal_subject(c, e))
+                .is_some_and(|(epochs, _)| outgrown(members, epochs))
+        {
+            return Err(DataError::NotReady {
+                name: c.clone(),
+                why: format!(
+                    "its epoch {e:?} outgrew its audience — a reader the record in force no \
+                     longer admits may hold its key — so nothing is sealed in it; put again once \
+                     a device of the owner's namespace that reads it has moved it to a new epoch"
+                ),
+            });
         }
         Ok(())
     }
@@ -8111,7 +9343,10 @@ impl Inner {
     /// (or the one the app built), checked and applied by the rule against
     /// the state before anything is kept: one the rule refuses is
     /// [`DataError::BadRequest`], with nothing stored, published or
-    /// counted in the log's head.
+    /// counted in the log's head. Refused for any reason once the edit
+    /// may have touched the state, the collection is read again
+    /// ([`St::reread`]): its state is the one its versions make, without
+    /// the refused edit.
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
@@ -8126,9 +9361,193 @@ impl Inner {
     ) -> Result<VersionId, DataError> {
         // Refused before the edit touches the state.
         let seq = self.next_seq(st)?;
-        let signed = self.sign_in(st, c, seq, key, type_id, keep, draft, None)?;
-        let judged = self.judge_own(st, &signed, true)?;
-        Ok(self.commit(st, ns, signed, batch, judged))
+        let judged = self
+            .sign_in(st, c, seq, key, type_id, keep, draft, None)
+            .and_then(|signed| Ok((self.judge_own(st, &signed, true)?, signed)));
+        match judged {
+            Ok((judged, signed)) => Ok(self.commit(st, ns, signed, batch, judged)),
+            Err(e) => {
+                st.reread(c, &self.config.rules, self.me());
+                Err(e)
+            }
+        }
+    }
+
+    /// Refuse the host's default record of `c`, a collection of this
+    /// namespace with no record in force here, while a device of the
+    /// namespace known here has not been walked ([`Self::unsynced`]): a
+    /// folder record above `c` that device may hold governs `c`, and a
+    /// default record would narrow `c` for good (spec §6.1).
+    /// [`DataError::NotReady`]: put again once they are reached.
+    async fn default_allowed(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
+        // A walk took the folder records above `c` only if it went toward
+        // `c`'s folder: toward a name under it, or followed a folder above.
+        let folder = folder_of(c);
+        let missing = self
+            .unsynced(
+                &self.ns,
+                |d| self.namespace_of_name(d) == self.ns,
+                |t| t.has_prefix(&folder) || folder.has_prefix(t),
+            )
+            .await;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let devices: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        Err(DataError::NotReady {
+            name: c.clone(),
+            why: format!(
+                "it has no members record here, and this device has not yet walked the summary \
+                 of {}, which may hold a folder record governing it; no default record is \
+                 signed, since one would narrow the collection for good. Bring that device \
+                 online and put again; if it is lost, mark its key suspected or revoke it \
+                 (it is not waited for then)",
+                devices.join(", ")
+            ),
+        })
+    }
+
+    /// Whether `device` is ended here: a key of it is suspected
+    /// ([`Self::suspects_device`]), or the trust context governing it
+    /// revokes one of its keys (spec §8.1).
+    fn ended(&self, st: &St, device: &Name) -> bool {
+        let ctx = self.validator.keyring().context_for(device);
+        self.suspects_device(st, device)
+            || ctx
+                .revocations()
+                .iter()
+                .chain(ctx.revocation_cuts().iter().map(|c| c.key()))
+                .any(|k| device_of(k).as_ref() == Some(device))
+    }
+
+    /// Whether `c` is still a fresh collection of this namespace: no record
+    /// in force over it, and no version held that waits for one (written
+    /// under a record this device does not hold). Otherwise
+    /// [`DataError::NotReady`]: put again under the record.
+    fn fresh(&self, st: &St, c: &Name) -> Result<(), DataError> {
+        let why = match st.colls.get(c) {
+            Some(x) if x.members.is_some() => {
+                "a members record of it arrived meanwhile: put again, under that record"
+            }
+            Some(x)
+                if !x.versions.is_empty()
+                    || !x.waiting.is_empty()
+                    || !x.locked.is_empty()
+                    || !x.outsiders.is_empty() =>
+            {
+                "it holds versions that wait for a members record this device does not hold \
+                 yet; no default record is signed over them: put again once that record arrives"
+            }
+            _ => return Ok(()),
+        };
+        Err(DataError::NotReady {
+            name: c.clone(),
+            why: why.into(),
+        })
+    }
+
+    /// Sign `draft` as the own version at `seq` of `c`, a fresh collection,
+    /// under `body`, the host's default record about to be signed for it
+    /// ([`Self::default_members`]), sealed with the key `made` of the epoch
+    /// it starts; and judge it, checked and applied, on a state of its own
+    /// that its rule starts empty — the state the record starts. The
+    /// version, its ruling and that state; nothing is kept. One the rule
+    /// refuses is [`DataError::BadRequest`].
+    #[allow(clippy::too_many_arguments)]
+    fn sign_fresh(
+        &self,
+        c: &Name,
+        seq: u64,
+        body: &MembersBody,
+        made: Option<&ContentKey>,
+        draft: Draft,
+        (type_id, keep): (TypeId, Keep),
+        group: Option<Group>,
+    ) -> Result<(Signed, Ruled, Box<dyn MergeState>), DataError> {
+        // The host default merges with `/merge/yrs` ([`Self::default_members`]).
+        let function = crate::merge::Yrs::new().function().clone();
+        let Some(rule) = self.config.rules.get(&function) else {
+            return Err(DataError::RuleUnknown {
+                collection: c.clone(),
+                rule: function,
+            });
+        };
+        let mut temp = rule.start(self.me());
+        let key = body.epoch.clone().zip(made.cloned());
+        let under = Under {
+            readers: body.readers.clone(),
+            function: Some(function.clone()),
+            parents: Parents::new(),
+        };
+        let signed = self.sign_version(
+            c,
+            seq,
+            under,
+            Some(&mut *temp),
+            key.as_ref(),
+            (type_id, keep, (self.config.clock)()),
+            draft,
+            group,
+        )?;
+        let (empty, none) = (Coll::default(), HashMap::new());
+        let past = PastOf::new(
+            &signed.held.version,
+            empty.waits(c),
+            &empty.by_digest,
+            &[],
+            &none,
+        );
+        let ruled =
+            rule_on(&mut *temp, &signed.held, &past, true).map_err(|e| DataError::BadRequest {
+                name: c.clone(),
+                why: format!(
+                    "{c} merges with {function}, whose rule refuses this operation ({e}); \
+                     nothing was written: put an operation the rule takes"
+                ),
+            })?;
+        Ok((signed, ruled, temp))
+    }
+
+    /// After the record [`Self::sign_fresh`] signed a version under is
+    /// kept: `c`'s state is `temp`, the state that record starts with the
+    /// version judged on it applied (nothing else is held of `c`,
+    /// [`Self::fresh`]).
+    fn start_fresh(&self, st: &mut St, c: &Name, temp: Box<dyn MergeState>) {
+        if let Some(coll) = st.colls.get_mut(c) {
+            coll.state = Some(temp);
+        }
+    }
+
+    /// Write `draft` as the first version of `c`, a fresh collection of
+    /// this namespace ([`Self::fresh`]), after the host's default record
+    /// ([`Self::default_members`]): the version is signed and judged first
+    /// ([`Self::sign_fresh`]), then the record signed, and both kept only
+    /// once both are. Refused, nothing is kept: no seq taken, no record
+    /// (spec §5).
+    fn put_fresh(
+        &self,
+        st: &mut St,
+        c: &Name,
+        ns: &Name,
+        draft: Draft,
+        options: (TypeId, Keep),
+    ) -> Result<VersionId, DataError> {
+        self.fresh(st, c)?;
+        let base = self.next_seq(st)?;
+        let Some(seq) = base.checked_add(1) else {
+            return Err(local(format!(
+                "{} has too few seqs left in its log for a collection's record and its first \
+                 version; enroll the device again under a new name",
+                self.device
+            )));
+        };
+        let (body, made) = self.default_members(c, base);
+        let (signed, ruled, temp) =
+            self.sign_fresh(c, seq, &body, made.as_ref(), draft, options, None)?;
+        let record = self.sign_members(c, base, (body, made))?;
+        self.keep_members(st, c, record);
+        self.start_fresh(st, c, temp);
+        Ok(self.commit(st, ns, signed, Duration::ZERO, Some(ruled)))
     }
 
     /// Sign `draft` as the own version at `seq` of `c`, under its record in
@@ -8162,7 +9581,7 @@ impl Inner {
                 Rule::Merge { function } => Some(function.clone()),
                 Rule::Log | Rule::OneKey => None,
             },
-            parents: coll.at(),
+            parents: coll.parents(),
         };
         self.sign_version(
             c,
@@ -8265,6 +9684,7 @@ impl Inner {
             keep,
             dated,
             group,
+            rule: under.function.clone(),
             fields,
             op: record_op,
             sealed,
@@ -8305,23 +9725,41 @@ impl Inner {
             return Ok(None);
         };
         let c = &signed.c;
-        let coll = st.colls.get_mut(c).expect("members known");
-        let Some(state) = coll.state.as_deref_mut() else {
+        let St { colls, cut_out, .. } = st;
+        let Coll {
+            members,
+            state,
+            entries,
+            skipped,
+            listings,
+            locked,
+            revoked,
+            versions,
+            by_digest,
+            outsiders,
+            ..
+        } = colls.get_mut(c).expect("members known");
+        let Some(state) = state.as_deref_mut() else {
             return Err(DataError::RuleUnknown {
                 collection: c.clone(),
                 rule: function.clone(),
             });
         };
+        // Its past, as every reader will see it (spec §5.2).
+        let waits = Waits {
+            collection: c,
+            members: members.as_ref(),
+            entries,
+            skipped,
+            listings,
+            locked,
+            revoked,
+            admitted: versions,
+        };
         let judged = rule_on(
             state,
             &signed.held,
-            &PastOf::new(
-                &signed.held.version,
-                &coll.versions,
-                &coll.locked,
-                &coll.outsiders,
-                &coll.by_digest,
-            ),
+            &PastOf::new(&signed.held.version, waits, by_digest, outsiders, cut_out),
             apply,
         );
         judged.map(Some).map_err(|e| DataError::BadRequest {
@@ -8395,7 +9833,7 @@ impl Inner {
             .or_insert_with(|| Tree::new(ns.clone()))
             .add(&c, seq, Kind::Version(retain));
         if let Some(g) = version.group {
-            st.note_member(&c, &id, g);
+            st.note_member(&c, &id, g, version.keep);
         }
         let coll = st.colls.get_mut(&c).expect("members known");
         coll.entries
@@ -8408,6 +9846,11 @@ impl Inner {
         }
         coll.batch = batch;
         coll.by_digest.insert(held.digest, id.clone());
+        // An own operation in pieces is not kept in memory once applied.
+        let held = match held.unloaded() {
+            Some(unloaded) => unloaded,
+            None => held,
+        };
         coll.versions.insert(id.clone(), Arc::new(held));
         st.emit(&c, &Change::Version(version), &id.writer, seq);
         for change in told {
@@ -8617,16 +10060,24 @@ impl Inner {
     /// The next members record of subject `s` — a collection, or a folder
     /// (spec §6) — owned here, after `current`, its own record in force
     /// (spec §6, §8, §9), and the key of the epoch it starts, if it starts
-    /// one: a writer prefix removed gets a cut accepting exactly the
+    /// one. It starts from the record in force over `s` — `current`
+    /// narrowed by the folders above, or theirs alone while `s` has no
+    /// record of its own (spec §5, §6.1) — so a first own record under a
+    /// folder carries on what the folder's governed: a writer prefix that
+    /// record admits and this one does not gets a cut accepting exactly the
     /// versions of its keys this device holds verified that the record in
-    /// force admits — in the collection, or in every collection under the
-    /// folder (a key's seqs are unique across its log); a prefix written
-    /// again, or that the folders above cover when the record lists no
-    /// writers and so takes theirs, drops its cut. A reader removed — or
+    /// force admits, each in its own collection — the collection, or every
+    /// collection under the folder (a key's log is one sequence across its
+    /// collections, so a seq accepted in one is accepted there only); a
+    /// prefix written again, or that the folders above cover when the
+    /// record lists no writers and so takes theirs, drops its cut; the cuts
+    /// in force carry over. A reader removed from `current` — or
     /// `new_epoch` — starts a new epoch at this record, with a new random
-    /// key; no readers, no seal. A rule changed, or a seal on a subject that
-    /// had none, sets `since` to what this device applied there. The record
-    /// names `current` as its parent.
+    /// key, as does a first record listing readers (its epoch's key check
+    /// is bound to `s`); no readers, no seal. A rule changed, or a seal on
+    /// a subject that had none in force, sets `since` to what this device
+    /// applied there; else the `since` in force carries over. The record
+    /// names `current` as its parent, and is revision 1 without it.
     #[allow(clippy::too_many_arguments)]
     fn next_members(
         &self,
@@ -8642,15 +10093,17 @@ impl Inner {
         // The seq it is written at, if the log can number one
         // ([`Self::next_seq`] refuses it otherwise).
         let seq = st.head.saturating_add(1);
+        // What it starts from: the record in force over `s`.
+        let basis = collection::effective(c, current, &st.folders_above(c));
+        let basis = basis.as_ref();
         // Where the versions it governs are held.
-        let held_in: Vec<&Coll> = match s.folder {
+        let held_in: Vec<(&Name, &Coll)> = match s.folder {
             true => st
                 .colls
                 .iter()
                 .filter(|(x, _)| x.has_prefix(c) && *x != c)
-                .map(|(_, x)| x)
                 .collect(),
-            false => st.colls.get(c).into_iter().collect(),
+            false => st.colls.get_key_value(c).into_iter().collect(),
         };
         // Listing no writers, it takes those of the folders above.
         let inherited = match writers.is_empty() {
@@ -8661,6 +10114,7 @@ impl Inner {
         };
         let covered = |of: &Name| writers.iter().chain(&inherited).any(|p| of.has_prefix(p));
         let mut cuts: Vec<CutBody> = current
+            .or(basis)
             .map(|m| {
                 m.cuts
                     .iter()
@@ -8672,16 +10126,11 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
-        for p in current
-            .map(|m| m.writers.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .filter(|p| !covered(p))
-        {
+        for p in &st.removing(c, current, &writers) {
             // Exactly the versions held verified — never what a summary
             // only listed — that the record in force admits.
             let mut accept = Accepted::new();
-            for coll in &held_in {
+            for (x, coll) in &held_in {
                 let held = coll
                     .versions
                     .keys()
@@ -8698,7 +10147,7 @@ impl Inner {
                             .as_ref()
                             .is_none_or(|m| m.refusal(&id).is_none())
                     {
-                        accept.insert(&id);
+                        accept.insert(x, &id);
                     }
                 }
             }
@@ -8724,10 +10173,10 @@ impl Inner {
             }
         };
         let restarts = |m: &Members| m.rule != rule || (m.epoch.is_none() && epoch.is_some());
-        let since = match current {
+        let since = match basis {
             Some(m) if restarts(m) => {
                 let mut f = Frontier::default();
-                for coll in &held_in {
+                for (_, coll) in &held_in {
                     for (w, s) in coll.at().iter() {
                         f.include(&VersionId {
                             writer: w.clone(),
@@ -8835,13 +10284,16 @@ impl Inner {
                 .packet_for(&bare, false)
                 .filter(|w| wire::implicit_digest(w).as_slice() == last.value.as_ref());
         }
-        // Own log entries and pieces of own versions; and, of a collection
-        // this device holds for its owner, every entry and piece it keeps
-        // (readers ask it for them under its own name, `32=held`). Nothing
-        // a known prune covers (by the prune records restored, not only the
-        // versions held), and no piece of an own version a release is
-        // auditing its holders for. Nothing expired here either (spec
-        // §14.1), checked as it is asked for.
+        // Own log entries and pieces of own versions; of a collection this
+        // device holds for its owner, every entry and piece it keeps
+        // (readers ask it for them under its own name, `32=held`); and of a
+        // merge collection, the entry and pieces of each version it applied,
+        // which those whose versions are made over it ask it for (spec
+        // §13.1): a writer serving its pieces to some devices only does not
+        // stall the rest. Nothing a known prune covers (by the prune records
+        // restored, not only the versions held), and no piece of an own
+        // version a release is auditing its holders for. Nothing expired
+        // here either (spec §14.1), checked as it is asked for.
         let log = parse_log_name(name).or_else(|| parse_piece_name(name).map(|p| p.log));
         if let Some(parsed) = log {
             let mut st = self.st.lock();
@@ -8856,10 +10308,11 @@ impl Inner {
                 let quarantined = version != *name && st.quarantine.contains(&version);
                 return (!quarantined).then(|| self.store.get(name)).flatten();
             }
-            let held = parsed
-                .subject
-                .as_ref()
-                .is_some_and(|c| st.holding.contains_key(c));
+            let held = parsed.subject.as_ref().is_some_and(|c| {
+                st.holding.contains_key(c)
+                    || matches!(st.held.get(&version), Some(Held::Version(id))
+                        if st.colls.get(c).is_some_and(|coll| coll.applies(id)))
+            });
             return held.then(|| self.store.get(name)).flatten();
         }
         // The head of a one-key collection this device writes (spec §5.3):
@@ -9783,7 +11236,7 @@ impl Inner {
                 ..
             }) => match v.payload {
                 Payload::Large { .. } => Probe::Large(v.id, v.dated),
-                _ => Probe::Read(v),
+                _ => Probe::Read(Box::new(v)),
             },
             Err(DataError::Expired { .. }) => match self.st.lock().held.get(&name) {
                 Some(Held::Expired(t)) => Probe::Expired(t.first, t.last),
@@ -10096,7 +11549,7 @@ impl Inner {
 /// What a range read found of one listed block (spec §5.4).
 enum Probe {
     /// Verified: a block, or a version of one entry.
-    Read(Version),
+    Read(Box<Version>),
     /// A version in pieces, and its date: read it by name.
     Large(VersionId, Timestamp),
     /// Expired here: the dates of its first and last entry (`None`: a
@@ -10253,8 +11706,11 @@ impl Inner {
     }
 
     /// [`Self::get_piece`], trying `first` before the others, and saying
-    /// which source answered (`None`: its writer by name; `Some(h)`: holder
-    /// `h`). The store answers first whatever `first` says.
+    /// which source answered (`None`: its writer by name; `Some(d)`: device
+    /// `d` under its own name — a holder of `c`, or, in a merge collection,
+    /// a device whose versions are made over the piece's version and so
+    /// applied it, [`St::appliers`]). The store answers first whatever
+    /// `first` says.
     async fn get_piece_from(
         self: &Arc<Self>,
         c: &Name,
@@ -10267,12 +11723,20 @@ impl Inner {
         {
             return Some((w, None));
         }
-        let holders = self.holders_of(&self.st.lock(), c);
+        let (holders, appliers) = {
+            let st = self.st.lock();
+            (self.holders_of(&st, c), st.appliers(c, &strip_piece(name)))
+        };
         // An Interest for this device's own name goes nowhere useful: its
         // own pieces it released are asked of the holders only.
         let own = parse_piece_name(name).is_some_and(|p| p.log.device == self.device);
         let mut sources: Vec<Option<Name>> = if own { Vec::new() } else { vec![None] };
         sources.extend(holders.into_iter().map(Some));
+        for d in appliers {
+            if d != self.device && !sources.contains(&Some(d.clone())) {
+                sources.push(Some(d));
+            }
+        }
         if let Some(f) = first
             && let Some(i) = sources.iter().position(|s| s == f)
         {
@@ -10536,6 +12000,14 @@ impl Inner {
         });
     }
 
+    /// Destroy the keys of epochs no version needs any more (spec §14): of
+    /// `c`'s own records ([`Self::erase_own`]), and of the records of every
+    /// folder at or above `c` ([`Self::erase_folders`]).
+    fn erase(&self, st: &mut St, c: &Name) {
+        self.erase_own(st, c);
+        self.erase_folders(st, c);
+    }
+
     /// Destroy the key of every epoch of `c` whose versions are all pruned
     /// or cut, as the signed records held show (spec §14): not the epoch of
     /// the record in force; at least one of its versions pruned; every
@@ -10543,14 +12015,10 @@ impl Inner {
     /// pruned, refused, or of another epoch; and every writer known to write
     /// into `c` done with the epoch — this device itself, a key the record
     /// in force admits no further version of (cut, or no writer), or one
-    /// that wrote a version in the record in force's epoch. Until then the
-    /// erasure is pending: a writer that has not moved on may still write
-    /// into the epoch. The held key, the key this device made, every grant
-    /// it keeps of that epoch, stored or signed for others, go; the erasure
-    /// is kept in the store, and a key granted again is refused. A version
-    /// only a prune a copy of this device's key signed covers
-    /// ([`Coll::foreign_prunes`]) counts as not pruned: its epoch's key stays.
-    fn erase(&self, st: &mut St, c: &Name) {
+    /// that wrote a version in the record in force's epoch ([`Coll::left`]).
+    /// Until then the erasure is pending: a writer that has not moved on
+    /// may still write into the epoch. Erased: [`Self::destroy_key`].
+    fn erase_own(&self, st: &mut St, c: &Name) {
         let Some(coll) = st.colls.get(c) else {
             return;
         };
@@ -10558,23 +12026,6 @@ impl Inner {
             return;
         };
         let current = members.epoch.clone();
-        let epoch_of = |id: &VersionId| -> Option<Option<Epoch>> {
-            if let Some(hv) = coll.versions.get(id) {
-                return Some(hv.epoch.clone());
-            }
-            if let Some(l) = coll
-                .locked
-                .iter()
-                .find(|l| l.writer == id.writer && l.seq == id.seq.0)
-            {
-                return Some(Some(l.epoch().clone()));
-            }
-            coll.waiting
-                .iter()
-                .chain(&coll.outsiders)
-                .find(|hv| hv.version.id == *id)
-                .map(|hv| hv.epoch.clone())
-        };
         // Whether writer `w` is done with every epoch before the current
         // one: it writes no more here, or it already wrote in the current.
         let moved_on = |w: &Writer, seqs: &BTreeSet<u64>| {
@@ -10586,58 +12037,25 @@ impl Inner {
                     })
                     .is_some()
                 || seqs.iter().any(|s| {
-                    epoch_of(&VersionId {
+                    coll.epoch_of(&VersionId {
                         writer: w.clone(),
                         seq: Seq(*s),
                     }) == Some(current.clone())
                 })
         };
-        let mut gone = Vec::new();
-        'epochs: for e in coll.line.epochs.keys() {
-            if Some(e) == current.as_ref() || coll.erased.contains(e) || st.keys.key(c, e).is_none()
-            {
-                continue;
-            }
-            if !coll
-                .pruned_keeps
-                .values()
-                .any(|(_, ep)| ep.as_ref() == Some(e))
-            {
-                continue;
-            }
-            for (w, seqs) in &coll.entries {
-                if !moved_on(w, seqs) {
-                    tracing::debug!(collection = %c, epoch = ?e, writer = ?w, "erasure pending: a writer may still write in the epoch");
-                    continue 'epochs;
-                }
-                for s in seqs {
-                    let id = VersionId {
-                        writer: w.clone(),
-                        seq: Seq(*s),
-                    };
-                    if let Some((_, ep)) = coll.pruned_keeps.get(&id) {
-                        // Pruned only by a copy of this device's key: its
-                        // bytes are kept, and so is its epoch's key.
-                        let foreign = coll
-                            .prunes
-                            .iter()
-                            .filter(|p| covers(p, &id))
-                            .all(|p| coll.foreign_prunes.contains(&p.name));
-                        if foreign && ep.as_ref() == Some(e) {
-                            continue 'epochs;
-                        }
-                        continue;
-                    }
-                    match epoch_of(&id) {
-                        Some(Some(x)) if x == *e => continue 'epochs,
-                        Some(_) => {}
-                        None if coll.skips(&id) => {}
-                        None => continue 'epochs,
-                    }
-                }
-            }
-            gone.push(e.clone());
-        }
+        let gone: Vec<Epoch> = coll
+            .line
+            .epochs
+            .keys()
+            .filter(|e| {
+                Some(*e) != current.as_ref()
+                    && !coll.erased.contains(e)
+                    && st.keys.key(c, e).is_some()
+                    && coll.pruned_in(e)
+                    && coll.left(e, moved_on)
+            })
+            .cloned()
+            .collect();
         if gone.is_empty() {
             return;
         }
@@ -10646,22 +12064,142 @@ impl Inner {
             coll.erased.insert(e.clone());
         }
         for e in gone {
-            self.store.insert(erased_name(c, &e), Bytes::new());
-            st.keys.forget(c, &e);
-            self.store.remove(&made_key_name(&self.device, c, &e));
-            for (n, _) in self.store.scan_under(&Name::root(), 0) {
-                if let Some((_, ask)) = parse_grant_name(&n)
-                    && ask.collection == *c
-                    && ask.epoch == e
-                {
-                    self.store.remove(&n);
-                }
-            }
-            st.grants.retain(|n| {
-                parse_grant_name(n).is_none_or(|(_, ask)| ask.collection != *c || ask.epoch != e)
-            });
-            tracing::info!(collection = %c, epoch = ?e, "erased: every writer's versions of the epoch are pruned or cut; its key is destroyed");
+            let marker = erased_name(c, &e);
+            self.destroy_key(st, c, &e, marker);
         }
+    }
+
+    /// [`Self::erase_folder`] for every folder at or above `c`.
+    fn erase_folders(&self, st: &mut St, c: &Name) {
+        let folders: Vec<Name> = st
+            .folders
+            .keys()
+            .filter(|f| c.has_prefix(f))
+            .cloned()
+            .collect();
+        for f in folders {
+            self.erase_folder(st, &f);
+        }
+    }
+
+    /// Destroy the key of every epoch of folder `f`'s records that no
+    /// collection under it needs any more (spec §14), by the rule of
+    /// [`Self::erase_own`] across every collection under `f`: not the
+    /// epoch of the folder's record in force; a version sealed in it
+    /// pruned in a collection under `f`; in every collection under `f`
+    /// known here, every version known pruned, refused, or of another
+    /// epoch; and every writer known to write under `f` done with the epoch
+    /// — this device, a key the folder's record in force admits no further
+    /// version of, or one with a version in the folder's epoch in force in
+    /// a collection that reads in it. Until then the erasure is pending; so
+    /// it is while a collection under `f` may not be known here — `f` not
+    /// followed whole, or a device known to write into its namespace not
+    /// walked in full ([`Self::not_walked`]). Erased:
+    /// [`Self::destroy_key`], under the folder's own marker.
+    fn erase_folder(&self, st: &mut St, f: &Name) {
+        let Some(folder) = st.folders.get(f) else {
+            return;
+        };
+        let Some(members) = folder.members.as_ref() else {
+            return;
+        };
+        let current = members.epoch.clone();
+        let candidates: Vec<&Epoch> = folder
+            .line
+            .epochs
+            .keys()
+            .filter(|e| {
+                Some(*e) != current.as_ref()
+                    && !folder.erased.contains(e)
+                    && st.keys.key(f, e).is_some()
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(ns) = namespace_of(f) else {
+            return;
+        };
+        if !st.inside(f)
+            || !self
+                .not_walked(st, &ns, |_| true, |t| f.has_prefix(t))
+                .is_empty()
+        {
+            tracing::debug!(folder = %f, "folder erasure pending: a collection under it may not be known here");
+            return;
+        }
+        let under: Vec<&Coll> = st
+            .colls
+            .iter()
+            .filter(|(x, _)| x.has_prefix(f) && *x != f)
+            .map(|(_, x)| x)
+            .collect();
+        // Whether writer `w` is done with every epoch of the folder before
+        // the one in force.
+        let moved_on = |w: &Writer, _: &BTreeSet<u64>| {
+            *w == self.writer
+                || members
+                    .refusal(&VersionId {
+                        writer: w.clone(),
+                        seq: Seq(u64::MAX),
+                    })
+                    .is_some()
+                || under
+                    .iter()
+                    .filter(|coll| coll.members.as_ref().is_some_and(|m| m.epoch == current))
+                    .any(|coll| {
+                        coll.entries.get(w).is_some_and(|seqs| {
+                            seqs.iter().any(|s| {
+                                coll.epoch_of(&VersionId {
+                                    writer: w.clone(),
+                                    seq: Seq(*s),
+                                }) == Some(current.clone())
+                            })
+                        })
+                    })
+        };
+        let gone: Vec<Epoch> = candidates
+            .into_iter()
+            .filter(|e| {
+                under.iter().any(|coll| coll.pruned_in(e))
+                    && under.iter().all(|coll| coll.left(e, moved_on))
+            })
+            .cloned()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let folder = st.folders.get_mut(f).expect("held above");
+        for e in &gone {
+            folder.erased.insert(e.clone());
+        }
+        for e in gone {
+            let marker = erased_folder_name(f, &e);
+            self.destroy_key(st, f, &e, marker);
+        }
+    }
+
+    /// Destroy the key of epoch `e` of `subject`'s records (a collection's,
+    /// or a folder's): the held key, the key this device made, every grant
+    /// it keeps of that epoch, stored or signed for others; and keep
+    /// `marker` in the store, so a restart refuses the key if granted again
+    /// (spec §14).
+    fn destroy_key(&self, st: &mut St, subject: &Name, e: &Epoch, marker: Name) {
+        self.store.insert(marker, Bytes::new());
+        st.keys.forget(subject, e);
+        self.store.remove(&made_key_name(&self.device, subject, e));
+        for (n, _) in self.store.scan_under(&Name::root(), 0) {
+            if let Some((_, ask)) = parse_grant_name(&n)
+                && ask.collection == *subject
+                && ask.epoch == *e
+            {
+                self.store.remove(&n);
+            }
+        }
+        st.grants.retain(|n| {
+            parse_grant_name(n).is_none_or(|(_, ask)| ask.collection != *subject || ask.epoch != *e)
+        });
+        tracing::info!(%subject, epoch = ?e, "erased: every writer's versions of the epoch are pruned or cut; its key is destroyed");
     }
 
     // ---- holding ------------------------------------------------------------------------------
@@ -11069,7 +12607,7 @@ impl Inner {
                 .filter(|line| {
                     line.own.as_ref().is_some_and(|m| {
                         !m.writers.is_empty()
-                            && id.as_ref().is_some_and(|id| m.refusal(id).is_some())
+                            && id.as_ref().is_some_and(|id| m.refusal_in(c, id).is_some())
                     })
                 })
                 .chain(std::iter::once(&coll.line));
@@ -11766,7 +13304,8 @@ fn anchor_key(ctx: &SignedTrustContext) -> Writer {
 
 /// The data-layer cut by which `ctx` ends `writer`'s key in the log
 /// `prefix` (`<D>/32=log/<C>`): of the key, accepting exactly the key's
-/// runs for that log, signed by the context's anchor key (spec §8). Empty
+/// runs for that log, in collection `C` (of the snapshot log `<D>/32=log`,
+/// under that prefix), signed by the context's anchor key (spec §8). Empty
 /// when the revocation has no cut, or the cut no runs there.
 fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) -> Cut {
     let key = key_name_of(writer.key());
@@ -11775,8 +13314,18 @@ fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) 
         .revocation_cut(&key)
         .and_then(|c| c.ranges().iter().find(|r| r.prefix == *prefix))
     {
+        let entry = Name::from_components(
+            prefix
+                .components()
+                .iter()
+                .cloned()
+                .chain([ndn_packet::NameComponent::sequence_num(0)]),
+        );
+        let c = parse_log_name(&entry)
+            .and_then(|l| l.subject)
+            .unwrap_or_else(|| prefix.clone());
         for &(first, last) in &range.runs {
-            accept.insert_range(writer, first, last);
+            accept.insert_range(&c, writer, first, last);
         }
     }
     Cut {
@@ -11830,6 +13379,7 @@ fn version_of(name: &Name, writer: &Writer, seq: u64, body: VersionBody) -> Vers
         keep: body.keep,
         dated: body.dated,
         group: body.group,
+        rule: body.rule,
         payload: match (body.chunks, body.block) {
             (Some(c), _) => Payload::Large { size: c.size },
             (None, Some(entries)) => Payload::Block(
@@ -11903,6 +13453,18 @@ impl Device {
                     .into(),
             ));
         }
+        if options.keep != Keep::Forever {
+            return Err(refuse(
+                first,
+                format!(
+                    "a group's versions are kept until pruned, and put_group was given keep {:?}: \
+                     a member that expires would leave a reader that never held it unable to \
+                     tell the group complete; put_group with Keep::Forever, or put the items \
+                     that expire one by one",
+                    options.keep
+                ),
+            ));
+        }
         let folder = folder_of(first);
         let mut seen = BTreeSet::new();
         for (c, _) in &items {
@@ -11961,6 +13523,9 @@ impl Device {
                     DataError::Unavailable { name: c.clone() }
                 });
             }
+            // Its default record waits until nothing a device of the
+            // namespace holds can govern it (spec §6.1).
+            inner.default_allowed(c).await?;
             fresh.insert(c.clone());
             keys.push(None);
         }
@@ -11991,16 +13556,14 @@ impl Device {
             why,
         };
         let first = &items[0].0;
-        let yrs = crate::merge::Yrs::new().function().clone();
         let mut st = inner.st.lock();
         // What each collection is written under, as it stands now.
         let mut audiences: Vec<BTreeSet<Audience>> = Vec::with_capacity(items.len());
         for ((c, edit), key) in items.iter().zip(keys) {
             if fresh.contains(c) {
-                if st.colls.get(c).is_some_and(|x| x.members.is_some()) {
-                    // A record arrived meanwhile: put_group again under it.
-                    return Err(DataError::Unavailable { name: c.clone() });
-                }
+                // A record arrived meanwhile, or versions written under one
+                // this device does not hold: put_group again under it.
+                inner.fresh(&st, c)?;
                 audiences.push([Audience::Person(inner.ns.clone())].into_iter().collect());
                 continue;
             }
@@ -12060,12 +13623,11 @@ impl Device {
             )));
         }
         let group = Group { id: gid, count };
-        let no_versions = BTreeMap::new();
-        let no_index = HashMap::new();
         // Signed and judged; nothing kept yet. A collection whose state an
         // edit or an application changed is read again if the group is
-        // refused.
-        let mut temps: HashMap<Name, Box<dyn MergeState>> = HashMap::new();
+        // refused; a fresh collection's operation is judged on a state of
+        // its own ([`Inner::sign_fresh`]), dropped if the group is refused.
+        let mut temps: HashMap<Name, (Box<dyn MergeState>, Ruled)> = HashMap::new();
         let mut touched = Vec::new();
         let mut signed = Vec::with_capacity(items.len());
         let restore = |st: &mut St, touched: &[Name]| {
@@ -12080,33 +13642,20 @@ impl Device {
                 Edit::Op(op) => Draft::Op(op.clone()),
             };
             let made = match records.iter().find(|(r, _)| r == c) {
-                Some((_, (body, made_key))) => {
-                    let Some(rule) = inner.config.rules.get(&yrs) else {
-                        return Err(DataError::RuleUnknown {
-                            collection: c.clone(),
-                            rule: yrs,
-                        });
-                    };
-                    let mut temp = rule.start(inner.me());
-                    let epoch_key = body.epoch.clone().zip(made_key.clone());
-                    let under = Under {
-                        readers: body.readers.clone(),
-                        function: Some(yrs.clone()),
-                        parents: Frontier::new(),
-                    };
-                    let made = inner.sign_version(
+                Some((_, (body, made_key))) => inner
+                    .sign_fresh(
                         c,
                         seq,
-                        under,
-                        Some(&mut *temp),
-                        epoch_key.as_ref(),
-                        (type_id.clone(), keep, (inner.config.clock)()),
+                        body,
+                        made_key.as_ref(),
                         draft,
+                        (type_id.clone(), keep),
                         Some(group),
-                    );
-                    temps.insert(c.clone(), temp);
-                    made
-                }
+                    )
+                    .map(|(s, r, temp)| {
+                        temps.insert(c.clone(), (temp, r));
+                        s
+                    }),
                 None => {
                     touched.push(c.clone());
                     inner.sign_in(
@@ -12129,33 +13678,13 @@ impl Device {
                 }
             }
         }
-        // Every operation checked before any is applied, then applied:
-        // what a rule refuses refuses the group.
+        // Every other operation checked before any is applied, then
+        // applied: what a rule refuses refuses the group.
         let mut ruled = Vec::with_capacity(signed.len());
         for apply in [false, true] {
             ruled.clear();
-            for (i, s) in signed.iter().enumerate() {
-                let r = match temps.get_mut(&s.c) {
-                    Some(temp) => rule_on(
-                        &mut **temp,
-                        &s.held,
-                        &PastOf::new(&s.held.version, &no_versions, &[], &[], &no_index),
-                        apply,
-                    )
-                    .map(Some)
-                    .map_err(|e| {
-                        refuse(
-                            &s.c,
-                            format!(
-                                "item {i} of the group: {}'s rule refuses its operation ({e}); \
-                                 nothing was written: put an operation the rule takes",
-                                s.c
-                            ),
-                        )
-                    }),
-                    None => inner.judge_own(&mut st, s, apply),
-                };
-                match r {
+            for s in signed.iter().filter(|s| !temps.contains_key(&s.c)) {
+                match inner.judge_own(&mut st, s, apply) {
                     Ok(r) => ruled.push(r),
                     Err(e) => {
                         restore(&mut st, &touched);
@@ -12164,18 +13693,34 @@ impl Device {
                 }
             }
         }
-        // Written: the records, then the group.
-        for (c, record) in records {
-            inner.append_members(&mut st, &c, record)?;
+        // The records the fresh collections need, signed before anything is
+        // kept.
+        let mut entries = Vec::with_capacity(records.len());
+        for ((c, record), seq) in records.into_iter().zip(base..) {
+            match inner.sign_members(&c, seq, record) {
+                Ok(entry) => entries.push((c, entry)),
+                Err(e) => {
+                    restore(&mut st, &touched);
+                    return Err(e);
+                }
+            }
+        }
+        // Kept: the records, then the group; nothing fails from here.
+        for (c, entry) in entries {
+            inner.keep_members(&mut st, &c, entry);
         }
         debug_assert_eq!(st.head + 1, gid);
+        let mut ruled = ruled.into_iter();
         let mut ids = Vec::with_capacity(signed.len());
-        for (s, r) in signed.into_iter().zip(ruled) {
-            // A fresh collection's state starts with its record: the
-            // operation, judged on a state alike, applies to it the same.
-            let r = match temps.contains_key(&s.c) {
-                true => inner.judge_own(&mut st, &s, true)?,
-                false => r,
+        for s in signed {
+            let r = match temps.remove(&s.c) {
+                Some((temp, r)) => {
+                    inner.start_fresh(&mut st, &s.c, temp);
+                    Some(r)
+                }
+                None => ruled
+                    .next()
+                    .expect("one ruling per item of a collection held"),
             };
             let ns = namespace_of(&s.c).expect("checked above");
             ids.push(inner.commit(&mut st, &ns, s, Duration::ZERO, r));
@@ -12219,27 +13764,68 @@ impl Device {
                 .wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
                 .await;
         }
-        {
+        let fresh = {
             let mut st = inner.st.lock();
             st.ensure(collection, &inner.config.rules, inner.me());
-            if st.colls.get(collection).is_none_or(|c| c.members.is_none()) {
-                if ns != inner.ns {
-                    let heard = !inner.known_for(&st, &ns).is_empty();
-                    return Err(if heard {
-                        DataError::NotAllowed {
-                            collection: collection.clone(),
-                            writer: inner.writer.clone(),
-                        }
-                    } else {
-                        DataError::Unavailable {
-                            name: collection.clone(),
-                        }
-                    });
-                }
-                let record = inner.default_members(collection, st.head.saturating_add(1));
-                inner.append_members(&mut st, collection, record)?;
+            let none = st.colls.get(collection).is_none_or(|c| c.members.is_none());
+            if none && ns != inner.ns {
+                let heard = !inner.known_for(&st, &ns).is_empty();
+                return Err(if heard {
+                    DataError::NotAllowed {
+                        collection: collection.clone(),
+                        writer: inner.writer.clone(),
+                    }
+                } else {
+                    DataError::Unavailable {
+                        name: collection.clone(),
+                    }
+                });
             }
-        }
+            none
+        };
+        // A collection of this namespace that no record governs gets the
+        // host's default, once nothing a device of the namespace holds can
+        // govern it (spec §6.1), signed with its first version and only once
+        // that version is judged (spec §5).
+        let draft = match fresh {
+            false => draft,
+            true => {
+                inner.default_allowed(collection).await?;
+                let written = {
+                    let mut st = inner.st.lock();
+                    st.ensure(collection, &inner.config.rules, inner.me());
+                    match st.colls.get(collection).is_none_or(|c| c.members.is_none()) {
+                        // A record arrived meanwhile: written under it.
+                        false => Err(draft),
+                        true if options.batch.is_some() => {
+                            return Err(DataError::BadRequest {
+                                name: collection.clone(),
+                                why: format!(
+                                    "{collection} has no members record yet, and the one it \
+                                     gets merges its versions, one operation per version: its \
+                                     entries are not batched into blocks; put without batch, or \
+                                     share it as a log collection first"
+                                ),
+                            });
+                        }
+                        true => Ok(inner.put_fresh(
+                            &mut st,
+                            collection,
+                            &ns,
+                            draft,
+                            (options.type_id.clone(), options.keep),
+                        )?),
+                    }
+                };
+                match written {
+                    Ok(id) => {
+                        inner.publish_about(collection, &[]).await?;
+                        return Ok(id);
+                    }
+                    Err(draft) => draft,
+                }
+            }
+        };
         let key = inner.write_key(collection).await?;
         let PutOptions {
             type_id,
@@ -12748,7 +14334,11 @@ impl DataLayer for Device {
             };
             inner.append(&mut st, Some(&c), wire::encode_prune(&body))?;
         }
-        inner.publish_about(&c, &[]).await
+        inner.publish_about(&c, &[]).await?;
+        // A prune in a folder's epoch in force owes the folder a new epoch
+        // (taken above): signed now (spec §14).
+        inner.settle().await;
+        Ok(())
     }
 
     async fn share(
@@ -12817,17 +14407,42 @@ impl Device {
             }
             _ => members.writers,
         };
-        inner.follow(name).await?;
+        // What lies under the subject is looked at: every device known to
+        // write into the namespace, walked for at most the first-look time.
+        inner.look(name).await?;
+        let own_record = |st: &St| match s.folder {
+            true => st.folders.get(name).and_then(|f| f.line.own.clone()),
+            false => st.colls.get(name).and_then(|c| c.line.own.clone()),
+        };
+        // A record removing a writer cuts over exactly what is held here of
+        // its keys (spec §8): every device of those writers known here that
+        // was not walked yet is walked first, as far as it is reachable
+        // within the first-look time, so what it lists under the subject is
+        // held. What a device not reached holds falls outside the cut: a
+        // removed writer cannot hold its own removal off by staying away.
+        let removed = {
+            let st = inner.st.lock();
+            st.removing(name, own_record(&st).as_ref(), &writers)
+        };
+        if !removed.is_empty() {
+            let missing = inner
+                .unsynced(
+                    &ns,
+                    |d| removed.iter().any(|p| d.has_prefix(p) || p.has_prefix(d)),
+                    |t| name.has_prefix(t),
+                )
+                .await;
+            if !missing.is_empty() {
+                tracing::warn!(subject = %name, folder = s.folder, devices = ?missing, "a record removing a writer is signed over what is held: these devices of the writers it removes were not reached, and what only they hold falls outside its cut");
+            }
+        }
         let before = inner.groups_of(&inner.st.lock(), name);
         {
             let mut st = inner.st.lock();
             if !s.folder {
                 widens(&st, name, &writers, &members.readers)?;
             }
-            let current = match s.folder {
-                true => st.folders.get(name).and_then(|f| f.line.own.clone()),
-                false => st.colls.get(name).and_then(|c| c.line.own.clone()),
-            };
+            let current = own_record(&st);
             let record = inner.next_members(
                 &st,
                 &s,
@@ -13289,7 +14904,7 @@ mod tests {
     fn version_body(c: &Name, sealed: Option<SealedBody>) -> VersionBody {
         VersionBody {
             collection: c.clone(),
-            parents: Frontier::new(),
+            parents: Parents::new(),
             type_id: crate::TypeId {
                 name: n("/types/note"),
                 revision: 1,
@@ -13298,6 +14913,7 @@ mod tests {
             keep: crate::Keep::Forever,
             dated: Timestamp(1),
             group: None,
+            rule: None,
             fields: Content::new(),
             op: Bytes::new(),
             sealed,
@@ -13530,8 +15146,8 @@ mod tests {
         {
             let st = dev.inner.st.lock();
             let cut = &st.colls[&c].members.as_ref().unwrap().cuts[0];
-            assert!(!cut.refuses(&id(40)) && !cut.refuses(&id(100)));
-            assert!(cut.refuses(&id(70)), "a seq only a summary listed");
+            assert!(!cut.refuses(&c, &id(40)) && !cut.refuses(&c, &id(100)));
+            assert!(cut.refuses(&c, &id(70)), "a seq only a summary listed");
         }
         // After his removal Bob signs seq 57, a seq he used elsewhere.
         assert!(matches!(
@@ -15096,9 +16712,12 @@ mod tests {
     ) -> Arc<HeldVersion> {
         let writer = Writer::new(key.clone());
         let parents = parent
-            .map(|p| VersionId {
-                writer: writer.clone(),
-                seq: Seq(p),
+            .map(|p| {
+                let id = VersionId {
+                    writer: writer.clone(),
+                    seq: Seq(p),
+                };
+                (id, None)
             })
             .into_iter()
             .collect();
@@ -15119,6 +16738,7 @@ mod tests {
                 keep: Keep::Forever,
                 dated: Timestamp(0),
                 group: None,
+                rule: None,
                 payload: Payload::Entry(Content::new()),
             },
             Bytes::new(),
@@ -15537,7 +17157,9 @@ mod tests {
         match r.dev.inner.take_data(&three, d3).await {
             Err(Refusal::OutsideCut(cut)) => {
                 assert_eq!(cut.of, r.key);
-                assert!(cut.accept.contains(&r.id(2)) && !cut.accept.contains(&r.id(3)));
+                assert!(
+                    cut.accept.contains(&r.c, &r.id(2)) && !cut.accept.contains(&r.c, &r.id(3))
+                );
             }
             other => panic!("a version outside the cut: {other:?}"),
         }
@@ -16433,14 +18055,15 @@ mod tests {
             assert_eq!(refused.next(), crate::error::NextStep::FixRequest);
         }
         assert_eq!(dev.inner.st.lock().head, head);
-        // Narrowed to Alice: Bob's versions are refused here.
+        // Narrowed to Alice: Bob, a writer of the folder's, is removed with
+        // a cut (spec §6.1), and his new versions are refused here.
         dev.share(&c, share_of(Rule::Log, &["/alice"], vec![person("/alice")]))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             hand(&dev, &n("/bob/phone"), &c, 1, version(&c)),
-            Some(Refusal::NotMember)
-        );
+            Some(Refusal::OutsideCut(_))
+        ));
         let carol = (n("/carol/phone"), n("/carol"));
         let bob = (n("/bob/phone"), n("/bob"));
         // A record that widens anyway (signed elsewhere) has no effect.
@@ -16761,3 +18384,12 @@ mod merge_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod group_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod merge_review_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod folder_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod admission_tests;

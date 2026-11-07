@@ -9,7 +9,7 @@ use ndn_sync::MemoryStore;
 
 /// A forwarder that never delivers anything: the test hands the device the
 /// packets it would have fetched.
-struct Unconnected;
+pub(super) struct Unconnected;
 
 #[async_trait::async_trait]
 impl Connection for Unconnected {
@@ -24,30 +24,30 @@ impl Connection for Unconnected {
     }
 }
 
-fn n(s: &str) -> Name {
+pub(super) fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
-fn plan() -> Name {
+pub(super) fn plan() -> Name {
     n("/alice/32=data/trip/plan")
 }
 
-fn budget() -> Name {
+pub(super) fn budget() -> Name {
     n("/alice/32=data/trip/budget")
 }
 
-fn key(device: &str) -> Name {
+pub(super) fn key(device: &str) -> Name {
     n(device).append("KEY").append("1")
 }
 
-fn id(device: &str, seq: u64) -> VersionId {
+pub(super) fn id(device: &str, seq: u64) -> VersionId {
     VersionId {
         writer: Writer::new(key(device)),
         seq: Seq(seq),
     }
 }
 
-fn log_share() -> Share {
+pub(super) fn log_share() -> Share {
     Share {
         rule: Rule::Log,
         writers: vec![n("/alice"), n("/bob"), n("/carol")],
@@ -57,13 +57,13 @@ fn log_share() -> Share {
 
 /// `/alice/laptop` on a forwarder that delivers nothing, owning `plan()`
 /// and `budget()` as log collections Alice, Bob and Carol write.
-async fn device() -> Device {
+pub(super) async fn device() -> Device {
     device_with(MergeRules::standard(), log_share()).await
 }
 
 /// `/alice/laptop`, knowing `rules`, owning `plan()` and `budget()` shared
 /// as `share` says.
-async fn device_with(rules: MergeRules, share: Share) -> Device {
+pub(super) async fn device_with(rules: MergeRules, share: Share) -> Device {
     let device = n("/alice/laptop");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob", "/carol"] {
@@ -98,16 +98,16 @@ async fn device_with(rules: MergeRules, share: Share) -> Device {
 }
 
 /// A log entry as fetched: its name, packet, signing key and record.
-struct Made {
-    name: Name,
-    packet: Bytes,
-    key: Name,
-    record: Record,
+pub(super) struct Made {
+    pub(super) name: Name,
+    pub(super) packet: Bytes,
+    pub(super) key: Name,
+    pub(super) record: Record,
 }
 
 /// Entry `seq` of `device` about `c` carrying `record`, signed (unchecked)
 /// by the device's key.
-fn made(device: &str, c: &Name, seq: u64, record: Record) -> Made {
+pub(super) fn made(device: &str, c: &Name, seq: u64, record: Record) -> Made {
     let name = log_name(&n(device), Some(c), seq);
     let key = key(device);
     let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
@@ -123,8 +123,18 @@ fn made(device: &str, c: &Name, seq: u64, record: Record) -> Made {
     }
 }
 
+/// A parent: the version `m` and the implicit digest of its packet.
+fn tip(m: &Made) -> (VersionId, Option<[u8; 32]>) {
+    let seq = parse_log_name(&m.name).expect("a log entry").seq;
+    let id = VersionId {
+        writer: Writer::new(m.key.clone()),
+        seq: Seq(seq),
+    };
+    (id, Some(wire::implicit_digest(&m.packet)))
+}
+
 /// Version `seq` of `device` in `c`, naming `parents`, of `group`.
-fn version(
+pub(super) fn version(
     device: &str,
     c: &Name,
     seq: u64,
@@ -133,7 +143,7 @@ fn version(
 ) -> Made {
     let body = VersionBody {
         collection: c.clone(),
-        parents: parents.iter().map(|(d, s)| id(d, *s)).collect(),
+        parents: parents.iter().map(|(d, s)| (id(d, *s), None)).collect(),
         type_id: TypeId {
             name: n("/types/note"),
             revision: 1,
@@ -142,6 +152,7 @@ fn version(
         keep: Keep::Forever,
         dated: Timestamp(1),
         group,
+        rule: None,
         fields: Content::new().with("t", format!("{device} {seq}")),
         op: Bytes::new(),
         sealed: None,
@@ -151,7 +162,7 @@ fn version(
     made(device, c, seq, Record::Version(body))
 }
 
-fn give(dev: &Device, m: &Made) {
+pub(super) fn give(dev: &Device, m: &Made) {
     let mut st = dev.inner.st.lock();
     dev.inner.take(
         &mut st,
@@ -164,16 +175,16 @@ fn give(dev: &Device, m: &Made) {
 }
 
 /// Whether `id` counts in `c` here: applied.
-fn counts(dev: &Device, c: &Name, id: &VersionId) -> bool {
+pub(super) fn counts(dev: &Device, c: &Name, id: &VersionId) -> bool {
     let st = dev.inner.st.lock();
     st.colls[c].at().contains(id) && st.colls[c].versions.contains_key(id)
 }
 
-fn refusal(dev: &Device, name: &Name) -> Option<Refusal> {
+pub(super) fn refusal(dev: &Device, name: &Name) -> Option<Refusal> {
     dev.inner.st.lock().refused.get(name).cloned()
 }
 
-fn options() -> PutOptions {
+pub(super) fn options() -> PutOptions {
     PutOptions {
         type_id: TypeId {
             name: n("/types/note"),
@@ -185,7 +196,7 @@ fn options() -> PutOptions {
 }
 
 /// Every change the watch has delivered so far.
-async fn drain(changes: &mut Changes) -> Vec<Change> {
+pub(super) async fn drain(changes: &mut Changes) -> Vec<Change> {
     use futures::StreamExt;
     let mut out = Vec::new();
     while let Ok(Some(Ok(change))) =
@@ -196,7 +207,7 @@ async fn drain(changes: &mut Changes) -> Vec<Change> {
     out
 }
 
-const PAIR: Group = Group { id: 10, count: 2 };
+pub(super) const PAIR: Group = Group { id: 10, count: 2 };
 
 #[tokio::test]
 async fn a_group_counts_all_or_none_in_either_arrival_order() {
@@ -320,19 +331,21 @@ async fn a_cut_refusing_one_member_withdraws_the_whole_group_and_spares_others_w
     dev.shutdown();
 }
 
-/// Version `seq` of `device` in merge collection `c`, naming `parents`, of
-/// `group`, carrying `op`.
+/// Version `seq` of `device` in merge collection `c` (under the merge
+/// tests' rule), naming `parents`, of `group`, carrying `op`.
 fn op_version(
     device: &str,
     c: &Name,
     seq: u64,
-    parents: &[(&str, u64)],
+    parents: &[&Made],
     group: Option<Group>,
     op: Bytes,
 ) -> Made {
-    let Record::Version(mut body) = version(device, c, seq, parents, group).record else {
+    let Record::Version(mut body) = version(device, c, seq, &[], group).record else {
         unreachable!("a version")
     };
+    body.parents = parents.iter().map(|m| tip(m)).collect();
+    body.rule = Some(n(super::merge_tests::RULE));
     body.fields = Content::new();
     body.op = op;
     made(device, c, seq, Record::Version(body))
@@ -364,7 +377,7 @@ async fn an_edit_made_over_a_withdrawn_member_by_its_digest_stays_counted() {
         "/carol/laptop",
         &plan(),
         5,
-        &[("/bob/laptop", 10)],
+        &[&a],
         None,
         edit(Some(basis), "c"),
     );
@@ -518,7 +531,7 @@ fn sealed_edit(
     c: &Name,
     (epoch, ck): &(Epoch, ContentKey),
     seq: u64,
-    parents: &[(&str, u64)],
+    parents: &[&Made],
     group: Option<Group>,
 ) -> Made {
     let bob = Writer::new(key("/bob/laptop"));
@@ -529,7 +542,7 @@ fn sealed_edit(
     let name = log_name(&n("/bob/laptop"), Some(c), seq);
     let body = VersionBody {
         collection: c.clone(),
-        parents: parents.iter().map(|(d, s)| id(d, *s)).collect(),
+        parents: parents.iter().map(|m| tip(m)).collect(),
         type_id: TypeId {
             name: n("/types/note"),
             revision: 1,
@@ -540,6 +553,7 @@ fn sealed_edit(
         keep: Keep::Forever,
         dated: Timestamp(1),
         group,
+        rule: Some(n("/merge/yrs")),
         fields: Content::new(),
         op: Bytes::new(),
         sealed: Some(SealedBody {
@@ -584,13 +598,12 @@ async fn a_sealed_merge_group_counts_all_or_none_in_any_order() {
         };
         let (ka, kc) = (key_of(&board("a")), key_of(&board("c")));
         let g = Group { id: 12, count: 2 };
-        let versions = [
-            sealed_edit(&board("a"), &ka, 9, &[], None),
-            sealed_edit(&board("c"), &kc, 11, &[], None),
-            sealed_edit(&board("a"), &ka, 12, &[("/bob/laptop", 9)], Some(g)),
-            sealed_edit(&board("c"), &kc, 13, &[("/bob/laptop", 11)], Some(g)),
-            sealed_edit(&board("a"), &ka, 14, &[("/bob/laptop", 12)], None),
-        ];
+        let v9 = sealed_edit(&board("a"), &ka, 9, &[], None);
+        let v11 = sealed_edit(&board("c"), &kc, 11, &[], None);
+        let v12 = sealed_edit(&board("a"), &ka, 12, &[&v9], Some(g));
+        let v13 = sealed_edit(&board("c"), &kc, 13, &[&v11], Some(g));
+        let v14 = sealed_edit(&board("a"), &ka, 14, &[&v12], None);
+        let versions = [v9, v11, v12, v13, v14];
         for i in order {
             give(&dev, &versions[i]);
             let (a, c) = (

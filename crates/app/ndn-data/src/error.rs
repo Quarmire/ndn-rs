@@ -92,8 +92,8 @@ pub enum Refusal {
         /// The last seq this device wrote.
         head: u64,
     },
-    /// The collection's merge rule refuses its operation: its check or its
-    /// application failed, for good.
+    /// The collection's merge rule refuses its operation: its check, which
+    /// sees the operation and its past alone, failed, for good.
     Rule {
         /// The rule's reason.
         why: String,
@@ -106,6 +106,28 @@ pub enum Refusal {
         /// Why.
         why: String,
     },
+    /// One of its parents names a packet this reader cannot take as what
+    /// it was made over (spec §5.2): the packet held at that writer and seq
+    /// has another digest (its writer named a packet that does not exist,
+    /// or that parent's key signed two at one seq — an equivocation), the
+    /// parent carries no digest, or — of a checkpoint — that parent never
+    /// applies here, so the checkpoint cannot stand for what lies below it.
+    Parent {
+        /// The parent named.
+        parent: VersionId,
+        /// Which of these.
+        why: String,
+    },
+    /// It was made for another merge rule than the one the collection's
+    /// members record names now (spec §5.1): its writer had not heard of
+    /// the change. Its operation is read only under the rule it was made
+    /// for.
+    OtherRule {
+        /// The rule it was made for; `None`: it names none.
+        made_for: Option<Name>,
+        /// The rule in force.
+        in_force: Name,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -115,7 +137,7 @@ impl std::fmt::Display for Refusal {
                 let accepted = cut
                     .accept
                     .iter()
-                    .map(|(w, ranges)| {
+                    .map(|(c, w, ranges)| {
                         let seqs = ranges
                             .iter()
                             .map(|(lo, hi)| match lo == hi {
@@ -123,7 +145,7 @@ impl std::fmt::Display for Refusal {
                                 false => format!("{lo}–{hi}"),
                             })
                             .collect::<Vec<_>>();
-                        format!("{} seq {}", w.key(), seqs.join(", "))
+                        format!("{} seq {} in {c}", w.key(), seqs.join(", "))
                     })
                     .collect::<Vec<_>>();
                 write!(
@@ -194,6 +216,24 @@ impl std::fmt::Display for Refusal {
                  device wrote ({head}): a copy of this device's key signed it; mark the key \
                  suspected and have the owner revoke it with a cut"
             ),
+            Refusal::Parent { parent, why } => write!(
+                f,
+                "it names {} seq {} among its parents, and {why}: it was not made over what \
+                 this reader holds there, so it never applies and nothing waits for it; its \
+                 writer writes again over the state it holds",
+                parent.writer.key(),
+                parent.seq.0
+            ),
+            Refusal::OtherRule { made_for, in_force } => write!(
+                f,
+                "it was made for the merge rule {}, and the collection now merges with \
+                 {in_force}: an operation is read only under the rule it was made for; its \
+                 writer, once it has the members record naming {in_force}, writes the change \
+                 again under it",
+                made_for
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string)
+            ),
         }
     }
 }
@@ -206,6 +246,17 @@ pub enum DataError {
     Unavailable {
         /// The name asked for.
         name: Name,
+    },
+    /// What is asked cannot be done yet, from what this device holds now:
+    /// `why` says what it waits for (a device of the namespace not walked
+    /// yet, a members record not held, an epoch to move to). The same call,
+    /// unchanged, can succeed once it is.
+    #[error("{name} is not ready: {why}")]
+    NotReady {
+        /// The name asked for.
+        name: Name,
+        /// What it waits for, and what to do.
+        why: String,
     },
     /// A signed summary covering the name shows there is no such version.
     #[error("no version is named {name}")]
@@ -344,7 +395,7 @@ impl DataError {
     /// Whether the same call, unchanged, can succeed later.
     pub fn retry(&self) -> bool {
         match self {
-            DataError::Unavailable { .. } => true,
+            DataError::Unavailable { .. } | DataError::NotReady { .. } => true,
             DataError::Refused { why, .. } => {
                 matches!(why, Refusal::BadSignature | Refusal::Rollback)
             }
@@ -355,7 +406,7 @@ impl DataError {
     /// What to do about it.
     pub fn next(&self) -> NextStep {
         match self {
-            DataError::Unavailable { .. } => NextStep::RetryLater,
+            DataError::Unavailable { .. } | DataError::NotReady { .. } => NextStep::RetryLater,
             DataError::NotFound { .. } | DataError::Pruned { .. } | DataError::Expired { .. } => {
                 NextStep::None
             }
@@ -370,7 +421,9 @@ impl DataError {
                 Refusal::Unsealed
                 | Refusal::NotInline
                 | Refusal::Rule { .. }
-                | Refusal::Group { .. } => NextStep::None,
+                | Refusal::Group { .. }
+                | Refusal::Parent { .. }
+                | Refusal::OtherRule { .. } => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,

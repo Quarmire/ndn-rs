@@ -106,6 +106,85 @@ impl FromIterator<VersionId> for Frontier {
     }
 }
 
+/// A version's parents (spec §4): the frontier of the collection's state
+/// its writer had applied when it wrote, and, per writer in it, the
+/// implicit digest of that writer's packet at that seq — the **tip** the
+/// version was made over, which binds the parent to bytes that exist.
+///
+/// A frontier names versions by seq alone, so a writer could name a seq of
+/// another key that does not exist yet and claim, once it does, to have
+/// seen everything below it; a digest it can only know of a packet it held.
+/// In a merge collection every parent carries one (spec §5.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Parents {
+    at: Frontier,
+    tips: BTreeMap<Writer, [u8; 32]>,
+}
+
+impl Parents {
+    /// No parents.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Name `id` as the tip of its writer, with the implicit digest of its
+    /// packet when known, in place of an earlier tip of that writer.
+    pub fn insert(&mut self, id: &VersionId, digest: Option<[u8; 32]>) {
+        self.at.0.insert(id.writer.clone(), id.seq);
+        match digest {
+            Some(d) => self.tips.insert(id.writer.clone(), d),
+            None => self.tips.remove(&id.writer),
+        };
+    }
+
+    /// The frontier they name.
+    pub fn frontier(&self) -> &Frontier {
+        &self.at
+    }
+
+    /// The highest sequence number of `writer` they include.
+    pub fn get(&self, writer: &Writer) -> Option<Seq> {
+        self.at.get(writer)
+    }
+
+    /// The implicit digest of `writer`'s tip, if they name one.
+    pub fn digest(&self, writer: &Writer) -> Option<&[u8; 32]> {
+        self.tips.get(writer)
+    }
+
+    /// Whether `id` lies inside the frontier they name.
+    pub fn contains(&self, id: &VersionId) -> bool {
+        self.at.contains(id)
+    }
+
+    /// The writers and their tips' sequence numbers, by writer.
+    pub fn iter(&self) -> impl Iterator<Item = (&Writer, Seq)> {
+        self.at.iter()
+    }
+
+    /// Each tip: its writer, seq and digest (if named), by writer.
+    pub fn tips(&self) -> impl Iterator<Item = (&Writer, Seq, Option<&[u8; 32]>)> {
+        self.at.iter().map(|(w, s)| (w, s, self.tips.get(w)))
+    }
+
+    /// Whether they name nothing.
+    pub fn is_empty(&self) -> bool {
+        self.at.is_empty()
+    }
+}
+
+impl FromIterator<(VersionId, Option<[u8; 32]>)> for Parents {
+    fn from_iter<I: IntoIterator<Item = (VersionId, Option<[u8; 32]>)>>(iter: I) -> Self {
+        let mut p = Parents::new();
+        for (id, digest) in iter {
+            if p.get(&id.writer).is_none_or(|s| s < id.seq) {
+                p.insert(&id, digest);
+            }
+        }
+        p
+    }
+}
+
 /// A named, versioned content schema, e.g. `/types/note` revision 2.
 ///
 /// Types grow; readers name the type they understand; writers keep the
@@ -243,8 +322,9 @@ pub struct Version {
     pub name: Name,
     /// The collection the version belongs to.
     pub collection: Name,
-    /// What the writer had seen when it wrote this version.
-    pub parents: Frontier,
+    /// What the writer had applied when it wrote this version, each tip
+    /// bound to its packet's digest.
+    pub parents: Parents,
     /// The content's type.
     pub type_id: TypeId,
     /// Who may read it.
@@ -256,6 +336,10 @@ pub struct Version {
     /// The group it belongs to, if its writer signed it as one of several
     /// versions counted all or none (spec §5.5).
     pub group: Option<Group>,
+    /// The merge rule its writer made its operation for, by exact name
+    /// (spec §5.1); `None` under the log and one-key rules. A merge
+    /// collection applies it only under that rule.
+    pub rule: Option<Name>,
     /// The content.
     pub payload: Payload,
 }

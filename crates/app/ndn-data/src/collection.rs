@@ -91,17 +91,24 @@ pub struct Members {
 }
 
 impl Members {
-    /// Why this record refuses version `id`, if it does: a key under a
-    /// writer prefix is admitted; else a key under a cut's prefix is
-    /// admitted if the cut accepts exactly that version and refused
-    /// otherwise, whatever date or seq it claims; else the key is no member.
+    /// Why this record refuses version `id` of its own collection, if it
+    /// does ([`Self::refusal_in`]).
     pub fn refusal(&self, id: &VersionId) -> Option<Refusal> {
+        self.refusal_in(&self.collection, id)
+    }
+
+    /// Why this record refuses version `id` of collection `c` (its own, or
+    /// of a folder record one under it), if it does: a key under a writer
+    /// prefix is admitted; else a key under a cut's prefix is admitted if
+    /// the cut accepts exactly that version in `c` and refused otherwise,
+    /// whatever date or seq it claims; else the key is no member.
+    pub fn refusal_in(&self, c: &Name, id: &VersionId) -> Option<Refusal> {
         let key = id.writer.key();
         if self.writers.iter().any(|p| key.has_prefix(p)) {
             return None;
         }
-        match self.cuts.iter().find(|c| key.has_prefix(&c.of)) {
-            Some(cut) if cut.accept.contains(id) => None,
+        match self.cuts.iter().find(|k| key.has_prefix(&k.of)) {
+            Some(cut) if cut.accept.contains(c, id) => None,
             Some(cut) => Some(Refusal::OutsideCut(cut.clone())),
             None => Some(Refusal::NotMember),
         }
@@ -297,8 +304,9 @@ impl Members {
 ///   the prefix sets); a level listing no writers takes those of the levels
 ///   above it;
 /// - cuts: every level's prefix, each accepting exactly the versions of its
-///   keys that every level admits — so a version is refused iff a level
-///   refuses it, as outside a cut wherever a level cuts its key;
+///   keys in `subject` (of a folder: in the collections under it) that
+///   every level admits — so a version is refused iff a level refuses it,
+///   as outside a cut wherever a level cuts its key;
 /// - readers: those of the nearest level listing readers, in its epoch and
 ///   with its key check, less any that an outer level listing readers does
 ///   not admit ([`admitted`]): widening has no effect; no level lists
@@ -332,12 +340,13 @@ pub(crate) fn effective(
     }
     writers.reverse();
     let admitted_by_all = above.unwrap_or_default();
-    // Per key a cut lists, the versions every level admits: by its writers,
-    // or by the first of its cuts over the key, as `Members::refusal` reads.
+    // Per key a cut lists, the versions in `subject` every level admits: by
+    // its writers, or by the first of its cuts over the key, as
+    // `Members::refusal` reads.
     let keys: BTreeSet<&Writer> = levels
         .iter()
         .flat_map(|m| m.cuts.iter())
-        .flat_map(|c| c.accept.iter().map(|(w, _)| w))
+        .flat_map(|c| c.accept.iter().map(|(_, w, _)| w))
         .collect();
     let mut accepted = Accepted::new();
     for w in keys {
@@ -350,7 +359,7 @@ pub(crate) fn effective(
                 .cuts
                 .iter()
                 .find(|c| w.key().has_prefix(&c.of))
-                .map(|c| c.accept.of_key(w))
+                .map(|c| c.accept.of_key(w).within(subject))
                 .unwrap_or_default();
             kept = Some(match kept {
                 None => level,
@@ -473,12 +482,19 @@ pub struct Epoch {
     pub seq: Seq,
 }
 
-/// Exactly the versions a [`Cut`] keeps, per key: the seqs of the key's
-/// versions in the collection that the cut's signer held verified (spec
-/// §8). Every other version of the cut's keys is outside it, whatever its
-/// seq: a removed writer cannot fill a gap below what was kept.
+/// One key's accepted seqs in a collection, as ascending, disjoint,
+/// inclusive ranges.
+pub type KeyRuns<'a> = (&'a Writer, &'a [(u64, u64)]);
+
+/// Exactly the versions a [`Cut`] keeps, per collection and key: the seqs
+/// of the key's versions in that collection that the cut's signer held
+/// verified (spec §8). Every other version of the cut's keys is outside
+/// it, whatever its seq or collection: a removed writer cannot fill a gap
+/// below what was kept, nor sign an accepted seq again in another
+/// collection — a key's log is one sequence across its collections, so a
+/// seq is accepted only in the collection it was held in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Accepted(BTreeMap<Writer, Vec<(u64, u64)>>);
+pub struct Accepted(BTreeMap<Name, BTreeMap<Writer, Vec<(u64, u64)>>>);
 
 impl Accepted {
     /// Nothing accepted.
@@ -486,24 +502,25 @@ impl Accepted {
         Self::default()
     }
 
-    /// Whether exactly `id` is accepted.
-    pub fn contains(&self, id: &VersionId) -> bool {
-        let Some(ranges) = self.0.get(&id.writer) else {
-            return false;
-        };
-        let s = id.seq.0;
-        let i = ranges.partition_point(|(lo, _)| *lo <= s);
-        i > 0 && ranges[i - 1].1 >= s
+    /// Whether exactly `id`, in collection `c`, is accepted.
+    pub fn contains(&self, c: &Name, id: &VersionId) -> bool {
+        self.highest_at_most(c, &id.writer, id.seq.0) == Some(id.seq.0)
     }
 
-    /// Accept `id`.
-    pub fn insert(&mut self, id: &VersionId) {
-        self.insert_range(&id.writer, id.seq.0, id.seq.0);
+    /// Accept `id` in collection `c`.
+    pub fn insert(&mut self, c: &Name, id: &VersionId) {
+        self.insert_range(c, &id.writer, id.seq.0, id.seq.0);
     }
 
-    /// Accept every seq of `writer` from `lo` to `hi`, inclusive.
-    pub(crate) fn insert_range(&mut self, writer: &Writer, lo: u64, hi: u64) {
-        let ranges = self.0.entry(writer.clone()).or_default();
+    /// Accept every seq of `writer` in collection `c` from `lo` to `hi`,
+    /// inclusive.
+    pub(crate) fn insert_range(&mut self, c: &Name, writer: &Writer, lo: u64, hi: u64) {
+        let ranges = self
+            .0
+            .entry(c.clone())
+            .or_default()
+            .entry(writer.clone())
+            .or_default();
         // The ranges that overlap or touch [lo, hi] fold into it.
         let start = ranges.partition_point(|(_, h)| h.saturating_add(1) < lo);
         let end = ranges.partition_point(|(l, _)| *l <= hi.saturating_add(1));
@@ -515,16 +532,27 @@ impl Accepted {
         ranges.splice(start..end, [(lo, hi)]);
     }
 
-    /// The highest accepted seq of `writer` at or below `seq`.
-    pub fn highest_at_most(&self, writer: &Writer, seq: u64) -> Option<u64> {
-        let ranges = self.0.get(writer)?;
+    /// The highest accepted seq of `writer` in collection `c` at or below
+    /// `seq`.
+    pub fn highest_at_most(&self, c: &Name, writer: &Writer, seq: u64) -> Option<u64> {
+        let ranges = self.0.get(c)?.get(writer)?;
         let i = ranges.partition_point(|(lo, _)| *lo <= seq);
         (i > 0).then(|| ranges[i - 1].1.min(seq))
     }
 
-    /// The accepted seqs per key, as ascending, disjoint, inclusive ranges.
-    pub fn iter(&self) -> impl Iterator<Item = (&Writer, &[(u64, u64)])> {
-        self.0.iter().map(|(w, r)| (w, r.as_slice()))
+    /// The accepted seqs per collection and key, as ascending, disjoint,
+    /// inclusive ranges.
+    pub fn iter(&self) -> impl Iterator<Item = (&Name, &Writer, &[(u64, u64)])> {
+        self.0
+            .iter()
+            .flat_map(|(c, ws)| ws.iter().map(move |(w, r)| (c, w, r.as_slice())))
+    }
+
+    /// The accepted seqs per collection, then per key in it.
+    pub fn collections(&self) -> impl Iterator<Item = (&Name, impl Iterator<Item = KeyRuns<'_>>)> {
+        self.0
+            .iter()
+            .map(|(c, ws)| (c, ws.iter().map(|(w, r)| (w, r.as_slice()))))
     }
 
     /// Whether nothing is accepted.
@@ -532,33 +560,46 @@ impl Accepted {
         self.0.is_empty()
     }
 
-    /// What it accepts of key `w`.
-    pub(crate) fn of_key(&self, w: &Writer) -> Accepted {
+    /// What it accepts of the entries whose collection and key `keep`
+    /// keeps.
+    fn only(&self, keep: impl Fn(&Name, &Writer) -> bool) -> Accepted {
         Accepted(
             self.0
-                .get_key_value(w)
-                .map(|(w, r)| (w.clone(), r.clone()))
-                .into_iter()
+                .iter()
+                .map(|(c, ws)| {
+                    let kept: BTreeMap<Writer, Vec<(u64, u64)>> = ws
+                        .iter()
+                        .filter(|(w, _)| keep(c, w))
+                        .map(|(w, r)| (w.clone(), r.clone()))
+                        .collect();
+                    (c.clone(), kept)
+                })
+                .filter(|(_, ws)| !ws.is_empty())
                 .collect(),
         )
+    }
+
+    /// What it accepts of key `w`.
+    pub(crate) fn of_key(&self, w: &Writer) -> Accepted {
+        self.only(|_, x| x == w)
     }
 
     /// What it accepts of the keys under `prefix`.
     pub(crate) fn under(&self, prefix: &Name) -> Accepted {
-        Accepted(
-            self.0
-                .iter()
-                .filter(|(w, _)| w.key().has_prefix(prefix))
-                .map(|(w, r)| (w.clone(), r.clone()))
-                .collect(),
-        )
+        self.only(|_, w| w.key().has_prefix(prefix))
+    }
+
+    /// What it accepts in collection `subject` or, of a folder, in the
+    /// collections under it.
+    pub(crate) fn within(&self, subject: &Name) -> Accepted {
+        self.only(|c, _| c.has_prefix(subject))
     }
 
     /// Accept also what `other` accepts.
     pub(crate) fn add(&mut self, other: &Accepted) {
-        for (w, ranges) in &other.0 {
+        for (c, w, ranges) in other.iter() {
             for (lo, hi) in ranges {
-                self.insert_range(w, *lo, *hi);
+                self.insert_range(c, w, *lo, *hi);
             }
         }
     }
@@ -566,8 +607,8 @@ impl Accepted {
     /// What both accept.
     pub fn intersection(&self, other: &Accepted) -> Accepted {
         let mut out = Accepted::new();
-        for (w, mine) in &self.0 {
-            let Some(theirs) = other.0.get(w) else {
+        for (c, w, mine) in self.iter() {
+            let Some(theirs) = other.0.get(c).and_then(|ws| ws.get(w)) else {
                 continue;
             };
             let (mut i, mut j) = (0, 0);
@@ -575,7 +616,7 @@ impl Accepted {
                 let lo = mine[i].0.max(theirs[j].0);
                 let hi = mine[i].1.min(theirs[j].1);
                 if lo <= hi {
-                    out.insert_range(w, lo, hi);
+                    out.insert_range(c, w, lo, hi);
                 }
                 if mine[i].1 < theirs[j].1 {
                     i += 1;
@@ -588,34 +629,23 @@ impl Accepted {
     }
 }
 
-impl FromIterator<VersionId> for Accepted {
-    fn from_iter<I: IntoIterator<Item = VersionId>>(iter: I) -> Self {
-        let mut a = Accepted::new();
-        for id in iter {
-            a.insert(&id);
-        }
-        a
-    }
-}
-
 /// A signed "this much and no more" for a key or a member (model change
 /// M3).
 ///
 /// Exactly the versions by the keys under [`of`](Self::of) that
 /// [`accept`](Self::accept) lists stay valid; anything else by those keys is
 /// refused, whatever date or seq it claims. It replaces clock-based
-/// signing-time validity. A reader that receives a cut re-checks everything
-/// it already accepted from those keys against it (open item "before a cut
-/// arrives"). Two kinds: a writer's removal, in the collection's members
-/// record; and a key's revocation, in its namespace's trust context (spec
-/// §8), where [`of`](Self::of) is the revoked key, [`accept`](Self::accept)
-/// the key's runs for the collection, and [`signer`](Self::signer) the
-/// context's anchor key.
+/// arrives"). Two kinds: a writer's removal, in the members record of a
+/// collection or of a folder; and a key's revocation, in its namespace's
+/// trust context (spec §8), where [`of`](Self::of) is the revoked key,
+/// [`accept`](Self::accept) the key's runs for the collection, and
+/// [`signer`](Self::signer) the context's anchor key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Cut {
     /// The key, or the prefix of a member's keys, being ended.
     pub of: Name,
-    /// What stays valid: exactly the versions the signer held verified.
+    /// What stays valid: exactly the versions the signer held verified,
+    /// each in its collection.
     pub accept: Accepted,
     /// The key that signed the cut (the collection owner, or the namespace
     /// authority for a revocation).
@@ -623,10 +653,10 @@ pub struct Cut {
 }
 
 impl Cut {
-    /// Whether this cut refuses `id`: its key falls under [`of`](Self::of)
-    /// and [`accept`](Self::accept) does not list it.
-    pub fn refuses(&self, id: &VersionId) -> bool {
-        id.writer.key().has_prefix(&self.of) && !self.accept.contains(id)
+    /// Whether this cut refuses `id` in collection `c`: its key falls under
+    /// [`of`](Self::of) and [`accept`](Self::accept) does not list it there.
+    pub fn refuses(&self, c: &Name, id: &VersionId) -> bool {
+        id.writer.key().has_prefix(&self.of) && !self.accept.contains(c, id)
     }
 }
 
@@ -675,47 +705,70 @@ mod tests {
         }
     }
 
+    fn plan() -> Name {
+        "/alice/32=data/docs/plan".parse().unwrap()
+    }
+
+    /// Exactly `ids`, accepted in collection `c`.
+    fn accepted(c: &Name, ids: impl IntoIterator<Item = VersionId>) -> Accepted {
+        let mut a = Accepted::new();
+        for id in ids {
+            a.insert(c, &id);
+        }
+        a
+    }
+
     #[test]
     fn a_cut_keeps_exactly_what_its_signer_held_and_refuses_the_rest() {
+        let p = plan();
         let cut = Cut {
             of: "/bob".parse().unwrap(),
-            accept: [id("/bob/phone/KEY/1", 40), id("/bob/phone/KEY/1", 100)]
-                .into_iter()
-                .collect(),
+            accept: accepted(
+                &p,
+                [id("/bob/phone/KEY/1", 40), id("/bob/phone/KEY/1", 100)],
+            ),
             signer: Writer::new("/alice/laptop/KEY/1".parse().unwrap()),
         };
-        assert!(!cut.refuses(&id("/bob/phone/KEY/1", 40)));
-        assert!(!cut.refuses(&id("/bob/phone/KEY/1", 100)));
-        assert!(cut.refuses(&id("/bob/phone/KEY/1", 101)));
+        assert!(!cut.refuses(&p, &id("/bob/phone/KEY/1", 40)));
+        assert!(!cut.refuses(&p, &id("/bob/phone/KEY/1", 100)));
+        assert!(cut.refuses(&p, &id("/bob/phone/KEY/1", 101)));
         // A seq the writer used elsewhere, below what was kept: a gap it
         // cannot fill after its removal.
-        assert!(cut.refuses(&id("/bob/phone/KEY/1", 57)));
+        assert!(cut.refuses(&p, &id("/bob/phone/KEY/1", 57)));
+        // A seq kept here, signed again in another collection: outside.
+        let other: Name = "/alice/32=data/docs/notes".parse().unwrap();
+        assert!(cut.refuses(&other, &id("/bob/phone/KEY/1", 40)));
         assert_eq!(
             cut.accept
-                .highest_at_most(&id("/bob/phone/KEY/1", 0).writer, 99),
+                .highest_at_most(&p, &id("/bob/phone/KEY/1", 0).writer, 99),
             Some(40)
         );
         // A key of the member never seen at all is outside the cut too.
-        assert!(cut.refuses(&id("/bob/laptop/KEY/1", 1)));
+        assert!(cut.refuses(&p, &id("/bob/laptop/KEY/1", 1)));
         // Keys outside the member are not touched.
-        assert!(!cut.refuses(&id("/carol/phone/KEY/1", 99)));
+        assert!(!cut.refuses(&p, &id("/carol/phone/KEY/1", 99)));
     }
 
     #[test]
     fn accepted_sets_fold_ranges_and_intersect() {
+        let p = plan();
         let w = |s| id("/bob/phone/KEY/1", s);
-        let a: Accepted = [1, 2, 3, 7, 5, 6, 9].into_iter().map(w).collect();
+        let a = accepted(&p, [1, 2, 3, 7, 5, 6, 9].map(w));
         assert_eq!(
-            a.iter().map(|(_, r)| r.to_vec()).collect::<Vec<_>>(),
+            a.iter().map(|(_, _, r)| r.to_vec()).collect::<Vec<_>>(),
             vec![vec![(1, 3), (5, 7), (9, 9)]]
         );
-        let b: Accepted = [2, 3, 4, 5, 9].into_iter().map(w).collect();
+        let mut b = accepted(&p, [2, 3, 4, 5, 9].map(w));
+        // What only another collection accepts is in no intersection here.
+        let other: Name = "/alice/32=data/docs/notes".parse().unwrap();
+        b.insert(&other, &w(7));
         let both = a.intersection(&b);
         assert_eq!(
-            both.iter().map(|(_, r)| r.to_vec()).collect::<Vec<_>>(),
+            both.iter().map(|(_, _, r)| r.to_vec()).collect::<Vec<_>>(),
             vec![vec![(2, 3), (5, 5), (9, 9)]]
         );
-        assert!(!both.contains(&w(4)) && !both.contains(&w(7)));
+        assert!(!both.contains(&p, &w(4)) && !both.contains(&p, &w(7)));
+        assert!(!both.contains(&other, &w(7)));
     }
 
     #[test]
@@ -723,7 +776,7 @@ mod tests {
         let alice = Writer::new("/alice/laptop/KEY/1".parse().unwrap());
         let cut = Cut {
             of: "/bob".parse().unwrap(),
-            accept: [id("/bob/phone/KEY/1", 41)].into_iter().collect(),
+            accept: accepted(&plan(), [id("/bob/phone/KEY/1", 41)]),
             signer: alice.clone(),
         };
         let mut m = Members {
@@ -794,7 +847,7 @@ mod tests {
     fn cut(of: &str, seqs: &[u64]) -> Cut {
         Cut {
             of: n(of),
-            accept: seqs.iter().map(|s| id("/bob/phone/KEY/1", *s)).collect(),
+            accept: accepted(&plan(), seqs.iter().map(|s| id("/bob/phone/KEY/1", *s))),
             signer: Writer::new(n("/alice/laptop/KEY/1")),
         }
     }
@@ -825,10 +878,10 @@ mod tests {
         assert_eq!(m.readers, vec![person("/alice")]);
         assert_eq!(m.cuts.len(), 1);
         assert!(
-            m.cuts[0].refuses(&id("/bob/phone/KEY/1", 5)),
+            m.cuts[0].refuses(&plan(), &id("/bob/phone/KEY/1", 5)),
             "same prefix: intersection"
         );
-        assert!(!m.cuts[0].refuses(&id("/bob/phone/KEY/1", 3)));
+        assert!(!m.cuts[0].refuses(&plan(), &id("/bob/phone/KEY/1", 3)));
         // Two readers each: the highest signer's epoch, which the reader the
         // other removed holds — so the merge must be resolved.
         let top = laptop.owner.clone().max(phone.owner.clone());
@@ -1089,5 +1142,17 @@ mod tests {
         }
         // With no folder, the own record stands as it is.
         assert_eq!(effective(&c, Some(&own), &[]), Some(own.clone()));
+        // A folder cut keeps each seq in the collection it was held in: a
+        // seq it kept in another collection is outside here.
+        let notes = n("/alice/32=data/docs/notes");
+        let mut elsewhere = cut("/bob", &[1]);
+        elsewhere.accept.insert(&notes, &bob(2));
+        let removed = folder(&["/alice"], &["/alice"], vec![elsewhere]);
+        let e = effective(&c, None, &[&removed]).unwrap();
+        assert_eq!(e.refusal(&bob(1)), None);
+        assert!(matches!(e.refusal(&bob(2)), Some(Refusal::OutsideCut(_))));
+        let e = effective(&notes, None, &[&removed]).unwrap();
+        assert_eq!(e.refusal(&bob(2)), None);
+        assert!(matches!(e.refusal(&bob(1)), Some(Refusal::OutsideCut(_))));
     }
 }

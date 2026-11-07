@@ -50,7 +50,8 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::collection::{Accepted, Cut, Epoch, Members, Parent, Rule};
 use crate::version::{
-    Audience, Content, Frontier, GROUP_MAX, Group, Keep, Seal, Seq, Timestamp, TypeId, Writer,
+    Audience, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Seal, Seq, Timestamp, TypeId,
+    Writer,
 };
 
 /// TLV-TYPE numbers (0x0520–0x057F).
@@ -59,7 +60,9 @@ pub mod tlv {
     pub const VERSION_RECORD: u64 = 0x0520;
     /// A frontier: `FrontierEntry*`, by writer.
     pub const FRONTIER: u64 = 0x0522;
-    /// One writer of a frontier: `Name` (key) + `Seq`.
+    /// One writer of a frontier: `Name` (key) + `Seq`; in a version's
+    /// parents, + `Digest` (the implicit digest of that writer's packet at
+    /// that seq: the tip).
     pub const FRONTIER_ENTRY: u64 = 0x0524;
     /// A sequence number (NonNegativeInteger); in a members record, its
     /// parent's revision.
@@ -96,7 +99,8 @@ pub mod tlv {
     pub const MERGE_OP: u64 = 0x0544;
     /// A members record: the Content of a members log entry.
     pub const MEMBERS_RECORD: u64 = 0x0546;
-    /// A collection rule: `RuleKind` [+ `Name` of the merge function].
+    /// A collection rule: `RuleKind` [+ `Name` of the merge function]; in a
+    /// merge version's record, the rule its operation was made for.
     pub const RULE: u64 = 0x0548;
     /// 0 one key, 1 log, 2 merge.
     pub const RULE_KIND: u64 = 0x054A;
@@ -119,7 +123,8 @@ pub mod tlv {
     /// One sub-collection: `Name` (one component), `Seq` (head), `Digest`.
     pub const CHILD: u64 = 0x055C;
     /// SHA-256 implicit digest of a summary packet (32 octets); in a members
-    /// record, SHA-256 of its parent's `MembersRecord`.
+    /// record, SHA-256 of its parent's `MembersRecord`; in a version's
+    /// parents, of the tip's packet.
     pub const DIGEST: u64 = 0x055E;
     /// Sub-collections, paged by hash: `Page*`, by bucket.
     pub const PAGES: u64 = 0x0560;
@@ -133,8 +138,10 @@ pub mod tlv {
     pub const WRITER: u64 = 0x0568;
     /// A members record's removals in force: `Cut*`, by prefix.
     pub const CUTS: u64 = 0x056A;
-    /// One removal: `Name` (the removed writer prefix), then per key whose
-    /// versions stay accepted, `Writer` and `Entries` (exactly those seqs).
+    /// One removal: `Name` (the removed writer prefix), then — in a
+    /// collection's record — per key whose versions stay accepted in the
+    /// collection, `Writer` and `Entries` (exactly those seqs), or — in a
+    /// folder's record — one `CutIn` per collection under the folder.
     pub const CUT: u64 = 0x056C;
     /// The epoch a sealed collection is read in: `Name` (the device that
     /// signed the record starting it), `Seq` (that record's seq).
@@ -249,6 +256,13 @@ pub mod tlv {
     pub const GROUP: u64 = 0x0557;
     /// NonNegativeInteger `1 ..= GROUP_MAX`: the versions in a group.
     pub const GROUP_COUNT: u64 = 0x0559;
+    /// In a folder record's `Cut`, once per collection under the folder in
+    /// which versions of the cut's keys stay accepted, collections
+    /// ascending: `Name` (the collection), then per key `Writer` and
+    /// `Entries` (exactly those seqs, in that collection). A key's log is
+    /// one sequence across its collections, so a seq is accepted only in
+    /// the collection it lists it under (spec §6.1, §8).
+    pub const CUT_IN: u64 = 0x055F;
 }
 
 /// Keyword components of the layer's names.
@@ -1433,15 +1447,57 @@ fn write_frontier(w: &mut TlvWriter, f: &Frontier) {
 
 fn read_frontier(value: Bytes) -> Result<Frontier, WireError> {
     let mut f = Frontier::new();
+    read_tips(value, |id, _| {
+        f.include(&id);
+        Ok(())
+    })?;
+    Ok(f)
+}
+
+/// A version's parents: a `Frontier` whose entries each carry, after the
+/// seq, the `Digest` of that writer's packet at that seq (spec §4).
+fn write_parents(w: &mut TlvWriter, p: &Parents) {
+    w.write_nested(tlv::FRONTIER, |w| {
+        for (writer, seq, digest) in p.tips() {
+            w.write_nested(tlv::FRONTIER_ENTRY, |w| {
+                write_name(w, writer.key());
+                write_nni(w, tlv::SEQ, seq.0);
+                if let Some(d) = digest {
+                    w.write_tlv(tlv::DIGEST, d);
+                }
+            });
+        }
+    });
+}
+
+fn read_parents(value: Bytes) -> Result<Parents, WireError> {
+    let mut p = Parents::new();
+    read_tips(value, |id, digest| {
+        if p.get(&id.writer).is_some() {
+            return Err(bad("a version names one tip per writer among its parents"));
+        }
+        p.insert(&id, digest);
+        Ok(())
+    })?;
+    Ok(p)
+}
+
+/// Each `FrontierEntry` of a `Frontier`: its writer and seq, and its
+/// `Digest` when it carries one.
+fn read_tips(
+    value: Bytes,
+    mut tip: impl FnMut(crate::VersionId, Option<[u8; 32]>) -> Result<(), WireError>,
+) -> Result<(), WireError> {
     each(value, |typ, v| {
         if typ != tlv::FRONTIER_ENTRY {
             return Ok(false);
         }
-        let (mut key, mut seq) = (None, None);
+        let (mut key, mut seq, mut digest) = (None, None, None);
         each(v, |t, v| {
             match t {
                 tlv_type::NAME => key = Some(read_name(v)?),
                 tlv::SEQ => seq = Some(read_nni(&v)?),
+                tlv::DIGEST => digest = Some(read_digest(&v)?),
                 _ => return Ok(false),
             }
             Ok(true)
@@ -1449,13 +1505,34 @@ fn read_frontier(value: Bytes) -> Result<Frontier, WireError> {
         let (Some(key), Some(seq)) = (key, seq) else {
             return Err(bad("a frontier entry names a writer and a seq"));
         };
-        f.include(&crate::VersionId {
-            writer: Writer::new(key),
-            seq: Seq(seq),
-        });
+        tip(
+            crate::VersionId {
+                writer: Writer::new(key),
+                seq: Seq(seq),
+            },
+            digest,
+        )?;
+        Ok(true)
+    })
+}
+
+/// The rule a version's operation was made for: a `Rule` of kind merge.
+fn read_made_under(value: Bytes) -> Result<Name, WireError> {
+    let (mut kind, mut function) = (None, None);
+    each(value, |t, v| {
+        match t {
+            tlv::RULE_KIND => kind = Some(read_nni(&v)?),
+            tlv_type::NAME => function = Some(read_name(v)?),
+            _ => return Ok(false),
+        }
         Ok(true)
     })?;
-    Ok(f)
+    match (kind, function) {
+        (Some(2), Some(function)) => Ok(function),
+        _ => Err(bad(
+            "a version names the merge rule its operation was made for",
+        )),
+    }
 }
 
 fn write_audiences(w: &mut TlvWriter, typ: u64, list: &[Audience]) {
@@ -1514,6 +1591,15 @@ fn write_ranges(w: &mut TlvWriter, typ: u64, ranges: &[(u64, u64)]) {
     });
 }
 
+/// Write what a cut keeps of each key in one collection: `Writer` and
+/// `Entries` per key, keys ascending.
+fn write_kept<'a>(w: &mut TlvWriter, kept: impl Iterator<Item = (&'a Writer, &'a [(u64, u64)])>) {
+    for (writer, ranges) in kept {
+        w.write_nested(tlv::WRITER, |w| write_name(w, writer.key()));
+        write_ranges(w, tlv::ENTRIES, ranges);
+    }
+}
+
 fn read_ranges(value: Bytes) -> Result<Vec<(u64, u64)>, WireError> {
     let mut out = Vec::new();
     each(value, |typ, v| {
@@ -1560,8 +1646,8 @@ fn read_digest(v: &[u8]) -> Result<[u8; 32], WireError> {
 pub struct VersionBody {
     /// The collection.
     pub collection: Name,
-    /// What the writer had seen.
-    pub parents: Frontier,
+    /// What the writer had applied, each tip with its packet's digest.
+    pub parents: Parents,
     /// The type the writer wrote.
     pub type_id: TypeId,
     /// Who may read it, as declared by the writer.
@@ -1572,6 +1658,9 @@ pub struct VersionBody {
     pub dated: Timestamp,
     /// The group the version belongs to (spec §5.5).
     pub group: Option<Group>,
+    /// The merge rule the operation was made for (spec §5.1); `None` under
+    /// the log and one-key rules.
+    pub rule: Option<Name>,
     /// The fields the writer set (an empty value removes the field); empty
     /// while the payload is sealed and not opened.
     pub fields: Content,
@@ -1668,7 +1757,9 @@ pub struct PruneBody {
 pub struct CutBody {
     /// The removed writer prefix.
     pub of: Name,
-    /// Exactly the versions of its keys that stay accepted.
+    /// Exactly the versions of its keys that stay accepted, each in its
+    /// collection: of a collection's record, that collection only; of a
+    /// folder's, collections strictly under the folder.
     pub accept: Accepted,
 }
 
@@ -1766,7 +1857,7 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
     let mut w = TlvWriter::new();
     w.write_nested(tlv::VERSION_RECORD, |w| {
         write_name(w, &b.collection);
-        write_frontier(w, &b.parents);
+        write_parents(w, &b.parents);
         w.write_nested(tlv::TYPE_ID, |w| {
             write_name(w, &b.type_id.name);
             write_nni(w, tlv::REVISION, b.type_id.revision);
@@ -1778,6 +1869,12 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
             w.write_nested(tlv::GROUP, |w| {
                 write_nni(w, tlv::SEQ, g.id);
                 write_nni(w, tlv::GROUP_COUNT, u64::from(g.count));
+            });
+        }
+        if let Some(function) = &b.rule {
+            w.write_nested(tlv::RULE, |w| {
+                write_nni(w, tlv::RULE_KIND, 2);
+                write_name(w, function);
             });
         }
         match (&b.sealed, &b.chunks) {
@@ -2099,9 +2196,16 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
                 for c in &b.cuts {
                     w.write_nested(tlv::CUT, |w| {
                         write_name(w, &c.of);
-                        for (writer, ranges) in c.accept.iter() {
-                            w.write_nested(tlv::WRITER, |w| write_name(w, writer.key()));
-                            write_ranges(w, tlv::ENTRIES, ranges);
+                        for (coll, accepted) in c.accept.collections() {
+                            match b.folder {
+                                // A collection's own versions, bare.
+                                false if *coll == b.collection => write_kept(w, accepted),
+                                false => {}
+                                true => w.write_nested(tlv::CUT_IN, |w| {
+                                    write_name(w, coll);
+                                    write_kept(w, accepted);
+                                }),
+                            }
                         }
                     });
                 }
@@ -2329,13 +2433,14 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut chunks = None;
     let mut block = None;
     let mut group = None;
+    let mut rule = None;
     // The TLV-TYPE before this one: `Group` comes right after `Dated`.
     let mut last = 0;
     each(value, |typ, v| {
         let before = std::mem::replace(&mut last, typ);
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
-            tlv::FRONTIER => parents = Some(read_frontier(v)?),
+            tlv::FRONTIER => parents = Some(read_parents(v)?),
             tlv::TYPE_ID => {
                 let (mut name, mut rev) = (None, None);
                 each(v, |t, v| {
@@ -2363,6 +2468,12 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                     return Err(bad("a version's Group comes once, right after its Dated"));
                 }
                 group = Some(read_group(v)?);
+            }
+            tlv::RULE => {
+                if rule.is_some() {
+                    return Err(bad("a version names one rule"));
+                }
+                rule = Some(read_made_under(v)?);
             }
             tlv::FIELDS => fields = Some(read_fields(v)?),
             tlv::MERGE_OP => op = Some(v),
@@ -2451,6 +2562,7 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         keep: keep.ok_or_else(|| missing("a keep"))?,
         dated: dated.ok_or_else(|| missing("a date"))?,
         group,
+        rule,
         fields,
         op,
         sealed,
@@ -2571,11 +2683,14 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
             }
             tlv::READERS => readers = Some(read_audiences(v)?),
             tlv::CUTS => {
+                let subject = collection
+                    .as_ref()
+                    .ok_or_else(|| bad("a members record's cuts follow its name"))?;
                 each(v, |t, v| {
                     if t != tlv::CUT {
                         return Ok(false);
                     }
-                    cuts.push(read_cut(v)?);
+                    cuts.push(read_cut(v, subject, folder)?);
                     Ok(true)
                 })?;
             }
@@ -2634,43 +2749,108 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
     })
 }
 
-/// Decode one `Cut`: its prefix, then per key `Writer` and `Entries`, keys
-/// ascending, each key's ranges ascending and disjoint.
-fn read_cut(value: Bytes) -> Result<CutBody, WireError> {
+/// Reads the `Writer` and `Entries` pairs of one collection's versions a
+/// cut keeps: keys ascending, once each, each key's ranges ascending and
+/// disjoint.
+#[derive(Default)]
+struct KeptReader {
+    writer: Option<Writer>,
+    last: Option<Writer>,
+}
+
+impl KeptReader {
+    /// Take a `Writer` or `Entries` TLV of collection `c` into `accept`.
+    fn take(&mut self, t: u64, v: Bytes, c: &Name, accept: &mut Accepted) -> Result<(), WireError> {
+        if t == tlv::WRITER {
+            if self.writer.is_some() {
+                return Err(bad("a cut's writer is followed by its entries"));
+            }
+            self.writer = Some(Writer::new(read_writer(v)?));
+            return Ok(());
+        }
+        let w = self
+            .writer
+            .take()
+            .ok_or_else(|| bad("a cut's entries follow their writer"))?;
+        if self.last.as_ref().is_some_and(|l| *l >= w) {
+            return Err(bad("a cut lists its writers once each, ascending"));
+        }
+        let ranges = read_ranges(v)?;
+        check_ranges(&ranges, u64::MAX, usize::MAX)?;
+        for (lo, hi) in ranges {
+            accept.insert_range(c, &w, lo, hi);
+        }
+        self.last = Some(w);
+        Ok(())
+    }
+
+    /// Every writer read has its entries.
+    fn end(&self) -> Result<(), WireError> {
+        match self.writer {
+            Some(_) => Err(bad("a cut's writer is followed by its entries")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Decode one `Cut` of the members record of `subject` — a folder's when
+/// `folder`: its prefix, then of a collection's record the `Writer` and
+/// `Entries` pairs of the versions kept in it, of a folder's one `CutIn`
+/// per collection strictly under it, collections ascending.
+fn read_cut(value: Bytes, subject: &Name, folder: bool) -> Result<CutBody, WireError> {
     let mut of = None;
     let mut accept = Accepted::new();
-    let mut writer: Option<Writer> = None;
-    let mut last: Option<Writer> = None;
+    let mut own = KeptReader::default();
+    let mut last: Option<Name> = None;
     each(value, |t, v| {
         match t {
             tlv_type::NAME if of.is_none() => of = Some(read_name(v)?),
-            tlv::WRITER => {
-                if writer.is_some() {
-                    return Err(bad("a cut's writer is followed by its entries"));
-                }
-                writer = Some(Writer::new(read_writer(v)?));
+            tlv::WRITER | tlv::ENTRIES if !folder => own.take(t, v, subject, &mut accept)?,
+            tlv::WRITER | tlv::ENTRIES => {
+                return Err(bad(
+                    "a folder record's cut lists the versions it keeps per collection, in CutIn",
+                ));
             }
-            tlv::ENTRIES => {
-                let w = writer
-                    .take()
-                    .ok_or_else(|| bad("a cut's entries follow their writer"))?;
-                if last.as_ref().is_some_and(|l| *l >= w) {
-                    return Err(bad("a cut lists its writers once each, ascending"));
+            tlv::CUT_IN if folder => {
+                let mut c = None;
+                let mut kept = KeptReader::default();
+                each(v, |t, v| {
+                    match (t, &c) {
+                        (tlv_type::NAME, None) => {
+                            let n = read_name(v)?;
+                            if n.len() <= subject.len() || !n.has_prefix(subject) {
+                                return Err(bad(
+                                    "a folder cut's CutIn names a collection under the folder",
+                                ));
+                            }
+                            c = Some(n);
+                        }
+                        (tlv::WRITER | tlv::ENTRIES, Some(c)) => kept.take(t, v, c, &mut accept)?,
+                        (tlv::WRITER | tlv::ENTRIES, None) => {
+                            return Err(bad("a CutIn names its collection first"));
+                        }
+                        _ => return Ok(false),
+                    }
+                    Ok(true)
+                })?;
+                kept.end()?;
+                let c = c.ok_or_else(|| bad("a CutIn names its collection"))?;
+                if last.as_ref().is_some_and(|l| *l >= c) {
+                    return Err(bad("a cut lists its collections once each, ascending"));
                 }
-                let ranges = read_ranges(v)?;
-                check_ranges(&ranges, u64::MAX, usize::MAX)?;
-                for (lo, hi) in ranges {
-                    accept.insert_range(&w, lo, hi);
-                }
-                last = Some(w);
+                last = Some(c);
+            }
+            tlv::CUT_IN => {
+                return Err(bad(
+                    "a collection record's cut lists the versions it keeps in the collection, \
+                     never a CutIn",
+                ));
             }
             _ => return Ok(false),
         }
         Ok(true)
     })?;
-    if writer.is_some() {
-        return Err(bad("a cut's writer is followed by its entries"));
-    }
+    own.end()?;
     let of = of.ok_or_else(|| bad("a cut names a prefix"))?;
     Ok(CutBody { of, accept })
 }
@@ -3175,13 +3355,17 @@ mod tests {
             readers: vec![Audience::Person(n("/alice"))],
             cuts: vec![CutBody {
                 of: n("/bob"),
-                accept: [40, 41, 100]
-                    .into_iter()
-                    .map(|s| crate::VersionId {
-                        writer: Writer::new(n("/bob/laptop/KEY/1")),
-                        seq: Seq(s),
-                    })
-                    .collect(),
+                accept: {
+                    let mut a = Accepted::new();
+                    for s in [40, 41, 100] {
+                        let id = crate::VersionId {
+                            writer: Writer::new(n("/bob/laptop/KEY/1")),
+                            seq: Seq(s),
+                        };
+                        a.insert(&n("/alice/32=data/notes"), &id);
+                    }
+                    a
+                },
             }],
             epoch: Some(Epoch {
                 creator: n("/alice/laptop"),
@@ -3317,6 +3501,92 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_cut_keeps_each_seq_in_its_own_collection_on_the_wire() {
+        let f = n("/alice/32=data/docs");
+        let (plan, notes) = (
+            n("/alice/32=data/docs/plan"),
+            n("/alice/32=data/docs/notes"),
+        );
+        let bob = |s| crate::VersionId {
+            writer: Writer::new(n("/bob/phone/KEY/1")),
+            seq: Seq(s),
+        };
+        let mut accept = Accepted::new();
+        accept.insert(&plan, &bob(1));
+        accept.insert(&notes, &bob(2));
+        let body = MembersBody {
+            collection: f.clone(),
+            folder: true,
+            revision: 2,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: Vec::new(),
+            cuts: vec![CutBody {
+                of: n("/bob"),
+                accept,
+            }],
+            epoch: None,
+            key_check: None,
+            since: None,
+            parent: Some(Parent {
+                revision: Seq(1),
+                digest: [1; 32],
+            }),
+        };
+        let Ok(Record::Members(back)) = decode_record(encode_members(&body)) else {
+            panic!("a folder record with a cut parses back");
+        };
+        assert_eq!(back, body);
+        let kept = &back.cuts[0].accept;
+        assert!(kept.contains(&plan, &bob(1)) && kept.contains(&notes, &bob(2)));
+        assert!(!kept.contains(&notes, &bob(1)) && !kept.contains(&plan, &bob(2)));
+        // A cut of the wrong shape for its record is refused: bare pairs
+        // in a folder's, a CutIn in a collection's, a CutIn of a collection
+        // outside the folder.
+        let record = |folder: bool, collection: &Name, cut: &dyn Fn(&mut TlvWriter)| {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv::MEMBERS_RECORD, |w| {
+                write_name(w, collection);
+                if folder {
+                    w.write_tlv(tlv::FOLDER, &[]);
+                }
+                write_nni(w, tlv::REVISION, 1);
+                w.write_nested(tlv::RULE, |w| write_nni(w, tlv::RULE_KIND, 1));
+                w.write_nested(tlv::WRITERS, |w| write_name(w, &n("/alice")));
+                write_audiences(w, tlv::READERS, &[]);
+                w.write_nested(tlv::CUTS, |w| {
+                    w.write_nested(tlv::CUT, |w| {
+                        write_name(w, &n("/bob"));
+                        cut(w);
+                    })
+                });
+            });
+            w.finish()
+        };
+        let pair = |w: &mut TlvWriter| {
+            w.write_nested(tlv::WRITER, |w| write_name(w, &n("/bob/phone/KEY/1")));
+            write_ranges(w, tlv::ENTRIES, &[(1, 1)]);
+        };
+        let cut_in = |c: Name| {
+            move |w: &mut TlvWriter| {
+                w.write_nested(tlv::CUT_IN, |w| {
+                    write_name(w, &c);
+                    pair(w);
+                })
+            }
+        };
+        assert!(decode_record(record(true, &f, &cut_in(plan.clone()))).is_ok());
+        assert!(decode_record(record(false, &plan, &pair)).is_ok());
+        assert!(decode_record(record(true, &f, &pair)).is_err());
+        assert!(decode_record(record(false, &plan, &cut_in(plan.clone()))).is_err());
+        for outside in [f.clone(), n("/alice/32=data/home/list")] {
+            assert!(decode_record(record(true, &f, &cut_in(outside))).is_err());
+        }
+        // `CutIn` is critical: a reader that does not know it refuses.
+        assert_eq!(tlv::CUT_IN % 2, 1);
+    }
+
+    #[test]
     fn a_node_listing_entries_beyond_its_head_or_out_of_order_or_too_many_is_refused() {
         let node = |head: u64, entries: Vec<(u64, u64)>| NodeBody {
             subject: n("/alice/32=data/notes"),
@@ -3417,7 +3687,7 @@ mod tests {
         };
         let body = VersionBody {
             collection: n("/alice/32=data/docs/plan"),
-            parents: Frontier::new(),
+            parents: Parents::new(),
             type_id: TypeId {
                 name: n("/types/note"),
                 revision: 1,
@@ -3428,6 +3698,7 @@ mod tests {
             keep: Keep::Forever,
             dated: Timestamp(5),
             group: None,
+            rule: None,
             fields: Content::new(),
             op: Bytes::new(),
             sealed: Some(SealedBody {
@@ -3470,7 +3741,7 @@ mod tests {
     fn a_versions_group_parses_back_and_only_right_after_its_date() {
         let body = VersionBody {
             collection: n("/alice/32=data/trip/plan"),
-            parents: Frontier::new(),
+            parents: Parents::new(),
             type_id: TypeId {
                 name: n("/types/note"),
                 revision: 1,
@@ -3479,6 +3750,7 @@ mod tests {
             keep: Keep::Forever,
             dated: Timestamp(5),
             group: Some(Group { id: 7, count: 3 }),
+            rule: None,
             fields: Content::new(),
             op: Bytes::from_static(b"op"),
             sealed: None,
@@ -3539,10 +3811,65 @@ mod tests {
     }
 
     #[test]
+    fn a_versions_parents_carry_their_tips_digests_and_its_rule_parses_back() {
+        let tip = |key: &str, seq: u64| crate::VersionId {
+            writer: Writer::new(n(key)),
+            seq: Seq(seq),
+        };
+        let parents: Parents = [
+            (tip("/bob/laptop/KEY/1", 4), Some([4; 32])),
+            (tip("/carol/phone/KEY/1", 9), None),
+        ]
+        .into_iter()
+        .collect();
+        let body = VersionBody {
+            collection: n("/alice/32=data/notes"),
+            parents,
+            type_id: TypeId {
+                name: n("/types/note"),
+                revision: 1,
+            },
+            seal: Seal { any_of: Vec::new() },
+            keep: Keep::Forever,
+            dated: Timestamp(5),
+            group: None,
+            rule: Some(n("/ndf/merge/element/v=1")),
+            fields: Content::new(),
+            op: Bytes::from_static(b"op"),
+            sealed: None,
+            chunks: None,
+            block: None,
+        };
+        assert_eq!(
+            decode_record(encode_version(&body)),
+            Ok(Record::Version(body.clone()))
+        );
+        // A frontier elsewhere reads the same entries, digests aside.
+        let mut w = TlvWriter::new();
+        write_parents(&mut w, &body.parents);
+        let mut r = TlvReader::new(w.finish());
+        let (_, v) = r.read_tlv().unwrap();
+        assert_eq!(read_frontier(v).as_ref(), Ok(body.parents.frontier()));
+        // Two tips of one writer are refused: which one was made over?
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::FRONTIER, |w| {
+            for s in [3, 4] {
+                w.write_nested(tlv::FRONTIER_ENTRY, |w| {
+                    write_name(w, &n("/bob/laptop/KEY/1"));
+                    write_nni(w, tlv::SEQ, s);
+                });
+            }
+        });
+        let mut r = TlvReader::new(w.finish());
+        let (_, v) = r.read_tlv().unwrap();
+        assert!(read_parents(v).is_err());
+    }
+
+    #[test]
     fn a_version_in_pieces_larger_than_the_payload_limit_is_refused() {
         let body = |size: u64| VersionBody {
             collection: n("/alice/32=data/photos"),
-            parents: Frontier::new(),
+            parents: Parents::new(),
             type_id: TypeId {
                 name: n("/types/photo"),
                 revision: 1,
@@ -3551,6 +3878,7 @@ mod tests {
             keep: Keep::Forever,
             dated: Timestamp(5),
             group: None,
+            rule: None,
             fields: Content::new(),
             op: Bytes::new(),
             sealed: None,
@@ -3623,7 +3951,7 @@ mod tests {
         ];
         let body = VersionBody {
             collection: c.clone(),
-            parents: Frontier::new(),
+            parents: Parents::new(),
             type_id: TypeId {
                 name: n("/types/reading"),
                 revision: 1,
@@ -3632,6 +3960,7 @@ mod tests {
             keep: Keep::Until(Timestamp(1_000_000)),
             dated: Timestamp(5),
             group: None,
+            rule: None,
             fields: Content::new(),
             op: Bytes::new(),
             sealed: None,

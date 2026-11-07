@@ -13,6 +13,7 @@
 //! rule ([`DataError::RuleUnknown`](crate::DataError::RuleUnknown)). This
 //! module ships one: [`Yrs`], named `/merge/yrs`.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -76,13 +77,19 @@ pub enum OpKind {
 }
 
 /// The versions an operation was made over (spec §5.2): exactly down(P)
-/// where P = the version's parents joined with (its writer, seq − 1).
+/// where P = the version's parents joined with (its writer, seq − 1) —
+/// every version of the collection at or below P, writer by writer, that
+/// applies at all. A version below P that never applies (refused for what
+/// it carries, outside a cut, by a key no writer) is not in it, whether or
+/// not this device holds it: every reader answers alike.
 pub trait Past {
     /// Whether `id` lies inside it.
     fn contains(&self, id: &VersionId) -> bool;
     /// The version of this collection inside the past whose packet has this
     /// implicit digest (SHA-256 of the whole Data packet: the version's
-    /// content address), if it is held here.
+    /// content address). An operation whose basis is a version that never
+    /// applies finds none: the rule judges it as a basis outside its past
+    /// (it refuses it, or counts it without that basis, as it defines).
     fn by_digest(&self, digest: &[u8; 32]) -> Option<VersionId>;
 }
 
@@ -126,19 +133,27 @@ pub trait MergeState: Send {
     }
 
     /// Whether `op` is one its writer may have made: nothing outside its
-    /// writer's identity, nothing outside `op.past`. A function of the
-    /// operation and its past only, so every reader judges it alike. Err:
-    /// refused for good. Says whether it is a checkpoint.
+    /// writer's identity, nothing outside `op.past`, nothing it cannot
+    /// carry. A function of the operation and its past only, so every
+    /// reader judges it alike. Err: refused for good — every reason in the
+    /// operation itself belongs here. Says whether it is a checkpoint.
     fn check(&self, op: &Op<'_>) -> Result<OpKind, MergeError>;
 
     /// Apply a checked operation. The layer applies a version only after
     /// its writer's earlier ones and its parents (an edit), or once every
-    /// version of its past is held (a checkpoint). Err: refused for good.
-    /// `NotCounted`: stored, shown, not in the value.
+    /// version of its past is held (a checkpoint). `NotCounted`: stored,
+    /// shown, not in the value — what an exclusion that depends on the
+    /// state (on other writers' versions) answers; the rule may count it
+    /// later. Err: it does not apply to the state met here; the state MUST
+    /// be left unchanged, and the layer keeps the version applied and not
+    /// counted with this reason (never refused: the state is others' doing,
+    /// so nothing apply answers withdraws a version or its group). An own
+    /// operation that errs is not written.
     ///
     /// A checkpoint's application yields the state of its past and itself,
     /// plus whatever concurrent versions were applied, whichever subset of
-    /// its past was applied before.
+    /// its past was applied before. It is applied only once each of its
+    /// parents is held here as the very packet it names (spec §5.2).
     fn apply(&mut self, op: &Op<'_>) -> Result<Counting, MergeError>;
 
     /// Versions earlier answered `NotCounted` that now count, since last
@@ -189,8 +204,10 @@ impl std::fmt::Debug for MergeRules {
 /// peer — NDN Workspace, Ownly — can apply the same bytes. Concurrent sets of
 /// one field resolve as Yjs resolves them (deterministically, by client id);
 /// different fields never conflict. Each writer's Yjs client id is the low
-/// 53 bits of SHA-256 over its key name, and an operation may only insert
-/// content under its writer's client id.
+/// 53 bits of SHA-256 over its key name; an operation may only insert
+/// content under its writer's client id, and may place its items against,
+/// and delete, only content inside its past: for each other client, below
+/// the clock that client's writer had reached in the operation's past.
 pub struct Yrs {
     function: Name,
 }
@@ -228,13 +245,110 @@ impl MergeRule for Yrs {
     fn start(&self, local: &Writer) -> Box<dyn MergeState> {
         let doc = yrs::Doc::with_client_id(yrs_client(local));
         let fields = doc.get_or_insert_map(FIELDS);
-        Box::new(YrsState { doc, fields })
+        Box::new(YrsState {
+            doc,
+            fields,
+            clocks: HashMap::new(),
+        })
     }
 }
 
 struct YrsState {
     doc: yrs::Doc,
     fields: yrs::MapRef,
+    /// Per Yjs client, its writer and the client's clock after each of
+    /// that writer's versions applied, by seq: what an operation's past
+    /// holds of each client.
+    clocks: HashMap<u64, (Writer, BTreeMap<u64, u32>)>,
+}
+
+/// What a Yjs update reaches, read as yrs reads it (lib0 v1): the clock
+/// ranges it carries content in, per client; every id its items are placed
+/// against (left and right origins, parent items); and its delete set.
+#[derive(Default)]
+struct Reach {
+    inserts: Vec<(u64, u32, u32)>,
+    refs: Vec<(u64, u32)>,
+    deletes: Vec<(u64, u32, u32)>,
+}
+
+fn reach(bytes: &[u8]) -> Result<Reach, yrs::encoding::read::Error> {
+    use yrs::block::{
+        BLOCK_GC_REF_NUMBER, BLOCK_SKIP_REF_NUMBER, HAS_ORIGIN, HAS_PARENT_SUB, HAS_RIGHT_ORIGIN,
+        ItemContent,
+    };
+    use yrs::encoding::read::{Cursor, Read};
+    use yrs::updates::decoder::{Decode, Decoder, DecoderV1};
+    let mut d = DecoderV1::new(Cursor::new(bytes));
+    let mut out = Reach::default();
+    let clients: u32 = d.read_var()?;
+    for _ in 0..clients {
+        let blocks: u32 = d.read_var()?;
+        let client = d.read_client()?.get();
+        let mut clock: u32 = d.read_var()?;
+        for _ in 0..blocks {
+            let info = d.read_info()?;
+            let len = match info {
+                BLOCK_SKIP_REF_NUMBER => {
+                    let len: u32 = d.read_var()?;
+                    clock = clock.saturating_add(len);
+                    continue;
+                }
+                BLOCK_GC_REF_NUMBER => d.read_len()?,
+                _ => {
+                    let (left, right) = (info & HAS_ORIGIN != 0, info & HAS_RIGHT_ORIGIN != 0);
+                    if left {
+                        let id = d.read_left_id()?;
+                        out.refs.push((id.client.get(), id.clock));
+                    }
+                    if right {
+                        let id = d.read_right_id()?;
+                        out.refs.push((id.client.get(), id.clock));
+                    }
+                    if !left && !right {
+                        if d.read_parent_info()? {
+                            d.read_string()?;
+                        } else {
+                            let id = d.read_left_id()?;
+                            out.refs.push((id.client.get(), id.clock));
+                        }
+                        if info & HAS_PARENT_SUB != 0 {
+                            d.read_string()?;
+                        }
+                    }
+                    ItemContent::decode(&mut d, info)?.len(yrs::OffsetKind::Utf16)
+                }
+            };
+            if len > 0 {
+                let end = clock.saturating_add(len);
+                out.inserts.push((client, clock, end));
+                clock = end;
+            }
+        }
+    }
+    let deleted = yrs::IdSet::decode(&mut d)?;
+    for (client, ranges) in deleted.iter() {
+        for r in ranges.iter() {
+            out.deletes.push((client.get(), r.start, r.end));
+        }
+    }
+    Ok(out)
+}
+
+impl YrsState {
+    /// The clock of `client` in `op`'s past: what its writer's highest
+    /// version applied inside the past reached.
+    fn bound(&self, op: &Op<'_>, client: u64) -> u32 {
+        let Some((writer, by_seq)) = self.clocks.get(&client) else {
+            return 0;
+        };
+        let mut upto = op.parents.get(writer).map(|s| s.0);
+        if *writer == op.id.writer {
+            upto = upto.max(op.id.seq.0.checked_sub(1));
+        }
+        upto.and_then(|s| by_seq.range(..=s).next_back())
+            .map_or(0, |(_, clock)| *clock)
+    }
 }
 
 impl MergeState for YrsState {
@@ -253,8 +367,8 @@ impl MergeState for YrsState {
     }
 
     fn apply(&mut self, op: &Op<'_>) -> Result<Counting, MergeError> {
-        use yrs::Transact;
         use yrs::updates::decoder::Decode;
+        use yrs::{ReadTxn, Transact};
         let update = yrs::Update::decode_v1(op.bytes)
             .map_err(|e| MergeError(format!("not a Yjs update: {e}")))?;
         // Content integrated already (this device's own edit) is skipped.
@@ -262,25 +376,52 @@ impl MergeState for YrsState {
             .transact_mut()
             .apply_update(update)
             .map_err(|e| MergeError(format!("the Yjs update does not apply: {e}")))?;
+        let client = yrs_client(&op.id.writer);
+        let clock = self
+            .doc
+            .transact()
+            .state_vector()
+            .get(&yrs::ClientID::new(client));
+        self.clocks
+            .entry(client)
+            .or_insert_with(|| (op.id.writer.clone(), BTreeMap::new()))
+            .1
+            .insert(op.id.seq.0, clock);
         Ok(Counting::Counted)
     }
 
     fn check(&self, op: &Op<'_>) -> Result<OpKind, MergeError> {
-        use yrs::updates::decoder::Decode;
-        let update = yrs::Update::decode_v1(op.bytes)
-            .map_err(|e| MergeError(format!("not a Yjs update: {e}")))?;
+        let reach = reach(op.bytes).map_err(|e| MergeError(format!("not a Yjs update: {e}")))?;
         let own = yrs_client(&op.id.writer);
-        match update
-            .state_vector()
-            .iter()
-            .map(|(client, _)| client.get())
-            .find(|c| *c != own)
-        {
-            Some(other) => Err(MergeError(format!(
+        if let Some((other, ..)) = reach.inserts.iter().find(|(c, ..)| *c != own) {
+            return Err(MergeError(format!(
                 "the update inserts content as Yjs client {other}, not its writer's {own}"
-            ))),
-            None => Ok(OpKind::Edit),
+            )));
         }
+        // What each client's content in the past reaches; the writer's own
+        // also what the update itself inserts.
+        let own_end = reach.inserts.iter().map(|(_, _, end)| *end).max();
+        let bound = |client: u64| {
+            let past = self.bound(op, client);
+            match client == own {
+                true => past.max(own_end.unwrap_or(0)),
+                false => past,
+            }
+        };
+        if let Some((client, clock)) = reach.refs.iter().find(|(c, k)| *k >= bound(*c)) {
+            return Err(MergeError(format!(
+                "the update places content against Yjs client {client}'s item {clock}, which \
+                 is not in the versions it was made over: an update is made only over content \
+                 its writer held"
+            )));
+        }
+        if let Some((client, from, to)) = reach.deletes.iter().find(|(c, _, to)| *to > bound(*c)) {
+            return Err(MergeError(format!(
+                "the update deletes Yjs client {client}'s items {from}..{to}, not all in the \
+                 versions it was made over: an update deletes only content its writer held"
+            )));
+        }
+        Ok(OpKind::Edit)
     }
 
     fn value(&self) -> Value {
@@ -376,9 +517,13 @@ mod tests {
             None,
             "the phone removed the tags"
         );
-        assert_eq!(a.check(&op(&taxi_id, &taxi, &none)), Ok(OpKind::Edit));
+        // The taxi edit removes tags of the base: made over it, it passes;
+        // made over nothing, it reaches outside its past.
+        let over_base: Frontier = [base_id.clone()].into_iter().collect();
+        assert_eq!(a.check(&op(&taxi_id, &taxi, &over_base)), Ok(OpKind::Edit));
+        assert!(a.check(&op(&taxi_id, &taxi, &none)).is_err());
         assert!(
-            a.check(&op(&id(&laptop, 3), &taxi, &none)).is_err(),
+            a.check(&op(&id(&laptop, 3), &taxi, &over_base)).is_err(),
             "an op is its writer's own"
         );
     }

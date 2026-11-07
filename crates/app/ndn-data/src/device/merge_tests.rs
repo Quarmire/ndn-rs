@@ -26,22 +26,23 @@ impl Connection for Unconnected {
     }
 }
 
-fn n(s: &str) -> Name {
+pub(super) fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
 pub(super) const RULE: &str = "/test/merge/notes/v=1";
 
-fn c() -> Name {
+pub(super) fn c() -> Name {
     n("/alice/32=data/notes")
 }
 
 /// Notes: an edit (`E`) names its basis by digest (all zero: none) and adds
-/// a note; a checkpoint (`C`) carries every note of its past; a held note
-/// (`W`) is not counted until its pair (`P`) applies; a follow-up (`B`)
-/// is checked against the notes applied: its first line must be one.
-struct Notes {
-    function: Name,
+/// a note; a checkpoint (`C`) replaces the notes of its past by its own,
+/// keeping those of versions concurrent to it; a held note (`W`) is not
+/// counted until its pair (`P`) applies; a follow-up (`B`) is checked
+/// against the notes applied: its first line must be one.
+pub(super) struct Notes {
+    pub(super) function: Name,
 }
 
 impl MergeRule for Notes {
@@ -56,7 +57,8 @@ impl MergeRule for Notes {
 
 #[derive(Default)]
 struct NotesState {
-    notes: BTreeSet<String>,
+    /// Each note in the value, with the version that wrote it.
+    notes: Vec<(VersionId, String)>,
     held: BTreeMap<String, VersionId>,
     paired: BTreeSet<String>,
     counted: Vec<VersionId>,
@@ -84,11 +86,11 @@ impl MergeState for NotesState {
                 Ok(OpKind::Edit)
             }
             Some(b'C') => Ok(OpKind::Checkpoint),
-            Some(b'W' | b'P') => Ok(OpKind::Edit),
+            Some(b'W' | b'P' | b'X') => Ok(OpKind::Edit),
             Some(b'B') => {
                 let t = text(op, 1)?;
                 let basis = t.lines().next().unwrap_or_default();
-                match self.notes.contains(basis) {
+                match self.notes.iter().any(|(_, n)| n == basis) {
                     true => Ok(OpKind::Edit),
                     false => Err(MergeError(format!("{basis} is not applied"))),
                 }
@@ -100,11 +102,14 @@ impl MergeState for NotesState {
     fn apply(&mut self, op: &Op<'_>) -> Result<Counting, MergeError> {
         match op.bytes.first() {
             Some(b'E') => {
-                self.notes.insert(text(op, 33)?);
+                self.notes.push((op.id.clone(), text(op, 33)?));
             }
             Some(b'C') => {
+                // The state of its past is the checkpoint's; what was
+                // applied concurrent to it stays.
+                self.notes.retain(|(id, _)| !op.past.contains(id));
                 for t in text(op, 1)?.split('\n').filter(|t| !t.is_empty()) {
-                    self.notes.insert(t.to_owned());
+                    self.notes.push((op.id.clone(), t.to_owned()));
                 }
             }
             Some(b'W') => {
@@ -113,15 +118,24 @@ impl MergeState for NotesState {
                     self.held.insert(t, op.id.clone());
                     return Ok(Counting::NotCounted("waits for its pair".into()));
                 }
-                self.notes.insert(t);
+                self.notes.push((op.id.clone(), t));
             }
             Some(b'P') => {
                 let t = text(op, 1)?;
                 self.paired.insert(t.clone());
                 if let Some(id) = self.held.remove(&t) {
-                    self.notes.insert(t);
+                    self.notes.push((id.clone(), t));
                     self.counted.push(id);
                 }
+            }
+            // A note claimed only if no one noted it yet: the rule's apply
+            // answers from the state, which others' versions make.
+            Some(b'X') => {
+                let t = text(op, 1)?;
+                if self.notes.iter().any(|(_, n)| *n == t) {
+                    return Err(MergeError(format!("{t} is noted already")));
+                }
+                self.notes.push((op.id.clone(), t));
             }
             Some(b'B') => {}
             _ => return Err(MergeError("not an operation of this rule".into())),
@@ -134,8 +148,10 @@ impl MergeState for NotesState {
     }
 
     fn value(&self) -> Value {
-        let notes: Vec<&str> = self.notes.iter().map(String::as_str).collect();
-        Value::Rule(Bytes::from(notes.join("\n")))
+        let notes: BTreeSet<&str> = self.notes.iter().map(|(_, n)| n.as_str()).collect();
+        Value::Rule(Bytes::from(
+            notes.into_iter().collect::<Vec<_>>().join("\n"),
+        ))
     }
 }
 
@@ -146,7 +162,7 @@ pub(super) fn edit(basis: Option<[u8; 32]>, note: &str) -> Bytes {
     Bytes::from(b)
 }
 
-fn checkpoint(notes: &[&str]) -> Bytes {
+pub(super) fn checkpoint(notes: &[&str]) -> Bytes {
     Bytes::from([b"C".as_slice(), notes.join("\n").as_bytes()].concat())
 }
 
@@ -164,13 +180,28 @@ pub(super) fn rules() -> MergeRules {
 
 /// `/alice/laptop`, knowing `rules`, owning `c()` merged by [`RULE`] and
 /// written by Alice, Bob and Carol, on a forwarder that delivers nothing.
-async fn device(rules: MergeRules) -> Device {
+pub(super) async fn device(rules: MergeRules) -> Device {
+    device_under(rules, &c(), RULE).await
+}
+
+/// `/alice/laptop`, knowing `rules`, owning `c` merged by `rule` and
+/// written by Alice, Bob and Carol, on a forwarder that delivers nothing.
+pub(super) async fn device_under(rules: MergeRules, c: &Name, rule: &str) -> Device {
+    device_on(rules, c, rule, Arc::new(MemoryStore::new())).await
+}
+
+/// [`device_under`], keeping its data in `store`.
+pub(super) async fn device_on(
+    rules: MergeRules,
+    c: &Name,
+    rule: &str,
+    store: Arc<dyn DataStore>,
+) -> Device {
     let device = n("/alice/laptop");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob", "/carol"] {
         assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
     }
-    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
     let keys = Arc::new(SecurityManager::new());
     keys.generate_ed25519(device.clone().append("KEY").append("1"))
         .unwrap();
@@ -193,9 +224,9 @@ async fn device(rules: MergeRules) -> Device {
     .await
     .unwrap();
     dev.share(
-        &c(),
+        c,
         crate::layer::Share {
-            rule: Rule::Merge { function: n(RULE) },
+            rule: Rule::Merge { function: n(rule) },
             writers: vec![n("/alice"), n("/bob"), n("/carol")],
             readers: Vec::new(),
         },
@@ -206,19 +237,19 @@ async fn device(rules: MergeRules) -> Device {
 }
 
 /// A log entry as fetched: its name, packet, signing key and record.
-struct Made {
-    name: Name,
-    packet: Bytes,
-    key: Name,
-    record: Record,
+pub(super) struct Made {
+    pub(super) name: Name,
+    pub(super) packet: Bytes,
+    pub(super) key: Name,
+    pub(super) record: Record,
 }
 
 impl Made {
-    fn digest(&self) -> [u8; 32] {
+    pub(super) fn digest(&self) -> [u8; 32] {
         wire::implicit_digest(&self.packet)
     }
 
-    fn id(&self) -> VersionId {
+    pub(super) fn id(&self) -> VersionId {
         VersionId {
             writer: Writer::new(self.key.clone()),
             seq: Seq(parse_log_name(&self.name).unwrap().seq),
@@ -226,21 +257,32 @@ impl Made {
     }
 }
 
-fn key(device: &str) -> Name {
+pub(super) fn key(device: &str) -> Name {
     n(device).append("KEY").append("1")
 }
 
-fn id(device: &str, seq: u64) -> VersionId {
+pub(super) fn id(device: &str, seq: u64) -> VersionId {
     VersionId {
         writer: Writer::new(key(device)),
         seq: Seq(seq),
     }
 }
 
+/// A parent: the version `m` and the implicit digest of its packet.
+pub(super) fn tip(m: &Made) -> (VersionId, [u8; 32]) {
+    (m.id(), m.digest())
+}
+
 /// Entry `seq` of `device` about `c()` carrying `record`, signed (unchecked)
 /// by the device's key.
-fn made(device: &str, seq: u64, record: Record) -> Made {
-    let name = log_name(&n(device), Some(&c()), seq);
+pub(super) fn made(device: &str, seq: u64, record: Record) -> Made {
+    made_in(&c(), device, seq, record)
+}
+
+/// Entry `seq` of `device` about `c` carrying `record`, signed (unchecked)
+/// by the device's key.
+pub(super) fn made_in(c: &Name, device: &str, seq: u64, record: Record) -> Made {
+    let name = log_name(&n(device), Some(c), seq);
     let key = key(device);
     let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
         ndn_packet::SignatureType::SignatureEd25519,
@@ -255,10 +297,26 @@ fn made(device: &str, seq: u64, record: Record) -> Made {
     }
 }
 
-fn body(parents: &[(&str, u64)], op: Bytes) -> VersionBody {
+/// A version record of `c()` under [`RULE`] naming `parents`, carrying `op`
+/// inline.
+pub(super) fn body(parents: &[(VersionId, [u8; 32])], op: Bytes) -> VersionBody {
+    body_in(&c(), RULE, parents, op)
+}
+
+/// A version record of `c`, made under `rule`, naming `parents`, carrying
+/// `op` inline.
+pub(super) fn body_in(
+    c: &Name,
+    rule: &str,
+    parents: &[(VersionId, [u8; 32])],
+    op: Bytes,
+) -> VersionBody {
     VersionBody {
-        collection: c(),
-        parents: parents.iter().map(|(d, s)| id(d, *s)).collect(),
+        collection: c.clone(),
+        parents: parents
+            .iter()
+            .map(|(id, digest)| (id.clone(), Some(*digest)))
+            .collect(),
         type_id: TypeId {
             name: n("/types/note"),
             revision: 1,
@@ -267,6 +325,7 @@ fn body(parents: &[(&str, u64)], op: Bytes) -> VersionBody {
         keep: Keep::Forever,
         dated: Timestamp(1),
         group: None,
+        rule: Some(n(rule)),
         fields: Content::new(),
         op,
         sealed: None,
@@ -276,16 +335,21 @@ fn body(parents: &[(&str, u64)], op: Bytes) -> VersionBody {
 }
 
 /// Version `seq` of `device` naming `parents`, carrying `op` inline.
-fn version(device: &str, seq: u64, parents: &[(&str, u64)], op: Bytes) -> Made {
+pub(super) fn version(
+    device: &str,
+    seq: u64,
+    parents: &[(VersionId, [u8; 32])],
+    op: Bytes,
+) -> Made {
     made(device, seq, Record::Version(body(parents, op)))
 }
 
 /// Version `seq` of `device` naming `parents`, carrying `op` in pieces: the
 /// version and its pieces.
-fn in_pieces(
+pub(super) fn in_pieces(
     device: &str,
     seq: u64,
-    parents: &[(&str, u64)],
+    parents: &[(VersionId, [u8; 32])],
     op: Bytes,
 ) -> (Made, Vec<pieces::Piece>) {
     let name = log_name(&n(device), Some(&c()), seq);
@@ -297,7 +361,7 @@ fn in_pieces(
     (made(device, seq, Record::Version(b)), pieces)
 }
 
-fn give(dev: &Device, m: &Made) {
+pub(super) fn give(dev: &Device, m: &Made) {
     let mut st = dev.inner.st.lock();
     dev.inner.take(
         &mut st,
@@ -309,18 +373,18 @@ fn give(dev: &Device, m: &Made) {
     );
 }
 
-fn at(dev: &Device) -> Frontier {
+pub(super) fn at(dev: &Device) -> Frontier {
     dev.inner.st.lock().colls[&c()].at()
 }
 
-async fn state(dev: &Device) -> State {
+pub(super) async fn state(dev: &Device) -> State {
     match dev.get(&c()).await.unwrap().got {
         Got::State(s) => s,
         other => panic!("not a state: {other:?}"),
     }
 }
 
-fn notes(s: &State) -> Vec<String> {
+pub(super) fn notes(s: &State) -> Vec<String> {
     let b = s.value.bytes().expect("the rule's own encoding");
     String::from_utf8(b.to_vec())
         .unwrap()
@@ -330,7 +394,7 @@ fn notes(s: &State) -> Vec<String> {
         .collect()
 }
 
-fn options() -> PutOptions {
+pub(super) fn options() -> PutOptions {
     PutOptions {
         type_id: TypeId {
             name: n("/types/note"),
@@ -399,13 +463,13 @@ async fn an_operation_whose_basis_is_outside_its_past_is_refused_and_not_waited_
     let outside = version(
         "/bob/laptop",
         11,
-        &[("/bob/laptop", 10)],
+        &[tip(&a)],
         edit(Some(carol.digest()), "x"),
     );
     let inside = version(
         "/bob/laptop",
         12,
-        &[("/bob/laptop", 11)],
+        &[tip(&outside)],
         edit(Some(a.digest()), "b"),
     );
     for m in [&carol, &a, &outside, &inside] {
@@ -437,7 +501,7 @@ async fn a_version_its_rule_does_not_count_is_applied_shown_and_counted_later() 
     let dev = device(rules()).await;
     let mut changes = dev.watch(&c(), &Frontier::new()).await.unwrap();
     let w = version("/bob/laptop", 10, &[], hold("w"));
-    let a = version("/bob/laptop", 11, &[("/bob/laptop", 10)], edit(None, "a"));
+    let a = version("/bob/laptop", 11, &[tip(&w)], edit(None, "a"));
     give(&dev, &w);
     give(&dev, &a);
     assert!(
@@ -457,7 +521,7 @@ async fn a_version_its_rule_does_not_count_is_applied_shown_and_counted_later() 
         seen.iter()
             .any(|ch| matches!(ch, Change::NotCounted { id, .. } if *id == w.id()))
     );
-    let p = version("/bob/laptop", 12, &[("/bob/laptop", 11)], pair("w"));
+    let p = version("/bob/laptop", 12, &[tip(&a)], pair("w"));
     give(&dev, &p);
     let s = state(&dev).await;
     assert!(notes(&s).contains(&"w".to_owned()), "counted now");
@@ -473,30 +537,25 @@ async fn a_version_its_rule_does_not_count_is_applied_shown_and_counted_later() 
 #[tokio::test]
 async fn the_same_versions_give_the_same_state_in_any_order_with_a_checkpoint() {
     let b1 = version("/bob/laptop", 10, &[], edit(None, "a"));
-    let b2 = version(
-        "/bob/laptop",
-        11,
-        &[("/bob/laptop", 10)],
-        edit(Some(b1.digest()), "b"),
-    );
+    let b2 = version("/bob/laptop", 11, &[tip(&b1)], edit(Some(b1.digest()), "b"));
     // Carol's edit travels in pieces, which only one device ever gets.
     let big = "c".repeat(3 * wire::INLINE_MAX);
     let (c1, c1_pieces) = in_pieces(
         "/carol/laptop",
         5,
-        &[("/bob/laptop", 10)],
+        &[tip(&b1)],
         edit(Some(b1.digest()), &big),
     );
     let cp = version(
         "/carol/laptop",
         6,
-        &[("/bob/laptop", 11), ("/carol/laptop", 5)],
+        &[tip(&b2), tip(&c1)],
         checkpoint(&["a", "b", big.as_str()]),
     );
     let b3 = version(
         "/bob/laptop",
         12,
-        &[("/bob/laptop", 11), ("/carol/laptop", 6)],
+        &[tip(&b2), tip(&cp)],
         edit(Some(cp.digest()), "d"),
     );
     let wanted = |dev: &Device| {
@@ -577,12 +636,7 @@ async fn a_merge_operation_in_pieces_waits_for_them_then_applies() {
     let dev = device(rules()).await;
     let big = "p".repeat(3 * wire::INLINE_MAX);
     let (large, pieces) = in_pieces("/bob/laptop", 10, &[], edit(None, &big));
-    let after = version(
-        "/bob/laptop",
-        11,
-        &[("/bob/laptop", 10)],
-        edit(None, "after"),
-    );
+    let after = version("/bob/laptop", 11, &[tip(&large)], edit(None, "after"));
     give(&dev, &large);
     give(&dev, &after);
     {
@@ -632,12 +686,7 @@ async fn a_version_a_checkpoint_covers_is_never_fetched_when_both_arrive_in_one_
     let dev = device(rules()).await;
     let big = "e".repeat(3 * wire::INLINE_MAX);
     let (covered, _) = in_pieces("/bob/laptop", 10, &[], edit(None, &big));
-    let (cp, cp_pieces) = in_pieces(
-        "/bob/laptop",
-        11,
-        &[("/bob/laptop", 10)],
-        checkpoint(&[&big]),
-    );
+    let (cp, cp_pieces) = in_pieces("/bob/laptop", 11, &[tip(&covered)], checkpoint(&[&big]));
     // One descent brings both: nothing is fetched while it lasts.
     let descending = Descending::new(&dev.inner.st);
     give(&dev, &covered);
@@ -685,11 +734,11 @@ async fn a_version_whose_past_is_held_but_not_applied_is_checked_only_once_it_is
         &[],
         edit(None, &"c".repeat(3 * wire::INLINE_MAX)),
     );
-    let x = version("/bob/laptop", 10, &[("/carol/phone", 1)], edit(None, "x"));
+    let x = version("/bob/laptop", 10, &[tip(&carol)], edit(None, "x"));
     // Bob's follow-up of "x", in pieces and whole: its past is held, its
     // rule judges it against "x" applied.
     let op = Bytes::from(format!("Bx\n{}", "b".repeat(3 * wire::INLINE_MAX)));
-    let (follow, follow_pieces) = in_pieces("/bob/laptop", 11, &[("/bob/laptop", 10)], op);
+    let (follow, follow_pieces) = in_pieces("/bob/laptop", 11, &[tip(&x)], op);
     for p in follow_pieces {
         dev.inner.store.insert(p.name, p.wire);
     }
@@ -757,7 +806,7 @@ async fn merge_pieces_are_not_released_without_a_covering_checkpoint_proved_kept
     let cp = version(
         "/carol/laptop",
         5,
-        &[("/bob/laptop", 10)],
+        &[tip(&large)],
         checkpoint(&[big.as_str()]),
     );
     give(&dev, &cp);

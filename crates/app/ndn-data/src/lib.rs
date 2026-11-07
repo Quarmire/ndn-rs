@@ -15,7 +15,8 @@
 //! Two kinds of thing exist: [`Version`]s, which never change, and
 //! collections, which grow. A version is signed by one key — its
 //! [`Writer`] — and is identified by `(writer, seq)` ([`VersionId`]); it names
-//! its parents as a [`Frontier`]. A collection has a [`Rule`] (one key, log or
+//! its parents as [`Parents`]: a [`Frontier`] bound to its tips' digests. A
+//! collection has a [`Rule`] (one key, log or
 //! merge) and an owner-signed [`Members`] record saying who writes and who
 //! reads. Everything else is a version that says something about other
 //! versions: a [`Summary`] (what a collection holds, signed, nested by
@@ -87,6 +88,6 @@ pub use merge::{
 pub use ndn_foundation_types::{Hash, Name};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{
-    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Payload, Seal, Seq, Timestamp,
-    TypeId, Version, VersionId, Writer,
+    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Payload, Seal, Seq,
+    Timestamp, TypeId, Version, VersionId, Writer,
 };
