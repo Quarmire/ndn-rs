@@ -142,12 +142,18 @@ pub(crate) async fn run_face_reader(
     }
 
     match kind {
-        // The engine's own internal faces live as long as the engine. An app
-        // face that closed is gone with its app, and is cleaned up below like
-        // any other local face: its routes kept, Interests under its prefixes
-        // would go to a dead face instead of to the app that registers them
-        // next (one started again).
+        // The engine's own internal faces live as long as the engine.
         FaceKind::Internal => {}
+        // An app face that stopped sending can no longer answer an Interest:
+        // its routes go, so Interests under its prefixes reach the app that
+        // registers them next (one started again) instead of a dead face.
+        // The face itself stays: an app done sending may still be waiting for
+        // the Data of what it asked.
+        FaceKind::App => {
+            rib.handle_face_down(face_id, &fib);
+            fib.remove_face(face_id);
+            debug!(target: t::FACE_SYSTEM, face=%face_id, "app face stopped sending: its routes removed");
+        }
         _ => match persistency {
             FacePersistency::Permanent => {
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "face reader stopped (permanent face retained)");
