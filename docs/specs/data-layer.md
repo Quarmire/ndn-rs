@@ -110,7 +110,9 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   `<O>/32=data` is the folder of every collection of `O`. The **owner** of
   collection `C` is its namespace, the components before its marker.
 - `put`, `get`, `share` and `snapshot` take collection names; `watch` takes
-  a collection or folder name (`<O>/32=data[/<path>]`). A verb given a name
+  a collection or folder name (`<O>/32=data[/<path>]`): a folder's watch is
+  one stream for every collection under it, those created after it began
+  included, each change tagged with its collection (§15). A verb given a name
   that is none of these — no marker, nothing before it, nothing after it
   where a collection is asked for, or another keyword or digest component —
   answers `BadName`, saying which and how the name must be formed
@@ -1396,7 +1398,13 @@ A reader:
   into children and pages whose digest differs from the one it last
   processed in full: an unchanged branch costs nothing. Watching a folder
   of 10,000 notes of which 37 changed costs the root, the `O/32=data` node,
-  the folder node, the changed pages, the 37 notes and their new entries;
+  the folder node, the changed pages, the 37 notes and their new entries.
+  Everything under a followed folder is followed, so a collection created
+  under it later — by any writer — is a new child of the folder node (or
+  of one of its pages): that node's digest changes and the next descent
+  goes into the new child alone, at the cost of the root, the nodes on the
+  way, the folder node or its changed page, and the new collection's node
+  and entries — never the folder's other collections, and no new call;
 - descends the root it verified to the end: it fetches the nodes and pages
   that root lists, not a newer root's, until every branch it follows is
   processed. A node that is not answered leaves the descent incomplete; the
@@ -2683,12 +2691,37 @@ slice.
 - **`watch(C, since F)`** reports every held version of `C` (or of the
   collections under folder `C`, which may be `<O>/32=data`) outside `F`,
   then every version applied later, the summaries of §7, each outside `F`,
-  and every version withdrawn (§8), pruned (§14) or expired (§14.1); from
-  slice 6 also every version held but not counted, with why
-  (`Change::NotCounted`, §5.2, §5.5), and every such version once it
-  counts (`Change::Counted`); it
-  starts a refresh of every device known to write into the namespace. The
-  stream ends when the device stops.
+  every equivocation (§4), and every version withdrawn (§8), pruned (§14)
+  or expired (§14.1); from slice 6 also every version held but not
+  counted, with why (`Change::NotCounted`, §5.2, §5.5), and every such
+  version once it counts (`Change::Counted`); it starts a refresh of every
+  device known to write into the namespace. The stream ends when the
+  device stops. A folder's watch is one stream for every collection under
+  it, including each collection created after the watch began — by this
+  device, or by any writer whose versions reach it (§7: the folder is
+  followed, so the new collection's branch is descended into on the next
+  notice) — with no further call. Every change MUST name the collection
+  it is about (`Change::collection`): a version, withdrawal, prune,
+  expiry, not-counted or counted report its version's collection; a
+  summary the node it summarises (the watched name or one below it); an
+  equivocation the collection it is told for — when the two entries at one
+  seq are in two collections it is told once for each, tagged with each,
+  so a watcher of both gets it twice, once per collection. The listing
+  reports what is applied, and, right after a version, `NotCounted` with
+  why when the rule does not count it, and a group member waiting for its
+  group as `NotCounted` alone (its version comes once the group counts); a
+  version held but not applied yet (it waits for an earlier one, its
+  group, its key or its pieces) is not listed and comes once it applies,
+  so the stream delivers no version twice (a version withdrawn and taken
+  back comes again, after its `Withdrawn`). `F` filters every collection
+  alike, by writer and seq, as a watch of that collection with `F` would;
+  within one collection a writer's versions come in seq order (a group's
+  members once their group counts), across collections in no common
+  order — one may wait for its key while another applies — so a frontier
+  joined from a folder's deliveries may cover a version of another
+  collection still to come: a host resuming a whole folder passes the
+  empty frontier (its listing is local), or resumes collections one by one
+  from their own frontiers.
 - **`snapshot(names)`** pins, for each name, the current state name of a
   merge collection or the exact name of a version, snapshot or entry, and
   signs the `SnapshotRecord`; a range name, which names no fixed set,
@@ -3206,6 +3239,9 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it; a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
 | Collection record wider than its folder | `share` refuses it; one signed anyway widens nothing: every reader intersects the levels. | §6.1 |
 | Release of merge pieces without a covering checkpoint proved held | Refused: the pieces are kept, saying why, and `NotHeld` when nothing is released. | §13.3 |
+| Collection created under a watched folder, by this device or another writer | Reported on the folder's one watch with no further call, every change tagged with its collection; finding it costs the new branch only (the root, the nodes on the way, the folder node or its changed page, the new collection's node and entries), never a walk of the folder. | §7, §15 |
+| Version listed by a watch while it waits (for an earlier version, its group, its key, its pieces) | Not listed: it comes once it applies, so no watch is handed a version twice; a group member waiting is listed `NotCounted` with why. | §15 |
+| Folder watch resumed from a frontier joined across its collections | May skip a version of another collection still to come: a writer's versions come in seq order within a collection only. A host resumes a whole folder from the empty frontier (the listing is local) or each collection from its own frontier. | §15 |
 | Reader that predates slice 6 | Refuses folder records and group members (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
 
 ## 18. Conformance
@@ -3334,6 +3370,24 @@ drops keeps its earlier versions, cut at what the owner held, and a seal
 keeps what was written unsealed before readable, at every reader). Their
 features are `RuleByName`, `AppOps`, `MergePieces`, `Groups` and
 `FolderMembers`.
+
+The folder-watch case is w1 (a note of 1,000 paragraphs, one element
+collection each, under one folder shared by `share_folder` with a second
+person as writer and reader; both watch the folder once. The other person
+adds a paragraph — a collection created after the watch began — and the
+watcher's stream reports its version tagged with the new collection; the
+same the other way round, and for the watcher's own add; a version the
+rule does not count, in another paragraph, is reported `NotCounted` and
+then `Counted` on the same stream, tagged with that paragraph; no watch is
+handed one version twice. The Interests the watching device sent from
+each add to its delivery, and the time, are measured, not asserted). Its
+feature is `FolderWatch`. Focused tests in `ndn-data`'s
+`device/watch_tests.rs` hand a device crafted entries: a collection
+created under a watched folder delivers its version, a group member's
+`NotCounted` and `Counted`, and a cross-collection equivocation once per
+collection, each tagged; a watch lists a group member waiting as
+`NotCounted`, and a version waiting for an earlier one when the watch
+begins is delivered once, when it applies.
 
 The storage durability cases (§4.2) run as cargo tests against both
 on-disk engines, fjall and redb, killing processes for real, not in the
