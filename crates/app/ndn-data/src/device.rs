@@ -1616,6 +1616,10 @@ struct St {
     /// this device follow ([`Self::brought`]), against
     /// [`Config::writer_collections`].
     bringing: HashMap<(Writer, Name), usize>,
+    /// The second packet held of each log entry name a writer signed two
+    /// different packets under (spec §4): kept in the store
+    /// ([`equivocal_name`]) and read back at start, so the evidence lasts.
+    twins: HashMap<Name, Bytes>,
     /// The merge rules this device runs ([`Config::rules`]).
     rules: MergeRules,
     /// This device's writer.
@@ -4741,7 +4745,8 @@ impl St {
     /// The equivocation evidence held of collections under `target`
     /// ([`Self::note_seq`]): each later version at a writer's seq beside
     /// the first, told for each of their collections under `target`, the
-    /// version of another collection by name and id only.
+    /// version of another collection by name and id only; and each second
+    /// packet at a name beside the version held there ([`St::twins`]).
     fn equivocations_under(&self, target: &Name) -> Vec<Change> {
         let mut writers: Vec<&Writer> = self.equivocal.keys().collect();
         writers.sort();
@@ -4766,6 +4771,27 @@ impl St {
                     });
                 }
             }
+        }
+        // Two packets at one name: one collection, both whole.
+        let mut names: Vec<&Name> = self.twins.keys().collect();
+        names.sort();
+        for name in names {
+            let Some(first) = self.held_version(name) else {
+                continue;
+            };
+            if !first.collection.has_prefix(target) {
+                continue;
+            }
+            let second = match self.reload(name, self.twins[name].clone()) {
+                Some(Ok(hv)) => hv.version,
+                Some(Err(lk)) => version_of(name, &lk.writer, lk.seq, lk.body),
+                None => continue,
+            };
+            out.push(Change::Equivocation {
+                collection: first.collection.clone(),
+                first: Equivocal::Here(Box::new(first)),
+                second: Equivocal::Here(Box::new(second)),
+            });
         }
         out
     }
@@ -6140,6 +6166,7 @@ impl Device {
                 equivocal: HashMap::new(),
                 brought: HashMap::new(),
                 bringing: HashMap::new(),
+                twins: HashMap::new(),
                 rules,
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
@@ -6995,6 +7022,22 @@ fn parked_name(entry: &Name) -> Name {
     under(&parked_prefix(), entry)
 }
 
+/// Where the store keeps the second packet a writer signed under a log
+/// entry name it already signed another packet under
+/// (`/localhost/ndn-data/equivocal/<log entry name>`, its value that
+/// packet): evidence against its key (spec §4), the first held under the
+/// name itself, read back at start ([`St::twins`]). One per name: one is
+/// proof enough.
+fn equivocal_prefix() -> Name {
+    "/localhost/ndn-data/equivocal"
+        .parse()
+        .expect("a valid name")
+}
+
+fn equivocal_name(entry: &Name) -> Name {
+    under(&equivocal_prefix(), entry)
+}
+
 /// Where the store keeps when this device first verified each log entry it
 /// holds, by its clock, and the digest of the public key that verified it
 /// (`/localhost/ndn-data/verified/<log entry name>`, its value the time as
@@ -7274,6 +7317,7 @@ impl Inner {
         let mut batched = Vec::new();
         let mut writers: HashMap<Name, Writer> = HashMap::new();
         let mut parked = Vec::new();
+        let mut twins = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if let Some(entry) = over(&verified_prefix(), &name) {
                 match decode_verified(&wire) {
@@ -7294,6 +7338,10 @@ impl Inner {
                 }
                 None => name,
             };
+            if let Some(entry) = over(&equivocal_prefix(), &name) {
+                twins.push((entry, wire));
+                continue;
+            }
             if let Some(c) = over(&batched_prefix(), &name) {
                 if let Some((seq, batch)) = decode_batched(&wire) {
                     batched.push((c, seq, batch));
@@ -7559,6 +7607,9 @@ impl Inner {
             st.wake(&c);
         }
         take_all(&mut st, rest);
+        // The second packets held at a name: evidence beside the version
+        // read back under it.
+        st.twins.extend(twins);
         // A parked copy its member no longer parks under, once the member is
         // stored under its own name (applied) or no longer held (refused,
         // let go); a member held otherwise keeps its copy for the next start.
@@ -9229,6 +9280,12 @@ impl Inner {
                 && held_wire(st, &name).is_some_and(|first| first != wire)
                 && let Some(first) = st.held_version(&name)
             {
+                // Kept first, then reported, so the evidence outlives a
+                // restart: one second packet per name.
+                if !st.twins.contains_key(&name) {
+                    self.store.insert(equivocal_name(&name), wire.clone());
+                    st.twins.insert(name.clone(), wire.clone());
+                }
                 let change = Change::Equivocation {
                     collection: body.collection.clone(),
                     first: Equivocal::Here(Box::new(first)),

@@ -171,7 +171,10 @@ it is one of a group of versions counted all or none, its group (§5.5).
   by name and id only (`Equivocal::Elsewhere`), never its content or
   anything opened of it, so a watch of one folder learns nothing of
   another folder's content — and lists it to every watch begun later
-  while both are held; a group of the key
+  while both are held, across restarts too: two packets at one name keep
+  the second in the store beside the first (ndn-data: under
+  `/localhost/ndn-data/equivocal/<log entry name>`, one per name), stored
+  before it is reported; a group of the key
   over that seq is malformed (§5.5). A cut accepts a seq only in the
   collection it lists it under (§6.1, §8, §8.1), so a removed or revoked
   key gains nothing by signing an accepted seq again elsewhere. An entry

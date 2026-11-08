@@ -556,3 +556,42 @@ async fn a_parked_member_and_its_equivocation_outlive_a_restart() {
     );
     dev.shutdown();
 }
+
+#[tokio::test]
+async fn two_packets_at_one_name_stay_evidence_across_a_restart() {
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519(n("/alice/laptop/KEY/1")).unwrap();
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let calls = Arc::new(Calls::default());
+    let plan = n("/alice/32=data/trip/plan");
+    let dev = start(&keys, &store, &calls).await;
+    dev.share(&plan, group_tests::log_share()).await.unwrap();
+    // Bob signs two different packets under one name.
+    let one = group_tests::version("/bob/phone", &plan, 7, &[], None);
+    let other = group_tests::version("/bob/phone", &plan, 7, &[("/bob/phone", 3)], None);
+    assert_eq!(one.name, other.name);
+    assert_ne!(one.packet, other.packet);
+    let mut changes = dev.watch(&plan, &Frontier::new()).await.unwrap();
+    give(&dev, &one);
+    give(&dev, &other);
+    let twins = |seen: &[Change]| {
+        seen.iter().any(|c| matches!(
+            c,
+            Change::Equivocation { collection, first: Equivocal::Here(a), second: Equivocal::Here(b) }
+                if *collection == plan && a.name == one.name && b.name == one.name && a != b
+        ))
+    };
+    let seen = group_tests::drain(&mut changes).await;
+    assert!(twins(&seen), "reported as it arrives: {seen:?}");
+    dev.shutdown();
+    drop(dev);
+
+    let dev = start(&keys, &store, &calls).await;
+    let mut changes = dev.watch(&plan, &Frontier::new()).await.unwrap();
+    let seen = group_tests::drain(&mut changes).await;
+    assert!(
+        twins(&seen),
+        "the second packet is kept: still reported after the restart: {seen:?}"
+    );
+    dev.shutdown();
+}
