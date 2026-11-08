@@ -273,24 +273,43 @@ impl CertCache {
     /// with a key name, all certificates of that key; with a certificate
     /// name, that certificate. Returns the newest evicted, if any.
     pub fn remove(&self, name: &Name) -> Option<Certificate> {
-        use sha2::{Digest, Sha256};
         let removed: Vec<Certificate> = self
             .matching(name)
             .filter_map(|cert| self.local.remove(&cert.name).map(|(_, c)| c))
             .collect();
         for cert in &removed {
-            let key_name = cert.key_name();
-            if let Some(mut names) = self.by_key.get_mut(&key_name) {
-                names.retain(|cn| *cn != cert.name);
-            }
-            self.by_key
-                .remove_if(&key_name, |_, names| names.is_empty());
-            if !self.by_key.contains_key(&key_name) {
-                let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
-                self.by_digest.remove_if(&digest, |_, k| *k == key_name);
-            }
+            self.unindex(cert);
         }
         pick_newest(removed, now_ns())
+    }
+
+    /// Evict `cert` if the cache holds exactly that copy under its name (the
+    /// same signed bytes and signature value): a copy a chain walk refused
+    /// is not kept to answer for its key again, while an honest copy cached
+    /// under that name since is left alone. Returns whether it was evicted.
+    pub fn evict(&self, cert: &Certificate) -> bool {
+        let Some((_, evicted)) = self.local.remove_if(&cert.name, |_, held| {
+            held.sig_value == cert.sig_value && held.signed_region == cert.signed_region
+        }) else {
+            return false;
+        };
+        self.unindex(&evicted);
+        true
+    }
+
+    /// Drop the indices of `cert`, just removed from `local`.
+    fn unindex(&self, cert: &Certificate) {
+        use sha2::{Digest, Sha256};
+        let key_name = cert.key_name();
+        if let Some(mut names) = self.by_key.get_mut(&key_name) {
+            names.retain(|cn| *cn != cert.name);
+        }
+        self.by_key
+            .remove_if(&key_name, |_, names| names.is_empty());
+        if !self.by_key.contains_key(&key_name) {
+            let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
+            self.by_digest.remove_if(&digest, |_, k| *k == key_name);
+        }
     }
 }
 

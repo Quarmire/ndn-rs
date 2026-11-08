@@ -1690,6 +1690,51 @@ When SchemaAuthoritative is set, every certificate hop must also satisfy the
 schema. A context decoded from the wire always judges certificate hops,
 because it has either the floor or the flag.
 
+### 6.5 Certificates a walk refuses
+
+A validator's certificate cache holds certificates as they were fetched,
+before any walk checked them; a walk checks each one it passes against its
+issuer's key. A certificate whose own signature that key does not verify
+is refused as a copy, not as a key: its bytes were altered on the way (a
+faulty or hostile link flips a byte of a signature) or never signed, and
+another copy of the same certificate may be honest. The rules, which bind
+every validator (a forwarder's validation stage and a device's data layer
+alike):
+
+1. A refused copy MUST NOT stay in the cache. It is evicted at once, by its
+   bytes: a copy cached under the same name since, which may be the honest
+   one, stays (`CertCache::evict`).
+2. The packet whose walk met the refused copy is not refused for it. A
+   fetching walk (`validate_chain`, `validate_durable`) walks once more,
+   which fetches the certificate again, and refuses the packet
+   `InvalidSignature` only if that copy is refused too; a cache-only walk
+   (`validate_chain_cached`, `validate_durable_cached`) answers `Pending`,
+   naming the certificate, which the caller fetches before validating
+   again (a forwarder's validation stage parks the Data and fetches it, as
+   for a certificate never cached).
+3. A certificate packet refused `InvalidSignature` is not remembered for its
+   key (the validator's refused-certificate memory, which lets a final
+   verdict on a certificate — its issuer revoked, its hop unauthorized —
+   answer for the Data its key signed). A verdict on bytes says nothing of
+   the key.
+
+*Threat note.* Without rule 1 one forged copy of a signer's certificate,
+fetched once through a node that carries the namespace unvalidated (a
+transit mark, `mgmt-trust.md`), made that node refuse every genuine packet
+the key signed for as long as the cache lived: the walk found the copy,
+its public key verified the packet, and its forged signature failed the
+next hop, every time. A copy whose signature was altered now costs one
+more fetch per walk that meets it, and never vouches for anything (every
+walk still ends at the anchors of the context judging the packet). Only a
+node's unvalidated paths can cache such a copy: a forwarder refuses a
+certificate packet that fails its validation before its fetcher takes it.
+Residual: a cached copy whose *public key* was replaced (so its signature
+cannot verify either) refuses, while cached, a genuine packet whose own
+signature it is asked to verify (depth 0: no cached certificate of the key
+verifies it, which a forged packet also shows), and is evicted only once a
+walk checks its signature at the next hop. An on-path attacker that can
+answer a node's certificate fetch can deny that key's packets there anyway.
+
 ## 7. Publication (RDR)
 
 A node that keeps contexts SHOULD publish them. ndn-fwd does so unless
@@ -2669,6 +2714,7 @@ may move.
 - Cut key digest, manifest and DataRequiresCut (by symbol): `tlv.rs` CUT_KEY_DIGEST 0x0430, CUT_MANIFEST 0x0432, DATA_REQUIRES_CUT 0x0434, MANIFEST_NODE 0x0436 and the MANIFEST_* children 0x0438–0x043E; `RevocationCut::{set_key_digest, key_digest, set_manifest, manifest, range_seq, accepts_exactly, covers}` (`accepts` admits a range only when the cut has no manifest: fails closed); `ndn_security::public_key_digest` (SHA-256 of `Certificate::public_key` as stored); `SignedTrustContext::{with_data_requires_cut, without_data_requires_cut, data_requires_cut, role_of, requires_cut_for, without_revocation_cuts}`.
 - `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `build_under` (the same tree, its packets named `<prefix>/seg=<i>`: the data layer's removal cuts name theirs under the members record, `<R>/32=cut`, data-layer.md §8), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
 - `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT, REVOKED_LAPSED}`; `Unverified::{verify, verify_live}` (`unverified.rs`).
+- `ndn-rs/crates/security/ndn-security/src/validator/chain.rs` (§6.5): `Validator::walk_to_anchor` (one more walk after a refused copy when fetching; `Pending` naming it when cache-only), `walk_once` (`WalkOutcome::RefusedCopy`: a cached certificate whose own signature its issuer's key does not verify, evicted), and the refused-certificate memory skipping `InvalidSignature` (`validate_chain_inner`); `CertCache::evict` (`cert_cache.rs`: exactly that copy, by its signed bytes and signature value).
 - `ndn-rs/crates/security/ndn-security/src/keyring.rs`: the revocation epoch moves, and listeners are told, when a version revokes a new name, when a held cut is not `covers`-ed by the new one (the key's name), or when a DataRequiresCut role is added (`/<ns>/<role>`).
 - `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs`: InterestLifetime clamped to one hour for PIT expiry and the per-PIT full-name deadline.
 

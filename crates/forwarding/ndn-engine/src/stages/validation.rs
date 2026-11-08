@@ -187,6 +187,14 @@ impl PendingQueue {
 /// and drops it when its original deadline passes. The fetcher dedups
 /// concurrent requests and backs off after a failure, and every re-queue
 /// keeps the original deadline, so a missing cert cannot loop or amplify.
+///
+/// A cached certificate copy whose own signature its issuer's key does not
+/// verify (altered on the way, e.g. fetched through a transit namespace) is
+/// evicted by the walk and named missing, never left to refuse the genuine
+/// Data its key signed: that Data is parked and the certificate fetched
+/// again, as above (trust-context.md §6.5). Data this stage refuses is never
+/// cached: [`CsInsertStage`](crate::stages::CsInsertStage) admits only Data
+/// it verified.
 pub struct ValidationStage {
     pub validator: Option<Arc<Validator>>,
     pending: Arc<Mutex<PendingQueue>>,
