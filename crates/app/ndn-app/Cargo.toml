@@ -74,7 +74,8 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 anyhow        = { workspace = true }
-tokio         = { workspace = true, features = ["rt", "macros", "time"] }
+# test-util: paused virtual time for the re-expressing fetch's timing tests.
+tokio         = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # Multicast forwarding so SVS sync Interests fan out across in-process faces
 # (the engine-backed Node publish/subscribe round-trip test).
 ndn-strategy  = { workspace = true }

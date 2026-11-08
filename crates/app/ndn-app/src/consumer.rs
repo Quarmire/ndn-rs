@@ -197,6 +197,11 @@ pub const DEFAULT_INTEREST_LIFETIME: Duration = Duration::from_millis(4000);
 /// Interest lifetime to absorb forwarding and processing delay.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4500);
 
+/// How long a fetch waits for a reply past its Interest's lifetime, for the
+/// forwarding and processing delay of a reply sent just before it ended
+/// (as [`InterestBuilder::build_with_timeout`] adds).
+pub const REPLY_SLACK: Duration = Duration::from_millis(500);
+
 /// Per-Interest attempts for whole-object (RDR) fetches. Each metadata-discovery
 /// and segment Interest is re-expressed up to this many times with back-off
 /// before the fetch fails. Lossy/high-latency faces (connectionless named-radio
@@ -431,6 +436,74 @@ impl Consumer {
         .await
         .map_err(|_| AppError::Timeout)?
         .map(|(data, _)| data)
+    }
+
+    /// Fetch one packet within `budget`, expressing its Interest again while
+    /// it goes unanswered. The Interest `make` builds (the same name and
+    /// selectors each time; the builder draws a fresh nonce per build) is
+    /// expressed again once each gap of `gaps` passed since the previous
+    /// one, as long as at least `min_left` of the budget is left after the
+    /// gap — at most once per gap `gaps` yields. Every Interest carries the
+    /// budget left as its lifetime and stays pending until the budget ends,
+    /// so a late reply to an earlier one answers as well as a reply to the
+    /// latest; the fetch waits [`REPLY_SLACK`] past the budget, as
+    /// [`Self::fetch_with`] waits past the lifetime. A Nack or a refusal
+    /// answers at once, as in [`Self::fetch_wire`]. Returns the Data and how
+    /// many Interests were expressed for it: a round-trip sample is
+    /// unambiguous only when that is 1.
+    ///
+    /// A lost Interest or Data then costs one gap, not the lifetime. A
+    /// forwarder hands a fresh-nonce Interest from the same face on upstream
+    /// once its retransmission-suppression window since its last forward
+    /// passed (NFD `RetxSuppressionExponential`: 10 ms, doubling per
+    /// forward, at most 250 ms); a shorter gap may be aggregated at the
+    /// first hop and cost an Interest for nothing.
+    ///
+    /// Time is counted in the gaps waited, never read off a clock, so the
+    /// fetch behaves the same on every runtime, a virtual one included.
+    pub async fn fetch_reexpressing(
+        &mut self,
+        mut make: impl FnMut() -> InterestBuilder,
+        budget: Duration,
+        min_left: Duration,
+        gaps: impl IntoIterator<Item = Duration>,
+    ) -> Result<(Data, u32), AppError> {
+        let wire = make().lifetime(budget).build();
+        let interest = interest_identity(&wire).map_err(|e| AppError::Protocol(e.to_string()))?;
+        let sel = interest.selectors();
+        let (can_be_prefix, must_be_fresh) = (sel.can_be_prefix, sel.must_be_fresh);
+        let mut replies = ReplySource::open(self.conn.as_ref(), &interest);
+        self.conn.send(wire).await?;
+        let mut expressed = 1u32;
+        let mut spent = Duration::ZERO;
+        let mut gaps = gaps.into_iter();
+        loop {
+            let gap = gaps
+                .next()
+                .filter(|g| budget.saturating_sub(spent + *g) >= min_left);
+            let wait = gap.unwrap_or(budget.saturating_sub(spent) + REPLY_SLACK);
+            let reply =
+                crate::rt::timeout(wait, replies.answer(&interest.name, can_be_prefix, false))
+                    .await;
+            match (reply, gap) {
+                (Ok(reply), _) => return reply.map(|(data, _)| (data, expressed)),
+                (Err(_), Some(gap)) => {
+                    spent += gap;
+                    let left = budget - spent;
+                    if let Some(registry) = replies.registry() {
+                        registry.expect_name(
+                            (*interest.name).clone(),
+                            can_be_prefix,
+                            must_be_fresh,
+                            left,
+                        );
+                    }
+                    self.conn.send(make().lifetime(left).build()).await?;
+                    expressed += 1;
+                }
+                (Err(_), None) => return Err(AppError::Timeout),
+            }
+        }
     }
 
     /// Like [`fetch`](Self::fetch) but also returns the received Data's
@@ -1646,6 +1719,111 @@ mod subscription_tests {
             name,
             "the reply pairs against the name inside the wrapper"
         );
+    }
+
+    /// A forwarder that loses the first `lose` Interests it is handed and
+    /// answers each later one with a Data under its name; it records the
+    /// nonce and lifetime of every Interest.
+    struct LoseFirst {
+        lose: usize,
+        sent: std::sync::Mutex<Vec<(Option<u32>, Option<Duration>)>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    impl LoseFirst {
+        fn new(lose: usize) -> Arc<Self> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Arc::new(Self {
+                lose,
+                sent: std::sync::Mutex::new(Vec::new()),
+                tx,
+                rx: tokio::sync::Mutex::new(rx),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Connection for LoseFirst {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            let interest = Interest::decode(wire).map_err(|e| AppError::Protocol(e.to_string()))?;
+            let mut sent = self.sent.lock().unwrap();
+            sent.push((interest.nonce(), interest.lifetime()));
+            if sent.len() > self.lose {
+                let reply = ndn_packet::encode::DataBuilder::new((*interest.name).clone(), b"x");
+                let _ = self.tx.send(reply.build());
+            }
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.rx.lock().await.recv().await
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// The gaps of the re-expressing tests: 250 ms, doubling.
+    fn doubling() -> impl Iterator<Item = Duration> {
+        (0..8).map(|k| Duration::from_millis(250 << k))
+    }
+
+    /// A lost Interest costs a re-expressing fetch one gap, not the
+    /// lifetime: the fetch is answered by its second Interest, which has a
+    /// fresh nonce and the budget left as its lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_interest_costs_one_gap() {
+        let conn = LoseFirst::new(1);
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let name: Name = "/a/lost/one".parse().unwrap();
+        let start = tokio::time::Instant::now();
+        let (data, expressed) = consumer
+            .fetch_reexpressing(
+                || InterestBuilder::new(name.clone()),
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                doubling(),
+            )
+            .await
+            .expect("the second Interest is answered");
+        assert_eq!(*data.name, name);
+        assert_eq!(expressed, 2);
+        assert_eq!(start.elapsed(), Duration::from_millis(250), "one gap");
+        let sent = conn.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[0].0, sent[1].0, "a fresh nonce");
+        assert_eq!(sent[0].1, Some(Duration::from_secs(2)));
+        assert_eq!(sent[1].1, Some(Duration::from_millis(1750)));
+    }
+
+    /// Unanswered, a re-expressing fetch sends one Interest per gap that
+    /// leaves `min_left` of the budget, never more, and times out once the
+    /// budget and the reply slack passed.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_fetch_is_expressed_a_bounded_number_of_times() {
+        let conn = LoseFirst::new(usize::MAX);
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let name: Name = "/never/answered".parse().unwrap();
+        let start = tokio::time::Instant::now();
+        let missed = consumer
+            .fetch_reexpressing(
+                || InterestBuilder::new(name.clone()),
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                doubling(),
+            )
+            .await;
+        assert!(matches!(missed, Err(AppError::Timeout)), "{missed:?}");
+        assert_eq!(start.elapsed(), Duration::from_secs(2) + REPLY_SLACK);
+        // At 0, 250, 750 and 1750 ms; the next gap would leave nothing.
+        let lifetimes: Vec<_> = conn
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|i| i.1.unwrap().as_millis())
+            .collect();
+        assert_eq!(lifetimes, [2000, 1750, 1250, 250]);
     }
 
     #[test]
