@@ -35,6 +35,20 @@ pub struct AdoptedContextInfo {
     pub published: bool,
 }
 
+/// The outcome of a `security/transit`: the marks management holds now on
+/// the namespace a local app asked this node to carry in transit, returned
+/// as JSON in the ControlResponse status text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransitInfo {
+    pub namespace: String,
+    /// The marks local apps hold on it after this command; `0`: it is no
+    /// longer carried in transit for them (a link may still carry it).
+    pub marks: u64,
+    /// The node holds the namespace's trust context: its Data is validated
+    /// and cached as any held namespace's, whatever the marks say.
+    pub held: bool,
+}
+
 /// The parameters of a [`TrustRefusal`] or a [`Detail`]: named facts a
 /// client words its own sentence from (names, versions, roles, times).
 pub type Params = std::collections::BTreeMap<String, String>;
@@ -824,6 +838,16 @@ pub mod code {
     /// otherwise).
     pub const DATA_NOT_FOUND: RefusalCode =
         RefusalCode::new("data-not-found", 504, true, NextStep::RetryLater);
+
+    // --- transit (security/transit)
+
+    /// The namespace asked to carry in transit is not a self-certifying
+    /// one (`/user/<0xA1: 32 bytes>`): only a person's namespace, adopted
+    /// by a local app for one scope of its own, is carried for it; any
+    /// other is adopted on the node, or served by a link. Params:
+    /// `namespace`.
+    pub const TRANSIT_NOT_PERSONAL: RefusalCode =
+        RefusalCode::new("transit-not-personal", 400, false, NextStep::FixRequest);
 }
 
 /// Why a trust-admin operation changed nothing, as structured data: a

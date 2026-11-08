@@ -1,8 +1,9 @@
 //! Invariant: a trust-changing verb (`security/context-adopt`,
-//! `security/enroll`, `security/context-update`, `security/context-refresh`)
-//! arriving over `/localhop` never reaches the trust-admin backend, even when
-//! it is signed by a key the localhop validator accepts. Trust changes are
-//! accepted only on the node's local management socket.
+//! `security/enroll`, `security/context-update`, `security/context-refresh`,
+//! `security/transit`) arriving over `/localhop` never reaches the
+//! trust-admin backend, even when it is signed by a key the localhop
+//! validator accepts. Trust changes are accepted only on the node's local
+//! management socket.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +13,7 @@ use ndn_config::{ControlParameters, ControlResponse};
 use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::{InProcFace, InProcHandle};
 use ndn_mgmt::{
-    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, MgmtHandles,
+    AdoptedContextInfo, ContextRefreshInfo, EnrollOutcome, EnrollRequest, MgmtHandles, TransitInfo,
     TrustAdminMgmtBackend, TrustRefusal, mount_management,
 };
 use ndn_packet::encode::InterestBuilder;
@@ -60,6 +61,11 @@ impl TrustAdminMgmtBackend for CountingBackend {
         &self,
         _namespace: Option<Name>,
     ) -> Result<Vec<ContextRefreshInfo>, TrustRefusal> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(reached())
+    }
+
+    fn transit(&self, _namespace: Name, _carry: bool) -> Result<TransitInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(reached())
     }
@@ -211,6 +217,17 @@ async fn localhop_trust_admin_verbs_never_run() {
     assert_eq!(
         cr.status_code, 403,
         "localhop context-refresh: {:?}",
+        cr.status_text
+    );
+
+    let transit = ControlParameters {
+        name: Some("/user/carol".parse().unwrap()),
+        ..Default::default()
+    };
+    let cr = send_localhop(&app_handle, &signer, &key_name, b"transit", &transit).await;
+    assert_eq!(
+        cr.status_code, 403,
+        "localhop transit: {:?}",
         cr.status_text
     );
 

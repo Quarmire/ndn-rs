@@ -293,6 +293,9 @@ impl MgmtModule for SecurityModule {
         if verb == verb::RENEW {
             return security_renew(ctx.trust_context_handler);
         }
+        if verb == verb::TRANSIT {
+            return security_transit(params, ctx.trust_context_handler);
+        }
         if verb == verb::ENROLL_STATUS {
             return security_enroll_status(ctx.trust_context_handler);
         }
@@ -434,6 +437,33 @@ fn security_renew(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> Mg
     };
     let backend = Arc::clone(backend);
     MgmtResponse::Deferred(Box::pin(async move { json_answer(backend.renew().await) }))
+}
+
+/// `security/transit`: one mark more on the self-certifying namespace in
+/// `ControlParameters.name`, carried in transit for a local app that adopted
+/// it for one scope of its own — or one taken back ([`verb::TRANSIT_RELEASE`]
+/// in `Flags`). Already authorized by the trust-admin peer-credential gate
+/// (and refused over `/localhop`). Answered at once. Success: `200` with
+/// [`crate::TransitInfo`] as JSON status text.
+fn security_transit(
+    params: ControlParameters,
+    backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
+) -> MgmtResponse {
+    let Some(backend) = backend else {
+        return refused(&crate::not_at_runtime(
+            "transit",
+            "this node carries no namespace in transit for an app",
+        ));
+    };
+    let Some(namespace) = params.name else {
+        return refused(&crate::missing_parameter(
+            "transit",
+            "Name",
+            "the self-certifying namespace to carry (/user/<0xA1: 32 bytes>)",
+        ));
+    };
+    let carry = params.flags.unwrap_or(0) & verb::TRANSIT_RELEASE == 0;
+    json_answer(backend.transit(namespace, carry)).into()
 }
 
 /// `security/enroll-status`: the requests for an admin's approval this node
@@ -841,6 +871,22 @@ mod security_v1_handler_tests {
         );
         // renew: needs a backend (a daemon holding certificates).
         assert_eq!(refused(security_renew(None)), code::NOT_AT_RUNTIME.code);
+        // transit: the namespace to carry, and a backend that carries it.
+        assert_eq!(
+            refused(security_transit(
+                ControlParameters::default(),
+                Some(&backend)
+            )),
+            code::MISSING_PARAMETER.code
+        );
+        let carol = ControlParameters {
+            name: Some("/user/carol".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            refused(security_transit(carol, None)),
+            code::NOT_AT_RUNTIME.code
+        );
     }
 }
 

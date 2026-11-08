@@ -40,5 +40,7 @@ mod security_v1_verbs;
 mod status_bridge;
 #[path = "trust_admin_localhop_refused.rs"]
 mod trust_admin_localhop_refused;
+#[path = "trust_admin_transit.rs"]
+mod trust_admin_transit;
 #[path = "web_wire_e2e.rs"]
 mod web_wire_e2e;

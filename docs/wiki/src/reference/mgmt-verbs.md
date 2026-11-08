@@ -156,6 +156,7 @@ Unknown TLVs inside the dataset are skipped.
 | Verb | Effect |
 |---|---|
 | `data-inspect` | Fetch the Data under `Name` (CanBePrefix: content store, else the network), validate it, answer `ndn_cert::report::DataInspection` as JSON: signature, metadata, the trusted prefix covering it, verdict with a coded detail, chain walked. `ExpirationPeriod` bounds the wait (ms). Command gate; answered deferred (`MgmtClient::security_data_inspect`). |
+| `transit` | One mark more on the self-certifying namespace in `Name` (`/user/<0xA1: …>`), which a local app adopted for one scope of its own: while marked, this forwarder, not holding it, forwards its Data unvalidated to the Interests pending for it and caches none of it; `Flags` `TRANSIT_RELEASE` takes one mark back. Answers `TransitInfo` (`namespace`, `marks`, `held`). Trust-admin gate (local operators only, never over `/localhop`); answered at once (`MgmtClient::security_transit`). |
 
 The full per-module verb list is in each module file's
 docstring.

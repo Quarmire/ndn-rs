@@ -546,7 +546,7 @@ pub use ndn_cert::report::{
     AdoptedContextInfo, ApprovalDecision, ContextRefreshInfo, EnrollOutcome, EnrollRequest,
     EnrolledInfo, IdentityStatus, MembershipChange, MembershipEvent, MembershipInfo,
     MembershipRelation, PendingEnrollInfo, RefreshState, RenewalInfo, RenewalState,
-    RootStoreStatus, SigningIdentityStatus, TrustEvent, TrustRefusal,
+    RootStoreStatus, SigningIdentityStatus, TransitInfo, TrustEvent, TrustRefusal,
 };
 
 /// Where this node keeps the root key of a namespace it is the root device
@@ -615,8 +615,9 @@ pub fn refusal_response(refusal: &TrustRefusal) -> ControlResponse {
 /// (`security/context-adopt`), enroll with an invite (`security/enroll`),
 /// refresh held contexts (`security/context-refresh`), take a newer version
 /// of a held context made on this device (`security/context-update`), renew
-/// this node's certificates (`security/renew`), and report the identity the
-/// node signs with now. The
+/// this node's certificates (`security/renew`), carry a person's namespace
+/// in transit for a local app (`security/transit`), and report the identity
+/// the node signs with now. The
 /// spec crate owns the trait; the forwarder (`ndn-fwd`)
 /// implements it over its engine, keyring, PIB, CA, context store and
 /// publisher. Authorization happens before a verb reaches the backend (the
@@ -666,6 +667,23 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
         Err(not_at_runtime(
             "renew",
             "this node does not renew certificates at runtime",
+        ))
+    }
+
+    /// `security/transit`: one more mark (`carry`) on the self-certifying
+    /// namespace `namespace`, which a local app adopted for one scope of its
+    /// own alone, or one taken back (`!carry`). While it holds a mark, this
+    /// forwarder carries the namespace in transit — forwards its Data
+    /// unvalidated to the Interests pending for it, caches none of it, runs
+    /// its sync group with the multicast strategy — unless the node holds
+    /// the namespace, whose Data is validated whatever the marks say. The
+    /// keyring is never touched. A release with no mark held changes
+    /// nothing (it never takes a mark a link holds).
+    fn transit(&self, namespace: Name, carry: bool) -> Result<TransitInfo, TrustRefusal> {
+        let _ = (namespace, carry);
+        Err(not_at_runtime(
+            "transit",
+            "this node carries no namespace in transit for an app",
         ))
     }
 

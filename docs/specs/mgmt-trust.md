@@ -96,6 +96,7 @@ refuses with `not-at-runtime`.
 | `context-refresh` | Name: a namespace (absent: every held one) | list of `ContextRefreshInfo` (`detail` is a detail) |
 | `context-update` | ContextData: a signed trust-context Data made on this device | one `ContextRefreshInfo` |
 | `renew` | — | list of `RenewalInfo` (`detail` of a refused or failed one is a detail) |
+| `transit` | Name: a self-certifying namespace (`/user/<0xA1: 32 bytes>`); Flags `TRANSIT_RELEASE`: take one mark back instead of adding one | `TransitInfo` (`namespace`, `marks`, `held`) — see [Transit](#transit) |
 | `memberships` | — | list of `MembershipInfo` (read only: any local client) |
 | `identity-status` | — | `IdentityStatus` (read only: any client, unsigned) |
 
@@ -135,7 +136,7 @@ in `cause` and carries its params too.
 
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
-| `not-at-runtime` | 404 | no | use-other-device | `operation` (`context-adopt`, `enroll`, `enroll-status`, `context-refresh`, `context-update`, `renew`, `memberships`, `approvals`, `ca-info`, `yubikey`) | this node does not do it at runtime (no backend) |
+| `not-at-runtime` | 404 | no | use-other-device | `operation` (`context-adopt`, `enroll`, `enroll-status`, `context-refresh`, `context-update`, `renew`, `transit`, `memberships`, `approvals`, `ca-info`, `yubikey`) | this node does not do it at runtime (no backend) |
 | `missing-parameter` | 400 | no | fix-request | `operation`, `parameter` (`Uri`, `Name`, `ContextData`), `expects` | a required parameter is missing |
 | `trust-change-over-localhop` | 403 | no | use-other-device | `operation` (`<module>/<verb>`) | a trust change arrived over `/localhop`; trust changes are made on the node itself |
 | `trust-change-unidentified` | 403 | no | fix-local | `daemon_uid`, `groups` (`, `-separated trust-admin groups; empty: none) | the face carries no caller identity (not the local management socket) |
@@ -210,6 +211,70 @@ YubiKey PIV support (`operation` = `yubikey`).
 |---|---|---|---|---|---|
 | `renewal-keys-unreadable` | 500 | no | fix-local | `error` | the certificates to renew could not be read |
 | `nothing-to-renew` | 404 | no | enroll | `location` | no certificate a namespace CA issued is held |
+
+### Transit
+
+`security/transit` carries a person's namespace **in transit** for a local
+app that adopted it for one scope of its own alone (trust-context.md
+§4.5.7; a data-layer device's folders, data-layer.md §6.3), on a forwarder
+that does not hold it, so the namespace's Data reaches the app, which
+validates every packet itself.
+
+- **The namespace.** Name is exactly a self-certifying namespace,
+  `/user/<0xA1: 32 bytes>` (trust-context.md §4.5). Any other is refused
+  (`transit-not-personal`): such a namespace is adopted on the node from
+  its anchor link, or carried by the link that serves its devices
+  ([ndn-link.md](ndn-link.md) §15.7).
+- **Marks, counted.** Each command is one mark; Flags `TRANSIT_RELEASE`
+  takes one back. Management counts its marks per namespace apart from the
+  links': each mark is one reason in the forwarder's one count of the
+  namespace's reasons to be in transit (ndn-rs `TransitPrefixes`, with a
+  link's), so it is in transit while any reason holds, and the first and
+  the last run the action the links' run — its sync group `<ns>/32=sync`
+  runs with the multicast strategy meanwhile (data-layer.md §12). Two
+  scopes adopting one namespace hold two marks; one releasing keeps the
+  other's. A release with no management mark held changes nothing and
+  answers `marks: 0`: it never takes a link's reason.
+- **What transit does** is ndn-link.md §15.7's: Data under the namespace is
+  forwarded to the Interests pending for it without validation and never
+  enters the Content Store; unsolicited Data is dropped as always. A
+  namespace the node holds is never in transit: its Data is validated
+  whatever the marks say (`held: true` in the answer). Nothing else
+  changes: the keyring, the trust contexts held, the certificates — the
+  node keeps refusing the namespace everywhere it judges, as a person's
+  namespace not held.
+- **Lifetime.** Marks are the running daemon's: they end with its run. An
+  app marks before it fetches the namespace's first packet (its adoption
+  for the scope fetches the trust-context versions through this transit
+  too) and releases when it stops judging the namespace. An app that ends
+  without releasing leaves its marks until the daemon restarts.
+- **Answer.** `TransitInfo`: `namespace`; `marks`, those management holds
+  after this command (`0`: no longer carried for apps, though a link may
+  still carry it); `held`.
+
+| code | status | retry | next | params | meaning |
+|---|---|---|---|---|---|
+| `transit-not-personal` | 400 | no | fix-request | `namespace` | the namespace is not a self-certifying one; adopt it on the node, or let a link carry it |
+
+**Threat note: who may mark, and what a local app then receives.** Only a
+local operator marks: the gate decides `transit` as it decides
+`context-adopt` — on the local management socket, by the kernel's peer
+credentials (the daemon's user, root, a member of a configured
+trust-admin group); never over `/localhop`, never on a face that carries no
+caller identity, never for another local user. While a namespace is
+marked, any local app on that daemon — not only the one that asked — may
+receive Data under it, **unvalidated and uncached**, for its own pending
+Interests: the forwarder vouches for none of it, and a copy forged on the
+way reaches the app as the real one would. An app that trusts what its
+face delivers because the forwarder validates would take it; an ndn-rs app
+validates end to end — the data layer judges each packet of the namespace
+with its scoped context, and every other path refuses the namespace as
+one not held (trust-context.md §4.5.6 note 4). A forged copy that answers
+a pending Interest first costs the app a fetch, which it asks again
+(data-layer.md §17.1), never a wrong answer. Nothing reaches beyond the
+node's own apps: the Data answers only Interests pending here, and none of
+it enters the Content Store, so no later requester, local or remote, is
+served it from this node.
 
 ### Details
 

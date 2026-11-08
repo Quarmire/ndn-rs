@@ -1018,6 +1018,32 @@ impl MgmtClient {
         .await
     }
 
+    /// `security/transit`: ask the daemon to carry the self-certifying
+    /// namespace `namespace` (`/user/<0xA1: …>`), which this app adopted for
+    /// one scope of its own alone, in transit (`carry`: one mark more), or
+    /// to take one mark back (`!carry`). While a mark is held the daemon,
+    /// not holding the namespace, forwards its Data unvalidated to the
+    /// Interests pending for it and caches none of it: the app validates
+    /// every packet itself. Local operators only (the trust-admin gate).
+    /// Answered at once. A refusal (`transit-not-personal`, the gate's) is
+    /// [`ForwarderError::Command`] carrying a structured refusal
+    /// ([`crate::trust_refusal_in`]).
+    pub async fn security_transit(
+        &self,
+        namespace: &Name,
+        carry: bool,
+    ) -> Result<ndn_cert::report::TransitInfo, ForwarderError> {
+        let params = ControlParameters {
+            name: Some(namespace.clone()),
+            flags: (!carry).then_some(verb::TRANSIT_RELEASE),
+            ..Default::default()
+        };
+        let resp = self
+            .send_interest(command_name(module::SECURITY, verb::TRANSIT, &params))
+            .await?;
+        json_answer(resp)
+    }
+
     /// `security/data-inspect`: have the daemon fetch the Data under `name`
     /// (CanBePrefix: from its content store or the network, through its own
     /// forwarder), validate it with its validator and say what it found:

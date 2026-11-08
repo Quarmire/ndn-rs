@@ -1260,6 +1260,13 @@ folder's members record lists, to judge that folder's data
   version; a refresh moves it on only from the version held, by
   continuity (`ScopedContext::moved_on` refuses an older version, another
   of the same number, another namespace).
+- A holder apart from its forwarder — an app beside a daemon — cannot
+  tell the forwarder's validator to expect the versions: it has the
+  forwarder carry the namespace in transit first (mgmt-trust.md
+  "Transit", a local operator's `security/transit`), then fetches the
+  versions over its own connection and checks each itself, as above
+  (`ndn_cert::adopt_scoped` with no forwarder); it takes the mark back if
+  the adoption fails.
 - It judges through a view only: `Keyring::with_scoped_view` shares the
   keyring's held contexts live and governs the scoped namespace's names
   by the scoped context **only where no held context covers them**: a

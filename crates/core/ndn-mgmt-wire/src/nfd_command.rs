@@ -192,6 +192,18 @@ pub mod verb {
     /// stored, served and kept signing with. Authorized like
     /// [`CONTEXT_ADOPT`].
     pub const RENEW: &[u8] = b"renew";
+    /// `security/transit` — carry the self-certifying namespace in
+    /// `ControlParameters.name` (`/user/<0xA1: …>`) in transit for a local
+    /// app that adopted it for one scope of its own alone: this forwarder,
+    /// which does not hold the namespace, forwards its Data unvalidated to
+    /// the Interests pending for it, caches none of it, and runs its sync
+    /// group with the multicast strategy. The keyring is never touched. Each
+    /// command is one mark; [`TRANSIT_RELEASE`] in `Flags` takes one back,
+    /// and the namespace leaves transit with its last mark. Authorized like
+    /// [`CONTEXT_ADOPT`].
+    pub const TRANSIT: &[u8] = b"transit";
+    /// `security/transit` flag bit: take one mark back instead of adding one.
+    pub const TRANSIT_RELEASE: u64 = 1;
     /// `security/memberships` — how this node takes part in each namespace
     /// (trusted prefix) it holds: following, member (with its role and the
     /// identity it signs the namespace's Data as) or owner; a JSON list of

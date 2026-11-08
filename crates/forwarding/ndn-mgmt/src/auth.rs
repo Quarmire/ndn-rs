@@ -274,7 +274,8 @@ fn signature_refused(error: String) -> TrustRefusal {
 }
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
-/// (adopting, refreshing or updating a trust context, enrolling, renewing).
+/// (adopting, refreshing or updating a trust context, enrolling, renewing,
+/// carrying a namespace in transit).
 /// Instead of the signed-command gate they require the caller to be a local
 /// trust administrator — see [`authorize_trust_admin`] — and they are refused
 /// over `/localhop`. Add every future trust-mutating verb here.
@@ -302,6 +303,12 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::ENROLL_STATUS,
+    ),
+    // Carrying a person's namespace in transit lets its Data reach local
+    // apps unvalidated: a trust change too, though the keyring stays as is.
+    (
+        ndn_mgmt_wire::nfd_command::module::SECURITY,
+        ndn_mgmt_wire::nfd_command::verb::TRANSIT,
     ),
     // Deciding who joins the namespace is a trust change too, and the
     // pending requests (keys, devices, codes) stay with local operators.
@@ -791,6 +798,7 @@ mod trust_admin_tests {
         assert!(is_trust_admin_verb(b"security", b"context-refresh"));
         assert!(is_trust_admin_verb(b"security", b"context-update"));
         assert!(is_trust_admin_verb(b"security", b"renew"));
+        assert!(is_trust_admin_verb(b"security", b"transit"));
         for verb in [
             b"invite-create" as &[u8],
             b"invite-list",
