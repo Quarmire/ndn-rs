@@ -3677,6 +3677,18 @@ impl St {
                     coll.waiting.push(hv);
                     return false;
                 }
+                Bound::Unbound => {
+                    // A cut signed before cuts bound bytes accepts nothing,
+                    // but what it keeps is history the owner held: refused,
+                    // and kept with its bytes, so the owner's next record
+                    // binds it from them and it is taken back ([`Inner::bind_cuts`]).
+                    tracing::info!(id = ?hv.version.id, collection = %c, "refused: a removal cut signed before cuts bound bytes keeps it; kept for the owner's next record to bind");
+                    self.other_bytes.remove(name);
+                    self.refused
+                        .insert(name.clone(), Refusal::OutsideCut(cut.clone()));
+                    coll.outsiders.push(hv);
+                    return false;
+                }
                 Bound::Other => {
                     // Other bytes than the cut keeps at that name: refused,
                     // and let go so the bytes it keeps are taken when they
@@ -8813,6 +8825,20 @@ impl Inner {
                             }
                         }
                         self.fetch_kept(false);
+                        return Err(Refusal::OutsideCut(cut));
+                    }
+                    Some((Bound::Unbound, cut)) => {
+                        // Bytes taken now at a seq a cut signed before cuts
+                        // bound bytes keeps need not be the ones its owner
+                        // held: none is taken. The owner's next record binds
+                        // the bytes it holds, asked for then by full name.
+                        tracing::debug!(%name, "refused as a packet: a removal cut signed before cuts bound bytes keeps this seq; the owner's next record binds its bytes");
+                        let mut st = self.st.lock();
+                        if !st.held.contains_key(name) {
+                            st.other_bytes
+                                .entry(name.clone())
+                                .or_insert_with(|| (cut.clone(), 0));
+                        }
                         return Err(Refusal::OutsideCut(cut));
                     }
                     Some((Bound::Missing(full), _)) => {
@@ -15327,10 +15353,12 @@ fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) 
 enum Bound {
     /// Every manifest binding it lists exactly these bytes.
     Listed,
-    /// A manifest lists other bytes at its name, or none; or the cut binds
-    /// what it keeps to no bytes (a record signed before cuts bound
-    /// bytes): outside the cut.
+    /// A manifest lists other bytes at its name, or none: outside the cut.
     Other,
+    /// The cut binds what it keeps to no bytes (a record signed before
+    /// cuts bound bytes): outside the cut, and kept, bytes and all, for the
+    /// owner's next record to bind (spec §8).
+    Unbound,
     /// A manifest packet on its path is not held: fetch it by this full
     /// name, then judge again.
     Missing(Name),
@@ -15410,7 +15438,7 @@ fn bound_bytes(
         }
     }
     match (any, missing) {
-        (false, _) => Bound::Other,
+        (false, _) => Bound::Unbound,
         (true, Some(full)) => Bound::Missing(full),
         (true, None) => Bound::Listed,
     }
@@ -19907,7 +19935,7 @@ mod tests {
         let judge =
             |cut: &Cut, digest: &[u8; 32]| bound_bytes(&held, &store, cut, &c, &id, &name, digest);
         assert!(
-            matches!(judge(&unbound, &honest), Bound::Other),
+            matches!(judge(&unbound, &honest), Bound::Unbound),
             "an unbound cut"
         );
         assert!(

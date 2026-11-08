@@ -157,9 +157,12 @@ impl std::fmt::Display for Refusal {
                     "its key lies under {}, which {} cut (a writer the collection's owner \
                      removed, or a key its namespace's trust context revoked), and the cut \
                      accepts exactly {}, which this version is not — another seq, another \
-                     collection, or other bytes at a name it keeps — whatever date or seq it \
-                     claims; ask the owner (who may write the member back in, or re-admit this \
-                     exact version of a revoked key)",
+                     collection, or other bytes at a name it keeps, or a version a removal cut \
+                     keeps without binding its bytes (a record from a build before cuts bound \
+                     bytes: kept here, refused until the owner's next members record binds it) \
+                     — whatever date or seq it claims; ask the owner (who may write the member \
+                     back in, share the collection again from a current build to bind what an \
+                     old removal cut keeps, or re-admit this exact version of a revoked key)",
                     cut.of,
                     cut.signer.key(),
                     if accepted.is_empty() {
