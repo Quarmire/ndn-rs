@@ -243,9 +243,12 @@ fn folder_epoch(dev: &Device, f: &Name) -> (Epoch, ContentKey) {
 /// Bob's version 1 of `plan`, which inherits the folder's record.
 async fn inheriting(readers: Vec<Audience>) -> (Device, Name) {
     let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
-    dev.share_folder(&folder(), share(Rule::Log, &["/alice", "/bob"], readers))
-        .await
-        .unwrap();
+    dev.share_folder(
+        &folder(),
+        share(Rule::Log, &["/alice", "/bob"], readers).into(),
+    )
+    .await
+    .unwrap();
     let bob = n("/bob/phone");
     assert_eq!(
         hand(&dev, &bob, &plan(), 1, version(&bob, &plan(), 1, None)),
@@ -369,7 +372,8 @@ async fn a_writer_does_not_seal_for_a_reader_the_folder_dropped() {
                 Rule::Log,
                 &["/alice", "/bob"],
                 vec![person("/alice"), person("/bob"), person("/carol")],
-            ),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -411,7 +415,8 @@ async fn a_writer_does_not_seal_for_a_reader_the_folder_dropped() {
                 Rule::Log,
                 &["/alice", "/bob"],
                 vec![person("/alice"), person("/bob")],
-            ),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -449,7 +454,8 @@ async fn a_folder_epoch_key_is_destroyed_only_once_every_writer_left_it_everywhe
             Rule::Log,
             &["/alice"],
             vec![person("/alice"), person("/bob")],
-        ),
+        )
+        .into(),
     )
     .await
     .unwrap();
@@ -477,9 +483,12 @@ async fn a_folder_epoch_key_is_destroyed_only_once_every_writer_left_it_everywhe
         None
     );
     // Bob removed: a new folder epoch.
-    dev.share_folder(&f, share(Rule::Log, &["/alice"], vec![person("/alice")]))
-        .await
-        .unwrap();
+    dev.share_folder(
+        &f,
+        share(Rule::Log, &["/alice"], vec![person("/alice")]).into(),
+    )
+    .await
+    .unwrap();
     let (second, second_key) = folder_epoch(&dev, &f);
     assert_ne!(first, second);
     // The phone moves on and prunes its version of the first epoch; the
@@ -560,7 +569,8 @@ async fn a_folder_epoch_is_kept_while_a_collection_under_it_is_not_known() {
                 Rule::Log,
                 &["/alice", "/bob"],
                 vec![person("/alice"), person("/bob")],
-            ),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -571,7 +581,7 @@ async fn a_folder_epoch_is_kept_while_a_collection_under_it_is_not_known() {
     owner
         .share_folder(
             &f,
-            share(Rule::Log, &["/alice", "/bob"], vec![person("/bob")]),
+            share(Rule::Log, &["/alice", "/bob"], vec![person("/bob")]).into(),
         )
         .await
         .unwrap();
@@ -624,7 +634,8 @@ async fn pruning_in_the_folder_epoch_in_force_rotates_it_and_erases_its_key() {
             Rule::Log,
             &["/alice"],
             vec![person("/alice"), person("/bob")],
-        ),
+        )
+        .into(),
     )
     .await
     .unwrap();
@@ -754,7 +765,7 @@ async fn a_walk_that_never_went_toward_the_folder_does_not_count_for_it() {
 async fn a_cut_is_signed_over_what_is_held_whoever_stays_away() {
     let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
     let f = folder();
-    dev.share_folder(&f, share(Rule::Log, &["/alice", "/bob"], Vec::new()))
+    dev.share_folder(&f, share(Rule::Log, &["/alice", "/bob"], Vec::new()).into())
         .await
         .unwrap();
     // Bob wrote in two collections under the folder, held here, neither
@@ -770,7 +781,7 @@ async fn a_cut_is_signed_over_what_is_held_whoever_stays_away() {
     );
     knows(&dev, "/bob/phone", 3, 0);
     // Removing him is not held off by his phone staying away.
-    dev.share_folder(&f, share(Rule::Log, &["/alice"], Vec::new()))
+    dev.share_folder(&f, share(Rule::Log, &["/alice"], Vec::new()).into())
         .await
         .unwrap();
     // The cut covers what is held, in every collection under the folder.
@@ -797,7 +808,8 @@ async fn an_epoch_owed_when_the_device_stopped_is_owed_again_after_a_restart() {
             Rule::Log,
             &["/alice"],
             vec![person("/alice"), person("/bob")],
-        ),
+        )
+        .into(),
     )
     .await
     .unwrap();
@@ -840,7 +852,8 @@ async fn another_writers_prune_in_the_folder_epoch_in_force_rotates_it() {
             Rule::Log,
             &["/alice"],
             vec![person("/alice"), person("/bob")],
-        ),
+        )
+        .into(),
     )
     .await
     .unwrap();
@@ -883,5 +896,38 @@ async fn a_lost_device_marked_suspected_is_not_waited_for() {
         .insert(n("/alice/phone/KEY/1"), Timestamp(1));
     dev.put(&plan(), reading(1), options()).await.unwrap();
     assert_eq!(own(&dev, &plan()).revision, Seq(1));
+    dev.shutdown();
+}
+
+/// A put into another person's collection with no members record held is
+/// refused by signed data only (spec §18.1): while a device of that
+/// namespace heard here was not walked toward the collection, its record
+/// may still arrive — a lost packet on a faulty network — so the put is
+/// `NotReady`; once every one was walked and none listed a record, the key
+/// may not write there: `NotAllowed`.
+#[tokio::test]
+async fn a_put_into_another_namespace_is_refused_only_once_its_devices_were_walked() {
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    // Alice's laptop is heard in her namespace's group, never walked.
+    let _ = dev.inner.join(&n("/alice")).await;
+    dev.inner
+        .st
+        .lock()
+        .groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(n("/alice/laptop"));
+    not_ready(dev.put(&plan(), reading(1), options()).await.unwrap_err());
+    // Walked in full, it listed no record of the plan.
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .entry((n("/alice/laptop"), n("/alice")))
+        .or_default()
+        .root = Some([1; 32]);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(matches!(refused, DataError::NotAllowed { .. }), "{refused}");
     dev.shutdown();
 }

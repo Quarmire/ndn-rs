@@ -178,7 +178,8 @@ async fn make(dir: &Path, count: usize) {
             rule: Rule::Merge { function: n(RULE) },
             writers: vec![n("/alice")],
             readers: Vec::new(),
-        },
+        }
+        .into(),
     )
     .await
     .unwrap();

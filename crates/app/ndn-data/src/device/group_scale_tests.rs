@@ -119,7 +119,8 @@ async fn measure(count: usize) {
                 rule: Rule::Merge { function: n(RULE) },
                 writers: vec![n("/alice")],
                 readers: vec![Audience::Person(n("/bob"))],
-            },
+            }
+            .into(),
         )
         .await
         .unwrap();

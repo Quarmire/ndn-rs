@@ -896,3 +896,71 @@ async fn merge_pieces_are_not_released_without_a_covering_checkpoint_proved_kept
     assert!(dev.inner.store.contains(&chunk), "its pieces stay");
     dev.shutdown();
 }
+
+/// The version told for `id` among `seen`, which must be there.
+fn told<'c>(seen: &'c [Change], id: &VersionId) -> &'c Version {
+    seen.iter()
+        .find_map(|c| match c {
+            Change::Version(v) if v.id == *id => Some(v),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{id:?} is told: {seen:?}"))
+}
+
+/// What a `get` of version name `name` answers, which must be a version.
+async fn got(dev: &Device, name: &Name) -> Version {
+    match dev.get(name).await.unwrap().got {
+        Got::Version(v) => v,
+        other => panic!("not a version: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_merge_version_comes_to_a_host_with_its_operation_and_digest() {
+    let dev = device(rules()).await;
+    let mut changes = dev.watch(&c(), &Frontier::new()).await.unwrap();
+    drain(&mut changes).await;
+    // Another writer's version: told, and read by its name, with the
+    // octets its rule applied and its packet's implicit digest.
+    let op = edit(None, "a");
+    let a = version("/bob/laptop", 10, &[], op.clone());
+    give(&dev, &a);
+    let seen = drain(&mut changes).await;
+    let v = told(&seen, &a.id());
+    assert_eq!((v.digest, v.op.as_ref()), (a.digest(), Some(&op)));
+    let v = got(&dev, &a.name).await;
+    assert_eq!((v.digest, v.op.as_ref()), (a.digest(), Some(&op)));
+    // This device's own: its digest is what the version after it names.
+    let mine = edit(Some(a.digest()), "b");
+    let own = dev.put_op(&c(), mine.clone(), options()).await.unwrap();
+    let seen = drain(&mut changes).await;
+    let v = told(&seen, &own).clone();
+    assert_eq!(v.op.as_ref(), Some(&mine));
+    let next = dev
+        .put_op(&c(), edit(Some(v.digest), "c"), options())
+        .await
+        .unwrap();
+    let after = told(&drain(&mut changes).await, &next).clone();
+    assert_eq!(
+        after.parents.digest(&own.writer),
+        Some(&v.digest),
+        "{after:?}"
+    );
+    assert_eq!(got(&dev, &v.name).await.digest, v.digest);
+    // An operation in pieces: told without it (its payload is listed by
+    // size), read whole by its name with it.
+    let big = edit(None, &"p".repeat(3 * wire::INLINE_MAX));
+    let (large, pieces) = in_pieces("/carol/laptop", 3, &[], big.clone());
+    for p in pieces {
+        dev.inner.store.insert(p.name, p.wire);
+    }
+    give(&dev, &large);
+    dev.inner.st.lock().pieces_arrived(&c(), &large.name);
+    let seen = drain(&mut changes).await;
+    let v = told(&seen, &large.id());
+    assert!(matches!(v.payload, Payload::Large { .. }), "{v:?}");
+    assert_eq!((v.digest, v.op.as_ref()), (large.digest(), None));
+    let v = got(&dev, &large.name).await;
+    assert_eq!((v.digest, v.op.as_ref()), (large.digest(), Some(&big)));
+    dev.shutdown();
+}

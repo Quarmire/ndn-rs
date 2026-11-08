@@ -1311,6 +1311,36 @@ writer had reached in the update's past (§5.1).
 **Pieces served to some devices only.** A writer could serve a version's
 pieces to one device, which builds on it, and to no one else, so everyone
 else's copy of what that device writes would stall. A device serves the
+- **Changing a folder's members.** `share_folder(F, change)` (§15) adds
+  and removes writer prefixes and readers of `F`'s own record in force,
+  and signs the result as the next revision exactly as a whole record
+  listing it: the same cuts for the writers it drops, the same new epoch
+  for a reader it drops, the same offers closed (§19.7). The change MUST
+  be applied to the record in force at the moment the device signs, under
+  the same lock it signs under, never to a copy read earlier: a member
+  added in between — by this device's admission of an introduction
+  (§19.4), or by a record of another owner device taken meanwhile — stays,
+  and a let-go names only whom it lets go. A writer to add that a listed
+  prefix covers, a reader to add that the record admits (or any reader of
+  a folder not sealed, which every reader reads), a writer or reader to
+  remove that is neither listed nor covered: each changes nothing. A
+  change that changes nothing signs nothing. The rule stays the record's.
+  It is refused, nothing signed (`BadRequest`, saying why and to share the
+  record whole instead), when it removes a writer or reader not listed but
+  covered by one listed (removing it would remove nothing at readers),
+  leaves no writer (a record listing none takes the writers of the
+  folders above, another meaning), leaves a sealed folder no reader (it
+  would unseal it), or changes the one writer of a one-key record. With no
+  record of `F` held it answers `NotReady`: share it whole first. An
+  introduction's admission is such a change (§19.4).
+- **Reading the record in force.** `members(F)` answers the rule, writers
+  and readers of `F`'s record in force: its own narrowed by the folders
+  above (the effective record's levels, above), whoever signed it.
+  `members(C)` of a collection answers its effective record's, which for
+  a collection with no record of its own is its nearest folder's; a name
+  with a folder record held answers the folder's. A watch is told
+  `Change::Members` when it changes (§15). Both read only records held
+  and verified here, so two devices holding the same records answer alike.
 pieces of every merge version it applied, and readers ask the devices
 whose versions are made over it (§13.1), so the version is available
 wherever something built on it is. This lets a holder under audit relay a
@@ -1403,6 +1433,17 @@ epoch's key is erased only at a device that follows the folder whole and
 has walked every device it knows (§14); a device that follows only some
 collections under it keeps the key, as it cannot tell what the others
 still hold.
+**A let-go signed from a stale list.** A host that kept its own copy of a
+folder's members and signed a whole record from it would drop every
+member added since — an introduction's admission signs internally — and
+the cut would refuse that member's later writes. The layer answers the
+record in force (`members`), tells every change of it (`Change::Members`),
+and takes a change applied under the signing lock to the record held
+then (§6.1), so a let-go removes exactly whom it names. Records of one
+revision signed concurrently by two owner devices still merge with
+removals winning (§6): a change does not make an addition outlast a
+removal another device signed.
+
 
 **Narrowing by accident.** A collection's first own record under a folder
 starts from the folder's effective record, so taking one never silently
@@ -2840,10 +2881,12 @@ With blocks, heads and expiry:
 | `hold` | `hold(prefix, {copies, until, holders}) → custody` | 3 |
 | `prune` | `prune(prefix, upto)` | 2 (refusing others' writes), 3 |
 | `share` | `share(collection, {rule, readers, writers})` | 1 (adding), 2 (removing, the rule), 4 (one key) |
-| `share_folder` | `share_folder(folder, {rule, readers, writers})` | 6 |
+| `share_folder` | `share_folder(folder, {rule, readers, writers} \| change)` | 6 |
+| `members` | `members(folder \| collection) → {rule, writers, readers}` | 6 |
 
-`put_op` and `put_group` are forms of `put`, and `share_folder` of
-`share`: the verbs stay seven. Code mostly uses `get`, `put` and `watch`.
+`put_op` and `put_group` are forms of `put`, `share_folder` of `share`,
+and `members` reads what they signed, as a `get` reads a version: the
+verbs stay seven. Code mostly uses `get`, `put` and `watch`.
 `hold`, `prune` and `share` run on host policy, or on the person's
 gesture. A function's answer is a `get` on its name (a later slice).
 Exposure over forwarder management and the mobile FFI is slice 7. A device
@@ -3126,12 +3169,24 @@ the writer did not answer.
   writer the folder's writers do not cover or a reader its readers do not
   admit answers `BadRequest`, saying what it would widen and to share the
   folder instead (next step `FixRequest`).
-- **`share_folder(F, {rule, writers, readers})`** signs the next revision
-  of folder `F`'s folder record (§6.1): at a device of `F`'s namespace
-  only (else `NotOwner`), of a folder of at least one path component
-  (else `BadName`), with the cuts across every collection under `F`, the
-  folder epoch and `Since` of §6 and §9. It looks at `F` first, and a
-  record removing a writer walks that writer's devices as `share` does.
+- **`share_folder(F, {rule, writers, readers} | change)`** signs the next
+  revision of folder `F`'s folder record (§6.1): at a device of `F`'s
+  namespace only (else `NotOwner`), of a folder of at least one path
+  component (else `BadName`), with the cuts across every collection under
+  `F`, the folder epoch and `Since` of §6 and §9. It looks at `F` first,
+  and a record removing a writer walks that writer's devices as `share`
+  does. Given a change (`ShareChange`: writers and readers to add and to
+  remove), it applies it to `F`'s own record in force when it signs, under
+  the signing lock, and signs the result as the whole record; a change
+  that changes nothing signs nothing; refusals and `NotReady` as §6.1
+  says.
+- **`members(F | C)`** answers the record in force (§6.1): of a folder
+  whose record is held, its own narrowed by the folders above; else of
+  collection `C`, its effective record. With no record over the name held
+  here it answers `NotReady` (next step `RetryLater`), saying so and what
+  to do: a device of its namespace shares it first; any other device
+  follows or watches it so the owner's record is fetched. A name that is
+  no data-layer name answers `BadName`.
 - **`hold(C, {copies, until, holders})`** (a device of `C`'s namespace,
   else `NotOwner`) names the holder devices, at least `copies` of them,
   none of them this device: else `BadRequest`, whose next step,
@@ -3220,6 +3275,18 @@ Every name parses one way, and a reader MUST refuse one that does not:
   namespace, never a node under one.
 - **State.** `32=state` is the next-to-last component and the collection
   name precedes it.
+- **Every `Version` a host receives** — answered by `get`, delivered or
+  listed by `watch`, carried whole in an equivocation — MUST carry
+  `digest`, the implicit digest of its packet (SHA-256 of the whole Data
+  wire: the name a merge operation's basis and a parent's `Digest` use,
+  §4, §5.1), and `op`: the `MergeOp` octets of a merge version, exactly
+  as its rule's check and apply received them, or nothing under the log
+  and one-key rules. A merge version's `op` is absent too while its
+  operation is not open here — sealed in an epoch whose key the device
+  does not hold, or carried in pieces and not read whole (`Payload::Large`,
+  listed by its size); a `get` of its name reads it whole and carries it.
+  A host keeping versions for history so names them as operations do,
+  and reads their edits, with no index of its own.
 - **Entry.** The last component is `seg=<i>` (a SegmentNameComponent), the
   next-to-last `32=entry`, and what precedes them is a log entry name with a
   collection: the block.
@@ -3309,6 +3376,20 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0564 | Bucket | NonNegativeInteger 0–15 |
 | 0x0566 | PagePath | octets, one bucket each (pages only) |
 | 0x0568 | Writer | Name (the writer's key) |
+  A watch is told the members record in force (`Change::Members`, with
+  the rule, writers and readers `members` answers): of a folder,
+  whenever its record in force changes — whoever signed the record that
+  changed it: this device (`share_folder`, an introduction's admission,
+  §19.4), another device of the owner, a merge of concurrent records —
+  tagged with the folder; of a collection, whenever its effective record
+  changes, tagged with the collection. A watch of a name is told that
+  name's; a watch of a folder is also told each folder under it, and each
+  collection under it that has a record of its own (a collection that
+  only inherits is told on its own watch, its folder's change included).
+  Only a change of what `members` answers is told, never a cut or epoch
+  alone. The listing starts with the record in force over each such name
+  held here, so a host that watches and then reads misses no change.
+
 | 0x056A | Cuts | Cut*, by prefix |
 | 0x056C | Cut | Name (removed writer prefix), CutBytes* (§8), then — in a collection's record — per key it keeps versions of in the collection, by key: Writer, Entries (exactly those seqs, §8); or — in a folder's record — CutIn*, by collection (§6.1); a signer gives a cut that keeps versions its CutBytes, one that keeps none none (a cut keeping versions without them binds them to no bytes, §8) |
 | 0x056E | SealEpoch | Name (the device that signed the record starting it), Seq (that record's seq) |
@@ -3870,12 +3951,16 @@ seqs carries a second entry is refused for its group at every reader),
 f1 (a folder of 1,000
 collections: a reader asks one grant per folder epoch, not one per
 collection), f2 (narrowing a collection under a folder works; widening
-it is refused, and a widening record signed anyway has no effect) and f3
+it is refused, and a widening record signed anyway has no effect), f3
 (a collection taking its first own record under a folder: a writer it
 drops keeps its earlier versions, cut at what the owner held, and a seal
-keeps what was written unsealed before readable, at every reader). Their
-features are `RuleByName`, `AppOps`, `MergePieces`, `Groups` and
-`FolderMembers`.
+keeps what was written unsealed before readable, at every reader) and f4
+(Carol and Bob join a note by codes; the owner's `members` and folder
+watch show both with no gesture of hers; she lets Carol go with a change
+naming Carol alone, and Bob stays a member, writing and reading, his
+device holding the same record, while Carol no longer reads what follows).
+Their features are `RuleByName`, `AppOps`, `MergePieces`, `Groups`,
+`FolderMembers` and, for f4, `Introduction`.
 
 The large-group case is g5 (one folder of 2,000 element collections; a
 writer puts one edit into each as a single group, above the former bound
@@ -4217,7 +4302,9 @@ verified chain from the asker's key to its anchor, named under the asker's
 namespace, and no other presented certificate; and signs the folder's next
 members record adding the asker's namespace as a writer (a writer's role)
 and as a reader (when the folder is sealed), unless the record in force
-already admits it so (`share_folder`, §6.1). If the adoption or the record
+already admits it so — a change of the record in force, applied when it
+signs (`share_folder`, §6.1), so a let-go signed meanwhile stays and the
+host is told the new record (`Change::Members`, §15). If the adoption or the record
 fails, or the anchors are refused, it drops the note durably — the offer
 is not spent — and gives no answer to a failure, `Conflict` to refused
 anchors; the joiner's retry is judged again. Else it keeps the acceptance

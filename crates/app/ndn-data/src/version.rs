@@ -342,6 +342,17 @@ pub struct Version {
     pub rule: Option<Name>,
     /// The content.
     pub payload: Payload,
+    /// The implicit digest of the version's packet: SHA-256 of its whole
+    /// Data wire, its content address — what a merge operation's basis and
+    /// a parent's digest name (spec §4, §5.1).
+    pub digest: [u8; 32],
+    /// The `MergeOp` octets of a merge version (`rule` is `Some`), as the
+    /// rule's [`Op::bytes`](crate::Op::bytes) received them. `None` under
+    /// the log and one-key rules, and while the operation is not open
+    /// here: sealed in an epoch whose key this device does not hold, or
+    /// carried in pieces and not read whole ([`Payload::Large`]; a `get` of
+    /// the version's name reads it whole and fills it).
+    pub op: Option<bytes::Bytes>,
 }
 
 /// The most versions one group holds (spec §5.5): as many seqs as a summary

@@ -331,7 +331,8 @@ struct HeldVersion {
 }
 
 impl HeldVersion {
-    /// A version as held: opened unless its payload is in pieces.
+    /// A version as held: opened unless its payload is in pieces. Its
+    /// digest is the version's ([`Version::digest`], of `wire`).
     fn new(
         version: Version,
         op: Bytes,
@@ -341,7 +342,7 @@ impl HeldVersion {
         chunks: Option<ChunksBody>,
     ) -> Self {
         HeldVersion {
-            digest: wire::implicit_digest(&wire),
+            digest: version.digest,
             version,
             op,
             wire,
@@ -3470,7 +3471,14 @@ impl St {
             let own = self.folders.get(&n).and_then(|x| x.line.own.as_ref());
             let new = collection::effective(&n, own, &self.folders_above(&n));
             let folder = self.folders.edit().get_mut(&n).expect("listed above");
-            folder.members = new;
+            let old = std::mem::replace(&mut folder.members, new);
+            Self::tell_members(
+                &mut self.watchers,
+                &n,
+                true,
+                old.as_ref(),
+                folder.members.as_ref(),
+            );
             if owes_epoch(
                 folder.line.own.as_ref(),
                 folder.members.as_ref(),
@@ -3535,6 +3543,88 @@ impl St {
         let parked: Vec<VersionId> = self
             .colls
             .get(c)
+    /// What [`DataLayer::members`] answers for `name` (spec §15): the
+    /// record in force of the folder `name` when one is held, else that of
+    /// collection `name` — its own narrowed by the folders above it, or the
+    /// nearest folder's when it has none.
+    fn members_in_force(&self, name: &Name) -> Option<crate::layer::Share> {
+        if let Some(m) = self.folders.get(name).and_then(|f| f.members.as_ref()) {
+            return Some(crate::layer::Share::of(m));
+        }
+        match self.colls.get(name).and_then(|c| c.members.as_ref()) {
+            Some(m) => Some(crate::layer::Share::of(m)),
+            None => self.effective(name).as_ref().map(crate::layer::Share::of),
+        }
+    }
+
+    /// The [`Change::Members`] a watch of `target` lists first (spec §15):
+    /// the record in force over `target`, then over each folder strictly
+    /// under it and each collection under it with a record of its own, by
+    /// name; what is held here.
+    fn members_listing(&self, target: &Name) -> Vec<Change> {
+        let told = |name: &Name, m: &Members| Change::Members {
+            collection: name.clone(),
+            share: crate::layer::Share::of(m),
+        };
+        let mut out: Vec<Change> = self
+            .members_in_force(target)
+            .map(|share| Change::Members {
+                collection: target.clone(),
+                share,
+            })
+            .into_iter()
+            .collect();
+        let mut under: Vec<Change> = self
+            .folders
+            .iter()
+            .filter(|(f, _)| f.has_prefix(target) && *f != target)
+            .filter_map(|(f, x)| x.members.as_ref().map(|m| told(f, m)))
+            .chain(
+                self.colls
+                    .iter()
+                    .filter(|(c, x)| c.has_prefix(target) && *c != target && x.line.own.is_some())
+                    .filter_map(|(c, x)| x.members.as_ref().map(|m| told(c, m))),
+            )
+            .collect();
+        under.sort_by(|a, b| a.collection().cmp(b.collection()));
+        out.extend(under);
+        out
+    }
+
+    /// Tell `watchers` that the members record in force over `name` (a
+    /// folder's, or a collection's) moved from `old` to `new`, when what
+    /// [`DataLayer::members`] answers changed ([`Change::Members`]): a
+    /// watch of `name` itself and, when `own` — a folder, or a collection
+    /// with a record of its own — a watch of a folder above it. Borrows
+    /// the watchers alone, so the records stay where they are held.
+    fn tell_members(
+        watchers: &mut Vec<Watcher>,
+        name: &Name,
+        own: bool,
+        old: Option<&Members>,
+        new: Option<&Members>,
+    ) {
+        let Some(new) = new else {
+            return;
+        };
+        if old.is_some_and(|o| {
+            o.rule == new.rule && o.writers == new.writers && o.readers == new.readers
+        }) {
+            return;
+        }
+        watchers.retain(|w| !w.tx.is_closed());
+        let mut change = None;
+        for w in watchers.iter_mut() {
+            if w.target == *name || (own && name.has_prefix(&w.target)) {
+                let change = change.get_or_insert_with(|| Change::Members {
+                    collection: name.clone(),
+                    share: crate::layer::Share::of(new),
+                });
+                w.send(change.clone());
+            }
+        }
+    }
+
             .map(|x| x.parked.keys().cloned().collect())
             .unwrap_or_default();
         let unparked = self.unpark(c, &parked);
@@ -3741,6 +3831,9 @@ impl St {
                 Bound::Missing(full) => {
                     tracing::debug!(id = ?hv.version.id, %full, "waits in {c} for the manifest of the removal cut keeping it");
                     self.bytes_wanted.entry(full).or_default().insert(c.clone());
+        // Its watchers learn the record in force before what it refuses.
+        let own = self.colls.get(c).is_some_and(|x| x.line.own.is_some());
+        Self::tell_members(&mut self.watchers, c, own, old.as_ref(), new.as_ref());
                     coll.waiting.push(hv);
                     return false;
                 }
@@ -3952,7 +4045,7 @@ impl St {
         }
         let op = body.op.clone();
         let chunks = body.chunks;
-        let version = version_of(name, &writer, seq, body);
+        let version = version_of(name, &writer, seq, body, wire::implicit_digest(&wire), true);
         Some(Ok(HeldVersion::new(
             version, op, wire, sealed, epoch, chunks,
         )))
@@ -4695,8 +4788,15 @@ impl St {
     /// equivocation. Both are kept, and it is reported to the watchers of
     /// both collections where both are versions. Whether it is such a
     /// second entry: once it is taken, the writer's groups over that seq
-    /// are judged again ([`Self::regroup_seq`]).
-    fn note_seq(&mut self, name: &Name, writer: &Writer, seq: u64, record: &Record) -> bool {
+    /// are judged again ([`Self::regroup_seq`]). `wire`: its packet.
+    fn note_seq(
+        &mut self,
+        name: &Name,
+        writer: &Writer,
+        seq: u64,
+        record: &Record,
+        wire: &[u8],
+    ) -> bool {
         let key = (writer.clone(), seq);
         let first = match self.seqs.get(&key) {
             None => {
@@ -4720,7 +4820,9 @@ impl St {
         if let Record::Version(body) = record
             && let Some(first) = self.held_version(&first)
         {
-            let second = version_of(name, writer, seq, body.clone());
+            let open = body.sealed.is_none();
+            let digest = wire::implicit_digest(wire);
+            let second = version_of(name, writer, seq, body.clone(), digest, open);
             let mut told = vec![body.collection.clone()];
             if first.collection != body.collection {
                 told.push(first.collection.clone());
@@ -4781,7 +4883,7 @@ impl St {
             }
             let second = match self.reload(name, self.twins[name].clone()) {
                 Some(Ok(hv)) => hv.version,
-                Some(Err(lk)) => version_of(name, &lk.writer, lk.seq, lk.body),
+                Some(Err(lk)) => lk.version(),
                 None => continue,
             };
             out.push(Change::Equivocation {
@@ -4904,7 +5006,7 @@ impl St {
                 coll.locked
                     .iter()
                     .find(|lk| lk.name == *name)
-                    .map(|lk| version_of(name, &lk.writer, lk.seq, lk.body.clone()))
+                    .map(|lk| lk.version())
             })
             .or_else(|| {
                 // Parked while its group waits, or of a collection not
@@ -4916,7 +5018,7 @@ impl St {
                 };
                 match self.reload(name, self.store.get(&at)?)? {
                     Ok(hv) => Some(hv.version),
-                    Err(lk) => Some(version_of(name, &lk.writer, lk.seq, lk.body)),
+                    Err(lk) => Some(lk.version()),
                 }
             })
     }
@@ -5565,7 +5667,14 @@ impl St {
             }
             let op = body.op.clone();
             let chunks = body.chunks;
-            let version = version_of(&name, &writer, seq, body);
+            let version = version_of(
+                &name,
+                &writer,
+                seq,
+                body,
+                wire::implicit_digest(&wire),
+                true,
+            );
             self.held.insert(name, Held::Version(version.id.clone()));
             self.admit(Arc::new(HeldVersion::new(
                 version, op, wire, true, epoch, chunks,
@@ -9353,8 +9462,8 @@ fn relayed_name(node: &Name) -> Name {
         // A key's log is one sequence across its collections and entry
         // kinds (spec §4): another entry at a seq it used is equivocation.
         // An entry the trust context refuses is a thief's (spec §8.1).
-        let second =
-            !st.cut_out.contains_key(&name) && st.note_seq(&name, &writer, parsed.seq, &record);
+        let second = !st.cut_out.contains_key(&name)
+            && st.note_seq(&name, &writer, parsed.seq, &record, &wire);
         if let (Record::Version(_), Some(c)) = (&record, &parsed.subject)
             && let Some(p) = st.colls.get(c).and_then(|x| x.pruned(&id)).cloned()
         {
@@ -9589,7 +9698,7 @@ fn relayed_name(node: &Name) -> Name {
                 }
                 let op = body.op.clone();
                 let chunks = body.chunks;
-                let version = version_of(&name, &writer, seq, body);
+                let version = version_of(&name, &writer, seq, body, digest, true);
                 st.held
                     .insert(name.clone(), Held::Version(version.id.clone()));
                 let in_folder_epoch = epoch
@@ -9755,6 +9864,8 @@ fn relayed_name(node: &Name) -> Name {
                 // namespace asks for its erasure: the folder moves to a new
                 // epoch first, whoever pruned (spec §14).
                 let folders: Vec<Name> = st
+                        wire::implicit_digest(&wire),
+                        body.sealed.is_none(),
                     .folders
                     .keys()
                     .filter(|f| {
@@ -11915,7 +12026,14 @@ fn relayed_name(node: &Name) -> Name {
         };
         let wire = self.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
         let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
-        let version = version_of(&name, &self.writer, seq, body);
+        let version = version_of(
+            &name,
+            &self.writer,
+            seq,
+            body,
+            wire::implicit_digest(&wire),
+            true,
+        );
         let held = HeldVersion {
             opened: true,
             ..HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks)
@@ -14285,7 +14403,7 @@ impl Inner {
             .ok_or_else(unavailable)?;
         let bad = || refused(&v.name, Refusal::BadSignature);
         // A payload in pieces is one entry: a block always travels inline.
-        let fields = match epoch {
+        let (fields, op) = match epoch {
             Some(e) => {
                 let key = self.st.lock().keys.key(&v.collection, &e).ok_or_else(|| {
                     DataError::Sealed {
@@ -14293,15 +14411,11 @@ impl Inner {
                     }
                 })?;
                 match seal::open_payload(&key, &v.name, &payload) {
-                    Some(Inline::Fields(fields, _)) => fields,
+                    Some(Inline::Fields(fields, op)) => (fields, op),
                     _ => return Err(bad()),
                 }
             }
-            None => {
-                wire::decode_payload(Bytes::from(payload))
-                    .map_err(|_| bad())?
-                    .0
-            }
+            None => wire::decode_payload(Bytes::from(payload)).map_err(|_| bad())?,
         };
         Ok(Version {
             payload: Payload::Entry(fields),
@@ -14863,8 +14977,11 @@ impl Inner {
         let parsed = parse_log_name(record)?;
         let c = parsed.subject.clone()?;
         let ns = namespace_of(&c)?;
+        // Read whole, a merge version's operation is open.
+        let op = v.rule.is_some().then_some(op);
         if !self.config.hold_for.contains(&ns) {
             tracing::debug!(collection = %c, "hold refused: this device holds for none of its namespace");
+            op,
             return None;
         }
         let (proof, asker) = Self::claimed_asker(&ask.asker)?;
@@ -15929,7 +16046,20 @@ fn refused(name: &Name, why: Refusal) -> DataError {
     DataError::Refused { id, why }
 }
 
-fn version_of(name: &Name, writer: &Writer, seq: u64, body: VersionBody) -> Version {
+/// The version `body` signed by `writer` at `seq` describes, its packet's
+/// implicit digest `digest`. `open`: whether its payload is open here (not
+/// sealed, or opened), so that its operation is the body's; a merge
+/// version's operation is carried ([`Version::op`]) only then, and only
+/// when it stands in the record, not in pieces.
+fn version_of(
+    name: &Name,
+    writer: &Writer,
+    seq: u64,
+    body: VersionBody,
+    digest: [u8; 32],
+    open: bool,
+) -> Version {
+    let op = (open && body.rule.is_some() && body.chunks.is_none()).then_some(body.op);
     Version {
         id: VersionId {
             writer: writer.clone(),
@@ -16547,6 +16677,8 @@ impl DataLayer for Device {
             };
         }
         if parse_log_name(name).is_some() {
+        digest,
+        op,
             return inner.get_log_entry(name).await;
         }
         check_collection(name)?;
@@ -16563,6 +16695,21 @@ impl DataLayer for Device {
             let st = inner.st.lock();
             if inner.sealed_off(&st, name) {
                 return Err(DataError::Sealed { name: name.clone() });
+impl Locked {
+    /// The version it is, its payload not open: no fields, no operation.
+    fn version(&self) -> Version {
+        let digest = wire::implicit_digest(&self.wire);
+        version_of(
+            &self.name,
+            &self.writer,
+            self.seq,
+            self.body.clone(),
+            digest,
+            false,
+        )
+    }
+}
+
             }
             st.colls.get(name).and_then(one_key)
         };
@@ -16691,7 +16838,11 @@ impl DataLayer for Device {
             }
             // Stable: a version comes before why it is not counted.
             listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            let mut changes: Vec<Change> = listed.into_iter().map(|(_, _, c)| c).collect();
+            // First the records in force (spec §15): over the target, and
+            // over each folder and each collection with a record of its own
+            // under it.
+            let mut changes = st.members_listing(collection);
+            changes.extend(listed.into_iter().map(|(_, _, c)| c));
             // The equivocation evidence held of what lies under the target,
             // whatever its frontier: it is reported as long as it is held
             // (spec §4), each version of another collection by name and id.
@@ -16997,14 +17148,14 @@ impl DataLayer for Device {
     async fn share_folder(
         &self,
         folder: &Name,
-        members: crate::layer::Share,
+        members: crate::layer::Sharing,
     ) -> Result<(), DataError> {
         self.share_subject(
             Subject {
                 name: folder.clone(),
                 folder: true,
             },
-            members,
+            crate::layer::Sharing::Whole(members),
         )
         .await
     }
@@ -17013,11 +17164,14 @@ impl DataLayer for Device {
 impl Device {
     /// [`DataLayer::share`] and [`DataLayer::share_folder`]: sign the next
     /// members record of subject `s` — a collection, or a folder governing
-    /// every collection under it (spec §6) — owned by this namespace.
+    /// every collection under it (spec §6) — owned by this namespace: the
+    /// whole content given, or a change to its own record in force,
+    /// applied to the record held when it is signed, under the lock it is
+    /// signed under (spec §15).
     async fn share_subject(
         &self,
         s: Subject,
-        members: crate::layer::Share,
+        members: crate::layer::Sharing,
     ) -> Result<(), DataError> {
         let inner = &self.inner;
         let name = &s.name;
@@ -17028,26 +17182,6 @@ impl Device {
                 collection: name.clone(),
             });
         }
-        // A one-key collection is written by exactly one key (spec §5.3):
-        // named as a key, or as this device (its key).
-        let writers = match (&members.rule, members.writers.as_slice()) {
-            (Rule::OneKey, [w]) if *w == inner.device => vec![inner.writer.key().clone()],
-            (Rule::OneKey, [w]) if device_of(w).is_some_and(|d| wire::is_device_name(&d)) => {
-                vec![w.clone()]
-            }
-            (Rule::OneKey, _) => {
-                return Err(DataError::BadRequest {
-                    name: name.clone(),
-                    why: "a one-key collection is written by exactly one key: name the one key \
-                          that writes, <D>/KEY/<id>, or this device"
-                        .into(),
-                });
-            }
-            _ => members.writers,
-        };
-        // What lies under the subject is looked at: every device known to
-        // write into the namespace, walked for at most the first-look time.
-        inner.look(name).await?;
         let own_record = |st: &St| match s.folder {
             true => st.folders.get(name).and_then(|f| f.line.own.clone()),
             false => st.colls.get(name).and_then(|c| c.line.own.clone()),
@@ -17096,19 +17230,23 @@ impl Device {
         let before = inner.groups_of(&inner.st.lock(), name);
         let dropped = {
             let mut st = inner.st.lock();
-            if !s.folder {
-                widens(&st, name, &writers, &members.readers)?;
-            }
+            // Resolved over the record held now: a change keeps what was
+            // added since it was asked (an introduction's admission, a
+            // record of another device of the owner).
             let current = own_record(&st);
-            let record = inner.next_members(
-                &st,
-                &s,
-                current.as_ref(),
-                members.rule,
+            let Some(crate::layer::Share {
+                rule,
                 writers,
-                members.readers,
-                false,
-            );
+                readers,
+            }) = inner.resolve_share(name, current.as_ref(), &members)?
+            else {
+                return Ok(());
+            };
+            if !s.folder {
+                widens(&st, name, &writers, &readers)?;
+            }
+            let record =
+                inner.next_members(&st, &s, current.as_ref(), rule, writers, readers, false);
             // The namespaces this record removes, as writers or readers.
             let dropped: Vec<Name> = current
                 .iter()
@@ -17596,6 +17734,20 @@ mod tests {
         let packet = DataBuilder::new(name.clone(), &content).sign_sync(
             ndn_packet::SignatureType::SignatureEd25519,
             Some(&key),
+
+    async fn members(&self, name: &Name) -> Result<crate::layer::Share, DataError> {
+        check_collection(name)?;
+        let st = self.inner.st.lock();
+        st.members_in_force(name)
+            .ok_or_else(|| DataError::NotReady {
+                name: name.clone(),
+                why: format!(
+                    "no members record over {name} is held here: a device of its namespace \
+                     shares it first (share_folder, or share); any other device follows or \
+                     watches it so that the owner's record is fetched, then asks again"
+                ),
+            })
+    }
             |_| Bytes::from_static(&[0; 64]),
         );
         let mut st = dev.inner.st.lock();
@@ -17640,6 +17792,18 @@ mod tests {
             (first, future)
         };
         let may = |e: &Epoch, (d, ns): &(Name, Name)| {
+        // What it would sign over the record held now: refused early, and
+        // the writers it removes walked below. Resolved again under the
+        // lock it is signed under.
+        let Some(crate::layer::Share { writers, .. }) = ({
+            let current = own_record(&inner.st.lock());
+            inner.resolve_share(name, current.as_ref(), &members)?
+        }) else {
+            return Ok(());
+        };
+        // What lies under the subject is looked at: every device known to
+        // write into the namespace, walked for at most the first-look time.
+        inner.look(name).await?;
             dev.inner
                 .grant_key(&dev.inner.st.lock(), &c, e, d, ns)
                 .is_some()
@@ -17731,6 +17895,122 @@ mod tests {
         // Another device answers the ask with a key it chose, wrapped to the
         // reader and signed: it opens, and is not the epoch's.
         let public = dev.inner.st.lock().keys.recipient.public();
+impl Inner {
+    /// The rule, writers and readers a record of `name` signs for
+    /// `members` over `current`, its own record in force (spec §15): the
+    /// whole content given, or `current` changed. `None` when a change
+    /// changes nothing: nothing is signed. A one-key record is written by
+    /// exactly one key (spec §5.3), named as a key or as this device.
+    fn resolve_share(
+        &self,
+        name: &Name,
+        current: Option<&Members>,
+        members: &crate::layer::Sharing,
+    ) -> Result<Option<crate::layer::Share>, DataError> {
+        let bad = |why: String| DataError::BadRequest {
+            name: name.clone(),
+            why,
+        };
+        let change = match members {
+            crate::layer::Sharing::Whole(share) => {
+                let writers = match (&share.rule, share.writers.as_slice()) {
+                    (Rule::OneKey, [w]) if *w == self.device => vec![self.writer.key().clone()],
+                    (Rule::OneKey, [w])
+                        if device_of(w).is_some_and(|d| wire::is_device_name(&d)) =>
+                    {
+                        vec![w.clone()]
+                    }
+                    (Rule::OneKey, _) => {
+                        return Err(bad("a one-key collection is written by exactly one key: \
+                                        name the one key that writes, <D>/KEY/<id>, or this \
+                                        device"
+                            .into()));
+                    }
+                    _ => share.writers.clone(),
+                };
+                return Ok(Some(crate::layer::Share {
+                    rule: share.rule.clone(),
+                    writers,
+                    readers: share.readers.clone(),
+                }));
+            }
+            crate::layer::Sharing::Change(change) => change,
+        };
+        let Some(m) = current else {
+            return Err(DataError::NotReady {
+                name: name.clone(),
+                why: "no members record of it is held here, so there is nothing to change: \
+                      share it whole first, or bring online the device of its namespace that \
+                      signed one and ask again"
+                    .into(),
+            });
+        };
+        let mut writers = m.writers.clone();
+        for w in &change.remove_writers {
+            if let Some(i) = writers.iter().position(|x| x == w) {
+                writers.remove(i);
+            } else if let Some(p) = writers.iter().find(|p| w.has_prefix(p)) {
+                return Err(bad(format!(
+                    "writer {w} is not listed, and {p}, which is listed, covers it: remove {p}, \
+                     or share the record whole"
+                )));
+            }
+        }
+        for w in &change.add_writers {
+            if !writers.iter().any(|p| w.has_prefix(p)) {
+                writers.push(w.clone());
+            }
+        }
+        let sealed = !m.readers.is_empty();
+        let mut readers = m.readers.clone();
+        for r in &change.remove_readers {
+            if let Some(i) = readers.iter().position(|x| x == r) {
+                readers.remove(i);
+            } else if collection::admitted(r, &readers) {
+                return Err(bad(format!(
+                    "reader {r:?} is not listed, and a reader listed admits it: remove that \
+                     reader, or share the record whole"
+                )));
+            }
+        }
+        // Not sealed, every reader reads already.
+        if sealed {
+            for r in &change.add_readers {
+                if !collection::admitted(r, &readers) {
+                    readers.push(r.clone());
+                }
+            }
+        }
+        if writers.is_empty() && !m.writers.is_empty() {
+            return Err(bad(
+                "the change leaves no writer, and a record listing none takes the writers of \
+                 the folders above it: share the record whole to mean that"
+                    .into(),
+            ));
+        }
+        if sealed && readers.is_empty() {
+            return Err(bad(
+                "the change leaves no reader, which unseals it for everyone: share the record \
+                 whole to mean that"
+                    .into(),
+            ));
+        }
+        if writers == m.writers && readers == m.readers {
+            return Ok(None);
+        }
+        if m.rule == Rule::OneKey && writers != m.writers {
+            return Err(bad(
+                "a one-key record's one writer changes only by sharing the record whole".into(),
+            ));
+        }
+        Ok(Some(crate::layer::Share {
+            rule: m.rule.clone(),
+            writers,
+            readers,
+        }))
+    }
+}
+
         let grant = |key: &ContentKey| {
             let ask = GrantAsk {
                 seal_key: seal_key_name(&device, &public),
@@ -19993,6 +20273,8 @@ mod tests {
             .unwrap()
             .entries
             .entry(r.writer())
+                digest: wire::implicit_digest(&[]),
+                op: None,
             .or_default()
             .insert(6);
         let prefix = |c: &Name| log_prefix(&log_name(&r.phone, Some(c), 0));
@@ -20453,6 +20735,11 @@ mod tests {
         validator: Arc<Validator>,
         store: Arc<dyn DataStore>,
         phone: Name,
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
         c: Name,
     }
 
@@ -20504,6 +20791,11 @@ mod tests {
                 .unwrap()
         }
     }
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
 
     #[tokio::test]
     async fn a_version_a_copy_of_its_key_wrote_under_its_name_is_not_restored_as_its_own() {
@@ -20751,9 +21043,12 @@ mod tests {
     async fn a_collection_with_no_record_of_its_own_is_written_and_read_by_its_folders() {
         let dev = device_in("/alice/laptop", &["/alice", "/bob"]).await;
         let (f, c) = (n("/alice/32=data/docs"), n("/alice/32=data/docs/plan"));
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice", "/bob"], Vec::new()))
-            .await
-            .unwrap();
+        dev.share_folder(
+            &f,
+            share_of(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+        )
+        .await
+        .unwrap();
         dev.put(&c, reading(1), options(None)).await.unwrap();
         {
             let st = dev.inner.st.lock();
@@ -20791,7 +21086,8 @@ mod tests {
                 Rule::Log,
                 &["/alice", "/bob"],
                 vec![person("/alice"), person("/bob")],
-            ),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -20862,7 +21158,7 @@ mod tests {
         laptop
             .share_folder(
                 &f,
-                share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]),
+                share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]).into(),
             )
             .await
             .unwrap();
@@ -20921,12 +21217,15 @@ mod tests {
         let f = n("/alice/32=data/docs");
         let [c1, c2, c3] = ["plan", "notes", "later"].map(|x| f.clone().append(x));
         let bob = n("/bob/phone");
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice", "/bob"], Vec::new()))
-            .await
-            .unwrap();
+        dev.share_folder(
+            &f,
+            share_of(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+        )
+        .await
+        .unwrap();
         assert_eq!(hand(&dev, &bob, &c1, 1, version(&c1)), None);
         assert_eq!(hand(&dev, &bob, &c2, 2, version(&c2)), None);
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice"], Vec::new()))
+        dev.share_folder(&f, share_of(Rule::Log, &["/alice"], Vec::new()).into())
             .await
             .unwrap();
         for (c, seq) in [(&c1, 3), (&c2, 4), (&c3, 5)] {
@@ -20956,12 +21255,15 @@ mod tests {
         let dev = device_in("/alice/laptop", &["/alice", "/bob", "/carol"]).await;
         let f = n("/alice/32=data/docs");
         let c = f.clone().append("plan");
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice", "/bob"], Vec::new()))
-            .await
-            .unwrap();
+        dev.share_folder(
+            &f,
+            share_of(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+        )
+        .await
+        .unwrap();
         let first = dev.inner.st.lock().folders[&f].line.own.clone().unwrap();
         // The laptop removes Bob; the phone, from the same record, adds Carol.
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice"], Vec::new()))
+        dev.share_folder(&f, share_of(Rule::Log, &["/alice"], Vec::new()).into())
             .await
             .unwrap();
         let adds = MembersBody {
@@ -21003,7 +21305,8 @@ mod tests {
                 Rule::Log,
                 &["/alice"],
                 vec![person("/alice"), person("/bob")],
-            ),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -21022,9 +21325,12 @@ mod tests {
                 .clone()
                 .unwrap()
         };
-        dev.share_folder(&f, share_of(Rule::Log, &["/alice"], vec![person("/alice")]))
-            .await
-            .unwrap();
+        dev.share_folder(
+            &f,
+            share_of(Rule::Log, &["/alice"], vec![person("/alice")]).into(),
+        )
+        .await
+        .unwrap();
         let st = dev.inner.st.lock();
         let own = st.colls[&c].line.own.clone().unwrap();
         assert!(
@@ -21089,7 +21395,7 @@ mod tests {
         let c = f.clone().append("cover");
         dev.share_folder(
             &f,
-            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]),
+            share_of(Rule::Log, &["/alice"], vec![Audience::Person(n("/bob"))]).into(),
         )
         .await
         .unwrap();
@@ -21170,3 +21476,13 @@ mod intro_tests;
 mod intro;
 
 mod groups;
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));

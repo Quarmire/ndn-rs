@@ -225,7 +225,8 @@ async fn alice(
                 rule: Rule::Log,
                 writers: vec![n("/alice")],
                 readers: vec![Audience::Person(n("/alice"))],
-            },
+            }
+            .into(),
         )
         .await
         .unwrap();

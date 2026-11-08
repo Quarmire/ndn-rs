@@ -82,7 +82,7 @@ pub use error::{DataError, NextStep, Refusal};
 pub use intro::{Code, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
-    PutOptions, Share, State,
+    PutOptions, Share, ShareChange, Sharing, State,
 };
 pub use merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs, owns,

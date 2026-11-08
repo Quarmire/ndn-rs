@@ -234,7 +234,8 @@ async fn after_a_restart_a_merge_state_is_built_on_first_need_from_its_newest_ch
             rule: Rule::Merge { function: n(RULE) },
             writers: vec![n("/alice")],
             readers: Vec::new(),
-        },
+        }
+        .into(),
     )
     .await
     .unwrap();
@@ -331,7 +332,8 @@ async fn a_version_a_checkpoint_covers_counts_as_that_checkpoint_counts() {
             rule: Rule::Merge { function: n(RULE) },
             writers: vec![n("/alice")],
             readers: Vec::new(),
-        },
+        }
+        .into(),
     )
     .await
     .unwrap();
@@ -410,7 +412,8 @@ async fn a_folder_watch_builds_only_the_collections_holding_versions_past_its_fr
             rule: Rule::Merge { function: n(RULE) },
             writers: vec![n("/alice")],
             readers: Vec::new(),
-        },
+        }
+        .into(),
     )
     .await
     .unwrap();

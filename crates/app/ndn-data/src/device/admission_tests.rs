@@ -91,7 +91,7 @@ async fn a_removed_writer_signing_a_kept_seq_again_in_another_collection_is_refu
         readers: Vec::new(),
     };
     owner
-        .share_folder(&f, share(&["/alice", "/bob"]))
+        .share_folder(&f, share(&["/alice", "/bob"]).into())
         .await
         .unwrap();
     let kept = [
@@ -101,7 +101,10 @@ async fn a_removed_writer_signing_a_kept_seq_again_in_another_collection_is_refu
     for m in &kept {
         give(&owner, m);
     }
-    owner.share_folder(&f, share(&["/alice"])).await.unwrap();
+    owner
+        .share_folder(&f, share(&["/alice"]).into())
+        .await
+        .unwrap();
     let record = newest(&owner, &f);
     // The reader holds the cut's manifest, as fetched by its full name.
     for (name, packet) in owner

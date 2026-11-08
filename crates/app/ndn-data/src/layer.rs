@@ -268,6 +268,24 @@ pub enum Change {
         /// it, or have the folder's owner remove the writer.
         why: String,
     },
+    /// The members record in force over `collection` changed (spec §6.1,
+    /// §15): a folder's (`collection` is the folder) or a collection's,
+    /// whoever signed it — this device ([`share_folder`], an introduction's
+    /// admission), another device of the owner, or a merge of concurrent
+    /// records. `share` is what [`members`](DataLayer::members) answers for
+    /// `collection` now. Told to a watch of `collection` itself, and to a
+    /// watch of a folder above it when `collection` is a folder or has a
+    /// record of its own; a collection that only inherits is told on its
+    /// own watch, its folder's change included. A watch's listing starts
+    /// with the record in force over each such name held here.
+    ///
+    /// [`share_folder`]: DataLayer::share_folder
+    Members {
+        /// The folder or collection whose record in force changed.
+        collection: Name,
+        /// Its record in force now.
+        share: Share,
+    },
 }
 
 /// One of the two versions of an [`Change::Equivocation`].
@@ -332,7 +350,8 @@ impl Change {
             | Change::NotCounted { collection, .. }
             | Change::Counted { collection, .. }
             | Change::Lagged { collection }
-            | Change::Untracked { collection, .. } => collection,
+            | Change::Untracked { collection, .. }
+            | Change::Members { collection, .. } => collection,
         }
     }
 }
@@ -365,6 +384,61 @@ pub struct Share {
     pub writers: Vec<Name>,
     /// Who may read.
     pub readers: Vec<Audience>,
+}
+
+impl Share {
+    /// The writers, readers and rule of `m`.
+    pub fn of(m: &crate::Members) -> Self {
+        Share {
+            rule: m.rule.clone(),
+            writers: m.writers.clone(),
+            readers: m.readers.clone(),
+        }
+    }
+}
+
+/// What [`share_folder`](DataLayer::share_folder) signs: the whole new
+/// content of the folder's members record, or a change to the record in
+/// force when the device signs it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Sharing {
+    /// The whole new content.
+    Whole(Share),
+    /// A change applied to the folder's own record in force at the moment
+    /// the device signs, under its lock: a member added meanwhile — by an
+    /// introduction's admission, or by a record of another device of the
+    /// owner — stays. The rule stays the record's.
+    Change(ShareChange),
+}
+
+impl From<Share> for Sharing {
+    fn from(share: Share) -> Self {
+        Sharing::Whole(share)
+    }
+}
+
+impl From<ShareChange> for Sharing {
+    fn from(change: ShareChange) -> Self {
+        Sharing::Change(change)
+    }
+}
+
+/// A change to a folder's members record ([`Sharing::Change`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ShareChange {
+    /// Writer prefixes to add; one a listed writer covers already adds
+    /// nothing.
+    pub add_writers: Vec<Name>,
+    /// Writer prefixes to remove, exactly as listed; one neither listed nor
+    /// covered removes nothing. Removing cuts as a whole record removing it
+    /// does.
+    pub remove_writers: Vec<Name>,
+    /// Readers to add; one admitted already, or any reader of a folder not
+    /// sealed (which every reader reads), adds nothing.
+    pub add_readers: Vec<Audience>,
+    /// Readers to remove, exactly as listed; one neither listed nor
+    /// admitted removes nothing. Removing moves the folder to a new epoch.
+    pub remove_readers: Vec<Audience>,
 }
 
 /// One device's data layer: the seven verbs, signing with this device's
@@ -502,7 +576,7 @@ pub trait DataLayer: Send + Sync {
     /// Filled by slice 2.
     async fn share(&self, collection: &Name, members: Share) -> Result<(), DataError>;
 
-    /// `share_folder(folder, {readers, writers})`.
+    /// `share_folder(folder, {readers, writers} | change)`.
     ///
     /// Sign a new members record of `folder` (a name with at least one
     /// component after `32=data`), which governs every collection under it
@@ -514,5 +588,28 @@ pub trait DataLayer: Send + Sync {
     /// collection under the folder; removing a reader moves the folder to a
     /// new epoch. Only the owner's devices may do it
     /// ([`DataError::NotOwner`]).
-    async fn share_folder(&self, folder: &Name, members: Share) -> Result<(), DataError>;
+    ///
+    /// [`Sharing::Whole`] gives the whole new content; [`Sharing::Change`]
+    /// adds and removes writers and readers of the folder's own record in
+    /// force when the device signs, under its lock, so a member added
+    /// meanwhile stays (spec §15). A change is refused
+    /// ([`DataError::BadRequest`], nothing signed) that removes a writer or
+    /// reader not listed but covered by one listed, or that would leave no
+    /// writer or a sealed folder no reader; with no record of the folder
+    /// held here it is [`DataError::NotReady`]. A change that changes
+    /// nothing signs nothing.
+    async fn share_folder(&self, folder: &Name, members: Sharing) -> Result<(), DataError>;
+
+    /// `members(folder | collection) → {rule, writers, readers}`.
+    ///
+    /// The members record in force over `name` (spec §6.1, §15): of a
+    /// folder, its own record narrowed by the folders above it; of a
+    /// collection, its own narrowed by the folders above it, which for a
+    /// collection with no record of its own is its nearest folder's. A name
+    /// with a folder record held answers the folder's. Whoever signed it —
+    /// this device, an introduction's admission, another device of the
+    /// owner — and its changes come as [`Change::Members`] on a watch.
+    /// [`DataError::NotReady`] when no record over `name` is held here,
+    /// saying what to do.
+    async fn members(&self, name: &Name) -> Result<Share, DataError>;
 }

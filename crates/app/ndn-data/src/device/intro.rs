@@ -20,14 +20,13 @@ use ndn_security::{
 use ndn_trust_envelope::{INTRO_WORDS_FINGERPRINT_LEN, IntroWords, Introduction, TrustEnvelope};
 
 use super::{Device, Held, Inner, St, Subject, check_collection, local, open_grant, owner_signed};
-use crate::collection;
 use crate::error::DataError;
 use crate::intro::{
     AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined, Offer,
     OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof, answer_proves, ask_proof,
     ask_proves, commitment, intro_name, intro_prefix, proof_key,
 };
-use crate::layer::Share;
+use crate::layer::{ShareChange, Sharing};
 use crate::version::{Audience, Writer};
 use crate::wire::{self, LogName, Record, device_of, namespace_of, parse_log_name};
 
@@ -729,42 +728,22 @@ impl Inner {
     /// Make `ns` a member of `folder` as `role` (spec §19.4): the next
     /// members record of the folder adds it as a writer (a writer's role)
     /// and as a reader (a sealed folder's), unless the record in force
-    /// already admits it so.
+    /// already admits it so. Signed as a change ([`ShareChange`]) to the
+    /// record held when it is signed, so a let-go signed meanwhile stays,
+    /// as an admission stays across a let-go (spec §15).
     async fn admit_joiner(
         self: &Arc<Self>,
         folder: &Name,
         role: Role,
         ns: &Name,
     ) -> Result<(), DataError> {
-        let share = {
-            let st = self.st.lock();
-            let m = st
-                .folders
-                .get(folder)
-                .and_then(|f| f.line.own.clone())
-                .ok_or_else(|| DataError::NotReady {
-                    name: folder.clone(),
-                    why: "no members record of the folder is held here".into(),
-                })?;
-            let reader = Audience::Person(ns.clone());
-            let writes = m.writers.iter().any(|w| ns.has_prefix(w));
-            let reads = m.readers.is_empty() || collection::admitted(&reader, &m.readers);
-            let mut writers = m.writers.clone();
-            let mut readers = m.readers.clone();
-            if role == Role::Writer && !writes {
-                writers.push(ns.clone());
-            }
-            if !reads {
-                readers.push(reader);
-            }
-            if writers.len() == m.writers.len() && readers.len() == m.readers.len() {
-                return Ok(());
-            }
-            Share {
-                rule: m.rule.clone(),
-                writers,
-                readers,
-            }
+        let change = ShareChange {
+            add_writers: match role {
+                Role::Writer => vec![ns.clone()],
+                _ => Vec::new(),
+            },
+            add_readers: vec![Audience::Person(ns.clone())],
+            ..ShareChange::default()
         };
         Device {
             inner: Arc::clone(self),
@@ -774,7 +753,7 @@ impl Inner {
                 name: folder.clone(),
                 folder: true,
             },
-            share,
+            Sharing::Change(change),
         )
         .await
     }

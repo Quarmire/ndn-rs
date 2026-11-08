@@ -6,6 +6,7 @@ use super::group_tests::{
     PAIR, budget, device, device_tuned, drain, give, id, log_share, n, plan, version,
 };
 use super::*;
+use crate::layer::{Share, ShareChange, Sharing};
 
 fn trip() -> Name {
     n("/alice/32=data/trip")
@@ -26,7 +27,7 @@ fn delivered(changes: &[Change], id: &VersionId) -> usize {
 #[tokio::test]
 async fn a_folder_watch_reports_every_kind_for_a_collection_created_after_it_began() {
     let dev = device().await;
-    dev.share_folder(&trip(), log_share()).await.unwrap();
+    dev.share_folder(&trip(), log_share().into()).await.unwrap();
     let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
     assert!(
         drain(&mut changes)
@@ -201,14 +202,15 @@ async fn a_watcher_that_falls_behind_is_told_it_lagged_never_queued_without_boun
     })
     .await;
     let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
-    drain(&mut changes).await;
+    // Its listing (the records in force) was queued beside the queue.
+    let listed = drain(&mut changes).await.len();
     // Many more changes than the queue holds, none read meanwhile.
     for seq in 1..=20 {
         give(&dev, &version("/bob/laptop", &plan(), seq, &[], None));
     }
     let seen = drain(&mut changes).await;
     assert!(
-        seen.len() <= queue + 1,
+        seen.len() <= queue + 1 + listed,
         "what a watcher leaves unread is bounded: {seen:?}"
     );
     assert!(
@@ -235,7 +237,7 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
         ..c
     })
     .await;
-    dev.share_folder(&trip(), log_share()).await.unwrap();
+    dev.share_folder(&trip(), log_share().into()).await.unwrap();
     let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
     drain(&mut changes).await;
     let new = |i: u64| n(&format!("/alice/32=data/trip/new{i}"));
@@ -279,5 +281,152 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
     give(&dev, &version("/bob/laptop", &new(2), 32, &[], None));
     let seen = drain(&mut by_name).await;
     assert_eq!(delivered(&seen, &id("/bob/laptop", 32)), 1, "{seen:?}");
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_version_comes_to_a_host_with_its_packets_digest_on_every_path() {
+    let dev = device().await;
+    let mut changes = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    drain(&mut changes).await;
+    let first = saying("/bob/laptop", &plan(), 20, "first");
+    let digest = wire::implicit_digest(&first.packet);
+    give(&dev, &first);
+    // Told on the watch, listed to a new one, read by its name: its
+    // digest, and no operation under the log rule.
+    let seen = drain(&mut changes).await;
+    assert!(
+        seen.iter().any(|c| matches!(c, Change::Version(v)
+            if v.id == id("/bob/laptop", 20) && v.digest == digest && v.op.is_none())),
+        "{seen:?}"
+    );
+    let mut again = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    let listed = drain(&mut again).await;
+    assert!(
+        listed.iter().any(|c| matches!(c, Change::Version(v)
+            if v.id == id("/bob/laptop", 20) && v.digest == digest)),
+        "{listed:?}"
+    );
+    match dev.get(&first.name).await.unwrap().got {
+        Got::Version(v) => assert_eq!((v.digest, v.op), (digest, None)),
+        other => panic!("not a version: {other:?}"),
+    }
+    // A second packet at its name: both told whole, each with its own.
+    let second = saying("/bob/laptop", &plan(), 20, "second");
+    give(&dev, &second);
+    let seen = drain(&mut changes).await;
+    let digests = seen.iter().find_map(|c| match c {
+        Change::Equivocation {
+            first: Equivocal::Here(a),
+            second: Equivocal::Here(b),
+            ..
+        } => Some((a.digest, b.digest)),
+        _ => None,
+    });
+    assert_eq!(
+        digests,
+        Some((digest, wire::implicit_digest(&second.packet))),
+        "{seen:?}"
+    );
+    dev.shutdown();
+}
+
+/// The `Change::Members` told for `name` among `seen`, newest last.
+fn told_members<'c>(seen: &'c [Change], name: &Name) -> Vec<&'c Share> {
+    seen.iter()
+        .filter_map(|c| match c {
+            Change::Members { collection, share } if collection == name => Some(share),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_folder_watch_is_told_its_members_and_a_change_keeps_whom_it_does_not_name() {
+    let dev = device().await;
+    let writers = |w: &[&str]| Share {
+        rule: Rule::Log,
+        writers: w.iter().map(|x| n(x)).collect(),
+        readers: Vec::new(),
+    };
+    let change = |add: &[&str], remove: &[&str]| -> Sharing {
+        ShareChange {
+            add_writers: add.iter().map(|x| n(x)).collect(),
+            remove_writers: remove.iter().map(|x| n(x)).collect(),
+            ..ShareChange::default()
+        }
+        .into()
+    };
+    // Nothing held: why, and nothing to change.
+    let none = dev.members(&trip()).await;
+    assert!(matches!(none, Err(DataError::NotReady { .. })), "{none:?}");
+    let none = dev.share_folder(&trip(), change(&["/bob"], &[])).await;
+    assert!(matches!(none, Err(DataError::NotReady { .. })), "{none:?}");
+
+    dev.share_folder(&trip(), writers(&["/alice"]).into())
+        .await
+        .unwrap();
+    let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
+    let mut plan_watch = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    let listed = drain(&mut changes).await;
+    assert!(
+        matches!(listed.first(), Some(Change::Members { collection, share })
+            if *collection == trip() && *share == writers(&["/alice"])),
+        "the listing starts with the record in force: {listed:?}"
+    );
+    assert_eq!(dev.members(&trip()).await.unwrap(), writers(&["/alice"]));
+    drain(&mut plan_watch).await;
+
+    // Bob added by a change (as an introduction's admission adds him),
+    // Carol added, then let go by a change naming her alone: Bob stays.
+    dev.share_folder(&trip(), change(&["/bob"], &[]))
+        .await
+        .unwrap();
+    dev.share_folder(&trip(), change(&["/carol"], &[]))
+        .await
+        .unwrap();
+    dev.share_folder(&trip(), change(&[], &["/carol"]))
+        .await
+        .unwrap();
+    let seen = drain(&mut changes).await;
+    assert_eq!(
+        told_members(&seen, &trip()),
+        [
+            &writers(&["/alice", "/bob"]),
+            &writers(&["/alice", "/bob", "/carol"]),
+            &writers(&["/alice", "/bob"]),
+        ],
+        "{seen:?}"
+    );
+    assert_eq!(
+        dev.members(&trip()).await.unwrap(),
+        writers(&["/alice", "/bob"])
+    );
+    // A collection under the folder, on its own watch: its record in force,
+    // the folder's narrowing included.
+    let seen = drain(&mut plan_watch).await;
+    let in_force = dev.members(&plan()).await.unwrap();
+    assert_eq!(
+        told_members(&seen, &plan()).last(),
+        Some(&&in_force),
+        "{seen:?}"
+    );
+
+    // A change that changes nothing signs nothing.
+    let head = dev.inner.st.lock().head;
+    dev.share_folder(&trip(), change(&["/bob/laptop"], &["/carol"]))
+        .await
+        .unwrap();
+    assert_eq!(dev.inner.st.lock().head, head);
+    // Refused, nothing signed: a writer covered but not listed, and a
+    // change leaving no writer.
+    for refused in [
+        change(&[], &["/bob/laptop"]),
+        change(&[], &["/alice", "/bob"]),
+    ] {
+        let r = dev.share_folder(&trip(), refused).await;
+        assert!(matches!(r, Err(DataError::BadRequest { .. })), "{r:?}");
+    }
+    assert_eq!(dev.inner.st.lock().head, head);
     dev.shutdown();
 }
