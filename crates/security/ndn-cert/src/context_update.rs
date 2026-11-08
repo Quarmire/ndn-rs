@@ -1042,7 +1042,9 @@ pub async fn bump_context_schema(
 /// was offline across years of a namespace's changes, at one Interest per
 /// version and within a management command's wait; a node further behind
 /// adopts the namespace again from a current anchor link, which costs one
-/// fetch.
+/// fetch. A self-certifying namespace has no such shortcut — it is adopted
+/// again only from its genesis, a longer walk still — so its walks are not
+/// bounded by position, only by [`MAX_CATCH_UP_TIME`] when they fetch.
 pub const MAX_CATCH_UP_VERSIONS: u64 = 128;
 
 /// How long a refresh's walk ([`follow_versions`]) fetches versions at
@@ -1401,7 +1403,10 @@ where
 /// - The last position must be fetched and must follow.
 ///
 /// At most [`MAX_CATCH_UP_VERSIONS`] positions are walked; a longer range
-/// is refused before anything is fetched. Returns every version reached,
+/// is refused before anything is fetched — except for a self-certifying
+/// namespace, whose walk is the only way to its newest version (a walk
+/// from its genesis is longer still): the source bounds its fetching
+/// instead ([`MAX_CATCH_UP_TIME`]). Returns every version reached,
 /// oldest first: the last is the one at the last position (empty only for
 /// an empty range). A walk that stops returns why, and the caller adopts
 /// nothing: a node changes its held version only to the newest, so a
@@ -1419,7 +1424,8 @@ where
         return Ok(Vec::new());
     }
     let gap = last - first + 1;
-    if gap > MAX_CATCH_UP_VERSIONS {
+    let by_genesis = matches!(self_certifying_digest(held.namespace()), Ok(Some(_)));
+    if gap > MAX_CATCH_UP_VERSIONS && !by_genesis {
         return Err(CatchUpStop::TooFar {
             gap,
             max: MAX_CATCH_UP_VERSIONS,

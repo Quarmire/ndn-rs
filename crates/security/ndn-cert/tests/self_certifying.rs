@@ -8,18 +8,21 @@
 //! - the name alone adopts the namespace: version 1 checked against it, the
 //!   newest reached by continuity, and a restart keeps it;
 //! - the name survives a recovery after a compromise, and a root moved to a
-//!   P-256 key: followers keep following, and a fresh device adopts by name.
+//!   P-256 key: followers keep following, and a fresh device adopts by name;
+//! - after a recovery, a line longer than an ordinary refresh walks is
+//!   still followed, by a holder, a fresh device and a restart;
+//! - a self-certifying namespace is never initialised twice.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::{
-    AdoptError, AnchorLink, CaExchange, CertError, ContextRefresh, GenesisKey, NamespaceInitError,
-    NamespacePolicies, NewRootStore, OldRoot, PersistedNamespace, RecoveryPlan, RecoverySeed,
-    RootStore, add_recovery_anchor, adopt_by_name, anchor_fingerprint, bump_context_revoking,
-    init_namespace_in_pib_with, init_self_certifying_in_pib_with, load_persisted_contexts,
-    persist_adoption, rdr_metadata_name, recover_namespace_in_pib, recovery_anchor,
-    recovery_version, refresh_context, reissue_version,
+    AdoptError, AnchorLink, CaExchange, CertError, ContextRefresh, GenesisKey,
+    MAX_CATCH_UP_VERSIONS, NamespaceInitError, NamespacePolicies, NewRootStore, OldRoot,
+    PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, add_recovery_anchor, adopt_by_name,
+    anchor_fingerprint, bump_context_revoking, init_namespace_in_pib_with,
+    init_self_certifying_in_pib_with, load_persisted_contexts, persist_adoption, rdr_metadata_name,
+    recover_namespace_in_pib, recovery_anchor, recovery_version, refresh_context, reissue_version,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name, NameComponent};
@@ -187,6 +190,22 @@ async fn init_names_the_namespace_from_its_new_ed25519_root() {
         loaded.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
     assert_eq!(keyring.version_of(&root.ns()), Some(1));
+    // Made again, even from the same key, it would be a second version 1.
+    let again = init_self_certifying_in_pib_with(
+        &root.pib,
+        &key,
+        "desk",
+        &NewRootStore::File,
+        &NamespacePolicies::default(),
+    )
+    .await
+    .err()
+    .expect("a self-certifying namespace was made again");
+    assert!(
+        matches!(again, NamespaceInitError::GenesisExists { .. }),
+        "{again}"
+    );
+    assert!(again.to_string().contains("ndn-fwd recover"), "{again}");
 }
 
 #[tokio::test]
@@ -513,4 +532,94 @@ async fn the_name_survives_its_root_moving_to_a_p256_key() {
     .unwrap();
     assert_eq!(fresh.version_of(&ns), Some(4));
     assert!(fresh.contexts()[0].is_anchor(&piv));
+}
+
+/// More versions after a recovery than an ordinary refresh walks: for a
+/// self-certifying name the walk is the only way to them (a walk from the
+/// genesis is longer still), so a holder far behind, a fresh device and a
+/// restart each follow the whole line.
+#[tokio::test]
+async fn a_long_line_after_a_recovery_is_followed_whatever_its_length() {
+    let alice = Root::new(&GenesisKey::generate().unwrap()).await;
+    let ns = alice.ns();
+    let seed = RecoverySeed::generate().unwrap();
+    let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
+    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+        .await
+        .unwrap()
+        .data;
+    let follower = follower(&ns, &[alice.genesis(), &v2]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pib = FilePib::new(dir.path()).unwrap();
+    let recovered = recover_namespace_in_pib(
+        &pib,
+        &v2,
+        &seed.signer(&ns),
+        "phone",
+        OldRoot::Compromised,
+        &[],
+        &[],
+        &NewRootStore::File,
+    )
+    .await
+    .unwrap();
+    let new_root = RootStore::open_for(&pib, &ns)
+        .unwrap()
+        .unwrap()
+        .signer(None)
+        .await
+        .unwrap();
+    let copy = |d: &Data| Data::decode(d.raw().clone()).unwrap();
+    let mut line = vec![
+        copy(alice.genesis()),
+        v2,
+        copy(&recovered.version.bump.data),
+        copy(&recovered.root_version.data),
+    ];
+    while (line.len() as u64) < MAX_CATCH_UP_VERSIONS + 8 {
+        let gone = ns
+            .clone()
+            .append("member")
+            .append(format!("m{}", line.len()).as_str())
+            .append("KEY")
+            .append("k");
+        let next = bump_context_revoking(
+            new_root.as_ref(),
+            line.last().unwrap(),
+            std::slice::from_ref(&gone),
+            &[],
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+        line.push(next);
+    }
+    let newest = line.len() as u64;
+    let served: Vec<&Data> = line.iter().collect();
+
+    let res = refresh_context(&follower, None, &mut Upstream::serving(&ns, &served), &ns).await;
+    assert!(matches!(res, Ok(ContextRefresh::Updated(_))), "{res:?}");
+    assert_eq!(follower.version_of(&ns), Some(newest));
+
+    let fresh = Keyring::new();
+    let adopted = adopt_by_name(
+        &fresh,
+        None,
+        &mut Upstream::serving(&ns, &served),
+        &ns,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.version_of(&ns), Some(newest));
+
+    let kept = tempfile::tempdir().unwrap();
+    persist_adoption(kept.path(), &adopted).unwrap();
+    let restarted = Keyring::new();
+    for (path, loaded) in load_persisted_contexts(kept.path(), &restarted).unwrap() {
+        loaded.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+    assert_eq!(restarted.version_of(&ns), Some(newest));
 }

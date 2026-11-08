@@ -461,14 +461,23 @@ impl Keyring {
 
     /// Select the context governing `name`: the adopted context whose
     /// namespace is the longest prefix of `name`, else the ambient context.
+    /// A name in a person's self-certifying namespace (`/user/<0xA1>/…`) is
+    /// governed only by that namespace's own context: a held `/user` or `/`
+    /// context never vouches for it, so without it the ambient context
+    /// judges (trust-context.md §4.5).
     pub fn context_for(&self, name: &Name) -> Arc<SignedTrustContext> {
+        let floor = if crate::self_certifying::in_personal_namespace(name) {
+            2
+        } else {
+            0
+        };
         let mut best: Option<Arc<SignedTrustContext>> = None;
         let mut best_len = 0usize;
         for r in self.contexts.iter() {
             let ns = r.key();
             // ns is a prefix of name, and longer (more specific) than any
             // match so far.
-            if name.has_prefix(ns) && (best.is_none() || ns.len() > best_len) {
+            if ns.len() >= floor && name.has_prefix(ns) && (best.is_none() || ns.len() > best_len) {
                 best_len = ns.len();
                 best = Some(Arc::clone(r.value()));
             }
@@ -526,6 +535,22 @@ mod tests {
         );
         // Unmatched namespace → ambient.
         assert_eq!(kr.context_for(&n("/transit/x")).namespace(), &Name::root());
+    }
+
+    #[test]
+    fn a_held_user_context_never_governs_a_persons_names() {
+        let kr = keyring();
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/user"))))
+            .unwrap();
+        let person = crate::self_certifying::self_certifying_name(&[7; 32]);
+        let doc = person.clone().append("doc");
+        assert_eq!(kr.context_for(&doc).namespace(), &Name::root());
+        assert_eq!(kr.context_for(&person).namespace(), &Name::root());
+        // Ordinary names under /user are still its own.
+        assert_eq!(
+            kr.context_for(&n("/user/alice/doc")).namespace(),
+            &n("/user")
+        );
     }
 
     #[test]

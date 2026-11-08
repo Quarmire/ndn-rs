@@ -344,6 +344,19 @@ pub enum NamespaceInitError {
         pib: String,
         what: String,
     },
+    /// A self-certifying namespace that exists in the PIB, made again: never
+    /// done, not even with force.
+    #[error(
+        "{namespace} is already initialized in {pib} ({what} exists); a self-certifying \
+         namespace is never made again, not even with force: its key would sign a second \
+         version 1, a fork every holder of the first refuses. To replace its root, recover the \
+         namespace with a recovery kit (`ndn-fwd recover`), which keeps the name"
+    )]
+    GenesisExists {
+        namespace: String,
+        pib: String,
+        what: String,
+    },
     #[error(transparent)]
     RootStore(#[from] RootStoreError),
     /// The namespace or the device name does not fit the role layout.
@@ -472,7 +485,7 @@ pub async fn init_self_certifying_in_pib(
 ///
 /// A namespace that exists in the PIB is never made again, not even with
 /// force: the same key would sign a second version 1, a fork every holder
-/// of the first refuses ([`NamespaceInitError::AlreadyInitialized`]). Its
+/// of the first refuses ([`NamespaceInitError::GenesisExists`]). Its
 /// root is replaced by a recovery instead, which keeps the name.
 pub async fn init_self_certifying_in_pib_with(
     pib: &FilePib,
@@ -534,6 +547,13 @@ async fn init_in_pib(
         None
     };
     if let Some(what) = existing {
+        if seed.is_some() {
+            return Err(NamespaceInitError::GenesisExists {
+                namespace: namespace.to_string(),
+                pib: pib.root().display().to_string(),
+                what,
+            });
+        }
         if !force {
             return Err(NamespaceInitError::AlreadyInitialized {
                 namespace: namespace.to_string(),

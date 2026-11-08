@@ -420,6 +420,18 @@ impl From<NamespaceInitError> for RootError {
             .with("namespace", namespace)
             .with("pib", pib)
             .with("what", what),
+            E::GenesisExists {
+                namespace,
+                pib,
+                what,
+            } => RootError::new(
+                code::ALREADY_INITIALIZED,
+                "the self-certifying namespace is initialized here already and is never made \
+                 again (a second version 1 is a fork); recover it to replace its root",
+            )
+            .with("namespace", namespace)
+            .with("pib", pib)
+            .with("what", what),
             E::Role(error) => {
                 RootError::new(code::ROOT_BAD_REQUEST, "a name is refused").with("error", error)
             }

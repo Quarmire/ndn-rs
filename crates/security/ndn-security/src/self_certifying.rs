@@ -103,6 +103,20 @@ pub fn self_certifying_digest(
     }
 }
 
+/// Whether `name` lies in a person's self-certifying namespace: it starts
+/// with `/user/<0xA1: 32 bytes>`. Such a name is judged only by that
+/// namespace's own trust context, never by a context of a shorter prefix
+/// (`/user` or `/`) — another root never vouches for a person's names
+/// ([`crate::Keyring::context_for`]).
+pub fn in_personal_namespace(name: &Name) -> bool {
+    let comps = name.components();
+    comps.len() >= 2
+        && comps[0].typ == ndn_packet::tlv_type::NAME_COMPONENT
+        && comps[0].value.as_ref() == PERSONAL_PREFIX
+        && comps[1].typ == SELF_CERTIFYING
+        && comps[1].value.len() == 32
+}
+
 /// Why a context Data is not the genesis of a self-certifying namespace.
 #[derive(Debug, thiserror::Error)]
 pub enum GenesisError {
