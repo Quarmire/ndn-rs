@@ -351,11 +351,8 @@ pub fn adopt_stored_context(
                 Err(UpdateRefusal::NotSignedByHeldAnchor { .. })
                     if ctx.version() > held.version() + 1 =>
                 {
-                    let mut stored = StoredVersions {
-                        pib_root,
-                        namespace: ctx.namespace(),
-                        newest: Some((ctx.version(), data)),
-                    };
+                    let mut stored =
+                        StoredVersions::new(pib_root, ctx.namespace(), (ctx.version(), data));
                     let walk = held.version() + 1..=ctx.version();
                     if let Err(stop) = follow_versions(&held, walk, &mut stored).await {
                         let refusal = UpdateRefusal::CatchUp {
@@ -416,11 +413,7 @@ async fn adopt_stored_genesis(
     {
         let reached = match refusal {
             UpdateRefusal::NotSignedByHeldAnchor { .. } if ctx.version() > 2 => {
-                let mut stored = StoredVersions {
-                    pib_root,
-                    namespace,
-                    newest: Some((ctx.version(), data)),
-                };
+                let mut stored = StoredVersions::new(pib_root, namespace, (ctx.version(), data));
                 follow_versions(genesis.context(), 2..=ctx.version(), &mut stored)
                     .await
                     .map(|_| ())
@@ -458,11 +451,38 @@ pub fn persist_adoption(
 /// The versions of `namespace` stored under `pib_root`, for a walk from a
 /// held version to the stored newest one, `newest`. Each is read as Data
 /// only: the walk checks each against the version before it
-/// ([`open_context_update`] — its signature, namespace and version).
+/// ([`open_context_update`] — its signature, namespace and version). The
+/// versions not stored are passed over at once ([`Unfetched::MissingUntil`]),
+/// so a walk costs what is stored, however far apart the versions are.
 struct StoredVersions<'a> {
     pib_root: &'a Path,
     namespace: &'a Name,
     newest: Option<(u64, &'a Data)>,
+    /// The versions with a file of their own, ascending.
+    kept: Vec<u64>,
+}
+
+impl<'a> StoredVersions<'a> {
+    fn new(pib_root: &'a Path, namespace: &'a Name, newest: (u64, &'a Data)) -> Self {
+        let mut kept: Vec<u64> = std::fs::read_dir(context_versions_dir(pib_root, namespace))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != CONTEXT_FILE_EXT {
+                    return None;
+                }
+                path.file_stem()?.to_str()?.parse().ok()
+            })
+            .collect();
+        kept.sort_unstable();
+        Self {
+            pib_root,
+            namespace,
+            newest: Some(newest),
+            kept,
+        }
+    }
 }
 
 impl VersionSource for StoredVersions<'_> {
@@ -473,6 +493,14 @@ impl VersionSource for StoredVersions<'_> {
     ) -> Result<Data, Unfetched> {
         let wire = match self.newest.take_if(|(version, _)| *version == position) {
             Some((_, data)) => data.raw().clone(),
+            None if self.kept.binary_search(&position).is_err() => {
+                let after = self.kept.partition_point(|&v| v <= position);
+                let next = self.kept.get(after).copied().unwrap_or(u64::MAX);
+                return Err(Unfetched::MissingUntil {
+                    next,
+                    reason: format!("no version of {} is stored there", self.namespace),
+                });
+            }
             None => {
                 let path = context_version_path(self.pib_root, self.namespace, position);
                 Bytes::from(

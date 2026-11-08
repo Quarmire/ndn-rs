@@ -1146,6 +1146,11 @@ pub enum Unfetched {
     /// Nothing usable arrived (no route, no answer, a reply under another
     /// name, not a Data packet): why.
     Missing(String),
+    /// Nothing is had for this position nor for any after it before `next`:
+    /// a walk past its time ([`MAX_CATCH_UP_TIME`]) fetches nothing more,
+    /// and a store knows which versions it keeps. The walk passes over them
+    /// all at once, so an empty range costs nothing however long it is.
+    MissingUntil { next: u64, reason: String },
     /// Something arrived, and this node's forwarder dropped it: why.
     Dropped(String),
     /// Another adoption or update of the namespace runs on this node.
@@ -1374,10 +1379,13 @@ where
             return Ok(data);
         }
         if web_time::Instant::now() >= self.deadline {
-            return Err(Unfetched::Missing(format!(
-                "the walk fetches for {}s at most",
-                MAX_CATCH_UP_TIME.as_secs()
-            )));
+            return Err(Unfetched::MissingUntil {
+                next: u64::MAX,
+                reason: format!(
+                    "the walk fetches for {}s at most",
+                    MAX_CATCH_UP_TIME.as_secs()
+                ),
+            });
         }
         let versioned = rdr_prefix(self.namespace).append_version(position);
         Ok(fetch_update(&mut *self.exchange, self.forwarder, from, &versioned).await?)
@@ -1434,7 +1442,8 @@ where
     let mut steps: Vec<ContextStep> = Vec::new();
     // Positions passed over since the last version reached: first, last, why.
     let mut passed: Option<(u64, u64, String)> = None;
-    for position in positions {
+    let mut position = first;
+    loop {
         let from: &SignedTrustContext = steps.last().map_or(held, |s| s.context.as_ref());
         let refusal = match source.fetch(position, from).await {
             Ok(data) => match open_context_update(from, &data).await {
@@ -1445,9 +1454,16 @@ where
                         signer,
                     });
                     passed = None;
+                    if position == last {
+                        break;
+                    }
+                    position += 1;
                     continue;
                 }
-                Err(UpdateRefusal::NotNewer { .. }) if position < last => continue,
+                Err(UpdateRefusal::NotNewer { .. }) if position < last => {
+                    position += 1;
+                    continue;
+                }
                 Err(refusal) => refusal,
             },
             Err(Unfetched::Dropped(reason)) => UpdateRefusal::DroppedByForwarder(reason),
@@ -1457,9 +1473,21 @@ where
                     Some((first, _, _)) => (first, position, reason),
                     None => (position, position, reason),
                 });
+                position += 1;
                 continue;
             }
-            Err(Unfetched::Missing(reason)) => {
+            // Passed over up to `next`, never past the last position, which
+            // must be fetched.
+            Err(Unfetched::MissingUntil { next, reason }) if position < last => {
+                let through = next.clamp(position + 1, last) - 1;
+                passed = Some(match passed {
+                    Some((first, _, _)) => (first, through, reason),
+                    None => (position, through, reason),
+                });
+                position = through + 1;
+                continue;
+            }
+            Err(Unfetched::Missing(reason) | Unfetched::MissingUntil { reason, .. }) => {
                 return Err(CatchUpStop::Unreachable {
                     version: position,
                     reason,

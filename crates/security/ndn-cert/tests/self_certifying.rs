@@ -17,12 +17,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::{
-    AdoptError, AnchorLink, CaExchange, CertError, ContextRefresh, GenesisKey,
+    AdoptError, AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, GenesisKey,
     MAX_CATCH_UP_VERSIONS, NamespaceInitError, NamespacePolicies, NewRootStore, OldRoot,
-    PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, add_recovery_anchor, adopt_by_name,
-    anchor_fingerprint, bump_context_revoking, init_namespace_in_pib_with,
-    init_self_certifying_in_pib_with, load_persisted_contexts, persist_adoption, rdr_metadata_name,
-    recover_namespace_in_pib, recovery_anchor, recovery_version, refresh_context, reissue_version,
+    PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, Unfetched, VersionSource,
+    add_recovery_anchor, adopt_by_name, anchor_fingerprint, bump_context_revoking, follow_versions,
+    init_namespace_in_pib_with, init_self_certifying_in_pib_with, load_persisted_contexts,
+    persist_adoption, rdr_metadata_name, recover_namespace_in_pib, recovery_anchor,
+    recovery_version, refresh_context, reissue_version,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name, NameComponent};
@@ -622,4 +623,58 @@ async fn a_long_line_after_a_recovery_is_followed_whatever_its_length() {
         loaded.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
     assert_eq!(restarted.version_of(&ns), Some(newest));
+}
+
+/// A source with nothing more before the walk's last position: a walk past
+/// its time, or a store keeping no version in between.
+struct NothingUntilLast {
+    last: u64,
+    newest: Option<Data>,
+}
+
+impl VersionSource for NothingUntilLast {
+    async fn fetch(
+        &mut self,
+        position: u64,
+        _from: &SignedTrustContext,
+    ) -> Result<Data, Unfetched> {
+        match self.newest.take() {
+            Some(data) if position == self.last => Ok(data),
+            newest => {
+                self.newest = newest;
+                Err(Unfetched::MissingUntil {
+                    next: u64::MAX,
+                    reason: "the walk fetches for 40s at most".into(),
+                })
+            }
+        }
+    }
+}
+
+/// A self-certifying walk is not bounded by position, so its length must
+/// not cost: the newest version's name is not authenticated, and an
+/// upstream naming `v=2^64-1` must not make the walk step through every
+/// position once nothing more is fetched.
+#[tokio::test]
+async fn an_unbounded_walk_passes_over_what_it_cannot_fetch_at_once() {
+    let alice = Root::new(&GenesisKey::generate().unwrap()).await;
+    let last = u64::MAX;
+    let stop = follow_versions(
+        &alice.out.init.context,
+        2..=last,
+        &mut NothingUntilLast {
+            last,
+            newest: Some(Data::decode(alice.genesis().raw().clone()).unwrap()),
+        },
+    )
+    .await
+    .expect_err("v1 offered as the newest does not follow");
+    assert!(
+        matches!(
+            stop,
+            CatchUpStop::Missing { first: 2, last: through, version, .. }
+                if through == last - 1 && version == last
+        ),
+        "{stop}"
+    );
 }

@@ -399,10 +399,13 @@ impl VersionSource for GroupVersions<'_> {
             return Ok(data);
         }
         if Instant::now() >= self.deadline {
-            return Err(Unfetched::Missing(format!(
-                "the walk fetches for {}s at most",
-                MAX_CATCH_UP_TIME.as_secs()
-            )));
+            return Err(Unfetched::MissingUntil {
+                next: u64::MAX,
+                reason: format!(
+                    "the walk fetches for {}s at most",
+                    MAX_CATCH_UP_TIME.as_secs()
+                ),
+            });
         }
         let name = self.group.clone().append_segment(position);
         let content = self
