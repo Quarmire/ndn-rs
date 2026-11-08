@@ -210,14 +210,17 @@ pub enum Change {
     /// Two different versions with one `(writer, seq)`: evidence against that
     /// key (model invariant 2). Readers keep both and report. Told once for
     /// each collection the two versions are in: when they are in two
-    /// collections, a watcher of both is told twice, once tagged with each.
+    /// collections, a watcher of both is told twice, once tagged with each,
+    /// and each telling carries the other collection's version by name and
+    /// id only ([`Equivocal::Elsewhere`]): a watch shows the content of what
+    /// lies under what it watches, never another collection's.
     Equivocation {
         /// The collection it is told for: `first`'s or `second`'s.
         collection: Name,
         /// The version seen first.
-        first: Box<Version>,
+        first: Equivocal,
         /// The conflicting version.
-        second: Box<Version>,
+        second: Equivocal,
     },
     /// A held, verified version that is not in the state: the rule's
     /// [`NotCounted`](crate::merge::Counting::NotCounted), or its group is
@@ -237,6 +240,80 @@ pub enum Change {
         /// The version.
         id: VersionId,
     },
+    /// The watcher fell behind: it left [`Config::watch_queue`] changes
+    /// unread, so the changes after it were dropped until it read what was
+    /// queued, and delivery then went on (spec §15). Never a silent loss:
+    /// it comes after every change delivered before the gap. Read again —
+    /// watch anew from the frontier held (what was missed is listed), or
+    /// `get` what is shown. Its tag is the watched name.
+    ///
+    /// [`Config::watch_queue`]: crate::Config::watch_queue
+    Lagged {
+        /// The watched collection or folder.
+        collection: Name,
+    },
+    /// A collection under the watched folder this device does not follow:
+    /// `writer`, outside the collection's namespace, already made it follow
+    /// as many collections of that namespace as
+    /// [`Config::writer_collections`] allows one writer (spec §15). Its
+    /// versions are not fetched; told once per writer and collection.
+    ///
+    /// [`Config::writer_collections`]: crate::Config::writer_collections
+    Untracked {
+        /// The collection not followed.
+        collection: Name,
+        /// The writer whose new collection it is.
+        writer: Writer,
+        /// Why, and what to do: follow the collection by its name to read
+        /// it, or have the folder's owner remove the writer.
+        why: String,
+    },
+}
+
+/// One of the two versions of an [`Change::Equivocation`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Equivocal {
+    /// A version of the collection the change is told for, whole.
+    Here(Box<Version>),
+    /// A version of another collection, by its name and id only: neither
+    /// its content nor anything opened of it.
+    Elsewhere {
+        /// The version's own name (its log entry).
+        name: Name,
+        /// `(writer, seq)`: the change's other version's too.
+        id: VersionId,
+    },
+}
+
+impl Equivocal {
+    /// `v`, as told to a watcher of collection `told`: whole when it is of
+    /// `told`, else by name and id.
+    pub fn of(v: &Version, told: &Name) -> Self {
+        if v.collection == *told {
+            Equivocal::Here(Box::new(v.clone()))
+        } else {
+            Equivocal::Elsewhere {
+                name: v.name.clone(),
+                id: v.id.clone(),
+            }
+        }
+    }
+
+    /// The version's own name.
+    pub fn name(&self) -> &Name {
+        match self {
+            Equivocal::Here(v) => &v.name,
+            Equivocal::Elsewhere { name, .. } => name,
+        }
+    }
+
+    /// The version's id.
+    pub fn id(&self) -> &VersionId {
+        match self {
+            Equivocal::Here(v) => &v.id,
+            Equivocal::Elsewhere { id, .. } => id,
+        }
+    }
 }
 
 impl Change {
@@ -253,7 +330,9 @@ impl Change {
             | Change::Expired { collection, .. }
             | Change::Equivocation { collection, .. }
             | Change::NotCounted { collection, .. }
-            | Change::Counted { collection, .. } => collection,
+            | Change::Counted { collection, .. }
+            | Change::Lagged { collection }
+            | Change::Untracked { collection, .. } => collection,
         }
     }
 }
@@ -371,9 +450,11 @@ pub trait DataLayer: Send + Sync {
     /// included, by any writer, every change tagged with its collection
     /// ([`Change::collection`]); `since` filters each collection alike. The
     /// listing shows what is applied (with [`Change::NotCounted`] for what
-    /// is held but not counted); a version not applied yet comes once it
-    /// applies, so no version comes twice. Nested summaries let it descend
-    /// only into children that changed. Filled by slice 1.
+    /// is held but not counted) and the equivocation evidence held; a
+    /// version not applied yet comes once it applies, so no version comes
+    /// twice. Nested summaries let it descend only into children that
+    /// changed. A watcher that leaves too many changes unread is told
+    /// [`Change::Lagged`] rather than queued for without bound.
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError>;
 
     /// `snapshot(names | collections) → snapshot`.

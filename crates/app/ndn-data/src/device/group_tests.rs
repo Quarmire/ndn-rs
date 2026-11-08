@@ -64,6 +64,12 @@ pub(super) async fn device() -> Device {
 /// `/alice/laptop`, knowing `rules`, owning `plan()` and `budget()` shared
 /// as `share` says.
 pub(super) async fn device_with(rules: MergeRules, share: Share) -> Device {
+    device_tuned(share, |c| Config { rules, ..c }).await
+}
+
+/// `/alice/laptop`, its configuration as `tune` makes it, owning `plan()`
+/// and `budget()` shared as `share` says.
+pub(super) async fn device_tuned(share: Share, tune: impl FnOnce(Config) -> Config) -> Device {
     let device = n("/alice/laptop");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob", "/carol"] {
@@ -83,11 +89,10 @@ pub(super) async fn device_with(rules: MergeRules, share: Share) -> Device {
         keys,
         validator,
         store,
-        Config {
-            rules,
+        tune(Config {
             first_look: Duration::from_millis(50),
             ..Config::new()
-        },
+        }),
     )
     .await
     .unwrap();

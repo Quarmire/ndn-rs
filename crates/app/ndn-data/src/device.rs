@@ -79,7 +79,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Got, Hold,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     PutOptions, State,
 };
 use crate::merge::{
@@ -162,13 +162,28 @@ pub struct Config {
     /// anchor and adopt another person's. `None`: [`Device::offer`] and
     /// [`Device::join`] answer [`DataError::Local`] naming this setting.
     pub introducer: Option<Arc<dyn crate::intro::Introducer>>,
+    /// How many changes a watcher may leave unread, past what its watch
+    /// listed as it began (spec §15): one more is not queued; the watcher
+    /// is told [`Change::Lagged`] and the changes after it are dropped
+    /// until it read what was queued. At least 1.
+    pub watch_queue: usize,
+    /// The most collections of one namespace's data one writer outside
+    /// that namespace can make this device follow, by writing into a
+    /// folder it follows (spec §15). Past it, that writer's new
+    /// collections there are not followed, and the folder's watchers are
+    /// told why ([`Change::Untracked`]). The namespace's own devices, and
+    /// collections followed by their own name or with a members record of
+    /// their own, are not counted.
+    pub writer_collections: usize,
 }
 
 impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
     /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
     /// not a holder, 16 pieces an audit, a day of clock skew, the operating
-    /// system's randomness, no introducer.
+    /// system's randomness, no introducer, 4096 changes a watcher may leave
+    /// unread, 1024 collections one outside writer can make it follow in a
+    /// namespace.
     pub fn new() -> Self {
         Self {
             svs: SvsConfig::default(),
@@ -189,6 +204,8 @@ impl Config {
                 getrandom::getrandom(buf).expect("the operating system provides randomness")
             }),
             introducer: None,
+            watch_queue: 4096,
+            writer_collections: 1024,
         }
     }
 }
@@ -211,6 +228,8 @@ impl std::fmt::Debug for Config {
             .field("audit_pieces", &self.audit_pieces)
             .field("clock_skew", &self.clock_skew)
             .field("introducer", &self.introducer.is_some())
+            .field("watch_queue", &self.watch_queue)
+            .field("writer_collections", &self.writer_collections)
             .finish_non_exhaustive()
     }
 }
@@ -1438,7 +1457,38 @@ struct SyncGroup {
 struct Watcher {
     target: Name,
     since: Frontier,
-    tx: mpsc::UnboundedSender<Result<Change, DataError>>,
+    /// Bounded: what the watch listed when it began, then
+    /// [`Config::watch_queue`] changes, then one slot for
+    /// [`Change::Lagged`] ([`Self::send`]).
+    tx: mpsc::Sender<Result<Change, DataError>>,
+    /// Told [`Change::Lagged`], and not read empty since: every change is
+    /// dropped until it is.
+    lagged: bool,
+}
+
+impl Watcher {
+    /// Deliver `change` (spec §15). A watcher too slow to read what it was
+    /// sent is not queued for without bound: the last slot of its queue
+    /// takes [`Change::Lagged`], and from there every change is dropped
+    /// until it read the queue empty, then delivery goes on. It learns of
+    /// the gap in order, after every change it was sent, and reads again
+    /// from the frontier it holds.
+    fn send(&mut self, change: Change) {
+        if self.lagged {
+            if self.tx.capacity() < self.tx.max_capacity() {
+                return;
+            }
+            self.lagged = false;
+        }
+        if self.tx.capacity() <= 1 {
+            self.lagged = true;
+            let _ = self.tx.try_send(Ok(Change::Lagged {
+                collection: self.target.clone(),
+            }));
+            return;
+        }
+        let _ = self.tx.try_send(Ok(change));
+    }
 }
 
 struct SignedRoot {
@@ -1550,6 +1600,15 @@ struct St {
     /// Every seq at which a key signed more than one entry, with the names
     /// of those entries: equivocation, its evidence kept (spec §4, §5.5).
     equivocal: HashMap<Writer, BTreeMap<u64, Vec<Name>>>,
+    /// Each collection of others' data this device follows only through a
+    /// folder above it, by the writer whose version or summary made it
+    /// follow it ([`Self::track`]): rebuilt from the versions held at
+    /// start, so a writer's count lasts across a restart.
+    brought: HashMap<Name, Writer>,
+    /// How many collections of each namespace each writer outside it made
+    /// this device follow ([`Self::brought`]), against
+    /// [`Config::writer_collections`].
+    bringing: HashMap<(Writer, Name), usize>,
     /// The merge rules this device runs ([`Config::rules`]).
     rules: MergeRules,
     /// This device's writer.
@@ -2955,9 +3014,9 @@ impl St {
 
     fn emit(&mut self, about: &Name, change: &Change, writer: &Writer, seq: u64) {
         self.watchers.retain(|w| !w.tx.is_closed());
-        for w in &self.watchers {
+        for w in &mut self.watchers {
             if about.has_prefix(&w.target) && w.since.get(writer).is_none_or(|s| s.0 < seq) {
-                let _ = w.tx.send(Ok(change.clone()));
+                w.send(change.clone());
             }
         }
     }
@@ -3043,9 +3102,9 @@ impl St {
     /// is taken back. The others had it delivered as it applied.
     fn tell_again(&mut self, v: &Version) {
         self.watchers.retain(|w| !w.tx.is_closed());
-        for w in &self.watchers {
+        for w in &mut self.watchers {
             if v.collection.has_prefix(&w.target) && w.since.contains(&v.id) {
-                let _ = w.tx.send(Ok(Change::Version(v.clone())));
+                w.send(Change::Version(v.clone()));
             }
         }
     }
@@ -3053,9 +3112,9 @@ impl St {
     /// Tell every watcher of collection `c`, whatever its frontier.
     fn tell(&mut self, c: &Name, change: &Change) {
         self.watchers.retain(|w| !w.tx.is_closed());
-        for w in &self.watchers {
+        for w in &mut self.watchers {
             if c.has_prefix(&w.target) {
-                let _ = w.tx.send(Ok(change.clone()));
+                w.send(change.clone());
             }
         }
     }
@@ -4456,11 +4515,11 @@ impl St {
         }
         watchers.retain(|w| !w.tx.is_closed());
         for (change, of) in changes {
-            for w in watchers.iter() {
+            for w in watchers.iter_mut() {
                 let to =
                     c.has_prefix(&w.target) && of.as_ref().is_none_or(|id| !w.since.contains(id));
                 if to {
-                    let _ = w.tx.send(Ok(change.clone()));
+                    w.send(change.clone());
                 }
             }
         }
@@ -4651,24 +4710,118 @@ impl St {
         names.push(name.clone());
         tracing::warn!(%first, second = %name, "two log entries of one key at one seq: equivocation");
         if let Record::Version(body) = record
-            && let Some(v) = self.held_version(&first)
+            && let Some(first) = self.held_version(&first)
         {
-            let first = Box::new(v.clone());
-            let second = Box::new(version_of(name, writer, seq, body.clone()));
+            let second = version_of(name, writer, seq, body.clone());
             let mut told = vec![body.collection.clone()];
-            if v.collection != body.collection {
-                told.push(v.collection.clone());
+            if first.collection != body.collection {
+                told.push(first.collection.clone());
             }
+            // Each collection's watchers see its own version whole and the
+            // other collection's by name and id only.
             for c in told {
                 let change = Change::Equivocation {
                     collection: c.clone(),
-                    first: first.clone(),
-                    second: second.clone(),
+                    first: Equivocal::of(&first, &c),
+                    second: Equivocal::of(&second, &c),
                 };
                 self.tell(&c, &change);
             }
         }
         true
+    }
+
+    /// The equivocation evidence held of collections under `target`
+    /// ([`Self::note_seq`]): each later version at a writer's seq beside
+    /// the first, told for each of their collections under `target`, the
+    /// version of another collection by name and id only.
+    fn equivocations_under(&self, target: &Name) -> Vec<Change> {
+        let mut writers: Vec<&Writer> = self.equivocal.keys().collect();
+        writers.sort();
+        let mut out = Vec::new();
+        for names in writers.into_iter().flat_map(|w| self.equivocal[w].values()) {
+            let Some((first, rest)) = names.split_first() else {
+                continue;
+            };
+            let Some(first) = self.held_version(first) else {
+                continue;
+            };
+            for second in rest.iter().filter_map(|n| self.held_version(n)) {
+                let mut told = vec![first.collection.clone()];
+                if second.collection != first.collection {
+                    told.push(second.collection.clone());
+                }
+                for c in told.into_iter().filter(|c| c.has_prefix(target)) {
+                    out.push(Change::Equivocation {
+                        first: Equivocal::of(&first, &c),
+                        second: Equivocal::of(&second, &c),
+                        collection: c,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a version or summary node of `writer` may make this device
+    /// follow collection `c` (spec §15, [`Config::writer_collections`]).
+    /// Yes when it follows `c` already — by its own name, under a members
+    /// record of its own, held for its owner, or brought by a writer
+    /// before — or follows nothing above it, or `writer` is a device of
+    /// `c`'s namespace; else when `writer` made it follow fewer than
+    /// `limit` collections of that namespace, and `c` then counts as one
+    /// more. Read back at start, what the store held counts and is never
+    /// refused. A refusal is told to the folder's watchers, naming the
+    /// writer and what to do.
+    fn track(&mut self, c: &Name, writer: &Writer, limit: usize) -> bool {
+        let Some(ns) = namespace_of(c) else {
+            return true;
+        };
+        if writer.key().has_prefix(&ns) {
+            // The namespace's own device: never counted, and a collection
+            // it writes into is its namespace's, not an outside writer's.
+            if let Some(before) = self.brought.insert(c.clone(), writer.clone())
+                && !before.key().has_prefix(&ns)
+                && let Some(n) = self.bringing.get_mut(&(before, ns))
+            {
+                *n = n.saturating_sub(1);
+            }
+            return true;
+        }
+        if self.brought.contains_key(c)
+            || self.follows.contains(c)
+            || self.holding.contains_key(c)
+            || self.colls.get(c).is_some_and(|x| x.members.is_some())
+            || !(self.restoring || self.inside(c))
+        {
+            return true;
+        }
+        let n = self
+            .bringing
+            .entry((writer.clone(), ns.clone()))
+            .or_default();
+        if self.restoring || *n < limit {
+            *n += 1;
+            self.brought.insert(c.clone(), writer.clone());
+            return true;
+        }
+        let w = writer.key();
+        let why = format!(
+            "{w} already made this device follow {limit} collections of {ns}, the most \
+             Config::writer_collections lets one writer outside {ns} add by writing into a \
+             folder, so {c} is not followed: follow {c} by its name to read it, or have {ns} \
+             remove {w} from the folder's writers"
+        );
+        tracing::warn!(collection = %c, writer = %w, "{why}");
+        self.tell(
+            c,
+            &Change::Untracked {
+                collection: c.clone(),
+                writer: writer.clone(),
+                why,
+            },
+        );
+        false
     }
 
     /// Judge again every group of `writer` over `seq` (spec §5.5): a second
@@ -5424,13 +5577,13 @@ impl St {
                 }
             }
             if at.contains(&id) {
-                for w in watchers.iter() {
+                for w in watchers.iter_mut() {
                     if c.has_prefix(&w.target) {
-                        let _ = w.tx.send(Ok(Change::Pruned {
+                        w.send(Change::Pruned {
                             collection: c.clone(),
                             id: id.clone(),
                             by: by.clone(),
-                        }));
+                        });
                     }
                 }
             }
@@ -5582,13 +5735,13 @@ impl St {
             }
             store.insert(expired_name(&name), wire::encode_tomb(&tomb));
             if at.contains(&id) {
-                for w in watchers.iter() {
+                for w in watchers.iter_mut() {
                     if c.has_prefix(&w.target) {
-                        let _ = w.tx.send(Ok(Change::Expired {
+                        w.send(Change::Expired {
                             collection: c.clone(),
                             id: id.clone(),
                             keep: tomb.keep,
-                        }));
+                        });
                     }
                 }
             }
@@ -5978,6 +6131,8 @@ impl Device {
                 group_folders: HashMap::new(),
                 seqs: HashMap::new(),
                 equivocal: HashMap::new(),
+                brought: HashMap::new(),
+                bringing: HashMap::new(),
                 rules,
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
@@ -8473,6 +8628,16 @@ impl Inner {
             let (children, pages) = {
                 let mut st = self.st.lock();
                 let inside = st.inside(&subject);
+                // A collection this outside writer may not make the device
+                // follow ([`St::track`]): nothing of it is taken from this
+                // writer's summary.
+                if inside
+                    && body.page.is_none()
+                    && !body.entries.is_empty()
+                    && !st.track(&subject, writer, self.config.writer_collections)
+                {
+                    return true;
+                }
                 // A collection peeked at: its records only (spec §5.3).
                 let peeked = !inside && st.peeks.contains(&subject);
                 if body.page.is_none() && (inside || peeked) {
@@ -9032,8 +9197,13 @@ impl Inner {
             {
                 let change = Change::Equivocation {
                     collection: body.collection.clone(),
-                    first: Box::new(first),
-                    second: Box::new(version_of(&name, &writer, seq, body.clone())),
+                    first: Equivocal::Here(Box::new(first)),
+                    second: Equivocal::Here(Box::new(version_of(
+                        &name,
+                        &writer,
+                        seq,
+                        body.clone(),
+                    ))),
                 };
                 st.emit(&body.collection, &change, &writer, seq.saturating_sub(1));
             }
@@ -9044,6 +9214,13 @@ impl Inner {
         }
         let parsed = parse_log_name(&name)?;
         if record.subject() != parsed.subject {
+            return None;
+        }
+        // A version of a collection its outside writer may not make this
+        // device follow is not taken ([`St::track`]).
+        if let (Record::Version(_), Some(c), false) = (&record, &parsed.subject, mine)
+            && !st.track(c, &writer, self.config.writer_collections)
+        {
             return None;
         }
         let id = VersionId {
@@ -16189,8 +16366,7 @@ impl DataLayer for Device {
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError> {
         let inner = &self.inner;
         inner.follow(collection).await?;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        {
+        let mut rx = {
             let mut st = inner.st.lock();
             // A collection under the target not built yet is built only if
             // it holds a version past `since` — one to list; the rest stay
@@ -16261,15 +16437,26 @@ impl DataLayer for Device {
             }
             // Stable: a version comes before why it is not counted.
             listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            for (_, _, change) in listed {
-                let _ = tx.send(Ok(change));
+            let mut changes: Vec<Change> = listed.into_iter().map(|(_, _, c)| c).collect();
+            // The equivocation evidence held of what lies under the target,
+            // whatever its frontier: it is reported as long as it is held
+            // (spec §4), each version of another collection by name and id.
+            changes.extend(st.equivocations_under(collection));
+            // The listing, then `watch_queue` changes and one slot for
+            // `Lagged` ([`Watcher::send`]).
+            let room = changes.len() + inner.config.watch_queue.max(1) + 1;
+            let (tx, rx) = mpsc::channel(room);
+            for change in changes {
+                let _ = tx.try_send(Ok(change));
             }
             st.watchers.push(Watcher {
                 target: collection.clone(),
                 since: since.clone(),
                 tx,
+                lagged: false,
             });
-        }
+            rx
+        };
         let ns = namespace_of(collection).expect("followed, so a data name");
         inner.refresh_group(&ns);
         Ok(Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx))))

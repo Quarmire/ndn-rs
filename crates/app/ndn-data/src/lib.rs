@@ -81,7 +81,7 @@ pub use device::{Clock, Config, CutBound, CutProposal, Device, Entropy, Released
 pub use error::{DataError, NextStep, Refusal};
 pub use intro::{Code, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Got, Hold,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     PutOptions, Share, State,
 };
 pub use merge::{
