@@ -1200,17 +1200,19 @@ These are refused before anything is written:
    whatever anchors it holds — a forwarder's holds every PIB trust anchor,
    its own root included, so a key certified under one person's root
    would otherwise vouch for another person's names. Without `/user/<h>`
-   held, every packet in it is refused — signed or not, under every
-   security profile, `accept-signed` included — with a refusal naming
-   `/user/<h>` and saying to adopt it by name first (ndn-rs
+   held, every signed packet in it is refused, under every security
+   profile, `accept-signed` included, with a refusal naming `/user/<h>`
+   and saying to adopt it by name first (ndn-rs
    `TrustError::PersonalNamespaceNotHeld`, forwarder refusal
-   `untrusted-root`), and a forwarder caches none of it. Two exceptions,
-   both needed to adopt `/user/<h>` by name: its context versions arrive
-   under an adoption's expectation (§4.4), and a DigestSha256 packet among
-   its own trust objects (`/user/<h>/32=trust-context/…`: the metadata
-   pointer, cut-manifest pieces) passes on its digest, integrity only — it
-   vouches for nothing, and every version it points at is checked from the
-   genesis.
+   `untrusted-root`), and a forwarder caches none of it. Two kinds of
+   packet are not refused: its context versions, under an adoption's
+   expectation (§4.4), so it can be adopted by name; and a DigestSha256
+   packet, which names no signer and vouches for nothing, so it passes
+   integrity-only as under every name — the namespace's metadata pointer,
+   whose versions are each checked from the genesis, and a device's
+   wrapped `32=held` answers, through which a stranger fetches an offer
+   before it trusts the inviter ([data-layer.md](data-layer.md) §19), are
+   such packets, and their consumers check what they carry.
 5. **No position bound.** The 128-position bound of §5.4 does not apply to
    a self-certifying namespace's walks — a refresh, a sync update, an
    adoption by name, a restart from the stored genesis — because the only
@@ -1454,10 +1456,11 @@ A name in a self-certifying namespace, `/user/<h>/…` (§4.5), is governed
 only by the context of `/user/<h>` itself: a held context of a shorter
 prefix (`/user`, `/`) is never selected for it, and **neither is the
 ambient context**. Without `/user/<h>` held, such a name is judged by a
-fixed context with no anchors and an empty schema, which accepts nothing —
-anchored or signature-only (`accept-signed`), signed or digest — and the
-validator refuses it up front, naming `/user/<h>` and saying to adopt it by
-name (§4.5.6 note 4 gives the two exceptions an adoption by name needs).
+fixed context with no anchors and an empty schema, which accepts no signed
+packet — anchored or signature-only (`accept-signed`) — and the validator
+refuses such a packet up front, naming `/user/<h>` and saying to adopt it by
+name (§4.5.6 note 4 gives what passes: context versions under an adoption's
+expectation, and integrity-only digests).
 Every path that judges a name by its context goes through this one
 selection (ndn-rs `Keyring::context_for`; `Keyring::held_for` answers
 whether a held context covers a name, `Keyring::unheld_personal_namespace`

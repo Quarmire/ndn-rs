@@ -155,40 +155,42 @@ async fn a_key_of_another_person_never_vouches_for_a_namespace_not_held() {
     }
 }
 
-/// A digest names no signer, so it vouches for nothing in a namespace not
-/// held — except the namespace's own trust objects (the RDR metadata
-/// pointer to its newest context), which an adoption by name through this
-/// validator fetches and checks from the genesis: those pass integrity-only,
-/// and a signed one is still refused.
+/// A digest names no signer and vouches for nothing, so in a namespace not
+/// held it passes integrity-only, as a digest does under every name — a
+/// device's wrapped `32=held` answers and the namespace's RDR metadata
+/// pointer are such packets, and the consumer checks what they carry — while
+/// a signed packet there, among the namespace's trust objects included, is
+/// still refused.
 #[tokio::test]
-async fn a_digest_packet_in_a_namespace_not_held_is_refused() {
+async fn a_digest_packet_in_a_namespace_not_held_is_integrity_only() {
     let bob = bob().await;
     let alice_mgr = SecurityManager::new();
     let (alice, _, _) = person(&alice_mgr, 2);
-    let digest =
-        || Data::decode(DataBuilder::new(alice.clone().append("doc"), b"x").sign_digest_sha256());
-    let v = validator(&bob);
-    assert_says_adopt(
-        &refusal(v.validate_durable(&digest().unwrap()).await, "digest"),
-        &alice,
-    );
-    assert_says_adopt(
-        &refusal(v.validate(&digest().unwrap()).await, "digest, single hop"),
-        &alice,
-    );
-
     let keyword = |k: &'static [u8]| NameComponent::keyword(Bytes::from_static(k));
     let pointer = alice
         .clone()
         .append_component(keyword(b"trust-context"))
         .append_component(keyword(b"metadata"));
-    let unsigned = Data::decode(DataBuilder::new(pointer.clone(), b"v=3").sign_digest_sha256());
-    match v.validate_durable(&unsigned.unwrap()).await {
-        ValidationResult::Valid(safe) => assert!(
-            matches!(safe.trust_path(), TrustPath::DigestSha256),
-            "integrity only"
-        ),
-        other => panic!("the namespace's metadata pointer, a digest, was refused: {other:?}"),
+    let held = alice
+        .clone()
+        .append("laptop")
+        .append_component(keyword(b"held"))
+        .append("piece");
+    let v = validator(&bob);
+    for name in [alice.clone().append("doc"), held, pointer.clone()] {
+        let digest = || Data::decode(DataBuilder::new(name.clone(), b"x").sign_digest_sha256());
+        for (how, result) in [
+            ("durable", v.validate_durable(&digest().unwrap()).await),
+            ("single hop", v.validate(&digest().unwrap()).await),
+        ] {
+            match result {
+                ValidationResult::Valid(safe) => assert!(
+                    matches!(safe.trust_path(), TrustPath::DigestSha256),
+                    "{name} ({how}) passed as more than integrity-only"
+                ),
+                other => panic!("a digest packet {name} ({how}) was refused: {other:?}"),
+            }
+        }
     }
     assert_says_adopt(
         &refusal(

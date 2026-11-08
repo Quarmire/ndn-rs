@@ -265,30 +265,25 @@ impl Validator {
             })
     }
 
-    /// The refusal of every packet named `name` while it lies in a person's
-    /// self-certifying namespace this validator's keyring does not hold
-    /// ([`Keyring::unheld_personal_namespace`]): no ambient anchor, held
-    /// `/user` or `/` context, signature-only posture or integrity-only
-    /// digest vouches for a person's names (trust-context.md §4.5.6).
+    /// The refusal of every signed packet named `name` while it lies in a
+    /// person's self-certifying namespace this validator's keyring does not
+    /// hold ([`Keyring::unheld_personal_namespace`]): no ambient anchor, held
+    /// `/user` or `/` context or signature-only posture vouches for a
+    /// person's names (trust-context.md §4.5.6).
     ///
-    /// One exception, so the namespace can be adopted by name through this
-    /// validator: a `digest` (DigestSha256) packet among the namespace's own
-    /// trust objects (`/user/<0xA1: …>/32=trust-context/…`: its RDR
-    /// metadata pointer, cut-manifest pieces) passes on its digest alone,
-    /// labelled integrity-only as every digest packet is — it vouches for
-    /// nothing, and the adopter checks every version it points at from the
-    /// genesis. The context versions themselves are signed: they are taken
-    /// only under an expectation ([`Self::expect_context`]), which is
-    /// decided before this.
+    /// A `digest` (DigestSha256) packet is not refused here: it names no
+    /// signer and vouches for nothing, so it passes on its digest alone,
+    /// labelled integrity-only, as under every other name. A device's
+    /// wrapped `32=held` answers (how a stranger to the namespace fetches an
+    /// offer before it trusts the inviter) and the namespace's RDR metadata
+    /// pointer are such packets; their consumers check what they carry. The
+    /// context versions themselves are signed: they are taken only under an
+    /// expectation ([`Self::expect_context`]), which is decided before this.
     pub(super) fn unheld_person(&self, name: &Name, digest: bool) -> Option<TrustError> {
-        let namespace = self.keyring.unheld_personal_namespace(name)?;
-        let trust_object = name.components().get(namespace.len())
-            == Some(&ndn_packet::NameComponent::keyword(
-                bytes::Bytes::from_static(crate::trust_context::TRUST_CONTEXT_KEYWORD),
-            ));
-        if digest && trust_object {
+        if digest {
             return None;
         }
+        let namespace = self.keyring.unheld_personal_namespace(name)?;
         Some(TrustError::PersonalNamespaceNotHeld {
             name: name.to_string(),
             namespace: namespace.to_string(),

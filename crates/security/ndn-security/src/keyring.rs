@@ -511,7 +511,8 @@ impl Keyring {
     /// context, whatever anchors it holds (a forwarder's holds every PIB
     /// anchor, its own root included). Without its own context such a name
     /// is judged by a fixed context with no anchors and an empty schema,
-    /// which accepts nothing, signed or not, anchored or not
+    /// which accepts no signer, anchored or not (a DigestSha256 packet,
+    /// which names none, stays integrity-only as under every name)
     /// ([`unheld_personal_namespace`](Self::unheld_personal_namespace) says
     /// which namespace to adopt; trust-context.md §4.5.6). That context's
     /// namespace is `/`, as the ambient's: a caller asking whether a held

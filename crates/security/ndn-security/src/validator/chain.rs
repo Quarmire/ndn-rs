@@ -155,8 +155,8 @@ impl Validator {
             return result(r);
         }
         // A person's names whose namespace is not held: refused whatever
-        // signs them, a digest included (but for the namespace's own
-        // integrity-only trust objects, see `unheld_person`).
+        // signs them; a digest, which vouches for nothing, passes
+        // integrity-only as under every name (see `unheld_person`).
         let digest = data
             .sig_info()
             .is_some_and(|s| s.sig_type == SignatureType::DigestSha256);
