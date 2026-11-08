@@ -385,6 +385,57 @@ async fn a_device_serves_the_pieces_of_a_version_it_applied() {
     dev.shutdown();
 }
 
+/// ndf's REPLY-12 §1 (spec §13.5): a device answers for every entry it holds
+/// verified of another device — applied or waiting, of its own namespace or
+/// another's, by name and under its own name — with the very packet its
+/// writer signed, and for nothing it refused or never held.
+#[tokio::test]
+async fn a_device_serves_every_entry_it_holds_of_others_and_nothing_it_refused() {
+    let dev = device(rules()).await;
+    let applied = version("/bob/laptop", 10, &[], edit(None, "applied"));
+    let missing = version(
+        "/bob/laptop",
+        11,
+        &[tip(&applied)],
+        edit(None, "never held"),
+    );
+    let waiting = version("/bob/laptop", 12, &[tip(&missing)], edit(None, "waiting"));
+    let phone = version("/alice/phone", 3, &[], edit(None, "phone"));
+    let refused = version(
+        "/carol/phone",
+        4,
+        &[],
+        Bytes::from_static(b"not an operation"),
+    );
+    for m in [&applied, &waiting, &phone, &refused] {
+        give(&dev, m);
+    }
+    assert!(at(&dev).contains(&applied.id()));
+    assert!(!at(&dev).contains(&waiting.id()), "it waits for its parent");
+    assert!(dev.inner.st.lock().refused.contains_key(&refused.name));
+    for m in [&applied, &waiting, &phone] {
+        assert_eq!(
+            dev.inner.packet_for(&m.name, false).as_ref(),
+            Some(&m.packet),
+            "{} served",
+            m.name
+        );
+        assert_eq!(
+            dev.inner.held_packet(&m.name).as_ref(),
+            Some(&m.packet),
+            "{} served under the device's own name",
+            m.name
+        );
+    }
+    assert_eq!(dev.inner.packet_for(&refused.name, false), None, "refused");
+    assert_eq!(
+        dev.inner.packet_for(&missing.name, false),
+        None,
+        "never held"
+    );
+    dev.shutdown();
+}
+
 #[tokio::test]
 async fn a_reader_asks_the_pieces_of_a_version_of_the_devices_that_built_over_it() {
     let dev = device(rules()).await;

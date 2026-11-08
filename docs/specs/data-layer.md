@@ -1563,7 +1563,10 @@ A reader:
 - discovers a writer's root with `<D>/32=summary/<O>/32=root` (CanBePrefix,
   MustBeFresh), verifies it as a log entry is verified (§4), and checks
   that its subject is `O`, its writer field its signing key and its name's
-  seq its `Head`;
+  seq its `Head`. A writer that does not answer is answered for by the
+  devices that hold its newest root (§13.5): taken only at or above the
+  head verified, under each device's own name, never by the root's
+  discovery name;
 - MUST refuse a root whose `Head` is lower than one it verified from that
   writer for `O`, or than the highest seq it holds of that writer under `O`
   (invariant 3, "rollback"). The highest `Head` verified per writer and
@@ -1857,6 +1860,8 @@ drops an anchor, or lists a new role in DataRequiresCut; and the first
 version of a namespace it adopts), it MUST judge again every entry it
 holds with the whole durable walk a fresh fetch gets (trust-context.md
 §6.3), run again on the stored packet: signature, chain, issuers, schema,
+  A node, page or entry its writer does not answer is asked of the devices
+  that hold it (§13.5), and checked as from the writer.
 revocation, cut, manifest and key digest. Checking only whether the
 entry's own signing key is revoked is not enough: a version can revoke an
 issuer, such as the old CA a compromised-root recovery revokes, and every
@@ -2396,7 +2401,7 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
 - Besides its writer and the holders, a reader asks for those pieces the
   devices whose versions held here are made over the version (their
   parents include it), each under its own name `<D>/32=held/<Name TLV>`:
-  a device serves the entry and pieces of every merge version it applied.
+  a device serves the entry and pieces of every version it holds (§13.5).
   A writer that serves its pieces to some devices only does not stall what
   others build over them.
 - A reader does not keep an applied operation in pieces in memory: it is
@@ -2874,6 +2879,122 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   one, `Expired` (§14.1).
 - **`get(entry name)`** answers `Entries` with that one entry of its block
   (`Age::Exact`), fetching the block when not held, as `get` of the block's
+### 13.5 What a device serves — slice 6 (round 3)
+
+Any holder of a signed packet may answer for it: a packet is trusted for
+its signature and the digests that name it, never for who sent it (§1).
+So a device serves every entry it holds verified, of every writer — its
+own, other devices of its namespace, other namespaces — not only its own
+log. Before, a device served only its own log, a holder's collections and
+the merge versions it applied: a person whose phone writes and goes away
+had their work reach others only while the phone, or a custody holder,
+was online (ndf's REPLY-12 §1; case h10).
+
+**What it serves.** By name and, asked under its own name, by
+`<D>/32=held/<Name TLV>` (answered DigestSha256, the packet inside, §13.1):
+
+- every log entry of another device it holds verified: a version, opened
+  or held sealed — a sealed one as the ciphertext its writer signed —, and
+  every record (members, folder, hold, lease, prune, snapshot); stored, or
+  waiting in memory (pending, parked while its group waits, locked);
+- every piece (chunk and manifest node) of such a version that it holds;
+- every node and page of another device's summary it verified in its
+  newest descent of that device: the reader keeps, per writer, node and
+  page, the newest packet it checked against the digest its parent listed
+  (ndn-data: under `/localhost/ndn-data/relayed/<node name without its
+  head>`, so a newer one of the node replaces it), and answers the node's
+  name with it when the head matches;
+- under its own name only, asked by the discovery prefix
+  `<W>/32=summary/<O>/32=root`, the newest summary root of writer `W` for
+  `O` it verified (kept for the rollback floor, §7). By name a root's
+  discovery still reaches the writer alone (FreshnessPeriod 0, §7): a
+  holder answering it would race the writer with an older root.
+
+It always serves exactly the packet it holds, never one it signs or
+re-wraps (the `32=held` answer carries the packet unchanged).
+
+**What it never serves.** What a known prune covers — by the prune
+records it holds, whether or not it held the version (§14) — and what
+expired by its own clock (§14.1): retention and erasure are the writer's,
+and a holder answering for pruned bytes would undo them. Erasure destroys
+an epoch's key only once every version sealed in it is pruned (§14), so a
+version of an erased epoch is never served either. Nothing refused or
+withdrawn here: by the record in force (`NotMember`, `OutsideCut`), a
+revocation cut or an untrusted chain (§8), its group (§5.5) or its rule's
+check (§5.2) — another reader would refuse it too, and serving it would
+only cost that reader a verification. Nothing it holds unverified: a
+packet that did not verify is never kept (§4). An own entry above the
+durable head, and an own piece a release is auditing holders for, stay
+unserved as before (§4.2, §13.3).
+
+**Asking for a writer who does not answer.** A reader asks the writer
+first, by name, as before. When the writer does not answer, it asks, in
+order, the holders of a live lease on the collection (§13.2), then, for
+pieces, the devices whose versions are made over the version (§13.1),
+then every other device it hears for the namespace (§12: heard in its
+group, or writing into it by the records held), not ended here (a key
+suspected or revoked), each under its own name:
+
+- for the writer's root of `O` (§7), every such device of `O`; it takes the
+  root with the highest head, if that head is at least the highest it
+  verified of that writer — an older one is a holder that is behind, not
+  the writer rolling back, and is not taken. It is asked MustBeFresh, so
+  no cache answers with an earlier answer;
+- for a node or page the root lists, the same devices; the packet must be
+  the one whose digest its parent lists, as from the writer;
+- for an entry and for a piece, the devices of the collection's namespace;
+  an entry is verified against its writer's key as from the writer, a
+  piece against its manifest.
+
+A device that holds nothing of it answers with a Nack, at once. The writer
+asked first, a reader that reaches it never waits on a holder; one that
+does not reach it waits one Interest per device asked, and only for what
+the writer did not answer.
+
+**Threat notes.**
+
+- *What serving others' packets exposes.* Nothing a reader of the
+  collection could not fetch from the writer: the same signed packets,
+  sealed payloads as ciphertext, under the same names. What is new is
+  that the holder's own name now answers for them, so anyone who can
+  reach the holder learns, by asking, which entries, pieces and summary
+  nodes it holds — which collections it follows and how far its copy
+  goes — and can fetch metadata (§9 lists it: names, sizes, parents,
+  groups, dates, the writer) longer than the writer stays online. Sealed
+  content stays sealed: the holder never unseals for anyone. A person who
+  wants a device to serve nothing of others does not let it follow their
+  collections; prune and expiry bound how long anything is served.
+- *Cache poisoning.* A holder answering with another packet than the one
+  asked for gains nothing: an entry is verified against its writer's key
+  (a packet signed by another key, or that does not decode, is dropped and
+  nothing is kept against its name, §4), a node or piece against the
+  digest its parent lists, a root by its writer's signature and the
+  rollback floor. The `32=held` wrapper is DigestSha256 under the holder's
+  name: a cache holding it answers only that holder's name, with the same
+  bytes; a root, asked fresh, is never answered from a cache.
+- *Amplification.* A holder answers one Interest with one packet it holds,
+  no larger than that packet and its wrapper; it never fetches on an
+  asker's behalf, signs nothing, and verifies nothing to answer (a lookup
+  in its store and its index). A reader asks each device once per packet
+  the writer did not answer, so its cost is bounded by the devices it
+  hears and what it was going to fetch anyway.
+- *A holder that withholds or is behind.* It can answer nothing, or serve
+  an older root: the reader then gets less, never wrong data, and never
+  goes below the head it verified; the writer, once reachable, is asked
+  first again. Withholding by every holder is the writer's being offline,
+  as before.
+- *Equivocation.* A holder answers for a name with the packet it holds. A
+  writer that signed two packets at one name (a copy of its key, §4)
+  may have one held at one device and the other elsewhere; a reader
+  takes the first that verifies, and the second, met later from any
+  source, is the equivocation §4 reports and §5.5 refuses a group for. A
+  holder cannot make one: it cannot sign for the writer. A removal cut
+  bound to bytes (§8) decides which packet stays, whoever serves it.
+- *Erasure.* Prune and expiry are checked as a packet is asked for, by the
+  prune records held and the device's clock; a device restarted with
+  orphan pieces of a pruned version serves none of them (the prune
+  records are restored, not only the versions held).
+
   name would (§4.1); an index past the block's last entry, `NotFound`.
 - **`get(range name)`** of a one-key collection answers `Entries` (§5.4),
   aged as `get(C)`; of another rule, `BadRequest` (next step `FixRequest`).
@@ -3824,6 +3945,9 @@ answered again), i3 (a code past its expiry by the offering device's
 clock is refused `Expired`; a new code admits), i4 (an offer closing at
 two wrong tries: the first is refused `WrongProof` with one left
 (`FixRequest`); the offering device restarts; the second is refused
+| Writer offline, another device holds its work | Readers ask the other devices they hear for the namespace, under their own names, for the writer's newest root, summary nodes, entries and pieces; each answers with the writer's own packets (sealed as ciphertext), verified as from the writer. Nothing pruned, expired, refused or unverified is served. | §13.5 |
+| Holder behind, or withholding | Its older root is not taken below the head verified; the reader gets less, never wrong data, and asks the writer first again once reachable. | §7, §13.5 |
+| Group member in pieces, not opened yet | Present once every piece is held; opened as it applies; the group counts whole, on readers and on the writer after it reads a collection again. | §5.5 |
 `Closed`, and so is the right code afterwards from the same key — the
 count survived the restart), i5 (two keys presenting one code at once:
 exactly one is admitted, the other refused `Used`, also when it asks
@@ -4054,6 +4178,11 @@ checks, in this order:
 8. **The asker's tries are not spent**: fewer wrong tries of this key
    counted than the offer's `Tries`. Else `Closed`.
 9. **The proof is right** (§19.6), for that key and its public key's
+h10 (a device serves the versions it holds that another device wrote:
+Alice's phone locks a paragraph of a sealed folder and goes away for good,
+no cache keeping what it served; her laptop answers for the phone's root,
+summary nodes and sealed entry, exactly as the phone signed them, and Bob
+counts the lock),
    digest. Else the wrong try is counted against the key, and toward the
    overall cap once the pause after the last one counted there has passed
    (`Config::intro.backoff`, 1 s by default, doubled by each counted, by

@@ -667,14 +667,6 @@ struct Dormant {
     parents: BTreeSet<Writer>,
 }
 
-impl Dormant {
-    fn holds(&self, id: &VersionId) -> bool {
-        self.held
-            .get(&id.writer)
-            .is_some_and(|s| s.contains(&id.seq.0))
-    }
-}
-
 /// A group member parked in the store while its group is incomplete
 /// ([`Coll::parked`]): its name, and what judging its group reads of it.
 struct Parked {
@@ -7421,6 +7413,17 @@ impl Inner {
             }
             if let Some((d, c)) = parse_head_prefix(&name) {
                 // Its signer, the one key it was verified as.
+/// Where the store keeps the newest packet of each node and page of another
+/// device's summary that this device verified in a descent, so that it can
+/// answer for them while that device is away (spec §13.5): under the node's
+/// name without its head, so that a newer one of the same node replaces it.
+fn relayed_name(node: &Name) -> Name {
+    let prefix: Name = "/localhost/ndn-data/relayed".parse().expect("a valid name");
+    let comps = node.components();
+    let headless = &comps[..comps.len().saturating_sub(1)];
+    Name::from_components(prefix.components().iter().chain(headless).cloned())
+}
+
                 let head = Data::decode(wire.clone()).ok().and_then(|data| {
                     let (hd, hc, s) = parse_head_name(&data.name)?;
                     let key = data.sig_info()?.key_locator_name()?;
@@ -8649,8 +8652,14 @@ impl Inner {
             return true;
         }
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
-        let Some(data) = self.fetch(root_prefix(device, ns), true).await else {
-            return false;
+        // A writer that does not answer is answered for by the devices that
+        // hold its newest root (spec §13.5).
+        let data = match self.fetch(root_prefix(device, ns), true).await {
+            Some(d) => d,
+            None => match self.ask_relays_root(ns, device).await {
+                Some(d) => d,
+                None => return false,
+            },
         };
         let (writer, body) = match self.accept_root(device, ns, &data).await {
             Ok(taken) => taken,
@@ -8911,9 +8920,14 @@ impl Inner {
                 // is kept for the next descent. Asked for by the digest its
                 // parent lists: no cache answers with another packet of the
                 // name (a writer whose store came back with entries it had
-                // lost signs a node of the same head anew).
+                // lost signs a node of the same head anew). A writer that
+                // does not answer is answered for by the devices that hold
+                // its node (spec §13.5), checked by the same digest.
                 let exact = name.clone().append_implicit_digest(digest);
-                let data = self.fetch(exact, false).await?;
+                let data = match self.fetch(exact, false).await {
+                    Some(d) => d,
+                    None => self.ask_relays(&name, ns, device, Some(digest)).await?,
+                };
                 if wire::implicit_digest(data.raw()) != digest {
                     tracing::debug!(%name, "not the packet its parent lists; ignored");
                     return None;
@@ -9461,6 +9475,8 @@ impl Inner {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
+                // Kept, the newest of its node, to answer for the writer.
+                self.store.insert(relayed_name(&name), data.raw().clone());
                     },
                 );
                 let c = body.collection.clone();
@@ -10961,18 +10977,18 @@ impl Inner {
 
     /// Fetch the log entry `name` — exactly the packet whose implicit
     /// digest is `digest`, if given — by its name, else from each holder of
-    /// a live lease on its collection.
+    /// a live lease on its collection, else from each other device heard
+    /// for its collection's namespace (spec §13.5).
     async fn fetch_entry(&self, name: &Name, digest: Option<[u8; 32]>) -> Option<Data> {
         let exact = digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
         if let Some(d) = self.fetch(exact, false).await {
             return Some(d);
         }
-        let holders = match parse_log_name(name).and_then(|l| l.subject) {
-            Some(c) => self.holders_of(&self.st.lock(), &c),
-            None => Vec::new(),
-        };
-        for h in holders {
-            if let Some(d) = self.fetch_held(name, &h).await
+        let log = parse_log_name(name)?;
+        let c = log.subject.as_ref()?;
+        let holders = self.holders_of(&self.st.lock(), c);
+        for h in &holders {
+            if let Some(d) = self.fetch_held(name, h).await
                 && digest.is_none_or(|x| wire::implicit_digest(d.raw()) == x)
             {
                 return Some(d);
@@ -11532,9 +11548,92 @@ impl Inner {
 
     /// Whether `device` is ended here: a key of it is suspected
     /// ([`Self::suspects_device`]), or the trust context governing it
+        let ns = namespace_of(c)?;
+        let relays = self.relays(&self.st.lock(), &ns, &log.device, &holders);
+        self.first_held(name, &relays, digest).await
+    }
+
+    /// The devices that may answer for `writer`'s packets of namespace `ns`
+    /// while it does not ([`wire::held_name`], spec §13.5): every other
+    /// device heard for `ns` ([`Self::known_for`]) that is not ended here,
+    /// but `skip`.
+    fn relays(&self, st: &St, ns: &Name, writer: &Name, skip: &[Name]) -> Vec<Name> {
+        self.known_for(st, ns)
+            .into_iter()
+            .filter(|d| d != &self.device && d != writer && !skip.contains(d) && !self.ended(st, d))
+            .collect()
+    }
+
+    /// `name`, `writer`'s packet of namespace `ns` — exactly the packet
+    /// whose implicit digest is `digest`, if given — from the first of its
+    /// relays ([`Self::relays`]) that answers with it.
+    async fn ask_relays(
+        &self,
+        name: &Name,
+        ns: &Name,
+        writer: &Name,
+        digest: Option<[u8; 32]>,
+    ) -> Option<Data> {
+        let relays = self.relays(&self.st.lock(), ns, writer, &[]);
+        self.first_held(name, &relays, digest).await
+    }
+
+    /// `name` — exactly the packet whose implicit digest is `digest`, if
+    /// given — from the first of `devices` that answers with it under its
+    /// own name ([`Self::fetch_held`]).
+    async fn first_held(
+        &self,
+        name: &Name,
+        devices: &[Name],
+        digest: Option<[u8; 32]>,
+    ) -> Option<Data> {
+        for d in devices {
+            if let Some(data) = self.fetch_held(name, d).await
+                && digest.is_none_or(|x| wire::implicit_digest(data.raw()) == x)
+            {
+                return Some(data);
+            }
+        }
     /// revokes one of its keys (spec §8.1).
     fn ended(&self, st: &St, device: &Name) -> bool {
         let ctx = self.validator.keyring().context_for(device);
+    /// `device`'s newest summary root of `ns` that a device answering for
+    /// it holds ([`Self::held_packet`], spec §13.5), when the writer does
+    /// not answer: the one with the highest head among its relays, if that
+    /// head is at least the highest verified here — an older one is a
+    /// holder that is behind, not the writer rolling back.
+    async fn ask_relays_root(&self, ns: &Name, device: &Name) -> Option<Data> {
+        let prefix = root_prefix(device, ns);
+        let (relays, seen) = {
+            let st = self.st.lock();
+            let seen = st
+                .peers
+                .get(&(device.clone(), ns.clone()))
+                .map_or(0, |p| p.head);
+            (self.relays(&st, ns, device, &[]), seen)
+        };
+        let mut best: Option<(u64, Data)> = None;
+        for r in &relays {
+            // Asked fresh: a cache must not answer with an older root.
+            let Some(reply) = self.fetch(wire::held_name(r, &prefix), true).await else {
+                continue;
+            };
+            let Some(root) = reply.content().and_then(|c| Data::decode(c.clone()).ok()) else {
+                continue;
+            };
+            let Some(head) = parse_summary_name(&root.name)
+                .filter(|_| root.name.has_prefix(&prefix))
+                .and_then(|s| s.head)
+            else {
+                continue;
+            };
+            if head >= seen && best.as_ref().is_none_or(|(h, _)| head > *h) {
+                best = Some((head, root));
+            }
+        }
+        best.map(|(_, root)| root)
+    }
+
         self.suspects_device(st, device)
             || ctx
                 .revocations()
@@ -12463,7 +12562,7 @@ impl Inner {
             && holder == self.device
         {
             let reply = self
-                .packet_for(&piece, false)
+                .held_packet(&piece)
                 .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256());
             self.reply(&name, responder, reply).await;
             return;
@@ -12515,12 +12614,14 @@ impl Inner {
             return self.store.get(name);
         }
         // Own log entries and pieces of own versions; of a collection this
-        // device holds for its owner, every entry and piece it keeps
-        // (readers ask it for them under its own name, `32=held`); and of a
-        // merge collection, the entry and pieces of each version it applied,
-        // which those whose versions are made over it ask it for (spec
-        // §13.1): a writer serving its pieces to some devices only does not
-        // stall the rest. Nothing a known prune covers (by the prune records
+        // device holds for its owner, every entry and piece it keeps; and of
+        // every other device, each entry it holds verified — a version, held
+        // sealed or opened, or a record — and the pieces of such a version
+        // it holds: the very packets their writers signed, never re-signed
+        // (spec §13.5). Readers ask it for another device's under its own
+        // name, `32=held`, when the writer does not answer. Nothing refused
+        // or withdrawn here (by its record, a cut, its chain, its group or
+        // its rule), nothing a known prune covers (by the prune records
         // restored, not only the versions held), and no piece of an own
         // version a release is auditing its holders for. Nothing expired
         // here either (spec §14.1), checked as it is asked for.
@@ -12543,19 +12644,25 @@ impl Inner {
                 let quarantined = version != *name && st.quarantine.contains(&version);
                 return (!quarantined).then(|| self.store.get(name)).flatten();
             }
-            // Of a collection not built yet, what the store holds of it was
-            // applied (and not refused since).
-            let applied = |coll: &Coll, id: &VersionId| {
-                coll.applies(id)
-                    || (coll.dormant.as_ref().is_some_and(|d| d.holds(id))
-                        && !st.cut_out.contains_key(&version))
-            };
-            let held = parsed.subject.as_ref().is_some_and(|c| {
-                st.holding.contains_key(c)
-                    || matches!(st.held.get(&version), Some(Held::Version(id))
-                        if st.colls.get(c).is_some_and(|coll| applied(coll, id)))
-            });
-            return held.then(|| self.store.get(name)).flatten();
+            let refused = st.refused.contains_key(&version) || st.cut_out.contains_key(&version);
+            let verified = matches!(
+                st.held.get(&version),
+                Some(Held::Version(_) | Held::Locked | Held::Record { .. } | Held::Snapshot(_))
+            );
+            let held = parsed
+                .subject
+                .as_ref()
+                .is_some_and(|c| st.holding.contains_key(c))
+                || (verified && !refused);
+            if !held {
+                return None;
+            }
+            // An entry not stored yet — pending, parked, held sealed — is
+            // answered from where it is held.
+            return self
+                .store
+                .get(name)
+                .or_else(|| (version == *name).then(|| held_wire(&st, name)).flatten());
         }
         // The head of a one-key collection this device writes (spec §5.3):
         // the newest by its discovery name, any other only by its own.
@@ -13104,6 +13211,21 @@ impl Inner {
                     let parsed = parse_log_name(name)?;
                     let c = parsed.subject?;
                     let v = st.colls.get(&c)?.versions.get(id)?;
+    /// What this device answers under its own name (`32=held`) for `name`,
+    /// another device's packet (spec §13.5): every packet it serves by name,
+    /// and, asked by its discovery prefix, the newest summary root of
+    /// another device it verified — the writer's own signed packet.
+    fn held_packet(&self, name: &Name) -> Option<Bytes> {
+        if let Some(s) = parse_summary_name(name)
+            && s.device != self.device
+            && s.head.is_none()
+            && subject_namespace(&s.subject).as_ref() == Some(&s.subject)
+        {
+            return self.store.get(&root_prefix(&s.device, &s.subject));
+        }
+        self.packet_for(name, false)
+    }
+
                     Ok(Answer {
                         got: Got::Version(v.version.clone()),
                         age: Age::Exact,
@@ -13207,6 +13329,19 @@ impl Inner {
         }
         if let Some(c) = &parsed.subject {
             let c = c.clone();
+        // A node or page of another device's summary, as this device kept
+        // it from its newest descent (spec §13.5): checked by the asker
+        // against the digest its parent lists. Another device's root only
+        // under this device's own name ([`Self::held_packet`]): discovery
+        // by name reaches the writer (§7).
+        if let Some(s) = parse_summary_name(name)
+            && s.head.is_some()
+            && subject_namespace(&s.subject).is_some_and(|ns| ns != s.subject)
+        {
+            let w = self.store.get(&relayed_name(name))?;
+            let kept = Data::decode(w.clone()).ok()?;
+            return (*kept.name == *name).then_some(w);
+        }
             self.wait_for(|st| {
                 st.colls.get(&c).is_some_and(|coll| coll.members.is_some())
                     && !matches!(st.held.get(name), Some(Held::Locked))
@@ -13983,9 +14118,10 @@ impl Inner {
 
     /// [`Self::get_piece`], trying `first` before the others, and saying
     /// which source answered (`None`: its writer by name; `Some(d)`: device
-    /// `d` under its own name — a holder of `c`, or, in a merge collection,
-    /// a device whose versions are made over the piece's version and so
-    /// applied it, [`St::appliers`]). The store answers first whatever
+    /// `d` under its own name — a holder of `c`, in a merge collection a
+    /// device whose versions are made over the piece's version and so
+    /// applied it, [`St::appliers`], then any other device heard for `c`'s
+    /// namespace, [`Self::relays`]). The store answers first whatever
     /// `first` says.
     async fn get_piece_from(
         self: &Arc<Self>,
@@ -13999,16 +14135,25 @@ impl Inner {
         {
             return Some((w, None));
         }
-        let (holders, appliers) = {
+        let writer = parse_piece_name(name).map(|p| p.log.device);
+        let (holders, appliers, relays) = {
             let st = self.st.lock();
-            (self.holders_of(&st, c), st.appliers(c, &strip_piece(name)))
+            let relays = match (namespace_of(c), &writer) {
+                (Some(ns), Some(w)) => self.relays(&st, &ns, w, &[]),
+                _ => Vec::new(),
+            };
+            (
+                self.holders_of(&st, c),
+                st.appliers(c, &strip_piece(name)),
+                relays,
+            )
         };
         // An Interest for this device's own name goes nowhere useful: its
-        // own pieces it released are asked of the holders only.
-        let own = parse_piece_name(name).is_some_and(|p| p.log.device == self.device);
+        // own pieces it released are asked of the others only.
+        let own = writer.as_ref() == Some(&self.device);
         let mut sources: Vec<Option<Name>> = if own { Vec::new() } else { vec![None] };
         sources.extend(holders.into_iter().map(Some));
-        for d in appliers {
+        for d in appliers.into_iter().chain(relays) {
             if d != self.device && !sources.contains(&Some(d.clone())) {
                 sources.push(Some(d));
             }
