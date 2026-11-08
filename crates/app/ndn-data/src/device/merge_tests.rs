@@ -233,7 +233,9 @@ pub(super) async fn device_on(
     let device = n("/alice/laptop");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob", "/carol"] {
-        assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
+        validator
+            .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+            .unwrap();
     }
     let keys = Arc::new(SecurityManager::new());
     keys.generate_ed25519(device.clone().append("KEY").append("1"))

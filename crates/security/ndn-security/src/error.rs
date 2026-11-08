@@ -74,6 +74,18 @@ pub enum TrustError {
     /// (an adoption in progress) and failed the expectation.
     #[error("trust context for {namespace} refused while adopting it: {reason}")]
     ExpectedContextRefused { namespace: String, reason: String },
+    /// The packet `name` lies in a person's self-certifying namespace
+    /// (`/user/<0xA1: …>`) that this node does not hold: such names are
+    /// judged only by their own trust context, never by the trust anchors
+    /// held for other names nor by a held `/user` or `/` context, so every
+    /// packet in it is refused — signed or not — until it is adopted.
+    #[error(
+        "{name} is in the self-certifying namespace {namespace}, which this node does not hold: \
+         a person's names are judged only by their own trust context, never by the trust \
+         anchors this node holds for other names; adopt {namespace} by name first (its anchor \
+         link: `ndn-fwd adopt <anchor link>`, which fetches and checks its genesis)"
+    )]
+    PersonalNamespaceNotHeld { name: String, namespace: String },
 }
 
 impl TrustError {

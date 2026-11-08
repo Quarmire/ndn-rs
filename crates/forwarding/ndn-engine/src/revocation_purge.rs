@@ -112,7 +112,8 @@ fn purge(
 /// Judge a cached `entry` stamped before the keyring's revocation epoch moved
 /// to `epoch` (loaded before this call, so before the context is read)
 /// against the revocations held now. Known clear: restamped with `epoch` and
-/// servable. Covered, not known clear, or no longer decodable: evicted unless
+/// servable. Covered, not known clear, in a person's namespace no longer
+/// held (judged by no context), or no longer decodable: evicted unless
 /// replaced meanwhile, and not servable. Returns whether it may be served.
 pub(crate) async fn recheck(
     cs: &dyn ErasedContentStore,
@@ -120,8 +121,13 @@ pub(crate) async fn recheck(
     entry: &CsEntry,
     epoch: u64,
 ) -> bool {
-    let ctx = validator.keyring().context_for(&entry.name);
-    let servable = known_clear(&ctx, validator.cert_cache(), &entry.data);
+    let keyring = validator.keyring();
+    let servable = keyring.unheld_personal_namespace(&entry.name).is_none()
+        && known_clear(
+            &keyring.context_for(&entry.name),
+            validator.cert_cache(),
+            &entry.data,
+        );
     if servable {
         cs.restamp_erased(&entry.name, &entry.data, epoch).await;
     } else {

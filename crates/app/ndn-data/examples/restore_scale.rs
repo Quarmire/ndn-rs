@@ -132,7 +132,9 @@ fn keys() -> Arc<SecurityManager> {
 
 async fn start(store: Arc<dyn DataStore>) -> Device {
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-    assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
+    validator
+        .adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
+        .unwrap();
     let conn: Arc<dyn Connection> = Arc::new(Unconnected);
     Device::start(
         Transport {

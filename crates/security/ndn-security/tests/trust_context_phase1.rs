@@ -98,8 +98,12 @@ async fn ctx02_multi_context_keyring_validates_each() {
     make_leaf(&mgr, &acme_leaf, &acme_root).await;
 
     let validator = validator_over(&mgr);
-    validator.adopt_context(hier_context("/home/bob", bob_anchor));
-    validator.adopt_context(hier_context("/work/acme", acme_anchor));
+    validator
+        .adopt_context(hier_context("/home/bob", bob_anchor))
+        .unwrap();
+    validator
+        .adopt_context(hier_context("/work/acme", acme_anchor))
+        .unwrap();
 
     let bob_data = sign_with(&mgr, "/home/bob/alice/doc", &bob_leaf);
     assert!(
@@ -135,8 +139,12 @@ async fn ctx02a_cross_namespace_forgery_rejected() {
     make_leaf(&mgr, &acme_leaf, &acme_root).await;
 
     let validator = validator_over(&mgr);
-    validator.adopt_context(hier_context("/home/bob", bob_anchor));
-    validator.adopt_context(hier_context("/work/acme", acme_anchor));
+    validator
+        .adopt_context(hier_context("/home/bob", bob_anchor))
+        .unwrap();
+    validator
+        .adopt_context(hier_context("/work/acme", acme_anchor))
+        .unwrap();
 
     // Eve (a legitimate /work/acme signer) forges a /home/bob name.
     let forged = sign_with(&mgr, "/home/bob/secret", &acme_leaf);
@@ -168,7 +176,9 @@ async fn ctx02b_hierarchical_floor_allows_own_subtree() {
     make_leaf(&mgr, &alice, &bob_root).await;
 
     let validator = validator_over(&mgr);
-    validator.adopt_context(hier_context("/home/bob", bob_anchor));
+    validator
+        .adopt_context(hier_context("/home/bob", bob_anchor))
+        .unwrap();
 
     for name in ["/home/bob/alice/doc", "/home/bob/alice/photos/2026/may"] {
         let data = sign_with(&mgr, name, &alice);
@@ -194,7 +204,9 @@ async fn ctx02b_skeleton_key_no_sign_outside_subtree() {
     make_leaf(&mgr, &alice, &bob_root).await;
 
     let validator = validator_over(&mgr);
-    validator.adopt_context(hier_context("/home/bob", bob_anchor));
+    validator
+        .adopt_context(hier_context("/home/bob", bob_anchor))
+        .unwrap();
 
     // Alice's key is valid under the /home/bob anchor, but charlie's subtree
     // is not hers. Under the loose first-component schema this would pass;
@@ -222,14 +234,14 @@ async fn ctx07_context_version_monotonic() {
     let validator = validator_over(&mgr);
     let v2 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     v2.add_anchor(anchor.clone());
-    assert!(validator.adopt_context(v2), "v2 must be adopted");
+    validator.adopt_context(v2).expect("v2 must be adopted");
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
 
     // Rollback to v1 is refused — the held context stays at v2.
     let v1 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
     v1.add_anchor(anchor.clone());
     assert!(
-        !validator.adopt_context(v1),
+        validator.adopt_context(v1).is_err(),
         "older version must be refused"
     );
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
@@ -239,7 +251,7 @@ async fn ctx07_context_version_monotonic() {
     let v3 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(3));
     v3.add_anchor(anchor);
     assert!(
-        !validator.adopt_context(Arc::clone(&v3)),
+        validator.adopt_context(Arc::clone(&v3)).is_err(),
         "a newer version must not replace the held one by plain adoption"
     );
     let held = validator.keyring().held(&n("/home/bob")).unwrap();
@@ -262,7 +274,7 @@ async fn ctx13_self_cert_rooted_context_validates() {
     make_leaf(&mgr, &leaf, &root).await;
 
     let validator = validator_over(&mgr);
-    validator.adopt_context(hier_context(ns, anchor));
+    validator.adopt_context(hier_context(ns, anchor)).unwrap();
 
     let data = sign_with(&mgr, &format!("{ns}/dev/telemetry"), &leaf);
     assert!(

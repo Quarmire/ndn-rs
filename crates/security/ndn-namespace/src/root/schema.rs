@@ -128,14 +128,13 @@ impl Adopted {
             self.select(namespace)?
         } else {
             self.none_held()?;
-            let ctx = self.keyring.context_for(data);
-            if Arc::ptr_eq(&ctx, self.keyring.ambient()) {
+            let Some(ctx) = self.keyring.held_for(data) else {
                 return Err(RootError::new(
                     code::NO_CONTEXT_GOVERNS,
                     "no held trust context governs the name",
                 )
                 .with("name", data));
-            }
+            };
             ctx
         };
         Ok(Explained {

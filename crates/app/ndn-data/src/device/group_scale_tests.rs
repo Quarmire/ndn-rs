@@ -54,7 +54,9 @@ impl MergeState for CountState {
 async fn start(device: &str, store: Arc<dyn DataStore>) -> Device {
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob"] {
-        assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
+        validator
+            .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+            .unwrap();
     }
     let keys = Arc::new(SecurityManager::new());
     keys.generate_ed25519(n(device).append("KEY").append("1"))

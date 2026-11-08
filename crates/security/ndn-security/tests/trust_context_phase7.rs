@@ -83,7 +83,7 @@ async fn ctx08_schema_loosen_no_retouch() {
         v1.set_schema(s);
     }
     v1.add_anchor(anchor.clone());
-    assert!(validator.adopt_context(v1));
+    validator.adopt_context(v1).unwrap();
 
     let guest_data = sign_with(&mgr, "/home/bob/guests/phone/hello", &guest);
     assert!(
@@ -171,7 +171,7 @@ async fn ctx10_anchor_rotation_bridged() {
     let windowed = validator_over(&mgr);
     let ctx_window = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
     ctx_window.add_anchor(old_anchor.clone());
-    windowed.adopt_context(ctx_window);
+    windowed.adopt_context(ctx_window).unwrap();
     assert!(
         matches!(
             windowed.validate_chain(&data).await,
@@ -186,7 +186,7 @@ async fn ctx10_anchor_rotation_bridged() {
     let new_anchor_cert = mgr.cert_cache().get(&Arc::new(new_root.clone())).unwrap();
     let ctx_after = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     ctx_after.add_anchor(new_anchor_cert);
-    after.adopt_context(ctx_after);
+    after.adopt_context(ctx_after).unwrap();
     let data2 = sign_with(&mgr, "/home/bob/dev/telemetry", &leaf);
     assert!(
         matches!(
@@ -230,7 +230,7 @@ async fn ctx11_intermediate_compromise_recovery() {
             .with_revocation(old_ca.clone()),
     );
     ctx.add_anchor(root_anchor);
-    validator.adopt_context(ctx);
+    validator.adopt_context(ctx).unwrap();
 
     // Data via the revoked CA is rejected (chain passes through old_ca).
     let bad = sign_with(&mgr, "/home/bob/dev1/telemetry", &old_leaf);

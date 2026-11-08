@@ -17115,7 +17115,7 @@ mod tests {
         let reader_keys = keys_of(&reader);
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(writer_cert);
 
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
@@ -17231,12 +17231,12 @@ mod tests {
                 other.err()
             ),
         }
-        assert!(validator.adopt_context(context("/home")));
+        validator.adopt_context(context("/home")).unwrap();
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
         assert_eq!(dev.namespace(), &n("/home"));
         dev.shutdown();
         // The longest held namespace governs it.
-        assert!(validator.adopt_context(context("/home/bob")));
+        validator.adopt_context(context("/home/bob")).unwrap();
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
         assert_eq!(dev.namespace(), &n("/home/bob"));
         dev.shutdown();
@@ -17246,7 +17246,7 @@ mod tests {
     async fn a_name_without_its_marker_is_refused_with_how_to_name_it() {
         let device = n("/home/bob/member/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/home/bob")));
+        validator.adopt_context(context("/home/bob")).unwrap();
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&device, &keys_of(&device), &validator, &store)
             .await
@@ -17327,8 +17327,8 @@ mod tests {
     async fn a_reader_takes_members_records_only_from_the_namespaces_own_devices() {
         let reader = n("/home/member/hub");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/home")));
-        assert!(validator.adopt_context(context("/home/bob")));
+        validator.adopt_context(context("/home")).unwrap();
+        validator.adopt_context(context("/home/bob")).unwrap();
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
             .await
@@ -17391,7 +17391,7 @@ mod tests {
         let device = n(device);
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         for ns in others {
-            assert!(validator.adopt_context(context(ns)));
+            validator.adopt_context(context(ns)).unwrap();
         }
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         start(&device, &keys_of(&device), &validator, &store)
@@ -17563,7 +17563,7 @@ mod tests {
         let device = n("/carol/phone");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         for ns in ["/alice", "/carol"] {
-            assert!(validator.adopt_context(context(ns)));
+            validator.adopt_context(context(ns)).unwrap();
         }
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
@@ -17742,7 +17742,7 @@ mod tests {
     async fn the_recipient_secret_lives_in_the_key_store_and_made_keys_only_wrapped() {
         let device = n("/alice/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/alice")));
+        validator.adopt_context(context("/alice")).unwrap();
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
@@ -17802,7 +17802,7 @@ mod tests {
     async fn concurrent_records_of_one_parent_keep_an_addition_and_a_removal_and_resolve() {
         let device = n("/alice/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/alice")));
+        validator.adopt_context(context("/alice")).unwrap();
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
@@ -18019,7 +18019,7 @@ mod tests {
     async fn an_epoch_key_is_destroyed_only_once_every_writer_left_the_epoch() {
         let device = n("/alice/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/alice")));
+        validator.adopt_context(context("/alice")).unwrap();
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
@@ -18135,7 +18135,7 @@ mod tests {
     async fn pruned_pieces_do_not_come_back_from_an_in_flight_walk() {
         let device = n("/alice/repo");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/alice")));
+        validator.adopt_context(context("/alice")).unwrap();
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
         let dev = start(&device, &keys, &validator, &store).await.unwrap();
@@ -18273,7 +18273,7 @@ mod tests {
         let device = n("/alice/repo");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         for ns in ["/alice", "/mallory"] {
-            assert!(validator.adopt_context(context(ns)));
+            validator.adopt_context(context(ns)).unwrap();
         }
         let (keys, store): (_, Arc<dyn DataStore>) =
             (keys_of(&device), Arc::new(MemoryStore::new()));
@@ -18458,7 +18458,7 @@ mod tests {
         let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
@@ -18554,7 +18554,7 @@ mod tests {
             .unwrap();
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(cert);
         validator.cert_cache().insert(other_cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
@@ -18623,7 +18623,7 @@ mod tests {
         let (spare_keys, spare_key, spare_cert) = device_key(&authority, &issuer, &spare).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(old_cert);
         validator.cert_cache().insert(spare_cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
@@ -18745,7 +18745,7 @@ mod tests {
         let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
@@ -18832,7 +18832,7 @@ mod tests {
         let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         assert!(validator.add_trust_anchor(anchor));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
@@ -18874,7 +18874,7 @@ mod tests {
     ) -> Device {
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         let ns = Name::from_components(device.components()[..1].iter().cloned());
-        assert!(validator.adopt_context(context(&ns.to_string())));
+        validator.adopt_context(context(&ns.to_string())).unwrap();
         let conn: Arc<dyn Connection> = Arc::new(Unconnected);
         let read = Arc::clone(clock);
         let config = Config {
@@ -19106,7 +19106,7 @@ mod tests {
     async fn a_range_read_of_withheld_blocks_answers_within_its_bound() {
         let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
             .await
@@ -19145,7 +19145,7 @@ mod tests {
     async fn a_sealed_block_expired_unopened_is_listed_expired_where_it_may_overlap() {
         let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/rita")));
+        validator.adopt_context(context("/rita")).unwrap();
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&reader, &keys_of(&reader), &validator, &store)
             .await
@@ -19543,8 +19543,10 @@ mod tests {
                 .await
                 .unwrap();
             let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-            assert!(validator.adopt_context(context("/rita")));
-            assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+            validator.adopt_context(context("/rita")).unwrap();
+            validator
+                .adopt_context(sam_context(&anchor, 1, None))
+                .unwrap();
             validator.cert_cache().insert(cert.clone());
             let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
             let tab = n("/rita/tab");
@@ -19883,7 +19885,9 @@ mod tests {
         let phone = n("/sam/phone");
         let (keys, key, cert) = device_key(&authority, &issuer, &phone).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+        validator
+            .adopt_context(sam_context(&anchor, 1, None))
+            .unwrap();
         validator.cert_cache().insert(cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&phone, &keys, &validator, &store).await.unwrap();
@@ -19945,7 +19949,9 @@ mod tests {
         let phone = n("/sam/phone");
         let (keys, key, cert) = device_key(&authority, &issuer, &phone).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+        validator
+            .adopt_context(sam_context(&anchor, 1, None))
+            .unwrap();
         validator.cert_cache().insert(cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let dev = start(&phone, &keys, &validator, &store).await.unwrap();
@@ -20299,7 +20305,9 @@ mod tests {
             let phone = n("/sam/phone");
             let (keys, key, cert) = device_key(&authority, &issuer, &phone).await;
             let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-            assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+            validator
+                .adopt_context(sam_context(&anchor, 1, None))
+                .unwrap();
             validator.cert_cache().insert(cert);
             let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
             let dev = start(&phone, &keys, &validator, &store).await.unwrap();
@@ -20432,8 +20440,10 @@ mod tests {
         let phone = n("/sam/admin/phone");
         let (phone_keys, phone_key, phone_cert) = device_key(&admin_keys, &admin_key, &phone).await;
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/rita")));
-        assert!(validator.adopt_context(sam_context(&anchor, 1, None)));
+        validator.adopt_context(context("/rita")).unwrap();
+        validator
+            .adopt_context(sam_context(&anchor, 1, None))
+            .unwrap();
         validator.cert_cache().insert(admin_cert);
         validator.cert_cache().insert(phone_cert);
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
@@ -20881,7 +20891,7 @@ mod tests {
     async fn a_restarted_device_announces_above_everything_its_earlier_run_announced() {
         let device = n("/alice/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.adopt_context(context("/alice")));
+        validator.adopt_context(context("/alice")).unwrap();
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let keys = keys_of(&device);
         let ns = n("/alice");
@@ -20913,7 +20923,7 @@ mod tests {
         let device = n("/alice/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         for ns in ["/alice", "/bob"] {
-            assert!(validator.adopt_context(context(ns)));
+            validator.adopt_context(context(ns)).unwrap();
         }
         let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
         let keys = keys_of(&device);

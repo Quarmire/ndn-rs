@@ -174,7 +174,9 @@ async fn start(
 ) -> Device {
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob"] {
-        assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
+        validator
+            .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+            .unwrap();
     }
     let conn: Arc<dyn Connection> = Arc::new(Unconnected);
     let rule = Counted {

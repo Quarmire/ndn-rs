@@ -101,7 +101,9 @@ impl Parts {
         let device = n(device);
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         for ns in others {
-            assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
+            validator
+                .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+                .unwrap();
         }
         let keys = Arc::new(SecurityManager::new());
         keys.generate_ed25519(key(&device)).unwrap();

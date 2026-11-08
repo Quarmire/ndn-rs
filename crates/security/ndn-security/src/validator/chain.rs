@@ -154,6 +154,15 @@ impl Validator {
         if let Some(r) = self.admit_expected_context(data).await {
             return result(r);
         }
+        // A person's names whose namespace is not held: refused whatever
+        // signs them, a digest included (but for the namespace's own
+        // integrity-only trust objects, see `unheld_person`).
+        let digest = data
+            .sig_info()
+            .is_some_and(|s| s.sig_type == SignatureType::DigestSha256);
+        if let Some(refused) = self.unheld_person(&data.name, digest) {
+            return result(ValidationResult::Invalid(refused));
+        }
         let Some(sig_info) = data.sig_info() else {
             return result(ValidationResult::Invalid(TrustError::InvalidSignature));
         };
@@ -245,6 +254,9 @@ impl Validator {
     /// is safe to use with a network fetcher: an unknown self-signed key is
     /// rejected rather than fetched-and-trusted.
     pub async fn validate_interest_chain(&self, interest: &Interest) -> InterestValidationOutcome {
+        if let Some(refused) = self.unheld_person(&interest.name, false) {
+            return InterestValidationOutcome::Invalid(refused);
+        }
         let Some(sig_info) = interest.sig_info() else {
             return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
         };
@@ -379,11 +391,16 @@ impl Validator {
             // CA within its namespace), so an enrolled device cannot certify
             // another device's key.
             Some(Hop::Cert(cert)) if !ctx.authorizes_certification(cert, signer) => {
-                let cas: Vec<String> = ctx.ca_endpoints().iter().map(Name::to_string).collect();
-                Some(WalkOutcome::Invalid(TrustError::CertNotAuthorized {
-                    cert: cert.to_string(),
-                    issuer: signer.to_string(),
-                    why: format!(
+                let why = if ctx.has_shared_user_floor() {
+                    // The ambient context refuses only across /user/<x>.
+                    "/user is shared by every person, so under the trust anchors this node \
+                     holds for names no adopted context covers, a key under one /user/<x> \
+                     certifies no key under another /user/<y>; adopt the trust context of the \
+                     certificate's /user/<y>, or add its own root as a trust anchor"
+                        .to_string()
+                } else {
+                    let cas: Vec<String> = ctx.ca_endpoints().iter().map(Name::to_string).collect();
+                    format!(
                         "under the trust context for {ns} a key certifies only names under its \
                          own identity, unless it is a trust anchor of the context or a key of \
                          the context's CA ({cas}) certifying a name under {ns}; have the key \
@@ -394,7 +411,12 @@ impl Validator {
                         } else {
                             cas.join(", ")
                         },
-                    ),
+                    )
+                };
+                Some(WalkOutcome::Invalid(TrustError::CertNotAuthorized {
+                    cert: cert.to_string(),
+                    issuer: signer.to_string(),
+                    why,
                 }))
             }
             // An authoritative schema also governs every certificate hop, as
@@ -1776,7 +1798,7 @@ mod tests {
         assert!(ctx.add_anchor(anchor(&root)));
         assert!(ctx.add_anchor(anchor(&outside_anchor)));
         let validator = Validator::new(TrustSchema::hierarchical());
-        validator.adopt_context(Arc::new(ctx));
+        validator.adopt_context(Arc::new(ctx)).unwrap();
         for (subject, issuer) in [
             (&ca, &root),
             (&eve, &ca),

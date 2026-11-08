@@ -73,7 +73,9 @@ pub(super) async fn device_tuned(share: Share, tune: impl FnOnce(Config) -> Conf
     let device = n("/alice/laptop");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     for ns in ["/alice", "/bob", "/carol"] {
-        assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns)))));
+        validator
+            .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+            .unwrap();
     }
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
     let keys = Arc::new(SecurityManager::new());

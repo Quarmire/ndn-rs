@@ -14,7 +14,7 @@ use ndn_packet::{Data, Interest, Name};
 
 use crate::cert_cache::Certificate;
 use crate::cert_fetcher::CertFetcher;
-use crate::keyring::Keyring;
+use crate::keyring::{AdoptRefusal, Keyring};
 use crate::trust_context::SignedTrustContext;
 use crate::trust_schema::SchemaRule;
 use crate::verifier::{DIGEST_NO_SIGNER, not_public_key, verify_by_sig_type, verify_digest};
@@ -265,6 +265,36 @@ impl Validator {
             })
     }
 
+    /// The refusal of every packet named `name` while it lies in a person's
+    /// self-certifying namespace this validator's keyring does not hold
+    /// ([`Keyring::unheld_personal_namespace`]): no ambient anchor, held
+    /// `/user` or `/` context, signature-only posture or integrity-only
+    /// digest vouches for a person's names (trust-context.md §4.5.6).
+    ///
+    /// One exception, so the namespace can be adopted by name through this
+    /// validator: a `digest` (DigestSha256) packet among the namespace's own
+    /// trust objects (`/user/<0xA1: …>/32=trust-context/…`: its RDR
+    /// metadata pointer, cut-manifest pieces) passes on its digest alone,
+    /// labelled integrity-only as every digest packet is — it vouches for
+    /// nothing, and the adopter checks every version it points at from the
+    /// genesis. The context versions themselves are signed: they are taken
+    /// only under an expectation ([`Self::expect_context`]), which is
+    /// decided before this.
+    pub(super) fn unheld_person(&self, name: &Name, digest: bool) -> Option<TrustError> {
+        let namespace = self.keyring.unheld_personal_namespace(name)?;
+        let trust_object = name.components().get(namespace.len())
+            == Some(&ndn_packet::NameComponent::keyword(
+                bytes::Bytes::from_static(crate::trust_context::TRUST_CONTEXT_KEYWORD),
+            ));
+        if digest && trust_object {
+            return None;
+        }
+        Some(TrustError::PersonalNamespaceNotHeld {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        })
+    }
+
     /// The keyring this validator dispatches against.
     pub fn keyring(&self) -> &Arc<Keyring> {
         &self.keyring
@@ -295,12 +325,15 @@ impl Validator {
 
     /// Adopt a named [`SignedTrustContext`] of a namespace not held into the
     /// keyring ([`Keyring::adopt`]). Data under its namespace is thereafter
-    /// validated against its schema and anchors. Returns `true` when adopted
-    /// or already held as is, `false` when refused: the namespace is held
-    /// with another version, which only a version checked under the held
-    /// anchors replaces ([`Keyring::adopt_update_from`]).
-    pub fn adopt_context(&self, ctx: Arc<SignedTrustContext>) -> bool {
-        self.keyring.adopt(ctx).is_ok()
+    /// validated against its schema and anchors. `Ok` when adopted or
+    /// already held as is; refused ([`AdoptRefusal`]) when the namespace is
+    /// held with another version — which only a version checked under the
+    /// held anchors replaces ([`Keyring::adopt_update_from`]) — or is a
+    /// self-certifying namespace not held, taken only from its checked
+    /// genesis ([`Keyring::adopt_genesis`]). The refusal says why and what
+    /// to do.
+    pub fn adopt_context(&self, ctx: Arc<SignedTrustContext>) -> Result<(), AdoptRefusal> {
+        self.keyring.adopt(ctx)
     }
 
     /// Snapshot `(verified_total, rejected_total)` since construction.
@@ -426,6 +459,12 @@ impl Validator {
         if let Some(result) = self.admit_expected_context(data).await {
             return result;
         }
+        let digest = data
+            .sig_info()
+            .is_some_and(|s| s.sig_type == ndn_packet::SignatureType::DigestSha256);
+        if let Some(refused) = self.unheld_person(&data.name, digest) {
+            return ValidationResult::Invalid(refused);
+        }
         let Some(sig_info) = data.sig_info() else {
             return ValidationResult::Invalid(TrustError::InvalidSignature);
         };
@@ -540,6 +579,9 @@ impl Validator {
     /// caller content with integrity checks the digest itself
     /// ([`verify_digest`]).
     pub async fn validate_interest(&self, interest: &Interest) -> InterestValidationOutcome {
+        if let Some(refused) = self.unheld_person(&interest.name, false) {
+            return InterestValidationOutcome::Invalid(refused);
+        }
         let Some(sig_info) = interest.sig_info() else {
             return InterestValidationOutcome::Invalid(TrustError::InvalidSignature);
         };
@@ -862,9 +904,11 @@ mod tests {
             sig_value: None,
             sig_type: ndn_packet::SignatureType::SignatureEd25519,
         });
-        validator.adopt_context(Arc::new(
-            SignedTrustContext::accept_all(name1("data")).with_revocation(key_name),
-        ));
+        validator
+            .adopt_context(Arc::new(
+                SignedTrustContext::accept_all(name1("data")).with_revocation(key_name),
+            ))
+            .unwrap();
 
         assert!(matches!(
             validator.validate(&data).await,

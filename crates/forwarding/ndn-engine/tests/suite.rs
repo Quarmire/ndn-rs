@@ -43,6 +43,8 @@ mod partition_throughput;
 mod partitioned_parity;
 #[path = "path_control.rs"]
 mod path_control;
+#[path = "personal_namespace_not_held.rs"]
+mod personal_namespace_not_held;
 #[path = "pit_fan_out_witness.rs"]
 mod pit_fan_out_witness;
 #[path = "rejected_interest_pit.rs"]

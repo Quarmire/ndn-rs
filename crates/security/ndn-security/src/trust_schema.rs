@@ -384,7 +384,10 @@ impl TrustSchema {
 
     /// Hierarchical trust: data and key must share a top component. Full
     /// hierarchy enforcement is the cert chain walk's job — the schema
-    /// only fixes the top-level namespace.
+    /// only fixes the top-level namespace. `/user` is shared by every
+    /// person, so it fixes nothing there: the ambient context adds that a
+    /// name under `/user/<x>` is signed and certified only by keys under
+    /// the same `/user/<x>` ([`SignedTrustContext::ambient`](crate::SignedTrustContext::ambient)).
     pub fn hierarchical() -> Self {
         let mut schema = Self::new();
         schema.add_rule(SchemaRule {

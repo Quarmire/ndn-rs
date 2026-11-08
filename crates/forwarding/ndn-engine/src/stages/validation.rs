@@ -451,6 +451,12 @@ fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
              fails closed): configure trust anchors, or choose profile \"accept-signed\" or \
              \"disabled\" explicitly",
         ),
+        TrustError::PersonalNamespaceNotHeld { .. } => (
+            Refusal::UntrustedRoot,
+            "REFUSED — in a person's self-certifying namespace (/user/<0xA1>) this forwarder does \
+             not hold: only that namespace's own trust context vouches for its names; adopt it \
+             by name (its anchor link) first",
+        ),
         TrustError::ExpectedContextRefused { .. } => (
             Refusal::Context,
             "REFUSED — trust context does not meet the adoption/update expectation",

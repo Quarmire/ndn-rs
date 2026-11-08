@@ -106,8 +106,8 @@ pub fn self_certifying_digest(
 /// Whether `name` lies in a person's self-certifying namespace: it starts
 /// with `/user/<0xA1: 32 bytes>`. Such a name is judged only by that
 /// namespace's own trust context, never by a context of a shorter prefix
-/// (`/user` or `/`) — another root never vouches for a person's names
-/// ([`crate::Keyring::context_for`]).
+/// (`/user` or `/`) nor by the ambient context — another root never vouches
+/// for a person's names ([`crate::Keyring::context_for`]).
 pub fn in_personal_namespace(name: &Name) -> bool {
     let comps = name.components();
     comps.len() >= 2
@@ -115,6 +115,13 @@ pub fn in_personal_namespace(name: &Name) -> bool {
         && comps[0].value.as_ref() == PERSONAL_PREFIX
         && comps[1].typ == SELF_CERTIFYING
         && comps[1].value.len() == 32
+}
+
+/// The person's namespace `/user/<0xA1: …>` that `name` lies in
+/// ([`in_personal_namespace`]), if any.
+pub fn personal_namespace_of(name: &Name) -> Option<Name> {
+    in_personal_namespace(name)
+        .then(|| Name::from_components(name.components()[..2].iter().cloned()))
 }
 
 /// Why a context Data is not the genesis of a self-certifying namespace.

@@ -529,13 +529,12 @@ impl SecurityManager {
     /// - otherwise the registered identity with the longest name that is a
     ///   prefix of `name`; none: the error says no identity covers `name`.
     pub fn signing_identity_for(&self, name: &Name) -> Result<SigningIdentity, TrustError> {
-        let ctx = self.keyring.context_for(name);
-        let held = !Arc::ptr_eq(&ctx, self.keyring.ambient());
+        let held = self.keyring.held_for(name);
         let refuse = |why: String| TrustError::NoSigningIdentity {
             name: name.to_string(),
             why,
         };
-        let chosen = if held {
+        let chosen = if let Some(ctx) = held {
             let ns = ctx.namespace();
             let candidates: Vec<(Name, IdentityKey)> = self
                 .by_identity
@@ -586,9 +585,9 @@ impl SecurityManager {
             .by_identity
             .iter()
             .filter(|e| {
-                let ctx = self.keyring.context_for(e.key());
-                Arc::ptr_eq(&ctx, self.keyring.ambient())
-                    || !is_authority(&ctx, e.key(), &e.value().key)
+                self.keyring
+                    .held_for(e.key())
+                    .is_none_or(|ctx| !is_authority(&ctx, e.key(), &e.value().key))
             })
             .filter_map(|e| {
                 let key = e.value().key.as_ref().clone();

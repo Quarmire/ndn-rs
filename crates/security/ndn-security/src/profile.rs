@@ -11,11 +11,18 @@ pub enum SecurityProfile {
     ///
     /// This is the default. When a `SecurityManager` is set on the builder,
     /// the engine wires a `Validator` with:
-    /// - `TrustSchema::hierarchical()` (data and key share first component)
+    /// - `TrustSchema::hierarchical()` (data and key share first component;
+    ///   under the shared `/user`, the first two) for names no adopted
+    ///   context covers
     /// - Shared `CertCache` from the `SecurityManager`
     /// - Trust anchors from the `SecurityManager`
     /// - `CertFetcher` for missing certificates (the engine fetches them
     ///   through its own faces)
+    ///
+    /// A name in a person's self-certifying namespace (`/user/<0xA1: …>`)
+    /// is judged only by that namespace's adopted context, never by these
+    /// anchors: without it, every packet in it is refused, under every
+    /// profile ([`Keyring::context_for`](crate::Keyring::context_for)).
     ///
     /// **When no `SecurityManager` is set** there are no trust anchors, and
     /// `Default` fails closed: every Data from a non-local face that names a

@@ -193,7 +193,9 @@ async fn device_on(device: &str, store: Arc<dyn DataStore>) -> Device {
 async fn device_over(device: &str, store: Arc<dyn DataStore>, conn: Arc<dyn Connection>) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-    assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
+    validator
+        .adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
+        .unwrap();
     let keys = Arc::new(SecurityManager::new());
     keys.generate_ed25519_from_seed(device.clone().append("KEY").append("1"), &[7; 32])
         .unwrap();

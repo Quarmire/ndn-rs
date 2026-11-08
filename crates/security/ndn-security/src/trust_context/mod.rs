@@ -182,7 +182,10 @@ fn schema_of(blobs: &[SchemaBlob]) -> Result<TrustSchema, SignedTrustContextErro
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextExplanation {
     /// The hierarchy floor's verdict (the key's identity is a prefix of the
-    /// data name), or `None` when the context does not enforce one.
+    /// data name) — in the ambient context, for a data name under the
+    /// shared `/user`, the shared-`/user` floor's (the key's identity lies
+    /// under the same `/user/<x>`) — or `None` when the context enforces
+    /// neither for the pair.
     pub hierarchy_floor: Option<bool>,
     /// The schema rule that admits the pair (rendered), or `None` if none does.
     pub rule: Option<String>,
@@ -1119,6 +1122,10 @@ pub struct SignedTrustContext {
     /// When set, [`authorizes`](Self::authorizes) requires the signing key's
     /// identity to be a prefix of the data name, on top of the schema.
     enforce_hierarchy: bool,
+    /// The ambient context's floor under the shared `/user`
+    /// ([`user_floor_allows`]): one `/user/<x>`'s keys neither sign nor
+    /// certify for another `/user/<y>`. Local, never on the wire.
+    shared_user_floor: bool,
     /// Monotonic, signed version (from the RDR name `…/v=N`). Anti-rollback:
     /// the keyring refuses to replace a context with a lower version.
     version: u64,
@@ -1165,6 +1172,7 @@ impl SignedTrustContext {
             anchors: Arc::new(DashMap::new()),
             schema: RwLock::new(schema),
             enforce_hierarchy,
+            shared_user_floor: false,
             version: 0,
             ca_endpoints: Vec::new(),
             enrollment_hint: None,
@@ -1203,16 +1211,28 @@ impl SignedTrustContext {
     }
 
     /// The ambient (root-namespace) context backing a [`Validator`]'s
-    /// flat-anchor API for backward compatibility. The hierarchy floor is
-    /// **off** so existing single-anchor callers keep their prior semantics,
-    /// and so are certificate-hop rules ([`authorizes_certification`](Self::authorizes_certification)).
-    pub(crate) fn ambient(
-        schema: TrustSchema,
-        anchors: Arc<DashMap<Arc<Name>, Certificate>>,
-    ) -> Self {
+    /// flat-anchor API for backward compatibility: `schema` over `anchors`
+    /// (the handle is shared as-is). The hierarchy floor is **off** so
+    /// existing single-anchor callers keep their prior semantics, and so are
+    /// the certificate-hop rules of a named context
+    /// ([`authorizes_certification`](Self::authorizes_certification)) —
+    /// except under the shared `/user`: there one `/user/<x>`'s keys
+    /// neither sign nor certify for another `/user/<y>` (see
+    /// [`authorizes`](Self::authorizes)). A person's self-certifying names
+    /// are never judged by it ([`Keyring::context_for`](crate::Keyring::context_for)).
+    pub fn ambient(schema: TrustSchema, anchors: Arc<DashMap<Arc<Name>, Certificate>>) -> Self {
         let mut c = Self::base(Name::root(), schema, false);
         c.anchors = anchors;
+        c.shared_user_floor = true;
         c
+    }
+
+    /// A context that accepts nothing: no anchors, an empty schema, the
+    /// hierarchy floor on. Judges a person's names whose namespace is not
+    /// held ([`Keyring::context_for`](crate::Keyring::context_for)); its
+    /// namespace is `/`, as the ambient's, since it is no namespace's.
+    pub(crate) fn deny_all() -> Self {
+        Self::base(Name::root(), TrustSchema::new(), true)
     }
 
     // ── builder setters (by-move; contexts are immutable once adopted) ──────
@@ -1531,13 +1551,18 @@ impl SignedTrustContext {
     }
 
     /// Authorization decision for a `(data_name, key_name)` pair: the
-    /// hierarchy floor (when enabled) AND the schema must both permit it.
+    /// hierarchy floor (when enabled) — in the ambient context, the
+    /// shared-`/user` floor (a name under `/user/<x>` only by a key under
+    /// the same `/user/<x>`) — AND the schema must both permit it.
     pub fn authorizes(&self, data_name: &Name, key_name: &Name) -> bool {
         if self.enforce_hierarchy {
             let identity = key_identity(key_name);
             if !data_name.has_prefix(&identity) {
                 return false;
             }
+        }
+        if self.shared_user_floor && !user_floor_allows(data_name, key_name) {
+            return false;
         }
         self.schema
             .read()
@@ -1593,9 +1618,15 @@ impl SignedTrustContext {
     /// So an enrolled device cannot certify another device's key. An
     /// authoritative schema also judges every certificate hop, on top
     /// ([`authorizes_hop`](Self::authorizes_hop)). [`accept_all`](Self::accept_all)
-    /// and the ambient flat-anchor context judge no certificate hop.
+    /// and the ambient flat-anchor context judge no certificate hop, except
+    /// that in the ambient context a key under one `/user/<x>` certifies no
+    /// key under another `/user/<y>`: `/user` is shared by every person, so
+    /// it is no authority of its own.
     pub fn authorizes_certification(&self, cert: &Name, issuer: &Name) -> bool {
         use crate::cert_name::key_name_of;
+        if self.shared_user_floor && !user_floor_allows(cert, issuer) {
+            return false;
+        }
         if !self.enforce_hierarchy && !self.schema_authoritative {
             return true;
         }
@@ -1608,14 +1639,26 @@ impl SignedTrustContext {
             || (self.ca_endpoints.contains(&issuer_id) && subject.has_prefix(&self.namespace))
     }
 
+    /// Whether this is an ambient context judging `/user/<x>` names by the
+    /// shared-`/user` floor ([`user_floor_allows`]).
+    pub(crate) fn has_shared_user_floor(&self) -> bool {
+        self.shared_user_floor
+    }
+
     /// Why [`authorizes`](Self::authorizes) decides as it does for
     /// `(data_name, key_name)`: the hierarchy floor's verdict (if enforced)
     /// and the schema rule that admits the pair. For inspection tooling;
     /// [`ContextExplanation::allowed`] equals `authorizes`.
     pub fn explain(&self, data_name: &Name, key_name: &Name) -> ContextExplanation {
-        let hierarchy_floor = self
+        let floor = self
             .enforce_hierarchy
             .then(|| data_name.has_prefix(&key_identity(key_name)));
+        let user_floor = (self.shared_user_floor && under_shared_user(data_name))
+            .then(|| user_floor_allows(data_name, key_name));
+        let hierarchy_floor = match (floor, user_floor) {
+            (None, None) => None,
+            (floor, user_floor) => Some(floor != Some(false) && user_floor != Some(false)),
+        };
         let schema = self.schema.read().expect("schema RwLock poisoned");
         ContextExplanation {
             hierarchy_floor,
@@ -1975,6 +2018,7 @@ impl SignedTrustContext {
             anchors: Arc::new(anchor_map),
             schema: RwLock::new(schema),
             enforce_hierarchy: !schema_authoritative,
+            shared_user_floor: false,
             version,
             ca_endpoints,
             enrollment_hint,
@@ -2206,6 +2250,28 @@ pub(crate) fn key_identity(key_name: &Name) -> Name {
         Some(pos) => Name::from_components(comps[..pos].iter().cloned()),
         None => key_name.clone(),
     }
+}
+
+/// Whether `name` lies under the shared `/user` as `/user/<x>/…` — its
+/// second component is no `KEY` component (`/user/KEY/…` is a key of
+/// `/user` itself).
+fn under_shared_user(name: &Name) -> bool {
+    let comps = name.components();
+    comps.len() >= 2
+        && comps[0].typ == ndn_packet::tlv_type::NAME_COMPONENT
+        && comps[0].value.as_ref() == crate::self_certifying::PERSONAL_PREFIX
+        && !crate::cert_name::is_key_component(&comps[1])
+}
+
+/// The ambient context's shared-`/user` floor: `signer` (a key or
+/// certificate name) may sign or certify `signed` (a data, key or
+/// certificate name) when `signed` is not under the shared `/user`, or when
+/// both lie under the same `/user/<x>`. `/user` is every person's prefix,
+/// so it is no authority of its own: the keys of one `/user/<x>` neither
+/// sign nor certify for another `/user/<y>` (trust-context.md §6.1).
+fn user_floor_allows(signed: &Name, signer: &Name) -> bool {
+    !under_shared_user(signed)
+        || (under_shared_user(signer) && signer.components()[1] == signed.components()[1])
 }
 
 #[cfg(test)]

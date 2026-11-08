@@ -99,10 +99,22 @@ pub enum AdoptRefusal {
 /// The `ambient` context (namespace `/`) backs the flat-anchor / single-schema
 /// API on [`Validator`](crate::Validator) for backward compatibility; named
 /// contexts adopted via [`adopt`](Self::adopt) take precedence by
-/// longest-prefix match.
+/// longest-prefix match. A name in a person's self-certifying namespace
+/// (`/user/<0xA1: …>`) is never judged by the ambient context: only by that
+/// namespace's own context, else by a context that accepts nothing
+/// ([`context_for`](Self::context_for)).
 pub struct Keyring {
-    contexts: DashMap<Name, Arc<SignedTrustContext>>,
+    /// The held contexts and what hangs off them, shared live by every
+    /// view of this keyring ([`with_ambient_view`](Self::with_ambient_view)).
+    held: Arc<Held>,
     ambient: Arc<SignedTrustContext>,
+}
+
+/// What the views of one keyring share: the held contexts, the listeners,
+/// the revocation epoch, and the context that judges a person's names
+/// whose namespace is not held.
+struct Held {
+    contexts: DashMap<Name, Arc<SignedTrustContext>>,
     revocation_listeners: RwLock<Vec<RevocationListener>>,
     adoption_listeners: RwLock<Vec<AdoptionListener>>,
     /// Bumped each time an adopted version refuses what the one it replaced
@@ -110,12 +122,15 @@ pub struct Keyring {
     /// needing a cut); see
     /// [`revocation_epoch`](Keyring::revocation_epoch).
     revocation_epoch: AtomicU64,
+    /// No anchors, an empty schema: judges every name in a person's
+    /// namespace not held, and accepts none of them.
+    unheld: Arc<SignedTrustContext>,
 }
 
 impl std::fmt::Debug for Keyring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Keyring")
-            .field("contexts", &self.contexts)
+            .field("contexts", &self.held.contexts)
             .field("ambient", &self.ambient)
             .finish_non_exhaustive()
     }
@@ -170,11 +185,29 @@ impl Default for Keyring {
 impl Keyring {
     pub(crate) fn with_ambient(ambient: Arc<SignedTrustContext>) -> Self {
         Self {
-            contexts: DashMap::new(),
+            held: Arc::new(Held {
+                contexts: DashMap::new(),
+                revocation_listeners: RwLock::new(Vec::new()),
+                adoption_listeners: RwLock::new(Vec::new()),
+                revocation_epoch: AtomicU64::new(0),
+                unheld: Arc::new(SignedTrustContext::deny_all()),
+            }),
             ambient,
-            revocation_listeners: RwLock::new(Vec::new()),
-            adoption_listeners: RwLock::new(Vec::new()),
-            revocation_epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// A view of this keyring with another ambient context: it shares this
+    /// keyring's held contexts **live** — an adoption, update or forget
+    /// through either is seen by both, and they share one revocation epoch
+    /// and one set of listeners — but judges a name no held context covers
+    /// with `ambient` instead (e.g. a phone's pinned peers, kept apart from
+    /// the node's held namespaces). A person's names whose namespace is
+    /// not held are refused by the view as by every keyring
+    /// ([`context_for`](Self::context_for)), whatever `ambient` holds.
+    pub fn with_ambient_view(&self, ambient: Arc<SignedTrustContext>) -> Keyring {
+        Keyring {
+            held: Arc::clone(&self.held),
+            ambient,
         }
     }
 
@@ -198,12 +231,13 @@ impl Keyring {
     pub fn of_claim(ctx: Arc<SignedTrustContext>) -> Result<Self, SelfCertifyingNameError> {
         self_certifying_digest(ctx.namespace())?;
         let keyring = Self::new();
-        keyring.contexts.insert(ctx.namespace().clone(), ctx);
+        keyring.held.contexts.insert(ctx.namespace().clone(), ctx);
         Ok(keyring)
     }
 
     /// The ambient (root-namespace) context — the validation target for names
-    /// not covered by any adopted context.
+    /// not covered by any adopted context, except a person's names
+    /// ([`context_for`](Self::context_for)).
     pub fn ambient(&self) -> &Arc<SignedTrustContext> {
         &self.ambient
     }
@@ -267,7 +301,7 @@ impl Keyring {
         needs_genesis: bool,
     ) -> Result<(), AdoptRefusal> {
         let ns = ctx.namespace().clone();
-        let revoked = match self.contexts.entry(ns) {
+        let revoked = match self.held.contexts.entry(ns) {
             dashmap::mapref::entry::Entry::Occupied(held) => {
                 let held = held.get();
                 if Arc::ptr_eq(held, &ctx)
@@ -302,7 +336,10 @@ impl Keyring {
 
     /// The context held for exactly `namespace`, if any.
     pub fn held(&self, namespace: &Name) -> Option<Arc<SignedTrustContext>> {
-        self.contexts.get(namespace).map(|c| Arc::clone(c.value()))
+        self.held
+            .contexts
+            .get(namespace)
+            .map(|c| Arc::clone(c.value()))
     }
 
     /// Replace the held context of `ctx`'s namespace with `ctx` only if
@@ -314,7 +351,7 @@ impl Keyring {
     /// concurrent adoptions of the same namespace. `Err(Some(held))`: the
     /// held version is not older; `Err(None)`: nothing is held to update.
     pub fn adopt_update(&self, ctx: Arc<SignedTrustContext>) -> Result<(), Option<u64>> {
-        let revoked = match self.contexts.get_mut(ctx.namespace()) {
+        let revoked = match self.held.contexts.get_mut(ctx.namespace()) {
             None => return Err(None),
             Some(held) if held.version() >= ctx.version() => return Err(Some(held.version())),
             Some(mut held) => {
@@ -342,7 +379,7 @@ impl Keyring {
         from: &Arc<SignedTrustContext>,
         ctx: Arc<SignedTrustContext>,
     ) -> Result<(), Option<u64>> {
-        let revoked = match self.contexts.get_mut(ctx.namespace()) {
+        let revoked = match self.held.contexts.get_mut(ctx.namespace()) {
             None => return Err(None),
             Some(held) if !Arc::ptr_eq(&held, from) || held.version() >= ctx.version() => {
                 return Err(Some(held.version()));
@@ -373,7 +410,8 @@ impl Keyring {
         &self,
         listener: impl Fn(&Arc<SignedTrustContext>, &[Name]) + Send + Sync + 'static,
     ) {
-        self.revocation_listeners
+        self.held
+            .revocation_listeners
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Arc::new(listener));
@@ -386,7 +424,8 @@ impl Keyring {
     /// adopting thread after the context is in force and after the
     /// revocation listeners, so it should only schedule work.
     pub fn on_adoption(&self, listener: impl Fn(&Arc<SignedTrustContext>) + Send + Sync + 'static) {
-        self.adoption_listeners
+        self.held
+            .adoption_listeners
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Arc::new(listener));
@@ -394,6 +433,7 @@ impl Keyring {
 
     fn notify_adopted(&self, ctx: &Arc<SignedTrustContext>) {
         let listeners = self
+            .held
             .adoption_listeners
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -411,7 +451,7 @@ impl Keyring {
     /// adoption, after the new context is in force and before the
     /// revocation listeners run.
     pub fn revocation_epoch(&self) -> u64 {
-        self.revocation_epoch.load(Ordering::SeqCst)
+        self.held.revocation_epoch.load(Ordering::SeqCst)
     }
 
     fn notify_revoked(&self, ctx: &Arc<SignedTrustContext>, revoked: &[Name]) {
@@ -421,8 +461,9 @@ impl Keyring {
         // After the replacement (so a reader that sees the new epoch then
         // selects the new context) and before the listeners (so whatever the
         // purge they run misses, a later epoch check catches).
-        self.revocation_epoch.fetch_add(1, Ordering::SeqCst);
+        self.held.revocation_epoch.fetch_add(1, Ordering::SeqCst);
         let listeners = self
+            .held
             .revocation_listeners
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -434,17 +475,18 @@ impl Keyring {
 
     /// The version currently held for `namespace`, if any context is adopted.
     pub fn version_of(&self, namespace: &Name) -> Option<u64> {
-        self.contexts.get(namespace).map(|c| c.version())
+        self.held.contexts.get(namespace).map(|c| c.version())
     }
 
     /// Drop a context by namespace; returns whether one was removed.
     pub fn forget(&self, namespace: &Name) -> bool {
-        self.contexts.remove(namespace).is_some()
+        self.held.contexts.remove(namespace).is_some()
     }
 
     /// All adopted (non-ambient) contexts.
     pub fn contexts(&self) -> Vec<Arc<SignedTrustContext>> {
-        self.contexts
+        self.held
+            .contexts
             .iter()
             .map(|r| Arc::clone(r.value()))
             .collect()
@@ -452,20 +494,45 @@ impl Keyring {
 
     /// Number of adopted (non-ambient) contexts.
     pub fn len(&self) -> usize {
-        self.contexts.len()
+        self.held.contexts.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.contexts.is_empty()
+        self.held.contexts.is_empty()
     }
 
     /// Select the context governing `name`: the adopted context whose
     /// namespace is the longest prefix of `name`, else the ambient context.
-    /// A name in a person's self-certifying namespace (`/user/<0xA1>/…`) is
-    /// governed only by that namespace's own context: a held `/user` or `/`
-    /// context never vouches for it, so without it the ambient context
-    /// judges (trust-context.md §4.5).
+    ///
+    /// A name in a person's self-certifying namespace (`/user/<0xA1>/…`,
+    /// [`in_personal_namespace`](crate::self_certifying::in_personal_namespace))
+    /// is governed only by that namespace's own context: a held `/user` or
+    /// `/` context never vouches for it, and neither does the ambient
+    /// context, whatever anchors it holds (a forwarder's holds every PIB
+    /// anchor, its own root included). Without its own context such a name
+    /// is judged by a fixed context with no anchors and an empty schema,
+    /// which accepts nothing, signed or not, anchored or not
+    /// ([`unheld_personal_namespace`](Self::unheld_personal_namespace) says
+    /// which namespace to adopt; trust-context.md §4.5.6). That context's
+    /// namespace is `/`, as the ambient's: a caller asking whether a held
+    /// context covers a name uses [`held_for`](Self::held_for). It is
+    /// shared, so never add anchors to or set the schema of a context
+    /// this returns; adopt one instead.
     pub fn context_for(&self, name: &Name) -> Arc<SignedTrustContext> {
+        match self.held_for(name) {
+            Some(held) => held,
+            None if crate::self_certifying::in_personal_namespace(name) => {
+                Arc::clone(&self.held.unheld)
+            }
+            None => Arc::clone(&self.ambient),
+        }
+    }
+
+    /// The held (adopted) context governing `name`, if any: the one whose
+    /// namespace is the longest prefix of `name` — for a person's name,
+    /// only their own namespace's ([`context_for`](Self::context_for)).
+    /// `None` when the ambient context, or nothing, judges `name`.
+    pub fn held_for(&self, name: &Name) -> Option<Arc<SignedTrustContext>> {
         let floor = if crate::self_certifying::in_personal_namespace(name) {
             2
         } else {
@@ -473,7 +540,7 @@ impl Keyring {
         };
         let mut best: Option<Arc<SignedTrustContext>> = None;
         let mut best_len = 0usize;
-        for r in self.contexts.iter() {
+        for r in self.held.contexts.iter() {
             let ns = r.key();
             // ns is a prefix of name, and longer (more specific) than any
             // match so far.
@@ -482,14 +549,29 @@ impl Keyring {
                 best = Some(Arc::clone(r.value()));
             }
         }
-        best.unwrap_or_else(|| Arc::clone(&self.ambient))
+        best
+    }
+
+    /// The person's namespace `/user/<0xA1: …>` that `name` lies in, when
+    /// this keyring does not hold it: every packet named `name` is refused
+    /// until it is adopted by name ([`context_for`](Self::context_for)).
+    /// `None` for a name in no person's namespace, or in one held.
+    pub fn unheld_personal_namespace(&self, name: &Name) -> Option<Name> {
+        let namespace = crate::self_certifying::personal_namespace_of(name)?;
+        self.held_for(name).is_none().then_some(namespace)
     }
 
     /// Whether `name` is an anchor in *any* held context (ambient included).
-    /// Anchor *termination* during a chain walk is still per-context; this is
-    /// the membership query used by diagnostics.
+    /// A name in a person's namespace is an anchor only of that
+    /// namespace's own context ([`context_for`](Self::context_for)), never
+    /// of the ambient or of another held context. Anchor *termination*
+    /// during a chain walk is still per-context; this is the membership
+    /// query used by diagnostics.
     pub fn is_anchor(&self, name: &Name) -> bool {
-        self.ambient.is_anchor(name) || self.contexts.iter().any(|r| r.value().is_anchor(name))
+        if crate::self_certifying::in_personal_namespace(name) {
+            return self.context_for(name).is_anchor(name);
+        }
+        self.ambient.is_anchor(name) || self.held.contexts.iter().any(|r| r.value().is_anchor(name))
     }
 }
 
@@ -551,6 +633,33 @@ mod tests {
             kr.context_for(&n("/user/alice/doc")).namespace(),
             &n("/user")
         );
+    }
+
+    /// A person's name whose namespace is not held is judged by a context
+    /// that accepts nothing — never by the ambient one, whatever it holds
+    /// and accepts (here: everything).
+    #[test]
+    fn a_persons_name_not_held_is_never_judged_by_the_ambient_context() {
+        let kr = keyring();
+        let held = crate::self_certifying::self_certifying_name(&[1; 32]);
+        let person = crate::self_certifying::self_certifying_name(&[7; 32]);
+        let doc = person.clone().append("doc");
+        let key = held.clone().append("KEY").append("k");
+        assert!(
+            kr.ambient().authorizes(&doc, &key),
+            "the ambient accepts all"
+        );
+        for name in [&person, &doc] {
+            let ctx = kr.context_for(name);
+            assert!(
+                !Arc::ptr_eq(&ctx, kr.ambient()),
+                "{name} is judged by the ambient context"
+            );
+            assert!(
+                ctx.anchors().is_empty() && !ctx.authorizes(name, &key),
+                "{name} is judged by a context that accepts something"
+            );
+        }
     }
 
     #[test]
