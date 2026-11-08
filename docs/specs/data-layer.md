@@ -4137,10 +4137,14 @@ X25519-to-ChaCha20-Poly1305 wrap.
   one the policy refuses is refused (`Conflict`): a joiner cannot speak for
   a namespace the inviter knows, take over a name under one (a device name
   of a person the inviter trusts, whose validation would then pick the
-  joiner's longer context), become the trust root over names it does not
-  hold (`/com`, the shared `/user`), nor shadow names of the inviter's own.
-  A joiner can claim any namespace that overlaps none the inviter trusts —
-  that is what a stranger is; the owner sees which one joined.
+  joiner's longer context), become the trust root over the shared `/user`
+  or a scope, nor shadow names of the inviter's own. A joiner can claim any
+  namespace that overlaps none the inviter trusts — that is what a
+  stranger is; the owner sees which one joined. A broad one (`/com`) is
+  the joiner's root over every name under it the inviter does not trust
+  yet, and a later introduction under it is refused `Conflict` while this
+  device trusts it: a deployment whose people's namespaces sit under such
+  a prefix lists it in `Config::intro.shared`.
 - **Inviter impersonation of a namespace the joiner trusts.** A code is
   made by anyone. The joiner judges the inviter's namespace as the inviter
   judges the joiner's (§19.3 step 4) before it adopts anything, so a
