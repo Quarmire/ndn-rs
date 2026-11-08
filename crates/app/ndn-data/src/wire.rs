@@ -44,6 +44,8 @@
 //! later revision can add fields old readers pass over and fields they must
 //! not.
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
@@ -138,7 +140,8 @@ pub mod tlv {
     pub const WRITER: u64 = 0x0568;
     /// A members record's removals in force: `Cut*`, by prefix.
     pub const CUTS: u64 = 0x056A;
-    /// One removal: `Name` (the removed writer prefix), then — in a
+    /// One removal: `Name` (the removed writer prefix), `CutBytes*` (the
+    /// manifests binding what it keeps to its bytes), then — in a
     /// collection's record — per key whose versions stay accepted in the
     /// collection, `Writer` and `Entries` (exactly those seqs), or — in a
     /// folder's record — one `CutIn` per collection under the folder.
@@ -263,6 +266,12 @@ pub mod tlv {
     /// one sequence across its collections, so a seq is accepted only in
     /// the collection it lists it under (spec §6.1, §8).
     pub const CUT_IN: u64 = 0x055F;
+    /// In a `Cut`, right after its `Name`, once per manifest: `Name`, the
+    /// full name (ending in its implicit digest) of the root packet of a
+    /// cut manifest listing the implicit digest of every version the cut
+    /// keeps (spec §8). A version is inside the cut only with those bytes;
+    /// a cut that keeps versions carries one in every record signed now.
+    pub const CUT_BYTES: u64 = 0x055B;
 
     // The introduction exchange (spec §19): odd numbers, critical.
 
@@ -312,6 +321,7 @@ const ASK: &[u8] = b"ask";
 const HEAD: &[u8] = b"head";
 const ENTRY: &[u8] = b"entry";
 const RANGE: &[u8] = b"range";
+const CUT: &[u8] = b"cut";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces, whatever the collection's rule (a block never).
@@ -871,6 +881,28 @@ pub fn parse_piece_name(name: &Name) -> Option<PieceName> {
     let log = parse_log_name(&version)?;
     log.subject.as_ref()?;
     Some(PieceName { version, log, kind })
+}
+
+/// `<R>/32=cut`, `R` a members record's log entry name: the prefix of the
+/// packets of the cut manifest binding the versions its cuts keep to their
+/// bytes (`seg=0` the root, spec §8, §16.1).
+pub fn cut_bytes_prefix(record: &Name) -> Name {
+    record.clone().append_component(kw(CUT))
+}
+
+/// Parse `<R>/32=cut/seg=<i>`, `R` a members record's log entry name (with
+/// a subject): the record, parsed.
+pub fn parse_cut_bytes_name(name: &Name) -> Option<LogName> {
+    let comps = name.components();
+    let (last, rest) = comps.split_last()?;
+    last.as_segment()?;
+    let (m, record) = rest.split_last()?;
+    if !is_kw(m, CUT) {
+        return None;
+    }
+    let log = parse_log_name(&name_of(record))?;
+    log.subject.as_ref()?;
+    Some(log)
 }
 
 /// What a hold ask asks a holder: to hold what an owner device's hold record
@@ -2244,6 +2276,17 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
                 for c in &b.cuts {
                     w.write_nested(tlv::CUT, |w| {
                         write_name(w, &c.of);
+                        // A collection's record keeps its own versions only.
+                        let written = |coll: &Name| b.folder || *coll == b.collection;
+                        let bound: BTreeSet<&Name> = c
+                            .accept
+                            .iter()
+                            .filter(|(coll, _, _)| written(coll))
+                            .flat_map(|(coll, key, _)| c.accept.manifests(coll, key))
+                            .collect();
+                        for root in bound {
+                            w.write_nested(tlv::CUT_BYTES, |w| write_name(w, root));
+                        }
                         for (coll, accepted) in c.accept.collections() {
                             match b.folder {
                                 // A collection's own versions, bare.
@@ -2846,17 +2889,32 @@ impl KeptReader {
 }
 
 /// Decode one `Cut` of the members record of `subject` — a folder's when
-/// `folder`: its prefix, then of a collection's record the `Writer` and
-/// `Entries` pairs of the versions kept in it, of a folder's one `CutIn`
-/// per collection strictly under it, collections ascending.
+/// `folder`: its prefix, the manifests binding what it keeps to its bytes
+/// (`CutBytes`, ascending, once each), then of a collection's record the
+/// `Writer` and `Entries` pairs of the versions kept in it, of a folder's
+/// one `CutIn` per collection strictly under it, collections ascending.
+/// A cut that keeps nothing binds nothing: it carries no `CutBytes`.
 fn read_cut(value: Bytes, subject: &Name, folder: bool) -> Result<CutBody, WireError> {
     let mut of = None;
     let mut accept = Accepted::new();
     let mut own = KeptReader::default();
     let mut last: Option<Name> = None;
+    let mut bytes: Vec<Name> = Vec::new();
     each(value, |t, v| {
         match t {
             tlv_type::NAME if of.is_none() => of = Some(read_name(v)?),
+            tlv::CUT_BYTES => {
+                if of.is_none() || !accept.is_empty() || own.writer.is_some() || last.is_some() {
+                    return Err(bad(
+                        "a cut's CutBytes come right after its prefix, before what it keeps",
+                    ));
+                }
+                let root = read_full_name(v)?;
+                if bytes.last().is_some_and(|l| *l >= root) {
+                    return Err(bad("a cut lists its CutBytes once each, ascending"));
+                }
+                bytes.push(root);
+            }
             tlv::WRITER | tlv::ENTRIES if !folder => own.take(t, v, subject, &mut accept)?,
             tlv::WRITER | tlv::ENTRIES => {
                 return Err(bad(
@@ -2904,6 +2962,14 @@ fn read_cut(value: Bytes, subject: &Name, folder: bool) -> Result<CutBody, WireE
     })?;
     own.end()?;
     let of = of.ok_or_else(|| bad("a cut names a prefix"))?;
+    if !bytes.is_empty() && accept.is_empty() {
+        return Err(bad(
+            "a cut's CutBytes bind the versions it keeps; this cut keeps none",
+        ));
+    }
+    for root in &bytes {
+        accept.bind(root);
+    }
     Ok(CutBody { of, accept })
 }
 
@@ -2915,6 +2981,23 @@ pub(crate) fn read_writer(v: Bytes) -> Result<Name, WireError> {
         return Err(bad("a writer is a key name"));
     }
     read_name(v)
+}
+
+/// Read a `CutBytes` TLV's value: one Name, a packet's full name, ending
+/// in its 32-octet implicit digest.
+fn read_full_name(v: Bytes) -> Result<Name, WireError> {
+    let mut r = TlvReader::new(v);
+    let (t, v) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if t != tlv_type::NAME || !r.is_empty() {
+        return Err(bad("a CutBytes is one name"));
+    }
+    let name = read_name(v)?;
+    match name.components().last() {
+        Some(c) if c.typ == tlv_type::IMPLICIT_SHA256 && c.value.len() == 32 => Ok(name),
+        _ => Err(bad(
+            "a CutBytes names a manifest packet by its full name, ending in its implicit digest",
+        )),
+    }
 }
 
 /// Check seq ranges read from a record: ascending and disjoint, none above

@@ -69,7 +69,8 @@ use ndn_security::safe_data::TrustPath;
 use ndn_security::verifier::{VerifyOutcome, verify_by_sig_type};
 use ndn_security::{
     Keyring, ManifestLookup, RevocationCut, SecurityManager, SignedTrustContext, Signer,
-    TrustError, ValidationResult, Validator, cut_manifest, public_key_digest, sync_group,
+    TrustError, ValidationResult, Validator, cut_manifest, cut_manifest::CutManifests,
+    public_key_digest, sync_group,
 };
 use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
@@ -96,13 +97,13 @@ use crate::version::{
 use crate::wire::{
     self, AuditAnswer, AuditAsk, BlockEntryBody, Branches, ChunksBody, CutBody, ExpiryRun,
     GrantAsk, HeadBody, HoldAsk, HoldBody, Inline, LeaseBody, MembersBody, NodeBody, PieceKind,
-    PruneBody, Range, Record, SealedBody, Tomb, VersionBody, audit_ask_name, device_of, entry_name,
-    grant_name, head_name, head_prefix, hold_ask_name, in_ranges, log_name, namespace_of,
-    node_name, page_name, parse_audit_ask_name, parse_entry_name, parse_grant_name,
-    parse_head_name, parse_head_prefix, parse_held_name, parse_hold_ask_name, parse_log_name,
-    parse_piece_name, parse_range_name, parse_seal_key_name, parse_state_name, parse_summary_name,
-    piece_name, piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name,
-    subject_namespace,
+    PruneBody, Range, Record, SealedBody, Tomb, VersionBody, audit_ask_name, cut_bytes_prefix,
+    device_of, entry_name, grant_name, head_name, head_prefix, hold_ask_name, in_ranges, log_name,
+    namespace_of, node_name, page_name, parse_audit_ask_name, parse_cut_bytes_name,
+    parse_entry_name, parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name,
+    parse_hold_ask_name, parse_log_name, parse_piece_name, parse_range_name, parse_seal_key_name,
+    parse_state_name, parse_summary_name, piece_name, piece_names, root_name, root_prefix,
+    seal_key_name, seqs_of, state_name, subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -1232,6 +1233,13 @@ const OWN_AHEAD: u64 = 64;
 /// The most cut manifest packets one look for an entry's listed digest
 /// fetches (spec §8): a manifest is a tree of a few levels.
 const MANIFEST_LOOKS: usize = 16;
+/// Removal cuts' manifest packets held in memory ([`St::cut_bytes`]); the
+/// store keeps every one taken, and one let go is read back from it.
+const CUT_BYTES_HELD: usize = 4096;
+/// The most versions the cuts of one members record keep (spec §8): each
+/// is listed with its digest in the record's cut manifest, about 45
+/// octets, so a record binds at most some 12 MB of manifest.
+const CUT_KEPT_MAX: usize = 262_144;
 
 /// The most collections one application carries its groups to before it
 /// leaves the rest to the next arrival ([`St::apply_ready`]): a bound on
@@ -1459,6 +1467,23 @@ struct St {
     /// Entries a trust context re-admits exactly that were not to be had
     /// when asked for: their digest, and how many times they were asked.
     readmitting: BTreeMap<Name, ([u8; 32], u32)>,
+    /// The packets of removal cuts' manifests held (spec §8), by full
+    /// name: a cache over the store, where every one taken is kept
+    /// ([`load_cut_bytes`] reads it back).
+    cut_bytes: CutManifests,
+    /// Packets of removal cuts' manifests not held that versions wait for,
+    /// with the collections those versions are in: fetched, then the
+    /// collections read again ([`Inner::fetch_wanted_bytes`]).
+    bytes_wanted: BTreeMap<Name, BTreeSet<Name>>,
+    /// Packets of removal cuts' manifests, and log entries such cuts keep,
+    /// being fetched.
+    bytes_fetching: BTreeSet<Name>,
+    /// Log entries a removal cut keeps bound to bytes whose other bytes
+    /// were refused here, with that cut and how many times the kept bytes
+    /// were asked for in vain: nothing of them is held, and the bytes the
+    /// cut keeps are still taken when they come, asked for by their full
+    /// name (spec §8, [`Inner::fetch_kept`]).
+    other_bytes: HashMap<Name, (Cut, u32)>,
     /// Where applied versions of other writers are kept.
     store: Arc<dyn DataStore>,
     /// The seal keys held.
@@ -1981,6 +2006,11 @@ struct LogEntry {
     wire: Bytes,
     record: Record,
 }
+
+/// An own members record signed and not yet kept
+/// ([`Inner::sign_members`]): the entry, the epoch it starts with its key,
+/// and the packets of its cuts' manifest, root first.
+type SignedMembers = (LogEntry, Option<(Epoch, ContentKey)>, Vec<Bytes>);
 
 /// An own version signed and not yet kept ([`Inner::sign_version`]).
 struct Signed {
@@ -2770,6 +2800,46 @@ impl St {
         }
     }
 
+    /// The bytes a removal cut of the record in force over the log entry
+    /// `name`'s collection binds at `name`, when it keeps it (spec §8):
+    /// `Ok(Some(digest))`, listed by its manifest; `Ok(None)`, no cut keeps
+    /// it with bytes listed; `Err(full)`, a manifest packet on its path is
+    /// not held.
+    fn kept_digest(&self, name: &Name) -> Result<Option<[u8; 32]>, Name> {
+        let Some(l) = parse_log_name(name) else {
+            return Ok(None);
+        };
+        let Some(c) = l.subject else {
+            return Ok(None);
+        };
+        let Some(m) = self.colls.get(&c).and_then(|x| x.members.as_ref()) else {
+            return Ok(None);
+        };
+        let keys = m
+            .cuts
+            .iter()
+            .flat_map(|k| k.accept.iter())
+            .filter(|(x, w, _)| **x == c && device_of(w.key()).as_ref() == Some(&l.device))
+            .map(|(_, w, _)| w);
+        for w in keys {
+            let id = VersionId {
+                writer: w.clone(),
+                seq: Seq(l.seq),
+            };
+            let Some(cut) = m.kept_by(&c, &id) else {
+                continue;
+            };
+            for root in cut.accept.manifests(&c, w) {
+                match listed_bytes(&self.cut_bytes, &*self.store, root, name) {
+                    ManifestLookup::Listed(d) => return Ok(Some(d)),
+                    ManifestLookup::Missing(full) => return Err(full),
+                    ManifestLookup::NotListed => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Deliver `v` again to every watcher of its collection it was
     /// delivered to before (its frontier holds it): it was withdrawn, and
     /// is taken back. The others had it delivered as it applied.
@@ -3285,6 +3355,12 @@ impl St {
                 Some(why @ (Refusal::OutsideCut(_) | Refusal::Untrusted { .. })) => {
                     Some((id, why.clone()))
                 }
+                // Other bytes than a removal cut keeps at its name, let go:
+                // the bytes it keeps may still come, so no group is refused.
+                None => self
+                    .other_bytes
+                    .get(&name)
+                    .map(|(cut, _)| (id, Refusal::OutsideCut(cut.clone()))),
                 _ => None,
             })
             .collect();
@@ -3382,6 +3458,53 @@ impl St {
             coll.outsiders.push(hv);
             return false;
         }
+        // A version a removal cut keeps is inside it only with the bytes
+        // the cut's manifests list (spec §8).
+        if let Some(cut) = members.kept_by(&c, &hv.version.id) {
+            let name = &hv.version.name;
+            match bound_bytes(
+                &self.cut_bytes,
+                &*self.store,
+                cut,
+                &c,
+                &hv.version.id,
+                name,
+                &hv.digest,
+            ) {
+                Bound::Listed => {}
+                Bound::Missing(full) => {
+                    tracing::debug!(id = ?hv.version.id, %full, "waits in {c} for the manifest of the removal cut keeping it");
+                    self.bytes_wanted.entry(full).or_default().insert(c.clone());
+                    coll.waiting.push(hv);
+                    return false;
+                }
+                Bound::Other => {
+                    // Other bytes than the cut keeps at that name: refused,
+                    // and let go so the bytes it keeps are taken when they
+                    // come, asked for by their full name ([`Inner::fetch_kept`]);
+                    // the writer's summary is walked again for them.
+                    tracing::info!(id = ?hv.version.id, collection = %c, "refused: other bytes than the removal cut keeps at its name; let go for the bytes it keeps");
+                    if self
+                        .store
+                        .get(name)
+                        .is_some_and(|w| wire::implicit_digest(&w) == hv.digest)
+                    {
+                        self.store.remove(name);
+                    }
+                    self.held.remove(name);
+                    self.other_bytes.insert(name.clone(), (cut.clone(), 0));
+                    if let (Some(l), Some(ns)) = (parse_log_name(name), namespace_of(&c))
+                        && let Some(peer) = self.peers.get_mut(&(l.device, ns))
+                    {
+                        peer.root = None;
+                        peer.nodes.retain(|(s, _), _| !c.has_prefix(s));
+                    }
+                    return false;
+                }
+            }
+        }
+        // Other bytes refused at its name before: these are the ones kept.
+        self.other_bytes.remove(&hv.version.name);
         // A merge rule takes one operation per version: a block carries
         // many (spec §4.1).
         if matches!(members.rule, Rule::Merge { .. })
@@ -5538,6 +5661,10 @@ impl Device {
                 cut_out: HashMap::new(),
                 cut_fetching: BTreeSet::new(),
                 readmitting: BTreeMap::new(),
+                cut_bytes: CutManifests::new(CUT_BYTES_HELD),
+                bytes_wanted: BTreeMap::new(),
+                bytes_fetching: BTreeSet::new(),
+                other_bytes: HashMap::new(),
                 store,
                 keys: seal_keys,
                 asking: BTreeSet::new(),
@@ -5602,6 +5729,9 @@ impl Device {
         // trust contexts held now (spec §8): a key above its signer may
         // have been revoked while the device was off.
         inner.rejudge(Rejudge::All).await;
+        // Versions kept by a removal cut whose manifest the store lacks wait
+        // for it: asked for now.
+        inner.fetch_wanted_bytes();
         // What the store holds may be only in the operating system's
         // buffers (an earlier run was killed before its flush): it is made
         // durable before any of it is published, or a power loss now could
@@ -6777,6 +6907,10 @@ impl Inner {
                 walked.push(w);
                 continue;
             }
+            // A removal cut's manifest packet: read back when judged by.
+            if parse_cut_bytes_name(&name).is_some() {
+                continue;
+            }
             let Some(parsed) = parse_log_name(&name) else {
                 match parse_piece_name(&name) {
                     Some(p) => pieces.push((name, p.version)),
@@ -7793,6 +7927,7 @@ impl Inner {
         }
         self.retry_readmissions();
         self.fetch_cut_runs();
+        self.fetch_kept(true);
     }
 
     // ---- fetching -----------------------------------------------------------------------------
@@ -8250,14 +8385,17 @@ impl Inner {
 
     /// Fetch, verify and take one log entry — by its name, else from each
     /// holder of a live lease on its collection ([`Self::fetch_entry`]);
-    /// whether it is now held or refused. The log of a device whose key is
-    /// suspected here is not fetched ([`Device::suspect`]).
+    /// whether it is now held or refused. One a removal cut keeps bound to
+    /// bytes is asked for by its full name, so only those bytes answer
+    /// ([`Self::kept_bytes`]). The log of a device whose key is suspected
+    /// here is not fetched ([`Device::suspect`]).
     async fn take_fetched(self: &Arc<Self>, name: Name) -> bool {
         if parse_log_name(&name).is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device)) {
             tracing::debug!(%name, "not fetched: its device's key is suspected here");
             return false;
         }
-        let Some(data) = self.fetch_entry(&name, None).await else {
+        let digest = self.kept_bytes(&name).await;
+        let Some(data) = self.fetch_entry(&name, digest).await else {
             return false;
         };
         match self.take_data(&name, data).await {
@@ -8352,6 +8490,64 @@ impl Inner {
             .filter(|r| r.subject() == parsed.subject)
         else {
             return Err(Refusal::BadSignature);
+        };
+        // A version a removal cut keeps is taken only with the bytes the
+        // cut's manifests list (spec §8): other bytes at its name are refused
+        // as a packet, before anything is held of them, and the ones it keeps
+        // may still come. While a manifest packet is not to be had, it is
+        // taken and waits ([`St::admit_one`]).
+        if let (Record::Version(_), Some(c)) = (&record, &parsed.subject) {
+            let id = VersionId {
+                writer: writer.clone(),
+                seq: Seq(parsed.seq),
+            };
+            let digest = wire::implicit_digest(data.raw());
+            for _ in 0..MANIFEST_LOOKS {
+                let verdict = {
+                    let st = self.st.lock();
+                    st.colls
+                        .get(c)
+                        .and_then(|x| x.members.as_ref())
+                        .and_then(|m| m.kept_by(c, &id))
+                        .map(|cut| {
+                            let bound =
+                                bound_bytes(&st.cut_bytes, &*st.store, cut, c, &id, name, &digest);
+                            (bound, cut.clone())
+                        })
+                };
+                match verdict {
+                    None | Some((Bound::Listed, _)) => break,
+                    Some((Bound::Other, cut)) => {
+                        tracing::debug!(%name, "refused as a packet: other bytes than the removal cut keeps at this name");
+                        {
+                            let mut st = self.st.lock();
+                            if !st.held.contains_key(name) {
+                                st.other_bytes
+                                    .entry(name.clone())
+                                    .or_insert_with(|| (cut.clone(), 0));
+                            }
+                        }
+                        self.fetch_kept(false);
+                        return Err(Refusal::OutsideCut(cut));
+                    }
+                    Some((Bound::Missing(full), _)) => {
+                        if !self.fetch_cut_bytes(&full).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // The manifests a members record's cuts bind their versions by: held
+        // here once it is, so this device judges by them and serves them.
+        let bound_by: Vec<Name> = match &record {
+            Record::Members(b) => b
+                .cuts
+                .iter()
+                .flat_map(|k| k.accept.all_manifests())
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
         };
         // A lease names a holder a missing member of a group may be fetched
         // from.
@@ -8453,6 +8649,18 @@ impl Inner {
                 inner.rejudge(Rejudge::Withdrawn(Some(key))).await;
             });
         }
+        if !bound_by.is_empty() && self.st.lock().held.contains_key(name) {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                for root in &bound_by {
+                    if !inner.hold_cut_tree(root).await {
+                        tracing::debug!(%root, "a removal cut's manifest not held whole yet; its versions wait for what they need");
+                    }
+                }
+            });
+        }
+        self.fetch_wanted_bytes();
+        self.fetch_kept(false);
         self.settle().await;
         Ok(())
     }
@@ -9088,6 +9296,191 @@ impl Inner {
             }
         }
         None
+    }
+
+    /// Hold the removal cut manifest packet `full` (a full name ending in
+    /// its implicit digest): from the store, else fetched by its full name
+    /// from whoever answers — it is trusted by that digest alone — and kept
+    /// in the store, so this device serves it too (spec §8). Whether it is
+    /// held now.
+    async fn fetch_cut_bytes(&self, full: &Name) -> bool {
+        {
+            let st = self.st.lock();
+            if load_cut_bytes(&st.cut_bytes, &*st.store, full) {
+                return true;
+            }
+        }
+        let Some(data) = self.fetch(full.clone(), false).await else {
+            tracing::debug!(%full, "a removal cut's manifest packet not to be had now");
+            return false;
+        };
+        let taken = data
+            .name
+            .as_ref()
+            .clone()
+            .append_implicit_digest(data.implicit_digest());
+        if taken != *full {
+            tracing::debug!(%full, "not the removal cut's manifest packet asked for; ignored");
+            return false;
+        }
+        let st = self.st.lock();
+        st.store.insert((*data.name).clone(), data.raw().clone());
+        if let Err(e) = st.cut_bytes.insert(&data) {
+            tracing::debug!(%full, "a removal cut's manifest packet that lists nothing: {e}");
+        }
+        true
+    }
+
+    /// Hold every packet of the removal cut manifest rooted at `root`
+    /// (fetched as [`Self::fetch_cut_bytes`] says), so this device judges
+    /// by it and serves it; whether all are held.
+    async fn hold_cut_tree(&self, root: &Name) -> bool {
+        // One round per level of the tree, at most.
+        for _ in 0..MANIFEST_LOOKS {
+            let missing: Vec<Name> = {
+                let st = self.st.lock();
+                st.cut_bytes
+                    .missing(root)
+                    .into_iter()
+                    .filter(|full| !load_cut_bytes(&st.cut_bytes, &*st.store, full))
+                    .collect()
+            };
+            if missing.is_empty() {
+                // What the store gave may have named more.
+                if self.st.lock().cut_bytes.missing(root).is_empty() {
+                    return true;
+                }
+                continue;
+            }
+            for full in missing {
+                if !self.fetch_cut_bytes(&full).await {
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// The digest to fetch the log entry `name` by, when a removal cut of
+    /// the record in force over its collection keeps it bound to bytes:
+    /// exactly those its manifest lists (its packets fetched as needed),
+    /// so other bytes at that name are never asked for (spec §8). `None`:
+    /// by name.
+    async fn kept_bytes(&self, name: &Name) -> Option<[u8; 32]> {
+        // A manifest is a tree a few levels deep; each look fetches one.
+        for _ in 0..MANIFEST_LOOKS {
+            let looked = self.st.lock().kept_digest(name);
+            match looked {
+                Ok(digest) => return digest,
+                Err(full) => {
+                    if !self.fetch_cut_bytes(&full).await {
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Fetch, in the background, the removal cut manifest packets versions
+    /// wait for ([`St::bytes_wanted`]), then read their collections again,
+    /// so the waiting versions are judged by them. A packet not to be had
+    /// stays wanted, asked for again on the next entry taken.
+    fn fetch_wanted_bytes(self: &Arc<Self>) {
+        let wanted: Vec<(Name, BTreeSet<Name>)> = {
+            let mut st = self.st.lock();
+            let all = std::mem::take(&mut st.bytes_wanted);
+            let (busy, free): (BTreeMap<_, _>, BTreeMap<_, _>) = all
+                .into_iter()
+                .partition(|(full, _)| st.bytes_fetching.contains(full));
+            st.bytes_wanted = busy;
+            st.bytes_fetching.extend(free.keys().cloned());
+            free.into_iter().collect()
+        };
+        for (full, colls) in wanted {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                let held = inner.fetch_cut_bytes(&full).await;
+                let fetch: Vec<(Name, ChunksBody)> = {
+                    let mut st = inner.st.lock();
+                    st.bytes_fetching.remove(&full);
+                    if !held {
+                        st.bytes_wanted.entry(full).or_default().extend(colls);
+                        return;
+                    }
+                    let mut fetch = Vec::new();
+                    for c in &colls {
+                        st.reread(c, &inner.config.rules, inner.me());
+                        fetch.extend(st.wanted_pieces(c));
+                    }
+                    fetch
+                };
+                for (v, chunks) in fetch {
+                    inner.spawn_pieces(v, chunks);
+                }
+                inner.fetch_wanted_bytes();
+                inner.fetch_kept(false);
+                inner.settle().await;
+            });
+        }
+    }
+
+    /// Ask, in the background, for the bytes a removal cut keeps at each
+    /// name whose other bytes were refused here ([`St::other_bytes`]), by
+    /// their full name (spec §8): only those bytes can answer, whoever
+    /// serves them. One not to be had now is asked for again after a
+    /// growing pause, up to [`READMIT_TRIES`] times, and at each refresh of
+    /// a group meanwhile. `all`: every such name; else those not asked for
+    /// yet.
+    fn fetch_kept(self: &Arc<Self>, all: bool) {
+        let names: Vec<Name> = {
+            let mut st = self.st.lock();
+            let names: Vec<Name> = st
+                .other_bytes
+                .iter()
+                .filter(|(n, (_, tries))| {
+                    (all || *tries == 0)
+                        && !st.held.contains_key(*n)
+                        && !st.bytes_fetching.contains(*n)
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            st.bytes_fetching.extend(names.iter().cloned());
+            names
+        };
+        for name in names {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                inner.fetch_kept_one(name).await;
+            });
+        }
+    }
+
+    /// [`Self::fetch_kept`] of one name.
+    async fn fetch_kept_one(self: &Arc<Self>, name: Name) {
+        let taken = self.take_fetched(name.clone()).await;
+        let retry = {
+            let mut st = self.st.lock();
+            st.bytes_fetching.remove(&name);
+            let held = taken && st.held.contains_key(&name);
+            match st.other_bytes.get_mut(&name) {
+                Some((_, tries)) if !held => {
+                    *tries = tries.saturating_add(1);
+                    (*tries <= READMIT_TRIES).then(|| READMIT_PAUSE * 2u32.pow(*tries - 1))
+                }
+                _ => None,
+            }
+        };
+        tracing::debug!(%name, ?retry, "the bytes a removal cut keeps, asked for by their full name");
+        if let Some(pause) = retry {
+            let weak = Arc::downgrade(self);
+            rt::spawn(async move {
+                rt::sleep(pause).await;
+                if let Some(inner) = weak.upgrade() {
+                    inner.fetch_kept(true);
+                }
+            });
+        }
     }
 
     /// Keep the refusal of `data`, the log entry `name`, by `cut`: its key
@@ -10269,31 +10662,141 @@ impl Inner {
         record: (MembersBody, Option<ContentKey>),
     ) -> Result<(), DataError> {
         let seq = self.next_seq(st)?;
-        let signed = self.sign_members(c, seq, record)?;
+        let signed = self.sign_members(st, c, seq, record)?;
         self.keep_members(st, c, signed);
         Ok(())
     }
 
     /// Sign `record`, a members record of `c`, as the own log's entry at
-    /// `seq`, with the key of the epoch it starts; nothing is kept.
+    /// `seq`, with the key of the epoch it starts, its cuts bound to the
+    /// bytes they keep ([`Self::bind_cuts`]); nothing is kept.
     fn sign_members(
         &self,
+        st: &St,
         c: &Name,
         seq: u64,
-        (body, key): (MembersBody, Option<ContentKey>),
-    ) -> Result<(LogEntry, Option<(Epoch, ContentKey)>), DataError> {
+        (mut body, key): (MembersBody, Option<ContentKey>),
+    ) -> Result<SignedMembers, DataError> {
+        let name = log_name(&self.device, Some(c), seq);
+        let manifest = self.bind_cuts(st, &name, &mut body)?;
         let entry = self.sign_entry(Some(c), seq, wire::encode_members(&body))?;
-        Ok((entry, body.epoch.zip(key)))
+        Ok((entry, body.epoch.zip(key), manifest))
     }
 
-    /// Keep a members record of `c` [`Self::sign_members`] signed, and the
-    /// key of the epoch it starts.
-    fn keep_members(
+    /// Bind every version the cuts of `body` keep to its bytes (spec §8):
+    /// the manifest of the record named `record` lists the implicit digest
+    /// of each — the one a manifest binding it lists already (a cut carried
+    /// over, or merged), else that of its packet held verified here — and
+    /// every cut keeping versions names it (`CutBytes`). A kept version
+    /// this device knows no bytes of is left out, as one only a summary
+    /// listed is (§6): it holds no verified copy. Returns the manifest's
+    /// packets, root first; none when nothing is kept. [`DataError::NotReady`]
+    /// while a manifest packet of a cut carried over is not held here.
+    fn bind_cuts(
         &self,
-        st: &mut St,
-        c: &Name,
-        (entry, made): (LogEntry, Option<(Epoch, ContentKey)>),
-    ) {
+        st: &St,
+        record: &Name,
+        body: &mut MembersBody,
+    ) -> Result<Vec<Bytes>, DataError> {
+        let mut entries: Vec<(Name, u64, [u8; 32])> = Vec::new();
+        let mut rebuilt: Vec<Accepted> = Vec::with_capacity(body.cuts.len());
+        for cut in &body.cuts {
+            let mut kept = Accepted::new();
+            for (c, w, runs) in cut.accept.iter() {
+                // A collection's record keeps its own versions only.
+                if !body.folder && *c != body.collection {
+                    continue;
+                }
+                let Some(device) = device_of(w.key()) else {
+                    continue;
+                };
+                let roots: Vec<&Name> = cut.accept.manifests(c, w).collect();
+                for &(lo, hi) in runs {
+                    if entries.len() as u64 + (hi - lo) >= CUT_KEPT_MAX as u64 {
+                        return Err(DataError::BadRequest {
+                            name: body.collection.clone(),
+                            why: format!(
+                                "its cuts would keep more than {CUT_KEPT_MAX} versions, more \
+                                 than one record binds to their bytes; write the removed \
+                                 writers back in, or share the collections apart"
+                            ),
+                        });
+                    }
+                    for seq in lo..=hi {
+                        let name = log_name(&device, Some(c), seq);
+                        let digest = match roots.is_empty() {
+                            true => held_digest(st, &name, w),
+                            false => {
+                                let mut listed: Option<[u8; 32]> = None;
+                                let mut agree = true;
+                                for root in &roots {
+                                    match listed_bytes(&st.cut_bytes, &*st.store, root, &name) {
+                                        ManifestLookup::Listed(d) => {
+                                            agree &= listed.is_none_or(|l| l == d);
+                                            listed = Some(d);
+                                        }
+                                        ManifestLookup::NotListed => agree = false,
+                                        ManifestLookup::Missing(full) => {
+                                            return Err(DataError::NotReady {
+                                                name: body.collection.clone(),
+                                                why: format!(
+                                                    "the manifest of a removal cut it carries \
+                                                     over is not held here yet ({full}); share \
+                                                     again once its signer, or a device that \
+                                                     took it, is reachable"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                listed.filter(|_| agree)
+                            }
+                        };
+                        match digest {
+                            Some(d) => {
+                                kept.insert_range(c, w, seq, seq);
+                                entries.push((log_prefix(&name), seq, d));
+                            }
+                            None => {
+                                tracing::debug!(%name, "left out of the cut: no bytes of it known here");
+                            }
+                        }
+                    }
+                }
+            }
+            rebuilt.push(kept);
+        }
+        let packets = match entries.is_empty() {
+            true => Vec::new(),
+            false => {
+                let built = cut_manifest::build_under(&cut_bytes_prefix(record), &entries)
+                    .map_err(|e| {
+                        local(format!("the manifest of {record}'s cuts is not made: {e}"))
+                    })?;
+                for kept in &mut rebuilt {
+                    if !kept.is_empty() {
+                        kept.bind(&built.root);
+                    }
+                }
+                built.packets
+            }
+        };
+        for (cut, kept) in body.cuts.iter_mut().zip(rebuilt) {
+            cut.accept = kept;
+        }
+        Ok(packets)
+    }
+
+    /// Keep a members record of `c` [`Self::sign_members`] signed, the key
+    /// of the epoch it starts, and its cuts' manifest: stored, so this
+    /// device serves it, and held, so it judges by it.
+    fn keep_members(&self, st: &mut St, c: &Name, (entry, made, manifest): SignedMembers) {
+        for wire in manifest {
+            if let Ok(data) = Data::decode(wire.clone()) {
+                st.store.insert((*data.name).clone(), wire);
+                let _ = st.cut_bytes.insert(&data);
+            }
+        }
         self.keep_entry(st, entry);
         if let Some((e, key)) = made {
             self.keep_made_key(st, c, e, key);
@@ -10567,7 +11070,7 @@ impl Inner {
         let (body, made) = self.default_members(c, base);
         let (signed, ruled, temp) =
             self.sign_fresh(c, seq, &body, made.as_ref(), draft, options, None)?;
-        let record = self.sign_members(c, base, (body, made))?;
+        let record = self.sign_members(st, c, base, (body, made))?;
         self.keep_members(st, c, record);
         self.start_fresh(st, c, temp);
         Ok(self.commit(st, ns, signed, Duration::ZERO, Some(ruled)))
@@ -11400,6 +11903,15 @@ impl Inner {
                 .packet_for(&bare, false)
                 .filter(|w| wire::implicit_digest(w).as_slice() == last.value.as_ref());
         }
+        // A packet of a removal cut's manifest (spec §8): of an own record
+        // once the record is durable; of another's, as taken here (it is
+        // trusted by the digest naming it, whoever serves it).
+        if let Some(record) = parse_cut_bytes_name(name) {
+            if record.device == self.device && record.seq > self.st.lock().durable {
+                return None;
+            }
+            return self.store.get(name);
+        }
         // Own log entries and pieces of own versions; of a collection this
         // device holds for its owner, every entry and piece it keeps
         // (readers ask it for them under its own name, `32=held`); and of a
@@ -12034,9 +12546,14 @@ impl Inner {
         };
         let mut failed = DataError::Unavailable { name: name.clone() };
         let mut taken = false;
+        // One a removal cut keeps bound to bytes: by its full name.
+        let exact = match self.kept_bytes(name).await {
+            Some(d) => name.clone().append_implicit_digest(d),
+            None => name.clone(),
+        };
         for source in std::iter::once(None).chain(holders.iter().map(Some)) {
             let data = match source {
-                None => self.fetch(name.clone(), false).await,
+                None => self.fetch(exact.clone(), false).await,
                 Some(h) => self.fetch_held(name, h).await,
             };
             let Some(data) = data else { continue };
@@ -12056,6 +12573,13 @@ impl Inner {
             }
         }
         if !taken {
+            // Only other bytes than a removal cut keeps came at this name:
+            // that refusal says why, though the kept ones may still come.
+            if matches!(failed, DataError::Unavailable { .. })
+                && let Some((cut, _)) = self.st.lock().other_bytes.get(name).cloned()
+            {
+                return Err(refused(name, Refusal::OutsideCut(cut)));
+            }
             return Err(failed);
         }
         // The entry came, but no members record of its collection is held:
@@ -14508,6 +15032,100 @@ fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) 
     }
 }
 
+/// What a removal cut's manifests say of the bytes of a version it keeps
+/// (spec §8): [`bound_bytes`].
+enum Bound {
+    /// Every manifest binding it lists exactly these bytes.
+    Listed,
+    /// A manifest lists other bytes at its name, or none; or the cut binds
+    /// what it keeps to no bytes (a record signed before cuts bound
+    /// bytes): outside the cut.
+    Other,
+    /// A manifest packet on its path is not held: fetch it by this full
+    /// name, then judge again.
+    Missing(Name),
+}
+
+/// Take the removal cut manifest packet `full` (a full name) into `held`,
+/// from `store` if not held; whether it is held now. Every packet taken is
+/// kept in the store, under its name, as it came.
+fn load_cut_bytes(held: &CutManifests, store: &dyn DataStore, full: &Name) -> bool {
+    if held.contains(full) {
+        return true;
+    }
+    let Some((last, bare)) = full.components().split_last() else {
+        return false;
+    };
+    let Some(wire) = store.get(&Name::from_components(bare.iter().cloned())) else {
+        return false;
+    };
+    if wire::implicit_digest(&wire).as_slice() != last.value.as_ref() {
+        return false;
+    }
+    let Ok(data) = Data::decode(wire) else {
+        return false;
+    };
+    // One that is no manifest node is held too: it lists nothing.
+    let _ = held.insert(&data);
+    true
+}
+
+/// What the removal cut manifest rooted at `root` lists for the log entry
+/// `entry` (`<D>/32=log/<C>/seq=<n>`, listed under `<D>/32=log/<C>`), its
+/// packets read back from `store` as needed.
+fn listed_bytes(
+    held: &CutManifests,
+    store: &dyn DataStore,
+    root: &Name,
+    entry: &Name,
+) -> ManifestLookup {
+    let Some((last, prefix)) = entry.components().split_last() else {
+        return ManifestLookup::NotListed;
+    };
+    let Some(seq) = last.as_sequence_num() else {
+        return ManifestLookup::NotListed;
+    };
+    let prefix = Name::from_components(prefix.iter().cloned());
+    loop {
+        match held.lookup(root, &prefix, seq) {
+            ManifestLookup::Missing(full) if load_cut_bytes(held, store, &full) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Whether version `id` of `c` (the log entry `name`, of implicit digest
+/// `digest`), which `cut` keeps, has the bytes the cut binds: every
+/// manifest binding `id`'s key in `c` must list exactly `digest` at
+/// `name`. Other bytes listed anywhere refuse it, whatever is not held.
+fn bound_bytes(
+    held: &CutManifests,
+    store: &dyn DataStore,
+    cut: &Cut,
+    c: &Name,
+    id: &VersionId,
+    name: &Name,
+    digest: &[u8; 32],
+) -> Bound {
+    let mut any = false;
+    let mut missing = None;
+    for root in cut.accept.manifests(c, &id.writer) {
+        any = true;
+        match listed_bytes(held, store, root, name) {
+            ManifestLookup::Listed(d) if d == *digest => {}
+            ManifestLookup::Missing(full) => {
+                missing.get_or_insert(full);
+            }
+            _ => return Bound::Other,
+        }
+    }
+    match (any, missing) {
+        (false, _) => Bound::Other,
+        (true, Some(full)) => Bound::Missing(full),
+        (true, None) => Bound::Listed,
+    }
+}
+
 /// The packet of the log entry `name` held here, opened or sealed — parked
 /// in the store while its group waits, or in a collection not built yet,
 /// read from the store.
@@ -14535,6 +15153,18 @@ fn held_wire(st: &St, name: &Name) -> Option<Bytes> {
                 .then(|| st.store.get(name))
                 .flatten()
         })
+}
+
+/// The implicit digest of the version `name` of `writer` held verified
+/// here, opened or sealed: what a removal cut this device signs binds it
+/// to (spec §8).
+fn held_digest(st: &St, name: &Name, writer: &Writer) -> Option<[u8; 32]> {
+    match st.held.get(name)? {
+        Held::Version(id) if id.writer == *writer => {}
+        Held::Locked => {}
+        _ => return None,
+    }
+    held_wire(st, name).map(|w| wire::implicit_digest(&w))
 }
 
 fn refused(name: &Name, why: Refusal) -> DataError {
@@ -14882,7 +15512,7 @@ impl Device {
         // kept.
         let mut entries = Vec::with_capacity(records.len());
         for ((c, record), seq) in records.into_iter().zip(base..) {
-            match inner.sign_members(&c, seq, record) {
+            match inner.sign_members(&st, &c, seq, record) {
                 Ok(entry) => entries.push((c, entry)),
                 Err(e) => {
                     restore(&mut st, &touched);
@@ -15683,6 +16313,25 @@ impl Device {
                 .await;
             if !missing.is_empty() {
                 tracing::warn!(subject = %name, folder = s.folder, devices = ?missing, "a record removing a writer is signed over what is held: these devices of the writers it removes were not reached, and what only they hold falls outside its cut");
+            }
+        }
+        // The manifests of the cuts it carries over are held first: it binds
+        // what they keep by the bytes they list (spec §8).
+        let carried: BTreeSet<Name> = {
+            let st = inner.st.lock();
+            let current = own_record(&st);
+            let folders = st.folders_above(name);
+            current
+                .iter()
+                .chain(folders.iter().copied())
+                .flat_map(|m| m.cuts.iter())
+                .flat_map(|k| k.accept.all_manifests())
+                .cloned()
+                .collect()
+        };
+        for root in &carried {
+            if !inner.hold_cut_tree(root).await {
+                tracing::debug!(subject = %name, %root, "a carried cut's manifest is not held whole");
             }
         }
         let before = inner.groups_of(&inner.st.lock(), name);

@@ -454,7 +454,17 @@ pub fn build(
     key: &Name,
     entries: &[(Name, u64, [u8; 32])],
 ) -> Result<BuiltManifest, CutManifestError> {
-    let prefix = manifest_prefix(namespace, key);
+    build_under(&manifest_prefix(namespace, key), entries)
+}
+
+/// [`build`], its packets named `<prefix>/seg=<i>` (the root `seg=0`): a
+/// manifest of the same form bound by another signed cut than a trust
+/// context's — a data-layer removal cut names its manifest under the
+/// members record carrying it.
+pub fn build_under(
+    prefix: &Name,
+    entries: &[(Name, u64, [u8; 32])],
+) -> Result<BuiltManifest, CutManifestError> {
     let mut sorted: Vec<&(Name, u64, [u8; 32])> = entries.iter().collect();
     sorted.sort_by(|a, b| cmp_key((&a.0, a.1), (&b.0, b.1)));
     sorted.dedup();
@@ -471,7 +481,7 @@ pub fn build(
     // Octets left for the node's elements: a packet of the largest
     // segment number with empty content, plus the growth of the Content
     // and Data length fields and the node's own header (bounded).
-    let empty = packet(&prefix, u64::MAX, &[]);
+    let empty = packet(prefix, u64::MAX, &[]);
     let budget = MAX_PACKET_SIZE
         .checked_sub(empty.len() + 4 + header(tlv::MANIFEST_NODE, MAX_PACKET_SIZE))
         .ok_or(CutManifestError::TooLarge)?;
@@ -481,7 +491,7 @@ pub fn build(
     let mut next_seg: u64 = 1;
     for _ in 0..MAX_DEPTH {
         if level.len() == 1 {
-            let root = packet(&prefix, 0, &level[0].node.encode());
+            let root = packet(prefix, 0, &level[0].node.encode());
             let root_name = full_name(&root);
             packets.insert(0, root);
             return Ok(BuiltManifest {
@@ -491,7 +501,7 @@ pub fn build(
         }
         let mut refs: Vec<ManifestChild> = Vec::with_capacity(level.len());
         for built in level {
-            let wire = packet(&prefix, next_seg, &built.node.encode());
+            let wire = packet(prefix, next_seg, &built.node.encode());
             next_seg += 1;
             refs.push(ManifestChild {
                 // Only the root of a one-node level may be empty.

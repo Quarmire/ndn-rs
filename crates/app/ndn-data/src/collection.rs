@@ -114,6 +114,21 @@ impl Members {
         }
     }
 
+    /// The cut that admits version `id` of collection `c` by keeping it,
+    /// if one does ([`Self::refusal_in`] admits it, and not as a writer's):
+    /// its bytes are then bound by that cut's manifests for `c` and the
+    /// key ([`Accepted::manifests`], spec §8).
+    pub fn kept_by(&self, c: &Name, id: &VersionId) -> Option<&Cut> {
+        let key = id.writer.key();
+        if self.writers.iter().any(|p| key.has_prefix(p)) {
+            return None;
+        }
+        self.cuts
+            .iter()
+            .find(|k| key.has_prefix(&k.of))
+            .filter(|cut| cut.accept.contains(c, id))
+    }
+
     /// What this record is as a parent: its revision and the SHA-256 of
     /// its `MembersRecord` TLV (spec §6, §16.2) — the Content of the packet
     /// that carries it. A merge is digested as the record it stands for.
@@ -493,8 +508,24 @@ pub type KeyRuns<'a> = (&'a Writer, &'a [(u64, u64)]);
 /// below what was kept, nor sign an accepted seq again in another
 /// collection — a key's log is one sequence across its collections, so a
 /// seq is accepted only in the collection it was held in.
+///
+/// A removal cut also binds what it keeps to its bytes (spec §8): per
+/// collection and key, the full names of the cut manifests (each the root
+/// packet, ending in its implicit digest) that list the implicit digest of
+/// every version kept there. A version is inside such a cut only with the
+/// bytes every one of them lists; where several records' cuts meet (a
+/// merge, or a folder's levels), each one's manifests bind what both keep.
+/// A key's versions kept with no manifest are bound to no bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Accepted(BTreeMap<Name, BTreeMap<Writer, Vec<(u64, u64)>>>);
+pub struct Accepted(BTreeMap<Name, BTreeMap<Writer, Kept>>);
+
+/// One key's versions kept in one collection: its seqs, and the manifests
+/// binding their bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct Kept {
+    runs: Vec<(u64, u64)>,
+    bytes: BTreeSet<Name>,
+}
 
 impl Accepted {
     /// Nothing accepted.
@@ -515,12 +546,13 @@ impl Accepted {
     /// Accept every seq of `writer` in collection `c` from `lo` to `hi`,
     /// inclusive.
     pub(crate) fn insert_range(&mut self, c: &Name, writer: &Writer, lo: u64, hi: u64) {
-        let ranges = self
+        let ranges = &mut self
             .0
             .entry(c.clone())
             .or_default()
             .entry(writer.clone())
-            .or_default();
+            .or_default()
+            .runs;
         // The ranges that overlap or touch [lo, hi] fold into it.
         let start = ranges.partition_point(|(_, h)| h.saturating_add(1) < lo);
         let end = ranges.partition_point(|(l, _)| *l <= hi.saturating_add(1));
@@ -532,10 +564,39 @@ impl Accepted {
         ranges.splice(start..end, [(lo, hi)]);
     }
 
+    /// Bind everything accepted to the bytes the cut manifest whose root's
+    /// full name is `root` lists (spec §8).
+    pub fn bind(&mut self, root: &Name) {
+        for kept in self.0.values_mut().flat_map(|ws| ws.values_mut()) {
+            kept.bytes.insert(root.clone());
+        }
+    }
+
+    /// The full names of the cut manifests' roots that bind the bytes of
+    /// `writer`'s versions accepted in collection `c`: each lists the
+    /// implicit digest of every one of them. Empty: bound to no bytes.
+    pub fn manifests(&self, c: &Name, writer: &Writer) -> impl Iterator<Item = &Name> {
+        self.0
+            .get(c)
+            .and_then(|ws| ws.get(writer))
+            .into_iter()
+            .flat_map(|k| k.bytes.iter())
+    }
+
+    /// Every cut manifest's root binding anything accepted, in canonical
+    /// order, once each.
+    pub fn all_manifests(&self) -> BTreeSet<&Name> {
+        self.0
+            .values()
+            .flat_map(|ws| ws.values())
+            .flat_map(|k| k.bytes.iter())
+            .collect()
+    }
+
     /// The highest accepted seq of `writer` in collection `c` at or below
     /// `seq`.
     pub fn highest_at_most(&self, c: &Name, writer: &Writer, seq: u64) -> Option<u64> {
-        let ranges = self.0.get(c)?.get(writer)?;
+        let ranges = &self.0.get(c)?.get(writer)?.runs;
         let i = ranges.partition_point(|(lo, _)| *lo <= seq);
         (i > 0).then(|| ranges[i - 1].1.min(seq))
     }
@@ -545,14 +606,14 @@ impl Accepted {
     pub fn iter(&self) -> impl Iterator<Item = (&Name, &Writer, &[(u64, u64)])> {
         self.0
             .iter()
-            .flat_map(|(c, ws)| ws.iter().map(move |(w, r)| (c, w, r.as_slice())))
+            .flat_map(|(c, ws)| ws.iter().map(move |(w, k)| (c, w, k.runs.as_slice())))
     }
 
     /// The accepted seqs per collection, then per key in it.
     pub fn collections(&self) -> impl Iterator<Item = (&Name, impl Iterator<Item = KeyRuns<'_>>)> {
         self.0
             .iter()
-            .map(|(c, ws)| (c, ws.iter().map(|(w, r)| (w, r.as_slice()))))
+            .map(|(c, ws)| (c, ws.iter().map(|(w, k)| (w, k.runs.as_slice()))))
     }
 
     /// Whether nothing is accepted.
@@ -561,16 +622,16 @@ impl Accepted {
     }
 
     /// What it accepts of the entries whose collection and key `keep`
-    /// keeps.
+    /// keeps, with their bindings.
     fn only(&self, keep: impl Fn(&Name, &Writer) -> bool) -> Accepted {
         Accepted(
             self.0
                 .iter()
                 .map(|(c, ws)| {
-                    let kept: BTreeMap<Writer, Vec<(u64, u64)>> = ws
+                    let kept: BTreeMap<Writer, Kept> = ws
                         .iter()
                         .filter(|(w, _)| keep(c, w))
-                        .map(|(w, r)| (w.clone(), r.clone()))
+                        .map(|(w, k)| (w.clone(), k.clone()))
                         .collect();
                     (c.clone(), kept)
                 })
@@ -595,33 +656,44 @@ impl Accepted {
         self.only(|c, _| c.has_prefix(subject))
     }
 
-    /// Accept also what `other` accepts.
+    /// Accept also what `other` accepts, bound as it is there too.
     pub(crate) fn add(&mut self, other: &Accepted) {
-        for (c, w, ranges) in other.iter() {
-            for (lo, hi) in ranges {
-                self.insert_range(c, w, *lo, *hi);
+        for (c, ws) in &other.0 {
+            for (w, k) in ws {
+                for (lo, hi) in &k.runs {
+                    self.insert_range(c, w, *lo, *hi);
+                }
+                if let Some(mine) = self.0.get_mut(c).and_then(|x| x.get_mut(w)) {
+                    mine.bytes.extend(k.bytes.iter().cloned());
+                }
             }
         }
     }
 
-    /// What both accept.
+    /// What both accept, bound by the manifests of both.
     pub fn intersection(&self, other: &Accepted) -> Accepted {
         let mut out = Accepted::new();
-        for (c, w, mine) in self.iter() {
-            let Some(theirs) = other.0.get(c).and_then(|ws| ws.get(w)) else {
-                continue;
-            };
-            let (mut i, mut j) = (0, 0);
-            while i < mine.len() && j < theirs.len() {
-                let lo = mine[i].0.max(theirs[j].0);
-                let hi = mine[i].1.min(theirs[j].1);
-                if lo <= hi {
-                    out.insert_range(c, w, lo, hi);
+        for (c, ws) in &self.0 {
+            for (w, mine) in ws {
+                let Some(theirs) = other.0.get(c).and_then(|x| x.get(w)) else {
+                    continue;
+                };
+                let (a, b) = (&mine.runs, &theirs.runs);
+                let (mut i, mut j) = (0, 0);
+                while i < a.len() && j < b.len() {
+                    let lo = a[i].0.max(b[j].0);
+                    let hi = a[i].1.min(b[j].1);
+                    if lo <= hi {
+                        out.insert_range(c, w, lo, hi);
+                    }
+                    if a[i].1 < b[j].1 {
+                        i += 1;
+                    } else {
+                        j += 1;
+                    }
                 }
-                if mine[i].1 < theirs[j].1 {
-                    i += 1;
-                } else {
-                    j += 1;
+                if let Some(k) = out.0.get_mut(c).and_then(|x| x.get_mut(w)) {
+                    k.bytes = mine.bytes.union(&theirs.bytes).cloned().collect();
                 }
             }
         }

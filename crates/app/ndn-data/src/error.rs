@@ -145,14 +145,19 @@ impl std::fmt::Display for Refusal {
                                 false => format!("{lo}–{hi}"),
                             })
                             .collect::<Vec<_>>();
-                        format!("{} seq {} in {c}", w.key(), seqs.join(", "))
+                        let bound = match cut.accept.manifests(c, w).next() {
+                            Some(_) => " (the bytes its manifest lists)",
+                            None => "",
+                        };
+                        format!("{} seq {} in {c}{bound}", w.key(), seqs.join(", "))
                     })
                     .collect::<Vec<_>>();
                 write!(
                     f,
                     "its key lies under {}, which {} cut (a writer the collection's owner \
                      removed, or a key its namespace's trust context revoked), and the cut \
-                     accepts exactly {}, which this version is not, whatever date or seq it \
+                     accepts exactly {}, which this version is not — another seq, another \
+                     collection, or other bytes at a name it keeps — whatever date or seq it \
                      claims; ask the owner (who may write the member back in, or re-admit this \
                      exact version of a revoked key)",
                     cut.of,
