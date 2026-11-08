@@ -285,6 +285,38 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
 }
 
 #[tokio::test]
+async fn records_made_again_unchanged_tell_a_watch_no_members_change() {
+    let dev = device().await;
+    dev.share_folder(&trip(), log_share().into()).await.unwrap();
+    let mut folder = dev.watch(&trip(), &Frontier::new()).await.unwrap();
+    let mut own = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    drain(&mut folder).await;
+    drain(&mut own).await;
+    let members = async || {
+        (
+            dev.members(&trip()).await.unwrap(),
+            dev.members(&plan()).await.unwrap(),
+        )
+    };
+    let before = members().await;
+    // The records in force made again from the same records held, as after
+    // a trust context refused a record that was not in force.
+    {
+        let mut st = dev.inner.st.lock();
+        for c in [trip(), plan()] {
+            dev.inner.rebuild_members(&mut st, &c, &Refusal::NotMember);
+        }
+    }
+    let seen: Vec<Change> = [drain(&mut folder).await, drain(&mut own).await].concat();
+    assert!(
+        !seen.iter().any(|c| matches!(c, Change::Members { .. })),
+        "nothing in force changed, so nothing is told: {seen:?}"
+    );
+    assert_eq!(members().await, before);
+    dev.shutdown();
+}
+
+#[tokio::test]
 async fn a_version_comes_to_a_host_with_its_packets_digest_on_every_path() {
     let dev = device().await;
     let mut changes = dev.watch(&plan(), &Frontier::new()).await.unwrap();
