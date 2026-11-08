@@ -987,7 +987,8 @@ in any arrival order.
     value — each is reported not counted ("group not readable here"), and
     versions that depend on a member wait (stale).
   - **Incomplete** — fewer than `count` members are present: held,
-    admitted, whole and opened, or known pruned (below). Each
+    admitted and whole (one in pieces: every piece held, below), or known
+    pruned (below). Each
     held member waits, reported not counted ("group incomplete: k of n"),
     and versions that depend on one wait.
   - **Complete** — all `count` members are present, and each held one is
@@ -1105,6 +1106,19 @@ and, once the rule changed, where the current rule starts.
   writer cannot delay its own removal (it would stay a writer meanwhile).
   The signer also binds every version the cut keeps to its bytes: it
   builds the record's cut manifest, listing the implicit digest of each,
+- **Members in pieces.** A member whose payload travels in pieces (§13.1)
+  is present once its record is admitted and every piece is held here —
+  whether or not it is opened yet. It is opened (and, sealed, unsealed) as
+  it applies, which only the group's verdict lets it do: a reader that
+  required it opened before counting it present would wait for its group
+  while the group waits for it, and the group would never count (ndf's
+  report: a 37,847-octet operation in a group of three). A member whose
+  pieces turn out not to open is refused (`BadSignature`, its writer
+  signed what does not decode), and its group with it. The same holds for
+  the writer's own device: what it applied in pieces is let go from memory
+  (§13.1), so when it reads a collection again — a new members record, a
+  re-admission, a revocation — its own members are pending and unopened,
+  present by their pieces held, and its group counts again whole.
   and the cut names it (`CutBytes`, §8); a kept version whose bytes it
   does not know is left out, as one a summary only listed.
   Cuts carry over to later revisions, bound again by each new record's own
@@ -3722,7 +3736,10 @@ checkpoint proved held by audited holders is refused, saying why), g1 (a
 group counted all or none on arrival, and withdrawn whole when one member
 is refused), g6 (a group with one member under a lock waits whole, each
 other member not counted with a reason naming that member and its
-reason, then counts whole once unlocked), g2 (`put_group` refuses a group that could not complete,
+reason, then counts whole once unlocked), g7 (a group of three whose
+37,847-octet member travels in pieces counts whole at a reader once every
+piece is held, and at the writer after a new members record makes it read
+the folder again), g2 (`put_group` refuses a group that could not complete,
 writing nothing), g3 (a group judged the same at every reader despite a
 concurrent narrowing of one of its collections), g4 (a copy of a
 writer's device signs seqs it already used in other collections: entries

@@ -836,3 +836,163 @@ async fn put_group_writes_all_or_nothing() {
     }
     dev.shutdown();
 }
+
+/// The collections of Alice's board folder, merged by `/merge/yrs`, which
+/// Alice and Bob write (and Carol too, with `carol`).
+fn board(x: &str) -> Name {
+    n(&format!("/alice/32=data/board/{x}"))
+}
+
+fn board_share(carol: bool) -> Share {
+    let mut writers = vec![n("/alice"), n("/bob")];
+    if carol {
+        writers.push(n("/carol"));
+    }
+    Share {
+        rule: Rule::Merge {
+            function: n("/merge/yrs"),
+        },
+        writers,
+        readers: Vec::new(),
+    }
+}
+
+/// A Yjs update by `device`, the first of its in `c`, setting field `t` to
+/// text that makes the update exactly `len` octets.
+fn yrs_op(c: &Name, device: &str, len: usize) -> Bytes {
+    let w = Writer::new(key(device));
+    let make = |text: usize| {
+        crate::merge::Yrs::new()
+            .start(c, &w)
+            .edit(&Content::new().with("t", "p".repeat(text)))
+            .unwrap()
+    };
+    let mut text = len;
+    for _ in 0..8 {
+        let op = make(text);
+        if op.len() == len {
+            return op;
+        }
+        text = (text + len).checked_sub(op.len()).expect("a shorter text");
+    }
+    panic!("no update of {len} octets");
+}
+
+/// Bob's version `seq` of `c` under `/merge/yrs`, of `group`, carrying `op`:
+/// in pieces, returned with it, when its payload is over `INLINE_MAX`.
+fn yrs_version(c: &Name, seq: u64, group: Group, op: Bytes) -> (Made, Vec<pieces::Piece>) {
+    let name = log_name(&n("/bob/laptop"), Some(c), seq);
+    let mut body = VersionBody {
+        collection: c.clone(),
+        parents: Parents::new(),
+        type_id: TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        seal: Seal { any_of: Vec::new() },
+        keep: Keep::Forever,
+        dated: Timestamp(1),
+        group: Some(group),
+        rule: Some(n("/merge/yrs")),
+        fields: Content::new(),
+        op: Bytes::new(),
+        sealed: None,
+        chunks: None,
+        block: None,
+    };
+    let payload = wire::encode_payload(&Content::new(), &op);
+    let pieces = if payload.len() > wire::INLINE_MAX {
+        let (pieces, chunks) = pieces::split(&name, &payload);
+        body.chunks = Some(chunks);
+        pieces
+    } else {
+        body.op = op;
+        Vec::new()
+    };
+    (made("/bob/laptop", c, seq, Record::Version(body)), pieces)
+}
+
+/// How many of `ids`, members of `c` in order, count here.
+fn counted(dev: &Device, cs: &[Name], ids: &[VersionId]) -> usize {
+    cs.iter()
+        .zip(ids)
+        .filter(|(c, id)| counts(dev, c, id))
+        .count()
+}
+
+/// ndf's report (REPLY-13 §8): a group whose member's operation travels in
+/// pieces never counted on a device that did not have that member open — the
+/// member, pending and unopened, was judged missing though every piece was
+/// held, so its group stayed incomplete and nothing opened it.
+#[tokio::test]
+async fn a_group_whose_member_travels_in_pieces_counts_whole() {
+    let cs = [board("a"), board("b"), board("c")];
+    let g = Group { id: 10, count: 3 };
+    let (a, _) = yrs_version(&cs[0], 10, g, yrs_op(&cs[0], "/bob/laptop", 64));
+    let (b, pieces) = yrs_version(&cs[1], 11, g, yrs_op(&cs[1], "/bob/laptop", 37_847));
+    let (c, _) = yrs_version(&cs[2], 12, g, yrs_op(&cs[2], "/bob/laptop", 64));
+    assert!(
+        !pieces.is_empty(),
+        "the 37,847-octet member travels in pieces"
+    );
+    let ids = [10, 11, 12].map(|s| id("/bob/laptop", s));
+    let dev = device().await;
+    for x in &cs {
+        dev.share(x, board_share(false)).await.unwrap();
+    }
+    for m in [&a, &b, &c] {
+        give(&dev, m);
+    }
+    assert_eq!(
+        counted(&dev, &cs, &ids),
+        0,
+        "its pieces not held: none counts"
+    );
+    for p in &pieces {
+        dev.inner.store.insert(p.name.clone(), p.wire.clone());
+    }
+    dev.inner.st.lock().pieces_arrived(&cs[1], &b.name);
+    assert_eq!(
+        counted(&dev, &cs, &ids),
+        3,
+        "every piece held: the group counts whole"
+    );
+    dev.shutdown();
+}
+
+/// The writer's own device, after a members record makes it read each
+/// collection again (its applied operation in pieces let go from memory),
+/// still counts all three.
+#[tokio::test]
+async fn the_writer_counts_its_group_with_a_member_in_pieces_after_a_rebuild() {
+    let cs = [board("a"), board("b"), board("c")];
+    let dev = device().await;
+    for x in &cs {
+        dev.share(x, board_share(false)).await.unwrap();
+    }
+    let items = vec![
+        (cs[0].clone(), Edit::Op(yrs_op(&cs[0], "/alice/laptop", 64))),
+        (
+            cs[1].clone(),
+            Edit::Op(yrs_op(&cs[1], "/alice/laptop", 37_847)),
+        ),
+        (cs[2].clone(), Edit::Op(yrs_op(&cs[2], "/alice/laptop", 64))),
+    ];
+    let ids = dev.put_group(items, options()).await.unwrap();
+    assert!(
+        dev.inner.st.lock().colls[&cs[1]].versions[&ids[1]]
+            .chunks
+            .is_some(),
+        "the 37,847-octet member travels in pieces"
+    );
+    assert_eq!(counted(&dev, &cs, &ids), 3, "counted at once");
+    for x in &cs {
+        dev.share(x, board_share(true)).await.unwrap();
+    }
+    assert_eq!(
+        counted(&dev, &cs, &ids),
+        3,
+        "read again under a new members record, the group still counts whole"
+    );
+    dev.shutdown();
+}

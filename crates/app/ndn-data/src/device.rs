@@ -4972,8 +4972,20 @@ impl St {
                     .epoch
                     .as_ref()
                     .is_some_and(|e| self.keys.key(c, e).is_none());
-                return match sealed_off {
-                    true => MemberState::Unreadable,
+                if sealed_off {
+                    return MemberState::Unreadable;
+                }
+                // Every piece held: waiting, opened as it applies — which
+                // its group's verdict lets it do. Judged missing, its group
+                // would wait for it, and it for its group (spec §5.5).
+                let whole = !coll.unwhole.contains(id)
+                    && hv.chunks.is_some_and(|chunks| {
+                        let name = &hv.version.name;
+                        self.walked.contains(name)
+                            || piece_names(name, &chunks).all(|p| self.store.contains(&p))
+                    });
+                return match whole {
+                    true => MemberState::Waiting,
                     false => MemberState::Missing,
                 };
             }
