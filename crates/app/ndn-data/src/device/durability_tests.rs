@@ -29,6 +29,7 @@
 use super::group_tests::{Unconnected, n, options};
 use super::*;
 use crate::layer::Share;
+use ndn_app::AppError;
 use ndn_security::TrustSchema;
 use ndn_sync::store::BackendStore;
 use sha2::{Digest, Sha256};
@@ -184,13 +185,18 @@ async fn laptop(store: Arc<dyn DataStore>) -> Device {
 
 /// Alice's device `device`, its key the same in every run, on `store`.
 async fn device_on(device: &str, store: Arc<dyn DataStore>) -> Device {
+    device_over(device, store, Arc::new(Unconnected)).await
+}
+
+/// Alice's device `device`, its key the same in every run, on `store`,
+/// sending over `conn`.
+async fn device_over(device: &str, store: Arc<dyn DataStore>, conn: Arc<dyn Connection>) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     assert!(validator.adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
     let keys = Arc::new(SecurityManager::new());
     keys.generate_ed25519_from_seed(device.clone().append("KEY").append("1"), &[7; 32])
         .unwrap();
-    let conn: Arc<dyn Connection> = Arc::new(Unconnected);
     Device::start(
         Transport {
             node: Node::from_connection(Arc::clone(&conn)),
@@ -437,9 +443,68 @@ struct Held {
 }
 
 impl Held {
-    fn hold(&self, held: bool) {
-        *self.held.lock().unwrap() = held;
-        self.let_go.notify_all();
+    /// Hold every flush until the guard returned is dropped. The guard
+    /// lets go also when a case fails while holding: a flush still held
+    /// then would keep the case's runtime, which waits for its blocking
+    /// threads as it shuts down, waiting for ever — a failure would hang.
+    fn hold(&self) -> Holding<'_> {
+        *self.held.lock().unwrap() = true;
+        Holding(self)
+    }
+}
+
+/// Flushes of a [`Held`] store wait while this lives.
+struct Holding<'a>(&'a Held);
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.let_go.notify_all();
+    }
+}
+
+/// A connection that keeps the highest seq the sync Interests sent into
+/// `group` announce for `device`: what the device announced.
+struct Announced {
+    group: Name,
+    device: Name,
+    seq: tokio::sync::watch::Sender<u64>,
+}
+
+#[async_trait::async_trait]
+impl Connection for Announced {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Some(interest) = bare_interest(wire) else {
+            return Ok(());
+        };
+        if !interest.name.has_prefix(&self.group) {
+            return Ok(());
+        }
+        let vector = interest.app_parameters().and_then(|p| {
+            SvsConfig::default()
+                .dialect
+                .decode_state_vector(&Bytes::copy_from_slice(p))
+        });
+        for entry in vector.into_iter().flatten() {
+            if entry.name == self.device {
+                self.seq.send_if_modified(|seq| {
+                    let higher = entry.seq > *seq;
+                    *seq = (*seq).max(entry.seq);
+                    higher
+                });
+            }
+        }
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        futures::future::pending().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
     }
 }
 
@@ -471,7 +536,18 @@ impl DataStore for Held {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() {
     let store = Arc::new(Held::default());
-    let dev = laptop(Arc::clone(&store) as Arc<dyn DataStore>).await;
+    let (seq, mut announced) = tokio::sync::watch::channel(0);
+    let sent: Arc<dyn Connection> = Arc::new(Announced {
+        group: sync_group(&n("/alice")),
+        device: n("/alice/laptop"),
+        seq,
+    });
+    let dev = device_over(
+        "/alice/laptop",
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        sent,
+    )
+    .await;
     let c = collection();
     dev.share(
         &c,
@@ -485,7 +561,6 @@ async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() 
     .unwrap();
     dev.inner.flushed().await;
     let ns = dev.namespace().clone();
-    let announced = || dev.inner.st.lock().groups[&ns].announced;
     let root_head = || {
         let wire = dev
             .inner
@@ -495,11 +570,14 @@ async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() 
             .and_then(|s| s.head)
             .unwrap()
     };
-    let (before, listed) = (announced(), root_head());
+    let listed = root_head();
 
-    store.hold(true);
-    // A flush may be under way as the hold begins: once the put returns,
-    // whatever round covers it waits.
+    let holding = store.hold();
+    // A commit round takes an announcement (counts it) before its flush
+    // and sends it after: one taken from now on is taken by a round whose
+    // flush waits for the hold, so none above those taken so far may go
+    // out — whichever round the put's announcement falls in.
+    let may_go_out = dev.inner.st.lock().groups[&ns].announced;
     let id = dev
         .put(&c, Content::new().with("text", "held"), options())
         .await
@@ -514,9 +592,8 @@ async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() 
         root_head() < id.seq.0,
         "a summary does not list an entry before it is durable"
     );
-    assert_eq!(
-        announced(),
-        before,
+    assert!(
+        *announced.borrow() <= may_go_out,
         "nothing is announced before what it announces is durable"
     );
     assert!(
@@ -524,12 +601,20 @@ async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() 
         "the device reads its own put at once"
     );
 
-    store.hold(false);
+    drop(holding);
     assert!(dev.inner.published(id.seq.0).await);
     dev.inner.flushed().await;
     assert!(dev.inner.packet_for(&entry, false).is_some());
     assert!(root_head() >= id.seq.0 && root_head() > listed);
-    assert!(announced() > before);
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        announced.wait_for(|seq| *seq > may_go_out),
+    )
+    .await;
+    assert!(
+        out.is_ok_and(|seen| seen.is_ok()),
+        "the put is announced once its flush returned"
+    );
     dev.shutdown();
 }
 
@@ -546,7 +631,7 @@ async fn each_store_instance_has_its_own_barrier() {
     };
     laptop.share(&c, share.clone()).await.unwrap();
     laptop.inner.flushed().await;
-    held.hold(true);
+    let holding = held.hold();
     let stuck = laptop
         .put(&c, Content::new().with("text", "held"), options())
         .await
@@ -567,7 +652,7 @@ async fn each_store_instance_has_its_own_barrier() {
             .is_none(),
         "the held store's device still waits for its own flush"
     );
-    held.hold(false);
+    drop(holding);
     assert!(laptop.inner.published(stuck.seq.0).await);
     laptop.shutdown();
     phone.shutdown();
