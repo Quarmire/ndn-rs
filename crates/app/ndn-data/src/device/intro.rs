@@ -743,7 +743,8 @@ impl Inner {
     /// whose asker does not verify — a stranger's garbage costs a parse and
     /// one signature check — and for an ask past the ones held already
     /// ([`IntroPolicy::asks_queued`](crate::intro::IntroPolicy)): opening
-    /// and verifying run at most [`super::ASKS_VERIFYING`] at once.
+    /// and verifying run at most [`Config::asks_verifying`](super::Config)
+    /// at once.
     pub(super) async fn answer_intro(
         self: &Arc<Self>,
         name: &Name,

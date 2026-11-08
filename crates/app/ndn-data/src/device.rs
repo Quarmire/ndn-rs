@@ -149,6 +149,11 @@ pub struct Config {
     pub hold_for: Vec<Name>,
     /// How many random pieces an audit asks each holder for.
     pub audit_pieces: usize,
+    /// How many askers' proofs this device verifies at once, whoever claims
+    /// to ask — hold and audit asks' proofs (spec §13) and introduction
+    /// asks, opened and verified (spec §19.4): what a crowd of strangers'
+    /// asks costs it at once; the rest wait their turn. At least 1.
+    pub asks_verifying: usize,
     /// How far ahead of this device's clock another device's may run, as
     /// this device judges it: a holder's signed `Expired` audit answer for a
     /// version its writer kept until `t` is evidence of a broken lease only
@@ -184,7 +189,8 @@ pub struct Config {
 impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
     /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
-    /// not a holder, 16 pieces an audit, a day of clock skew, the operating
+    /// not a holder, 16 pieces an audit, 8 asker proofs verified at once, a
+    /// day of clock skew, the operating
     /// system's randomness, no introducer, the default introductions
     /// ([`crate::intro::IntroPolicy::new`]), 4096 changes a watcher may leave
     /// unread, 1024 collections one outside writer can make it follow in a
@@ -204,6 +210,7 @@ impl Config {
             window: 32,
             hold_for: Vec::new(),
             audit_pieces: 16,
+            asks_verifying: 8,
             clock_skew: Duration::from_secs(24 * 60 * 60),
             entropy: Arc::new(|buf| {
                 getrandom::getrandom(buf).expect("the operating system provides randomness")
@@ -232,6 +239,7 @@ impl std::fmt::Debug for Config {
             .field("window", &self.window)
             .field("hold_for", &self.hold_for)
             .field("audit_pieces", &self.audit_pieces)
+            .field("asks_verifying", &self.asks_verifying)
             .field("clock_skew", &self.clock_skew)
             .field("introducer", &self.introducer.is_some())
             .field("intro", &self.intro)
@@ -1241,9 +1249,6 @@ const SEAL_KEYS_KEPT: usize = 1024;
 /// Answers to hold and audit asks a holder keeps signed, by the ask's name:
 /// the same ask asked again (a replay) costs no work and no signature.
 const ANSWERS_KEPT: usize = 1024;
-/// Asker proofs a holder verifies at once, whoever claims to ask: what a
-/// stranger's asks can cost it before they are refused.
-const ASKS_VERIFYING: usize = 8;
 /// Hold asks of one owner device a holder works on at once.
 const HOLDS_PER_ASKER: usize = 1;
 /// Audit asks of one owner device a holder answers at once.
@@ -1698,7 +1703,7 @@ struct Inner {
     /// Told after each commit round that moved [`St::durable`].
     committed: Notify,
     slots: Semaphore,
-    /// Asker proofs being verified ([`ASKS_VERIFYING`]).
+    /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
     signatures: AtomicU64,
     /// Epoch keys asked for ([`Device::grants_asked`]).
@@ -6100,6 +6105,7 @@ impl Device {
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
         let window = config.window.max(1);
+        let asks_verifying = config.asks_verifying.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
         let clock = Arc::clone(&config.clock);
@@ -6192,7 +6198,7 @@ impl Device {
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
             slots: Semaphore::new(window),
-            verifying: Semaphore::new(ASKS_VERIFYING),
+            verifying: Semaphore::new(asks_verifying),
             signatures: AtomicU64::new(0),
             grants_asked: AtomicU64::new(0),
             grants_answered: AtomicU64::new(0),
@@ -14638,8 +14644,8 @@ impl Inner {
 
     /// Whether `proof` is `asker`'s, for the ask whose binding is
     /// `binding`: named `<asker>/32=ask/<binding>` and signed by a key of
-    /// `asker` that verifies to a trust anchor. At most [`ASKS_VERIFYING`]
-    /// proofs are verified at once.
+    /// `asker` that verifies to a trust anchor. At most
+    /// [`Config::asks_verifying`] proofs are verified at once.
     async fn proves(&self, proof: &Data, asker: &Name, binding: &[u8; 32]) -> bool {
         if *proof.name != wire::ask_name(asker, binding) {
             return false;

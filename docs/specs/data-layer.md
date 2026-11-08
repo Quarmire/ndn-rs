@@ -2420,7 +2420,8 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   the proof's key locator names the device that signed the hold record —
   any other ask is dropped before a signature is checked; that asker has
   no other hold ask in progress here; the proof is named for this ask and
-  verifies to a key of that device (at most 8 proofs are verified at once);
+  verifies to a key of that device (at most `Config::asks_verifying`
+  proofs, 8 by default, are verified at once);
   the record, fetched and verified, is that device's newest hold record for
   `C` and names `H`; and its date is past now. `H` then follows `C`, takes
   every version inside `at` with every piece (fetching back what it lost —
@@ -2558,8 +2559,8 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
 - It cannot be made to work by a stranger: an ask from a device that is not
   the owner device its record names costs it a parse, no signature check
   and no fetch; an owner's asks are bounded (one hold ask and 64 audits in
-  progress per asker, 8 proofs verified at once), and a replayed ask is
-  answered from the cache.
+  progress per asker, `Config::asks_verifying` proofs verified at once),
+  and a replayed ask is answered from the cache.
 - It cannot be framed by records its auditor has not heard yet: a prune or
   a members record it followed is its answer, and it is evidence against it
   only where the auditor's own records prove the piece should be there.
@@ -3971,8 +3972,9 @@ gets the same answer while it is kept, and a refusal or an answer is never
 computed twice for one ask. A crowd of asks is bounded: the device holds at
 most `Config::intro.asks_queued` asks at once (32 by default), verifying or
 waiting for their turn — one more gets no answer at once (a Nack), says so
-in its log, and its asker retries — and opens and verifies at most a few at
-once (the same bound as hold asks' proofs, §13), before any unwrapping. It
+in its log, and its asker retries — and opens and verifies at most
+`Config::asks_verifying` at once (8 by default, the bound hold and audit
+asks' proofs share, §13), before any unwrapping. It
 checks, in this order:
 
 1. **It opens**: the name's digest is its parameters', the content key
@@ -4116,7 +4118,8 @@ X25519-to-ChaCha20-Poly1305 wrap.
   default), past any short expiry. Online guessing gains nothing: each
   guess is one in 2^128.
 - **A crowd of asks.** Each ask costs an unwrap, an AEAD open and a
-  signature check before it is judged; a few are opened at once, and past
+  signature check before it is judged; at most `Config::asks_verifying`
+  are opened at once, and past
   `Config::intro.asks_queued` held an ask gets no answer at once, so a
   crowd costs bounded work and memory and delays honest asks only until it
   ebbs.
