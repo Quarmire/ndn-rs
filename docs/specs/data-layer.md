@@ -863,7 +863,9 @@ in any arrival order.
   refused, together. A stalled group of 65,536 members so costs a reader
   no memory per member. A parked member is not applied, so it is not kept
   across a restart: it is fetched again as any version not held. A member
-  in pieces not held whole stays in memory while its pieces are fetched.
+  in pieces not held whole stays in memory while its pieces are fetched,
+  and so does a member of a collection held for its owner (§13.2): a
+  holder keeps, audits and leases exactly what it holds.
 - **Writing.** `put_group` (§15) signs its items under one lock at
   consecutive seqs of the device's log, each carrying the group; no other
   entry of that log comes between them. It refuses, and writes nothing — no
