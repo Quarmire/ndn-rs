@@ -65,8 +65,10 @@ pub struct EngineConfig {
     pub reflexive: crate::reflexive::ReflexiveConfig,
     /// Producer-region prefixes for NDNLPv2 ForwardingHint handling
     /// (NFD NetworkRegionTable). An Interest whose forwarding hint reaches one
-    /// of these regions has its hint stripped; otherwise it is forwarded toward
-    /// the hint's delegation name. Empty (default) = no local producer region.
+    /// of these regions (a delegation is the region or an ancestor of it) has
+    /// its hint stripped; otherwise it is forwarded toward the hint's
+    /// delegation name. Empty (default) = no local producer region. A node's
+    /// own names are not regions: see `NetworkRegionTable::add_own_name`.
     pub network_region: Vec<ndn_packet::Name>,
     /// Whether to opportunistically cache **unsolicited** Data (Data with no
     /// matching PIT entry, e.g. overheard on a broadcast/ad-hoc medium).

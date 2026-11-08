@@ -313,10 +313,10 @@ pub struct EngineInner {
     /// by `mount_management` after engine build (mgmt owns the notification
     /// stream lifecycle).
     pub(crate) face_lifecycle_sink: OnceLock<Arc<dyn ndn_transport::FaceLifecycleSink>>,
-    /// Producer regions for NDNLPv2 ForwardingHint stripping (shared with the
-    /// strategy stage). Mutable at runtime via [`ForwarderEngine::network_region`]
-    /// so a node can declare its own routable prefix as a producer region after
-    /// build (e.g. at discovery start).
+    /// Producer regions and own names for NDNLPv2 ForwardingHint stripping
+    /// (shared with the strategy stage). Mutable at runtime via
+    /// [`ForwarderEngine::network_region`] so a node can declare its region
+    /// or its own names after build.
     pub(crate) network_region: Arc<crate::stages::strategy::NetworkRegionTable>,
     /// Registered [`FaceFactory`](ndn_transport::FaceFactory)s for data-driven
     /// face construction (see [`ForwarderEngine::add_face_of_kind`]). Looked up
@@ -430,10 +430,12 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.strategy_table)
     }
 
-    /// The NDNLPv2 ForwardingHint producer-region table (NFD
-    /// `NetworkRegionTable`). A node adds its own routable prefix here so a
-    /// hinted Interest that reaches it is stripped and forwarded by name to the
-    /// local producer. Mutable at runtime via [`NetworkRegionTable::add_region`].
+    /// The NDNLPv2 ForwardingHint table (NFD `NetworkRegionTable`, plus the
+    /// node's own names). A node adds the names it signs as here
+    /// ([`NetworkRegionTable::add_own_name`]) so a hinted Interest naming it
+    /// is stripped and forwarded by name to the local producer, while one
+    /// hinted toward an ancestor namespace keeps going toward it; a region
+    /// it is in goes in with [`NetworkRegionTable::add_region`].
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn network_region(&self) -> Arc<crate::stages::strategy::NetworkRegionTable> {
         Arc::clone(&self.inner.network_region)

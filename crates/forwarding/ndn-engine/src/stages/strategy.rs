@@ -57,53 +57,89 @@ pub(crate) fn next_hop_override(
     }
 }
 
-/// Producer-region prefixes for NDNLPv2 ForwardingHint handling — the
-/// NFD `NetworkRegionTable`. Empty = this forwarder hosts no producer region,
-/// so a hinted Interest is always forwarded toward its hint.
+/// Where a ForwardingHint reaches this forwarder — the NFD
+/// `NetworkRegionTable`, plus the forwarder's own names. Empty = this
+/// forwarder hosts no producer region and has no name, so a hinted Interest
+/// is always forwarded toward its hint.
 ///
-/// Runtime-mutable: a mobile node learns its own producer region (its
-/// `/ndn/node/<id>` prefix) at discovery start rather than at build time, so a
-/// hinted Interest reaching it can be stripped and forwarded by name to the
-/// local producer. The lock is only taken when an Interest actually carries a
-/// forwarding hint (rare on the hot path).
+/// Two kinds of entry, judged differently:
+///
+/// - A **region** (NFD's sense: a network region this forwarder is in, such
+///   as `/arizona/cs`) is reached by a delegation that is the region or an
+///   ancestor of it: a hint `/arizona` names a network this forwarder is
+///   part of (`NetworkRegionTable::isInProducerRegion`).
+/// - An **own name** (the name of the device this forwarder runs for, such
+///   as `/ns/member/dev`) is reached by a delegation that is that name or a
+///   name under it: the hint names this device or something it produces. An
+///   ancestor (`/ns`, the device's namespace) is not reached here: it names
+///   whatever serves that namespace elsewhere (its CA, its relay), and an
+///   Interest hinted toward it must keep going there.
+///
+/// Runtime-mutable: a node learns its own names (the identities it signs
+/// as) or its region (a mobile node's `/ndn/node/<id>`) after build, so a
+/// hinted Interest reaching it can be stripped and forwarded by name. The
+/// lock is only taken when an Interest actually carries a forwarding hint
+/// (rare on the hot path).
 #[derive(Default)]
 pub struct NetworkRegionTable {
-    regions: std::sync::RwLock<Vec<Name>>,
+    entries: std::sync::RwLock<RegionEntries>,
+}
+
+#[derive(Default)]
+struct RegionEntries {
+    regions: Vec<Name>,
+    own_names: Vec<Name>,
 }
 
 impl NetworkRegionTable {
     pub fn new(regions: Vec<Name>) -> Self {
         Self {
-            regions: std::sync::RwLock::new(regions),
+            entries: std::sync::RwLock::new(RegionEntries {
+                regions,
+                own_names: Vec::new(),
+            }),
         }
     }
 
-    /// True if any delegation in the hint reaches (is a prefix of) a producer
-    /// region — `NetworkRegionTable::isInProducerRegion`. At that point NFD
-    /// strips the hint and forwards by the Interest name.
+    /// True if any delegation in the hint reaches this forwarder: is a
+    /// prefix of one of its regions, or names one of its own names or a
+    /// name under one (see [`NetworkRegionTable`]). At that point the hint
+    /// is stripped and the Interest forwarded by its name.
     pub fn is_in_producer_region(&self, hint: &[Arc<Name>]) -> bool {
-        let regions = self.regions.read().unwrap();
-        regions
-            .iter()
-            .any(|region| hint.iter().any(|deleg| region.has_prefix(deleg)))
+        let entries = self.entries.read().unwrap();
+        hint.iter().any(|deleg| {
+            entries
+                .regions
+                .iter()
+                .any(|region| region.has_prefix(deleg))
+                || entries.own_names.iter().any(|own| deleg.has_prefix(own))
+        })
     }
 
-    /// Add a producer region this forwarder hosts (idempotent). Used at runtime
-    /// when a node learns its own routable prefix (e.g. discovery start).
+    /// Add a producer region this forwarder is in (idempotent). Used at
+    /// runtime when a node learns its region (e.g. discovery start).
     pub fn add_region(&self, region: Name) {
-        let mut regions = self.regions.write().unwrap();
-        if !regions.contains(&region) {
-            regions.push(region);
+        let mut entries = self.entries.write().unwrap();
+        if !entries.regions.contains(&region) {
+            entries.regions.push(region);
         }
     }
 
-    /// Take a producer region this forwarder no longer hosts (a name the
-    /// node no longer holds). Returns whether it was there.
-    pub fn remove_region(&self, region: &Name) -> bool {
-        let mut regions = self.regions.write().unwrap();
-        let before = regions.len();
-        regions.retain(|r| r != region);
-        regions.len() != before
+    /// Add a name of the device this forwarder runs for (idempotent): a
+    /// hint naming it, or a name under it, has reached this forwarder.
+    pub fn add_own_name(&self, name: Name) {
+        let mut entries = self.entries.write().unwrap();
+        if !entries.own_names.contains(&name) {
+            entries.own_names.push(name);
+        }
+    }
+
+    /// Take a name the device no longer holds. Returns whether it was there.
+    pub fn remove_own_name(&self, name: &Name) -> bool {
+        let mut entries = self.entries.write().unwrap();
+        let before = entries.own_names.len();
+        entries.own_names.retain(|n| n != name);
+        entries.own_names.len() != before
     }
 }
 
