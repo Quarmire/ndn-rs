@@ -314,6 +314,16 @@ async fn init_names_a_self_certifying_namespace_from_its_new_root() {
         made.persisted.init.anchor.public_key.as_ref(),
         &key_public(&expected, &made)[..]
     );
+    // Its genesis, the root alone, then version 2 with the rest; a key
+    // made now is looked for nowhere.
+    let genesis = made.persisted.init.genesis.as_ref().unwrap();
+    assert_eq!(genesis.context().version(), 1);
+    assert!(genesis.context().ca_endpoints().is_empty());
+    assert_eq!(made.persisted.init.context.version(), 2);
+    assert_eq!(
+        made.persisted.init.genesis_check,
+        Some(ndn_cert::GenesisCheck::NewKey)
+    );
 }
 
 /// The root public key whose SHA-256 `ns` names, checked.

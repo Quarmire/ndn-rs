@@ -19,23 +19,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ndn_packet::{Data, Name};
+use ndn_packet::{Data, Name, SignatureType};
+use ndn_security::cert_name::{SELF_ISSUER, cert_name};
 use ndn_security::self_certifying::{
-    SelfCertifyingNameError, self_certifying_digest, self_certifying_name,
+    Genesis, GenesisError, SelfCertifyingNameError, self_certifying_digest, self_certifying_name,
 };
 use ndn_security::{
     AdvertisedRelay, Certificate, EnrollmentHint, FilePib, KeyRole, LinkPolicy, PibError,
-    SecurityManager, SignedTrustContext, SignedTrustContextError, TrustError,
+    SecurityManager, SignedTrustContext, SignedTrustContextError, Signer, TrustError,
+    encode_cert_data,
 };
 use ndn_trust_envelope::TrustEnvelope;
 use zeroize::Zeroizing;
 
 use crate::ca::{deserialize_cert, serialize_cert};
 use crate::ca_policy::NamespacePolicies;
+use crate::client::CaExchange;
 use crate::context_store::{
     ContextStoreError, context_file_path, namespace_hex, persist_context, remove_stored_context,
 };
-use crate::onboarding::anchor_fingerprint;
+use crate::onboarding::{anchor_fingerprint, fetch_versioned_context, rdr_prefix};
 use crate::roles::{Role, RoleError, device_identity, namespace_schema, validate_namespace};
 use crate::root_store::{NewRootStore, PendingRoot, RootStore, RootStoreError};
 
@@ -55,6 +58,20 @@ pub const CA_CERT_VALIDITY_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
 /// Lifetime of the primary device's cert minted by [`init_namespace_in_pib`]: a day
 /// short of the CA's, so it ends inside the issuer's validity.
 pub const DEVICE_CERT_VALIDITY_MS: u64 = CA_CERT_VALIDITY_MS - 24 * 3600 * 1000;
+/// Version of the root anchor certificate a self-certifying namespace's
+/// genesis lists, `<root key>/self/v=0` ([`sign_genesis`]): fixed, where
+/// an ordinary certificate's version is the time it was issued, so the
+/// genesis is a pure function of its key.
+pub const GENESIS_ROOT_CERT_VERSION: u64 = 0;
+/// Start of that certificate's validity, in nanoseconds since the Unix
+/// epoch: the epoch itself (`19700101T000000`), the earliest a
+/// [`Certificate`] holds. Fixed, never the time of signing.
+pub const GENESIS_ROOT_VALID_FROM_NS: u64 = 0;
+/// End of that certificate's validity: the last instant a [`Certificate`]
+/// holds (`u64::MAX` nanoseconds, `25540721T233433`), as for every
+/// non-expiring anchor. With [`GENESIS_ROOT_VALID_FROM_NS`], the widest
+/// window ndn-rs represents.
+pub const GENESIS_ROOT_VALID_UNTIL_NS: u64 = u64::MAX;
 
 /// The namespace root key name: `<namespace>/KEY/root`.
 pub fn root_key_name(namespace: &Name) -> Name {
@@ -114,7 +131,9 @@ pub struct NamespaceInit {
     pub anchor: Certificate,
     /// The published, versioned trust context (generated namespace
     /// schema, authoritative; the default enrollment policy:
-    /// [`ApprovalPolicy::default`](crate::policy::ApprovalPolicy::default)).
+    /// [`ApprovalPolicy::default`](crate::policy::ApprovalPolicy::default)):
+    /// version 1, or version 2 of a self-certifying namespace, whose
+    /// version 1 is its [`genesis`](Self::genesis).
     pub context: Arc<SignedTrustContext>,
     /// The context as signed NDN Data at [`SignedTrustContext::rdr_name`],
     /// signed by the root anchor — what is published and what adopters verify.
@@ -123,6 +142,16 @@ pub struct NamespaceInit {
     /// [`TrustEnvelope::Anchor`] carrying the namespace, the anchor
     /// fingerprint, and the signed context Data inline.
     pub envelope: TrustEnvelope,
+    /// A self-certifying namespace's version 1, its genesis
+    /// ([`sign_genesis`]): the root anchor alone, the same bytes whenever
+    /// its key makes it. Kept and served with [`context`](Self::context),
+    /// which follows from it by continuity. `None` for a namespace named
+    /// otherwise.
+    pub genesis: Option<Genesis>,
+    /// Whether a genesis of a self-certifying namespace's key could exist
+    /// elsewhere, and was looked for ([`GenesisKey::check`]). `None` for a
+    /// namespace named otherwise.
+    pub genesis_check: Option<GenesisCheck>,
 }
 
 impl NamespaceInit {
@@ -157,6 +186,7 @@ pub fn init_namespace(
         mgr,
         namespace,
         None,
+        None,
         &[],
         EnrollmentHint::namespace_default(),
         LinkPolicy::default(),
@@ -166,8 +196,14 @@ pub fn init_namespace(
 
 /// [`init_namespace`] of the self-certifying namespace of `key`
 /// (`/user/<0xA1: SHA-256 of its public key>`): `key` is its root, held by
-/// `mgr`, and signs its version 1, the genesis
-/// ([`ndn_security::self_certifying`]).
+/// `mgr`, and signs its version 1, the genesis ([`sign_genesis`]: the root
+/// anchor alone, a pure function of the key), then version 2, which
+/// carries the schema and policies ([`NamespaceInit::context`]).
+///
+/// A key held already is looked for on the network first
+/// ([`ExistingGenesisKey::probe`]), or explicitly not
+/// ([`ExistingGenesisKey::offline`]); the result says which
+/// ([`NamespaceInit::genesis_check`]).
 pub fn init_self_certifying(
     mgr: &SecurityManager,
     key: &GenesisKey,
@@ -178,6 +214,7 @@ pub fn init_self_certifying(
     futures::executor::block_on(build_namespace(
         mgr,
         &namespace,
+        Some(key.check.clone()),
         None,
         &[],
         EnrollmentHint::namespace_default(),
@@ -190,30 +227,66 @@ pub fn init_self_certifying(
 /// genesis root, whose public key's SHA-256 is the namespace's last
 /// component: new ([`generate`](Self::generate)), or one held already
 /// ([`from_seed`](Self::from_seed), e.g. an ndf-rs personal key, whose
-/// `record::personal_root` is this same name).
+/// `record::personal_root` is this same name), looked for on the network
+/// first ([`ExistingGenesisKey::probe`]) or explicitly not
+/// ([`ExistingGenesisKey::offline`]).
 pub struct GenesisKey {
     seed: Zeroizing<[u8; 32]>,
     public: [u8; 32],
+    check: GenesisCheck,
+}
+
+/// Whether a genesis of a [`GenesisKey`] could exist already, and was
+/// looked for — what an init from it states
+/// ([`NamespaceInit::genesis_check`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenesisCheck {
+    /// A key made now ([`GenesisKey::generate`]): no genesis of it exists
+    /// anywhere, so none was looked for.
+    NewKey,
+    /// A key held already, whose genesis was asked of the network
+    /// ([`ExistingGenesisKey::probe`]) and did not answer: `reason`, what
+    /// the fetch of its version 1 met instead. A network that drops or
+    /// hides an existing genesis cannot be told from one without it.
+    NoneReachable { reason: String },
+    /// A key held already, not looked for ([`ExistingGenesisKey::offline`]):
+    /// a namespace made from it elsewhere may exist. The genesis made now
+    /// is the same bytes as its, but the versions after it are not: every
+    /// holder of that namespace refuses this device's version 2 as a fork.
+    Unchecked,
 }
 
 impl GenesisKey {
-    /// A new key from the system RNG.
+    /// A new key from the system RNG. No genesis of it can exist, so an
+    /// init from it looks for none ([`GenesisCheck::NewKey`]).
     pub fn generate() -> Result<Self, TrustError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::getrandom(&mut seed[..])
             .map_err(|_| TrustError::KeyStore("system RNG unavailable".into()))?;
-        Ok(Self::from_zeroizing(seed))
+        Ok(Self::from_zeroizing(seed, GenesisCheck::NewKey))
     }
 
     /// The key of the Ed25519 secret `seed` (RFC 8032's 32-byte private
-    /// key, as `ed25519_dalek::SigningKey::to_bytes` gives it).
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        Self::from_zeroizing(Zeroizing::new(seed))
+    /// key, as `ed25519_dalek::SigningKey::to_bytes` gives it), held
+    /// already — so its namespace may have been made before, on another
+    /// device or before a reinstall. It makes a namespace only once looked
+    /// for: [`ExistingGenesisKey::probe`] over the network, which refuses
+    /// a key whose genesis answers, or [`ExistingGenesisKey::offline`],
+    /// whose init states it was not checked.
+    pub fn from_seed(seed: [u8; 32]) -> ExistingGenesisKey {
+        ExistingGenesisKey(Self::from_zeroizing(
+            Zeroizing::new(seed),
+            GenesisCheck::Unchecked,
+        ))
     }
 
-    fn from_zeroizing(seed: Zeroizing<[u8; 32]>) -> Self {
+    fn from_zeroizing(seed: Zeroizing<[u8; 32]>, check: GenesisCheck) -> Self {
         let public = ndn_security::Ed25519Signer::from_seed(&seed, Name::root()).public_key_bytes();
-        Self { seed, public }
+        Self {
+            seed,
+            public,
+            check,
+        }
     }
 
     /// The raw 32-byte public key.
@@ -225,14 +298,129 @@ impl GenesisKey {
     pub fn namespace(&self) -> Name {
         self_certifying_name(&self.public)
     }
+
+    /// Whether a genesis of this key could exist already, and was looked
+    /// for.
+    pub fn check(&self) -> &GenesisCheck {
+        &self.check
+    }
 }
 
 impl std::fmt::Debug for GenesisKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GenesisKey")
             .field("namespace", &self.namespace().to_string())
+            .field("check", &self.check)
             .finish_non_exhaustive()
     }
+}
+
+/// An Ed25519 key held already ([`GenesisKey::from_seed`]), not yet a
+/// [`GenesisKey`]: its namespace may exist, made from it before, and a
+/// second root device making it again would sign versions every holder
+/// of the first refuses. [`probe`](Self::probe) looks for its genesis on
+/// the network, [`offline`](Self::offline) states it was not looked for.
+#[derive(Debug)]
+pub struct ExistingGenesisKey(GenesisKey);
+
+impl ExistingGenesisKey {
+    /// The raw 32-byte public key.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.0.public_key()
+    }
+
+    /// The namespace this key names: `/user/<0xA1: SHA-256(public key)>`.
+    pub fn namespace(&self) -> Name {
+        self.0.namespace()
+    }
+
+    /// Look for the genesis of this key's namespace through `exchange`
+    /// (the network the caller is on): fetch
+    /// `<ns>/32=trust-context/v=1` and check it ([`Genesis::open_stored`]:
+    /// signed by this very key, which no one else holds). A genesis that
+    /// answers is refused ([`NamespaceInitError::GenesisReachable`]):
+    /// the namespace exists, and is adopted by its name and recovered, not
+    /// made again. Anything else — no answer, or an answer that is not its
+    /// genesis — is no evidence of it, and the key is returned stating
+    /// what the fetch met ([`GenesisCheck::NoneReachable`]). Only a
+    /// genesis refuses: the RDR pointer to a newest version is
+    /// unauthenticated, and anyone answering it would stop the init.
+    pub async fn probe<E>(self, exchange: &mut E) -> Result<GenesisKey, NamespaceInitError>
+    where
+        E: CaExchange + ?Sized,
+    {
+        let namespace = self.namespace();
+        let at = rdr_prefix(&namespace).append_version(1);
+        let reason = match fetch_versioned_context(exchange, &at).await {
+            Err(e) => format!("no genesis answered: {e}"),
+            Ok(data) => match Genesis::open_stored(&data).await {
+                Ok(genesis) if *genesis.namespace() == namespace => {
+                    return Err(NamespaceInitError::GenesisReachable {
+                        namespace: namespace.to_string(),
+                        at: at.to_string(),
+                    });
+                }
+                Ok(genesis) => format!(
+                    "{at} answered with the genesis of {}, not of this key",
+                    genesis.namespace()
+                ),
+                Err(e) => format!("{at} answered with no genesis of this key: {e}"),
+            },
+        };
+        Ok(GenesisKey {
+            check: GenesisCheck::NoneReachable { reason },
+            ..self.0
+        })
+    }
+
+    /// This key, not looked for on the network (no network, or the caller
+    /// knows its namespace was never made): an init from it states so
+    /// ([`GenesisCheck::Unchecked`]).
+    pub fn offline(self) -> GenesisKey {
+        self.0
+    }
+}
+
+/// Version 1 of the self-certifying namespace of the Ed25519 key `root`
+/// — its genesis — signed by `root`: the namespace `/user/<0xA1: SHA-256
+/// of its raw public key>` and its root anchor certificate
+/// (`<root key>/self/v=0`, [`GENESIS_ROOT_CERT_VERSION`], valid over the
+/// fixed window [`GENESIS_ROOT_VALID_FROM_NS`] to
+/// [`GENESIS_ROOT_VALID_UNTIL_NS`]), under the hierarchical schema, and
+/// nothing else: no CA, schema of its own, policy or relay, and no time of
+/// signing. Ed25519 signatures are deterministic, so the same key under
+/// the same key name signs the same bytes on every device at any time: a
+/// namespace made again from its key never forks at its genesis.
+/// Whatever it states besides is in the versions after it, each signed by
+/// an anchor of the one before. Refused unless `root` is a raw Ed25519 key
+/// ([`NamespaceInitError::GenesisKeyNotEd25519`]).
+pub async fn sign_genesis(root: &dyn Signer) -> Result<Genesis, NamespaceInitError> {
+    let public: Option<[u8; 32]> = root
+        .public_key()
+        .and_then(|key| key.as_ref().try_into().ok());
+    let public = match (root.sig_type(), public) {
+        (SignatureType::SignatureEd25519, Some(public)) => public,
+        _ => {
+            return Err(NamespaceInitError::GenesisKeyNotEd25519 {
+                key: root.key_name().to_string(),
+            });
+        }
+    };
+    let name = cert_name(root.key_name(), SELF_ISSUER, GENESIS_ROOT_CERT_VERSION);
+    let wire = encode_cert_data(
+        &name,
+        &public,
+        root,
+        GENESIS_ROOT_VALID_FROM_NS,
+        GENESIS_ROOT_VALID_UNTIL_NS,
+    )
+    .await?;
+    let cert = Data::decode(wire)
+        .map_err(|e| TrustError::KeyStore(format!("the genesis root certificate: {e}")))?;
+    let context = SignedTrustContext::hierarchical(self_certifying_name(&public)).with_version(1);
+    context.add_anchor(Certificate::decode(&cert)?);
+    let data = context.sign_into_data_async(root).await?;
+    Ok(Genesis::open_stored(&data).await?)
 }
 
 /// Refuse to make `namespace` from a new root: a self-certifying name is
@@ -251,9 +439,15 @@ fn refuse_self_certifying(namespace: &Name) -> Result<(), NamespaceInitError> {
 /// `root_device_keys` (the CA and admin keys that will live beside the root)
 /// get the [`KeyRole::ROOT_DEVICE`] role in the context, which advertises
 /// `relays`.
+///
+/// Given `genesis_check`, the namespace is self-certifying: the root first
+/// signs its genesis ([`sign_genesis`]), whose anchor certificate is the
+/// root's, then the context as version 2.
+#[allow(clippy::too_many_arguments)]
 async fn build_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
+    genesis_check: Option<GenesisCheck>,
     ca_endpoint: Option<Name>,
     root_device_keys: &[Name],
     hint: EnrollmentHint,
@@ -262,14 +456,24 @@ async fn build_namespace(
 ) -> Result<NamespaceInit, NamespaceInitError> {
     let anchor_key = root_key_name(namespace);
     let signer = mgr.get_signer_sync(&anchor_key)?;
-    let pk = signer.public_key().unwrap_or_default();
-    let anchor = mgr
-        .issue_self_signed_async(&anchor_key, pk, u64::MAX)
-        .await?;
+    let (anchor, genesis) = if genesis_check.is_some() {
+        let genesis = sign_genesis(signer.as_ref()).await?;
+        let anchor = genesis.root().clone();
+        // As `issue_self_signed_async` keeps an anchor it issues.
+        mgr.cert_cache().insert(anchor.clone());
+        mgr.add_trust_anchor(anchor.clone());
+        (anchor, Some(genesis))
+    } else {
+        let pk = signer.public_key().unwrap_or_default();
+        let anchor = mgr
+            .issue_self_signed_async(&anchor_key, pk, u64::MAX)
+            .await?;
+        (anchor, None)
+    };
 
     let schema = namespace_schema(namespace)?;
     let mut context = SignedTrustContext::hierarchical(namespace.clone())
-        .with_version(1)
+        .with_version(if genesis.is_some() { 2 } else { 1 })
         .with_enrollment_hint(hint)
         .with_link_policy(link)
         .with_relays(relays)
@@ -301,6 +505,8 @@ async fn build_namespace(
         context,
         context_data,
         envelope,
+        genesis,
+        genesis_check,
     })
 }
 
@@ -348,15 +554,37 @@ pub enum NamespaceInitError {
     /// done, not even with force.
     #[error(
         "{namespace} is already initialized in {pib} ({what} exists); a self-certifying \
-         namespace is never made again, not even with force: its key would sign a second \
-         version 1, a fork every holder of the first refuses. To replace its root, recover the \
-         namespace with a recovery kit (`ndn-fwd recover`), which keeps the name"
+         namespace is never made again, not even with force: its key would sign a second line \
+         of versions after its genesis, a fork every holder of the first refuses. To replace its \
+         root, recover the namespace with a recovery kit (`ndn-fwd recover`), which keeps the \
+         name"
     )]
     GenesisExists {
         namespace: String,
         pib: String,
         what: String,
     },
+    /// A self-certifying namespace made from a key held already, whose
+    /// genesis answered on the network ([`ExistingGenesisKey::probe`]).
+    #[error(
+        "a genesis of {namespace} already exists: its version 1, signed by this very key, \
+         answered at {at}. The namespace was made before — on another device, or before a \
+         reinstall — and making it again would sign a second line of versions after it, a \
+         fork every holder of the first refuses. Nothing was written. Adopt {namespace} by its \
+         name instead (its name-only anchor link, `ndn-fwd adopt`) and enroll this device in \
+         it; if its root device is lost, recover the namespace with its recovery kit \
+         (`ndn-fwd recover`), which keeps the name"
+    )]
+    GenesisReachable { namespace: String, at: String },
+    /// A genesis asked of a key that is not a raw Ed25519 key.
+    #[error(
+        "{key} is not a raw Ed25519 key: a self-certifying namespace is named from the Ed25519 \
+         key that signs its genesis (SHA-256 of its 32-byte public key). Sign it with that key"
+    )]
+    GenesisKeyNotEd25519 { key: String },
+    /// The genesis signed does not check as one.
+    #[error(transparent)]
+    Genesis(#[from] GenesisError),
     #[error(transparent)]
     RootStore(#[from] RootStoreError),
     /// The namespace or the device name does not fit the role layout.
@@ -480,13 +708,24 @@ pub async fn init_self_certifying_in_pib(
 /// `key`, `/user/<0xA1: SHA-256 of its public key>` (`key.namespace()`):
 /// `key` is stored as its root in the store `root` and signs version 1, the
 /// genesis every adopter checks against the name
-/// ([`ndn_security::self_certifying`]). A YubiKey store is refused
-/// ([`NamespaceInitError::GenesisOnToken`]): it takes no Ed25519 key.
+/// ([`ndn_security::self_certifying`]) — the root anchor alone, the same
+/// bytes whenever this key makes it ([`sign_genesis`]) — then version 2,
+/// carrying the CA, schema, policies and relays ([`NamespaceInit::context`]).
+/// Both are stored, version 1 to be served beside the newest. A YubiKey
+/// store is refused ([`NamespaceInitError::GenesisOnToken`]): it takes no
+/// Ed25519 key.
+///
+/// A key held already ([`GenesisKey::from_seed`]) is looked for on the
+/// network first ([`ExistingGenesisKey::probe`], which refuses a key whose
+/// genesis answers before anything is written), or explicitly not
+/// ([`ExistingGenesisKey::offline`]); [`NamespaceInit::genesis_check`]
+/// says which.
 ///
 /// A namespace that exists in the PIB is never made again, not even with
-/// force: the same key would sign a second version 1, a fork every holder
-/// of the first refuses ([`NamespaceInitError::GenesisExists`]). Its
-/// root is replaced by a recovery instead, which keeps the name.
+/// force: the same key would sign a second line of versions after its
+/// genesis, a fork every holder of the first refuses
+/// ([`NamespaceInitError::GenesisExists`]). Its root is replaced by a
+/// recovery instead, which keeps the name.
 pub async fn init_self_certifying_in_pib_with(
     pib: &FilePib,
     key: &GenesisKey,
@@ -498,24 +737,15 @@ pub async fn init_self_certifying_in_pib_with(
         return Err(NamespaceInitError::GenesisOnToken);
     }
     let namespace = key.namespace();
-    init_in_pib(
-        pib,
-        &namespace,
-        Some(&key.seed),
-        device,
-        false,
-        root,
-        policies,
-    )
-    .await
+    init_in_pib(pib, &namespace, Some(key), device, false, root, policies).await
 }
 
 /// The namespace `namespace` made in `pib`, its root generated in `root` —
-/// or, given `seed`, that Ed25519 key (a self-certifying namespace's).
+/// or, given `genesis`, that Ed25519 key (a self-certifying namespace's).
 async fn init_in_pib(
     pib: &FilePib,
     namespace: &Name,
-    seed: Option<&[u8; 32]>,
+    genesis: Option<&GenesisKey>,
     device: &str,
     force: bool,
     root: &NewRootStore,
@@ -547,7 +777,7 @@ async fn init_in_pib(
         None
     };
     if let Some(what) = existing {
-        if seed.is_some() {
+        if genesis.is_some() {
             return Err(NamespaceInitError::GenesisExists {
                 namespace: namespace.to_string(),
                 pib: pib.root().display().to_string(),
@@ -576,12 +806,14 @@ async fn init_in_pib(
     // Root: generated in its store (in memory for a sealed one, on the token
     // for a YubiKey), held by an in-process manager for the signing steps
     // below, and recorded once the anchor is signed.
+    let seed = genesis.map(|key| &*key.seed);
     let pending = PendingRoot::create(pib, &anchor_key, root, seed).await?;
     let mgr = SecurityManager::new();
     mgr.register_signer(anchor_key.clone(), pending.signer());
     let init = build_namespace(
         &mgr,
         namespace,
+        genesis.map(|key| key.check.clone()),
         Some(namespace.clone().append("CA")),
         &[ca_key.clone(), device_key.clone()],
         policies.approval.to_hint(),
@@ -632,6 +864,11 @@ async fn init_in_pib(
     ndn_security::secure_fs::write_private(&device_cert_path, serialize_cert(&device_cert))
         .map_err(io(&device_cert_path))?;
 
+    // A self-certifying namespace's genesis first: adopters fetch it by
+    // name, and a restart takes the namespace again only from it.
+    if let Some(genesis) = &init.genesis {
+        persist_context(pib.root(), genesis.context(), genesis.data())?;
+    }
     let context_path = persist_context(pib.root(), &init.context, &init.context_data)?;
     Ok(PersistedNamespace {
         init,

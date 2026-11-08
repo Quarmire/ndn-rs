@@ -427,7 +427,8 @@ impl From<NamespaceInitError> for RootError {
             } => RootError::new(
                 code::ALREADY_INITIALIZED,
                 "the self-certifying namespace is initialized here already and is never made \
-                 again (a second version 1 is a fork); recover it to replace its root",
+                 again (a second line of versions after its genesis is a fork); recover it to \
+                 replace its root",
             )
             .with("namespace", namespace)
             .with("pib", pib)

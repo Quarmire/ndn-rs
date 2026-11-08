@@ -6,7 +6,9 @@
 //! schema and the stated policies — stored in the PIB. An existing root is
 //! never replaced unless forced. A self-certifying namespace
 //! (`/user/<0xA1: …>`, [`InitNamespace::SelfCertifying`]) is named from its
-//! new Ed25519 root ([`ndn_cert::init_self_certifying_in_pib_with`]).
+//! new Ed25519 root ([`ndn_cert::init_self_certifying_in_pib_with`]): its
+//! version 1, the genesis, lists the root alone, and the context above is
+//! its version 2.
 
 use std::path::{Path, PathBuf};
 

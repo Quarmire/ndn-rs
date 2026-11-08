@@ -11,15 +11,18 @@
 //!   P-256 key: followers keep following, and a fresh device adopts by name;
 //! - after a recovery, a line longer than an ordinary refresh walks is
 //!   still followed, by a holder, a fresh device and a restart;
-//! - a self-certifying namespace is never initialised twice.
+//! - a self-certifying namespace is never initialised twice: its version 1
+//!   is a pure function of its key (the same bytes on every device, at any
+//!   time), and a key held already whose genesis answers on the network is
+//!   refused before anything is written.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::{
-    AdoptError, AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, GenesisKey,
-    MAX_CATCH_UP_VERSIONS, NamespaceInitError, NamespacePolicies, NewRootStore, OldRoot,
-    PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, Unfetched, VersionSource,
+    AdoptError, AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, GenesisCheck,
+    GenesisKey, MAX_CATCH_UP_VERSIONS, NamespaceInitError, NamespacePolicies, NewRootStore,
+    OldRoot, PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, Unfetched, VersionSource,
     add_recovery_anchor, adopt_anchor_link, adopt_by_name, anchor_fingerprint,
     bump_context_revoking, follow_versions, init_namespace_in_pib_with,
     init_self_certifying_in_pib_with, load_persisted_contexts, persist_adoption, rdr_metadata_name,
@@ -76,7 +79,19 @@ impl Root {
             .unwrap()
     }
 
+    /// Version 1, the genesis: the root anchor alone.
     fn genesis(&self) -> &Data {
+        self.out
+            .init
+            .genesis
+            .as_ref()
+            .expect("a self-certifying init signs a genesis")
+            .data()
+    }
+
+    /// Version 2, which init signs after the genesis: the CA, schema and
+    /// policies.
+    fn v2(&self) -> &Data {
         &self.out.init.context_data
     }
 }
@@ -173,7 +188,8 @@ async fn init_names_the_namespace_from_its_new_ed25519_root() {
         root.out.init.anchor.public_key.as_ref(),
         &key.public_key()[..]
     );
-    assert_eq!(root.out.init.context.version(), 1);
+    assert_eq!(open(root.genesis()).version(), 1);
+    assert_eq!(root.out.init.context.version(), 2);
     // The bytes ndf-rs's `record::personal_root` makes from the same key.
     let seed = [3u8; 32];
     let given = GenesisKey::from_seed(seed);
@@ -190,8 +206,9 @@ async fn init_names_the_namespace_from_its_new_ed25519_root() {
     for (path, loaded) in load_persisted_contexts(root.pib.root(), &keyring).unwrap() {
         loaded.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
-    assert_eq!(keyring.version_of(&root.ns()), Some(1));
-    // Made again, even from the same key, it would be a second version 1.
+    assert_eq!(keyring.version_of(&root.ns()), Some(2));
+    // Made again, even from the same key, it would be a second line after
+    // its genesis.
     let again = init_self_certifying_in_pib_with(
         &root.pib,
         &key,
@@ -334,9 +351,9 @@ async fn a_self_certifying_namespace_is_adopted_by_its_name_alone() {
         .append("old")
         .append("KEY")
         .append("k");
-    let v2 = bump_context_revoking(
+    let v3 = bump_context_revoking(
         alice.root().await.as_ref(),
-        alice.genesis(),
+        alice.v2(),
         std::slice::from_ref(&revoked),
         &[],
     )
@@ -358,20 +375,22 @@ async fn a_self_certifying_namespace_is_adopted_by_its_name_alone() {
     let adopted = ndn_cert::adopt_anchor_link(
         &keyring,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3]),
         &link,
     )
     .await
     .unwrap();
-    assert_eq!(adopted.context.version(), 2);
+    assert_eq!(adopted.context.version(), 3);
     assert!(adopted.context.is_revoked(&revoked));
     let earlier: Vec<u64> = adopted
         .earlier
         .iter()
         .map(|s| s.context.version())
         .collect();
+    // Version 3 is signed by the root, an anchor of the genesis: reached
+    // from it directly.
     assert_eq!(earlier, [1]);
-    assert_eq!(keyring.version_of(&ns), Some(2));
+    assert_eq!(keyring.version_of(&ns), Some(3));
 
     // Through a validating forwarder that holds nothing: told to expect the
     // name's genesis root.
@@ -379,13 +398,13 @@ async fn a_self_certifying_namespace_is_adopted_by_its_name_alone() {
     let validator =
         Validator::with_keyring(Arc::clone(&keyring), Arc::new(CertCache::new()), None, 4);
     let mut forwarded = Forwarded {
-        upstream: Upstream::serving(&ns, &[alice.genesis(), &v2]),
+        upstream: Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3]),
         forwarder: &validator,
     };
     let adopted = adopt_by_name(&keyring, Some(&validator), &mut forwarded, &ns, None)
         .await
         .unwrap();
-    assert_eq!(keyring.version_of(&ns), Some(2));
+    assert_eq!(keyring.version_of(&ns), Some(3));
 
     // Kept with its genesis, a restart holds it again, by the same check.
     let dir = tempfile::tempdir().unwrap();
@@ -394,7 +413,7 @@ async fn a_self_certifying_namespace_is_adopted_by_its_name_alone() {
     for (path, loaded) in load_persisted_contexts(dir.path(), &restarted).unwrap() {
         loaded.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
-    assert_eq!(restarted.version_of(&ns), Some(2));
+    assert_eq!(restarted.version_of(&ns), Some(3));
     // Without its genesis it is not taken.
     std::fs::remove_file(ndn_cert::context_version_path(dir.path(), &ns, 1)).unwrap();
     let restarted = Keyring::new();
@@ -409,17 +428,17 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
     let ns = alice.ns();
     let seed = RecoverySeed::generate().unwrap();
     let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
-    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+    let v3 = add_recovery_anchor(alice.root().await.as_ref(), alice.v2(), &kit)
         .await
         .unwrap()
         .data;
-    let follower = follower(&ns, &[alice.genesis(), &v2]).await;
+    let follower = follower(&ns, &[alice.genesis(), alice.v2(), &v3]).await;
 
     let dir = tempfile::tempdir().unwrap();
     let pib = FilePib::new(dir.path()).unwrap();
     let recovered = recover_namespace_in_pib(
         &pib,
-        &v2,
+        &v3,
         &seed.signer(&ns),
         "phone",
         OldRoot::Compromised,
@@ -429,10 +448,10 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
     )
     .await
     .unwrap();
-    let v3 = &recovered.version.bump.data;
-    let v4 = &recovered.root_version.data;
-    assert_eq!(open(v4).namespace(), &ns);
-    assert!(open(v4).is_revoked(&alice.out.init.anchor_key));
+    let v4 = &recovered.version.bump.data;
+    let v5 = &recovered.root_version.data;
+    assert_eq!(open(v5).namespace(), &ns);
+    assert!(open(v5).is_revoked(&alice.out.init.anchor_key));
     assert_ne!(
         anchor_fingerprint(&recovered.anchor),
         anchor_fingerprint(&alice.out.init.anchor)
@@ -442,12 +461,12 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
     let res = refresh_context(
         &follower,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, v3, v4]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3, v4, v5]),
         &ns,
     )
     .await;
     assert!(matches!(res, Ok(ContextRefresh::Updated(_))), "{res:?}");
-    assert_eq!(follower.version_of(&ns), Some(4));
+    assert_eq!(follower.version_of(&ns), Some(5));
 
     // A fresh device adopts it by name: the genesis signed by the old
     // (now revoked) root, then each version by continuity.
@@ -455,7 +474,7 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
     let adopted = adopt_by_name(
         &fresh,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, v3, v4]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3, v4, v5]),
         &ns,
         None,
     )
@@ -466,8 +485,8 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
         .iter()
         .map(|s| s.context.version())
         .collect();
-    assert_eq!(earlier, [1, 2, 3]);
-    assert_eq!(fresh.version_of(&ns), Some(4));
+    assert_eq!(earlier, [1, 2, 3, 4]);
+    assert_eq!(fresh.version_of(&ns), Some(5));
     assert!(fresh.contexts()[0].is_anchor(&recovered.anchor.key_name()));
 }
 
@@ -483,14 +502,14 @@ async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_gen
     let ns = alice.ns();
     let seed = RecoverySeed::generate().unwrap();
     let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
-    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+    let v3 = add_recovery_anchor(alice.root().await.as_ref(), alice.v2(), &kit)
         .await
         .unwrap()
         .data;
     let dir = tempfile::tempdir().unwrap();
     let recovered = recover_namespace_in_pib(
         &FilePib::new(dir.path()).unwrap(),
-        &v2,
+        &v3,
         &seed.signer(&ns),
         "phone",
         OldRoot::Compromised,
@@ -500,8 +519,8 @@ async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_gen
     )
     .await
     .unwrap();
-    let v3 = &recovered.version.bump.data;
-    let v4 = &recovered.root_version.data;
+    let v4 = &recovered.version.bump.data;
+    let v5 = &recovered.root_version.data;
     let inline = |data: &Data| AnchorLink {
         namespace: ns.clone(),
         expected_fingerprint: anchor_fingerprint(&recovered.anchor),
@@ -511,18 +530,18 @@ async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_gen
 
     let fresh = Keyring::new();
     assert!(!inline(alice.genesis()).fetches(&fresh));
-    let link = inline(v4);
+    let link = inline(v5);
     assert!(link.fetches(&fresh));
     let adopted = adopt_anchor_link(
         &fresh,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, v3, v4]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3, v4, v5]),
         &link,
     )
     .await
     .unwrap();
     assert!(adopted.fetched);
-    assert_eq!(fresh.version_of(&ns), Some(4));
+    assert_eq!(fresh.version_of(&ns), Some(5));
     // Held now: the same link moves it on by continuity alone, offline.
     assert!(!link.fetches(&fresh));
 }
@@ -536,11 +555,11 @@ async fn the_name_survives_its_root_moving_to_a_p256_key() {
     let ns = alice.ns();
     let seed = RecoverySeed::generate().unwrap();
     let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
-    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+    let v3 = add_recovery_anchor(alice.root().await.as_ref(), alice.v2(), &kit)
         .await
         .unwrap()
         .data;
-    let follower = follower(&ns, &[alice.genesis(), &v2]).await;
+    let follower = follower(&ns, &[alice.genesis(), alice.v2(), &v3]).await;
 
     let mgr = SecurityManager::new();
     let piv = ns.clone().append("KEY").append("piv");
@@ -556,38 +575,38 @@ async fn the_name_survives_its_root_moving_to_a_p256_key() {
         kept_kits: &[],
         cuts: &[],
     };
-    let v3 = recovery_version(&seed.signer(&ns), &v2, &plan)
+    let v4 = recovery_version(&seed.signer(&ns), &v3, &plan)
         .await
         .unwrap()
         .bump
         .data;
-    let v4 = reissue_version(p256.as_ref(), &v3).await.unwrap().data;
+    let v5 = reissue_version(p256.as_ref(), &v4).await.unwrap().data;
     assert_eq!(
-        v4.sig_info().unwrap().sig_type,
+        v5.sig_info().unwrap().sig_type,
         ndn_packet::SignatureType::SignatureSha256WithEcdsa
     );
 
     let res = refresh_context(
         &follower,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, &v3, &v4]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3, &v4, &v5]),
         &ns,
     )
     .await;
     assert!(matches!(res, Ok(ContextRefresh::Updated(_))), "{res:?}");
-    assert_eq!(follower.version_of(&ns), Some(4));
+    assert_eq!(follower.version_of(&ns), Some(5));
 
     let fresh = Keyring::new();
     adopt_by_name(
         &fresh,
         None,
-        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, &v3, &v4]),
+        &mut Upstream::serving(&ns, &[alice.genesis(), alice.v2(), &v3, &v4, &v5]),
         &ns,
         None,
     )
     .await
     .unwrap();
-    assert_eq!(fresh.version_of(&ns), Some(4));
+    assert_eq!(fresh.version_of(&ns), Some(5));
     assert!(fresh.contexts()[0].is_anchor(&piv));
 }
 
@@ -601,17 +620,17 @@ async fn a_long_line_after_a_recovery_is_followed_whatever_its_length() {
     let ns = alice.ns();
     let seed = RecoverySeed::generate().unwrap();
     let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
-    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+    let v3 = add_recovery_anchor(alice.root().await.as_ref(), alice.v2(), &kit)
         .await
         .unwrap()
         .data;
-    let follower = follower(&ns, &[alice.genesis(), &v2]).await;
+    let follower = follower(&ns, &[alice.genesis(), alice.v2(), &v3]).await;
 
     let dir = tempfile::tempdir().unwrap();
     let pib = FilePib::new(dir.path()).unwrap();
     let recovered = recover_namespace_in_pib(
         &pib,
-        &v2,
+        &v3,
         &seed.signer(&ns),
         "phone",
         OldRoot::Compromised,
@@ -630,7 +649,8 @@ async fn a_long_line_after_a_recovery_is_followed_whatever_its_length() {
     let copy = |d: &Data| Data::decode(d.raw().clone()).unwrap();
     let mut line = vec![
         copy(alice.genesis()),
-        v2,
+        copy(alice.v2()),
+        v3,
         copy(&recovered.version.bump.data),
         copy(&recovered.root_version.data),
     ];
@@ -716,7 +736,7 @@ async fn an_unbounded_walk_passes_over_what_it_cannot_fetch_at_once() {
     let alice = Root::new(&GenesisKey::generate().unwrap()).await;
     let last = u64::MAX;
     let stop = follow_versions(
-        &alice.out.init.context,
+        alice.out.init.genesis.as_ref().unwrap().context(),
         2..=last,
         &mut NothingUntilLast {
             last,
@@ -732,5 +752,146 @@ async fn an_unbounded_walk_passes_over_what_it_cannot_fetch_at_once() {
                 if through == last - 1 && version == last
         ),
         "{stop}"
+    );
+}
+
+/// Version 1 of a self-certifying namespace is a pure function of its key:
+/// made again from the same seed — on another device, after a reinstall,
+/// at another time, in memory or in a PIB — it is the same Data, byte for
+/// byte, never a second genesis (a fork every holder of the first refuses).
+/// It carries the root anchor alone; what the namespace states besides
+/// (its CA, schema, policies, relays) is in the versions after it.
+#[tokio::test]
+async fn version_1_is_a_pure_function_of_the_seed() {
+    let seed = [9u8; 32];
+    let genesis_of = |device: &'static str| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let pib = FilePib::new(dir.path()).unwrap();
+        let out = init_self_certifying_in_pib_with(
+            &pib,
+            &GenesisKey::from_seed(seed).offline(),
+            device,
+            &NewRootStore::File,
+            &NamespacePolicies::default(),
+        )
+        .await
+        .unwrap();
+        let ns = out.init.context.namespace().clone();
+        std::fs::read(ndn_cert::context_version_path(dir.path(), &ns, 1)).unwrap()
+    };
+    let first = genesis_of("desk").await;
+    // Every field that could hold the time of signing (a certificate
+    // version in milliseconds, a validity period in seconds) differs now.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = genesis_of("phone").await;
+    assert!(
+        first == second,
+        "the same seed signed two different versions 1"
+    );
+    let in_memory = ndn_cert::init_self_certifying(
+        &SecurityManager::new(),
+        &GenesisKey::from_seed(seed).offline(),
+    )
+    .unwrap();
+    assert!(
+        in_memory.genesis.as_ref().unwrap().data().raw().as_ref() == first.as_slice(),
+        "an in-memory init from the same seed signed another version 1"
+    );
+    // Pinned across releases: a device on another ndn-rs release signs
+    // these very bytes from this key, or the two fork at version 1. A
+    // change here is a change of every self-certifying namespace's genesis.
+    use sha2::Digest;
+    let digest: String = sha2::Sha256::digest(&first)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        digest,
+        "e53e2f61d2fc5793d0a083edf24d7b0dd699c04b9888326ed8fb4e50a2745ee3"
+    );
+
+    let genesis = ndn_security::self_certifying::Genesis::open_received(
+        &Data::decode(Bytes::from(first)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let ctx = genesis.context();
+    assert_eq!(ctx.anchors().len(), 1, "v1 lists the root anchor alone");
+    assert!(ctx.ca_endpoints().is_empty(), "no CA in v1");
+    assert!(ctx.enrollment_hint().is_none(), "no policy in v1");
+    assert!(ctx.relays().is_empty(), "no relay in v1");
+}
+
+/// A key held already ([`GenesisKey::from_seed`], ndf-rs's personal key)
+/// makes its namespace only once looked for on the network: a genesis of
+/// it that answers means the namespace exists — made on another device,
+/// or before a reinstall — and making it again would sign versions after
+/// that genesis every holder refuses. Refused before anything is written,
+/// saying why and what to do. What is no genesis of it (no answer, or a
+/// version 1 another key signed) does not refuse, and the init states
+/// what was looked for; so does an init explicitly not looked for.
+#[tokio::test]
+async fn init_from_a_held_key_whose_genesis_answers_is_refused() {
+    let seed = [11u8; 32];
+    let first = Root::new(&GenesisKey::from_seed(seed).offline()).await;
+    let ns = first.ns();
+    assert_eq!(first.out.init.genesis_check, Some(GenesisCheck::Unchecked));
+
+    // Another device of the same person, holding the same key.
+    let dir = tempfile::tempdir().unwrap();
+    let pib = FilePib::new(dir.path()).unwrap();
+    let refused = GenesisKey::from_seed(seed)
+        .probe(&mut Upstream::serving(&ns, &[first.genesis(), first.v2()]))
+        .await
+        .expect_err("a held key whose genesis answers was made again");
+    assert!(
+        matches!(refused, NamespaceInitError::GenesisReachable { .. }),
+        "{refused}"
+    );
+    let why = refused.to_string();
+    for said in ["already exists", "Adopt", "ndn-fwd recover"] {
+        assert!(why.contains(said), "{why}");
+    }
+    assert!(pib.list_keys().unwrap().is_empty(), "nothing written");
+    assert!(RootStore::open_for(&pib, &ns).unwrap().is_none());
+
+    // No genesis answers, or only one another key signed: made, stating so.
+    let mallory: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(
+        &[66; 32],
+        ns.clone().append("KEY").append("mallory"),
+    ));
+    let forged = SignedTrustContext::decode_content(first.genesis().content().unwrap(), 1).unwrap();
+    forged.add_anchor(recovery_anchor(Arc::clone(&mallory)).await.unwrap());
+    let forged = forged.sign_into_data_async(mallory.as_ref()).await.unwrap();
+    for served in [vec![], vec![&forged]] {
+        let key = GenesisKey::from_seed(seed)
+            .probe(&mut Upstream::serving(&ns, &served))
+            .await
+            .unwrap();
+        assert!(
+            matches!(key.check(), GenesisCheck::NoneReachable { .. }),
+            "{key:?}"
+        );
+    }
+    let key = GenesisKey::from_seed(seed)
+        .probe(&mut Upstream::serving(&ns, &[]))
+        .await
+        .unwrap();
+    let made = init_self_certifying_in_pib_with(
+        &pib,
+        &key,
+        "phone",
+        &NewRootStore::File,
+        &NamespacePolicies::default(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        made.init.genesis_check,
+        Some(GenesisCheck::NoneReachable { .. })
+    ));
+    assert_eq!(
+        GenesisKey::generate().unwrap().check(),
+        &GenesisCheck::NewKey
     );
 }

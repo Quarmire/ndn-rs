@@ -73,12 +73,12 @@ pub use context_store::{
 };
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
-    MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump, SchemaChange, Unfetched,
-    UpdateRefusal, VersionSource, adopt_by_name, bump_context_data_requires_cut,
-    bump_context_readmitting, bump_context_revoking, bump_context_schema, check_cut, check_cuts,
-    device_log_of, follow_versions, key_name_of, link_narrowing, open_context_update, orphan_cuts,
-    readmissions_to_add, refresh_context, relay_narrowing, revocations_to_add, schema_change,
-    split_full_name,
+    MAX_CATCH_UP_MISSES, MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump,
+    SchemaChange, Unfetched, UpdateRefusal, VersionSource, adopt_by_name,
+    bump_context_data_requires_cut, bump_context_readmitting, bump_context_revoking,
+    bump_context_schema, check_cut, check_cuts, device_log_of, follow_versions, key_name_of,
+    link_narrowing, open_context_update, orphan_cuts, readmissions_to_add, refresh_context,
+    relay_narrowing, revocations_to_add, schema_change, split_full_name,
 };
 pub use cut_file::{CutFile, CutFileError};
 pub use ecdh::{EcdhKeypair, SessionKey};
@@ -97,10 +97,11 @@ pub use invites::{
 };
 pub use issued::{CaIssued, CaIssuedListing, HostCas, HostIssued, IssuedEntry};
 pub use namespace::{
-    GenesisKey, NamespaceInit, NamespaceInitError, PersistedNamespace, ValidityMode, ca_dir,
-    ca_dir_of, ca_key_name, device_key_name, init_namespace, init_namespace_in_pib,
-    init_namespace_in_pib_with, init_self_certifying, init_self_certifying_in_pib,
-    init_self_certifying_in_pib_with, root_key_name,
+    ExistingGenesisKey, GENESIS_ROOT_CERT_VERSION, GENESIS_ROOT_VALID_FROM_NS,
+    GENESIS_ROOT_VALID_UNTIL_NS, GenesisCheck, GenesisKey, NamespaceInit, NamespaceInitError,
+    PersistedNamespace, ValidityMode, ca_dir, ca_dir_of, ca_key_name, device_key_name,
+    init_namespace, init_namespace_in_pib, init_namespace_in_pib_with, init_self_certifying,
+    init_self_certifying_in_pib, init_self_certifying_in_pib_with, root_key_name, sign_genesis,
 };
 pub use node_identity::{NodeIdentity, NodeIdentitySource, choose_node_identity};
 pub use onboarding::{
