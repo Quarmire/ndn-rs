@@ -66,6 +66,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Data, Name, NameComponent, tlv_type};
+use ndn_security::self_certifying::{Genesis, GenesisError, self_certifying_digest};
 use ndn_security::{
     AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy,
     LvsModel, OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SchemaRule,
@@ -75,8 +76,8 @@ use ndn_security::{
 use crate::client::CaExchange;
 use crate::error::CertError;
 use crate::onboarding::{
-    CONTEXT_EXPECTATION_TTL, FetchContextError, fetch_context_pointer, fetch_versioned_context,
-    rdr_prefix,
+    AdoptError, CONTEXT_EXPECTATION_TTL, FetchContextError, LinkAdoption, adopt_checked,
+    fetch_context_pointer, fetch_versioned_context, rdr_prefix, refused,
 };
 
 // ── Bump (root device) ─────────────────────────────────────────────────────
@@ -1559,45 +1560,13 @@ where
         newest: None,
         deadline: web_time::Instant::now() + MAX_CATCH_UP_TIME,
     };
-    let direct = match fetch_update(&mut *versions.exchange, forwarder, &held, &pointer).await {
-        Ok(data) => match open_context_update(&held, &data).await {
-            Ok((context, signer)) => Ok(ContextStep {
-                context: Arc::new(context),
-                data,
-                signer,
-            }),
-            Err(refusal) => {
-                versions.newest = Some((offered, data));
-                Err(refusal)
-            }
-        },
-        Err(UpdateFetchError::Dropped(reason)) => Err(UpdateRefusal::DroppedByForwarder(reason)),
-        Err(UpdateFetchError::InProgress(e)) => return Err(e.into()),
-        Err(UpdateFetchError::Fetch(source)) => return Err(fetch_failed(source)),
-    };
-    let (newest, walked) = match direct {
-        Ok(newest) => (newest, Vec::new()),
-        // Not signed by an anchor of the held version: a version in between
-        // may have installed the key that signed it (a recovery).
-        Err(UpdateRefusal::NotSignedByHeldAnchor { .. } | UpdateRefusal::DroppedByForwarder(_))
-            if offered > held.version() + 1 =>
-        {
-            let mut walked = follow_versions(&held, held.version() + 1..=offered, &mut versions)
-                .await
-                .map_err(|stop| {
-                    refused(UpdateRefusal::CatchUp {
-                        held: held.version(),
-                        offered,
-                        stop,
-                    })
-                })?;
-            let newest = walked
-                .pop()
-                .expect("a walk that succeeds ends at its last position");
-            (newest, walked)
-        }
-        Err(refusal) => return Err(refused(refusal)),
-    };
+    let (newest, walked) = reach_newest(&mut versions, &held, offered, &pointer)
+        .await
+        .map_err(|unreached| match unreached {
+            Unreached::Refused(refusal) => refused(refusal),
+            Unreached::Fetch(source) => fetch_failed(source),
+            Unreached::InProgress(e) => e.into(),
+        })?;
 
     let ContextStep {
         context,
@@ -1628,4 +1597,198 @@ where
         revoked,
         walked,
     }))
+}
+
+/// Why [`reach_newest`] did not reach the newest version.
+enum Unreached {
+    Refused(UpdateRefusal),
+    Fetch(FetchContextError),
+    InProgress(ExpectContextError),
+}
+
+/// From `from`, the newest version `offered`, named `pointer`: fetched as
+/// an update of `from` and taken when signed by an anchor of it
+/// ([`open_context_update`]); else, when versions lie in between, reached
+/// by walking them ([`follow_versions`]). Adopts nothing. The newest, and
+/// the versions walked to it, oldest first.
+async fn reach_newest<E>(
+    versions: &mut ByName<'_, E>,
+    from: &SignedTrustContext,
+    offered: u64,
+    pointer: &Name,
+) -> Result<(ContextStep, Vec<ContextStep>), Unreached>
+where
+    E: CaExchange + Send + ?Sized,
+{
+    let direct = match fetch_update(&mut *versions.exchange, versions.forwarder, from, pointer)
+        .await
+    {
+        Ok(data) => match open_context_update(from, &data).await {
+            Ok((context, signer)) => Ok(ContextStep {
+                context: Arc::new(context),
+                data,
+                signer,
+            }),
+            Err(refusal) => {
+                versions.newest = Some((offered, data));
+                Err(refusal)
+            }
+        },
+        Err(UpdateFetchError::Dropped(reason)) => Err(UpdateRefusal::DroppedByForwarder(reason)),
+        Err(UpdateFetchError::InProgress(e)) => return Err(Unreached::InProgress(e)),
+        Err(UpdateFetchError::Fetch(source)) => return Err(Unreached::Fetch(source)),
+    };
+    match direct {
+        Ok(newest) => Ok((newest, Vec::new())),
+        // Not signed by an anchor of `from`: a version in between may have
+        // installed the key that signed it (a recovery).
+        Err(UpdateRefusal::NotSignedByHeldAnchor { .. } | UpdateRefusal::DroppedByForwarder(_))
+            if offered > from.version() + 1 =>
+        {
+            let mut walked = follow_versions(from, from.version() + 1..=offered, versions)
+                .await
+                .map_err(|stop| {
+                    Unreached::Refused(UpdateRefusal::CatchUp {
+                        held: from.version(),
+                        offered,
+                        stop,
+                    })
+                })?;
+            let newest = walked
+                .pop()
+                .expect("a walk that succeeds ends at its last position");
+            Ok((newest, walked))
+        }
+        Err(refusal) => Err(Unreached::Refused(refusal)),
+    }
+}
+
+/// The version a context Data's name carries (`…/v=<N>`), if any.
+pub(crate) fn version_of(data: &Data) -> Option<u64> {
+    data.name.components().last()?.as_version()
+}
+
+/// Adopt the self-certifying namespace `namespace`
+/// (`/user/<0xA1: SHA-256 of an Ed25519 key>`) by its name alone — the
+/// name is the expected fingerprint of its genesis root, so nothing else is
+/// needed (`docs/specs/trust-context.md` §4.5):
+///
+/// 1. Version 1, `<ns>/32=trust-context/v=1`, and the newest version's
+///    name (RDR metadata) are fetched through `exchange`; a validating
+///    `forwarder` is told to expect a context of `namespace` signed by the
+///    key the name hashes ([`Validator::expect_context`]).
+/// 2. Version 1 must be its genesis ([`Genesis::open_received`]): signed
+///    with Ed25519 by an anchor of its own whose raw public key's SHA-256 is
+///    the name's last component. A forged genesis is refused here.
+/// 3. The newest, not older than `min_version`, is reached from the
+///    genesis by the continuity rule — directly, or by walking the versions
+///    in between ([`follow_versions`]) — so a recovery, or a root moved to
+///    another key type, keeps the name.
+/// 4. It is adopted with the genesis ([`Keyring::adopt_genesis`]).
+///
+/// A namespace held already moves on only by continuity, as from any link.
+/// The adoption returns the genesis and the versions walked
+/// ([`LinkAdoption::earlier`]): keep them with the newest
+/// ([`crate::persist_adoption`]), since a restart takes the namespace again
+/// only from its genesis.
+pub async fn adopt_by_name<E>(
+    keyring: &Keyring,
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    namespace: &Name,
+    min_version: Option<u64>,
+) -> Result<LinkAdoption, AdoptError>
+where
+    E: CaExchange + Send + ?Sized,
+{
+    let digest =
+        self_certifying_digest(namespace)?.ok_or_else(|| GenesisError::NotSelfCertifying {
+            namespace: namespace.to_string(),
+        })?;
+    if keyring.held(namespace).is_some() {
+        let link = crate::AnchorLink {
+            namespace: namespace.clone(),
+            expected_fingerprint: digest,
+            min_version,
+            context_data: None,
+        };
+        return crate::onboarding::adopt_fetched(keyring, forwarder, exchange, &link).await;
+    }
+
+    let expectation = forwarder
+        .map(|v| v.expect_context(namespace.clone(), digest, CONTEXT_EXPECTATION_TTL))
+        .transpose()?;
+    let fetched = async {
+        let genesis =
+            fetch_versioned_context(&mut *exchange, &rdr_prefix(namespace).append_version(1))
+                .await?;
+        let pointer = fetch_context_pointer(&mut *exchange, namespace).await?;
+        Ok::<_, FetchContextError>((genesis, pointer))
+    }
+    .await;
+    let outcome = expectation.map(|e| e.finish()).unwrap_or_default();
+    let (genesis, pointer) = fetched.map_err(|source| match outcome.refused {
+        Some(reason) => AdoptError::WrongContext {
+            namespace: namespace.to_string(),
+            reason,
+        },
+        None => AdoptError::Fetch {
+            namespace: namespace.to_string(),
+            source,
+        },
+    })?;
+    let genesis = Genesis::open_received(&genesis).await?;
+    // `fetch_context_pointer` confines the pointer to `<ns>/32=trust-context/v=<N>`.
+    let offered = pointer
+        .components()
+        .last()
+        .and_then(NameComponent::as_version)
+        .unwrap_or_default();
+    if let Some(required) = min_version.filter(|&required| offered < required) {
+        return Err(AdoptError::Downgrade { offered, required });
+    }
+    let first = ContextStep {
+        context: Arc::clone(genesis.context()),
+        data: Data::decode(genesis.data().raw().clone())
+            .map_err(|e| AdoptError::BadData(e.to_string()))?,
+        signer: genesis.root().clone(),
+    };
+    let (newest, earlier) = if offered <= 1 {
+        (first, Vec::new())
+    } else {
+        let mut versions = ByName {
+            exchange,
+            forwarder,
+            namespace,
+            newest: None,
+            deadline: web_time::Instant::now() + MAX_CATCH_UP_TIME,
+        };
+        let (newest, walked) = reach_newest(&mut versions, genesis.context(), offered, &pointer)
+            .await
+            .map_err(|unreached| match unreached {
+                Unreached::Refused(refusal) => AdoptError::NotReached {
+                    namespace: namespace.to_string(),
+                    version: offered,
+                    refusal: Box::new(refusal),
+                },
+                Unreached::Fetch(source) => AdoptError::Fetch {
+                    namespace: namespace.to_string(),
+                    source,
+                },
+                Unreached::InProgress(e) => e.into(),
+            })?;
+        (newest, std::iter::once(first).chain(walked).collect())
+    };
+    if let Err(refusal) = keyring.adopt_genesis(&genesis, Arc::clone(&newest.context)) {
+        // Taken meanwhile by another adoption: this one moves it on only
+        // by continuity from what is held.
+        refused(refusal, newest.context.version())?;
+        adopt_checked(keyring, Arc::clone(&newest.context), Some(&newest.data)).await?;
+    }
+    Ok(LinkAdoption {
+        context: newest.context,
+        data: newest.data,
+        fetched: true,
+        earlier,
+    })
 }

@@ -15,7 +15,7 @@ use ndn_packet::{Data, Name};
 use ndn_security::FilePib;
 use tempfile::TempDir;
 
-use super::init::{InitRequest, RootStoreChoice};
+use super::init::{InitNamespace, InitRequest, RootStoreChoice, YubikeyRoot};
 use super::kit::{KitRequest, KitSpec};
 use super::recover::RecoverRequest;
 use super::*;
@@ -222,7 +222,7 @@ async fn init_adds_a_root_beside_the_others_and_never_replaces_one() {
     let secrets = Secrets::new(b"correct horse");
     let request = |ns: &str, root| InitRequest {
         pib_dir: pib.clone(),
-        namespace: n(ns),
+        namespace: InitNamespace::Named(n(ns)),
         device: "desk".into(),
         force: false,
         stated: PolicyInput::default(),
@@ -261,6 +261,76 @@ async fn init_adds_a_root_beside_the_others_and_never_replaces_one() {
         .unwrap();
     assert_code(&again, code::ALREADY_INITIALIZED);
     assert_eq!(versions(&pib), (1, 1));
+}
+
+/// `init` of a self-certifying namespace names it from its new root key,
+/// and refuses — before anything is asked or made — a name that key does
+/// not make, a self-certifying name given as an ordinary one, and a YubiKey
+/// (it takes no Ed25519 key).
+#[tokio::test]
+async fn init_names_a_self_certifying_namespace_from_its_new_root() {
+    let (_dir, pib) = two_roots().await;
+    let secrets = Secrets::new(b"correct horse");
+    let request = |namespace, root| InitRequest {
+        pib_dir: pib.clone(),
+        namespace,
+        device: "desk".into(),
+        force: false,
+        stated: PolicyInput::default(),
+        root,
+    };
+    let someone = ndn_security::self_certifying::self_certifying_name(&[5; 32]);
+    for refused in [
+        request(
+            InitNamespace::self_certifying(Some(someone.clone())).unwrap(),
+            RootStoreChoice::SealedFile,
+        ),
+        request(
+            InitNamespace::Named(someone.clone()),
+            RootStoreChoice::SealedFile,
+        ),
+        request(
+            InitNamespace::self_certifying(None).unwrap(),
+            RootStoreChoice::YubikeyPiv(YubikeyRoot::default()),
+        ),
+    ] {
+        let refused = init::init(refused, &secrets).await.err().unwrap();
+        assert_code(&refused, code::ROOT_BAD_REQUEST);
+        assert!(refused.to_string().contains("self-certifying"), "{refused}");
+    }
+    assert!(secrets.asked().is_empty(), "nothing asked before a refusal");
+    assert_eq!(versions(&pib), (1, 1));
+
+    let namespace = InitNamespace::self_certifying(None).unwrap();
+    let InitNamespace::SelfCertifying { key, .. } = &namespace else {
+        unreachable!()
+    };
+    let expected = key.namespace();
+    let made = init::init(request(namespace, RootStoreChoice::SealedFile), &secrets)
+        .await
+        .unwrap();
+    assert_eq!(made.persisted.init.context.namespace(), &expected);
+    assert_eq!(
+        made.persisted.init.anchor.public_key.as_ref(),
+        &key_public(&expected, &made)[..]
+    );
+}
+
+/// The root public key whose SHA-256 `ns` names, checked.
+fn key_public(ns: &Name, made: &init::Initialized) -> [u8; 32] {
+    let pk: [u8; 32] = made
+        .persisted
+        .init
+        .anchor
+        .public_key
+        .as_ref()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        ndn_security::self_certifying::self_certifying_name(&pk),
+        *ns
+    );
+    pk
 }
 
 #[tokio::test]

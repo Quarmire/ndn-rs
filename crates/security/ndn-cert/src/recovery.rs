@@ -1515,7 +1515,7 @@ pub async fn recover_namespace_in_pib(
     let device_key = new_key_name(&device_identity)?;
 
     let built: Result<_, RecoveryError> = async {
-        let pending = PendingRoot::create(pib, &root_key, root).await?;
+        let pending = PendingRoot::create(pib, &root_key, root, None).await?;
         let mgr = SecurityManager::new();
         let root_signer = pending.signer();
         let public_key = root_signer.public_key().unwrap_or_default();

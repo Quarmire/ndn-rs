@@ -41,7 +41,10 @@ pub enum PatternComponent {
 /// Text format: `/`-separated components; `/literal` is a literal,
 /// `/<var>` captures one component, `/<**var>` matches all remaining
 /// components, zero or more, binding nothing (must be last), `/<!literal>`
-/// matches one component other than `literal`.
+/// matches one component other than `literal`. A literal written
+/// `<type>=<value>` with a decimal type other than 8 is a typed component in
+/// its NDN URI form (`161=%AB…`, a self-certifying component); any other
+/// literal is a generic component holding the text as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamePattern(pub Vec<PatternComponent>);
 
@@ -84,8 +87,7 @@ impl NamePattern {
                     components.push(PatternComponent::Capture(Arc::from(var)));
                 }
             } else {
-                let comp = NameComponent::generic(bytes::Bytes::copy_from_slice(part.as_bytes()));
-                components.push(PatternComponent::Literal(comp));
+                components.push(PatternComponent::Literal(literal(part)));
             }
         }
 
@@ -173,9 +175,7 @@ impl std::fmt::Display for NamePattern {
         for comp in &self.0 {
             f.write_str("/")?;
             match comp {
-                PatternComponent::Literal(nc) => {
-                    f.write_str(&String::from_utf8_lossy(&nc.value))?;
-                }
+                PatternComponent::Literal(nc) => write_literal(f, nc)?,
                 PatternComponent::Capture(var) => {
                     write!(f, "<{var}>")?;
                 }
@@ -189,6 +189,32 @@ impl std::fmt::Display for NamePattern {
         }
         Ok(())
     }
+}
+
+/// The component a literal pattern segment names: a typed component in its
+/// NDN URI form when written `<type>=<value>` with a decimal type other than
+/// generic (8), else a generic component holding `part` as written.
+fn literal(part: &str) -> NameComponent {
+    let typed = part
+        .split_once('=')
+        .and_then(|(t, _)| t.parse::<u64>().ok())
+        .filter(|&t| t != ndn_packet::tlv_type::NAME_COMPONENT);
+    if typed.is_some()
+        && let Ok(name) = format!("/{part}").parse::<Name>()
+        && let [comp] = name.components()
+    {
+        return comp.clone();
+    }
+    NameComponent::generic(bytes::Bytes::copy_from_slice(part.as_bytes()))
+}
+
+/// Write `nc` as [`literal`] reads it back.
+fn write_literal(f: &mut std::fmt::Formatter<'_>, nc: &NameComponent) -> std::fmt::Result {
+    if nc.typ == ndn_packet::tlv_type::NAME_COMPONENT {
+        return f.write_str(&String::from_utf8_lossy(&nc.value));
+    }
+    let uri = Name::from_components([nc.clone()]).to_string();
+    f.write_str(&uri[1..])
 }
 
 impl std::fmt::Display for SchemaRule {

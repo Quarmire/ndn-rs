@@ -4,14 +4,17 @@
 //! this device's admin identity `<ns>/admin/<device>` certified by the CA,
 //! and the root-signed trust context — carrying the generated namespace
 //! schema and the stated policies — stored in the PIB. An existing root is
-//! never replaced unless forced.
+//! never replaced unless forced. A self-certifying namespace
+//! (`/user/<0xA1: …>`, [`InitNamespace::SelfCertifying`]) is named from its
+//! new Ed25519 root ([`ndn_cert::init_self_certifying_in_pib_with`]).
 
 use std::path::{Path, PathBuf};
 
 use ndn_cert::report::code;
 use ndn_cert::{
-    NamespacePolicies, NewRootStore, PersistedNamespace, PolicyInput, SlotGuard,
-    anchor_fingerprint, init_namespace_in_pib_with,
+    GenesisKey, NamespaceInitError, NamespacePolicies, NewRootStore, PersistedNamespace,
+    PolicyInput, SlotGuard, anchor_fingerprint, init_namespace_in_pib_with,
+    init_self_certifying_in_pib_with,
 };
 use ndn_packet::Name;
 use ndn_trust_envelope::TrustEnvelope;
@@ -107,14 +110,42 @@ pub async fn new_root_store(
     })
 }
 
+/// Which namespace [`init`] makes.
+pub enum InitNamespace {
+    /// This name, with a new root.
+    Named(Name),
+    /// The self-certifying namespace of `key`, `/user/<0xA1: SHA-256 of its
+    /// public key>`: `key` is its root and signs its genesis. `given`, a
+    /// name the person typed, must be that one: a new key never hashes to
+    /// a name chosen before it.
+    SelfCertifying {
+        key: GenesisKey,
+        given: Option<Name>,
+    },
+}
+
+impl InitNamespace {
+    /// A self-certifying namespace named from a new root key, which must
+    /// make `given` when one is given.
+    pub fn self_certifying(given: Option<Name>) -> Result<Self, RootError> {
+        let key = GenesisKey::generate().map_err(|e| {
+            RootError::new(code::ROOT_BAD_REQUEST, "no root key could be made")
+                .with("error", &e)
+                .caused_by(e)
+        })?;
+        Ok(Self::SelfCertifying { key, given })
+    }
+}
+
 /// What [`init`] makes.
 pub struct InitRequest {
     pub pib_dir: PathBuf,
-    pub namespace: Name,
+    pub namespace: InitNamespace,
     /// This device's name (`<ns>/admin/<device>`).
     pub device: String,
     /// Replace an existing root of the namespace (every adopter must then
-    /// adopt again).
+    /// adopt again). A self-certifying namespace is never made again: its
+    /// root is replaced by a recovery, which keeps its name.
     pub force: bool,
     /// What enrollment needs an admin's approval for, which devices may
     /// link, relay and make direct paths, which relays are advertised: the
@@ -136,6 +167,9 @@ pub struct Initialized {
     /// The anchor link without the context: a short QR; the context is
     /// fetched by name. (The full link is `persisted.init.envelope`.)
     pub fingerprint_link: TrustEnvelope,
+    /// Whether it is self-certifying (`/user/<0xA1: …>`): its name alone
+    /// adopts it, with no expected fingerprint.
+    pub self_certifying: bool,
 }
 
 /// The anchor link of `namespace`: its expected `fingerprint`, `version`,
@@ -162,7 +196,10 @@ pub(crate) fn absolute(path: &Path) -> PathBuf {
 
 /// Make the namespace `request` names on this device. The stated policies
 /// are checked first, then the root's secret asked, then everything made;
-/// the root signer is dropped once done.
+/// the root signer is dropped once done. A self-certifying namespace is
+/// named from its root key: a name given that the key does not make, or a
+/// YubiKey root store (which takes no Ed25519 key), is refused before
+/// anything is asked or made.
 pub async fn init(
     request: InitRequest,
     secrets: &dyn SecretSource,
@@ -175,11 +212,42 @@ pub async fn init(
         stated,
         root,
     } = request;
+    let (namespace, genesis) = match namespace {
+        InitNamespace::Named(namespace) => {
+            let self_certifying = ndn_security::self_certifying::self_certifying_digest(&namespace)
+                .map_err(NamespaceInitError::from)?;
+            if self_certifying.is_some() {
+                return Err(NamespaceInitError::SelfCertifying {
+                    namespace: namespace.to_string(),
+                }
+                .into());
+            }
+            (namespace, None)
+        }
+        InitNamespace::SelfCertifying { key, given } => {
+            let namespace = key.namespace();
+            if let Some(given) = given.filter(|given| *given != namespace) {
+                return Err(NamespaceInitError::SelfCertifying {
+                    namespace: given.to_string(),
+                }
+                .into());
+            }
+            if matches!(root, RootStoreChoice::YubikeyPiv(_)) {
+                return Err(NamespaceInitError::GenesisOnToken.into());
+            }
+            (namespace, Some(key))
+        }
+    };
     let policies = stated.new_namespace_policies(&namespace)?;
     let root = new_root_store(&root, secrets).await?;
     let pib = create_pib(&pib_dir)?;
-    let persisted =
-        init_namespace_in_pib_with(&pib, &namespace, &device, force, &root, &policies).await?;
+    let persisted = match &genesis {
+        None => {
+            init_namespace_in_pib_with(&pib, &namespace, &device, force, &root, &policies).await?
+        }
+        Some(key) => init_self_certifying_in_pib_with(&pib, key, &device, &root, &policies).await?,
+    };
+    let self_certifying = genesis.is_some();
     drop(root);
     let init = &persisted.init;
     let fingerprint = anchor_fingerprint(&init.anchor);
@@ -188,6 +256,7 @@ pub async fn init(
         pib_abs: absolute(&pib_dir),
         anchor_fingerprint: fingerprint,
         fingerprint_link,
+        self_certifying,
         persisted,
         policies,
     })

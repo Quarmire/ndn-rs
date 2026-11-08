@@ -1138,16 +1138,22 @@ impl PendingRoot {
     }
 
     /// Generate the root key `key` (`<namespace>/KEY/<id>`) in the store
-    /// `spec`.
+    /// `spec` — or, given `seed`, store that Ed25519 key there instead: the
+    /// genesis root of a self-certifying namespace, whose name was made
+    /// from it. A YubiKey generates its own key, so it takes no `seed`.
     pub(crate) async fn create(
         pib: &FilePib,
         key: &Name,
         spec: &NewRootStore,
+        seed: Option<&[u8; 32]>,
     ) -> Result<PendingRoot, RootStoreError> {
         let key = key.clone();
         match spec {
             NewRootStore::File => Ok(PendingRoot {
-                signer: Arc::new(pib.generate_ed25519(&key)?),
+                signer: Arc::new(match seed {
+                    Some(seed) => pib.import_ed25519_seed(&key, seed)?,
+                    None => pib.generate_ed25519(&key)?,
+                }),
                 key,
                 seal: Seal::File,
             }),
@@ -1157,12 +1163,23 @@ impl PendingRoot {
                         "refusing an empty passphrase for the sealed root".into(),
                     ));
                 }
-                Self::software(key, RootStoreKind::SealedFile, Some(passphrase.clone()))
+                Self::software(
+                    key,
+                    RootStoreKind::SealedFile,
+                    Some(passphrase.clone()),
+                    seed,
+                )
             }
             NewRootStore::OsKeyring => {
                 keychain::probe()?;
-                Self::software(key, RootStoreKind::OsKeyring, None)
+                Self::software(key, RootStoreKind::OsKeyring, None, seed)
             }
+            NewRootStore::YubikeyPiv { .. } if seed.is_some() => Err(RootStoreError::Yubikey(
+                "a self-certifying namespace's root is the Ed25519 key its name hashes, and a \
+                 YubiKey's PIV slot takes no Ed25519 key: create it in a software root store \
+                 (os-keyring or sealed-file)"
+                    .into(),
+            )),
             NewRootStore::YubikeyPiv {
                 pin,
                 slot,
@@ -1177,11 +1194,15 @@ impl PendingRoot {
         key: Name,
         kind: RootStoreKind,
         passphrase: Option<RootSecret>,
+        given: Option<&[u8; 32]>,
     ) -> Result<PendingRoot, RootStoreError> {
         let mut seed = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(&mut seed[..]).map_err(|_| {
-            RootStoreError::Trust(TrustError::KeyStore("system RNG unavailable".into()))
-        })?;
+        match given {
+            Some(given) => seed.copy_from_slice(given),
+            None => getrandom::getrandom(&mut seed[..]).map_err(|_| {
+                RootStoreError::Trust(TrustError::KeyStore("system RNG unavailable".into()))
+            })?,
+        }
         let pkcs8 = Zeroizing::new(
             ndn_security::safebag::ed25519_seed_to_pkcs8(&seed)
                 .map_err(|e| RootStoreError::Trust(TrustError::KeyStore(e.to_string())))?,

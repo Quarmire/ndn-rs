@@ -123,10 +123,22 @@ impl FilePib {
     /// loading through the read path; this just writes the new format
     /// for fresh keys.
     pub fn generate_ed25519(&self, key_name: &Name) -> Result<Ed25519Signer, PibError> {
-        let seed = random_seed();
-        let signer = Ed25519Signer::from_seed(&seed, key_name.clone());
-        let pkcs8 = crate::safebag::ed25519_seed_to_pkcs8(&seed)
-            .map_err(|e| PibError::Corrupt(format!("ed25519 → pkcs8: {e}")))?;
+        self.import_ed25519_seed(key_name, &random_seed())
+    }
+
+    /// Persist the Ed25519 key of `seed` as PKCS#8 under `key_name` and
+    /// return its signer: a key made before its name was known (a
+    /// self-certifying namespace's root, named from its own public key).
+    pub fn import_ed25519_seed(
+        &self,
+        key_name: &Name,
+        seed: &[u8; 32],
+    ) -> Result<Ed25519Signer, PibError> {
+        let signer = Ed25519Signer::from_seed(seed, key_name.clone());
+        let pkcs8 = zeroize::Zeroizing::new(
+            crate::safebag::ed25519_seed_to_pkcs8(seed)
+                .map_err(|e| PibError::Corrupt(format!("ed25519 → pkcs8: {e}")))?,
+        );
         let dir = self.key_dir(key_name)?;
         secure_fs::write_private(&dir.join("private.pkcs8.der"), &pkcs8)?;
         secure_fs::write_private(&dir.join("name.uri"), name_to_uri(key_name))?;

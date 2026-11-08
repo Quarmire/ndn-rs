@@ -474,10 +474,17 @@ pub async fn ensure_invite_context<E>(
     invite: &InviteLink,
 ) -> Result<Option<LinkAdoption>, InviteEnrollError>
 where
-    E: CaExchange + ?Sized,
+    E: CaExchange + Send + ?Sized,
 {
     if let Some(held) = held_context(keyring, &invite.namespace) {
-        let Some(expected) = invite.expected_fingerprint else {
+        // A self-certifying namespace held is its genesis's, whatever root
+        // signs it now.
+        let Some(expected) = invite.expected_fingerprint.filter(|_| {
+            !matches!(
+                ndn_security::self_certifying::self_certifying_digest(&invite.namespace),
+                Ok(Some(_))
+            )
+        }) else {
             return Ok(None);
         };
         let fingerprints: Vec<[u8; 32]> = held
@@ -494,17 +501,26 @@ where
             expected: hex(&expected),
         });
     }
-    let expected_fingerprint =
-        invite
-            .expected_fingerprint
-            .ok_or_else(|| InviteEnrollError::NoExpectedFingerprint {
+    let link = match invite.expected_fingerprint {
+        _ if matches!(
+            ndn_security::self_certifying::self_certifying_digest(&invite.namespace),
+            Ok(Some(_))
+        ) =>
+        {
+            AnchorLink::by_name(&invite.namespace)
+                .map_err(|e| InviteEnrollError::from_adopt(e, &invite.namespace))?
+        }
+        Some(expected_fingerprint) => AnchorLink {
+            namespace: invite.namespace.clone(),
+            expected_fingerprint,
+            min_version: None,
+            context_data: None,
+        },
+        None => {
+            return Err(InviteEnrollError::NoExpectedFingerprint {
                 namespace: invite.namespace.to_string(),
-            })?;
-    let link = AnchorLink {
-        namespace: invite.namespace.clone(),
-        expected_fingerprint,
-        min_version: None,
-        context_data: None,
+            });
+        }
     };
     adopt_anchor_link(keyring, forwarder, exchange, &link)
         .await
@@ -530,7 +546,7 @@ pub async fn enroll_with_invite<E>(
     device_key: Arc<dyn Signer>,
 ) -> Result<InviteEnrollment, InviteEnrollFailure>
 where
-    E: CaExchange + ?Sized,
+    E: CaExchange + Send + ?Sized,
 {
     invite.device_of_key(device_key.key_name())?;
     let adopted = ensure_invite_context(keyring, forwarder, exchange, invite).await?;

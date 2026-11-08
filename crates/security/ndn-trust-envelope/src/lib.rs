@@ -22,9 +22,13 @@
 //! An [`Anchor`](TrustEnvelope::Anchor) is either *inline* (the context's
 //! **signed** NDN Data, `context_data`) or *by reference* (namespace + the
 //! 32-byte SHA-256 fingerprint of the root anchor's public key, the expected
-//! fingerprint), or both. `ndn_cert::adopt_anchor_link` fetches a by-reference
-//! context by name and, like the inline path, verifies its signature under an
-//! anchor with the expected fingerprint before anything is trusted. The older unsigned
+//! fingerprint), or both. A self-certifying namespace (`/user/<0xA1:
+//! SHA-256 of an Ed25519 key>`) needs its namespace alone: its name is the
+//! fingerprint of its genesis root. `ndn_cert::adopt_anchor_link` fetches a
+//! by-reference context by name and, like the inline path, verifies its
+//! signature under an anchor with the expected fingerprint (or a
+//! self-certifying namespace's genesis against its name) before anything is
+//! trusted. The older unsigned
 //! inline form (`context_content`, the bare `SignedTrustContext` Content —
 //! also what `ndn-ctx:1:` carries) still decodes, but nothing adopts it unless
 //! the caller explicitly opts in to unverified legacy adoption.
@@ -351,8 +355,10 @@ impl IntroWords {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustEnvelope {
     /// Adopt a trust context. At least one of `context_data` /
-    /// `context_content` (inline) or `fingerprint` (by reference) is present;
-    /// see the crate docs.
+    /// `context_content` (inline), `fingerprint` (by reference) or, for a
+    /// self-certifying namespace (`/user/<0xA1: …>`, whose name is its
+    /// genesis root's fingerprint), `namespace` alone is present; see the
+    /// crate docs.
     Anchor {
         /// The context namespace, as an NDN URI (e.g. `/home/bob`).
         namespace: Option<String>,
@@ -648,8 +654,15 @@ impl TrustEnvelope {
         let need = EnvelopeError::MissingField;
         Ok(match kind {
             TrustKind::Anchor => {
-                if wire.is_none() && context_data.is_none() && fingerprint.is_none() {
-                    return Err(need("anchor content or fingerprint"));
+                // A namespace alone is a self-certifying one's link: the
+                // name is its genesis root's fingerprint (`ndn_cert` judges
+                // which namespaces that holds for).
+                if wire.is_none()
+                    && context_data.is_none()
+                    && fingerprint.is_none()
+                    && namespace.is_none()
+                {
+                    return Err(need("anchor content, fingerprint or namespace"));
                 }
                 TrustEnvelope::Anchor {
                     namespace,
@@ -949,19 +962,32 @@ mod tests {
         );
     }
 
+    /// An anchor names something to adopt: inline content, a fingerprint, or
+    /// a namespace alone (a self-certifying one's link; `ndn_cert` refuses
+    /// a namespace alone of any other kind).
     #[test]
-    fn anchor_needs_content_or_fingerprint() {
-        let e = TrustEnvelope::Anchor {
-            namespace: Some("/home/bob".into()),
+    fn anchor_needs_content_fingerprint_or_namespace() {
+        let nothing = TrustEnvelope::Anchor {
+            namespace: None,
             fingerprint: None,
             version: Some(1),
             context_data: None,
             context_content: None,
         };
         assert_eq!(
-            TrustEnvelope::decode(&e.encode()),
-            Err(EnvelopeError::MissingField("anchor content or fingerprint"))
+            TrustEnvelope::decode(&nothing.encode()),
+            Err(EnvelopeError::MissingField(
+                "anchor content, fingerprint or namespace"
+            ))
         );
+        let named = TrustEnvelope::Anchor {
+            namespace: Some("/home/bob".into()),
+            fingerprint: None,
+            version: Some(1),
+            context_data: None,
+            context_content: None,
+        };
+        assert_eq!(TrustEnvelope::decode(&named.encode()), Ok(named));
     }
 
     #[test]

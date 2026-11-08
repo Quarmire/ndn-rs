@@ -423,6 +423,13 @@ impl From<NamespaceInitError> for RootError {
             E::Role(error) => {
                 RootError::new(code::ROOT_BAD_REQUEST, "a name is refused").with("error", error)
             }
+            E::SelfCertifying { .. } | E::SelfCertifyingName(_) | E::GenesisOnToken => {
+                RootError::new(
+                    code::ROOT_BAD_REQUEST,
+                    "a self-certifying namespace is named from its own new root key",
+                )
+                .with("error", &e)
+            }
             _ => return local(e),
         };
         refused.caused_by(e)

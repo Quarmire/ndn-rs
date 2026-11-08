@@ -223,15 +223,20 @@ fn store_and_publish(
     Ok(stored)
 }
 
-/// Keep a context adopted into the keyring by link: stored and published.
-/// Refused (`409`) when the keyring meanwhile holds a newer version of the
-/// namespace: that one is what is kept.
+/// Keep a context adopted into the keyring by link: stored and published,
+/// after the versions it was reached through (a self-certifying
+/// namespace's genesis and the versions walked from it, which a restart
+/// needs). Refused (`409`) when the keyring meanwhile holds a newer version
+/// of the namespace: that one is what is kept.
 pub fn keep_adopted(
     p: &Participant,
     adopted: &LinkAdoption,
     expected_fingerprint: &[u8; 32],
 ) -> Result<AdoptedContextInfo, TrustRefusal> {
     let ctx = &adopted.context;
+    for step in &adopted.earlier {
+        keep_walked(p, &step.context, &step.data)?;
+    }
     let stored = keep(p, ctx, &adopted.data, ContextChange::Adopt)?.stored?;
     tracing::info!(
         target: "security",

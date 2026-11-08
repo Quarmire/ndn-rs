@@ -12,6 +12,7 @@ use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::cert_name::key_name_of;
 use ndn_security::confidentiality::{ContentKey, Sealed, wrap_ck_to};
 use ndn_security::safe_data::TrustPath;
+use ndn_security::self_certifying::self_certifying_digest;
 use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
     anchor_fingerprint, public_key_digest,
@@ -146,10 +147,7 @@ async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
     let data = Data::decode(first.clone()).ok()?;
     let (ctx, anchor) = SignedTrustContext::open_received(&data).await.ok()?;
     let ctx = Arc::new(ctx);
-    let keyring = Keyring::new();
-    if keyring.adopt(Arc::clone(&ctx)).is_err() {
-        return None;
-    }
+    let keyring = Keyring::of_claim(Arc::clone(&ctx)).ok()?;
     let cache = CertCache::new();
     for p in rest {
         cache.insert(Certificate::decode(&Data::decode(p.clone()).ok()?).ok()?);
@@ -214,6 +212,27 @@ impl Opened {
             at = issuer;
         }
         out
+    }
+
+    /// Whether what `keyring` now holds of this context's namespace vouches
+    /// for every anchor these credentials carry (by public key). Checked
+    /// once the host adopted the namespace: a self-certifying one is
+    /// adopted from its genesis by name, not from these credentials, so a
+    /// proof checked against them counts only if their anchors are the
+    /// namespace's. A namespace of another kind is adopted from these very
+    /// credentials, and holds.
+    fn vouched_by(&self, keyring: &Keyring) -> bool {
+        let ns = self.ctx.namespace();
+        if !matches!(self_certifying_digest(ns), Ok(Some(_))) {
+            return true;
+        }
+        keyring.held(ns).is_some_and(|held| {
+            self.ctx.anchors().iter().all(|a| {
+                held.anchors()
+                    .iter()
+                    .any(|h| h.value().public_key == a.value().public_key)
+            })
+        })
     }
 
     /// SHA-256 of the anchor's public key.
@@ -913,6 +932,11 @@ impl Inner {
             self.release(offer).await;
             return None;
         }
+        if !opened.vouched_by(self.validator.keyring()) {
+            tracing::info!(%offer, namespace = %theirs, "an ask refused as a conflict: its credentials carry anchors the namespace adopted from its genesis does not hold");
+            self.release(offer).await;
+            return Some(refuse(by, IntroRefusal::Conflict));
+        }
         for c in opened.chain(&by.0, &theirs) {
             self.validator.cert_cache().insert(c);
         }
@@ -1293,6 +1317,17 @@ impl Device {
                  again with the same code (the offer is yours: asking again is answered again)"
             ))
         })?;
+        if !theirs.vouched_by(inner.validator.keyring()) {
+            return Err(DataError::Introduction {
+                offer: offer.clone(),
+                why: IntroRefusal::InviterConflict {
+                    inviter,
+                    why: "carries anchors its namespace, adopted from its genesis, does not \
+                          hold"
+                        .into(),
+                },
+            });
+        }
         if let Some((key, _)) = &signer {
             for c in theirs.chain(key, &inviter) {
                 inner.validator.cert_cache().insert(c);

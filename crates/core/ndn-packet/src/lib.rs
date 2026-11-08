@@ -108,6 +108,12 @@ pub mod tlv_type {
     pub const VERSION: u64 = 0x36;
     pub const TIMESTAMP: u64 = 0x38;
     pub const SEQUENCE_NUM: u64 = 0x3A;
+    /// Self-certifying name component (`161=…`): SHA-256 of the raw
+    /// Ed25519 public key that is the genesis root of the namespace
+    /// `/user/<it>` (ndn-rs `docs/specs/trust-context.md` §4.5). From the
+    /// NDN packet format's application range for name component types,
+    /// 128–252; the same type ndf-rs uses for its personal namespaces.
+    pub const SELF_CERTIFYING: u64 = 0xA1;
     pub const CAN_BE_PREFIX: u64 = 0x21;
     pub const MUST_BE_FRESH: u64 = 0x12;
     pub const FORWARDING_HINT: u64 = 0x1e;

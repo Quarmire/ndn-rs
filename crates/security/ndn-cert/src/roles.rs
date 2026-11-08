@@ -213,7 +213,10 @@ pub fn sanitize_device_name(host: &str) -> Option<String> {
 
 /// Check that `namespace` can root a namespace and its generated
 /// schema: at least one component, each a generic component of URI-unreserved
-/// ASCII (so it reads the same in LVS and native rule text) and not `KEY`.
+/// ASCII (so it reads the same in LVS and native rule text) and not `KEY` —
+/// or exactly `/user/<0xA1: 32 bytes>`, a self-certifying namespace
+/// ([`ndn_security::self_certifying`]), whose schema names that component
+/// in its URI form.
 pub fn validate_namespace(namespace: &Name) -> Result<(), RoleError> {
     let err = |reason| RoleError::InvalidNamespace {
         namespace: namespace.to_string(),
@@ -222,7 +225,15 @@ pub fn validate_namespace(namespace: &Name) -> Result<(), RoleError> {
     if namespace.is_empty() {
         return Err(err("it is the root name"));
     }
+    let self_certifying = ndn_security::self_certifying::self_certifying_digest(namespace)
+        .map_err(|_| {
+            err("a self-certifying component (type 0xA1) names a person only as /user/<32 bytes>")
+        })?
+        .is_some();
     for c in namespace.components() {
+        if self_certifying && c.typ == ndn_security::self_certifying::SELF_CERTIFYING {
+            continue;
+        }
         if c.typ != ndn_packet::tlv_type::NAME_COMPONENT {
             return Err(err("every component must be a generic name component"));
         }
@@ -397,13 +408,18 @@ impl NamespaceSchema {
 /// Generate the namespace trust schema for `namespace` (§4).
 pub fn namespace_schema(namespace: &Name) -> Result<NamespaceSchema, RoleError> {
     validate_namespace(namespace)?;
+    // Each component in its NDN URI form: for a generic one
+    // (`validate_namespace` keeps it URI-unreserved) its raw value, for a
+    // self-certifying one `161=%..`; LVS literals and native rule text read
+    // both forms back.
     let lvs_ns: String = namespace
         .components()
         .iter()
-        .map(|c| format!("/\"{}\"", String::from_utf8_lossy(&c.value)))
+        .map(|c| {
+            let uri = Name::from_components([c.clone()]).to_string();
+            format!("/\"{}\"", &uri[1..])
+        })
         .collect();
-    // `validate_namespace` keeps every component URI-unreserved, so the raw
-    // value is also its URI form.
     let ns = namespace.to_string();
 
     // Only `_device` is a named pattern: the key id, issuer id, version and

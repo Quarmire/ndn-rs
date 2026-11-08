@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_packet::{Data, Name};
+use ndn_security::self_certifying::Genesis;
 use ndn_security::{Keyring, SignedTrustContext};
 use ndn_trust_envelope::TrustEnvelope;
 
@@ -48,7 +49,8 @@ use crate::context_update::{
     Unfetched, UpdateRefusal, VersionSource, follow_versions, open_context_update,
 };
 use crate::onboarding::{
-    AdoptError, adopt_anchor_envelope, adopt_or_held, not_continuous, open_signed_context,
+    AdoptError, LinkAdoption, adopt_anchor_envelope, adopt_or_held, not_continuous,
+    open_signed_context, refused,
 };
 
 /// Directory (under the PIB root) holding adopted contexts.
@@ -75,6 +77,12 @@ pub enum ContextStoreError {
     MisfiledVersion { path: PathBuf, version: u64 },
     #[error(transparent)]
     Adopt(#[from] AdoptError),
+    #[error(
+        "{namespace} is self-certifying, and its genesis (version 1) is not stored at {}: it is \
+         trusted only from that version; adopt {namespace} by name again",
+        path.display()
+    )]
+    GenesisMissing { namespace: String, path: PathBuf },
 }
 
 /// The hex of `namespace`'s URI: the file stem of its store entries, and
@@ -308,6 +316,11 @@ pub fn load_persisted_contexts(
 /// over exactly the version it was checked against. A stored copy never
 /// replaces a held namespace's anchors otherwise
 /// ([`AdoptError::NotContinuous`]); an older one is a rollback.
+///
+/// A self-certifying namespace not held is taken only from its stored
+/// genesis, as on its first adoption: version 1 checked against the name,
+/// then `ctx` reached from it through the stored versions
+/// ([`ContextStoreError::GenesisMissing`] when version 1 is not stored).
 pub fn adopt_stored_context(
     pib_root: &Path,
     keyring: &Keyring,
@@ -319,8 +332,17 @@ pub fn adopt_stored_context(
     // drive the futures inline.
     futures::executor::block_on(async {
         loop {
-            let Some(held) = adopt_or_held(keyring, &ctx)? else {
-                return Ok(Arc::clone(&ctx));
+            let held = match adopt_or_held(keyring, &ctx) {
+                Err(AdoptError::GenesisRequired { .. }) => {
+                    match adopt_stored_genesis(pib_root, keyring, &ctx, data).await? {
+                        Some(held) => held,
+                        None => return Ok(Arc::clone(&ctx)),
+                    }
+                }
+                other => match other? {
+                    Some(held) => held,
+                    None => return Ok(Arc::clone(&ctx)),
+                },
             };
             match open_context_update(&held, data).await {
                 Ok(_) => {}
@@ -352,6 +374,85 @@ pub fn adopt_stored_context(
             // Another version was adopted meanwhile: judge against it.
         }
     })
+}
+
+/// [`adopt_stored_context`] of a self-certifying namespace not held: its
+/// stored genesis checked against the name, `ctx` reached from it through
+/// the stored versions, both adopted. `Some(held)` when another adoption
+/// took the namespace meanwhile.
+async fn adopt_stored_genesis(
+    pib_root: &Path,
+    keyring: &Keyring,
+    ctx: &Arc<SignedTrustContext>,
+    data: &Data,
+) -> Result<Option<Arc<SignedTrustContext>>, ContextStoreError> {
+    let namespace = ctx.namespace();
+    let path = context_version_path(pib_root, namespace, 1);
+    let wire = match std::fs::read(&path) {
+        Ok(wire) => Bytes::from(wire),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ContextStoreError::GenesisMissing {
+                namespace: namespace.to_string(),
+                path,
+            });
+        }
+        Err(source) => return Err(ContextStoreError::Io { path, source }),
+    };
+    let genesis = Data::decode(wire).map_err(|e| ContextStoreError::BadData {
+        path: path.clone(),
+        reason: e.to_string(),
+    })?;
+    let genesis = Genesis::open_stored(&genesis)
+        .await
+        .map_err(AdoptError::from)?;
+    if genesis.namespace() != namespace {
+        return Err(ContextStoreError::Misfiled {
+            path,
+            namespace: genesis.namespace().to_string(),
+        });
+    }
+    if ctx.version() > 1
+        && let Err(refusal) = open_context_update(genesis.context(), data).await
+    {
+        let reached = match refusal {
+            UpdateRefusal::NotSignedByHeldAnchor { .. } if ctx.version() > 2 => {
+                let mut stored = StoredVersions {
+                    pib_root,
+                    namespace,
+                    newest: Some((ctx.version(), data)),
+                };
+                follow_versions(genesis.context(), 2..=ctx.version(), &mut stored)
+                    .await
+                    .map(|_| ())
+                    .map_err(|stop| UpdateRefusal::CatchUp {
+                        held: 1,
+                        offered: ctx.version(),
+                        stop,
+                    })
+            }
+            refusal => Err(refusal),
+        };
+        if let Err(refusal) = reached {
+            return Err(not_continuous(ctx, genesis.context(), refusal).into());
+        }
+    }
+    match keyring.adopt_genesis(&genesis, Arc::clone(ctx)) {
+        Ok(()) => Ok(None),
+        Err(refusal) => Ok(Some(refused(refusal, ctx.version())?)),
+    }
+}
+
+/// Keep an adoption under `pib_root`: the versions it was reached through
+/// ([`LinkAdoption::earlier`], a self-certifying namespace's genesis among
+/// them), then the newest ([`persist_context`]). Returns the newest's file.
+pub fn persist_adoption(
+    pib_root: &Path,
+    adoption: &LinkAdoption,
+) -> Result<PathBuf, ContextStoreError> {
+    for step in &adoption.earlier {
+        persist_context(pib_root, &step.context, &step.data)?;
+    }
+    persist_context(pib_root, &adoption.context, &adoption.data)
 }
 
 /// The versions of `namespace` stored under `pib_root`, for a walk from a

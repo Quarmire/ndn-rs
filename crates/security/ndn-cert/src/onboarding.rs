@@ -23,6 +23,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
+use ndn_security::self_certifying::{
+    Genesis, GenesisError, SelfCertifyingNameError, self_certifying_digest,
+};
 use ndn_security::{
     AdoptRefusal, Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
     SignedTrustContextError, Validator,
@@ -31,7 +34,7 @@ use ndn_tlv::TlvReader;
 use ndn_trust_envelope::TrustEnvelope;
 
 use crate::client::CaExchange;
-use crate::context_update::{UpdateRefusal, open_context_update};
+use crate::context_update::{ContextStep, UpdateRefusal, open_context_update};
 use crate::error::CertError;
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
@@ -184,6 +187,29 @@ pub enum AdoptError {
     WrongContext { namespace: String, reason: String },
     #[error("{0}")]
     InProgress(#[from] ExpectContextError),
+    /// A self-certifying namespace whose genesis is refused.
+    #[error(transparent)]
+    Genesis(#[from] GenesisError),
+    /// A self-certifying component where none may be.
+    #[error(transparent)]
+    SelfCertifyingName(#[from] SelfCertifyingNameError),
+    #[error(
+        "{namespace} is self-certifying and not trusted here yet, and this is its version \
+         {version}: it is trusted only from its version 1 (its genesis, signed by the key the \
+         name hashes) and the versions after it. Adopt it by name over NDN (an anchor link \
+         naming {namespace} alone), or from a link carrying its version 1"
+    )]
+    GenesisRequired { namespace: String, version: u64 },
+    #[error(
+        "the genesis of {namespace} checks against the name, but its newest version \
+         v{version} does not follow from it ({refusal}); nothing was adopted"
+    )]
+    NotReached {
+        namespace: String,
+        version: u64,
+        #[source]
+        refusal: Box<UpdateRefusal>,
+    },
 }
 
 impl From<OpenContextError> for AdoptError {
@@ -215,7 +241,9 @@ pub fn open_signed_context(data: &Data) -> Result<(SignedTrustContext, Certifica
 
 /// [`SignedTrustContext::open_received`] plus the out-of-band checks: the
 /// context roots `namespace`, its signing anchor is valid now and has
-/// `expected_fingerprint`. Adopts nothing.
+/// `expected_fingerprint`. Adopts nothing. A self-certifying namespace has
+/// no expected fingerprint: its name is checked against its genesis on
+/// adoption ([`adopt_checked`]).
 async fn authenticate(
     context_data: &Data,
     namespace: &Name,
@@ -228,7 +256,9 @@ async fn authenticate(
             found: ctx.namespace().to_string(),
         });
     }
-    if &anchor_fingerprint(&signer) != expected_fingerprint {
+    if self_certifying_digest(namespace)?.is_none()
+        && &anchor_fingerprint(&signer) != expected_fingerprint
+    {
         return Err(AdoptError::FingerprintMismatch(signer.name.to_string()));
     }
     Ok(ctx)
@@ -258,6 +288,8 @@ pub struct AnchorLink {
     /// The namespace the anchor roots.
     pub namespace: Name,
     /// SHA-256 of the namespace root's public key ([`anchor_fingerprint`]).
+    /// Not used for a self-certifying namespace, whose name is the
+    /// fingerprint of its genesis root ([`adopt_anchor_link`]).
     pub expected_fingerprint: [u8; 32],
     /// The context version the link names: a fetched context older than this
     /// is refused ([`AdoptError::Downgrade`]).
@@ -267,8 +299,30 @@ pub struct AnchorLink {
 }
 
 impl AnchorLink {
+    /// The link to the self-certifying namespace `namespace` by its name
+    /// alone: its context is fetched and its genesis checked against it.
+    pub fn by_name(namespace: &Name) -> Result<Self, AdoptError> {
+        let digest =
+            self_certifying_digest(namespace)?.ok_or_else(|| GenesisError::NotSelfCertifying {
+                namespace: namespace.to_string(),
+            })?;
+        Ok(Self {
+            namespace: namespace.clone(),
+            expected_fingerprint: digest,
+            min_version: None,
+            context_data: None,
+        })
+    }
+
+    /// Whether the link names a self-certifying namespace.
+    pub fn is_self_certifying(&self) -> bool {
+        matches!(self_certifying_digest(&self.namespace), Ok(Some(_)))
+    }
+
     /// Read an anchor envelope: it must name a namespace and an expected
-    /// fingerprint; an inline context must be the signed Data form.
+    /// fingerprint — none for a self-certifying namespace, whose name is the
+    /// fingerprint of its genesis root — and an inline context must be the
+    /// signed Data form.
     pub fn from_envelope(envelope: &TrustEnvelope) -> Result<Self, AdoptError> {
         let TrustEnvelope::Anchor {
             namespace,
@@ -286,8 +340,12 @@ impl AnchorLink {
         let namespace: Name = namespace
             .parse()
             .map_err(|_| AdoptError::BadNamespace(namespace.to_string()))?;
-        let expected_fingerprint =
-            fingerprint.ok_or(AdoptError::LinkMissing("expected fingerprint"))?;
+        let self_certifying = self_certifying_digest(&namespace)?;
+        let expected_fingerprint = match (self_certifying, fingerprint) {
+            (Some(digest), _) => digest,
+            (None, Some(fingerprint)) => *fingerprint,
+            (None, None) => return Err(AdoptError::LinkMissing("expected fingerprint")),
+        };
         let context_data = match (context_data, context_content) {
             (Some(wire), _) => {
                 Some(Data::decode(wire.clone()).map_err(|e| AdoptError::BadData(e.to_string()))?)
@@ -360,6 +418,11 @@ pub struct LinkAdoption {
     pub data: Data,
     /// Whether it was fetched over NDN (else it came inline).
     pub fetched: bool,
+    /// The versions before `context` it was reached through, oldest first,
+    /// to keep and serve with it: for a self-certifying namespace not held
+    /// before, its genesis and the versions walked from it (a restart takes
+    /// the namespace again only from its genesis); empty otherwise.
+    pub earlier: Vec<ContextStep>,
 }
 
 /// Adopt the namespace an anchor link names into `keyring`.
@@ -374,6 +437,12 @@ pub struct LinkAdoption {
 ///   context Data (and drops a forged one) instead of dropping it for lack of
 ///   an anchor. If the forwarder admitted exactly the Data that arrived, its
 ///   verified result is reused instead of verifying again.
+/// - A self-certifying namespace (`/user/<0xA1: …>`) not held: the name is
+///   the expected fingerprint of its genesis root, so the link needs no
+///   other. An inline version 1 is checked as its genesis and adopted; else
+///   it is adopted by name ([`crate::adopt_by_name`]): version 1 fetched and
+///   checked against the name, then the newest reached from it by the
+///   continuity rule.
 ///
 /// A fetched version older than the link's `version` is refused
 /// ([`AdoptError::Downgrade`]), closing the first-contact downgrade an on-path
@@ -389,8 +458,24 @@ pub async fn adopt_anchor_link<E>(
     link: &AnchorLink,
 ) -> Result<LinkAdoption, AdoptError>
 where
-    E: CaExchange + ?Sized,
+    E: CaExchange + Send + ?Sized,
 {
+    if link.is_self_certifying()
+        && keyring.held(&link.namespace).is_none()
+        && link
+            .context_data
+            .as_ref()
+            .is_none_or(|d| crate::context_update::version_of(d) != Some(1))
+    {
+        return crate::context_update::adopt_by_name(
+            keyring,
+            forwarder,
+            exchange,
+            &link.namespace,
+            link.min_version,
+        )
+        .await;
+    }
     if let Some(data) = &link.context_data {
         let ctx = link.authenticate(data).await?;
         return Ok(LinkAdoption {
@@ -398,8 +483,23 @@ where
             data: Data::decode(data.raw().clone())
                 .map_err(|e| AdoptError::BadData(e.to_string()))?,
             fetched: false,
+            earlier: Vec::new(),
         });
     }
+    adopt_fetched(keyring, forwarder, exchange, link).await
+}
+
+/// [`adopt_anchor_link`] of a link without its context inline: fetched by
+/// name, checked against the link, adopted.
+pub(crate) async fn adopt_fetched<E>(
+    keyring: &Keyring,
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    link: &AnchorLink,
+) -> Result<LinkAdoption, AdoptError>
+where
+    E: CaExchange + ?Sized,
+{
     let expectation = forwarder
         .map(|v| {
             v.expect_context(
@@ -435,6 +535,7 @@ where
         context: adopt_checked(keyring, context, Some(&data)).await?,
         data,
         fetched: true,
+        earlier: Vec::new(),
     })
 }
 
@@ -481,14 +582,29 @@ pub fn adopt_unsigned_legacy_with_tofu(
 /// [`AdoptError::UnsignedOverHeld`]): a link, an envelope or a stored copy
 /// never replaces a held namespace's anchors, whatever fingerprint it was
 /// checked against.
+///
+/// A self-certifying namespace not held is adopted only at version 1,
+/// signed, and checked as its genesis ([`Genesis::open_received`]): a later
+/// version needs the walk from it ([`AdoptError::GenesisRequired`]).
 pub(crate) async fn adopt_checked(
     keyring: &Keyring,
     ctx: Arc<SignedTrustContext>,
     data: Option<&Data>,
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
     loop {
-        let Some(held) = adopt_or_held(keyring, &ctx)? else {
-            return Ok(ctx);
+        let held = match adopt_or_held(keyring, &ctx) {
+            Err(AdoptError::GenesisRequired { .. }) if ctx.version() == 1 && data.is_some() => {
+                let genesis = Genesis::open_received(data.expect("checked above")).await?;
+                match keyring.adopt_genesis(&genesis, Arc::clone(genesis.context())) {
+                    Ok(()) => return Ok(Arc::clone(genesis.context())),
+                    // Taken meanwhile by another adoption: judged as held.
+                    Err(refusal) => refused(refusal, 1)?,
+                }
+            }
+            other => match other? {
+                Some(held) => held,
+                None => return Ok(ctx),
+            },
         };
         let Some(data) = data else {
             return Err(AdoptError::UnsignedOverHeld {
@@ -509,19 +625,40 @@ pub(crate) async fn adopt_checked(
 
 /// [`Keyring::adopt`] `ctx`: `None` once adopted (or held as is), the held
 /// context when `ctx` is newer — it replaces it only if it follows from it
-/// (the continuity rule) — and refused when older or a fork.
+/// (the continuity rule) — and refused when older or a fork, or a
+/// self-certifying namespace not held ([`AdoptError::GenesisRequired`]).
 pub(crate) fn adopt_or_held(
     keyring: &Keyring,
     ctx: &Arc<SignedTrustContext>,
 ) -> Result<Option<Arc<SignedTrustContext>>, AdoptError> {
     match keyring.adopt(Arc::clone(ctx)) {
         Ok(()) => Ok(None),
-        Err(AdoptRefusal::Older { held_ctx, offered }) => Err(AdoptError::Rollback {
+        Err(refusal) => refused(refusal, ctx.version()).map(Some),
+    }
+}
+
+/// What a keyring's refusal of version `offered` means for an adoption:
+/// the held context to judge it against by continuity, or why it is
+/// refused.
+pub(crate) fn refused(
+    refusal: AdoptRefusal,
+    offered: u64,
+) -> Result<Arc<SignedTrustContext>, AdoptError> {
+    match refusal {
+        AdoptRefusal::Older { held_ctx, offered } => Err(AdoptError::Rollback {
             offered,
             held: held_ctx.version(),
         }),
-        Err(AdoptRefusal::Fork { held_ctx }) => Err(AdoptError::Fork(held_ctx.version())),
-        Err(AdoptRefusal::Held { held_ctx, .. }) => Ok(Some(held_ctx)),
+        AdoptRefusal::Fork { held_ctx } => Err(AdoptError::Fork(held_ctx.version())),
+        AdoptRefusal::Held { held_ctx, .. } => Ok(held_ctx),
+        AdoptRefusal::GenesisRequired { namespace }
+        | AdoptRefusal::NotFromGenesis {
+            genesis: namespace, ..
+        } => Err(AdoptError::GenesisRequired {
+            namespace: namespace.to_string(),
+            version: offered,
+        }),
+        AdoptRefusal::Name(e) => Err(e.into()),
     }
 }
 

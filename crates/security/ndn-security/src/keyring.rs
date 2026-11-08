@@ -16,6 +16,7 @@ use portable_atomic::AtomicU64;
 use dashmap::DashMap;
 use ndn_packet::Name;
 
+use crate::self_certifying::{Genesis, SelfCertifyingNameError, self_certifying_digest};
 use crate::trust_context::SignedTrustContext;
 
 /// Called once a context is adopted that refuses what the version it
@@ -67,6 +68,29 @@ pub enum AdoptRefusal {
     Held {
         held_ctx: Arc<SignedTrustContext>,
         offered: u64,
+    },
+    /// A self-certifying namespace not held (`/user/<0xA1: …>`): taken only
+    /// from its checked genesis, through
+    /// [`Keyring::adopt_genesis`].
+    #[error(
+        "{namespace} is self-certifying: it is trusted only from its version 1 (genesis), \
+         signed by the Ed25519 key the name hashes, and then by the continuity rule; adopt it \
+         by name, which fetches and checks its genesis"
+    )]
+    GenesisRequired { namespace: Name },
+    /// The namespace carries a self-certifying component where none may be.
+    #[error(transparent)]
+    Name(#[from] SelfCertifyingNameError),
+    /// [`Keyring::adopt_genesis`] was given a context that is not of the
+    /// genesis's namespace, or another version 1.
+    #[error(
+        "{offered} v{version} does not follow from the genesis of {genesis}: only a version of \
+         {genesis} checked from its genesis is adopted with it"
+    )]
+    NotFromGenesis {
+        genesis: Name,
+        offered: Name,
+        version: u64,
     },
 }
 
@@ -164,6 +188,20 @@ impl Keyring {
         )))
     }
 
+    /// A keyring holding `ctx` alone, as a party's own credentials claim
+    /// it: to check that party's proof against the context it carries
+    /// before anything of it is trusted, never as a node's keyring. A
+    /// self-certifying namespace is held here without its genesis — whether
+    /// it is that namespace's is decided where it is adopted
+    /// ([`adopt_genesis`](Self::adopt_genesis)). A namespace with a
+    /// self-certifying component anywhere else is refused.
+    pub fn of_claim(ctx: Arc<SignedTrustContext>) -> Result<Self, SelfCertifyingNameError> {
+        self_certifying_digest(ctx.namespace())?;
+        let keyring = Self::new();
+        keyring.contexts.insert(ctx.namespace().clone(), ctx);
+        Ok(keyring)
+    }
+
     /// The ambient (root-namespace) context — the validation target for names
     /// not covered by any adopted context.
     pub fn ambient(&self) -> &Arc<SignedTrustContext> {
@@ -180,7 +218,54 @@ impl Keyring {
     /// held one only through [`adopt_update_from`](Self::adopt_update_from)
     /// once checked under the held version's anchors. Atomic against
     /// concurrent adoptions of the same namespace.
+    ///
+    /// A self-certifying namespace (`/user/<0xA1: …>`,
+    /// [`crate::self_certifying`]) not held is refused
+    /// ([`AdoptRefusal::GenesisRequired`]): it is taken only from its checked
+    /// genesis ([`adopt_genesis`](Self::adopt_genesis)). A namespace with a
+    /// self-certifying component anywhere else is refused
+    /// ([`AdoptRefusal::Name`]).
     pub fn adopt(&self, ctx: Arc<SignedTrustContext>) -> Result<(), AdoptRefusal> {
+        let self_certifying = self_certifying_digest(ctx.namespace())?.is_some();
+        self.adopt_entry(ctx, self_certifying)
+    }
+
+    /// Adopt the self-certifying namespace of `genesis` at `newest`: the
+    /// genesis itself, or a later version the caller checked from it by
+    /// the continuity rule (each version signed by an anchor of the one
+    /// before it: `ndn_cert::open_context_update`, or a catch-up walk
+    /// through the versions in between). Version 1 is judged against the
+    /// name ([`Genesis`]); the versions after it, by continuity alone, so a
+    /// recovery or a root moved to another key type keeps the name.
+    ///
+    /// `newest` must be of the genesis's namespace, and at version 1 it must
+    /// be the genesis itself ([`AdoptRefusal::NotFromGenesis`]). A held
+    /// namespace is changed here never, as by [`adopt`](Self::adopt).
+    pub fn adopt_genesis(
+        &self,
+        genesis: &Genesis,
+        newest: Arc<SignedTrustContext>,
+    ) -> Result<(), AdoptRefusal> {
+        if newest.namespace() != genesis.namespace()
+            || (newest.version() == 1
+                && newest.encode_content() != genesis.context().encode_content())
+        {
+            return Err(AdoptRefusal::NotFromGenesis {
+                genesis: genesis.namespace().clone(),
+                offered: newest.namespace().clone(),
+                version: newest.version(),
+            });
+        }
+        self.adopt_entry(newest, false)
+    }
+
+    /// [`adopt`](Self::adopt) once the namespace is judged: a namespace not
+    /// held is refused when `needs_genesis`.
+    fn adopt_entry(
+        &self,
+        ctx: Arc<SignedTrustContext>,
+        needs_genesis: bool,
+    ) -> Result<(), AdoptRefusal> {
         let ns = ctx.namespace().clone();
         let revoked = match self.contexts.entry(ns) {
             dashmap::mapref::entry::Entry::Occupied(held) => {
@@ -197,6 +282,11 @@ impl Keyring {
                     std::cmp::Ordering::Less => AdoptRefusal::Older { held_ctx, offered },
                     std::cmp::Ordering::Equal => AdoptRefusal::Fork { held_ctx },
                     std::cmp::Ordering::Greater => AdoptRefusal::Held { held_ctx, offered },
+                });
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) if needs_genesis => {
+                return Err(AdoptRefusal::GenesisRequired {
+                    namespace: ctx.namespace().clone(),
                 });
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {

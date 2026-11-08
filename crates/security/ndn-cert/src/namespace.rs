@@ -20,11 +20,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ndn_packet::{Data, Name};
+use ndn_security::self_certifying::{
+    SelfCertifyingNameError, self_certifying_digest, self_certifying_name,
+};
 use ndn_security::{
     AdvertisedRelay, Certificate, EnrollmentHint, FilePib, KeyRole, LinkPolicy, PibError,
     SecurityManager, SignedTrustContext, SignedTrustContextError, TrustError,
 };
 use ndn_trust_envelope::TrustEnvelope;
+use zeroize::Zeroizing;
 
 use crate::ca::{deserialize_cert, serialize_cert};
 use crate::ca_policy::NamespacePolicies;
@@ -144,6 +148,7 @@ pub fn init_namespace(
     mgr: &SecurityManager,
     namespace: &Name,
 ) -> Result<NamespaceInit, NamespaceInitError> {
+    refuse_self_certifying(namespace)?;
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     mgr.generate_ed25519(anchor_key)?;
@@ -157,6 +162,88 @@ pub fn init_namespace(
         LinkPolicy::default(),
         Vec::new(),
     ))
+}
+
+/// [`init_namespace`] of the self-certifying namespace of `key`
+/// (`/user/<0xA1: SHA-256 of its public key>`): `key` is its root, held by
+/// `mgr`, and signs its version 1, the genesis
+/// ([`ndn_security::self_certifying`]).
+pub fn init_self_certifying(
+    mgr: &SecurityManager,
+    key: &GenesisKey,
+) -> Result<NamespaceInit, NamespaceInitError> {
+    let namespace = key.namespace();
+    mgr.generate_ed25519_from_seed(root_key_name(&namespace), &key.seed)?;
+    // In-memory Ed25519 signers never suspend: drive the future inline.
+    futures::executor::block_on(build_namespace(
+        mgr,
+        &namespace,
+        None,
+        &[],
+        EnrollmentHint::namespace_default(),
+        LinkPolicy::default(),
+        Vec::new(),
+    ))
+}
+
+/// The Ed25519 key a self-certifying namespace is created from — its
+/// genesis root, whose public key's SHA-256 is the namespace's last
+/// component: new ([`generate`](Self::generate)), or one held already
+/// ([`from_seed`](Self::from_seed), e.g. an ndf-rs personal key, whose
+/// `record::personal_root` is this same name).
+pub struct GenesisKey {
+    seed: Zeroizing<[u8; 32]>,
+    public: [u8; 32],
+}
+
+impl GenesisKey {
+    /// A new key from the system RNG.
+    pub fn generate() -> Result<Self, TrustError> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut seed[..])
+            .map_err(|_| TrustError::KeyStore("system RNG unavailable".into()))?;
+        Ok(Self::from_zeroizing(seed))
+    }
+
+    /// The key of the Ed25519 secret `seed` (RFC 8032's 32-byte private
+    /// key, as `ed25519_dalek::SigningKey::to_bytes` gives it).
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self::from_zeroizing(Zeroizing::new(seed))
+    }
+
+    fn from_zeroizing(seed: Zeroizing<[u8; 32]>) -> Self {
+        let public = ndn_security::Ed25519Signer::from_seed(&seed, Name::root()).public_key_bytes();
+        Self { seed, public }
+    }
+
+    /// The raw 32-byte public key.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public
+    }
+
+    /// The namespace this key names: `/user/<0xA1: SHA-256(public key)>`.
+    pub fn namespace(&self) -> Name {
+        self_certifying_name(&self.public)
+    }
+}
+
+impl std::fmt::Debug for GenesisKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenesisKey")
+            .field("namespace", &self.namespace().to_string())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Refuse to make `namespace` from a new root: a self-certifying name is
+/// its root's hash, which a key made now never matches.
+fn refuse_self_certifying(namespace: &Name) -> Result<(), NamespaceInitError> {
+    match self_certifying_digest(namespace)? {
+        Some(_) => Err(NamespaceInitError::SelfCertifying {
+            namespace: namespace.to_string(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Build the namespace around the root key `root_key_name(namespace)` already held
@@ -264,6 +351,25 @@ pub enum NamespaceInitError {
     Role(#[from] RoleError),
     #[error(transparent)]
     Trust(#[from] TrustError),
+    /// A self-certifying name given to a root made for it.
+    #[error(
+        "{namespace} is self-certifying: its last component must be SHA-256 of the \
+         namespace's genesis root key, and a root key made now never hashes to a name chosen \
+         before it. Create a namespace named from its new root key instead (`ndn-fwd init \
+         --self-certifying`), or create {namespace} from the Ed25519 key it names \
+         (`init_self_certifying_in_pib_with`)"
+    )]
+    SelfCertifying { namespace: String },
+    /// A self-certifying component where none may be.
+    #[error(transparent)]
+    SelfCertifyingName(#[from] SelfCertifyingNameError),
+    /// A self-certifying namespace asked for on a YubiKey.
+    #[error(
+        "a self-certifying namespace is named from its Ed25519 root key, and a YubiKey's PIV \
+         slot takes no Ed25519 key: create it with the os-keyring or sealed-file root store. Its \
+         root can later be replaced by a recovery onto a YubiKey: the name stays"
+    )]
+    GenesisOnToken,
     #[error("trust context: {0}")]
     Context(#[from] SignedTrustContextError),
     #[error(transparent)]
@@ -342,6 +448,66 @@ pub async fn init_namespace_in_pib_with(
     root: &NewRootStore,
     policies: &NamespacePolicies,
 ) -> Result<PersistedNamespace, NamespaceInitError> {
+    refuse_self_certifying(namespace)?;
+    init_in_pib(pib, namespace, None, device, force, root, policies).await
+}
+
+/// [`init_namespace_in_pib`] of the self-certifying namespace of `key`
+/// ([`init_self_certifying_in_pib_with`]).
+pub async fn init_self_certifying_in_pib(
+    pib: &FilePib,
+    key: &GenesisKey,
+    device: &str,
+    root: &NewRootStore,
+) -> Result<PersistedNamespace, NamespaceInitError> {
+    init_self_certifying_in_pib_with(pib, key, device, root, &NamespacePolicies::default()).await
+}
+
+/// [`init_namespace_in_pib_with`] of the self-certifying namespace of
+/// `key`, `/user/<0xA1: SHA-256 of its public key>` (`key.namespace()`):
+/// `key` is stored as its root in the store `root` and signs version 1, the
+/// genesis every adopter checks against the name
+/// ([`ndn_security::self_certifying`]). A YubiKey store is refused
+/// ([`NamespaceInitError::GenesisOnToken`]): it takes no Ed25519 key.
+///
+/// A namespace that exists in the PIB is never made again, not even with
+/// force: the same key would sign a second version 1, a fork every holder
+/// of the first refuses ([`NamespaceInitError::AlreadyInitialized`]). Its
+/// root is replaced by a recovery instead, which keeps the name.
+pub async fn init_self_certifying_in_pib_with(
+    pib: &FilePib,
+    key: &GenesisKey,
+    device: &str,
+    root: &NewRootStore,
+    policies: &NamespacePolicies,
+) -> Result<PersistedNamespace, NamespaceInitError> {
+    if matches!(root, NewRootStore::YubikeyPiv { .. }) {
+        return Err(NamespaceInitError::GenesisOnToken);
+    }
+    let namespace = key.namespace();
+    init_in_pib(
+        pib,
+        &namespace,
+        Some(&key.seed),
+        device,
+        false,
+        root,
+        policies,
+    )
+    .await
+}
+
+/// The namespace `namespace` made in `pib`, its root generated in `root` —
+/// or, given `seed`, that Ed25519 key (a self-certifying namespace's).
+async fn init_in_pib(
+    pib: &FilePib,
+    namespace: &Name,
+    seed: Option<&[u8; 32]>,
+    device: &str,
+    force: bool,
+    root: &NewRootStore,
+    policies: &NamespacePolicies,
+) -> Result<PersistedNamespace, NamespaceInitError> {
     validate_namespace(namespace)?;
     let anchor_key = root_key_name(namespace);
     let ca_key = ca_key_name(namespace);
@@ -390,7 +556,7 @@ pub async fn init_namespace_in_pib_with(
     // Root: generated in its store (in memory for a sealed one, on the token
     // for a YubiKey), held by an in-process manager for the signing steps
     // below, and recorded once the anchor is signed.
-    let pending = PendingRoot::create(pib, &anchor_key, root).await?;
+    let pending = PendingRoot::create(pib, &anchor_key, root, seed).await?;
     let mgr = SecurityManager::new();
     mgr.register_signer(anchor_key.clone(), pending.signer());
     let init = build_namespace(
