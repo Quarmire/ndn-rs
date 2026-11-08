@@ -2816,9 +2816,9 @@ gesture. A function's answer is a `get` on its name (a later slice).
 Exposure over forwarder management and the mobile FFI is slice 7. A device
 answers a verb or option of a later slice with an error that names the
 slice. Beside the verbs, a `Device` makes and takes introductions (§19):
-`offer(folder, {role, until, tries}) → code` on an owner device, and
-`join(code) → {folder, role, inviter}` on the joiner's; the joiner then
-uses the folder with the verbs as any member.
+`offer(folder, {role, until, tries}) → code` and `close_offer(offer)` on
+an owner device, and `join(code) → {folder, role, inviter}` on the
+joiner's; the joiner then uses the folder with the verbs as any member.
 
 - **`get(C)`** of a merge collection answers its state now — `State` with a
   state name, `at`, the value (typed by the rule, §5.1) and `not_counted`:
@@ -3793,18 +3793,37 @@ answered again), i3 (a code past its expiry by the offering device's
 clock is refused `Expired`; a new code admits), i4 (an offer closing at
 two wrong tries: the first is refused `WrongProof` with one left
 (`FixRequest`); the offering device restarts; the second is refused
-`Closed`, and so is the right code afterwards — the count survived the
-restart), i5 (two keys presenting one code at once: exactly one is
-admitted, the other refused `Used`, also when it asks again, and only the
-admitted one reads), i6 (an ask with a guessed secret is refused
-`WrongProof`, counted, and grants nothing; the real code, within its
-tries, still admits) and i7 (the offering device offline: the join is
-refused `NotReady` (`RetryLater`) and spends nothing; once it is back the
-same code admits, and each reads what the other writes). Their feature is
-`Introduction`. `ndn-data`'s `intro.rs` unit tests check the records, asks
-and answers round-trip, that malformed ones are refused, and that each
-proof binds every field it covers (another offer, key, digest, nonce or
-secret fails it).
+`Closed`, and so is the right code afterwards from the same key — the
+count survived the restart), i5 (two keys presenting one code at once:
+exactly one is admitted, the other refused `Used`, also when it asks
+again, and only the admitted one reads), i6 (an ask with a guessed secret
+is refused `WrongProof`, counted, and grants nothing; the real code,
+within its tries, still admits), i7 (the offering device offline: the
+join is refused `NotReady` (`RetryLater`) and spends nothing; once it is
+back the same code admits, and each reads what the other writes), i8 (a
+joiner whose namespace lies under one the inviter trusts — `/carol/m`
+once Carol joined — or is the shared `/user` is refused `Conflict`
+(`FixLocal`), reads nothing, and the offer still admits its holder), i9 (a
+code from `/carol/m` to a joiner trusting `/carol`, as a link or as words,
+is refused `InviterConflict` (`AskOwner`) and the joiner adopts and reads
+nothing of it), i10 (a member who joined by a code and was removed asks
+again with the code, before and after the inviter restarts: refused
+`Closed` — the removal closed the offer — and never reads what the owner
+writes afterwards), i11 (a stranger spending its own wrong tries is
+refused `Closed` while the code's holder still joins; on a used offer a
+stranger's guesses are refused `Used`, counted nowhere, and the user
+asking again is answered) and i12 (not among strangers, so the owner's
+other device reads the member's writes: a member removed by that device,
+which closes nothing, asks the offering device again: answered, never
+admitted again). Their feature is `Introduction`.
+`ndn-data`'s `intro.rs` unit tests check the records, asks and answers
+round-trip, that malformed ones are refused, that each proof binds every
+field it covers (another offer, key, digest, nonce or secret fails it),
+and the default `IntroPolicy`; its device tests (`device/intro_tests.rs`)
+check that only the certificates of the verified chain are cached, that a
+joiner whose key is its own anchor is answered, that an offer is not spent
+when the host does not adopt the asker, that a closed offer refuses its
+user too, and that asks past `asks_queued` get no answer at once.
 
 ## 19. Introductions — slice 6
 
@@ -3823,24 +3842,30 @@ An **offer** (`IntroOffer`) is an entry in the offering device's log about
 the folder `F` it offers, `<D>/32=log/<F>/seq=<n>` — the offer's name. It
 carries `F`; the `Role` it grants (0 reader, 1 writer); its expiry
 (`KeepUntil`, judged by the offering device's clock); `Tries`, the number
-of wrong tries that close it (at least 1); the commitment to its secret
-(`Digest`, §19.6); and the offering device's `SealKey` (§9), to which asks
-are sealed. `F` MUST be a folder of the offering device's namespace (the
-device signs its members records, §6). Nothing secret is in it: the
-secret is in the code only.
+of wrong tries of one asker key that close it to that key (at least 1);
+the commitment to its secret (`Digest`, §19.6); and the offering device's
+`SealKey` (§9), to which asks are sealed. `F` MUST be a folder of the
+offering device's namespace (the device signs its members records, §6).
+Nothing secret is in it: the secret is in the code only.
 
 A **use mark** (`IntroUsed`) is an entry in the offering device's log
 about the same folder naming the offer and either the key the offer was
 used by and its public key's digest (`Writer`, `Digest`) — the offer is
-used — or neither — the offer is closed after its wrong tries. The first
-mark of an offer stands; a device signs no second one. Only the offering
-device marks its offer: a reader takes an offer or a mark only when a
-device of the folder's own namespace signed it, and a mark only when the
-device that signed it is the offer's.
+used — or neither — a **closing mark**: the offer is closed for good, to
+everyone, its user too (all askers' wrong tries at the device's cap,
+§19.4; `close_offer`, §19.2; or the member it brought removed, §19.7). The
+first mark naming a key stands and a device signs no second one; a closing
+mark closes the offer whenever it comes, used or not, and a device signs
+one at most. Only the offering device marks its offer: a reader takes an
+offer or a mark only when a device of the folder's own namespace signed
+it, and a mark only when the device that signed it is the offer's.
 
-The offering device keeps the offer's proof key (§19.6) in its store,
-wrapped to its own recipient key (§9) under a local name no device serves,
-and the count of wrong tries under another; it keeps no secret.
+The offering device keeps in its store, each under a local name no device
+serves: the offer's proof key (§19.6), wrapped to its own recipient key
+(§9); the wrong tries of each asker key, by its public key's digest; the
+wrong tries counted toward the overall cap and when the last was counted;
+while a use is under way, the key it is for (§19.4); and once used, the
+acceptance it answered. It keeps no secret.
 
 ### 19.2 Offering
 
@@ -3867,9 +3892,17 @@ as **words**: the offer's name, then 24 BIP39 English words encoding the
 secret followed by the fingerprint's first 16 octets (its checksum catches
 a mistyped word).
 
+`close_offer(offer)` on the device that made the offer signs its closing
+mark and returns once it is durable: every ask of the offer is then
+refused `Closed`, its user's too; what the offer granted stays until a
+members record removes it. Another device's offer, or a name that is no
+offer held, is `BadRequest`; closing a closed offer does nothing more.
+
 ### 19.3 Joining
 
-`join(code)`, the link (or its https mirror) or the words:
+`join(code)`, the link (or its https mirror) or the words. A namespace the
+code names is judged first, as in step 4, before anything is fetched or
+asked:
 
 1. Fetches the offer as `<D>/32=held/<offer>` (§16.1; DigestSha256, so the
    joiner's forwarder needs no trust of the inviter), `D` the offer name's
@@ -3895,7 +3928,7 @@ a mistyped word).
    MUST pass every check, else the join answers `Forged` (`RetryLater`) and
    adopts nothing: it names the offer, this device's key and its digest;
    its `Proof` verifies under the proof key the code's secret yields; its
-   credentials open (§19.4, step 5) to a context whose anchor fingerprint
+   credentials open (§19.4, step 2) to a context whose anchor fingerprint
    is the code's (whole, or its first half for words), whose namespace is
    the code's (when it names one) and a prefix of `D`; the inviter's proof
    packet `<D>/32=ask/<binding>`, the binding SHA-256 of the intro-answer
@@ -3903,12 +3936,24 @@ a mistyped word).
    are both signed by a key of `D`
    that chains to that anchor through those certificates; the offer's
    commitment is the code's secret's; the folder and role are the offer's.
-4. Has its host adopt the inviter's anchor (an inline anchor link of the
+4. **The inviter's namespace is no other's**, judged by this device (the
+   words name none, so it is judged here for them too): not the root, not
+   one the policy refuses (`Config::intro`, §19.4 step 10), not this
+   device's own namespace nor under or over it, not under or over any
+   namespace this device trusts, and not one it trusts under another
+   anchor (the same namespace under the same anchor is a party it knows:
+   joining a second folder of theirs). Else `InviterConflict { inviter,
+   why }` (`AskOwner`: do not use the code), and nothing is adopted: a
+   stranger's code can never make this device trust a name it trusts
+   already, nor names under or over it.
+5. Has its host adopt the inviter's anchor (an inline anchor link of the
    context the answer carried, `Introducer::adopt`); a refusal is `Local`
    (fix the host and join again with the same code: the same key asking
-   again is answered again). Takes the inviter's certificates into its
-   validator, follows `F` (§15, `watch`'s first look), and returns the
-   folder, the role and the inviter's namespace.
+   again is answered again). Takes into its validator the certificates on
+   the chain from the key that signed the inviter's proof packet to its
+   anchor, named under the inviter's namespace — no other certificate the
+   answer carries — follows `F` (§15, `watch`'s first look), and returns
+   the folder, the role and the inviter's namespace.
 
 The joiner's Interests carry a ForwardingHint: the relays the code names,
 else those its own namespace's trust context advertises; none, routed by
@@ -3917,10 +3962,15 @@ name. Hints only reach (§19.7).
 ### 19.4 Answering
 
 The offering device answers an ask of its own name in its own task, one
-ask at a time (so a use mark, a counted try and a closing mark each see
-the one before), keeping each answer by the ask's name: the same ask asked
-again gets the same answer while it is kept, and a refusal or an answer is
-never computed twice for one ask. It checks, in this order:
+ask at a time (so a use, a counted try and a closing mark each see the one
+before), keeping each answer by the ask's name: the same ask asked again
+gets the same answer while it is kept, and a refusal or an answer is never
+computed twice for one ask. A crowd of asks is bounded: the device holds at
+most `Config::intro.asks_queued` asks at once (32 by default), verifying or
+waiting for their turn — one more gets no answer at once (a Nack), says so
+in its log, and its asker retries — and opens and verifies at most a few at
+once (the same bound as hold asks' proofs, §13), before any unwrapping. It
+checks, in this order:
 
 1. **It opens**: the name's digest is its parameters', the content key
    unwraps with its recipient key and the body decodes, under
@@ -3928,42 +3978,66 @@ never computed twice for one ask. It checks, in this order:
 2. **Its credentials parse**: a trust-context Data whose signature
    verifies under one of the context's own anchors, valid now
    (`SignedTrustContext::open_received`), then certificates (at most 8);
-   the claimed key — the proof packet's KeyLocator — has a certificate
-   among them. Else no answer.
+   the claimed key — the proof packet's KeyLocator — is an anchor of the
+   context (a key that is its own anchor) or has a valid certificate among
+   them. Else no answer.
 3. **The offer is its own and known**: named under this device, an offer
    record it holds, its proof key in its store. Else `Unknown`.
-4. **Not closed**: no closing mark, and fewer wrong tries counted than its
-   `Tries`. Else `Closed`.
-5. **Not expired**: its expiry is after this device's clock now. Else
-   `Expired`.
-6. **The asker's key chains to the anchor it sent**: the proof packet,
+4. **Not closed**: no closing mark, and fewer wrong tries counted toward
+   the overall cap than `Config::intro.wrong_tries_max`. Else `Closed`.
+5. **The asker's key chains to the anchor it sent**: the proof packet,
    named `<J>/32=ask/<binding>` for this ask, verifies by a validator that
    holds the presented context alone and the presented certificates (the
    hierarchical schema and certificate validity checked), signed by a key
    of `J`. Else no answer: a forgery, or a broken enrollment the joiner's
    own check (§19.3, step 2) reports.
-7. **The proof is right** (§19.6), for that key and its public key's
-   digest. Else the wrong try is counted, the count made durable before
-   the answer; at `Tries` the device signs the closing mark, durable before
-   the answer, and answers `Closed`; below, `WrongProof { left }`, the
-   wrong tries left before it closes.
-8. **The asker's namespace is no other's**: not the inviter's own, not
-   under or over it, a prefix of `J`, and not a namespace this device
-   already trusts under another anchor. Else `Conflict` (`FixLocal`).
-9. **Not used by another key**: a use mark naming another key or digest is
-   `Used`. Unused, the device signs the use mark naming this key and
-   digest and answers only once it is durable; used by this key, it
-   answers again.
+6. **Not used by another key**: a use mark — or a use under way that a
+   stop interrupted — naming another key or digest is `Used`; nothing is
+   counted. Used by this key, it answers the acceptance it kept for the
+   use, and does nothing else: no step below runs again, no anchor is
+   adopted and no members record is signed — a namespace a later members
+   record removed is never added back by its code.
+7. **Not expired**: its expiry is after this device's clock now. Else
+   `Expired`.
+8. **The asker's tries are not spent**: fewer wrong tries of this key
+   counted than the offer's `Tries`. Else `Closed`.
+9. **The proof is right** (§19.6), for that key and its public key's
+   digest. Else the wrong try is counted against the key, and toward the
+   overall cap once the pause after the last one counted there has passed
+   (`Config::intro.backoff`, 1 s by default, doubled by each counted, by
+   this device's clock); both made durable before the answer. At the
+   overall cap the device signs the closing mark, durable before the
+   answer, and answers `Closed`; at the key's `Tries`, `Closed`; below,
+   `WrongProof { left }`, the key's wrong tries left.
+10. **The asker's namespace is no other's**: a prefix of `J`; not the
+    root; not one the policy refuses — fewer components than
+    `Config::intro.min_components` (1 by default: `/alice` is a person's
+    namespace, the root never), equal to, under or over a name of
+    `Config::intro.reserved` (by default `/localhost`, `/localhop`: scopes,
+    never a person's), or equal to or over a name of
+    `Config::intro.shared` (by default `/user`: its `/user/<hash>` names
+    are people's, so `/user/<hash>` is fine and `/user` is not); not the
+    inviter's own nor under or over it; not under or over any namespace
+    this device trusts; and not one it trusts under another anchor. The
+    same namespace under the same anchor is a party it knows already, and
+    is not refused. Else `Conflict` (`FixLocal`).
 
-Then it has its host adopt the asker's anchor (an inline anchor link of
-the presented context), takes the presented certificates into its
-validator, and signs the folder's next members record adding the asker's
-namespace as a writer (a writer's role) and as a reader (when the folder is
-sealed), unless the record in force already admits it so (`share_folder`,
-§6.1). If either fails, no answer: the joiner's retry, same key, comes
-back through step 9 and runs both again. The acceptance names the offer,
-the asker's key and digest, the folder, the role, the inviter's
-credentials and the inviter's proof packet, and carries the answer proof.
+Then the use. The device notes durably in its store the key the use is
+for; has its host adopt the asker's anchor (an inline anchor link of the
+presented context); takes into its validator the certificates on the
+verified chain from the asker's key to its anchor, named under the asker's
+namespace, and no other presented certificate; and signs the folder's next
+members record adding the asker's namespace as a writer (a writer's role)
+and as a reader (when the folder is sealed), unless the record in force
+already admits it so (`share_folder`, §6.1). If the adoption or the record
+fails, it drops the note durably — the offer is not spent — and gives no
+answer; the joiner's retry is judged again. Else it keeps the acceptance
+in its store and signs the use mark naming the key and digest, and answers
+only once both are durable. A stop after the note and before the mark
+leaves the offer to that key: its retry runs the use again (step 6 lets no
+other key in). The acceptance names the offer, the asker's key and digest,
+the folder, the role, the inviter's credentials and the inviter's proof
+packet, and carries the answer proof.
 
 ### 19.5 Refusals
 
@@ -3974,9 +4048,10 @@ credentials and the inviter's proof packet, and carries the answer proof.
 | `Unknown` | the offering device holds no such offer | `AskOwner` (a new code) | no |
 | `Used` | another key joined with this offer | `AskOwner` | no |
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
-| `Closed` | its wrong tries are spent: refused for good, even to the right secret | `AskOwner` | no |
-| `WrongProof { left }` | the proof of the secret is wrong; counted | `FixRequest` (check the code) | no |
-| `Conflict` | the asker's namespace overlaps the inviter's, or one the inviter trusts under another anchor | `FixLocal` | no |
+| `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed | `AskOwner` | no |
+| `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
+| `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10) | `FixLocal` | no |
+| `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the
@@ -4001,26 +4076,47 @@ X25519-to-ChaCha20-Poly1305 wrap.
 
 - **Code theft.** The code is a bearer secret until used: whoever presents
   it first, within its expiry, joins with its role. One use binds it to one
-  key (step 9); the owner sees who joined in the folder's members record
-  and removes them as any member (§6). Keep expiries short.
+  key (step 6); the owner sees who joined in the folder's members record
+  and removes them as any member (§6). The removal lasts: the folder record
+  removing a namespace closes every offer a key under it used (or was
+  using), and a used offer's user asking again — a fresh ask, before or
+  after a restart — is answered the acceptance kept for its use and never
+  admitted again (step 6). `close_offer` closes an offer at any time. Keep
+  expiries short.
 - **Replay.** An ask replayed by anyone gets the answer kept for it: bound
   to the asker's key and digest, it admits only the asker's namespace,
   which the record already admits; it shows the replayer the folder's name,
   the role and the inviter's public credentials (the answer is not sealed).
   A replay after the inviter's device dropped the kept answer is judged
-  again: at worst it counts as a wrong try again (when it was one), closing
-  the offer sooner.
-- **Forged asks.** An ask without the secret fails step 7 and is counted;
+  again: a used offer answers its user's kept acceptance (admitting
+  nothing) and anyone else `Used`, counting nothing; an unused one counts a
+  wrong try again against the replayed key (when it was one).
+- **Forged asks.** An ask without the secret fails step 9 and is counted;
   it cannot be turned into another key's membership: the proof binds the
   offer, the key, its digest and the nonce. One without valid credentials
   costs one signature check and gets no answer.
 - **Offline guessing.** The offer and its commitment are public; the
   secret has 128 bits, so neither the commitment nor an observed proof can
   be searched for it.
-- **Tries brute force.** Online guesses are bounded by `Tries`, counted
-  durably across restarts; past them the offer closes for good, even to the
-  right secret. Anyone who knows the offer's name can thus close it — a
-  denial, never an admission; the owner makes a new code.
+- **Offer names are public.** An offer is an entry of the offering
+  device's log: served to anyone who asks for it by name, and listed in its
+  summaries. Anyone can thus ask with it.
+- **Tries brute force.** Wrong tries are counted durably, across restarts,
+  per asker key: past the offer's `Tries` it is closed to that key for good,
+  even to the right secret. A stranger spends only its own tries — it
+  cannot close an offer meant for someone else — and a used offer counts no
+  tries at all. Anyone can make new keys, so all askers' wrong tries are
+  bounded too (`Config::intro.wrong_tries_max`), counted with a backoff
+  that doubles after each (`Config::intro.backoff`): at the cap the offer
+  closes for everyone, a denial, never an admission, and reaching it takes
+  strangers about `backoff` · 2^`wrong_tries_max` (some 18 hours by
+  default), past any short expiry. Online guessing gains nothing: each
+  guess is one in 2^128.
+- **A crowd of asks.** Each ask costs an unwrap, an AEAD open and a
+  signature check before it is judged; a few are opened at once, and past
+  `Config::intro.asks_queued` held an ask gets no answer at once, so a
+  crowd costs bounded work and memory and delays honest asks only until it
+  ebbs.
 - **Inviter impersonation.** An acceptance must prove the secret and be
   signed by the offering device under the anchor whose fingerprint the code
   carries (128 bits of it in the words form); a party that served a
@@ -4030,17 +4126,28 @@ X25519-to-ChaCha20-Poly1305 wrap.
   is not authenticated: a forged one denies, never admits, and an on-path
   party can deny anyway.
 - **Joiner impersonation.** The asker's key must chain to the anchor it
-  presents, and a namespace already trusted under another anchor, or one
-  overlapping the inviter's, is refused (`Conflict`): a joiner cannot speak
-  for a namespace the inviter knows, nor shadow names of the inviter's own.
-  A joiner can claim any namespace nobody the inviter trusts holds — that
-  is what a stranger is; the owner sees which one joined.
+  presents, and a namespace already trusted under another anchor, one
+  under or over any namespace the inviter trusts or its own, the root, or
+  one the policy refuses is refused (`Conflict`): a joiner cannot speak for
+  a namespace the inviter knows, take over a name under one (a device name
+  of a person the inviter trusts, whose validation would then pick the
+  joiner's longer context), become the trust root over names it does not
+  hold (`/com`, the shared `/user`), nor shadow names of the inviter's own.
+  A joiner can claim any namespace that overlaps none the inviter trusts —
+  that is what a stranger is; the owner sees which one joined.
+- **Inviter impersonation of a namespace the joiner trusts.** A code is
+  made by anyone. The joiner judges the inviter's namespace as the inviter
+  judges the joiner's (§19.3 step 4) before it adopts anything, so a
+  stranger's code cannot replace the anchor of a namespace the joiner
+  trusts, nor claim one under or over it (`InviterConflict`).
 - **Reuse across the inviter's devices.** An offer is answered only by the
   device that made it, which alone holds its proof key; another device of
   the inviter answers `Unknown`. The use mark is in that device's log, so
   every device of the inviter sees the offer used.
-- **Clock.** Expiry is judged by the offering device's clock alone: a slow
-  one keeps an offer open longer, a fast one closes it early; no other
+- **Clock.** Expiry, and the overall cap's backoff, are judged by the
+  offering device's clock alone: a slow one keeps an offer open longer and
+  counts toward the cap more slowly, a fast one closes it early and counts
+  sooner; no other
   decision reads a clock, and certificate validity in the credentials is
   checked as a live exchange (§8.5).
 - **Unauthenticated hints.** Relay hints in the code, or the joiner's own
