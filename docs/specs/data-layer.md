@@ -1048,8 +1048,9 @@ and, once the rule changed, where the current rule starts.
   force admits (and, as for every entry, the trust schema admits under the
   writer's own name): a key under a writer prefix is admitted; else a key
   under the prefix of one of the record's cuts is admitted exactly when the
-  cut lists that version, and refused otherwise, `OutsideCut`, whatever
-  date or seq it claims; any other key is refused `NotMember`. Versions that
+  cut lists that version, with the bytes it binds there (§8), and refused
+  otherwise, `OutsideCut`, whatever date or seq it claims; any other key is
+  refused `NotMember`. Versions that
   arrive before any members record wait for one. Admission depends on the
   record in force only, so every change of it re-checks everything held of
   `C` (§8).
@@ -1066,8 +1067,13 @@ and, once the rule changed, where the current rule starts.
   walk; versions that only a device it could not reach holds fall outside
   it. The record is never held off for a device that stays away: a removed
   writer cannot delay its own removal (it would stay a writer meanwhile).
-  Cuts carry over to later revisions; a revision whose writers cover a
-  cut's prefix again
+  The signer also binds every version the cut keeps to its bytes: it
+  builds the record's cut manifest, listing the implicit digest of each,
+  and the cut names it (`CutBytes`, §8); a kept version whose bytes it
+  does not know is left out, as one a summary only listed.
+  Cuts carry over to later revisions, bound again by each new record's own
+  manifest from the digests the manifests carried over list (§8); a
+  revision whose writers cover a cut's prefix again
   drops that cut, and the prefix's keys are admitted again (all of their
   versions, the owner having written them back in).
 - **Readers.** The audience is exactly the readers listed — people (a
@@ -1125,7 +1131,9 @@ seal epoch, and so one grant per reader, for all of them.
     readers count only as far as every folder's readers admit them.
   - *Cuts:* every level's cuts apply. A key any level refuses is refused:
     `OutsideCut` when a level's cut refuses it, else `NotMember`. A folder
-    cut accepts, for `C`, exactly what it lists under `C` (below).
+    cut accepts, for `C`, exactly what it lists under `C` (below), with the
+    bytes it binds; where cuts of several levels keep one version, every
+    level's manifests bind it, and all must list the same bytes (§8).
   - *Rule and `Since`:* the own record's when `C` has one, else the
     nearest folder record's.
 
@@ -1149,7 +1157,8 @@ seal epoch, and so one grant per reader, for all of them.
   another collection — a new name, so no same-name equivocation — is
   outside the cut there, at every reader. Before signing it looks at `F`,
   so every collection under `F` is followed whole, and walks the removed
-  writers' devices as §6 says; the cut covers what it holds then.
+  writers' devices as §6 says; the cut covers what it holds then, and its
+  manifest binds what it keeps in every collection to its bytes (§8).
 - **A collection's first own record.** `share(C, …)` of a collection that
   so far had none — it was written and read under the folder's — starts
   from the effective record, as any record starts from the record in
@@ -1157,9 +1166,11 @@ seal epoch, and so one grant per reader, for all of them.
   change or a seal of a collection the folder left unsealed sets `Since`
   (else the folder's `Since` carries over), a writer prefix the folder
   admitted that the record drops gets its cut, and the folder's cuts carry
-  over. A first record listing readers starts an epoch of its own (its key
-  check is bound to `C`, §9). So a collection taking its own record keeps
-  its history readable and its writers' past admitted, as a revision would.
+  over, bound by the record's own manifest to the bytes the folder's
+  manifests list (§8). A first record listing readers starts an epoch of
+  its own (its key check is bound to `C`, §9). So a collection taking its
+  own record keeps its history readable and its writers' past admitted, as
+  a revision would.
 - **Widening refused.** `share(C, …)` of a collection under a folder whose
   record is in force answers `BadRequest`, saying what it would widen and
   to share the folder instead (next step `FixRequest`), when it lists a
@@ -1361,6 +1372,29 @@ revoke another namespace's key — and what only its unreachable devices
 hold falls outside the cut, refused `OutsideCut` everywhere: the price of
 staying away while being removed.
 
+**Other bytes at a kept seq.** A removed writer — or a copy of its device,
+key and storage — can sign other bytes at a name its cut keeps: the same
+name as the version the owner held, so no reader can tell them apart by
+name, and an equivocation only a device holding both sees. Were a cut to
+list seqs only, a reader that never held the honest version would take
+whichever bytes reached it first as inside the cut, for good, while the
+owner reads the honest ones: the removed writer would choose what late
+readers read. A removal cut therefore binds every version it keeps to the
+implicit digest of the packet the owner held (§8). Other bytes at that
+name are refused `OutsideCut` at every reader, whenever they arrive, and
+let go, so that the honest bytes — fetched by full name, the only ones that
+answer it, whoever serves them — are taken once any device holding them
+answers; a reader that applied other bytes before it held the cut
+withdraws them on the re-check (§8). The manifest is self-certifying: the
+signed record names its root by digest, each node its children, so any
+holder or cache may serve it and no other packet answers for it. A
+withheld manifest — the owner's devices, and every device that took it,
+unreachable — makes the versions the cut keeps wait at a reader that does
+not hold it: stale, never accepted unbound. A cut signed before cuts bound
+bytes keeps nothing at an updated reader until the owner's next record
+binds it again, from the bytes the owner holds: a seq alone is never
+trusted.
+
 **Release of merge pieces and permanent blocking.** In a merge collection
 every later version waits for an earlier one's pieces (§13.1), so pieces
 lost for good would block the collection for every reader lacking them.
@@ -1543,6 +1577,48 @@ key, signed with it by the namespace's root (§8.1).
   The list is what the cut's signer held verified: an entry a summary only
   listed is not in it; and, for a revocation cut, only what it first
   verified before the key was lost (§8.1).
+- **A removal cut binds its bytes.** A seq names a version, but a removed
+  writer can sign other bytes at the same name (§6.2). So a removal cut
+  that keeps versions carries `CutBytes` (§16.2): the full name, ending in
+  its implicit digest, of the root of a **cut manifest** listing, under
+  each kept version's log prefix `<D>/32=log/<C>`, its seq and the
+  implicit digest of its packet. The manifest has the form of a revocation
+  cut's (trust-context.md §3.3.12: self-certifying DigestSha256 packets,
+  each node naming its children by full name), its packets named
+  `<R>/32=cut/seg=<i>`, `R` the members record's log entry name, the root
+  `seg=0` (§16.1). A cut that keeps nothing carries no `CutBytes`.
+  - *Signing.* A record's cuts share one manifest, which its signer builds
+    as it signs: the digest of each kept version is the one a manifest
+    binding it already lists (a cut carried over or merged), else that of
+    the packet the signer holds verified; a kept version whose bytes it
+    knows neither way is left out of the cut, as an entry a summary only
+    listed is. While a manifest packet of a cut it carries over is not held
+    here, signing answers `NotReady` (next step `RetryLater`) and signs
+    nothing; `share` first fetches those packets, by full name. The
+    manifest's packets are stored with the record and served as its log
+    entries are, once durable (§4.2). A record's cuts keep at most 262,144
+    versions; beyond, `share` answers `BadRequest` (next step
+    `FixRequest`: write the removed writers back in, or share the
+    collections apart).
+  - *Reading.* A version at a seq a removal cut keeps is inside it only
+    with the bytes every manifest binding its key in its collection lists
+    at its name — one per record whose cut keeps it, where concurrent
+    records merge (§6) or a folder's levels meet (§6.1). Other bytes, or a
+    manifest listing none there, put it outside, `OutsideCut`, when it
+    arrives and on every re-check. Such a version is not kept refused
+    against its name: it is let go (withdrawn when it was applied), and the
+    listed bytes are fetched by full name, digest included, from any
+    device, asked again later until they come; `get` of the version
+    fetches it so, and answers `Refused` (`OutsideCut`) while only other
+    bytes have come. While a manifest packet on the path to its entry is
+    not held, the version waits, neither applied nor refused, and the
+    packet is fetched by full name; a packet of other bytes under that name
+    is never taken for it.
+  - *Unbound cuts.* A removal cut keeping versions without `CutBytes` — one
+    signed before cuts bound bytes — binds them to no bytes, and a reader
+    refuses every version it keeps, `OutsideCut`: nothing is accepted
+    unbound. The owner's next record binds them again from the bytes it
+    holds.
 - A cut replaces clock-based signing-time validity: no date in a version,
   and no certificate's validity period, decides whether it is inside
   (§8.5).
@@ -2894,6 +2970,7 @@ both from the NDN naming conventions.
 | hold, lease, prune record | `<D>/32=log/<C>/seq=<n>` | device key |
 | chunk of version `V` | `<V>/seg=<i>` | DigestSha256 |
 | manifest node of `V` | `<V>/32=manifest/seg=<k>`, Content `Digest*` | DigestSha256 |
+| cut manifest node of members record `R` (§8) | `<R>/32=cut/seg=<i>`, the root `seg=0`, Content `CutManifestNode` (trust-context.md §3.3.12), FreshnessPeriod 1 h | DigestSha256 |
 | hold ask (answer: the lease's packet) | `<H>/32=hold/<HoldAsk TLV>` | DigestSha256 |
 | held packet (answer: the packet) | `<H>/32=held/<Name TLV>` (also a joiner's fetch of an offer from its device, §19.3) | DigestSha256 |
 | audit ask and answer | `<H>/32=audit/<AuditAsk TLV>`, Content `AuditAnswer`, FreshnessPeriod 0 | the holder's device key |
@@ -2933,6 +3010,11 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Entry.** The last component is `seg=<i>` (a SegmentNameComponent), the
   next-to-last `32=entry`, and what precedes them is a log entry name with a
   collection: the block.
+- **Cut manifest.** The last component is `seg=<i>`, the next-to-last
+  `32=cut`, and what precedes them is a log entry name with a collection:
+  the members record whose cuts the manifest binds. A reader fetches its
+  packets only by full name, as `CutBytes` names the root and each node
+  its children (§8).
 - **Range.** `32=range` is the next-to-last component and the collection
   name precedes it; the last is one GenericNameComponent whose value is one
   `SeqRange` (low ≤ high) or one `TimeRange` (from < to) TLV, nothing else.
@@ -3010,7 +3092,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0566 | PagePath | octets, one bucket each (pages only) |
 | 0x0568 | Writer | Name (the writer's key) |
 | 0x056A | Cuts | Cut*, by prefix |
-| 0x056C | Cut | Name (removed writer prefix), then — in a collection's record — per key it keeps versions of in the collection, by key: Writer, Entries (exactly those seqs, §8); or — in a folder's record — CutIn*, by collection (§6.1) |
+| 0x056C | Cut | Name (removed writer prefix), CutBytes* (§8), then — in a collection's record — per key it keeps versions of in the collection, by key: Writer, Entries (exactly those seqs, §8); or — in a folder's record — CutIn*, by collection (§6.1); a signer gives a cut that keeps versions its CutBytes, one that keeps none none (a cut keeping versions without them binds them to no bytes, §8) |
 | 0x056E | SealEpoch | Name (the device that signed the record starting it), Seq (that record's seq) |
 | 0x0570 | RuleSince | Frontier: what the owner had applied when the rule changed, or when it sealed the collection |
 | 0x0572 | Sealed | SealEpoch, Ciphertext |
@@ -3049,6 +3131,7 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0555 | Folder | empty; in a MembersRecord right after its Name: the record governs the folder Name and every collection strictly under it (§6.1) |
 | 0x0557 | Group | Seq (the group's id: the seq of its first version), GroupCount; in a VersionRecord right after Dated (§5.5) |
 | 0x0559 | GroupCount | NonNegativeInteger 1–65,536 (`GROUP_MAX`): the number of versions in the group |
+| 0x055B | CutBytes | Name: the full name, ending in its ImplicitSha256DigestComponent, of the root of a cut manifest (`<R>/32=cut/seg=0`, §16.1; trust-context.md §3.3.12) listing, under `<D>/32=log/<C>`, the seq and implicit digest of every version the cut keeps; in a Cut right after its Name, ascending, once each; never in a cut that keeps nothing (§8) |
 | 0x055F | CutIn | Name (a collection strictly under the folder), then per key it keeps versions of in that collection, by key: Writer, Entries (exactly those seqs); in a folder record's Cut only, once per collection (§6.1, §8) |
 | 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
 | 0x0563 | IntroUsed | Name (the offer), then Writer and Digest (the asker key it was used by and its public key's digest) when used, neither when closed; a log record (§19.1) |
@@ -3093,6 +3176,13 @@ withdraw every version it kept — wrong, not stale; one reading its seqs
 as valid in every collection would admit a removed writer's re-signed
 seqs.
 
+`CutBytes` is odd for the same reason. A reader passing over it would take
+a cut's kept seqs as accepting whatever bytes arrive at them: a removed
+writer's other bytes at a kept name, taken for good by a reader that never
+held the honest ones (§6.2) — wrong, not stale. Refusing it, an older
+reader drops every record whose cut keeps versions, and holds the record
+before it in force (§17).
+
 The introduction's numbers (§19) are odd for the same reasons: a reader
 passing over `IntroOffer` or `IntroUsed` would take a record of the log
 for nothing and could not say whether an offer is used; one passing over
@@ -3121,7 +3211,9 @@ it is the trust context's `RevocationCut` (`0x0428`, with `CutRange`
 [trust-context.md](trust-context.md) §3.3.12), signed by the root with the
 revocation it belongs to, so it reaches every node the revocation reaches.
 The layer's own names are what its ranges list (§8.1, §16.1). The
-slice-2 `Cut` (0x056C) stays the members record's removal cut.
+slice-2 `Cut` (0x056C) stays the members record's removal cut; the
+manifest its `CutBytes` names reuses the revocation cut's manifest form
+(trust-context.md §3.3.12), named under the record (§16.1).
 
 ### 16.3 Why these encodings
 
@@ -3308,6 +3400,7 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Disk acknowledges a flush it did not make | Residual: a power loss can then make an honest device equivocate, and readers report it as any equivocation. | §4.2 |
 | Root compromised | The recovery's versions carry every cut but orphans and cuts naming entries outside their key's log, may cut the keys they revoke, and, on the operator's confirmation, the new CA certifies a cut key again only for the public key its cut's digest names, so its in-cut versions keep a chain and nothing else gains one. | §8.4 |
 | Node that predates cuts | Refuses every version of a revoked key, the in-cut ones too: safe, and fixed by updating. A node that knows cuts but predates manifests, key digests and DataRequiresCut keeps those residuals until updated. | trust-context.md §3.3.12 |
+| Node that predates cut bytes | Cannot decode a members record whose cut keeps versions (`CutBytes` is critical), so it holds the record before it in force: a writer removed since stays a writer there until the node is updated. | §8, §16.2 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
 | Holder withholds a range's blocks | A time search probes a window at once and stops a round none of whose probes answers; the read answers within its bound, listing what it did not reach `missing`. | invariant 4, §5.4 |
@@ -3329,6 +3422,9 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Own device left out | An audience that does not list it leaves it out of the epoch and every later one; no device holds a secret that yields future keys. | §6, §9 |
 | Removed writer fills a gap | A new entry at a seq below what its cut kept is refused: the cut lists exactly the versions kept. | §8 |
 | Removed writer re-signs a kept seq in another collection | Refused at every reader: a cut accepts each seq only in the collection it lists it under, a folder's cut per collection under the folder. | §6.1, §8 |
+| Removed writer signs other bytes at a kept seq | Refused `OutsideCut` at every reader, whenever they arrive: the cut binds each version it keeps to the digest of the packet the owner held. A reader that never held the honest version lets the other bytes go and takes the honest ones, fetched by full name, once a device holding them answers; one that applied the other bytes first withdraws them. | §6.2, §8 |
+| Removal cut's manifest withheld | The versions the cut keeps wait at a reader not holding a manifest packet, neither applied nor refused, the packet asked for by full name from any device; never accepted unbound. An owner device signing a record that carries the cut over answers `NotReady` until it holds the packets. | §6.2, §8 |
+| Removal cut signed before cuts bound bytes | An updated reader refuses every version it keeps, `OutsideCut`, until the owner's next record binds them again from the bytes it holds. | §8 |
 | Wrong key granted | Refused against the epoch's key check; the right key from any device is taken. | §9 |
 | Writer behind on a seal | Its unsealed version is refused `Unsealed`; its later sealed versions do not wait for it. | §5.2, §9 |
 | Relay or repository of another person | Carries ciphertext and grants wrapped to one device each; reads no payload and no key, and sees the metadata §9 lists. | §9 |
@@ -3413,7 +3509,23 @@ collection moves to a new epoch), r3 (the owner lists one of her devices
 alone; her other device opens nothing written after) and r4 (one of the
 owner's devices adds Carol while another, offline, removes Bob, both from
 one record; Carol then writes and reads everywhere, Bob's later edits are
-refused and he opens nothing written after).
+refused and he opens nothing written after). r5, added with removal cuts
+binding their bytes (§8, §6.2), is a copy of Bob's phone, key and storage,
+signing other bytes at the name of the plan Bob wrote into Alice's trip
+folder, which Alice holds; Alice removes Bob, her folder cut keeping the
+plan's seq. Carol, a reader away all along who never held the plan, comes
+back while Bob and Alice are away and only the copy answers for Bob's
+phone, so she meets the copy's bytes before the folder's record; once
+Alice is back with the record, Carol shows no other bytes at the plan's
+name and `get` of it answers `Refused` (`OutsideCut`), and once Bob is
+back she reads his honest plan, fetched by full name, as Alice does,
+neither listing the copy's bytes. Its features
+are `Merge`, `WritersAcrossPrefixes`, `RemovalCut`, `FolderMembers` and
+`CutManifest`. `ndn-data`'s unit tests check that `CutBytes` round-trips,
+that one out of place, repeated, not a full name or in a cut keeping
+nothing is refused, and that a kept version is inside a cut only with the
+bytes every manifest binding it lists, outside under an unbound cut, and
+waiting while a manifest packet is not held.
 
 The slice-3 cases are c5 (a photo the repo leased is pruned: no lease
 outlives keep, readers report it pruned), h1 (a photo of hundreds of pieces
