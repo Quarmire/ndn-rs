@@ -26,7 +26,15 @@ Whatever the form, a context is adopted only if:
 3. that anchor's fingerprint equals the expected fingerprint from the link;
 4. its version is not below the version the link names (a fetched older
    context is refused as a downgrade), and not below a version the node
-   already holds (anti-rollback).
+   already holds (anti-rollback);
+5. when the node already holds the namespace, it follows from the held
+   version: signed by an anchor of the held version and strictly newer (the
+   [continuity rule](./context-updates.md#the-continuity-rule)). A link
+   never replaces a held namespace's anchors — anyone can sign a `/<ns>`
+   context listing their own root and hand out a link with its
+   fingerprint. The held version again changes nothing; a newer one that
+   does not follow is refused, and `ndn-fwd context refresh <ns>` follows
+   the owner's versions one by one, a recovery's included.
 
 ## The forwarder problem, and expectations
 

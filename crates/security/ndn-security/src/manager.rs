@@ -1388,7 +1388,7 @@ mod tests {
             .with_version(1)
             .with_ca_endpoint(ns.append("CA"));
         ctx.add_anchor(anchor);
-        assert!(mgr.keyring().adopt(Arc::new(ctx)));
+        mgr.keyring().adopt(Arc::new(ctx)).unwrap();
     }
 
     /// The invariants of choosing a signer by name: a device that owns /a
@@ -1413,13 +1413,15 @@ mod tests {
         other.generate_ed25519(b_root.clone()).unwrap();
         hold(&other, "/b", &b_root);
         mgr.keyring()
-            .adopt(other.keyring().contexts().into_iter().next().unwrap());
+            .adopt(other.keyring().contexts().into_iter().next().unwrap())
+            .unwrap();
         // /c's root is elsewhere; only its context is held.
         let c = SecurityManager::new();
         c.generate_ed25519(n("/c/KEY/root")).unwrap();
         hold(&c, "/c", &n("/c/KEY/root"));
         mgr.keyring()
-            .adopt(c.keyring().contexts().into_iter().next().unwrap());
+            .adopt(c.keyring().contexts().into_iter().next().unwrap())
+            .unwrap();
 
         let key_for = |name: &str| mgr.signer_for(&n(name)).map(|s| s.key_name().clone());
         assert_eq!(key_for("/a/admin/desk/notes").unwrap(), a_dev);

@@ -227,7 +227,7 @@ mod tests {
         let ctx = edit(SignedTrustContext::hierarchical(n("/home/bob")).with_version(1));
         assert!(ctx.add_anchor(anchor));
         let keyring = Arc::new(Keyring::new());
-        assert!(keyring.adopt(Arc::new(ctx)));
+        keyring.adopt(Arc::new(ctx)).unwrap();
         let cache = Arc::new(CertCache::new());
         cache.insert(leaf);
         (Validator::with_keyring(keyring, cache, None, 5), phone)

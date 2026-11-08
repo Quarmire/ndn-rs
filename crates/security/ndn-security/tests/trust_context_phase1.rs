@@ -211,7 +211,8 @@ async fn ctx02b_skeleton_key_no_sign_outside_subtree() {
 // ── Phase 2: SignedTrustContext wire object + versioning ──────────────────────────
 
 /// CTX.07 (anti-rollback): the keyring refuses a strictly older context
-/// version for the same namespace; a newer or equal version is accepted.
+/// version for the same namespace; a newer version replaces the held one
+/// only as an update checked against it, never by plain adoption.
 #[tokio::test]
 async fn ctx07_context_version_monotonic() {
     let mgr = SecurityManager::new();
@@ -233,10 +234,16 @@ async fn ctx07_context_version_monotonic() {
     );
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
 
-    // A newer version is accepted.
+    // A newer version is no plain adoption: it replaces the held one only as
+    // an update checked against it (the continuity rule).
     let v3 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(3));
     v3.add_anchor(anchor);
-    assert!(validator.adopt_context(v3), "newer version must be adopted");
+    assert!(
+        !validator.adopt_context(Arc::clone(&v3)),
+        "a newer version must not replace the held one by plain adoption"
+    );
+    let held = validator.keyring().held(&n("/home/bob")).unwrap();
+    validator.keyring().adopt_update_from(&held, v3).unwrap();
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(3));
 }
 

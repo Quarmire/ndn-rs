@@ -51,7 +51,9 @@ fn ctx16_clockless_monotonic_version_and_single_use() {
     assert!(v.adopt_context(mk(2)), "v2 adopted");
     assert!(!v.adopt_context(mk(1)), "older v1 refused with no clock");
     assert_eq!(v.keyring().version_of(&n("/home/bob")), Some(2));
-    assert!(v.adopt_context(mk(3)), "newer v3 adopted");
+    v.keyring()
+        .adopt_update(mk(3))
+        .expect("newer v3 adopted as an update");
 
     // …and single-use tokens (no TTL set ⇒ no clock dependence).
     let store = TokenStore::new();

@@ -71,7 +71,7 @@ pub use confidentiality::{
 pub use cut_manifest::{BuiltManifest, CutManifestError, CutManifests, ManifestLookup};
 pub use error::TrustError;
 pub use keychain::{KeyAlgorithm, KeyChain};
-pub use keyring::Keyring;
+pub use keyring::{AdoptRefusal, Keyring};
 pub use lvs::{LvsError, LvsModel, LvsUserFn, UserFnRegistry};
 pub use lvs_compile::{
     LvsCompileError, compile as compile_lvs, compile_to_binary as compile_lvs_to_binary,

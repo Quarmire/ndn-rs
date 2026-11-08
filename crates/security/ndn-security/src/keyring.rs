@@ -27,6 +27,49 @@ type RevocationListener = Arc<dyn Fn(&Arc<SignedTrustContext>, &[Name]) + Send +
 /// See [`Keyring::on_adoption`].
 type AdoptionListener = Arc<dyn Fn(&Arc<SignedTrustContext>) + Send + Sync>;
 
+/// Why [`Keyring::adopt`] did not take a context: its namespace is held,
+/// and `adopt` changes a held namespace never. A newer version of a held
+/// namespace is taken only once checked under the held version's anchors
+/// (the continuity rule — `ndn_cert::open_context_update`, or a walk
+/// through the versions in between for a recovery) and then adopted with
+/// [`Keyring::adopt_update_from`] over the held context the refusal carries.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AdoptRefusal {
+    /// It is older than the held version: a rollback.
+    #[error(
+        "{namespace} v{offered} is older than the held v{held}; only a newer version signed by \
+         a held anchor replaces it",
+        namespace = .held_ctx.namespace(),
+        held = .held_ctx.version()
+    )]
+    Older {
+        held_ctx: Arc<SignedTrustContext>,
+        offered: u64,
+    },
+    /// It carries the held version number with other content: a fork.
+    #[error(
+        "{namespace} v{version} differs from the held v{version} (a fork); only a newer version \
+         signed by a held anchor replaces it",
+        namespace = .held_ctx.namespace(),
+        version = .held_ctx.version()
+    )]
+    Fork { held_ctx: Arc<SignedTrustContext> },
+    /// It is newer than the held version: taken only once checked under
+    /// the held version's anchors, then adopted with
+    /// [`Keyring::adopt_update_from`] over `held_ctx`.
+    #[error(
+        "{namespace} is already trusted (v{held} held): v{offered} replaces it only once it is \
+         checked under the held version's anchors (a refresh of {namespace} does that, a \
+         recovery included)",
+        namespace = .held_ctx.namespace(),
+        held = .held_ctx.version()
+    )]
+    Held {
+        held_ctx: Arc<SignedTrustContext>,
+        offered: u64,
+    },
+}
+
 /// A node's set of adopted trust contexts plus an ambient fallback context.
 ///
 /// The `ambient` context (namespace `/`) backs the flat-anchor / single-schema
@@ -127,30 +170,34 @@ impl Keyring {
         &self.ambient
     }
 
-    /// Adopt a context into the keyring, keyed by its namespace.
+    /// Adopt a context of a namespace not held, keyed by its namespace.
     ///
-    /// Anti-rollback: a context is accepted only if its `version` is **≥** the
-    /// version currently held for the same namespace (a strictly older version
-    /// is refused, so an attacker cannot serve a stale context to re-introduce
-    /// a weakened schema or a revoked anchor). An *equal* version is accepted
-    /// only when it encodes to the same content as the held one, and then
-    /// changes nothing (re-adopting what is held); a differing context under
-    /// the held version number — a fork — is refused. Returns `true` if
-    /// adopted or already held.
-    pub fn adopt(&self, ctx: Arc<SignedTrustContext>) -> bool {
+    /// A held namespace is never changed here, whoever signed the context:
+    /// re-adopting what is held (the same version, encoding to the same
+    /// content) is a no-op `Ok`; anything else is refused with the held
+    /// context ([`AdoptRefusal`]) — older (a rollback), the held version
+    /// number with other content (a fork), or newer, which replaces the
+    /// held one only through [`adopt_update_from`](Self::adopt_update_from)
+    /// once checked under the held version's anchors. Atomic against
+    /// concurrent adoptions of the same namespace.
+    pub fn adopt(&self, ctx: Arc<SignedTrustContext>) -> Result<(), AdoptRefusal> {
         let ns = ctx.namespace().clone();
         let revoked = match self.contexts.entry(ns) {
-            dashmap::mapref::entry::Entry::Occupied(mut held) => {
-                if ctx.version() < held.get().version() {
-                    return false;
+            dashmap::mapref::entry::Entry::Occupied(held) => {
+                let held = held.get();
+                if Arc::ptr_eq(held, &ctx)
+                    || (ctx.version() == held.version()
+                        && held.encode_content() == ctx.encode_content())
+                {
+                    return Ok(());
                 }
-                if ctx.version() == held.get().version() {
-                    return Arc::ptr_eq(held.get(), &ctx)
-                        || held.get().encode_content() == ctx.encode_content();
-                }
-                let revoked = newly_refused(Some(held.get().as_ref()), &ctx);
-                held.insert(Arc::clone(&ctx));
-                revoked
+                let held_ctx = Arc::clone(held);
+                let offered = ctx.version();
+                return Err(match offered.cmp(&held_ctx.version()) {
+                    std::cmp::Ordering::Less => AdoptRefusal::Older { held_ctx, offered },
+                    std::cmp::Ordering::Equal => AdoptRefusal::Fork { held_ctx },
+                    std::cmp::Ordering::Greater => AdoptRefusal::Held { held_ctx, offered },
+                });
             }
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let revoked = newly_refused(None, &ctx);
@@ -160,12 +207,20 @@ impl Keyring {
         };
         self.notify_revoked(&ctx, &revoked);
         self.notify_adopted(&ctx);
-        true
+        Ok(())
+    }
+
+    /// The context held for exactly `namespace`, if any.
+    pub fn held(&self, namespace: &Name) -> Option<Arc<SignedTrustContext>> {
+        self.contexts.get(namespace).map(|c| Arc::clone(c.value()))
     }
 
     /// Replace the held context of `ctx`'s namespace with `ctx` only if
     /// `ctx` is **strictly newer** — the rule for an update, where an equal
-    /// version must not replace the held one either. Atomic against
+    /// version must not replace the held one either. The caller has checked
+    /// `ctx` under the held version's anchors (the continuity rule);
+    /// [`adopt_update_from`](Self::adopt_update_from) also makes sure the
+    /// held version is still the one checked against. Atomic against
     /// concurrent adoptions of the same namespace. `Err(Some(held))`: the
     /// held version is not older; `Err(None)`: nothing is held to update.
     pub fn adopt_update(&self, ctx: Arc<SignedTrustContext>) -> Result<(), Option<u64>> {
@@ -185,12 +240,13 @@ impl Keyring {
 
     /// Replace the held context of `ctx`'s namespace with `ctx` only if the
     /// held one is still `from` (the same `Arc`) — the version `ctx` was
-    /// checked against as an update — and `ctx` is strictly newer. Lets a
-    /// caller check an update without holding any lock (fetching it may
-    /// take many round trips) and adopt it only if nothing changed the
-    /// namespace meanwhile. Atomic against concurrent adoptions.
-    /// `Err(Some(held))`: the held context is another one (or not older);
-    /// `Err(None)`: nothing is held to update.
+    /// checked against as an update, under its anchors (the continuity
+    /// rule) — and `ctx` is strictly newer: the one way a held namespace
+    /// moves on. Lets a caller check an update without holding any lock
+    /// (fetching it may take many round trips) and adopt it only if nothing
+    /// changed the namespace meanwhile. Atomic against concurrent
+    /// adoptions. `Err(Some(held))`: the held context is another one (or
+    /// not older); `Err(None)`: nothing is held to update.
     pub fn adopt_update_from(
         &self,
         from: &Arc<SignedTrustContext>,
@@ -361,9 +417,10 @@ mod tests {
     #[test]
     fn longest_prefix_match_wins() {
         let kr = keyring();
-        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home"))));
-        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))));
-        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/work/acme"))));
+        for ns in ["/home", "/home/bob", "/work/acme"] {
+            kr.adopt(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+                .unwrap();
+        }
 
         assert_eq!(
             kr.context_for(&n("/home/bob/doc")).namespace(),
@@ -384,7 +441,8 @@ mod tests {
     #[test]
     fn forget_removes_context() {
         let kr = keyring();
-        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))));
+        kr.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))))
+            .unwrap();
         assert_eq!(kr.len(), 1);
         assert!(kr.forget(&n("/home/bob")));
         assert!(kr.is_empty());
@@ -400,7 +458,7 @@ mod tests {
         let kr = keyring();
         let ctx = |v| Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(v));
         assert_eq!(kr.adopt_update(ctx(2)), Err(None), "nothing held to update");
-        kr.adopt(ctx(2));
+        kr.adopt(ctx(2)).unwrap();
         assert_eq!(kr.adopt_update(ctx(2)), Err(Some(2)), "equal is refused");
         assert_eq!(kr.adopt_update(ctx(1)), Err(Some(2)), "older is refused");
         assert_eq!(kr.adopt_update(ctx(3)), Ok(()));
@@ -413,7 +471,7 @@ mod tests {
     fn an_update_is_adopted_only_over_the_version_it_was_checked_against() {
         let kr = keyring();
         let ctx = |v| Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(v));
-        kr.adopt(ctx(2));
+        kr.adopt(ctx(2)).unwrap();
         let checked_against = kr.contexts().pop().unwrap();
         kr.adopt_update(ctx(3)).unwrap();
         assert_eq!(kr.adopt_update_from(&checked_against, ctx(5)), Err(Some(3)));
@@ -436,8 +494,8 @@ mod tests {
     }
 
     /// Revocation listeners hear each name exactly once, when a version that
-    /// first revokes it is adopted — by either adoption path — and never for
-    /// an adoption that revokes nothing new. The revocation epoch moves with
+    /// first revokes it is adopted — by any update path — and never for an
+    /// adoption that revokes nothing new. The revocation epoch moves with
     /// them, and has already moved when a listener runs.
     #[test]
     fn listeners_hear_only_newly_revoked_names() {
@@ -453,16 +511,21 @@ mod tests {
         });
         let (k1, k2) = (n("/home/bob/member/a/KEY/1"), n("/home/bob/member/b/KEY/2"));
         let base = || SignedTrustContext::hierarchical(n("/home/bob"));
-        kr.adopt(Arc::new(base().with_version(1)));
+        kr.adopt(Arc::new(base().with_version(1))).unwrap();
         assert_eq!(kr.revocation_epoch(), 0, "nothing revoked yet");
         kr.adopt_update(Arc::new(base().with_version(2).with_revocation(k1.clone())))
             .unwrap();
-        kr.adopt(Arc::new(
-            base()
-                .with_version(3)
-                .with_revocation(k1.clone())
-                .with_revocation(k2.clone()),
-        ));
+        let held = kr.held(&n("/home/bob")).unwrap();
+        kr.adopt_update_from(
+            &held,
+            Arc::new(
+                base()
+                    .with_version(3)
+                    .with_revocation(k1.clone())
+                    .with_revocation(k2.clone()),
+            ),
+        )
+        .unwrap();
         kr.adopt_update(Arc::new(
             base()
                 .with_version(4)
@@ -481,14 +544,17 @@ mod tests {
         let kr = keyring();
         let base = || SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
         let held = Arc::new(base());
-        assert!(kr.adopt(Arc::clone(&held)));
-        assert!(kr.adopt(Arc::new(base())), "the same content again");
+        kr.adopt(Arc::clone(&held)).unwrap();
+        kr.adopt(Arc::new(base())).expect("the same content again");
         assert!(
             Arc::ptr_eq(&kr.contexts().pop().unwrap(), &held),
             "nothing replaced"
         );
         let fork = Arc::new(base().with_revocation(n("/home/bob/member/x/KEY/k")));
-        assert!(!kr.adopt(fork), "a differing v2 is a fork");
+        assert!(
+            matches!(kr.adopt(fork), Err(AdoptRefusal::Fork { .. })),
+            "a differing v2 is a fork"
+        );
         assert!(
             !kr.contexts()
                 .pop()
@@ -496,6 +562,59 @@ mod tests {
                 .is_revoked(&n("/home/bob/member/x/KEY/k"))
         );
         assert_eq!(kr.revocation_epoch(), 0);
+    }
+
+    /// `adopt` never replaces a held namespace: another party's newer
+    /// version of it (Mallory's `/carol` v1000 under her own anchor) is
+    /// refused with the held context and leaves it in force; an older one
+    /// is a rollback; re-adopting the held one is a no-op; a vacant
+    /// namespace adopts. Only the update path — a version checked under the
+    /// held anchors (Carol's v4, or a recovery's version signed by a
+    /// recovery anchor of the held one) — moves it on.
+    #[test]
+    fn adopt_never_replaces_a_held_namespace() {
+        let kr = Arc::new(keyring());
+        let adopted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&adopted);
+        kr.on_adoption(move |ctx| sink.lock().unwrap().push(ctx.version()));
+        let carol = Arc::new(SignedTrustContext::hierarchical(n("/carol")).with_version(3));
+        kr.adopt(Arc::clone(&carol))
+            .expect("a vacant namespace adopts");
+        let mallory = Arc::new(
+            SignedTrustContext::hierarchical(n("/carol"))
+                .with_version(1000)
+                .with_revocation(n("/carol/member/phone/KEY/k")),
+        );
+        match kr.adopt(mallory) {
+            Err(AdoptRefusal::Held {
+                ref held_ctx,
+                offered: 1000,
+            }) => assert!(Arc::ptr_eq(held_ctx, &carol)),
+            other => panic!("a newer version of a held namespace was not refused: {other:?}"),
+        }
+        assert!(
+            Arc::ptr_eq(&kr.held(&n("/carol")).unwrap(), &carol),
+            "a newer version of a held namespace replaced it outside the update path"
+        );
+        let older = Arc::new(SignedTrustContext::hierarchical(n("/carol")).with_version(2));
+        assert!(matches!(
+            kr.adopt(older),
+            Err(AdoptRefusal::Older { offered: 2, .. })
+        ));
+        kr.adopt(Arc::new(
+            SignedTrustContext::hierarchical(n("/carol")).with_version(3),
+        ))
+        .expect("re-adopting the held version is a no-op");
+        assert!(Arc::ptr_eq(&kr.held(&n("/carol")).unwrap(), &carol));
+        assert_eq!(
+            *adopted.lock().unwrap(),
+            [3],
+            "refusals and no-ops adopt nothing"
+        );
+
+        let v4 = Arc::new(SignedTrustContext::hierarchical(n("/carol")).with_version(4));
+        kr.adopt_update_from(&carol, Arc::clone(&v4)).unwrap();
+        assert!(Arc::ptr_eq(&kr.held(&n("/carol")).unwrap(), &v4));
     }
 
     /// A version that accepts less of a revoked key than the version it
@@ -534,7 +653,7 @@ mod tests {
                 None => ctx,
             })
         };
-        kr.adopt(version(1, Some(cut(5, false))));
+        kr.adopt(version(1, Some(cut(5, false)))).unwrap();
         let epoch = kr.revocation_epoch();
 
         // Re-admission only adds: not revoking.

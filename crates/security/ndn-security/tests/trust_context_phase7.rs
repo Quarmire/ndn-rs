@@ -95,13 +95,15 @@ async fn ctx08_schema_loosen_no_retouch() {
     );
 
     // v2: loosen — hierarchical floor admits any in-subtree signer. Pull bumps
-    // the version; existing /work/* etc. namespaces are untouched.
+    // the version (an update checked against v1); existing /work/* etc.
+    // namespaces are untouched.
     let v2 = Arc::new(SignedTrustContext::hierarchical(n("/home/bob")).with_version(2));
     v2.add_anchor(anchor);
-    assert!(
-        validator.adopt_context(v2),
-        "loosened v2 adopted by version bump"
-    );
+    let held = validator.keyring().held(&n("/home/bob")).unwrap();
+    validator
+        .keyring()
+        .adopt_update_from(&held, v2)
+        .expect("loosened v2 adopted by version bump");
     assert_eq!(validator.keyring().version_of(&n("/home/bob")), Some(2));
 
     let guest_data = sign_with(&mgr, "/home/bob/guests/phone/hello", &guest);

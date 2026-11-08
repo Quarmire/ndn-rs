@@ -1276,13 +1276,13 @@ mod tests {
             .unwrap();
         let _serving = publisher.spawn(&engine);
         let keyring = Keyring::new();
-        assert!(
-            keyring.adopt(Arc::new(
+        keyring
+            .adopt(Arc::new(
                 ndn_cert::open_signed_context(&init.init.context_data)
                     .unwrap()
-                    .0
+                    .0,
             ))
-        );
+            .unwrap();
         let store: Arc<dyn ContextStore> = Arc::new(PibContextStore::new(device));
         let (sync, _groups) = prepare(member_id(device), Arc::clone(&store));
         let member: Name = "/home/bob/member/tab".parse().unwrap();

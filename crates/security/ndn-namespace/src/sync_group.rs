@@ -119,7 +119,9 @@ mod tests {
             .await
             .unwrap();
         let keyring = Keyring::new();
-        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
+        keyring
+            .adopt(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
+            .unwrap();
         let before = engine.strategy_table().dump().len();
 
         carry_held(&engine, &keyring);
@@ -130,7 +132,9 @@ mod tests {
         );
         assert_eq!(strategy_at(&engine, &n("/home/bob/32=sync")), None);
 
-        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob")))));
+        keyring
+            .adopt(Arc::new(SignedTrustContext::hierarchical(n("/home/bob"))))
+            .unwrap();
         assert_eq!(
             strategy_at(&engine, &n("/home/bob/32=sync")),
             Some(multicast)
@@ -149,7 +153,9 @@ mod tests {
             .await
             .unwrap();
         let keyring = engine.keyring().expect("the engine validates");
-        assert!(keyring.adopt(Arc::new(SignedTrustContext::hierarchical(n("/alice")))));
+        keyring
+            .adopt(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
+            .unwrap();
         let multicast = MulticastStrategy::strategy_name();
         for ns in ["/alice", "/visitor"] {
             carry(&engine, &n(ns));

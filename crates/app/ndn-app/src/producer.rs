@@ -572,9 +572,11 @@ mod router_tests {
         let c_key = n("/c/member/x/KEY/k2");
         mgr.generate_ed25519(a_key.clone()).unwrap();
         mgr.generate_ed25519(c_key.clone()).unwrap();
-        mgr.keyring().adopt(Arc::new(
-            ndn_security::SignedTrustContext::hierarchical(n("/b")).with_version(1),
-        ));
+        mgr.keyring()
+            .adopt(Arc::new(
+                ndn_security::SignedTrustContext::hierarchical(n("/b")).with_version(1),
+            ))
+            .unwrap();
         let conn = Arc::new(RecordingConn {
             q: Mutex::new(VecDeque::from(vec![
                 InterestBuilder::new(n("/a/member/x/d")).build(),

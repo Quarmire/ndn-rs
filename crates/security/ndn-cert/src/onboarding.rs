@@ -24,13 +24,14 @@ use bytes::Bytes;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::{
-    Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
+    AdoptRefusal, Certificate, ExpectContextError, Keyring, OpenContextError, SignedTrustContext,
     SignedTrustContextError, Validator,
 };
 use ndn_tlv::TlvReader;
 use ndn_trust_envelope::TrustEnvelope;
 
 use crate::client::CaExchange;
+use crate::context_update::{UpdateRefusal, open_context_update};
 use crate::error::CertError;
 
 /// The RDR keyword component naming a published context: `/<ns>/32=trust-context`.
@@ -111,6 +112,31 @@ pub enum AdoptError {
          the held one (a fork); only a newer version replaces it"
     )]
     Fork(u64),
+    #[error(
+        "refused: {namespace} is already trusted (version {held} held), and this context, \
+         version {offered}, does not follow from it ({refusal}). A link never replaces the \
+         anchors of a namespace this node trusts: if this is {namespace}'s newer version, \
+         refresh {namespace} — a refresh follows each version its owner signs with a held \
+         anchor, a recovery's included (an owner who lost its root recovers the namespace with \
+         its recovery key). Whoever holds another root of {namespace} cannot take it over"
+    )]
+    NotContinuous {
+        namespace: String,
+        held: u64,
+        offered: u64,
+        #[source]
+        refusal: Box<UpdateRefusal>,
+    },
+    #[error(
+        "refused: {namespace} is already trusted (version {held} held), and an unsigned \
+         context (version {offered}) cannot show it follows from it; refresh {namespace} for \
+         its owner's newer version"
+    )]
+    UnsignedOverHeld {
+        namespace: String,
+        held: u64,
+        offered: u64,
+    },
     #[error(
         "refused: the fetched context is version {offered}, older than version {required} \
          named by the invite/QR (an outdated or replayed context); retry once the namespace \
@@ -223,7 +249,7 @@ pub fn adopt_with_tofu(
     // The verifiers never suspend; drive the future inline.
     let ctx =
         futures::executor::block_on(authenticate(context_data, namespace, expected_fingerprint))?;
-    adopt_into(keyring, ctx)
+    futures::executor::block_on(adopt_checked(keyring, Arc::new(ctx), Some(context_data)))
 }
 
 /// What an `ndn-trust://anchor` link asks a device to adopt.
@@ -322,7 +348,8 @@ pub fn adopt_anchor_envelope(
     };
     // The verifiers never suspend; drive the future inline.
     let ctx = futures::executor::block_on(link.authenticate(&data))?;
-    Ok((adopt_into(keyring, ctx)?, data))
+    let ctx = futures::executor::block_on(adopt_checked(keyring, Arc::new(ctx), Some(&data)))?;
+    Ok((ctx, data))
 }
 
 /// A context adopted from an anchor link.
@@ -350,8 +377,9 @@ pub struct LinkAdoption {
 ///
 /// A fetched version older than the link's `version` is refused
 /// ([`AdoptError::Downgrade`]), closing the first-contact downgrade an on-path
-/// forger could otherwise attempt by pointing at an old genuine context. The
-/// keyring's anti-rollback still refuses anything older than a held version.
+/// forger could otherwise attempt by pointing at an old genuine context. A
+/// namespace already held changes only by the continuity rule
+/// ([`adopt_checked`]): a link never replaces its anchors.
 /// Persistence is the caller's (the Data is returned verbatim).
 pub async fn adopt_anchor_link<E>(
     keyring: &Keyring,
@@ -365,7 +393,7 @@ where
     if let Some(data) = &link.context_data {
         let ctx = link.authenticate(data).await?;
         return Ok(LinkAdoption {
-            context: adopt_into(keyring, ctx)?,
+            context: adopt_checked(keyring, Arc::new(ctx), Some(data)).await?,
             data: Data::decode(data.raw().clone())
                 .map_err(|e| AdoptError::BadData(e.to_string()))?,
             fetched: false,
@@ -403,7 +431,7 @@ where
         _ => Arc::new(link.authenticate(&data).await?),
     };
     Ok(LinkAdoption {
-        context: adopt_arc_into(keyring, context)?,
+        context: adopt_checked(keyring, context, Some(&data)).await?,
         data,
         fetched: true,
     })
@@ -435,33 +463,79 @@ pub fn adopt_unsigned_legacy_with_tofu(
     if !matches {
         return Err(AdoptError::NoExpectedAnchor);
     }
-    adopt_into(keyring, ctx)
+    futures::executor::block_on(adopt_checked(keyring, Arc::new(ctx), None))
 }
 
-/// Hand `ctx` to the keyring's anti-rollback adoption, surfacing a refusal.
-pub(crate) fn adopt_into(
-    keyring: &Keyring,
-    ctx: SignedTrustContext,
-) -> Result<Arc<SignedTrustContext>, AdoptError> {
-    adopt_arc_into(keyring, Arc::new(ctx))
-}
-
-fn adopt_arc_into(
+/// Adopt `ctx` into `keyring` — authenticated from its signed Data `data`,
+/// `None` for an unsigned legacy context.
+///
+/// A namespace not held is adopted, and the held version again changes
+/// nothing. A held namespace moves on only by the continuity rule: `ctx`
+/// strictly newer and signed by an anchor of the held version
+/// ([`open_context_update`]), adopted over exactly the version it was
+/// checked against ([`Keyring::adopt_update_from`]; a version adopted
+/// meanwhile is judged again). Anything else is refused — an older version
+/// ([`AdoptError::Rollback`]), a fork ([`AdoptError::Fork`]), a newer one
+/// that does not follow ([`AdoptError::NotContinuous`],
+/// [`AdoptError::UnsignedOverHeld`]): a link, an envelope or a stored copy
+/// never replaces a held namespace's anchors, whatever fingerprint it was
+/// checked against.
+pub(crate) async fn adopt_checked(
     keyring: &Keyring,
     ctx: Arc<SignedTrustContext>,
+    data: Option<&Data>,
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
-    if keyring.adopt(Arc::clone(&ctx)) {
-        return Ok(ctx);
-    }
-    let held = keyring.version_of(ctx.namespace()).unwrap_or_default();
-    Err(if held == ctx.version() {
-        AdoptError::Fork(held)
-    } else {
-        AdoptError::Rollback {
-            offered: ctx.version(),
-            held,
+    loop {
+        let Some(held) = adopt_or_held(keyring, &ctx)? else {
+            return Ok(ctx);
+        };
+        let Some(data) = data else {
+            return Err(AdoptError::UnsignedOverHeld {
+                namespace: ctx.namespace().to_string(),
+                held: held.version(),
+                offered: ctx.version(),
+            });
+        };
+        if let Err(refusal) = open_context_update(&held, data).await {
+            return Err(not_continuous(&ctx, &held, refusal));
         }
-    })
+        if keyring.adopt_update_from(&held, Arc::clone(&ctx)).is_ok() {
+            return Ok(ctx);
+        }
+        // Another version was adopted meanwhile: judge against it.
+    }
+}
+
+/// [`Keyring::adopt`] `ctx`: `None` once adopted (or held as is), the held
+/// context when `ctx` is newer — it replaces it only if it follows from it
+/// (the continuity rule) — and refused when older or a fork.
+pub(crate) fn adopt_or_held(
+    keyring: &Keyring,
+    ctx: &Arc<SignedTrustContext>,
+) -> Result<Option<Arc<SignedTrustContext>>, AdoptError> {
+    match keyring.adopt(Arc::clone(ctx)) {
+        Ok(()) => Ok(None),
+        Err(AdoptRefusal::Older { held_ctx, offered }) => Err(AdoptError::Rollback {
+            offered,
+            held: held_ctx.version(),
+        }),
+        Err(AdoptRefusal::Fork { held_ctx }) => Err(AdoptError::Fork(held_ctx.version())),
+        Err(AdoptRefusal::Held { held_ctx, .. }) => Ok(Some(held_ctx)),
+    }
+}
+
+/// The refusal of `ctx`, which does not follow from the held `held`.
+pub(crate) fn not_continuous(
+    ctx: &SignedTrustContext,
+    held: &SignedTrustContext,
+    refusal: UpdateRefusal,
+) -> AdoptError {
+    AdoptError::NotContinuous {
+        namespace: ctx.namespace().to_string(),
+        held: held.version(),
+        offered: ctx.version(),
+        refusal: Box::new(refusal),
+    }
 }
 
 /// TLV type of the Name inside RDR metadata Content.
@@ -1092,6 +1166,202 @@ mod tests {
             );
         }
         assert!(keyring.is_empty());
+    }
+
+    /// A root of `ns` whose key `keys` holds.
+    fn root_of(
+        ns: &str,
+    ) -> (
+        ndn_security::SecurityManager,
+        crate::namespace::NamespaceInit,
+    ) {
+        let keys = ndn_security::SecurityManager::new();
+        let init = crate::namespace::init_namespace(&keys, &n(ns)).unwrap();
+        (keys, init)
+    }
+
+    /// Version `version` of `init`'s context, signed by its root.
+    fn signed_version(
+        keys: &ndn_security::SecurityManager,
+        init: &crate::namespace::NamespaceInit,
+        version: u64,
+    ) -> Data {
+        SignedTrustContext::decode_content(&init.context.encode_content(), version)
+            .unwrap()
+            .sign_into_data(keys.get_signer_sync(&init.anchor_key).unwrap().as_ref())
+            .unwrap()
+    }
+
+    /// A network serving `data` as the newest context of its namespace.
+    fn serving_version(ns: &str, data: &Data) -> FakeNet {
+        FakeNet::new(vec![
+            metadata(&n(ns), &data.name.encode_to_tlv()),
+            ((*data.name).clone(), data.raw().clone()),
+        ])
+    }
+
+    /// Invariant: a link never replaces a held namespace's anchors. Mallory's
+    /// `/carol` v1000, signed by her own root and named by a link carrying
+    /// her fingerprint, leaves Carol's held v3 in force — inline, fetched
+    /// directly, fetched through a validating forwarder, as an envelope, or
+    /// handed over with its fingerprint.
+    #[test]
+    fn a_link_never_replaces_a_held_namespace() {
+        let (carol_keys, carol) = root_of("/carol");
+        let (mallory_keys, mallory) = root_of("/carol");
+        let keyring = Keyring::new();
+        let v3 = signed_version(&carol_keys, &carol, 3);
+        adopt_with_tofu(
+            &keyring,
+            &v3,
+            &n("/carol"),
+            &anchor_fingerprint(&carol.anchor),
+        )
+        .unwrap();
+        let held = keyring.held(&n("/carol")).unwrap();
+        let forged = signed_version(&mallory_keys, &mallory, 1000);
+        let fp = anchor_fingerprint(&mallory.anchor);
+        let still_carol = |how: &str, refused: Option<&AdoptError>| {
+            assert!(
+                matches!(
+                    refused,
+                    Some(AdoptError::NotContinuous {
+                        held: 3,
+                        offered: 1000,
+                        ..
+                    })
+                ),
+                "{how}: {refused:?}"
+            );
+            assert_eq!(keyring.len(), 1, "{how}");
+            assert!(
+                Arc::ptr_eq(&keyring.held(&n("/carol")).unwrap(), &held),
+                "{how}: Mallory's /carol replaced Carol's held one"
+            );
+        };
+
+        let inline = AnchorLink {
+            context_data: Some(decode(forged.raw())),
+            ..link("/carol", fp, Some(1000))
+        };
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut FakeNet::new(Vec::new()),
+            &inline,
+        ));
+        still_carol("inline", res.as_ref().err());
+
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut serving_version("/carol", &forged),
+            &link("/carol", fp, None),
+        ));
+        still_carol("fetched", res.as_ref().err());
+
+        let v = forwarder();
+        let mut through_forwarder = ForwardedNet {
+            net: serving_version("/carol", &forged),
+            forwarder: &v,
+        };
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            Some(&v),
+            &mut through_forwarder,
+            &link("/carol", fp, None),
+        ));
+        still_carol("fetched through a validating forwarder", res.as_ref().err());
+
+        let envelope = TrustEnvelope::Anchor {
+            namespace: Some("/carol".into()),
+            fingerprint: Some(fp),
+            version: Some(1000),
+            context_data: Some(forged.raw().clone()),
+            context_content: None,
+        };
+        let res = adopt_anchor_envelope(&keyring, &envelope);
+        still_carol("envelope", res.as_ref().err());
+
+        let res = adopt_with_tofu(&keyring, &forged, &n("/carol"), &fp);
+        still_carol("handed over with its fingerprint", res.as_ref().err());
+    }
+
+    /// A link moves a held namespace on by the continuity rule: Carol's v4,
+    /// signed by the root her held v3 names, is adopted (inline and
+    /// fetched); the held version again changes nothing; an older one is a
+    /// rollback.
+    #[test]
+    fn a_link_moves_a_held_namespace_on_only_by_continuity() {
+        let (keys, carol) = root_of("/carol");
+        let fp = anchor_fingerprint(&carol.anchor);
+        let keyring = Keyring::new();
+        adopt_with_tofu(
+            &keyring,
+            &signed_version(&keys, &carol, 3),
+            &n("/carol"),
+            &fp,
+        )
+        .unwrap();
+        let v3 = keyring.held(&n("/carol")).unwrap();
+
+        let again = AnchorLink {
+            context_data: Some(signed_version(&keys, &carol, 3)),
+            ..link("/carol", fp, None)
+        };
+        futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut FakeNet::new(Vec::new()),
+            &again,
+        ))
+        .expect("the held version again");
+        assert!(Arc::ptr_eq(&keyring.held(&n("/carol")).unwrap(), &v3));
+
+        let older = AnchorLink {
+            context_data: Some(signed_version(&keys, &carol, 2)),
+            ..link("/carol", fp, None)
+        };
+        let res = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut FakeNet::new(Vec::new()),
+            &older,
+        ));
+        assert!(
+            matches!(
+                res,
+                Err(AdoptError::Rollback {
+                    offered: 2,
+                    held: 3
+                })
+            ),
+            "{res:?}"
+        );
+
+        let v4 = AnchorLink {
+            context_data: Some(signed_version(&keys, &carol, 4)),
+            ..link("/carol", fp, None)
+        };
+        let adopted = futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut FakeNet::new(Vec::new()),
+            &v4,
+        ))
+        .expect("v4 is signed by the held root");
+        assert_eq!(adopted.context.version(), 4);
+        assert_eq!(keyring.version_of(&n("/carol")), Some(4));
+
+        let v5 = signed_version(&keys, &carol, 5);
+        futures::executor::block_on(adopt_anchor_link(
+            &keyring,
+            None,
+            &mut serving_version("/carol", &v5),
+            &link("/carol", fp, Some(5)),
+        ))
+        .expect("fetched v5 is signed by the held root");
+        assert_eq!(keyring.version_of(&n("/carol")), Some(5));
     }
 
     /// Invariant: malformed links are refused with a reason, never a panic.

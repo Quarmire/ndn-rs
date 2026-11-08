@@ -47,7 +47,9 @@ a refresh, which checks its update without holding any lock (fetching may
 take many round trips), adopts with `Keyring::adopt_update_from`: only if
 the version it checked against is still the one held, so a version another
 command adopted meanwhile is never skipped over. (`Keyring::adopt`, used
-for first adoption, keeps its `≥` rule.)
+for first adoption, never changes a held namespace: an anchor link, an
+envelope or a stored copy of a held namespace is taken only under this
+rule, then by `Keyring::adopt_update_from`.)
 
 A refused or failed refresh changes nothing: the held version stays in force.
 A missed refresh only delays an update; it never weakens what is accepted.

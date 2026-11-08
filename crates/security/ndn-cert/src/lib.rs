@@ -65,10 +65,11 @@ pub use challenge::yubikey::YubikeyHotpChallenge;
 pub use challenge::{ChallengeHandler, ChallengeOutcome, ChallengeState};
 pub use client::{CaExchange, ChallengeExchange, ChallengeRound, EnrollmentSession};
 pub use context_store::{
-    ContextStoreError, StoredCutManifestPacket, adopt_envelope_into_store, context_file_path,
-    context_version_path, context_versions_dir, cut_manifests_dir, load_persisted_contexts,
-    persist_context, persist_cut_manifest_packet, read_cut_manifest_packets, read_stored_context,
-    read_stored_contexts, read_stored_versions, remove_stored_context,
+    ContextStoreError, StoredCutManifestPacket, adopt_envelope_into_store, adopt_stored_context,
+    context_file_path, context_version_path, context_versions_dir, cut_manifests_dir,
+    load_persisted_contexts, persist_context, persist_cut_manifest_packet,
+    read_cut_manifest_packets, read_stored_context, read_stored_contexts, read_stored_versions,
+    remove_stored_context,
 };
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,

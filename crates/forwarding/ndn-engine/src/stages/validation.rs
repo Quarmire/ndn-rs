@@ -801,7 +801,7 @@ mod tests {
             sig_type: SignatureType::SignatureEd25519,
         }));
         let keyring = Arc::new(Keyring::new());
-        assert!(keyring.adopt(Arc::new(ctx)));
+        keyring.adopt(Arc::new(ctx)).unwrap();
         let cache = Arc::new(CertCache::new());
         cache.insert(Certificate::decode(&Data::decode(leaf_cert).unwrap()).unwrap());
         let served = HashMap::from([(manifest.root.clone(), manifest.packets[0].clone())]);

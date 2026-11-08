@@ -795,7 +795,7 @@ mod tests {
         };
         engine.cs().insert_erased(stale, name, fresh).await;
         let keyring = Arc::new(ndn_security::Keyring::new());
-        assert!(keyring.adopt(Arc::new(version(1).0)));
+        keyring.adopt(Arc::new(version(1).0)).unwrap();
         let device = Participant::new(ParticipantParts {
             engine,
             keyring,

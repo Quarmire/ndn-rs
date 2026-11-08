@@ -17211,8 +17211,8 @@ mod tests {
             owner_signed(keyring, &entry, &c, &writer)
         };
         let both = Keyring::new();
-        both.adopt(context("/home"));
-        both.adopt(context("/home/bob"));
+        both.adopt(context("/home")).unwrap();
+        both.adopt(context("/home/bob")).unwrap();
         // A /home/bob device lies under /home, but /home/bob governs it.
         let laptop = "/home/bob/member/laptop";
         assert!(!signed(&both, laptop, "/home/32=data/x"));
@@ -17224,7 +17224,7 @@ mod tests {
         assert!(!signed(&both, "/alice/laptop", "/home/32=data/x"));
         // Held alone, /home governs every device under it.
         let only_home = Keyring::new();
-        only_home.adopt(context("/home"));
+        only_home.adopt(context("/home")).unwrap();
         assert!(signed(&only_home, laptop, "/home/32=data/x"));
         assert!(!signed(&only_home, laptop, "/home/bob/32=data/x"));
         // No context held: nobody owns anything.

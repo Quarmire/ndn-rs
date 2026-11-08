@@ -171,7 +171,7 @@ async fn later(earlier: &Earlier, revoke: &[Name]) -> Later {
     assert!(context.add_anchor(anchor));
     let context = Arc::new(context);
     let keyring = Arc::new(Keyring::new());
-    assert!(keyring.adopt(Arc::clone(&context)));
+    keyring.adopt(Arc::clone(&context)).unwrap();
 
     let ca = ca(mgr, ca_key.clone(), TokenStore::new());
     ca.accept_earlier_ca_certificates(keyring);
@@ -352,8 +352,12 @@ async fn a_device_renews_an_earlier_ca_certificate_at_the_later_ca() {
 
     let later = later(&earlier, &[]).await;
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
-    // The device follows the context naming the new root, as it would.
-    assert!(device.keyring.adopt(Arc::clone(&later.context)));
+    // The device follows the context naming the new root, as it would (an
+    // update of the version it holds).
+    device
+        .keyring
+        .adopt_update(Arc::clone(&later.context))
+        .unwrap();
 
     let renewed = renew(&later, &device)
         .await
@@ -393,7 +397,10 @@ async fn only_the_kept_issuer_chain_renews_once_nobody_serves_the_earlier_ca() {
     let device = enroll(&earlier).await;
     let earlier_ca_key = ca_key_name(&ns());
     let later = later(&earlier, &[]).await;
-    assert!(device.keyring.adopt(Arc::clone(&later.context)));
+    device
+        .keyring
+        .adopt_update(Arc::clone(&later.context))
+        .unwrap();
     assert!(later.ca.cert_for_interest(&earlier_ca_key, true).is_none());
 
     let refused = renew_keeping(&later, &device, &[]).await;

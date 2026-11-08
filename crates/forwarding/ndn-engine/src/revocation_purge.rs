@@ -337,7 +337,7 @@ mod tests {
     async fn data_cached_before_a_revoking_update_is_never_served_after_it() {
         let (a, b) = keys();
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&a, &b], 1, &[]));
+        keyring.adopt(context(&[&a, &b], 1, &[])).unwrap();
         let node = Node::new(Arc::clone(&keyring), Arc::new(LruCs::new(1 << 20)), false);
         node.receive(a.data(A_PHOTO)).await;
         node.receive(b.data(B_PHOTO)).await;
@@ -367,7 +367,7 @@ mod tests {
     async fn data_validated_before_a_revoking_update_and_cached_after_it_is_never_served() {
         let (a, b) = keys();
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&a, &b], 1, &[]));
+        keyring.adopt(context(&[&a, &b], 1, &[])).unwrap();
         let node = Node::new(Arc::clone(&keyring), Arc::new(LruCs::new(1 << 20)), true);
         let by_a = node.validated(a.data(A_PHOTO)).await;
         let by_b = node.validated(b.data(B_PHOTO)).await;
@@ -447,7 +447,7 @@ mod tests {
     async fn data_cached_during_a_revoking_update_is_never_served() {
         let a = Key::new("/home/bob/member/a/KEY/1", 1);
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&a], 1, &[]));
+        keyring.adopt(context(&[&a], 1, &[])).unwrap();
         let cs = Arc::new(UpdateDuringInsert {
             inner: LruCs::new(1 << 20),
             keyring: Arc::clone(&keyring),
@@ -478,7 +478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let keyring = Arc::new(Keyring::new());
-            keyring.adopt(context(&[&a, &b, &c], 1, &[]));
+            keyring.adopt(context(&[&a, &b, &c], 1, &[])).unwrap();
             keyring
                 .adopt_update(context(&[&a, &b, &c], 2, &[&c]))
                 .unwrap();
@@ -490,7 +490,7 @@ mod tests {
         }
 
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&a, &b, &c], 3, &[&c, &a]));
+        keyring.adopt(context(&[&a, &b, &c], 3, &[&c, &a])).unwrap();
         assert_eq!(
             keyring.revocation_epoch(),
             1,
@@ -528,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let keyring = Arc::new(Keyring::new());
-            keyring.adopt(context(&[&root, &b], 1, &[]));
+            keyring.adopt(context(&[&root, &b], 1, &[])).unwrap();
             let certs = Arc::new(CertCache::new());
             certs.insert(ca.certified_by(&root));
             certs.insert(d.certified_by(&ca));
@@ -540,7 +540,7 @@ mod tests {
         }
 
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&root, &b], 2, &[&ca]));
+        keyring.adopt(context(&[&root, &b], 2, &[&ca])).unwrap();
         let cs = Arc::new(FjallCs::open(dir.path(), 1 << 20).unwrap());
         let node = Node::new(Arc::clone(&keyring), cs, true);
 
@@ -565,7 +565,7 @@ mod tests {
         let ca = Key::new("/home/bob/CA/KEY/9", 11);
         let d = Key::new("/home/bob/member/d/KEY/4", 12);
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&root], 1, &[]));
+        keyring.adopt(context(&[&root], 1, &[])).unwrap();
         let certs = Arc::new(CertCache::new());
         certs.insert(ca.certified_by(&root));
         certs.insert(d.certified_by(&ca));
@@ -635,7 +635,7 @@ mod tests {
             assert!(ctx.add_anchor(root.anchor()));
             Arc::new(ctx)
         };
-        keyring.adopt(version(1, 3));
+        keyring.adopt(version(1, 3)).unwrap();
         let certs = Arc::new(CertCache::new());
         certs.insert(ca.certified_by(&root));
         certs.insert(d.certified_by(&ca));
@@ -685,7 +685,7 @@ mod tests {
             Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
         };
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&root], 1, &[]));
+        keyring.adopt(context(&[&root], 1, &[])).unwrap();
         let certs = Arc::new(CertCache::new());
         certs.insert(old_ca.certified_by(&root));
         certs.insert(new_ca.certified_by(&root));
@@ -723,7 +723,7 @@ mod tests {
         let ca = Key::new("/home/bob/CA/KEY/9", 11);
         let d = Key::new("/home/bob/member/d/KEY/4", 12);
         let keyring = Arc::new(Keyring::new());
-        keyring.adopt(context(&[&root], 1, &[]));
+        keyring.adopt(context(&[&root], 1, &[])).unwrap();
         let certs = Arc::new(CertCache::new());
         certs.insert(ca.certified_by(&root));
         certs.insert(d.certified_by(&ca));

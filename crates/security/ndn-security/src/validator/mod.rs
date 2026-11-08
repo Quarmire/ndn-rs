@@ -293,12 +293,14 @@ impl Validator {
         self.cert_fetcher.set(fetcher)
     }
 
-    /// Adopt a named [`SignedTrustContext`] into the keyring. Data under its
-    /// namespace is thereafter validated against its schema and anchors.
-    /// Returns `false` if refused by the keyring's anti-rollback rule (a
-    /// strictly older version than one already held).
+    /// Adopt a named [`SignedTrustContext`] of a namespace not held into the
+    /// keyring ([`Keyring::adopt`]). Data under its namespace is thereafter
+    /// validated against its schema and anchors. Returns `true` when adopted
+    /// or already held as is, `false` when refused: the namespace is held
+    /// with another version, which only a version checked under the held
+    /// anchors replaces ([`Keyring::adopt_update_from`]).
     pub fn adopt_context(&self, ctx: Arc<SignedTrustContext>) -> bool {
-        self.keyring.adopt(ctx)
+        self.keyring.adopt(ctx).is_ok()
     }
 
     /// Snapshot `(verified_total, rejected_total)` since construction.

@@ -348,7 +348,7 @@ mod tests {
         let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
             .with_version(2)
             .with_revocation(n("/home/bob/member/tablet/KEY/s"));
-        assert!(keyring.adopt(Arc::new(ctx)));
+        keyring.adopt(Arc::new(ctx)).unwrap();
         let hosted = host(Arc::clone(&state), Arc::clone(&keyring));
         let revoked: Vec<(String, bool)> = hosted.list(None).unwrap()[0]
             .certificates
@@ -367,7 +367,7 @@ mod tests {
         let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
             .with_version(3)
             .with_revocation(ca_key());
-        assert!(keyring.adopt(Arc::new(ctx)));
+        keyring.adopt_update(Arc::new(ctx)).unwrap();
         assert!(
             hosted.list(None).unwrap()[0]
                 .certificates

@@ -124,7 +124,7 @@ fn open(data: &Data) -> SignedTrustContext {
 /// Whether `cert` validates under `ctx`, with `issuers` known.
 async fn validates(ctx: SignedTrustContext, cert: &Certificate, issuers: &[&Certificate]) -> bool {
     let keyring = Arc::new(Keyring::new());
-    assert!(keyring.adopt(Arc::new(ctx)));
+    keyring.adopt(Arc::new(ctx)).unwrap();
     let validator = Validator::with_keyring(keyring, Arc::new(CertCache::new()), None, 8);
     for issuer in issuers {
         validator.cert_cache().insert((*issuer).clone());
@@ -619,7 +619,7 @@ impl CaExchange for Forwarded<'_> {
 /// A node holding version `held`.
 fn holding(held: &Data) -> Arc<Keyring> {
     let keyring = Arc::new(Keyring::new());
-    assert!(keyring.adopt(Arc::new(open(held))));
+    keyring.adopt(Arc::new(open(held))).unwrap();
     keyring
 }
 
@@ -810,4 +810,52 @@ async fn after_a_recovery_the_root_fingerprint_adopts_a_fresh_device() {
         .unwrap();
     assert_eq!(adopted.context.version(), open(n2).version());
     assert_eq!(fresh.version_of(&ns), Some(open(n2).version()));
+}
+
+/// A node holding `N` takes a recovery from a link only by continuity: the
+/// link carrying `N+2` (signed by the new root, which is no anchor of `N`)
+/// leaves `N` in force, while the link carrying `N+1` (signed by the
+/// recovery key, an anchor of `N`) is adopted — and a refresh then follows
+/// `N+2` from it.
+#[tokio::test]
+async fn a_held_namespace_takes_a_recovery_from_a_link_only_by_continuity() {
+    let ns = n("/home/bob");
+    let root_dev = RootDevice::new().await;
+    let (_, held) = root_dev.held();
+    let (seed, with_kit) = add_word_kit(&root_dev, &held).await;
+    let (_dir, recovered) = recover(&with_kit, &seed, OldRoot::Destroyed).await;
+    let n1 = &recovered.version.bump.data;
+    let n2 = &recovered.root_version.data;
+    let node = holding(&with_kit);
+    let v = open(&with_kit).version();
+    let inline = |data: &Data, fingerprint: [u8; 32]| AnchorLink {
+        namespace: ns.clone(),
+        expected_fingerprint: fingerprint,
+        min_version: None,
+        context_data: Some(Data::decode(data.raw().clone()).unwrap()),
+    };
+
+    let skipping = inline(n2, anchor_fingerprint(&recovered.anchor));
+    let _ = ndn_cert::adopt_anchor_link(&node, None, &mut Upstream::serving(&[]), &skipping).await;
+    assert_eq!(
+        node.version_of(&ns),
+        Some(v),
+        "a link replaced the held version with one that does not follow from it"
+    );
+
+    let recovery_key = open(&with_kit)
+        .anchors()
+        .iter()
+        .map(|a| a.value().clone())
+        .find(|a| a.key_name() == recovered.version.recovery_key)
+        .expect("the kit's key is an anchor of N");
+    let next = inline(n1, anchor_fingerprint(&recovery_key));
+    let adopted = ndn_cert::adopt_anchor_link(&node, None, &mut Upstream::serving(&[]), &next)
+        .await
+        .expect("N+1 follows from N");
+    assert_eq!(adopted.context.version(), v + 1);
+    let mut upstream = Upstream::serving(&[&with_kit, n1, n2]);
+    let res = refresh_context(&node, None, &mut upstream, &ns).await;
+    assert!(matches!(res, Ok(ContextRefresh::Updated(_))), "{res:?}");
+    assert_eq!(node.version_of(&ns), Some(v + 2));
 }

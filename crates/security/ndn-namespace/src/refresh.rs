@@ -396,7 +396,9 @@ mod tests {
             .unwrap();
         let _serving = publisher.spawn(&engine);
         let keyring = Arc::new(Keyring::new());
-        assert!(keyring.adopt(Arc::new(ndn_cert::open_signed_context(&v2.data).unwrap().0)));
+        keyring
+            .adopt(Arc::new(ndn_cert::open_signed_context(&v2.data).unwrap().0))
+            .unwrap();
         let admin = Participant::new(ParticipantParts {
             engine,
             keyring,
@@ -480,7 +482,7 @@ mod tests {
         let held = ndn_cert::open_signed_context(&init.init.context_data)
             .unwrap()
             .0;
-        assert!(keyring.adopt(Arc::new(held)));
+        keyring.adopt(Arc::new(held)).unwrap();
         let admin = Participant::new(ParticipantParts {
             engine,
             keyring,
@@ -561,7 +563,7 @@ mod tests {
         let held = ndn_cert::open_signed_context(&init.init.context_data)
             .unwrap()
             .0;
-        assert!(keyring.adopt(Arc::new(held)));
+        keyring.adopt(Arc::new(held)).unwrap();
         let admin = Arc::new(Participant::new(ParticipantParts {
             engine: engine.clone(),
             keyring,

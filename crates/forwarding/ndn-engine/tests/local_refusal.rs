@@ -92,7 +92,7 @@ async fn validator_fetching(
     }
     assert!(ctx.add_anchor(anchor_cert(root)));
     let keyring = Arc::new(Keyring::new());
-    assert!(keyring.adopt(Arc::new(ctx)));
+    keyring.adopt(Arc::new(ctx)).unwrap();
     let cache = Arc::new(CertCache::new());
     let cert_wire = ndn_security::encode_cert_data(
         member.key_name(),

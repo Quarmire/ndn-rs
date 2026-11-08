@@ -2488,10 +2488,15 @@ mod tests {
         assert_eq!(decoded.namespace(), ctx.namespace());
 
         let keyring = Keyring::new();
-        assert!(keyring.adopt(Arc::new(decoded)), "first adoption succeeds");
+        keyring
+            .adopt(Arc::new(decoded))
+            .expect("first adoption succeeds");
         // Anti-rollback: a lower version is refused.
         let older = SignedTrustContext::hierarchical(n("/home/bob")).with_version(2);
-        assert!(!keyring.adopt(Arc::new(older)), "older version refused");
+        assert!(
+            keyring.adopt(Arc::new(older)).is_err(),
+            "older version refused"
+        );
     }
 
     /// A signer with only an async `sign` (a hardware token, a custodian):

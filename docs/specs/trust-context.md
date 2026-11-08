@@ -906,14 +906,26 @@ How the context is fetched is in §8.1. ndn-rs refuses unsigned (legacy
 
 ### 5.1 Anti-rollback
 
-A node MUST NOT replace its held version with a lower one. ndn-rs applies
-two rules:
+A node MUST NOT replace its held version with a lower one, nor with one that
+its held version does not authorize. ndn-rs applies two rules:
 
-- **Adoption from a link** (§4.4) replaces the held context iff the offered
-  version is greater than the held version. An offered version *equal* to
-  the held one is accepted only when its content encodes identically to the
-  held context's (§3.2), and then changes nothing. A different context under
-  the held version number is a fork, and a node MUST refuse it.
+- **Adoption from a link** (§4.4) — an anchor link, an envelope, a stored
+  copy — adopts a namespace not held. For a held namespace it changes
+  nothing unless the offered version passes the update rule (§5.2): signed
+  by an anchor of the held version and strictly newer. A link names an
+  expected fingerprint, but that proves only who signed the offered context,
+  not that the namespace's owner made it: anyone can sign a `/<ns>` context
+  listing their own root. So a node MUST refuse a newer version of a held
+  namespace that does not follow from the held one, whatever fingerprint it
+  was checked against. The namespace's owner moves it on by signing the next
+  version with a held anchor (a recovery kit's key included), and a node
+  that missed versions follows them by refresh (§5.4). An offered version
+  *equal* to the held one is accepted only when its content encodes
+  identically to the held context's (§3.2), and then changes nothing. A
+  different context under the held version number is a fork, and a node
+  MUST refuse it. In ndn-rs `Keyring::adopt` never changes a held
+  namespace; the link paths check the update rule and then adopt by
+  compare-and-swap (`Keyring::adopt_update_from`).
 - **Update** (§5.2) replaces it iff the offered version is *strictly*
   greater. ndn-rs also requires that the held context is still the exact
   one the update was checked against, a compare-and-swap. If another
@@ -2176,6 +2188,15 @@ is open.
   application opts into as live keep the clock. Otherwise an application
   would refuse honest old Data and in-cut Data that the rest of the node
   accepts.
+- **Q21 A link never replaces a held namespace.** Adoption from a link once
+  replaced a held namespace whenever the offered version was higher. The
+  expected fingerprint only proves who signed the offered context, so a
+  stranger's link naming a namespace the node holds, carrying the
+  stranger's own root and a high version, replaced the owner's anchors: the
+  stranger then signed anything under it. A held namespace now moves on
+  only by the update rule (§5.1, §5.2), the one the owner already uses for
+  every version and a recovery; a link to a version that does not follow
+  is refused with why and what to do (refresh the namespace).
 
 ## Appendix A. Code references (non-normative)
 

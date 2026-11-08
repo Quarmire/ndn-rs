@@ -2370,7 +2370,7 @@ mod tests {
             // Inserted directly: `add_anchor` refuses an anchor expired now.
             ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
             let keyring = Arc::new(Keyring::new());
-            assert!(keyring.adopt(Arc::new(ctx)));
+            keyring.adopt(Arc::new(ctx)).unwrap();
             let cache = Arc::new(CertCache::new());
             cache.insert(ca_cert);
             if cache_leaf {
@@ -2699,7 +2699,7 @@ mod tests {
                 );
                 ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
                 let keyring = Arc::new(Keyring::new());
-                assert!(keyring.adopt(Arc::new(ctx)));
+                keyring.adopt(Arc::new(ctx)).unwrap();
                 let cache = Arc::new(CertCache::new());
                 cache.insert(decoded(&cert(&ca, &root, "root", PAST, u64::MAX).await));
                 cache.insert(decoded(&cert(&guest, &ca, "CA", PAST, until).await));

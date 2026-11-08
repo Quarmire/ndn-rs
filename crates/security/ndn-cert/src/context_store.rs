@@ -44,7 +44,12 @@ use ndn_packet::{Data, Name};
 use ndn_security::{Keyring, SignedTrustContext};
 use ndn_trust_envelope::TrustEnvelope;
 
-use crate::onboarding::{AdoptError, adopt_anchor_envelope, adopt_into, open_signed_context};
+use crate::context_update::{
+    Unfetched, UpdateRefusal, VersionSource, follow_versions, open_context_update,
+};
+use crate::onboarding::{
+    AdoptError, adopt_anchor_envelope, adopt_or_held, not_continuous, open_signed_context,
+};
 
 /// Directory (under the PIB root) holding adopted contexts.
 pub const CONTEXTS_DIR: &str = "contexts";
@@ -276,9 +281,10 @@ type AdoptedRead = Result<Arc<SignedTrustContext>, ContextStoreError>;
 type StoredRead = Result<(SignedTrustContext, Data), ContextStoreError>;
 
 /// Load every stored context under `pib_root` into `keyring`, re-verifying
-/// each one. Returns one entry per `*.tc` file (sorted by path) with the
-/// adopted context or why that file was refused; a missing store directory
-/// yields an empty list.
+/// each one ([`adopt_stored_context`]: a namespace held already moves on to
+/// the stored version only by the continuity rule). Returns one entry per
+/// `*.tc` file (sorted by path) with the adopted context or why that file
+/// was refused; a missing store directory yields an empty list.
 pub fn load_persisted_contexts(
     pib_root: &Path,
     keyring: &Keyring,
@@ -286,10 +292,96 @@ pub fn load_persisted_contexts(
     Ok(read_stored_contexts(pib_root)?
         .into_iter()
         .map(|(path, stored)| {
-            let result = stored.and_then(|(ctx, _data)| Ok(adopt_into(keyring, ctx)?));
+            let result =
+                stored.and_then(|(ctx, data)| adopt_stored_context(pib_root, keyring, ctx, &data));
             (path, result)
         })
         .collect())
+}
+
+/// Adopt `ctx`, stored under `pib_root` as its signed Data `data`, into
+/// `keyring`. A namespace not held adopts it, and the held version again
+/// changes nothing. A held namespace moves on to it only by the continuity
+/// rule, as a refresh does: `ctx` signed by an anchor of the held version,
+/// or reached through the versions stored in between, each signed by an
+/// anchor of the one before (a recovery: [`follow_versions`]) — adopted
+/// over exactly the version it was checked against. A stored copy never
+/// replaces a held namespace's anchors otherwise
+/// ([`AdoptError::NotContinuous`]); an older one is a rollback.
+pub fn adopt_stored_context(
+    pib_root: &Path,
+    keyring: &Keyring,
+    ctx: SignedTrustContext,
+    data: &Data,
+) -> Result<Arc<SignedTrustContext>, ContextStoreError> {
+    let ctx = Arc::new(ctx);
+    // The verifiers never suspend and the versions are read from disk:
+    // drive the futures inline.
+    futures::executor::block_on(async {
+        loop {
+            let Some(held) = adopt_or_held(keyring, &ctx)? else {
+                return Ok(Arc::clone(&ctx));
+            };
+            match open_context_update(&held, data).await {
+                Ok(_) => {}
+                // A version stored in between may have installed the key
+                // that signed it (a recovery).
+                Err(UpdateRefusal::NotSignedByHeldAnchor { .. })
+                    if ctx.version() > held.version() + 1 =>
+                {
+                    let mut stored = StoredVersions {
+                        pib_root,
+                        namespace: ctx.namespace(),
+                        newest: Some((ctx.version(), data)),
+                    };
+                    let walk = held.version() + 1..=ctx.version();
+                    if let Err(stop) = follow_versions(&held, walk, &mut stored).await {
+                        let refusal = UpdateRefusal::CatchUp {
+                            held: held.version(),
+                            offered: ctx.version(),
+                            stop,
+                        };
+                        return Err(not_continuous(&ctx, &held, refusal).into());
+                    }
+                }
+                Err(refusal) => return Err(not_continuous(&ctx, &held, refusal).into()),
+            }
+            if keyring.adopt_update_from(&held, Arc::clone(&ctx)).is_ok() {
+                return Ok(Arc::clone(&ctx));
+            }
+            // Another version was adopted meanwhile: judge against it.
+        }
+    })
+}
+
+/// The versions of `namespace` stored under `pib_root`, for a walk from a
+/// held version to the stored newest one, `newest`. Each is read as Data
+/// only: the walk checks each against the version before it
+/// ([`open_context_update`] — its signature, namespace and version).
+struct StoredVersions<'a> {
+    pib_root: &'a Path,
+    namespace: &'a Name,
+    newest: Option<(u64, &'a Data)>,
+}
+
+impl VersionSource for StoredVersions<'_> {
+    async fn fetch(
+        &mut self,
+        position: u64,
+        _from: &SignedTrustContext,
+    ) -> Result<Data, Unfetched> {
+        let wire = match self.newest.take_if(|(version, _)| *version == position) {
+            Some((_, data)) => data.raw().clone(),
+            None => {
+                let path = context_version_path(self.pib_root, self.namespace, position);
+                Bytes::from(
+                    std::fs::read(&path)
+                        .map_err(|e| Unfetched::Missing(format!("{}: {e}", path.display())))?,
+                )
+            }
+        };
+        Data::decode(wire).map_err(|e| Unfetched::Missing(e.to_string()))
+    }
 }
 
 /// Read and re-verify every stored context under `pib_root` without adopting
@@ -545,5 +637,130 @@ mod tests {
         remove_stored_context(dir.path(), &ns).unwrap();
         assert!(read_stored_context(dir.path(), &ns).unwrap().is_none());
         assert!(read_stored_versions(dir.path(), &ns).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+    use ndn_security::SecurityManager;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    /// A root of `/carol` whose key `keys` holds.
+    fn root() -> (SecurityManager, crate::namespace::NamespaceInit) {
+        let keys = SecurityManager::new();
+        let init = crate::namespace::init_namespace(&keys, &n("/carol")).unwrap();
+        (keys, init)
+    }
+
+    /// `ctx` again at `version`, signed by `key` of `keys`.
+    fn signed(
+        keys: &SecurityManager,
+        key: &Name,
+        ctx: &SignedTrustContext,
+        version: u64,
+    ) -> (SignedTrustContext, Data) {
+        let ctx = SignedTrustContext::decode_content(&ctx.encode_content(), version).unwrap();
+        let data = ctx
+            .sign_into_data(keys.get_signer_sync(key).unwrap().as_ref())
+            .unwrap();
+        (ctx, data)
+    }
+
+    fn fingerprint(ctx: &SignedTrustContext) -> Vec<[u8; 32]> {
+        ctx.anchors()
+            .iter()
+            .map(|a| ndn_security::anchor_fingerprint(a.value()))
+            .collect()
+    }
+
+    /// Invariant: a stored copy never replaces a held namespace's anchors.
+    /// `ndn-fwd adopt` of Mallory's `/carol` v1000 envelope over the stored
+    /// Carol v3 leaves v3 stored; loading a store holding Mallory's v1000
+    /// into a keyring holding Carol's v3 leaves v3 held.
+    #[test]
+    fn a_stored_copy_never_replaces_a_held_namespace() {
+        let (carol_keys, carol) = root();
+        let (mallory_keys, mallory) = root();
+        let (v3, v3_data) = signed(&carol_keys, &carol.anchor_key, &carol.context, 3);
+        let (forged, forged_data) =
+            signed(&mallory_keys, &mallory.anchor_key, &mallory.context, 1000);
+
+        let dir = tempfile::tempdir().unwrap();
+        persist_context(dir.path(), &v3, &v3_data).unwrap();
+        let envelope = TrustEnvelope::Anchor {
+            namespace: Some("/carol".into()),
+            fingerprint: Some(ndn_security::anchor_fingerprint(&mallory.anchor)),
+            version: Some(1000),
+            context_data: Some(forged_data.raw().clone()),
+            context_content: None,
+        };
+        let _ = adopt_envelope_into_store(dir.path(), &envelope);
+        let (stored, _) = read_stored_context(dir.path(), &n("/carol"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.version(), fingerprint(&stored)),
+            (3, fingerprint(&v3)),
+            "Mallory's envelope replaced the stored /carol"
+        );
+
+        let keyring = Keyring::new();
+        keyring.adopt(Arc::new(v3)).unwrap();
+        let held = keyring.held(&n("/carol")).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        persist_context(other.path(), &forged, &forged_data).unwrap();
+        let _ = load_persisted_contexts(other.path(), &keyring);
+        assert!(
+            Arc::ptr_eq(&keyring.held(&n("/carol")).unwrap(), &held),
+            "a stored copy of Mallory's /carol replaced the held one"
+        );
+    }
+
+    /// A held namespace follows its owner's newer versions from the store:
+    /// v5, signed by a root v4 installed, is reached from v3 through the
+    /// stored v4 (as a refresh walks a recovery), and refused when v4 is not
+    /// stored.
+    #[test]
+    fn a_held_namespace_follows_the_stored_versions_by_continuity() {
+        let (keys, carol) = root();
+        let (v3, _) = signed(&keys, &carol.anchor_key, &carol.context, 3);
+        let second = n("/carol/KEY/second");
+        keys.generate_ed25519(second.clone()).unwrap();
+        let pk = keys
+            .get_signer_sync(&second)
+            .unwrap()
+            .public_key()
+            .unwrap_or_default();
+        let second_anchor =
+            futures::executor::block_on(keys.issue_self_signed_async(&second, pk, u64::MAX))
+                .unwrap();
+        let rotated = SignedTrustContext::decode_content(&v3.encode_content(), 4).unwrap();
+        rotated.add_anchor(second_anchor);
+        let (v4, v4_data) = signed(&keys, &carol.anchor_key, &rotated, 4);
+        let (v5, v5_data) = signed(&keys, &second, &rotated, 5);
+
+        let dir = tempfile::tempdir().unwrap();
+        persist_context(dir.path(), &v5, &v5_data).unwrap();
+        let keyring = Keyring::new();
+        keyring.adopt(Arc::new(v3)).unwrap();
+        let loaded = load_persisted_contexts(dir.path(), &keyring).unwrap();
+        assert!(
+            matches!(
+                loaded[0].1,
+                Err(ContextStoreError::Adopt(AdoptError::NotContinuous { .. }))
+            ),
+            "{:?}",
+            loaded[0].1
+        );
+        assert_eq!(keyring.version_of(&n("/carol")), Some(3));
+
+        persist_context(dir.path(), &v4, &v4_data).unwrap();
+        let loaded = load_persisted_contexts(dir.path(), &keyring).unwrap();
+        assert!(loaded[0].1.is_ok(), "{:?}", loaded[0].1);
+        assert_eq!(keyring.version_of(&n("/carol")), Some(5));
     }
 }
