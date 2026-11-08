@@ -12,7 +12,7 @@ define the bytes on the wire:
 | Spec | Covers |
 |---|---|
 | [ndn-link.md](ndn-link.md) | QUIC links: ALPN `ndn-link/1`, RFC 7250 raw public keys, key fingerprint, hello/verdict TLVs (incl. enrollment link), datagram framing, timeouts, close reasons, admission, duplicate-link rule |
-| [trust-context.md](trust-context.md) | Trust context TLVs (anchors, revocations and revocation cuts, KeyRole, LinkPolicy, EnrollmentHint, schema), versions, continuity, catch-up, RDR publication, context sync group, how Data is judged against revocations without clocks |
+| [trust-context.md](trust-context.md) | Trust context TLVs (anchors, revocations and revocation cuts, KeyRole, LinkPolicy, EnrollmentHint, schema), versions, continuity, catch-up, RDR publication, context sync group, how Data is judged against revocations without clocks, self-certifying namespaces `/user/<h>` (§4.5) |
 | [ndncert-extensions.md](ndncert-extensions.md) | NDNCERT extensions: approval (CA/APPROVAL, CA/PENDING, CA/STATUS, verification code), renewal challenge, invite tokens |
 | [trust-envelope.md](trust-envelope.md) | `ndn-trust://` envelopes: kinds, TLV 0x0470–0x048F, carriage forms incl. QR |
 | [recovery-kit.md](recovery-kit.md) | Recovery kits: BIP39 → Ed25519 recovery key, key naming, file kit (PBES2), hardware kit |
@@ -52,3 +52,17 @@ here before using it.
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
 | 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
 | 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553; slice 6's folder flag of a members record, a version's group and its count, 0x0555–0x0559, a removal cut's binding of what it keeps to its bytes (CutBytes, the full name of its cut manifest), 0x055B, and a folder cut's list per collection (CutIn), 0x055F; slice 6 reuses, in a version record, FrontierEntry 0x0524 with Digest 0x055E — each parent bound to its tip's packet — and Rule 0x0548, the merge rule an operation was made for; the introduction's offer and use-mark records, ask, answer, role, tries, refusal and credentials, 0x0561–0x056F, §19) |
+
+### Name-component types
+
+NDN name components carry a TLV-TYPE of their own. The NDN packet format
+assigns 1 (ImplicitSha256Digest), 2 (ParametersSha256Digest), 8 (Generic),
+32 (Keyword), 50 (Segment), 52 (ByteOffset), 54 (Version), 56 (Timestamp)
+and 58 (SequenceNum), and leaves 128–252 to applications
+([NDN packet format, name component types](https://docs.named-data.net/NDN-packet-spec/current/types.html)).
+These specs use the assigned types and allocate application types here,
+each with one owner. Allocate from 128–252 and add it here before using it.
+
+| Type | Name | URI form | Owner |
+|---|---|---|---|
+| 161 (`0xA1`) | SelfCertifying: SHA-256 of a namespace's genesis root, an Ed25519 public key (32 octets), only as the second component of `/user/<h>` (`ndn_packet::tlv_type::SELF_CERTIFYING`; the type ndf-rs uses for the same names) | `161=%xx…` | [trust-context.md](trust-context.md) §4.5 |

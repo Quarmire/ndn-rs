@@ -64,7 +64,10 @@ An envelope is unsigned. A consumer gets authenticity from two sources:
 1. **The channel.** A QR code shown on the root device's screen, a link from a known person,
    or a file the user wrote.
 2. **The expected fingerprint inside the envelope.** It is checked against the signed objects
-   the consumer later receives (the context, the issued certificate chain).
+   the consumer later receives (the context, the issued certificate chain). For a
+   self-certifying namespace `/user/<h>` the namespace itself is the expected fingerprint of
+   its genesis root ([trust-context.md](trust-context.md) §4.5), so an `anchor` may carry the
+   namespace alone (§7.1).
 
 Every signed object an envelope carries inline (the context Data, a certificate, a delegation)
 is verified by the consumer. The envelope layer never verifies it.
@@ -76,7 +79,7 @@ in a URI is a routing hint that MUST match the `Kind` TLV (§5.2); the TLV is au
 
 | Kind token | Code | Direction | Carries | Consumer |
 |---|---|---|---|---|
-| `anchor` | `1` | in | Namespace, expected fingerprint, context version, signed context Data (inline and/or by reference) | adopt (F1, F2) |
+| `anchor` | `1` | in | Namespace, expected fingerprint (none needed for a self-certifying namespace), context version, signed context Data (inline and/or by reference) | adopt (F1, F2) |
 | `invite` | `2` | in | CA prefix, identity namespace `/<ns>/<role>`, token, remaining lifetime, expected fingerprint | enroll by invite (F2) |
 | `delegation` | `3` | in/out | A signed delegation and the principal's public key | device delegation (mobile) |
 | `recovery` | `4` | in | A recovery bundle (public history, no private keys) | restore (mobile) |
@@ -189,7 +192,9 @@ Further producer rules:
     `<type>=<value>` form. Equal Names then give byte-identical envelopes. Parsers do not
     check the form.
   - A namespace that a consumer validates (invite, §7.2) MUST consist only of
-    GenericNameComponents whose bytes are ASCII letters, digits, `-`, `_`, `.` and `~`.
+    GenericNameComponents whose bytes are ASCII letters, digits, `-`, `_`, `.` and `~`, or be
+    exactly a self-certifying namespace `/user/<h>` (`<h>` of TLV-TYPE `0xA1`, 32 octets,
+    written `161=%xx…`; [trust-context.md](trust-context.md) §4.5).
 - **UTF-8 string (Token, ScopePattern).** UTF-8 bytes, no terminator. A parser MUST reject
   invalid UTF-8.
   - The token grammar is `<role>-<secret>[-until<unix-secs>]` ([ndncert-extensions.md](ndncert-extensions.md)).
@@ -474,7 +479,7 @@ defined for another kind (evolvability rule). For example:
 
 | Kind | Requirement | Error |
 |---|---|---|
-| anchor | at least one of Wire, ContextData, AnchorFingerprint | MissingField("anchor content or fingerprint") |
+| anchor | at least one of Wire, ContextData, AnchorFingerprint, Namespace (a Namespace alone is the link of a self-certifying namespace; whether the namespace is one is the consumer's check, §7.1) | MissingField("anchor content, fingerprint or namespace") |
 | invite | CaPrefix, IdentityNamespace, Token present (Token may be empty here, §7.2) | MissingField("ca prefix" / "identity namespace" / "token") |
 | delegation | Wire, PrincipalPubkey present | MissingField("delegation wire" / "principal pubkey") |
 | recovery | Wire present (may be empty) | MissingField("recovery bundle") |
@@ -500,8 +505,14 @@ interoperating with ndn-rs flows.
 
 `ndn_cert::AnchorLink` and the mobile parser apply the following:
 
-1. **Namespace.** It MUST be present and MUST parse as an NDN Name.
-2. **AnchorFingerprint.** It MUST be present.
+1. **Namespace.** It MUST be present and MUST parse as an NDN Name. A name with a
+   self-certifying component (TLV-TYPE `0xA1`) anywhere but as the second component of
+   exactly `/user/<h>`, or a namespace under `/user/<h>`, MUST be refused
+   ([trust-context.md](trust-context.md) §4.5.1).
+2. **AnchorFingerprint.** It MUST be present, unless Namespace is a self-certifying namespace
+   `/user/<h>`. For such a namespace the name is the expected fingerprint of its genesis root,
+   and an AnchorFingerprint the envelope carries is ignored, never compared: the genesis
+   decides (`ndn_cert::AnchorLink::from_envelope`).
 3. **Context Data.**
    - If ContextData is present, it MUST decode as an NDN Data packet. Wire is then ignored.
    - If only Wire is present (the legacy unsigned form), the consumer MUST refuse. It MAY
@@ -511,6 +522,13 @@ interoperating with ndn-rs flows.
 4. **Verification.** The consumer verifies the inline or fetched context, which:
    - MUST be signed by an anchor of the context whose fingerprint equals AnchorFingerprint;
    - MUST root Namespace.
+
+   A self-certifying namespace the consumer does not hold is adopted from its genesis instead
+   ([trust-context.md](trust-context.md) §4.5.3): an inline ContextData of version 1 is checked
+   by the genesis rule (§4.5.2 there) and adopted; otherwise, an inline ContextData of a later
+   version included, the consumer fetches version 1, checks it by that rule, and reaches the
+   newest from it by continuity. A held one moves on only by continuity, as any held
+   namespace.
 5. **Version.** If Version is present, the consumer MUST refuse a context with a version below
    it (downgrade).
 
@@ -530,7 +548,9 @@ interoperating with ndn-rs flows.
      `member`, `node` or `guest`, with a non-empty rest.
    - A token without a role prefix counts as `member`.
 6. AnchorFingerprint, if present, is the expected fingerprint used to adopt the namespace's
-   context before enrolling.
+   context before enrolling; without it, an invite to a namespace not held is refused. For a
+   self-certifying namespace it is ignored: the context is adopted by name from its genesis
+   ([trust-context.md](trust-context.md) §4.5.3), and a held one is not compared with it.
 7. TtlSecs is informational. It holds the remaining token lifetime, computed when the
    envelope was emitted, and consumers ignore it. The authoritative expiry is the token's
    `-until` suffix.
@@ -793,6 +813,11 @@ means the decode succeeds.
   substitute the expected fingerprint. Show and scan anchors over a channel the user trusts
   (a screen they can see). Inline signed objects only protect against tampering in transit
   if the expected fingerprint itself is authentic.
+- **Name-only anchors.** An `anchor` carrying only the Namespace of a self-certifying
+  namespace `/user/<h>` is as authentic as its name: substituting it substitutes the person.
+  Its context is authenticated by the genesis rule and continuity
+  ([trust-context.md](trust-context.md) §4.5); what a fresh adopter of such a namespace can
+  and cannot detect is in §4.5.6 there.
 - **Downgrade.** An `anchor` with a Version lets the consumer refuse an older context served
   by name (§7.1). A fingerprint-only anchor without Version accepts any version signed by the
   expected anchor.
@@ -861,6 +886,14 @@ means the decode succeeds.
   consumers compare parsed Names (§4.4). Equal values give byte-identical envelopes without a
   Name codec in the envelope layer. The CA's invite maker (`ndn_cert::CaInvites::create`)
   and `ndn-pair-kiosk` emit Names in canonical form.
+- **Q17 Name-only anchor.** An `anchor` may carry a Namespace alone (§6.3), the link of a
+  self-certifying namespace, whose name is its genesis root's fingerprint
+  ([trust-context.md](trust-context.md) §4.5). The envelope layer does not judge names, so
+  it accepts any Namespace alone; the consumer refuses one that is not self-certifying
+  (§7.1, item 2). A fingerprint carried beside such a namespace is ignored rather than
+  compared, because the namespace's current root need not be its genesis root (a recovery
+  changes it and keeps the name). `ndn-fwd init --self-certifying` prints this form as
+  `anchor_uri_name`.
 
 ## Appendix A. Code references (non-normative)
 
@@ -877,7 +910,7 @@ Paths are relative to the workspace root. Code in `ndn-fwd` may move to library 
 | Body field order per kind; 8-byte u64; empty nonce omitted | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:309-391` |
 | Outer decode: BadTag, trailing bytes, one-byte and repeated children, critical rule, error order | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:393-434` |
 | Body decode (pass 1): fields per kind, critical rule, repeated fields, fingerprint and Direction length, ScopePattern push | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:436-490` |
-| Per-kind requirements (pass 2) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:492-535` |
+| Per-kind requirements (pass 2; an anchor's Namespace alone) | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:654-674` |
 | `to_uri`, `to_https_url` | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:537-554` |
 | `qr_uri`: inline anchor falls back to by-reference | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:556-584` |
 | `from_uri`: trim, legacy digits, scheme split, mirror rule, base64, kind-token check | `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs:586-646` |
@@ -892,14 +925,14 @@ Paths are relative to the workspace root. Code in `ndn-fwd` may move to library 
 | Minimal VAR-NUMBER encode | `ndn-rs/crates/core/ndn-tlv/src/writer.rs:33-66` |
 | Anchor fingerprint = SHA-256(cert public key) | `ndn-rs/crates/security/ndn-security/src/trust_context/mod.rs:1056-1063` |
 | Cert public key: Ed25519 SPKI unwrapped, else Content | `ndn-rs/crates/security/ndn-security/src/cert_cache.rs:31-38`; `ndn-rs/crates/security/ndn-security/src/spki.rs:46-49` |
-| Anchor consumer checks | `ndn-rs/crates/security/ndn-cert/src/onboarding.rs:237-298` |
-| Invite consumer checks | `ndn-rs/crates/security/ndn-cert/src/invite.rs:85-152` |
+| Anchor consumer checks (a self-certifying namespace: no fingerprint, adopted from its genesis) | `ndn-rs/crates/security/ndn-cert/src/onboarding.rs` (`AnchorLink::{from_envelope, by_name}`, `adopt_anchor_link`); `ndn-rs/crates/security/ndn-cert/src/context_update.rs` (`adopt_by_name`) |
+| Invite consumer checks (a self-certifying namespace adopted by name) | `ndn-rs/crates/security/ndn-cert/src/invite.rs:85-152`, `ensure_invite_context` |
 | Token role / `-until` expiry; namespace component rule | `ndn-rs/crates/security/ndn-cert/src/roles.rs:91-93,204-232,303-340` |
 | File kit: URI text, reading and checks | `ndn-rs/crates/security/ndn-cert/src/recovery.rs:400-513` |
 | File kit written as `<uri>\n`, 0600 | `ndn-fwd/binaries/ndn-fwd/src/recovery_kit.rs:484-485` |
 | Namespace init emits inline signed anchor | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:159-165` |
 | Init anchor link has a QR form within the shared limit (inline or by reference) | `ndn-rs/crates/security/ndn-cert/src/namespace.rs:589-611` |
-| `ndn-fwd init` prints `anchor_uri`, `anchor_url` (ndn.local), `anchor_uri_fp`, QR hint by size | `ndn-fwd/binaries/ndn-fwd/src/onboard.rs:472-497` |
+| `ndn-fwd init` prints `anchor_uri`, `anchor_url` (ndn.local), `anchor_uri_fp`, QR hint by size; `anchor_uri_name` for `--self-certifying` | `ndn-fwd/binaries/ndn-fwd/src/onboard.rs` (`run_init`) |
 | Invite emission (CA prefix and scope as Names, TtlSecs = remaining token life, DeviceName hint) | `ndn-rs/crates/security/ndn-cert/src/invites.rs` (`CaInvites::create`) |
 | Mirror via `--domain`; QR rendering (`qr::encode`, ASCII 2×1, SVG ≥256 px, 0600) | `ndn-fwd/binaries/ndn-fwd-tokens/src/main.rs` (`shown_link`, `render_qr`) |
 | Context authoring: signed vs unsigned legacy anchor; QR via `qr_uri` | `ndn-fwd/binaries/ndn-trust-context/src/lib.rs:103-148`; `ndn-fwd/binaries/ndn-trust-context/src/main.rs:142-206` |

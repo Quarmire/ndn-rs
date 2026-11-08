@@ -101,7 +101,14 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   ([trust-context.md](trust-context.md)): one or more components (`/alice`,
   `/home/bob`), none of them a KeywordNameComponent (type 0x20), a digest
   component or a SequenceNumNameComponent. It is the unit of the
-  hierarchical trust schema, so it is the person data belongs to.
+  hierarchical trust schema, so it is the person data belongs to. A
+  person's **self-certifying namespace** `/user/<h>` (`<h>` a component of
+  type `0xA1`, 32 octets: SHA-256 of the Ed25519 key that signed its
+  context's version 1, trust-context.md §4.5) is a namespace like any
+  other here: its collections are `/user/<h>/32=data/<path>`, its devices
+  `/user/<h>/<role>/<device>`, and members records, folders, seals and
+  introductions name it as they name `/alice`. A device adopts it by its
+  name alone (trust-context.md §4.5.3).
 - A **collection name** is `<O>/32=data/<path>`: the namespace, the
   KeywordNameComponent `data` (the **marker**, which says where `O` ends),
   and a path of one or more components. No component of it besides the
@@ -142,7 +149,10 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   chain ends at `/home`'s anchor), so to it the device is `/home`'s.
 - **The namespace of a name** here (a writer prefix, a device, a person)
   is that of the held trust context governing it, the one whose namespace
-  is its longest prefix; a name no held context governs has none. A
+  is its longest prefix; a name no held context governs has none. A name
+  under `/user/<h>` is governed only by `/user/<h>`'s own context, never by
+  a held `/user` or `/` (trust-context.md §6.1): without `/user/<h>` held it
+  has none. A
   device that writes into or reads another person's collections holds that
   person's trust context — it verifies their entries with it — so the
   person's namespace is held wherever their data is used. Holding it is
@@ -3954,7 +3964,16 @@ asked:
 5. Has its host adopt the inviter's anchor (an inline anchor link of the
    context the answer carried, `Introducer::adopt`); a refusal is `Local`
    (fix the host and join again with the same code: the same key asking
-   again is answered again). Takes into its validator the certificates on
+   again is answered again). A self-certifying inviter namespace
+   `/user/<h>` is adopted from its genesis, not from the credentials
+   (trust-context.md §4.5.3: the host fetches version 1 by name unless the
+   credentials carry version 1 itself), so the credentials only count if
+   they are that namespace's: every anchor they carry MUST then be an anchor
+   of the context the host holds for it (by public key), else
+   `InviterConflict` (`why`: its credentials carry anchors its namespace,
+   adopted from its genesis, does not hold). For any other namespace the
+   host adopted these very credentials, and this holds. Takes into its
+   validator the certificates on
    the chain from the key that signed the inviter's proof packet to its
    anchor, named under the inviter's namespace — no other certificate the
    answer carries — follows `F` (§15, `watch`'s first look), and returns
@@ -4030,14 +4049,18 @@ checks, in this order:
 
 Then the use. The device notes durably in its store the key the use is
 for; has its host adopt the asker's anchor (an inline anchor link of the
-presented context); takes into its validator the certificates on the
+presented context; a self-certifying asker namespace is adopted from its
+genesis, as in §19.3 step 5, and then every anchor of the presented
+context MUST be an anchor of the context the host holds for it, by public
+key, else `Conflict`); takes into its validator the certificates on the
 verified chain from the asker's key to its anchor, named under the asker's
 namespace, and no other presented certificate; and signs the folder's next
 members record adding the asker's namespace as a writer (a writer's role)
 and as a reader (when the folder is sealed), unless the record in force
 already admits it so (`share_folder`, §6.1). If the adoption or the record
-fails, it drops the note durably — the offer is not spent — and gives no
-answer; the joiner's retry is judged again. Else it keeps the acceptance
+fails, or the anchors are refused, it drops the note durably — the offer
+is not spent — and gives no answer to a failure, `Conflict` to refused
+anchors; the joiner's retry is judged again. Else it keeps the acceptance
 in its store and signs the use mark naming the key and digest, and answers
 only once both are durable. A stop after the note and before the mark
 leaves the offer to that key: its retry runs the use again (step 6 lets no
@@ -4056,8 +4079,8 @@ packet, and carries the answer proof.
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
 | `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a record the offering device signed | `AskOwner` | no |
 | `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
-| `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10) | `FixLocal` | no |
-| `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps | `AskOwner` (do not use the code) | no |
+| `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not (§19.4, the use) | `FixLocal` | no |
+| `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not (§19.3 step 5) | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the

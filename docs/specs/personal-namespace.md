@@ -28,6 +28,7 @@ Terms used throughout:
 | Term | Meaning |
 |---|---|
 | namespace | a name prefix `/<ns>` owned by a root key |
+| self-certifying namespace | `/user/<hash>`: a person's namespace named by its genesis root key (`<hash>` = SHA-256 of that Ed25519 key, name component type `0xA1`), followed by name alone (F1; trust-context.md §4.5) |
 | root device | the device that creates the namespace's root and CA (`ndn-fwd init`) |
 | trust context | the root-signed statement of the namespace's anchors and rules |
 | adopt | accept a namespace's trust context (`ndn-fwd adopt`) |
@@ -51,8 +52,9 @@ Terms used throughout:
    schema can check it without new mechanism. Owners never write the schema;
    it is generated (§4).
 5. **Nothing is adopted silently.** Every trust decision is a TOFU check
-   against an expected fingerprint (QR / short code) or a signature chain to
-   the adopted root.
+   against an expected fingerprint (QR / short code), the name of a
+   self-certifying namespace (which is its genesis root's fingerprint), or
+   a signature chain to the adopted root.
 
 ## 2. Actors and where keys live
 
@@ -93,6 +95,8 @@ the key. `ndn-fwd
 root-key move --to <store>` moves a software root (new store signs first,
 then the plaintext copy is overwritten and deleted); a software (Ed25519)
 root cannot move onto PIV, so a hardware root is a new namespace or F10.
+A self-certifying namespace's root goes onto a YubiKey only through a
+recovery (F8), which keeps its name (F1).
 The CA key and admin device keys stay in the FilePib: the daemon uses them
 unattended. A relay never holds the root.
 
@@ -192,6 +196,42 @@ Each flow lists steps, what is stored where, failure handling, and status
    `ndn-fwd root-key status` counts the recovery anchors and keeps
    recommending one while there is none (**have**). The owner may decline.
 3. Optional: delegate the CA to a relay (F3).
+
+**Self-certifying namespace** (**have**). A person's namespace may instead
+be named by its root key: `/user/<hash>`, where `<hash>` is a name
+component of type `0xA1` holding SHA-256 of the raw 32-byte Ed25519 public
+key that signs the context's version 1, the **genesis root**
+(trust-context.md §4.5; registry: [README.md](README.md)). The name is the
+same as ndf-rs's `record::personal_root` gives for that key.
+- **Create:** `ndn-fwd init --self-certifying [--namespace /user/<hash>]
+  [--device <name>] [--root-store os-keyring|sealed-file|file]` makes a new
+  Ed25519 root and names the namespace from it; a `--namespace` given must be
+  that name. An application holding an Ed25519 key already (ndf-rs) creates
+  the namespace of that key: `ndn_cert::GenesisKey::from_seed`, then
+  `init_self_certifying_in_pib_with` (or `init_self_certifying` in memory).
+  Everything else is F1 as above. Refused before anything is written, each
+  saying why and what to do: a `/user/<hash>` name given to an ordinary
+  `init` (a new root never hashes to a chosen name), a name that is not the
+  new key's, a `yubikey-piv` root store (PIV holds no Ed25519 key), and a
+  self-certifying namespace that exists already (a second version 1 would
+  be a fork; a recovery replaces the root instead).
+- **Follow by name:** `init` also prints `anchor_uri_name`, an anchor link
+  carrying the namespace alone (trust-envelope.md §7.1). Any device adopts
+  `/user/<hash>` from that name: it fetches version 1, checks that the key
+  the name hashes signed it, and follows the continuity rule to the newest
+  version, no expected fingerprint needed (`ndn-fwd adopt`, invites and
+  every other adoption path; `ndn_cert::adopt_by_name`). It keeps version 1
+  and the versions it walked, and takes the namespace again only from its
+  stored version 1 after a restart.
+- **The name outlives the root:** only version 1 is judged against the
+  name. A recovery (F8), including one onto a P-256 YubiKey root, and the
+  re-issue after it keep `/user/<hash>`.
+- **What the name does not prove** (trust-context.md §4.5.6): a stolen
+  root can sign versions that follow from version 1, and a device adopting
+  fresh that reaches only the thief's versions follows them; devices that
+  hold the owner's recovery refuse them.
+- Names under `/user/<hash>` are the person's: no other namespace is
+  adopted under it, and a held `/user` context never vouches for them.
 
 ### F2 Add a device
 - **By invite (token):** an admin makes an invite at the running CA
