@@ -9,10 +9,11 @@
 //! ([`Device::join`]) fetches the offer, sends an **ask** sealed to the
 //! offering device carrying its own anchor link and a proof of the secret
 //! bound to its key, and takes the **answer**: the folder, the role and the
-//! owner's anchor link, bound to its key. The owner's device marks the
-//! offer used in its log, adopts the joiner's anchor and adds the joiner to
-//! the folder's members record; the joiner adopts the owner's anchor and
-//! follows the folder.
+//! owner's anchor link, bound to its key. The owner's device adopts the
+//! joiner's anchor, adds the joiner to the folder's members record and
+//! marks the offer used in its log; the joiner, unless the owner's
+//! namespace overlaps one it trusts, adopts the owner's anchor and follows
+//! the folder. [`IntroPolicy`] is what a device allows of it.
 //!
 //! This module holds the types, the bytes ([`IntroRecord`], [`IntroAsk`],
 //! [`AskBody`], [`AnswerBody`]) and the proofs; the exchange itself is the
@@ -85,9 +86,97 @@ pub struct Offer {
     pub role: Role,
     /// Its expiry, judged by the offering device's clock (spec §8.5).
     pub until: Timestamp,
-    /// How many wrong tries close it (at least one): the wrong try that
-    /// makes this many closes it for good, even to the right secret.
+    /// How many wrong tries of one asker (one key) close it to that asker
+    /// (at least one): its wrong try that makes this many closes the offer
+    /// to it for good, even to the right secret. Others' tries are
+    /// counted apart; all askers' together are bounded by
+    /// [`IntroPolicy::wrong_tries_max`].
     pub tries: u32,
+}
+
+/// What a device's introductions allow and cost it (`Config::intro`, spec
+/// §19.4, §19.7): which namespaces an introduction may bring, either way,
+/// and how wrong tries and a crowd of asks are bounded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntroPolicy {
+    /// The fewest name components a namespace an introduction brings has:
+    /// the root, over every name, is never brought, whatever this says.
+    pub min_components: usize,
+    /// Names no introduction brings, nor a name under or over one: scopes
+    /// that are never a person's (`/localhost`, `/localhop`).
+    pub reserved: Vec<Name>,
+    /// Typed prefixes shared by many people's namespaces (`/user`, whose
+    /// `/user/<hash>` names are people's): no introduction brings one of
+    /// them or a name over it; a name under one is a person's like any
+    /// other.
+    pub shared: Vec<Name>,
+    /// Wrong tries of one offer, all askers' together, that close it for
+    /// everyone, durably: the backstop under per-asker counting
+    /// ([`Offer::tries`]), which anyone can make new askers for.
+    pub wrong_tries_max: u32,
+    /// The pause after a wrong try counted toward `wrong_tries_max`,
+    /// doubled by each one counted (by the offering device's clock): a
+    /// wrong try within the pause counts against its asker alone, so
+    /// closing an offer for everyone takes strangers about `backoff`
+    /// times 2^`wrong_tries_max`.
+    pub backoff: std::time::Duration,
+    /// Asks a device holds at once — verifying their asker or waiting for
+    /// their turn to be judged; one more gets no answer (a Nack) at once,
+    /// and its asker retries.
+    pub asks_queued: usize,
+}
+
+impl IntroPolicy {
+    /// Defaults: one component at least (`/alice`); `/localhost` and
+    /// `/localhop` reserved; `/user` shared; 16 wrong tries in all, the
+    /// pause after each counted from 1 s doubling; 32 asks held.
+    pub fn new() -> Self {
+        let n = |s: &str| s.parse::<Name>().expect("a valid name");
+        Self {
+            min_components: 1,
+            reserved: vec![n("/localhost"), n("/localhop")],
+            shared: vec![n("/user")],
+            wrong_tries_max: 16,
+            backoff: std::time::Duration::from_secs(1),
+            asks_queued: 32,
+        }
+    }
+
+    /// Why no introduction brings the namespace `ns` by this policy, if it
+    /// does not: "… <why>" completes "the namespace <ns> …".
+    pub fn refuses(&self, ns: &Name) -> Option<String> {
+        if ns.is_empty() {
+            return Some("is the root, over every name".into());
+        }
+        if ns.len() < self.min_components {
+            return Some(format!(
+                "has fewer than {} name components (IntroPolicy::min_components)",
+                self.min_components
+            ));
+        }
+        if let Some(r) = self
+            .reserved
+            .iter()
+            .find(|r| ns.has_prefix(r) || r.has_prefix(ns))
+        {
+            return Some(format!(
+                "overlaps {r}, a reserved name no introduction brings (IntroPolicy::reserved)"
+            ));
+        }
+        if let Some(s) = self.shared.iter().find(|s| s.has_prefix(ns)) {
+            return Some(format!(
+                "is or lies over {s}, a prefix many people's namespaces share \
+                 (IntroPolicy::shared)"
+            ));
+        }
+        None
+    }
+}
+
+impl Default for IntroPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// An offer's code: what the owner shows the joiner. Its link and words
@@ -132,20 +221,35 @@ pub enum IntroRefusal {
     Used,
     /// It expired by the offering device's clock.
     Expired,
-    /// Too many wrong tries: refused for good, even with the right secret.
+    /// Too many wrong tries — this asker's own, or the offer's in all
+    /// (`IntroPolicy::wrong_tries_max`) — or closed by its maker: refused for
+    /// good, even with the right secret.
     Closed,
-    /// The proof of the secret is wrong; it counted as a wrong try.
+    /// The proof of the secret is wrong; it counted as a wrong try of this
+    /// asker.
     WrongProof {
-        /// Wrong tries left before the offer closes.
+        /// Wrong tries this asker has left before the offer closes to it.
         left: u32,
     },
     /// What answered for the inviter proves neither the code's secret nor
     /// its anchor.
     Forged,
-    /// The asker's namespace is the inviter's own, lies under or over it,
-    /// or is one the inviter's device already trusts under another anchor:
-    /// adopting it would let one namespace speak for another.
+    /// The asker's namespace is the inviter's own, lies under or over it or
+    /// under or over any namespace the inviter's device trusts, is one it
+    /// trusts under another anchor, or is one no introduction brings (the
+    /// root, a reserved or shared name: `IntroPolicy`): adopting it would let
+    /// one namespace speak for another.
     Conflict,
+    /// The inviter's namespace, judged by the joiner: it overlaps a
+    /// namespace this device already trusts or is its own (equal under
+    /// another anchor, under or over it), or is one no introduction brings.
+    /// Nothing of it was adopted. Never on the wire.
+    InviterConflict {
+        /// The inviter's namespace.
+        inviter: Name,
+        /// What it overlaps, and how.
+        why: String,
+    },
 }
 
 impl std::fmt::Display for IntroRefusal {
@@ -161,21 +265,28 @@ impl std::fmt::Display for IntroRefusal {
                 "the offer expired by the inviter's clock: ask the inviter for a new code",
             ),
             IntroRefusal::Closed => f.write_str(
-                "the offer is closed after too many wrong tries, for good: ask the inviter for \
-                 a new code",
+                "the offer is closed to you, for good (too many wrong tries, or closed by the \
+                 inviter): ask the inviter for a new code",
             ),
             IntroRefusal::WrongProof { left } => write!(
                 f,
                 "the code's secret is wrong (a mistyped word or link?): check the code; {left} \
-                 wrong tries left before the offer closes"
+                 wrong tries left before the offer closes to you"
             ),
             IntroRefusal::Forged => f.write_str(
                 "what answered for the inviter proves neither the code's secret nor its anchor \
                  (someone else answered): retry, and check the code",
             ),
             IntroRefusal::Conflict => f.write_str(
-                "your namespace overlaps the inviter's or one the inviter's device trusts under \
-                 another anchor: join from a device of a namespace of your own",
+                "your namespace overlaps the inviter's, or one the inviter's device trusts, or \
+                 is one no introduction brings (the root, a reserved or shared name): join from \
+                 a device of a namespace of your own",
+            ),
+            IntroRefusal::InviterConflict { inviter, why } => write!(
+                f,
+                "the inviter's namespace {inviter} {why}, so adopting it would let one namespace \
+                 speak for another: nothing of it was adopted; do not use this code, and ask \
+                 whoever sent it for a code from a namespace of their own"
             ),
         }
     }
@@ -189,7 +300,7 @@ impl IntroRefusal {
             IntroRefusal::Expired => 3,
             IntroRefusal::Closed => 4,
             IntroRefusal::WrongProof { .. } => 5,
-            IntroRefusal::Conflict => 6,
+            IntroRefusal::Conflict | IntroRefusal::InviterConflict { .. } => 6,
             IntroRefusal::Forged => 0,
         }
     }
@@ -236,13 +347,16 @@ pub struct OfferBody {
     pub seal_key: [u8; 32],
 }
 
-/// A use mark (spec §19.1): the offer used by a key, or closed.
+/// A use mark (spec §19.1): the offer used by a key, or closed. The first
+/// mark naming a key stands; a closing mark closes the offer whenever it
+/// comes, used or not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsedBody {
     /// The offer record's name.
     pub offer: Name,
     /// The key it was used by and its public key's digest; `None`: closed
-    /// after too many wrong tries.
+    /// for good (all askers' wrong tries at the device's cap, its maker's
+    /// `close_offer`, or the member it brought removed).
     pub by: Option<(Name, [u8; 32])>,
 }
 
@@ -790,6 +904,20 @@ mod tests {
 
     fn offer_name() -> Name {
         log_name(&n("/alice/laptop"), Some(&n("/alice/32=data/notes")), 7)
+    }
+
+    /// The default policy brings people's namespaces — one component or
+    /// more, a `/user/<hash>` — and never the root, a local scope or a
+    /// name under one, nor the shared `/user` or a name over it.
+    #[test]
+    fn the_default_policy_refuses_the_root_scopes_and_shared_prefixes_only() {
+        let p = IntroPolicy::new();
+        for ok in ["/alice", "/home/bob", "/user/3f9a", "/ia"] {
+            assert_eq!(p.refuses(&n(ok)), None, "{ok}");
+        }
+        for refused in ["/", "/localhost", "/localhost/x", "/localhop/y", "/user"] {
+            assert!(p.refuses(&n(refused)).is_some(), "{refused}");
+        }
     }
 
     /// Both records round-trip through the log's record codec; a use mark

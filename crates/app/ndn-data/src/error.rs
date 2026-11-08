@@ -459,7 +459,8 @@ impl DataError {
                 crate::intro::IntroRefusal::Unknown
                 | crate::intro::IntroRefusal::Used
                 | crate::intro::IntroRefusal::Expired
-                | crate::intro::IntroRefusal::Closed => NextStep::AskOwner,
+                | crate::intro::IntroRefusal::Closed
+                | crate::intro::IntroRefusal::InviterConflict { .. } => NextStep::AskOwner,
             },
         }
     }

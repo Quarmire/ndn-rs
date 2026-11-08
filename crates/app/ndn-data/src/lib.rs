@@ -79,7 +79,7 @@ pub mod wire;
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{Clock, Config, CutBound, CutProposal, Device, Entropy, Released, Transport};
 pub use error::{DataError, NextStep, Refusal};
-pub use intro::{Code, IntroRefusal, Introducer, Joined, Offer, Role};
+pub use intro::{Code, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     PutOptions, Share, State,

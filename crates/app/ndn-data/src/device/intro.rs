@@ -2,7 +2,7 @@
 //! the log, the asks it answers, and the joins it makes. Types, bytes and
 //! proofs are [`crate::intro`]'s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -46,12 +46,17 @@ pub(super) struct Intros {
     /// Offers held, by the offer record's name: this device's own, and
     /// other devices' of its namespace.
     pub(super) offers: BTreeMap<Name, OfferBody>,
-    /// Use marks held, by offer: the key it was used by and its digest, or
-    /// `None` when closed. The first mark held of an offer stands.
-    pub(super) used: BTreeMap<Name, Option<(Name, [u8; 32])>>,
-    /// Asks are judged one at a time: a use mark, a wrong try counted, a
+    /// Use marks naming a key held, by offer: the key it was used by and
+    /// its digest. The first held of an offer stands.
+    pub(super) used: BTreeMap<Name, (Name, [u8; 32])>,
+    /// Offers a closing mark is held of: closed for good, used or not.
+    pub(super) closed: BTreeSet<Name>,
+    /// Asks are judged one at a time: a use, a wrong try counted, a
     /// closing mark each see what the one before wrote.
     serial: Arc<tokio::sync::Mutex<()>>,
+    /// Asks held now, verifying or waiting for their turn
+    /// ([`IntroPolicy::asks_queued`](crate::intro::IntroPolicy::asks_queued)).
+    queued: usize,
 }
 
 impl Intros {
@@ -59,26 +64,63 @@ impl Intros {
         Self {
             offers: BTreeMap::new(),
             used: BTreeMap::new(),
+            closed: BTreeSet::new(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            queued: 0,
         }
     }
 }
 
-/// Where the store keeps an own offer's proof key, wrapped to the device's
-/// recipient key: a local name no device serves.
-fn proof_key_name(offer: &Name) -> Name {
-    let base: Name = "/localhost/ndn-data/intro/key"
+/// One ask held ([`Intros::queued`]), let go as it is dropped.
+struct Queued<'a>(&'a Inner);
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.st.lock();
+        st.intro.queued = st.intro.queued.saturating_sub(1);
+    }
+}
+
+/// `/localhost/ndn-data/intro/<what>/<offer's Name TLV>`: where the store
+/// keeps what an own offer needs, under a local name no device serves.
+fn local_name(what: &str, offer: &Name) -> Name {
+    let base: Name = format!("/localhost/ndn-data/intro/{what}")
         .parse()
         .expect("a valid name");
     base.append_component(NameComponent::generic(offer.encode_to_tlv()))
 }
 
-/// Where the store keeps how many wrong tries an own offer was asked with.
+/// Where the store keeps an own offer's proof key, wrapped to the device's
+/// recipient key.
+fn proof_key_name(offer: &Name) -> Name {
+    local_name("key", offer)
+}
+
+/// Where the store keeps an own offer's wrong tries, all askers' together:
+/// how many were counted toward the cap, then when the last one was (4 and
+/// 8 octets, big-endian; the time by the device's clock).
 fn tries_name(offer: &Name) -> Name {
-    let base: Name = "/localhost/ndn-data/intro/tries"
-        .parse()
-        .expect("a valid name");
-    base.append_component(NameComponent::generic(offer.encode_to_tlv()))
+    local_name("tries", offer)
+}
+
+/// Where the store keeps how many wrong tries one asker key, by its public
+/// key's digest, asked an own offer with (4 octets, big-endian).
+fn asker_tries_name(offer: &Name, digest: &[u8; 32]) -> Name {
+    tries_name(offer).append_component(NameComponent::generic(Bytes::copy_from_slice(digest)))
+}
+
+/// Where the store keeps the use of an own offer under way: the asker key
+/// and its digest (the key's Name TLV, then the digest), from before the
+/// asker's anchor is adopted until the use mark is durable. A stop between
+/// leaves it: the offer is that key's, whose retry finishes the use.
+fn using_name(offer: &Name) -> Name {
+    local_name("using", offer)
+}
+
+/// Where the store keeps the acceptance an own offer's use was answered
+/// with: its user asking again gets it again (spec §19.4).
+fn accepted_name(offer: &Name) -> Name {
+    local_name("accepted", offer)
 }
 
 /// Credentials opened ([`AskBody::credentials`], an answer's): the signed
@@ -90,7 +132,6 @@ struct Opened {
     anchor: Certificate,
     /// The trust context's signed Data, as the credentials carry it.
     context: Bytes,
-    certs: Vec<Certificate>,
     validator: Validator,
 }
 
@@ -106,15 +147,12 @@ async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
     let (ctx, anchor) = SignedTrustContext::open_received(&data).await.ok()?;
     let ctx = Arc::new(ctx);
     let keyring = Keyring::new();
-    if !keyring.adopt(Arc::clone(&ctx)) {
+    if keyring.adopt(Arc::clone(&ctx)).is_err() {
         return None;
     }
     let cache = CertCache::new();
-    let mut certs = Vec::with_capacity(rest.len());
     for p in rest {
-        let cert = Certificate::decode(&Data::decode(p.clone()).ok()?).ok()?;
-        cache.insert(cert.clone());
-        certs.push(cert);
+        cache.insert(Certificate::decode(&Data::decode(p.clone()).ok()?).ok()?);
     }
     let validator = Validator::with_keyring(Arc::new(keyring), Arc::new(cache), None, CHAIN_MAX)
         .refuse_without_anchors();
@@ -122,7 +160,6 @@ async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
         ctx,
         anchor,
         context: first.clone(),
-        certs,
         validator,
     })
 }
@@ -139,11 +176,44 @@ impl Opened {
         }
         let locator = data.sig_info()?.key_locator_name()?;
         let key = key_name_of(&locator);
+        Some((key.clone(), self.claimed(&key)?))
+    }
+
+    /// The public key digest `key` has by these credentials, unverified: an
+    /// anchor of the context (a key that is its own anchor shows no
+    /// certificate), else the certificate of it a chain walk picks.
+    fn claimed(&self, key: &Name) -> Option<[u8; 32]> {
         let cert = self
             .ctx
-            .anchor_for(&key)
-            .or_else(|| self.validator.cert_cache().get_valid(&key))?;
-        Some((key, public_key_digest(&cert.public_key)))
+            .anchor_for(key)
+            .or_else(|| self.validator.cert_cache().get_valid(key))?;
+        Some(public_key_digest(&cert.public_key))
+    }
+
+    /// The certificates on the chain from `key` to the context's anchor,
+    /// as a chain walk picks them, named under `ns`: what a validator
+    /// adopting the context takes of these credentials, and nothing else
+    /// they carry (a certificate on no chain, of another party's key, would
+    /// only shadow that party's in the cache).
+    fn chain(&self, key: &Name, ns: &Name) -> Vec<Certificate> {
+        let mut out = Vec::new();
+        let mut at = key.clone();
+        for _ in 0..=CHAIN_MAX {
+            if self.ctx.anchor_for(&at).is_some() {
+                break;
+            }
+            let Some(cert) = self.validator.cert_cache().get_valid(&at) else {
+                break;
+            };
+            let Some(issuer) = cert.issuer.as_deref().cloned() else {
+                break;
+            };
+            if cert.key_name().has_prefix(ns) {
+                out.push(cert);
+            }
+            at = issuer;
+        }
+        out
     }
 
     /// SHA-256 of the anchor's public key.
@@ -307,7 +377,14 @@ impl Inner {
                     return;
                 }
                 self.store.insert(name, wire);
-                st.intro.used.entry(body.offer).or_insert(body.by);
+                match body.by {
+                    Some(by) => {
+                        st.intro.used.entry(body.offer).or_insert(by);
+                    }
+                    None => {
+                        st.intro.closed.insert(body.offer);
+                    }
+                }
             }
         }
     }
@@ -326,7 +403,7 @@ impl Inner {
     /// This device's credentials: its namespace's signed trust context, as
     /// the host gives it, then the certificates of its key up to the
     /// context's anchor.
-    fn credentials(&self) -> Result<Vec<Bytes>, DataError> {
+    pub(super) fn credentials(&self) -> Result<Vec<Bytes>, DataError> {
         let context = self.introducer()?.anchor().ok_or_else(|| {
             local(
                 "the host's introducer gives no anchor (this device's namespace's signed trust \
@@ -418,30 +495,100 @@ impl Inner {
         open_grant(&st.keys.recipient, &name, wire).map(|k| *k.expose())
     }
 
-    /// How many wrong tries the own offer `offer` was asked with.
-    fn wrong_tries(&self, offer: &Name) -> u32 {
+    /// The own offer `offer`'s wrong tries counted toward
+    /// [`IntroPolicy::wrong_tries_max`](crate::intro::IntroPolicy), and
+    /// when the last one was counted.
+    fn overall_tries(&self, offer: &Name) -> (u32, u64) {
+        let Some(b) = self.store.get(&tries_name(offer)) else {
+            return (0, 0);
+        };
+        let count = b
+            .get(..4)
+            .and_then(|c| <[u8; 4]>::try_from(c).ok())
+            .map_or(0, u32::from_be_bytes);
+        let at = b
+            .get(4..12)
+            .and_then(|t| <[u8; 8]>::try_from(t).ok())
+            .map_or(0, u64::from_be_bytes);
+        (count, at)
+    }
+
+    /// How many wrong tries the key of public key digest `digest` asked the
+    /// own offer `offer` with.
+    fn asker_tries(&self, offer: &Name, digest: &[u8; 32]) -> u32 {
         self.store
-            .get(&tries_name(offer))
+            .get(&asker_tries_name(offer, digest))
             .and_then(|b| <[u8; 4]>::try_from(b.as_ref()).ok())
             .map_or(0, u32::from_be_bytes)
     }
 
-    /// Count one more wrong try of `offer`, durably: the count, once the
-    /// store's barrier passed it, or `None` if the device stopped first.
-    async fn count_wrong(&self, offer: &Name) -> Option<u32> {
-        let n = self.wrong_tries(offer).saturating_add(1);
-        self.store
-            .insert(tries_name(offer), Bytes::copy_from_slice(&n.to_be_bytes()));
-        self.barrier().await.then_some(n)
+    /// Count a wrong try of `offer` by the key of digest `digest`, durably:
+    /// against the asker always; toward the overall cap once the pause
+    /// after the last one counted there passed (the policy's backoff,
+    /// doubled by each counted). The asker's count and the overall one,
+    /// once the store's barrier passed them; `None` if the device stopped
+    /// first.
+    async fn count_wrong(&self, offer: &Name, digest: &[u8; 32]) -> Option<(u32, u32)> {
+        let mine = self.asker_tries(offer, digest).saturating_add(1);
+        self.store.insert(
+            asker_tries_name(offer, digest),
+            Bytes::copy_from_slice(&mine.to_be_bytes()),
+        );
+        let (mut all, last) = self.overall_tries(offer);
+        let now = (self.config.clock)().0;
+        let pause = u64::try_from(self.config.intro.backoff.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1u64 << all.saturating_sub(1).min(32));
+        if all == 0 || now >= last.saturating_add(pause) {
+            all = all.saturating_add(1);
+            let mut v = Vec::with_capacity(12);
+            v.extend_from_slice(&all.to_be_bytes());
+            v.extend_from_slice(&now.to_be_bytes());
+            self.store.insert(tries_name(offer), Bytes::from(v));
+        }
+        self.barrier().await.then_some((mine, all))
     }
 
-    /// Sign the use mark `body` of an offer of `folder` into the own log,
-    /// unless a mark of it is held; wait until it is durable. Whether a
-    /// mark of the offer is durable now.
+    /// The key a use of the own offer `offer` is under way for, if one is
+    /// (a stop came between its start and its use mark).
+    fn using(&self, offer: &Name) -> Option<(Name, [u8; 32])> {
+        let b = self.store.get(&using_name(offer))?;
+        let split = b.len().checked_sub(32)?;
+        let key = Name::decode_from_tlv(b.slice(..split)).ok()?;
+        Some((key, <[u8; 32]>::try_from(&b[split..]).ok()?))
+    }
+
+    /// Note durably that the own offer `offer` is being used by `by`,
+    /// before anything of the use is done: whether the note is durable.
+    async fn note_using(&self, offer: &Name, (key, digest): &(Name, [u8; 32])) -> bool {
+        let mut v = key.encode_to_tlv().to_vec();
+        v.extend_from_slice(digest);
+        self.store.insert(using_name(offer), Bytes::from(v));
+        self.barrier().await
+    }
+
+    /// Drop the note of a use of `offer` that did not happen (the host
+    /// did not adopt the asker, or it was not added): the offer is not
+    /// spent.
+    async fn release(&self, offer: &Name) {
+        self.store.remove(&using_name(offer));
+        if !self.barrier().await {
+            tracing::debug!(%offer, "the device stopped before an offer's use note was dropped durably");
+        }
+    }
+
+    /// Sign the mark `body` of an own offer of `folder` into the own log —
+    /// a use mark unless one naming a key is held, a closing mark unless
+    /// one is held — and wait until it is durable. Whether such a mark of
+    /// the offer is durable now.
     async fn mark(self: &Arc<Self>, folder: &Name, body: UsedBody) -> bool {
         let seq = {
             let mut st = self.st.lock();
-            if st.intro.used.contains_key(&body.offer) {
+            let held = match body.by {
+                Some(_) => st.intro.used.contains_key(&body.offer),
+                None => st.intro.closed.contains(&body.offer),
+            };
+            if held {
                 // The device's own marks are restored at a start once
                 // durable, and taken here as they are signed.
                 st.head
@@ -462,6 +609,78 @@ impl Inner {
             tracing::debug!(%folder, "a use mark is not announced: {e}");
         }
         true
+    }
+
+    /// Close every own offer of `folder` used — or being used — by a key
+    /// under one of `dropped`, namespaces the folder's new members record
+    /// removed (spec §19.7): a removed member never comes back by its code.
+    pub(super) async fn close_used_by(self: &Arc<Self>, folder: &Name, dropped: &[Name]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let offers: Vec<Name> = {
+            let st = self.st.lock();
+            st.intro
+                .offers
+                .iter()
+                .filter(|(o, ob)| {
+                    ob.folder == *folder
+                        && !st.intro.closed.contains(*o)
+                        && parse_log_name(o).is_some_and(|l| l.device == self.device)
+                })
+                .filter(|(o, _)| {
+                    st.intro
+                        .used
+                        .get(*o)
+                        .cloned()
+                        .or_else(|| self.using(o))
+                        .is_some_and(|(k, _)| dropped.iter().any(|d| k.has_prefix(d)))
+                })
+                .map(|(o, _)| o.clone())
+                .collect()
+        };
+        for offer in offers {
+            let closing = UsedBody {
+                offer: offer.clone(),
+                by: None,
+            };
+            if !self.mark(folder, closing).await {
+                tracing::warn!(%offer, "the offer of a removed member is not closed: the device stopped first; close it with close_offer");
+            }
+        }
+    }
+
+    /// Why the namespace `ns`, which an introduction would bring under the
+    /// anchor of `fingerprint`, may not be (spec §19.3, §19.4): "… <why>"
+    /// completes "the namespace <ns> …". The policy's refusals
+    /// ([`IntroPolicy::refuses`](crate::intro::IntroPolicy::refuses)); this
+    /// device's own namespace or one over or under it; and every namespace
+    /// it trusts — over or under one, or equal under another anchor. The
+    /// same namespace under the same anchor is a party known already.
+    fn overlap(&self, ns: &Name, fingerprint: &[u8; 32]) -> Option<String> {
+        if let Some(why) = self.config.intro.refuses(ns) {
+            return Some(why);
+        }
+        if *ns == self.ns || ns.has_prefix(&self.ns) || self.ns.has_prefix(ns) {
+            return Some(format!("overlaps this device's own namespace {}", self.ns));
+        }
+        for ctx in self.validator.keyring().contexts() {
+            let held = ctx.namespace();
+            if held == ns {
+                let same = ctx
+                    .anchors()
+                    .iter()
+                    .any(|a| anchor_fingerprint(a.value()) == *fingerprint);
+                if !same {
+                    return Some("is trusted here already under another anchor".into());
+                }
+            } else if ns.has_prefix(held) {
+                return Some(format!("lies under {held}, which this device trusts"));
+            } else if held.has_prefix(ns) {
+                return Some(format!("lies over {held}, which this device trusts"));
+            }
+        }
+        None
     }
 
     /// Make `ns` a member of `folder` as `role` (spec §19.4): the next
@@ -521,8 +740,10 @@ impl Inner {
     /// order specified, and answer — admitting the asker, or refusing and
     /// saying why. One ask at a time; the same ask asked again gets the same
     /// answer while it is kept. `None` (a Nack) for what does not open or
-    /// whose asker does not verify: a stranger's garbage costs a parse and
-    /// one signature check.
+    /// whose asker does not verify — a stranger's garbage costs a parse and
+    /// one signature check — and for an ask past the ones held already
+    /// ([`IntroPolicy::asks_queued`](crate::intro::IntroPolicy)): opening
+    /// and verifying run at most [`super::ASKS_VERIFYING`] at once.
     pub(super) async fn answer_intro(
         self: &Arc<Self>,
         name: &Name,
@@ -533,37 +754,50 @@ impl Inner {
         }
         // The name's digest binds the parameters: an ask is its parameters.
         let params = params.filter(|p| intro_name(&self.device, p) == *name)?;
-        let ask = IntroAsk::decode(params).ok()?;
-        let aad = intro_prefix(&self.device).encode_to_tlv();
-        let plain = {
-            let st = self.st.lock();
-            let wrapped = Sealed::from_bytes(&ask.key).ok()?;
-            let ck = st
-                .keys
-                .recipient
-                .unwrap_ck(&ask.ephemeral, &wrapped, &aad)
-                .ok()?;
-            ck.open(&Sealed::from_bytes(&ask.sealed).ok()?, &aad).ok()?
+        let _held = {
+            let mut st = self.st.lock();
+            if st.intro.queued >= self.config.intro.asks_queued {
+                tracing::warn!(
+                    me = %self.device,
+                    held = st.intro.queued,
+                    "an introduction ask is not answered: as many asks as Config::intro.asks_queued allows are held already; its asker's retry is judged once they are done"
+                );
+                return None;
+            }
+            st.intro.queued += 1;
+            Queued(self)
         };
-        let body = AskBody::decode(Bytes::from(plain)).ok()?;
-        let (proof, asker) = Self::claimed_asker(&body.asker)?;
-        let opened = open_credentials(&body.credentials).await?;
-        // Who it claims to be, unverified: what a refusal before the chain
-        // is checked is addressed to.
-        let locator = proof.sig_info()?.key_locator_name()?;
-        let claimed = key_name_of(&locator);
-        let claimed_digest = opened
-            .certs
-            .iter()
-            .find(|c| c.key_name() == claimed)
-            .map(|c| public_key_digest(&c.public_key))?;
+        let (body, proof, asker, opened, claimed) = {
+            let _verifying = self.verifying.acquire().await.ok()?;
+            let ask = IntroAsk::decode(params).ok()?;
+            let aad = intro_prefix(&self.device).encode_to_tlv();
+            let plain = {
+                let st = self.st.lock();
+                let wrapped = Sealed::from_bytes(&ask.key).ok()?;
+                let ck = st
+                    .keys
+                    .recipient
+                    .unwrap_ck(&ask.ephemeral, &wrapped, &aad)
+                    .ok()?;
+                ck.open(&Sealed::from_bytes(&ask.sealed).ok()?, &aad).ok()?
+            };
+            let body = AskBody::decode(Bytes::from(plain)).ok()?;
+            let (proof, asker) = Self::claimed_asker(&body.asker)?;
+            let opened = open_credentials(&body.credentials).await?;
+            // Who it claims to be, unverified: what a refusal before the
+            // chain is checked is addressed to.
+            let locator = proof.sig_info()?.key_locator_name()?;
+            let claimed = key_name_of(&locator);
+            let digest = opened.claimed(&claimed)?;
+            (body, proof, asker, opened, (claimed, digest))
+        };
         let serial = Arc::clone(&self.st.lock().intro.serial);
         let _turn = serial.lock().await;
         if let Some(r) = self.st.lock().answers.get(name) {
             return Some(r.clone());
         }
         let answer = self
-            .judge_ask(&body, &proof, &asker, &opened, (claimed, claimed_digest))
+            .judge_ask(&body, &proof, &asker, &opened, claimed)
             .await?;
         let reply = DataBuilder::new(name.clone(), &answer.encode()).sign_digest_sha256();
         self.st.lock().answers.insert(name.clone(), reply.clone());
@@ -571,13 +805,15 @@ impl Inner {
     }
 
     /// Judge an opened ask, in order (spec §19.4): the offer is this
-    /// device's and known; not closed; not expired by this device's clock;
-    /// the asker's key chains to the anchor its credentials carry; the
-    /// proof is right (a wrong one counted durably, the offer closed for
-    /// good at its tries); the asker's namespace is no other's; the offer
-    /// is not used by another key. Then the use mark is made durable, the
-    /// asker's anchor adopted, the asker added to the folder, and the answer
-    /// signed.
+    /// device's and known; not closed; the asker's key chains to the anchor
+    /// its credentials carry; not used by another key (its user is answered
+    /// the acceptance it was given, and nothing more is done); not expired
+    /// by this device's clock; the asker's own wrong tries not spent; the
+    /// proof is right (a wrong one counted durably, against the asker and
+    /// toward the overall cap); the asker's namespace is no other's. Then
+    /// the use is noted, the asker's anchor adopted, the asker added to the
+    /// folder, and the acceptance kept and the use mark signed, both
+    /// durable before the answer; a failure before lets the use go.
     async fn judge_ask(
         self: &Arc<Self>,
         body: &AskBody,
@@ -600,16 +836,16 @@ impl Inner {
             own.then(|| st.intro.offers.get(offer).cloned())
                 .flatten()
                 .and_then(|ob| Some((self.proof_key_of(&st, offer)?, ob)))
-                .map(|(pk, ob)| (pk, ob, st.intro.used.get(offer).cloned()))
+                .map(|(pk, ob)| {
+                    let used = st.intro.used.get(offer).cloned();
+                    (pk, ob, used, st.intro.closed.contains(offer))
+                })
         };
-        let Some((pk, ob, used)) = held else {
+        let Some((pk, ob, used, closed)) = held else {
             return Some(refuse(claimed, IntroRefusal::Unknown));
         };
-        if matches!(used, Some(None)) || self.wrong_tries(offer) >= ob.tries {
+        if closed || self.overall_tries(offer).0 >= self.config.intro.wrong_tries_max {
             return Some(refuse(claimed, IntroRefusal::Closed));
-        }
-        if ob.until <= (self.config.clock)() {
-            return Some(refuse(claimed, IntroRefusal::Expired));
         }
         let (key, digest) = opened.signer(proof).await?;
         if *proof.name != wire::ask_name(asker, &body.binding(&self.device))
@@ -618,10 +854,24 @@ impl Inner {
             tracing::debug!(%offer, %asker, "an ask whose asker's proof does not verify; not answered");
             return None;
         }
-        let by = (key.clone(), digest);
-        if !ask_proves(&pk, offer, &key, &digest, &body.nonce, &body.proof) {
-            let n = self.count_wrong(offer).await?;
-            if n >= ob.tries {
+        let by = (key, digest);
+        // One use: a use mark, else a use a stop interrupted. Its user is
+        // answered again — never admitted again: a later members record
+        // may have removed it (spec §19.7).
+        match used.clone().or_else(|| self.using(offer)) {
+            Some(user) if user != by => return Some(refuse(by, IntroRefusal::Used)),
+            Some(_) if used.is_some() => return self.accepted_again(offer, &ob, &pk, by),
+            _ => {}
+        }
+        if ob.until <= (self.config.clock)() {
+            return Some(refuse(by, IntroRefusal::Expired));
+        }
+        if self.asker_tries(offer, &by.1) >= ob.tries {
+            return Some(refuse(by, IntroRefusal::Closed));
+        }
+        if !ask_proves(&pk, offer, &by.0, &by.1, &body.nonce, &body.proof) {
+            let (mine, all) = self.count_wrong(offer, &by.1).await?;
+            if all >= self.config.intro.wrong_tries_max {
                 let closing = UsedBody {
                     offer: offer.clone(),
                     by: None,
@@ -631,55 +881,69 @@ impl Inner {
                 }
                 return Some(refuse(by, IntroRefusal::Closed));
             }
-            return Some(refuse(by, IntroRefusal::WrongProof { left: ob.tries - n }));
+            if mine >= ob.tries {
+                return Some(refuse(by, IntroRefusal::Closed));
+            }
+            return Some(refuse(
+                by,
+                IntroRefusal::WrongProof {
+                    left: ob.tries - mine,
+                },
+            ));
         }
         let theirs = opened.ctx.namespace().clone();
-        let fingerprint = opened.fingerprint();
-        let shadowed = self
-            .validator
-            .keyring()
-            .contexts()
-            .into_iter()
-            .find(|c| *c.namespace() == theirs)
-            .is_some_and(|c| {
-                !c.anchors()
-                    .iter()
-                    .any(|a| anchor_fingerprint(a.value()) == fingerprint)
-            });
-        if theirs.has_prefix(&self.ns)
-            || self.ns.has_prefix(&theirs)
-            || !asker.has_prefix(&theirs)
-            || shadowed
-        {
+        let overlap = if asker.has_prefix(&theirs) {
+            self.overlap(&theirs, &opened.fingerprint())
+        } else {
+            Some(format!("is not a prefix of the asking device {asker}"))
+        };
+        if let Some(why) = overlap {
+            tracing::info!(%offer, namespace = %theirs, "an ask refused as a conflict: the namespace {why}");
             return Some(refuse(by, IntroRefusal::Conflict));
         }
-        match &used {
-            Some(Some(user)) if *user != by => return Some(refuse(by, IntroRefusal::Used)),
-            Some(Some(_)) => {}
-            _ => {
-                let mark = UsedBody {
-                    offer: offer.clone(),
-                    by: Some(by.clone()),
-                };
-                if !self.mark(&ob.folder, mark).await {
-                    return None;
-                }
-                // Concurrent asks are judged one at a time, so the mark held
-                // is this one.
-            }
+        // The use, noted before anything of it is done: a stop from here
+        // on leaves the offer this key's, and its retry finishes the use.
+        if !self.note_using(offer, &by).await {
+            return None;
         }
         let introducer = self.introducer().ok()?;
         if let Err(why) = introducer.adopt(&opened.link()).await {
-            tracing::warn!(%offer, namespace = %theirs, "the host did not adopt the asker's anchor: {why}; the asker's retry is answered again");
+            tracing::warn!(%offer, namespace = %theirs, "the host did not adopt the asker's anchor: {why}; the offer is not spent and the asker's retry is judged again");
+            self.release(offer).await;
             return None;
         }
-        for c in &opened.certs {
-            self.validator.cert_cache().insert(c.clone());
+        for c in opened.chain(&by.0, &theirs) {
+            self.validator.cert_cache().insert(c);
         }
         if let Err(e) = self.admit_joiner(&ob.folder, ob.role, &theirs).await {
-            tracing::warn!(%offer, namespace = %theirs, "the asker is not added to the folder yet: {e}; its retry is answered again");
+            tracing::warn!(%offer, namespace = %theirs, "the asker is not added to the folder: {e}; the offer is not spent and the asker's retry is judged again");
+            self.release(offer).await;
             return None;
         }
+        let answer = self.acceptance(offer, &ob, &pk, by.clone())?;
+        // Kept with the use mark: the store's barrier under the mark makes
+        // both durable before the answer.
+        self.store.insert(accepted_name(offer), answer.encode());
+        let mark = UsedBody {
+            offer: offer.clone(),
+            by: Some(by),
+        };
+        if !self.mark(&ob.folder, mark).await {
+            return None;
+        }
+        self.store.remove(&using_name(offer));
+        Some(answer)
+    }
+
+    /// The acceptance of `offer` for its asker key `by`: the folder, the
+    /// role, this device's credentials and proof packet, the answer proof.
+    fn acceptance(
+        &self,
+        offer: &Name,
+        ob: &OfferBody,
+        pk: &[u8; 32],
+        (key, digest): (Name, [u8; 32]),
+    ) -> Option<AnswerBody> {
         let credentials = self.credentials().ok()?;
         let mut answer = AnswerBody {
             offer: offer.clone(),
@@ -697,8 +961,30 @@ impl Inner {
         if let Outcome::Accepted { inviter, .. } = &mut answer.outcome {
             *inviter = signed;
         }
-        answer.proof = Some(answer_proof(&pk, &answer));
+        answer.proof = Some(answer_proof(pk, &answer));
         Some(answer)
+    }
+
+    /// The acceptance the used offer `offer` was answered with, for its
+    /// user `by`, asking again: as kept. A use marked before acceptances
+    /// were kept is answered the same acceptance signed afresh. Neither
+    /// adopts nor admits anything.
+    fn accepted_again(
+        &self,
+        offer: &Name,
+        ob: &OfferBody,
+        pk: &[u8; 32],
+        by: (Name, [u8; 32]),
+    ) -> Option<AnswerBody> {
+        let kept = self
+            .store
+            .get(&accepted_name(offer))
+            .and_then(|b| AnswerBody::decode(b).ok())
+            .filter(|a| a.asker == by.0 && a.digest == by.1);
+        match kept {
+            Some(a) => Some(a),
+            None => self.acceptance(offer, ob, pk, by),
+        }
     }
 }
 
@@ -850,6 +1136,20 @@ impl Device {
                 "the code offers a folder of this device's own namespace: it is yours already",
             ));
         }
+        // A namespace the code names is judged before anything is asked:
+        // this device trusts none of it yet, and never one overlapping a
+        // namespace it trusts (spec §19.3).
+        if let (Some(ns), Fingerprint::Whole(fp)) = (&code.namespace, &code.fingerprint)
+            && let Some(why) = inner.overlap(ns, fp)
+        {
+            return Err(DataError::Introduction {
+                offer: offer.clone(),
+                why: IntroRefusal::InviterConflict {
+                    inviter: ns.clone(),
+                    why,
+                },
+            });
+        }
         let introducer = Arc::clone(inner.introducer()?);
         let credentials = inner.credentials()?;
         let own = open_credentials(&credentials).await.ok_or_else(|| {
@@ -961,20 +1261,30 @@ impl Device {
         let theirs = open_credentials(credentials).await.ok_or_else(forged)?;
         let inviter = theirs.ctx.namespace().clone();
         let signed = Data::decode(signed.clone()).map_err(|_| forged())?;
-        let by_device = |k: Option<(Name, [u8; 32])>| {
-            k.is_some_and(|(k, _)| device_of(&k).as_ref() == Some(&device))
+        let by_device = |k: &Option<(Name, [u8; 32])>| {
+            k.as_ref()
+                .is_some_and(|(k, _)| device_of(k).as_ref() == Some(&device))
         };
+        let signer = theirs.signer(&signed).await;
         if !code.fingerprint.matches(&theirs.fingerprint())
             || code.namespace.as_ref().is_some_and(|ns| *ns != inviter)
             || !device.has_prefix(&inviter)
             || *signed.name != wire::ask_name(&device, &answer.binding())
-            || !by_device(theirs.signer(&signed).await)
-            || !by_device(theirs.signer(&entry).await)
+            || !by_device(&signer)
+            || !by_device(&theirs.signer(&entry).await)
             || ob.commitment != commitment(&code.secret)
             || ob.folder != folder
             || ob.role != role
         {
             return Err(forged());
+        }
+        // The inviter proved the code: its namespace is judged as one the
+        // code named would have been — the words name none.
+        if let Some(why) = inner.overlap(&inviter, &theirs.fingerprint()) {
+            return Err(DataError::Introduction {
+                offer: offer.clone(),
+                why: IntroRefusal::InviterConflict { inviter, why },
+            });
         }
         introducer.adopt(&theirs.link()).await.map_err(|why| {
             local(format!(
@@ -982,8 +1292,10 @@ impl Device {
                  again with the same code (the offer is yours: asking again is answered again)"
             ))
         })?;
-        for c in &theirs.certs {
-            inner.validator.cert_cache().insert(c.clone());
+        if let Some((key, _)) = &signer {
+            for c in theirs.chain(key, &inviter) {
+                inner.validator.cert_cache().insert(c);
+            }
         }
         inner.look(&folder).await?;
         Ok(Joined {
@@ -991,5 +1303,51 @@ impl Device {
             role,
             inviter,
         })
+    }
+
+    /// Close the offer `offer` this device made, for good (spec §19.2):
+    /// a closing mark in the own log, signed and durable before this
+    /// returns. Every ask of it is refused as closed from then on, its
+    /// user's too; what the offer granted stays, until the folder's members
+    /// record removes it. Closing a closed offer does nothing more.
+    pub async fn close_offer(&self, offer: &Name) -> Result<(), DataError> {
+        let inner = &self.inner;
+        let maker = parse_log_name(offer).map(|l| l.device);
+        if maker.as_ref() != Some(&inner.device) {
+            return Err(DataError::BadRequest {
+                name: offer.clone(),
+                why: match maker {
+                    Some(d) => format!(
+                        "the offer was made by the device {d}, which alone answers and closes \
+                         it: close it there"
+                    ),
+                    None => "this is no offer's name (a log entry \
+                             <device>/32=log/<folder>/seq=<n>): give the name the offer printed"
+                        .into(),
+                },
+            });
+        }
+        let folder = inner
+            .st
+            .lock()
+            .intro
+            .offers
+            .get(offer)
+            .map(|ob| ob.folder.clone())
+            .ok_or_else(|| DataError::BadRequest {
+                name: offer.clone(),
+                why: "this device holds no offer of that name: give the name the offer printed"
+                    .into(),
+            })?;
+        let closing = UsedBody {
+            offer: offer.clone(),
+            by: None,
+        };
+        if !inner.mark(&folder, closing).await {
+            return Err(local(
+                "the device stopped before the offer's closing mark was durable: close it again",
+            ));
+        }
+        Ok(())
     }
 }

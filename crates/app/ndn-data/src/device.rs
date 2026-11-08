@@ -162,6 +162,10 @@ pub struct Config {
     /// anchor and adopt another person's. `None`: [`Device::offer`] and
     /// [`Device::join`] answer [`DataError::Local`] naming this setting.
     pub introducer: Option<Arc<dyn crate::intro::Introducer>>,
+    /// What introductions allow and cost this device (spec §19.4, §19.7):
+    /// the namespaces they may bring either way, the overall cap on an
+    /// offer's wrong tries and its backoff, the asks held at once.
+    pub intro: crate::intro::IntroPolicy,
     /// How many changes a watcher may leave unread, past what its watch
     /// listed as it began (spec §15): one more is not queued; the watcher
     /// is told [`Change::Lagged`] and the changes after it are dropped
@@ -181,7 +185,8 @@ impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
     /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
     /// not a holder, 16 pieces an audit, a day of clock skew, the operating
-    /// system's randomness, no introducer, 4096 changes a watcher may leave
+    /// system's randomness, no introducer, the default introductions
+    /// ([`crate::intro::IntroPolicy::new`]), 4096 changes a watcher may leave
     /// unread, 1024 collections one outside writer can make it follow in a
     /// namespace.
     pub fn new() -> Self {
@@ -204,6 +209,7 @@ impl Config {
                 getrandom::getrandom(buf).expect("the operating system provides randomness")
             }),
             introducer: None,
+            intro: crate::intro::IntroPolicy::new(),
             watch_queue: 4096,
             writer_collections: 1024,
         }
@@ -228,6 +234,7 @@ impl std::fmt::Debug for Config {
             .field("audit_pieces", &self.audit_pieces)
             .field("clock_skew", &self.clock_skew)
             .field("introducer", &self.introducer.is_some())
+            .field("intro", &self.intro)
             .field("watch_queue", &self.watch_queue)
             .field("writer_collections", &self.writer_collections)
             .finish_non_exhaustive()
@@ -16867,7 +16874,7 @@ impl Device {
             }
         }
         let before = inner.groups_of(&inner.st.lock(), name);
-        {
+        let dropped = {
             let mut st = inner.st.lock();
             if !s.folder {
                 widens(&st, name, &writers, &members.readers)?;
@@ -16882,9 +16889,31 @@ impl Device {
                 members.readers,
                 false,
             );
+            // The namespaces this record removes, as writers or readers.
+            let dropped: Vec<Name> = current
+                .iter()
+                .flat_map(|m| {
+                    let writers = m
+                        .writers
+                        .iter()
+                        .filter(|w| !record.0.writers.contains(w))
+                        .cloned();
+                    let readers = m.readers.iter().filter_map(|r| match r {
+                        Audience::Person(p) if !record.0.readers.contains(r) => Some(p.clone()),
+                        _ => None,
+                    });
+                    writers.chain(readers).collect::<Vec<_>>()
+                })
+                .collect();
             inner.append_members(&mut st, name, record)?;
-        }
+            dropped
+        };
         inner.publish_about(name, &before).await?;
+        // An introduced member removed never comes back by its code: the
+        // offers it used are closed (spec §19.7).
+        if s.folder {
+            inner.close_used_by(name, &dropped).await;
+        }
         // A collection sealed to this one as a group moves to a new epoch
         // with it, and a merge this record left unresolved is resolved; so
         // does a collection with readers of its own that a folder record
@@ -20904,6 +20933,9 @@ mod lazy_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod group_scale_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod intro_tests;
 
 mod intro;
 
