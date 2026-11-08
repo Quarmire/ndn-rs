@@ -23,18 +23,23 @@ use crate::engine_exchange::EngineExchange;
 /// Adopt the namespace `link` names into `keyring`, fetching through
 /// `engine` whatever the adoption needs from the network
 /// ([`AnchorLink::fetches`]): the context of a link carrying only a
-/// fingerprint or a name, and the genesis chain of a self-certifying
-/// namespace not held whose inline context is a later version (see
-/// [`ndn_cert::adopt_anchor_link`] for the checks). The consumer face lives
-/// only for this call (its fetches are bounded by the Interest timeout).
-/// Persisting and publishing the adopted context are the caller's.
+/// fingerprint or a name, and — whatever the link carries — a
+/// self-certifying namespace not held, adopted by name from its fetched
+/// genesis, a version 1 inline only compared with it (see
+/// [`ndn_cert::adopt_anchor_link`] for the checks). An engine is a network
+/// bound, so an inline version 1 is never taken alone here. The consumer
+/// face lives only for this call (its fetches are bounded by the Interest
+/// timeout). Persisting and publishing the adopted context are the
+/// caller's.
 pub async fn adopt_anchor_link_via_engine(
     engine: &ForwarderEngine,
     keyring: &Keyring,
     link: &AnchorLink,
 ) -> Result<LinkAdoption, AdoptError> {
     if !link.fetches(keyring) {
-        // Inline and adopted from it alone: no network, no consumer face.
+        // Inline, and checked against the link and what is held alone
+        // (another kind of namespace, or a held one moving on by
+        // continuity): no consumer face.
         return ndn_cert::adopt_anchor_link(keyring, None, &mut NoNetwork, link).await;
     }
     let validator = engine.validator();
@@ -61,7 +66,8 @@ pub async fn refresh_context_via_engine(
     ndn_cert::refresh_context(keyring, validator.as_deref(), &mut exchange, namespace).await
 }
 
-/// The exchange for an inline link, which never expresses an Interest.
+/// The exchange for an inline link that fetches nothing
+/// (`!AnchorLink::fetches`), which never expresses an Interest.
 struct NoNetwork;
 
 impl CaExchange for NoNetwork {

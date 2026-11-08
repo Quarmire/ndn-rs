@@ -495,7 +495,8 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
 /// device that does not hold the namespace: it is taken only from its
 /// genesis, so the adoption fetches — version 1, then the versions to the
 /// newest — and a host binding it to a network must give it one
-/// (`AnchorLink::fetches`). An inline genesis needs nothing fetched.
+/// (`AnchorLink::fetches`). So does an inline genesis: with a network bound
+/// it only checks against the fetched one (tests/inline_genesis.rs).
 #[tokio::test]
 async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_genesis() {
     let alice = Root::new(&GenesisKey::generate().unwrap()).await;
@@ -529,7 +530,7 @@ async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_gen
     };
 
     let fresh = Keyring::new();
-    assert!(!inline(alice.genesis()).fetches(&fresh));
+    assert!(inline(alice.genesis()).fetches(&fresh));
     let link = inline(v5);
     assert!(link.fetches(&fresh));
     let adopted = adopt_anchor_link(

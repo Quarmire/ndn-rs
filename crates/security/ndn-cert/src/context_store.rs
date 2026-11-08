@@ -641,15 +641,18 @@ fn read_one_version(
     Ok((ctx, data))
 }
 
-/// `ndn-fwd adopt`'s one-shot: TOFU-adopt the context carried inline by an
-/// anchor `envelope` and persist it under `pib_root`. Contexts already stored
-/// there are loaded first, so anti-rollback holds across invocations (an
-/// older version never replaces a newer stored one). Returns the adopted
-/// context and the file it was written to.
+/// `ndn-fwd adopt`'s one-shot with no daemon (no network bound): TOFU-adopt
+/// the context carried inline by an anchor `envelope`
+/// ([`adopt_anchor_envelope`]) and persist it under `pib_root`. Contexts
+/// already stored there are loaded first, so anti-rollback holds across
+/// invocations (an older version never replaces a newer stored one).
+/// Returns the adoption — whose [`LinkAdoption::offline_genesis`] says a
+/// self-certifying namespace was taken from the link's own version 1
+/// without checking the network — and the file it was written to.
 pub fn adopt_envelope_into_store(
     pib_root: &Path,
     envelope: &TrustEnvelope,
-) -> Result<(Arc<SignedTrustContext>, PathBuf), ContextStoreError> {
+) -> Result<(LinkAdoption, PathBuf), ContextStoreError> {
     let keyring = Keyring::new();
     // A stored file that no longer verifies must not block a fresh adoption;
     // it is simply replaced below.
@@ -658,9 +661,9 @@ pub fn adopt_envelope_into_store(
             tracing::warn!(path = %path.display(), error = %e, "ignoring unloadable stored trust context");
         }
     }
-    let (ctx, data) = adopt_anchor_envelope(&keyring, envelope)?;
-    let path = persist_context(pib_root, &ctx, &data)?;
-    Ok((ctx, path))
+    let adopted = adopt_anchor_envelope(&keyring, envelope)?;
+    let path = persist_context(pib_root, &adopted.context, &adopted.data)?;
+    Ok((adopted, path))
 }
 
 #[cfg(test)]

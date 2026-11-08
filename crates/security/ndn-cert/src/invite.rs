@@ -403,6 +403,10 @@ impl InviteEnrollError {
                 namespace,
                 detail: source.to_string(),
             },
+            e @ AdoptError::GenesisUnreachable { .. } => Self::ContextUnreachable {
+                namespace,
+                detail: e.to_string(),
+            },
             AdoptError::WrongContext { reason, .. } => {
                 Self::ContextFromDifferentRoot { namespace, reason }
             }

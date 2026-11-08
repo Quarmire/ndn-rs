@@ -24,6 +24,11 @@ pub struct AdoptedContextInfo {
     pub ca_endpoints: usize,
     /// Fetched from the network (else carried inline by the link).
     pub fetched: bool,
+    /// A self-certifying namespace taken from the link's own version 1
+    /// without checking the network (no network was bound):
+    /// [`crate::LinkAdoption::OFFLINE_GENESIS_NOTE`] says what to tell.
+    #[serde(default)]
+    pub offline_genesis: bool,
     /// Where the signed context was stored.
     pub stored: String,
     /// Whether this node now publishes it by name.

@@ -294,10 +294,10 @@ fn envelope_adoption_requires_a_signed_inline_context() {
     assert!(keyring.is_empty(), "nothing adopted by default");
 
     let uri = anchor(Some(&root_dev.published_data), None).to_uri();
-    let (ctx, data) =
-        adopt_anchor_envelope(&keyring, &TrustEnvelope::from_uri(&uri).unwrap()).unwrap();
-    assert_eq!(ctx.namespace(), &n("/home/bob"));
-    assert_eq!(data.raw(), root_dev.published_data.raw());
+    let adopted = adopt_anchor_envelope(&keyring, &TrustEnvelope::from_uri(&uri).unwrap()).unwrap();
+    assert_eq!(adopted.context.namespace(), &n("/home/bob"));
+    assert_eq!(adopted.data.raw(), root_dev.published_data.raw());
+    assert!(!adopted.offline_genesis, "not a self-certifying namespace");
 
     // The explicit, unverified legacy path still exists for operators who opt in.
     let legacy = Keyring::new();

@@ -53,7 +53,8 @@
 //!   anchor of the one before it. Every node keeps and serves each version
 //!   it held ([`crate::context_store`]), so the chain of signed versions, not
 //!   the timing of refreshes, carries a node from any version it held to the
-//!   newest. Bounded by [`MAX_CATCH_UP_VERSIONS`] and [`MAX_CATCH_UP_TIME`];
+//!   newest. Bounded by [`MAX_CATCH_UP_VERSIONS`], [`MAX_CATCH_UP_MISSES`]
+//!   and [`MAX_CATCH_UP_TIME`];
 //!   the fetches hold no lock — the newest is adopted only if the version
 //!   it was checked against is still held ([`Keyring::adopt_update_from`]).
 //!
@@ -1044,8 +1045,24 @@ pub async fn bump_context_schema(
 /// adopts the namespace again from a current anchor link, which costs one
 /// fetch. A self-certifying namespace has no such shortcut — it is adopted
 /// again only from its genesis, a longer walk still — so its walks are not
-/// bounded by position, only by [`MAX_CATCH_UP_TIME`] when they fetch.
+/// bounded by position, only by [`MAX_CATCH_UP_MISSES`] and
+/// [`MAX_CATCH_UP_TIME`].
 pub const MAX_CATCH_UP_VERSIONS: u64 = 128;
+
+/// How many positions a walk ([`follow_versions`]) fetches one by one at
+/// most and cannot use — nothing fetched there, or a version not newer than
+/// the one reached — before it passes over the rest at once and fetches
+/// only its last position. An ordinary walk spans at most
+/// [`MAX_CATCH_UP_VERSIONS`] positions, so this bounds only a
+/// self-certifying one: its newest version's number is not authenticated,
+/// and positions that fail at once (a Nack, an old version) would otherwise
+/// cost one Interest each for [`MAX_CATCH_UP_TIME`]. A walk costs the
+/// versions it reaches — each signed by an anchor of the one before, so as
+/// many as the namespace's owner made — plus this many misses at most,
+/// whatever number the pointer names: a line of any length after a
+/// recovery is still followed, and a by-name or sync-triggered walk costs
+/// an announcement's sender at most this many Interests.
+pub const MAX_CATCH_UP_MISSES: u64 = MAX_CATCH_UP_VERSIONS;
 
 /// How long a refresh's walk ([`follow_versions`]) fetches versions at
 /// most: a walk whose upstream answers the newest version's name but lets
@@ -1413,8 +1430,11 @@ where
 /// At most [`MAX_CATCH_UP_VERSIONS`] positions are walked; a longer range
 /// is refused before anything is fetched — except for a self-certifying
 /// namespace, whose walk is the only way to its newest version (a walk
-/// from its genesis is longer still): the source bounds its fetching
-/// instead ([`MAX_CATCH_UP_TIME`]). Returns every version reached,
+/// from its genesis is longer still). Such a walk fetches at most
+/// [`MAX_CATCH_UP_MISSES`] positions it passes over (nothing fetched, or a
+/// version not newer), then passes over the rest at once to the last
+/// position; the source bounds its fetching in time too
+/// ([`MAX_CATCH_UP_TIME`]). Returns every version reached,
 /// oldest first: the last is the one at the last position (empty only for
 /// an empty range). A walk that stops returns why, and the caller adopts
 /// nothing: a node changes its held version only to the newest, so a
@@ -1442,8 +1462,22 @@ where
     let mut steps: Vec<ContextStep> = Vec::new();
     // Positions passed over since the last version reached: first, last, why.
     let mut passed: Option<(u64, u64, String)> = None;
+    // Positions fetched and passed over (nothing fetched, or not newer).
+    let mut misses: u64 = 0;
     let mut position = first;
     loop {
+        if misses >= MAX_CATCH_UP_MISSES && position < last {
+            // Only the last position is fetched now; it must follow.
+            let reason = format!(
+                "the walk fetches at most {MAX_CATCH_UP_MISSES} versions it cannot use (not \
+                 served, or not newer than the version reached) before going to v{last}"
+            );
+            passed = Some(match passed {
+                Some((first, _, _)) => (first, last - 1, reason),
+                None => (position, last - 1, reason),
+            });
+            position = last;
+        }
         let from: &SignedTrustContext = steps.last().map_or(held, |s| s.context.as_ref());
         let refusal = match source.fetch(position, from).await {
             Ok(data) => match open_context_update(from, &data).await {
@@ -1461,6 +1495,7 @@ where
                     continue;
                 }
                 Err(UpdateRefusal::NotNewer { .. }) if position < last => {
+                    misses += 1;
                     position += 1;
                     continue;
                 }
@@ -1469,6 +1504,7 @@ where
             Err(Unfetched::Dropped(reason)) => UpdateRefusal::DroppedByForwarder(reason),
             Err(Unfetched::InProgress(e)) => return Err(e.into()),
             Err(Unfetched::Missing(reason)) if position < last => {
+                misses += 1;
                 passed = Some(match passed {
                     Some((first, _, _)) => (first, position, reason),
                     None => (position, position, reason),
@@ -1697,6 +1733,110 @@ where
     }
 }
 
+/// [`adopt_by_name`] of a namespace held already (`held`): it moves on only
+/// as a refresh moves it ([`refresh_context`]) — the newest version fetched
+/// as an update of the held one, a validating `forwarder` told to expect a
+/// version signed by an anchor of the held version
+/// ([`Validator::expect_context_update`]), never one signed by the key the
+/// name hashes — and reached directly or by walking from the held version.
+/// So after a recovery, a version the (perhaps stolen) genesis key signs is
+/// neither admitted by the forwarder nor adopted, and a holder behind
+/// reaches the recovered line's newest. Already at the newest, that
+/// version's Data is fetched the same way and must be the held version.
+/// A newest version older than `min_version`, or than the held one, is
+/// refused before anything is fetched or adopted. Returns the versions
+/// walked through as [`LinkAdoption::earlier`], to keep and serve.
+async fn adopt_held_by_name<E>(
+    keyring: &Keyring,
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    held: Arc<SignedTrustContext>,
+    min_version: Option<u64>,
+) -> Result<LinkAdoption, AdoptError>
+where
+    E: CaExchange + Send + ?Sized,
+{
+    let namespace = held.namespace();
+    let fetch_failed = |source| AdoptError::Fetch {
+        namespace: namespace.to_string(),
+        source,
+    };
+    let pointer = fetch_context_pointer(&mut *exchange, namespace)
+        .await
+        .map_err(fetch_failed)?;
+    // `fetch_context_pointer` confines the pointer to `<ns>/32=trust-context/v=<N>`.
+    let offered = pointer
+        .components()
+        .last()
+        .and_then(NameComponent::as_version)
+        .unwrap_or_default();
+    if let Some(required) = min_version.filter(|&required| offered < required) {
+        return Err(AdoptError::Downgrade { offered, required });
+    }
+    if offered < held.version() {
+        return Err(AdoptError::Rollback {
+            offered,
+            held: held.version(),
+        });
+    }
+    if offered == held.version() {
+        let data = fetch_update(&mut *exchange, forwarder, &held, &pointer)
+            .await
+            .map_err(|e| match e {
+                UpdateFetchError::Fetch(source) => fetch_failed(source),
+                UpdateFetchError::Dropped(reason) => AdoptError::WrongContext {
+                    namespace: namespace.to_string(),
+                    reason,
+                },
+                UpdateFetchError::InProgress(e) => e.into(),
+            })?;
+        let (context, _) = SignedTrustContext::open_received(&data).await?;
+        // The held version as is, else refused (a fork).
+        let context = adopt_checked(keyring, Arc::new(context), Some(&data)).await?;
+        return Ok(LinkAdoption {
+            context,
+            data,
+            fetched: true,
+            earlier: Vec::new(),
+            offline_genesis: false,
+        });
+    }
+    let mut versions = ByName {
+        exchange,
+        forwarder,
+        namespace,
+        newest: None,
+        deadline: web_time::Instant::now() + MAX_CATCH_UP_TIME,
+    };
+    let (newest, walked) = reach_newest(&mut versions, &held, offered, &pointer)
+        .await
+        .map_err(|unreached| match unreached {
+            Unreached::Refused(refusal) => AdoptError::NotContinuous {
+                namespace: namespace.to_string(),
+                held: held.version(),
+                offered,
+                refusal: Box::new(refusal),
+            },
+            Unreached::Fetch(source) => fetch_failed(source),
+            Unreached::InProgress(e) => e.into(),
+        })?;
+    if keyring
+        .adopt_update_from(&held, Arc::clone(&newest.context))
+        .is_err()
+    {
+        // Changed meanwhile: it moves on only by continuity from what is
+        // held now.
+        adopt_checked(keyring, Arc::clone(&newest.context), Some(&newest.data)).await?;
+    }
+    Ok(LinkAdoption {
+        context: newest.context,
+        data: newest.data,
+        fetched: true,
+        earlier: walked,
+        offline_genesis: false,
+    })
+}
+
 /// The version a context Data's name carries (`…/v=<N>`), if any.
 pub(crate) fn version_of(data: &Data) -> Option<u64> {
     data.name.components().last()?.as_version()
@@ -1720,7 +1860,8 @@ pub(crate) fn version_of(data: &Data) -> Option<u64> {
 ///    another key type, keeps the name.
 /// 4. It is adopted with the genesis ([`Keyring::adopt_genesis`]).
 ///
-/// A namespace held already moves on only by continuity, as from any link.
+/// A namespace held already moves on only as a refresh moves it, from the
+/// held version (see `adopt_held_by_name`), never from its genesis key.
 /// The adoption returns the genesis and the versions walked
 /// ([`LinkAdoption::earlier`]): keep them with the newest
 /// ([`crate::persist_adoption`]), since a restart takes the namespace again
@@ -1735,19 +1876,51 @@ pub async fn adopt_by_name<E>(
 where
     E: CaExchange + Send + ?Sized,
 {
+    adopt_by_name_checking(keyring, forwarder, exchange, namespace, min_version, None).await
+}
+
+/// [`adopt_by_name`] of a namespace a link names, `inline_genesis` the
+/// version 1 the link carries inline, if it does. Not held, that version 1
+/// is checked as the namespace's genesis, then compared with the one
+/// fetched: a different one is refused as a fork
+/// ([`AdoptError::GenesisFork`]) — two versions 1 signed by the key the
+/// name hashes — and nothing is adopted. It is never adopted in place of
+/// the fetched one: a thief holding a stolen genesis key can sign a version
+/// 1 of his own, and only the network shows which line the owner's devices
+/// serve.
+pub(crate) async fn adopt_by_name_checking<E>(
+    keyring: &Keyring,
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    namespace: &Name,
+    min_version: Option<u64>,
+    inline_genesis: Option<&Data>,
+) -> Result<LinkAdoption, AdoptError>
+where
+    E: CaExchange + Send + ?Sized,
+{
     let digest =
         self_certifying_digest(namespace)?.ok_or_else(|| GenesisError::NotSelfCertifying {
             namespace: namespace.to_string(),
         })?;
-    if keyring.held(namespace).is_some() {
-        let link = crate::AnchorLink {
-            namespace: namespace.clone(),
-            expected_fingerprint: digest,
-            min_version,
-            context_data: None,
-        };
-        return crate::onboarding::adopt_fetched(keyring, forwarder, exchange, &link).await;
+    if let Some(held) = keyring.held(namespace) {
+        return adopt_held_by_name(keyring, forwarder, exchange, held, min_version).await;
     }
+
+    // A link's own version 1: a genesis of this namespace, or no use at all.
+    let inline_genesis = match inline_genesis {
+        Some(data) => {
+            let inline = Genesis::open_received(data).await?;
+            if inline.namespace() != namespace {
+                return Err(AdoptError::NamespaceMismatch {
+                    expected: namespace.to_string(),
+                    found: inline.namespace().to_string(),
+                });
+            }
+            Some(inline)
+        }
+        None => None,
+    };
 
     let expectation = forwarder
         .map(|v| v.expect_context(namespace.clone(), digest, CONTEXT_EXPECTATION_TTL))
@@ -1766,12 +1939,19 @@ where
             namespace: namespace.to_string(),
             reason,
         },
-        None => AdoptError::Fetch {
+        None => AdoptError::GenesisUnreachable {
             namespace: namespace.to_string(),
-            source,
+            source: Box::new(source),
         },
     })?;
     let genesis = Genesis::open_received(&genesis).await?;
+    if let Some(inline) = &inline_genesis
+        && inline.data().content() != genesis.data().content()
+    {
+        return Err(AdoptError::GenesisFork {
+            namespace: namespace.to_string(),
+        });
+    }
     // `fetch_context_pointer` confines the pointer to `<ns>/32=trust-context/v=<N>`.
     let offered = pointer
         .components()
@@ -1805,9 +1985,9 @@ where
                     version: offered,
                     refusal: Box::new(refusal),
                 },
-                Unreached::Fetch(source) => AdoptError::Fetch {
+                Unreached::Fetch(source) => AdoptError::GenesisUnreachable {
                     namespace: namespace.to_string(),
-                    source,
+                    source: Box::new(source),
                 },
                 Unreached::InProgress(e) => e.into(),
             })?;
@@ -1824,5 +2004,6 @@ where
         data: newest.data,
         fetched: true,
         earlier,
+        offline_genesis: false,
     })
 }

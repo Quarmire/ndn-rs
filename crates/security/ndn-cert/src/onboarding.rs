@@ -196,10 +196,32 @@ pub enum AdoptError {
     #[error(
         "{namespace} is self-certifying and not trusted here yet, and this is its version \
          {version}: it is trusted only from its version 1 (its genesis, signed by the key the \
-         name hashes) and the versions after it. Adopt it by name over NDN (an anchor link \
-         naming {namespace} alone), or from a link carrying its version 1"
+         name hashes) and the versions after it. Adopt it by name over NDN (any anchor link \
+         naming {namespace}, on a node with a route toward its devices)"
     )]
     GenesisRequired { namespace: String, version: u64 },
+    #[error(
+        "refused: the link's version 1 of {namespace} differs from the version 1 its network \
+         serves. Both are signed by the key the name hashes, so that key signed two versions 1: \
+         evidence of a fork (the key stolen, or misused). Nothing of {namespace} was adopted. \
+         Do not use this link or code; ask {namespace}'s owner, by another channel than the one \
+         that brought it, which line is theirs"
+    )]
+    GenesisFork { namespace: String },
+    #[error(
+        "{namespace} is self-certifying and not trusted here yet, so it is adopted by name — \
+         its version 1 and newest version fetched over NDN — and that failed: {source}. A \
+         version 1 a link or an introduction carries is never taken alone by a node with a \
+         network (whoever stole the key the name hashes could sign another one). Retry once \
+         {namespace}'s devices are reachable: this node needs a route for {namespace} toward a \
+         node serving its context"
+    )]
+    GenesisUnreachable {
+        namespace: String,
+        /// Boxed: beside [`Self::Fetch`], it would grow every `AdoptError`.
+        #[source]
+        source: Box<FetchContextError>,
+    },
     #[error(
         "the genesis of {namespace} checks against the name, but its newest version \
          v{version} does not follow from it ({refusal}); nothing was adopted"
@@ -270,6 +292,13 @@ async fn authenticate(
 /// path from "received a context" to "trust a context": a context whose
 /// signing anchor was not authenticated out-of-band (QR/NFC/pre-baked), or
 /// whose content was altered after signing, never enters the keyring.
+///
+/// No network is bound here: a version 1 of a self-certifying namespace not
+/// held is checked as its genesis against the name alone and adopted
+/// ([`LinkAdoption::OFFLINE_GENESIS_NOTE`] says what that leaves
+/// unchecked). A caller with a network adopts such a namespace by name
+/// instead ([`adopt_anchor_link`], [`crate::adopt_by_name`]), which compares
+/// a version 1 it was handed with the fetched one.
 pub fn adopt_with_tofu(
     keyring: &Keyring,
     context_data: &Data,
@@ -320,26 +349,30 @@ impl AnchorLink {
     }
 
     /// Whether [`adopt_anchor_link`] of this link into `keyring` fetches
-    /// over the network: when the context is not inline, and when it is a
-    /// self-certifying namespace `keyring` does not hold whose inline
-    /// context is not its genesis (version 1) — such a namespace is taken
-    /// only from its genesis, so it is adopted by name
-    /// ([`crate::adopt_by_name`]): version 1 fetched, the newest reached
-    /// from it. A host binding the adoption to a network (an engine) gives
-    /// it one whenever this holds.
+    /// over the network: when the context is not inline, and for a
+    /// self-certifying namespace `keyring` does not hold, whatever the link
+    /// carries — such a namespace is adopted by name
+    /// ([`crate::adopt_by_name`]): version 1 fetched and checked as its
+    /// genesis, the newest reached from it; an inline version 1 is only
+    /// compared with the fetched one (a different one is a fork). A host
+    /// binding the adoption to a network (an engine) gives it one whenever
+    /// this holds. Only with no network bound is an inline version 1 taken
+    /// alone ([`adopt_anchor_envelope`]).
     pub fn fetches(&self, keyring: &Keyring) -> bool {
-        self.context_data.is_none() || self.reached_from_genesis(keyring)
+        self.context_data.is_none() || self.genesis_not_held(keyring)
     }
 
-    /// A self-certifying namespace `keyring` does not hold, its inline
-    /// context (if any) not its genesis: adopted by name from its genesis.
-    fn reached_from_genesis(&self, keyring: &Keyring) -> bool {
-        self.is_self_certifying()
-            && keyring.held(&self.namespace).is_none()
-            && self
-                .context_data
-                .as_ref()
-                .is_none_or(|d| crate::context_update::version_of(d) != Some(1))
+    /// A self-certifying namespace `keyring` does not hold: taken only from
+    /// its genesis.
+    fn genesis_not_held(&self, keyring: &Keyring) -> bool {
+        self.is_self_certifying() && keyring.held(&self.namespace).is_none()
+    }
+
+    /// The version 1 the link carries inline, if it does.
+    fn inline_genesis(&self) -> Option<&Data> {
+        self.context_data
+            .as_ref()
+            .filter(|d| crate::context_update::version_of(d) == Some(1))
     }
 
     /// Read an anchor envelope: it must name a namespace and an expected
@@ -410,17 +443,26 @@ impl AnchorLink {
     }
 }
 
-/// [`adopt_with_tofu`] driven by a scanned anchor envelope: the envelope must
-/// name a namespace and expected fingerprint and carry the signed context
-/// inline (offline adoption). Fingerprint-only envelopes
+/// The offline adoption of a scanned anchor envelope, with no network
+/// bound: the envelope must name a namespace and expected fingerprint and
+/// carry the signed context inline, which is checked against it as
+/// [`adopt_with_tofu`] checks. Fingerprint-only envelopes
 /// ([`AdoptError::InlineContextRequired`]) need a fetch over NDN:
 /// [`adopt_anchor_link`]. Unsigned legacy content
 /// ([`AdoptError::UnsignedLegacyContext`]) is refused.
-/// Returns the adopted context and its signed Data (for persistence).
+///
+/// A self-certifying namespace not held is taken from an inline version 1
+/// checked as its genesis against the name alone
+/// ([`LinkAdoption::offline_genesis`]): nothing shows it is the version 1
+/// its owner's devices serve. A node with a network adopts the link with
+/// [`adopt_anchor_link`] instead, which fetches version 1 and refuses an
+/// inline one that differs as a fork.
+///
+/// Returns the adoption: the context and its signed Data (for persistence).
 pub fn adopt_anchor_envelope(
     keyring: &Keyring,
     envelope: &TrustEnvelope,
-) -> Result<(Arc<SignedTrustContext>, Data), AdoptError> {
+) -> Result<LinkAdoption, AdoptError> {
     let link = AnchorLink::from_envelope(envelope)?;
     let data = link.context_data.ok_or(AdoptError::InlineContextRequired)?;
     let link = AnchorLink {
@@ -429,8 +471,19 @@ pub fn adopt_anchor_envelope(
     };
     // The verifiers never suspend; drive the future inline.
     let ctx = futures::executor::block_on(link.authenticate(&data))?;
-    let ctx = futures::executor::block_on(adopt_checked(keyring, Arc::new(ctx), Some(&data)))?;
-    Ok((ctx, data))
+    let (context, offline_genesis) = futures::executor::block_on(adopt_checked_as(
+        keyring,
+        Arc::new(ctx),
+        Some(&data),
+        InlineGenesis::Taken,
+    ))?;
+    Ok(LinkAdoption {
+        context,
+        data,
+        fetched: false,
+        earlier: Vec::new(),
+        offline_genesis,
+    })
 }
 
 /// A context adopted from an anchor link.
@@ -444,14 +497,32 @@ pub struct LinkAdoption {
     /// The versions before `context` it was reached through, oldest first,
     /// to keep and serve with it: for a self-certifying namespace not held
     /// before, its genesis and the versions walked from it (a restart takes
-    /// the namespace again only from its genesis); empty otherwise.
+    /// the namespace again only from its genesis); for one held and adopted
+    /// by name again, the versions walked from the held one; empty
+    /// otherwise.
     pub earlier: Vec<ContextStep>,
+    /// A self-certifying namespace not held before, taken from the link's
+    /// own version 1 without checking the network (no network was bound,
+    /// [`adopt_anchor_envelope`]): checked against the name only, so if
+    /// whoever holds the key the name hashes signed another version 1
+    /// (that key stolen), this may be the other line. Say so to the user.
+    pub offline_genesis: bool,
 }
 
-/// Adopt the namespace an anchor link names into `keyring`.
+impl LinkAdoption {
+    /// What to tell the user of an [`Self::offline_genesis`] adoption.
+    pub const OFFLINE_GENESIS_NOTE: &'static str = "adopted from the link's own version 1 \
+        without checking the network: it checks against the name, but nothing shows it is the \
+        version 1 the owner's devices serve (a stolen genesis key can sign another). Adopt \
+        this namespace's links on a node with a network, which fetches version 1 and refuses a \
+        different one as a fork; check with the owner if in doubt";
+}
+
+/// Adopt the namespace an anchor link names into `keyring`, `exchange`
+/// being this node's network.
 ///
 /// - Context inline: verify it against the link (namespace, expected
-///   fingerprint, version) and adopt; no network.
+///   fingerprint, version) and adopt; nothing fetched.
 /// - Fingerprint only: fetch the context by name through `exchange`
 ///   ([`fetch_context`]), then verify and adopt it the same way. When the
 ///   Interests go through a validating forwarder, pass its `forwarder`
@@ -460,12 +531,15 @@ pub struct LinkAdoption {
 ///   context Data (and drops a forged one) instead of dropping it for lack of
 ///   an anchor. If the forwarder admitted exactly the Data that arrived, its
 ///   verified result is reused instead of verifying again.
-/// - A self-certifying namespace (`/user/<0xA1: …>`) not held: the name is
-///   the expected fingerprint of its genesis root, so the link needs no
-///   other. An inline version 1 is checked as its genesis and adopted; else
-///   it is adopted by name ([`crate::adopt_by_name`]): version 1 fetched and
-///   checked against the name, then the newest reached from it by the
-///   continuity rule.
+/// - A self-certifying namespace (`/user/<0xA1: …>`) not held, whatever the
+///   link carries: the name is the expected fingerprint of its genesis
+///   root, so the link needs no other. It is adopted by name
+///   ([`crate::adopt_by_name`]): version 1 fetched and checked against the
+///   name, then the newest reached from it by the continuity rule. A
+///   version 1 the link carries inline is checked as a genesis and compared
+///   with the fetched one: a different one is refused as a fork
+///   ([`AdoptError::GenesisFork`]); it is never taken alone here (offline:
+///   [`adopt_anchor_envelope`]). A later version inline is not used.
 ///
 /// A fetched version older than the link's `version` is refused
 /// ([`AdoptError::Downgrade`]), closing the first-contact downgrade an on-path
@@ -483,24 +557,30 @@ pub async fn adopt_anchor_link<E>(
 where
     E: CaExchange + Send + ?Sized,
 {
-    if link.reached_from_genesis(keyring) {
-        return crate::context_update::adopt_by_name(
+    if link.is_self_certifying() && link.fetches(keyring) {
+        return crate::context_update::adopt_by_name_checking(
             keyring,
             forwarder,
             exchange,
             &link.namespace,
             link.min_version,
+            link.inline_genesis(),
         )
         .await;
     }
     if let Some(data) = &link.context_data {
         let ctx = link.authenticate(data).await?;
+        // A self-certifying namespace is held here (else adopted by name
+        // above): one forgotten meanwhile is not taken from this version.
+        let (context, _) =
+            adopt_checked_as(keyring, Arc::new(ctx), Some(data), InlineGenesis::Refused).await?;
         return Ok(LinkAdoption {
-            context: adopt_checked(keyring, Arc::new(ctx), Some(data)).await?,
+            context,
             data: Data::decode(data.raw().clone())
                 .map_err(|e| AdoptError::BadData(e.to_string()))?,
             fetched: false,
             earlier: Vec::new(),
+            offline_genesis: false,
         });
     }
     adopt_fetched(keyring, forwarder, exchange, link).await
@@ -553,6 +633,7 @@ where
         data,
         fetched: true,
         earlier: Vec::new(),
+        offline_genesis: false,
     })
 }
 
@@ -602,25 +683,54 @@ pub fn adopt_unsigned_legacy_with_tofu(
 ///
 /// A self-certifying namespace not held is adopted only at version 1,
 /// signed, and checked as its genesis ([`Genesis::open_received`]): a later
-/// version needs the walk from it ([`AdoptError::GenesisRequired`]).
+/// version needs the walk from it ([`AdoptError::GenesisRequired`]). That
+/// version 1 is taken as given: callers with a network adopt such a
+/// namespace by name ([`crate::adopt_by_name`]) and reach this only with
+/// what they fetched, or with no network bound.
 pub(crate) async fn adopt_checked(
     keyring: &Keyring,
     ctx: Arc<SignedTrustContext>,
     data: Option<&Data>,
 ) -> Result<Arc<SignedTrustContext>, AdoptError> {
+    adopt_checked_as(keyring, ctx, data, InlineGenesis::Taken)
+        .await
+        .map(|(ctx, _)| ctx)
+}
+
+/// Whether [`adopt_checked_as`] takes a self-certifying namespace not held
+/// from the version 1 it is given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineGenesis {
+    /// Checked as its genesis and adopted.
+    Taken,
+    /// Refused ([`AdoptError::GenesisRequired`]): it is adopted by name.
+    Refused,
+}
+
+/// [`adopt_checked`], a version 1 of a self-certifying namespace not held
+/// taken as `take` says. The context adopted (or held), and whether it
+/// was taken as the namespace's genesis.
+pub(crate) async fn adopt_checked_as(
+    keyring: &Keyring,
+    ctx: Arc<SignedTrustContext>,
+    data: Option<&Data>,
+    take: InlineGenesis,
+) -> Result<(Arc<SignedTrustContext>, bool), AdoptError> {
     loop {
         let held = match adopt_or_held(keyring, &ctx) {
-            Err(AdoptError::GenesisRequired { .. }) if ctx.version() == 1 && data.is_some() => {
+            Err(AdoptError::GenesisRequired { .. })
+                if take == InlineGenesis::Taken && ctx.version() == 1 && data.is_some() =>
+            {
                 let genesis = Genesis::open_received(data.expect("checked above")).await?;
                 match keyring.adopt_genesis(&genesis, Arc::clone(genesis.context())) {
-                    Ok(()) => return Ok(Arc::clone(genesis.context())),
+                    Ok(()) => return Ok((Arc::clone(genesis.context()), true)),
                     // Taken meanwhile by another adoption: judged as held.
                     Err(refusal) => refused(refusal, 1)?,
                 }
             }
             other => match other? {
                 Some(held) => held,
-                None => return Ok(ctx),
+                None => return Ok((ctx, false)),
             },
         };
         let Some(data) = data else {
@@ -634,7 +744,7 @@ pub(crate) async fn adopt_checked(
             return Err(not_continuous(&ctx, &held, refusal));
         }
         if keyring.adopt_update_from(&held, Arc::clone(&ctx)).is_ok() {
-            return Ok(ctx);
+            return Ok((ctx, false));
         }
         // Another version was adopted meanwhile: judge against it.
     }
