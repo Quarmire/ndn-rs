@@ -124,6 +124,26 @@ pub async fn run_rib_expiry_task(
 
 const IDLE_TIMEOUT_NS: u64 = 5 * 60 * 1_000_000_000;
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether an on-demand face of `kind` is removed once idle for
+/// [`IDLE_TIMEOUT_NS`]: only connectionless ones (UDP and the like). Local
+/// faces use the cancel token; connection-oriented ones (TCP, WebSocket,
+/// QUIC) clean up when their connection closes, so a quiet connection — a
+/// peer whose sync group another member keeps alive — stays up.
+fn idles_out(kind: FaceKind) -> bool {
+    !matches!(
+        kind,
+        FaceKind::App
+            | FaceKind::Shm
+            | FaceKind::Internal
+            | FaceKind::Unix
+            | FaceKind::Tcp
+            | FaceKind::WebSocket
+            | FaceKind::Quic
+            | FaceKind::Management,
+    )
+}
+
 #[tracing::instrument(
     level = "info",
     target = "engine",
@@ -154,21 +174,10 @@ pub async fn run_idle_face_task(
                     if entry.persistency != FacePersistency::OnDemand {
                         continue;
                     }
-                    // Idle timeout only applies to connectionless (UDP) faces.
-                    // Local faces use the cancel token; connection-oriented
-                    // faces clean up when the socket closes.
+                    // Idle timeout only applies to connectionless faces.
                     let face_id = *entry.key();
                     if let Some(face) = face_table.get(face_id)
-                        && matches!(
-                            face.kind(),
-                            FaceKind::App
-                                | FaceKind::Shm
-                                | FaceKind::Internal
-                                | FaceKind::Unix
-                                | FaceKind::Tcp
-                                | FaceKind::WebSocket
-                                | FaceKind::Management,
-                        )
+                        && !idles_out(face.kind())
                     {
                         continue;
                     }
@@ -196,6 +205,17 @@ pub async fn run_idle_face_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QUIC face is a connection: it closes with its connection, never on the idle timer,
+    /// so a peer that only listens (its sync group kept alive by another member) keeps its
+    /// face and routes. A UDP face, connectionless, still idles out.
+    #[test]
+    fn connection_faces_do_not_idle_out() {
+        for kind in [FaceKind::Quic, FaceKind::Tcp, FaceKind::WebSocket] {
+            assert!(!idles_out(kind), "{kind:?} idled out");
+        }
+        assert!(idles_out(FaceKind::Udp));
+    }
 
     #[tokio::test]
     async fn expiry_task_cancels_promptly() {
