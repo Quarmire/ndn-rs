@@ -48,6 +48,18 @@ pub fn adopt_refusal(e: &AdoptError) -> TrustRefusal {
                 ],
             );
         }
+        // Adopted by name only: no inline context is the way round.
+        AdoptError::GenesisUnreachable { namespace, source } => {
+            return refuse(
+                code::CONTEXT_UNREACHABLE,
+                [
+                    ("namespace", namespace.clone()),
+                    ("source", source.to_string()),
+                    ("self_certifying", "true".to_owned()),
+                    ("error", e.to_string()),
+                ],
+            );
+        }
         AdoptError::WrongContext { namespace, reason } => {
             return refuse(
                 code::CONTEXT_REFUSED,
@@ -67,7 +79,9 @@ pub fn adopt_refusal(e: &AdoptError) -> TrustRefusal {
         | AdoptError::BadNamespace(_)
         | AdoptError::BadData(_)
         | AdoptError::UnsignedLegacyContext => code::LINK_INVALID,
-        AdoptError::Fetch { .. } => code::CONTEXT_UNREACHABLE,
+        AdoptError::Fetch { .. } | AdoptError::GenesisUnreachable { .. } => {
+            code::CONTEXT_UNREACHABLE
+        }
         AdoptError::InProgress(_) => code::TRUST_CHANGE_IN_PROGRESS,
         _ => code::CONTEXT_REFUSED,
     };
@@ -243,9 +257,18 @@ pub fn keep_adopted(
         namespace = %ctx.namespace(),
         version = ctx.version(),
         fetched = adopted.fetched,
+        offline_genesis = adopted.offline_genesis,
         stored = %stored,
         "adopted trust context"
     );
+    if adopted.offline_genesis {
+        tracing::warn!(
+            target: "security",
+            namespace = %ctx.namespace(),
+            "{}",
+            LinkAdoption::OFFLINE_GENESIS_NOTE
+        );
+    }
     Ok(AdoptedContextInfo {
         namespace: ctx.namespace().to_string(),
         version: ctx.version(),
@@ -253,6 +276,7 @@ pub fn keep_adopted(
         anchors: ctx.anchors().len(),
         ca_endpoints: ctx.ca_endpoints().len(),
         fetched: adopted.fetched,
+        offline_genesis: adopted.offline_genesis,
         stored,
         published: p.publisher().is_some(),
     })
@@ -260,10 +284,12 @@ pub fn keep_adopted(
 
 /// Adopt the trust context `link` names — inline: verified against the
 /// link; fingerprint only: fetched by name through the engine while its
-/// validator expects exactly that context — then keep it: stored and
-/// published. A fetch goes to the forwarders serving the namespace, not to
-/// this device's own publisher, and never takes a pointer this device
-/// cached.
+/// validator expects exactly that context; a self-certifying namespace not
+/// held, whatever the link carries: adopted by name from its genesis — then
+/// keep it: stored and published. Every fetch an adoption makes
+/// ([`AnchorLink::fetches`]) goes to the forwarders serving the namespace,
+/// not to this device's own publisher, and never takes a pointer this
+/// device cached.
 pub async fn adopt_link(
     p: &Participant,
     link: &AnchorLink,
@@ -271,11 +297,12 @@ pub async fn adopt_link(
     // A fetched context must come from the forwarders serving the
     // namespace, not from this device's own publisher (which holds only the
     // versions this device already has).
-    let bypass = match (p.publisher(), &link.context_data) {
-        (Some(publisher), None) => Some(publisher.bypass(&link.namespace)),
-        _ => None,
-    };
-    if link.context_data.is_none() {
+    let fetches = link.fetches(p.keyring());
+    let bypass = p
+        .publisher()
+        .filter(|_| fetches)
+        .map(|publisher| publisher.bypass(&link.namespace));
+    if fetches {
         crate::publish::forget_cached_metadata(p.engine(), &link.namespace);
     }
     let adopted = ndn_identity::adopt_anchor_link_via_engine(p.engine(), p.keyring(), link)
@@ -465,4 +492,183 @@ fn stored_copy(p: &Participant, held: &SignedTrustContext, data: &Data) -> Optio
             let (_, kept) = stored.read.ok()?;
             (kept.raw() == data.raw()).then_some((version, stored.location))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use ndn_engine::{EngineBuilder, EngineConfig};
+    use ndn_security::self_certifying::self_certifying_name;
+    use ndn_security::{Ed25519Signer, FilePib, Keyring, SecurityManager, Signer};
+    use ndn_transport::FaceId;
+    use ndn_trust_envelope::TrustEnvelope;
+
+    use super::*;
+    use crate::{ParticipantParts, PibContextStore};
+
+    /// A self-certifying namespace's line after a recovery: v1 (its
+    /// genesis), v2 adding a recovery anchor, v3 (signed by it) and v4 (the
+    /// new root's); and a thief's own version 1, signed with the stolen
+    /// genesis key, which nothing of that line follows from.
+    async fn recovered_line() -> (Name, Vec<Data>, Data) {
+        let seed = [43u8; 32];
+        let public = Ed25519Signer::from_seed(&seed, Name::root()).public_key_bytes();
+        let ns = self_certifying_name(&public);
+        let root: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_seed(
+            &seed,
+            ns.clone().append("KEY").append("genesis"),
+        ));
+        let ctx = SignedTrustContext::hierarchical(ns.clone()).with_version(1);
+        assert!(ctx.add_anchor(ndn_cert::recovery_anchor(Arc::clone(&root)).await.unwrap()));
+        let v1 = ctx.sign_into_data_async(root.as_ref()).await.unwrap();
+        let recovery = ndn_cert::RecoverySeed::generate().unwrap();
+        let kit = ndn_cert::recovery_anchor(Arc::new(recovery.signer(&ns)))
+            .await
+            .unwrap();
+        let v2 = ndn_cert::add_recovery_anchor(root.as_ref(), &v1, &kit)
+            .await
+            .unwrap()
+            .data;
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = ndn_cert::recover_namespace_in_pib(
+            &FilePib::new(dir.path()).unwrap(),
+            &v2,
+            &recovery.signer(&ns),
+            "phone",
+            ndn_cert::OldRoot::Compromised,
+            &[],
+            &[],
+            &ndn_cert::NewRootStore::File,
+        )
+        .await
+        .unwrap();
+        let thief = SignedTrustContext::decode_content(v1.content().unwrap(), 1)
+            .unwrap()
+            .with_ca_endpoint(ns.clone().append("thief").append("CA"))
+            .sign_into_data_async(root.as_ref())
+            .await
+            .unwrap();
+        (
+            ns,
+            vec![
+                v1,
+                v2,
+                recovered.version.bump.data,
+                recovered.root_version.data,
+            ],
+            thief,
+        )
+    }
+
+    fn store(dir: &std::path::Path, versions: &[Data]) {
+        for data in versions {
+            let (ctx, _) = ndn_cert::open_signed_context(data).unwrap();
+            ndn_cert::persist_context(dir, &ctx, data).unwrap();
+        }
+    }
+
+    /// A link carrying a later version of a self-certifying namespace not
+    /// held inline (an introduction's credentials) is adopted by name, and
+    /// that fetch, like any by-name fetch of a link, goes to the forwarders
+    /// serving the namespace — not to this device's own publisher, which
+    /// serves the older versions this device stored — so the version the
+    /// link names is reached, not refused as a downgrade.
+    #[tokio::test]
+    async fn a_link_with_its_context_inline_that_fetches_bypasses_the_own_publisher() {
+        let (ns, line, _) = recovered_line().await;
+        let (upstream, device) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        store(upstream.path(), &line);
+        store(device.path(), &line[..2]);
+        let (upstream_face, upstream_publisher) =
+            crate::publish::prepare(&PibContextStore::new(upstream.path()), FaceId(0xFFFF_0005));
+        let (own_face, own_publisher) =
+            crate::publish::prepare(&PibContextStore::new(device.path()), FaceId(0xFFFF_0006));
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .security_profile(ndn_security::SecurityProfile::Disabled)
+            .security(Arc::new(SecurityManager::new()))
+            .face(upstream_face)
+            .face(own_face)
+            .build()
+            .await
+            .unwrap();
+        let _upstream = upstream_publisher.spawn(&engine);
+        // The upstream is farther than this device's own publisher.
+        let prefix = ndn_cert::rdr_prefix(&ns);
+        engine.fib().remove_nexthop(&prefix, FaceId(0xFFFF_0005));
+        engine.fib().add_nexthop(&prefix, FaceId(0xFFFF_0005), 10);
+        let own = own_publisher.spawn(&engine);
+        let p = Participant::new(ParticipantParts {
+            engine,
+            keyring: Arc::new(Keyring::new()),
+            store: Arc::new(PibContextStore::new(device.path())),
+            publisher: Some(own),
+            own_certs: None,
+            sync: None,
+            cas: Vec::new(),
+            words: Default::default(),
+        });
+        let newest = line.last().unwrap();
+        let link = AnchorLink::from_envelope(&TrustEnvelope::Anchor {
+            namespace: Some(ns.to_string()),
+            fingerprint: None,
+            version: Some(4),
+            context_data: Some(newest.raw().clone()),
+            context_content: None,
+        })
+        .unwrap();
+        let adopted = adopt_link(&p, &link).await;
+        let adopted = adopted.unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!((adopted.version, adopted.fetched), (4, true));
+        assert_eq!(p.keyring().version_of(&ns), Some(4));
+        shutdown.shutdown().await;
+    }
+
+    /// The daemon's `security/context-adopt` (and so an introduction's
+    /// host): the thief's version 1 inline, the owner's recovered line
+    /// served upstream. The daemon fetches version 1, refuses the link's as
+    /// a fork, and holds and stores nothing of the namespace.
+    #[tokio::test]
+    async fn a_thiefs_inline_genesis_is_refused_as_a_fork_by_the_daemon() {
+        let (ns, line, thief) = recovered_line().await;
+        let (upstream, device) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        store(upstream.path(), &line);
+        let (face, publisher) =
+            crate::publish::prepare(&PibContextStore::new(upstream.path()), FaceId(0xFFFF_0005));
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .security_profile(ndn_security::SecurityProfile::Disabled)
+            .security(Arc::new(SecurityManager::new()))
+            .face(face)
+            .build()
+            .await
+            .unwrap();
+        let _upstream = publisher.spawn(&engine);
+        let p = Participant::new(ParticipantParts {
+            engine,
+            keyring: Arc::new(Keyring::new()),
+            store: Arc::new(PibContextStore::new(device.path())),
+            publisher: None,
+            own_certs: None,
+            sync: None,
+            cas: Vec::new(),
+            words: Default::default(),
+        });
+        let link = AnchorLink::from_envelope(&TrustEnvelope::Anchor {
+            namespace: Some(ns.to_string()),
+            fingerprint: None,
+            version: Some(1),
+            context_data: Some(thief.raw().clone()),
+            context_content: None,
+        })
+        .unwrap();
+        let refused = adopt_link(&p, &link)
+            .await
+            .expect_err("the daemon adopted the thief's version 1");
+        assert!(refused.reason.contains("fork"), "{}", refused.reason);
+        assert!(p.keyring().held(&ns).is_none());
+        assert!(
+            ndn_cert::read_stored_context(device.path(), &ns)
+                .unwrap()
+                .is_none()
+        );
+        shutdown.shutdown().await;
+    }
 }

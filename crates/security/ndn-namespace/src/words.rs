@@ -196,6 +196,19 @@ impl HostWords {
         };
         let text = match code {
             c if c == code::CONTEXT_NOT_HELD.code => self.no_context(get("namespace")),
+            c if c == code::CONTEXT_UNREACHABLE.code && has("self_certifying") => {
+                let ns = get("namespace");
+                format!(
+                    "could not fetch the trust context of {ns}: {}. {ns} is named after its own \
+                     key and not trusted here yet, so it is adopted by name — its version 1 \
+                     checked against the name, then its newest version — and never from a \
+                     context a link or an introduction carries alone (a stolen key could have \
+                     signed it). Retry once {ns}'s devices are reachable: this node needs a \
+                     route for {ns} toward a node that holds its context ({})",
+                    get("source"),
+                    self.add_route.replace("{namespace}", ns)
+                )
+            }
             c if c == code::CONTEXT_UNREACHABLE.code && has("source") => {
                 let ns = get("namespace");
                 format!(
