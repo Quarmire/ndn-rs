@@ -997,10 +997,36 @@ A node that holds no context of `/user/<h>` adopts it from the name alone
    version and why.
 5. It adopts the newest together with the genesis (§4.5.4).
 
-An anchor link that carries version 1 inline is checked by §4.5.2 and
-adopted at version 1; one that carries any other version inline is adopted
-by name as above, its inline context unused. A namespace already held moves
-on only by the continuity rule, from a link as from anywhere (§5.1).
+A node with a network adopts `/user/<h>` not held by name, as above,
+whatever context a link, an envelope or an introduction carries inline
+(ndn-cert `AnchorLink::fetches`, `adopt_anchor_link`): an inline version 1
+MUST pass §4.5.2 and MUST then equal, in Content byte for byte, the version
+1 fetched in step 1; a different one is refused as a fork (two versions 1
+signed by the key `<h>` names, ndn-cert `AdoptError::GenesisFork`), and
+nothing is adopted. An inline later version is unused. An inline version 1
+is never adopted in place of the fetched one: whoever stole the genesis key
+can sign a version 1 of his own (§4.5.6 note 1). When the fetch fails, the
+node refuses, saying to retry once the person's devices are reachable
+(`AdoptError::GenesisUnreachable`). Only a node with no network bound — the
+CLI adopting into the PIB with no daemon running (`ndn-fwd adopt`, ndn-cert
+`adopt_anchor_envelope`, `adopt_with_tofu`) — takes an inline version 1
+checked by §4.5.2 alone, and the adoption says so
+(`LinkAdoption::offline_genesis`, `LinkAdoption::OFFLINE_GENESIS_NOTE`:
+"adopted from the link's own version 1 without checking the network; …").
+An introduction never takes it alone ([data-layer.md](data-layer.md) §19).
+A namespace already held moves on only by the continuity rule, from a link
+as from anywhere (§5.1).
+Adopting a held `/user/<h>` by name again is a refresh of it (§8.2): the
+newest version is fetched as an update of the held version, a validating
+forwarder is told to expect a version signed by an anchor of the held
+version (never a context whose signing anchor has the fingerprint `<h>`),
+and the newest is reached from the held version directly or by walking
+(§5.4). After a recovery, a version signed by the genesis root — perhaps
+stolen — is therefore neither admitted by the forwarder nor adopted. When
+the held version is the newest, its Data is fetched the same way and MUST
+be the held version (else a fork); a newest version older than the held
+one is refused as a rollback, and one older than the link's version as a
+downgrade, before anything is adopted.
 
 A node MUST keep the genesis and every version it walked beside the newest
 (§7; ndn-cert `LinkAdoption::earlier`, `persist_adoption`). At a restart it
@@ -1045,9 +1071,56 @@ ndn-rs creates a self-certifying namespace with
 (`GenesisKey::from_seed`, the 32-octet RFC 8032 seed — an ndf-rs personal
 key, for one) with `init_self_certifying`, `init_self_certifying_in_pib` or
 `init_self_certifying_in_pib_with`. The key becomes the root
-`/user/<h>/KEY/root` and signs version 1 (§4.3). Besides the usual anchor
-links, `ndn-fwd init` prints `anchor_uri_name`: an anchor envelope carrying
-the namespace alone.
+`/user/<h>/KEY/root`.
+
+**The genesis is a pure function of the key.** Init signs two versions
+(§4.3):
+
+- version 1, the genesis (ndn-cert `sign_genesis`): the namespace, the
+  hierarchical schema and one anchor — the root's self-signed certificate
+  `/user/<h>/KEY/root/self/v=0` with the fixed validity `19700101T000000`
+  to `25540721T233433` (0 to 2^64−1 ns, the widest a certificate holds in
+  ndn-rs; `GENESIS_ROOT_VALID_FROM_NS`, `GENESIS_ROOT_VALID_UNTIL_NS`) — and
+  nothing else: no CA, schema of its own, policy, relay or key role, and no
+  field holding the time of signing. Ed25519 signatures are deterministic
+  (RFC 8032), so the same key signs a byte-identical version 1 on every
+  device, at any time;
+- version 2, signed by the root (an anchor of version 1, §5.2): the
+  generated namespace schema, the CA endpoint, the root device's key roles,
+  the enrollment and link policies, the relays and the DataRequiresCut
+  roles — what an ordinary init puts in its version 1.
+
+Both are stored (§7), and the node serves version 1 beside the newest.
+Besides the usual anchor links, which carry version 2, `ndn-fwd init`
+prints `genesis` (the file of version 1) and `anchor_uri_name`: an anchor
+envelope carrying the namespace alone.
+
+**A key held already is looked for first.** A key made now has no genesis
+anywhere. A key held already may have made its namespace before, on
+another device or before a reinstall; a second init would sign the same
+version 1 but another version 2, which every holder of the first refuses
+as a fork (§5.1). `GenesisKey::from_seed` therefore returns an
+`ExistingGenesisKey`, which makes a namespace only through one of:
+
+- `probe(exchange)`: fetches `/user/<h>/32=trust-context/v=1` over the
+  caller's network and checks it by §4.5.2 (as a stored copy, so an
+  expired anchor does not hide it). A genesis of the key that answers
+  refuses the init before anything is written
+  (`NamespaceInitError::GenesisReachable`), saying the namespace exists,
+  and to adopt it by name and enroll this device, or to recover it.
+  Anything else — no answer, or a version 1 another key signed — is no
+  evidence: the init proceeds and states what the fetch met
+  (`GenesisCheck::NoneReachable`). Only a genesis refuses: the RDR pointer
+  is unauthenticated, and anyone answering it would stop the init. A
+  network that drops or hides the genesis cannot be told from one without
+  it;
+- `offline()`: not looked for, and the init states so
+  (`GenesisCheck::Unchecked`).
+
+Every init reports which in `NamespaceInit::genesis_check` (`NewKey` for
+a key made now). An application holding its key already (ndf-rs) runs
+`GenesisKey::from_seed(seed).probe(&mut exchange).await?` over its engine,
+then `init_self_certifying_in_pib_with` with the key it returns.
 
 These are refused before anything is written:
 
@@ -1063,9 +1136,11 @@ These are refused before anything is written:
   the root onto a YubiKey and keep the name;
 - a namespace §4.5.1 refuses;
 - a self-certifying namespace that exists in the PIB already, whatever
-  force is given: its key would sign a second version 1, which every holder
-  of the first refuses as a fork (§5.1). The root is replaced by a recovery
-  ([recovery-kit.md](recovery-kit.md)), which keeps the name.
+  force is given (`NamespaceInitError::GenesisExists`): its key would sign
+  the same genesis but a second line of versions after it, which every
+  holder of the first refuses as a fork (§5.1). The root is replaced by a
+  recovery ([recovery-kit.md](recovery-kit.md)), which keeps the name;
+- a key held already whose genesis answers the probe (above).
 
 #### 4.5.6 Threat notes
 
@@ -1092,10 +1167,27 @@ These are refused before anything is written:
      A version floor in its link refuses an older newest, not a branch
      with a higher number. To take the owner's line after a compromise, a
      fresh adopter must fetch from a node that holds it.
-2. **Two version 1s.** If the owner signs two different versions 1, a node
-   holding one refuses the other as a fork (§5.1); a node holding neither
-   adopts whichever it fetches first. ndn-rs never signs a second one
-   (§4.5.5).
+   - What a thief hands over is not a network position. A link, an
+     envelope or an introduction carrying the thief's own version 1 inline
+     (one leaving out the owner's recovery anchor) moves no node with a
+     network: it adopts by name, and the inline version 1 only checks
+     against the fetched one — a different one, when the owner's line is
+     what its network serves, is refused as a fork and nothing is adopted
+     (§4.5.3). Only a node with no network bound takes an inline version 1
+     alone, and its adoption says it did not check the network
+     (`LinkAdoption::offline_genesis`).
+2. **Two lines from one key.** If the owner signs two different versions
+   1, or two lines after one genesis, a node holding one refuses the other
+   as a fork (§5.1); a node holding neither follows whichever it fetches
+   first. The genesis is a pure function of its key (§4.5.5), so making a
+   namespace again from its key never forks at version 1; two inits from
+   one key (a second device, a reinstall) would fork at version 2. ndn-rs
+   refuses that second init when the
+   namespace is in the PIB (`GenesisExists`) or its genesis answers the
+   probe (`GenesisReachable`); an init from a held key explicitly not
+   looked for (`GenesisCheck::Unchecked`), or looked for over a network
+   that hides the genesis, can still make a second line, which holders of
+   the first refuse.
 3. **Collisions.** The name binds 256 bits of SHA-256. Forging another
    party's genesis needs an Ed25519 key whose SHA-256 is that party's
    `<h>`, a second preimage; two keys with one name need a collision,
@@ -1104,21 +1196,41 @@ These are refused before anything is written:
 4. **Names under `/user/<h>` are the person's.** No context of another
    namespace is rooted at or under `/user/<h>` (§4.5.1), and a name in it
    is judged only by `/user/<h>`'s own context (§6.1). A held `/user` or
-   `/` context never vouches for it; without `/user/<h>` held, the ambient
-   context judges it, which a plain `Keyring` makes deny-all.
-5. **No walk bound.** The 128-position bound of §5.4 does not apply to a
-   self-certifying namespace's walks — a refresh, a sync update, an
+   `/` context never vouches for it, and neither does the ambient context,
+   whatever anchors it holds — a forwarder's holds every PIB trust anchor,
+   its own root included, so a key certified under one person's root
+   would otherwise vouch for another person's names. Without `/user/<h>`
+   held, every packet in it is refused — signed or not, under every
+   security profile, `accept-signed` included — with a refusal naming
+   `/user/<h>` and saying to adopt it by name first (ndn-rs
+   `TrustError::PersonalNamespaceNotHeld`, forwarder refusal
+   `untrusted-root`), and a forwarder caches none of it. Two exceptions,
+   both needed to adopt `/user/<h>` by name: its context versions arrive
+   under an adoption's expectation (§4.4), and a DigestSha256 packet among
+   its own trust objects (`/user/<h>/32=trust-context/…`: the metadata
+   pointer, cut-manifest pieces) passes on its digest, integrity only — it
+   vouches for nothing, and every version it points at is checked from the
+   genesis.
+5. **No position bound.** The 128-position bound of §5.4 does not apply to
+   a self-certifying namespace's walks — a refresh, a sync update, an
    adoption by name, a restart from the stored genesis — because the only
    alternative to a long walk is a longer one from the genesis. A walk over
-   the network is bounded by time instead: no fetch starts after 40 s
-   (`MAX_CATCH_UP_TIME`). The positions left are then passed over at once,
-   never stepped through one by one, and only the newest, fetched before
-   the walk, is judged: it must follow from the version reached, else the
-   walk stops, nothing adopted, naming the versions it missed (retry once a
-   node that kept them is reachable). A pointer naming an absurd version
-   therefore costs at most 40 s of fetching per attempt. A walk at a
-   restart reads only the stored versions, with no network, at a cost of
-   their number, not of the distance between versions.
+   the network is bounded by work and by time instead. It fetches at most
+   **128** positions it cannot use (`MAX_CATCH_UP_MISSES`: nothing usable
+   arrived, or a version not newer than the one reached), and no fetch
+   starts after 40 s (`MAX_CATCH_UP_TIME`). The positions left are then
+   passed over at once, never stepped through one by one, and only the
+   newest, fetched before the walk, is judged: it must follow from the
+   version reached, else the walk stops, nothing adopted, naming the
+   versions it missed and why (retry once a node that kept them is
+   reachable). A walk thus costs the versions it reaches — each signed by an
+   anchor of the one before, so no more than the namespace's owner made —
+   plus at most 128 misses: a pointer or sync announcement naming an absurd
+   version, with every position in between failing at once (a Nack, an old
+   version), costs at most 128 Interests and 40 s per attempt, while a line
+   of any length after a recovery is still followed. A walk at a restart
+   reads only the stored versions, with no network, at a cost of their
+   number, not of the distance between versions.
 
 ## 5. Versioning and continuity
 
@@ -1286,11 +1398,17 @@ refused.
 - **Bound:** if the number of positions exceeds **128**
   (`MAX_CATCH_UP_VERSIONS`), the walk is refused before anything is fetched,
   and the refusal says to adopt the namespace again from a current anchor
-  link. A self-certifying namespace's walks have no such bound; the
-  deadline alone bounds them (§4.5.6, note 5).
+  link. A self-certifying namespace's walks have no such bound; the misses
+  bound and the deadline bound them (§4.5.6, note 5).
+- **Misses:** at most **128** positions (`MAX_CATCH_UP_MISSES`) are fetched
+  and passed over under rules 2 and 3 below. Once that many have been, the
+  positions before `M` are passed over at once, recorded as passed over
+  (the reason says the walk's limit), and only `M` is judged. An ordinary
+  walk has at most 128 positions, so this binds only a self-certifying one.
 - **Deadline:** no fetch starts after **40 s** (`MAX_CATCH_UP_TIME`). The
   clock starts when the refresh begins fetching the newest version. A
-  position not fetched by then counts as missing.
+  position not fetched by then counts as missing, and the positions left
+  are passed over at once.
 - **Fetch:** position `p` is fetched by exact name `/<ns>/32=trust-context/v=<p>`
   (refresh), or as the group Data `<member>/seg=<p>` (sync, §9.3). Position
   `M` reuses `D`.
@@ -1323,13 +1441,48 @@ nodes behind it can walk the same way.
 
 A node validates a packet or certificate named `X` under the adopted
 context whose namespace is the **longest** component-wise prefix of `X`. If
-no adopted context matches, it uses the ambient context. In a plain
-`Keyring`, the ambient context is deny-all: hierarchical with no anchors.
+no adopted context matches, it uses the ambient context. What the ambient
+context holds depends on the keyring: a `Keyring::new()` makes it
+deny-all (hierarchical, no anchors), but a `Validator`'s flat-anchor API
+and a forwarder's `default` profile make it a context over every trust
+anchor configured — on a forwarder, every PIB trust anchor, the node's own
+namespace root included — with the hierarchical schema (data name and
+key name share their first component) and no hierarchy floor or
+certificate-hop rule.
+
 A name in a self-certifying namespace, `/user/<h>/…` (§4.5), is governed
 only by the context of `/user/<h>` itself: a held context of a shorter
-prefix (`/user`, `/`) is never selected for it, and without `/user/<h>`
-held the ambient context is used (ndn-rs `Keyring::context_for`,
-`self_certifying::in_personal_namespace`).
+prefix (`/user`, `/`) is never selected for it, and **neither is the
+ambient context**. Without `/user/<h>` held, such a name is judged by a
+fixed context with no anchors and an empty schema, which accepts nothing —
+anchored or signature-only (`accept-signed`), signed or digest — and the
+validator refuses it up front, naming `/user/<h>` and saying to adopt it by
+name (§4.5.6 note 4 gives the two exceptions an adoption by name needs).
+Every path that judges a name by its context goes through this one
+selection (ndn-rs `Keyring::context_for`; `Keyring::held_for` answers
+whether a held context covers a name, `Keyring::unheld_personal_namespace`
+which person's namespace is missing): chain-walk anchor termination,
+revocation and cut checks, anchor membership (`Keyring::is_anchor`), the
+forwarder's content-store re-check, link admission and the data layer.
+
+**The ambient context and the shared `/user`.** Every person's keys sit
+under the one component `user`, so the hierarchical schema's
+first-component rule no longer separates them for ordinary names under
+`/user` (`/user/alice/doc`, no 0xA1 component): a key of `/user/<hB>`
+would share `user` with it, and since the ambient context judges no
+certificate hop, any key chaining to a configured anchor — a device key of
+the node's own root, stolen or not — could sign it, or certify a key named
+`/user/alice/KEY/…` that then signs it. The ambient context therefore
+treats `/user` as no authority of its own: a data, key or certificate
+name under `/user/<x>` is signed or certified in it only by a key under the
+same `/user/<x>` (ndn-rs: the ambient's shared-`/user` floor,
+`SignedTrustContext::ambient`). A key under `/user/alice` that is itself a
+configured anchor still signs `/user/alice/…`. Names outside `/user` keep
+the flat-anchor semantics: any key chaining to any configured anchor may
+certify a key under the data's first component. That is the ambient
+context's nature, not a gap of this rule — hold a context for a namespace
+whose names need its own authority.
+
 A chain walk terminates only at an anchor of the selected context.
 
 ### 6.2 Anchor matching
@@ -1786,8 +1939,9 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   loses its store can be offered an older genuine version on re-adoption,
   unless the link names a minimum version.
 - A relay that serves a forged newest version and lets intermediate versions
-  time out costs at most one walk (128 positions, 40 s; 40 s for a
-  self-certifying namespace, §4.5.6). ndn-rs does not retry such a walk
+  time out costs at most one walk (128 positions, 40 s; for a
+  self-certifying namespace, 128 positions it cannot use beside the
+  versions it reaches, and 40 s, §4.5.6). ndn-rs does not retry such a walk
   from sync.
 - A self-certifying name binds version 1 only. A stolen root, while it is
   an anchor, can sign a branch continuous from the genesis, which a fresh
@@ -2499,11 +2653,12 @@ may move.
 - `ndn-rs/crates/core/ndn-packet/src/lib.rs`: `tlv_type::SELF_CERTIFYING` = 0xA1.
 - `ndn-rs/crates/security/ndn-security/src/self_certifying.rs`: `key_digest`, `self_certifying_name`, `self_certifying_digest` (`SelfCertifyingNameError::{Misplaced, Under}`), `in_personal_namespace`, `Genesis::{open_received, open_stored}` (`GenesisError::{NotSelfCertifying, NotVersionOne, NotEd25519, Mismatch}`).
 - `ndn-rs/crates/security/ndn-security/src/keyring.rs`: `Keyring::adopt` (`AdoptRefusal::{GenesisRequired, Name}`), `Keyring::adopt_genesis` (`AdoptRefusal::NotFromGenesis`), `Keyring::of_claim`, `Keyring::context_for` (the `/user/<h>` floor).
-- `ndn-rs/crates/security/ndn-cert/src/context_update.rs`: `adopt_by_name`, `reach_newest`, `follow_versions`.
-- `ndn-rs/crates/security/ndn-cert/src/onboarding.rs`: `AnchorLink::{by_name, from_envelope, is_self_certifying}`, `adopt_anchor_link`, `adopt_checked`, `LinkAdoption::earlier`, `AdoptError::{GenesisRequired, NotReached}`.
+- `ndn-rs/crates/security/ndn-cert/src/context_update.rs`: `adopt_by_name`, `adopt_by_name_checking` (an inline version 1 compared with the fetched one), `reach_newest`, `follow_versions`.
+- `ndn-rs/crates/security/ndn-cert/src/onboarding.rs`: `AnchorLink::{by_name, from_envelope, is_self_certifying, fetches}`, `adopt_anchor_link`, `adopt_anchor_envelope` (offline), `adopt_checked`, `LinkAdoption::{earlier, offline_genesis, OFFLINE_GENESIS_NOTE}`, `AdoptError::{GenesisRequired, GenesisFork, GenesisUnreachable, NotReached}`.
+- `ndn-rs/crates/security/ndn-namespace/src/keep.rs`: `adopt_link` (the publisher bypass and cached-metadata eviction for every link that fetches); `ndn-rs/crates/security/ndn-identity/src/adopt.rs` `adopt_anchor_link_via_engine`.
 - `ndn-rs/crates/security/ndn-cert/src/context_store.rs`: `adopt_stored_context`, `adopt_stored_genesis` (`ContextStoreError::GenesisMissing`), `persist_adoption`.
-- `ndn-rs/crates/security/ndn-cert/src/namespace.rs`: `GenesisKey::{generate, from_seed}`, `init_self_certifying`, `init_self_certifying_in_pib`, `init_self_certifying_in_pib_with`, `NamespaceInitError::{SelfCertifying, GenesisOnToken}`; `invite.rs` `ensure_invite_context`.
-- `ndn-rs/crates/security/ndn-namespace/src/root/init.rs`: `InitNamespace::{Named, SelfCertifying}` (refusals before anything is asked); `ndn-fwd/binaries/ndn-fwd/src/onboard.rs` `run_init` (`--self-certifying`, `anchor_uri_name`).
+- `ndn-rs/crates/security/ndn-cert/src/namespace.rs`: `GenesisKey::{generate, from_seed, check}`, `ExistingGenesisKey::{probe, offline}`, `GenesisCheck::{NewKey, NoneReachable, Unchecked}`, `sign_genesis` (`GENESIS_ROOT_CERT_VERSION`, `GENESIS_ROOT_VALID_FROM_NS`, `GENESIS_ROOT_VALID_UNTIL_NS`), `init_self_certifying`, `init_self_certifying_in_pib`, `init_self_certifying_in_pib_with`, `NamespaceInit::{genesis, genesis_check}`, `NamespaceInitError::{SelfCertifying, GenesisOnToken, GenesisExists, GenesisReachable, GenesisKeyNotEd25519}`; `invite.rs` `ensure_invite_context`.
+- `ndn-rs/crates/security/ndn-namespace/src/root/init.rs`: `InitNamespace::{Named, SelfCertifying}` (refusals before anything is asked); `ndn-fwd/binaries/ndn-fwd/src/onboard.rs` `run_init` (`--self-certifying`, `genesis`, `anchor_uri_name`).
 
 **ndn-identity**
 

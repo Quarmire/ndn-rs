@@ -64,11 +64,16 @@ The daemon:
 2. adopts it with `ndn_identity::adopt_anchor_link_via_engine`: an inline
    context is checked directly; a fingerprint-only link registers the
    expectation, fetches the context over RDR (`ndn_cert::fetch_context`)
-   through an in-process consumer face, and checks it. While it fetches, this
-   node's own publisher is taken out of the route for
-   `/<ns>/32=trust-context`, so the fetch reaches the forwarders serving
-   `/<ns>` instead of being answered with the version this node already
-   holds (otherwise a newer version could never be fetched);
+   through an in-process consumer face, and checks it. A self-certifying
+   namespace `/user/<h>` not held is adopted by name whatever the link
+   carries: version 1 fetched and checked against the name, the newest
+   reached from it; a version 1 the link carries inline only checks against
+   the fetched one, and a different one is refused as a fork (a stolen
+   genesis key's second version 1). While anything is fetched, this node's
+   own publisher is taken out of the route for `/<ns>/32=trust-context` and
+   the metadata it cached is dropped, so the fetch reaches the forwarders
+   serving `/<ns>` instead of being answered with the version this node
+   already holds (otherwise a newer version could never be fetched);
 3. adopts it into the keyring its validator uses (trusted at once);
 4. stores the signed Data in `<pib_path>/contexts/` (loaded again at every
    start);

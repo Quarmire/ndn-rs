@@ -3965,14 +3965,24 @@ asked:
    context the answer carried, `Introducer::adopt`); a refusal is `Local`
    (fix the host and join again with the same code: the same key asking
    again is answered again). A self-certifying inviter namespace
-   `/user/<h>` is adopted from its genesis, not from the credentials
-   (trust-context.md §4.5.3: the host fetches version 1 by name unless the
-   credentials carry version 1 itself), so the credentials only count if
+   `/user/<h>` not held is adopted from its genesis by name, never from the
+   credentials (trust-context.md §4.5.3: the host fetches version 1 and the
+   newest; a version 1 the credentials carry only checks against the
+   fetched one, a different one refused as a fork; with no network to
+   fetch over, the host refuses, saying to join again once the inviter's
+   devices are reachable), so the credentials only count if
    they are that namespace's: every anchor they carry MUST then be an anchor
    of the context the host holds for it (by public key), else
    `InviterConflict` (`why`: its credentials carry anchors its namespace,
    adopted from its genesis, does not hold). For any other namespace the
-   host adopted these very credentials, and this holds. Takes into its
+   host adopted these very credentials, or holds the namespace already.
+   Then, for every namespace, the inviter's proof packet and its offer
+   entry are checked again by this device's validator — by the context it
+   now holds (its anchors, schema and revocations), through the
+   credentials' certificates — and MUST still be signed by the key that
+   signed them under the credentials, a device of the inviter, else
+   `InviterConflict` (`why`: it answered with a key its namespace, as
+   this device holds it, does not certify). Takes into its
    validator the certificates on
    the chain from the key that signed the inviter's proof packet to its
    anchor, named under the inviter's namespace — no other certificate the
@@ -4052,7 +4062,11 @@ for; has its host adopt the asker's anchor (an inline anchor link of the
 presented context; a self-certifying asker namespace is adopted from its
 genesis, as in §19.3 step 5, and then every anchor of the presented
 context MUST be an anchor of the context the host holds for it, by public
-key, else `Conflict`); takes into its validator the certificates on the
+key, else `Conflict`); checks the asker's proof packet again by this
+device's validator — by the context it now holds for the asker's
+namespace, through the presented certificates — which MUST find the same
+key, else `Conflict` (a key the held version revokes, shown with an older
+version, does not ask); takes into its validator the certificates on the
 verified chain from the asker's key to its anchor, named under the asker's
 namespace, and no other presented certificate; and signs the folder's next
 members record adding the asker's namespace as a writer (a writer's role)
@@ -4079,8 +4093,8 @@ packet, and carries the answer proof.
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
 | `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a record the offering device signed | `AskOwner` | no |
 | `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
-| `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not (§19.4, the use) | `FixLocal` | no |
-| `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not (§19.3 step 5) | `AskOwner` (do not use the code) | no |
+| `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§19.4, the use) | `FixLocal` (renew the device's certificate when it is the last) | no |
+| `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer entry does not verify under the context the joiner holds (§19.3 step 5) | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the

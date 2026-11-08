@@ -524,11 +524,14 @@ interoperating with ndn-rs flows.
    - MUST root Namespace.
 
    A self-certifying namespace the consumer does not hold is adopted from its genesis instead
-   ([trust-context.md](trust-context.md) §4.5.3): an inline ContextData of version 1 is checked
-   by the genesis rule (§4.5.2 there) and adopted; otherwise, an inline ContextData of a later
-   version included, the consumer fetches version 1, checks it by that rule, and reaches the
-   newest from it by continuity. A held one moves on only by continuity, as any held
-   namespace.
+   ([trust-context.md](trust-context.md) §4.5.3). A consumer with a network fetches version 1,
+   checks it by the genesis rule (§4.5.2 there), and reaches the newest from it by continuity,
+   whatever ContextData the envelope carries: an inline ContextData of version 1 MUST pass the
+   genesis rule and MUST equal the fetched version 1 in Content, else the consumer refuses it
+   as a fork and adopts nothing; an inline later version is unused. Only a consumer with no
+   network bound adopts an inline version 1 by the genesis rule alone, and it MUST tell the
+   user that the version 1 was not checked against the network. A held one moves on only by
+   continuity, as any held namespace.
 5. **Version.** If Version is present, the consumer MUST refuse a context with a version below
    it (downgrade).
 

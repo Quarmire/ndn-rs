@@ -206,15 +206,24 @@ same as ndf-rs's `record::personal_root` gives for that key.
 - **Create:** `ndn-fwd init --self-certifying [--namespace /user/<hash>]
   [--device <name>] [--root-store os-keyring|sealed-file|file]` makes a new
   Ed25519 root and names the namespace from it; a `--namespace` given must be
-  that name. An application holding an Ed25519 key already (ndf-rs) creates
-  the namespace of that key: `ndn_cert::GenesisKey::from_seed`, then
-  `init_self_certifying_in_pib_with` (or `init_self_certifying` in memory).
-  Everything else is F1 as above. Refused before anything is written, each
-  saying why and what to do: a `/user/<hash>` name given to an ordinary
-  `init` (a new root never hashes to a chosen name), a name that is not the
-  new key's, a `yubikey-piv` root store (PIV holds no Ed25519 key), and a
-  self-certifying namespace that exists already (a second version 1 would
-  be a fork; a recovery replaces the root instead).
+  that name. Its version 1, the genesis, lists the root alone under a fixed
+  validity — the same bytes whenever the key makes it — and version 2,
+  signed by the root, carries the CA, schema, policies and relays; both are
+  kept and served. An application holding an Ed25519 key already (ndf-rs)
+  creates the namespace of that key: `ndn_cert::GenesisKey::from_seed`,
+  then `.probe(&mut exchange)` over its network — refused when a genesis of
+  that key answers: the namespace exists (another device, a reinstall), so
+  adopt it by name and enroll, or recover it — or explicitly `.offline()`,
+  which the init reports as not checked; then
+  `init_self_certifying_in_pib_with` (or `init_self_certifying` in
+  memory). Everything else is F1 as above. Refused before anything is
+  written, each saying why and what to do: a `/user/<hash>` name given to
+  an ordinary `init` (a new root never hashes to a chosen name), a name that
+  is not the new key's, a `yubikey-piv` root store (PIV holds no Ed25519
+  key), a self-certifying namespace that exists already in the PIB (a
+  second line of versions after its genesis would be a fork; a recovery
+  replaces the root instead), and a held key whose genesis answers the
+  probe.
 - **Follow by name:** `init` also prints `anchor_uri_name`, an anchor link
   carrying the namespace alone (trust-envelope.md §7.1). Any device adopts
   `/user/<hash>` from that name: it fetches version 1, checks that the key
@@ -231,7 +240,11 @@ same as ndf-rs's `record::personal_root` gives for that key.
   fresh that reaches only the thief's versions follows them; devices that
   hold the owner's recovery refuse them.
 - Names under `/user/<hash>` are the person's: no other namespace is
-  adopted under it, and a held `/user` context never vouches for them.
+  adopted under it, and neither a held `/user` context nor a node's other
+  trust anchors (its own root included) vouch for them. A node not holding
+  `/user/<hash>` refuses everything in it — on a forwarder too, under every
+  security profile — and says to adopt it by name first
+  (trust-context.md §4.5.6 note 4, §6.1).
 
 ### F2 Add a device
 - **By invite (token):** an admin makes an invite at the running CA
