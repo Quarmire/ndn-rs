@@ -143,7 +143,7 @@ impl IntroPolicy {
     }
 
     /// Why no introduction brings the namespace `ns` by this policy, if it
-    /// does not: "… <why>" completes "the namespace <ns> …".
+    /// does not: the answer completes "the namespace `<ns>` …".
     pub fn refuses(&self, ns: &Name) -> Option<String> {
         if ns.is_empty() {
             return Some("is the root, over every name".into());

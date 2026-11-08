@@ -379,7 +379,8 @@ pub struct LinkAdoption {
 /// ([`AdoptError::Downgrade`]), closing the first-contact downgrade an on-path
 /// forger could otherwise attempt by pointing at an old genuine context. A
 /// namespace already held changes only by the continuity rule
-/// ([`adopt_checked`]): a link never replaces its anchors.
+/// ([`crate::context_update::open_context_update`], then
+/// [`Keyring::adopt_update_from`]): a link never replaces its anchors.
 /// Persistence is the caller's (the Data is returned verbatim).
 pub async fn adopt_anchor_link<E>(
     keyring: &Keyring,
