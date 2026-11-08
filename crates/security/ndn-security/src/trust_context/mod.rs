@@ -1210,7 +1210,7 @@ impl SignedTrustContext {
         Self::base(namespace, TrustSchema::accept_all(), false)
     }
 
-    /// The ambient (root-namespace) context backing a [`Validator`]'s
+    /// The ambient (root-namespace) context backing a [`Validator`](crate::Validator)'s
     /// flat-anchor API for backward compatibility: `schema` over `anchors`
     /// (the handle is shared as-is). The hierarchy floor is **off** so
     /// existing single-anchor callers keep their prior semantics, and so are
