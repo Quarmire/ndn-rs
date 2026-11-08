@@ -381,13 +381,14 @@ impl AskBody {
         w.finish()
     }
 
-    /// What the asker's proof packet names: SHA-256 over the offering
-    /// device's Name TLV and [`fields`](Self::fields).
+    /// What the asker's proof packet names: the introduction ask's label,
+    /// the offering device's Name TLV and [`fields`](Self::fields)
+    /// ([`wire::ask_binding`]).
     pub fn binding(&self, device: &Name) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(device.encode_to_tlv());
-        h.update(self.fields());
-        h.finalize().into()
+        wire::ask_binding(
+            wire::AskProtocol::IntroAsk,
+            &[&device.encode_to_tlv(), &self.fields()],
+        )
     }
 
     /// Its plaintext.
@@ -565,13 +566,14 @@ impl AnswerBody {
         }
     }
 
-    /// What the offering device's proof packet names: SHA-256 over the
-    /// answer's fields before it.
+    /// What the offering device's proof packet names: the introduction
+    /// answer's label and the answer's fields before it
+    /// ([`wire::ask_binding`]).
     pub fn binding(&self) -> [u8; 32] {
         let mut w = TlvWriter::new();
         self.head(&mut w);
         self.outcome_fields(&mut w, false);
-        Sha256::digest(w.finish()).into()
+        wire::ask_binding(wire::AskProtocol::IntroAnswer, &[&w.finish()])
     }
 
     /// What its `Proof` is over: every field before it.

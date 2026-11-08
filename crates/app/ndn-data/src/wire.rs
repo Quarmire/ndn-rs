@@ -920,10 +920,13 @@ pub struct HoldAsk {
 }
 
 impl HoldAsk {
-    /// What the asker's proof names: SHA-256 over the holder's name and the
-    /// ask without the proof.
+    /// What the asker's proof names: the hold label, the holder's name and
+    /// the ask without the proof ([`ask_binding`]).
     pub fn binding(&self, holder: &Name) -> [u8; 32] {
-        binding(holder, &self.fields())
+        ask_binding(
+            AskProtocol::Hold,
+            &[&holder.encode_to_tlv(), &self.fields()],
+        )
     }
 
     fn fields(&self) -> Bytes {
@@ -936,12 +939,52 @@ impl HoldAsk {
     }
 }
 
-/// SHA-256 over `holder`'s Name TLV and `fields`: what an asker's proof binds.
-fn binding(holder: &Name, fields: &[u8]) -> [u8; 32] {
+/// A protocol whose asks or answers carry a proof `<device>/32=ask/
+/// <binding>` ([`ask_name`]): its label opens every binding it makes (spec
+/// §16.3), so a proof made for one protocol never verifies as another's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AskProtocol {
+    /// A hold ask ([`HoldAsk`]).
+    Hold,
+    /// An audit ask ([`AuditAsk`]).
+    Audit,
+    /// An introduction ask ([`crate::intro::AskBody`]).
+    IntroAsk,
+    /// An introduction answer ([`crate::intro::AnswerBody`]).
+    IntroAnswer,
+}
+
+impl AskProtocol {
+    /// Every protocol.
+    pub const ALL: [AskProtocol; 4] = [
+        AskProtocol::Hold,
+        AskProtocol::Audit,
+        AskProtocol::IntroAsk,
+        AskProtocol::IntroAnswer,
+    ];
+
+    /// The octets opening its bindings: ASCII ending in a zero octet, so
+    /// none is a prefix of another.
+    pub const fn label(self) -> &'static [u8] {
+        match self {
+            AskProtocol::Hold => b"ndn-data hold ask\0",
+            AskProtocol::Audit => b"ndn-data audit ask\0",
+            AskProtocol::IntroAsk => b"ndn-data intro ask\0",
+            AskProtocol::IntroAnswer => b"ndn-data intro answer\0",
+        }
+    }
+}
+
+/// What a proof of `protocol` names: SHA-256 over its label, then `parts`
+/// in order. The receiver computes it with the label of the protocol it
+/// expects, and the proof verifies only if it names that binding.
+pub fn ask_binding(protocol: AskProtocol, parts: &[&[u8]]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(holder.encode_to_tlv());
-    h.update(fields);
+    h.update(protocol.label());
+    for part in parts {
+        h.update(part);
+    }
     h.finalize().into()
 }
 
@@ -1214,12 +1257,12 @@ pub struct AuditAsk {
 }
 
 impl AuditAsk {
-    /// What the auditor's proof names: SHA-256 over the holder's name and
-    /// the ask without the proof.
+    /// What the auditor's proof names: the audit label, the holder's name
+    /// and the ask without the proof ([`ask_binding`]).
     pub fn binding(&self, holder: &Name) -> [u8; 32] {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::AUDIT_ASK, |w| self.write_fields(w));
-        binding(holder, &w.finish())
+        ask_binding(AskProtocol::Audit, &[&holder.encode_to_tlv(), &w.finish()])
     }
 
     fn write_fields(&self, w: &mut TlvWriter) {
@@ -3353,6 +3396,33 @@ mod tests {
 
     fn n(s: &str) -> Name {
         s.parse().unwrap()
+    }
+
+    /// A `32=ask` proof made for one protocol never verifies as another's:
+    /// the same octets bound under two protocols name two proofs (spec
+    /// §16.3).
+    #[test]
+    fn a_proof_binding_of_one_protocol_never_verifies_as_another() {
+        let asker = n("/alice/laptop");
+        let parts: [&[u8]; 2] = [&n("/alice/repo").encode_to_tlv(), b"the same fields"];
+        for p in AskProtocol::ALL {
+            let proof = ask_name(&asker, &ask_binding(p, &parts));
+            for q in AskProtocol::ALL.into_iter().filter(|q| *q != p) {
+                assert_ne!(
+                    proof,
+                    ask_name(&asker, &ask_binding(q, &parts)),
+                    "a {p:?} proof verifies as a {q:?} proof"
+                );
+            }
+        }
+        for (i, p) in AskProtocol::ALL.into_iter().enumerate() {
+            for q in &AskProtocol::ALL[i + 1..] {
+                assert!(
+                    !p.label().starts_with(q.label()) && !q.label().starts_with(p.label()),
+                    "no label is a prefix of another: {p:?} {q:?}"
+                );
+            }
+        }
     }
 
     #[test]
