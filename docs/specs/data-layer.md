@@ -3857,7 +3857,8 @@ about the same folder naming the offer and either the key the offer was
 used by and its public key's digest (`Writer`, `Digest`) — the offer is
 used — or neither — a **closing mark**: the offer is closed for good, to
 everyone, its user too (all askers' wrong tries at the device's cap,
-§19.4; `close_offer`, §19.2; or the member it brought removed, §19.7). The
+§19.4; `close_offer`, §19.2; or a record it signs removing the member the
+offer brought, §19.7). The
 first mark naming a key stands and a device signs no second one; a closing
 mark closes the offer whenever it comes, used or not, and a device signs
 one at most. Only the offering device marks its offer: a reader takes an
@@ -4053,7 +4054,7 @@ packet, and carries the answer proof.
 | `Unknown` | the offering device holds no such offer | `AskOwner` (a new code) | no |
 | `Used` | another key joined with this offer | `AskOwner` | no |
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
-| `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed | `AskOwner` | no |
+| `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a record the offering device signed | `AskOwner` | no |
 | `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10) | `FixLocal` | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps | `AskOwner` (do not use the code) | no |
@@ -4082,12 +4083,15 @@ X25519-to-ChaCha20-Poly1305 wrap.
 - **Code theft.** The code is a bearer secret until used: whoever presents
   it first, within its expiry, joins with its role. One use binds it to one
   key (step 6); the owner sees who joined in the folder's members record
-  and removes them as any member (§6). The removal lasts: the folder record
-  removing a namespace closes every offer a key under it used (or was
-  using), and a used offer's user asking again — a fresh ask, before or
-  after a restart — is answered the acceptance kept for its use and never
-  admitted again (step 6). `close_offer` closes an offer at any time. Keep
-  expiries short.
+  and removes them as any member (§6). The removal lasts: a used offer's
+  user asking again — a fresh ask, before or after a restart — is answered
+  the acceptance kept for its use and never admitted again (step 6), and
+  no other key can use it, whichever owner device removed the member. A
+  folder record the offering device signs removing a namespace also closes
+  every offer of that device a key under it used (or was using), so even
+  its acceptance is no longer answered; a record another device signed
+  closes nothing (only the offering device marks its offers).
+  `close_offer` closes an offer at any time. Keep expiries short.
 - **Replay.** An ask replayed by anyone gets the answer kept for it: bound
   to the asker's key and digest, it admits only the asker's namespace,
   which the record already admits; it shows the replayer the folder's name,
