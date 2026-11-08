@@ -222,8 +222,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Synchronization
 parking_lot = "0.12"
-# The data layer's merge rule (/merge/yrs): Yjs in Rust, MIT.
-yrs = { version = "0.28", default-features = false }
+# The data layer's merge rule (/merge/yrs): Yjs in Rust, MIT. 0.28.1 at
+# least: it replaced `ItemContent::len(OffsetKind)` with `len_utf16`, which
+# the operation reader in ndn-data's merge.rs counts clocks by.
+yrs = { version = "0.28.1", default-features = false }
 
 # Persistent storage
 # 3.1.8 at least: from there its lsm-tree (~3.1.8) fsyncs each version file

@@ -365,7 +365,7 @@ fn reach(bytes: &[u8]) -> Result<Reach, yrs::encoding::read::Error> {
                             d.read_string()?;
                         }
                     }
-                    ItemContent::decode(&mut d, info)?.len(yrs::OffsetKind::Utf16)
+                    ItemContent::decode(&mut d, info)?.len_utf16()
                 }
             };
             if len > 0 {
