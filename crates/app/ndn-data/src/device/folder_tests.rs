@@ -931,3 +931,95 @@ async fn a_put_into_another_namespace_is_refused_only_once_its_devices_were_walk
     assert!(matches!(refused, DataError::NotAllowed { .. }), "{refused}");
     dev.shutdown();
 }
+
+/// A put into another person's collection under a record that does not
+/// admit the key is refused by signed data only (spec §18.1): while a
+/// device of that namespace heard here was not walked toward the
+/// collection, the record admitting it — signed by a share or an
+/// introduction, and lost on its way — may still arrive, so the put is
+/// `NotReady`; once every one was walked, the record in force refuses it.
+#[tokio::test]
+async fn a_put_under_a_record_not_admitting_the_key_is_refused_only_once_its_devices_were_walked() {
+    let alice = device("/alice/laptop", &["/alice"]).await;
+    alice
+        .share_folder(&folder(), share(Rule::Log, &["/alice"], Vec::new()).into())
+        .await
+        .unwrap();
+    let seq = alice.inner.st.lock().head;
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    let _ = dev.inner.join(&n("/alice")).await;
+    dev.inner
+        .st
+        .lock()
+        .groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(n("/alice/laptop"));
+    assert_eq!(relay(&alice, &dev, &folder(), seq), None);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(
+        dev.inner.st.lock().colls[&plan()].members.is_some(),
+        "the folder's record governs the plan here"
+    );
+    not_ready(refused);
+    // Walked in full, it listed no record admitting Bob.
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .entry((n("/alice/laptop"), n("/alice")))
+        .or_default()
+        .root = Some([1; 32]);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(matches!(refused, DataError::NotAllowed { .. }), "{refused}");
+    alice.shutdown();
+    dev.shutdown();
+}
+
+/// Whether `dev` still holds `other`'s summary of `/alice` as walked in full.
+fn still_walked(dev: &Device, other: &Name) -> bool {
+    dev.inner.st.lock().peers[&(other.clone(), n("/alice"))]
+        .root
+        .is_some()
+}
+
+/// Reading a collection held inside a folder this device follows costs no
+/// walk (spec §15, §18.1): the walks that went toward the folder took it. A
+/// collection an outside writer was refused making it follow (spec §15,
+/// `Config::writer_collections`) was not taken, and following it by its name
+/// walks again.
+#[tokio::test]
+async fn following_a_collection_inside_a_followed_folder_walks_nothing_again() {
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    let alice = n("/alice/laptop");
+    assert!(dev.inner.follow(&folder()).await.unwrap(), "followed anew");
+    // Alice's summary walked in full while the folder was followed: it took
+    // her version of the plan.
+    hand(&dev, &alice, &plan(), 1, version(&alice, &plan(), 1, None));
+    assert!(dev.inner.st.lock().colls.contains_key(&plan()));
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .entry((alice.clone(), n("/alice")))
+        .or_default()
+        .root = Some([1; 32]);
+    assert!(
+        !dev.inner.follow(&plan()).await.unwrap(),
+        "a collection held inside the followed folder is nothing new"
+    );
+    assert!(
+        still_walked(&dev, &alice),
+        "nor is the walk that took it forgotten"
+    );
+    let other = n("/alice/32=data/docs/other");
+    let carol = Writer::new(key(&n("/carol/phone")));
+    assert!(!dev.inner.st.lock().track(&other, &carol, 0));
+    assert!(
+        dev.inner.follow(&other).await.unwrap(),
+        "a collection refused to an outside writer is followed anew by its name"
+    );
+    assert!(!still_walked(&dev, &alice), "and walked again");
+    dev.shutdown();
+}

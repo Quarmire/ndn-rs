@@ -1113,6 +1113,19 @@ in any arrival order.
   evidence for a reader that never held the member — the writer's node
   stops listing it — which is why a group with a member that may expire
   never counts.
+- **Members in pieces.** A member whose payload travels in pieces (§13.1)
+  is present once its record is admitted and every piece is held here —
+  whether or not it is opened yet. It is opened (and, sealed, unsealed) as
+  it applies, which only the group's verdict lets it do: a reader that
+  required it opened before counting it present would wait for its group
+  while the group waits for it, and the group would never count (ndf's
+  report: a 37,847-octet operation in a group of three). A member whose
+  pieces turn out not to open is refused (`BadSignature`, its writer
+  signed what does not decode), and its group with it. The same holds for
+  the writer's own device: what it applied in pieces is let go from memory
+  (§13.1), so when it reads a collection again — a new members record, a
+  re-admission, a revocation — its own members are pending and unopened,
+  present by their pieces held, and its group counts again whole.
 - A device holding a member of an incomplete group follows the member's
   folder (its parent name, §12), so that the others arrive.
 - **A group counts only while every member counts.** While a member
@@ -1215,19 +1228,6 @@ and, once the rule changed, where the current rule starts.
   writer cannot delay its own removal (it would stay a writer meanwhile).
   The signer also binds every version the cut keeps to its bytes: it
   builds the record's cut manifest, listing the implicit digest of each,
-- **Members in pieces.** A member whose payload travels in pieces (§13.1)
-  is present once its record is admitted and every piece is held here —
-  whether or not it is opened yet. It is opened (and, sealed, unsealed) as
-  it applies, which only the group's verdict lets it do: a reader that
-  required it opened before counting it present would wait for its group
-  while the group waits for it, and the group would never count (ndf's
-  report: a 37,847-octet operation in a group of three). A member whose
-  pieces turn out not to open is refused (`BadSignature`, its writer
-  signed what does not decode), and its group with it. The same holds for
-  the writer's own device: what it applied in pieces is let go from memory
-  (§13.1), so when it reads a collection again — a new members record, a
-  re-admission, a revocation — its own members are pending and unopened,
-  present by their pieces held, and its group counts again whole.
   and the cut names it (`CutBytes`, §8); a kept version whose bytes it
   does not know is left out, as one a summary only listed.
   Cuts carry over to later revisions, bound again by each new record's own
@@ -1318,6 +1318,36 @@ seal epoch, and so one grant per reader, for all of them.
   so every collection under `F` is followed whole, and walks the removed
   writers' devices as §6 says; the cut covers what it holds then, and its
   manifest binds what it keeps in every collection to its bytes (§8).
+- **Changing a folder's members.** `share_folder(F, change)` (§15) adds
+  and removes writer prefixes and readers of `F`'s own record in force,
+  and signs the result as the next revision exactly as a whole record
+  listing it: the same cuts for the writers it drops, the same new epoch
+  for a reader it drops, the same offers closed (§19.7). The change MUST
+  be applied to the record in force at the moment the device signs, under
+  the same lock it signs under, never to a copy read earlier: a member
+  added in between — by this device's admission of an introduction
+  (§19.4), or by a record of another owner device taken meanwhile — stays,
+  and a let-go names only whom it lets go. A writer to add that a listed
+  prefix covers, a reader to add that the record admits (or any reader of
+  a folder not sealed, which every reader reads), a writer or reader to
+  remove that is neither listed nor covered: each changes nothing. A
+  change that changes nothing signs nothing. The rule stays the record's.
+  It is refused, nothing signed (`BadRequest`, saying why and to share the
+  record whole instead), when it removes a writer or reader not listed but
+  covered by one listed (removing it would remove nothing at readers),
+  leaves no writer (a record listing none takes the writers of the
+  folders above, another meaning), leaves a sealed folder no reader (it
+  would unseal it), or changes the one writer of a one-key record. With no
+  record of `F` held it answers `NotReady`: share it whole first. An
+  introduction's admission is such a change (§19.4).
+- **Reading the record in force.** `members(F)` answers the rule, writers
+  and readers of `F`'s record in force: its own narrowed by the folders
+  above (the effective record's levels, above), whoever signed it.
+  `members(C)` of a collection answers its effective record's, which for
+  a collection with no record of its own is its nearest folder's; a name
+  with a folder record held answers the folder's. A watch is told
+  `Change::Members` when it changes (§15). Both read only records held
+  and verified here, so two devices holding the same records answer alike.
 - **A collection's first own record.** `share(C, …)` of a collection that
   so far had none — it was written and read under the folder's — starts
   from the effective record, as any record starts from the record in
@@ -1410,6 +1440,17 @@ the past, as every reader holds them before judging what was made over
 them. An honest writer whose basis is later cut out loses the operations
 that need it, alike everywhere.
 
+**A let-go signed from a stale list.** A host that kept its own copy of a
+folder's members and signed a whole record from it would drop every
+member added since — an introduction's admission signs internally — and
+the cut would refuse that member's later writes. The layer answers the
+record in force (`members`), tells every change of it (`Change::Members`),
+and takes a change applied under the signing lock to the record held
+then (§6.1), so a let-go removes exactly whom it names. Records of one
+revision signed concurrently by two owner devices still merge with
+removals winning (§6): a change does not make an addition outlast a
+removal another device signed.
+
 **A Yjs update reaching outside its past.** Yjs ids are predictable, and
 yrs keeps an update whose references it lacks pending until they arrive,
 so an update could delete, or place items against, another writer's
@@ -1420,36 +1461,6 @@ writer had reached in the update's past (§5.1).
 **Pieces served to some devices only.** A writer could serve a version's
 pieces to one device, which builds on it, and to no one else, so everyone
 else's copy of what that device writes would stall. A device serves the
-- **Changing a folder's members.** `share_folder(F, change)` (§15) adds
-  and removes writer prefixes and readers of `F`'s own record in force,
-  and signs the result as the next revision exactly as a whole record
-  listing it: the same cuts for the writers it drops, the same new epoch
-  for a reader it drops, the same offers closed (§19.7). The change MUST
-  be applied to the record in force at the moment the device signs, under
-  the same lock it signs under, never to a copy read earlier: a member
-  added in between — by this device's admission of an introduction
-  (§19.4), or by a record of another owner device taken meanwhile — stays,
-  and a let-go names only whom it lets go. A writer to add that a listed
-  prefix covers, a reader to add that the record admits (or any reader of
-  a folder not sealed, which every reader reads), a writer or reader to
-  remove that is neither listed nor covered: each changes nothing. A
-  change that changes nothing signs nothing. The rule stays the record's.
-  It is refused, nothing signed (`BadRequest`, saying why and to share the
-  record whole instead), when it removes a writer or reader not listed but
-  covered by one listed (removing it would remove nothing at readers),
-  leaves no writer (a record listing none takes the writers of the
-  folders above, another meaning), leaves a sealed folder no reader (it
-  would unseal it), or changes the one writer of a one-key record. With no
-  record of `F` held it answers `NotReady`: share it whole first. An
-  introduction's admission is such a change (§19.4).
-- **Reading the record in force.** `members(F)` answers the rule, writers
-  and readers of `F`'s record in force: its own narrowed by the folders
-  above (the effective record's levels, above), whoever signed it.
-  `members(C)` of a collection answers its effective record's, which for
-  a collection with no record of its own is its nearest folder's; a name
-  with a folder record held answers the folder's. A watch is told
-  `Change::Members` when it changes (§15). Both read only records held
-  and verified here, so two devices holding the same records answer alike.
 pieces of every merge version it applied, and readers ask the devices
 whose versions are made over it (§13.1), so the version is available
 wherever something built on it is. This lets a holder under audit relay a
@@ -1542,17 +1553,6 @@ epoch's key is erased only at a device that follows the folder whole and
 has walked every device it knows (§14); a device that follows only some
 collections under it keeps the key, as it cannot tell what the others
 still hold.
-**A let-go signed from a stale list.** A host that kept its own copy of a
-folder's members and signed a whole record from it would drop every
-member added since — an introduction's admission signs internally — and
-the cut would refuse that member's later writes. The layer answers the
-record in force (`members`), tells every change of it (`Change::Members`),
-and takes a change applied under the signing lock to the record held
-then (§6.1), so a let-go removes exactly whom it names. Records of one
-revision signed concurrently by two owner devices still merge with
-removals winning (§6): a change does not make an addition outlast a
-removal another device signed.
-
 
 **Narrowing by accident.** A collection's first own record under a folder
 starts from the folder's effective record, so taking one never silently
@@ -1699,7 +1699,10 @@ gesture beyond the owner's records.
   not held. Through a forwarder that cannot validate `P`, the host carries
   `P`'s Data to the device in transit while `P` is adopted for a folder
   (ndn-link.md §15.7): forwarded unvalidated to the Interests pending for
-  it, cached by no one; the device validates every packet itself.
+  it, cached by no one; the device validates every packet itself. A host
+  beside a forwarder daemon asks it to (`security/transit`, mgmt-trust.md
+  "Transit": one mark for each namespace adopted, taken back when it is
+  released or its adoption failed), before the adoption's first fetch.
 - **Records move.** As each subject's own record in force moves, the
   namespaces it lists are read again: one a record newly lists is adopted;
   one already adopted is refreshed by continuity from the version held
@@ -1848,7 +1851,13 @@ A reader:
   of one of its pages): that node's digest changes and the next descent
   goes into the new child alone, at the cost of the root, the nodes on the
   way, the folder node or its changed page, and the new collection's node
-  and entries — never the folder's other collections, and no new call;
+  and entries — never the folder's other collections, and no new call.
+  Reading, writing or watching a collection held under a followed folder
+  is so nothing new: the descents toward the folder took it, and the
+  reader neither walks again nor waits a first look for it (a
+  collection the reader does not hold yet there — new, or one a writer
+  outside the namespace was refused making it follow, §15 — is followed
+  anew by its name);
 - descends the root it verified to the end: it fetches the nodes and pages
   that root lists, not a newer root's, until every branch it follows is
   processed. A node that is not answered leaves the descent incomplete; the
@@ -1867,6 +1876,8 @@ A reader:
   list in `Entries`: a bound covers only what the node lists;
 - fetches the entries the visited nodes list that it does not hold, except
   those its newest node of their writer shows expired (keep bounds, above).
+  A node, page or entry its writer does not answer is asked of the devices
+  that hold it (§13.5), and checked as from the writer.
 
 `watch` reports a `Summary` for each verified node of the watched name or
 below it that it descends into: the collection, the signing writer,
@@ -2124,8 +2135,6 @@ drops an anchor, or lists a new role in DataRequiresCut; and the first
 version of a namespace it adopts), it MUST judge again every entry it
 holds with the whole durable walk a fresh fetch gets (trust-context.md
 §6.3), run again on the stored packet: signature, chain, issuers, schema,
-  A node, page or entry its writer does not answer is asked of the devices
-  that hold it (§13.5), and checked as from the writer.
 revocation, cut, manifest and key digest. Checking only whether the
 entry's own signing key is revoked is not enough: a version can revoke an
 issuer, such as the old CA a compromised-root recovery revokes, and every
@@ -2457,7 +2466,9 @@ forward ciphertext. Erasure is the destruction of the key.
   packet; past that it signs the name anew, a packet that opens to the same
   key. An asker asks only for an epoch a held record names and that it may
   hold by (2) and (3) as far as it can tell, the epoch's creator first,
-  then every other device it knows to write into `C`'s namespace. Keys are
+  then every other device it knows to write into `C`'s namespace, round
+  after round with a capped backoff until the key is held or no longer
+  owed (§17.1), never one try per granter. Keys are
   per epoch for every reader: a device of the owner's own namespace is
   granted like any other (a second device of 10,000 collections, each in
   its own epoch, asks 10,000 grants once).
@@ -2550,16 +2561,24 @@ device name `D`.
 `O`, it publishes into `O`'s group and into the group of every other
 namespace that `C`'s newest members record names — the namespaces of its
 writer prefixes and readers (a group reader by its collection's namespace),
-each as the held context governing it says (§3) — joining those groups
-first. So the notice reaches every member's devices through the group of
-their own namespace, which every forwarder holding that namespace carries
-to its devices; no group needs to reach outside its namespace.
+each as the held context governing it says (§3), or, for a person's
+self-certifying name no held context covers — a writer adopted for the
+folder alone (§6.3) — that person's namespace `/user/<h>` by the name's
+shape — joining those groups first. So the notice reaches every member's
+devices through the group of their own namespace, which every forwarder
+holding that namespace carries to its devices; no group needs to reach
+outside its namespace. Without the self-certifying rule two members who
+hold only the owner's namespace, each adopting the other for the folder,
+would hear each other only if the owner's group reached both, which
+nothing routes; the group of a writer adopted for a folder carries no
+trust (a notice decides nothing), so its name's shape suffices.
 
 **Hearing.** The group only says "`D` moved". It carries no data and
 decides nothing: a reader that hears it in any group fetches `D`'s root for
 the group's namespace and for every other namespace it follows that `D`
 writes into — `D`'s own, and each one of whose collections a members
-record it holds lists a writer of `D`'s namespace (§7). The devices a
+record it holds lists a writer of `D`'s namespace (§7), `D`'s namespace and
+each writer's taken by the same rule as for publishing. The devices a
 reader looks at for a namespace `O` (its first look, a watch, a key) are
 those it heard in `O`'s group and those it heard in any group that write
 into `O` by the same rule. Sync Interests are unsigned; a stranger in a
@@ -2714,7 +2733,11 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   answers a hold ask only when, in this order: `C` is of such a namespace;
   the proof's key locator names the device that signed the hold record —
   any other ask is dropped before a signature is checked; that asker has
-  no other hold ask in progress here; the proof is named for this ask and
+  no other ask in progress here (one more ask of that asker — the same
+  ask duplicated on the way, or the owner asking again, §13.3 — waits for
+  the one in progress to end, at most a hold ask's lifetime: three first
+  looks and one Interest lifetime, 14 s by default; any further one is
+  dropped); the proof is named for this ask and
   verifies to a key of that device (at most `Config::asks_verifying`
   proofs, 8 by default, are verified at once);
   the record, fetched and verified, is that device's newest hold record for
@@ -2722,7 +2745,20 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   every version inside `at` with every piece (fetching back what it lost —
   re-replication — from the writer or another holder), signs the lease
   over what its store holds whole, and answers with it (a DigestSha256 Data
-  whose Content is the lease's packet). It keeps its last 1,024 answers by
+  whose Content is the lease's packet). The take runs in a task of its
+  own, one per collection at a time, which outlives any one ask: over a
+  lossy path a large collection takes longer than an ask lives. It goes in
+  rounds — while a writer's newest version inside `at` is not heard of,
+  it refreshes every device writing into the namespace; then it asks each
+  piece it lacks once of each source — asked again after the pause of
+  §17.1, at most 16 rounds (`REPAIR_ROUNDS`), stopping after 3 rounds in a
+  row that brought no version heard of and no piece (`REPAIR_IDLE`). An
+  ask that finds every version inside `at` kept whole (seen, not merely
+  not yet known) is answered at once; else it waits for the take for a
+  hold ask's lifetime less one Interest lifetime and is answered when the
+  take is done (whole, or out of rounds: the lease holds what is kept),
+  or not at all while it is still under way — the owner asks again.
+  It keeps its last 1,024 answers by
   name, so an ask asked again gets the same packet at no cost. It signs a
   new lease when what it holds grows. Holders join the groups of the
   namespaces they hold for, to hear what they keep; an owner asks only the
@@ -2748,7 +2784,15 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   chunk of it — and asks each with the Interest `<H>/32=audit/<AuditAsk>`
   (`Nonce`, 16 fresh random octets, the piece's name, and `Asker`, the
   auditor's proof binding `H` and the ask as in §13.2, under the audit
-  label, §16.1). A manifest node the
+  label, §16.1). An ask to which no answer signed by `H` comes back —
+  lost, late, refused on the way as a packet (§4) or Nacked — is asked
+  again after the pause of §17.1, each time as a new ask: a fresh nonce,
+  so a new name and a new proof. At most `AUDIT_TRIES` (8) asks are sent
+  for one piece in one audit; only when none got an answer signed by `H`
+  is the piece unanswered. An answer counts only as the answer to the ask
+  whose name it carries, judged under that ask's nonce, so a holder never
+  passes with an answer to an earlier ask, and a retry is never evidence.
+  A manifest node the
   auditor lacks, needed to list the chunks, it fetches from the writer or
   the holders, and at last asks of the audited holder itself through an
   audit ask, judged like any other.
@@ -2787,7 +2831,7 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
     — no answer, never evidence: the lease is unanswered for the piece and
     repair may ask again. So an auditor whose clock is behind the holder's
     cannot frame an honest holder that dropped at keep.
-  - Nothing signed by `H`: no answer.
+  - Nothing signed by `H` to any of the `AUDIT_TRIES` asks: no answer.
 - Verdict: **broken** on any evidence; else **unanswered** when an ask got
   no answer, or no device produced a manifest node a promised version's
   chunks are listed in (the audit is unverified, never kept); else
@@ -2799,6 +2843,21 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   `copies` count, `hold` asks every holder the record names whose lease
   does not count, all at once (a holder asked again fetches back what it
   lost), and audits each lease that comes back. It asks no other device.
+  A holder whose lease still does not count — no lease came back, as the
+  ask or its answer was lost or the holder's take is still under way
+  (§13.2), or the lease that came is not live, not audited kept, or holds
+  less than `at` (the holder's own fetches met loss) — is asked again
+  after the pause of §17.1, each time under a fresh nonce and proof, while
+  fewer than `copies` count: at most `HOLD_TRIES` (16) hold asks per
+  holder in one `hold` call — some four minutes of 14 s asks, for a holder
+  taking a large collection over a lossy path — each lease that comes back
+  audited afresh. It stops asking a holder that answers the same lease
+  twice, audited kept: that holder keeps all it could take of what was
+  asked, and the next `hold` asks again.
+  Each such audit draws its pieces anew; it passes only with every piece
+  answered, so a holder keeping a fraction `f` passes one `hold` call with
+  probability at most about `HOLD_TRIES · f^16`, and staying silent on the
+  pieces it lacks gains it nothing.
   `Custody` lists the live leases with this device's audit of each, those
   found broken or unanswered before repair, and `unkept`: the versions
   inside `at` that this device does not keep whole and that no lease
@@ -2812,7 +2871,10 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   2. While it asks them it serves none of the version's chunks and
      manifest nodes, to anyone (quarantine); its log entry stays served.
   3. It asks each candidate one audit ask marked `Whole`, naming the
-     version's log entry, under a fresh nonce. The answer is `Proof`:
+     version's log entry, under a fresh nonce (asked again, each time
+     under a new nonce, while no signed answer comes back, up to
+     `AUDIT_TRIES` asks; the proof is checked under the nonce of the ask
+     it answers). The answer is `Proof`:
      SHA-256 over the nonce, then, for each piece of the version — its log
      entry, its manifest nodes in heap order, its chunks in order — the
      piece's length (8 octets, big-endian) and its whole packet. A holder
@@ -2862,12 +2924,18 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   hold ask and its lease counts for nothing.
 - It cannot be made to work by a stranger: an ask from a device that is not
   the owner device its record names costs it a parse, no signature check
-  and no fetch; an owner's asks are bounded (one hold ask and 64 audits in
-  progress per asker, `Config::asks_verifying` proofs verified at once),
-  and a replayed ask is answered from the cache.
+  and no fetch; an owner's asks are bounded (one hold ask in progress and
+  one waiting, and 64 audits in progress, per asker; `Config::asks_verifying`
+  proofs verified at once), and a replayed ask is answered from the cache.
+  An owner asking again under loss sends at most `HOLD_TRIES` hold asks
+  per holder per `hold` call and `AUDIT_TRIES` audit asks per piece per
+  audit (§13.3).
 - It cannot be framed by records its auditor has not heard yet: a prune or
   a members record it followed is its answer, and it is evidence against it
   only where the auditor's own records prove the piece should be there.
+  Nor by a lossy path: a lost ask or answer is asked again, and an ask
+  still unanswered after the bound leaves the lease unanswered, never
+  broken.
 - It cannot read sealed data it holds without being of the audience: it
   stores and serves ciphertext (§9 lists the metadata it sees). A device of
   the namespace is an owner device (§3): it may sign the members record
@@ -2885,6 +2953,125 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   domain. It can stop answering: its lease becomes unanswered and repair
   starts, but nothing marks it broken without evidence. It sees which
   pieces are asked, and when.
+
+### 13.5 What a device serves — slice 6 (round 3)
+
+Any holder of a signed packet may answer for it: a packet is trusted for
+its signature and the digests that name it, never for who sent it (§1).
+So a device serves every entry it holds verified, of every writer — its
+own, other devices of its namespace, other namespaces — not only its own
+log. Before, a device served only its own log, a holder's collections and
+the merge versions it applied: a person whose phone writes and goes away
+had their work reach others only while the phone, or a custody holder,
+was online (ndf's REPLY-12 §1; case h10).
+
+**What it serves.** By name and, asked under its own name, by
+`<D>/32=held/<Name TLV>` (answered DigestSha256, the packet inside, §13.1):
+
+- every log entry of another device it holds verified: a version, opened
+  or held sealed — a sealed one as the ciphertext its writer signed —, and
+  every record (members, folder, hold, lease, prune, snapshot); stored, or
+  waiting in memory (pending, parked while its group waits, locked);
+- every piece (chunk and manifest node) of such a version that it holds;
+- every node and page of another device's summary it verified in its
+  newest descent of that device: the reader keeps, per writer, node and
+  page, the newest packet it checked against the digest its parent listed
+  (ndn-data: under `/localhost/ndn-data/relayed/<node name without its
+  head>`, so a newer one of the node replaces it), and answers the node's
+  name with it when the head matches;
+- under its own name only, asked by the discovery prefix
+  `<W>/32=summary/<O>/32=root`, the newest summary root of writer `W` for
+  `O` it verified (kept for the rollback floor, §7). By name a root's
+  discovery still reaches the writer alone (FreshnessPeriod 0, §7): a
+  holder answering it would race the writer with an older root.
+
+It always serves exactly the packet it holds, never one it signs or
+re-wraps (the `32=held` answer carries the packet unchanged).
+
+**What it never serves.** What a known prune covers — by the prune
+records it holds, whether or not it held the version (§14) — and what
+expired by its own clock (§14.1): retention and erasure are the writer's,
+and a holder answering for pruned bytes would undo them. Erasure destroys
+an epoch's key only once every version sealed in it is pruned (§14), so a
+version of an erased epoch is never served either. Nothing refused or
+withdrawn here: by the record in force (`NotMember`, `OutsideCut`), a
+revocation cut or an untrusted chain (§8), its group (§5.5) or its rule's
+check (§5.2) — another reader would refuse it too, and serving it would
+only cost that reader a verification. Nothing it holds unverified: a
+packet that did not verify is never kept (§4). An own entry above the
+durable head, and an own piece a release is auditing holders for, stay
+unserved as before (§4.2, §13.3).
+
+**Asking for a writer who does not answer.** A reader asks the writer
+first, by name, as before. When the writer does not answer, it asks, in
+order, the holders of a live lease on the collection (§13.2), then, for
+pieces, the devices whose versions are made over the version (§13.1),
+then every other device it hears for the namespace (§12: heard in its
+group, or writing into it by the records held), not ended here (a key
+suspected or revoked), all of them at once, each under its own name:
+
+- for the writer's root of `O` (§7), every such device of `O`; it takes the
+  root with the highest head, if that head is at least the highest it
+  verified of that writer — an older one is a holder that is behind, not
+  the writer rolling back, and is not taken. It is asked MustBeFresh, so
+  no cache answers with an earlier answer;
+- for a node or page the root lists, the same devices; the packet must be
+  the one whose digest its parent lists, as from the writer;
+- for an entry and for a piece, the devices of the collection's namespace;
+  an entry is verified against its writer's key as from the writer, a
+  piece against its manifest.
+
+A device that holds nothing of it answers with a Nack, at once. The writer
+asked first, a reader that reaches it never waits on a holder; one that
+does not reach it waits one Interest lifetime more — the devices are asked
+at once, so one that is away too costs no more — and only for what the
+writer did not answer. (Asked one after another, devices away each cost a
+lifetime: a holder taking a hold, which refreshes every writer it knows,
+outlived its asker's patience; case g1.)
+
+**Threat notes.**
+
+- *What serving others' packets exposes.* Nothing a reader of the
+  collection could not fetch from the writer: the same signed packets,
+  sealed payloads as ciphertext, under the same names. What is new is
+  that the holder's own name now answers for them, so anyone who can
+  reach the holder learns, by asking, which entries, pieces and summary
+  nodes it holds — which collections it follows and how far its copy
+  goes — and can fetch metadata (§9 lists it: names, sizes, parents,
+  groups, dates, the writer) longer than the writer stays online. Sealed
+  content stays sealed: the holder never unseals for anyone. A person who
+  wants a device to serve nothing of others does not let it follow their
+  collections; prune and expiry bound how long anything is served.
+- *Cache poisoning.* A holder answering with another packet than the one
+  asked for gains nothing: an entry is verified against its writer's key
+  (a packet signed by another key, or that does not decode, is dropped and
+  nothing is kept against its name, §4), a node or piece against the
+  digest its parent lists, a root by its writer's signature and the
+  rollback floor. The `32=held` wrapper is DigestSha256 under the holder's
+  name: a cache holding it answers only that holder's name, with the same
+  bytes; a root, asked fresh, is never answered from a cache.
+- *Amplification.* A holder answers one Interest with one packet it holds,
+  no larger than that packet and its wrapper; it never fetches on an
+  asker's behalf, signs nothing, and verifies nothing to answer (a lookup
+  in its store and its index). A reader asks each device once per packet
+  the writer did not answer, so its cost is bounded by the devices it
+  hears and what it was going to fetch anyway.
+- *A holder that withholds or is behind.* It can answer nothing, or serve
+  an older root: the reader then gets less, never wrong data, and never
+  goes below the head it verified; the writer, once reachable, is asked
+  first again. Withholding by every holder is the writer's being offline,
+  as before.
+- *Equivocation.* A holder answers for a name with the packet it holds. A
+  writer that signed two packets at one name (a copy of its key, §4)
+  may have one held at one device and the other elsewhere; a reader
+  takes the first that verifies, and the second, met later from any
+  source, is the equivocation §4 reports and §5.5 refuses a group for. A
+  holder cannot make one: it cannot sign for the writer. A removal cut
+  bound to bytes (§8) decides which packet stays, whoever serves it.
+- *Erasure.* Prune and expiry are checked as a packet is asked for, by the
+  prune records held and the device's clock; a device restarted with
+  orphan pieces of a pruned version serves none of them (the prune
+  records are restored, not only the versions held).
 
 ## 14. Prune and expiry — slices 2 (scope), 3, 4 (expiry), 6 (folder epochs)
 
@@ -3154,124 +3341,20 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   (`NotFound`); a refused entry answers `Refused` with the reason; a
   version sealed to an audience the device is not in, `Sealed`; an expired
   one, `Expired` (§14.1).
+- **Every `Version` a host receives** — answered by `get`, delivered or
+  listed by `watch`, carried whole in an equivocation — MUST carry
+  `digest`, the implicit digest of its packet (SHA-256 of the whole Data
+  wire: the name a merge operation's basis and a parent's `Digest` use,
+  §4, §5.1), and `op`: the `MergeOp` octets of a merge version, exactly
+  as its rule's check and apply received them, or nothing under the log
+  and one-key rules. A merge version's `op` is absent too while its
+  operation is not open here — sealed in an epoch whose key the device
+  does not hold, or carried in pieces and not read whole (`Payload::Large`,
+  listed by its size); a `get` of its name reads it whole and carries it.
+  A host keeping versions for history so names them as operations do,
+  and reads their edits, with no index of its own.
 - **`get(entry name)`** answers `Entries` with that one entry of its block
   (`Age::Exact`), fetching the block when not held, as `get` of the block's
-### 13.5 What a device serves — slice 6 (round 3)
-
-Any holder of a signed packet may answer for it: a packet is trusted for
-its signature and the digests that name it, never for who sent it (§1).
-So a device serves every entry it holds verified, of every writer — its
-own, other devices of its namespace, other namespaces — not only its own
-log. Before, a device served only its own log, a holder's collections and
-the merge versions it applied: a person whose phone writes and goes away
-had their work reach others only while the phone, or a custody holder,
-was online (ndf's REPLY-12 §1; case h10).
-
-**What it serves.** By name and, asked under its own name, by
-`<D>/32=held/<Name TLV>` (answered DigestSha256, the packet inside, §13.1):
-
-- every log entry of another device it holds verified: a version, opened
-  or held sealed — a sealed one as the ciphertext its writer signed —, and
-  every record (members, folder, hold, lease, prune, snapshot); stored, or
-  waiting in memory (pending, parked while its group waits, locked);
-- every piece (chunk and manifest node) of such a version that it holds;
-- every node and page of another device's summary it verified in its
-  newest descent of that device: the reader keeps, per writer, node and
-  page, the newest packet it checked against the digest its parent listed
-  (ndn-data: under `/localhost/ndn-data/relayed/<node name without its
-  head>`, so a newer one of the node replaces it), and answers the node's
-  name with it when the head matches;
-- under its own name only, asked by the discovery prefix
-  `<W>/32=summary/<O>/32=root`, the newest summary root of writer `W` for
-  `O` it verified (kept for the rollback floor, §7). By name a root's
-  discovery still reaches the writer alone (FreshnessPeriod 0, §7): a
-  holder answering it would race the writer with an older root.
-
-It always serves exactly the packet it holds, never one it signs or
-re-wraps (the `32=held` answer carries the packet unchanged).
-
-**What it never serves.** What a known prune covers — by the prune
-records it holds, whether or not it held the version (§14) — and what
-expired by its own clock (§14.1): retention and erasure are the writer's,
-and a holder answering for pruned bytes would undo them. Erasure destroys
-an epoch's key only once every version sealed in it is pruned (§14), so a
-version of an erased epoch is never served either. Nothing refused or
-withdrawn here: by the record in force (`NotMember`, `OutsideCut`), a
-revocation cut or an untrusted chain (§8), its group (§5.5) or its rule's
-check (§5.2) — another reader would refuse it too, and serving it would
-only cost that reader a verification. Nothing it holds unverified: a
-packet that did not verify is never kept (§4). An own entry above the
-durable head, and an own piece a release is auditing holders for, stay
-unserved as before (§4.2, §13.3).
-
-**Asking for a writer who does not answer.** A reader asks the writer
-first, by name, as before. When the writer does not answer, it asks, in
-order, the holders of a live lease on the collection (§13.2), then, for
-pieces, the devices whose versions are made over the version (§13.1),
-then every other device it hears for the namespace (§12: heard in its
-group, or writing into it by the records held), not ended here (a key
-suspected or revoked), each under its own name:
-
-- for the writer's root of `O` (§7), every such device of `O`; it takes the
-  root with the highest head, if that head is at least the highest it
-  verified of that writer — an older one is a holder that is behind, not
-  the writer rolling back, and is not taken. It is asked MustBeFresh, so
-  no cache answers with an earlier answer;
-- for a node or page the root lists, the same devices; the packet must be
-  the one whose digest its parent lists, as from the writer;
-- for an entry and for a piece, the devices of the collection's namespace;
-  an entry is verified against its writer's key as from the writer, a
-  piece against its manifest.
-
-A device that holds nothing of it answers with a Nack, at once. The writer
-asked first, a reader that reaches it never waits on a holder; one that
-does not reach it waits one Interest per device asked, and only for what
-the writer did not answer.
-
-**Threat notes.**
-
-- *What serving others' packets exposes.* Nothing a reader of the
-  collection could not fetch from the writer: the same signed packets,
-  sealed payloads as ciphertext, under the same names. What is new is
-  that the holder's own name now answers for them, so anyone who can
-  reach the holder learns, by asking, which entries, pieces and summary
-  nodes it holds — which collections it follows and how far its copy
-  goes — and can fetch metadata (§9 lists it: names, sizes, parents,
-  groups, dates, the writer) longer than the writer stays online. Sealed
-  content stays sealed: the holder never unseals for anyone. A person who
-  wants a device to serve nothing of others does not let it follow their
-  collections; prune and expiry bound how long anything is served.
-- *Cache poisoning.* A holder answering with another packet than the one
-  asked for gains nothing: an entry is verified against its writer's key
-  (a packet signed by another key, or that does not decode, is dropped and
-  nothing is kept against its name, §4), a node or piece against the
-  digest its parent lists, a root by its writer's signature and the
-  rollback floor. The `32=held` wrapper is DigestSha256 under the holder's
-  name: a cache holding it answers only that holder's name, with the same
-  bytes; a root, asked fresh, is never answered from a cache.
-- *Amplification.* A holder answers one Interest with one packet it holds,
-  no larger than that packet and its wrapper; it never fetches on an
-  asker's behalf, signs nothing, and verifies nothing to answer (a lookup
-  in its store and its index). A reader asks each device once per packet
-  the writer did not answer, so its cost is bounded by the devices it
-  hears and what it was going to fetch anyway.
-- *A holder that withholds or is behind.* It can answer nothing, or serve
-  an older root: the reader then gets less, never wrong data, and never
-  goes below the head it verified; the writer, once reachable, is asked
-  first again. Withholding by every holder is the writer's being offline,
-  as before.
-- *Equivocation.* A holder answers for a name with the packet it holds. A
-  writer that signed two packets at one name (a copy of its key, §4)
-  may have one held at one device and the other elsewhere; a reader
-  takes the first that verifies, and the second, met later from any
-  source, is the equivocation §4 reports and §5.5 refuses a group for. A
-  holder cannot make one: it cannot sign for the writer. A removal cut
-  bound to bytes (§8) decides which packet stays, whoever serves it.
-- *Erasure.* Prune and expiry are checked as a packet is asked for, by the
-  prune records held and the device's clock; a device restarted with
-  orphan pieces of a pruned version serves none of them (the prune
-  records are restored, not only the versions held).
-
   name would (§4.1); an index past the block's last entry, `NotFound`.
 - **`get(range name)`** of a one-key collection answers `Entries` (§5.4),
   aged as `get(C)`; of another rule, `BadRequest` (next step `FixRequest`).
@@ -3282,8 +3365,19 @@ the writer did not answer.
   It requires a members record — under a folder, an effective record
   (§6.1) — that lists the device's key among the
   writers; for a collection of another namespace the device first looks for
-  one, and answers `Unavailable` when no device writing into that namespace
-  was heard, else `NotAllowed`. For a collection of its own namespace with
+  one admitting its key. With none held and no device writing into that
+  namespace heard, it answers `Unavailable`. While none held admits the
+  key — none is held, or the one in force does not list the key as a
+  writer or, sealed, does not admit the device to its audience — and a
+  device of that namespace heard here has not been walked toward the
+  collection's folder (as for the default record, §5), it answers
+  `NotReady` (next step `RetryLater`, naming the devices): the record a
+  share or an introduction signed admitting the key may still be on its
+  way, and a refusal is judged by records held, never by how long the
+  device waited (§18.1). Once every one was walked, the records held
+  decide: `NotAllowed` with none held or a record not listing the key,
+  `Sealed` with one not admitting the device. For a collection of its own
+  namespace with
   no record in force it signs the host's default record with the first
   version, once that version is judged, and only once nothing a device of
   its namespace holds can govern the collection (§5): else `NotReady`
@@ -3358,6 +3452,20 @@ the writer did not answer.
   collection still to come: a host resuming a whole folder passes the
   empty frontier (its listing is local), or resumes collections one by one
   from their own frontiers.
+
+  A watch is told the members record in force (`Change::Members`, with
+  the rule, writers and readers `members` answers): of a folder,
+  whenever its record in force changes — whoever signed the record that
+  changed it: this device (`share_folder`, an introduction's admission,
+  §19.4), another device of the owner, a merge of concurrent records —
+  tagged with the folder; of a collection, whenever its effective record
+  changes, tagged with the collection. A watch of a name is told that
+  name's; a watch of a folder is also told each folder under it, and each
+  collection under it that has a record of its own (a collection that
+  only inherits is told on its own watch, its folder's change included).
+  Only a change of what `members` answers is told, never a cut or epoch
+  alone. The listing starts with the record in force over each such name
+  held here, so a host that watches and then reads misses no change.
 
   A watch is never queued for without bound. Past what its listing
   queued, a watcher may leave `Config::watch_queue` changes unread (4096
@@ -3509,18 +3617,6 @@ Every name parses one way, and a reader MUST refuse one that does not:
   namespace, never a node under one.
 - **State.** `32=state` is the next-to-last component and the collection
   name precedes it.
-- **Every `Version` a host receives** — answered by `get`, delivered or
-  listed by `watch`, carried whole in an equivocation — MUST carry
-  `digest`, the implicit digest of its packet (SHA-256 of the whole Data
-  wire: the name a merge operation's basis and a parent's `Digest` use,
-  §4, §5.1), and `op`: the `MergeOp` octets of a merge version, exactly
-  as its rule's check and apply received them, or nothing under the log
-  and one-key rules. A merge version's `op` is absent too while its
-  operation is not open here — sealed in an epoch whose key the device
-  does not hold, or carried in pieces and not read whole (`Payload::Large`,
-  listed by its size); a `get` of its name reads it whole and carries it.
-  A host keeping versions for history so names them as operations do,
-  and reads their edits, with no index of its own.
 - **Entry.** The last component is `seg=<i>` (a SegmentNameComponent), the
   next-to-last `32=entry`, and what precedes them is a log entry name with a
   collection: the block.
@@ -3610,20 +3706,6 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x0564 | Bucket | NonNegativeInteger 0–15 |
 | 0x0566 | PagePath | octets, one bucket each (pages only) |
 | 0x0568 | Writer | Name (the writer's key) |
-  A watch is told the members record in force (`Change::Members`, with
-  the rule, writers and readers `members` answers): of a folder,
-  whenever its record in force changes — whoever signed the record that
-  changed it: this device (`share_folder`, an introduction's admission,
-  §19.4), another device of the owner, a merge of concurrent records —
-  tagged with the folder; of a collection, whenever its effective record
-  changes, tagged with the collection. A watch of a name is told that
-  name's; a watch of a folder is also told each folder under it, and each
-  collection under it that has a record of its own (a collection that
-  only inherits is told on its own watch, its folder's change included).
-  Only a change of what `members` answers is told, never a cut or epoch
-  alone. The listing starts with the record in force over each such name
-  held here, so a host that watches and then reads misses no change.
-
 | 0x056A | Cuts | Cut*, by prefix |
 | 0x056C | Cut | Name (removed writer prefix), CutBytes* (§8), then — in a collection's record — per key it keeps versions of in the collection, by key: Writer, Entries (exactly those seqs, §8); or — in a folder's record — CutIn*, by collection (§6.1); a signer gives a cut that keeps versions its CutBytes, one that keeps none none (a cut keeping versions without them binds them to no bytes, §8) |
 | 0x056E | SealEpoch | Name (the device that signed the record starting it), Seq (that record's seq) |
@@ -3952,6 +4034,9 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | A basis refused by its key | In no past on any reader, held or not: judged alike everywhere. | §5.2 |
 | A Yjs update deleting or placing against content outside its past | Refused by `/merge/yrs`'s check. | §5.1 |
 | Pieces served to one device only | Readers ask the devices whose versions are made over the version. | §13.1 |
+| Writer offline, another device holds its work | Readers ask the other devices they hear for the namespace, under their own names, for the writer's newest root, summary nodes, entries and pieces; each answers with the writer's own packets (sealed as ciphertext), verified as from the writer. Nothing pruned, expired, refused or unverified is served. | §13.5 |
+| Holder behind, or withholding | Its older root is not taken below the head verified; the reader gets less, never wrong data, and asks the writer first again once reachable. | §7, §13.5 |
+| Group member in pieces, not opened yet | Present once every piece is held; opened as it applies; the group counts whole, on readers and on the writer after it reads a collection again. | §5.5 |
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
 | Poisoned cache | Verification fails, or the packet is signed by another device's key or does not decode: that packet is dropped, nothing is kept against its name, and it is fetched elsewhere; the genuine copy is taken. | invariant 1, §4 |
 | Stranger in a sync group | Costs a root fetch; its entries are refused `NotMember`. | §6, §12 |
@@ -3968,6 +4053,7 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | Writer behind on a seal | Its unsealed version is refused `Unsealed`; its later sealed versions do not wait for it. | §5.2, §9 |
 | Relay or repository of another person | Carries ciphertext and grants wrapped to one device each; reads no payload and no key, and sees the metadata §9 lists. | §9 |
 | Member offline | Its newest verified summary is what the reader is complete against; it catches up when the member returns. | §7 |
+| Lossy link (packets dropped, delayed past the lifetime) | Every fetch that missed is asked again while the device's durable state still owes what it was for — a walk of a summary and what it lists, an epoch key, a merge version's pieces, a removal cut's manifest packet — with a pause doubling from 250 ms to 4 s, never waiting for a new sync notice and never one try per granter; within one ask, an Interest nothing answered is expressed again under a fresh nonce after a retransmission timeout from the round trips the device measured (at least 250 ms, doubling, at most 3 times within the lifetime), so a lost packet costs about that timeout rather than the lifetime; at 20 % loss a sealed folder's first version reaches a reader's watch in seconds. Bounded: at most `FETCH_TRIES` asks of at most 1 + `REEXPRESS_MAX` Interests each per owed packet and source per lifetime plus pause. | §17.1 |
 | Holder relays audits | Passes spot audits (they prove it can produce, not that it stores), but cannot make the owner release: a release asks a proof over every piece while the owner serves none of them. | §13.3, §13.4 |
 | Stranger asks a holder | Dropped for the cost of a parse: only an owner device whose hold record names the holder may ask, and its asks are bounded. | §13.2, §13.3 |
 | Holder hears a prune first | Its audit answer names the prune; the auditor verifies and takes it, and the piece is excused. | §13.3, §14 |
@@ -4025,6 +4111,163 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | Offer asked of another device of the inviter | `Unknown`: only the offering device holds its proof key; its use mark is seen by every device of the inviter. | §19.7 |
 | Lying relay hint | Fails to reach; nothing it says is trusted. | §19.7 |
 
+### 17.1 Asking again under loss
+
+A fetch **misses** when nothing answers within the Interest lifetime
+(`Config::lifetime`, 2 s by default), the forwarder refuses the packet for
+now (a certificate on its chain not to be had yet), a Nack comes, or what
+comes is refused as a packet (§4: it does not verify, or is not its name's
+packet). A miss decides nothing (invariant 1): it is the network's, and the
+device MUST ask again for what the fetch was for, for as long as what it
+holds still owes it, whether or not a new sync notice arrives (§12: the
+group counter does not move again for what was announced). What is owed,
+and until when:
+
+- **A walk of a summary** (§7) — the writer's root, the nodes and pages on
+  the way, and the members records and versions they list that the device
+  follows or peeks at, with the cut manifest packets on the way to an
+  entry (§8). Asked again of the writer's device, from its newest root,
+  skipping every branch processed in full. Owed while the head of the
+  newest root verified of that device is above the head it walked in full
+  (both kept across restarts, §7), until both meet. A device whose root
+  does not come, of which nothing verified says it owes more than was
+  walked (only a notice said it moved: it is offline, or a stranger named
+  it), is asked at most `REFRESH_TRIES` (16) times in a row per trigger —
+  a sync notice naming it, a watch of its namespace — then left until the
+  next one.
+- **Inside a walk**, a node, page, members record or version that missed
+  for want of an answer (or a refusal for now) is asked again in place, up
+  to `FETCH_TRIES` (3) asks in all, so one lost packet costs the walk about
+  one retransmission timeout (below) rather than the walk; only when every
+  ask missed is the walk asked again from the root.
+- **An epoch key** (§9) — asked, round after round, of the epoch's creator,
+  then of every other device known to write into the namespace, one
+  Interest each a round, while the key is not held, a held owner-signed
+  record of the subject names the epoch, the device may hold the key by
+  conditions (2) and (3) of §9 as far as it can tell, and a version held
+  here is sealed in it and waits for it, or it is the epoch of the record
+  in force (for reading what comes next, and writing): that key is asked
+  for as soon as the record is held, so a reader holds it before the first
+  version sealed in it arrives. A device never stops after one try per
+  granter. A watch of the namespace asks again for every key a held
+  version waits for, after a restart too.
+- **A merge version's pieces** (§5.2, §13.1) — while the version waits for
+  them: not covered by a checkpoint held whole, not pruned, cut or let go.
+- **A removal cut's manifest packet** a version waits for (§8) — by its full
+  name, from any device, while a version waits for it. Re-admitted entries
+  and the bytes a cut keeps (§8.2) keep their own schedule
+  (`READMIT_TRIES` asks, the pause doubling from 500 ms), and are asked
+  again at every group refresh.
+- **Custody asks** (§13.3) — within one `hold` call or release, never
+  past it: an audit ask no answer signed by the holder came back to, as a
+  new ask under a fresh nonce, up to `AUDIT_TRIES` (8) asks per piece per
+  audit; a hold ask to a named holder whose lease does not count, under a
+  fresh nonce and proof, up to `HOLD_TRIES` (16) asks per holder per call,
+  while fewer than `copies` count. A piece still unanswered after its
+  bound leaves the audit unanswered, never broken; a holder still without
+  a lease that counts is left to the next `hold`.
+- **A holder's take** of what an accepted hold record asks (§13.2) — in
+  rounds, while a version inside `at` is not heard of or a piece of one
+  is missing: at most `REPAIR_ROUNDS` (16) rounds per take, ended by 3
+  rounds in a row (`REPAIR_IDLE`) that brought nothing; the owner's next
+  hold ask starts the next take.
+
+**Re-expression within an ask (normative).** An ask is one fetch of one
+name within one Interest lifetime. An Interest of it that nothing answered
+within the device's retransmission timeout `RTO` MUST be expressed again —
+the same name and selectors, a fresh nonce, the lifetime left as its
+InterestLifetime — and again after 2·`RTO`, 4·`RTO`, … since the previous
+one, at most `REEXPRESS_MAX` (3) times per ask, and only while at least
+`RTO_MIN` (250 ms) of the lifetime is left after the wait. One ask so sends
+at most 1 + `REEXPRESS_MAX` Interests and ends with its lifetime (and the
+500 ms the consumer waits past it for a reply sent just before the end);
+every Interest of it stays pending until then, and a reply to any of them
+answers the ask. `RTO` comes from the round trips the device measured
+(RFC 6298), one estimate per device. Only an ask answered by its first
+Interest gives a sample R — one answered after a re-expression does not,
+since which Interest was answered is not known (Karn). The first sample
+sets SRTT = R and RTTVAR = R/2; each later one sets RTTVAR ← ¾·RTTVAR +
+¼·|SRTT − R|, then SRTT ← ⅞·SRTT + ⅛·R. `RTO` = SRTT + 4·RTTVAR, doubled
+once for every ask since the last sample that needed a re-expression or
+that nothing answered, and kept within [`RTO_MIN`, `Config::lifetime`].
+Before the first sample `RTO` is the lifetime: nothing is re-expressed on
+a path the device has not measured. `RTO_MIN` is the longest a forwarder's
+retransmission suppression holds back a fresh-nonce Interest from the same
+downstream face (NFD `RetxSuppressionExponential` caps its window at
+250 ms; the ndn-rs engine follows it), so every re-expression goes on
+upstream rather than being aggregated, and the forwarder needs nothing
+beyond its generic Interest pipeline. A packet lost on a measured path then
+costs the ask about one `RTO` — a quarter second where round trips are
+short — instead of the lifetime; where the round trip nears the lifetime,
+`RTO` reaches it and an ask is one Interest, as without re-expression. A
+custody ask (§13.3) is expressed once: its call asks again, as a new ask
+under a fresh nonce. A granter that sees two Interests of one grant ask
+answers both with the one packet it keeps for that name (§9). Re-expression
+is liveness only: it decides nothing (invariant 1), and what is held or
+counted never depends on its timing.
+
+**Pause.** After `k` misses in a row of one such loop (`k` = 0, 1, …) the
+device waits min(250 ms · 2^`k`, 4 s) before asking again
+(`REFRESH_PAUSE`, `REFRESH_PAUSE_MAX`), and 64 s (`REFRESH_IDLE`) once 16
+asks in a row missed. So at a loss `p` per packet, where an exchange
+succeeds with (1 − `p`)², a lost packet costs about one `RTO` within an
+ask; a whole ask misses only when all its Interests or their answers are
+lost — (1 − (1 − `p`)²)⁴, about 1.7 % at 20 % loss, when all four fit in
+the lifetime — and then costs one lifetime and a fraction of a second; and
+a walk, a key and its grant complete in seconds at 10–20 % loss rather
+than in minutes. What is no longer owed is not asked for again: held,
+pruned, cut, expired past its keep, released, its collection or folder no
+longer followed, its epoch no longer named or no longer admitting this
+device.
+
+**Bound (normative).** At most one loop asks for one owed thing at a time:
+one per (device, namespace) for a walk — a notice for a device already
+being walked marks it to walk again, starting nothing beside it — one per
+(subject, epoch) for a key, one per version for pieces, one per name for a
+manifest packet. Each pass of a loop makes at most `FETCH_TRIES` asks per
+packet it misses (one per granter for a key), each of at most 1 +
+`REEXPRESS_MAX` Interests within one lifetime, and every fetch holds one of
+the device's `Config::window` slots. So one owed packet costs at most
+`FETCH_TRIES` asks — `FETCH_TRIES` · (1 + `REEXPRESS_MAX`) = 12 Interests —
+per source per (lifetime + pause): after the first misses, about one ask
+per source every 6 s; after 16 misses in a row, one a minute, until it is
+no longer owed. A name nothing verified owes costs at most
+`REFRESH_TRIES` root asks per trigger, at most 4 Interests each.
+Custody asks are bounded per call: one `hold` sends a holder at most
+`HOLD_TRIES` hold asks (each with a lifetime of three first looks and one
+Interest lifetime) and, per audit, `AUDIT_TRIES` asks for each of its
+`Config::audit_pieces` pieces; a release asks each candidate at most
+`AUDIT_TRIES` `Whole` asks. A holder runs one take per collection at a
+time, of at most `REPAIR_ROUNDS` rounds, each asking every missing piece
+once per source; hold asks arriving meanwhile start nothing beside it.
+
+**Threat note: retry cost.** Who can make a device ask again? (1) A sync
+notice is unsigned (§12): a stranger naming a device that never answers
+costs the reader at most 16 root asks (64 Interests at most) per notice,
+spread over about a minute, and none more while that name is being walked
+— the "stranger in a sync group" row above, bounded in time as well. (2)
+What is owed for
+longer is named only by data the device verified: a root its writer
+signed, a record its owner signed, a version a writer signed. A member
+that lists what it never serves costs each reader the bounded rate above
+for as long as it stays a member; its owner ends it by removing it. (3) A
+cache or a forger answering with packets that do not verify makes a fetch
+miss, never a hold: the same bound, and the genuine copy is still taken
+when it comes (§4). (4) A granter is asked only for an epoch a record held
+here names and that admits this device; it answers only an asker the
+records it holds admit (§9), and fetches that asker's seal key with one
+ask per grant it makes, never asking again on the asker's behalf.
+(5) A holder is asked again only by its owner, within the call that asked
+it, up to the bounds above; it waits for at most one repeated hold ask of
+an asker beside the one in progress (§13.2), and answers a repeated audit
+ask, under its new nonce, as any other, never from an earlier answer.
+(6) Re-expression is timed by what the device measured itself and bounded
+per ask: nothing another party sends makes one ask carry more than 1 +
+`REEXPRESS_MAX` Interests. A party that delays replies — or a slow
+producer — raises `RTO`, or, by answering only after re-expressions, keeps
+it doubled; either lowers how often the device re-expresses. A forger that
+answers one of the Interests ends the ask with a packet refused as in (3).
+
 ## 18. Conformance
 
 `ndn-data-conformance` (ndn-sim) runs the study's use cases against an
@@ -4036,7 +4279,10 @@ c8 (a laptop back after four months: 10,000 notes, 37 changed), c11
 (citing a merged state) and o4 (a reader keeps up with a writer that never
 pauses: it holds everything written before it looked, then every later
 moment's versions, while the writer keeps putting and a second reader
-makes it sign a new root many times a second). The slice-2 cases are c2
+makes it sign a new root many times a second) and o5 (a sealed folder
+converges under loss: with one packet in five dropped on its way into each
+device, the first version Alice seals reaches Bob's folder watch, opened,
+within 8 s of virtual time, §17.1). The slice-2 cases are c2
 (Bob removed while offline: his later edit is refused whatever its date),
 c4 (a note sealed to Alice opens for her host, and a device outside the
 audience cannot read it), c9 (a family chat under the log rule: members'
@@ -4189,6 +4435,11 @@ writer's device signs seqs it already used in other collections: entries
 at seqs a folder cut kept are refused `OutsideCut` in the collection the
 cut did not list them under, at every reader, and a group one of whose
 seqs carries a second entry is refused for its group at every reader),
+h10 (a device serves the versions it holds that another device wrote:
+Alice's phone locks a paragraph of a sealed folder and goes away for good,
+no cache keeping what it served; her laptop answers for the phone's root,
+summary nodes and sealed entry, exactly as the phone signed them, and Bob
+counts the lock),
 f1 (a folder of 1,000
 collections: a reader asks one grant per folder epoch, not one per
 collection), f2 (narrowing a collection under a folder works; widening
@@ -4271,9 +4522,6 @@ answered again), i3 (a code past its expiry by the offering device's
 clock is refused `Expired`; a new code admits), i4 (an offer closing at
 two wrong tries: the first is refused `WrongProof` with one left
 (`FixRequest`); the offering device restarts; the second is refused
-| Writer offline, another device holds its work | Readers ask the other devices they hear for the namespace, under their own names, for the writer's newest root, summary nodes, entries and pieces; each answers with the writer's own packets (sealed as ciphertext), verified as from the writer. Nothing pruned, expired, refused or unverified is served. | §13.5 |
-| Holder behind, or withholding | Its older root is not taken below the head verified; the reader gets less, never wrong data, and asks the writer first again once reachable. | §7, §13.5 |
-| Group member in pieces, not opened yet | Present once every piece is held; opened as it applies; the group counts whole, on readers and on the writer after it reads a collection again. | §5.5 |
 `Closed`, and so is the right code afterwards from the same key — the
 count survived the restart), i5 (two keys presenting one code at once:
 exactly one is admitted, the other refused `Used`, also when it asks
@@ -4305,6 +4553,73 @@ check that only the certificates of the verified chain are cached, that a
 joiner whose key is its own anchor is answered, that an offer is not spent
 when the host does not adopt the asker, that a closed offer refuses its
 user too, and that asks past `asks_queued` get no answer at once.
+
+### 18.1 Faulty mode
+
+A conforming implementation passes every case it implements on a faulty
+network as on a clean one. `ndn-data-conformance --faulty` runs the whole
+suite on ndf's faulty profile; `--faults SPEC` runs another profile and
+`--fault-seed N` another seed. The integrator's runs use `--faulty` with
+the default seed and two more, each with `--check-determinism`.
+
+- **Profile.** `drop=0.2,dup=0.1,forge=0.05,delay=400,reorder=0.1,blocks=1500`,
+  the profile of ndf's element-link fault layer, with its semantics
+  exactly (`ndn_sim::Faults`). Each packet, with draws in this order: is
+  dropped with probability 0.2; otherwise is held a uniform 0..=400 ms;
+  with probability 0.1 is held a further max(400, 50) ms, so later packets
+  overtake it; if it is a Data — a frame carrying a whole Data packet,
+  bare or as an NDNLPv2 fragment; a fragment of a larger Data is not
+  one — is held a further uniform 0..=1500 ms; with probability 0.1 is
+  delivered twice, both copies after the same hold; and, if a Data, with
+  probability 0.05 has one byte of its SignatureValue XORed with 0x5A. A
+  SPEC is comma-separated `key=value` pairs of the keys `drop`, `dup`,
+  `forge`, `delay`, `reorder`, `blocks` (milliseconds) and `seed`; a key
+  left out is no fault, an unknown key or value is refused, saying which.
+- **Where it applies.** To every packet arriving at a device from its
+  link, below the device's forwarder. What arrives at the hub is not
+  faulted, so every packet from one device to another meets the profile
+  exactly once — as on a direct connection under ndf's per-arrival layer,
+  where each end faults what it receives. The faulty links are the face
+  ndf's layer sits on, an ndn-link QUIC stream face: whole packets meet
+  the faults (no NDNLPv2 fragments, so a large Data is dropped, held or
+  forged once), and no NDNLPv2 reliability resends what is dropped: every
+  loss reaches the forwarder and the device. The faults ride on the
+  link's own latency, and taking a device offline still cuts its link
+  outright. A case that declares its own profile (o5) keeps it;
+  `--fault-seed` replaces its seed too.
+- **Seeding.** Each link direction draws from its own xorshift64 stream,
+  seeded from the fault seed and the two node ids only (the default seed
+  is 0). Nothing else — the order of cases, the process, the fabric's
+  world seed, another link's traffic — enters a draw, and the kernel is
+  virtual, so a faulty run is as deterministic as a clean one: a case run
+  alone in a fresh process with the same flags must give the same status,
+  faults, cost and measures as in the suite (`--check-determinism` checks
+  this under `--faulty`; each child run gets the runner's fault flags).
+  The JSON report records the network (`network`: `mode` — `clean`,
+  `faulty` or `faults` — the profile as run and its seed) and, for each
+  case, the profile it ran under (`faults`).
+- **What passing means.** Every assertion a case makes holds, unchanged:
+  what each device reads, what it refuses and why, what it keeps and
+  serves, the signatures made and the person's gestures. Time to converge
+  stays within the case's own limits and its budget of virtual time; the
+  faults are never loosened to make a case pass, and a case is never made
+  to tolerate a wrong answer. A failure under faults is a defect in the
+  implementation (or the case) at its cause, fixed there.
+
+**Threat notes — faulty mode.** A forged packet — any Data whose
+signature fails — is refused by the device's verifier and is never
+applied, stored, served or cached as good: not by the data layer, and not
+by the device's forwarder, whose content store must not answer a later
+Interest with it. Nothing is kept against its name: a forged copy never
+makes a device refuse the genuine packet at that name, never counts as
+evidence (an equivocation, a breach, a refused version), and never stops
+the device asking again, from any holder, until the genuine one arrives.
+A duplicated packet is idempotent: a version, group member, grant,
+members record, summary, head, ask or answer delivered twice is taken
+once, reported to watchers once, and counted once — a duplicated ask with
+a wrong proof spends one try, a duplicated join spends the code once. A
+delayed or reordered packet is judged by what it signs, never by when it
+arrives (§17): a version arriving before what it depends on waits for it.
 
 ## 19. Introductions — slice 6
 
@@ -4504,11 +4819,6 @@ checks, in this order:
 8. **The asker's tries are not spent**: fewer wrong tries of this key
    counted than the offer's `Tries`. Else `Closed`.
 9. **The proof is right** (§19.6), for that key and its public key's
-h10 (a device serves the versions it holds that another device wrote:
-Alice's phone locks a paragraph of a sealed folder and goes away for good,
-no cache keeping what it served; her laptop answers for the phone's root,
-summary nodes and sealed entry, exactly as the phone signed them, and Bob
-counts the lock),
    digest. Else the wrong try is counted against the key, and toward the
    overall cap once the pause after the last one counted there has passed
    (`Config::intro.backoff`, 1 s by default, doubled by each counted, by

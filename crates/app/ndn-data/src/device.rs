@@ -131,7 +131,9 @@ pub struct Config {
     pub rules: MergeRules,
     /// The device's wall clock, for the dates it writes.
     pub clock: Clock,
-    /// Interest lifetime of every fetch.
+    /// Interest lifetime of every fetch: one ask lasts it, and an Interest
+    /// of the ask nothing answered is expressed again within it after the
+    /// device's measured retransmission timeout (spec §17.1).
     pub lifetime: Duration,
     /// How long `get`, `put` and `watch` wait for a first look at a
     /// collection the device has not seen before.
@@ -1242,10 +1244,33 @@ const SEAL_KEYS_KEPT: usize = 1024;
 /// Answers to hold and audit asks a holder keeps signed, by the ask's name:
 /// the same ask asked again (a replay) costs no work and no signature.
 const ANSWERS_KEPT: usize = 1024;
-/// Hold asks of one owner device a holder works on at once.
+/// Hold asks of one owner device a holder works on at once. One more may
+/// wait for it to end ([`Inner::hold_slot`]).
 const HOLDS_PER_ASKER: usize = 1;
 /// Audit asks of one owner device a holder answers at once.
 const AUDITS_PER_ASKER: usize = 64;
+/// The most hold asks one `hold` call sends one holder its record names
+/// (spec §13.3, repair; §17.1): asked again after [`retry_pause`], each
+/// time under a fresh nonce and proof, while no lease came back (lost, or
+/// the holder's take of what the record asks still under way) or the one
+/// that came does not count (not live, not audited kept, or holding less
+/// than the record's `at`) — but not once the same lease came back twice
+/// audited kept. With a hold ask's lifetime of about 14 s, some four
+/// minutes for a holder to take a large collection over a lossy path.
+/// Liveness only: what counts is the lease and the audit.
+const HOLD_TRIES: u32 = 16;
+/// The most audit asks one piece is asked with in one audit (spec §13.3,
+/// §17.1): while no answer signed by the holder comes back, it is asked
+/// again after [`retry_pause`] under a fresh nonce; only then is it
+/// unanswered. No answer is never evidence.
+const AUDIT_TRIES: u32 = 8;
+/// The most rounds a holder asks for the pieces it lacks of what an
+/// accepted hold record asks, in one take ([`Inner::repair_held`], spec
+/// §13.2, §17.1).
+const REPAIR_ROUNDS: u32 = 16;
+/// Rounds in a row that fetched no piece after which a holder stops asking
+/// for the rest, until the next hold ask ([`Inner::repair_held`]).
+const REPAIR_IDLE: u32 = 3;
 /// How long a range read takes at most, in first looks
 /// ([`Config::first_look`]): what withheld or unreachable blocks can cost a
 /// reader before the blocks it did not reach are answered `missing` (spec
@@ -1288,18 +1313,108 @@ const CUT_KEPT_MAX: usize = 262_144;
 /// round each, in seq order, so the largest group completes within one.
 const APPLY_ROUNDS: usize = 4 * GROUP_MAX as usize;
 
-/// How long a device whose announced change was not taken (not reached, or
-/// its summary not processed in full) is left before it is asked again
-/// ([`Inner::schedule`]); doubled each time up to [`REFRESH_PAUSE_MAX`], for
-/// [`REFRESH_TRIES`] times. Liveness only: what counts is decided by the
-/// versions held.
-const REFRESH_PAUSE: Duration = Duration::from_secs(2);
+/// The first pause before something a fetch missed is asked for again
+/// (spec §17.1): a device's summary not reached or not processed in full
+/// ([`Inner::schedule`]), an epoch key no device granted
+/// ([`Inner::obtain`]), a merge version's pieces not all found
+/// ([`Inner::spawn_pieces`]), a removal cut's manifest packet a version
+/// waits for ([`Inner::fetch_wanted_bytes`]). Doubled after each further
+/// miss in a row up to [`REFRESH_PAUSE_MAX`] ([`retry_pause`]). Liveness
+/// only: what counts is decided by the versions held.
+const REFRESH_PAUSE: Duration = Duration::from_millis(250);
 
-/// The longest pause between two asks of a device not reached.
-const REFRESH_PAUSE_MAX: Duration = Duration::from_secs(64);
+/// The longest pause between two asks while they keep missing, for the
+/// first [`REFRESH_TRIES`] misses in a row: short, so a packet lost at
+/// 10–20 % loss costs an Interest lifetime and a few seconds, not a minute.
+const REFRESH_PAUSE_MAX: Duration = Duration::from_secs(4);
 
-/// How many times a device not reached is asked again.
+/// How many asks in a row may miss before the pause becomes
+/// [`REFRESH_IDLE`] for what durable state still owes, and before a device
+/// nothing verified says it owes more is no longer asked (spec §17.1).
 const REFRESH_TRIES: u32 = 16;
+
+/// The pause between two asks for what is still owed once
+/// [`REFRESH_TRIES`] asks in a row missed: a source away for long costs one
+/// ask a minute, until what is owed comes or is no longer owed.
+const REFRESH_IDLE: Duration = Duration::from_secs(64);
+
+/// The pause before asking again for something after `misses` asks for it
+/// missed in a row (spec §17.1): [`REFRESH_PAUSE`] · 2^`misses`, at most
+/// [`REFRESH_PAUSE_MAX`]; [`REFRESH_IDLE`] from [`REFRESH_TRIES`] misses on.
+fn retry_pause(misses: u32) -> Duration {
+    if misses >= REFRESH_TRIES {
+        return REFRESH_IDLE;
+    }
+    REFRESH_PAUSE
+        .saturating_mul(1 << misses.min(8))
+        .min(REFRESH_PAUSE_MAX)
+}
+
+/// The most asks one fetch of a packet a summary being walked lists makes
+/// ([`Inner::fetch_owed`], spec §17.1), each of at most 1 +
+/// [`REEXPRESS_MAX`] Interests: a miss asking again may mend is asked again
+/// in place, so one lost packet does not cost the whole walk.
+const FETCH_TRIES: u32 = 3;
+
+/// The most times one ask expresses its Interest again within its lifetime
+/// (spec §17.1): an ask sends at most 1 + this Interests.
+const REEXPRESS_MAX: u32 = 3;
+
+/// The shortest wait before an unanswered Interest is expressed again
+/// (spec §17.1): the longest a forwarder's retransmission suppression
+/// holds back a fresh-nonce Interest from the same face (NFD
+/// `RetxSuppressionExponential` caps its window at 250 ms), so a
+/// re-expression always goes on upstream. Also the least of the lifetime
+/// that must be left for one.
+const RTO_MIN: Duration = Duration::from_millis(250);
+
+/// The device's round-trip estimate, from which it times re-expressing an
+/// unanswered Interest (spec §17.1, RFC 6298): the smoothed round trip and
+/// its variation over the asks answered by their first Interest, and how
+/// many asks since the last such answer needed a re-expression or missed.
+/// An ask answered after a re-expression gives no sample (Karn: which
+/// Interest was answered is not known). Before any sample nothing is
+/// re-expressed: the timeout is the lifetime.
+#[derive(Debug, Default)]
+struct Rtt {
+    srtt: Option<Duration>,
+    rttvar: Duration,
+    backoff: u32,
+}
+
+impl Rtt {
+    /// Take the round trip of an ask answered by its first Interest.
+    fn sample(&mut self, r: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(r);
+                self.rttvar = r / 2;
+            }
+            Some(srtt) => {
+                self.rttvar = (self.rttvar * 3 + srtt.abs_diff(r)) / 4;
+                self.srtt = Some((srtt * 7 + r) / 8);
+            }
+        }
+        self.backoff = 0;
+    }
+
+    /// An ask needed a re-expression, or nothing answered it: the next
+    /// waits twice as long, until an ask gives a sample again.
+    fn missed(&mut self) {
+        self.backoff = (self.backoff + 1).min(16);
+    }
+
+    /// The wait before expressing an unanswered Interest again:
+    /// srtt + 4·rttvar (the lifetime before any sample), doubled per
+    /// [`Self::missed`] since the last sample, at least [`RTO_MIN`] and at
+    /// most `lifetime`.
+    fn rto(&self, lifetime: Duration) -> Duration {
+        self.srtt
+            .map_or(lifetime, |srtt| srtt + self.rttvar * 4)
+            .saturating_mul(1 << self.backoff)
+            .clamp(RTO_MIN, lifetime.max(RTO_MIN))
+    }
+}
 
 /// How long the committer waits before it asks the store again for a flush
 /// that failed ([`Inner::commit_rounds`]); doubled each time up to
@@ -1530,6 +1645,11 @@ struct St {
     groups: HashMap<Name, SyncGroup>,
     follows: BTreeSet<Name>,
     watchers: Vec<Watcher>,
+    /// While the records in force are made again from those held
+    /// ([`Inner::rebuild_members`]): what is in force passes through
+    /// records that were in force before, so nothing is told until it is
+    /// made, and then only what changed (spec §15).
+    quiet_members: bool,
     refused: groups::Noted<Refusal>,
     /// The log entries refused by a revocation, by name: each also in
     /// `refused`, as [`Refusal::OutsideCut`].
@@ -1547,6 +1667,8 @@ struct St {
     /// with the collections those versions are in: fetched, then the
     /// collections read again ([`Inner::fetch_wanted_bytes`]).
     bytes_wanted: BTreeMap<Name, BTreeSet<Name>>,
+    /// Of those, how many fetches of each missed in a row ([`retry_pause`]).
+    bytes_misses: HashMap<Name, u32>,
     /// Packets of removal cuts' manifests, and log entries such cuts keep,
     /// being fetched.
     bytes_fetching: BTreeSet<Name>,
@@ -1587,6 +1709,9 @@ struct St {
     /// longer hold back the pieces of the versions in their past
     /// ([`St::wanted_pieces`]).
     unfound: BTreeSet<Name>,
+    /// Of those, how many fetches of each missed in a row: it is asked again
+    /// after [`retry_pause`] of that, while it is still wanted (spec §17.1).
+    piece_misses: HashMap<Name, u32>,
     /// Descents of summaries under way ([`Descending`]): the pieces of the
     /// merge versions they bring are fetched once none is.
     descents: usize,
@@ -1628,6 +1753,12 @@ struct St {
     quarantine: BTreeSet<Name>,
     /// Per asker device, its hold and audit asks this holder is working on.
     asks: HashMap<Name, usize>,
+    /// Asker devices one of whose hold asks waits here for its other one
+    /// to end ([`Inner::hold_slot`]).
+    hold_waits: BTreeSet<Name>,
+    /// Collections held whose take of what the accepted hold record asks is
+    /// under way ([`Inner::take_held`]).
+    taking: BTreeSet<Name>,
     /// Answers to hold and audit asks signed, by the ask's name.
     answers: Kept<Bytes>,
     /// This device's wall clock (retention only).
@@ -1671,6 +1802,9 @@ struct St {
     to_apply: Vec<Name>,
     /// The collections whose state is not built yet ([`Coll::dormant`]).
     sleeping: BTreeSet<Name>,
+    /// The persons' namespaces the records in force list as writers, and
+    /// what is adopted of them for those records' subjects (spec §6.3).
+    scopes: scoped::Scopes,
 }
 
 struct Inner {
@@ -1696,6 +1830,8 @@ struct Inner {
     /// Told after each commit round that moved [`St::durable`].
     committed: Notify,
     slots: Semaphore,
+    /// The round-trip estimate re-expressions are timed from (spec §17.1).
+    rtt: Mutex<Rtt>,
     /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
     signatures: AtomicU64,
@@ -1705,9 +1841,6 @@ struct Inner {
     grants_answered: AtomicU64,
     started: Instant,
     serving: Mutex<Option<ServeGuard>>,
-    /// The persons' namespaces the records in force list as writers, and
-    /// what is adopted of them for those records' subjects (spec §6.3).
-    scopes: scoped::Scopes,
     /// Set by [`Device::shutdown`]: trust contexts adopted from then on are
     /// not taken (a restart judges what is held again).
     stopped: AtomicBool,
@@ -2013,6 +2146,12 @@ fn past_frontier(v: &Version) -> Frontier {
     within
 }
 
+/// The covered versions of one merge collection fetched at once as the
+/// basis of versions written apart from a checkpoint (spec §5.2, bound):
+/// the writer of such a version chooses which covered versions it names,
+/// so their fetches are paced, the next as one ends.
+const BASIS_FETCHES: usize = 16;
+
 /// The checkpoints applied in a merge collection and what they cover
 /// (spec §5.2): a version inside the cover of one counts exactly when a
 /// checkpoint covering it counts — the rule's word on that checkpoint, or,
@@ -2020,7 +2159,8 @@ fn past_frontier(v: &Version) -> Frontier {
 /// covered version itself is not told. A checkpoint covered by another is
 /// never applied by a state built from the newest checkpoint, so only the
 /// checkpoints no other covers decide: the same after a restart. Cleared
-/// with the state.
+/// with the state, with what the rule holds of the versions covered as a
+/// basis.
 #[derive(Clone, Default)]
 struct Cover {
     /// Per writer, the highest seq inside the cover of any (the join of
@@ -2031,6 +2171,17 @@ struct Cover {
     checkpoints: BTreeMap<VersionId, (Frontier, Option<String>)>,
     /// The checkpoints that count, as above.
     counted: BTreeSet<VersionId>,
+    /// The versions inside the cover the rule holds as a basis (spec §5.2,
+    /// covered versions as a basis): applied before a checkpoint covered
+    /// them, or handed ([`MergeState::basis`]) — or found unfit to hand
+    /// (refused by the check, or not taken by the rule), alike on every
+    /// reader. Never handed again.
+    basis: BTreeSet<VersionId>,
+    /// The versions inside the cover that a version not covered, applied
+    /// or about to apply, is made over, not handed yet: not whole here (in
+    /// pieces not held, or sealed without the key). Their pieces are
+    /// fetched ([`St::wanted_pieces`]); each is handed once whole.
+    wanted: BTreeSet<VersionId>,
 }
 
 impl Cover {
@@ -2316,6 +2467,7 @@ fn rule_on(
         parents: held.version.parents.frontier(),
         past,
         bytes: &held.op,
+        dated: held.version.dated,
     };
     let kind = state.check(&op)?;
     if !apply {
@@ -2518,6 +2670,17 @@ enum Took {
     Waits,
 }
 
+/// What [`Run::hand`] did with one covered version wanted as a basis.
+enum Hand {
+    /// The rule holds it (or it is no basis on any reader).
+    Taken,
+    /// Its pieces are still to be fetched: what is made over it waits.
+    Fetching,
+    /// Not to be had now (found nowhere, or sealed without the key): what
+    /// is made over it applies without it, and it is handed on arrival.
+    Later,
+}
+
 /// One collection's pending versions run through its rule (spec §5.2):
 /// each applied once its writer's earlier versions and its parents are; a
 /// merge version only once whole and opened, only if it was made for the
@@ -2553,6 +2716,11 @@ struct Run<'a> {
     unwhole: &'a mut BTreeSet<VersionId>,
     /// The checkpoints applied and what they cover ([`Coll::cover`]).
     cover: &'a mut Cover,
+    /// How many asks for each large version's pieces missed in a row
+    /// ([`St::piece_misses`]): a version made over one of them as a basis
+    /// applies without it once [`REFRESH_TRIES`] did (spec §5.2, when a
+    /// basis is gone).
+    misses: &'a HashMap<Name, u32>,
     out: Vec<Ran>,
 }
 
@@ -2597,7 +2765,10 @@ impl Run<'_> {
     /// one ([`Self::checkpoint`]): it stands for everything it covers, which
     /// is then never applied to the rule (spec §5.2) — so a collection read
     /// from its versions anew applies its newest checkpoint and what came
-    /// after, whatever the order the versions were held in.
+    /// after, whatever the order the versions were held in. A covered
+    /// version reaches the rule only as the basis of a version written
+    /// apart from the checkpoint ([`Self::bases`]): first, those that became
+    /// whole since they were wanted.
     fn run(mut self) -> Vec<Ran> {
         // A member of a group refused never applies.
         let stopped: Vec<(VersionId, Refusal)> = self
@@ -2615,6 +2786,10 @@ impl Run<'_> {
         if merge {
             self.other_rule();
             self.cover();
+            let late: Vec<VersionId> = self.cover.wanted.iter().cloned().collect();
+            for v in late {
+                self.hand(&v);
+            }
         }
         loop {
             if merge && self.checkpoint() {
@@ -2808,6 +2983,7 @@ impl Run<'_> {
             parents: hv.version.parents.frontier(),
             past: &past,
             bytes: &hv.op,
+            dated: hv.version.dated,
         };
         self.state.as_deref().expect("a merge run").check(&op)
     }
@@ -2847,6 +3023,11 @@ impl Run<'_> {
                 return Took::Refused;
             }
         }
+        // An edit written apart from a checkpoint is merged against what it
+        // was made over: the covered versions of its past, handed first.
+        if kind == OpKind::Edit && !self.bases(id) {
+            return Took::Waits;
+        }
         let hv = Arc::clone(&self.versions[id]);
         let done = {
             // Its past, from the fields, while the state is borrowed.
@@ -2873,6 +3054,7 @@ impl Run<'_> {
                 parents: hv.version.parents.frontier(),
                 past: &past,
                 bytes: &hv.op,
+                dated: hv.version.dated,
             };
             self.state.as_deref_mut().expect("a merge run").apply(&op)
         };
@@ -2894,6 +3076,29 @@ impl Run<'_> {
             self.versions.insert(id.clone(), Arc::new(unloaded));
         }
         if kind == OpKind::Checkpoint {
+            // What the rule applied of what the checkpoint covers stays in
+            // it, as a basis only ([`MergeState::apply`]): never handed.
+            let covers = past_frontier(&hv.version);
+            for (w, s) in covers.iter() {
+                let from = self.cover.join.get(w).map_or(1, |j| j + 1);
+                if from > s.0 {
+                    continue;
+                }
+                let lo = VersionId {
+                    writer: w.clone(),
+                    seq: Seq(from),
+                };
+                let hi = VersionId {
+                    writer: w.clone(),
+                    seq: s,
+                };
+                let ruled = self.versions.range(lo..=hi).filter(|(v, _)| {
+                    !self.pending.contains(*v)
+                        && self.applied.get(&v.writer).is_some_and(|a| *a >= v.seq.0)
+                });
+                let ruled: Vec<VersionId> = ruled.map(|(v, _)| v.clone()).collect();
+                self.cover.basis.extend(ruled);
+            }
             // The frontier moves past everything the checkpoint covers:
             // each of its parents, held as the packet it names.
             for t in tips(&self.waits(), id, hv.version.parents.frontier()) {
@@ -2924,6 +3129,192 @@ impl Run<'_> {
             self.cover();
         }
         Took::Applied(kind)
+    }
+
+    /// Hand the rule the basis of `id`, an edit about to apply (spec §5.2,
+    /// covered versions as a basis): each version inside the cover that it
+    /// was made over, apart from the checkpoints inside its past, which the
+    /// rule does not hold yet ([`Self::basis_of`]). Whether `id` applies
+    /// now: not while a basis in pieces is still to be fetched. One found
+    /// nowhere, or sealed in an epoch whose key is not held, is handed when
+    /// it arrives; `id` applies without it meanwhile.
+    fn bases(&mut self, id: &VersionId) -> bool {
+        if self.cover.checkpoints.is_empty() {
+            return true;
+        }
+        let mut now = true;
+        for v in self.basis_of(id) {
+            if let Hand::Fetching = self.hand(&v) {
+                now = false;
+            }
+        }
+        now
+    }
+
+    /// The versions `id` is merged against that a checkpoint applied here
+    /// covers and the rule does not hold: those inside `down(P(id))` and
+    /// in no `down(P(K))` of a checkpoint `K` applied here inside it, and
+    /// the same of each of them, by id. Each is a version of `C` that
+    /// exists here — an entry known, held as a signed record — and is
+    /// visited once, so what `id`'s writer names costs at most the history
+    /// the checkpoints cover (spec §5.2, bound).
+    fn basis_of(&self, id: &VersionId) -> Vec<VersionId> {
+        let w = self.waits();
+        let within = |u: &VersionId| -> Option<Frontier> {
+            let parents = match self.versions.get(u) {
+                Some(hv) => hv.version.parents.frontier(),
+                None => self
+                    .locked
+                    .iter()
+                    .find(|l| l.writer == u.writer && l.seq == u.seq.0)
+                    .map(|l| l.body.parents.frontier())?,
+            };
+            let mut p = parents.clone();
+            if let Some(before) = u.seq.0.checked_sub(1).filter(|s| *s > 0) {
+                p.include(&VersionId {
+                    writer: u.writer.clone(),
+                    seq: Seq(before),
+                });
+            }
+            Some(p)
+        };
+        let mut out: BTreeSet<VersionId> = BTreeSet::new();
+        let mut seen: BTreeSet<VersionId> = BTreeSet::new();
+        let mut todo = vec![id.clone()];
+        while let Some(u) = todo.pop() {
+            if !seen.insert(u.clone()) {
+                continue;
+            }
+            // A checkpoint applied here, now covered, stands for its past.
+            if u != *id && self.cover.checkpoints.contains_key(&u) {
+                continue;
+            }
+            let Some(p) = within(&u) else { continue };
+            // Below a checkpoint applied here inside it, that checkpoint
+            // stands for its past.
+            let mut floor: BTreeMap<&Writer, u64> = BTreeMap::new();
+            for (k, (covers, _)) in &self.cover.checkpoints {
+                if p.contains(k) {
+                    for (y, s) in covers.iter() {
+                        let f = floor.entry(y).or_insert(0);
+                        *f = (*f).max(s.0);
+                    }
+                }
+            }
+            for (y, t) in p.iter() {
+                let top = t.0.min(self.cover.join.get(y).copied().unwrap_or(0));
+                let lo = floor.get(y).copied().unwrap_or(0);
+                if lo >= top {
+                    continue;
+                }
+                let Some(seqs) = self.entries.get(y) else {
+                    continue;
+                };
+                for s in seqs.range(lo + 1..=top) {
+                    let v = VersionId {
+                        writer: y.clone(),
+                        seq: Seq(*s),
+                    };
+                    if self.cover.basis.contains(&v) || w.never(&v) || self.history(&v) {
+                        continue;
+                    }
+                    if out.insert(v.clone()) {
+                        todo.push(v);
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Hand covered version `v` to the rule as a basis if it is whole here
+    /// ([`MergeState::basis`]): opened, checked against its own past (one
+    /// the check refuses, or whose pieces do not open, is no basis on any
+    /// reader, and never handed), and taken. Not whole, it is wanted: its
+    /// pieces fetched ([`St::wanted_pieces`]) and handed when they arrive.
+    fn hand(&mut self, v: &VersionId) -> Hand {
+        if self.cover.basis.contains(v) {
+            self.cover.wanted.remove(v);
+            return Hand::Taken;
+        }
+        let Some(hv) = self.versions.get(v).cloned() else {
+            // Held sealed, its epoch's key not here: handed once it opens.
+            self.cover.wanted.insert(v.clone());
+            return Hand::Later;
+        };
+        let opened = if hv.opened {
+            None
+        } else {
+            match open_held(self.store, self.keys, &hv) {
+                Opening::Opened(op) => Some(op),
+                Opening::Missing => {
+                    self.cover.wanted.insert(v.clone());
+                    let gone = self
+                        .misses
+                        .get(&hv.version.name)
+                        .is_some_and(|m| *m >= REFRESH_TRIES);
+                    return if gone { Hand::Later } else { Hand::Fetching };
+                }
+                Opening::NoKey => {
+                    self.cover.wanted.insert(v.clone());
+                    return Hand::Later;
+                }
+                Opening::Bad => {
+                    tracing::debug!(?v, "no basis: its payload in pieces does not open");
+                    self.cover.wanted.remove(v);
+                    self.cover.basis.insert(v.clone());
+                    return Hand::Taken;
+                }
+            }
+        };
+        let taken = {
+            let waits = Waits {
+                collection: &self.members.collection,
+                members: Some(self.members),
+                entries: self.entries,
+                skipped: self.skipped,
+                listings: self.listings,
+                locked: self.locked,
+                revoked: self.revoked,
+                admitted: self.versions,
+            };
+            let past = PastOf::new(
+                &hv.version,
+                waits,
+                self.by_digest,
+                self.outsiders,
+                self.cut_out,
+            );
+            let op = Op {
+                id: v,
+                digest: &hv.digest,
+                parents: hv.version.parents.frontier(),
+                past: &past,
+                bytes: opened.as_deref().unwrap_or(&hv.op),
+                dated: hv.version.dated,
+            };
+            let state = self.state.as_deref_mut().expect("a merge run");
+            state.check(&op).and_then(|_| state.basis(&op))
+        };
+        if let Err(e) = taken {
+            tracing::debug!(?v, "no basis: its rule does not take it: {e}");
+        }
+        self.cover.wanted.remove(v);
+        self.cover.basis.insert(v.clone());
+        let changed = self
+            .state
+            .as_deref_mut()
+            .expect("a merge run")
+            .counting_changed();
+        for (other, counting) in &changed {
+            self.cover.recount(other, counting);
+        }
+        self.out.extend(
+            changed
+                .into_iter()
+                .map(|(id, counting)| Ran::Counting(id, counting)),
+        );
+        Hand::Taken
     }
 
     /// Apply the newest checkpoint whose past is held, if one is pending:
@@ -3188,6 +3579,8 @@ impl St {
             return;
         };
         let resolve = line.resolve;
+        // The persons' namespaces it lists are adopted for it (spec §6.3).
+        self.scopes.note(&c, line.own.as_ref());
         let groups = |m: &Members| -> Vec<Name> {
             m.readers
                 .iter()
@@ -3246,6 +3639,88 @@ impl St {
     fn effective(&self, c: &Name) -> Option<Members> {
         let own = self.colls.get(c).and_then(|x| x.line.own.as_ref());
         collection::effective(c, own, &self.folders_above(c))
+    }
+
+    /// What [`DataLayer::members`] answers for `name` (spec §15): the
+    /// record in force of the folder `name` when one is held, else that of
+    /// collection `name` — its own narrowed by the folders above it, or the
+    /// nearest folder's when it has none.
+    fn members_in_force(&self, name: &Name) -> Option<crate::layer::Share> {
+        if let Some(m) = self.folders.get(name).and_then(|f| f.members.as_ref()) {
+            return Some(crate::layer::Share::of(m));
+        }
+        match self.colls.get(name).and_then(|c| c.members.as_ref()) {
+            Some(m) => Some(crate::layer::Share::of(m)),
+            None => self.effective(name).as_ref().map(crate::layer::Share::of),
+        }
+    }
+
+    /// The [`Change::Members`] a watch of `target` lists first (spec §15):
+    /// the record in force over `target`, then over each folder strictly
+    /// under it and each collection under it with a record of its own, by
+    /// name; what is held here.
+    fn members_listing(&self, target: &Name) -> Vec<Change> {
+        let told = |name: &Name, m: &Members| Change::Members {
+            collection: name.clone(),
+            share: crate::layer::Share::of(m),
+        };
+        let mut out: Vec<Change> = self
+            .members_in_force(target)
+            .map(|share| Change::Members {
+                collection: target.clone(),
+                share,
+            })
+            .into_iter()
+            .collect();
+        let mut under: Vec<Change> = self
+            .folders
+            .iter()
+            .filter(|(f, _)| f.has_prefix(target) && *f != target)
+            .filter_map(|(f, x)| x.members.as_ref().map(|m| told(f, m)))
+            .chain(
+                self.colls
+                    .iter()
+                    .filter(|(c, x)| c.has_prefix(target) && *c != target && x.line.own.is_some())
+                    .filter_map(|(c, x)| x.members.as_ref().map(|m| told(c, m))),
+            )
+            .collect();
+        under.sort_by(|a, b| a.collection().cmp(b.collection()));
+        out.extend(under);
+        out
+    }
+
+    /// Tell `watchers` that the members record in force over `name` (a
+    /// folder's, or a collection's) moved from `old` to `new`, when what
+    /// [`DataLayer::members`] answers changed ([`Change::Members`]): a
+    /// watch of `name` itself and, when `own` — a folder, or a collection
+    /// with a record of its own — a watch of a folder above it. Borrows
+    /// the watchers alone, so the records stay where they are held.
+    fn tell_members(
+        watchers: &mut Vec<Watcher>,
+        name: &Name,
+        own: bool,
+        old: Option<&Members>,
+        new: Option<&Members>,
+    ) {
+        let Some(new) = new else {
+            return;
+        };
+        if old.is_some_and(|o| {
+            o.rule == new.rule && o.writers == new.writers && o.readers == new.readers
+        }) {
+            return;
+        }
+        watchers.retain(|w| !w.tx.is_closed());
+        let mut change = None;
+        for w in watchers.iter_mut() {
+            if w.target == *name || (own && name.has_prefix(&w.target)) {
+                let change = change.get_or_insert_with(|| Change::Members {
+                    collection: name.clone(),
+                    share: crate::layer::Share::of(new),
+                });
+                w.send(change.clone());
+            }
+        }
     }
 
     /// Whether a version of a collection under folder `f` that reads in
@@ -3454,6 +3929,11 @@ impl St {
                 self.owed.insert(x, Owed::Group);
             }
         }
+        // Its watchers learn the record in force before what it refuses.
+        let own = self.colls.get(c).is_some_and(|x| x.line.own.is_some());
+        if !self.quiet_members {
+            Self::tell_members(&mut self.watchers, c, own, old.as_ref(), new.as_ref());
+        }
         if new.is_some() {
             self.reread(c, rules, me);
         }
@@ -3475,15 +3955,15 @@ impl St {
             let new = collection::effective(&n, own, &self.folders_above(&n));
             let folder = self.folders.edit().get_mut(&n).expect("listed above");
             let old = std::mem::replace(&mut folder.members, new);
-            Self::tell_members(
-                &mut self.watchers,
-                &n,
-                true,
-                old.as_ref(),
-        // The persons' namespaces it lists are adopted for it (spec §6.3).
-        self.scopes.note(&c, line.own.as_ref());
-                folder.members.as_ref(),
-            );
+            if !self.quiet_members {
+                Self::tell_members(
+                    &mut self.watchers,
+                    &n,
+                    true,
+                    old.as_ref(),
+                    folder.members.as_ref(),
+                );
+            }
             if owes_epoch(
                 folder.line.own.as_ref(),
                 folder.members.as_ref(),
@@ -3548,88 +4028,6 @@ impl St {
         let parked: Vec<VersionId> = self
             .colls
             .get(c)
-    /// What [`DataLayer::members`] answers for `name` (spec §15): the
-    /// record in force of the folder `name` when one is held, else that of
-    /// collection `name` — its own narrowed by the folders above it, or the
-    /// nearest folder's when it has none.
-    fn members_in_force(&self, name: &Name) -> Option<crate::layer::Share> {
-        if let Some(m) = self.folders.get(name).and_then(|f| f.members.as_ref()) {
-            return Some(crate::layer::Share::of(m));
-        }
-        match self.colls.get(name).and_then(|c| c.members.as_ref()) {
-            Some(m) => Some(crate::layer::Share::of(m)),
-            None => self.effective(name).as_ref().map(crate::layer::Share::of),
-        }
-    }
-
-    /// The [`Change::Members`] a watch of `target` lists first (spec §15):
-    /// the record in force over `target`, then over each folder strictly
-    /// under it and each collection under it with a record of its own, by
-    /// name; what is held here.
-    fn members_listing(&self, target: &Name) -> Vec<Change> {
-        let told = |name: &Name, m: &Members| Change::Members {
-            collection: name.clone(),
-            share: crate::layer::Share::of(m),
-        };
-        let mut out: Vec<Change> = self
-            .members_in_force(target)
-            .map(|share| Change::Members {
-                collection: target.clone(),
-                share,
-            })
-            .into_iter()
-            .collect();
-        let mut under: Vec<Change> = self
-            .folders
-            .iter()
-            .filter(|(f, _)| f.has_prefix(target) && *f != target)
-            .filter_map(|(f, x)| x.members.as_ref().map(|m| told(f, m)))
-            .chain(
-                self.colls
-                    .iter()
-                    .filter(|(c, x)| c.has_prefix(target) && *c != target && x.line.own.is_some())
-                    .filter_map(|(c, x)| x.members.as_ref().map(|m| told(c, m))),
-            )
-            .collect();
-        under.sort_by(|a, b| a.collection().cmp(b.collection()));
-        out.extend(under);
-        out
-    }
-
-    /// Tell `watchers` that the members record in force over `name` (a
-    /// folder's, or a collection's) moved from `old` to `new`, when what
-    /// [`DataLayer::members`] answers changed ([`Change::Members`]): a
-    /// watch of `name` itself and, when `own` — a folder, or a collection
-    /// with a record of its own — a watch of a folder above it. Borrows
-    /// the watchers alone, so the records stay where they are held.
-    fn tell_members(
-        watchers: &mut Vec<Watcher>,
-        name: &Name,
-        own: bool,
-        old: Option<&Members>,
-        new: Option<&Members>,
-    ) {
-        let Some(new) = new else {
-            return;
-        };
-        if old.is_some_and(|o| {
-            o.rule == new.rule && o.writers == new.writers && o.readers == new.readers
-        }) {
-            return;
-        }
-        watchers.retain(|w| !w.tx.is_closed());
-        let mut change = None;
-        for w in watchers.iter_mut() {
-            if w.target == *name || (own && name.has_prefix(&w.target)) {
-                let change = change.get_or_insert_with(|| Change::Members {
-                    collection: name.clone(),
-                    share: crate::layer::Share::of(new),
-                });
-                w.send(change.clone());
-            }
-        }
-    }
-
             .map(|x| x.parked.keys().cloned().collect())
             .unwrap_or_default();
         let unparked = self.unpark(c, &parked);
@@ -3836,9 +4234,6 @@ impl St {
                 Bound::Missing(full) => {
                     tracing::debug!(id = ?hv.version.id, %full, "waits in {c} for the manifest of the removal cut keeping it");
                     self.bytes_wanted.entry(full).or_default().insert(c.clone());
-        // Its watchers learn the record in force before what it refuses.
-        let own = self.colls.get(c).is_some_and(|x| x.line.own.is_some());
-        Self::tell_members(&mut self.watchers, c, own, old.as_ref(), new.as_ref());
                     coll.waiting.push(hv);
                     return false;
                 }
@@ -4364,6 +4759,7 @@ impl St {
             store,
             keys,
             cut_out,
+            piece_misses,
             ..
         } = self;
         let Some(coll) = colls.get_mut(c) else {
@@ -4442,6 +4838,7 @@ impl St {
                 outsiders,
                 unwhole,
                 cover,
+                misses: piece_misses,
                 out: Vec::new(),
             }
             .run();
@@ -6021,6 +6418,7 @@ impl St {
             outsiders: &mut outsiders,
             unwhole: &mut BTreeSet::new(),
             cover: &mut cover,
+            misses: &self.piece_misses,
             out: Vec::new(),
         }
         .run();
@@ -6102,8 +6500,10 @@ impl St {
     /// found whole already. A version in the past of another such version
     /// whose pieces are yet to be found waits for that one's: it may be a
     /// checkpoint covering it (spec §5.2), which opens and applies as soon
-    /// as it is whole, and what a checkpoint covers is never fetched. Under
-    /// a rule this device does not know, none: it applies nothing.
+    /// as it is whole, and what a checkpoint covers is fetched only as the
+    /// basis of a version written apart from it ([`Cover::wanted`]), at
+    /// most [`BASIS_FETCHES`] at once. Under a rule this device does not
+    /// know, none: it applies nothing.
     fn wanted_pieces(&self, c: &Name) -> Vec<(Name, ChunksBody)> {
         let Some(coll) = self.colls.get(c) else {
             return Vec::new();
@@ -6130,7 +6530,7 @@ impl St {
                         || (w.version.id.writer == v.writer && v.seq < w.version.id.seq))
             })
         };
-        unopened
+        let mut out: Vec<(Name, ChunksBody)> = unopened
             .iter()
             .filter(|hv| {
                 !self.fetching.contains(&hv.version.name)
@@ -6139,7 +6539,28 @@ impl St {
                     && !later_unopened(&hv.version.id)
             })
             .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
-            .collect()
+            .collect();
+        let bases = || {
+            coll.cover
+                .wanted
+                .iter()
+                .filter_map(|id| coll.versions.get(id))
+                .filter(|hv| !hv.opened)
+        };
+        let busy = bases()
+            .filter(|hv| self.fetching.contains(&hv.version.name))
+            .count();
+        out.extend(
+            bases()
+                .filter(|hv| {
+                    !self.fetching.contains(&hv.version.name)
+                        && !self.walked.contains(&hv.version.name)
+                        && !self.unfound.contains(&hv.version.name)
+                })
+                .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
+                .take(BASIS_FETCHES.saturating_sub(busy)),
+        );
+        out
     }
 
     /// Every piece of version `v` of `c` was found: a merge version waiting
@@ -6163,6 +6584,28 @@ impl St {
         });
         if !waits {
             self.walked.remove(v);
+        }
+    }
+
+    /// A fetch found the pieces of version `v` of `c` nowhere: when it is
+    /// the basis of a version written apart from a checkpoint (spec §5.2,
+    /// [`Cover::wanted`]) and every one of [`REFRESH_TRIES`] asks missed it
+    /// (one lost packet is no evidence it is gone), that version stops
+    /// waiting for it and applies without it — the rule's conflict
+    /// handling — and it is handed when it is found later.
+    fn basis_unfound(&mut self, c: &Name, v: &Name) {
+        if self.piece_misses.get(v).is_none_or(|m| *m < REFRESH_TRIES) {
+            return;
+        }
+        let wanted = self.colls.get(c).is_some_and(|x| {
+            x.state.is_some()
+                && x.cover
+                    .wanted
+                    .iter()
+                    .any(|id| x.versions.get(id).is_some_and(|hv| hv.version.name == *v))
+        });
+        if wanted {
+            self.apply_ready(c, &BTreeSet::new());
         }
     }
 }
@@ -6261,12 +6704,14 @@ impl Device {
                 groups: HashMap::new(),
                 follows: BTreeSet::new(),
                 watchers: Vec::new(),
+                quiet_members: false,
                 refused: groups::Noted::default(),
                 cut_out: groups::Gen::new(HashMap::new()),
                 cut_fetching: BTreeSet::new(),
                 readmitting: BTreeMap::new(),
                 cut_bytes: CutManifests::new(CUT_BYTES_HELD),
                 bytes_wanted: BTreeMap::new(),
+                bytes_misses: HashMap::new(),
                 bytes_fetching: BTreeSet::new(),
                 other_bytes: HashMap::new(),
                 store,
@@ -6282,6 +6727,7 @@ impl Device {
                 fetching: BTreeSet::new(),
                 walked: BTreeSet::new(),
                 unfound: BTreeSet::new(),
+                piece_misses: HashMap::new(),
                 descents: 0,
                 txns: HashMap::new(),
                 books: Default::default(),
@@ -6295,6 +6741,8 @@ impl Device {
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
                 asks: HashMap::new(),
+                hold_waits: BTreeSet::new(),
+                taking: BTreeSet::new(),
                 answers: Kept::new(ANSWERS_KEPT),
                 clock,
                 peeks: BTreeSet::new(),
@@ -6310,12 +6758,14 @@ impl Device {
                 woken: HashMap::new(),
                 to_apply: Vec::new(),
                 sleeping: BTreeSet::new(),
+                scopes: scoped::Scopes::default(),
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
             slots: Semaphore::new(window),
+            rtt: Mutex::new(Rtt::default()),
             verifying: Semaphore::new(asks_verifying),
             signatures: AtomicU64::new(0),
             grants_asked: AtomicU64::new(0),
@@ -6657,7 +7107,6 @@ impl Device {
 
     /// Mark `key` (a key name `<id>/KEY/<k>`, or one of its certificate
     /// names) suspected since `since`, by this device's clock, as the owner
-                scopes: scoped::Scopes::default(),
     /// says when the device was lost (spec §8): from now on this device
     /// takes no new log entry of the key — none is fetched, applied or
     /// stored, and a `get` of one answers [`Refusal::Suspected`] — while
@@ -6753,8 +7202,10 @@ impl Device {
     /// versions' pieces to anyone, so a holder relaying them from this
     /// device proves nothing. The version records and their manifests stay;
     /// a later `get` reads the chunks from the holders. Versions not proved
-    /// so stay, each with why ([`Released::kept`]); when none was released,
-    /// [`DataError::NotHeld`] says why.
+    /// so stay, each with why ([`Released::kept`]), as does a covered
+    /// version that a version held here written apart from its checkpoint
+    /// is made over (its basis, spec §5.2, §13.3 step 6); when none was
+    /// released, [`DataError::NotHeld`] says why.
     pub async fn release(&self, name: &Name) -> Result<Released, DataError> {
         let inner = &self.inner;
         let (c, only) = match parse_log_name(name) {
@@ -6771,7 +7222,7 @@ impl Device {
         // holds whole; and what proves each kept elsewhere (`provings`:
         // a version held whole here, what each proof is checked against,
         // with the named holders whose live leases hold it).
-        let (targets, provings, merge, copies) = {
+        let (targets, provings, merge, copies, basis_kept) = {
             let mut st = inner.st.lock();
             st.awaken(&c);
             let st = st;
@@ -6811,6 +7262,25 @@ impl Device {
                 .collect();
             let mut provings: Vec<(Name, Option<ChunksBody>, Vec<Name>)> = Vec::new();
             let mut targets: Vec<(Name, ChunksBody, Vec<usize>)> = Vec::new();
+            let mut basis_kept: Vec<(Name, String)> = Vec::new();
+            // The basis of a version held here written apart from a
+            // checkpoint covering it (spec §5.2, §13.3 step 6): kept, so this
+            // device is never the one that lets it go.
+            // A checkpoint stands for its past and is merged against none.
+            let made_over = |v: &VersionId| -> Option<&VersionId> {
+                coll.versions.keys().find(|u| {
+                    if coll.cover.inside(u) || coll.kinds.get(*u) == Some(&OpKind::Checkpoint) {
+                        return false;
+                    }
+                    let p = past_frontier(&coll.versions[*u].version);
+                    p.contains(v)
+                        && !coll
+                            .cover
+                            .checkpoints
+                            .iter()
+                            .any(|(k, (covers, _))| p.contains(k) && covers.contains(v))
+                })
+            };
             for hv in coll.versions.values() {
                 let Some(chunks) = hv.chunks else { continue };
                 if only.as_ref().is_some_and(|n| *n != hv.version.name)
@@ -6820,6 +7290,22 @@ impl Device {
                     continue;
                 }
                 let mut by = Vec::new();
+                if merge
+                    && coll.cover.inside(&hv.version.id)
+                    && let Some(u) = made_over(&hv.version.id)
+                {
+                    basis_kept.push((
+                        hv.version.name.clone(),
+                        format!(
+                            "the version {} seq {}, written apart from the checkpoint covering \
+                             it, is made over it: its rule merges that version exactly only with \
+                             it",
+                            u.writer.key(),
+                            u.seq.0
+                        ),
+                    ));
+                    continue;
+                }
                 if merge {
                     for (cp, covers) in &checkpoints {
                         if !covers.contains(&hv.version.id) {
@@ -6848,11 +7334,30 @@ impl Device {
                 }
                 targets.push((hv.version.name.clone(), chunks, by));
             }
-            (targets, provings, merge, hold.copies.max(1) as usize)
+            (
+                targets,
+                provings,
+                merge,
+                hold.copies.max(1) as usize,
+                basis_kept,
+            )
         };
         let mut out = Released::default();
+        out.kept.extend(basis_kept);
         if targets.is_empty() {
-            return Ok(out);
+            if out.kept.is_empty() {
+                return Ok(out);
+            }
+            let why = out
+                .kept
+                .iter()
+                .map(|(v, why)| format!("{v}: {why}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(DataError::NotHeld {
+                name: name.clone(),
+                why,
+            });
         }
         // Fresh evidence, with this device's own copies of the proved
         // versions' pieces served to no one meanwhile.
@@ -7023,6 +7528,17 @@ fn walked_prefix() -> Name {
 
 fn walked_name(device: &Name, ns: &Name) -> Name {
     under(&walked_prefix(), &root_prefix(device, ns))
+}
+
+/// Where the store keeps the newest packet of each node and page of another
+/// device's summary that this device verified in a descent, so that it can
+/// answer for them while that device is away (spec §13.5): under the node's
+/// name without its head, so that a newer one of the same node replaces it.
+fn relayed_name(node: &Name) -> Name {
+    let prefix: Name = "/localhost/ndn-data/relayed".parse().expect("a valid name");
+    let comps = node.components();
+    let headless = &comps[..comps.len().saturating_sub(1)];
+    Name::from_components(prefix.components().iter().chain(headless).cloned())
 }
 
 /// A walked marker's value: the head walked (8 octets, big-endian), then
@@ -7528,17 +8044,6 @@ impl Inner {
             }
             if let Some((d, c)) = parse_head_prefix(&name) {
                 // Its signer, the one key it was verified as.
-/// Where the store keeps the newest packet of each node and page of another
-/// device's summary that this device verified in a descent, so that it can
-/// answer for them while that device is away (spec §13.5): under the node's
-/// name without its head, so that a newer one of the same node replaces it.
-fn relayed_name(node: &Name) -> Name {
-    let prefix: Name = "/localhost/ndn-data/relayed".parse().expect("a valid name");
-    let comps = node.components();
-    let headless = &comps[..comps.len().saturating_sub(1)];
-    Name::from_components(prefix.components().iter().chain(headless).cloned())
-}
-
                 let head = Data::decode(wire.clone()).ok().and_then(|data| {
                     let (hd, hc, s) = parse_head_name(&data.name)?;
                     let key = data.sig_info()?.key_locator_name()?;
@@ -7985,11 +8490,25 @@ fn relayed_name(node: &Name) -> Name {
             .clone()
     }
 
+    /// The namespace whose sync group `name`'s device notices in (spec
+    /// §12): that of the context governing it here, or — for a person's
+    /// self-certifying name no held context covers, a writer a record
+    /// lists, adopted for a folder alone (§6.3) — the person's namespace
+    /// by the name's shape. Empty when neither is.
+    fn group_namespace_of(&self, name: &Name) -> Name {
+        let ns = self.namespace_of_name(name);
+        if ns.is_empty() {
+            ndn_security::self_certifying::personal_namespace_of(name).unwrap_or(ns)
+        } else {
+            ns
+        }
+    }
+
     /// The namespaces this device follows (has joined the group of) that
     /// `device` may write into: its own, and those of whose collections or
     /// folders a members record held lists a writer of `device`'s namespace.
     fn written_by(&self, st: &St, device: &Name) -> BTreeSet<Name> {
-        let dns = self.namespace_of_name(device);
+        let dns = self.group_namespace_of(device);
         let mut out = BTreeSet::new();
         if dns.is_empty() {
             return out;
@@ -8011,7 +8530,7 @@ fn relayed_name(node: &Name) -> Name {
             if out.contains(&ns) || !st.groups.contains_key(&ns) {
                 continue;
             }
-            if m.writers.iter().any(|w| self.namespace_of_name(w) == dns) {
+            if m.writers.iter().any(|w| self.group_namespace_of(w) == dns) {
                 out.insert(ns);
             }
         }
@@ -8069,9 +8588,10 @@ fn relayed_name(node: &Name) -> Name {
     }
 
     /// The namespaces whose groups a change about `c` is published into:
-    /// `c`'s own, and every namespace held here that its members record —
-    /// its collection's or its folder's (spec §6) — names among the writers
-    /// or readers (a group reader by the namespace of its collection).
+    /// `c`'s own, and the namespace of every writer or reader its members
+    /// record — its collection's or its folder's (spec §6) — names, as
+    /// [`Self::group_namespace_of`] says (a group reader by the namespace
+    /// of its collection).
     fn groups_of(&self, st: &St, c: &Name) -> Vec<Name> {
         let own = namespace_of(c).expect("a collection has a namespace");
         let mut out = vec![own];
@@ -8089,7 +8609,7 @@ fn relayed_name(node: &Name) -> Name {
                 }))
         });
         for n in named {
-            let ns = self.namespace_of_name(&n);
+            let ns = self.group_namespace_of(&n);
             if !ns.is_empty() && wire::is_namespace(&ns) && !out.contains(&ns) {
                 out.push(ns);
             }
@@ -8207,6 +8727,9 @@ fn relayed_name(node: &Name) -> Name {
                 }
             });
         }
+        // The writers the records in force list from persons' namespaces
+        // this node does not hold are adopted for those records (§6.3).
+        self.scope_writers();
         for c in signed {
             if let Err(e) = self.publish_about(&c, &[]).await {
                 tracing::debug!(collection = %c, "the record owed is not announced: {e}");
@@ -8230,8 +8753,8 @@ fn relayed_name(node: &Name) -> Name {
         }
         let inner = Arc::clone(self);
         rt::spawn(async move {
-            let mut pause = REFRESH_PAUSE;
-            let mut tries = 0;
+            // Asks of this device's summary that missed in a row.
+            let mut misses = 0;
             loop {
                 let ok = inner.refresh(&ns, &device).await;
                 // Again now; again later; or done.
@@ -8239,12 +8762,21 @@ fn relayed_name(node: &Name) -> Name {
                     let mut st = inner.st.lock();
                     // A device whose announced change was not taken in full
                     // (not reached now: offline, restarted with its routes
-                    // not yet back, a holder away) is asked again, later:
-                    // its group counter will not move again for what it
-                    // already announced, so nothing else would ask (spec
-                    // §12); and a member of a group held here waits for it
-                    // (spec §5.5).
-                    let waits = !ok && tries < REFRESH_TRIES;
+                    // not yet back, a holder away, a packet lost) is asked
+                    // again, later: its group counter will not move again
+                    // for what it already announced, so nothing else would
+                    // ask (spec §12); and a member of a group held here
+                    // waits for it (spec §5.5). While a root of it verified
+                    // here is above the head walked in full (both kept),
+                    // what that root lists is owed, and asked for until it
+                    // is taken; otherwise only the notice says it moved, and
+                    // it is asked at most [`REFRESH_TRIES`] times in a row
+                    // (spec §17.1).
+                    let owed = st
+                        .peers
+                        .get(&(device.clone(), ns.clone()))
+                        .is_some_and(|p| p.head > p.walked);
+                    let waits = !ok && (owed || misses < REFRESH_TRIES);
                     match st.groups.get_mut(&ns) {
                         None => None,
                         Some(g) => match g.busy.get_mut(&device) {
@@ -8267,9 +8799,8 @@ fn relayed_name(node: &Name) -> Name {
                     None => break,
                     Some(false) => {}
                     Some(true) => {
-                        tries += 1;
-                        rt::sleep(pause).await;
-                        pause = (pause * 2).min(REFRESH_PAUSE_MAX);
+                        rt::sleep(retry_pause(misses)).await;
+                        misses = misses.saturating_add(1);
                     }
                 }
             }
@@ -8471,16 +9002,21 @@ fn relayed_name(node: &Name) -> Name {
 
     /// Start following `target`: join its namespace's group, and forget
     /// which summaries on the way to it were processed (they were processed
-    /// without it). Returns whether it is new. A merge collection followed
-    /// — read, written, held or watched — has its state built now if it was
-    /// not yet (spec §5.2).
+    /// without it). Returns whether it is new. A collection held here inside
+    /// a name followed already is not: the walks toward that name took it
+    /// (spec §15). One a writer outside its namespace was refused making
+    /// this device follow ([`St::track`]) is not held, so following it by
+    /// its name walks again. A merge collection followed — read, written,
+    /// held or watched — has its state built now if it was not yet (spec
+    /// §5.2).
     async fn follow(self: &Arc<Self>, target: &Name) -> Result<bool, DataError> {
         wire::data_marker(target).map_err(|why| bad_name(target, why))?;
         let ns = namespace_of(target).expect("a data name has a namespace");
         let new = {
             let mut st = self.st.lock();
             st.awaken(target);
-            let new = st.follows.insert(target.clone());
+            let taken = st.inside(target) && st.colls.contains_key(target);
+            let new = st.follows.insert(target.clone()) && !taken;
             if new {
                 for ((_, pns), peer) in st.peers.iter_mut() {
                     if *pns == ns {
@@ -8575,8 +9111,13 @@ fn relayed_name(node: &Name) -> Name {
     }
 
     /// Wait until `done` holds or the first-look time passes.
-    async fn wait_for(&self, mut done: impl FnMut(&St) -> bool) -> bool {
-        let deadline = Instant::now() + self.config.first_look;
+    async fn wait_for(&self, done: impl FnMut(&St) -> bool) -> bool {
+        self.wait_within(self.config.first_look, done).await
+    }
+
+    /// Wait until `done` holds or `within` passes.
+    async fn wait_within(&self, within: Duration, mut done: impl FnMut(&St) -> bool) -> bool {
+        let deadline = Instant::now() + within;
         loop {
             let notified = self.progress.notified();
             if done(&self.st.lock()) {
@@ -8592,11 +9133,25 @@ fn relayed_name(node: &Name) -> Name {
 
     /// Refresh in the background every device known to write into `ns`;
     /// ask again for what a trust context re-admits, or a revocation cut
-    /// accepts, that was not to be had before (spec §8).
+    /// accepts, that was not to be had before (spec §8), and for the epoch
+    /// keys versions of `ns` held here wait for (spec §17.1: owed by what is
+    /// held, after a restart too).
     fn refresh_group(self: &Arc<Self>, ns: &Name) {
-        let devices = self.known_for(&self.st.lock(), ns);
+        let (devices, locked) = {
+            let st = self.st.lock();
+            let locked: Vec<Name> = st
+                .colls
+                .iter()
+                .filter(|(c, x)| !x.locked.is_empty() && namespace_of(c).as_ref() == Some(ns))
+                .map(|(c, _)| c.clone())
+                .collect();
+            (self.known_for(&st, ns), locked)
+        };
         for d in devices {
             self.schedule(ns.clone(), d);
+        }
+        for c in locked {
+            self.chase_keys(&c);
         }
         self.retry_readmissions();
         self.fetch_cut_runs();
@@ -8608,21 +9163,91 @@ fn relayed_name(node: &Name) -> Name {
     /// Fetch `name`; `None` if nothing answered in time or the network said
     /// no.
     async fn fetch(&self, name: Name, discover: bool) -> Option<Data> {
-        let _slot = self.slots.acquire().await.ok()?;
-        let mut b = InterestBuilder::new(name).lifetime(self.config.lifetime);
-        // The writers the records in force list from persons' namespaces
-        // this node does not hold are adopted for those records (§6.3).
-        self.scope_writers();
-        if discover {
-            b = b.can_be_prefix().must_be_fresh();
-        }
-        match Consumer::new(self.node.connection()).fetch_with(b).await {
-            Ok(d) => Some(d),
+        self.fetch_once(name, discover).await.ok()
+    }
+
+    /// [`Self::fetch`], saying of a miss whether asking again may get the
+    /// packet: nothing answered in time, or the forwarder refused it for
+    /// now (a certificate on its chain not to be had yet). A Nack, a final
+    /// refusal or a closed connection is an answer. Re-expressed up to
+    /// [`REEXPRESS_MAX`] times ([`Self::fetch_expressed`]).
+    async fn fetch_once(&self, name: Name, discover: bool) -> Result<Data, bool> {
+        self.fetch_expressed(name, discover, REEXPRESS_MAX).await
+    }
+
+    /// One ask, within one Interest lifetime: an Interest nothing answered
+    /// within the device's retransmission timeout ([`Rtt::rto`]) is
+    /// expressed again under a fresh nonce, the timeout doubling each time,
+    /// at most `most` times, while at least [`RTO_MIN`] of the lifetime is
+    /// left (spec §17.1). A lost packet then costs about one round-trip
+    /// timeout, not the lifetime. An ask its caller asks again under a
+    /// fresh name of its own (a custody ask, §13.3) is expressed once
+    /// (`most` 0). The miss is told as in [`Self::fetch_once`].
+    async fn fetch_expressed(&self, name: Name, discover: bool, most: u32) -> Result<Data, bool> {
+        let Ok(_slot) = self.slots.acquire().await else {
+            return Err(false);
+        };
+        let lifetime = self.config.lifetime;
+        let rto = self.rtt.lock().rto(lifetime);
+        let interest = || {
+            let b = InterestBuilder::new(name.clone());
+            if discover {
+                b.can_be_prefix().must_be_fresh()
+            } else {
+                b
+            }
+        };
+        let asked = Instant::now();
+        let fetched = Consumer::new(self.node.connection())
+            .fetch_reexpressing(
+                interest,
+                lifetime,
+                RTO_MIN,
+                (0..most).map(|k| rto.saturating_mul(1 << k)),
+            )
+            .await;
+        match fetched {
+            Ok((d, expressed)) => {
+                let mut rtt = self.rtt.lock();
+                if expressed == 1 {
+                    rtt.sample(asked.elapsed());
+                } else {
+                    rtt.missed();
+                }
+                Ok(d)
+            }
             Err(e) => {
                 tracing::trace!(me = %self.device, "fetch missed: {e}");
-                None
+                Err(match e {
+                    ndn_app::AppError::Timeout => {
+                        self.rtt.lock().missed();
+                        true
+                    }
+                    ndn_app::AppError::Refused { reason } => !reason.is_final(),
+                    _ => false,
+                })
             }
         }
+    }
+
+    /// Fetch a packet a summary being walked lists (a node, a members
+    /// record, a version): a miss that asking again may mend is asked
+    /// again in place, after [`retry_pause`], up to [`FETCH_TRIES`] asks
+    /// in all (spec §17.1). A lost packet then costs its walk about one
+    /// round-trip timeout ([`Self::fetch_once`]), not the walk: the walk is
+    /// asked again from the writer's root only when every ask missed.
+    async fn fetch_owed(&self, name: Name, discover: bool) -> Option<Data> {
+        for tries in 0..FETCH_TRIES {
+            if tries > 0 {
+                rt::sleep(retry_pause(tries - 1)).await;
+            }
+            match self.fetch_once(name.clone(), discover).await {
+                Ok(d) => return Some(d),
+                Err(true) => {}
+                Err(false) => return None,
+            }
+        }
+        None
     }
 
     /// Verify a key-signed packet with the device's validator, walking its
@@ -8694,12 +9319,12 @@ fn relayed_name(node: &Name) -> Name {
         let sig_type = data.sig_info()?.sig_type;
         let mut keys: Vec<Bytes> = Vec::new();
         let anchor = self
-            .validator
+            .judge(&data.name)
             .keyring()
             .context_for(&data.name)
             .anchor_for(key);
         for pk in self
-            .judge(&data.name)
+            .validator
             .cert_cache()
             .all(key)
             .into_iter()
@@ -9046,7 +9671,7 @@ fn relayed_name(node: &Name) -> Name {
                 // does not answer is answered for by the devices that hold
                 // its node (spec §13.5), checked by the same digest.
                 let exact = name.clone().append_implicit_digest(digest);
-                let data = match self.fetch(exact, false).await {
+                let data = match self.fetch_owed(exact, false).await {
                     Some(d) => d,
                     None => self.ask_relays(&name, ns, device, Some(digest)).await?,
                 };
@@ -9065,6 +9690,8 @@ fn relayed_name(node: &Name) -> Name {
                     tracing::debug!(%name, "a summary node that does not match its name; ignored");
                     return None;
                 }
+                // Kept, the newest of its node, to answer for the writer.
+                self.store.insert(relayed_name(&name), data.raw().clone());
                 if !self.descend(device, ns, writer, child).await {
                     return None;
                 }
@@ -9381,18 +10008,30 @@ fn relayed_name(node: &Name) -> Name {
     }
 
     /// Ask, in the background, for every epoch key that a locked version of
-    /// `c` needs, that is not held or being asked for, and that this device
-    /// may hold ([`Self::may_hold`]).
+    /// `c` needs, or that the record in force over `c` is in, that is not
+    /// held or being asked for, and that this device may hold
+    /// ([`Self::may_hold`]).
     fn chase_keys(self: &Arc<Self>, c: &Name) {
         let asks: BTreeSet<(Name, Epoch)> = {
             let st = self.st.lock();
-            let Some(coll) = st.colls.get(c) else { return };
-            if coll.locked.is_empty() {
-                return;
-            }
-            coll.locked
-                .iter()
-                .map(|l| l.epoch().clone())
+            // The epochs of its locked versions, and of the record in force
+            // over it (its own, or its folder's: a folder's own record when
+            // `c` is a folder), whose key is owed for what comes next and for
+            // writing (spec §17.1): asked as soon as the record is held, not
+            // once the first version sealed in it waits.
+            let coll = st.colls.get(c);
+            let mut epochs: BTreeSet<Epoch> = coll
+                .into_iter()
+                .flat_map(|x| x.locked.iter().map(|l| l.epoch().clone()))
+                .collect();
+            epochs.extend(
+                coll.and_then(|x| x.members.as_ref())
+                    .into_iter()
+                    .chain(st.folders.get(c).and_then(|f| f.members.as_ref()))
+                    .filter_map(|m| m.epoch.clone()),
+            );
+            epochs
+                .into_iter()
                 .filter(|e| st.keys.key(c, e).is_none())
                 // Of the collection, or of the folder whose epoch it is.
                 .map(|e| (st.seal_subject(c, &e).name, e))
@@ -9448,6 +10087,8 @@ fn relayed_name(node: &Name) -> Name {
                         &writer,
                         seq,
                         body.clone(),
+                        wire::implicit_digest(&wire),
+                        body.sealed.is_none(),
                     ))),
                 };
                 st.emit(&body.collection, &change, &writer, seq.saturating_sub(1));
@@ -9597,8 +10238,6 @@ fn relayed_name(node: &Name) -> Name {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
-                // Kept, the newest of its node, to answer for the writer.
-                self.store.insert(relayed_name(&name), data.raw().clone());
                     },
                 );
                 let c = body.collection.clone();
@@ -9877,8 +10516,6 @@ fn relayed_name(node: &Name) -> Name {
                 // namespace asks for its erasure: the folder moves to a new
                 // epoch first, whoever pruned (spec §14).
                 let folders: Vec<Name> = st
-                        wire::implicit_digest(&wire),
-                        body.sealed.is_none(),
                     .folders
                     .keys()
                     .filter(|f| {
@@ -10122,7 +10759,8 @@ fn relayed_name(node: &Name) -> Name {
     /// Fetch, in the background, the removal cut manifest packets versions
     /// wait for ([`St::bytes_wanted`]), then read their collections again,
     /// so the waiting versions are judged by them. A packet not to be had
-    /// stays wanted, asked for again on the next entry taken.
+    /// stays wanted, asked for again on the next entry taken and after
+    /// [`retry_pause`] of the misses in a row for it (spec §17.1).
     fn fetch_wanted_bytes(self: &Arc<Self>) {
         let wanted: Vec<(Name, BTreeSet<Name>)> = {
             let mut st = self.st.lock();
@@ -10142,9 +10780,21 @@ fn relayed_name(node: &Name) -> Name {
                     let mut st = inner.st.lock();
                     st.bytes_fetching.remove(&full);
                     if !held {
+                        let misses = st.bytes_misses.entry(full.clone()).or_insert(0);
+                        let pause = retry_pause(*misses);
+                        *misses = misses.saturating_add(1);
                         st.bytes_wanted.entry(full).or_default().extend(colls);
+                        drop(st);
+                        let weak = Arc::downgrade(&inner);
+                        rt::spawn(async move {
+                            rt::sleep(pause).await;
+                            if let Some(inner) = weak.upgrade() {
+                                inner.fetch_wanted_bytes();
+                            }
+                        });
                         return;
                     }
+                    st.bytes_misses.remove(&full);
                     let mut fetch = Vec::new();
                     for c in &colls {
                         st.reread(c, &inner.config.rules, inner.me());
@@ -10887,6 +11537,30 @@ fn relayed_name(node: &Name) -> Name {
                     .map(|hv| (x.clone(), hv.version.id.clone(), hv.version.name.clone())),
             );
         }
+        // What is in force now over every name the records govern: made
+        // again, a watch is told only what changed (spec §15).
+        let in_force: Vec<(Name, bool, Option<Members>)> = st
+            .folders
+            .iter()
+            .filter(|(f, _)| f.has_prefix(c))
+            .map(|(f, x)| (f.clone(), true, x.members.clone()))
+            .chain(
+                st.colls
+                    .keys()
+                    .chain(st.peeks.iter())
+                    .filter(|x| *x == c || (folder && x.has_prefix(c)))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|x| {
+                        (
+                            x.clone(),
+                            false,
+                            st.colls.get(x).and_then(|y| y.members.clone()),
+                        )
+                    }),
+            )
+            .collect();
+        st.quiet_members = true;
         // `c` is read again whatever record comes back.
         if let Some(coll) = st.colls.get_mut(c) {
             coll.line = Line::default();
@@ -10906,6 +11580,18 @@ fn relayed_name(node: &Name) -> Name {
         }
         if st.colls.contains_key(c) {
             st.refold(c, rules, me);
+        }
+        st.quiet_members = false;
+        for (name, folder, before) in in_force {
+            let (own, now) = match folder {
+                true => (true, st.folders.get(&name).and_then(|x| x.members.clone())),
+                false => {
+                    let x = st.colls.get(&name);
+                    let own = x.is_some_and(|x| x.line.own.is_some());
+                    (own, x.and_then(|x| x.members.clone()))
+                }
+            };
+            St::tell_members(&mut st.watchers, &name, own, before.as_ref(), now.as_ref());
         }
         if let Some(coll) = st.colls.get_mut(c)
             && coll.members.is_none()
@@ -11112,7 +11798,7 @@ fn relayed_name(node: &Name) -> Name {
     /// for its collection's namespace (spec §13.5).
     async fn fetch_entry(&self, name: &Name, digest: Option<[u8; 32]>) -> Option<Data> {
         let exact = digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
-        if let Some(d) = self.fetch(exact, false).await {
+        if let Some(d) = self.fetch_owed(exact, false).await {
             return Some(d);
         }
         let log = parse_log_name(name)?;
@@ -11125,7 +11811,96 @@ fn relayed_name(node: &Name) -> Name {
                 return Some(d);
             }
         }
+        let ns = namespace_of(c)?;
+        let relays = self.relays(&self.st.lock(), &ns, &log.device, &holders);
+        self.first_held(name, &relays, digest).await
+    }
+
+    /// The devices that may answer for `writer`'s packets of namespace `ns`
+    /// while it does not ([`wire::held_name`], spec §13.5): every other
+    /// device heard for `ns` ([`Self::known_for`]) that is not ended here,
+    /// but `skip`.
+    fn relays(&self, st: &St, ns: &Name, writer: &Name, skip: &[Name]) -> Vec<Name> {
+        self.known_for(st, ns)
+            .into_iter()
+            .filter(|d| d != &self.device && d != writer && !skip.contains(d) && !self.ended(st, d))
+            .collect()
+    }
+
+    /// `name`, `writer`'s packet of namespace `ns` — exactly the packet
+    /// whose implicit digest is `digest`, if given — from the first of its
+    /// relays ([`Self::relays`]) that answers with it.
+    async fn ask_relays(
+        &self,
+        name: &Name,
+        ns: &Name,
+        writer: &Name,
+        digest: Option<[u8; 32]>,
+    ) -> Option<Data> {
+        let relays = self.relays(&self.st.lock(), ns, writer, &[]);
+        self.first_held(name, &relays, digest).await
+    }
+
+    /// `name` — exactly the packet whose implicit digest is `digest`, if
+    /// given — from the first of `devices` that answers with it under its
+    /// own name ([`Self::fetch_held`]). All are asked at once: a device
+    /// that is away costs one Interest lifetime, not one each.
+    async fn first_held(
+        &self,
+        name: &Name,
+        devices: &[Name],
+        digest: Option<[u8; 32]>,
+    ) -> Option<Data> {
+        let mut asks: stream::FuturesUnordered<_> =
+            devices.iter().map(|d| self.fetch_held(name, d)).collect();
+        while let Some(got) = asks.next().await {
+            if let Some(data) = got
+                && digest.is_none_or(|x| wire::implicit_digest(data.raw()) == x)
+            {
+                return Some(data);
+            }
+        }
         None
+    }
+
+    /// `device`'s newest summary root of `ns` that a device answering for
+    /// it holds ([`Self::held_packet`], spec §13.5), when the writer does
+    /// not answer: the one with the highest head among its relays, asked at
+    /// once, if that head is at least the highest verified here — an older
+    /// one is a holder that is behind, not the writer rolling back.
+    async fn ask_relays_root(&self, ns: &Name, device: &Name) -> Option<Data> {
+        let prefix = root_prefix(device, ns);
+        let (relays, seen) = {
+            let st = self.st.lock();
+            let seen = st
+                .peers
+                .get(&(device.clone(), ns.clone()))
+                .map_or(0, |p| p.head);
+            (self.relays(&st, ns, device, &[]), seen)
+        };
+        // Asked fresh: a cache must not answer with an older root.
+        let replies = futures::future::join_all(
+            relays
+                .iter()
+                .map(|r| self.fetch(wire::held_name(r, &prefix), true)),
+        )
+        .await;
+        let mut best: Option<(u64, Data)> = None;
+        for reply in replies.into_iter().flatten() {
+            let Some(root) = reply.content().and_then(|c| Data::decode(c.clone()).ok()) else {
+                continue;
+            };
+            let Some(head) = parse_summary_name(&root.name)
+                .filter(|_| root.name.has_prefix(&prefix))
+                .and_then(|s| s.head)
+            else {
+                continue;
+            };
+            if head >= seen && best.as_ref().is_none_or(|(h, _)| head > *h) {
+                best = Some((head, root));
+            }
+        }
+        best.map(|(_, root)| root)
     }
 
     /// Fetch, in the background, every entry of a collection this device
@@ -11677,94 +12452,84 @@ fn relayed_name(node: &Name) -> Name {
         })
     }
 
-    /// Whether `device` is ended here: a key of it is suspected
-    /// ([`Self::suspects_device`]), or the trust context governing it
-        let ns = namespace_of(c)?;
-        let relays = self.relays(&self.st.lock(), &ns, &log.device, &holders);
-        self.first_held(name, &relays, digest).await
+    /// Whether the members record in force over `c` here admits this
+    /// device's key to write into it: lists it as a writer and, when it
+    /// seals, admits this device to its audience.
+    fn admitted(&self, st: &St, c: &Name) -> bool {
+        st.colls
+            .get(c)
+            .and_then(|x| x.members.as_ref())
+            .is_some_and(|m| {
+                m.writers.iter().any(|p| self.writer.key().has_prefix(p))
+                    && (m.epoch.is_none() || self.admits_record(st, m, &self.device, &self.ns))
+            })
     }
 
-    /// The devices that may answer for `writer`'s packets of namespace `ns`
-    /// while it does not ([`wire::held_name`], spec §13.5): every other
-    /// device heard for `ns` ([`Self::known_for`]) that is not ended here,
-    /// but `skip`.
-    fn relays(&self, st: &St, ns: &Name, writer: &Name, skip: &[Name]) -> Vec<Name> {
-        self.known_for(st, ns)
-            .into_iter()
-            .filter(|d| d != &self.device && d != writer && !skip.contains(d) && !self.ended(st, d))
-            .collect()
-    }
-
-    /// `name`, `writer`'s packet of namespace `ns` — exactly the packet
-    /// whose implicit digest is `digest`, if given — from the first of its
-    /// relays ([`Self::relays`]) that answers with it.
-    async fn ask_relays(
-        &self,
-        name: &Name,
-        ns: &Name,
-        writer: &Name,
-        digest: Option<[u8; 32]>,
-    ) -> Option<Data> {
-        let relays = self.relays(&self.st.lock(), ns, writer, &[]);
-        self.first_held(name, &relays, digest).await
-    }
-
-    /// `name` — exactly the packet whose implicit digest is `digest`, if
-    /// given — from the first of `devices` that answers with it under its
-    /// own name ([`Self::fetch_held`]).
-    async fn first_held(
-        &self,
-        name: &Name,
-        devices: &[Name],
-        digest: Option<[u8; 32]>,
-    ) -> Option<Data> {
-        for d in devices {
-            if let Some(data) = self.fetch_held(name, d).await
-                && digest.is_none_or(|x| wire::implicit_digest(data.raw()) == x)
-            {
-                return Some(data);
+    /// Why `c`, a collection of another person's namespace `ns`, cannot be
+    /// written here while no members record held admits this key — none is
+    /// held, or the one in force does not list it as a writer or, sealed,
+    /// does not admit this device to its audience; `None` once one admits
+    /// it ([`Self::admitted`]). Only signed data refuses the key (spec
+    /// §18.1): while a device of `ns` known here was not walked toward
+    /// `c`'s folder, a record it holds — the one a share or an
+    /// introduction admitting this key signed — could still arrive
+    /// ([`DataError::NotReady`]: put again). Once every one was walked, the
+    /// records held decide: with none, nothing admits this key there
+    /// ([`DataError::NotAllowed`]); with one, `None`, and the record in
+    /// force refuses the write ([`Self::writable`], [`Self::write_key`]).
+    /// With no device of `ns` known at all, nothing can be asked
+    /// ([`DataError::Unavailable`] when no record is held).
+    async fn unadmitted(self: &Arc<Self>, c: &Name, ns: &Name) -> Option<DataError> {
+        let recorded = |st: &St| st.colls.get(c).is_some_and(|x| x.members.is_some());
+        let owner = |d: &Name| self.namespace_of_name(d) == *ns;
+        {
+            let st = self.st.lock();
+            if self.admitted(&st, c) {
+                return None;
+            }
+            let heard = self.known_for(&st, ns).iter().any(owner)
+                || st
+                    .peers
+                    .iter()
+                    .any(|((d, n), p)| n == ns && p.kept > 0 && owner(d));
+            if !heard {
+                return (!recorded(&st)).then(|| DataError::Unavailable { name: c.clone() });
             }
         }
+        let folder = folder_of(c);
+        let missing = self
+            .unsynced(ns, owner, |t| t.has_prefix(&folder) || folder.has_prefix(t))
+            .await;
+        let st = self.st.lock();
+        if self.admitted(&st, c) || (missing.is_empty() && recorded(&st)) {
+            return None;
+        }
+        if missing.is_empty() {
+            return Some(DataError::NotAllowed {
+                collection: c.clone(),
+                writer: self.writer.clone(),
+            });
+        }
+        let held = match recorded(&st) {
+            true => "the members record in force here does not admit this key",
+            false => "it has no members record here yet",
+        };
+        let devices: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        Some(DataError::NotReady {
+            name: c.clone(),
+            why: format!(
+                "{held}, and this device has not yet walked the summary of {}, which may hold \
+                 the record admitting this key; put again once that device is reached",
+                devices.join(", ")
+            ),
+        })
+    }
+
+    /// Whether `device` is ended here: a key of it is suspected
+    /// ([`Self::suspects_device`]), or the trust context governing it
     /// revokes one of its keys (spec §8.1).
     fn ended(&self, st: &St, device: &Name) -> bool {
         let ctx = self.validator.keyring().context_for(device);
-    /// `device`'s newest summary root of `ns` that a device answering for
-    /// it holds ([`Self::held_packet`], spec §13.5), when the writer does
-    /// not answer: the one with the highest head among its relays, if that
-    /// head is at least the highest verified here — an older one is a
-    /// holder that is behind, not the writer rolling back.
-    async fn ask_relays_root(&self, ns: &Name, device: &Name) -> Option<Data> {
-        let prefix = root_prefix(device, ns);
-        let (relays, seen) = {
-            let st = self.st.lock();
-            let seen = st
-                .peers
-                .get(&(device.clone(), ns.clone()))
-                .map_or(0, |p| p.head);
-            (self.relays(&st, ns, device, &[]), seen)
-        };
-        let mut best: Option<(u64, Data)> = None;
-        for r in &relays {
-            // Asked fresh: a cache must not answer with an older root.
-            let Some(reply) = self.fetch(wire::held_name(r, &prefix), true).await else {
-                continue;
-            };
-            let Some(root) = reply.content().and_then(|c| Data::decode(c.clone()).ok()) else {
-                continue;
-            };
-            let Some(head) = parse_summary_name(&root.name)
-                .filter(|_| root.name.has_prefix(&prefix))
-                .and_then(|s| s.head)
-            else {
-                continue;
-            };
-            if head >= seen && best.as_ref().is_none_or(|(h, _)| head > *h) {
-                best = Some((head, root));
-            }
-        }
-        best.map(|(_, root)| root)
-    }
-
         self.suspects_device(st, device)
             || ctx
                 .revocations()
@@ -12730,6 +13495,21 @@ fn relayed_name(node: &Name) -> Name {
         }
     }
 
+    /// What this device answers under its own name (`32=held`) for `name`,
+    /// another device's packet (spec §13.5): every packet it serves by name,
+    /// and, asked by its discovery prefix, the newest summary root of
+    /// another device it verified — the writer's own signed packet.
+    fn held_packet(&self, name: &Name) -> Option<Bytes> {
+        if let Some(s) = parse_summary_name(name)
+            && s.device != self.device
+            && s.head.is_none()
+            && subject_namespace(&s.subject).as_ref() == Some(&s.subject)
+        {
+            return self.store.get(&root_prefix(&s.device, &s.subject));
+        }
+        self.packet_for(name, false)
+    }
+
     fn packet_for(&self, name: &Name, can_be_prefix: bool) -> Option<Bytes> {
         // A name ending in an implicit digest asks for exactly that packet
         // (a re-admission fetches so, spec §8): the packet of the name
@@ -12840,6 +13620,19 @@ fn relayed_name(node: &Name) -> Name {
                 head,
                 name,
             );
+        }
+        // A node or page of another device's summary, as this device kept
+        // it from its newest descent (spec §13.5): checked by the asker
+        // against the digest its parent lists. Another device's root only
+        // under this device's own name ([`Self::held_packet`]): discovery
+        // by name reaches the writer (§7).
+        if let Some(s) = parse_summary_name(name)
+            && s.head.is_some()
+            && subject_namespace(&s.subject).is_some_and(|ns| ns != s.subject)
+        {
+            let w = self.store.get(&relayed_name(name))?;
+            let kept = Data::decode(w.clone()).ok()?;
+            return (*kept.name == *name).then_some(w);
         }
         if let Some((device, public)) = parse_seal_key_name(name)
             && device == self.device
@@ -13095,6 +13888,11 @@ fn relayed_name(node: &Name) -> Name {
         st.seal_keys.insert(ask.seal_key.clone(), public);
         // Checked again: the records may have moved during the fetch.
         let key = self.grant_key(&st, c, e, &asker, &asker_ns)?;
+        // Another Interest of the same ask (a re-expression, spec §17.1)
+        // was answered meanwhile: one name, one packet.
+        if let Some(p) = st.grants.get(name) {
+            return Some(p.clone());
+        }
         let (ephemeral, wrapped) = wrap_ck_to(&public, &key, &name.encode_to_tlv()).ok()?;
         let wire = self
             .sign(DataBuilder::new(
@@ -13111,14 +13909,18 @@ fn relayed_name(node: &Name) -> Name {
     /// whose record names it ([`St::seal_subject`]): `c`, or the folder
     /// above it whose epoch it is, so one ask serves every collection that
     /// reads in a folder's epoch — from the epoch's creator, then from
-    /// every other device known to write into `c`'s namespace. A granted
-    /// key is taken only if it matches the key check of the held record
-    /// naming the epoch. Opens what it unlocks. Whether the key is held now.
+    /// every other device known to write into `c`'s namespace
+    /// ([`Self::ask_grants`]). A granted key is taken only if it matches the
+    /// key check of the held record naming the epoch. Opens what it unlocks.
+    /// Whether the key is held now. A round no device granted is asked
+    /// again in the background, round after round with a capped backoff
+    /// ([`retry_pause`]), for as long as the key is owed here
+    /// ([`Self::key_owed`], spec §17.1): never one try per granter.
     async fn obtain(self: &Arc<Self>, c: &Name, e: &Epoch) -> bool {
         let Some(ns) = namespace_of(c) else {
             return false;
         };
-        let (c, seal_key) = {
+        let (s, seal_key) = {
             let mut st = self.st.lock();
             if st.keys.key(c, e).is_some() {
                 return true;
@@ -13134,27 +13936,56 @@ fn relayed_name(node: &Name) -> Name {
             if !st.asking.insert((s.name.clone(), e.clone())) {
                 return false;
             }
-            (
-                s.name,
-                seal_key_name(&self.device, &st.keys.recipient.public()),
-            )
+            (s, seal_key_name(&self.device, &st.keys.recipient.public()))
         };
-        let c = &c;
         self.grants_asked.fetch_add(1, Ordering::Relaxed);
         let ask = GrantAsk {
             seal_key,
-            collection: c.clone(),
+            collection: s.name.clone(),
             epoch: e.clone(),
         };
+        if self.ask_grants(&ns, &ask).await {
+            self.obtained(&ask, true).await;
+            return true;
+        }
+        if !self.key_owed(&self.st.lock(), &s, e) {
+            self.obtained(&ask, false).await;
+            return false;
+        }
+        // Asked again while owed; the ask stays under way meanwhile, so
+        // nothing starts a second round beside these.
+        let inner = Arc::clone(self);
+        rt::spawn(async move {
+            let mut misses = 0;
+            let got = loop {
+                rt::sleep(retry_pause(misses)).await;
+                misses = misses.saturating_add(1);
+                if !inner.key_owed(&inner.st.lock(), &s, &ask.epoch) {
+                    break inner.st.lock().keys.key(&s.name, &ask.epoch).is_some();
+                }
+                if inner.ask_grants(&ns, &ask).await {
+                    break true;
+                }
+            };
+            inner.obtained(&ask, got).await;
+        });
+        false
+    }
+
+    /// One round of asks for the key `ask` names (spec §9): of the epoch's
+    /// creator, then of every other device known to write into `ns`, one
+    /// Interest each, until one grants a key that matches the epoch's key
+    /// check. Whether one did; the grant is kept in the store.
+    async fn ask_grants(self: &Arc<Self>, ns: &Name, ask: &GrantAsk) -> bool {
+        let (c, e) = (&ask.collection, &ask.epoch);
         let mut granters = vec![e.creator.clone()];
-        let others = self.known_for(&self.st.lock(), &ns);
+        let others = self.known_for(&self.st.lock(), ns);
         granters.extend(others.into_iter().filter(|d| *d != e.creator));
-        let mut got = false;
         for granter in granters {
             if granter == self.device {
                 continue;
             }
-            let name = grant_name(&granter, &ask);
+            let name = grant_name(&granter, ask);
             let Some(data) = self.fetch(name.clone(), false).await else {
                 continue;
             };
@@ -13176,20 +14007,50 @@ fn relayed_name(node: &Name) -> Name {
                 continue;
             }
             self.store.insert(name, data.raw().clone());
-            got = true;
-            break;
+            return true;
         }
-        self.st.lock().asking.remove(&(c.clone(), e.clone()));
+        tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key this round; asked again while it is owed");
+        false
+    }
+
+    /// End the ask for the key `ask` names: no longer under way; `got`, it
+    /// opens what it unlocks.
+    async fn obtained(self: &Arc<Self>, ask: &GrantAsk, got: bool) {
+        self.st
+            .lock()
+            .asking
+            .remove(&(ask.collection.clone(), ask.epoch.clone()));
         if got {
             // Merge versions in pieces it unlocked wait for them; a group
             // member it opened may make its folder followed.
             self.fetch_wanted(true);
             self.settle().await;
         } else {
-            tracing::debug!(collection = %c, epoch = ?e, "no device granted the epoch's key");
+            tracing::debug!(collection = %ask.collection, epoch = ?ask.epoch, "the epoch's key is not owed here (no version held waits for it, or this device may not hold it): not asked again until one arrives");
         }
         self.progress.notify_waiters();
-        got
+    }
+
+    /// Whether the key of epoch `e` of subject `s` is still owed here
+    /// (spec §17.1): not held; a held record of `s` names `e` and this
+    /// device may hold its key ([`Self::may_hold`]); and a version held
+    /// here waits for it, or it is the epoch of `s`'s record in force (for
+    /// writing). Pruned, cut or let-go versions, a record that no longer
+    /// admits this device and a subject no longer followed end it.
+    fn key_owed(&self, st: &St, s: &Subject, e: &Epoch) -> bool {
+        if st.keys.key(&s.name, e).is_some() {
+            return false;
+        }
+        let Some((epochs, record)) = st.line_of(s) else {
+            return false;
+        };
+        if !epochs.contains_key(e) || !self.may_hold(st, &s.name, e, &self.device, &self.ns) {
+            return false;
+        }
+        record.and_then(|m| m.epoch.as_ref()) == Some(e)
+            || st.colls.iter().any(|(c, coll)| {
+                coll.locked.iter().any(|l| l.epoch() == e) && st.seal_subject(c, e) == *s
+            })
     }
 
     /// The key of `c`'s current epoch, for writing: obtained if this device
@@ -13349,21 +14210,6 @@ fn relayed_name(node: &Name) -> Name {
                     let parsed = parse_log_name(name)?;
                     let c = parsed.subject?;
                     let v = st.colls.get(&c)?.versions.get(id)?;
-    /// What this device answers under its own name (`32=held`) for `name`,
-    /// another device's packet (spec §13.5): every packet it serves by name,
-    /// and, asked by its discovery prefix, the newest summary root of
-    /// another device it verified — the writer's own signed packet.
-    fn held_packet(&self, name: &Name) -> Option<Bytes> {
-        if let Some(s) = parse_summary_name(name)
-            && s.device != self.device
-            && s.head.is_none()
-            && subject_namespace(&s.subject).as_ref() == Some(&s.subject)
-        {
-            return self.store.get(&root_prefix(&s.device, &s.subject));
-        }
-        self.packet_for(name, false)
-    }
-
                     Ok(Answer {
                         got: Got::Version(v.version.clone()),
                         age: Age::Exact,
@@ -13415,7 +14261,7 @@ fn relayed_name(node: &Name) -> Name {
         };
         for source in std::iter::once(None).chain(holders.iter().map(Some)) {
             let data = match source {
-                None => self.fetch(exact.clone(), false).await,
+                None => self.fetch_owed(exact.clone(), false).await,
                 Some(h) => self.fetch_held(name, h).await,
             };
             let Some(data) = data else { continue };
@@ -13467,19 +14313,6 @@ fn relayed_name(node: &Name) -> Name {
         }
         if let Some(c) = &parsed.subject {
             let c = c.clone();
-        // A node or page of another device's summary, as this device kept
-        // it from its newest descent (spec §13.5): checked by the asker
-        // against the digest its parent lists. Another device's root only
-        // under this device's own name ([`Self::held_packet`]): discovery
-        // by name reaches the writer (§7).
-        if let Some(s) = parse_summary_name(name)
-            && s.head.is_some()
-            && subject_namespace(&s.subject).is_some_and(|ns| ns != s.subject)
-        {
-            let w = self.store.get(&relayed_name(name))?;
-            let kept = Data::decode(w.clone()).ok()?;
-            return (*kept.name == *name).then_some(w);
-        }
             self.wait_for(|st| {
                 st.colls.get(&c).is_some_and(|coll| coll.members.is_some())
                     && !matches!(st.held.get(name), Some(Held::Locked))
@@ -14233,9 +15066,12 @@ impl Inner {
 
     /// Fetch `name`, another device's packet, from `holder`, which keeps
     /// it for that device's collection: asked under the holder's own name
-    /// ([`wire::held_name`]), answered with the packet inside.
+    /// ([`wire::held_name`]), answered with the packet inside; a miss
+    /// asking again may mend is asked again in place ([`Self::fetch_owed`]).
     async fn fetch_held(&self, name: &Name, holder: &Name) -> Option<Data> {
-        let reply = self.fetch(wire::held_name(holder, name), false).await?;
+        let reply = self
+            .fetch_owed(wire::held_name(holder, name), false)
+            .await?;
         let inner = Data::decode(reply.content()?.clone()).ok()?;
         (*inner.name == *name).then_some(inner)
     }
@@ -14304,7 +15140,7 @@ impl Inner {
         }
         for source in sources {
             let data = match &source {
-                None => self.fetch(name.clone(), false).await,
+                None => self.fetch_owed(name.clone(), false).await,
                 Some(h) => self.fetch_held(name, h).await,
             };
             let Some(data) = data else { continue };
@@ -14437,8 +15273,11 @@ impl Inner {
             }
             None => wire::decode_payload(Bytes::from(payload)).map_err(|_| bad())?,
         };
+        // Read whole, a merge version's operation is open.
+        let op = v.rule.is_some().then_some(op);
         Ok(Version {
             payload: Payload::Entry(fields),
+            op,
             ..v
         })
     }
@@ -14479,25 +15318,68 @@ impl Inner {
                 Some(c) => inner.walk_pieces(&v, c, chunks, false).await.is_some(),
                 None => false,
             };
-            {
+            let retry = {
                 let mut st = inner.st.lock();
                 st.fetching.remove(&v);
                 match (&c, whole) {
                     (Some(c), true) => {
                         st.unfound.remove(&v);
+                        st.piece_misses.remove(&v);
                         st.pieces_arrived(c, &v);
+                        None
                     }
                     _ => {
-                        tracing::debug!(name = %v, "not every piece of a held version is to be had yet");
+                        tracing::debug!(name = %v, "not every piece of a held version is to be had yet; asked again while it waits for them");
                         st.unfound.insert(v.clone());
+                        let misses = st.piece_misses.entry(v.clone()).or_insert(0);
+                        let pause = retry_pause(*misses);
+                        *misses = misses.saturating_add(1);
+                        if let Some(c) = &c {
+                            st.basis_unfound(c, &v);
+                        }
+                        Some(pause)
                     }
                 }
+            };
+            if let Some(pause) = retry {
+                inner.retry_pieces(v, pause);
             }
             inner.progress.notify_waiters();
             // What it opened (a checkpoint, maybe, covering older versions)
             // or did not find decides which pieces are fetched next.
             inner.fetch_wanted(false);
             inner.renew().await;
+        });
+    }
+
+    /// Ask again, after `pause`, for the pieces of the merge version `v` a
+    /// fetch did not find whole (spec §17.1): if it still waits for them
+    /// ([`St::wanted_pieces`]: not covered by a checkpoint held whole, not
+    /// pruned, cut or let go) and nothing asked for them meanwhile. A descent
+    /// under way fetches them when it ends.
+    fn retry_pieces(self: &Arc<Self>, v: Name, pause: Duration) {
+        let weak = Arc::downgrade(self);
+        rt::spawn(async move {
+            rt::sleep(pause).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let wanted = {
+                let mut st = inner.st.lock();
+                if !st.unfound.remove(&v) || st.descents > 0 {
+                    return;
+                }
+                let wanted = parse_log_name(&v)
+                    .and_then(|l| l.subject)
+                    .and_then(|c| st.wanted_pieces(&c).into_iter().find(|(n, _)| *n == v));
+                if wanted.is_none() {
+                    st.piece_misses.remove(&v);
+                }
+                wanted
+            };
+            if let Some((v, chunks)) = wanted {
+                inner.spawn_pieces(v, chunks);
+            }
         });
     }
 
@@ -14874,15 +15756,16 @@ impl Inner {
 
     /// Fetch back what this holder lost of `c` of what its accepted hold
     /// record asks: records from what it holds in memory, pieces from their
-    /// writer or other holders.
-    async fn repair_held(self: &Arc<Self>, c: &Name) {
+    /// writer or other holders, each asked once per source. How many pieces
+    /// of the versions it holds the records of are still missing.
+    async fn repair_held(self: &Arc<Self>, c: &Name) -> usize {
         let large: Vec<(Name, ChunksBody)> = {
             let st = self.st.lock();
             let (Some(coll), Some(h)) = (st.colls.get(c), st.holding.get(c)) else {
-                return;
+                return 0;
             };
             let Some(m) = coll.members.as_ref() else {
-                return;
+                return 0;
             };
             let mut large = Vec::new();
             let asked = |id: &VersionId| h.at.contains(id) && m.refusal(id).is_none();
@@ -14911,9 +15794,10 @@ impl Inner {
             }
             large
         };
-        let todo: Vec<_> = large
-            .into_iter()
+        let todo: Vec<(Name, ChunksBody)> = large
+            .iter()
             .filter(|(v, ch)| !self.pieces_held(v, ch))
+            .cloned()
             .collect();
         stream::iter(todo)
             .map(|(v, ch)| async move {
@@ -14922,6 +15806,101 @@ impl Inner {
             .buffer_unordered(4)
             .collect::<Vec<_>>()
             .await;
+        large
+            .iter()
+            .map(|(v, ch)| {
+                piece_names(v, ch)
+                    .filter(|p| !self.store.contains(p))
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Whether every version of `c` inside `at` is kept whole here, or
+    /// skipped as never applying: seen, not merely not known yet.
+    fn keeps_all(&self, st: &St, c: &Name, at: &Frontier) -> bool {
+        let held = self.held_frontier(st, c);
+        at.iter()
+            .all(|(w, s)| held.get(w).is_some_and(|h| h.0 >= s.0))
+    }
+
+    /// How many versions of `c` inside `at` this device does not hold the
+    /// record of yet — a writer's newest not even heard of counts one —
+    /// leaving out those that never apply.
+    fn unheld(&self, st: &St, c: &Name, at: &Frontier) -> usize {
+        let Some(coll) = st.colls.get(c) else {
+            return at.iter().count();
+        };
+        at.iter()
+            .map(|(w, s)| {
+                let Some(seqs) = coll.entries.get(w) else {
+                    return 1;
+                };
+                let unheard = usize::from(!seqs.contains(&s.0));
+                let unheld = seqs
+                    .range(..=s.0)
+                    .filter(|x| {
+                        let id = VersionId {
+                            writer: w.clone(),
+                            seq: Seq(**x),
+                        };
+                        !coll.skips(&id) && !holds_entry(coll, &id)
+                    })
+                    .count();
+                unheard + unheld
+            })
+            .sum()
+    }
+
+    /// Take what the accepted hold record of `c` asks, in a task of its
+    /// own (one per collection at a time), so the work outlives any one
+    /// hold ask (spec §13.2), in rounds: while a version inside the
+    /// record's `at` is not heard of yet, see what every device writing
+    /// into `ns` has now (the asker moved since a first look, and another
+    /// holder's lease names where a lost piece may still be:
+    /// re-replication), then fetch every piece it lacks
+    /// ([`Self::repair_held`]). Asked again after [`retry_pause`] while it
+    /// lacks any, up to [`REPAIR_ROUNDS`] rounds, stopping after
+    /// [`REPAIR_IDLE`] rounds in a row that brought nothing (spec §17.1).
+    /// A lease is signed by the hold ask that finds it done.
+    fn take_held(self: &Arc<Self>, c: &Name, ns: &Name) {
+        if !self.st.lock().taking.insert(c.clone()) {
+            return;
+        }
+        let inner = Arc::clone(self);
+        let (c, ns) = (c.clone(), ns.clone());
+        rt::spawn(async move {
+            let (mut rounds, mut idle) = (0, 0);
+            // What is still lacking: versions not heard of, pieces missing.
+            let mut lacking = (usize::MAX, usize::MAX);
+            while rounds < REPAIR_ROUNDS && idle < REPAIR_IDLE {
+                let Some(at) = inner.st.lock().holding.get(&c).map(|h| h.at.clone()) else {
+                    break;
+                };
+                if inner.keeps_all(&inner.st.lock(), &c, &at) {
+                    break;
+                }
+                if rounds > 0 {
+                    rt::sleep(retry_pause(idle)).await;
+                }
+                if inner.unheld(&inner.st.lock(), &c, &at) > 0 {
+                    let devices = inner.known_for(&inner.st.lock(), &ns);
+                    futures::future::join_all(devices.iter().map(|d| inner.refresh(&ns, d))).await;
+                    inner.wait_for(|st| inner.unheld(st, &c, &at) == 0).await;
+                }
+                let missing = inner.repair_held(&c).await;
+                let unheld = inner.unheld(&inner.st.lock(), &c, &at);
+                let progressed = unheld < lacking.0 || missing < lacking.1;
+                idle = if progressed { 0 } else { idle + 1 };
+                lacking = (unheld, missing);
+                rounds += 1;
+            }
+            if lacking != (0, 0) && rounds > 0 {
+                tracing::debug!(collection = %c, unheld = lacking.0, missing = lacking.1, rounds, "what the hold record asks is not all to be had yet");
+            }
+            inner.st.lock().taking.remove(&c);
+            inner.progress.notify_waiters();
+        });
     }
 
     /// The device an ask's proof claims asks, by its key locator, and the
@@ -14965,6 +15944,47 @@ impl Inner {
         })
     }
 
+    /// [`Self::ask_slot`] for a hold ask of `asker`. While another ask of
+    /// that asker is in progress here — the asker asks again when the
+    /// answer to its hold ask was lost or not ready within the ask's
+    /// lifetime (spec §13.2, §17.1) — this one waits for it to end, at most
+    /// a hold ask's lifetime ([`Self::hold_ask_lifetime`]), then goes on
+    /// like any other: the work is done by then, so it costs little. One
+    /// ask of each asker waits; another is refused.
+    async fn hold_slot(&self, asker: &Name) -> Option<AskSlot<'_>> {
+        if let Some(slot) = self.ask_slot(asker, HOLDS_PER_ASKER) {
+            return Some(slot);
+        }
+        if !self.st.lock().hold_waits.insert(asker.clone()) {
+            return None;
+        }
+        let deadline = Instant::now() + self.hold_ask_lifetime();
+        let slot = loop {
+            rt::sleep(REFRESH_PAUSE).await;
+            let free = self
+                .st
+                .lock()
+                .asks
+                .get(asker)
+                .is_none_or(|n| *n < HOLDS_PER_ASKER);
+            if free && let Some(slot) = self.ask_slot(asker, HOLDS_PER_ASKER) {
+                break Some(slot);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+        };
+        self.st.lock().hold_waits.remove(asker);
+        slot
+    }
+
+    /// The lifetime of a hold ask: the holder answers once it took what the
+    /// record asks, which may take it a first look and a fetch of every
+    /// piece.
+    fn hold_ask_lifetime(&self) -> Duration {
+        self.config.first_look * 3 + self.config.lifetime
+    }
+
     /// A proof of who asks for this device's own asks: `<me>/32=ask/
     /// <binding>`, signed by the device key.
     fn ask_proof(&self, binding: &[u8; 32]) -> Option<Bytes> {
@@ -14986,9 +16006,10 @@ impl Inner {
     /// device holds for, a record naming this device a holder and asking
     /// past now. Hold the collection, take it and every piece of it inside
     /// the record's frontier (fetching back what was lost), and answer with
-    /// the lease, signed. One ask of each asker at a time; the same ask
-    /// asked again gets the same answer. `None` (a Nack) otherwise, and a
-    /// stranger's ask costs nothing but its parse.
+    /// the lease, signed. One ask of each asker at a time, and one more
+    /// waiting for it ([`Self::hold_slot`]); the same ask asked again gets
+    /// the same answer. `None` (a Nack) otherwise, and a stranger's ask
+    /// costs nothing but its parse.
     async fn accept_hold(self: &Arc<Self>, name: &Name, ask: HoldAsk) -> Option<Bytes> {
         if let Some(r) = self.st.lock().answers.get(name) {
             return Some(r.clone());
@@ -14997,11 +16018,8 @@ impl Inner {
         let parsed = parse_log_name(record)?;
         let c = parsed.subject.clone()?;
         let ns = namespace_of(&c)?;
-        // Read whole, a merge version's operation is open.
-        let op = v.rule.is_some().then_some(op);
         if !self.config.hold_for.contains(&ns) {
             tracing::debug!(collection = %c, "hold refused: this device holds for none of its namespace");
-            op,
             return None;
         }
         let (proof, asker) = Self::claimed_asker(&ask.asker)?;
@@ -15009,7 +16027,7 @@ impl Inner {
             tracing::debug!(%record, %asker, "hold refused: only the device that signed the hold record asks for it");
             return None;
         }
-        let _slot = self.ask_slot(&asker, HOLDS_PER_ASKER)?;
+        let _slot = self.hold_slot(&asker).await?;
         if !self
             .proves(&proof, &asker, &ask.binding(&self.device))
             .await
@@ -15018,7 +16036,7 @@ impl Inner {
             return None;
         }
         if !self.st.lock().held.contains_key(record) {
-            let data = self.fetch(record.clone(), false).await?;
+            let data = self.fetch_owed(record.clone(), false).await?;
             self.take_data(record, data).await.ok()?;
         }
         let body = {
@@ -15055,19 +16073,26 @@ impl Inner {
             h.at = body.at.clone();
         }
         self.look(&c).await.ok()?;
-        // See what every device writing into the namespace has now: the
-        // asker moved since a first look, and another holder's lease names
-        // where a lost piece may still be (re-replication).
-        let devices = self.known_for(&self.st.lock(), &ns);
-        futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d))).await;
-        self.repair_held(&c).await;
         let at = body.at.clone();
-        self.wait_for(|st| {
-            st.colls
-                .get(&c)
-                .is_some_and(|coll| reaches(coll, &self.held_frontier(st, &c), &at))
-        })
-        .await;
+        let whole = |st: &St| self.keeps_all(st, &c, &at);
+        // Everything the record asks is in the store already — an ask asked
+        // again once the work for an earlier one is done (spec §13.2) — is
+        // answered at once. Else the take runs in a task of its own, which
+        // outlives this ask; the ask waits for it for a hold ask's lifetime
+        // less one Interest lifetime, so its answer still reaches the asker.
+        if !whole(&self.st.lock()) {
+            self.take_held(&c, &ns);
+            let within = self
+                .hold_ask_lifetime()
+                .saturating_sub(self.config.lifetime);
+            self.wait_within(within, |st| whole(st) || !st.taking.contains(&c))
+                .await;
+            let st = self.st.lock();
+            if !whole(&st) && st.taking.contains(&c) {
+                tracing::debug!(collection = %c, "hold not answered yet: the take of what it asks is under way; the asker asks again");
+                return None;
+            }
+        }
         let (lease, new) = {
             let mut st = self.st.lock();
             self.sign_lease(&mut st, &c)?
@@ -15380,10 +16405,33 @@ impl Inner {
 
     /// Ask holder device `holder` for `piece` under a fresh nonce, with this
     /// device's proof of asking; or, `whole`, for the proof over every
-    /// piece of the version `piece` names. The nonce asked under, and the
-    /// answer: `None` when no answer signed by the holder came back,
-    /// `Some(None)` when one did that is no answer.
+    /// piece of the version `piece` names. While no answer signed by the
+    /// holder comes back, asked again after [`retry_pause`], each time
+    /// under a fresh nonce, up to [`AUDIT_TRIES`] asks (spec §13.3, §17.1):
+    /// one lost packet is no answer yet, never evidence, and an answer is
+    /// only ever to the ask it is named for. The nonce of the ask answered,
+    /// and the answer: `None` when no answer signed by the holder came back
+    /// to any, `Some(None)` when one did that is no answer.
     async fn ask_holder(
+        &self,
+        holder: &Name,
+        piece: &Name,
+        whole: bool,
+    ) -> Option<([u8; wire::NONCE_LEN], Option<AuditAnswer>)> {
+        for tries in 0..AUDIT_TRIES {
+            if tries > 0 {
+                rt::sleep(retry_pause(tries - 1)).await;
+            }
+            if let Some(answered) = self.ask_holder_once(holder, piece, whole).await {
+                return Some(answered);
+            }
+        }
+        tracing::debug!(%holder, %piece, "no answer to {AUDIT_TRIES} audit asks");
+        None
+    }
+
+    /// One audit ask of [`Self::ask_holder`], under a nonce of its own.
+    async fn ask_holder_once(
         &self,
         holder: &Name,
         piece: &Name,
@@ -15397,7 +16445,9 @@ impl Inner {
         };
         ask.asker = self.ask_proof(&ask.binding(holder))?;
         let name = audit_ask_name(holder, &ask);
-        let data = self.fetch(name.clone(), false).await?;
+        // Asked again as a new ask under a fresh nonce ([`Self::ask_holder`]),
+        // so expressed once (spec §17.1).
+        let data = self.fetch_expressed(name.clone(), false, 0).await.ok()?;
         if *data.name != name {
             return None;
         }
@@ -15546,49 +16596,42 @@ impl Inner {
     }
 
     /// Ask holder device `holder` to hold `c` under the hold record
-    /// `record`, with this device's proof of asking; whether it answered
-    /// with a lease, which is then taken.
-    async fn ask_hold(self: &Arc<Self>, holder: &Name, record: &Name) -> bool {
+    /// `record`, one hold ask under a fresh nonce, with this device's proof
+    /// of asking; the name of the lease it answered with, which is then
+    /// taken. `hold` asks again ([`HOLD_TRIES`]).
+    async fn ask_hold(self: &Arc<Self>, holder: &Name, record: &Name) -> Option<Name> {
         // The holder fetches the record from this device, which serves it
         // once it is durable (spec §4.2).
         if let Some(l) = parse_log_name(record)
             && l.device == self.device
             && !self.published(l.seq).await
         {
-            return false;
+            return None;
         }
         let mut ask = HoldAsk {
             record: record.clone(),
             nonce: self.nonce(),
             asker: Bytes::new(),
         };
-        let Some(proof) = self.ask_proof(&ask.binding(holder)) else {
-            return false;
-        };
+        let proof = self.ask_proof(&ask.binding(holder))?;
         ask.asker = proof;
         let name = hold_ask_name(holder, &ask);
-        // The holder answers once it took what the record asks, which may
-        // take it a first look and a fetch of every piece.
-        let b = InterestBuilder::new(name.clone())
-            .lifetime(self.config.first_look * 3 + self.config.lifetime);
+        let b = InterestBuilder::new(name.clone()).lifetime(self.hold_ask_lifetime());
         let reply = {
-            let Ok(_slot) = self.slots.acquire().await else {
-                return false;
-            };
+            let _slot = self.slots.acquire().await.ok()?;
             Consumer::new(self.node.connection()).fetch_with(b).await
         };
         let Ok(reply) = reply else {
             tracing::debug!(%holder, "no lease: the device did not answer the hold ask");
-            return false;
+            return None;
         };
-        let Some(lease) = reply.content().and_then(|w| Data::decode(w.clone()).ok()) else {
-            return false;
-        };
+        let lease = Data::decode(reply.content()?.clone()).ok()?;
         let lease_name = (*lease.name).clone();
         if parse_log_name(&lease_name).is_none_or(|l| l.device != *holder) {
-            return false;
+            return None;
         }
-        self.take_data(&lease_name, lease).await.is_ok()
+        self.take_data(&lease_name, lease).await.ok()?;
+        Some(lease_name)
     }
 
     /// Whether holder device `holder` proves, to a fresh `whole` audit ask,
@@ -16094,6 +17137,8 @@ fn version_of(
         dated: body.dated,
         group: body.group,
         rule: body.rule,
+        digest,
+        op,
         payload: match (body.chunks, body.block) {
             (Some(c), _) => Payload::Large { size: c.size },
             (None, Some(entries)) => Payload::Block(
@@ -16107,6 +17152,21 @@ fn version_of(
             ),
             (None, None) => Payload::Entry(body.fields),
         },
+    }
+}
+
+impl Locked {
+    /// The version it is, its payload not open: no fields, no operation.
+    fn version(&self) -> Version {
+        let digest = wire::implicit_digest(&self.wire);
+        version_of(
+            &self.name,
+            &self.writer,
+            self.seq,
+            self.body.clone(),
+            digest,
+            false,
+        )
     }
 }
 
@@ -16213,29 +17273,22 @@ impl Device {
             inner.st.lock().ensure(c, &inner.config.rules, inner.me());
             if ns != inner.ns {
                 let c = c.clone();
-                inner
-                    .wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
-                    .await;
+                inner.wait_for(|st| inner.admitted(st, &c)).await;
+            }
+            if ns != inner.ns
+                && let Some(refused) = inner.unadmitted(c, &ns).await
+            {
+                return Err(refused);
             }
             let has = {
                 let mut st = inner.st.lock();
                 st.ensure(c, &inner.config.rules, inner.me());
                 st.colls.get(c).is_some_and(|x| x.members.is_some())
             };
-            if has {
+            // Another person's collection is held under its record by now.
+            if has || ns != inner.ns {
                 keys.push(inner.write_key(c).await?);
                 continue;
-            }
-            if ns != inner.ns {
-                let heard = !inner.known_for(&inner.st.lock(), &ns).is_empty();
-                return Err(if heard {
-                    DataError::NotAllowed {
-                        collection: c.clone(),
-                        writer: inner.writer.clone(),
-                    }
-                } else {
-                    DataError::Unavailable { name: c.clone() }
-                });
             }
             // Its default record waits until nothing a device of the
             // namespace holds can govern it (spec §6.1).
@@ -16474,28 +17527,16 @@ impl Device {
             .ensure(collection, &inner.config.rules, inner.me());
         if ns != inner.ns {
             let c = collection.clone();
-            inner
-                .wait_for(|st| st.colls.get(&c).is_some_and(|coll| coll.members.is_some()))
-                .await;
+            inner.wait_for(|st| inner.admitted(st, &c)).await;
+            if let Some(refused) = inner.unadmitted(collection, &ns).await {
+                return Err(refused);
+            }
         }
+        // Another person's collection is held under its record by now.
         let fresh = {
             let mut st = inner.st.lock();
             st.ensure(collection, &inner.config.rules, inner.me());
-            let none = st.colls.get(collection).is_none_or(|c| c.members.is_none());
-            if none && ns != inner.ns {
-                let heard = !inner.known_for(&st, &ns).is_empty();
-                return Err(if heard {
-                    DataError::NotAllowed {
-                        collection: collection.clone(),
-                        writer: inner.writer.clone(),
-                    }
-                } else {
-                    DataError::Unavailable {
-                        name: collection.clone(),
-                    }
-                });
-            }
-            none
+            ns == inner.ns && st.colls.get(collection).is_none_or(|c| c.members.is_none())
         };
         // A collection of this namespace that no record governs gets the
         // host's default, once nothing a device of the namespace holds can
@@ -16697,8 +17738,6 @@ impl DataLayer for Device {
             };
         }
         if parse_log_name(name).is_some() {
-        digest,
-        op,
             return inner.get_log_entry(name).await;
         }
         check_collection(name)?;
@@ -16715,21 +17754,6 @@ impl DataLayer for Device {
             let st = inner.st.lock();
             if inner.sealed_off(&st, name) {
                 return Err(DataError::Sealed { name: name.clone() });
-impl Locked {
-    /// The version it is, its payload not open: no fields, no operation.
-    fn version(&self) -> Version {
-        let digest = wire::implicit_digest(&self.wire);
-        version_of(
-            &self.name,
-            &self.writer,
-            self.seq,
-            self.body.clone(),
-            digest,
-            false,
-        )
-    }
-}
-
             }
             st.colls.get(name).and_then(one_key)
         };
@@ -17003,7 +18027,9 @@ impl Locked {
             .collect();
         // Repair: ask every named holder whose lease is not live, not kept
         // or holds less than was asked (a holder asked again fetches back
-        // what it lost), at once, and audit what they answer.
+        // what it lost), at once, and audit what they answer; ask again
+        // (spec §17.1), up to HOLD_TRIES asks each, while its lease does
+        // not count and fewer than `copies` do.
         let holding = |st: &St, h: &Name| -> bool {
             st.colls.get(prefix).is_some_and(|coll| {
                 coll.leases
@@ -17011,13 +18037,15 @@ impl Locked {
                     .is_some_and(|l| l.audit.kept() && reaches(coll, &l.body.holds, &at))
             })
         };
-        let ask: Vec<Name> = {
-            let st = inner.st.lock();
-            let counted: Vec<Name> = inner
-                .live_leases(&st, prefix)
+        let counted = |st: &St| -> Vec<Name> {
+            inner
+                .live_leases(st, prefix)
                 .into_iter()
-                .filter(|h| holding(&st, h))
-                .collect();
+                .filter(|h| holding(st, h))
+                .collect()
+        };
+        let ask: Vec<Name> = {
+            let counted = counted(&inner.st.lock());
             if counted.len() >= want.copies as usize {
                 Vec::new()
             } else {
@@ -17028,21 +18056,40 @@ impl Locked {
                     .collect()
             }
         };
-        let answered: Vec<Name> = stream::iter(ask)
+        let copies = want.copies as usize;
+        stream::iter(ask)
             .map(|d| {
-                let record = &record;
-                async move { inner.ask_hold(&d, record).await.then_some(d) }
+                let (record, counted) = (&record, &counted);
+                async move {
+                    let mut last: Option<Name> = None;
+                    for tries in 0..HOLD_TRIES {
+                        if tries > 0 {
+                            rt::sleep(retry_pause(tries - 1)).await;
+                            if counted(&inner.st.lock()).len() >= copies {
+                                return;
+                            }
+                        }
+                        let Some(lease) = inner.ask_hold(&d, record).await else {
+                            continue;
+                        };
+                        let live = inner.live_leases(&inner.st.lock(), prefix).contains(&d);
+                        let kept = live && inner.audit(prefix, &d).await.kept();
+                        if counted(&inner.st.lock()).contains(&d) {
+                            return;
+                        }
+                        // The same lease again, audited kept, holding less
+                        // than asked: the holder keeps all it could take of
+                        // it; the next `hold` asks again.
+                        if kept && last.as_ref() == Some(&lease) {
+                            return;
+                        }
+                        last = Some(lease);
+                    }
+                }
             })
             .buffer_unordered(inner.config.window)
-            .filter_map(|d| async move { d })
-            .collect()
+            .collect::<Vec<()>>()
             .await;
-        let fresh: Vec<Name> = {
-            let st = inner.st.lock();
-            let live = inner.live_leases(&st, prefix);
-            answered.into_iter().filter(|d| live.contains(d)).collect()
-        };
-        futures::future::join_all(fresh.iter().map(|h| inner.audit(prefix, h))).await;
         let st = inner.st.lock();
         let live = inner.live_leases(&st, prefix);
         let leases = live
@@ -17160,7 +18207,7 @@ impl Locked {
                 name: collection.clone(),
                 folder: false,
             },
-            members,
+            crate::layer::Sharing::Whole(members),
         )
         .await
     }
@@ -17175,9 +18222,23 @@ impl Locked {
                 name: folder.clone(),
                 folder: true,
             },
-            crate::layer::Sharing::Whole(members),
+            members,
         )
         .await
+    }
+
+    async fn members(&self, name: &Name) -> Result<crate::layer::Share, DataError> {
+        check_collection(name)?;
+        let st = self.inner.st.lock();
+        st.members_in_force(name)
+            .ok_or_else(|| DataError::NotReady {
+                name: name.clone(),
+                why: format!(
+                    "no members record over {name} is held here: a device of its namespace \
+                     shares it first (share_folder, or share); any other device follows or \
+                     watches it so that the owner's record is fetched, then asks again"
+                ),
+            })
     }
 }
 
@@ -17206,6 +18267,18 @@ impl Device {
             true => st.folders.get(name).and_then(|f| f.line.own.clone()),
             false => st.colls.get(name).and_then(|c| c.line.own.clone()),
         };
+        // What it would sign over the record held now: refused early, and
+        // the writers it removes walked below. Resolved again under the
+        // lock it is signed under.
+        let Some(crate::layer::Share { writers, .. }) = ({
+            let current = own_record(&inner.st.lock());
+            inner.resolve_share(name, current.as_ref(), &members)?
+        }) else {
+            return Ok(());
+        };
+        // What lies under the subject is looked at: every device known to
+        // write into the namespace, walked for at most the first-look time.
+        inner.look(name).await?;
         // A record removing a writer cuts over exactly what is held here of
         // its keys (spec §8): every device of those writers known here that
         // was not walked yet is walked first, as far as it is reachable
@@ -17298,6 +18371,122 @@ impl Device {
         // dropped one of.
         inner.settle().await;
         Ok(())
+    }
+}
+
+impl Inner {
+    /// The rule, writers and readers a record of `name` signs for
+    /// `members` over `current`, its own record in force (spec §15): the
+    /// whole content given, or `current` changed. `None` when a change
+    /// changes nothing: nothing is signed. A one-key record is written by
+    /// exactly one key (spec §5.3), named as a key or as this device.
+    fn resolve_share(
+        &self,
+        name: &Name,
+        current: Option<&Members>,
+        members: &crate::layer::Sharing,
+    ) -> Result<Option<crate::layer::Share>, DataError> {
+        let bad = |why: String| DataError::BadRequest {
+            name: name.clone(),
+            why,
+        };
+        let change = match members {
+            crate::layer::Sharing::Whole(share) => {
+                let writers = match (&share.rule, share.writers.as_slice()) {
+                    (Rule::OneKey, [w]) if *w == self.device => vec![self.writer.key().clone()],
+                    (Rule::OneKey, [w])
+                        if device_of(w).is_some_and(|d| wire::is_device_name(&d)) =>
+                    {
+                        vec![w.clone()]
+                    }
+                    (Rule::OneKey, _) => {
+                        return Err(bad("a one-key collection is written by exactly one key: \
+                                        name the one key that writes, <D>/KEY/<id>, or this \
+                                        device"
+                            .into()));
+                    }
+                    _ => share.writers.clone(),
+                };
+                return Ok(Some(crate::layer::Share {
+                    rule: share.rule.clone(),
+                    writers,
+                    readers: share.readers.clone(),
+                }));
+            }
+            crate::layer::Sharing::Change(change) => change,
+        };
+        let Some(m) = current else {
+            return Err(DataError::NotReady {
+                name: name.clone(),
+                why: "no members record of it is held here, so there is nothing to change: \
+                      share it whole first, or bring online the device of its namespace that \
+                      signed one and ask again"
+                    .into(),
+            });
+        };
+        let mut writers = m.writers.clone();
+        for w in &change.remove_writers {
+            if let Some(i) = writers.iter().position(|x| x == w) {
+                writers.remove(i);
+            } else if let Some(p) = writers.iter().find(|p| w.has_prefix(p)) {
+                return Err(bad(format!(
+                    "writer {w} is not listed, and {p}, which is listed, covers it: remove {p}, \
+                     or share the record whole"
+                )));
+            }
+        }
+        for w in &change.add_writers {
+            if !writers.iter().any(|p| w.has_prefix(p)) {
+                writers.push(w.clone());
+            }
+        }
+        let sealed = !m.readers.is_empty();
+        let mut readers = m.readers.clone();
+        for r in &change.remove_readers {
+            if let Some(i) = readers.iter().position(|x| x == r) {
+                readers.remove(i);
+            } else if collection::admitted(r, &readers) {
+                return Err(bad(format!(
+                    "reader {r:?} is not listed, and a reader listed admits it: remove that \
+                     reader, or share the record whole"
+                )));
+            }
+        }
+        // Not sealed, every reader reads already.
+        if sealed {
+            for r in &change.add_readers {
+                if !collection::admitted(r, &readers) {
+                    readers.push(r.clone());
+                }
+            }
+        }
+        if writers.is_empty() && !m.writers.is_empty() {
+            return Err(bad(
+                "the change leaves no writer, and a record listing none takes the writers of \
+                 the folders above it: share the record whole to mean that"
+                    .into(),
+            ));
+        }
+        if sealed && readers.is_empty() {
+            return Err(bad(
+                "the change leaves no reader, which unseals it for everyone: share the record \
+                 whole to mean that"
+                    .into(),
+            ));
+        }
+        if writers == m.writers && readers == m.readers {
+            return Ok(None);
+        }
+        if m.rule == Rule::OneKey && writers != m.writers {
+            return Err(bad(
+                "a one-key record's one writer changes only by sharing the record whole".into(),
+            ));
+        }
+        Ok(Some(crate::layer::Share {
+            rule: m.rule.clone(),
+            writers,
+            readers,
+        }))
     }
 }
 
@@ -17754,20 +18943,6 @@ mod tests {
         let packet = DataBuilder::new(name.clone(), &content).sign_sync(
             ndn_packet::SignatureType::SignatureEd25519,
             Some(&key),
-
-    async fn members(&self, name: &Name) -> Result<crate::layer::Share, DataError> {
-        check_collection(name)?;
-        let st = self.inner.st.lock();
-        st.members_in_force(name)
-            .ok_or_else(|| DataError::NotReady {
-                name: name.clone(),
-                why: format!(
-                    "no members record over {name} is held here: a device of its namespace \
-                     shares it first (share_folder, or share); any other device follows or \
-                     watches it so that the owner's record is fetched, then asks again"
-                ),
-            })
-    }
             |_| Bytes::from_static(&[0; 64]),
         );
         let mut st = dev.inner.st.lock();
@@ -17812,18 +18987,6 @@ mod tests {
             (first, future)
         };
         let may = |e: &Epoch, (d, ns): &(Name, Name)| {
-        // What it would sign over the record held now: refused early, and
-        // the writers it removes walked below. Resolved again under the
-        // lock it is signed under.
-        let Some(crate::layer::Share { writers, .. }) = ({
-            let current = own_record(&inner.st.lock());
-            inner.resolve_share(name, current.as_ref(), &members)?
-        }) else {
-            return Ok(());
-        };
-        // What lies under the subject is looked at: every device known to
-        // write into the namespace, walked for at most the first-look time.
-        inner.look(name).await?;
             dev.inner
                 .grant_key(&dev.inner.st.lock(), &c, e, d, ns)
                 .is_some()
@@ -17915,122 +19078,6 @@ mod tests {
         // Another device answers the ask with a key it chose, wrapped to the
         // reader and signed: it opens, and is not the epoch's.
         let public = dev.inner.st.lock().keys.recipient.public();
-impl Inner {
-    /// The rule, writers and readers a record of `name` signs for
-    /// `members` over `current`, its own record in force (spec §15): the
-    /// whole content given, or `current` changed. `None` when a change
-    /// changes nothing: nothing is signed. A one-key record is written by
-    /// exactly one key (spec §5.3), named as a key or as this device.
-    fn resolve_share(
-        &self,
-        name: &Name,
-        current: Option<&Members>,
-        members: &crate::layer::Sharing,
-    ) -> Result<Option<crate::layer::Share>, DataError> {
-        let bad = |why: String| DataError::BadRequest {
-            name: name.clone(),
-            why,
-        };
-        let change = match members {
-            crate::layer::Sharing::Whole(share) => {
-                let writers = match (&share.rule, share.writers.as_slice()) {
-                    (Rule::OneKey, [w]) if *w == self.device => vec![self.writer.key().clone()],
-                    (Rule::OneKey, [w])
-                        if device_of(w).is_some_and(|d| wire::is_device_name(&d)) =>
-                    {
-                        vec![w.clone()]
-                    }
-                    (Rule::OneKey, _) => {
-                        return Err(bad("a one-key collection is written by exactly one key: \
-                                        name the one key that writes, <D>/KEY/<id>, or this \
-                                        device"
-                            .into()));
-                    }
-                    _ => share.writers.clone(),
-                };
-                return Ok(Some(crate::layer::Share {
-                    rule: share.rule.clone(),
-                    writers,
-                    readers: share.readers.clone(),
-                }));
-            }
-            crate::layer::Sharing::Change(change) => change,
-        };
-        let Some(m) = current else {
-            return Err(DataError::NotReady {
-                name: name.clone(),
-                why: "no members record of it is held here, so there is nothing to change: \
-                      share it whole first, or bring online the device of its namespace that \
-                      signed one and ask again"
-                    .into(),
-            });
-        };
-        let mut writers = m.writers.clone();
-        for w in &change.remove_writers {
-            if let Some(i) = writers.iter().position(|x| x == w) {
-                writers.remove(i);
-            } else if let Some(p) = writers.iter().find(|p| w.has_prefix(p)) {
-                return Err(bad(format!(
-                    "writer {w} is not listed, and {p}, which is listed, covers it: remove {p}, \
-                     or share the record whole"
-                )));
-            }
-        }
-        for w in &change.add_writers {
-            if !writers.iter().any(|p| w.has_prefix(p)) {
-                writers.push(w.clone());
-            }
-        }
-        let sealed = !m.readers.is_empty();
-        let mut readers = m.readers.clone();
-        for r in &change.remove_readers {
-            if let Some(i) = readers.iter().position(|x| x == r) {
-                readers.remove(i);
-            } else if collection::admitted(r, &readers) {
-                return Err(bad(format!(
-                    "reader {r:?} is not listed, and a reader listed admits it: remove that \
-                     reader, or share the record whole"
-                )));
-            }
-        }
-        // Not sealed, every reader reads already.
-        if sealed {
-            for r in &change.add_readers {
-                if !collection::admitted(r, &readers) {
-                    readers.push(r.clone());
-                }
-            }
-        }
-        if writers.is_empty() && !m.writers.is_empty() {
-            return Err(bad(
-                "the change leaves no writer, and a record listing none takes the writers of \
-                 the folders above it: share the record whole to mean that"
-                    .into(),
-            ));
-        }
-        if sealed && readers.is_empty() {
-            return Err(bad(
-                "the change leaves no reader, which unseals it for everyone: share the record \
-                 whole to mean that"
-                    .into(),
-            ));
-        }
-        if writers == m.writers && readers == m.readers {
-            return Ok(None);
-        }
-        if m.rule == Rule::OneKey && writers != m.writers {
-            return Err(bad(
-                "a one-key record's one writer changes only by sharing the record whole".into(),
-            ));
-        }
-        Ok(Some(crate::layer::Share {
-            rule: m.rule.clone(),
-            writers,
-            readers,
-        }))
-    }
-}
-
         let grant = |key: &ContentKey| {
             let ask = GrantAsk {
                 seal_key: seal_key_name(&device, &public),
@@ -18722,6 +19769,210 @@ impl Inner {
             "an ask whose proof does not verify is not answered"
         );
         assert_eq!(dev.signatures(), before, "nor signed for");
+        dev.shutdown();
+    }
+
+    /// What [`Asks`] answers the `n`th ask (from 0) of the holder's name
+    /// with: `None`, the ask or its answer is lost.
+    type Answering = Box<dyn Fn(&Name, usize) -> Option<Bytes> + Send + Sync>;
+
+    /// A forwarder that carries only the asks of device `holder`'s name
+    /// (spec §13): each is recorded and answered as `answer` says; nothing
+    /// else arrives.
+    struct Asks {
+        holder: Name,
+        asked: std::sync::Mutex<Vec<Name>>,
+        answer: Answering,
+        tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+        rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    impl Asks {
+        fn new(holder: &Name, answer: Answering) -> Arc<Self> {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            Arc::new(Asks {
+                holder: holder.clone(),
+                asked: std::sync::Mutex::new(Vec::new()),
+                answer,
+                tx,
+                rx: futures::lock::Mutex::new(rx),
+            })
+        }
+
+        fn asked(&self) -> Vec<Name> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for Asks {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            let Ok(interest) = Interest::decode(wire) else {
+                return Ok(());
+            };
+            let name = (*interest.name).clone();
+            if !name.has_prefix(&self.holder) {
+                return Ok(());
+            }
+            let nth = {
+                let mut asked = self.asked.lock().unwrap();
+                asked.push(name.clone());
+                asked.len() - 1
+            };
+            if let Some(reply) = (self.answer)(&name, nth) {
+                let _ = self.tx.unbounded_send(reply);
+            }
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.rx.lock().await.next().await
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// Start `device` on `conn`.
+    async fn start_on(
+        device: &Name,
+        keys: &Arc<SecurityManager>,
+        validator: &Arc<Validator>,
+        conn: Arc<dyn Connection>,
+    ) -> Device {
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        Device::start(
+            Transport {
+                node: Node::from_connection(Arc::clone(&conn)),
+                sync: conn,
+            },
+            device.clone(),
+            Arc::clone(keys),
+            Arc::clone(validator),
+            store,
+            Config::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_audit_ask_no_answer_comes_back_to_is_asked_again_under_fresh_nonces_up_to_its_bound()
+     {
+        let (phone, repo) = (n("/alice/phone"), n("/alice/repo"));
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        validator.adopt_context(context("/alice")).unwrap();
+        let asks = Asks::new(&repo, Box::new(|_, _| None));
+        let dev = start_on(&phone, &keys_of(&phone), &validator, asks.clone()).await;
+        let piece = log_name(&phone, Some(&n("/alice/32=data/photos")), 1);
+        let got = dev.inner.ask_holder(&repo, &piece, false).await;
+        assert!(got.is_none(), "nothing answered: {got:?}");
+        let asked: Vec<AuditAsk> = asks
+            .asked()
+            .iter()
+            .map(|a| parse_audit_ask_name(a).expect("an audit ask").1)
+            .collect();
+        assert_eq!(
+            asked.len(),
+            AUDIT_TRIES as usize,
+            "a lost ask or answer is asked again, up to the bound and no more"
+        );
+        assert!(asked.iter().all(|a| a.piece == piece && !a.whole));
+        let nonces: BTreeSet<_> = asked.iter().map(|a| a.nonce).collect();
+        assert_eq!(nonces.len(), asked.len(), "each ask under a fresh nonce");
+        dev.shutdown();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_audit_answer_is_taken_only_for_the_ask_it_answers() {
+        let wendy = n("/wendy");
+        let (authority, issuer, anchor) = authority(&wendy).await;
+        let (phone, repo) = (n("/alice/phone"), n("/wendy/repo"));
+        let (repo_keys, repo_key, repo_cert) = device_key(&authority, &issuer, &repo).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        validator.adopt_context(context("/alice")).unwrap();
+        validator.cert_cache().insert(repo_cert);
+        // The first two asks, or their answers, are lost; the third is
+        // answered, signed by the repo.
+        let answer: Answering = Box::new(move |name, nth| {
+            let content = wire::encode_audit_answer(&AuditAnswer::Missing);
+            (nth == 2).then(|| signed(&repo_keys, &repo_key, name, &content).0)
+        });
+        let asks = Asks::new(&repo, answer);
+        let dev = start_on(&phone, &keys_of(&phone), &validator, asks.clone()).await;
+        let piece = log_name(&phone, Some(&n("/alice/32=data/photos")), 1);
+        let got = dev.inner.ask_holder(&repo, &piece, false).await;
+        let asked = asks.asked();
+        assert_eq!(asked.len(), 3, "asked until answered, and no more");
+        let third = parse_audit_ask_name(&asked[2]).unwrap().1;
+        assert!(
+            matches!(got, Some((nonce, Some(AuditAnswer::Missing))) if nonce == third.nonce),
+            "the answer is to the ask it is named for, under that ask's nonce: {got:?}"
+        );
+        dev.shutdown();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_ask_no_lease_comes_back_to_is_asked_again_under_fresh_nonces_up_to_its_bound() {
+        let (phone, repo) = (n("/alice/phone"), n("/alice/repo"));
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        validator.adopt_context(context("/alice")).unwrap();
+        let asks = Asks::new(&repo, Box::new(|_, _| None));
+        let dev = start_on(&phone, &keys_of(&phone), &validator, asks.clone()).await;
+        let c = n("/alice/32=data/photos");
+        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
+            .await
+            .unwrap();
+        let want = Hold {
+            copies: 1,
+            until: LATER,
+            holders: vec![repo.clone()],
+        };
+        let custody = dev.hold(&c, want).await.unwrap();
+        assert!(custody.leases.is_empty(), "no lease came back");
+        let asked: Vec<HoldAsk> = asks
+            .asked()
+            .iter()
+            .map(|a| parse_hold_ask_name(a).expect("a hold ask").1)
+            .collect();
+        assert_eq!(
+            asked.len(),
+            HOLD_TRIES as usize,
+            "a hold ask no lease came back to is asked again, up to the bound and no more"
+        );
+        let record = &asked[0].record;
+        assert!(asked.iter().all(|a| a.record == *record));
+        let nonces: BTreeSet<_> = asked.iter().map(|a| a.nonce).collect();
+        assert_eq!(nonces.len(), asked.len(), "each ask under a fresh nonce");
+        dev.shutdown();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_ask_asked_again_waits_for_the_one_in_progress() {
+        let dev = device_in("/alice/repo", &["/alice"]).await;
+        let asker = n("/alice/phone");
+        let first = dev
+            .inner
+            .ask_slot(&asker, HOLDS_PER_ASKER)
+            .expect("a first ask is worked on");
+        let (waited, third) = tokio::join!(dev.inner.hold_slot(&asker), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let third = dev.inner.hold_slot(&asker).await.is_some();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(first);
+            third
+        });
+        assert!(
+            waited.is_some(),
+            "the ask asked again is worked on once the first ends"
+        );
+        assert!(!third, "one ask of an asker waits; another is refused");
+        // One that would wait past a hold ask's lifetime is refused.
+        let held = waited;
+        let late = dev.inner.hold_slot(&asker).await;
+        assert!(late.is_none(), "it waited longer than an ask lives");
+        drop(held);
+        assert!(dev.inner.hold_slot(&asker).await.is_some());
         dev.shutdown();
     }
 
@@ -19705,6 +20956,8 @@ impl Inner {
                 dated: Timestamp(0),
                 group: None,
                 rule: None,
+                digest: wire::implicit_digest(&[]),
+                op: None,
                 payload: Payload::Entry(Content::new()),
             },
             Bytes::new(),
@@ -20165,6 +21418,11 @@ impl Inner {
             .watch(&r.c, &upto("/sam/phone/KEY/1", 3))
             .await
             .unwrap();
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
         r.revoke(2, r.cut(1, 2, &[]));
         let three = packets[2].0.clone();
         until(&r.dev, |st| st.refused.contains_key(&three)).await;
@@ -20216,6 +21474,11 @@ impl Inner {
             .watch(&r.c, &upto("/sam/phone/KEY/1", 2))
             .await
             .unwrap();
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
         // The owner re-admits seq 3, exactly its bytes.
         r.revoke(3, r.cut(1, 2, &[full[2].clone()]));
         let three = log_name(&r.phone, Some(&r.c), 3);
@@ -20293,8 +21556,6 @@ impl Inner {
             .unwrap()
             .entries
             .entry(r.writer())
-                digest: wire::implicit_digest(&[]),
-                op: None,
             .or_default()
             .insert(6);
         let prefix = |c: &Name| log_prefix(&log_name(&r.phone, Some(c), 0));
@@ -20755,11 +22016,6 @@ impl Inner {
         validator: Arc<Validator>,
         store: Arc<dyn DataStore>,
         phone: Name,
-        // The listing starts with the record in force (spec §15).
-        assert!(matches!(
-            changes.next().await,
-            Some(Ok(Change::Members { .. }))
-        ));
         c: Name,
     }
 
@@ -20811,11 +22067,6 @@ impl Inner {
                 .unwrap()
         }
     }
-        // The listing starts with the record in force (spec §15).
-        assert!(matches!(
-            changes.next().await,
-            Some(Ok(Change::Members { .. }))
-        ));
 
     #[tokio::test]
     async fn a_version_a_copy_of_its_key_wrote_under_its_name_is_not_restored_as_its_own() {
@@ -20945,6 +22196,11 @@ impl Inner {
             .watch(&c, &upto("/sam/admin/phone/KEY/1", 2))
             .await
             .unwrap();
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
         // The issuer's key is revoked: nothing it certified signs Data.
         let ctx = SignedTrustContext::hierarchical(n("/sam"))
             .with_version(2)
@@ -21007,6 +22263,11 @@ impl Inner {
             .watch(&c, &upto("/sam/admin/phone/KEY/1", 2))
             .await
             .unwrap();
+        // The listing starts with the record in force (spec §15).
+        assert!(matches!(
+            changes.next().await,
+            Some(Ok(Change::Members { .. }))
+        ));
         let three = log_name(&phone, Some(&c), 3);
         let (packet, _) = signed(
             &phone_keys,
@@ -21496,15 +22757,8 @@ mod intro_tests;
 mod intro;
 
 mod groups;
-        // The listing starts with the record in force (spec §15).
-        assert!(matches!(
-            changes.next().await,
-            Some(Ok(Change::Members { .. }))
-        ));
-        // The listing starts with the record in force (spec §15).
-        assert!(matches!(
-            changes.next().await,
-            Some(Ok(Change::Members { .. }))
-        ));
 
 mod scoped;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fetch_tests;
