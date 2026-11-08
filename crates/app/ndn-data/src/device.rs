@@ -1705,6 +1705,9 @@ struct Inner {
     grants_answered: AtomicU64,
     started: Instant,
     serving: Mutex<Option<ServeGuard>>,
+    /// The persons' namespaces the records in force list as writers, and
+    /// what is adopted of them for those records' subjects (spec §6.3).
+    scopes: scoped::Scopes,
     /// Set by [`Device::shutdown`]: trust contexts adopted from then on are
     /// not taken (a restart judges what is held again).
     stopped: AtomicBool,
@@ -3477,6 +3480,8 @@ impl St {
                 &n,
                 true,
                 old.as_ref(),
+        // The persons' namespaces it lists are adopted for it (spec §6.3).
+        self.scopes.note(&c, line.own.as_ref());
                 folder.members.as_ref(),
             );
             if owes_epoch(
@@ -6652,6 +6657,7 @@ impl Device {
 
     /// Mark `key` (a key name `<id>/KEY/<k>`, or one of its certificate
     /// names) suspected since `since`, by this device's clock, as the owner
+                scopes: scoped::Scopes::default(),
     /// says when the device was lost (spec §8): from now on this device
     /// takes no new log entry of the key — none is fetched, applied or
     /// stored, and a `get` of one answers [`Refusal::Suspected`] — while
@@ -8604,6 +8610,9 @@ fn relayed_name(node: &Name) -> Name {
     async fn fetch(&self, name: Name, discover: bool) -> Option<Data> {
         let _slot = self.slots.acquire().await.ok()?;
         let mut b = InterestBuilder::new(name).lifetime(self.config.lifetime);
+        // The writers the records in force list from persons' namespaces
+        // this node does not hold are adopted for those records (§6.3).
+        self.scope_writers();
         if discover {
             b = b.can_be_prefix().must_be_fresh();
         }
@@ -8635,7 +8644,11 @@ fn relayed_name(node: &Name) -> Name {
             .sig_info()
             .and_then(|s| s.key_locator_name())
             .ok_or(Refusal::BadSignature)?;
-        match self.validator.validate_durable(data).await {
+        // A person's namespace adopted for a folder judges its packets
+        // about that folder alone (spec §6.3); the device's own validator
+        // every other packet.
+        let judge = self.judge(&data.name);
+        match judge.validate_durable(data).await {
             ValidationResult::Valid(safe)
                 if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
             {
@@ -8648,7 +8661,7 @@ fn relayed_name(node: &Name) -> Name {
                     .is_ok_and(|n| key_name_of(&n) == key_name_of(&key)) =>
             {
                 let writer = Writer::new((*key).clone());
-                let ctx = self.validator.keyring().context_for(&data.name);
+                let ctx = judge.keyring().context_for(&data.name);
                 tracing::debug!(name = %data.name, key = %key, "refused: its key is revoked and the cut does not accept it");
                 Err(Refusal::OutsideCut(revocation_cut_for(
                     &ctx,
@@ -8686,7 +8699,7 @@ fn relayed_name(node: &Name) -> Name {
             .context_for(&data.name)
             .anchor_for(key);
         for pk in self
-            .validator
+            .judge(&data.name)
             .cert_cache()
             .all(key)
             .into_iter()
@@ -10612,7 +10625,7 @@ fn relayed_name(node: &Name) -> Name {
                 let Ok(data) = Data::decode(wire.clone()) else {
                     continue;
                 };
-                let (result, missing) = self.validator.validate_durable_cached(&data).await;
+                let (result, missing) = self.judge(&name).validate_durable_cached(&data).await;
                 match self.verdict(&name, &writer, result, missing) {
                     Verdict::Accepted if withdrawn => back.push((name, data)),
                     Verdict::Cut(cut) if !withdrawn => found.push((
@@ -10709,7 +10722,14 @@ fn relayed_name(node: &Name) -> Name {
             }
             let wanted = match which {
                 Rejudge::All => true,
-                Rejudge::Namespace(ns) => withdrawn || keyring.context_for(name).namespace() == ns,
+                // A person's namespace adopted for a folder is no context
+                // the keyring holds: its entries are found by their name.
+                Rejudge::Namespace(ns) => {
+                    withdrawn
+                        || keyring.context_for(name).namespace() == ns
+                        || ndn_security::self_certifying::personal_namespace_of(name).as_ref()
+                            == Some(ns)
+                }
                 Rejudge::Withdrawn(None) => withdrawn,
                 Rejudge::Withdrawn(Some(key)) => {
                     withdrawn && out_of.is_some_and(|o| key_name_of(o.writer.key()) == *key)
@@ -10756,7 +10776,7 @@ fn relayed_name(node: &Name) -> Name {
                     .parse::<Name>()
                     .is_ok_and(|n| key_name_of(&n) == key_name_of(writer.key())) =>
             {
-                let ctx = self.validator.keyring().context_for(name);
+                let ctx = self.judge(name).keyring().context_for(name);
                 if ctx.is_revoked(writer.key()) {
                     Verdict::Cut(revocation_cut_for(&ctx, writer, &log_prefix(name)))
                 } else {
@@ -10784,7 +10804,7 @@ fn relayed_name(node: &Name) -> Name {
         }
         // The validator's fetcher brings the certificate in.
         !matches!(
-            self.validator.validate_durable(data).await,
+            self.judge(&data.name).validate_durable(data).await,
             ValidationResult::Pending
         )
     }
@@ -21486,3 +21506,5 @@ mod groups;
             changes.next().await,
             Some(Ok(Change::Members { .. }))
         ));
+
+mod scoped;

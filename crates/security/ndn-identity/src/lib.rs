@@ -28,7 +28,9 @@ pub mod revocation;
 pub mod signed_delegation;
 pub mod transition;
 
-pub use adopt::{adopt_anchor_link_via_engine, refresh_context_via_engine};
+pub use adopt::{
+    adopt_anchor_link_via_engine, adopt_scoped_via_engine, refresh_context_via_engine,
+};
 pub use approval::{
     fetch_pending_via_engine, poll_approval_via_engine, poll_via_engine_budget,
     push_decision_via_engine, request_status_via_engine,

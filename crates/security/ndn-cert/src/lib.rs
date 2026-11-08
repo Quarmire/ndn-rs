@@ -74,7 +74,7 @@ pub use context_store::{
 pub use context_update::{
     BumpError, CatchUpStop, ContextBump, ContextRefresh, ContextStep, ContextUpdate,
     MAX_CATCH_UP_MISSES, MAX_CATCH_UP_TIME, MAX_CATCH_UP_VERSIONS, RefreshError, SchemaBump,
-    SchemaChange, Unfetched, UpdateRefusal, VersionSource, adopt_by_name,
+    SchemaChange, Unfetched, UpdateRefusal, VersionSource, adopt_by_name, adopt_scoped,
     bump_context_data_requires_cut, bump_context_readmitting, bump_context_revoking,
     bump_context_schema, check_cut, check_cuts, device_log_of, follow_versions, key_name_of,
     link_narrowing, open_context_update, orphan_cuts, readmissions_to_add, refresh_context,

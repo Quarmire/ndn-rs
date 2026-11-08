@@ -70,7 +70,7 @@ use ndn_packet::{Data, Name, NameComponent, tlv_type};
 use ndn_security::self_certifying::{Genesis, GenesisError, self_certifying_digest};
 use ndn_security::{
     AdvertisedRelay, Certificate, EnrollmentHint, ExpectContextError, Keyring, LinkPolicy,
-    LvsModel, OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SchemaRule,
+    LvsModel, OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SchemaRule, ScopedContext,
     SignedTrustContext, SignedTrustContextError, Signer, Validator,
 };
 
@@ -1877,6 +1877,67 @@ where
     E: CaExchange + Send + ?Sized,
 {
     adopt_by_name_checking(keyring, forwarder, exchange, namespace, min_version, None).await
+}
+
+/// Adopt the self-certifying namespace `namespace` by its name alone, as
+/// [`adopt_by_name`] does, for one scope of its holder's alone
+/// (`docs/specs/data-layer.md` §6.3): into no keyring a node judges by, but
+/// as a [`ScopedContext`] that its holder judges that scope's data by
+/// ([`Keyring::with_scoped_view`]), so no other path ever sees it.
+///
+/// Not held (`held` is `None`): version 1 is fetched and checked as the
+/// genesis the name hashes, and the newest is reached from it. Held as
+/// `held`: a refresh from that version, by the continuity rule — never a
+/// fresh check from the genesis key, so a thief's branch after a recovery
+/// is refused as [`adopt_by_name`] refuses it for a held namespace. The
+/// fetches, the walk and its bounds ([`MAX_CATCH_UP_MISSES`],
+/// [`MAX_CATCH_UP_TIME`]), a validating `forwarder`'s expectation and the
+/// refusals are [`adopt_by_name`]'s.
+pub async fn adopt_scoped<E>(
+    forwarder: Option<&Validator>,
+    exchange: &mut E,
+    namespace: &Name,
+    held: Option<&ScopedContext>,
+) -> Result<ScopedContext, AdoptError>
+where
+    E: CaExchange + Send + ?Sized,
+{
+    let scratch = Keyring::new();
+    if let Some(held) = held {
+        if held.namespace() != namespace {
+            return Err(AdoptError::NamespaceMismatch {
+                expected: namespace.to_string(),
+                found: held.namespace().to_string(),
+            });
+        }
+        if let Err(refusal) = scratch.adopt_genesis(held.genesis(), Arc::clone(held.context())) {
+            refused(refusal, held.context().version())?;
+        }
+    }
+    let adoption = adopt_by_name(&scratch, forwarder, exchange, namespace, None).await?;
+    let reached = |refusal| match refused(refusal, adoption.context.version()) {
+        Ok(_) => AdoptError::GenesisRequired {
+            namespace: namespace.to_string(),
+            version: adoption.context.version(),
+        },
+        Err(e) => e,
+    };
+    match held {
+        Some(held) => {
+            let newest = scratch
+                .held(namespace)
+                .unwrap_or_else(|| Arc::clone(held.context()));
+            held.moved_on(newest).map_err(reached)
+        }
+        None => {
+            let first = adoption
+                .earlier
+                .first()
+                .map_or(&adoption.data, |step| &step.data);
+            let genesis = Genesis::open_received(first).await?;
+            ScopedContext::new(genesis, Arc::clone(&adoption.context)).map_err(reached)
+        }
+    }
 }
 
 /// [`adopt_by_name`] of a namespace a link names, `inline_genesis` the

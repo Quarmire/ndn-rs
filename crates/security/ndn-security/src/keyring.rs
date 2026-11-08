@@ -108,6 +108,100 @@ pub struct Keyring {
     /// view of this keyring ([`with_ambient_view`](Self::with_ambient_view)).
     held: Arc<Held>,
     ambient: Arc<SignedTrustContext>,
+    /// A person's namespace this view alone also judges by, for the scope
+    /// its holder gave it, where no held context covers it
+    /// ([`with_scoped_view`](Self::with_scoped_view)). `None` in every
+    /// keyring a node holds.
+    scoped: Option<Arc<SignedTrustContext>>,
+}
+
+/// A person's self-certifying namespace (`/user/<0xA1: …>`) adopted by name
+/// for one scope alone — e.g. for judging the data of the folders whose
+/// members records list it as a writer (data-layer.md §6.3) — and never
+/// into a node's keyring: its checked genesis and the newest version
+/// reached from it by the continuity rule. Made only from a [`Genesis`],
+/// which only its signature check makes, exactly as
+/// [`Keyring::adopt_genesis`] takes one; judged by only through a view
+/// ([`Keyring::with_scoped_view`], [`Validator::scoped_view`](crate::Validator::scoped_view)),
+/// so no path that does not ask for that view ever sees it.
+#[derive(Clone, Debug)]
+pub struct ScopedContext {
+    genesis: Arc<Genesis>,
+    context: Arc<SignedTrustContext>,
+}
+
+impl ScopedContext {
+    /// The namespace of `genesis` at `newest`: the genesis itself, or a
+    /// later version the caller checked from it (or from a scoped version
+    /// held before) by the continuity rule. Refused as
+    /// [`Keyring::adopt_genesis`] refuses: `newest` of another namespace,
+    /// or a version 1 that is not the genesis
+    /// ([`AdoptRefusal::NotFromGenesis`]).
+    pub fn new(genesis: Genesis, newest: Arc<SignedTrustContext>) -> Result<Self, AdoptRefusal> {
+        if !from_genesis(&genesis, &newest) {
+            return Err(AdoptRefusal::NotFromGenesis {
+                genesis: genesis.namespace().clone(),
+                offered: newest.namespace().clone(),
+                version: newest.version(),
+            });
+        }
+        Ok(Self {
+            genesis: Arc::new(genesis),
+            context: newest,
+        })
+    }
+
+    /// The person's namespace, `/user/<0xA1: …>`.
+    pub fn namespace(&self) -> &Name {
+        self.genesis.namespace()
+    }
+
+    /// Its checked version 1.
+    pub fn genesis(&self) -> &Genesis {
+        &self.genesis
+    }
+
+    /// The newest version reached from the genesis: what judges.
+    pub fn context(&self) -> &Arc<SignedTrustContext> {
+        &self.context
+    }
+
+    /// The same namespace at `newer`, a version the caller checked by the
+    /// continuity rule from this one (a refresh): kept with the same
+    /// genesis. Refused unless it is of this namespace and not older
+    /// ([`AdoptRefusal::Older`], [`AdoptRefusal::Fork`],
+    /// [`AdoptRefusal::NotFromGenesis`]); this very version again is `Ok`.
+    pub fn moved_on(&self, newer: Arc<SignedTrustContext>) -> Result<Self, AdoptRefusal> {
+        if newer.namespace() != self.namespace() {
+            return Err(AdoptRefusal::NotFromGenesis {
+                genesis: self.namespace().clone(),
+                offered: newer.namespace().clone(),
+                version: newer.version(),
+            });
+        }
+        let held_ctx = Arc::clone(&self.context);
+        match newer.version().cmp(&held_ctx.version()) {
+            std::cmp::Ordering::Greater => Ok(Self {
+                genesis: Arc::clone(&self.genesis),
+                context: newer,
+            }),
+            std::cmp::Ordering::Equal if newer.encode_content() == held_ctx.encode_content() => {
+                Ok(self.clone())
+            }
+            std::cmp::Ordering::Equal => Err(AdoptRefusal::Fork { held_ctx }),
+            std::cmp::Ordering::Less => Err(AdoptRefusal::Older {
+                held_ctx,
+                offered: newer.version(),
+            }),
+        }
+    }
+}
+
+/// Whether `newest` is of `genesis`'s namespace and, at version 1, the
+/// genesis itself.
+fn from_genesis(genesis: &Genesis, newest: &SignedTrustContext) -> bool {
+    newest.namespace() == genesis.namespace()
+        && (newest.version() != 1 || newest.encode_content() == genesis.context().encode_content())
 }
 
 /// What the views of one keyring share: the held contexts, the listeners,
@@ -193,6 +287,7 @@ impl Keyring {
                 unheld: Arc::new(SignedTrustContext::deny_all()),
             }),
             ambient,
+            scoped: None,
         }
     }
 
@@ -208,6 +303,29 @@ impl Keyring {
         Keyring {
             held: Arc::clone(&self.held),
             ambient,
+            scoped: self.scoped.clone(),
+        }
+    }
+
+    /// A view of this keyring that also judges the names of `scoped`'s
+    /// person's namespace by `scoped`'s context, wherever no held context
+    /// covers them: for its holder's one scope (data-layer.md §6.3). It
+    /// shares this keyring's held contexts **live**, as
+    /// [`with_ambient_view`](Self::with_ambient_view) does, and its ambient.
+    ///
+    /// A scoped context never replaces a held one: while this keyring holds
+    /// the namespace (adopted before the view was made or after), the held
+    /// context judges its names here as everywhere, and `scoped` is not
+    /// consulted. The keyring itself never holds `scoped`: it is not among
+    /// its [`contexts`](Self::contexts), and every path that judges by the
+    /// keyring and not by this view — a forwarder's validation, another
+    /// scope — refuses the namespace as one not held. Adopting through the
+    /// view adopts into the shared held contexts, as through the keyring.
+    pub fn with_scoped_view(&self, scoped: &ScopedContext) -> Keyring {
+        Keyring {
+            held: Arc::clone(&self.held),
+            ambient: Arc::clone(&self.ambient),
+            scoped: Some(Arc::clone(scoped.context())),
         }
     }
 
@@ -280,10 +398,7 @@ impl Keyring {
         genesis: &Genesis,
         newest: Arc<SignedTrustContext>,
     ) -> Result<(), AdoptRefusal> {
-        if newest.namespace() != genesis.namespace()
-            || (newest.version() == 1
-                && newest.encode_content() != genesis.context().encode_content())
-        {
+        if !from_genesis(genesis, &newest) {
             return Err(AdoptRefusal::NotFromGenesis {
                 genesis: genesis.namespace().clone(),
                 offered: newest.namespace().clone(),
@@ -532,7 +647,10 @@ impl Keyring {
     /// The held (adopted) context governing `name`, if any: the one whose
     /// namespace is the longest prefix of `name` — for a person's name,
     /// only their own namespace's ([`context_for`](Self::context_for)).
-    /// `None` when the ambient context, or nothing, judges `name`.
+    /// `None` when the ambient context, or nothing, judges `name`. In a
+    /// scoped view ([`with_scoped_view`](Self::with_scoped_view)), a name of
+    /// the scoped namespace that no held context covers is governed by the
+    /// scoped context.
     pub fn held_for(&self, name: &Name) -> Option<Arc<SignedTrustContext>> {
         let floor = if crate::self_certifying::in_personal_namespace(name) {
             2
@@ -550,7 +668,14 @@ impl Keyring {
                 best = Some(Arc::clone(r.value()));
             }
         }
-        best
+        // A held context of the namespace is used as is: the scoped one
+        // judges only where nothing held does.
+        best.or_else(|| {
+            self.scoped
+                .as_ref()
+                .filter(|s| name.has_prefix(s.namespace()))
+                .cloned()
+        })
     }
 
     /// The person's namespace `/user/<0xA1: …>` that `name` lies in, when

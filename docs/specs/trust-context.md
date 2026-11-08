@@ -1062,6 +1062,9 @@ ndn-rs:
   check that party's proof against it before anything of it is trusted
   (the data layer's introductions, ndn-link). It never makes the namespace
   trusted, and it refuses what §4.5.1 refuses.
+- `ScopedContext::new(genesis, newest)` is the one other value made from a
+  `Genesis`, with `adopt_genesis`'s checks: a namespace adopted for one
+  scope alone (§4.5.7). It enters no keyring.
 
 #### 4.5.5 Creating one
 
@@ -1233,6 +1236,42 @@ These are refused before anything is written:
    of any length after a recovery is still followed. A walk at a restart
    reads only the stored versions, with no network, at a cost of their
    number, not of the distance between versions.
+6. **A scope that leaks.** A namespace adopted for one scope (§4.5.7)
+   judges only through its view: the keyring never holds it, so every
+   other path — a forwarder's validation stage, another view, the
+   keyring's own `contexts()` — refuses it as note 4 says, and a held
+   context of the namespace always wins over it, never replaced. Where a
+   forwarder carries such a namespace in transit for the scope's holder,
+   it vouches for and caches none of it (data-layer.md §6.2, "Scope
+   leaks").
+
+#### 4.5.7 Adopted for one scope
+
+A holder may adopt a self-certifying namespace by name for one scope of
+its own alone — the data layer adopts every self-certifying writer a
+folder's members record lists, to judge that folder's data
+(data-layer.md §6.3) — without the node trusting it anywhere else.
+
+- The adoption is §4.5.3's (genesis fetched and checked, the newest
+  reached by continuity, a validating forwarder told to expect the
+  versions, the walk bounded as note 5 says), into no node keyring
+  (ndn-cert `adopt_scoped`, `ndn_identity::adopt_scoped_via_engine`). Its
+  result, a `ScopedContext`, holds the checked `Genesis` and the newest
+  version; a refresh moves it on only from the version held, by
+  continuity (`ScopedContext::moved_on` refuses an older version, another
+  of the same number, another namespace).
+- It judges through a view only: `Keyring::with_scoped_view` shares the
+  keyring's held contexts live and governs the scoped namespace's names
+  by the scoped context **only where no held context covers them**: a
+  context of that namespace the keyring holds, adopted before the view or
+  after, is used as is. `Validator::scoped_view` is a validator over such
+  a view, with the same certificate cache, fetcher and posture; the
+  validator it is made from, and every user of its keyring, keep refusing
+  the namespace (`PersonalNamespaceNotHeld`). Which packets a view judges
+  is the holder's rule (data-layer.md §6.3).
+- A certificate a view fetches enters the shared cache, where it vouches
+  for nothing by itself: every walk ends at the anchors of the context
+  judging the packet.
 
 ## 5. Versioning and continuity
 

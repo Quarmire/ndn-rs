@@ -219,6 +219,40 @@ impl Validator {
         }
     }
 
+    /// A validator that judges as this one does — the same certificate
+    /// cache, fetcher, chain depth and posture, over a live view of the
+    /// same keyring — and also judges the names of `scoped`'s person's
+    /// namespace by `scoped`'s context wherever this keyring holds none
+    /// ([`Keyring::with_scoped_view`]): for one scope of its holder's
+    /// (data-layer.md §6.3). This validator itself, and every other user of
+    /// its keyring (a forwarder's validation stage), keep refusing that
+    /// namespace as one not held. Expected-context admissions are this
+    /// validator's own and are not carried over. A certificate the view
+    /// fetches enters the shared cache, where it vouches for nothing by
+    /// itself: every walk ends at the anchors of the context judging the
+    /// packet.
+    pub fn scoped_view(&self, scoped: &crate::keyring::ScopedContext) -> Validator {
+        Self {
+            keyring: Arc::new(self.keyring.with_scoped_view(scoped)),
+            cert_cache: Arc::clone(&self.cert_cache),
+            max_chain: self.max_chain,
+            cert_fetcher: {
+                let cell = std::sync::OnceLock::new();
+                if let Some(f) = self.cert_fetcher.get() {
+                    let _ = cell.set(Arc::clone(f));
+                }
+                cell
+            },
+            verified_total: AtomicU64::new(0),
+            rejected_total: AtomicU64::new(0),
+            expectations: Default::default(),
+            expecting: Default::default(),
+            require_anchor: self.require_anchor,
+            refuse_without_anchors: self.refuse_without_anchors,
+            refused_certs: DashMap::new(),
+        }
+    }
+
     /// Verify each packet's signature against its signer's certificate —
     /// resolved from the cache or fetched, a self-signed certificate
     /// included — without walking the chain on to a trust anchor: the

@@ -26,6 +26,7 @@ use bytes::Bytes;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
+use ndn_security::ScopedContext;
 use ndn_tlv::{TlvReader, TlvWriter};
 use ndn_trust_envelope::TrustEnvelope;
 use sha2::{Digest, Sha256};
@@ -317,8 +318,17 @@ pub type Adopting<'a> = futures::future::BoxFuture<'a, Result<(), String>>;
 #[cfg(target_arch = "wasm32")]
 pub type Adopting<'a> = futures::future::LocalBoxFuture<'a, Result<(), String>>;
 
+/// The future of an [`Introducer::adopt_scoped`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type Scoping<'a> = futures::future::BoxFuture<'a, Result<ScopedContext, String>>;
+/// The future of an [`Introducer::adopt_scoped`].
+#[cfg(target_arch = "wasm32")]
+pub type Scoping<'a> = futures::future::LocalBoxFuture<'a, Result<ScopedContext, String>>;
+
 /// What the host does for introductions (`Config::introducer`): give this
-/// device's anchor link, and adopt another person's.
+/// device's anchor link, and adopt another person's — for the whole node,
+/// or for this device's data layer alone, to judge the data of the folders
+/// that list that person as a writer (spec §6.3).
 pub trait Introducer: Send + Sync {
     /// The signed trust-context Data of this device's namespace, whole, as
     /// the host adopted it (what an inline anchor link carries).
@@ -338,6 +348,50 @@ pub trait Introducer: Send + Sync {
     /// fork. With no network to fetch over, refuse, saying to join again
     /// once the person's devices are reachable.
     fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a>;
+
+    /// Adopt the self-certifying namespace `namespace` (`/user/<0xA1: …>`),
+    /// which a members record this layer holds lists as a writer, by name
+    /// for this data layer alone (spec §6.3): version 1 fetched and checked
+    /// as the genesis the name hashes, the newest reached from it
+    /// (`ndn_cert::adopt_scoped`, `ndn_identity::adopt_scoped_via_engine`);
+    /// `held`, the version the layer holds already, is refreshed from by
+    /// continuity instead. The namespace is adopted into no keyring the
+    /// node judges by: the node's forwarder, and every path but the layer's
+    /// judging of those folders, keep refusing it as a person's namespace
+    /// not held. From an `Ok` until [`release_scoped`](Self::release_scoped)
+    /// the host carries the namespace's Data to this device though its
+    /// forwarder cannot validate it — forwarded unvalidated to the Interests
+    /// pending for it and never cached (transit) — and routes its sync
+    /// group; the layer validates every packet itself. An error says why
+    /// not and what to do; the layer asks again later.
+    ///
+    /// The default refuses: a host that cannot fetch a namespace without
+    /// adopting it for the node, or cannot carry its Data in transit, says
+    /// so, and the folders' versions of that writer wait here until the
+    /// node adopts the namespace (an anchor link naming it).
+    fn adopt_scoped<'a>(
+        &'a self,
+        namespace: &'a Name,
+        held: Option<&'a ScopedContext>,
+    ) -> Scoping<'a> {
+        let _ = held;
+        Box::pin(async move {
+            Err(format!(
+                "this host adopts no namespace for one folder alone, so {namespace}, a writer in \
+                 a folder this device reads, is not trusted here: adopt {namespace} by name on \
+                 this device's node (an anchor link naming it), or run the device on a host \
+                 that adopts namespaces for a folder (spec §6.3)"
+            ))
+        })
+    }
+
+    /// No members record the layer holds lists `namespace` any more, or the
+    /// node now holds it: the host stops carrying its Data to this device
+    /// in transit. Called once for each namespace an
+    /// [`adopt_scoped`](Self::adopt_scoped) adopted.
+    fn release_scoped(&self, namespace: &Name) {
+        let _ = namespace;
+    }
 }
 
 // ---- records ----------------------------------------------------------------------------------

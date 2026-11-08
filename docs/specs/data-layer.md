@@ -1607,6 +1607,120 @@ A reader:
   seq its `Head`. A writer that does not answer is answered for by the
   devices that hold its newest root (§13.5): taken only at or above the
   head verified, under each device's own name, never by the root's
+**A malicious owner listing a victim's namespace.** An owner may list any
+person's `/user/<h>` as a writer of its folder (§6.3). Readers then adopt
+that namespace from its own genesis, so the only versions the folder
+accepts under it are versions that person's keys signed, and only in the
+owner's own folder, where the owner already decides who writes. Nothing
+of the victim's is vouched for elsewhere: not its own folders, not another
+owner's, not at any forwarder. What the owner can cost the readers is the
+adoption itself — a version 1, a pointer and a walk per record, bounded
+as every walk (trust-context.md §4.5.6 note 5) and at most
+`SCOPE_ASKS` (4) in flight per device — and a reader's forwarder carrying
+that namespace in transit meanwhile.
+
+**Scope leaks.** A namespace adopted for a folder judges only its own
+packets about that folder (§6.3), through a view of the device's validator
+that nothing else uses: the node's keyring never holds it, so the
+forwarder's validation, the node's other apps and the device's judgement
+of every other subject keep refusing it as a person's namespace not held
+(trust-context.md §4.5.6 note 4, §4.5.7). It makes the person no owner of
+anything at the reader — the owner rule (§3) reads held contexts only — so
+no members record of theirs is taken, nor a collection of theirs read. The
+one exposure is the transit that carries the namespace's Data to the
+device through a forwarder that cannot validate it: that forwarder
+vouches for none of it and caches none of it, as for any namespace in
+transit, so a local app that relies on its forwarder's validation instead
+of validating gets that namespace's Data with no verdict while it is
+carried. Apps that read a person's names validate them, as the data layer
+does.
+
+**Record churn.** An owner signing record after record makes every reader
+refresh each namespace the records list, once per record. A refresh is a
+walk from the version held (bounded as every walk), at most one in flight
+per namespace and `SCOPE_ASKS` (4) per device; records arriving meanwhile
+coalesce into the next. A record that drops and adds a writer again does
+not unsettle what is held: versions the cut keeps stay applied, the others
+wait for the record that admits them again (§6).
+
+**Stale walks.** A namespace adopted for a folder is as new as its last
+walk: a revocation or a recovery in a later version reaches the reader
+with the next record listing the namespace, or the next adoption (a
+restart adopts it again). Until then the reader judges that namespace's
+versions in the folder by the version it holds, as any holder of a
+context that has not yet refreshed (§8.3), and the owner can bring the
+refresh forward by signing a record. A reader holds such a namespace in
+memory only: a restart adopts it by name again from its genesis, a fresh
+adopter's check, which cannot tell two continuous branches apart
+(trust-context.md §4.5.6 note 1) — a thief's branch, if the only one the
+reader's network serves after the owner's recovery, is followed in that
+folder until the owner's line is reachable. A namespace the node holds is
+never taken from a walk of this kind.
+
+### 6.3 Members' namespaces, adopted for the folder — round 3
+
+Members of one folder read each other: a device reads, in a folder, what
+every writer the folder's records list writes there, when that writer's
+namespace is self-certifying (`/user/<h>`, trust-context.md §4.5), with no
+gesture beyond the owner's records.
+
+- **Adoption.** For each subject `S` — a folder, or a collection — whose
+  own record in force (owner-signed, taken as every record, §6, §6.1)
+  lists a writer prefix, or the prefix of a cut, under a person's
+  self-certifying namespace `P` that the device's node does not hold, the
+  device MUST adopt `P` by name for `S`: version 1 fetched and checked as
+  the genesis `P` hashes, the newest reached from it by the continuity
+  rule, with the bounds of every walk (trust-context.md §4.5.3, §4.5.6 note
+  5). The adoption is the host's (`Introducer::adopt_scoped`): over the
+  node's network, its forwarder told to expect the versions, and into no
+  keyring the node judges by (trust-context.md §4.5.7). A namespace the
+  node holds — an introduction or an anchor link adopted it — is not
+  adopted again: its held context judges, as it does everywhere.
+- **Scope.** The adopted context judges exactly `P`'s packets about `S`:
+  log entries of `S` and of every collection under it, with their pieces
+  and block entries; one-key heads of those collections; and the summary
+  roots, nodes and pages of `P`'s devices whose subject lies under `S` or
+  on the way to it (a prefix of `S`: the root of `S`'s namespace, the
+  folders above `S`). Every other packet of `P` — about another folder,
+  about a collection of `P`'s own, about the device's own collections — is
+  judged by the device's validator, which refuses it while `P` is not held
+  (trust-context.md §4.5.6 note 4). `P` is no namespace of a name here
+  (§3): a device of `P` owns nothing at the reader, so no members record
+  `P` signs is taken.
+- **Never replaces, never seen.** A context of `P` the node holds is used
+  as is: while it is held, adopted before the folder's or after, it judges
+  `P`'s names everywhere, and the folder's is released. The folder's is
+  never in the node's keyring: the forwarder, the node's other apps and the
+  device's every other judgement keep refusing `P` as a person's namespace
+  not held. Through a forwarder that cannot validate `P`, the host carries
+  `P`'s Data to the device in transit while `P` is adopted for a folder
+  (ndn-link.md §15.7): forwarded unvalidated to the Interests pending for
+  it, cached by no one; the device validates every packet itself.
+- **Records move.** As each subject's own record in force moves, the
+  namespaces it lists are read again: one a record newly lists is adopted;
+  one already adopted is refreshed by continuity from the version held
+  (never checked again from its genesis key), so a recovery or a
+  revocation reaches the reader with the record; one that no record in
+  force lists any more — neither as a writer nor by a cut — is released. A
+  record that drops a writer keeps it listed by the removal cut it must
+  carry (§6): the versions the cut keeps, bound to their bytes, stay
+  judged and applied; every other version of that writer in `S` is refused
+  `OutsideCut` by admission, whatever context still judges its signature.
+  So the device stops trusting a dropped writer for new versions in the
+  folder, and the cut governs the old ones.
+- **Cost and refusals.** A device has at most `SCOPE_ASKS` (4) adoptions
+  in flight; the rest wait their turn. One the host could not make is asked
+  again after 2 s, doubling to 64 s, and its refusal is reported with the
+  namespace, why and what to do (adopt the namespace on the node by an
+  anchor link naming it, or configure a host that adopts for a folder:
+  without `Config::introducer`, or with a host that adopts for the node
+  only, none is made). Meanwhile that writer's versions in `S` wait —
+  stale, never wrong — and are fetched once it is adopted (what it refused
+  is judged again, and the summaries of `S`'s namespace refreshed).
+- A writer namespace that is not self-certifying is unchanged: a reader
+  adopts it (an introduction, an anchor link) before it reads its
+  versions, and no record vouches for it.
+
   discovery name;
 - MUST refuse a root whose `Head` is lower than one it verified from that
   writer for `O`, or than the highest seq it holds of that writer under `O`
