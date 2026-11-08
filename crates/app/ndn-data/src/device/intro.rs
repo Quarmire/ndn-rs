@@ -30,13 +30,17 @@ use crate::layer::{ShareChange, Sharing};
 use crate::version::{Audience, Writer};
 use crate::wire::{self, LogName, Record, device_of, namespace_of, parse_log_name};
 
-/// How many times a join sends its ask (the same Interest each time, so a
-/// retry is answered from the inviter device's cache) before it says the
-/// inviter is not reachable.
-const ASK_TRIES: u32 = 4;
+/// How many times a join sends its ask (the same parameters each time, so a
+/// retry is answered from the answer the inviter device keeps for it) before
+/// it says the inviter is not reachable. On a lossy path about half of the
+/// exchanges fail (the faulty network of spec §18.1: a fifth of the packets
+/// lost each way, some held past the Interest's lifetime); eight sends leave
+/// about one join in two hundred unanswered, and an inviter really offline
+/// is reported after eight lifetimes.
+const ASK_TRIES: u32 = 8;
 
-/// How many times a join asks for the offer record.
-const OFFER_TRIES: u32 = 2;
+/// How many times a join asks for the offer record: as often as it asks.
+const OFFER_TRIES: u32 = ASK_TRIES;
 
 /// The longest certificate chain credentials carry, or are walked for.
 const CHAIN_MAX: usize = 8;
