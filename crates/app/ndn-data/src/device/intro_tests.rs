@@ -124,6 +124,7 @@ impl Introducer for Host {
             }
             let TrustEnvelope::Anchor {
                 namespace: Some(ns),
+                fingerprint,
                 context_data: Some(data),
                 ..
             } = link
@@ -138,8 +139,21 @@ impl Introducer for Host {
             let (ctx, _) = SignedTrustContext::open_received(&data)
                 .await
                 .map_err(|e| e.to_string())?;
-            self.validator.adopt_context(Arc::new(ctx));
-            Ok(())
+            // Held at this version or a newer one, rooted in the link's
+            // anchor: nothing to adopt (as the daemon's host answers).
+            let held = self.validator.keyring().held(&ns).is_some_and(|held| {
+                held.version() >= ctx.version()
+                    && held
+                        .anchors()
+                        .iter()
+                        .any(|a| Some(ndn_security::anchor_fingerprint(a.value())) == *fingerprint)
+            });
+            if held {
+                return Ok(());
+            }
+            self.validator
+                .adopt_context(Arc::new(ctx))
+                .map_err(|refused| refused.to_string())
         })
     }
 }
@@ -156,7 +170,7 @@ async fn start(
 ) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-    assert!(validator.adopt_context(Arc::clone(&person.ctx)));
+    validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
     let keys = match keys {
         Some(k) => k,
         None => {
@@ -324,6 +338,28 @@ async fn only_the_certificates_of_the_verified_chain_go_into_the_validator() {
     assert!(
         cache.get_valid(&key(&n("/bob/phone"))).is_some(),
         "the asker's own certificate was not cached"
+    );
+}
+
+/// Bob's phone asks with credentials carrying his namespace's version 1,
+/// whose key his version 2 — the one Alice's laptop holds — revokes. Its
+/// proof verifies under the context the credentials carry, but the device
+/// judges it by what it holds after its host's adoption: refused.
+#[tokio::test]
+async fn an_ask_by_a_key_the_held_version_revokes_is_refused() {
+    let (laptop, offer, secret) = alice(&[], None).await;
+    let bob = Person::new("/bob");
+    let bob_phone = start(&bob, "/bob/phone", None, &[], None).await;
+    let v2 = SignedTrustContext::hierarchical(n("/bob"))
+        .with_version(2)
+        .with_revocation(key(&n("/bob/phone")));
+    let anchor = bob.ctx.anchors().iter().next().unwrap().value().clone();
+    assert!(v2.add_anchor(anchor));
+    laptop.inner.validator.adopt_context(Arc::new(v2)).unwrap();
+    let got = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Conflict))),
+        "a key the held version revokes was answered {got:?}"
     );
 }
 

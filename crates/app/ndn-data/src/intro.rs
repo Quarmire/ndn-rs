@@ -238,7 +238,9 @@ pub enum IntroRefusal {
     /// under or over any namespace the inviter's device trusts, is one it
     /// trusts under another anchor, or is one no introduction brings (the
     /// root, a reserved or shared name: `IntroPolicy`): adopting it would let
-    /// one namespace speak for another.
+    /// one namespace speak for another. Also: the asker's credentials do
+    /// not hold under its namespace as the inviter's device trusts it (they
+    /// carry anchors it does not hold, or a key the held version revokes).
     Conflict,
     /// The inviter's namespace, judged by the joiner: it overlaps a
     /// namespace this device already trusts or is its own (equal under
@@ -280,7 +282,9 @@ impl std::fmt::Display for IntroRefusal {
             IntroRefusal::Conflict => f.write_str(
                 "your namespace overlaps the inviter's, or one the inviter's device trusts, or \
                  is one no introduction brings (the root, a reserved or shared name): join from \
-                 a device of a namespace of your own",
+                 a device of a namespace of your own; or your device's credentials do not hold \
+                 under your namespace as the inviter's device trusts it (an older version, or a \
+                 key a newer version revokes): renew this device's certificate and join again",
             ),
             IntroRefusal::InviterConflict { inviter, why } => write!(
                 f,
@@ -325,6 +329,14 @@ pub trait Introducer: Send + Sync {
     /// checked: `Ok` once this device's validator trusts the namespace; an
     /// error says why not. A host on a forwarder adopts through it, so the
     /// forwarder also validates and routes the namespace.
+    ///
+    /// A self-certifying namespace (`/user/<0xA1: …>`) not held is adopted
+    /// by name over the network (`ndn_cert::adopt_anchor_link`): its version
+    /// 1 fetched and checked against the name, the newest reached from it;
+    /// the context the link carries is never taken alone — a version 1 is
+    /// only compared with the fetched one, and a different one refused as a
+    /// fork. With no network to fetch over, refuse, saying to join again
+    /// once the person's devices are reachable.
     fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a>;
 }
 

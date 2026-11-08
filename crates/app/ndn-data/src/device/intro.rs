@@ -133,6 +133,8 @@ struct Opened {
     anchor: Certificate,
     /// The trust context's signed Data, as the credentials carry it.
     context: Bytes,
+    /// Their certificates.
+    certs: Arc<CertCache>,
     validator: Validator,
 }
 
@@ -148,16 +150,17 @@ async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
     let (ctx, anchor) = SignedTrustContext::open_received(&data).await.ok()?;
     let ctx = Arc::new(ctx);
     let keyring = Keyring::of_claim(Arc::clone(&ctx)).ok()?;
-    let cache = CertCache::new();
+    let certs = Arc::new(CertCache::new());
     for p in rest {
-        cache.insert(Certificate::decode(&Data::decode(p.clone()).ok()?).ok()?);
+        certs.insert(Certificate::decode(&Data::decode(p.clone()).ok()?).ok()?);
     }
-    let validator = Validator::with_keyring(Arc::new(keyring), Arc::new(cache), None, CHAIN_MAX)
+    let validator = Validator::with_keyring(Arc::new(keyring), Arc::clone(&certs), None, CHAIN_MAX)
         .refuse_without_anchors();
     Some(Opened {
         ctx,
         anchor,
         context: first.clone(),
+        certs,
         validator,
     })
 }
@@ -167,7 +170,28 @@ impl Opened {
     /// verifies by a chain of these certificates to this context's anchor
     /// (its schema obeyed, certificates valid now).
     async fn signer(&self, data: &Data) -> Option<(Name, [u8; 32])> {
-        match self.validator.validate_chain(data).await {
+        self.signer_by(&self.validator, data).await
+    }
+
+    /// [`Self::signer`], judged by `keyring` — this device's, once its host
+    /// adopted the namespace: by a chain of these certificates to an anchor
+    /// of the version it holds, under that version's schema and
+    /// revocations. A proof that verifies only under the context the
+    /// credentials carry (an older one, a key the held version revokes)
+    /// does not count.
+    async fn signer_held(&self, keyring: &Arc<Keyring>, data: &Data) -> Option<(Name, [u8; 32])> {
+        let held = Validator::with_keyring(
+            Arc::clone(keyring),
+            Arc::clone(&self.certs),
+            None,
+            CHAIN_MAX,
+        )
+        .refuse_without_anchors();
+        self.signer_by(&held, data).await
+    }
+
+    async fn signer_by(&self, validator: &Validator, data: &Data) -> Option<(Name, [u8; 32])> {
+        match validator.validate_chain(data).await {
             ValidationResult::Valid(safe)
                 if !matches!(safe.trust_path(), TrustPath::DigestSha256) => {}
             _ => return None,
@@ -937,6 +961,19 @@ impl Inner {
             self.release(offer).await;
             return Some(refuse(by, IntroRefusal::Conflict));
         }
+        // The proof again, judged by what this device now holds of the
+        // namespace: a key its held version revokes, shown with an older
+        // version, does not ask for it.
+        if opened
+            .signer_held(self.validator.keyring(), proof)
+            .await
+            .as_ref()
+            != Some(&by)
+        {
+            tracing::info!(%offer, namespace = %theirs, key = %by.0, "an ask refused as a conflict: its proof does not verify under the namespace as this device holds it (a key the held version revokes, or credentials older than it)");
+            self.release(offer).await;
+            return Some(refuse(by, IntroRefusal::Conflict));
+        }
         for c in opened.chain(&by.0, &theirs) {
             self.validator.cert_cache().insert(c);
         }
@@ -1324,6 +1361,23 @@ impl Device {
                     inviter,
                     why: "carries anchors its namespace, adopted from its genesis, does not \
                           hold"
+                        .into(),
+                },
+            });
+        }
+        // Its signatures again, judged by what this device now holds of
+        // the namespace: a key the held version revokes, shown with an
+        // older version, does not answer for it.
+        let keyring = inner.validator.keyring();
+        if theirs.signer_held(keyring, &signed).await != signer
+            || !by_device(&theirs.signer_held(keyring, &entry).await)
+        {
+            return Err(DataError::Introduction {
+                offer: offer.clone(),
+                why: IntroRefusal::InviterConflict {
+                    inviter,
+                    why: "answered with a key its namespace, as this device holds it, does not \
+                          certify (a key the held version revokes, or credentials older than it)"
                         .into(),
                 },
             });
