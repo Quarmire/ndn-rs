@@ -502,7 +502,8 @@ and which version of `C` inside it, held here, has a given implicit digest.
 - **Value** is the merged value, typed by the rule: named fields (what
   `/merge/yrs` merges into), or the rule's own encoding, which the program
   defining the rule decodes. The layer passes the applied versions it holds
-  back (members of a group waiting on another member, §5.5); the value
+  back (members of a group waiting on another member, §5.5, and versions
+  covered only by checkpoints the rule does not count, §5.2); the value
   leaves them out, while the rule's counting of every version still sees
   them (the layer's holding back never feeds back into the rule).
 - **Determinism.** The layer applies parents first (§5.2), and versions
@@ -623,12 +624,25 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   checkpoint (by its writer's seq), then what became ready; so a
   collection read anew from its versions applies its newest checkpoint and
   what came after it, whatever order they were held in. A version inside
-  the cover of a checkpoint applied here (the join of their `P(CP)`) counts
-  as its checkpoint counts: it leaves `not_counted` when the checkpoint
-  applies (`Change::Counted` if it was told not counted), and what the
-  rule later says of it is not told. The state, value and `not_counted`
-  are then the same whether a covered version was applied before its
-  checkpoint or never.
+  the cover of a checkpoint applied here (its `P(CP)`) counts exactly when
+  a checkpoint covering it counts: one no other checkpoint applied covers
+  counts as its rule counts it, one covered by others as this same test
+  says (a covered checkpoint is never applied by a collection read anew
+  from its newest checkpoint, so only uncovered ones decide). Covered by a
+  checkpoint that counts, a version leaves `not_counted`
+  (`Change::Counted` if it was told not counted); covered only by
+  checkpoints the rule does not count, it is not counted — listed in
+  `not_counted` with the reason ("covered by the checkpoint `<key>` seq
+  `<s>`, which its rule does not count: `<the rule's reason>`"), told
+  `Change::NotCounted`, and left out of the value (the layer passes it
+  back to the rule's value as held back, §5.1), whether the rule applied it
+  before or never. It follows its checkpoints' counting as
+  `counting_changed` moves it, told each time it changes; what the rule
+  says of the covered version itself is not told. The state, value and
+  `not_counted` are then the same whether a covered version was applied
+  before its checkpoint or never, and after a restart. A rule that would
+  not count a checkpoint should rather refuse it in its check: a
+  checkpoint not counted takes everything it covers out of the value.
 - A reader MUST NOT fetch the pieces (§13.1) of a version covered by a
   checkpoint it holds whole and checked. Release (§13.3) counts only a
   checkpoint applied here.
@@ -3446,6 +3460,7 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | Rule does not count a version | It is applied to the frontier, held, served and shown with why (`NotCounted`, `not_counted`), never dropped; when the rule counts it, watchers are told (`Counted`). | §5.2 |
 | Merge version's pieces missing | It waits as a missing parent, with what depends on it, while its pieces are fetched from the writer and the holders; covered by a checkpoint held whole and checked, its pieces are never fetched. | §5.2, §13.1 |
 | Member writes a bogus checkpoint | Applied alike everywhere as its writer's claim; the owner's removal cut withdraws it, and the versions it covered then apply. | §5.2, §6.2, §8 |
+| Checkpoint the rule does not count | What only such checkpoints cover is not counted, saying which checkpoint and why, and is out of the value, alike whether it was applied before the checkpoint or never and after a restart; a member's write the rule never counts stays not counted under her own checkpoint. It counts, and watchers are told, once a checkpoint covering it counts. | §5.2 |
 | Group member never arrives | The group stays incomplete: its members held and shown not counted, what depends on them waiting — stale, never wrong. | §5.5 |
 | Group member refused, or group malformed | No member counts, on every reader alike; members applied before are withdrawn in every collection (`Refusal::Group`); others' versions made over them stay counted. | §5.5 |
 | Two members, or a member and another entry, at one seq of a group, in collections of its folder | The group is malformed at every reader of the folder once it holds both (an entry kept `Forever`, or listed and pruned, or listed in a merge collection), whatever their order; one outside the folder, or kept to expire, changes nothing; the equivocation is reported. | §4, §5.5 |

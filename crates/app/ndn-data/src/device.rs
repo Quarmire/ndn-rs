@@ -610,11 +610,11 @@ struct Coll {
     /// stopped, as an index only. Its versions are loaded from the store,
     /// and its state built from them, on the first need ([`St::wake`]).
     dormant: Option<Dormant>,
-    /// Per writer, the highest seq inside the cover of a checkpoint applied
-    /// here (the join of their `P(CP)`, spec §5.2): a version inside it
-    /// counts as its checkpoint counts, and the rule's word on it is not
-    /// told. Cleared with the state.
-    covered: BTreeMap<Writer, u64>,
+    /// The checkpoints applied here and what they cover ([`Cover`], spec
+    /// §5.2): a version inside a cover counts as the checkpoints covering
+    /// it count, and the rule's word on it is not told. Cleared with the
+    /// state.
+    cover: Cover,
     /// The members held here of groups not yet complete, kept in the store
     /// (under [`parked_name`]) rather than in memory until their group is
     /// complete or refused (spec §5.5): what judging the group needs of
@@ -903,6 +903,23 @@ impl Coll {
         all.into_iter()
             .map(|(id, why)| (id.clone(), why.clone()))
             .collect()
+    }
+
+    /// The applied versions the value leaves out besides those its rule
+    /// does not count: members of groups held back ([`Self::excluded`]),
+    /// and versions only checkpoints not counted cover ([`Cover`]).
+    fn held_back(&self) -> std::borrow::Cow<'_, BTreeSet<VersionId>> {
+        let mut covered = self
+            .not_counted
+            .keys()
+            .filter(|id| self.cover.inside(id))
+            .peekable();
+        if covered.peek().is_none() {
+            return std::borrow::Cow::Borrowed(&self.excluded);
+        }
+        let mut all = self.excluded.clone();
+        all.extend(covered.cloned());
+        std::borrow::Cow::Owned(all)
     }
 
     /// Whether `id` is applied here: admitted, no longer pending, and —
@@ -1925,6 +1942,180 @@ fn past_frontier(v: &Version) -> Frontier {
     within
 }
 
+/// The checkpoints applied in a merge collection and what they cover
+/// (spec §5.2): a version inside the cover of one counts exactly when a
+/// checkpoint covering it counts — the rule's word on that checkpoint, or,
+/// for one itself covered, the same test — and the rule's word on the
+/// covered version itself is not told. A checkpoint covered by another is
+/// never applied by a state built from the newest checkpoint, so only the
+/// checkpoints no other covers decide: the same after a restart. Cleared
+/// with the state.
+#[derive(Clone, Default)]
+struct Cover {
+    /// Per writer, the highest seq inside the cover of any (the join of
+    /// their `P(CP)`).
+    join: BTreeMap<Writer, u64>,
+    /// Each checkpoint applied: its cover `P(CP)`, and why the rule does
+    /// not count it, if it does not.
+    checkpoints: BTreeMap<VersionId, (Frontier, Option<String>)>,
+    /// The checkpoints that count, as above.
+    counted: BTreeSet<VersionId>,
+}
+
+impl Cover {
+    /// Whether `id` lies inside the cover of a checkpoint applied.
+    fn inside(&self, id: &VersionId) -> bool {
+        self.join.get(&id.writer).is_some_and(|s| *s >= id.seq.0)
+    }
+
+    /// Checkpoint `id` applied, covering `cover`, counted as `counting`.
+    fn add(&mut self, id: &VersionId, cover: Frontier, counting: &Counting) {
+        for (w, s) in cover.iter() {
+            let j = self.join.entry(w.clone()).or_insert(0);
+            *j = (*j).max(s.0);
+        }
+        self.checkpoints
+            .insert(id.clone(), (cover, not_counted_why(counting)));
+        self.recompute();
+    }
+
+    /// The rule's counting of applied version `id` changed: whether it is
+    /// a checkpoint, so what it covers may count otherwise now.
+    fn recount(&mut self, id: &VersionId, counting: &Counting) -> bool {
+        let Some((_, why)) = self.checkpoints.get_mut(id) else {
+            return false;
+        };
+        *why = not_counted_why(counting);
+        self.recompute();
+        true
+    }
+
+    /// How version `id` counts by the checkpoints covering it: `None`
+    /// when none does; `Some(None)` counted; else why not.
+    fn counting(&self, id: &VersionId) -> Option<Option<String>> {
+        if !self.inside(id) {
+            return None;
+        }
+        let covering: Vec<&VersionId> = self
+            .checkpoints
+            .iter()
+            .filter(|(_, (cover, _))| cover.contains(id))
+            .map(|(k, _)| k)
+            .collect();
+        if covering.iter().any(|k| self.counted.contains(*k)) {
+            return Some(None);
+        }
+        // The newest of those no checkpoint covers names the reason: they
+        // are the ones a state built from the newest checkpoint applies.
+        let root = covering
+            .iter()
+            .rev()
+            .find(|k| !self.covered_by_other(k))
+            .or(covering.last());
+        let Some(k) = root else {
+            return Some(None);
+        };
+        Some(Some(match &self.checkpoints[*k].1 {
+            Some(why) if !self.covered_by_other(k) => format!(
+                "covered by the checkpoint {} seq {}, which its rule does not count: {why}",
+                k.writer.key(),
+                k.seq.0
+            ),
+            _ => format!(
+                "covered by the checkpoint {} seq {}, itself covered only by checkpoints its \
+                 rule does not count",
+                k.writer.key(),
+                k.seq.0
+            ),
+        }))
+    }
+
+    /// Whether another checkpoint applied covers checkpoint `k`.
+    fn covered_by_other(&self, k: &VersionId) -> bool {
+        self.checkpoints
+            .iter()
+            .any(|(o, (cover, _))| o != k && cover.contains(k))
+    }
+
+    /// The checkpoints that count: one no other covers, as its rule
+    /// counts it; one covered, when a checkpoint covering it counts.
+    fn recompute(&mut self) {
+        let mut counted: BTreeSet<VersionId> = BTreeSet::new();
+        loop {
+            let mut grew = false;
+            for (k, (_, why)) in &self.checkpoints {
+                if counted.contains(k) {
+                    continue;
+                }
+                let mut covering = self
+                    .checkpoints
+                    .iter()
+                    .filter(|(o, (cover, _))| *o != k && cover.contains(k))
+                    .peekable();
+                let counts = match covering.peek() {
+                    None => why.is_none(),
+                    Some(_) => covering.any(|(o, _)| counted.contains(o)),
+                };
+                if counts {
+                    counted.insert(k.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        self.counted = counted;
+    }
+}
+
+/// Why `counting` does not count, if it does not.
+fn not_counted_why(counting: &Counting) -> Option<String> {
+    match counting {
+        Counting::Counted => None,
+        Counting::NotCounted(why) => Some(why.clone()),
+    }
+}
+
+/// Count again by `cover` ([`Cover::counting`]) the applied versions
+/// among `ids` inside it — every applied version inside it when `None` —
+/// keeping `not_counted` as it says: each whose counting moved, with how
+/// it counts now (`None`: counted; else why not).
+fn recount_covered(
+    cover: &Cover,
+    not_counted: &mut BTreeMap<VersionId, String>,
+    versions: &BTreeMap<VersionId, Arc<HeldVersion>>,
+    pending: &BTreeSet<VersionId>,
+    ids: Option<Vec<VersionId>>,
+) -> Vec<(VersionId, Option<String>)> {
+    let ids: Vec<VersionId> = match ids {
+        Some(ids) => ids,
+        None => versions
+            .keys()
+            .filter(|id| cover.inside(id))
+            .cloned()
+            .collect(),
+    };
+    let mut moved = Vec::new();
+    for id in ids {
+        if pending.contains(&id) || !versions.contains_key(&id) {
+            continue;
+        }
+        let Some(now) = cover.counting(&id) else {
+            continue;
+        };
+        if not_counted.get(&id) == now.as_ref() {
+            continue;
+        }
+        match &now {
+            None => not_counted.remove(&id),
+            Some(why) => not_counted.insert(id.clone(), why.clone()),
+        };
+        moved.push((id, now));
+    }
+    moved
+}
+
 /// The past of a version as its rule sees it (spec §5.2): down
 /// ([`past_frontier`]) — the versions inside it not refused by their key —
 /// and, of those, the ones held here by the implicit digest of their packet:
@@ -2289,8 +2480,8 @@ struct Run<'a> {
     /// Pending versions found not whole ([`Coll::unwhole`]): not looked
     /// for again until their pieces arrive.
     unwhole: &'a mut BTreeSet<VersionId>,
-    /// The join of the covers of the checkpoints applied ([`Coll::covered`]).
-    covered: &'a mut BTreeMap<Writer, u64>,
+    /// The checkpoints applied and what they cover ([`Coll::cover`]).
+    cover: &'a mut Cover,
     out: Vec<Ran>,
 }
 
@@ -2640,10 +2831,7 @@ impl Run<'_> {
             }
             // What it covers counts as it counts, whether or not some of it
             // was applied before.
-            for (w, s) in past_frontier(&hv.version).iter() {
-                let c = self.covered.entry(w.clone()).or_insert(0);
-                *c = (*c).max(s.0);
-            }
+            self.cover.add(id, past_frontier(&hv.version), &counting);
         }
         let a = self.applied.entry(id.writer.clone()).or_insert(0);
         *a = (*a).max(id.seq.0);
@@ -2653,6 +2841,9 @@ impl Run<'_> {
             .as_deref_mut()
             .expect("a merge run")
             .counting_changed();
+        for (other, counting) in &changed {
+            self.cover.recount(other, counting);
+        }
         self.out.extend(
             changed
                 .into_iter()
@@ -3316,7 +3507,7 @@ impl St {
             _ => None,
         };
         coll.kinds.clear();
-        coll.covered.clear();
+        coll.cover = Cover::default();
         coll.unwhole.clear();
         let not_counted = std::mem::take(&mut coll.not_counted);
         // The groups of members told not counted: judged again once the
@@ -4019,7 +4210,7 @@ impl St {
             revoked,
             outsiders,
             unwhole,
-            covered,
+            cover,
             parked,
             ..
         } = coll;
@@ -4073,17 +4264,33 @@ impl St {
                 kinds,
                 outsiders,
                 unwhole,
-                covered,
+                cover,
                 out: Vec::new(),
             }
             .run();
             // Only what still waits is remembered not whole.
             unwhole.retain(|id| pending.contains(id));
             // A version a checkpoint applied covers counts as the
-            // checkpoint counts: what the rule says of it is not told, and
-            // it leaves `not_counted` (spec §5.2) — so the state is the same
+            // checkpoints covering it count ([`Cover`]): what the rule says
+            // of it is not told (spec §5.2) — so the state is the same
             // whether it was applied before the checkpoint or never.
-            let inside = |id: &VersionId| covered.get(&id.writer).is_some_and(|s| *s >= id.seq.0);
+            // Covers moved (a checkpoint applied, or its counting changed):
+            // everything inside them is counted again; else only what ran.
+            let moved = ran.iter().any(|r| match r {
+                Ran::Applied(id, _) | Ran::Counting(id, _) => cover.checkpoints.contains_key(id),
+                _ => false,
+            });
+            let ran_ids: Option<Vec<VersionId>> = (!moved).then(|| {
+                ran.iter()
+                    .filter_map(|r| match r {
+                        Ran::Applied(id, _) | Ran::Covered(id) | Ran::Counting(id, _) => {
+                            Some(id.clone())
+                        }
+                        Ran::Refused(..) => None,
+                    })
+                    .collect()
+            });
+            let inside = |id: &VersionId| cover.inside(id);
             for r in ran {
                 match r {
                     Ran::Applied(id, counting) => {
@@ -4129,6 +4336,7 @@ impl St {
                         }
                         refused.insert(hv.version.name.clone(), why);
                     }
+                    Ran::Counting(id, _) if inside(&id) => {}
                     Ran::Counting(id, counting) => {
                         let group = group_of(versions, &id);
                         if let Some(g) = group {
@@ -4148,7 +4356,7 @@ impl St {
                                 }
                             }
                             Counting::NotCounted(why) => {
-                                if not_counted.get(&id) != Some(&why) && !inside(&id) {
+                                if not_counted.get(&id) != Some(&why) {
                                     not_counted.insert(id.clone(), why.clone());
                                     if tell {
                                         changes.push((
@@ -4166,26 +4374,31 @@ impl St {
                     }
                 }
             }
-            let now_covered: Vec<VersionId> = not_counted
-                .keys()
-                .filter(|id| inside(id))
-                .cloned()
-                .collect();
-            for id in now_covered {
-                not_counted.remove(&id);
-                match group_of(versions, &id) {
-                    Some(g) => {
-                        touched.insert((id.writer.clone(), g));
-                    }
-                    None if !quiet.contains(&id) => changes.push((
+            for (id, now) in recount_covered(cover, not_counted, versions, pending, ran_ids) {
+                let group = group_of(versions, &id);
+                if let Some(g) = group {
+                    touched.insert((id.writer.clone(), g));
+                }
+                if group.is_some() || quiet.contains(&id) {
+                    continue;
+                }
+                changes.push(match now {
+                    None => (
                         Change::Counted {
                             collection: c.clone(),
                             id,
                         },
                         None,
-                    )),
-                    None => {}
-                }
+                    ),
+                    Some(why) => (
+                        Change::NotCounted {
+                            collection: c.clone(),
+                            id: id.clone(),
+                            why,
+                        },
+                        Some(id),
+                    ),
+                });
             }
         }
         // Why each member of a group not counted waits, told when it
@@ -5436,7 +5649,7 @@ impl St {
             return coll
                 .state
                 .as_ref()
-                .map(|s| (s.value(&coll.excluded), coll.not_counted_list()));
+                .map(|s| (s.value(&coll.held_back()), coll.not_counted_list()));
         }
         let mut state = rules.get(function)?.start(c, me);
         let mut versions = coll.versions.clone();
@@ -5448,7 +5661,7 @@ impl St {
         let mut skipped = coll.skipped.clone();
         let mut applied = BTreeMap::new();
         let mut kinds = HashMap::new();
-        let mut covered = BTreeMap::new();
+        let mut cover = Cover::default();
         let mut outsiders = coll.outsiders.clone();
         // A group's members inside `at` count as the group does now: all of
         // a complete one, none of a refused one, and none held back while
@@ -5486,7 +5699,7 @@ impl St {
             kinds: &mut kinds,
             outsiders: &mut outsiders,
             unwhole: &mut BTreeSet::new(),
-            covered: &mut covered,
+            cover: &mut cover,
             out: Vec::new(),
         }
         .run();
@@ -5513,14 +5726,21 @@ impl St {
                 _ => {}
             }
         }
-        // What a checkpoint covers counts as it counts (spec §5.2).
-        not_counted.retain(|id, _| covered.get(&id.writer).is_none_or(|s| *s < id.seq.0));
-        let excluded: BTreeSet<VersionId> = coll
+        // What a checkpoint covers counts as the checkpoints covering it
+        // count (spec §5.2), and leaves the value when they do not.
+        not_counted.retain(|id, _| !cover.inside(id));
+        let mut excluded: BTreeSet<VersionId> = coll
             .excluded
             .iter()
             .filter(|id| at.contains(id))
             .cloned()
             .collect();
+        for id in versions.keys().filter(|id| at.contains(id)) {
+            if let Some(Some(why)) = cover.counting(id) {
+                not_counted.insert(id.clone(), why);
+                excluded.insert(id.clone());
+            }
+        }
         for id in &excluded {
             if let Some((_, why)) = coll.group_held.get(id) {
                 not_counted.entry(id.clone()).or_insert_with(|| why.clone());
@@ -11401,6 +11621,12 @@ impl Inner {
         {
             let coll = st.colls.get_mut(&c).expect("members known");
             coll.kinds.insert(id.clone(), kind);
+            // An own checkpoint covers its past as any does (spec §5.2):
+            // what it covers counts as the checkpoints covering it count.
+            let mut moved = kind == OpKind::Checkpoint;
+            if moved {
+                coll.cover.add(&id, past_frontier(&version), &counting);
+            }
             if let Counting::NotCounted(why) = counting {
                 coll.not_counted.insert(id.clone(), why.clone());
                 if version.group.is_none() {
@@ -11413,6 +11639,11 @@ impl Inner {
                 }
             }
             for (other, counting) in changed {
+                moved |= coll.cover.recount(&other, &counting);
+                // The rule's word on a covered version is not told.
+                if coll.cover.inside(&other) {
+                    continue;
+                }
                 let group = coll
                     .versions
                     .get(&other)
@@ -11432,11 +11663,7 @@ impl Inner {
                             })
                     }
                     Counting::NotCounted(why) => {
-                        let inside = coll
-                            .covered
-                            .get(&other.writer)
-                            .is_some_and(|s| *s >= other.seq.0);
-                        (!inside && coll.not_counted.get(&other) != Some(&why)).then(|| {
+                        (coll.not_counted.get(&other) != Some(&why)).then(|| {
                             coll.not_counted.insert(other.clone(), why.clone());
                             Change::NotCounted {
                                 collection: c.clone(),
@@ -11450,33 +11677,31 @@ impl Inner {
                     told.push((change, other));
                 }
             }
-            // An own checkpoint covers its past as any does (spec §5.2):
-            // what it covers counts as it counts.
-            if kind == OpKind::Checkpoint {
-                for (w, s) in past_frontier(&version).iter() {
-                    let x = coll.covered.entry(w.clone()).or_insert(0);
-                    *x = (*x).max(s.0);
-                }
-                let inside: Vec<VersionId> = coll
-                    .not_counted
-                    .keys()
-                    .filter(|o| coll.covered.get(&o.writer).is_some_and(|s| *s >= o.seq.0))
-                    .cloned()
-                    .collect();
-                for other in inside {
-                    coll.not_counted.remove(&other);
-                    match coll.versions.get(&other).and_then(|hv| hv.version.group) {
-                        Some(g) => {
-                            touched.insert((other.writer.clone(), g.id));
-                        }
-                        None => told.push((
-                            Change::Counted {
-                                collection: c.clone(),
-                                id: other.clone(),
-                            },
-                            other,
-                        )),
+            if moved {
+                let recounted = recount_covered(
+                    &coll.cover,
+                    &mut coll.not_counted,
+                    &coll.versions,
+                    &coll.pending,
+                    None,
+                );
+                for (other, now) in recounted {
+                    if let Some(g) = coll.versions.get(&other).and_then(|hv| hv.version.group) {
+                        touched.insert((other.writer.clone(), g.id));
+                        continue;
                     }
+                    let change = match now {
+                        None => Change::Counted {
+                            collection: c.clone(),
+                            id: other.clone(),
+                        },
+                        Some(why) => Change::NotCounted {
+                            collection: c.clone(),
+                            id: other.clone(),
+                            why,
+                        },
+                    };
+                    told.push((change, other));
                 }
             }
         }
@@ -12485,7 +12710,7 @@ impl Inner {
                     name: state_name(c, &at),
                     collection: c.clone(),
                     at,
-                    value: state.value(&coll.excluded),
+                    value: state.value(&coll.held_back()),
                     not_counted: coll.not_counted_list(),
                 }))
             }

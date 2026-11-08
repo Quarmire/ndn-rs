@@ -49,9 +49,11 @@ impl Calls {
     }
 }
 
-/// Notes that count (`E`), notes held back (`N`, never counted), and a
+/// Notes that count (`E`), notes held back (`N`, never counted), a
 /// checkpoint (`C`) whose notes replace those of its past, keeping those
-/// concurrent to it; every start and apply counted in `calls`.
+/// concurrent to it, and one (`D`) the rule does not count until a release
+/// (`R`, a note that counts) is applied; every start and apply counted in
+/// `calls`.
 struct Counted {
     function: Name,
     calls: Arc<Calls>,
@@ -68,6 +70,9 @@ impl MergeRule for Counted {
             calls: Arc::clone(&self.calls),
             notes: Vec::new(),
             held: Vec::new(),
+            unreleased: BTreeSet::new(),
+            released: false,
+            changed: Vec::new(),
         })
     }
 }
@@ -76,6 +81,10 @@ struct CountedState {
     calls: Arc<Calls>,
     notes: Vec<(VersionId, String)>,
     held: Vec<(VersionId, String)>,
+    /// The `D` checkpoints applied while no release was.
+    unreleased: BTreeSet<VersionId>,
+    released: bool,
+    changed: Vec<(VersionId, Counting)>,
 }
 
 fn text(op: &Op<'_>) -> Result<String, MergeError> {
@@ -85,8 +94,8 @@ fn text(op: &Op<'_>) -> Result<String, MergeError> {
 impl MergeState for CountedState {
     fn check(&self, op: &Op<'_>) -> Result<OpKind, MergeError> {
         match op.bytes.first() {
-            Some(b'E' | b'N') => Ok(OpKind::Edit),
-            Some(b'C') => Ok(OpKind::Checkpoint),
+            Some(b'E' | b'N' | b'R') => Ok(OpKind::Edit),
+            Some(b'C' | b'D') => Ok(OpKind::Checkpoint),
             _ => Err(MergeError("not an operation of this rule".into())),
         }
     }
@@ -99,11 +108,24 @@ impl MergeState for CountedState {
                 self.held.push((op.id.clone(), text(op)?));
                 return Ok(Counting::NotCounted("held back".into()));
             }
-            Some(b'C') => {
+            Some(b'R') => {
+                self.notes.push((op.id.clone(), text(op)?));
+                self.released = true;
+                for id in std::mem::take(&mut self.unreleased) {
+                    self.changed.push((id, Counting::Counted));
+                }
+            }
+            Some(k @ (b'C' | b'D')) => {
                 self.notes.retain(|(id, _)| !op.past.contains(id));
                 self.held.retain(|(id, _)| !op.past.contains(id));
                 for t in text(op)?.split('\n').filter(|t| !t.is_empty()) {
                     self.notes.push((op.id.clone(), t.to_owned()));
+                }
+                if *k == b'D' && !self.released {
+                    self.unreleased.insert(op.id.clone());
+                    return Ok(Counting::NotCounted(
+                        "a checkpoint held back until a release".into(),
+                    ));
                 }
             }
             _ => return Err(MergeError("not an operation of this rule".into())),
@@ -111,11 +133,15 @@ impl MergeState for CountedState {
         Ok(Counting::Counted)
     }
 
+    fn counting_changed(&mut self) -> Vec<(VersionId, Counting)> {
+        std::mem::take(&mut self.changed)
+    }
+
     fn value(&self, excluded: &BTreeSet<VersionId>) -> Value {
         let notes: BTreeSet<&str> = self
             .notes
             .iter()
-            .filter(|(id, _)| !excluded.contains(id))
+            .filter(|(id, _)| !excluded.contains(id) && !self.unreleased.contains(id))
             .map(|(_, t)| t.as_str())
             .collect();
         Value::Rule(Bytes::from(
@@ -275,6 +301,95 @@ async fn after_a_restart_a_merge_state_is_built_on_first_need_from_its_newest_ch
         Value::Rule(Bytes::from_static(b"more\nother"))
     );
     assert!(dev.inner.st.lock().colls[&c].dormant.is_some());
+    dev.shutdown();
+}
+
+/// The ids `s` lists not counted.
+fn not_counted(s: &State) -> BTreeSet<VersionId> {
+    s.not_counted.iter().map(|(id, _)| id.clone()).collect()
+}
+
+/// A version a checkpoint covers counts as the checkpoints covering it
+/// count, and follows them (spec §5.2, round-2 review M1): covered only by
+/// one the rule does not count, it is not counted — and out of the value,
+/// whether it was applied before or never —, the same after a restart's
+/// lazy build; once the rule counts the checkpoint, it counts.
+#[tokio::test]
+async fn a_version_a_checkpoint_covers_counts_as_that_checkpoint_counts() {
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519(n("/alice/laptop/KEY/1")).unwrap();
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let calls = Arc::new(Calls::default());
+    let f = n("/alice/32=data/notes");
+    let a = f.clone().append("a");
+    let dev = start(&keys, &store, &calls).await;
+    dev.share_folder(
+        &f,
+        Share {
+            rule: Rule::Merge { function: n(RULE) },
+            writers: vec![n("/alice")],
+            readers: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut changes = dev.watch(&a, &Frontier::new()).await.unwrap();
+    let one = dev.put_op(&a, op(b'E', "one"), options()).await.unwrap();
+    let held = dev.put_op(&a, op(b'N', "held"), options()).await.unwrap();
+    let cp = dev.put_op(&a, op(b'D', "kept"), options()).await.unwrap();
+    let s = state(&dev, &a).await;
+    assert_eq!(
+        not_counted(&s),
+        BTreeSet::from([one.clone(), held.clone(), cp.clone()]),
+        "a version covered only by a checkpoint the rule does not count is not counted: {:?}",
+        s.not_counted
+    );
+    assert_eq!(
+        s.value,
+        Value::Rule(Bytes::new()),
+        "what a checkpoint not counted covers is out of the value, as the state says"
+    );
+    let told = group_tests::drain(&mut changes).await;
+    assert!(
+        !told
+            .iter()
+            .any(|c| matches!(c, Change::Counted { id, .. } if *id == held || *id == one)),
+        "no covered version is told counted while its checkpoint does not count: {told:?}"
+    );
+    let before = shown(&s);
+    dev.shutdown();
+    drop(dev);
+
+    let dev = start(&keys, &store, &calls).await;
+    assert_eq!(
+        shown(&state(&dev, &a).await),
+        before,
+        "the state built lazily from the newest checkpoint is the state before the restart"
+    );
+    let mut changes = dev.watch(&a, &Frontier::new()).await.unwrap();
+    let _ = group_tests::drain(&mut changes).await;
+    // The rule now counts the checkpoint: what it covers counts with it.
+    dev.put_op(&a, op(b'R', "go"), options()).await.unwrap();
+    let s = state(&dev, &a).await;
+    assert!(
+        s.not_counted.is_empty(),
+        "the checkpoint counts, and what it covers with it: {:?}",
+        s.not_counted
+    );
+    assert_eq!(s.value, Value::Rule(Bytes::from_static(b"go\nkept")));
+    let told = group_tests::drain(&mut changes).await;
+    for id in [&one, &held, &cp] {
+        assert!(
+            told.iter()
+                .any(|c| matches!(c, Change::Counted { id: x, .. } if x == id)),
+            "{id:?} is told counted as its checkpoint's counting changes: {told:?}"
+        );
+    }
+    let after = shown(&s);
+    dev.shutdown();
+    drop(dev);
+    let dev = start(&keys, &store, &calls).await;
+    assert_eq!(shown(&state(&dev, &a).await), after);
     dev.shutdown();
 }
 
