@@ -96,7 +96,11 @@
 //! What an announcement can cost is bounded. Each costs one
 //! fetch of the newest version, plus — when it does not follow from the
 //! held version — a walk of at most [`ndn_cert::MAX_CATCH_UP_VERSIONS`]
-//! positions that starts no fetch after [`ndn_cert::MAX_CATCH_UP_TIME`].
+//! positions (a self-certifying namespace's walk: the versions it reaches,
+//! each signed by an anchor of the one before, plus at most
+//! [`ndn_cert::MAX_CATCH_UP_MISSES`] positions it cannot use, whatever
+//! sequence number is announced) that starts no fetch after
+//! [`ndn_cert::MAX_CATCH_UP_TIME`].
 //! Retries of a member none of whose announced versions ever passed the
 //! continuity rule stop after [`UNPROVEN_TRIES`] tries, and at most
 //! [`UNPROVEN_PENDING`] such members wait at once; a member whose announced
@@ -236,7 +240,8 @@ pub struct Processed {
 /// from the one after the held version up to it is followed oldest first
 /// ([`follow_versions`]) — not only those from the update's low end, which
 /// says only what this member last heard, not which versions exist —
-/// fetching for [`MAX_CATCH_UP_TIME`] at most, as a refresh does. The newest
+/// fetching for [`MAX_CATCH_UP_TIME`] and [`ndn_cert::MAX_CATCH_UP_MISSES`]
+/// positions it cannot use at most, as a refresh does. The newest
 /// is adopted only if it passes
 /// [`open_context_update`] against the held version of its namespace —
 /// directly or through that walk — and [`Keyring::adopt_update_from`] (that
