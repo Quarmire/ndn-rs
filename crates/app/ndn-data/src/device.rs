@@ -3575,7 +3575,12 @@ impl St {
     /// refused ([`Self::unpark_group`]).
     fn park(&mut self, c: &Name, id: &VersionId) {
         // A member in pieces not held whole stays: its pieces are fetched
-        // as it waits ([`Self::wanted_pieces`]).
+        // as it waits ([`Self::wanted_pieces`]). So does one of a collection
+        // held here for its owner: a holder keeps, audits and leases
+        // exactly what it holds (spec §13.2).
+        if self.holding.contains_key(c) {
+            return;
+        }
         let Some(g) = self.colls.get(c).and_then(|x| {
             let hv = x.versions.get(id).filter(|hv| hv.opened)?;
             x.pending.contains(id).then_some(hv.version.group).flatten()
