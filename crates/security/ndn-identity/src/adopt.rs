@@ -20,8 +20,11 @@ use ndn_security::Keyring;
 
 use crate::engine_exchange::EngineExchange;
 
-/// Adopt the namespace `link` names into `keyring`, fetching the context
-/// through `engine` when the link carries only a fingerprint (see
+/// Adopt the namespace `link` names into `keyring`, fetching through
+/// `engine` whatever the adoption needs from the network
+/// ([`AnchorLink::fetches`]): the context of a link carrying only a
+/// fingerprint or a name, and the genesis chain of a self-certifying
+/// namespace not held whose inline context is a later version (see
 /// [`ndn_cert::adopt_anchor_link`] for the checks). The consumer face lives
 /// only for this call (its fetches are bounded by the Interest timeout).
 /// Persisting and publishing the adopted context are the caller's.
@@ -30,8 +33,8 @@ pub async fn adopt_anchor_link_via_engine(
     keyring: &Keyring,
     link: &AnchorLink,
 ) -> Result<LinkAdoption, AdoptError> {
-    if link.context_data.is_some() {
-        // Inline: no network, no consumer face.
+    if !link.fetches(keyring) {
+        // Inline and adopted from it alone: no network, no consumer face.
         return ndn_cert::adopt_anchor_link(keyring, None, &mut NoNetwork, link).await;
     }
     let validator = engine.validator();

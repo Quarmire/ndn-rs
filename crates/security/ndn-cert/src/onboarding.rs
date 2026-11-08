@@ -319,6 +319,29 @@ impl AnchorLink {
         matches!(self_certifying_digest(&self.namespace), Ok(Some(_)))
     }
 
+    /// Whether [`adopt_anchor_link`] of this link into `keyring` fetches
+    /// over the network: when the context is not inline, and when it is a
+    /// self-certifying namespace `keyring` does not hold whose inline
+    /// context is not its genesis (version 1) — such a namespace is taken
+    /// only from its genesis, so it is adopted by name
+    /// ([`crate::adopt_by_name`]): version 1 fetched, the newest reached
+    /// from it. A host binding the adoption to a network (an engine) gives
+    /// it one whenever this holds.
+    pub fn fetches(&self, keyring: &Keyring) -> bool {
+        self.context_data.is_none() || self.reached_from_genesis(keyring)
+    }
+
+    /// A self-certifying namespace `keyring` does not hold, its inline
+    /// context (if any) not its genesis: adopted by name from its genesis.
+    fn reached_from_genesis(&self, keyring: &Keyring) -> bool {
+        self.is_self_certifying()
+            && keyring.held(&self.namespace).is_none()
+            && self
+                .context_data
+                .as_ref()
+                .is_none_or(|d| crate::context_update::version_of(d) != Some(1))
+    }
+
     /// Read an anchor envelope: it must name a namespace and an expected
     /// fingerprint — none for a self-certifying namespace, whose name is the
     /// fingerprint of its genesis root — and an inline context must be the
@@ -460,13 +483,7 @@ pub async fn adopt_anchor_link<E>(
 where
     E: CaExchange + Send + ?Sized,
 {
-    if link.is_self_certifying()
-        && keyring.held(&link.namespace).is_none()
-        && link
-            .context_data
-            .as_ref()
-            .is_none_or(|d| crate::context_update::version_of(d) != Some(1))
-    {
+    if link.reached_from_genesis(keyring) {
         return crate::context_update::adopt_by_name(
             keyring,
             forwarder,

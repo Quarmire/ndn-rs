@@ -20,10 +20,10 @@ use ndn_cert::{
     AdoptError, AnchorLink, CaExchange, CatchUpStop, CertError, ContextRefresh, GenesisKey,
     MAX_CATCH_UP_VERSIONS, NamespaceInitError, NamespacePolicies, NewRootStore, OldRoot,
     PersistedNamespace, RecoveryPlan, RecoverySeed, RootStore, Unfetched, VersionSource,
-    add_recovery_anchor, adopt_by_name, anchor_fingerprint, bump_context_revoking, follow_versions,
-    init_namespace_in_pib_with, init_self_certifying_in_pib_with, load_persisted_contexts,
-    persist_adoption, rdr_metadata_name, recover_namespace_in_pib, recovery_anchor,
-    recovery_version, refresh_context, reissue_version,
+    add_recovery_anchor, adopt_anchor_link, adopt_by_name, anchor_fingerprint,
+    bump_context_revoking, follow_versions, init_namespace_in_pib_with,
+    init_self_certifying_in_pib_with, load_persisted_contexts, persist_adoption, rdr_metadata_name,
+    recover_namespace_in_pib, recovery_anchor, recovery_version, refresh_context, reissue_version,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name, NameComponent};
@@ -469,6 +469,62 @@ async fn the_name_survives_a_recovery_after_a_compromise() {
     assert_eq!(earlier, [1, 2, 3]);
     assert_eq!(fresh.version_of(&ns), Some(4));
     assert!(fresh.contexts()[0].is_anchor(&recovered.anchor.key_name()));
+}
+
+/// A link carrying a recovered self-certifying namespace's newest version
+/// inline (as an introduction's credentials carry it) is not enough for a
+/// device that does not hold the namespace: it is taken only from its
+/// genesis, so the adoption fetches — version 1, then the versions to the
+/// newest — and a host binding it to a network must give it one
+/// (`AnchorLink::fetches`). An inline genesis needs nothing fetched.
+#[tokio::test]
+async fn an_inline_later_version_of_a_namespace_not_held_is_reached_from_its_genesis() {
+    let alice = Root::new(&GenesisKey::generate().unwrap()).await;
+    let ns = alice.ns();
+    let seed = RecoverySeed::generate().unwrap();
+    let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
+    let v2 = add_recovery_anchor(alice.root().await.as_ref(), alice.genesis(), &kit)
+        .await
+        .unwrap()
+        .data;
+    let dir = tempfile::tempdir().unwrap();
+    let recovered = recover_namespace_in_pib(
+        &FilePib::new(dir.path()).unwrap(),
+        &v2,
+        &seed.signer(&ns),
+        "phone",
+        OldRoot::Compromised,
+        &[],
+        &[],
+        &NewRootStore::File,
+    )
+    .await
+    .unwrap();
+    let v3 = &recovered.version.bump.data;
+    let v4 = &recovered.root_version.data;
+    let inline = |data: &Data| AnchorLink {
+        namespace: ns.clone(),
+        expected_fingerprint: anchor_fingerprint(&recovered.anchor),
+        min_version: Some(open(data).version()),
+        context_data: Some(Data::decode(data.raw().clone()).unwrap()),
+    };
+
+    let fresh = Keyring::new();
+    assert!(!inline(alice.genesis()).fetches(&fresh));
+    let link = inline(v4);
+    assert!(link.fetches(&fresh));
+    let adopted = adopt_anchor_link(
+        &fresh,
+        None,
+        &mut Upstream::serving(&ns, &[alice.genesis(), &v2, v3, v4]),
+        &link,
+    )
+    .await
+    .unwrap();
+    assert!(adopted.fetched);
+    assert_eq!(fresh.version_of(&ns), Some(4));
+    // Held now: the same link moves it on by continuity alone, offline.
+    assert!(!link.fetches(&fresh));
 }
 
 /// The root moves to a P-256 key (as a YubiKey's PIV slot holds): a
