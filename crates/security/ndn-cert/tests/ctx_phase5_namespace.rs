@@ -48,8 +48,11 @@ fn ctx16_clockless_monotonic_version_and_single_use() {
         let c = SignedTrustContext::hierarchical(n("/home/bob")).with_version(ver);
         Arc::new(c)
     };
-    assert!(v.adopt_context(mk(2)), "v2 adopted");
-    assert!(!v.adopt_context(mk(1)), "older v1 refused with no clock");
+    v.adopt_context(mk(2)).expect("v2 adopted");
+    assert!(
+        v.adopt_context(mk(1)).is_err(),
+        "older v1 refused with no clock"
+    );
     assert_eq!(v.keyring().version_of(&n("/home/bob")), Some(2));
     v.keyring()
         .adopt_update(mk(3))
@@ -129,8 +132,8 @@ async fn init_envelope_adopt_persists_and_validates_after_reload() {
 
     // The adopting node only ever sees the scanned URI.
     let envelope = TrustEnvelope::from_uri(&uri).unwrap();
-    let (ctx, path) = adopt_envelope_into_store(node_dir.path(), &envelope).unwrap();
-    assert_eq!(ctx.namespace(), &ns);
+    let (adopted, path) = adopt_envelope_into_store(node_dir.path(), &envelope).unwrap();
+    assert_eq!(adopted.context.namespace(), &ns);
     assert!(path.starts_with(node_dir.path().join("contexts")));
 
     // The CA cert as published (signed by the root), and Data signed by a
