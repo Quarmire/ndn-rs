@@ -907,6 +907,38 @@ mod tests {
         assert!(matches!(err, CutManifestError::TwoDigests { seq: 3, .. }));
     }
 
+    /// A manifest built under another prefix has the same form, its
+    /// packets named `<prefix>/seg=<i>`, the root `seg=0`: its root names
+    /// it, and it lists exactly its entries.
+    #[test]
+    fn a_manifest_built_under_a_prefix_is_named_under_it() {
+        let prefix = n("/alice/laptop/32=log/alice/32=data/notes/seq=4/32=cut");
+        for per in [3, 2_000] {
+            let listed = entries(&["/bob/phone/32=log/alice/32=data/notes"], per);
+            let built = build_under(&prefix, &listed).unwrap();
+            for (i, wire) in built.packets.iter().enumerate() {
+                let data = Data::decode(wire.clone()).unwrap();
+                let last = data.name.components().last().unwrap().clone();
+                assert!(data.name.has_prefix(&prefix) && data.name.len() == prefix.len() + 1);
+                assert_eq!(
+                    last.as_segment(),
+                    Some(i as u64),
+                    "root seg=0, then each node"
+                );
+            }
+            let store = held(&built);
+            for (p, seq, digest) in &listed {
+                assert_eq!(
+                    store.lookup(&built.root, p, *seq),
+                    ManifestLookup::Listed(*digest)
+                );
+            }
+            // The same entries under another prefix: another root.
+            let elsewhere = build_under(&n("/alice/laptop/32=cut"), &listed).unwrap();
+            assert_ne!(elsewhere.root, built.root);
+        }
+    }
+
     /// A packet that is not DigestSha256-signed, or whose content breaks
     /// the canonical rules, is no manifest node.
     #[test]

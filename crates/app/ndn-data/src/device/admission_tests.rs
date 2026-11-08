@@ -100,7 +100,16 @@ async fn a_removed_writer_signing_a_kept_seq_again_in_another_collection_is_refu
         give(&owner, m);
     }
     owner.share_folder(&f, share(&["/alice"])).await.unwrap();
-    give(&other, &newest(&owner, &f));
+    let record = newest(&owner, &f);
+    // The reader holds the cut's manifest, as fetched by its full name.
+    for (name, packet) in owner
+        .inner
+        .store
+        .scan_under(&wire::cut_bytes_prefix(&record.name), 0)
+    {
+        other.inner.store.insert(name, packet);
+    }
+    give(&other, &record);
     for m in &kept {
         give(&other, m);
     }

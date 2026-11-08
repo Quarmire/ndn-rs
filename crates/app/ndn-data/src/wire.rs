@@ -3499,6 +3499,7 @@ mod tests {
                         };
                         a.insert(&n("/alice/32=data/notes"), &id);
                     }
+                    a.bind(&manifest_root(1, 5));
                     a
                 },
             }],
@@ -3649,6 +3650,7 @@ mod tests {
         let mut accept = Accepted::new();
         accept.insert(&plan, &bob(1));
         accept.insert(&notes, &bob(2));
+        accept.bind(&manifest_root(2, 1));
         let body = MembersBody {
             collection: f.clone(),
             folder: true,
@@ -3719,6 +3721,108 @@ mod tests {
         }
         // `CutIn` is critical: a reader that does not know it refuses.
         assert_eq!(tlv::CUT_IN % 2, 1);
+    }
+
+    /// The full name of the root of the cut manifest of `/alice/laptop`'s
+    /// members record of seq `seq` (spec §16.1), of digest `[d; 32]`.
+    fn manifest_root(seq: u64, d: u8) -> Name {
+        let record = log_name(&n("/alice/laptop"), Some(&n("/alice/32=data/notes")), seq);
+        cut_bytes_prefix(&record)
+            .append_segment(0)
+            .append_implicit_digest([d; 32])
+    }
+
+    #[test]
+    fn a_cut_names_the_manifests_binding_what_it_keeps_right_after_its_prefix() {
+        let c = n("/alice/32=data/notes");
+        let mut accept = Accepted::new();
+        for (key, seq) in [("/bob/phone/KEY/1", 3), ("/bob/laptop/KEY/1", 8)] {
+            let id = crate::VersionId {
+                writer: Writer::new(n(key)),
+                seq: Seq(seq),
+            };
+            accept.insert(&c, &id);
+        }
+        let (one, two) = (manifest_root(2, 1), manifest_root(3, 2));
+        accept.bind(&two);
+        accept.bind(&one);
+        let body = MembersBody {
+            collection: c.clone(),
+            folder: false,
+            revision: 3,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: Vec::new(),
+            cuts: vec![CutBody {
+                of: n("/bob"),
+                accept,
+            }],
+            epoch: None,
+            key_check: None,
+            since: None,
+            parent: Some(Parent {
+                revision: Seq(2),
+                digest: [1; 32],
+            }),
+        };
+        let Ok(Record::Members(back)) = decode_record(encode_members(&body)) else {
+            panic!("a record with a bound cut parses back");
+        };
+        assert_eq!(back, body);
+        let kept = &back.cuts[0].accept;
+        for key in ["/bob/phone/KEY/1", "/bob/laptop/KEY/1"] {
+            let roots: Vec<&Name> = kept.manifests(&c, &Writer::new(n(key))).collect();
+            assert_eq!(
+                roots,
+                [&one, &two],
+                "every manifest binds every key it keeps"
+            );
+        }
+        // A cut of hand-made fields, in a collection's record.
+        let record = |parts: &[&dyn Fn(&mut TlvWriter)]| {
+            let mut w = TlvWriter::new();
+            w.write_nested(tlv::MEMBERS_RECORD, |w| {
+                write_name(w, &c);
+                write_nni(w, tlv::REVISION, 1);
+                w.write_nested(tlv::RULE, |w| write_nni(w, tlv::RULE_KIND, 1));
+                w.write_nested(tlv::WRITERS, |w| write_name(w, &n("/alice")));
+                write_audiences(w, tlv::READERS, &[]);
+                w.write_nested(tlv::CUTS, |w| {
+                    w.write_nested(tlv::CUT, |w| {
+                        for part in parts {
+                            part(w);
+                        }
+                    })
+                });
+            });
+            w.finish()
+        };
+        let prefix = |w: &mut TlvWriter| write_name(w, &n("/bob"));
+        let bytes = |root: Name| {
+            move |w: &mut TlvWriter| w.write_nested(tlv::CUT_BYTES, |w| write_name(w, &root))
+        };
+        let pair = |w: &mut TlvWriter| {
+            w.write_nested(tlv::WRITER, |w| write_name(w, &n("/bob/phone/KEY/1")));
+            write_ranges(w, tlv::ENTRIES, &[(3, 3)]);
+        };
+        let (b1, b2) = (bytes(one.clone()), bytes(two.clone()));
+        assert!(decode_record(record(&[&prefix, &b1, &b2, &pair])).is_ok());
+        // Not right after the prefix: before it, or after what it keeps.
+        assert!(decode_record(record(&[&b1, &prefix, &pair])).is_err());
+        assert!(decode_record(record(&[&prefix, &pair, &b1])).is_err());
+        // Once each, ascending.
+        assert!(decode_record(record(&[&prefix, &b2, &b1, &pair])).is_err());
+        assert!(decode_record(record(&[&prefix, &b1, &b1, &pair])).is_err());
+        // A packet's full name, ending in its implicit digest.
+        let unnamed =
+            bytes(cut_bytes_prefix(&log_name(&n("/alice/laptop"), Some(&c), 2)).append_segment(0));
+        assert!(decode_record(record(&[&prefix, &unnamed, &pair])).is_err());
+        // A cut that keeps nothing binds nothing.
+        assert!(decode_record(record(&[&prefix])).is_ok());
+        assert!(decode_record(record(&[&prefix, &b1])).is_err());
+        // `CutBytes` is critical: a reader that does not know it refuses
+        // the record rather than take what the cut keeps unbound.
+        assert_eq!(tlv::CUT_BYTES % 2, 1);
     }
 
     #[test]

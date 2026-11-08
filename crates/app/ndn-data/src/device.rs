@@ -19579,6 +19579,84 @@ mod tests {
         r.dev.shutdown();
     }
 
+    /// A removal cut binds what it keeps to the bytes its manifest lists
+    /// (spec §8): a kept version is inside it only with exactly those
+    /// bytes, as every manifest binding its key lists them; a cut binding
+    /// no bytes (signed before cuts bound bytes) keeps nothing inside; and
+    /// while a manifest packet is not held — nor another packet under its
+    /// name taken for it — the version waits on it, by full name.
+    #[test]
+    fn a_kept_version_is_inside_a_removal_cut_only_with_the_bytes_its_manifest_lists() {
+        let c = n("/alice/32=data/trip/plan");
+        let id = VersionId {
+            writer: Writer::new(n("/bob/phone/KEY/1")),
+            seq: Seq(1),
+        };
+        let name = log_name(&n("/bob/phone"), Some(&c), 1);
+        let (honest, other) = ([1u8; 32], [2u8; 32]);
+        let manifest = |seq: u64, digest: [u8; 32]| {
+            let record = log_name(&n("/alice/laptop"), Some(&c), seq);
+            cut_manifest::build_under(
+                &wire::cut_bytes_prefix(&record),
+                &[(log_prefix(&name), 1, digest)],
+            )
+            .unwrap()
+        };
+        let built = manifest(4, honest);
+        let mut accept = Accepted::new();
+        accept.insert(&c, &id);
+        let unbound = Cut {
+            of: n("/bob"),
+            accept,
+            signer: Writer::new(n("/alice/laptop/KEY/1")),
+        };
+        let mut bound = unbound.clone();
+        bound.accept.bind(&built.root);
+        let held = CutManifests::new(16);
+        let store = MemoryStore::new();
+        let judge =
+            |cut: &Cut, digest: &[u8; 32]| bound_bytes(&held, &store, cut, &c, &id, &name, digest);
+        assert!(
+            matches!(judge(&unbound, &honest), Bound::Other),
+            "an unbound cut"
+        );
+        assert!(
+            matches!(judge(&bound, &honest), Bound::Missing(full) if full == built.root),
+            "waits on the root, by full name"
+        );
+        // Other bytes under the root's name are not taken for it.
+        let root_name = Name::from_components(
+            built.root.components()[..built.root.len() - 1]
+                .iter()
+                .cloned(),
+        );
+        store.insert(root_name.clone(), manifest(4, other).packets[0].clone());
+        assert!(
+            matches!(judge(&bound, &honest), Bound::Missing(_)),
+            "other bytes under the root's name"
+        );
+        store.insert(root_name, built.packets[0].clone());
+        assert!(matches!(judge(&bound, &honest), Bound::Listed));
+        assert!(
+            matches!(judge(&bound, &other), Bound::Other),
+            "other bytes at the kept seq"
+        );
+        // Two manifests binding one key: every one must list the bytes.
+        let disagreeing = manifest(5, other);
+        for wire in &disagreeing.packets {
+            let data = Data::decode(wire.clone()).unwrap();
+            held.insert(&data).unwrap();
+        }
+        let mut both = bound.clone();
+        both.accept.bind(&disagreeing.root);
+        for digest in [&honest, &other] {
+            assert!(
+                matches!(judge(&both, digest), Bound::Other),
+                "manifests disagree"
+            );
+        }
+    }
+
     /// `/sam/phone`, its key certified by `/sam`'s namespace key, writing
     /// into its log collection `/sam/32=data/notes`.
     struct OwnLog {
