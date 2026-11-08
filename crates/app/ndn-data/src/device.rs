@@ -6978,8 +6978,8 @@ fn unexpired(name: &Name) -> Option<Name> {
 /// Where the store keeps a group member held while its group is incomplete
 /// (`/localhost/ndn-data/parked/<log entry name>`, its value the packet):
 /// on disk, not in memory, until the group is complete or refused (spec
-/// §5.5). Not applied, so not stored under its own name; dropped at a
-/// restart, after which it is fetched again as any version not held.
+/// §5.5). Not applied, so not stored under its own name; read back at a
+/// restart as any held entry, and parked again while its group waits.
 fn parked_prefix() -> Name {
     "/localhost/ndn-data/parked".parse().expect("a valid name")
 }
@@ -7266,6 +7266,7 @@ impl Inner {
         let mut untrusted: HashMap<Name, String> = HashMap::new();
         let mut batched = Vec::new();
         let mut writers: HashMap<Name, Writer> = HashMap::new();
+        let mut parked = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if let Some(entry) = over(&verified_prefix(), &name) {
                 match decode_verified(&wire) {
@@ -7276,12 +7277,16 @@ impl Inner {
                 }
                 continue;
             }
-            // A group member parked while its group waited: not applied,
-            // so not held across a restart; fetched again when listed.
-            if over(&parked_prefix(), &name).is_some() {
-                self.store.remove(&name);
-                continue;
-            }
+            // A group member parked while its group waited (spec §5.5):
+            // verified when it was parked, so taken again as any held
+            // entry, and parked again while its group still waits.
+            let name = match over(&parked_prefix(), &name) {
+                Some(entry) => {
+                    parked.push(entry.clone());
+                    entry
+                }
+                None => name,
+            };
             if let Some(c) = over(&batched_prefix(), &name) {
                 if let Some((seq, batch)) = decode_batched(&wire) {
                     batched.push((c, seq, batch));
@@ -7539,7 +7544,29 @@ impl Inner {
                 tracing::debug!(%name, "a stored key that does not open, or does not match its epoch's key check; dropped");
             }
         }
+        // A collection with a member parked is built now rather than at its
+        // first need: a collection not built indexes what its store holds as
+        // applied, which a parked member is not; built, the member parks
+        // again as it is taken.
+        for c in parked.iter().filter_map(|e| parse_log_name(e)?.subject) {
+            st.wake(&c);
+        }
         take_all(&mut st, rest);
+        // A parked copy its member no longer parks under, once the member is
+        // stored under its own name (applied) or no longer held (refused,
+        // let go); a member held otherwise keeps its copy for the next start.
+        if !parked.is_empty() {
+            let still: BTreeSet<&Name> = st
+                .colls
+                .values()
+                .flat_map(|coll| coll.parked.values().map(|p| &p.name))
+                .collect();
+            for entry in parked.iter().filter(|e| !still.contains(e)) {
+                if !st.held.contains_key(entry) || self.store.get(entry).is_some() {
+                    self.store.remove(&parked_name(entry));
+                }
+            }
+        }
         for (c, seq, tomb) in tombs {
             if !wrote(&log_name(&self.device, Some(&c), seq)) {
                 continue;

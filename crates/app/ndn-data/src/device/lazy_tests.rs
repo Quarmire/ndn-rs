@@ -504,3 +504,55 @@ async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
     drop(st);
     dev.shutdown();
 }
+
+#[tokio::test]
+async fn a_parked_member_and_its_equivocation_outlive_a_restart() {
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519(n("/alice/laptop/KEY/1")).unwrap();
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let calls = Arc::new(Calls::default());
+    let (plan, budget, list) = (
+        n("/alice/32=data/trip/plan"),
+        n("/alice/32=data/trip/budget"),
+        n("/alice/32=data/home/list"),
+    );
+    let dev = start(&keys, &store, &calls).await;
+    for c in [&plan, &budget, &list] {
+        dev.share(c, group_tests::log_share()).await.unwrap();
+    }
+    let group = Group { id: 5, count: 2 };
+    let (a, b) = (bobs(&plan, 5, group), bobs(&budget, 6, group));
+    // Bob's second entry at seq 5, in another folder: equivocation.
+    let twin = group_tests::version("/bob/phone", &list, 5, &[], None);
+    give(&dev, &a);
+    give(&dev, &twin);
+    let five = group_tests::id("/bob/phone", 5);
+    assert!(dev.inner.st.lock().colls[&plan].parked.contains_key(&five));
+    dev.shutdown();
+    drop(dev);
+
+    // Nothing reaches the restarted device but the group's other member.
+    let dev = start(&keys, &store, &calls).await;
+    give(&dev, &b);
+    assert!(
+        group_tests::counts(&dev, &plan, &five)
+            && group_tests::counts(&dev, &budget, &group_tests::id("/bob/phone", 6)),
+        "the member parked before the restart is still held: its group completes without it \
+         being fetched again"
+    );
+    let mut changes = dev.watch(&list, &Frontier::new()).await.unwrap();
+    let seen = group_tests::drain(&mut changes).await;
+    // Which of the two was seen first depends on the order they were read
+    // back in; both are reported.
+    let pair = BTreeSet::from([a.name.clone(), twin.name.clone()]);
+    assert!(
+        seen.iter().any(|c| matches!(
+            c,
+            Change::Equivocation { collection, first, second }
+                if *collection == list
+                    && BTreeSet::from([first.name().clone(), second.name().clone()]) == pair
+        )),
+        "the equivocation is still reported after the restart: {seen:?}"
+    );
+    dev.shutdown();
+}
