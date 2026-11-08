@@ -157,7 +157,11 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   person's trust context — it verifies their entries with it — so the
   person's namespace is held wherever their data is used. Holding it is
   the person's gesture of pointing at someone (adopting their anchor
-  link); nothing else names people.
+  link); nothing else names people, with one exception: a self-certifying
+  writer an owner-signed members record lists is adopted by name for that
+  record's subject alone (§6.3) — the owner's gesture, judging the
+  writer's data there and nowhere else, and making it the namespace of no
+  name here.
 - Every packet a device signs MUST be named under `D`, so any forwarder's
   hierarchical schema admits it and Interests for it route to the device.
 
