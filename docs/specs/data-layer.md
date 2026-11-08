@@ -166,7 +166,12 @@ it is one of a group of versions counted all or none, its group (§5.5).
 - Two different entries of one key at one seq — in one collection or in
   two, of one kind or of two — are **equivocation** (invariant 2). A reader
   holding both keeps both and reports `Change::Equivocation` to the
-  watchers of each collection when both are versions; a group of the key
+  watchers of each collection when both are versions — to each
+  collection's watchers its own version whole and the other collection's
+  by name and id only (`Equivocal::Elsewhere`), never its content or
+  anything opened of it, so a watch of one folder learns nothing of
+  another folder's content — and lists it to every watch begun later
+  while both are held; a group of the key
   over that seq is malformed (§5.5). A cut accepts a seq only in the
   collection it lists it under (§6.1, §8, §8.1), so a removed or revoked
   key gains nothing by signing an accepted seq again elsewhere. An entry
@@ -882,8 +887,12 @@ in any arrival order.
   epoch. The member is listed not counted with why as before. Once the
   group is complete or refused its members are loaded and applied, or
   refused, together. A stalled group so costs a reader that index per
-  member, not the members. A parked member is not applied, so it is not
-  kept across a restart: it is fetched again as any version not held. A
+  member, not the members. A parked member is not applied, yet it was
+  verified as it was parked, so it is kept across a restart: read back from
+  its parked copy at start as any held entry, it parks again while its
+  group waits, and a stalled group is never fetched again for it. Its seq
+  is noted again as it is read back, so an equivocation it is part of is
+  kept and reported after the restart too (§4). A
   member in pieces not held whole stays in memory while its pieces are
   fetched, so does a member held sealed that this device cannot open (no
   key of its epoch held, §9), and so does a member of a collection held
@@ -2400,8 +2409,9 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   with the Interest `<H>/32=hold/<HoldAsk>`: the hold record's name, a
   fresh 16-octet `Nonce`, and `Asker`, `A`'s proof of asking — a Data
   packet `<A>/32=ask/<binding>` signed by `A`'s device key, `binding` the
-  SHA-256 of `H`'s Name TLV followed by the `HoldAsk` TLV without its
-  `Asker`. The proof binds the holder and this one ask, so it serves no
+  SHA-256 of the hold label (§16.1) followed by `H`'s Name TLV and the
+  `HoldAsk` TLV without its `Asker`. The proof binds the protocol, the
+  holder and this one ask, so it serves no
   other. A device holds only for the namespaces its host lists, and
   answers a hold ask only when, in this order: `C` is of such a namespace;
   the proof's key locator names the device that signed the hold record —
@@ -2438,7 +2448,8 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   not passed by the auditor's clock (§14.1), and each manifest node and
   chunk of it — and asks each with the Interest `<H>/32=audit/<AuditAsk>`
   (`Nonce`, 16 fresh random octets, the piece's name, and `Asker`, the
-  auditor's proof binding `H` and the ask as in §13.2). A manifest node the
+  auditor's proof binding `H` and the ask as in §13.2, under the audit
+  label, §16.1). A manifest node the
   auditor lacks, needed to list the chunks, it fetches from the writer or
   the holders, and at last asks of the audited holder itself through an
   audit ask, judged like any other.
@@ -2902,7 +2913,10 @@ uses the folder with the verbs as any member.
   summary the node it summarises (the watched name or one below it); an
   equivocation the collection it is told for — when the two entries at one
   seq are in two collections it is told once for each, tagged with each,
+  carrying its own version whole and the other by name and id only (§4),
   so a watcher of both gets it twice, once per collection. The listing
+  also reports the equivocation evidence held about what is watched,
+  whatever `F`. The listing
   reports what is applied, and, right after a version, `NotCounted` with
   why when the rule does not count it, and a group member waiting for its
   group as `NotCounted` alone (its version comes once the group counts); a
@@ -2918,6 +2932,32 @@ uses the folder with the verbs as any member.
   collection still to come: a host resuming a whole folder passes the
   empty frontier (its listing is local), or resumes collections one by one
   from their own frontiers.
+
+  A watch is never queued for without bound. Past what its listing
+  queued, a watcher may leave `Config::watch_queue` changes unread (4096
+  by default); the change after them is not queued: the queue's last slot
+  takes `Change::Lagged` (tagged with the watched name), and every change
+  after it is dropped until the watcher has read the queue empty, when
+  delivery goes on. The gap is so never silent: `Lagged` comes after every
+  change delivered before it, and tells the watcher to read again — watch
+  anew from the frontier it holds (the listing reports what it missed), or
+  `get` what it shows.
+
+  What a folder's watch follows is bounded by policy too. A writer outside
+  a namespace may make a device follow at most `Config::writer_collections`
+  collections of that namespace (1024 by default) by writing into a folder
+  the device follows: each new collection is counted to the writer whose
+  version or summary node first made the device follow it. The
+  namespace's own devices are not counted, nor is a collection followed by
+  its own name, held for its owner (§13.2) or with a members record of its
+  own. Past it, the writer's new collection is not followed — none of its
+  versions is fetched or taken from that writer — and the folder's
+  watchers are told `Change::Untracked` with the collection, the writer
+  and why, naming the writer and what to do: follow the collection by its
+  name to read it, or have the namespace remove the writer from the
+  folder's writers. The count is of what is held: read back at start, the
+  versions held count again (never refused), so a restart gives no writer
+  a fresh allowance.
 - **`snapshot(names)`** pins, for each name, the current state name of a
   merge collection or the exact name of a version, snapshot or entry, and
   signs the `SnapshotRecord`; a range name, which names no fixed set,
@@ -3055,10 +3095,15 @@ Every name parses one way, and a reader MUST refuse one that does not:
   log entry with a collection.
 - **Asker's proof.** `A` is the components before the first `32=ask`, a
   device name; one GenericNameComponent of 32 octets follows, the binding:
-  SHA-256 of the holder's Name TLV followed by the ask's TLV without its
-  `Asker` (§13.2); in an introduction, of the offering device's Name TLV
-  followed by the ask's fields before its `Asker`, or of the answer's
-  fields before its `Asker` (§19.3).
+  SHA-256 of the protocol's label, then the holder's Name TLV followed by
+  the ask's TLV without its `Asker` (§13.2, §13.3); in an introduction,
+  the offering device's Name TLV followed by the ask's fields before its
+  `Asker`, or the answer's fields before its `Asker` (§19.3). The labels,
+  ASCII each ending in a zero octet so none is a prefix of another, are
+  `ndn-data hold ask\0`, `ndn-data audit ask\0`, `ndn-data intro ask\0`
+  and `ndn-data intro answer\0`. A receiver computes the binding with the
+  label of the protocol it expects, so a proof made for one protocol
+  never verifies as another's, whatever its fields.
 - **Introduction ask.** `D` is the components before the first
   `32=intro`, a device name; exactly one ParametersSha256DigestComponent
   follows, the SHA-256 of the Interest's ApplicationParameters TLV, whose
@@ -3302,7 +3347,12 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
   rather than a signed Interest, so the existing validator and trust
   schema check it like any packet of `A`, and its key locator names the
   claimed asker before any signature is checked, which is what lets a
-  holder drop a stranger's ask for the cost of a parse.
+  holder drop a stranger's ask for the cost of a parse. Its binding opens
+  with a protocol label because every protocol's proofs share one name
+  shape and one key: without it, only the first TLV type of each
+  protocol's fields tells them apart, and a later protocol whose fields
+  happen to start alike would let one protocol's proof stand for
+  another's.
 - **Release by quarantine and a whole proof**, not a holder-specific
   encoding of the pieces: any encoding a holder can compute from its
   storage it can also compute from the plain pieces fetched from the
@@ -3484,7 +3534,7 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | A stored version gone or no longer decoding when a merge state is first built after a restart | It is no longer held: the state is built from the versions that read, and the lost one is fetched again where a summary lists it; versions after it wait for it — stale, never wrong: every verdict is the one the signed versions held give, as before the restart. | §5.2, §7 |
 | Device stops or loses power while a merge state is being built | Nothing is lost or changed: the build computes from the versions its store holds, each verdict a function of them; the next start indexes the collection again and its next need builds the same state. | §4.2, §5.2 |
 | A large group stalls (a member never arrives, or never opens here) | Its members held whole and opened wait in the store, each costing memory only its index (id, name, keep, seal, epoch); members in pieces, members sealed in an epoch whose key is not held here, and members of a collection held for its owner stay in memory. Each is listed not counted with why; what depends on them waits — stale, never wrong. | §5.5 |
-| Device restarts with group members parked | They are dropped at start — never applied, so nothing relied on them — and fetched again as any version not held, then parked again until the group completes or is refused; the verdict, a function of the group's signed members, is the same. | §5.5, §7 |
+| Device restarts with group members parked | They are read back from their parked copies at start, verified when parked, and parked again while the group waits: nothing of a stalled group is fetched again, a member whose writer is gone still completes its group, and an equivocation a parked member is part of is noted again and still reported. A parked copy whose member applied, was refused or was let go is dropped. | §4, §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back. | §5, §6.1 |
@@ -3496,6 +3546,9 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | Collection created under a watched folder, by this device or another writer | Reported on the folder's one watch with no further call, every change tagged with its collection; finding it costs the new branch only (the root, the nodes on the way, the folder node or its changed page, the new collection's node and entries), never a walk of the folder. | §7, §15 |
 | Version listed by a watch while it waits (for an earlier version, its group, its key, its pieces) | Not listed: it comes once it applies, so no watch is handed a version twice; a group member waiting is listed `NotCounted` with why. | §15 |
 | Folder watch resumed from a frontier joined across its collections | May skip a version of another collection still to come: a writer's versions come in seq order within a collection only. A host resumes a whole folder from the empty frontier (the listing is local) or each collection from its own frontier. | §15 |
+| Watcher reads slower than changes come | Its queue holds what its listing queued and `Config::watch_queue` changes more; then `Change::Lagged`, and every change after it is dropped until the watcher read the queue empty — memory bounded, the gap told in order, never silent. The watcher reads again from its frontier. | §15 |
+| Folder writer creates collection after collection | It makes a follower follow at most `Config::writer_collections` collections of a namespace outside its own; past it, its new collection is neither fetched nor taken, and the folder's watchers are told `Change::Untracked` naming the writer and what to do (follow the collection by name, or have the writer removed). Counted from what is held, so a restart grants no new allowance. | §15 |
+| Equivocation across two folders | Each collection's watchers are told with their own version whole and the other by name and id only: no watcher learns content of a collection it does not watch. | §4, §15 |
 | Reader that predates slice 6 | Refuses folder records and group members (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
 | Code stolen or forwarded | Admits whoever presents it first within its expiry, with its role; then one key only: every other is refused `Used` and gains nothing; the owner sees and removes the joiner as any member. | §19.4, §19.7 |
 | Ask replayed | Answered from the answer kept for it, bound to the asker's key: admits nobody new. | §19.4, §19.7 |
@@ -3686,8 +3739,10 @@ frontier, value and `not_counted` equal those before the restart; the
 untouched collections stay unbuilt, costing index entries only). ndn-data
 carries l1 as a unit test, its rule counting starts and applies
 (`device/lazy_tests.rs`), with a folder watch that builds only the
-collections holding versions past its `since`, and the parking of an
-incomplete group's members.
+collections holding versions past its `since`, the parking of an
+incomplete group's members, and parked members read back after a restart
+(the group completes with nothing fetched, and an equivocation a parked
+member is part of is still listed).
 
 The folder-watch case is w1 (a note of 1,000 paragraphs, one element
 collection each, under one folder shared by `share_folder` with a second
@@ -3703,9 +3758,14 @@ feature is `FolderWatch`. Focused tests in `ndn-data`'s
 `device/watch_tests.rs` hand a device crafted entries: a collection
 created under a watched folder delivers its version, a group member's
 `NotCounted` and `Counted`, and a cross-collection equivocation once per
-collection, each tagged; a watch lists a group member waiting as
-`NotCounted`, and a version waiting for an earlier one when the watch
-begins is delivered once, when it applies.
+collection, each tagged; an equivocation across two folders shows a
+watcher nothing of the other folder's content; a watch lists a group
+member waiting as `NotCounted`, and a version waiting for an earlier one
+when the watch begins is delivered once, when it applies; a watcher that
+falls behind is told `Lagged`, its queue bounded, and delivery goes on
+once it read the queue empty; and an outside writer past
+`writer_collections` is refused its next collection, told `Untracked`,
+which following the collection by name lifts.
 
 The storage durability cases (§4.2) run as cargo tests against both
 on-disk engines, fjall and redb, killing processes for real, not in the
@@ -3822,7 +3882,8 @@ a mistyped word).
    credentials (its namespace's signed trust context, as its host gives
    it, then its key's certificates up to that context's anchor) and its
    proof packet `<J>/32=ask/<binding>` signed by its key, the binding
-   SHA-256 of `D`'s Name TLV and the body's fields before it — sealed:
+   SHA-256 of the intro-ask label (§16.1), `D`'s Name TLV and the body's
+   fields before it — sealed:
    a fresh content key wrapped to the offer's `SealKey` and the body sealed
    under it, both binding `<D>/32=intro` (its Name TLV) as associated data
    (§9's primitives). Before sending, the joiner checks that its own
@@ -3837,8 +3898,9 @@ a mistyped word).
    credentials open (§19.4, step 5) to a context whose anchor fingerprint
    is the code's (whole, or its first half for words), whose namespace is
    the code's (when it names one) and a prefix of `D`; the inviter's proof
-   packet `<D>/32=ask/<binding>`, the binding SHA-256 of the answer's
-   fields before it, and the offer record are both signed by a key of `D`
+   packet `<D>/32=ask/<binding>`, the binding SHA-256 of the intro-answer
+   label (§16.1) and the answer's fields before it, and the offer record
+   are both signed by a key of `D`
    that chains to that anchor through those certificates; the offer's
    commitment is the code's secret's; the folder and role are the offer's.
 4. Has its host adopt the inviter's anchor (an inline anchor link of the
