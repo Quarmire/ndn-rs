@@ -1502,111 +1502,6 @@ never by prefix or by nearest version, and an unknown name answers
 record; changing it is a new revision that starts the collection again
 (`Since`, §6), and altering it in transit breaks the signature.
 
-## 7. Summary — slice 1 (listing by keep: slice 4)
-
-A writer's summary of a namespace `O` is its own log's index over `O`: a
-tree of **nodes**, one per name under `O` the writer wrote into (and every
-name on the way there). The tree runs from `O` through its marker: the
-root is the node of `O`, its one child the folder `O/32=data`, and below
-that one node per path component down to each collection
-`O/32=data/<path>`. A reader descends from a root only into the child
-`32=data`; any other child of a root names no data of `O`. Completeness is
-per writer: with many writers each publishes its own, and a reader gathers
-them from the devices it hears move (§12) — the members records it holds
-say which writers a collection gathers, of whichever namespace. A device's
-own log is complete to itself; a summary is for the others. Nothing signs a
-combined summary of many writers.
-
-A node of name `X` carries:
-
-- `Head`: the writer's highest seq in the subtree of `X`;
-- `Entries`: the seqs of the writer's versions directly in `X`, as ranges —
-  the seq → name mapping, since an entry's name is `<D>/32=log/<X>/seq=<n>`;
-  of a log or one-key collection, only those unexpired at the node's
-  reference date (listing by keep, below); of a merge collection, all;
-- `Expiry` (slice 4): of a log or one-key collection, bounds of the keeps of
-  the listed versions kept `Until` a date, in at most 64 runs, each a list
-  of seq ranges and a date no earlier than the keep of any version in it
-  (listing by keep, below);
-- `MembersEntries`: the seqs of its members records of `X`;
-- its children: for each next name component under `X` with entries in its
-  subtree, the child's component, `Head` and the implicit digest (SHA-256 of
-  the whole Data packet) of the child's node. A node with more than 64
-  children lists them on **pages** instead: 16 buckets by the first nibble
-  of SHA-256 over the child component's TLV, each a page node listing its
-  children, or (beyond 64 again) 16 sub-pages by the next nibble.
-
-A node's content is fixed by the writer's log up to its head, so one node
-name (`<D>/32=summary/<X>/seq=<head>`, a page
-`<D>/32=summary/<X>/32=page/<buckets>/seq=<head>`) has one packet. Inner nodes
-and pages are DigestSha256 packets; a reader MUST check each against the
-digest its parent lists. The **root**, the node of `O` itself, is the only
-signed one: `<D>/32=summary/<O>/32=root/seq=<head>`, signed by the device key,
-FreshnessPeriod 0 so that discovery always reaches the writer. A writer
-SHOULD sign a new root only when one is asked for and the tree changed. A
-one-key collection's node is also named by the collection's signed head
-(§5.3), one hop from the reader.
-
-**Listing by keep (slice 4).** A writer's node of a log or one-key
-collection `X` lists in `Entries` only its versions unexpired (§14.1) at
-the node's **reference date** `E`: the `Dated` of the writer's newest
-version in `X` up to the node's head. A version kept `Until(t)` is listed
-when `t > E`; one kept for the last `n` while fewer than `n` of the writer's
-later versions in `X` lie at or below the head; one kept `Forever`, always.
-`E` and those counts are fixed by the log up to the head, so one node name
-still has one packet, and a constant stream's node stays bounded by its
-keep window: 30 days at one block a minute is 43,200 seqs, within the
-65,536 a node may list. The writer's own clock moves only its own listing:
-it decides the dates, hence `E`, and nothing else of any reader.
-
-**Keep bounds (slice 4).** A writer that stops writing leaves `E` where it
-was, so its newest node keeps listing versions kept `Until` a date that has
-since passed by every holder's clock: the holders dropped them, and a reader
-that never held them could fetch them from no one and could not tell from
-the node that they expired. So the node also states, in `Expiry`, a bound
-of each such version's keep. The writer takes the listed versions kept
-`Until` a date in seq order; while the groups of consecutive ones with one
-keep number at most 64, each group is a run stating that keep, exact;
-beyond, they split in seq order into 64 runs of equal count (the last may
-hold fewer), each stating the latest keep in it. A version kept `Forever`
-or for the last `n` is in no run: the last-`n` listing already matches what
-holders keep, since a stopped writer writes no newer versions to end them.
-The runs are fixed by the log up to the head (the writer's tombstones keep
-each dropped version's keep, §14.1), so one node name still has one packet.
-
-A reader keeps, per collection and writer, the newest node it verified —
-its `Head`, `Entries` and `Expiry` — and does not wait (§5.2) for a seq of
-that writer at or below the `Head` that it does not hold and that either
-the node does not list (whether or not the reader ever learned the seq) or
-the node lists in a run whose date its own clock has reached. It does not
-fetch such versions. It reads again what waits when its clock reaches the
-earliest such date still ahead, with the expiry sweep of §14.1, and applies
-what became ready. A run's date is an upper bound: the reader stops waiting
-at most one run's span (its latest keep minus its earliest) after a
-version's own keep, and never before it, so nothing it applied or skipped
-depends on a date it was not given.
-
-A writer MUST serve every node and page that any root or head it signed
-lists, for as long as it holds the log entries that node lists — in slice 1
-a writer never drops its own entries, so always, across its own restarts
-too (prune, slice 3, and expiry, slice 4, drop entries, not nodes: the
-writer's tombstones keep each node's content, §14, §14.1). Keeping them
-costs no storage: a node's content is fixed by the log up to its head, so
-a superseded node is rebuilt from the log when asked for; a writer MAY
-keep recently superseded packets ready. A writer MUST answer an Interest
-for a summary name that none of its roots or heads listed with a Nack.
-Hence the time a reader's descent takes is bounded by the descent alone —
-its own fetches being answered — and never by how fast or how long the
-writer keeps putting.
-
-A reader:
-
-- discovers a writer's root with `<D>/32=summary/<O>/32=root` (CanBePrefix,
-  MustBeFresh), verifies it as a log entry is verified (§4), and checks
-  that its subject is `O`, its writer field its signing key and its name's
-  seq its `Head`. A writer that does not answer is answered for by the
-  devices that hold its newest root (§13.5): taken only at or above the
-  head verified, under each device's own name, never by the root's
 **A malicious owner listing a victim's namespace.** An owner may list any
 person's `/user/<h>` as a writer of its folder (§6.3). Readers then adopt
 that namespace from its own genesis, so the only versions the folder
@@ -1721,6 +1616,111 @@ gesture beyond the owner's records.
   adopts it (an introduction, an anchor link) before it reads its
   versions, and no record vouches for it.
 
+## 7. Summary — slice 1 (listing by keep: slice 4)
+
+A writer's summary of a namespace `O` is its own log's index over `O`: a
+tree of **nodes**, one per name under `O` the writer wrote into (and every
+name on the way there). The tree runs from `O` through its marker: the
+root is the node of `O`, its one child the folder `O/32=data`, and below
+that one node per path component down to each collection
+`O/32=data/<path>`. A reader descends from a root only into the child
+`32=data`; any other child of a root names no data of `O`. Completeness is
+per writer: with many writers each publishes its own, and a reader gathers
+them from the devices it hears move (§12) — the members records it holds
+say which writers a collection gathers, of whichever namespace. A device's
+own log is complete to itself; a summary is for the others. Nothing signs a
+combined summary of many writers.
+
+A node of name `X` carries:
+
+- `Head`: the writer's highest seq in the subtree of `X`;
+- `Entries`: the seqs of the writer's versions directly in `X`, as ranges —
+  the seq → name mapping, since an entry's name is `<D>/32=log/<X>/seq=<n>`;
+  of a log or one-key collection, only those unexpired at the node's
+  reference date (listing by keep, below); of a merge collection, all;
+- `Expiry` (slice 4): of a log or one-key collection, bounds of the keeps of
+  the listed versions kept `Until` a date, in at most 64 runs, each a list
+  of seq ranges and a date no earlier than the keep of any version in it
+  (listing by keep, below);
+- `MembersEntries`: the seqs of its members records of `X`;
+- its children: for each next name component under `X` with entries in its
+  subtree, the child's component, `Head` and the implicit digest (SHA-256 of
+  the whole Data packet) of the child's node. A node with more than 64
+  children lists them on **pages** instead: 16 buckets by the first nibble
+  of SHA-256 over the child component's TLV, each a page node listing its
+  children, or (beyond 64 again) 16 sub-pages by the next nibble.
+
+A node's content is fixed by the writer's log up to its head, so one node
+name (`<D>/32=summary/<X>/seq=<head>`, a page
+`<D>/32=summary/<X>/32=page/<buckets>/seq=<head>`) has one packet. Inner nodes
+and pages are DigestSha256 packets; a reader MUST check each against the
+digest its parent lists. The **root**, the node of `O` itself, is the only
+signed one: `<D>/32=summary/<O>/32=root/seq=<head>`, signed by the device key,
+FreshnessPeriod 0 so that discovery always reaches the writer. A writer
+SHOULD sign a new root only when one is asked for and the tree changed. A
+one-key collection's node is also named by the collection's signed head
+(§5.3), one hop from the reader.
+
+**Listing by keep (slice 4).** A writer's node of a log or one-key
+collection `X` lists in `Entries` only its versions unexpired (§14.1) at
+the node's **reference date** `E`: the `Dated` of the writer's newest
+version in `X` up to the node's head. A version kept `Until(t)` is listed
+when `t > E`; one kept for the last `n` while fewer than `n` of the writer's
+later versions in `X` lie at or below the head; one kept `Forever`, always.
+`E` and those counts are fixed by the log up to the head, so one node name
+still has one packet, and a constant stream's node stays bounded by its
+keep window: 30 days at one block a minute is 43,200 seqs, within the
+65,536 a node may list. The writer's own clock moves only its own listing:
+it decides the dates, hence `E`, and nothing else of any reader.
+
+**Keep bounds (slice 4).** A writer that stops writing leaves `E` where it
+was, so its newest node keeps listing versions kept `Until` a date that has
+since passed by every holder's clock: the holders dropped them, and a reader
+that never held them could fetch them from no one and could not tell from
+the node that they expired. So the node also states, in `Expiry`, a bound
+of each such version's keep. The writer takes the listed versions kept
+`Until` a date in seq order; while the groups of consecutive ones with one
+keep number at most 64, each group is a run stating that keep, exact;
+beyond, they split in seq order into 64 runs of equal count (the last may
+hold fewer), each stating the latest keep in it. A version kept `Forever`
+or for the last `n` is in no run: the last-`n` listing already matches what
+holders keep, since a stopped writer writes no newer versions to end them.
+The runs are fixed by the log up to the head (the writer's tombstones keep
+each dropped version's keep, §14.1), so one node name still has one packet.
+
+A reader keeps, per collection and writer, the newest node it verified —
+its `Head`, `Entries` and `Expiry` — and does not wait (§5.2) for a seq of
+that writer at or below the `Head` that it does not hold and that either
+the node does not list (whether or not the reader ever learned the seq) or
+the node lists in a run whose date its own clock has reached. It does not
+fetch such versions. It reads again what waits when its clock reaches the
+earliest such date still ahead, with the expiry sweep of §14.1, and applies
+what became ready. A run's date is an upper bound: the reader stops waiting
+at most one run's span (its latest keep minus its earliest) after a
+version's own keep, and never before it, so nothing it applied or skipped
+depends on a date it was not given.
+
+A writer MUST serve every node and page that any root or head it signed
+lists, for as long as it holds the log entries that node lists — in slice 1
+a writer never drops its own entries, so always, across its own restarts
+too (prune, slice 3, and expiry, slice 4, drop entries, not nodes: the
+writer's tombstones keep each node's content, §14, §14.1). Keeping them
+costs no storage: a node's content is fixed by the log up to its head, so
+a superseded node is rebuilt from the log when asked for; a writer MAY
+keep recently superseded packets ready. A writer MUST answer an Interest
+for a summary name that none of its roots or heads listed with a Nack.
+Hence the time a reader's descent takes is bounded by the descent alone —
+its own fetches being answered — and never by how fast or how long the
+writer keeps putting.
+
+A reader:
+
+- discovers a writer's root with `<D>/32=summary/<O>/32=root` (CanBePrefix,
+  MustBeFresh), verifies it as a log entry is verified (§4), and checks
+  that its subject is `O`, its writer field its signing key and its name's
+  seq its `Head`. A writer that does not answer is answered for by the
+  devices that hold its newest root (§13.5): taken only at or above the
+  head verified, under each device's own name, never by the root's
   discovery name;
 - MUST refuse a root whose `Head` is lower than one it verified from that
   writer for `O`, or than the highest seq it holds of that writer under `O`
