@@ -19,7 +19,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 
-use crate::version::{Content, Frontier, VersionId, Writer};
+use crate::version::{Content, Frontier, Timestamp, VersionId, Writer};
 
 /// Why an operation cannot be made or applied: refused for good.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -73,7 +73,8 @@ pub enum OpKind {
     /// A checkpoint: its operation stands for every version it was made
     /// over, so a reader applies it once those are held as signed records
     /// (applied or not, whole or not), and never applies them to the rule
-    /// afterwards.
+    /// afterwards: they reach it only as the basis of a version written
+    /// apart from the checkpoint ([`MergeState::basis`]).
     Checkpoint,
 }
 
@@ -106,6 +107,13 @@ pub struct Op<'a> {
     pub past: &'a dyn Past,
     /// The `MergeOp` octets.
     pub bytes: &'a [u8],
+    /// The version's signed `Dated`: its writer's clock when it signed, the
+    /// value its signature covers, so the same on every reader (spec §5.1).
+    /// A writer's claim: a rule ordering by time ("latest wins") reads it
+    /// rather than a time its operation carries beside it, bounds the order
+    /// it gives by the past (a version never loses to one made over it),
+    /// and never lets it decide a check.
+    pub dated: Timestamp,
 }
 
 /// A named merge function.
@@ -184,7 +192,37 @@ pub trait MergeState: Send {
     /// plus whatever concurrent versions were applied, whichever subset of
     /// its past was applied before. It is applied only once each of its
     /// parents is held here as the very packet it names (spec §5.2).
+    ///
+    /// The state after a checkpoint MUST NOT depend on whether the versions
+    /// it covers were applied before it (spec §5.2): applying it drops them
+    /// from the applied set. A covered version then counts for nothing on
+    /// its own — no value, no lock, no head, no alternative — and serves
+    /// only as what a version written apart from the checkpoint was made
+    /// over, exactly as one handed by [`Self::basis`].
     fn apply(&mut self, op: &Op<'_>) -> Result<Counting, MergeError>;
+
+    /// Take `op`, a version a checkpoint applied here covers, as the basis
+    /// of the versions made over it apart from that checkpoint (spec §5.2,
+    /// covered versions as a basis). The layer hands, before such a version
+    /// `W` applies, each covered version of `W`'s past (down to the
+    /// checkpoints applied inside it) that the state does not hold yet —
+    /// once, checked, with its own past — or later, when it arrives after
+    /// `W` applied without it. A basis is never counted, never listed in
+    /// [`Self::counting_changed`] and never shown: it only lets the rule
+    /// merge `W` against what `W` was made over. The state MUST be a
+    /// function of the versions applied that no checkpoint covers (each
+    /// with its past) and of the bases held for them: handing a basis after
+    /// the versions made over it gives the state handing it before gives,
+    /// and what changed counting is told by `counting_changed`. Without a
+    /// basis (gone everywhere after a release, spec §13.3) the rule merges
+    /// `W` against the checkpoint's state alone: its conflict handling.
+    /// Err: the rule cannot take it; the state MUST be left unchanged, and
+    /// the versions made over it merge as without it. A rule that keeps no
+    /// history (yrs: every operation an edit, no checkpoint) ignores it.
+    fn basis(&mut self, op: &Op<'_>) -> Result<(), MergeError> {
+        let _ = op;
+        Ok(())
+    }
 
     /// The applied versions, other than the one `apply` just answered for,
     /// whose counting changed since last asked, each with how it counts
@@ -549,6 +587,7 @@ mod tests {
             parents,
             past: &Nothing,
             bytes,
+            dated: Timestamp(0),
         }
     }
 

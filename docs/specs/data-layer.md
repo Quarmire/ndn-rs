@@ -457,9 +457,18 @@ state knows whose collection it is. The layer hands the state each
 operation as an `Op`: the version's id
 `(w, s)` — its writer, one key, and its seq —, the implicit digest of its
 packet (SHA-256 of the whole Data packet: the version's content address),
-its parents, its **past** and the `MergeOp` octets. The past is exactly
-`down(P(v))` (§5.2): the rule asks it whether a version id lies inside it,
-and which version of `C` inside it, held here, has a given implicit digest.
+its parents, its **past**, the `MergeOp` octets and — round 3 — its
+**signed date** (`Dated`, §4.1: its writer's clock when it signed). The past
+is exactly `down(P(v))` (§5.2): the rule asks it whether a version id lies
+inside it, and which version of `C` inside it, held here, has a given
+implicit digest. The date is the very value the version's signature
+covers, so every reader sees the same one: a rule that orders by time
+(ndf's "latest wins") reads it rather than a time its operation carries
+beside it. It is a writer's claim, as everywhere in the layer (display
+only, §4.1): a rule MAY order by it only where its order is bounded by the
+past (a version never loses to one made over it), never let it decide a
+check, and MUST treat it as any other field of the operation — the same
+on every reader.
 
 - **Owners** (ndn-data: `merge::owns(collection, writer)`). A writer `w`
   (key `<D>/KEY/<k>`) is an **owner device** of `C` exactly when `D` lies
@@ -500,6 +509,11 @@ and which version of `C` inside it, held here, has a given implicit digest.
   the state as it was before it; the layer keeps the version applied and
   not counted, with the reason (an own operation that fails is not
   written).
+- **Basis** (ndn-data: `MergeState::basis`, round 3) hands the state a
+  version a checkpoint applied here covers, which a version not covered
+  was made over (§5.2, covered versions as a basis): it is what that
+  version is merged against, never applied, counted, told or shown. A rule
+  that keeps no history of its own needs none, and ignores it.
 - **Made for one rule.** A merge version names the rule its operation was
   made for. A reader refuses one that names another rule than the one in
   force, or none — unless it lies inside the record's `since` (history) —
@@ -631,12 +645,102 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   held as the packet it names, so a checkpoint covers only what its writer
   applied. Every waiting version now inside `at` is **covered**: held,
   stored, delivered as a version, and never applied to the rule nor
-  checked. A version arriving later inside `at` is covered likewise. A
+  checked (it reaches the rule only as a basis, below). A version arriving
+  later inside `at` is covered likewise. A
   checkpoint planted in a log a removal cut later accepts gains nothing:
   the same check applies to it.
 - The rule MUST make applying `CP` yield the state of `down(P(CP))` with
   `CP`, plus the versions concurrent to it already applied, whichever
   subset of `down(P(CP))` it applied before.
+- **A checkpoint stands alone for what it covers — round 3.** A rule's
+  state after applying a checkpoint MUST NOT depend on whether the versions
+  it covers were applied before it: its value, which versions it counts
+  and why, and whatever it keeps (locks, alternatives, heads) are the same
+  on a device that applied `V1..Vn` before `CP` and on one that applied
+  `CP` first and never fetched them, for `CP` and for every version
+  applied after it, given the same bases (below). Applying `CP`, the rule
+  drops every version `CP` covers from its applied set: a covered version
+  counts for nothing on its own — it writes nothing into the value, takes
+  and lifts no lock, is no head and no alternative of a conflict — and no
+  version is judged against it, except as what a version written apart
+  from the checkpoint was made over (below). A version written apart from
+  `CP` over some of `V1..Vn` is then counted alike, for the same reason,
+  on both devices (conformance `b8`).
+- **Covered versions as a basis — round 3.** A version `W` that no
+  checkpoint applied here covers may be made over versions one covers:
+  its writer worked apart from the checkpoint. A rule merges `W` exactly
+  only against what it was made over, so before `W` applies the reader
+  hands the rule `W`'s **basis** (`MergeState::basis`, §5.1): every
+  version inside the cover of a checkpoint applied here that lies in
+  `down(P(W))` and in no `down(P(K))` of a checkpoint `K` applied here
+  inside `down(P(W))` — and, of each of those, its own basis by the same
+  rule — that the rule does not hold yet. A version the rule applied before
+  a checkpoint covered it serves as a basis as it is; nothing is handed
+  twice. Each is taken from what the reader holds:
+  - held whole — its operation inline in its record, which a reader holds
+    before it applies the checkpoint (above), or its pieces held — it is
+    opened, checked (one the check refuses is not handed: the check
+    answers from the `Op` alone, alike on every reader) and handed as an
+    `Op` with its own past;
+  - in pieces not held, its pieces are fetched from any holder (§13.1:
+    its writer, each holder of a live lease, each device whose version
+    held here is made over it — `W`'s writer among them, which applied it
+    whole before it wrote `W` — and any device holding it), and `W` waits
+    for them as for a parent's pieces; once 16 asks in a row (with the
+    missed-fetch backoff of §17.1) found them nowhere, `W` applies without
+    them — one lost packet is no evidence they are gone — and they are
+    handed whenever they arrive;
+  - held sealed in an epoch whose key the reader does not hold, it is
+    handed once the key arrives, and `W` does not wait for it.
+
+  The rule takes a basis only as what the versions made over it were made
+  over: it MUST NOT count it, list it in `counting_changed` or show it,
+  and handing it changes nothing else. Its state is a function of the
+  versions applied that no checkpoint covers (each with its past) and of
+  the basis held for them: a basis handed after the versions made over it
+  MUST give the state handing it before gives — what was made over it
+  merges again, and the counting that moves is told (`counting_changed`).
+  So `W` merges exactly on every device that holds its basis or can fetch
+  it: the reference rule replaces with `W`'s edit what the checkpoint
+  restated of what `W` was made over, and keeps what the checkpoint
+  changed beside (conformance `b9`).
+- **When a basis is gone.** Given no basis for a version `W` was made
+  over, a rule merges `W` against the checkpoint's state alone: its
+  conflict handling (the reference rule keeps `W`'s edit as an alternative
+  beside the checkpoint's statement; ndf's turns an edit that no longer
+  fits into a conflict carrying its words). This happens only after a
+  release. A merge collection is never pruned nor expired (§14, §14.1),
+  and a version's record — an inline operation with it — is never
+  released; only a large version's chunks leave a device, by release
+  (§13.3), which drops a device's own copy only once a covering checkpoint
+  is proved held, and never drops the basis of a version held there (§13.3,
+  step 6). `W`'s writer applied `W`'s basis whole and serves it, as does
+  every device that merged `W` exactly (§13.1). A basis is therefore gone
+  everywhere only once every device that held it whole released it, and a
+  reader knows it as it knows a missing piece: every holder it asks
+  answers without it, ask after ask (16 in a row, above). Every reader
+  then merges `W` without it alike; one
+  that finds it again (a holder returning) hands it, and its state moves
+  to the exact merge, with every other reader's as they find it too.
+- **Bound — round 3.** `W`'s writer chooses `P(W)`, so it chooses what
+  readers fetch as a basis: at most the versions inside the cover in
+  `down(P(W))` — signed versions of `C` that exist, each bound to its
+  packet by the parents' digests above and carrying at most `PAYLOAD_MAX`
+  (§13.1) — each fetched once per device and held after; at most 16 basis
+  versions of one collection are fetched at once (ndn-data:
+  `BASIS_FETCHES`), the next as one ends; and only for a version admitted
+  (signed by a key the record in force names a writer, §8).
+
+  **Threat note.** A member who writes over a frontier deep in the
+  history a checkpoint covers makes every reader that applied the
+  checkpoint first fetch and hold that history again — what a reader that
+  joined before the checkpoint fetched anyway, and no more: nothing outside
+  `C`, nothing its writer did not sign, nothing a reader does not verify
+  through the manifest. It cannot make a reader count a covered version,
+  nor change how any version counts beyond what an exact merge against its
+  own past gives. A holder withholding a basis delays the exact merge on
+  readers that can ask only it, as a withheld piece delays any version; it
+  cannot make readers differ once the basis reaches them.
 - **Newest first; what it covers counts as it counts.** In each pass a
   reader first applies, if one is pending and its past is held, the newest
   checkpoint (by its writer's seq), then what became ready; so a
@@ -662,8 +766,9 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   not count a checkpoint should rather refuse it in its check: a
   checkpoint not counted takes everything it covers out of the value.
 - A reader MUST NOT fetch the pieces (§13.1) of a version covered by a
-  checkpoint it holds whole and checked. Release (§13.3) counts only a
-  checkpoint applied here.
+  checkpoint it holds whole and checked, unless it is the basis of a
+  version that no checkpoint applied here covers (above). Release (§13.3)
+  counts only a checkpoint applied here.
 - **The past every reader sees.** `down(P)` holds the versions at or
   below `P` not refused by their key (a cut that does not list them, a key
   no writer, a revocation, an issuer no longer trusted): `Past::contains`
@@ -2550,7 +2655,9 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   the one its parent lists is dropped and fetched elsewhere.
 - **In a merge collection — slice 6.** A version in pieces is admitted,
   and its pieces fetched as above unless a checkpoint the reader holds
-  whole and checked covers it (§5.2). Until it is whole it waits as a
+  whole and checked covers it (§5.2) and no version that checkpoint does
+  not cover is made over it (a basis, §5.2: fetched then, at most 16 of a
+  collection at once). Until it is whole it waits as a
   missing parent does: later versions of its writer and versions naming it
   wait. Whole, it is opened (when sealed), checked and applied (§5.2).
 - Besides its writer and the holders, a reader asks for those pieces the
@@ -2724,6 +2831,15 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
      version's pieces hold back every later version of the collection
      (§13.1); a covering checkpoint proved held makes them unneeded by
      every reader that takes it.
+  6. *Round 3.* A merge version that a version held here is made over
+     apart from every checkpoint applied here covering it — the basis of
+     a version written apart from the checkpoint (§5.2) — is not released:
+     its chunks are kept, saying why ("the version `<key>` seq `<s>`,
+     written apart from the checkpoint covering it, is made over it: its
+     rule merges that version exactly only with it"). A device holding
+     such a version is never the one that lets its basis go, so a basis is
+     gone only once no device holding a version made over it held it
+     (§5.2, when a basis is gone).
 
 ### 13.4 What a holder can and cannot do
 
@@ -4048,7 +4164,14 @@ the lock arrives after the write, and starts on unlock),
 b4 (a 20 KiB operation and a 100 KiB checkpoint in one merge collection,
 in pieces, read and applied at another device; versions the checkpoint
 covers are not fetched), b5 (releasing merge pieces without a covering
-checkpoint proved held by audited holders is refused, saying why), g1 (a
+checkpoint proved held by audited holders is refused, saying why), b8 (a
+device that applied a checkpoint first, never fetching what it covers, and
+one that applied the covered versions before it count a version written
+apart from the checkpoint alike, for the same reason, and show the same
+value, also after an owner writes over it), b9 (a checkpoint written while
+another member works offline: back before any release, the member's edit
+merges exactly on every device, the device that applied the checkpoint
+first fetching the covered version it was made over, with no conflict), g1 (a
 group counted all or none on arrival, and withdrawn whole when one member
 is refused), g6 (a group with one member under a lock waits whole, each
 other member not counted with a reason naming that member and its
