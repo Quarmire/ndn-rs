@@ -632,32 +632,6 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
 - A reader MUST NOT fetch the pieces (§13.1) of a version covered by a
   checkpoint it holds whole and checked. Release (§13.3) counts only a
   checkpoint applied here.
-
-**Merge state across restarts: built lazily — slice 6.** At start a
-device restores only what it needs to publish and judge: its log and
-summaries, heads, records (members, holds, leases, prunes, cuts,
-introductions), groups, refusals, equivocation evidence, and per merge
-collection the index of the versions its store holds (ndn-data:
-`Coll::dormant`, each writer's seqs and the writers their parents name).
-A merge collection's state is not built then. It is built on the first
-need: a `get` of the collection, of a state name, version or entry of it;
-a `watch` of it; a `watch` of a folder over it, only when the collection
-holds a version past the watch's `since` (one to list — a collection
-wholly inside `since` stays unbuilt, and what arrives later builds it);
-`put`, `put_op` or `put_group` into it; `hold` or `release` of it; a
-version arriving for it; a group with a member in it being judged; a new
-members record over it; a revocation of a key that wrote in it. The build
-loads its versions from the store and applies them by the rules above —
-its newest checkpoint first, then the versions after it — so its state,
-frontier, value, `not_counted` and every verdict are those it had before
-the restart: each a function of the signed versions held, never of
-timing. Nothing else is persisted for it: the store holds, of other
-writers, only versions applied here (stored as they apply), and of this
-device every version it wrote; a check's verdict is a function of the
-operation alone, so refused versions, not stored, are fetched and refused
-again alike. Until built, the collection serves what its store holds of
-it as applied (§13.1). A collection nobody touches costs its index
-entries only.
 - **The past every reader sees.** `down(P)` holds the versions at or
   below `P` not refused by their key (a cut that does not list them, a key
   no writer, a revocation, an issuer no longer trusted): `Past::contains`
@@ -668,6 +642,39 @@ entries only.
   it): a rule finds no basis there and judges the operation as one whose
   basis is outside its past (it refuses it, or counts it without that
   basis, as it defines).
+
+**Merge state across restarts: built lazily — slice 6.** A merge
+collection's state is a function of the signed versions held (above), so
+a device need not build it at start; it builds it on first need, and the
+state it builds is the one it had before the restart.
+
+- **What start restores.** What the device needs to publish and judge:
+  its log and summaries, heads, records (members, holds, leases, prunes,
+  cuts, introductions), groups, refusals, equivocation evidence, and per
+  merge collection the index of the versions its store holds (ndn-data:
+  `Coll::dormant`, each writer's seqs and the writers their parents name).
+  No merge state is built then.
+- **What builds a state.** A `get` of the collection, of a state name,
+  version or entry of it; a `watch` of it; a `watch` of a folder over it,
+  only when the collection holds a version past the watch's `since` (one
+  to list — a collection wholly inside `since` stays unbuilt, and what
+  arrives later builds it); `put`, `put_op` or `put_group` into it; `hold`
+  or `release` of it; a version arriving for it; a group with a member in
+  it being judged; a new members record over it; a revocation of a key
+  that wrote in it.
+- **The build.** It loads the collection's versions from the store and
+  applies them by the rules above — its newest checkpoint first, then the
+  versions after it — so its state, frontier, value, `not_counted` and
+  every verdict are those it had before the restart: each a function of
+  the signed versions held, never of timing.
+- **Nothing more persisted.** The store holds, of other writers, only
+  versions applied here (stored as they apply), and of this device every
+  version it wrote; a check's verdict is a function of the operation
+  alone, so refused versions, not stored, are fetched and refused again
+  alike.
+- **Until built,** the collection serves what its store holds of it as
+  applied (§13.1). A collection nobody touches costs its index entries
+  only.
 
 ### 5.3 One key — slice 4
 
@@ -854,18 +861,20 @@ in any arrival order.
   would leave a reader that never held it unable to tell the group
   complete (§14.1).
 - **A reader's memory.** While a group waits — incomplete, or for a key, an
-  audience or a keep — a reader keeps each member it holds whole in its
-  store, not in memory (ndn-data: under
+  audience or a keep — a reader keeps each member it holds whole and
+  opened in its store, not in memory (ndn-data: under
   `/localhost/ndn-data/parked/<log entry name>`), and in memory only what
   judging the group reads of it: its id, name, keep, declared seal and
   epoch. The member is listed not counted with why as before. Once the
   group is complete or refused its members are loaded and applied, or
-  refused, together. A stalled group of 65,536 members so costs a reader
-  no memory per member. A parked member is not applied, so it is not kept
-  across a restart: it is fetched again as any version not held. A member
-  in pieces not held whole stays in memory while its pieces are fetched,
-  and so does a member of a collection held for its owner (§13.2): a
-  holder keeps, audits and leases exactly what it holds.
+  refused, together. A stalled group so costs a reader that index per
+  member, not the members. A parked member is not applied, so it is not
+  kept across a restart: it is fetched again as any version not held. A
+  member in pieces not held whole stays in memory while its pieces are
+  fetched, so does a member held sealed that this device cannot open (no
+  key of its epoch held, §9), and so does a member of a collection held
+  for its owner (§13.2): a holder keeps, audits and leases exactly what it
+  holds.
 - **Writing.** `put_group` (§15) signs its items under one lock at
   consecutive seqs of the device's log, each carrying the group; no other
   entry of that log comes between them. It refuses, and writes nothing — no
@@ -3350,6 +3359,10 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut.
 | Group member pruned | It counts as present for its group's verdict, alike at every reader (the prune record and the writer's summary say so): the group counts once every other member is present, and nothing counted is uncounted by the prune. | §5.5, §14 |
 | Group member that may expire | The group never counts and nothing of it is refused, at every reader: one holding the member and one that never learns of it both wait, so no reader applies the writer's later versions there and no honest writer builds on them. | §5.5, §6.2, §14.1 |
 | Group member its writer's node stops listing (store loss) | Nothing is refused: the group waits, and counts everywhere — with versions made over the member — once the node lists it again and it is fetched. | §5.5, §7 |
+| A stored version gone or no longer decoding when a merge state is first built after a restart | It is no longer held: the state is built from the versions that read, and the lost one is fetched again where a summary lists it; versions after it wait for it — stale, never wrong: every verdict is the one the signed versions held give, as before the restart. | §5.2, §7 |
+| Device stops or loses power while a merge state is being built | Nothing is lost or changed: the build computes from the versions its store holds, each verdict a function of them; the next start indexes the collection again and its next need builds the same state. | §4.2, §5.2 |
+| A large group stalls (a member never arrives, or never opens here) | Its members held whole and opened wait in the store, each costing memory only its index (id, name, keep, seal, epoch); members in pieces, members sealed in an epoch whose key is not held here, and members of a collection held for its owner stay in memory. Each is listed not counted with why; what depends on them waits — stale, never wrong. | §5.5 |
+| Device restarts with group members parked | They are dropped at start — never applied, so nothing relied on them — and fetched again as any version not held, then parked again until the group completes or is refused; the verdict, a function of the group's signed members, is the same. | §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back. | §5, §6.1 |
