@@ -725,6 +725,14 @@ impl Inner {
                 st.scopes
                     .adopted
                     .insert(ns.clone(), Adopted::Held { ctx, judge });
+                if refuses && from.is_some() {
+                    // After the new view is in force, as the keyring's own
+                    // revocation epoch moves (spec §20: signal runs a
+                    // revoked key or issuer certified are walked again).
+                    self.signals
+                        .scoped_revocations
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Some(refuses)
             }
             // Adopted after the last record listing it went: released.

@@ -4,21 +4,129 @@
 //! nothing else: nothing of a signal is stored, served or counted here.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 use ndn_security::cert_name::key_name_of;
-use ndn_security::sync_group;
+use ndn_security::safe_data::TrustPath;
+use ndn_security::{ValidationResult, sync_group};
+use parking_lot::Mutex;
 
 use super::{Device, Inner, St, bad_name};
 use crate::collection::{Epoch, Members};
 use crate::error::DataError;
 use crate::layer::Share;
-use crate::rt;
-use crate::signal::{SignalKey, SignalRefusal, SignalScope};
+use crate::rt::{self, Instant};
+use crate::signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};
 use crate::wire::{self, RUN_ID_LEN, device_of, parse_signal_run_name, signal_run_name};
+
+/// Run headers of one sender namespace that may wait for certificates at
+/// once (spec §20).
+pub const SIGNAL_FETCHES_PER_NAMESPACE: usize = 2;
+
+/// How long no certificate is fetched for a device's run headers again
+/// once a fetch for one of them brought none (spec §20).
+pub const SIGNAL_FETCH_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Certificates fetched for one run header at most: one chain.
+const SIGNAL_CHAIN_FETCHES: usize = 4;
+
+/// Size at which devices past their back-off are swept.
+const SIGNAL_BACKOFF_PRUNE_AT: usize = 1024;
+
+/// What the gate keeps between questions (spec §20): the certificate
+/// fetches run headers wait for, and what tells a transport that a trust
+/// context revoking keys was adopted.
+#[derive(Default)]
+pub(super) struct SignalGate {
+    fetches: Mutex<Fetches>,
+    /// Views adopted for a person's namespace (§6.3) replaced by a version
+    /// that refuses more ([`Device::signal_revocations`]).
+    pub(super) scoped_revocations: AtomicU64,
+}
+
+#[derive(Default)]
+struct Fetches {
+    /// Run headers waiting for certificates, per sender namespace.
+    waiting: HashMap<Name, usize>,
+    /// Devices no certificate is fetched for until then.
+    backoff: HashMap<Name, Instant>,
+}
+
+/// A sender namespace's place among the headers waiting for
+/// certificates, given back when dropped.
+struct FetchSlot<'a> {
+    gate: &'a SignalGate,
+    namespace: Name,
+}
+
+impl Drop for FetchSlot<'_> {
+    fn drop(&mut self) {
+        let mut f = self.gate.fetches.lock();
+        if let Some(n) = f.waiting.get_mut(&self.namespace) {
+            *n -= 1;
+            if *n == 0 {
+                f.waiting.remove(&self.namespace);
+            }
+        }
+    }
+}
+
+impl SignalGate {
+    /// A place for `sender`'s header among those waiting for certificates:
+    /// refused while its device backs off, or while its namespace has
+    /// [`SIGNAL_FETCHES_PER_NAMESPACE`] waiting.
+    fn fetch_slot(&self, sender: &SignalSender) -> Result<FetchSlot<'_>, SignalRefusal> {
+        let mut f = self.fetches.lock();
+        let now = Instant::now();
+        if let Some(until) = f.backoff.get(&sender.device).copied() {
+            if now < until {
+                return Err(SignalRefusal::Unverified {
+                    key: sender.key.clone(),
+                    why: format!(
+                        "a certificate a header of {} needed could not be had a moment ago, and \
+                         none is fetched for that device for {} s after",
+                        sender.device,
+                        SIGNAL_FETCH_BACKOFF.as_secs()
+                    ),
+                });
+            }
+            f.backoff.remove(&sender.device);
+        }
+        let waiting = f.waiting.entry(sender.namespace.clone()).or_default();
+        if *waiting >= SIGNAL_FETCHES_PER_NAMESPACE {
+            return Err(SignalRefusal::Unverified {
+                key: sender.key.clone(),
+                why: format!(
+                    "{SIGNAL_FETCHES_PER_NAMESPACE} run headers of {} wait for certificates here \
+                     already",
+                    sender.namespace
+                ),
+            });
+        }
+        *waiting += 1;
+        Ok(FetchSlot {
+            gate: self,
+            namespace: sender.namespace.clone(),
+        })
+    }
+
+    /// A fetch for a header of `device` brought no certificate: none is
+    /// fetched for it for [`SIGNAL_FETCH_BACKOFF`].
+    fn backoff(&self, device: &Name) {
+        let mut f = self.fetches.lock();
+        let now = Instant::now();
+        if f.backoff.len() >= SIGNAL_BACKOFF_PRUNE_AT {
+            f.backoff.retain(|_, until| now < *until);
+        }
+        f.backoff.insert(device.clone(), now + SIGNAL_FETCH_BACKOFF);
+    }
+}
 
 impl Device {
     /// What this device may do with signals over `scope`, a folder or a
@@ -92,16 +200,20 @@ impl Device {
         ))
     }
 
-    /// Admit another device's signal run header for `scope` (spec §20): its
+    /// The signer of another device's signal run header for `scope`, if it
+    /// is a member, before anything about it is verified (spec §20): its
     /// name is `<device>/32=signal/<scope>/32=run/<16 octets>`, `device`
-    /// the device of the key its KeyLocator names; it verifies by this
-    /// device's validator (for a member's self-certifying namespace adopted
-    /// for the folder, the view adopted for it, §6.3; certificates fetched
-    /// as for versions; a revoked key refused); and its key is a member of
-    /// `scope` by the record in force now ([`Self::signal_member`]). The
-    /// signer's key name when admitted. The header is not kept, served nor
-    /// counted as a version.
-    pub async fn signal_admit(&self, scope: &Name, header: &Data) -> Result<Name, SignalRefusal> {
+    /// the device of the key its KeyLocator names (`Malformed` otherwise);
+    /// a record over `scope` is held (`NotReady` otherwise); and that key
+    /// is a member of `scope` by the record in force now (`NotMember`
+    /// otherwise; `BadSignature` for a key the trust context governing it
+    /// revokes). Synchronous and offline: a transport asks it before it
+    /// spends anything on the header. Nothing is verified.
+    pub fn signal_sender(
+        &self,
+        scope: &Name,
+        header: &Data,
+    ) -> Result<SignalSender, SignalRefusal> {
         let malformed = |why: String| SignalRefusal::Malformed {
             scope: scope.clone(),
             why,
@@ -129,23 +241,75 @@ impl Device {
             )));
         }
         let inner = &self.inner;
-        if inner.st.lock().record_in_force(scope).is_none() {
+        let st = inner.st.lock();
+        let Some(m) = st.record_in_force(scope) else {
             return Err(SignalRefusal::NotReady {
                 scope: scope.clone(),
                 why: NO_RECORD.into(),
             });
+        };
+        match inner.signal_member_by(&st, &m, scope, &key) {
+            Ok(()) => {}
+            Err(NotMember::Unlisted) => {
+                return Err(SignalRefusal::NotMember {
+                    scope: scope.clone(),
+                    key,
+                });
+            }
+            Err(NotMember::Revoked) => return Err(SignalRefusal::BadSignature { key }),
         }
-        if let Err(why) = inner.verify(header).await {
-            tracing::debug!(%scope, %key, ?why, "signal run header refused: it does not verify");
-            return Err(SignalRefusal::BadSignature { key });
-        }
-        if !self.signal_member(scope, &key) {
+        let namespace = inner.group_namespace_of(&st, &run.device);
+        Ok(SignalSender {
+            namespace: match namespace.is_empty() {
+                true => run.device.clone(),
+                false => namespace,
+            },
+            device: run.device,
+            key,
+        })
+    }
+
+    /// Admit another device's signal run header for `scope` (spec §20):
+    /// its signer is a member ([`Self::signal_sender`], asked first, so a
+    /// stranger's header costs nothing more), and it verifies by this
+    /// device's validator (for a member's self-certifying namespace
+    /// adopted for the folder, the view adopted for it, §6.3) by the
+    /// **live** rule: its certificates valid now, a revoked key refused.
+    /// The chain is walked from the certificates held first; one not held
+    /// is fetched only while fewer than 2 headers of the signer's namespace
+    /// wait for certificates, and not for a device whose last fetch brought
+    /// none within 30 s (`Unverified` otherwise: ask again when the header
+    /// rides again). Its signer is a member still once it verified.
+    /// The header is not kept, served nor counted as a version.
+    pub async fn signal_admit(
+        &self,
+        scope: &Name,
+        header: &Data,
+    ) -> Result<SignalSender, SignalRefusal> {
+        let sender = self.signal_sender(scope, header)?;
+        self.inner.signal_verify(&sender, header).await?;
+        if !self.signal_member(scope, &sender.key) {
             return Err(SignalRefusal::NotMember {
                 scope: scope.clone(),
-                key,
+                key: sender.key,
             });
         }
-        Ok(key)
+        Ok(sender)
+    }
+
+    /// A count that moves whenever a trust context revoking keys is
+    /// adopted here — the device's own, or a view adopted for a person's
+    /// namespace (§6.3) replaced by a version that refuses more (spec
+    /// §20). A transport that admitted run headers when it read one count
+    /// and reads another now walks their chains again: a revoked issuer
+    /// ends the runs it certified. One atomic load each.
+    pub fn signal_revocations(&self) -> u64 {
+        let inner = &self.inner;
+        inner
+            .validator
+            .keyring()
+            .revocation_epoch()
+            .wrapping_add(inner.signals.scoped_revocations.load(Ordering::SeqCst))
     }
 
     /// Whether `key` is a member of `scope` now (spec §20): a writer
@@ -174,6 +338,70 @@ enum NotMember {
 }
 
 impl Inner {
+    /// Verify `sender`'s run header by the live rule (spec §20,
+    /// [`Device::signal_admit`]): the certificates held first; one missing
+    /// fetched within the sender namespace's place among the headers
+    /// waiting for certificates, at most [`SIGNAL_CHAIN_FETCHES`] of them.
+    async fn signal_verify(
+        &self,
+        sender: &SignalSender,
+        header: &Data,
+    ) -> Result<(), SignalRefusal> {
+        let judge = self.judge(&header.name);
+        let key = &sender.key;
+        let unverified = |why: String| SignalRefusal::Unverified {
+            key: key.clone(),
+            why,
+        };
+        let mut slot = None;
+        for _ in 0..=SIGNAL_CHAIN_FETCHES {
+            let (result, missing) = judge.validate_chain_cached(header).await;
+            let missing = match result {
+                ValidationResult::Valid(safe)
+                    if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
+                {
+                    return Ok(());
+                }
+                ValidationResult::Pending => missing,
+                other => {
+                    tracing::debug!(name = %header.name, %key, "signal run header refused: {other:?}");
+                    return Err(SignalRefusal::BadSignature { key: key.clone() });
+                }
+            };
+            let Some(missing) = missing else {
+                return Err(SignalRefusal::BadSignature { key: key.clone() });
+            };
+            let Some(fetcher) = judge.cert_fetcher() else {
+                return Err(unverified(format!(
+                    "the certificate {missing} its chain needs is not held here, and this device \
+                     fetches none"
+                )));
+            };
+            if slot.is_none() {
+                slot = Some(self.signals.fetch_slot(sender)?);
+            }
+            if let Err(e) = fetcher.fetch_missing(&missing, None).await {
+                self.signals.backoff(&sender.device);
+                let held = match judge.cert_cache().all(&missing).is_empty() {
+                    false => {
+                        "only an expired certificate of it is held here, so its device renews \
+                         its certificate; "
+                    }
+                    true => "",
+                };
+                return Err(unverified(format!(
+                    "no current certificate {missing} its chain needs could be had ({e}); {held}\
+                     none is fetched for {} for {} s",
+                    sender.device,
+                    SIGNAL_FETCH_BACKOFF.as_secs()
+                )));
+            }
+        }
+        Err(unverified(format!(
+            "its chain needs more than {SIGNAL_CHAIN_FETCHES} certificates not held here"
+        )))
+    }
+
     /// The record in force over `scope` when this device may use signals
     /// over it: held, and this device a member by it (spec §20).
     fn signal_gate<'a>(&self, st: &'a St, scope: &Name) -> Result<Cow<'a, Members>, DataError> {

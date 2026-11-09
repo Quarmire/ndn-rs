@@ -446,11 +446,14 @@ async fn a_members_header_is_admitted_and_every_other_refused_saying_why() {
     relay(&alice, &bob, &f, one);
     let header = Data::decode(bob.signal_header(&f, &RUN, b"run").unwrap()).unwrap();
     assert_eq!(*header.name, wire::signal_run_name(&phone, &f, &RUN));
-    assert_eq!(alice.signal_admit(&f, &header).await, Ok(bob_key.clone()));
+    assert_eq!(
+        alice.signal_admit(&f, &header).await.map(|s| s.key),
+        Ok(bob_key.clone())
+    );
     let held = alice.inner.store.get(&header.name);
     assert!(held.is_none(), "a run header is not kept");
 
-    let malformed = |got: Result<Name, SignalRefusal>| match got {
+    let malformed = |got: Result<crate::signal::SignalSender, SignalRefusal>| match got {
         Err(r @ SignalRefusal::Malformed { .. }) => r.to_string(),
         other => panic!("not a run header of the scope: {other:?}"),
     };
@@ -519,4 +522,191 @@ async fn a_members_header_is_admitted_and_every_other_refused_saying_why() {
     alice.shutdown();
     bob.shutdown();
     rita.shutdown();
+}
+
+/// `device`'s key `KEY/<id>` in a key store of its own, certified by its
+/// namespace's authority for `validity_ms` from now; the certificate held
+/// by the validator only when `held`.
+async fn keys_for(
+    world: &World,
+    device: &Name,
+    id: &str,
+    validity_ms: u64,
+    held: bool,
+) -> (SecurityManager, Name) {
+    let a = world.authority(device);
+    let keys = SecurityManager::new();
+    let k = keys
+        .generate_ed25519(device.clone().append("KEY").append(id))
+        .unwrap();
+    let public = keys.get_signer_sync(&k).unwrap().public_key().unwrap();
+    let cert = a
+        .keys
+        .certify(&k, public, &a.issuer, validity_ms)
+        .await
+        .unwrap();
+    if held {
+        world.validator.cert_cache().insert(cert);
+    }
+    (keys, k)
+}
+
+/// A run header of `f` for `device`, signed by key `k` in `keys`.
+fn header_by(keys: &SecurityManager, k: &Name, device: &Name, f: &Name) -> Data {
+    let signer = keys.get_signer_sync(k).unwrap();
+    let wire = DataBuilder::new(wire::signal_run_name(device, f, &RUN), b"run").sign_sync(
+        signer.sig_type(),
+        Some(k),
+        |region| signer.sign_sync(region).unwrap(),
+    );
+    Data::decode(wire).unwrap()
+}
+
+/// Live data is admitted by the live rule (spec §20): a header signed by a
+/// device key whose certificate has expired is refused, though the key is
+/// a member and revoked by nothing.
+#[tokio::test]
+async fn a_header_signed_under_an_expired_certificate_is_refused() {
+    let world = World::new().await;
+    let alice = world.device("/alice/laptop").await;
+    let f = folder();
+    share_folder(&alice, &f, share(&["/alice", "/bob/phone"], Vec::new())).await;
+    let phone = n("/bob/phone");
+    let (keys, k) = keys_for(&world, &phone, "1", 1, true).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let header = header_by(&keys, &k, &phone, &f);
+    assert!(alice.signal_member(&f, &k), "a member, revoked by nothing");
+    match alice.signal_admit(&f, &header).await {
+        Err(r @ SignalRefusal::BadSignature { .. }) => {
+            assert!(r.to_string().contains("expired"), "{r}")
+        }
+        other => panic!("a header under an expired certificate: {other:?}"),
+    }
+    alice.shutdown();
+}
+
+/// What `fetch` was asked, in order.
+type Asked = Arc<std::sync::Mutex<Vec<Name>>>;
+
+/// The validator fetches missing certificates through a fetch that notes
+/// every name asked, never answers a name under `/bob/slow`, and answers
+/// every other that none is to be had.
+fn fetching(world: &World) -> Asked {
+    let asked: Asked = Arc::default();
+    let noted = Arc::clone(&asked);
+    let fetch: ndn_security::FetchFn = Arc::new(move |name: Name| {
+        noted.lock().unwrap().push(name.clone());
+        Box::pin(async move {
+            if name.has_prefix(&n("/bob/slow")) {
+                futures::future::pending::<()>().await;
+            }
+            Err(ndn_security::FetchMiss::Absent)
+        })
+    });
+    let fetcher = ndn_security::CertFetcher::new(
+        world.validator.cert_cache_arc(),
+        fetch,
+        Duration::from_secs(60),
+    )
+    .with_negative_ttl(Duration::ZERO);
+    assert!(world.validator.set_cert_fetcher(Arc::new(fetcher)).is_ok());
+    asked
+}
+
+/// A header's signer is found a member before anything is verified, its
+/// chain is walked from the certificates held first, and a certificate not
+/// held is fetched only within its namespace's budget (spec §20): a
+/// stranger's header costs no fetch, devices of one namespace whose
+/// certificates can't be had hold at most its budget of fetches, and a
+/// member whose certificate is held is admitted meanwhile.
+#[tokio::test]
+async fn a_headers_certificates_are_fetched_for_a_member_only_within_its_namespaces_budget() {
+    let world = World::new().await;
+    let alice = world.device("/alice/laptop").await;
+    let asked = fetching(&world);
+    let f = folder();
+    share_folder(&alice, &f, share(&["/alice", "/bob"], Vec::new())).await;
+    let soon = Duration::from_secs(2);
+
+    let eve = n("/eve/pc");
+    let (eve_keys, eve_key) = keys_for(&world, &eve, "1", VALIDITY_MS, false).await;
+    let stranger = header_by(&eve_keys, &eve_key, &eve, &f);
+    let got = tokio::time::timeout(soon, alice.signal_admit(&f, &stranger))
+        .await
+        .expect("a stranger's header is refused at once");
+    assert!(
+        matches!(got, Err(SignalRefusal::NotMember { .. })),
+        "{got:?}"
+    );
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "a stranger costs no fetch"
+    );
+
+    let alice = Arc::new(alice);
+    let mut slow = Vec::new();
+    for d in ["/bob/slow/1", "/bob/slow/2", "/bob/slow/3", "/bob/slow/4"] {
+        let device = n(d);
+        let (keys, k) = keys_for(&world, &device, "1", VALIDITY_MS, false).await;
+        let header = header_by(&keys, &k, &device, &f);
+        let (alice, f) = (Arc::clone(&alice), f.clone());
+        slow.push(tokio::spawn(async move {
+            alice.signal_admit(&f, &header).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let fetching = asked.lock().unwrap().len();
+    assert!(
+        (1..=2).contains(&fetching),
+        "one namespace holds at most 2 fetches at once: {fetching}"
+    );
+    let refused: Vec<_> = slow.iter().filter(|t| t.is_finished()).collect();
+    assert_eq!(
+        refused.len(),
+        4 - fetching,
+        "the others are refused at once"
+    );
+    for t in slow.into_iter().filter(|t| t.is_finished()) {
+        match t.await.unwrap() {
+            Err(r @ SignalRefusal::Unverified { .. }) => {
+                assert!(r.to_string().contains("again"), "{r}")
+            }
+            other => panic!("over its namespace's fetches: {other:?}"),
+        }
+    }
+
+    let phone = n("/bob/phone");
+    let (keys, k) = keys_for(&world, &phone, "1", VALIDITY_MS, true).await;
+    let header = header_by(&keys, &k, &phone, &f);
+    let got = tokio::time::timeout(soon, alice.signal_admit(&f, &header))
+        .await
+        .expect("a member whose certificate is held is admitted meanwhile");
+    assert_eq!(got.map(|s| s.key), Ok(k));
+    alice.shutdown();
+}
+
+/// A device whose certificate could not be had is not fetched for again
+/// while its back-off lasts, whatever key id its next header names: a
+/// fresh key id per header drives no fetch per header (spec §20).
+#[tokio::test]
+async fn a_device_whose_certificate_could_not_be_had_drives_no_fetch_per_key_id() {
+    let world = World::new().await;
+    let alice = world.device("/alice/laptop").await;
+    let asked = fetching(&world);
+    let f = folder();
+    share_folder(&alice, &f, share(&["/alice", "/bob"], Vec::new())).await;
+    let tablet = n("/bob/tablet");
+    for (i, id) in ["1", "2", "3"].into_iter().enumerate() {
+        let (keys, k) = keys_for(&world, &tablet, id, VALIDITY_MS, false).await;
+        let got = alice
+            .signal_admit(&f, &header_by(&keys, &k, &tablet, &f))
+            .await;
+        assert!(got.is_err(), "no certificate of {k} is to be had");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "header {i}: one fetch for the device, then none while it backs off"
+        );
+    }
+    alice.shutdown();
 }

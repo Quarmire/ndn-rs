@@ -611,7 +611,10 @@ async fn a_self_certifying_members_run_header_is_judged_by_the_view_adopted_for_
         signer.sign_sync(r).unwrap()
     });
     let header = Data::decode(wire).unwrap();
-    assert_eq!(dev.signal_admit(&f, &header).await, Ok(k1.clone()));
+    assert_eq!(
+        dev.signal_admit(&f, &header).await.map(|s| s.key),
+        Ok(k1.clone())
+    );
     assert!(dev.signal_member(&f, k1));
     dev.shutdown();
 }

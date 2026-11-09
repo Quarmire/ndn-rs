@@ -5,7 +5,7 @@
 //! unsigned edits — pushed to the members of a folder or collection and
 //! never a version: nothing of it is stored, served or counted here. The
 //! signal transport (`ndn_surface::signal`) asks a [`Device`](crate::Device)
-//! four things, and nothing else leaves this crate:
+//! six things, and nothing else leaves this crate:
 //!
 //! - [`Device::signal_scope`](crate::Device::signal_scope): what this
 //!   device may do with signals over a scope — the record in force, the
@@ -13,10 +13,15 @@
 //!   the one to listen on;
 //! - [`Device::signal_header`](crate::Device::signal_header): sign a run
 //!   header with the device key;
+//! - [`Device::signal_sender`](crate::Device::signal_sender): a run
+//!   header's signer if it is a member, before anything is verified;
 //! - [`Device::signal_admit`](crate::Device::signal_admit): admit another
 //!   device's run header, or say why not ([`SignalRefusal`]);
 //! - [`Device::signal_member`](crate::Device::signal_member): whether a key
-//!   is a member of a scope now, asked for every packet.
+//!   is a member of a scope now, asked for every packet;
+//! - [`Device::signal_revocations`](crate::Device::signal_revocations): a
+//!   count that moves when a trust context revoking keys is adopted, so the
+//!   chains of the runs admitted are walked again.
 //!
 //! A **member** of a scope, for signals, is a device whose key a writer
 //! prefix of the record in force over the scope covers, or which that
@@ -128,6 +133,22 @@ impl fmt::Debug for SignalKey {
     }
 }
 
+/// The signer of a run header, a member of the scope by the record in force
+/// ([`Device::signal_sender`](crate::Device::signal_sender),
+/// [`Device::signal_admit`](crate::Device::signal_admit)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalSender {
+    /// The key that signed it.
+    pub key: Name,
+    /// That key's device.
+    pub device: Name,
+    /// The namespace whose sync group the device notices in (spec §12) —
+    /// the device itself when none is held — which a transport bounds a
+    /// sender's admissions and runs by: a person listed by prefix can make
+    /// as many keys and devices as it likes, never more namespaces.
+    pub namespace: Name,
+}
+
 /// Why a run header is not admitted
 /// ([`Device::signal_admit`](crate::Device::signal_admit)). Each says what
 /// to do. None is kept: a refused header is dropped with its run.
@@ -145,19 +166,19 @@ pub enum SignalRefusal {
         /// What is wrong with it.
         why: String,
     },
-    /// Its signature does not verify by this device's validator, or its key
-    /// is revoked.
+    /// Its signature does not verify by this device's validator under the
+    /// live rule, its key is revoked, or its certificate has expired.
     #[error(
-        "a run header signed by {key} does not verify here, or that key is revoked: drop its run \
-         (its sender sends the header again within a second, so one damaged in transit is \
-         replaced; a revoked key's runs stay refused)"
+        "a run header signed by {key} does not verify here, that key is revoked, or its \
+         certificate has expired: drop its run (its sender sends the header again within a \
+         second, so one damaged in transit is replaced; a revoked key's runs stay refused, and an \
+         expired one's until its device renews its certificate)"
     )]
     BadSignature {
         /// The key its KeyLocator names.
         key: Name,
     },
-    /// It verifies, and its key is no member of the scope by the record in
-    /// force here.
+    /// Its key is no member of the scope by the record in force here.
     #[error(
         "{key} is no member of {scope} by the record in force here: drop its run; its runs are \
          refused until a record admitting it is held (its owner adds it)"
@@ -176,6 +197,21 @@ pub enum SignalRefusal {
     NotReady {
         /// The scope.
         scope: Name,
+        /// What it waits for.
+        why: String,
+    },
+    /// Its signer is a member, and a certificate its chain needs is not
+    /// held here and is not fetched now: the fetch budget of the signer's
+    /// namespace is spent, its device backs off after a fetch that brought
+    /// none, or no current certificate could be had.
+    #[error(
+        "a run header signed by {key} cannot be verified here now: {why}; drop its run for now \
+         and admit its header again when it rides again (within a second) — it is admitted once \
+         its certificate is held here"
+    )]
+    Unverified {
+        /// The key its KeyLocator names.
+        key: Name,
         /// What it waits for.
         why: String,
     },

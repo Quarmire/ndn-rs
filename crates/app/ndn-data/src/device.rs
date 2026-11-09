@@ -2216,6 +2216,8 @@ struct Inner {
     /// The digest of the device key's public key, as its certificate
     /// stores it ([`Verified::key`] of its own entries).
     own_key: Option<[u8; 32]>,
+    /// What the signal gate keeps between questions (spec §20).
+    signals: signal::SignalGate,
 }
 
 /// What [`Inner::rejudge`] judges again.
@@ -7318,6 +7320,7 @@ impl Device {
             serving: Mutex::new(None),
             stopped: AtomicBool::new(false),
             own_key,
+            signals: signal::SignalGate::default(),
         });
         // A trust context adopted later may revoke keys whose entries are
         // held here, or re-admit entries refused here (spec §8): the
