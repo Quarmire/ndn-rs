@@ -1541,3 +1541,67 @@ async fn the_writers_root_is_taken_without_waiting_for_a_silent_relay() {
     reader.shutdown();
     writer.shutdown();
 }
+
+/// The phone, a reader of the laptop's sealed collection, asks the laptop
+/// for the epoch's key. The laptop's one ask in place for the phone's seal
+/// key is lost, so that grant is not answered; the laptop asks for it again
+/// in the background and keeps it. The phone's next round of grant asks is
+/// answered at once, whatever becomes of an ask the laptop would make then
+/// (spec §9, §17.1): a lossy path between them costs a round, not every
+/// round.
+#[tokio::test(start_paused = true)]
+async fn a_seal_key_a_grants_ask_missed_is_learned_for_the_next_round() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let asker = start_on(
+        &phone,
+        Arc::clone(&keys[1]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let public = asker.inner.st.lock().keys.recipient.public();
+    let seal = wire::seal_key_name(&phone, &public);
+    let net = Hostile::new(&[&asker], &seal, None, &laptop, &ns);
+    let granter = start_on(&laptop, Arc::clone(&keys[0]), validator(), net.clone()).await;
+    let c = n("/wendy/32=data/diary");
+    granter
+        .share(
+            &c,
+            crate::layer::Share {
+                rule: Rule::Log,
+                writers: vec![ns.clone()],
+                readers: vec![Audience::Person(ns.clone())],
+            },
+        )
+        .await
+        .unwrap();
+    granter.inner.flushed().await;
+    let epoch = granter.inner.st.lock().colls[&c]
+        .members
+        .as_ref()
+        .and_then(|m| m.epoch.clone())
+        .expect("a sealed collection");
+    let ask = GrantAsk {
+        seal_key: seal.clone(),
+        collection: c.clone(),
+        epoch,
+    };
+    let name = grant_name(&laptop, &ask);
+
+    net.losing.store(true, Ordering::Relaxed);
+    assert_eq!(
+        granter.inner.grant(&name, ask.clone()).await,
+        None,
+        "precondition: the seal key's ask in place is lost"
+    );
+    net.losing.store(false, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    net.losing.store(true, Ordering::Relaxed);
+    assert!(
+        granter.inner.grant(&name, ask).await.is_some(),
+        "the next round of the phone's asks is answered with the seal key learned meanwhile"
+    );
+    granter.shutdown();
+    asker.shutdown();
+}

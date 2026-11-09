@@ -2041,6 +2041,9 @@ struct St {
     grants: Kept<Bytes>,
     /// Askers' seal keys verified, by name.
     seal_keys: Kept<[u8; 32]>,
+    /// Askers' seal keys a grant's ask in place did not get, asked again in
+    /// the background ([`Inner::learn_seal_key`]): one run per key.
+    seal_learning: BTreeSet<Name>,
     /// The device's seal key packet, once signed.
     seal_key: Option<Bytes>,
     /// Collections and folders of this namespace this device owes a new
@@ -7245,6 +7248,7 @@ impl Device {
                 asking: BTreeSet::new(),
                 grants: Kept::new(GRANTS_KEPT),
                 seal_keys: Kept::new(SEAL_KEYS_KEPT),
+                seal_learning: BTreeSet::new(),
                 seal_key: None,
                 owed: BTreeMap::new(),
                 to_follow: BTreeSet::new(),
@@ -15395,7 +15399,10 @@ impl Inner {
     /// may hold the key of the epoch asked for and that it is held here
     /// ([`Self::grant_key`]), verify the asker's seal key, and wrap the key
     /// to it. One name, one packet while it is kept. `None` (a Nack)
-    /// otherwise.
+    /// otherwise. The seal key is asked once in place, within the asker's
+    /// wait; when that ask misses, it is asked again in the background
+    /// ([`Self::learn_seal_key`]), so the asker's next round is answered
+    /// from the key then verified.
     async fn grant(self: &Arc<Self>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
         let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
         let asker_ns = self.namespace_of_name(&asker);
@@ -15412,13 +15419,14 @@ impl Inner {
             st.seal_keys.get(&ask.seal_key).copied()
         };
         if verified.is_none() {
-            let data = self.fetch(ask.seal_key.clone(), false).await?;
-            let signer = self.verify(&data).await.ok()?;
-            if *data.name != ask.seal_key
-                || device_of(signer.key()).as_ref() != Some(&asker)
-                || wire::decode_seal_key(data.content()?.clone()).ok()? != public
-            {
-                tracing::debug!(%asker, "grant refused: its seal key does not verify as its own");
+            let fetched = self.fetch(ask.seal_key.clone(), false).await;
+            let ok = match &fetched {
+                Some(data) => self.seal_key_of(data, &ask.seal_key, &asker, &public).await,
+                None => false,
+            };
+            if !ok {
+                tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; asked again in the background");
+                self.learn_seal_key(&ask.seal_key, &asker, &public);
                 return None;
             }
         }
@@ -15441,6 +15449,51 @@ impl Inner {
         st.grants.insert(name.clone(), wire.clone());
         self.grants_answered.fetch_add(1, Ordering::Relaxed);
         Some(wire)
+    }
+
+    /// Whether `data` is `asker`'s seal key packet `seal_key`, naming
+    /// `public`: verified, signed by the asker's device.
+    async fn seal_key_of(
+        &self,
+        data: &Data,
+        seal_key: &Name,
+        asker: &Name,
+        public: &[u8; 32],
+    ) -> bool {
+        let Ok(signer) = self.verify(data).await else {
+            return false;
+        };
+        *data.name == *seal_key
+            && device_of(signer.key()).as_ref() == Some(asker)
+            && data
+                .content()
+                .and_then(|c| wire::decode_seal_key(c.clone()).ok())
+                .is_some_and(|p| p == *public)
+    }
+
+    /// Ask again, in the background, for `asker`'s seal key `seal_key`
+    /// that a grant's ask in place did not get (spec §9, §17.1): up to
+    /// [`FETCH_TRIES`] asks, one run per key at a time, and, verified, it is
+    /// kept, so the asker's next round of grant asks is answered at once.
+    /// Only an asker the records held admit gets here ([`Self::grant_key`]):
+    /// a stranger costs no asks.
+    fn learn_seal_key(self: &Arc<Self>, seal_key: &Name, asker: &Name, public: &[u8; 32]) {
+        if !self.st.lock().seal_learning.insert(seal_key.clone()) {
+            return;
+        }
+        let (inner, seal_key, asker, public) =
+            (Arc::clone(self), seal_key.clone(), asker.clone(), *public);
+        rt::spawn(async move {
+            let got = match inner.fetch_owed(seal_key.clone(), false).await {
+                Some(data) => inner.seal_key_of(&data, &seal_key, &asker, &public).await,
+                None => false,
+            };
+            let mut st = inner.st.lock();
+            st.seal_learning.remove(&seal_key);
+            if got {
+                st.seal_keys.insert(seal_key, public);
+            }
+        });
     }
 
     /// Get the key of epoch `e` of `c` (spec §9) — asked of the subject

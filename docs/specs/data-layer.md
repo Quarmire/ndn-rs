@@ -2603,7 +2603,11 @@ forward ciphertext. Erasure is the destruction of the key.
   record in force, when it seals `C`, admits the asker, and (4) `G` holds
   `E`'s key; anything else gets no answer, and `G` fetches nothing for it.
   It then fetches and verifies the asker's seal key (signed by the asker's
-  device key) and answers, signed by its own key, with the key wrapped to
+  device key) — one ask in place, within the asker's wait; when it misses,
+  up to `FETCH_TRIES` asks more in the background, one run per seal key, the
+  key kept once verified, so the asker's next round is answered at once
+  (round 3, faulty cases f2 and r7: a lossy path to the asker made every
+  round's one ask miss) — and answers, signed by its own key, with the key wrapped to
   it: a fresh X25519 key agrees a secret with the seal key, the wrapping
   key is HKDF-SHA256 of that secret (no salt; info
   `ndn-security/confidentiality/x25519-kek/1`, the ephemeral and the seal
@@ -4876,7 +4880,9 @@ asking another source (a holder, §13.1) goes around it. (4) A granter is
 asked only for an epoch a record held here names and that admits this
 device; it answers only an asker the
 records it holds admit (§9), and fetches that asker's seal key with one
-ask per grant it makes, never asking again on the asker's behalf.
+ask per grant it makes and, when that misses, `FETCH_TRIES` asks more in
+the background, one run per seal key at a time — only for an asker the
+records admit, never for a stranger.
 (5) A holder is asked again only by its owner, within the call that asked
 it, up to the bounds above; it waits for at most one repeated hold ask of
 an asker beside the one in progress (§13.2), and answers a repeated audit
