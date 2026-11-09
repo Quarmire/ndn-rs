@@ -113,6 +113,16 @@ async fn start_on(
     validator: Arc<Validator>,
     conn: Arc<dyn Connection>,
 ) -> Device {
+    start_with(device, keys, validator, conn, Config::new()).await
+}
+
+async fn start_with(
+    device: &Name,
+    keys: Arc<SecurityManager>,
+    validator: Arc<Validator>,
+    conn: Arc<dyn Connection>,
+    config: Config,
+) -> Device {
     Device::start(
         Transport {
             node: Node::from_connection(Arc::clone(&conn)),
@@ -122,7 +132,7 @@ async fn start_on(
         keys,
         validator,
         Arc::new(MemoryStore::new()),
-        Config::new(),
+        config,
     )
     .await
     .unwrap()
@@ -239,6 +249,178 @@ async fn a_walk_that_missed_a_listed_version_fetches_it_later_without_a_new_noti
         holds(&reader, &version),
         "a version a verified root lists is owed until held, asked again without a new notice"
     );
+    reader.shutdown();
+    writer.shutdown();
+}
+
+/// A reader's link to one writer device over a slow path: every Interest
+/// under the writer's name is answered with what the writer serves after
+/// `delay`, except the first `lose` Interests for `lost`, which are lost.
+struct SlowLink {
+    writer: Arc<Inner>,
+    delay: Duration,
+    lost: Name,
+    lose: std::sync::atomic::AtomicUsize,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl Connection for SlowLink {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Ok(interest) = Interest::decode(wire) else {
+            return Ok(());
+        };
+        if !interest.name.has_prefix(&self.writer.device) {
+            return Ok(());
+        }
+        if interest.name.has_prefix(&self.lost)
+            && self
+                .lose
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Ok(());
+        }
+        if let Some(reply) = self
+            .writer
+            .packet_for(&interest.name, interest.selectors().can_be_prefix)
+        {
+            let (tx, delay) = (self.tx.clone(), self.delay);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx.unbounded_send(reply);
+            });
+        }
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// The laptop's collection lists many versions, which the phone's walk
+/// takes a few at a time over a slow path; every ask of the first one in
+/// its first round of asks is lost. That version is asked again in place
+/// (spec §17.1, inside a walk): held a round of asks later, not only once
+/// every other version of the walk came and a new walk began from the root.
+#[tokio::test(start_paused = true)]
+async fn a_version_missed_inside_a_walk_is_asked_again_in_place_not_after_the_walk() {
+    let ns = n("/wendy");
+    let authority = SecurityManager::new();
+    let issuer = authority
+        .generate_ed25519(ns.clone().append("KEY").append("ns"))
+        .unwrap();
+    let public = authority
+        .get_signer_sync(&issuer)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let anchor = authority
+        .issue_self_signed_async(&issuer, public, VALIDITY_MS)
+        .await
+        .unwrap();
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (laptop_keys, laptop_cert) = device_key(&authority, &issuer, &laptop).await;
+    let (phone_keys, phone_cert) = device_key(&authority, &issuer, &phone).await;
+    let validator = || {
+        let v = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        let ctx = SignedTrustContext::hierarchical(ns.clone());
+        assert!(ctx.add_anchor(anchor.clone()));
+        v.adopt_context(Arc::new(ctx)).unwrap();
+        v.cert_cache().insert(laptop_cert.clone());
+        v.cert_cache().insert(phone_cert.clone());
+        v
+    };
+
+    let writer = start_on(&laptop, laptop_keys, validator(), Arc::new(Unconnected)).await;
+    let c = n("/wendy/32=data/notes");
+    writer
+        .share(
+            &c,
+            crate::layer::Share {
+                rule: Rule::Log,
+                writers: vec![ns.clone()],
+                readers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let options = || PutOptions {
+        type_id: crate::TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    };
+    // Versions enough that the walk takes them for far longer than a round
+    // of asks of one: two at a time, a second each.
+    const VERSIONS: usize = 80;
+    let mut ids = Vec::new();
+    for i in 0..VERSIONS {
+        let content = Content::new().with("t", Bytes::from(i.to_string()));
+        ids.push(writer.put(&c, content, options()).await.unwrap());
+    }
+    let first = log_name(&laptop, Some(&c), ids[0].seq.0);
+    let last = log_name(&laptop, Some(&c), ids[VERSIONS - 1].seq.0);
+    for _ in 0..100 {
+        if writer.inner.packet_for(&last, false).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        writer.inner.packet_for(&last, false).is_some(),
+        "the laptop serves its versions once durable"
+    );
+
+    // Each reply comes so near the end of its Interest's lifetime that no
+    // Interest is expressed again (spec §17.1): an ask is one Interest.
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let link = Arc::new(SlowLink {
+        writer: Arc::clone(&writer.inner),
+        delay: Config::new().lifetime - RTO_MIN / 2,
+        lost: first.clone(),
+        // Every ask of one round.
+        lose: std::sync::atomic::AtomicUsize::new(FETCH_TRIES as usize),
+        tx,
+        rx: futures::lock::Mutex::new(rx),
+    });
+    let mut config = Config::new();
+    config.window = 2;
+    let reader = start_with(&phone, phone_keys, validator(), link.clone(), config).await;
+    reader.inner.on_update(
+        &ns,
+        SyncUpdate {
+            publisher: laptop.to_string(),
+            name: laptop.clone(),
+            low_seq: 1,
+            high_seq: ids[VERSIONS - 1].seq.0,
+            mapping: None,
+            serving_party: None,
+        },
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let started = tokio::time::Instant::now();
+    let _ = reader.get(&c).await;
+    // A round of asks lost, the pause, and one more ask: well within the
+    // time the walk takes the other versions (two a lifetime).
+    let within = Duration::from_secs(25);
+    tokio::time::sleep(within.saturating_sub(started.elapsed())).await;
+    assert!(
+        !holds(&reader, &last),
+        "the walk is still taking the other versions"
+    );
+    assert!(
+        holds(&reader, &first),
+        "a version that missed inside a walk is asked again in place, not after the walk"
+    );
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(holds(&reader, &last), "the walk takes every version");
     reader.shutdown();
     writer.shutdown();
 }

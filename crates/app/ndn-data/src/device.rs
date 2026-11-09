@@ -1401,6 +1401,77 @@ fn retry_pause(misses: u32) -> Duration {
 /// in place, so one lost packet does not cost the whole walk.
 const FETCH_TRIES: u32 = 3;
 
+/// The most walks of one device's summary of one namespace under way at
+/// once ([`Inner::walk_beside`], spec §17.1): the refresh loop's or a first
+/// look's, and walks of newer roots begun beside them.
+const WALKS_AT_ONCE: u32 = 3;
+
+/// One walk of a writer's summary root ([`Inner::refresh`]), as
+/// [`Inner::descend`] carries it down the tree.
+struct Walk {
+    /// [`Peer::resets`] when it began: what it processed is recorded only
+    /// if nothing was forgotten since.
+    since: u64,
+    /// [`Peer::heard`] before its root was asked for.
+    heard: u64,
+    /// It took a version its root lists ([`Inner::walk_beside`]).
+    reached: AtomicBool,
+}
+
+/// A walk of `key`'s summary (device, namespace) under way, counted in
+/// [`Peer::walking`] until dropped.
+struct Walking<'a> {
+    inner: &'a Inner,
+    key: (Name, Name),
+}
+
+impl<'a> Walking<'a> {
+    fn begin(inner: &'a Inner, ns: &Name, device: &Name) -> Self {
+        let key = (device.clone(), ns.clone());
+        inner
+            .st
+            .lock()
+            .peers
+            .entry(key.clone())
+            .or_default()
+            .walking += 1;
+        Walking { inner, key }
+    }
+}
+
+impl Drop for Walking<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.inner.st.lock().peers.get_mut(&self.key) {
+            p.walking = p.walking.saturating_sub(1);
+        }
+    }
+}
+
+/// A walk's ask under way ([`Inner::asking`]), telling whether it took what
+/// it asked for.
+type WalkAsk = futures::future::Shared<futures::channel::oneshot::Receiver<bool>>;
+
+/// One packet a summary being walked lists (spec §17.1, inside a walk):
+/// `round` — [`FETCH_TRIES`] asks of its writer's device, then of the
+/// devices answering for it — asked again in place after [`retry_pause`]
+/// while it misses, up to [`FETCH_TRIES`] rounds. A walk takes its branches
+/// side by side and ends only once the last of them did, so a packet left
+/// to the next walk waits for every other branch of this one first: under
+/// a long walk (a first catch-up, a writer that never pauses) that is far
+/// longer than a round. Only when every round missed is the walk asked
+/// again from the root.
+async fn in_rounds<T, F: Future<Output = Option<T>>>(mut round: impl FnMut() -> F) -> Option<T> {
+    for tries in 0..FETCH_TRIES {
+        if tries > 0 {
+            rt::sleep(retry_pause(tries - 1)).await;
+        }
+        if let Some(got) = round().await {
+            return Some(got);
+        }
+    }
+    None
+}
+
 /// The most times one ask expresses its Interest again within its lifetime
 /// (spec §17.1): an ask sends at most 1 + this Interests.
 const REEXPRESS_MAX: u32 = 3;
@@ -1613,6 +1684,29 @@ struct Peer {
     /// a walk under way since before records nothing as processed, for it
     /// went toward less than is followed or peeked at now.
     resets: u64,
+    /// Its roots lie in a person's namespace no trust context held here
+    /// judges ([`Inner::unjudged`]): refused whoever serves them, so not
+    /// asked for, and no try of a walk is spent on them (spec §17.1).
+    unjudged: Option<Unjudged>,
+    /// How many sync notices naming it were heard in this run
+    /// ([`Inner::on_update`]): one heard since a walk asked for its root
+    /// says the writer may have moved past it ([`Inner::walk_beside`]).
+    heard: u64,
+    /// Walks of its summary under way ([`Walking`]).
+    walking: u32,
+}
+
+/// Where another device's roots stand that no trust context held here
+/// judged when last asked for ([`Peer::unjudged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unjudged {
+    /// No trust context held judges them: asking learns nothing until one
+    /// is adopted.
+    Unheld,
+    /// A context adopted since judges them — the node's own adoption, or
+    /// one for a folder's scope (spec §6.3): the walk is owed until a root
+    /// of them verifies ([`St::owes_walk`]).
+    Adopted,
 }
 
 impl Peer {
@@ -1905,6 +1999,11 @@ struct Inner {
     slots: Semaphore,
     /// The round-trip estimate re-expressions are timed from (spec §17.1).
     rtt: Mutex<Rtt>,
+    /// What walks ask for now ([`Inner::asked_once`]): a members record or
+    /// version by its name, a summary node by its exact name with the
+    /// [`Peer::resets`] its walk began at. A second walk listing the same
+    /// waits for the first's ask, and its outcome, rather than asking again.
+    asking: Mutex<HashMap<(Name, Option<u64>), WalkAsk>>,
     /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
     signatures: AtomicU64,
@@ -3493,18 +3592,32 @@ impl St {
     /// device follows and holds not — not pruned, expired, cut, released or
     /// refused — is in a branch no walk took in full, so the walk stays
     /// owed until one takes it or it is no longer wanted, whatever ended
-    /// the walk before.
+    /// the walk before. So is a walk of a device whose roots no trust
+    /// context held judged when last asked for, once one adopted since
+    /// judges them ([`Unjudged::Adopted`]), until a root of it verifies:
+    /// the refusals before say nothing of what it lists.
     fn owes_walk(&self, device: &Name, ns: &Name) -> bool {
         let Some(peer) = self.peers.get(&(device.clone(), ns.clone())) else {
             return false;
         };
         let toward = self.toward_in(ns);
         !toward.is_empty()
-            && (peer.head > peer.walked
+            && (peer.unjudged == Some(Unjudged::Adopted)
+                || peer.head > peer.walked
                 || (peer.head > 0
                     && toward.iter().any(|t| {
                         self.follows.contains(t) && !peer.followed.iter().any(|w| t.has_prefix(w))
                     })))
+    }
+
+    /// Whether `device`'s roots of `ns` lie in a person's namespace no
+    /// trust context held here judged when last asked for
+    /// ([`Unjudged::Unheld`]): asking again learns nothing until one is
+    /// adopted, which owes the walk ([`Inner::owe_unjudged_roots`]).
+    fn unheld_roots(&self, device: &Name, ns: &Name) -> bool {
+        self.peers
+            .get(&(device.clone(), ns.clone()))
+            .is_some_and(|p| p.unjudged == Some(Unjudged::Unheld))
     }
 
     fn page_relevant(&self, subject: &Name, path: &[u8]) -> bool {
@@ -6873,6 +6986,7 @@ impl Device {
             committed: Notify::new(),
             slots: Semaphore::new(in_flight),
             rtt: Mutex::new(Rtt::default()),
+            asking: Mutex::new(HashMap::new()),
             verifying: Semaphore::new(asks_verifying),
             signatures: AtomicU64::new(0),
             grants_asked: AtomicU64::new(0),
@@ -8578,6 +8692,11 @@ impl Inner {
             }
             let mut targets = self.written_by(&st, &device);
             targets.insert(ns.clone());
+            for t in &targets {
+                if let Some(p) = st.peers.get_mut(&(device.clone(), t.clone())) {
+                    p.heard += 1;
+                }
+            }
             targets
         };
         for t in targets {
@@ -8837,6 +8956,9 @@ impl Inner {
         // The writers the records in force list from persons' namespaces
         // this node does not hold are adopted for those records (§6.3).
         self.scope_writers();
+        // What was adopted, or a record listing a person for a subject, may
+        // judge roots refused unasked before: their walks are owed.
+        self.owe_unjudged_roots();
         for c in signed {
             if let Err(e) = self.publish_about(&c, &[]).await {
                 tracing::debug!(collection = %c, "the record owed is not announced: {e}");
@@ -8902,9 +9024,13 @@ impl Inner {
                     // after a pass taken in full that a name followed
                     // meanwhile or a newer root left owing; otherwise only
                     // the notice says it moved, and it is asked at most
-                    // [`REFRESH_TRIES`] times in a row (spec §17.1).
+                    // [`REFRESH_TRIES`] times in a row (spec §17.1). Roots
+                    // no trust context held here judges are not asked for
+                    // and spend no try: the adoption that judges them owes
+                    // the walk ([`Self::owe_unjudged_roots`]).
                     let owed = st.owes_walk(&device, &ns);
-                    let waits = owed || (!ok && misses < REFRESH_TRIES);
+                    let waits =
+                        owed || (!ok && misses < REFRESH_TRIES && !st.unheld_roots(&device, &ns));
                     match st.groups.get_mut(&ns) {
                         None => None,
                         Some(g) => match g.busy.get_mut(&device) {
@@ -9183,7 +9309,9 @@ impl Inner {
     /// again in place after the pause, up to [`FETCH_TRIES`] walks in all,
     /// then handed to the device's refresh loop ([`Self::walk_again`]),
     /// which asks again after the pause for as long as the walk is owed
-    /// ([`St::owes_walk`], spec §17.1). Whether it was taken in full.
+    /// ([`St::owes_walk`], spec §17.1). Roots no trust context held here
+    /// judges end it at once: the adoption that judges them owes the walk
+    /// ([`Self::owe_unjudged_roots`]). Whether it was taken in full.
     async fn walk(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
         let (tx, rx) = futures::channel::oneshot::channel();
         let inner = Arc::clone(self);
@@ -9193,6 +9321,9 @@ impl Inner {
             let whole = loop {
                 if inner.refresh(&ns, &device).await {
                     break true;
+                }
+                if inner.st.lock().unheld_roots(&device, &ns) {
+                    break false;
                 }
                 misses += 1;
                 if misses >= FETCH_TRIES {
@@ -9312,6 +9443,56 @@ impl Inner {
         self.retry_readmissions();
         self.fetch_cut_runs();
         self.fetch_kept(true);
+    }
+
+    /// Whether no trust context held here judges `name`: it lies in a
+    /// person's namespace (`/user/<0xA1: …>`) that the validator judging it
+    /// ([`Self::judge`]: the node's, or a view adopted for a folder's scope,
+    /// spec §6.3) does not hold, so every signed packet of it is refused,
+    /// whoever serves it (trust-context.md §4.5.6).
+    fn unjudged(&self, name: &Name) -> bool {
+        self.judge(name)
+            .keyring()
+            .unheld_personal_namespace(name)
+            .is_some()
+    }
+
+    /// Owe the walk of every device whose roots no trust context held here
+    /// judged when last asked for ([`Unjudged::Unheld`]) that one held now
+    /// judges — a namespace adopted by the node or for a folder's scope, a
+    /// record listing it for a subject — and walk it: asked again after the
+    /// pause while owed ([`St::owes_walk`], spec §17.1), whatever the
+    /// refusals before it.
+    fn owe_unjudged_roots(self: &Arc<Self>) {
+        let unheld: Vec<(Name, Name)> = self
+            .st
+            .lock()
+            .peers
+            .iter()
+            .filter(|(_, p)| p.unjudged == Some(Unjudged::Unheld))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let judged: Vec<(Name, Name)> = unheld
+            .into_iter()
+            .filter(|(d, ns)| !self.unjudged(&root_prefix(d, ns)))
+            .collect();
+        if judged.is_empty() {
+            return;
+        }
+        {
+            let mut st = self.st.lock();
+            for key in &judged {
+                if let Some(p) = st.peers.get_mut(key)
+                    && p.unjudged == Some(Unjudged::Unheld)
+                {
+                    p.unjudged = Some(Unjudged::Adopted);
+                }
+            }
+        }
+        for (device, ns) in judged {
+            tracing::debug!(%device, %ns, "its roots are judged here now: its walk is owed");
+            self.schedule(ns, device);
+        }
     }
 
     // ---- fetching -----------------------------------------------------------------------------
@@ -9545,6 +9726,7 @@ impl Inner {
             });
         }
         peer.head = body.head;
+        peer.unjudged = None;
         if body.head > peer.kept {
             peer.kept = body.head;
             self.store
@@ -9560,18 +9742,53 @@ impl Inner {
     /// reached the writer's state: not when only a relay answered, with a
     /// root no newer than the head walked in full (spec §13.5, §17.1).
     async fn refresh(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
+        let walking = Walking::begin(self, ns, device);
+        let whole = self.refresh_walk(ns, device).await;
+        drop(walking);
+        whole
+    }
+
+    /// [`Self::refresh`], counted among the walks under way by its caller.
+    async fn refresh_walk(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
         if !self.st.lock().toward(ns) {
             return true;
         }
+        // The notices heard of it before its root is asked: one heard after
+        // says the writer may have moved past that root ([`Self::walk_beside`]).
+        let heard = self
+            .st
+            .lock()
+            .peers
+            .get(&(device.clone(), ns.clone()))
+            .map_or(0, |p| p.heard);
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
+        // A root in a person's namespace no trust context held here judges
+        // is refused whoever serves it: not asked for, and no try is spent
+        // on it; the adoption that judges it owes the walk
+        // ([`Self::owe_unjudged_roots`], spec §17.1). Marked before the
+        // second look, so an adoption in between is seen by one of them.
+        let root = root_prefix(device, ns);
+        if self.unjudged(&root) {
+            let key = (device.clone(), ns.clone());
+            self.st
+                .lock()
+                .peers
+                .entry(key.clone())
+                .or_default()
+                .unjudged = Some(Unjudged::Unheld);
+            if self.unjudged(&root) {
+                tracing::debug!(%device, %ns, "not asked: its roots lie in a person's namespace no trust context held here judges; adopt the namespace, and its walk is owed");
+                return false;
+            }
+            // Adopted between the looks: owed like any adoption.
+            if let Some(p) = self.st.lock().peers.get_mut(&key) {
+                p.unjudged = Some(Unjudged::Adopted);
+            }
+        }
         // A writer that does not answer is answered for by the devices that
         // hold its newest root (spec §13.5).
-        let (data, relayed) = match self.fetch(root_prefix(device, ns), true).await {
-            Some(d) => (d, false),
-            None => match self.ask_relays_root(ns, device).await {
-                Some(d) => (d, true),
-                None => return false,
-            },
+        let Some((data, relayed)) = self.fetch_root(root, ns, device).await else {
+            return false;
         };
         let (writer, body) = match self.accept_root(device, ns, &data).await {
             Ok(taken) => taken,
@@ -9626,7 +9843,12 @@ impl Inner {
             let since = st.peers.get(&key).map_or(0, |p| p.resets);
             (toward, followed, since)
         };
-        let whole = self.descend(device, ns, &writer, body, since).await;
+        let walk = Walk {
+            since,
+            heard,
+            reached: AtomicBool::new(false),
+        };
+        let whole = self.descend(device, ns, &writer, body, &walk).await;
         if descending.end() {
             self.fetch_wanted(true);
         }
@@ -9662,6 +9884,32 @@ impl Inner {
         !stale
     }
 
+    /// Begin a walk of `device`'s newest root of `ns` beside the walks of it
+    /// under way (spec §17.1), once one of them — begun after `heard`
+    /// notices of it — took a version its root lists: if a notice of it
+    /// came since, saying the writer may have moved past that root, and
+    /// fewer than [`WALKS_AT_ONCE`] walk it now. A walk takes its root's
+    /// branches side by side and ends once the slowest did; a writer that
+    /// never pauses would otherwise have each version wait for the walk
+    /// under way as it was written, then for the next. What walks under way
+    /// at once both list is asked once ([`Self::asked_once`]).
+    fn walk_beside(self: &Arc<Self>, ns: &Name, device: &Name, heard: u64) {
+        let key = (device.clone(), ns.clone());
+        {
+            let mut st = self.st.lock();
+            let Some(p) = st.peers.get_mut(&key) else {
+                return;
+            };
+            if p.heard <= heard || p.walking >= WALKS_AT_ONCE {
+                return;
+            }
+        }
+        let inner = Arc::clone(self);
+        rt::spawn(async move {
+            inner.refresh(&key.1, &key.0).await;
+        });
+    }
+
     /// Process a verified node (or page) of `writer`'s summary of `ns`,
     /// published by `device`: its entries if followed, then its changed,
     /// relevant branches. Returns whether all of it was processed; what was
@@ -9675,9 +9923,10 @@ impl Inner {
         ns: &'a Name,
         writer: &'a Writer,
         body: NodeBody,
-        since: u64,
+        walk: &'a Walk,
     ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
+            let since = walk.since;
             let subject = body.subject.clone();
             let path = body.page.clone().unwrap_or_default();
             // Entries, for a followed collection: its records first (a prune
@@ -9804,7 +10053,7 @@ impl Inner {
             };
 
             let fetched = stream::iter(records)
-                .map(|name| async move { self.take_fetched(name).await })
+                .map(|name| async move { self.take_listed(name).await })
                 .buffer_unordered(self.config.window)
                 .collect::<Vec<_>>()
                 .await;
@@ -9831,11 +10080,17 @@ impl Inner {
                     .collect()
             };
             let fetched_versions = stream::iter(versions)
-                .map(|name| async move { self.take_fetched(name).await })
+                .map(|name| async move { self.take_listed(name).await })
                 .buffer_unordered(self.config.window)
                 .collect::<Vec<_>>()
                 .await;
             let entries_taken = fetched.iter().chain(&fetched_versions).all(|ok| *ok);
+            // The walk reached the versions its root lists: a newer root the
+            // writer was announced at meanwhile is walked beside it.
+            if fetched_versions.iter().any(|ok| *ok) && !walk.reached.swap(true, Ordering::Relaxed)
+            {
+                self.walk_beside(ns, device, walk.heard);
+            }
 
             let branch_results = stream::iter(
                 children
@@ -9863,50 +10118,129 @@ impl Inner {
             )
             .map(|(name, key, digest, head)| async move {
                 // The writer serves every node any root it signed lists
-                // (§7): a miss is the network's, and what was processed
-                // is kept for the next descent. Asked for by the digest its
-                // parent lists: no cache answers with another packet of the
-                // name (a writer whose store came back with entries it had
-                // lost signs a node of the same head anew). A writer that
-                // does not answer is answered for by the devices that hold
-                // its node (spec §13.5), checked by the same digest.
+                // (§7): a miss is the network's, asked again in place in
+                // rounds ([`in_rounds`]), and what was processed is kept for
+                // the next descent. Asked for by the digest its parent
+                // lists: no cache answers with another packet of the name (a
+                // writer whose store came back with entries it had lost
+                // signs a node of the same head anew). A writer that does
+                // not answer is answered for by the devices that hold its
+                // node (spec §13.5), checked by the same digest. A walk of
+                // another root listing the same node meanwhile, begun for
+                // the same names followed, waits for this one's outcome
+                // ([`Self::asked_once`]).
                 let exact = name.clone().append_implicit_digest(digest);
-                let data = match self.fetch_owed(exact, false).await {
-                    Some(d) => d,
-                    None => self.ask_relays(&name, ns, device, Some(digest)).await?,
+                let branch = async {
+                    let data = in_rounds(|| async {
+                        match self.fetch_owed(exact.clone(), false).await {
+                            Some(d) => Some(d),
+                            None => self.ask_relays(&name, ns, device, Some(digest)).await,
+                        }
+                    })
+                    .await;
+                    let data = data?;
+                    if wire::implicit_digest(data.raw()) != digest {
+                        tracing::debug!(%name, "not the packet its parent lists; ignored");
+                        return None;
+                    }
+                    let child = data
+                        .content()
+                        .and_then(|c| wire::decode_node(c.clone()).ok())?;
+                    if child.subject != key.0
+                        || child.writer != *writer.key()
+                        || child.head != head
+                        || child.page != key.1
+                    {
+                        tracing::debug!(%name, "a summary node that does not match its name; ignored");
+                        return None;
+                    }
+                    // Kept, the newest of its node, to answer for the writer.
+                    self.store.insert(relayed_name(&name), data.raw().clone());
+                    if !self.descend(device, ns, writer, child, walk).await {
+                        return None;
+                    }
+                    let mut st = self.st.lock();
+                    let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
+                    if peer.resets == since {
+                        peer.nodes.insert(key, digest);
+                    }
+                    Some(())
                 };
-                if wire::implicit_digest(data.raw()) != digest {
-                    tracing::debug!(%name, "not the packet its parent lists; ignored");
-                    return None;
-                }
-                let child = data
-                    .content()
-                    .and_then(|c| wire::decode_node(c.clone()).ok())?;
-                if child.subject != key.0
-                    || child.writer != *writer.key()
-                    || child.head != head
-                    || child.page != key.1
-                {
-                    tracing::debug!(%name, "a summary node that does not match its name; ignored");
-                    return None;
-                }
-                // Kept, the newest of its node, to answer for the writer.
-                self.store.insert(relayed_name(&name), data.raw().clone());
-                if !self.descend(device, ns, writer, child, since).await {
-                    return None;
-                }
-                let mut st = self.st.lock();
-                let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
-                if peer.resets == since {
-                    peer.nodes.insert(key, digest);
-                }
-                Some(())
+                self.asked_once((exact.clone(), Some(since)), async { branch.await.is_some() })
+                    .await
+                    .then_some(())
             })
             .buffer_unordered(self.config.window)
             .collect::<Vec<_>>()
             .await;
             entries_taken && branch_results.iter().all(Option::is_some)
         })
+    }
+
+    /// `ask`, a walk's ask for `key` ([`Inner::asking`]), unless another
+    /// walk asks for the same now: then that one's outcome, waited for, so
+    /// walks of two roots of one writer under way at once ask once for
+    /// what both list. Whether what it asks for was taken (an ask whose
+    /// walk stopped tells its waiters it was not).
+    async fn asked_once(&self, key: (Name, Option<u64>), ask: impl Future<Output = bool>) -> bool {
+        /// Takes the ask out of [`Inner::asking`] however it ends.
+        struct Ending<'a>(
+            &'a Mutex<HashMap<(Name, Option<u64>), WalkAsk>>,
+            (Name, Option<u64>),
+        );
+        impl Drop for Ending<'_> {
+            fn drop(&mut self) {
+                self.0.lock().remove(&self.1);
+            }
+        }
+        let tx = {
+            let mut asking = self.asking.lock();
+            match asking.get(&key) {
+                Some(under_way) => Err(under_way.clone()),
+                None => {
+                    let (tx, rx) = futures::channel::oneshot::channel();
+                    asking.insert(key.clone(), futures::FutureExt::shared(rx));
+                    Ok(tx)
+                }
+            }
+        };
+        match tx {
+            Err(under_way) => under_way.await.unwrap_or(false),
+            Ok(tx) => {
+                let ending = Ending(&self.asking, key);
+                let got = ask.await;
+                drop(ending);
+                let _ = tx.send(got);
+                got
+            }
+        }
+    }
+
+    /// [`Self::take_fetched`] for a members record or version a summary
+    /// being walked lists: asked again in place in rounds while it misses
+    /// ([`in_rounds`], spec §17.1), so it costs its walk a round of asks,
+    /// not a walk begun anew once every other branch ended. A refusal
+    /// decided against the name, or a device whose key is suspected here,
+    /// ends it. One another walk asks for now is waited for, not asked
+    /// again ([`Self::asked_once`]). Whether it is now held or refused.
+    async fn take_listed(self: &Arc<Self>, name: Name) -> bool {
+        let decided = |st: &St| st.held.contains_key(&name) || st.refused.contains_key(&name);
+        if decided(&self.st.lock()) {
+            return true;
+        }
+        let rounds = in_rounds(|| async {
+            if self.take_fetched(name.clone()).await {
+                return Some(true);
+            }
+            let st = self.st.lock();
+            let ended = st.refused.contains_key(&name)
+                || parse_log_name(&name).is_some_and(|l| self.suspects_device(&st, &l.device));
+            ended.then_some(false)
+        });
+        self.asked_once((name.clone(), None), async {
+            rounds.await.unwrap_or(false)
+        })
+        .await
     }
 
     /// Fetch, verify and take one log entry — by its name, else from each
@@ -12088,6 +12422,39 @@ impl Inner {
                 && digest.is_none_or(|x| wire::implicit_digest(data.raw()) == x)
             {
                 return Some(data);
+            }
+        }
+        None
+    }
+
+    /// `device`'s newest summary root of `ns`, `root` its prefix (spec
+    /// §13.5, §17.1), and whether a device answering for it gave it: asked
+    /// of the writer; while the writer does not answer, of the writer again
+    /// and at once of the devices answering for it ([`Self::ask_relays_root`])
+    /// — the writer's root taken over theirs, which may be behind it — after
+    /// the pause, up to [`FETCH_TRIES`] rounds in all. One lost packet then
+    /// costs neither the writer's newest root (a holder behind it walked
+    /// instead, its writes since left to a later walk) nor a pass of the
+    /// refresh loop; a writer away costs the lifetime it did before its
+    /// relays answer.
+    async fn fetch_root(&self, root: Name, ns: &Name, device: &Name) -> Option<(Data, bool)> {
+        if let Some(d) = self.fetch(root.clone(), true).await {
+            return Some((d, false));
+        }
+        for tries in 1..FETCH_TRIES {
+            if tries > 1 {
+                rt::sleep(retry_pause(tries - 2)).await;
+            }
+            let (own, relayed) = futures::future::join(
+                self.fetch(root.clone(), true),
+                self.ask_relays_root(ns, device),
+            )
+            .await;
+            if let Some(d) = own {
+                return Some((d, false));
+            }
+            if let Some(d) = relayed {
+                return Some((d, true));
             }
         }
         None

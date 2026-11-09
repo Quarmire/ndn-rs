@@ -377,6 +377,8 @@ impl Inner {
                 self.refresh_group(&o);
             }
         }
+        // Roots refused unasked for want of it are judged now: owed.
+        self.owe_unjudged_roots();
         self.scope_writers();
     }
 }

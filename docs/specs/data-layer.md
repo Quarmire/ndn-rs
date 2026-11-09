@@ -4234,6 +4234,19 @@ announced). What is owed, and until when:
   `REFRESH_TRIES` (16) times in a row per trigger — a sync notice naming
   it, a watch of its namespace, a first look (its walks in place counted
   among them) — then left until the next one.
+
+  *A root no trust context judges (normative).* A device's roots that lie
+  in a person's self-certifying namespace (trust-context.md §4.5) that no
+  trust context held here judges — neither the node's keyring nor a view
+  adopted for a folder's scope (§6.3) — are refused whoever serves them,
+  so they are not asked for: the walk ends at once, spends none of the
+  tries above and asks nothing of the network. This is decided from the
+  contexts held alone, before asking, never from a refusal received. Once
+  a context held judges them — the namespace adopted by the node or for a
+  scope, or a record in force listing it for the subject — the walk is
+  owed until a root of that device verifies, and asked again from then on
+  as any owed walk, however many refusals or notices came before; a notice
+  is not needed.
 - **Inside a walk**, a node, page, members record or version that missed
   for want of an answer (or a refusal for now) is asked again in place, up
   to `FETCH_TRIES` (3) asks in all, so one lost packet costs the walk about
@@ -4428,6 +4441,13 @@ older root its writer signed (§13.5) cannot stand in for the writer's
 state — no newer than the head walked, the writer counts as not reached —
 and a reader that stops waiting cuts no walk short; either costs at most
 the bounds above, never a version left unasked.
+(8) Nothing another party sends makes a device stop asking for a walk: a
+root is left unasked only while no trust context held here judges its
+namespace, decided from the contexts held, never from a refusal or a
+forged root (a forged root that names an anchor nobody holds is refused,
+as in (3), and asked again); and the adoption that ends it owes the walk
+without waiting for a notice, so a namespace adopted after its writer
+fell quiet is still read.
 
 ## 18. Conformance
 
