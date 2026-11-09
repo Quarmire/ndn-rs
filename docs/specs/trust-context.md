@@ -1842,6 +1842,17 @@ A forged pointer can only lead to one of these outcomes:
   minimum version refuses on first contact;
 - a name nobody serves, which fails the fetch.
 
+A copy of a context version whose signature does not verify under the anchor
+it names was forged or altered on the way, and says nothing of the version:
+another copy may be honest. A forwarder deciding it under an expectation
+(`Validator::expect_context`, `expect_context_update`) refuses it as forged
+(`InvalidSignature`, answered `bad-signature`), not as a context failing the
+expectation (`ExpectedContextRefused`, answered `context`), and keeps its
+reason for the adopter. A fetcher asks again for a `bad-signature` answer
+(ndn-rs `EngineExchange::fetching`, up to 8 asks); only when no honest copy
+arrives does the adoption or refresh end, saying why. Before this rule one
+forged copy of a version under fault ended an adoption by name.
+
 ### 8.2 Refresh
 
 A node that does not hold the namespace root key refreshes each held context
@@ -2726,7 +2737,7 @@ may move.
 - `ndn-rs/crates/security/ndn-security/src/cert_name.rs:39-41` is_key_component (GenericNameComponent `KEY`); `:46-49` is_cert_name; `:54-60` key_name_of; `:77-83` cert_name.
 - `ndn-rs/crates/security/ndn-security/src/manager.rs:514-594` certificate encoding (8-octet MetaInfo integers, ValidityPeriod).
 - `ndn-rs/crates/security/ndn-security/src/trust_schema.rs:41-93` pattern grammar; `:123-125` MultiCapture matches zero or more, binds nothing; `:147-165` rule parse/check.
-- `ndn-rs/crates/security/ndn-security/src/validator/expected.rs:270` forwarder expectation opens with open_received.
+- `ndn-rs/crates/security/ndn-security/src/validator/expected.rs:281` forwarder expectation opens with open_received; `:288-291` a copy whose signature does not verify is refused `InvalidSignature` (§8.1).
 - `ndn-rs/crates/core/ndn-packet/src/signature.rs:36-40` signature type codes.
 - `ndn-rs/crates/core/ndn-packet/src/encode/data.rs:411-416` `build` = DigestSha256; `:535-588` sign_sync (MetaInfo only if set).
 - `ndn-rs/crates/core/ndn-packet/src/lib.rs:105-108` SEGMENT 0x32, KEYWORD 0x20, VERSION 0x36.

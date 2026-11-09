@@ -15,8 +15,10 @@
 //! is signed by an anchor that context lists, the signature verifies under
 //! that anchor's key, and that anchor's key fingerprint equals the expected
 //! one. Anything else at that name — a forged root, a digest signature, a
-//! malformed context — is refused. Names of any other shape, and every name
-//! while no expectation is active, are validated exactly as before.
+//! malformed context — is refused; a copy whose signature does not verify
+//! is refused as forged (`InvalidSignature`), so its fetcher asks again
+//! (trust-context.md §8.1). Names of any other shape, and every name while
+//! no expectation is active, are validated exactly as before.
 //!
 //! The admitted result is kept with the expectation so the adopter can take
 //! it ([`ContextExpectation::finish`]) instead of verifying the same Data a
@@ -40,7 +42,9 @@ use web_time::Instant;
 
 use crate::cert_cache::Certificate;
 use crate::safe_data::TrustPath;
-use crate::trust_context::{SignedTrustContext, anchor_fingerprint, context_namespace_of};
+use crate::trust_context::{
+    OpenContextError, SignedTrustContext, anchor_fingerprint, context_namespace_of,
+};
 use crate::{SafeData, TrustError};
 
 use super::{ValidationResult, Validator, now_ns};
@@ -276,6 +280,15 @@ impl Validator {
         };
         let (context, anchor) = match SignedTrustContext::open_received(data).await {
             Ok(opened) => opened,
+            // A signature that does not verify says nothing of the context:
+            // this copy was forged or altered on the way, and another may be
+            // honest. Refused as forged (a forwarder answers `bad-signature`,
+            // which its fetcher asks again for), its reason still recorded
+            // for an adopter that never receives an honest copy.
+            Err(e @ OpenContextError::BadSignature(_)) => {
+                self.record(&namespace, |o| o.refused = Some(e.to_string()));
+                return Some(ValidationResult::Invalid(TrustError::InvalidSignature));
+            }
             Err(e) => return refused(e.to_string()),
         };
         if !expected.contains(&anchor_fingerprint(&anchor)) {
@@ -340,5 +353,58 @@ mod tests {
             v.expect_context(ns, [3; 32], Duration::from_secs(30))
                 .is_ok()
         );
+    }
+
+    /// A copy of the expected context whose signature does not verify (a
+    /// byte of it flipped on the way) is refused as forged —
+    /// `InvalidSignature`, which a forwarder answers `bad-signature`, so the
+    /// adopter's fetch asks again: another copy may be honest — not as a
+    /// context failing the expectation, which ends the adoption. The honest
+    /// copy is then admitted.
+    #[tokio::test]
+    async fn a_forged_copy_of_the_expected_context_is_refused_as_forged() {
+        use crate::signer::Ed25519Signer;
+        let n = |s: &str| s.parse::<Name>().unwrap();
+        let root = Ed25519Signer::from_seed(&[6; 32], n("/home/bob/KEY/root"));
+        let anchor_wire = crate::manager::encode_cert_data(
+            &n("/home/bob/KEY/root/self/v=1"),
+            &root.public_key_bytes(),
+            &root,
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let anchor = Certificate::decode(&Data::decode(anchor_wire).unwrap()).unwrap();
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob")).with_version(1);
+        assert!(ctx.add_anchor(anchor.clone()));
+        let honest = ctx.sign_into_data(&root).unwrap();
+        // The SignatureValue is the packet's last element.
+        let mut altered = honest.raw().to_vec();
+        *altered.last_mut().unwrap() ^= 0x5a;
+        let forged = Data::decode(Bytes::from(altered)).unwrap();
+
+        let v = Validator::new(TrustSchema::new());
+        let expectation = v
+            .expect_context(
+                n("/home/bob"),
+                anchor_fingerprint(&anchor),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let (verdict, _) = v.validate_chain_cached(&forged).await;
+        assert!(
+            matches!(
+                verdict,
+                ValidationResult::Invalid(TrustError::InvalidSignature)
+            ),
+            "a forged copy refused as not the expected context: {verdict:?}"
+        );
+        let (verdict, _) = v.validate_chain_cached(&honest).await;
+        assert!(
+            matches!(verdict, ValidationResult::Valid(_)),
+            "got {verdict:?}"
+        );
+        assert!(expectation.finish().admitted.is_some());
     }
 }
