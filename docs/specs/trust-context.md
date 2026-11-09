@@ -730,7 +730,13 @@ under the durable rule (§6.3) only:
 
 1. while some certificate of the key that the node holds, with the same
    public key as the certificate that verifies the Data, is inside its
-   ValidityPeriod by the reader's clock; or
+   ValidityPeriod by the reader's clock. Under a posture whose walks reach
+   the anchors, a held certificate counts only when vouched for (§6.5): an
+   unverified one — a renewal fetched, or a copy anyone could have served
+   with a later ValidityPeriod — is first walked to the anchors as a
+   certificate, and counts once that walk reaches them (one it cannot
+   reach is dropped; a cache-only walk waits for the certificate it names
+   missing). An `accept-signed` walk trusts the certificate as resolved; or
 2. once the context revokes the key with a cut (§3.3.12): the cut then
    decides alone, whatever the clock says.
 
@@ -1207,7 +1213,15 @@ These are refused before anything is written:
    profile, `accept-signed` included, with a refusal naming `/user/<h>`
    and saying to adopt it by name first (ndn-rs
    `TrustError::PersonalNamespaceNotHeld`, forwarder refusal
-   `untrusted-root`), and a forwarder caches none of it. Two kinds of
+   `untrusted-root`), and a forwarder caches none of it. With `/user/<h>`
+   held, or judged through a scoped view (§4.5.7), every walk for a signed
+   packet in it ends at an anchor of `/user/<h>`'s context, under every
+   profile, `accept-signed` included: that profile ends other names' walks
+   at the packet's verified signer, but nothing short of the namespace's
+   genesis line vouches for a person's keys, and a certificate anyone
+   issued under `/user/<h>` would otherwise vouch for a device they made up
+   there (ndn-rs `Validator::accept_signed`; ndn-fwd's accept-signed
+   validator walks as deep as the default's). Two kinds of
    packet are not refused: its context versions, under an adoption's
    expectation (§4.4), so it can be adopted by name; and a DigestSha256
    packet, which names no signer and vouches for nothing, so it passes
@@ -1256,29 +1270,59 @@ folder's members record lists, to judge that folder's data
   reached by continuity, a validating forwarder told to expect the
   versions, the walk bounded as note 5 says), into no node keyring
   (ndn-cert `adopt_scoped`, `ndn_identity::adopt_scoped_via_engine`). Its
-  result, a `ScopedContext`, holds the checked `Genesis` and the newest
-  version; a refresh moves it on only from the version held, by
+  result, a `ScopedContext`, holds the checked `Genesis`, the newest
+  version and that version's signed Data as received
+  (`ScopedContext::data`; `with_data` binds it, refusing Data of another
+  name or content); a refresh moves it on only from the version held, by
   continuity (`ScopedContext::moved_on` refuses an older version, another
   of the same number, another namespace).
+- The holder keeps the newest version it adopted for the scope durably,
+  beside its own state: its number, the SHA-256 of its content, and the
+  genesis's and that version's signed Data. After a restart it opens them
+  again — the genesis by `Genesis::open_stored` (signature and genesis
+  rule, no clock), the version by `SignedTrustContext::open_signed` and
+  `with_data` — and holds the namespace at that version, refreshing from it
+  by continuity, as a holder of the namespace would (§5.1, §5.2): the walk
+  never starts at the genesis again, so neither an older version nor a
+  branch that does not descend from the version kept — a thief's after a
+  recovery, whatever its numbers — is taken. An adoption that reaches an
+  older version, or that number with other content, is refused as §5.1
+  refuses one for a held namespace; the refusal says which version was
+  reached before and to reach a device or relay serving it, and the holder
+  asks again later (data-layer.md §6.3).
 - A holder apart from its forwarder — an app beside a daemon — cannot
   tell the forwarder's validator to expect the versions: it has the
   forwarder carry the namespace in transit first (mgmt-trust.md
-  "Transit", a local operator's `security/transit`), then fetches the
+  "Transit", `security/transit` from a local operator or a member of a
+  transit group, owned by the connection that asked), then fetches the
   versions over its own connection and checks each itself, as above
-  (`ndn_cert::adopt_scoped` with no forwarder); it takes the mark back if
-  the adoption fails.
+  (`ndn_cert::adopt_scoped` with no forwarder). It carries each namespace
+  once, whether it adopts it anew or refreshes from a version the scope's
+  holder kept, takes back a mark that adoption took if it fails, and the
+  one mark when the scope releases the namespace.
 - It judges through a view only: `Keyring::with_scoped_view` shares the
   keyring's held contexts live and governs the scoped namespace's names
   by the scoped context **only where no held context covers them**: a
   context of that namespace the keyring holds, adopted before the view or
   after, is used as is. `Validator::scoped_view` is a validator over such
-  a view, with the same certificate cache, fetcher and posture; the
-  validator it is made from, and every user of its keyring, keep refusing
-  the namespace (`PersonalNamespaceNotHeld`). Which packets a view judges
-  is the holder's rule (data-layer.md §6.3).
-- A certificate a view fetches enters the shared cache, where it vouches
-  for nothing by itself: every walk ends at the anchors of the context
-  judging the packet.
+  a view, with the same certificate cache, fetcher, chain depth and
+  refusals; the validator it is made from, and every user of its keyring,
+  keep refusing the namespace (`PersonalNamespaceNotHeld`). Which packets
+  a view judges is the holder's rule (data-layer.md §6.3).
+- A view walks every packet it judges to the anchors of the context
+  judging it, whatever the posture of the validator it is made from: one
+  made from an `accept-signed` validator — a forwarder's, which an
+  embedded data layer verifies with — still requires the anchors (note
+  4). A certificate a view fetches enters the shared cache unverified
+  (§6.5) and vouches for nothing by itself.
+
+*Threat note.* Before a view required the anchors, a view made from an
+`accept-signed` validator ended each walk at the packet's verified signer:
+Mallory, heard in a folder's group, served a root of a device she made up
+under a listed writer's namespace (`/user/<hC>/m`, its key
+`/user/<hC>/m/KEY/1`) with a certificate she issued herself; the writer's
+schema passed the hop, and her versions were admitted as the writer's.
+The genesis check that justified adopting the writer was never used.
 
 ## 5. Versioning and continuity
 
@@ -1692,48 +1736,84 @@ because it has either the floor or the flag.
 
 ### 6.5 Certificates a walk refuses
 
-A validator's certificate cache holds certificates as they were fetched,
-before any walk checked them; a walk checks each one it passes against its
-issuer's key. A certificate whose own signature that key does not verify
-is refused as a copy, not as a key: its bytes were altered on the way (a
-faulty or hostile link flips a byte of a signature) or never signed, and
-another copy of the same certificate may be honest. The rules, which bind
-every validator (a forwarder's validation stage and a device's data layer
-alike):
+A validator's certificate cache holds two kinds of certificate
+(`CertCache`): those **vouched for** — inserted by the node itself (its
+own certificates, its anchors, what it provisioned or checked), or
+admitted by a walk that reached a trust anchor through them — and
+**unverified** ones, fetched over the network
+(`CertCache::insert_unverified`, the `CertFetcher`), which no walk has
+vouched for yet. Neither kind vouches for a packet: every walk still ends
+at the anchors of the context judging it. The kinds decide only which copy
+of a certificate answers for its key and which copy a failing signature
+condemns. A copy is refused as a copy, not as a key: its bytes were
+altered on the way (a faulty or hostile link flips a byte) or never
+signed, and another copy of the same certificate may be honest. The
+rules, which bind every validator (a forwarder's validation stage and a
+device's data layer alike):
 
-1. A refused copy MUST NOT stay in the cache. It is evicted at once, by its
-   bytes: a copy cached under the same name since, which may be the honest
-   one, stays (`CertCache::evict`).
-2. The packet whose walk met the refused copy is not refused for it. A
+1. Only a walk that reached an anchor admits a fetched certificate to the
+   certificates vouched for: every unverified one it verified up to it.
+   A fetched copy never displaces a certificate vouched for under its
+   name, and an unverified one never answers a KeyDigest lookup. A walk
+   takes a key's certificate vouched for first, an unverified one only
+   when none answers. Only a certificate vouched for renews a lapsed key
+   whose role needs a cut (§3.3.13, case 1), for a walk that must reach an
+   anchor: an unverified one is walked to the anchors first, as a
+   certificate, and admitted or dropped by that walk.
+2. A signature that does not verify under a key vouched for (or an
+   anchor) is forged. The packet's own refuses the packet
+   `InvalidSignature`. A certificate's makes that copy a refused copy: it
+   is evicted at once, by its bytes, and a copy cached under the same name
+   since, which may be the honest one, stays (`CertCache::evict`).
+3. A signature that does not verify under an *unverified* certificate
+   says nothing yet of which is forged, the certificate's copy or the
+   signed bytes. A walk that must reach an anchor goes on with that key:
+   reaching an anchor vouches for the key, so the signed bytes are forged
+   (rule 2), and a later forged packet under that key is refused at once,
+   at no fetch. Not reaching one makes the key's copy a refused copy,
+   dropped. An `accept-signed` walk, which reaches for no anchor, makes it
+   a refused copy at once.
+4. A walk that ends without reaching an anchor — refused, or with a
+   certificate it cannot have — drops every unverified certificate it
+   took, so a forged copy never outlives the walk that met it, and a
+   later walk fetches them again. A cache-only walk waiting for a missing
+   certificate keeps them until the fetch of what is missing fails: it
+   resumes once its caller fetches it.
+5. The packet whose walk met a refused copy is not refused for it. A
    fetching walk (`validate_chain`, `validate_durable`) walks once more,
    which fetches the certificate again, and refuses the packet
    `InvalidSignature` only if that copy is refused too; a cache-only walk
    (`validate_chain_cached`, `validate_durable_cached`) answers `Pending`,
    naming the certificate, which the caller fetches before validating
    again (a forwarder's validation stage parks the Data and fetches it, as
-   for a certificate never cached).
-3. A certificate packet refused `InvalidSignature` is not remembered for its
+   for a certificate never cached). A fetching walk that dropped
+   certificates an earlier walk fetched (rule 4) also walks once more.
+6. A certificate packet refused `InvalidSignature` is not remembered for its
    key (the validator's refused-certificate memory, which lets a final
    verdict on a certificate — its issuer revoked, its hop unauthorized —
    answer for the Data its key signed). A verdict on bytes says nothing of
    the key.
 
-*Threat note.* Without rule 1 one forged copy of a signer's certificate,
-fetched once through a node that carries the namespace unvalidated (a
-transit mark, `mgmt-trust.md`), made that node refuse every genuine packet
-the key signed for as long as the cache lived: the walk found the copy,
-its public key verified the packet, and its forged signature failed the
-next hop, every time. A copy whose signature was altered now costs one
-more fetch per walk that meets it, and never vouches for anything (every
-walk still ends at the anchors of the context judging the packet). Only a
-node's unvalidated paths can cache such a copy: a forwarder refuses a
-certificate packet that fails its validation before its fetcher takes it.
-Residual: a cached copy whose *public key* was replaced (so its signature
-cannot verify either) refuses, while cached, a genuine packet whose own
-signature it is asked to verify (depth 0: no cached certificate of the key
-verifies it, which a forged packet also shows), and is evicted only once a
-walk checks its signature at the next hop. An on-path attacker that can
-answer a node's certificate fetch can deny that key's packets there anyway.
+*Threat note.* Only a node's unvalidated paths can cache a forged copy (a
+transit mark, `mgmt-trust.md`, or a validator whose fetches its forwarder
+does not validate): a forwarder refuses a certificate packet that fails
+its validation before its fetcher takes it. Before these rules a forged
+copy, fetched once, stayed in the cache with the same standing as an
+honest one and refused the key's genuine packets for as long as the cache
+lived: a copy holding another *public key* refused every genuine packet
+at its own hop (depth 0), and a forged *issuer* certificate refused the
+honest certificate below it, which was evicted and fetched again at every
+validation while the forged issuer stayed; a copy Mallory issued herself
+(the honest public key, her key as its issuer) ended every walk at her
+untrusted root. Now a forged copy costs at most the walk that meets it
+and one more fetch, and a certificate vouched for is never condemned by a
+packet's forged signature. Residual: an on-path attacker that answers
+every fetch of a certificate with a forged copy denies that key's packets
+there for as long as it does so — it could anyway — and costs a fetch per
+packet it makes the node walk. Before the renewal clause of rule 1, an
+unverified copy of a lapsed guest key with a later ValidityPeriod — which
+anyone answering the renewal fetch could serve, signed by no CA — renewed
+the key: the guest's Data was accepted after its invitation ended.
 
 ## 7. Publication (RDR)
 
@@ -2742,7 +2822,9 @@ may move.
 - Cut key digest, manifest and DataRequiresCut (by symbol): `tlv.rs` CUT_KEY_DIGEST 0x0430, CUT_MANIFEST 0x0432, DATA_REQUIRES_CUT 0x0434, MANIFEST_NODE 0x0436 and the MANIFEST_* children 0x0438–0x043E; `RevocationCut::{set_key_digest, key_digest, set_manifest, manifest, range_seq, accepts_exactly, covers}` (`accepts` admits a range only when the cut has no manifest: fails closed); `ndn_security::public_key_digest` (SHA-256 of `Certificate::public_key` as stored); `SignedTrustContext::{with_data_requires_cut, without_data_requires_cut, data_requires_cut, role_of, requires_cut_for, without_revocation_cuts}`.
 - `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `build_under` (the same tree, its packets named `<prefix>/seg=<i>`: the data layer's removal cuts name theirs under the members record, `<R>/32=cut`, data-layer.md §8), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
 - `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT, REVOKED_LAPSED}`; `Unverified::{verify, verify_live}` (`unverified.rs`).
-- `ndn-rs/crates/security/ndn-security/src/validator/chain.rs` (§6.5): `Validator::walk_to_anchor` (one more walk after a refused copy when fetching; `Pending` naming it when cache-only), `walk_once` (`WalkOutcome::RefusedCopy`: a cached certificate whose own signature its issuer's key does not verify, evicted), and the refused-certificate memory skipping `InvalidSignature` (`validate_chain_inner`); `CertCache::evict` (`cert_cache.rs`: exactly that copy, by its signed bytes and signature value).
+- `ndn-rs/crates/security/ndn-security/src/validator/chain.rs` (§6.5): `Validator::walk_to_anchor` (one more walk after a refused copy, or after dropping certificates an earlier walk fetched, when fetching; `Pending` naming a refused copy when cache-only), `walk_once` with `reached_anchor` (admits the unverified certificates verified up to the anchor), `bad_signature` / `forged` (a signature failing under a key vouched for condemns the signed bytes; under an unverified one the walk goes on with it as the `Suspect`), `unvouched` (a walk not reaching an anchor drops what it took; a cache-only walk waiting on a fetch that has not failed, `CertFetcher::failed_recently`, keeps it), `durable_cached` (vouched for first), and the refused-certificate memory skipping `InvalidSignature` (`validate_chain_inner`); `CertCache::{insert, insert_unverified, evict}` and the crate's `resolve`, `get_any`, `all_by_kind`, `admit`, `drop_unverified` (`cert_cache.rs`: two kinds, a copy matched by its signed bytes and signature value); `CertFetcher::do_fetch` holds what it fetches unverified.
+- §4.5.6 note 4 and §4.5.7, anchors under every profile: `Validator::anchor_required` (`validator/mod.rs`: a person's names, under `accept_signed` too), `Validator::scoped_view` (always requires anchors); ndn-engine `resolve_security_profile` (`builder.rs`: the accept-signed validator's chain depth is the default's, 5).
+- §3.3.13 case 1 and §6.5 rule 1, a renewal vouched for: `signer_rule` / `valid_now` (`validator/durable.rs`: other certificates of the key count when vouched for, unverified ones only for a walk that reaches for no anchor; `chain_clear` counts vouched ones only), `Validator::durable_signer` and `vouch_renewal` (`validator/chain.rs`: an unverified renewal held or fetched is walked to the anchors as a certificate, `walk_to_anchor`'s `cert_walk`, then admitted or dropped).
 - `ndn-rs/crates/security/ndn-security/src/keyring.rs`: the revocation epoch moves, and listeners are told, when a version revokes a new name, when a held cut is not `covers`-ed by the new one (the key's name), or when a DataRequiresCut role is added (`/<ns>/<role>`).
 - `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs`: InterestLifetime clamped to one hour for PIT expiry and the per-PIT full-name deadline.
 

@@ -400,7 +400,16 @@ default record.
   with the names it went toward, so a device merely offline since such a
   walk does not hold anything back. Nor does a device ended here — a key
   of it marked suspected, or revoked by the trust context governing it
-  (§8.1): what it holds is not taken anyway. Each one not
+  (§8.1): what it holds is not taken anyway —, nor one nothing signed held
+  here vouches for (§13.5: no root of it verified, in this run or an
+  earlier one, no version of it applied, no lease, hold or members record
+  naming it) once a walk of it ended with no root of it verified — every
+  round of its root missed, or no trust context held judges its roots and
+  no record held lists its person (§6.3) —: a name a Sync Interest
+  carried, or a device never reached, gives no reason to wait, and holds
+  this back for one walk at most, however many notices of it come (round
+  3; before, one unsigned Sync Interest naming a device that does not
+  exist held `put`, `get` and folder erasure here until restart). Each one not
   walked is refreshed once more, for at most the first-look time. Until
   then `put` answers `NotReady` (next step `RetryLater`), naming each
   device it waits for and what to do — bring it online, or, if it is
@@ -690,10 +699,15 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
     its writer, each holder of a live lease, each device whose version
     held here is made over it — `W`'s writer among them, which applied it
     whole before it wrote `W` — and any device holding it), and `W` waits
-    for them as for a parent's pieces; once 16 asks in a row (with the
-    missed-fetch backoff of §17.1) found them nowhere, `W` applies without
-    them — one lost packet is no evidence they are gone — and they are
-    handed whenever they arrive;
+    for them as for a parent's pieces — but for its whole basis set at
+    most one budget of missed asks: once 16 asks for the bases `W` waits
+    for missed, counted over all of them together (each with the
+    missed-fetch backoff of §17.1), `W` applies without the ones still
+    missing — one lost packet is no evidence they are gone — and they are
+    still fetched, and handed whenever they arrive; a basis whose last 16
+    asks in a row missed already is not waited for (round 3, review L5:
+    counted per basis, a `W` over a wide covered past waited 16 asks for
+    each batch of 16 bases, the next fetched only as one ended);
   - held sealed in an epoch whose key the reader does not hold, it is
     handed once the key arrives, and `W` does not wait for it.
 
@@ -704,6 +718,12 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   the basis held for them: a basis handed after the versions made over it
   MUST give the state handing it before gives — what was made over it
   merges again, and the counting that moves is told (`counting_changed`).
+  When a basis handed after the versions made over it changes the value
+  (`MergeState::value`), the collection's watchers are told
+  `Change::Remerged` with the collection and the bases handed (§15),
+  whatever their frontier: no version arrives with the change, so without
+  it a host showing the value would not know to read it again. A basis
+  that leaves the value as it was is not told.
   So `W` merges exactly on every device that holds its basis or can fetch
   it: the reference rule replaces with `W`'s edit what the checkpoint
   restated of what `W` was made over, and keeps what the checkpoint
@@ -725,7 +745,8 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   answers without it, ask after ask (16 in a row, above). Every reader
   then merges `W` without it alike; one
   that finds it again (a holder returning) hands it, and its state moves
-  to the exact merge, with every other reader's as they find it too.
+  to the exact merge, with every other reader's as they find it too; its
+  watchers are told `Change::Remerged` when the value moved.
 - **Bound — round 3.** `W`'s writer chooses `P(W)`, so it chooses what
   readers fetch as a basis: at most the versions inside the cover in
   `down(P(W))` — signed versions of `C` that exist, each bound to its
@@ -733,7 +754,9 @@ tells it from an edit. It **covers** exactly `down(P(CP))`, by frontier.
   (§13.1) — each fetched once per device and held after; at most 16 basis
   versions of one collection are fetched at once (ndn-data:
   `BASIS_FETCHES`), the next as one ends; and only for a version admitted
-  (signed by a key the record in force names a writer, §8).
+  (signed by a key the record in force names a writer, §8). However many
+  bases `W` names, it waits for them at most 16 missed asks in all
+  (above): what it names delays its own exact merge, never its applying.
 
   **Threat note.** A member who writes over a frontier deep in the
   history a checkpoint covers makes every reader that applied the
@@ -1179,19 +1202,23 @@ and, once the rule changed, where the current rule starts.
   revision of the record in force at its signer (1 for the first), and from
   revision 2 it names that record as its **parent**: its revision and the
   SHA-256 of its `MembersRecord` TLV — the Content of the packet carrying
-  it or, when the record in force was a merge of concurrent records
-  (below), the `MembersRecord` that merge stands for, encoded as §16.2
-  lists (its parent the one its records share, none when they name
-  different ones). The digest is of the Content, not of the whole Data
-  packet: a merge is carried by no packet, and devices holding the same
-  records compute the same merge, so the same digest, whoever signed what.
+  it or, when the record in force was a merge of concurrent records or a
+  record taken onto the revision below (below), the `MembersRecord` it
+  stands for, encoded as §16.2 lists (a merge's parent the one its records
+  share, none when they name different ones; a record taken, what the
+  revision below stands for). The digest is of the Content, not of the
+  whole Data packet: a merge is carried by no packet, and devices holding
+  the same records compute the same merge, so the same digest, whoever
+  signed what.
 - A reader MUST ignore a members record that the owner rule (§3) does not
-  give to `C`'s namespace. The **record in force** is the merge of the
-  records it holds of the highest `Revision`, one per signer (its latest);
-  a record of a lower revision changes it only as the parent the records
-  of the highest revision name (below). A reader keeps, besides those,
-  every record of the revision below that it took and every merge of them
-  it computed: the parents they may name.
+  give to `C`'s namespace. It keeps every record it takes, one per signer
+  and revision (its latest). Each revision held **stands for** one record:
+  the merge (below) of its records, each signed from another view first
+  taken onto what the revision below stands for (below, across
+  revisions). The **record in force** is what the highest revision held
+  stands for. It is a function of the records held alone: readers holding
+  the same records hold the same record in force, whatever order the
+  records arrived in.
 - **Concurrent records.** Two devices of the owner may each sign revision
   `n` from their own view (the laptop adds Carol while the phone, offline,
   removes Bob). Their records merge, whatever order they arrive in:
@@ -1225,6 +1252,35 @@ and, once the rule changed, where the current rule starts.
     record added a reader while another moved to a new epoch). Devices
     resolving at once sign records of one revision, one parent and one
     audience, whose merge needs no more.
+- **Across revisions.** A record of revision `n + 1` signed from a view
+  without a record of revision `n` the reader holds names another parent
+  than `B`, what revision `n` stands for at the reader (the laptop's
+  revision 2 removes Carol, with a cut, while the phone, offline, signs
+  revision 2 admitting Dave, then revision 3 for Eve on top of its own
+  revision 2, still listing Carol and carrying no cut). The reader MUST
+  first take it onto `B`: when it holds the record's parent `P`, the
+  record and `B` merge three ways against `P` as concurrent records do
+  (above) — so a removal, and its cut, that `B` carries and `P` does not
+  still applies, a removal beating an addition, and what the record itself
+  changed stands; else they merge without one (the intersection, above).
+  The record taken keeps its revision and signer and names `B` as parent;
+  the records of revision `n + 1` then merge against `B`. The reader holds
+  `P` when it is `B`, a record of revision `n` it holds, or what a device
+  holding only some of those records took revision `n` to stand for: the
+  records of a proper subset of them settled as above (each taken onto
+  what revision `n − 1` stands for, then merged). It looks for `P` among
+  those subsets when revision `n` holds records of at most 8 signers (at
+  most 254 merges, made once per change of what it holds); with more, a
+  record whose parent is not `B` nor a record held merges without one,
+  losing its additions as such a merge does (above). A record of a
+  revision below the highest (arriving late, or from a device long
+  offline) settles its revision and every revision above it held in a row
+  again, with the merges of subsets made from what is held then.
+  What taking a record leaves to resolve is resolved as a merge is
+  (above), by a record naming what its revision stands for. So Carol
+  stays removed and her later versions refused `OutsideCut`, and Dave and
+  Eve are admitted, at every reader holding the four records, whatever
+  order they arrived in.
 - **Admission.** A reader MUST apply to `C` only versions the record in
   force admits (and, as for every entry, the trust schema admits under the
   writer's own name): a key under a writer prefix is admitted; else a key
@@ -1471,7 +1527,8 @@ and takes a change applied under the signing lock to the record held
 then (§6.1), so a let-go removes exactly whom it names. Records of one
 revision signed concurrently by two owner devices still merge with
 removals winning (§6): a change does not make an addition outlast a
-removal another device signed.
+removal another device signed, nor does a later revision signed by a
+device that had not seen that removal (§6, across revisions).
 
 **A Yjs update reaching outside its past.** Yjs ids are predictable, and
 yrs keeps an update whose references it lacks pending until they arrive,
@@ -1662,26 +1719,37 @@ carried. Apps that read a person's names validate them, as the data layer
 does.
 
 **Record churn.** An owner signing record after record makes every reader
-refresh each namespace the records list, once per record. A refresh is a
-walk from the version held (bounded as every walk), at most one in flight
-per namespace and `SCOPE_ASKS` (4) per device; records arriving meanwhile
+refresh each namespace the records list, once per `REFRESH_PAUSE_MAX`
+(4 s) at most, however many records arrive (§6.3). A refresh is a walk
+from the version held (bounded as every walk), at most one in flight per
+namespace and `SCOPE_ASKS` (4) per device; records arriving meanwhile
 coalesce into the next. A record that drops and adds a writer again does
 not unsettle what is held: versions the cut keeps stay applied, the others
 wait for the record that admits them again (§6).
 
+**Many writers.** An owner can list any number of persons' namespaces,
+real or made up. A reader lists at most `SCOPE_PER_SUBJECT` (64) for one
+subject and `SCOPE_NAMESPACES` (256) in all (§6.3), so that is all it ever
+adopts, refreshes, carries in transit or joins the groups of; a person's
+namespace it has not adopted is no group at all (§12). The rest are told
+to the subject's watchers (`Change::NotAdopted`) and their versions wait:
+the owner's records are the owner's to fix.
+
 **Stale walks.** A namespace adopted for a folder is as new as its last
 walk: a revocation or a recovery in a later version reaches the reader
-with the next record listing the namespace, or the next adoption (a
-restart adopts it again). Until then the reader judges that namespace's
+with the next record listing the namespace, or the next refresh (a
+restart refreshes it). Until then the reader judges that namespace's
 versions in the folder by the version it holds, as any holder of a
 context that has not yet refreshed (§8.3), and the owner can bring the
-refresh forward by signing a record. A reader holds such a namespace in
-memory only: a restart adopts it by name again from its genesis, a fresh
-adopter's check, which cannot tell two continuous branches apart
-(trust-context.md §4.5.6 note 1) — a thief's branch, if the only one the
-reader's network serves after the owner's recovery, is followed in that
-folder until the owner's line is reachable. A namespace the node holds is
-never taken from a walk of this kind.
+refresh forward by signing a record. The version held is kept in the
+store, signed (§6.3): after a restart the reader judges by it again and
+walks on from it by continuity, as a holder of the namespace would, never
+from the genesis again — so neither a path serving only older versions nor
+a thief's branch that does not descend from it, whatever its numbers, is
+taken, and a key a newer version revoked does not write again. Only a
+namespace first adopted from its genesis is open to a fresh adopter's
+limit (trust-context.md §4.5.6 note 1). A namespace the node holds is never
+taken from a walk of this kind.
 
 ### 6.3 Members' namespaces, adopted for the folder — round 3
 
@@ -1690,18 +1758,49 @@ every writer the folder's records list writes there, when that writer's
 namespace is self-certifying (`/user/<h>`, trust-context.md §4.5), with no
 gesture beyond the owner's records.
 
-- **Adoption.** For each subject `S` — a folder, or a collection — whose
-  own record in force (owner-signed, taken as every record, §6, §6.1)
-  lists a writer prefix, or the prefix of a cut, under a person's
-  self-certifying namespace `P` that the device's node does not hold, the
-  device MUST adopt `P` by name for `S`: version 1 fetched and checked as
-  the genesis `P` hashes, the newest reached from it by the continuity
-  rule, with the bounds of every walk (trust-context.md §4.5.3, §4.5.6 note
-  5). The adoption is the host's (`Introducer::adopt_scoped`): over the
-  node's network, its forwarder told to expect the versions, and into no
-  keyring the node judges by (trust-context.md §4.5.7). A namespace the
-  node holds — an introduction or an anchor link adopted it — is not
-  adopted again: its held context judges, as it does everywhere.
+- **Adoption.** For each subject `S` — a folder, or a collection, each by
+  its name and kind: a folder and a collection of one name have a record
+  each, and each lists its own — whose own record in force (owner-signed,
+  taken as every record, §6, §6.1) lists a writer prefix, or the prefix of
+  a cut, under a person's self-certifying namespace `P` that the device's
+  node does not hold, the device MUST adopt `P` by name for `S`, within
+  the caps below: version 1 fetched and checked as the genesis `P` hashes,
+  the newest reached from it by the continuity rule, with the bounds of
+  every walk (trust-context.md §4.5.3, §4.5.6 note 5). The adoption is the
+  host's (`Introducer::adopt_scoped`): over the node's network, its
+  forwarder told to expect the versions, and into no keyring the node
+  judges by (trust-context.md §4.5.7). A namespace the node holds — an
+  introduction or an anchor link adopted it — is not adopted again: its
+  held context judges, as it does everywhere.
+- **Caps.** A device lists for adoption at most `SCOPE_PER_SUBJECT` (64)
+  persons' namespaces for one subject — the first its record lists,
+  writer prefixes before cuts — and at most `SCOPE_NAMESPACES` (256) for
+  all subjects together, subjects taken in name order (a collection before
+  a folder of the same name), so the caps fall the same way whatever order
+  the records came in; namespaces the node holds count too. A namespace
+  past a cap is not adopted for that subject, and its versions there are
+  refused while it is not. The device logs it and tells the subject's
+  watchers `Change::NotAdopted` (§15) with the namespaces left out, why and
+  what to do — the owner lists too many writers: list fewer, or adopt
+  those namespaces on the node — each time the namespaces left out change.
+  A person's namespace not adopted is no sync group either (§12): a record
+  listing many writers costs a reader at most the caps' adoptions, groups
+  and transit marks.
+- **No going back.** The device keeps the newest version of `P` it
+  adopted in its store (`/localhost/ndn-data/scoped/<P>`): its number, the
+  SHA-256 of its content, and — as the host gives them
+  (`ScopedContext::data`) — the genesis's and that version's signed Data.
+  At start, before anything asks for `P`, it opens them again (signatures
+  checked; no clock decides) and holds `P` at that version for the subjects
+  listing it: judging at once, and refreshed from it by continuity (`held`
+  given to `Introducer::adopt_scoped`), so a branch that does not descend
+  from it is refused whatever its numbers. An adoption that reaches an
+  older version, or that number with other content, is refused — its
+  transit released when it was a fresh adoption — and asked again as any
+  refusal. A refresh that fails keeps the version held judging and is
+  asked again after a pause doubling from 8 s to 64 s. A record that keeps
+  the number and digest only (a host that gave no signed Data) still
+  refuses older versions (trust-context.md §4.5.7).
 - **Scope.** The adopted context judges exactly `P`'s packets about `S`:
   log entries of `S` and of every collection under it, with their pieces
   and block entries; one-key heads of those collections; and the summary
@@ -1721,16 +1820,27 @@ gesture beyond the owner's records.
   not held. Through a forwarder that cannot validate `P`, the host carries
   `P`'s Data to the device in transit while `P` is adopted for a folder
   (ndn-link.md §15.7): forwarded unvalidated to the Interests pending for
-  it, cached by no one; the device validates every packet itself. A host
-  beside a forwarder daemon asks it to (`security/transit`, mgmt-trust.md
-  "Transit": one mark for each namespace adopted, taken back when it is
-  released or its adoption failed), before the adoption's first fetch.
+  it, cached by no one; the device validates every packet itself. The
+  host's carrying is idempotent: every successful `adopt_scoped` of `P` —
+  fresh, or a refresh from a version held, one restored after a restart
+  included — has the host carry `P` if it does not already, until
+  `release_scoped(P)`; a failed one leaves the carrying as it was; a
+  release of what it does not carry does nothing. A host beside a
+  forwarder daemon asks it to (`security/transit`, mgmt-trust.md
+  "Transit": one mark for each namespace it carries, taken back when it is
+  released or the adoption that took it failed), before the adoption's
+  first fetch, over a management connection it keeps for its run: the
+  marks are that connection's, released by the daemon when it closes, so a
+  host that crashes leaves none. It runs with the transit capability
+  (`[security] transit_groups`), not as a trust admin.
 - **Records move.** As each subject's own record in force moves, the
   namespaces it lists are read again: one a record newly lists is adopted;
   one already adopted is refreshed by continuity from the version held
-  (never checked again from its genesis key), so a recovery or a
-  revocation reaches the reader with the record; one that no record in
-  force lists any more — neither as a writer nor by a cut — is released. A
+  (never checked again from its genesis key) — at most once per
+  `REFRESH_PAUSE_MAX` (4 s), a burst of records coalescing into one
+  refresh after the pause — so a recovery or a revocation reaches the
+  reader with the record; one that no record in force lists any more —
+  neither as a writer nor by a cut — is released. A
   record that drops a writer keeps it listed by the removal cut it must
   carry (§6): the versions the cut keeps, bound to their bytes, stay
   judged and applied; every other version of that writer in `S` is refused
@@ -2035,8 +2145,10 @@ always did.
   once the cut is held, so a reader following `C` learns `K`'s entries in
   `C` from the cut: when it adopts the context and when it starts following
   `C`, it fetches every entry of `C` the cut accepts that it neither holds
-  nor has refused. When the cut has a manifest (trust-context.md §3.3.12),
-  the reader first fetches the manifest packets by full name, then each
+  nor has refused; one not to be had then (its writer away, every reply
+  lost) is asked for again on the schedule of re-admitted entries (§17.1),
+  as nothing else would ask. When the cut has a manifest (trust-context.md
+  §3.3.12), the reader first fetches the manifest packets by full name, then each
   entry by its full name, digest included, as the manifest lists it: only
   the honest bytes can answer, whoever serves them. A cut made before
   manifests lists names only; its entries are fetched by name, and the
@@ -2495,9 +2607,12 @@ forward ciphertext. Erasure is the destruction of the key.
   packet; past that it signs the name anew, a packet that opens to the same
   key. An asker asks only for an epoch a held record names and that it may
   hold by (2) and (3) as far as it can tell, the epoch's creator first,
-  then every other device it knows to write into `C`'s namespace, round
-  after round with a capped backoff until the key is held or no longer
-  owed (§17.1), never one try per granter. Keys are
+  then the devices answering for others (§13.5: those it knows to write
+  into `C`'s namespace that signed data it holds vouches for, at most
+  `RELAYS_ASKED`), round after round with a capped backoff until the key
+  is held or no longer owed (§17.1), never one try per granter; a name a
+  Sync Interest carried is never asked, so a round never waits behind
+  strangers. Keys are
   per epoch for every reader: a device of the owner's own namespace is
   granted like any other (a second device of 10,000 collections, each in
   its own epoch, asks 10,000 grants once).
@@ -2591,16 +2706,21 @@ device name `D`.
 namespace that `C`'s newest members record names — the namespaces of its
 writer prefixes and readers (a group reader by its collection's namespace),
 each as the held context governing it says (§3), or, for a person's
-self-certifying name no held context covers — a writer adopted for the
-folder alone (§6.3) — that person's namespace `/user/<h>` by the name's
-shape — joining those groups first. So the notice reaches every member's
-devices through the group of their own namespace, which every forwarder
-holding that namespace carries to its devices; no group needs to reach
-outside its namespace. Without the self-certifying rule two members who
-hold only the owner's namespace, each adopting the other for the folder,
-would hear each other only if the owner's group reached both, which
-nothing routes; the group of a writer adopted for a folder carries no
-trust (a notice decides nothing), so its name's shape suffices.
+self-certifying name no held context covers, that person's namespace
+`/user/<h>` once it is adopted here for the folder (§6.3) — joining those
+groups first. A person's namespace neither held nor adopted is no group:
+never by the name's shape alone, so an owner listing many made-up writers
+makes no device join their groups (§6.2). When a writer's namespace is
+adopted, a device that publishes about a subject listing it — one of its
+own namespace's, or one it wrote into — joins that group then and
+announces into it. So the notice reaches every member's devices through
+the group of their own namespace, which every forwarder holding that
+namespace carries to its devices; no group needs to reach outside its
+namespace. Without the self-certifying rule two members who hold only the
+owner's namespace, each adopting the other for the folder, would hear each
+other only if the owner's group reached both, which nothing routes; the
+group of a writer adopted for a folder carries no trust (a notice decides
+nothing).
 
 **Hearing.** The group only says "`D` moved". It carries no data and
 decides nothing: a reader that hears it in any group fetches `D`'s root for
@@ -2610,8 +2730,26 @@ record it holds lists a writer of `D`'s namespace (§7), `D`'s namespace and
 each writer's taken by the same rule as for publishing. The devices a
 reader looks at for a namespace `O` (its first look, a watch, a key) are
 those it heard in `O`'s group and those it heard in any group that write
-into `O` by the same rule. Sync Interests are unsigned; a stranger in a
-group costs a reader a root fetch, never a wrong answer. A device's
+into `O` by the same rule. Sync Interests are unsigned: anyone who can
+send one names any devices it likes. So a reader keeps at most
+`HEARD_MAX` (64) devices heard per group; past it, it drops the device
+heard longest ago that no signed data it holds vouches for (§13.5,
+asking for a writer who does not answer), and only when every other one
+is vouched for, the device heard longest ago — a name a Sync Interest
+carried never displaces a device vouched for. A name dropped is walked no
+more, and what was noted of it without anything of it verified is
+forgotten. The state vector it keeps for the group — which every Sync
+Interest it sends carries whole — holds the same devices by the same rule
+(ndn-sync `SvsConfig::max_producers` and `vouch`): at most `HEARD_MAX`
+besides itself, a device vouched for never displaced by a name a Sync
+Interest carried, an entry at counter 0 never kept (it brings nothing to
+fetch), and what the group was heard to carry (§17.1, a change
+announced) noted for those only. So names a stranger sends grow neither
+its memory nor its Sync Interests (round 3; before, the vector took up
+to 16,384 names, each Sync Interest carrying them all — past the packet
+size, so the device's group went silent — and the noted carriage grew
+without bound). A stranger in a group costs a reader a root fetch, never
+a wrong answer, and is never asked to answer for another device. A device's
 counter in a group starts, when it joins, above its durable log head and
 above every counter it announced there before, which it keeps; a counter
 is kept, and durable, before it is announced, and an announcement goes
@@ -2810,12 +2948,16 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   not yet known) is answered at once; else it waits for the take for a
   hold ask's lifetime less one Interest lifetime and is answered when the
   take is done (whole, or out of rounds: the lease holds what is kept),
-  or, the take still under way, when it brought nothing during the wait —
-  no record inside `at` and no piece of what it lacks came, as nothing in
-  reach has it — with the lease of what is kept, so the owner learns `H`
-  keeps less than asked instead of asking again a take that gets nowhere.
-  Only while the take still brings more is the ask not answered: the
-  owner asks again.
+  or, the take still under way, when it brought nothing since `H` last
+  answered this record with less than `at` — before any such answer,
+  nothing during the wait — no record inside `at` and no piece of what it
+  lacks came, as nothing in reach has it — with the lease of what is
+  kept, so the owner learns `H` keeps less than asked instead of asking
+  again a take that gets nowhere. While the take brings more since that
+  answer — even if nothing came during this wait — the ask is not
+  answered: the owner asks again. A take that brought a record or a piece
+  between two asks has not shown that it keeps all it can, and answering
+  the same lease twice would end the owner's asks (below).
   It keeps its last 1,024 answers by
   name, so an ask asked again gets the same packet at no cost. It signs a
   new lease when what it holds grows. Holders join the groups of the
@@ -2922,8 +3064,9 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   taking a large collection over a lossy path — each lease that comes back
   audited afresh. It stops asking a holder that answers the same lease
   twice, audited kept: that holder keeps all it could take of what was
-  asked (a take that brought nothing during an ask answers with the lease
-  of what is kept, §13.2), and the next `hold` asks again.
+  asked (`H` answers with the same lease again only if its take brought
+  nothing since its last such answer, §13.2), and the next `hold` asks
+  again.
   Each such audit draws its pieces anew; it passes only with every piece
   answered, so a holder keeping a fraction `f` passes one `hold` call with
   probability at most about `HOLD_TRIES · f^16`, and staying silent on the
@@ -3068,29 +3211,50 @@ version of an erased epoch is never served either. Nothing refused or
 withdrawn here: by the record in force (`NotMember`, `OutsideCut`), a
 revocation cut or an untrusted chain (§8), its group (§5.5) or its rule's
 check (§5.2) — another reader would refuse it too, and serving it would
-only cost that reader a verification. Nothing it holds unverified: a
+only cost that reader a verification. This holds for a collection the
+device holds for its owner (§13.2) as for any other: a holder keeps
+outsiders' versions and packets withdrawn after it stored them, and
+serves none of them (round 3, review L3). Nothing it holds unverified: a
 packet that did not verify is never kept (§4). An own entry above the
 durable head, and an own piece a release is auditing holders for, stay
-unserved as before (§4.2, §13.3).
+unserved as before (§4.2, §13.3). An ask for an entry the device does not
+hold costs it one lookup by name, whatever it holds of the collection
+(ndn-data: `St::held` indexes every entry held, waiting or refused
+included), so asks for made-up seqs cost no scan under its lock.
 
 **Asking for a writer who does not answer.** A reader asks the writer
 first, by name, as before. When the writer does not answer, it asks, in
 order, the holders of a live lease on the collection (§13.2), then, for
 pieces, the devices whose versions are made over the version (§13.1),
-then every other device it hears for the namespace (§12: heard in its
-group, or writing into it by the records held), not ended here (a key
-suspected or revoked), all of them at once, each under its own name:
+then the other devices it hears for the namespace (§12: heard in its
+group, or writing into it by the records held) that signed data it
+holds vouches for as members or holders of the namespace — a summary
+root of theirs for it verified (in this run or kept from an earlier one),
+a version of theirs applied in a collection of it, a lease or hold record
+of such a collection naming them, or a members record in force of a
+collection or folder of it listing their device or one of their keys (a
+writer prefix naming a whole namespace or person vouches for no device
+under it: a Sync Interest may carry any name there) — not ended here (a
+key suspected or revoked), those whose root it verified first, at most
+`RELAYS_ASKED` (8) of them, all at once, each under its own name. A name
+only a Sync Interest carried is never asked to answer for another
+device; it is walked toward itself, as any device a notice names (§12).
 
-- for the writer's root of `O` (§7), every such device of `O`; it takes the
-  root with the highest head, if that head is at least the highest it
-  verified of that writer — an older one is a holder that is behind, not
-  the writer rolling back, and is not taken. It is asked MustBeFresh, so
-  no cache answers with an earlier answer;
+- for the writer's root of `O` (§7), every such device of `O`; of their
+  replies whose head is at least the highest it verified of that writer —
+  an older one is a holder that is behind, not the writer rolling back,
+  and is not taken — it checks each, from the highest head down, against
+  the writer's signature and its name, and takes the first that checks:
+  a reply that does not check is passed over, never taken in place of the
+  others of its round. It is asked MustBeFresh, so no cache answers with
+  an earlier answer;
 - for a node or page the root lists, the same devices; the packet must be
   the one whose digest its parent lists, as from the writer;
 - for an entry and for a piece, the devices of the collection's namespace;
-  an entry is verified against its writer's key as from the writer, a
-  piece against its manifest.
+  of the answers as they come, it takes the first that checks: an entry
+  verified against its writer's key as from the writer (or the very bytes
+  a digest names, when it asks by one), a piece against its manifest. The
+  holders of a live lease, asked in turn before, are checked the same way.
 
 A device that holds nothing of it answers with a Nack, at once. The writer
 asked first, a reader that reaches it never waits on a holder. Outside a
@@ -3137,15 +3301,27 @@ of that pass took; otherwise it asks the writer again in the next round.
   (a packet signed by another key, or that does not decode, is dropped and
   nothing is kept against its name, §4), a node or piece against the
   digest its parent lists, a root by its writer's signature and the
-  rollback floor. The `32=held` wrapper is DigestSha256 under the holder's
-  name: a cache holding it answers only that holder's name, with the same
-  bytes; a root, asked fresh, is never answered from a cache.
+  rollback floor. Each answer is checked as it is chosen, so a hostile
+  device answering first, or claiming a higher head, cancels no other
+  device's answer in that round: its forgery is passed over and the next
+  answer checked (round 3, review M3; before, the highest head won
+  unchecked and its refusal threw the round away, so one hostile device
+  heard kept a writer that is away from being read through anyone). The
+  `32=held` wrapper is DigestSha256 under the holder's name: a cache
+  holding it answers only that holder's name, with the same bytes; a root,
+  asked fresh, is never answered from a cache.
 - *Amplification.* A holder answers one Interest with one packet it holds,
   no larger than that packet and its wrapper; it never fetches on an
   asker's behalf, signs nothing, and verifies nothing to answer (a lookup
-  in its store and its index). A reader asks each device once per packet
-  the writer did not answer, so its cost is bounded by the devices it
-  hears and what it was going to fetch anyway.
+  in its store and its index). A reader asks at most `RELAYS_ASKED`
+  devices once per packet the writer did not answer, each vouched for by
+  signed data it holds, so its cost is bounded by that and what it was
+  going to fetch anyway, whatever names Sync Interests carry. Before
+  (round 3, review M2), every device heard was asked, and one unsigned Sync
+  Interest naming `N` devices made every walk of each ask all `N` — about
+  `N`² · `FETCH_TRIES` asks, reflected onto any device it named; now such
+  names are at most `HEARD_MAX` per group (§12), each walked toward itself
+  only, and asked for no one else.
 - *A holder that withholds or is behind.* It can answer nothing, or serve
   an older root: the reader then gets less, never wrong data, and never
   goes below the head it verified; the writer, once reachable, is asked
@@ -3560,6 +3736,14 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   empty frontier (its listing is local), or resumes collections one by one
   from their own frontiers.
 
+  A watch of a merge collection is told `Change::Remerged` (the
+  collection and the bases handed) when bases that versions applied here
+  were made over arrive after those versions applied without them and
+  change the value (§5.2, covered versions as a basis): no version comes
+  with that change, so a host showing the value reads it again. It is told
+  to every watcher of the collection, whatever its frontier, and never for
+  a basis that leaves the value as it was.
+
   A watch is told the members record in force (`Change::Members`, with
   the rule, writers and readers `members` answers): of a folder,
   whenever its record in force changes — whoever signed the record that
@@ -3598,7 +3782,11 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   name to read it, or have the namespace remove the writer from the
   folder's writers. The count is of what is held: read back at start, the
   versions held count again (never refused), so a restart gives no writer
-  a fresh allowance.
+  a fresh allowance. Likewise a subject whose record lists persons'
+  namespaces past the caps of §6.3 has its watchers told
+  `Change::NotAdopted` with the subject, the namespaces not adopted and
+  why — the owner lists too many writers: list fewer, or adopt those
+  namespaces on the node — each time the namespaces left out change.
 - **`snapshot(names)`** pins, for each name, the current state name of a
   merge collection or the exact name of a version, snapshot or entry, and
   signs the `SnapshotRecord`; a range name, which names no fixed set,
@@ -4136,7 +4324,7 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Root compromised | The recovery's versions carry every cut but orphans and cuts naming entries outside their key's log, may cut the keys they revoke, and, on the operator's confirmation, the new CA certifies a cut key again only for the public key its cut's digest names, so its in-cut versions keep a chain and nothing else gains one. | §8.4 |
 | Node that predates cuts | Refuses every version of a revoked key, the in-cut ones too: safe, and fixed by updating. A node that knows cuts but predates manifests, key digests and DataRequiresCut keeps those residuals until updated. | trust-context.md §3.3.12 |
 | Node that predates cut bytes | Cannot decode a members record whose cut keeps versions (`CutBytes` is critical), so it holds the record before it in force: a writer removed since stays a writer there until the node is updated. | §8, §16.2 |
-| Owner device that predates cut bytes signs a members record | It cannot read a record carrying `CutBytes`, so it never names one as parent: its record carries cuts bound to no bytes — or, from a view before the removal, no cut, the removed writer listed again. At a revision no higher than the bound record's it merges with it (§6: cuts by prefix, every manifest kept), and the binding stands. At a higher revision it is the record in force: updated readers refuse what its unbound cuts keep and keep it (§8), and a writer it lists again is a writer. Updated devices do not refuse it as a downgrade: such a record names nothing that tells, and whether a bound record of a lower revision exists is known only to the devices holding one, so refusing would make the record in force depend on which records reached a device rather than on the signed records alone. Update every owner device before removing writers. Afterwards a current owner device's next record binds what an unbound cut it carries keeps, from the bytes it holds; a writer listed again stays one until removed again. | §6, §8 |
+| Owner device that predates cut bytes signs a members record | It cannot read a record carrying `CutBytes`, so it never names one as parent: its record carries cuts bound to no bytes — or, from a view before the removal, no cut, the removed writer listed again. At a revision no higher than the bound record's it merges with it (§6: cuts by prefix, every manifest kept), and the binding stands. At a higher revision it is taken onto what the revision below stands for (§6, across revisions): a removal of the bound record that its parent does not carry stays, with the bound cut, so a writer it lists only because its view predates the removal stays removed; one it adds over its parent is a writer; updated readers refuse what its unbound cuts keep and keep it (§8). Updated devices do not refuse it as a downgrade: such a record names nothing that tells, and refusing would make the record in force depend on which records reached a device rather than on the signed records alone. Update every owner device before removing writers. Afterwards a current owner device's next record binds what an unbound cut it carries keeps, from the bytes it holds. | §6, §8 |
 | Member removed mid-edit | Edits inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §6, §8 |
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
 | Holder withholds a range's blocks | A time search probes a window at once and stops a round none of whose probes answers; the read answers within its bound, listing what it did not reach `missing`. | invariant 4, §5.4 |
@@ -4154,9 +4342,9 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Group member in pieces, not opened yet | Present once every piece is held; opened as it applies; the group counts whole, on readers and on the writer after it reads a collection again. | §5.5 |
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
 | Poisoned cache | Verification fails, or the packet is signed by another device's key or does not decode: that packet is dropped, nothing is kept against its name, and it is fetched elsewhere; the genuine copy is taken. | invariant 1, §4 |
-| Stranger in a sync group | Costs a root fetch; its entries are refused `NotMember`. | §6, §12 |
+| Stranger in a sync group | Costs a root fetch per name it carries, at most `HEARD_MAX` names per group kept heard; never asked to answer for another device or to grant; its entries are refused `NotMember`. | §6, §12, §13.5 |
 | Removed reader | Refused every grant; the key of the epoch its removal starts did not exist before it, so the new epoch's versions stay closed to it; what it opened before it keeps. | §9 |
-| Owner's devices edit members at once | Records of one revision merge against the parent they name, keeping every addition and removal, removals winning (by intersection when the parent is not held); a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. | §6 |
+| Owner's devices edit members at once | Records of one revision merge against the parent they name, keeping every addition and removal, removals winning (by intersection when the parent is not held); a record of the next revision signed without one of them is taken onto their merge, so a removal its signer never saw still wins; a merge that leaves a removed reader in the epoch is resolved by a new record in a new epoch. The record in force depends on the records held alone, not on their order. | §6 |
 | Group member removed | Every collection sealed to the group, of any owner, moves to a new epoch signed by a device of its own namespace. | §6 |
 | Own device left out | An audience that does not list it leaves it out of the epoch and every later one; no device holds a secret that yields future keys. | §6, §9 |
 | Removed writer fills a gap | A new entry at a seq below what its cut kept is refused: the cut lists exactly the versions kept. | §8 |
@@ -4202,11 +4390,11 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Device restarts with group members parked | They are read back from their parked copies at start, verified when parked, and parked again while the group waits: nothing of a stalled group is fetched again, a member whose writer is gone still completes its group, and an equivocation a parked member is part of is noted again and still reported. A parked copy whose member applied, was refused or was let go is dropped. | §4, §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
-| Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back. | §5, §6.1 |
-| Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal, never turns it into a read; a device marked suspected or revoked is not waited for. | §9, §15 |
+| Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back, nor does one nothing signed held vouches for once a walk of it ended unreached. | §5, §6.1, §13.5 |
+| Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal by one walk at most (nothing signed vouches for it), never turns it into a read; a device marked suspected or revoked is not waited for. | §5, §9, §15 |
 | Write refused after the edit (too large, rule refuses) | Nothing signed or stored, no default record, the log head unmoved; the collection is read again, so the refused edit is not in the state. | §5, §5.1, §15 |
 | Removed writer keeps its devices unreachable | The owner walks the writer's known devices as far as they are reachable and signs the cut over what it holds then; the removal is never held off, and versions only the unreachable devices hold fall outside the cut. | §6, §6.2 |
-| Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it; a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
+| Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it (one nothing signed vouches for, once a walk of it ended unreached, is not waited for, §5); a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
 | Collection record wider than its folder | `share` refuses it; one signed anyway widens nothing: every reader intersects the levels. | §6.1 |
 | Release of merge pieces without a covering checkpoint proved held | Refused: the pieces are kept, saying why, and `NotHeld` when nothing is released. | §13.3 |
 | Collection created under a watched folder, by this device or another writer | Reported on the folder's one watch with no further call, every change tagged with its collection; finding it costs the new branch only (the root, the nodes on the way, the folder node or its changed page, the new collection's node and entries), never a walk of the folder. | §7, §15 |
@@ -4214,6 +4402,8 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Folder watch resumed from a frontier joined across its collections | May skip a version of another collection still to come: a writer's versions come in seq order within a collection only. A host resumes a whole folder from the empty frontier (the listing is local) or each collection from its own frontier. | §15 |
 | Watcher reads slower than changes come | Its queue holds what its listing queued and `Config::watch_queue` changes more; then `Change::Lagged`, and every change after it is dropped until the watcher read the queue empty — memory bounded, the gap told in order, never silent. The watcher reads again from its frontier. | §15 |
 | Folder writer creates collection after collection | It makes a follower follow at most `Config::writer_collections` collections of a namespace outside its own; past it, its new collection is neither fetched nor taken, and the folder's watchers are told `Change::Untracked` naming the writer and what to do (follow the collection by name, or have the writer removed). Counted from what is held, so a restart grants no new allowance. | §15 |
+| Owner lists thousands of persons' namespaces | A reader adopts, refreshes, carries in transit and joins the groups of at most `SCOPE_PER_SUBJECT` (64) for one subject and `SCOPE_NAMESPACES` (256) in all; no group of a namespace not adopted is joined; the rest are logged and told `Change::NotAdopted` with what to do, their versions waiting. | §6.3, §12 |
+| After a restart, a path serves only an older version of a member's context, or a thief's branch numbered past the one held | The newest version adopted is kept in the store, signed, held again at start and refreshed from by continuity: an older version, that number with other content, or a branch not descending from it is refused and asked again later, so a key a newer version revoked never writes again. | §6.3 |
 | Equivocation across two folders | Each collection's watchers are told with their own version whole and the other by name and id only: no watcher learns content of a collection it does not watch. | §4, §15 |
 | Reader that predates slice 6 | Refuses folder records and group members (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
 | Code stolen or forwarded | Admits whoever presents it first within its expiry, with its role; then one key only: every other is refused `Used` and gains nothing; the owner sees and removes the joiner as any member. | §19.4, §19.7 |
@@ -4323,9 +4513,19 @@ announced). What is owed, and until when:
   nothing newer: a path may deliver an old copy of the root late — a
   duplicate it delayed answers a later ask — and the notice may announce
   no new root (a device announcing itself as it joins), which costs
-  `FETCH_TRIES` − 1 root asks more. Which root answered decides nothing
-  (invariant 1): what is held and owed follows from the roots and entries
-  verified, as above.
+  `FETCH_TRIES` − 1 root asks more. A pass of the loop a notice asks for
+  begins at once after a pass that took a root of the device newer than
+  the one verified as it began; after one that did not, it begins after
+  the pause below, `k` being such passes in a row (64 s from
+  `REFRESH_TRIES` on), the count starting afresh once a pass takes a newer
+  root. So notices that bring nothing new — repeated by a stranger, or
+  for a root a relay holds behind the writer — cost root asks at the pace
+  of misses, never one walk per notice back to back; a notice whose root
+  moved is answered as before, after at most the pause it falls in. A
+  pass something held here asks for — a name followed, a namespace
+  adopted — begins at once, whatever notices came.
+  Which root answered decides nothing (invariant 1): what is held and owed
+  follows from the roots and entries verified, as above.
 - **A group heard from no one (normative).** A first look (§15, a peek
   of §5.3 among them) that finds no device heard that writes into the
   namespace — none heard in its group, none heard in another group that
@@ -4348,14 +4548,22 @@ announced). What is owed, and until when:
   three. In a group in which it heard some member, the device announces
   its state vector again after the pause below, `k` being the
   announcements made so far since its newest change was announced, up to
-  `REFRESH_TRIES` (16) times, until a member is heard to have taken the
-  change: a Sync Interest of the group heard here carries the device's
-  counter at that announcement, or the device answered an ask for its own
-  root of the namespace since (a member walking it takes the change). A
-  newer change announced during the run counts `k` afresh. One such run
-  per group at a time. Being heard to have taken it decides nothing
-  (invariant 1): it only ends the announcing; what a member takes is
-  judged as always.
+  `REFRESH_TRIES` (16) times in one run, until a member is heard to have
+  taken the change: a Sync Interest of the group heard here carries the
+  device's counter at that announcement, or the device answered an ask for
+  its own newest root of any namespace since (a member walking it takes
+  the change; members walk it in every namespace they follow that it
+  writes into, whatever group they heard the announcement in, so a group
+  of readers of another namespace counts as well). A newer change
+  announced during the run is announced again in the same run, which
+  keeps its count and pace. One such run per group at a time. A run that
+  sent all its announcements while no ask for any root of the device was
+  answered leaves the group unheard: its members' Sync Interests carry a
+  change only on their period, which each announcement covering them
+  defers, so nothing would ever end a run there, and no run starts in that
+  group again until an ask for a root of the device is answered. Being
+  heard to have taken it decides nothing (invariant 1): it only ends the
+  announcing; what a member takes is judged as always.
 - **Inside a walk (normative)**, a node, page, members record or version
   the walk lists that missed for want of an answer (or a refusal for now)
   is asked again in place, in rounds: the first round asks its writer's
@@ -4382,10 +4590,13 @@ announced). What is owed, and until when:
   namespace walks, beside the walk it began with, the newer roots sync
   notices tell of: once the walk begun last is past the way to its
   versions — it took a version its root lists, or a round of asks (above)
-  for a node or page on the way missed — or ended, a notice of that device
-  that arrived since that walk began begins a walk of the device's newest
-  root, while fewer than `WALKS_AT_ONCE` (3) walks of the pass are under
-  way; a walk ending makes room for one. A walk begun beside others takes
+  for a node or page on the way missed — or ended with a root of the
+  device newer than the one verified as it began, a notice of that
+  device that arrived since that walk began begins a walk of the device's
+  newest root, while fewer than `WALKS_AT_ONCE` (3) walks of the pass are
+  under way; a walk ending makes room for one. A notice arriving after a
+  walk that ended with nothing newer is left to the loop's next pass, after
+  the pause ("A notice answered"). A walk begun beside others takes
   a root a device answering for the writer gives only if its head is above
   every root a walk of the pass took — an older or equal one says nothing
   of what the writer did since — and otherwise asks the writer again in
@@ -4395,7 +4606,8 @@ announced). What is owed, and until when:
   is held, owed and walked in full follows from the roots and entries
   verified, as above.
 - **An epoch key** (§9) — asked, round after round, of the epoch's creator,
-  then of every other device known to write into the namespace, one
+  then of the devices answering for others that signed data held here
+  vouches for (§13.5, at most `RELAYS_ASKED`), one
   Interest each a round, while the key is not held, a held owner-signed
   record of the subject names the epoch, the device may hold the key by
   conditions (2) and (3) of §9 as far as it can tell, and a version held
@@ -4434,10 +4646,13 @@ announced). What is owed, and until when:
   payload. A read asks again as its caller does; the loops above ask
   again for merge pieces and a holder's take.
 - **A removal cut's manifest packet** a version waits for (§8) — by its full
-  name, from any device, while a version waits for it. Re-admitted entries
-  and the bytes a cut keeps (§8.2) keep their own schedule
-  (`READMIT_TRIES` asks, the pause doubling from 500 ms), and are asked
-  again at every group refresh.
+  name, from any device, while a version waits for it: asked when the
+  version comes to wait, on whatever path admits it (an entry taken, a key
+  obtained opening it, a descent ended, pieces arrived, a start), then
+  after the pause above. Re-admitted entries, the entries a revocation
+  cut accepts (§8) and the bytes a cut keeps (§8.2) keep their own
+  schedule (`READMIT_TRIES` asks, the pause doubling from 500 ms), and are
+  asked again at every group refresh.
 - **Custody asks** (§13.3) — within one `hold` call or release, never
   past it: an audit ask no answer signed by the holder came back to, as a
   new ask under a fresh nonce, up to `AUDIT_TRIES` (8) asks per piece per
@@ -4457,8 +4672,10 @@ announced). What is owed, and until when:
   hold ask starts the next take. Each round asks each entry inside `at`
   it can name and does not hold as an owed fetch (`FETCH_TRIES` asks). A
   hold ask waiting for the take is answered, with the lease of what is
-  kept, once the take brought nothing during its wait, so an owner's
-  asks of a holder whose take gets nowhere end at the same lease twice.
+  kept, once the take brought nothing since the last such answer (before
+  one, during its wait), so an owner's asks of a holder whose take gets
+  nowhere end at the same lease twice, and those of a holder whose take
+  still brings pieces do not.
 - **A members record's cut manifests** (§8), before the record is taken —
   up to `FETCH_TRIES` (3) rounds over the record's manifest trees, after
   the pause above; then the record is taken whether or not they came, so
@@ -4525,7 +4742,14 @@ one per (device, namespace) for a walk — a notice for a device already
 being walked marks it to walk again, and begins a walk of its newer root
 within the loop's pass only as "Walks of newer roots" above says, at most
 `WALKS_AT_ONCE` (3) walks of one pass under way at once, what two of them
-both list asked once; a reader's first look walks beside the loop once,
+both list asked once, and a pass a notice asks for after one that took
+nothing newer waits the pause ("A notice answered"); a burst of members
+records refreshes each person's namespace adopted for a folder that they
+list (§6.3) at most once per `REFRESH_PAUSE_MAX`, not once per record;
+the devices answering for a writer are at most `RELAYS_ASKED` (8) per
+ask, a granter round at most the creator and `RELAYS_ASKED` more, and
+the devices heard at most `HEARD_MAX` (64) per group (§12, §13.5); a
+reader's first look walks beside the loop once,
 at most `FETCH_TRIES` passes, and hands it what it did not take, starting
 no second loop — one per (subject, epoch) for a key, one per version for
 pieces, one per name for a manifest packet. Each pass of a loop makes at
@@ -4552,8 +4776,9 @@ costs one walk at most `n` · `FETCH_TRIES` asks per source, the bound
 above per piece, never more for being fetched at once. A first look in a
 group heard from no one costs at most `REFRESH_TRIES` Sync Interests more
 in that group, spread over about a minute, one run per group at a time;
-so does a change announced that no member is heard to have taken, the
-count starting afresh at each newer change.
+so does a change announced that no member is heard to have taken: at most
+`REFRESH_TRIES` per run whatever the rate of changes, and in a group whose
+members never walk the device's roots one run in all, until one does.
 A verb's own asks are bounded per call: a one-key read makes at most
 `FETCH_TRIES` asks for the head and as many for the node it names; a verb
 waiting for an epoch key waits for at most `FETCH_TRIES` rounds of its
@@ -4580,15 +4805,28 @@ it.
 notice is unsigned (§12): a stranger naming a device that never answers
 costs the reader at most 16 root asks (64 Interests at most) per notice,
 spread over about a minute, and none more while that name is being walked
-— the "stranger in a sync group" row above, bounded in time as well. A
+— the "stranger in a sync group" row above, bounded in time as well. One
+Sync Interest may name many devices: at most `HEARD_MAX` of them per group
+are kept heard and walked (a name dropped begins no further pass, and
+never displaces a device signed data held vouches for), and none is asked
+to answer for another device or to grant (§13.5), so its cost is linear in
+`HEARD_MAX`, never in the square of the names; the state vector, and so
+every Sync Interest the reader sends into the group, stays at most
+`HEARD_MAX` + 1 entries, and such a name holds back a default record, a
+refusal or a folder erasure for one walk at most (§5, §12). A
 stranger's notices of a device being walked begin walks of its newest
 root only as the pass allows (at most `WALKS_AT_ONCE` under way, each
-once the one before is past its way or ended), each a root ask and what
-that root newly lists, what two walks share asked once; a root walked in
-full before ends its walk at once, once the root's rounds brought nothing
-newer: a notice of a device whose root did not move costs `FETCH_TRIES`
-root asks of it, and `FETCH_TRIES` − 1 of each device answering for it ("A
-notice answered"). (2)
+once the one before is past its way or ended with a newer root), each a
+root ask and what that root newly lists, what two walks share asked once;
+a root walked in full before ends its walk at once, once the root's
+rounds brought nothing newer: a notice of a device whose root did not
+move costs `FETCH_TRIES` root asks of it, and `FETCH_TRIES` − 1 of each
+device answering for it, at most `RELAYS_ASKED` ("A notice answered") —
+and notices repeated back to back cost that once per pause, `k` passes in
+a row bringing nothing newer waiting the pause of `k` misses, one a
+minute from `REFRESH_TRIES` on. They can so delay, by at most that pause,
+the walk a genuine notice of the device asks for, never what is held.
+(2)
 What is owed for
 longer is named only by data the device verified: a root its writer
 signed, a record its owner signed, a version a writer signed. A member
@@ -4969,6 +5207,11 @@ the default seed and two more, each with `--check-determinism`.
   alone in a fresh process with the same flags must give the same status,
   faults, cost and measures as in the suite (`--check-determinism` checks
   this under `--faulty`; each child run gets the runner's fault flags).
+  The implementation keeps its share of this: whatever it does for
+  several groups or collections at one moment — announcements, their
+  re-announcements, fetches, asks — it starts in name order, never in a
+  hash table's per-process order, and the random bytes it draws (keys,
+  nonces) change what it sends, never its order or timing.
   The JSON report records the network (`network`: `mode` — `clean`,
   `faulty` or `faults` — the profile as run and its seed) and, for each
   case, the profile it ran under (`faults`).

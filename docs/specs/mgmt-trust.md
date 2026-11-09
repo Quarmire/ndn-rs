@@ -84,9 +84,11 @@ The verbs that change what a device trusts or holds, under
 it only on the local management socket from a local operator (the daemon's
 user, root, or a member of a configured trust-admin group, by the kernel's
 peer credentials), never over `/localhop` (the **gate**, refusals below).
-Each is the `ndn-namespace` operation of the same name over the host's
-participant and key vault; a host without one (no trust-admin backend)
-refuses with `not-at-runtime`.
+`transit` alone has a narrower gate of its own: a local operator, or a
+member of a configured transit group ([Transit](#transit)). Each is the
+`ndn-namespace` operation of the same name over the host's participant and
+key vault; a host without one (no trust-admin backend) refuses with
+`not-at-runtime`.
 
 | verb | ControlParameters | answer (JSON in the status text) |
 |---|---|---|
@@ -139,7 +141,7 @@ in `cause` and carries its params too.
 | `not-at-runtime` | 404 | no | use-other-device | `operation` (`context-adopt`, `enroll`, `enroll-status`, `context-refresh`, `context-update`, `renew`, `transit`, `memberships`, `approvals`, `ca-info`, `yubikey`) | this node does not do it at runtime (no backend) |
 | `missing-parameter` | 400 | no | fix-request | `operation`, `parameter` (`Uri`, `Name`, `ContextData`), `expects` | a required parameter is missing |
 | `trust-change-over-localhop` | 403 | no | use-other-device | `operation` (`<module>/<verb>`) | a trust change arrived over `/localhop`; trust changes are made on the node itself |
-| `trust-change-unidentified` | 403 | no | fix-local | `daemon_uid`, `groups` (`, `-separated trust-admin groups; empty: none) | the face carries no caller identity (not the local management socket) |
+| `trust-change-unidentified` | 403 | no | fix-local | `daemon_uid`, `groups` (`, `-separated trust-admin groups; empty: none), `transit_groups` (likewise; `transit` only) | the face carries no caller identity (not the local management socket) |
 | `trust-change-not-operator` | 403 | no | fix-local | `uid`, `daemon_uid`, `groups` | the caller is a local user who is no operator of this node |
 
 Every other signed management command goes through the command gate: on the
@@ -220,21 +222,33 @@ app that adopted it for one scope of its own alone (trust-context.md
 that does not hold it, so the namespace's Data reaches the app, which
 validates every packet itself.
 
+- **Who may mark.** The transit gate: on the local management socket, by
+  the kernel's peer credentials, a local operator (as for every trust
+  change) or a member of a group in `[security] transit_groups` — the
+  **transit capability**, which runs no other trust-changing verb: it
+  enrolls, adopts, refreshes, updates, renews and decides approvals no
+  more than any other local user. A data host runs with it, not as a
+  trust admin. Another local user is refused (`transit-not-permitted`,
+  naming who may and how to be given it); a face with no caller identity
+  is refused (`trust-change-unidentified`); over `/localhop` it is
+  refused as every trust change is (`trust-change-over-localhop`).
 - **The namespace.** Name is exactly a self-certifying namespace,
   `/user/<0xA1: 32 bytes>` (trust-context.md §4.5). Any other is refused
   (`transit-not-personal`): such a namespace is adopted on the node from
   its anchor link, or carried by the link that serves its devices
   ([ndn-link.md](ndn-link.md) §15.7).
-- **Marks, counted.** Each command is one mark; Flags `TRANSIT_RELEASE`
-  takes one back. Management counts its marks per namespace apart from the
-  links': each mark is one reason in the forwarder's one count of the
-  namespace's reasons to be in transit (ndn-rs `TransitPrefixes`, with a
-  link's), so it is in transit while any reason holds, and the first and
-  the last run the action the links' run — its sync group `<ns>/32=sync`
-  runs with the multicast strategy meanwhile (data-layer.md §12). Two
-  scopes adopting one namespace hold two marks; one releasing keeps the
-  other's. A release with no management mark held changes nothing and
-  answers `marks: 0`: it never takes a link's reason.
+- **Marks, counted, owned by the face that asked.** Each command is one
+  mark; Flags `TRANSIT_RELEASE` takes one back. Each mark is owned by the
+  management face the command arrived on (an internally generated command
+  is the node's own), and only that face takes it back. Each mark is one
+  reason in the forwarder's one count of the namespace's reasons to be in
+  transit (ndn-rs `TransitPrefixes`, with a link's), so it is in transit
+  while any reason holds, and the first and the last run the action the
+  links' run — its sync group `<ns>/32=sync` runs with the multicast
+  strategy meanwhile (data-layer.md §12). Two scopes adopting one
+  namespace hold two marks; one releasing keeps the other's. A release
+  with no mark of its face held changes nothing: it never takes another
+  face's mark, nor a link's reason.
 - **What transit does** is ndn-link.md §15.7's: Data under the namespace is
   forwarded to the Interests pending for it without validation and never
   enters the Content Store; unsolicited Data is dropped as always. A
@@ -243,26 +257,36 @@ validates every packet itself.
   changes: the keyring, the trust contexts held, the certificates — the
   node keeps refusing the namespace everywhere it judges, as a person's
   namespace not held.
-- **Lifetime.** Marks are the running daemon's: they end with its run. An
-  app marks before it fetches the namespace's first packet (its adoption
-  for the scope fetches the trust-context versions through this transit
-  too) and releases when it stops judging the namespace. An app that ends
-  without releasing leaves its marks until the daemon restarts.
-- **Answer.** `TransitInfo`: `namespace`; `marks`, those management holds
+- **Lifetime.** A face's marks end when the face closes: management
+  releases every mark it still holds, so an app that ends, crashes or is
+  restarted leaves none behind, and its next run marks again over its new
+  connection. An app therefore marks over a management connection it keeps
+  open for as long as it judges the namespace (the data host: one for its
+  whole run). It marks before it fetches the namespace's first packet (its
+  adoption for the scope fetches the trust-context versions through this
+  transit too) and releases when it stops judging the namespace. All marks
+  end with the daemon's run.
+- **Answer.** `TransitInfo`: `namespace`; `marks`, those all faces hold
   after this command (`0`: no longer carried for apps, though a link may
   still carry it); `held`.
 
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
 | `transit-not-personal` | 400 | no | fix-request | `namespace` | the namespace is not a self-certifying one; adopt it on the node, or let a link carry it |
+| `transit-not-permitted` | 403 | no | fix-local | `uid`, `daemon_uid`, `groups`, `transit_groups` (`, `-separated; empty: none) | the caller is a local user who is neither an operator nor in a transit group |
 
 **Threat note: who may mark, and what a local app then receives.** Only a
-local operator marks: the gate decides `transit` as it decides
-`context-adopt` — on the local management socket, by the kernel's peer
-credentials (the daemon's user, root, a member of a configured
-trust-admin group); never over `/localhop`, never on a face that carries no
-caller identity, never for another local user. While a namespace is
-marked, any local app on that daemon — not only the one that asked — may
+local operator or a member of a transit group marks, on the local
+management socket, by the kernel's peer credentials; never over
+`/localhop`, never on a face that carries no caller identity, never for
+another local user. The transit capability is narrow on purpose: a data
+host parses remote content, and a flaw in it gives the attacker only what
+the host's own credentials allow — carrying a person's namespace in
+transit, which changes no trust (below) — not enrolling, adopting or
+approving. Marks die with the face that made them, so a host that crashes
+or is killed cannot leave a namespace in transit for the rest of the
+daemon's run. While a namespace is marked, any local app on that daemon —
+not only the one that asked — may
 receive Data under it, **unvalidated and uncached**, for its own pending
 Interests: the forwarder vouches for none of it, and a copy forged on the
 way reaches the app as the real one would. An app that trusts what its
