@@ -129,7 +129,12 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// [`IDLE_TIMEOUT_NS`]: only connectionless ones (UDP and the like). Local
 /// faces use the cancel token; connection-oriented ones (TCP, WebSocket,
 /// QUIC) clean up when their connection closes, so a quiet connection — a
-/// peer whose sync group another member keeps alive — stays up.
+/// peer whose sync group another member keeps alive — stays up here. A
+/// QUIC link face is persistent and its connection is the link layer's:
+/// `ndn-link` closes a link another device dialed once it carried no NDN
+/// packet for `[links] quiet_close_secs` with no route to its face and no
+/// namespace in transit over it (removing the face here would leave the
+/// connection open); a link with routes stays however quiet.
 fn idles_out(kind: FaceKind) -> bool {
     !matches!(
         kind,

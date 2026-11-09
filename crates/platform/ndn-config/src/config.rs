@@ -2420,7 +2420,7 @@ impl RelayServiceConfig {
     }
 }
 
-/// `[links]`: timing of every link.
+/// `[links]`: timing and bounds of every link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinksConfig {
@@ -2431,6 +2431,17 @@ pub struct LinksConfig {
     /// (≥ 3 × keep_alive_secs, ≤ 600).
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// Most links other devices dialed here, admitted and up at once (with
+    /// the attempts in progress); beyond it an attempt is refused before
+    /// its handshake until one closes. Links this device dials do not count
+    /// (≥ 1).
+    #[serde(default = "default_max_links")]
+    pub max_links: usize,
+    /// Seconds a link another device dialed here may carry no NDN packet,
+    /// while nothing here routes to it and it carries no namespace in
+    /// transit, before it is closed (≥ 1).
+    #[serde(default = "default_quiet_close_secs")]
+    pub quiet_close_secs: u64,
 }
 
 fn default_keep_alive_secs() -> u64 {
@@ -2439,12 +2450,20 @@ fn default_keep_alive_secs() -> u64 {
 fn default_idle_timeout_secs() -> u64 {
     30
 }
+fn default_max_links() -> usize {
+    1024
+}
+fn default_quiet_close_secs() -> u64 {
+    300
+}
 
 impl Default for LinksConfig {
     fn default() -> Self {
         Self {
             keep_alive_secs: default_keep_alive_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            max_links: default_max_links(),
+            quiet_close_secs: default_quiet_close_secs(),
         }
     }
 }
@@ -2467,6 +2486,20 @@ impl LinksConfig {
                  noticed",
                 3 * k
             )));
+        }
+        if self.max_links == 0 {
+            return Err(ConfigError::Invalid(
+                "[links] max_links = 0 would refuse every device that dials this one: set at \
+                 least 1, or stop listening (remove listen from [[face]] kind = \"quic\")"
+                    .into(),
+            ));
+        }
+        if self.quiet_close_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "[links] quiet_close_secs = 0 would close a link another device dialed before \
+                 it could carry anything: set at least 1 (default 300)"
+                    .into(),
+            ));
         }
         Ok(())
     }

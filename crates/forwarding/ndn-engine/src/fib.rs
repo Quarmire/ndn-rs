@@ -100,6 +100,13 @@ impl FibTrie {
             path.pop();
         }
     }
+
+    fn routes_to(&self, face_id: FaceId) -> bool {
+        self.entry
+            .as_ref()
+            .is_some_and(|e| e.nexthops.iter().any(|n| n.face_id == face_id))
+            || self.children.values().any(|c| c.routes_to(face_id))
+    }
 }
 
 pub struct Fib {
@@ -156,6 +163,11 @@ impl Fib {
         let mut out = Vec::new();
         self.trie.load().dump(&mut Vec::new(), &mut out);
         out
+    }
+
+    /// Whether any entry has a nexthop on `face_id`: a route points at it.
+    pub fn routes_to(&self, face_id: FaceId) -> bool {
+        self.trie.load().routes_to(face_id)
     }
 
     pub fn remove_prefix(&self, prefix: &Name) {
