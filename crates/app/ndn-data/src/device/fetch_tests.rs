@@ -373,6 +373,7 @@ async fn a_holders_take_asks_for_an_entry_it_heard_of_by_its_name() {
                 .into_iter()
                 .collect(),
                 lease: None,
+                answered: None,
             },
         );
         // A summary of the laptop's listed it.
@@ -394,10 +395,12 @@ async fn a_holders_take_asks_for_an_entry_it_heard_of_by_its_name() {
 }
 
 /// A network on which the device's Sync Interests into `group` reach no
-/// one: it counts them, and carries only what the case gives the device.
+/// one: it counts them, keeps the parameters of the newest, and carries
+/// only what the case gives the device.
 struct Unheard {
     group: Name,
     sent: std::sync::atomic::AtomicUsize,
+    last: std::sync::Mutex<Option<Bytes>>,
     tx: futures::channel::mpsc::UnboundedSender<Bytes>,
     rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
 }
@@ -408,6 +411,7 @@ impl Unheard {
         Arc::new(Unheard {
             group,
             sent: std::sync::atomic::AtomicUsize::new(0),
+            last: std::sync::Mutex::new(None),
             tx,
             rx: futures::lock::Mutex::new(rx),
         })
@@ -416,13 +420,28 @@ impl Unheard {
     fn sent(&self) -> usize {
         self.sent.load(Ordering::Relaxed)
     }
+
+    /// The state vector the newest Sync Interest sent carried.
+    fn last_vector(&self) -> Vec<ndn_sync::StateEntry> {
+        let last = self
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a Sync Interest was sent");
+        SvsConfig::default()
+            .dialect
+            .decode_state_vector(&last)
+            .expect("a state vector")
+    }
 }
 
 #[async_trait::async_trait]
 impl Connection for Unheard {
     async fn send(&self, wire: Bytes) -> Result<(), AppError> {
-        if bare_interest(wire).is_some_and(|i| i.name.has_prefix(&self.group)) {
+        if let Some(i) = bare_interest(wire).filter(|i| i.name.has_prefix(&self.group)) {
             self.sent.fetch_add(1, Ordering::Relaxed);
+            *self.last.lock().unwrap() = i.app_parameters().map(|p| Bytes::copy_from_slice(p));
         }
         Ok(())
     }
@@ -554,6 +573,120 @@ async fn a_change_no_member_is_heard_to_have_taken_is_announced_again() {
         conn.sent(),
         before,
         "once a member is heard to have taken the change, it is no longer announced again"
+    );
+    dev.shutdown();
+}
+
+/// A group whose members were heard but never walk this device's roots —
+/// no ask for one is answered while a change is announced again — pays
+/// one run of [`REFRESH_TRIES`] announcements, not one per change: its next
+/// change goes out once, and the group's period carries it (spec §17.1, a
+/// change announced; its Sync Interests carry the change only on their
+/// period, which every announcement covering them defers).
+#[tokio::test(start_paused = true)]
+async fn a_group_no_member_walks_is_announced_again_for_one_run_only() {
+    let ns = n("/alice");
+    let group = sync_group(&ns);
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner.join(&ns).await.expect("the group is joined");
+    conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = conn.sent();
+    dev.inner.publish(&ns);
+    // The whole run: REFRESH_TRIES announcements, the pause doubling to its
+    // most.
+    tokio::time::sleep(REFRESH_PAUSE_MAX * (REFRESH_TRIES + 2)).await;
+    let run = conn.sent() - before;
+    assert!(
+        run > REFRESH_TRIES as usize,
+        "the first change is announced again while no member is heard to take it: {run}"
+    );
+    // The group's own Sync Interests over a minute, nothing published.
+    let quiet = conn.sent();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let period = conn.sent() - quiet;
+    let before = conn.sent();
+    dev.inner.publish(&ns);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let next = conn.sent() - before;
+    assert!(
+        next <= period + 1,
+        "a later change in a group no member walks goes out once beside the group's period: \
+         {next} Sync Interests in a minute, the period alone {period}"
+    );
+    dev.shutdown();
+}
+
+/// One Sync Interest names 250 devices under Alice's namespace that do not
+/// exist — 200 at counter 1, 50 at counter 0. The state vector the device
+/// keeps for the group, which every Sync Interest it sends carries, and what
+/// it notes the group carried stay within the devices it keeps heard (spec
+/// §12): the laptop, which signed data held here vouches for, kept among
+/// them, a name at counter 0 never kept at all.
+#[tokio::test(start_paused = true)]
+async fn a_sync_interest_naming_many_devices_leaves_the_state_vector_bounded() {
+    let ns = n("/alice");
+    let group = sync_group(&ns);
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner.join(&ns).await.expect("the group is joined");
+    let laptop = n("/alice/laptop");
+    conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The laptop's root was verified in an earlier run: vouched for.
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .entry((laptop.clone(), ns.clone()))
+        .or_default()
+        .kept = 1;
+
+    let fakes: Vec<ndn_sync::StateEntry> = (0..250)
+        .map(|i| ndn_sync::StateEntry {
+            name: n(&format!("/alice/fake{i}")),
+            boot: 0,
+            seq: u64::from(i < 200),
+        })
+        .collect();
+    let vector = SvsConfig::default().dialect.encode_state_vector(&fakes);
+    let flood = InterestBuilder::new(group.clone().append_version(2))
+        .lifetime(Duration::from_secs(1))
+        .app_parameters(vector.to_vec())
+        .build();
+    conn.tx.unbounded_send(flood).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    dev.inner.publish(&ns);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let carried = conn.last_vector();
+    let bound = super::heard::HEARD_MAX + 1;
+    assert!(
+        carried.len() <= bound,
+        "a Sync Interest carries at most the devices kept heard and this one: {} entries, at \
+         most {bound}",
+        carried.len()
+    );
+    assert!(
+        carried.iter().any(|e| e.name == laptop),
+        "a device signed data vouches for is kept"
+    );
+    assert!(
+        !carried
+            .iter()
+            .any(|e| e.seq == 0 && e.name.to_string().contains("fake")),
+        "a name at counter 0 brings nothing and is not kept"
+    );
+    let observed = dev.inner.st.lock().groups[&ns]
+        .observed
+        .clone()
+        .expect("observed")
+        .snapshot()
+        .len();
+    assert!(
+        observed <= bound,
+        "what the group carried is noted for the devices kept only: {observed} names"
     );
     dev.shutdown();
 }

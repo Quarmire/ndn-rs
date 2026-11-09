@@ -436,6 +436,80 @@ async fn a_device_serves_every_entry_it_holds_of_others_and_nothing_it_refused()
     dev.shutdown();
 }
 
+/// Round-3 review L3 (spec §13.5): a collection this device holds for its
+/// owner serves nothing refused or withdrawn here either — not an outsider's
+/// version, not one its rule refused, not one its trust context withdrew —
+/// while every entry held verified still is; and an ask for a seq it never
+/// held is answered with nothing.
+#[tokio::test]
+async fn a_holder_serves_nothing_of_a_held_collection_it_refused_or_withdrew() {
+    let dev = device(rules()).await;
+    let applied = version("/bob/laptop", 10, &[], edit(None, "applied"));
+    let outsider = version("/dave/phone", 2, &[], edit(None, "not a writer"));
+    let ruled = version(
+        "/carol/phone",
+        4,
+        &[],
+        Bytes::from_static(b"not an operation"),
+    );
+    let withdrawn = version("/alice/phone", 3, &[], edit(None, "withdrawn"));
+    for m in [&applied, &outsider, &ruled, &withdrawn] {
+        give(&dev, m);
+    }
+    {
+        let mut st = dev.inner.st.lock();
+        st.holding.insert(
+            c(),
+            Holding {
+                hold: log_name(&n("/alice/phone"), Some(&c()), 1),
+                until: Timestamp(u64::MAX),
+                at: Frontier::new(),
+                lease: None,
+                answered: None,
+            },
+        );
+        let why = Refusal::Untrusted {
+            why: "its chain no longer verifies".into(),
+        };
+        st.cut_out.edit().insert(
+            withdrawn.name.clone(),
+            OutOfCut {
+                writer: Writer::new(withdrawn.key.clone()),
+                digest: withdrawn.digest(),
+                wire: Some(withdrawn.packet.clone()),
+                why: why.clone(),
+            },
+        );
+        st.refused.insert(withdrawn.name.clone(), why);
+        assert!(st.refused.contains_key(&outsider.name));
+        assert!(st.refused.contains_key(&ruled.name));
+    }
+    assert_eq!(
+        dev.inner.packet_for(&applied.name, false).as_ref(),
+        Some(&applied.packet),
+        "an entry held verified is served"
+    );
+    for (m, what) in [
+        (&outsider, "an outsider's version"),
+        (&ruled, "a version its rule refused"),
+        (&withdrawn, "a version its trust context withdrew"),
+    ] {
+        assert_eq!(
+            dev.inner.packet_for(&m.name, false),
+            None,
+            "{what} is not served by its holder"
+        );
+        assert_eq!(
+            dev.inner.held_packet(&m.name),
+            None,
+            "{what} is not served under the holder's own name"
+        );
+    }
+    let never = log_name(&n("/bob/laptop"), Some(&c()), 999);
+    assert_eq!(dev.inner.packet_for(&never, false), None, "never held");
+    dev.shutdown();
+}
+
 #[tokio::test]
 async fn a_reader_asks_the_pieces_of_a_version_of_the_devices_that_built_over_it() {
     let dev = device(rules()).await;

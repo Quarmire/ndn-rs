@@ -354,16 +354,25 @@ pub trait Introducer: Send + Sync {
     /// for this data layer alone (spec §6.3): version 1 fetched and checked
     /// as the genesis the name hashes, the newest reached from it
     /// (`ndn_cert::adopt_scoped`, `ndn_identity::adopt_scoped_via_engine`);
-    /// `held`, the version the layer holds already, is refreshed from by
-    /// continuity instead. The namespace is adopted into no keyring the
-    /// node judges by: the node's forwarder, and every path but the layer's
-    /// judging of those folders, keep refusing it as a person's namespace
-    /// not held. From an `Ok` until [`release_scoped`](Self::release_scoped)
-    /// the host carries the namespace's Data to this device though its
-    /// forwarder cannot validate it — forwarded unvalidated to the Interests
-    /// pending for it and never cached (transit) — and routes its sync
-    /// group; the layer validates every packet itself. An error says why
-    /// not and what to do; the layer asks again later.
+    /// `held`, the version the layer holds already — one it kept across a
+    /// restart included — is refreshed from by continuity instead, so a
+    /// branch that does not descend from it is refused. The namespace is
+    /// adopted into no keyring the node judges by: the node's forwarder, and
+    /// every path but the layer's judging of those folders, keep refusing it
+    /// as a person's namespace not held. The result carries the newest
+    /// version's signed Data (`ScopedContext::data`), which the layer keeps.
+    ///
+    /// Transit, idempotent: on an `Ok` — with `held` or without — the host
+    /// carries the namespace's Data to this device though its forwarder
+    /// cannot validate it (forwarded unvalidated to the Interests pending for
+    /// it and never cached) and routes its sync group, taking that on only
+    /// if it does not carry the namespace already; it carries it until
+    /// [`release_scoped`](Self::release_scoped). An error leaves the
+    /// carrying as it was before the call, says why and what to do; the
+    /// layer asks again later. The layer validates every packet itself, and
+    /// refuses an `Ok` older than the newest version it adopted of the
+    /// namespace before, or of that number with other content (releasing
+    /// it when it held no version).
     ///
     /// The default refuses: a host that cannot fetch a namespace without
     /// adopting it for the node, or cannot carry its Data in transit, says
@@ -386,9 +395,9 @@ pub trait Introducer: Send + Sync {
     }
 
     /// No members record the layer holds lists `namespace` any more, or the
-    /// node now holds it: the host stops carrying its Data to this device
-    /// in transit. Called once for each namespace an
-    /// [`adopt_scoped`](Self::adopt_scoped) adopted.
+    /// node now holds it, or the layer refused the host's adoption: the host
+    /// stops carrying its Data to this device in transit. Releasing a
+    /// namespace the host does not carry does nothing.
     fn release_scoped(&self, namespace: &Name) {
         let _ = namespace;
     }

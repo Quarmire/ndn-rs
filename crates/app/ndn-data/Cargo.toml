@@ -47,6 +47,9 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # device on both on-disk engines after a simulated power loss.
 ndn-sync = { workspace = true, features = ["store-fjall", "store-redb"] }
 tempfile = "3"
+# Scoped adoption tests (`device/scoped_tests.rs`) adopt as the hosts do,
+# `ndn_cert::adopt_scoped`, over an in-memory network.
+ndn-cert = { workspace = true }
 
 [lints]
 workspace = true

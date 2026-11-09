@@ -1753,6 +1753,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "ndn-app",
+ "ndn-cert",
  "ndn-foundation-types",
  "ndn-packet",
  "ndn-security",

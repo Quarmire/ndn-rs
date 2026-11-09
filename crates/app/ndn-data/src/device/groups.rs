@@ -14,17 +14,19 @@
 //! member by member, as before.
 
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::{HashSet, hash_map};
+use std::collections::{HashSet, btree_map};
 use std::ops::{Deref, Range};
 
 use super::*;
 
 /// The collections known here ([`St::colls`]), with when each last
 /// changed: every access that may change one notes it, so a [`Book`] reads
-/// again only what changed since it last read.
+/// again only what changed since it last read. By name, so what is done
+/// collection by collection (fetches, asks) goes out in the same order in
+/// every run (data-layer §18.1).
 #[derive(Default)]
 pub(super) struct Colls {
-    map: HashMap<Name, Coll>,
+    map: BTreeMap<Name, Coll>,
     touches: RefCell<Touches>,
 }
 
@@ -57,7 +59,7 @@ impl Touches {
 }
 
 impl Deref for Colls {
-    type Target = HashMap<Name, Coll>;
+    type Target = BTreeMap<Name, Coll>;
 
     fn deref(&self) -> &Self::Target {
         &self.map
@@ -73,13 +75,13 @@ impl Colls {
     }
 
     /// Collection `c`'s entry, to change or add.
-    pub(super) fn entry(&mut self, c: Name) -> hash_map::Entry<'_, Name, Coll> {
+    pub(super) fn entry(&mut self, c: Name) -> btree_map::Entry<'_, Name, Coll> {
         self.touches.get_mut().touch(&c);
         self.map.entry(c)
     }
 
     /// Every collection, to change.
-    pub(super) fn iter_mut(&mut self) -> hash_map::IterMut<'_, Name, Coll> {
+    pub(super) fn iter_mut(&mut self) -> btree_map::IterMut<'_, Name, Coll> {
         let touches = self.touches.get_mut();
         for c in self.map.keys() {
             touches.touch(c);

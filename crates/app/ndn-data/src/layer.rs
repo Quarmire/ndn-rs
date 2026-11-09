@@ -240,6 +240,19 @@ pub enum Change {
         /// The version.
         id: VersionId,
     },
+    /// The value of a merge collection changed with no version delivered:
+    /// `bases`, covered versions that versions applied here were made over
+    /// (spec §5.2, covered versions as a basis), arrived after those
+    /// versions applied without them, and the rule merged them again
+    /// against them. Told to every watcher of the collection, whatever its
+    /// frontier, only when the value changed; `get` the collection for its
+    /// value now.
+    Remerged {
+        /// The collection.
+        collection: Name,
+        /// The bases handed, as the rule took them.
+        bases: Vec<VersionId>,
+    },
     /// The watcher fell behind: it left [`Config::watch_queue`] changes
     /// unread, so the changes after it were dropped until it read what was
     /// queued, and delivery then went on (spec §15). Never a silent loss:
@@ -266,6 +279,21 @@ pub enum Change {
         writer: Writer,
         /// Why, and what to do: follow the collection by its name to read
         /// it, or have the folder's owner remove the writer.
+        why: String,
+    },
+    /// Persons' namespaces (`/user/<0xA1: …>`) the members record of
+    /// `collection` — a folder or a collection — lists as writers, or by
+    /// cuts, that this device does not adopt for it: past the most one
+    /// subject adopts, or the most the device adopts for all folders
+    /// together (spec §6.3). Their versions in `collection` are refused
+    /// while not adopted. Told when the namespaces left out change.
+    NotAdopted {
+        /// The folder or collection whose record lists them.
+        collection: Name,
+        /// The namespaces not adopted for it.
+        namespaces: Vec<Name>,
+        /// Why, and what to do: the owner lists too many writers; have it
+        /// list fewer, or adopt those namespaces on the device's node.
         why: String,
     },
     /// The members record in force over `collection` changed (spec §6.1,
@@ -349,8 +377,10 @@ impl Change {
             | Change::Equivocation { collection, .. }
             | Change::NotCounted { collection, .. }
             | Change::Counted { collection, .. }
+            | Change::Remerged { collection, .. }
             | Change::Lagged { collection }
             | Change::Untracked { collection, .. }
+            | Change::NotAdopted { collection, .. }
             | Change::Members { collection, .. } => collection,
         }
     }

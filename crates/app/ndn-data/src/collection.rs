@@ -46,7 +46,10 @@ pub enum Rule {
 /// (model invariant 3). Each names its [`parent`](Self::parent), the record
 /// its signer had in force; records of one revision signed by different
 /// devices of the owner merge ([`Members::merge`]) against the parent they
-/// share: every addition and every removal is kept, and removals win.
+/// share: every addition and every removal is kept, and removals win. A
+/// record of the next revision signed from a view without one of them is
+/// taken onto their merge first, so a removal wins across revisions too
+/// (spec §6).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Members {
     /// The collection this record governs; of a folder record, the folder.
@@ -162,9 +165,16 @@ impl Members {
         records: &[Members],
         held: impl Fn(&Parent) -> Option<&'a Members>,
     ) -> Option<(Members, Resolve)> {
-        let top = records.iter().max_by(|a, b| a.owner.cmp(&b.owner))?;
+        Self::merge_refs(&records.iter().collect::<Vec<_>>(), held)
+    }
+
+    /// [`Self::merge`] of records held by reference.
+    fn merge_refs<'a>(
+        records: &[&Members],
+        held: impl Fn(&Parent) -> Option<&'a Members>,
+    ) -> Option<(Members, Resolve)> {
         if let [one] = records {
-            return Some((one.clone(), Resolve::Nothing));
+            return Some(((*one).clone(), Resolve::Nothing));
         }
         let shared = records
             .iter()
@@ -172,6 +182,68 @@ impl Members {
             .reduce(|a, b| a.filter(|p| b == Some(*p)))
             .flatten();
         let base = shared.and_then(|p| held(&p).filter(|m| m.as_parent() == p));
+        let (mut merged, resolve) = Self::merge_over(records, base)?;
+        merged.parent = shared;
+        Some((merged, resolve))
+    }
+
+    /// This record, of revision `n + 1`, taken onto `below`, the record
+    /// revision `n` stands for at this reader, when its signer signed it
+    /// from another view (spec §6): it merges with `below` three ways
+    /// against `parent`, the record of revision `n` it names, when that is
+    /// held — so what `below` removed (or added) that `parent` still lists
+    /// (or lacks) applies, and what this record changed stands, a removal
+    /// winning — and is intersected with `below` otherwise. It keeps its
+    /// revision and signer; its parent is `below`.
+    pub(crate) fn onto(&self, below: &Members, parent: Option<&Members>) -> (Members, Resolve) {
+        let (mut m, resolve) = Self::merge_over(&[self, below], parent).expect("two records");
+        m.owner = self.owner.clone();
+        m.revision = self.revision;
+        m.parent = Some(below.as_parent());
+        (m, resolve)
+    }
+
+    /// The record that `records` — owner-signed records of one subject and
+    /// one revision, by distinct signers — stand for at this reader, and
+    /// what it leaves to resolve (spec §6). Each comes with its parent, when
+    /// the reader holds it (a record of the revision below, or a merge of
+    /// some of them); `below` is the record the revision below stands for
+    /// here, with what it is as a parent, when a record of it is held. A
+    /// record naming `below` is taken as it is, any other onto `below`
+    /// ([`Self::onto`]); they then merge against `below`
+    /// ([`Self::merge`]). With no record of the revision below held, they
+    /// merge as they are, against no parent. So what stands is a function
+    /// of the records held alone, whatever order they arrived in. `None`
+    /// for no records.
+    pub(crate) fn settle(
+        records: &[(&Members, Option<&Members>)],
+        below: Option<(&Members, Parent)>,
+    ) -> Option<(Members, Resolve)> {
+        let Some((below, at)) = below else {
+            let records: Vec<&Members> = records.iter().map(|(r, _)| *r).collect();
+            return Self::merge_refs(&records, |_| None);
+        };
+        let mut resolve = Resolve::Nothing;
+        let taken: Vec<std::borrow::Cow<'_, Members>> = records
+            .iter()
+            .map(|(r, parent)| match r.parent {
+                Some(p) if p == at => std::borrow::Cow::Borrowed(*r),
+                _ => {
+                    let (m, why) = r.onto(below, *parent);
+                    resolve = resolve.max(why);
+                    std::borrow::Cow::Owned(m)
+                }
+            })
+            .collect();
+        let taken: Vec<&Members> = taken.iter().map(|m| m.as_ref()).collect();
+        let (merged, why) = Self::merge_refs(&taken, |p| (*p == at).then_some(below))?;
+        Some((merged, resolve.max(why)))
+    }
+
+    /// `records` merged against `base`, their shared parent when held
+    /// ([`Self::merge`]); the merge names no parent.
+    fn merge_over(records: &[&Members], base: Option<&Members>) -> Option<(Members, Resolve)> {
+        let top = *records.iter().max_by(|a, b| a.owner.cmp(&b.owner))?;
         let mut writers: Vec<Name> = match base {
             Some(p) => {
                 let removed: Vec<(usize, &Name)> = records
@@ -256,6 +328,7 @@ impl Members {
                 .iter()
                 .filter(|m| m.rule != p.rule || m.since != p.since)
                 .max_by(|a, b| a.owner.cmp(&b.owner))
+                .copied()
                 .unwrap_or(p),
             None => top,
         };
@@ -304,7 +377,7 @@ impl Members {
             epoch: sealing.epoch.clone(),
             key_check: sealing.key_check,
             since: ruling.since.clone(),
-            parent: shared,
+            parent: None,
         };
         Some((merged, resolve))
     }
@@ -464,8 +537,9 @@ pub struct Parent {
 
 /// What a merge of concurrent members records leaves to do (spec §6): a
 /// device of the owner's namespace that is of the merged audience resolves
-/// it with a record of the next revision.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// it with a record of the next revision. Ordered by what it asks: a new
+/// epoch does all a record listing the readers does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Resolve {
     /// Nothing: the merge stands.
     #[default]

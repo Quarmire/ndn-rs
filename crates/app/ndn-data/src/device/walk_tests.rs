@@ -7,6 +7,7 @@
 //! root its writer gave, newer than every root verified before it unless
 //! every round of the root brought nothing newer.
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
 use super::*;
@@ -1014,4 +1015,411 @@ async fn a_notice_answered_by_a_relays_root_behind_the_writer_asks_the_writer_ag
     reader.shutdown();
     relay.shutdown();
     writer.shutdown();
+}
+
+/// A reader's link to some devices, as [`Net`]: an Interest under a
+/// device's name is answered with what that device serves, under its
+/// `32=held` with what it holds for others. Every Interest under `away` is
+/// lost while `losing` holds. `forger`, if given, answers every `32=held`
+/// ask first with a forgery under the name asked for: for `writer`'s root
+/// of `ns`, a root claiming head 99; for anything else, a packet of junk —
+/// neither signed by the writer; the other devices' `32=held` answers then
+/// come 100 ms later. Every Interest name sent is kept.
+struct Hostile {
+    devices: Vec<Arc<Inner>>,
+    away: Name,
+    losing: AtomicBool,
+    forger: Option<Name>,
+    root: Name,
+    forged_root: Name,
+    asked: std::sync::Mutex<Vec<Name>>,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+impl Hostile {
+    fn new(
+        devices: &[&Device],
+        away: &Name,
+        forger: Option<&Name>,
+        writer: &Name,
+        ns: &Name,
+    ) -> Arc<Self> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        Arc::new(Hostile {
+            devices: devices.iter().map(|d| Arc::clone(&d.inner)).collect(),
+            away: away.clone(),
+            losing: AtomicBool::new(false),
+            forger: forger.cloned(),
+            root: root_prefix(writer, ns),
+            forged_root: root_name(writer, ns, 99),
+            asked: std::sync::Mutex::new(Vec::new()),
+            tx,
+            rx: futures::lock::Mutex::new(rx),
+        })
+    }
+
+    /// The names of the Interests sent so far that `pick` picks.
+    fn asked(&self, pick: impl Fn(&Name) -> bool) -> Vec<Name> {
+        let asked = self.asked.lock().unwrap();
+        asked.iter().filter(|n| pick(n)).cloned().collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Hostile {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Ok(interest) = Interest::decode(wire) else {
+            return Ok(());
+        };
+        let name: &Name = &interest.name;
+        self.asked.lock().unwrap().push(name.clone());
+        if self.losing.load(Ordering::Relaxed) && name.has_prefix(&self.away) {
+            return Ok(());
+        }
+        let held = parse_held_name(name);
+        if let (Some((holder, piece)), Some(forger)) = (&held, &self.forger)
+            && holder == forger
+        {
+            let inside = match piece.has_prefix(&self.root) {
+                true => self.forged_root.clone(),
+                false => piece.clone(),
+            };
+            let forged = DataBuilder::new(inside, b"forged").sign_digest_sha256();
+            let reply = DataBuilder::new(name.clone(), &forged).sign_digest_sha256();
+            let _ = self.tx.unbounded_send(reply);
+            return Ok(());
+        }
+        let Some(device) = self.devices.iter().find(|d| name.has_prefix(&d.device)) else {
+            return Ok(());
+        };
+        let reply = match &held {
+            Some((holder, piece)) if *holder == device.device => device
+                .held_packet(piece)
+                .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256()),
+            _ => device.packet_for(name, interest.selectors().can_be_prefix),
+        };
+        let Some(reply) = reply else {
+            return Ok(());
+        };
+        // With a forger about, an honest device's answer for another comes
+        // after the forger's.
+        if held.is_some() && self.forger.is_some() {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = tx.unbounded_send(reply);
+            });
+        } else {
+            let _ = self.tx.unbounded_send(reply);
+        }
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// The laptop writes and the phone walks it; the tablet takes the laptop's
+/// second version. Then the laptop goes away, and one Sync Interest names
+/// many devices under Wendy's namespace that do not exist. Nothing signed
+/// held here vouches for them (spec §13.5): none is asked to answer for
+/// another device, the devices heard stay bounded — the tablet, whose root
+/// the phone verified, kept among them and still asked for the laptop —
+/// and only a bounded number of the names is walked at all.
+#[tokio::test(start_paused = true)]
+async fn devices_a_sync_interest_names_are_never_asked_for_others_and_stay_bounded() {
+    let (laptop, tablet, phone) = (n("/wendy/laptop"), n("/wendy/tablet"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &tablet, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let to_writer = Net::new(&[&writer], n("/nothing"));
+    let relay = start_on(&tablet, Arc::clone(&keys[1]), validator(), to_writer).await;
+    let net = Hostile::new(&[&writer, &relay], &laptop, None, &laptop, &ns);
+    let reader = start_on(&phone, Arc::clone(&keys[2]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&tablet));
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    relay.inner.follow(&c).await.unwrap();
+    relay.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&relay, &second, 60).await,
+        "precondition: the tablet takes the second version"
+    );
+
+    net.losing.store(true, Ordering::Relaxed);
+    const FAKES: usize = 72;
+    let fakes: Vec<Name> = (0..FAKES).map(|i| n(&format!("/wendy/fake{i}"))).collect();
+    for f in &fakes {
+        reader.inner.on_update(&ns, notice(f));
+    }
+    reader.inner.on_update(&ns, notice(&laptop));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let fake = |name: &Name| fakes.iter().any(|f| name.has_prefix(f));
+    let held_of_fakes = net.asked(|name| fake(name) && parse_held_name(name).is_some());
+    assert!(
+        held_of_fakes.is_empty(),
+        "a device nothing held vouches for is never asked to answer for another: {} asks, \
+         e.g. {:?}",
+        held_of_fakes.len(),
+        held_of_fakes.first()
+    );
+    let walked: HashSet<Name> = net
+        .asked(fake)
+        .into_iter()
+        .filter_map(|name| fakes.iter().find(|f| name.has_prefix(f)).cloned())
+        .collect();
+    assert!(
+        walked.len() <= super::heard::HEARD_MAX,
+        "at most the devices heard are walked toward: {} of {FAKES} names",
+        walked.len()
+    );
+    {
+        let st = reader.inner.st.lock();
+        let heard = &st.groups[&ns].members;
+        assert!(
+            heard.contains(&tablet) && heard.contains(&laptop),
+            "a name a Sync Interest carried never displaces a device signed data vouches for"
+        );
+        assert!(
+            heard.iter().count() <= super::heard::HEARD_MAX,
+            "the devices heard stay bounded"
+        );
+        let granters = reader.inner.granters(&st, &ns, &laptop);
+        assert_eq!(
+            granters,
+            vec![laptop.clone(), tablet.clone()],
+            "an epoch key is asked of its creator, then of devices signed data vouches for, \
+             never of a name a Sync Interest carried"
+        );
+    }
+    let tablet_asked = net.asked(|name| {
+        parse_held_name(name).is_some_and(|(h, piece)| h == tablet && piece.has_prefix(&laptop))
+    });
+    assert!(
+        !tablet_asked.is_empty(),
+        "the tablet, whose root the phone verified, is asked to answer for the laptop"
+    );
+    reader.shutdown();
+    relay.shutdown();
+    writer.shutdown();
+}
+
+/// The tablet holds the laptop's second version; Mallory, a device of
+/// Wendy's namespace, is hostile. The laptop goes away and announces its
+/// second version. Mallory answers every ask for the laptop's packets
+/// first, with forgeries: a root claiming a higher head than any, and junk
+/// under the version's name. Each reply is verified as it is chosen (spec
+/// §13.5): the forgeries are passed over, not taken in place of the
+/// tablet's answers in the same round, and the phone takes the second
+/// version from the tablet.
+#[tokio::test(start_paused = true)]
+async fn a_hostile_relays_forgeries_do_not_cancel_an_honest_relays_answers() {
+    let (laptop, tablet, mallory, phone) = (
+        n("/wendy/laptop"),
+        n("/wendy/tablet"),
+        n("/wendy/mallory"),
+        n("/wendy/phone"),
+    );
+    let (ns, keys, validator) = wendy(&[&laptop, &tablet, &mallory, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let to_writer = Net::new(&[&writer], n("/nothing"));
+    let relay = start_on(&tablet, Arc::clone(&keys[1]), validator(), to_writer).await;
+    let hostile = start_on(
+        &mallory,
+        Arc::clone(&keys[2]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let net = Hostile::new(
+        &[&writer, &relay, &hostile],
+        &laptop,
+        Some(&mallory),
+        &laptop,
+        &ns,
+    );
+    let reader = start_on(&phone, Arc::clone(&keys[3]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&tablet));
+    reader.inner.on_update(&ns, notice(&mallory));
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    relay.inner.follow(&c).await.unwrap();
+    relay.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&relay, &second, 60).await,
+        "precondition: the tablet takes the second version"
+    );
+
+    net.losing.store(true, Ordering::Relaxed);
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &second, 60).await,
+        "a forged root or entry a hostile relay answers with first does not cancel the honest \
+         relay's answer in the same round"
+    );
+    let asked_of_mallory: Vec<Name> = net
+        .asked(|name| parse_held_name(name).is_some_and(|(h, _)| h == mallory))
+        .into_iter()
+        .filter_map(|name| parse_held_name(&name).map(|(_, piece)| piece))
+        .collect();
+    let root = root_prefix(&laptop, &ns);
+    assert!(
+        asked_of_mallory.iter().any(|p| p.has_prefix(&root)) && asked_of_mallory.contains(&second),
+        "precondition: Mallory was asked for the laptop's root and its second version: \
+         {asked_of_mallory:?}"
+    );
+    reader.shutdown();
+    hostile.shutdown();
+    relay.shutdown();
+    writer.shutdown();
+}
+
+/// The phone walked the laptop's root. Then notices of the laptop keep
+/// coming, ten a second for two minutes, while its root does not move. A
+/// rerun of the walk that took nothing new comes after the pause, which
+/// grows as such reruns go on, idle after `REFRESH_TRIES` of them (spec
+/// §17.1): the root asks stay bounded, not one walk per notice back to
+/// back. Once the laptop writes again, its notice is still answered.
+#[tokio::test(start_paused = true)]
+async fn notices_of_a_device_whose_root_does_not_move_rerun_its_walk_only_after_the_pause() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let net = Hostile::new(&[&writer], &n("/nothing"), None, &laptop, &ns);
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let root = root_prefix(&laptop, &ns);
+    let before = net.asked(|name| name.has_prefix(&root)).len();
+    for _ in 0..1200 {
+        reader.inner.on_update(&ns, notice(&laptop));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let asks = net.asked(|name| name.has_prefix(&root)).len() - before;
+    let bound = (REFRESH_TRIES as usize + 2) * FETCH_TRIES as usize;
+    assert!(
+        asks <= bound,
+        "reruns that take nothing new are paced: {asks} root asks in two minutes of notices, \
+         at most {bound}"
+    );
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &second, 90).await,
+        "a notice of a root that moved is still answered"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
+/// The phone hears a name under Wendy's namespace that nothing signed it
+/// holds vouches for, and that never answers: once a walk of it ended with
+/// no root of it verified, it no longer holds back what waits for the
+/// devices not walked (spec §6.1, §12) — a default record, a folder's
+/// erasure — however many notices of it come. The tablet, whose root the
+/// phone verified in an earlier run, is away too: it still holds them back,
+/// as before.
+#[tokio::test(start_paused = true)]
+async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended() {
+    let (tablet, phone, fake) = (n("/wendy/tablet"), n("/wendy/phone"), n("/wendy/fake"));
+    let (ns, keys, validator) = wendy(&[&tablet, &phone]).await;
+    let net = Hostile::new(&[], &n("/nothing"), None, &tablet, &ns);
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    let c = n("/wendy/32=data/notes");
+    let folder = folder_of(&c);
+    reader.inner.follow(&c).await.unwrap();
+    let unwalked = |dev: &Device| {
+        let st = dev.inner.st.lock();
+        dev.inner.not_walked(
+            &st,
+            &ns,
+            |_| true,
+            |t| t.has_prefix(&folder) || folder.has_prefix(t),
+        )
+    };
+
+    reader.inner.on_update(&ns, notice(&fake));
+    let mut allowed = false;
+    for _ in 0..12 {
+        reader.inner.on_update(&ns, notice(&fake));
+        if reader.inner.default_allowed(&c).await.is_ok() {
+            allowed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    assert!(
+        allowed && unwalked(&reader).is_empty(),
+        "a name nothing vouches for holds nothing back once its walk ended: {:?}",
+        unwalked(&reader)
+    );
+
+    // The tablet's root was verified in an earlier run: it is vouched for,
+    // and, away, it is waited for as before.
+    reader
+        .inner
+        .st
+        .lock()
+        .peers
+        .entry((tablet.clone(), ns.clone()))
+        .or_default()
+        .kept = 3;
+    reader.inner.on_update(&ns, notice(&tablet));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        matches!(
+            reader.inner.default_allowed(&c).await,
+            Err(DataError::NotReady { .. })
+        ),
+        "a device signed data vouches for, away, is still waited for"
+    );
+    assert_eq!(unwalked(&reader), vec![tablet.clone()]);
+    reader.shutdown();
 }
