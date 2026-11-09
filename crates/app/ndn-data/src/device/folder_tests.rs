@@ -1073,3 +1073,40 @@ async fn following_a_collection_inside_a_followed_folder_walks_nothing_again() {
     assert!(!still_walked(&dev, &alice), "and walked again");
     dev.shutdown();
 }
+
+/// A device following a folder whole learns of a collection under it from
+/// a walk — a writer's node lists a version of it — before any version of
+/// it is taken (the first one listed is not to be had yet). `get` of that
+/// collection answers its state under the folder's record (spec §6.1),
+/// the versions it waits for not in it — not `Unavailable` because no
+/// version of it arrived yet to set its record in force.
+#[tokio::test]
+async fn a_collection_a_walk_listed_under_a_followed_folder_is_read_under_the_folder_record() {
+    let dev = device("/bob/phone", &["/alice", "/bob"]).await;
+    let owner = device("/alice/laptop", &["/alice", "/bob"]).await;
+    let f = folder();
+    owner
+        .share_folder(&f, share(yrs(), &["/alice", "/bob"], Vec::new()).into())
+        .await
+        .unwrap();
+    assert_eq!(relay(&owner, &dev, &f, 1), None);
+    dev.inner.follow(&f).await.unwrap();
+    // The laptop's node of `plan` lists its version 7, not taken yet.
+    dev.inner
+        .st
+        .lock()
+        .colls
+        .entry(plan())
+        .or_default()
+        .entries
+        .entry(Writer::new(key(&n("/alice/laptop"))))
+        .or_default()
+        .insert(7);
+    let got = dev.get(&plan()).await;
+    assert!(
+        matches!(&got, Ok(Answer { got: Got::State(s), .. }) if s.at.is_empty()),
+        "a collection under a followed folder is read under the folder's record: {got:?}"
+    );
+    dev.shutdown();
+    owner.shutdown();
+}

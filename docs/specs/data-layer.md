@@ -403,13 +403,16 @@ default record.
   (§8.1): what it holds is not taken anyway —, nor one nothing signed held
   here vouches for (§13.5: no root of it verified, in this run or an
   earlier one, no version of it applied, no lease, hold or members record
-  naming it) once a walk of it ended with no root of it verified — every
-  round of its root missed, or no trust context held judges its roots and
-  no record held lists its person (§6.3) —: a name a Sync Interest
-  carried, or a device never reached, gives no reason to wait, and holds
-  this back for one walk at most, however many notices of it come (round
-  3; before, one unsigned Sync Interest naming a device that does not
-  exist held `put`, `get` and folder erasure here until restart). Each one not
+  naming it) once its walks spent their tries with no root of it verified
+  — `REFRESH_TRIES` (16) walks of one refresh loop (§17.1) whose root's
+  rounds all missed, or no trust context held judges its roots and no
+  record held lists its person (§6.3) —: a name a Sync Interest carried,
+  or a device never reached, gives no reason to wait, and holds this back
+  for those tries at most (a few minutes), however many notices of it come;
+  a real device a faulty path kept from a walk or a few is still waited
+  for (round 3; before, one unsigned Sync Interest naming a device that
+  does not exist held `put`, `get` and folder erasure here until restart).
+  Each one not
   walked is refreshed once more, for at most the first-look time. Until
   then `put` answers `NotReady` (next step `RetryLater`), naming each
   device it waits for and what to do — bring it online, or, if it is
@@ -1426,6 +1429,10 @@ seal epoch, and so one grant per reader, for all of them.
   with a folder record held answers the folder's. A watch is told
   `Change::Members` when it changes (§15). Both read only records held
   and verified here, so two devices holding the same records answer alike.
+  A collection under a followed folder that a walk listed before any of
+  its versions was taken is read under that record all the same: `get`
+  answers its state at what it applied (none yet), not `Unavailable`
+  while the versions listed are on their way (or withheld).
 - **A collection's first own record.** `share(C, …)` of a collection that
   so far had none — it was written and read under the folder's — starts
   from the effective record, as any record starts from the record in
@@ -2957,7 +2964,12 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   answer — even if nothing came during this wait — the ask is not
   answered: the owner asks again. A take that brought a record or a piece
   between two asks has not shown that it keeps all it can, and answering
-  the same lease twice would end the owner's asks (below).
+  the same lease twice would end the owner's asks (below). The members
+  record in force over `C` counts as one record the take lacks until `H`
+  holds it — before it, no version is judged and the pieces a version
+  lacks are not counted, so its arrival is never mistaken for nothing
+  brought — and the last answer is the one given when this ask is
+  answered, by any ask of the owner waiting beside it.
   It keeps its last 1,024 answers by
   name, so an ask asked again gets the same packet at no cost. It signs a
   new lease when what it holds grows. Holders join the groups of the
@@ -3263,7 +3275,14 @@ writer's asks missed (§17.1), all at once, so one that is away too costs no
 more than one of them, and only for what the writer did not answer. (Asked
 one after another, devices away each cost a lifetime: a holder taking a
 hold, which refreshes every writer it knows, outlived its asker's
-patience; case g1.)
+patience; case g1.) A piece of a version being read is asked as a walk's
+packets are: once the writer's first ask missed, beside its later asks,
+the holders and the devices whose versions are made over it in turn, then
+the other devices at once; the first answer that checks is taken. So a
+device that holds nothing — its Nack lost or held back on the way — costs
+the read no time beside the writer's own asks (round 3, faulty case h9:
+asked after them, such a device cost every piece the writer's lost asks
+missed `FETCH_TRIES` lifetimes more).
 
 **Rounds of a walk (normative).** A walk (§7) asks for its root, and for
 each node, page and entry it lists, in rounds (§17.1). The first round asks
@@ -3271,7 +3290,9 @@ the writer alone: its root by one ask, what the root lists by up to
 `FETCH_TRIES` asks. Each later round asks the writer again and, at the
 same time, the devices above, up to `FETCH_TRIES` rounds with the pause
 between. A root the writer gives in a round is taken over any a device
-gives in it, which may be behind the writer's; a node, page or entry is
+gives in it, which may be behind the writer's — as it comes, when newer
+than the floor: the devices' answers are not waited for, so a device
+that is silent costs it no lifetime; a node, page or entry is
 taken from whichever answers first with the packet that checks. So a
 writer that answers never waits behind a device. One that does not
 answer costs one Interest lifetime more for its root — its first ask —
@@ -4390,11 +4411,11 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Device restarts with group members parked | They are read back from their parked copies at start, verified when parked, and parked again while the group waits: nothing of a stalled group is fetched again, a member whose writer is gone still completes its group, and an equivocation a parked member is part of is noted again and still reported. A parked copy whose member applied, was refused or was let go is dropped. | §4, §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
-| Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back, nor does one nothing signed held vouches for once a walk of it ended unreached. | §5, §6.1, §13.5 |
-| Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal by one walk at most (nothing signed vouches for it), never turns it into a read; a device marked suspected or revoked is not waited for. | §5, §9, §15 |
+| Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back, nor does one nothing signed held vouches for once its walks spent their `REFRESH_TRIES` tries unreached; one a faulty path kept from a few walks is still waited for. | §5, §6.1, §13.5 |
+| Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal by its walks' tries at most (nothing signed vouches for it), never turns it into a read; a device marked suspected or revoked is not waited for. | §5, §9, §15 |
 | Write refused after the edit (too large, rule refuses) | Nothing signed or stored, no default record, the log head unmoved; the collection is read again, so the refused edit is not in the state. | §5, §5.1, §15 |
 | Removed writer keeps its devices unreachable | The owner walks the writer's known devices as far as they are reachable and signs the cut over what it holds then; the removal is never held off, and versions only the unreachable devices hold fall outside the cut. | §6, §6.2 |
-| Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it (one nothing signed vouches for, once a walk of it ended unreached, is not waited for, §5); a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
+| Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it (one nothing signed vouches for, once its walks spent their tries unreached, is not waited for, §5); a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
 | Collection record wider than its folder | `share` refuses it; one signed anyway widens nothing: every reader intersects the levels. | §6.1 |
 | Release of merge pieces without a covering checkpoint proved held | Refused: the pieces are kept, saying why, and `NotHeld` when nothing is released. | §13.3 |
 | Collection created under a watched folder, by this device or another writer | Reported on the folder's one watch with no further call, every change tagged with its collection; finding it costs the new branch only (the root, the nodes on the way, the folder node or its changed page, the new collection's node and entries), never a walk of the folder. | §7, §15 |
@@ -4515,13 +4536,16 @@ announced). What is owed, and until when:
   no new root (a device announcing itself as it joins), which costs
   `FETCH_TRIES` − 1 root asks more. A pass of the loop a notice asks for
   begins at once after a pass that took a root of the device newer than
-  the one verified as it began; after one that did not, it begins after
-  the pause below, `k` being such passes in a row (64 s from
-  `REFRESH_TRIES` on), the count starting afresh once a pass takes a newer
-  root. So notices that bring nothing new — repeated by a stranger, or
-  for a root a relay holds behind the writer — cost root asks at the pace
-  of misses, never one walk per notice back to back; a notice whose root
-  moved is answered as before, after at most the pause it falls in. A
+  the one verified as it began, or that did not reach the device's state
+  (a loss, a relay behind it: its own rounds pace its asks); after one
+  that reached it and took nothing newer, it begins after the pause
+  below, `k` being such passes in a row (64 s from `REFRESH_TRIES` on),
+  the count starting afresh once a pass takes a newer root. So notices
+  that bring nothing new — repeated by a stranger — cost root asks at the
+  pace of misses, never one walk per notice back to back, while a writer
+  that never pauses, its asks lost now and then, is followed as before;
+  a notice whose root moved is answered as before, after at most the
+  pause it falls in. A
   pass something held here asks for — a name followed, a namespace
   adopted — begins at once, whatever notices came.
   Which root answered decides nothing (invariant 1): what is held and owed
@@ -4591,12 +4615,14 @@ announced). What is owed, and until when:
   notices tell of: once the walk begun last is past the way to its
   versions — it took a version its root lists, or a round of asks (above)
   for a node or page on the way missed — or ended with a root of the
-  device newer than the one verified as it began, a notice of that
+  device newer than the one verified as it began, or without reaching the
+  device's state, a notice of that
   device that arrived since that walk began begins a walk of the device's
   newest root, while fewer than `WALKS_AT_ONCE` (3) walks of the pass are
   under way; a walk ending makes room for one. A notice arriving after a
-  walk that ended with nothing newer is left to the loop's next pass, after
-  the pause ("A notice answered"). A walk begun beside others takes
+  walk that reached the device's state with nothing newer is left to the
+  loop's next pass, after the pause ("A notice answered"). A walk begun
+  beside others takes
   a root a device answering for the writer gives only if its head is above
   every root a walk of the pass took — an older or equal one says nothing
   of what the writer did since — and otherwise asks the writer again in
@@ -4813,7 +4839,13 @@ to answer for another device or to grant (§13.5), so its cost is linear in
 `HEARD_MAX`, never in the square of the names; the state vector, and so
 every Sync Interest the reader sends into the group, stays at most
 `HEARD_MAX` + 1 entries, and such a name holds back a default record, a
-refusal or a folder erasure for one walk at most (§5, §12). A
+refusal or a folder erasure until its walks spent their tries (§5):
+`REFRESH_TRIES` walks of one refresh loop whose root's rounds all missed,
+paced as any loop's (a few minutes), its notices counting no try afresh
+— so a real device a faulty path kept from a walk or a few, at a loss
+that misses a whole root ask about one time in sixty, is still waited
+for (round 3: counting one walk let a lost owner device stop holding
+back a `put`, which then answered `NotAllowed`). A
 stranger's notices of a device being walked begin walks of its newest
 root only as the pass allows (at most `WALKS_AT_ONCE` under way, each
 once the one before is past its way or ended with a newer root), each a
@@ -4823,9 +4855,12 @@ rounds brought nothing newer: a notice of a device whose root did not
 move costs `FETCH_TRIES` root asks of it, and `FETCH_TRIES` − 1 of each
 device answering for it, at most `RELAYS_ASKED` ("A notice answered") —
 and notices repeated back to back cost that once per pause, `k` passes in
-a row bringing nothing newer waiting the pause of `k` misses, one a
-minute from `REFRESH_TRIES` on. They can so delay, by at most that pause,
-the walk a genuine notice of the device asks for, never what is held.
+a row that reached the device and brought nothing newer waiting the pause
+of `k` misses, one a minute from `REFRESH_TRIES` on (a pass that did not
+reach it is itself bounded by its rounds' lifetimes and pauses: at most
+`FETCH_TRIES` root asks per `FETCH_TRIES` lifetimes). They can so delay,
+by at most that pause, the walk a genuine notice of the device asks for,
+never what is held.
 (2)
 What is owed for
 longer is named only by data the device verified: a root its writer

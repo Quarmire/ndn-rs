@@ -1360,12 +1360,12 @@ async fn notices_of_a_device_whose_root_does_not_move_rerun_its_walk_only_after_
 }
 
 /// The phone hears a name under Wendy's namespace that nothing signed it
-/// holds vouches for, and that never answers: once a walk of it ended with
-/// no root of it verified, it no longer holds back what waits for the
-/// devices not walked (spec §6.1, §12) — a default record, a folder's
-/// erasure — however many notices of it come. The tablet, whose root the
-/// phone verified in an earlier run, is away too: it still holds them back,
-/// as before.
+/// holds vouches for, and that never answers: once its walks spent their
+/// tries with no root of it verified (`REFRESH_TRIES` passes), it no
+/// longer holds back what waits for the devices not walked (spec §5,
+/// §17.1) — a default record, a folder's erasure — however many notices of
+/// it come. The tablet, whose root the phone verified in an earlier run, is
+/// away too: it still holds them back, as before.
 #[tokio::test(start_paused = true)]
 async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended() {
     let (tablet, phone, fake) = (n("/wendy/tablet"), n("/wendy/phone"), n("/wendy/fake"));
@@ -1387,7 +1387,7 @@ async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended
 
     reader.inner.on_update(&ns, notice(&fake));
     let mut allowed = false;
-    for _ in 0..12 {
+    for _ in 0..80 {
         reader.inner.on_update(&ns, notice(&fake));
         if reader.inner.default_allowed(&c).await.is_ok() {
             allowed = true;
@@ -1422,4 +1422,122 @@ async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended
     );
     assert_eq!(unwalked(&reader), vec![tablet.clone()]);
     reader.shutdown();
+}
+
+/// The laptop, a device of Wendy's namespace the phone hears for the first
+/// time, is away when the phone first walks it — every ask of its root lost,
+/// as on a faulty path. A walk that ended unreached says nothing of what
+/// the laptop holds: until its walks spent their tries (spec §17.1), a
+/// default record is still refused `NotReady`, not signed over a folder
+/// record the laptop may hold. Once the laptop answers, it is walked and
+/// holds nothing back.
+#[tokio::test(start_paused = true)]
+async fn an_owner_device_away_for_a_walk_still_holds_back_until_its_tries_are_spent() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let net = Hostile::new(&[&writer], &laptop, None, &laptop, &ns);
+    net.losing.store(true, Ordering::Relaxed);
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    let c = n("/wendy/32=data/notes");
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&laptop));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(
+        matches!(
+            reader.inner.default_allowed(&c).await,
+            Err(DataError::NotReady { .. })
+        ),
+        "a device of the namespace a walk did not reach is still waited for"
+    );
+    net.losing.store(false, Ordering::Relaxed);
+    let mut allowed = false;
+    for _ in 0..30 {
+        if reader.inner.default_allowed(&c).await.is_ok() {
+            allowed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    assert!(
+        allowed,
+        "once the laptop answers it is walked and holds nothing back"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
+/// The laptop writes a second version and announces it; the phone's first
+/// ask of its root is lost, so the root's next round asks the laptop again
+/// and, at the same time, the tablet — a device of Wendy's namespace whose
+/// root the phone verified before, now silent. The laptop answers at once:
+/// its root is taken then (spec §13.5, rounds of a walk), not after the
+/// tablet's ask ran out its lifetime.
+#[tokio::test(start_paused = true)]
+async fn the_writers_root_is_taken_without_waiting_for_a_silent_relay() {
+    let (laptop, tablet, phone) = (n("/wendy/laptop"), n("/wendy/tablet"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &tablet, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let root = root_prefix(&laptop, &ns);
+    let net = Hostile::new(&[&writer], &root, None, &laptop, &ns);
+    let reader = start_on(&phone, Arc::clone(&keys[2]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+    // The tablet: heard, its root verified before (vouched for), silent.
+    reader.inner.on_update(&ns, notice(&tablet));
+    reader
+        .inner
+        .st
+        .lock()
+        .peers
+        .entry((tablet.clone(), ns.clone()))
+        .or_default()
+        .kept = 1;
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        reader
+            .inner
+            .relays(&reader.inner.st.lock(), &ns, &laptop, &[]),
+        vec![tablet.clone()],
+        "precondition: the tablet answers for the laptop"
+    );
+
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    net.losing.store(true, Ordering::Relaxed);
+    let start = tokio::time::Instant::now();
+    reader.inner.on_update(&ns, notice(&laptop));
+    // The first ask of the root, and its re-expressions, are lost.
+    tokio::time::sleep(reader.inner.config.lifetime + Duration::from_millis(100)).await;
+    net.losing.store(false, Ordering::Relaxed);
+    while !holds(&reader, &second) && start.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let took = start.elapsed();
+    let bound = reader.inner.config.lifetime * 2;
+    assert!(
+        holds(&reader, &second) && took < bound,
+        "the writer's root answered in the root's second round is taken at once, not after a \
+         silent relay's lifetime: {took:?}, at most {bound:?}"
+    );
+    reader.shutdown();
+    writer.shutdown();
 }

@@ -175,10 +175,10 @@ impl Inner {
             || self.vouched(st, device, ns)
     }
 
-    /// Note that a walk of `device`'s summary of `ns` ended with no root of
-    /// it verified ([`Peer::unreached`]). The first time, with nothing held
-    /// vouching for it, the erasures of `ns`'s folders it may have held back
-    /// are judged again ([`Self::not_walked`]).
+    /// Note that the walks of `device`'s summary of `ns` spent their tries
+    /// with no root of it verified ([`Peer::unreached`]). The first time,
+    /// with nothing held vouching for it, the erasures of `ns`'s folders it
+    /// may have held back are judged again ([`Self::not_walked`]).
     pub(super) fn mark_unreached(&self, st: &mut St, device: &Name, ns: &Name) {
         let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
         if std::mem::replace(&mut peer.unreached, true) || self.vouched(st, device, ns) {
