@@ -1810,15 +1810,16 @@ gesture beyond the owner's records.
   refuses older versions (trust-context.md §4.5.7).
 - **Scope.** The adopted context judges exactly `P`'s packets about `S`:
   log entries of `S` and of every collection under it, with their pieces
-  and block entries; one-key heads of those collections; and the summary
-  roots, nodes and pages of `P`'s devices whose subject lies under `S` or
-  on the way to it (a prefix of `S`: the root of `S`'s namespace, the
-  folders above `S`). Every other packet of `P` — about another folder,
-  about a collection of `P`'s own, about the device's own collections — is
-  judged by the device's validator, which refuses it while `P` is not held
-  (trust-context.md §4.5.6 note 4). `P` is no namespace of a name here
-  (§3): a device of `P` owns nothing at the reader, so no members record
-  `P` signs is taken.
+  and block entries; one-key heads of those collections; the signal run
+  headers of `P`'s devices about `S` or a collection under it (§20); and
+  the summary roots, nodes and pages of `P`'s devices whose subject lies
+  under `S` or on the way to it (a prefix of `S`: the root of `S`'s
+  namespace, the folders above `S`). Every other packet of `P` — about
+  another folder, about a collection of `P`'s own, about the device's own
+  collections — is judged by the device's validator, which refuses it
+  while `P` is not held (trust-context.md §4.5.6 note 4). `P` is no
+  namespace of a name here (§3): a device of `P` owns nothing at the
+  reader, so no members record `P` signs is taken.
 - **Never replaces, never seen.** A context of `P` the node holds is used
   as is: while it is held, adopted before the folder's or after, it judges
   `P`'s names everywhere, and the folder's is released. The folder's is
@@ -3907,6 +3908,7 @@ both from the NDN naming conventions.
 | asker's proof (inside a hold, audit or introduction ask or answer, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
 | offer, use mark (§19.1) | `<D>/32=log/<F>/seq=<n>` | device key |
 | introduction ask and answer (§19) | Interest `<D>/32=intro/<ParametersSha256Digest>`, ApplicationParameters `IntroAsk`; answer named the same, Content `IntroAnswer` | DigestSha256 (the answer carries the offering device's proof inside) |
+| signal run header (§20; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, `S` a folder or collection, the run id one GenericNameComponent of 16 octets, no FreshnessPeriod | device key |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
 from the node, one octet (0–15) each. Log entries are named after the
@@ -3924,6 +3926,10 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Log entry.** `D` is the components before the first `32=log` (`D` has
   no keyword); the last component is `seq=<n>`; what lies between is empty
   (a snapshot) or a collection name.
+- **Signal run header.** `D` is the components before the first
+  `32=signal` (`D` has no keyword); the last component is a
+  GenericNameComponent of 16 octets, the next-to-last `32=run`; what lies
+  between is a folder or collection name, the scope (§20).
 - **Summary.** `D` is the components before the first `32=summary`; a last
   `seq=` component is the head; a `32=page` then the next-to-last
   component is the page, and a `32=head` just before the last `seq=` makes
@@ -5690,3 +5696,93 @@ X25519-to-ChaCha20-Poly1305 wrap.
   namespace's relays, are reachability only: a lying hint fails to reach,
   and nothing a relay carries is trusted — the offer, the ask and the
   answer are judged by the checks above.
+
+## 20. Signals: the gate — round 4
+
+A **signal** is ephemeral live data — presence, cursors, a drag, live
+unsigned edits — pushed to the members of a folder or collection. It is
+never a version. Its transport (run keys, packets, sealing, the push into
+sync groups, the local ring, replay and expiry) is
+[signals.md](signals.md); this section is what the data layer decides for
+it, and the four questions the transport asks a device
+(`Device::signal_scope`, `signal_header`, `signal_admit`,
+`signal_member`). Nothing else of the layer is reachable from a signal.
+
+- **The record in force over a scope.** A scope `S` is a folder or
+  collection name (§16.1). The record in force over `S` is what `members`
+  answers for it (§15): the folder `S`'s record in force when one is held;
+  else collection `S`'s, its own narrowed by the folders above it, or the
+  nearest folder's when it has none (§6.1). Nothing about signals over `S`
+  is decided while none is held.
+- **Members.** A key `K` of device `D` (`D` is `K` without `KEY/<id>`) is
+  a **member** of `S` exactly when, by the record in force over `S` at
+  the moment of the question, a writer prefix it lists covers `K`, or its
+  audience admits `D` (§9: a reader names `D`'s person — the namespace of
+  the trust context governing `D` here — or `D`, or a group whose record
+  names either; or `D` started the record's epoch); and the trust context
+  governing `K` — as the device judges `K`'s packets about `S`, so the
+  context adopted for the folder for a person's namespace adopted there
+  (§6.3) — does not revoke `K` (trust-context.md §3.3.6, §6.3). A key
+  kept only by a removal cut (§8) is no member: a cut keeps versions, not
+  a voice.
+  In a scope with no readers listed only the writers are members. A
+  device MUST answer membership from the records and contexts it holds at
+  the question, with no network exchange, so the transport asks it for
+  every packet: a member removed, or a key revoked, is refused from the
+  first packet after the device holds the record or context that ends it.
+- **The gate.** `signal_scope(S)` answers, for this device: the record in
+  force over `S` (as a `Share`); the signal keys when `S` is sealed; the
+  sync groups to push into; and this device's own namespace's group
+  `sync_group(<own namespace>)`, where others push for it. It refuses with
+  `NotReady` (retry) when no record over `S` is held; `NotAllowed` (ask
+  the owner) when this device's key is no member of `S`, its key revoked
+  included; `Sealed` when this device is a member only as a writer outside
+  a sealed scope's audience, which may never hold its key; and `NotReady`
+  when `S` is sealed and the key of its epoch in force is not held yet —
+  its ask is then started as a sealed read's is (§9, §17.1: the epoch's
+  creator, then the devices that write into it) and the same call
+  succeeds once the key is granted. `signal_header` refuses as
+  `signal_scope` does, except that a sealed scope's key need not be held
+  to sign a header.
+- **The groups.** The groups of `S` are `<O>/32=sync` for exactly the
+  namespaces a version about `S` is published into (§12): `S`'s own, and
+  that of every writer and reader the record in force over `S` names — a
+  self-certifying namespace only once adopted here for the folder (§6.3),
+  a group reader by the namespace of its collection.
+- **Signal keys.** In a sealed scope, the signal key of epoch `E` (its
+  creator `D`, its seq `s`) whose content key `CK` this device holds
+  (§9) is HKDF-SHA256 with `CK` as input keying material, no salt, and as
+  info `ndn-data/signal/1` ‖ the Name TLV of `S` ‖ the Name TLV of `D` ‖
+  `s` as 8 octets big-endian; 32 octets. Its **id** is the first 8 octets
+  of HKDF-SHA256 with the signal key as input keying material, no salt,
+  and info `ndn-data/signal/id/1`. Every member holding `CK` derives the
+  same key and id; the key binds `S`, so it opens nothing of another scope
+  sealed in the same epoch, and nothing of the layer's own payloads (their
+  key is `CK`, never derived from a signal key). `signal_scope` lists the
+  key of the epoch in force first — the one to seal with — then those of
+  the other epochs of `S`'s record line whose content keys are held, by
+  their record's seq, highest first, to open what members still seal in
+  them across a move to a new epoch. The content key never leaves the
+  device; the signal key is handed to the transport, which zeroes it when
+  dropped.
+- **Run headers.** A run header is Data named
+  `<D>/32=signal/<S>/32=run/<run id>` (§16.1), `D` the device whose key
+  signs it, the run id 16 octets, its Content the transport's run header
+  body (signals.md), signed by `D`'s device key, with no FreshnessPeriod.
+  It is named under its signer's device, as every signed packet of the
+  layer is, so the trust context governing its name is the signer's.
+- **Admission.** `signal_admit(S, header)` admits a run header, answering
+  the signer's key name, exactly when: its name parses as a run header
+  (§16.1) whose scope is `S` and whose device is the device of the key
+  its KeyLocator names (`Malformed` otherwise); a record over `S` is held
+  (`NotReady` otherwise); it verifies by the device's validator — the view
+  adopted for the folder for a self-certifying member's (§6.3), the
+  durable rule with no clock, certificates fetched as for versions — and
+  its key is not revoked (`BadSignature` otherwise); and its key is a
+  member of `S` by the record in force (`NotMember` otherwise). Each
+  refusal's text says why and what to do.
+- **Nothing kept.** A device MUST NOT store, serve, count or list anything
+  of a signal: no run header is kept in the store or a summary, given a
+  seq, counted as a version, a write or a holder's evidence, or answered
+  to an Interest, and no signal packet reaches the layer at all. A signal
+  never becomes a version; a commit of live work is an ordinary `put`.
