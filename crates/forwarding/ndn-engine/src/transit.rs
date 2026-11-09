@@ -14,16 +14,28 @@
 //! action (it runs the namespace's sync group with the multicast strategy
 //! meanwhile). A namespace this forwarder holds is never in transit: its
 //! Data is validated whatever the marks say.
+//!
+//! Every forwarded Data is looked up here, so the lookup is a few hash
+//! probes — one per distinct length of the namespaces held (a person's
+//! `/user/<h>` is two components) — never a scan of the namespaces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{PoisonError, RwLock};
 
-use ndn_packet::Name;
+use ndn_packet::{Name, NameComponent};
 
 /// Namespaces in transit, each counted by how many links hold it there.
 #[derive(Debug, Default)]
 pub struct TransitPrefixes {
-    prefixes: RwLock<HashMap<Name, usize>>,
+    held: RwLock<Held>,
+}
+
+/// The namespaces, keyed by their components, and how many of them have
+/// each length: a Data name is probed at those lengths only.
+#[derive(Debug, Default)]
+struct Held {
+    reasons: HashMap<Box<[NameComponent]>, usize>,
+    lengths: BTreeMap<usize, usize>,
 }
 
 impl TransitPrefixes {
@@ -32,13 +44,12 @@ impl TransitPrefixes {
     /// [`remove`](Self::remove) racing, their actions happen in the order
     /// of their counts.
     pub fn add(&self, prefix: &Name, first: impl FnOnce()) {
-        let mut prefixes = self
-            .prefixes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let count = prefixes.entry(prefix.clone()).or_default();
+        let mut guard = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let held = &mut *guard;
+        let count = held.reasons.entry(prefix.components().into()).or_default();
         *count += 1;
         if *count == 1 {
+            *held.lengths.entry(prefix.len()).or_default() += 1;
             first();
         }
     }
@@ -46,23 +57,32 @@ impl TransitPrefixes {
     /// One reason less; the last one takes `prefix` out of transit and
     /// runs `last`, under the lock.
     pub fn remove(&self, prefix: &Name, last: impl FnOnce()) {
-        let mut prefixes = self
-            .prefixes
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = prefixes.get_mut(prefix) {
-            *count -= 1;
-            if *count == 0 {
-                prefixes.remove(prefix);
-                last();
+        let mut guard = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let held = &mut *guard;
+        let Some(count) = held.reasons.get_mut(prefix.components()) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            held.reasons.remove(prefix.components());
+            if let Some(n) = held.lengths.get_mut(&prefix.len()) {
+                *n -= 1;
+                if *n == 0 {
+                    held.lengths.remove(&prefix.len());
+                }
             }
+            last();
         }
     }
 
     /// Whether `name` is under a namespace in transit.
     pub fn covers(&self, name: &Name) -> bool {
-        let prefixes = self.prefixes.read().unwrap_or_else(PoisonError::into_inner);
-        !prefixes.is_empty() && prefixes.keys().any(|p| name.has_prefix(p))
+        let held = self.held.read().unwrap_or_else(PoisonError::into_inner);
+        let components = name.components();
+        held.lengths
+            .keys()
+            .take_while(|&&len| len <= components.len())
+            .any(|&len| held.reasons.contains_key(&components[..len]))
     }
 }
 
@@ -88,5 +108,43 @@ mod tests {
         transit.remove(&ns, last);
         assert_eq!((firsts.get(), lasts.get()), (1, 1));
         assert!(!transit.covers(&"/rb/x".parse().unwrap()));
+    }
+
+    /// A Data name is in transit exactly when one of the namespaces held
+    /// is a prefix of it, whole components compared, whatever their
+    /// lengths: a person's `/user/<h>` and a one-component namespace side
+    /// by side, a sibling person's namespace never matching, and a
+    /// namespace leaving taking only its own names with it.
+    #[test]
+    fn covers_matches_whole_components_of_any_held_length() {
+        use ndn_security::self_certifying::self_certifying_name;
+        let transit = TransitPrefixes::default();
+        let carol = self_certifying_name(&[7; 32]);
+        let dave = self_certifying_name(&[8; 32]);
+        let ra: Name = "/ra".parse().unwrap();
+        let under = |ns: &Name, rest: &str| ns.clone().append(rest);
+        transit.add(&carol, || {});
+        transit.add(&ra, || {});
+        assert!(transit.covers(&under(&carol, "dev/32=data/x")));
+        assert!(transit.covers(&carol), "the namespace's own name");
+        assert!(transit.covers(&under(&ra, "member")));
+        assert!(!transit.covers(&under(&dave, "dev")), "a sibling person");
+        assert!(
+            !transit.covers(&"/rab/x".parse().unwrap()),
+            "a longer component"
+        );
+        assert!(
+            !transit.covers(&"/user".parse().unwrap()),
+            "shorter than any held"
+        );
+        assert!(!transit.covers(&Name::root()));
+        transit.remove(&ra, || {});
+        assert!(!transit.covers(&under(&ra, "member")));
+        assert!(transit.covers(&under(&carol, "dev")));
+        transit.add(&Name::root(), || {});
+        assert!(
+            transit.covers(&under(&dave, "dev")),
+            "the root covers every name"
+        );
     }
 }
