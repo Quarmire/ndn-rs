@@ -59,6 +59,7 @@ enum MultiControl {
         reply: oneshot::Sender<Option<SyncHandle>>,
     },
     Leave(Name),
+    Announce(Name),
 }
 
 /// Spawn a multiplexed SVS driver over one shared face (`send`/`recv`). All
@@ -98,6 +99,15 @@ impl MultiSvs {
     /// Stop carrying `group` (its `SyncHandle` also stops when dropped).
     pub async fn leave(&self, group: Name) {
         let _ = self.control_tx.send(MultiControl::Leave(group)).await;
+    }
+
+    /// Emit `group`'s state vector now and start its periodic timer anew, as
+    /// on joining (the join announcement, again): a member that has heard
+    /// no peer since it joined — its announcement, or every answer to it,
+    /// lost — asks for their state again instead of waiting a period.
+    /// Nothing when `group` is not joined.
+    pub async fn announce(&self, group: Name) {
+        let _ = self.control_tx.send(MultiControl::Announce(group)).await;
     }
 
     /// Stop the driver and every group it carries.
@@ -370,6 +380,12 @@ async fn multi_task(
                 groups.remove(&group);
                 publishes.remove(&group);
                 acks.remove(&group);
+            }
+
+            Event::Control(MultiControl::Announce(group)) => {
+                if let Some(gc) = groups.get_mut(&group) {
+                    gc.announce(&send).await;
+                }
             }
         }
     }

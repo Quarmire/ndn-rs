@@ -71,6 +71,12 @@ impl Connection for LosesFirst {
 }
 
 async fn device_on(conn: Arc<dyn Connection>) -> Device {
+    device_with(Arc::clone(&conn), conn).await
+}
+
+/// A device whose fetches go over `node` and whose sync group traffic over
+/// `sync`.
+async fn device_with(node: Arc<dyn Connection>, sync: Arc<dyn Connection>) -> Device {
     let device = n("/alice/phone");
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator
@@ -81,8 +87,8 @@ async fn device_on(conn: Arc<dyn Connection>) -> Device {
         .unwrap();
     Device::start(
         Transport {
-            node: Node::from_connection(Arc::clone(&conn)),
-            sync: conn,
+            node: Node::from_connection(node),
+            sync,
         },
         device,
         keys,
@@ -383,6 +389,103 @@ async fn a_holders_take_asks_for_an_entry_it_heard_of_by_its_name() {
     assert!(
         conn.asked(&entry) > 0,
         "the entry the summary listed is asked for by its name"
+    );
+    dev.shutdown();
+}
+
+/// A network on which the device's Sync Interests into `group` reach no
+/// one: it counts them, and carries only what the case gives the device.
+struct Unheard {
+    group: Name,
+    sent: std::sync::atomic::AtomicUsize,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+impl Unheard {
+    fn new(group: Name) -> Arc<Self> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        Arc::new(Unheard {
+            group,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+            tx,
+            rx: futures::lock::Mutex::new(rx),
+        })
+    }
+
+    fn sent(&self) -> usize {
+        self.sent.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Unheard {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        if bare_interest(wire).is_some_and(|i| i.name.has_prefix(&self.group)) {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// A first look into a namespace whose group the device heard no one in —
+/// its join announcement, or every answer to it, lost — asks the group
+/// again after the pause, not after the group's half-minute period (spec
+/// §17.1, a group heard from no one); once a device writing into the
+/// namespace is heard, it stops.
+#[tokio::test(start_paused = true)]
+async fn a_first_look_into_a_group_heard_from_no_one_asks_the_group_again() {
+    let group = sync_group(&n("/bob"));
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner
+        .look(&n("/bob/32=data/notes"))
+        .await
+        .expect("a data name is looked at");
+    tokio::time::sleep(REFRESH_PAUSE_MAX * 2).await;
+    let asked = conn.sent();
+    assert!(
+        asked >= 4,
+        "the group is asked again while no one is heard: {asked} Sync Interests in {:?}",
+        REFRESH_PAUSE_MAX * 2
+    );
+    // Bob's laptop is heard: its vector covers the device's own entry.
+    let vector = SvsConfig::default().dialect.encode_state_vector(&[
+        ndn_sync::StateEntry {
+            name: n("/bob/laptop"),
+            boot: 0,
+            seq: 1,
+        },
+        ndn_sync::StateEntry {
+            name: n("/alice/phone"),
+            boot: 0,
+            seq: u64::MAX >> 1,
+        },
+    ]);
+    let heard = InterestBuilder::new(group.append_version(2))
+        .lifetime(Duration::from_secs(1))
+        .app_parameters(vector.to_vec())
+        .build();
+    conn.tx.unbounded_send(heard).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !dev.inner
+            .known_for(&dev.inner.st.lock(), &n("/bob"))
+            .is_empty(),
+        "the laptop is heard"
+    );
+    let before = conn.sent();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        conn.sent(),
+        before,
+        "once a device writing into the namespace is heard, the group is no longer asked again"
     );
     dev.shutdown();
 }
