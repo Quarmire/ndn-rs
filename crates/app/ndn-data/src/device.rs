@@ -4136,16 +4136,22 @@ impl St {
     }
 
     /// What [`DataLayer::members`] answers for `name` (spec §15): the
-    /// record in force of the folder `name` when one is held, else that of
-    /// collection `name` — its own narrowed by the folders above it, or the
-    /// nearest folder's when it has none.
+    /// record in force over it ([`Self::record_in_force`]).
     fn members_in_force(&self, name: &Name) -> Option<crate::layer::Share> {
+        self.record_in_force(name)
+            .map(|m| crate::layer::Share::of(&m))
+    }
+
+    /// The record in force over `name`: of the folder `name` when one is
+    /// held, else that of collection `name` — its own narrowed by the
+    /// folders above it, or the nearest folder's when it has none.
+    fn record_in_force(&self, name: &Name) -> Option<std::borrow::Cow<'_, Members>> {
         if let Some(m) = self.folders.get(name).and_then(|f| f.members.as_ref()) {
-            return Some(crate::layer::Share::of(m));
+            return Some(std::borrow::Cow::Borrowed(m));
         }
         match self.colls.get(name).and_then(|c| c.members.as_ref()) {
-            Some(m) => Some(crate::layer::Share::of(m)),
-            None => self.effective(name).as_ref().map(crate::layer::Share::of),
+            Some(m) => Some(std::borrow::Cow::Borrowed(m)),
+            None => self.effective(name).map(std::borrow::Cow::Owned),
         }
     }
 
@@ -9289,22 +9295,29 @@ impl Inner {
             st.colls.get(c).and_then(|coll| coll.members.as_ref()),
             st.folders.get(c).and_then(|f| f.members.as_ref()),
         ];
-        let named = records.into_iter().flatten().flat_map(|m| {
-            m.writers
-                .iter()
-                .cloned()
-                .chain(m.readers.iter().map(|a| match a {
-                    Audience::Person(n) | Audience::Device(n) => n.clone(),
-                    Audience::Group(g) => namespace_of(g).unwrap_or_else(|| g.clone()),
-                }))
-        });
+        for m in records.into_iter().flatten() {
+            self.groups_named(st, m, &mut out);
+        }
+        out
+    }
+
+    /// Add to `out` the namespace of every writer or reader record `m`
+    /// names, as [`Self::groups_of`] counts them, each once.
+    fn groups_named(&self, st: &St, m: &Members, out: &mut Vec<Name>) {
+        let named = m
+            .writers
+            .iter()
+            .cloned()
+            .chain(m.readers.iter().map(|a| match a {
+                Audience::Person(n) | Audience::Device(n) => n.clone(),
+                Audience::Group(g) => namespace_of(g).unwrap_or_else(|| g.clone()),
+            }));
         for n in named {
             let ns = self.group_namespace_of(st, &n);
             if !ns.is_empty() && wire::is_namespace(&ns) && !out.contains(&ns) {
                 out.push(ns);
             }
         }
-        out
     }
 
     /// Publish a change about `c` into each of its groups ([`Self::groups_of`])
@@ -25670,6 +25683,8 @@ mod intro;
 mod groups;
 
 mod scoped;
+
+mod signal;
 
 mod heard;
 

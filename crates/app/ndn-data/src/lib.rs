@@ -71,6 +71,7 @@ pub mod merge;
 mod pieces;
 mod rt;
 mod seal;
+pub mod signal;
 pub mod statement;
 mod tree;
 pub mod version;
@@ -88,6 +89,7 @@ pub use merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs, owns,
 };
 pub use ndn_foundation_types::{Hash, Name};
+pub use signal::{SignalKey, SignalRefusal, SignalScope};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{
     Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Payload, Seal, Seq,

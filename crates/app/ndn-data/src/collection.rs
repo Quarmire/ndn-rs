@@ -94,6 +94,12 @@ pub struct Members {
 }
 
 impl Members {
+    /// Whether a writer prefix this record lists covers `key` (a key
+    /// kept only by a cut is not covered).
+    pub(crate) fn lists_writer(&self, key: &Name) -> bool {
+        self.writers.iter().any(|p| key.has_prefix(p))
+    }
+
     /// Why this record refuses version `id` of its own collection, if it
     /// does ([`Self::refusal_in`]).
     pub fn refusal(&self, id: &VersionId) -> Option<Refusal> {
@@ -107,7 +113,7 @@ impl Members {
     /// whatever date or seq it claims; else the key is no member.
     pub fn refusal_in(&self, c: &Name, id: &VersionId) -> Option<Refusal> {
         let key = id.writer.key();
-        if self.writers.iter().any(|p| key.has_prefix(p)) {
+        if self.lists_writer(key) {
             return None;
         }
         match self.cuts.iter().find(|k| key.has_prefix(&k.of)) {
@@ -123,7 +129,7 @@ impl Members {
     /// key ([`Accepted::manifests`], spec §8).
     pub fn kept_by(&self, c: &Name, id: &VersionId) -> Option<&Cut> {
         let key = id.writer.key();
-        if self.writers.iter().any(|p| key.has_prefix(p)) {
+        if self.lists_writer(key) {
             return None;
         }
         self.cuts

@@ -1768,6 +1768,7 @@ dependencies = [
  "tracing",
  "web-time",
  "yrs",
+ "zeroize",
 ]
 
 [[package]]

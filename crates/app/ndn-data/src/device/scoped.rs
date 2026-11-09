@@ -26,12 +26,12 @@ use ndn_security::self_certifying::{Genesis, personal_namespace_of};
 use ndn_security::{ScopedContext, SignedTrustContext, Validator};
 use sha2::{Digest, Sha256};
 
-use super::{Inner, REFRESH_PAUSE_MAX, Rejudge, Subject, refuses_more, under};
+use super::{Inner, REFRESH_PAUSE_MAX, Rejudge, St, Subject, refuses_more, under};
 use crate::collection::Members;
 use crate::rt::{self, Instant};
 use crate::wire::{
     namespace_of, parse_entry_name, parse_head_name, parse_log_name, parse_piece_name,
-    parse_summary_name,
+    parse_signal_run_name, parse_summary_name,
 };
 
 /// The first pause before a namespace the host could not adopt is asked
@@ -148,8 +148,9 @@ fn reached_of(ctx: &SignedTrustContext) -> Reached {
 }
 
 /// What a packet is about, for the scope that judges it: its subject (the
-/// collection of a log entry, a head or a piece; the node of a summary) and
-/// whether, as a summary node, it may also lie on the way to a scope.
+/// collection of a log entry, a head or a piece; the node of a summary; the
+/// scope of a signal run header) and whether, as a summary node, it may
+/// also lie on the way to a scope.
 pub(super) struct About {
     subject: Name,
     toward: bool,
@@ -157,8 +158,9 @@ pub(super) struct About {
 
 /// What the packet named `name` is about, if it is a packet a scope may
 /// judge: a log entry of a collection (its pieces, its block entries), a
-/// one-key head, or a summary root, node or page. Nothing else — a
-/// snapshot, a seal key, a grant — is about a folder.
+/// one-key head, a summary root, node or page, or a signal run header of a
+/// folder or collection (spec §20). Nothing else — a snapshot, a seal key,
+/// a grant — is about a folder.
 pub(super) fn about(name: &Name) -> Option<About> {
     let of_entry = |entry: &Name| {
         parse_log_name(entry)?.subject.map(|subject| About {
@@ -166,6 +168,12 @@ pub(super) fn about(name: &Name) -> Option<About> {
             toward: false,
         })
     };
+    if let Some(run) = parse_signal_run_name(name) {
+        return Some(About {
+            subject: run.scope,
+            toward: false,
+        });
+    }
     if let Some(s) = parse_summary_name(name) {
         return Some(About {
             subject: s.subject,
@@ -394,14 +402,16 @@ impl Scopes {
     }
 
     /// The view judging a packet of `ns`, a person's namespace no context
-    /// held covers, that is `about` this: the scoped one when a record in
-    /// force lists `ns` for a subject the packet lies in — or, for a summary
-    /// node, lies on the way to — and `ns` is adopted; else `None` (the
-    /// device's own validator, which refuses it).
-    fn judge(&self, ns: &Name, about: &About) -> Option<Arc<Validator>> {
-        let inside = self.listed.get(ns)?.iter().any(|s| {
-            about.subject.has_prefix(&s.name) || (about.toward && s.name.has_prefix(&about.subject))
-        });
+    /// held covers, about `subject`: the scoped one when a record in force
+    /// lists `ns` for a subject the packet lies in — or, `toward` (a
+    /// summary node), lies on the way to — and `ns` is adopted; else `None`
+    /// (the device's own validator, which refuses it).
+    fn judge(&self, ns: &Name, subject: &Name, toward: bool) -> Option<Arc<Validator>> {
+        let inside = self
+            .listed
+            .get(ns)?
+            .iter()
+            .any(|s| subject.has_prefix(&s.name) || (toward && s.name.has_prefix(subject)));
         match self.adopted.get(ns) {
             Some(Adopted::Held { judge, .. }) if inside => Some(Arc::clone(judge)),
             _ => None,
@@ -554,7 +564,25 @@ impl Inner {
             .keyring()
             .unheld_personal_namespace(name)
             .and_then(|ns| Some((ns, about(name)?)))
-            .and_then(|(ns, about)| self.st.lock().scopes.judge(&ns, &about));
+            .and_then(|(ns, about)| {
+                self.st
+                    .lock()
+                    .scopes
+                    .judge(&ns, &about.subject, about.toward)
+            });
+        scoped.unwrap_or_else(|| Arc::clone(&self.validator))
+    }
+
+    /// The validator that judges key `key`'s packets about `scope`, read
+    /// from `st` (held by the caller): what [`Self::judge`] picks for a
+    /// packet of `key`'s device about `scope` (spec §20: whether a signal
+    /// sender's key is revoked is asked of it).
+    pub(super) fn judge_signer(&self, st: &St, key: &Name, scope: &Name) -> Arc<Validator> {
+        let scoped = self
+            .validator
+            .keyring()
+            .unheld_personal_namespace(key)
+            .and_then(|ns| st.scopes.judge(&ns, scope, false));
         scoped.unwrap_or_else(|| Arc::clone(&self.validator))
     }
 

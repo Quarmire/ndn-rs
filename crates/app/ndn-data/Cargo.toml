@@ -25,6 +25,8 @@ futures-core = { version = "0.3", default-features = false, features = ["alloc"]
 parking_lot  = { workspace = true }
 sha2         = { workspace = true }
 hkdf         = { workspace = true }
+# Signal keys (spec §20) are zeroed when dropped.
+zeroize      = "1"
 # Introductions: an ask's and an answer's proof of the offer's secret.
 hmac         = "0.13"
 getrandom    = { workspace = true }

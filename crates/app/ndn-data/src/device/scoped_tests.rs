@@ -556,6 +556,66 @@ async fn a_folder_and_a_collection_of_one_name_list_their_writers_apart() {
     dev.shutdown();
 }
 
+/// A member's signal run header (spec §20) is judged as its log entries
+/// are: Carol's, about the folder whose record lists her, by the view
+/// adopted for it — so it verifies and is admitted — and one about another
+/// scope by the device's own validator.
+#[tokio::test(start_paused = true)]
+async fn a_self_certifying_members_run_header_is_judged_by_the_view_adopted_for_its_folder() {
+    let host = Arc::new(Host::default());
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let carol = Carol::new();
+    let ns = carol.ns.clone();
+    let (k1, a1) = &carol.k1;
+    host.serve(&[&carol.version(1, &[a1], k1, None).await]);
+    let dev = laptop(&host, &store).await;
+    let f = folder();
+    let phone = n("/alice/phone");
+    let name = log_name(&phone, Some(&f), 1);
+    let record = Record::Members(MembersBody {
+        collection: f.clone(),
+        folder: true,
+        revision: 1,
+        rule: Rule::Log,
+        writers: vec![n("/alice"), ns.clone()],
+        readers: Vec::new(),
+        cuts: Vec::new(),
+        epoch: None,
+        key_check: None,
+        since: None,
+        parent: None,
+    });
+    let k = key(&phone);
+    let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
+        ndn_packet::SignatureType::SignatureEd25519,
+        Some(&k),
+        |_| Bytes::from_static(&[0; 64]),
+    );
+    {
+        let mut st = dev.inner.st.lock();
+        dev.inner
+            .take(&mut st, name.clone(), packet, Writer::new(k), record, false);
+        assert_eq!(st.refused.get(&name), None);
+    }
+    dev.inner.settle().await;
+    let run = [9; 16];
+    let header_name = wire::signal_run_name(&ns, &f, &run);
+    assert!(
+        until(|| scoped_judge(&dev, &header_name), 30).await,
+        "Carol's run header about the folder is judged by the view adopted for it"
+    );
+    let elsewhere = wire::signal_run_name(&ns, &n("/alice/32=data/other"), &run);
+    assert!(!scoped_judge(&dev, &elsewhere));
+    let signer = carol.mgr.get_signer_sync(k1).unwrap();
+    let wire = DataBuilder::new(header_name, b"run").sign_sync(signer.sig_type(), Some(k1), |r| {
+        signer.sign_sync(r).unwrap()
+    });
+    let header = Data::decode(wire).unwrap();
+    assert_eq!(dev.signal_admit(&f, &header).await, Ok(k1.clone()));
+    assert!(dev.signal_member(&f, k1));
+    dev.shutdown();
+}
+
 /// A burst of records listing an adopted namespace refreshes it once per
 /// [`REFRESH_PAUSE_MAX`], not once per record; the refresh it defers is
 /// asked once the pause ends (M4, record churn).
