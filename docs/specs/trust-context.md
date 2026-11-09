@@ -1603,8 +1603,10 @@ A node judges a signed packet in one of two ways.
 outside its ValidityPeriod by the node's clock: signed Interests and command
 Interests, management authorization, adopting a context (§4.4, §5.2: the
 signer anchor valid now), enrollment, renewal and NDNCERT, link admission
-and peer authentication, certificate issuance and serving, and the prefix
-announcements a forwarder installs routes from. These are
+and peer authentication, certificate issuance and serving, the prefix
+announcements a forwarder installs routes from, and signal run headers
+([signals.md](signals.md) §7: Data, but never kept, served or answered for,
+admitted only to open a live run). These are
 exchanges whose freshness is the point; a refusal is retried, never stored,
 so a wrong clock there denies service, loudly, and decides nothing about
 stored data.

@@ -5712,9 +5712,10 @@ unsigned edits — pushed to the members of a folder or collection. It is
 never a version. Its transport (run keys, packets, sealing, the push into
 sync groups, the local ring, replay and expiry) is
 [signals.md](signals.md); this section is what the data layer decides for
-it, and the four questions the transport asks a device
-(`Device::signal_scope`, `signal_header`, `signal_admit`,
-`signal_member`). Nothing else of the layer is reachable from a signal.
+it, and the six questions the transport asks a device
+(`Device::signal_scope`, `signal_header`, `signal_sender`, `signal_admit`,
+`signal_member`, `signal_revocations`). Nothing else of the layer is
+reachable from a signal.
 
 - **The record in force over a scope.** A scope `S` is a folder or
   collection name (§16.1). The record in force over `S` is what `members`
@@ -5770,25 +5771,50 @@ it, and the four questions the transport asks a device
   key of the epoch in force first — the one to seal with — then those of
   the other epochs of `S`'s record line whose content keys are held, by
   their record's seq, highest first, to open what members still seal in
-  them across a move to a new epoch. The content key never leaves the
-  device; the signal key is handed to the transport, which zeroes it when
-  dropped.
+  them across a move to a new epoch; the transport opens with an earlier
+  epoch's key only for a grace after it first sees that epoch superseded
+  (signals.md §4.2), so a removed member's old key soon opens nothing. The
+  content key never leaves the device; the signal key is handed to the
+  transport, which zeroes it when dropped.
 - **Run headers.** A run header is Data named
   `<D>/32=signal/<S>/32=run/<run id>` (§16.1), `D` the device whose key
   signs it, the run id 16 octets, its Content the transport's run header
   body (signals.md), signed by `D`'s device key, with no FreshnessPeriod.
   It is named under its signer's device, as every signed packet of the
   layer is, so the trust context governing its name is the signer's.
+- **The sender.** `signal_sender(S, header)` answers a run header's signer
+  before anything is verified — its key name, its device and its
+  namespace (the one whose group the device notices in, §12, else the
+  device itself), which the transport bounds admissions and runs by —
+  exactly when: its name parses as a run header (§16.1) whose scope is `S`
+  and whose device is the device of the key its KeyLocator names
+  (`Malformed` otherwise); a record over `S` is held (`NotReady`
+  otherwise); and its key is a member of `S` by the record in force
+  (`NotMember` otherwise; `BadSignature` for a key the context governing
+  it revokes). It is synchronous and offline, so a stranger's header costs
+  a receiver nothing more.
 - **Admission.** `signal_admit(S, header)` admits a run header, answering
-  the signer's key name, exactly when: its name parses as a run header
-  (§16.1) whose scope is `S` and whose device is the device of the key
-  its KeyLocator names (`Malformed` otherwise); a record over `S` is held
-  (`NotReady` otherwise); it verifies by the device's validator — the view
-  adopted for the folder for a self-certifying member's (§6.3), the
-  durable rule with no clock, certificates fetched as for versions — and
-  its key is not revoked (`BadSignature` otherwise); and its key is a
-  member of `S` by the record in force (`NotMember` otherwise). Each
-  refusal's text says why and what to do.
+  its sender, exactly when `signal_sender` does; it verifies by the
+  device's validator — the view adopted for the folder for a
+  self-certifying member's (§6.3) — by the **live** rule
+  (trust-context.md §6.3: certificates valid by the device's clock, a
+  revoked key or issuer refused; a header is never kept, so nothing needs
+  a durable verdict) (`BadSignature` otherwise); and its key is still a
+  member once it verified (`NotMember` otherwise). The chain is walked from
+  the certificates held first. A certificate not held is fetched only
+  while fewer than 2 headers of the signer's namespace wait for
+  certificates here, and not for 30 s for a device whose last fetch for a
+  header brought none, whatever key id its next header names
+  (`Unverified` otherwise, or when no current certificate could be had:
+  ask again when the header rides again). Each refusal's text says why and
+  what to do.
+- **Revocations.** `signal_revocations()` is a count that moves whenever
+  a trust context revoking keys is adopted here: the device's own
+  (its keyring's revocation epoch), or a view adopted for a person's
+  namespace replaced by a version that refuses more (§6.3). A transport
+  that admitted headers under one count and reads another walks their
+  chains again, so a revoked issuer ends the runs of the keys it
+  certified (signals.md §7).
 - **Nothing kept.** A device MUST NOT store, serve, count or list anything
   of a signal: no run header is kept in the store or a summary, given a
   seq, counted as a version, a write or a holder's evidence, or answered
