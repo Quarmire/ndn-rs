@@ -3070,12 +3070,31 @@ suspected or revoked), all of them at once, each under its own name:
   piece against its manifest.
 
 A device that holds nothing of it answers with a Nack, at once. The writer
-asked first, a reader that reaches it never waits on a holder; one that
-does not reach it waits one Interest lifetime more — the devices are asked
-at once, so one that is away too costs no more — and only for what the
-writer did not answer. (Asked one after another, devices away each cost a
-lifetime: a holder taking a hold, which refreshes every writer it knows,
-outlived its asker's patience; case g1.)
+asked first, a reader that reaches it never waits on a holder. Outside a
+walk, a reader that does not reach the writer asks the devices once the
+writer's asks missed (§17.1), all at once, so one that is away too costs no
+more than one of them, and only for what the writer did not answer. (Asked
+one after another, devices away each cost a lifetime: a holder taking a
+hold, which refreshes every writer it knows, outlived its asker's
+patience; case g1.)
+
+**Rounds of a walk (normative).** A walk (§7) asks for its root, and for
+each node, page and entry it lists, in rounds (§17.1). The first round asks
+the writer alone: its root by one ask, what the root lists by up to
+`FETCH_TRIES` asks. Each later round asks the writer again and, at the
+same time, the devices above, up to `FETCH_TRIES` rounds with the pause
+between. A root the writer gives in a round is taken over any a device
+gives in it, which may be behind the writer's; a node, page or entry is
+taken from whichever answers first with the packet that checks. So a
+writer that answers never waits behind a device. One that does not
+answer costs one Interest lifetime more for its root — its first ask —
+and one round for a packet the root lists, before a device answers for
+it; a device away or holding nothing costs no time beside the writer, who
+is still asked; and one packet of the writer's lost does not make the walk
+take a device's older root, the writes since left to a later walk. A walk
+begun beside others of its refresh loop's pass (§17.1, walks of newer
+roots) takes a device's root only if its head is above every root a walk
+of that pass took; otherwise it asks the writer again in the next round.
 
 **Threat notes.**
 
@@ -4247,11 +4266,54 @@ announced). What is owed, and until when:
   owed until a root of that device verifies, and asked again from then on
   as any owed walk, however many refusals or notices came before; a notice
   is not needed.
-- **Inside a walk**, a node, page, members record or version that missed
-  for want of an answer (or a refusal for now) is asked again in place, up
-  to `FETCH_TRIES` (3) asks in all, so one lost packet costs the walk about
-  one retransmission timeout (below) rather than the walk; only when every
-  ask missed is the walk asked again from the root.
+- **The root of a walk** (§7) — asked of the writer's device by one ask;
+  while the writer does not answer, the writer again and, at the same
+  time, the devices answering for it (§13.5), up to `FETCH_TRIES` (3)
+  rounds with the pause below between them. A root the writer gives in a
+  round is taken over any a device gives, which may be behind it; a
+  device's root is taken only if its head is at least the highest verified
+  of that writer. So one lost packet costs neither the writer's newest
+  root — a holder's older root walked instead, the writes since left to a
+  later walk — nor a pass of the refresh loop, and a writer away costs one
+  Interest lifetime more than one that answers.
+- **Inside a walk (normative)**, a node, page, members record or version
+  the walk lists that missed for want of an answer (or a refusal for now)
+  is asked again in place, in rounds: the first round asks its writer's
+  device, up to `FETCH_TRIES` (3) asks; each later round asks the writer
+  again, up to `FETCH_TRIES` asks, and, at the same time, the devices
+  answering for it (§13.5), the first answer that checks taken — the node
+  or page whose digest its parent lists, an entry that verifies. At most
+  `FETCH_TRIES` rounds, with the pause below between them. So one lost
+  packet costs the walk about one retransmission timeout (below), a packet
+  the writer missed a whole round of costs one round more rather than the
+  walk, and a device answering for the writer that does not answer costs no
+  time beside it. A refusal decided against the name, or a device whose
+  key is suspected (§8), ends the rounds. Only when every round missed is
+  the walk asked again from the root, after the walk ended. Two walks of
+  one device's summary under way at once (below) that list the same packet
+  — the same node or page by name and digest, both walking toward what was
+  followed when they began (no reset between, above), or the same entry —
+  ask for it once: the later waits for the earlier's outcome.
+- **Walks of newer roots (normative).** A walk takes its root's branches
+  side by side and ends once the last of them did, its slowest asks
+  included. A writer that never pauses would otherwise have each version
+  wait for the walk under way when it was written, long tail and all, and
+  then for the next. So one pass of the refresh loop of a device and a
+  namespace walks, beside the walk it began with, the newer roots sync
+  notices tell of: once the walk begun last is past the way to its
+  versions — it took a version its root lists, or a round of asks (above)
+  for a node or page on the way missed — or ended, a notice of that device
+  that arrived since that walk began begins a walk of the device's newest
+  root, while fewer than `WALKS_AT_ONCE` (3) walks of the pass are under
+  way; a walk ending makes room for one. A walk begun beside others takes
+  a root a device answering for the writer gives only if its head is above
+  every root a walk of the pass took — an older or equal one says nothing
+  of what the writer did since — and otherwise asks the writer again in
+  the root's next round. The pass ends once all its walks ended, and
+  counts as taken in full, and as reaching the writer, when the walk begun
+  last did. Which walks run, and when, decides nothing (invariant 1): what
+  is held, owed and walked in full follows from the roots and entries
+  verified, as above.
 - **An epoch key** (§9) — asked, round after round, of the epoch's creator,
   then of every other device known to write into the namespace, one
   Interest each a round, while the key is not held, a held owner-signed
@@ -4365,18 +4427,24 @@ device.
 
 **Bound (normative).** At most one loop asks for one owed thing at a time:
 one per (device, namespace) for a walk — a notice for a device already
-being walked marks it to walk again, starting nothing beside it; a reader's
-first look walks beside it once, at most `FETCH_TRIES` passes, and hands
-it what it did not take, starting no second loop — one per
-(subject, epoch) for a key, one per version for pieces, one per name for a
-manifest packet. Each pass of a loop makes at most `FETCH_TRIES` asks per
-packet it misses (one per granter for a key), each of at most 1 +
-`REEXPRESS_MAX` Interests within one lifetime, and every fetch holds one of
-the device's `Config::in_flight` slots (256 by default). So one owed
-packet costs at most `FETCH_TRIES` asks — `FETCH_TRIES` · (1 +
-`REEXPRESS_MAX`) = 12 Interests — per source per (lifetime + pause): after
-the first misses, about one ask per source every 6 s; after 16 misses in a
-row, one a minute, until it is no longer owed. A name nothing verified
+being walked marks it to walk again, and begins a walk of its newer root
+within the loop's pass only as "Walks of newer roots" above says, at most
+`WALKS_AT_ONCE` (3) walks of one pass under way at once, what two of them
+both list asked once; a reader's first look walks beside the loop once,
+at most `FETCH_TRIES` passes, and hands it what it did not take, starting
+no second loop — one per (subject, epoch) for a key, one per version for
+pieces, one per name for a manifest packet. Each pass of a loop makes at
+most `FETCH_TRIES` asks per packet it misses (one per granter for a key),
+or, for a root or a packet a walk lists, at most `FETCH_TRIES` rounds of
+at most `FETCH_TRIES` asks per source (one ask of each for a root); each
+ask is of at most 1 + `REEXPRESS_MAX` Interests within one lifetime, and
+every fetch holds one of the device's `Config::in_flight` slots (256 by
+default). So one owed packet costs at most `FETCH_TRIES` asks —
+`FETCH_TRIES` · (1 + `REEXPRESS_MAX`) = 12 Interests — per source per
+(lifetime + pause), and a walk at most `FETCH_TRIES` such rounds per packet
+it lists, the walks of one pass sharing them: after the first misses,
+about one ask per source every 6 s; after 16 misses in a row, one a
+minute, until it is no longer owed. A name nothing verified
 owes costs at most `REFRESH_TRIES` root asks per trigger, at most 4
 Interests each. One walk has at most `Config::window` (32) asks in flight
 — the nodes or entries one summary node lists, the pieces of one version,
@@ -4408,7 +4476,12 @@ once per source; hold asks arriving meanwhile start nothing beside it.
 notice is unsigned (§12): a stranger naming a device that never answers
 costs the reader at most 16 root asks (64 Interests at most) per notice,
 spread over about a minute, and none more while that name is being walked
-— the "stranger in a sync group" row above, bounded in time as well. (2)
+— the "stranger in a sync group" row above, bounded in time as well. A
+stranger's notices of a device being walked begin walks of its newest
+root only as the pass allows (at most `WALKS_AT_ONCE` under way, each
+once the one before is past its way or ended), each a root ask and what
+that root newly lists, what two walks share asked once; a root walked in
+full before ends its walk at once. (2)
 What is owed for
 longer is named only by data the device verified: a root its writer
 signed, a record its owner signed, a version a writer signed. A member

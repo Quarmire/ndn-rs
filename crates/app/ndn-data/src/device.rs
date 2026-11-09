@@ -51,7 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -1401,10 +1401,11 @@ fn retry_pause(misses: u32) -> Duration {
 /// in place, so one lost packet does not cost the whole walk.
 const FETCH_TRIES: u32 = 3;
 
-/// The most walks of one device's summary of one namespace under way at
-/// once ([`Inner::walk_beside`], spec §17.1): the refresh loop's or a first
-/// look's, and walks of newer roots begun beside them.
-const WALKS_AT_ONCE: u32 = 3;
+/// The most walks of one device's summary of one namespace one pass of its
+/// refresh loop has under way at once ([`Inner::refresh_pass`], spec
+/// §17.1): the walk it began with, and walks of newer roots begun beside
+/// it.
+const WALKS_AT_ONCE: usize = 3;
 
 /// One walk of a writer's summary root ([`Inner::refresh`]), as
 /// [`Inner::descend`] carries it down the tree.
@@ -1412,37 +1413,38 @@ struct Walk {
     /// [`Peer::resets`] when it began: what it processed is recorded only
     /// if nothing was forgotten since.
     since: u64,
-    /// [`Peer::heard`] before its root was asked for.
-    heard: u64,
-    /// It took a version its root lists ([`Inner::walk_beside`]).
-    reached: AtomicBool,
+    /// The pass of the refresh loop it is one of ([`Inner::refresh_pass`]).
+    reach: Option<Reach>,
 }
 
-/// A walk of `key`'s summary (device, namespace) under way, counted in
-/// [`Peer::walking`] until dropped.
-struct Walking<'a> {
-    inner: &'a Inner,
-    key: (Name, Name),
+/// One pass of a refresh loop ([`Inner::refresh_pass`]), as its walks tell
+/// it how far they came.
+struct Pass {
+    /// One more than the place of the latest-begun walk of the pass that is
+    /// past the way to its versions ([`Reach::past`]).
+    past: AtomicUsize,
+    /// The highest head of the roots its walks took.
+    head: AtomicU64,
+    /// Wakes the pass.
+    wake: Arc<Notify>,
 }
 
-impl<'a> Walking<'a> {
-    fn begin(inner: &'a Inner, ns: &Name, device: &Name) -> Self {
-        let key = (device.clone(), ns.clone());
-        inner
-            .st
-            .lock()
-            .peers
-            .entry(key.clone())
-            .or_default()
-            .walking += 1;
-        Walking { inner, key }
-    }
+/// A walk of a refresh loop's pass ([`Inner::refresh_pass`]).
+struct Reach {
+    /// Its place among the pass's walks, in the order they began.
+    index: usize,
+    pass: Arc<Pass>,
 }
 
-impl Drop for Walking<'_> {
-    fn drop(&mut self) {
-        if let Some(p) = self.inner.st.lock().peers.get_mut(&self.key) {
-            p.walking = p.walking.saturating_sub(1);
+impl Reach {
+    /// The walk is past the way to its versions — it took a version its
+    /// root lists, so its root and the nodes on the way came; or a round
+    /// of asks for a node on the way missed, so its root is a slow way to
+    /// what was written since: the pass is woken, unless a walk begun after
+    /// it got past first.
+    fn past(&self) {
+        if self.pass.past.fetch_max(self.index + 1, Ordering::Relaxed) <= self.index {
+            self.pass.wake.notify_one();
         }
     }
 }
@@ -1452,24 +1454,43 @@ impl Drop for Walking<'_> {
 type WalkAsk = futures::future::Shared<futures::channel::oneshot::Receiver<bool>>;
 
 /// One packet a summary being walked lists (spec §17.1, inside a walk):
-/// `round` — [`FETCH_TRIES`] asks of its writer's device, then of the
-/// devices answering for it — asked again in place after [`retry_pause`]
-/// while it misses, up to [`FETCH_TRIES`] rounds. A walk takes its branches
-/// side by side and ends only once the last of them did, so a packet left
-/// to the next walk waits for every other branch of this one first: under
-/// a long walk (a first catch-up, a writer that never pauses) that is far
-/// longer than a round. Only when every round missed is the walk asked
-/// again from the root.
-async fn in_rounds<T, F: Future<Output = Option<T>>>(mut round: impl FnMut() -> F) -> Option<T> {
+/// `round` — [`FETCH_TRIES`] asks of its writer's device in the first
+/// round, and in each later one, at the same time, of the writer and of
+/// the devices answering for it ([`first_some`]) — asked again in place
+/// after [`retry_pause`] while it misses, up to [`FETCH_TRIES`] rounds,
+/// each told its number from 0. A walk takes its branches side by side and
+/// ends only once the last of them did, so a packet left to the next walk
+/// waits for every other branch of this one first: under a long walk (a
+/// first catch-up, a writer that never pauses) that is far longer than a
+/// round. Only when every round missed is the walk asked again from the
+/// root.
+async fn in_rounds<T, F: Future<Output = Option<T>>>(mut round: impl FnMut(u32) -> F) -> Option<T> {
     for tries in 0..FETCH_TRIES {
         if tries > 0 {
             rt::sleep(retry_pause(tries - 1)).await;
         }
-        if let Some(got) = round().await {
+        if let Some(got) = round(tries).await {
             return Some(got);
         }
     }
     None
+}
+
+/// What the first of `a` and `b` to come with something came with, or
+/// `None` once both came with nothing: a writer asked again at the same
+/// time as the devices answering for it, so neither waits on the other
+/// (spec §13.5, §17.1).
+async fn first_some<T>(
+    a: impl Future<Output = Option<T>>,
+    b: impl Future<Output = Option<T>>,
+) -> Option<T> {
+    let (a, b) = (std::pin::pin!(a), std::pin::pin!(b));
+    match futures::future::select(a, b).await {
+        futures::future::Either::Left((Some(got), _))
+        | futures::future::Either::Right((Some(got), _)) => Some(got),
+        futures::future::Either::Left((None, other)) => other.await,
+        futures::future::Either::Right((None, other)) => other.await,
+    }
 }
 
 /// The most times one ask expresses its Interest again within its lifetime
@@ -1688,12 +1709,6 @@ struct Peer {
     /// judges ([`Inner::unjudged`]): refused whoever serves them, so not
     /// asked for, and no try of a walk is spent on them (spec §17.1).
     unjudged: Option<Unjudged>,
-    /// How many sync notices naming it were heard in this run
-    /// ([`Inner::on_update`]): one heard since a walk asked for its root
-    /// says the writer may have moved past it ([`Inner::walk_beside`]).
-    heard: u64,
-    /// Walks of its summary under way ([`Walking`]).
-    walking: u32,
 }
 
 /// Where another device's roots stand that no trust context held here
@@ -1731,14 +1746,24 @@ struct SyncGroup {
     pending: bool,
     /// Devices heard in the group.
     members: BTreeSet<Name>,
-    /// Devices being refreshed, and whether to refresh again after.
-    busy: HashMap<Name, bool>,
+    /// Devices being refreshed ([`Inner::refresh_loop`]).
+    busy: HashMap<Name, Busy>,
     /// When the device last knew nothing newer was outstanding.
     confirmed: Option<Instant>,
     /// The group counter of this device's latest announcement in the group
     /// (from the join on): kept in the store before each announcement goes
     /// out ([`announced_name`]), so a restart starts above it.
     announced: u64,
+}
+
+/// A device whose refresh loop runs ([`Inner::refresh_loop`]).
+struct Busy {
+    /// A notice of it arrived since the loop's newest walk began: its
+    /// newest root is walked again.
+    again: bool,
+    /// Wakes the loop's pass ([`Inner::refresh_pass`]) when a notice
+    /// arrives.
+    wake: Arc<Notify>,
 }
 
 struct Watcher {
@@ -8692,11 +8717,6 @@ impl Inner {
             }
             let mut targets = self.written_by(&st, &device);
             targets.insert(ns.clone());
-            for t in &targets {
-                if let Some(p) = st.peers.get_mut(&(device.clone(), t.clone())) {
-                    p.heard += 1;
-                }
-            }
             targets
         };
         for t in targets {
@@ -8984,20 +9004,32 @@ impl Inner {
 
     /// The one refresh loop of (`device`, `ns`) ([`Self::schedule`]),
     /// started after `missed` passes in a row missed (0: on a notice); a
-    /// notice arriving while it runs marks it to walk again, a walk that
-    /// missed does not (the loop asks again while owed).
+    /// notice arriving while it runs marks it to walk again and wakes its
+    /// pass ([`Self::refresh_pass`]), a walk that missed does not (the loop
+    /// asks again while owed).
     fn refresh_loop(self: &Arc<Self>, ns: Name, device: Name, missed: u32) {
-        {
+        let wake = {
             let mut st = self.st.lock();
             let Some(g) = st.groups.get_mut(&ns) else {
                 return;
             };
-            if let Some(again) = g.busy.get_mut(&device) {
-                *again |= missed == 0;
+            if let Some(busy) = g.busy.get_mut(&device) {
+                if missed == 0 {
+                    busy.again = true;
+                    busy.wake.notify_one();
+                }
                 return;
             }
-            g.busy.insert(device.clone(), false);
-        }
+            let wake = Arc::new(Notify::new());
+            g.busy.insert(
+                device.clone(),
+                Busy {
+                    again: false,
+                    wake: Arc::clone(&wake),
+                },
+            );
+            wake
+        };
         let inner = Arc::clone(self);
         rt::spawn(async move {
             // Passes in a row that left the walk owed or missed.
@@ -9006,7 +9038,7 @@ impl Inner {
                 rt::sleep(retry_pause(missed - 1)).await;
             }
             loop {
-                let ok = inner.refresh(&ns, &device).await;
+                let ok = inner.refresh_pass(&ns, &device, &wake).await;
                 // Again now; again later; or done.
                 let next: Option<bool> = {
                     let mut st = inner.st.lock();
@@ -9034,8 +9066,8 @@ impl Inner {
                     match st.groups.get_mut(&ns) {
                         None => None,
                         Some(g) => match g.busy.get_mut(&device) {
-                            Some(again) if *again => {
-                                *again = false;
+                            Some(busy) if busy.again => {
+                                busy.again = false;
                                 Some(false)
                             }
                             Some(_) if waits => Some(true),
@@ -9319,7 +9351,7 @@ impl Inner {
         rt::spawn(async move {
             let mut misses = 0;
             let whole = loop {
-                if inner.refresh(&ns, &device).await {
+                if inner.refresh(&ns, &device, None).await {
                     break true;
                 }
                 if inner.st.lock().unheld_roots(&device, &ns) {
@@ -9740,27 +9772,13 @@ impl Inner {
     /// meanwhile is refreshed again from its newer root, which skips every
     /// branch processed in full here. Returns whether it completed and
     /// reached the writer's state: not when only a relay answered, with a
-    /// root no newer than the head walked in full (spec §13.5, §17.1).
-    async fn refresh(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
-        let walking = Walking::begin(self, ns, device);
-        let whole = self.refresh_walk(ns, device).await;
-        drop(walking);
-        whole
-    }
-
-    /// [`Self::refresh`], counted among the walks under way by its caller.
-    async fn refresh_walk(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
+    /// root no newer than the head walked in full (spec §13.5, §17.1). A
+    /// walk of a refresh loop's pass tells the pass how far it came
+    /// (`reach`, [`Self::refresh_pass`]).
+    async fn refresh(self: &Arc<Self>, ns: &Name, device: &Name, reach: Option<Reach>) -> bool {
         if !self.st.lock().toward(ns) {
             return true;
         }
-        // The notices heard of it before its root is asked: one heard after
-        // says the writer may have moved past that root ([`Self::walk_beside`]).
-        let heard = self
-            .st
-            .lock()
-            .peers
-            .get(&(device.clone(), ns.clone()))
-            .map_or(0, |p| p.heard);
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
         // A root in a person's namespace no trust context held here judges
         // is refused whoever serves it: not asked for, and no try is spent
@@ -9786,8 +9804,14 @@ impl Inner {
             }
         }
         // A writer that does not answer is answered for by the devices that
-        // hold its newest root (spec §13.5).
-        let Some((data, relayed)) = self.fetch_root(root, ns, device).await else {
+        // hold its newest root (spec §13.5). A walk begun beside others of
+        // its pass is for what the writer did since their roots: a relay's
+        // root no newer than those says nothing of that.
+        let above = reach
+            .as_ref()
+            .filter(|r| r.index > 0)
+            .map(|r| r.pass.head.load(Ordering::Relaxed));
+        let Some((data, relayed)) = self.fetch_root(root, ns, device, above).await else {
             return false;
         };
         let (writer, body) = match self.accept_root(device, ns, &data).await {
@@ -9801,6 +9825,9 @@ impl Inner {
                 return false;
             }
         };
+        if let Some(r) = &reach {
+            r.pass.head.fetch_max(body.head, Ordering::Relaxed);
+        }
         let digest = wire::implicit_digest(data.raw());
         let key = (device.clone(), ns.clone());
         // A relay holds the newest root it verified, which may be older than
@@ -9843,11 +9870,7 @@ impl Inner {
             let since = st.peers.get(&key).map_or(0, |p| p.resets);
             (toward, followed, since)
         };
-        let walk = Walk {
-            since,
-            heard,
-            reached: AtomicBool::new(false),
-        };
+        let walk = Walk { since, reach };
         let whole = self.descend(device, ns, &writer, body, &walk).await;
         if descending.end() {
             self.fetch_wanted(true);
@@ -9884,30 +9907,78 @@ impl Inner {
         !stale
     }
 
-    /// Begin a walk of `device`'s newest root of `ns` beside the walks of it
-    /// under way (spec §17.1), once one of them — begun after `heard`
-    /// notices of it — took a version its root lists: if a notice of it
-    /// came since, saying the writer may have moved past that root, and
-    /// fewer than [`WALKS_AT_ONCE`] walk it now. A walk takes its root's
-    /// branches side by side and ends once the slowest did; a writer that
-    /// never pauses would otherwise have each version wait for the walk
-    /// under way as it was written, then for the next. What walks under way
-    /// at once both list is asked once ([`Self::asked_once`]).
-    fn walk_beside(self: &Arc<Self>, ns: &Name, device: &Name, heard: u64) {
-        let key = (device.clone(), ns.clone());
-        {
-            let mut st = self.st.lock();
-            let Some(p) = st.peers.get_mut(&key) else {
-                return;
+    /// One pass of `device`'s refresh loop of `ns` ([`Self::refresh_loop`],
+    /// spec §17.1): a walk of its newest root ([`Self::refresh`]) and,
+    /// beside it, walks of the newer roots notices tell of. Once the walk
+    /// begun last is past the way to its versions ([`Reach::past`]: it took
+    /// one, or a round of asks for a node on the way missed) or ended, a
+    /// notice arrived since it began ([`Busy`]) begins a walk of the newest
+    /// root, while fewer than [`WALKS_AT_ONCE`] of the pass's walks are
+    /// under way; one ending makes room. A walk takes its root's branches
+    /// side by side and ends once the slowest did: a writer that never
+    /// pauses would otherwise have each version wait for the walk under way
+    /// as it was written, long tail and all, then for the next. What walks
+    /// under way at once both list is asked once ([`Self::asked_once`]); a
+    /// walk begun beside takes no root a device answering for the writer
+    /// gives that is no newer than one a walk of the pass took
+    /// ([`Self::fetch_root`]). The pass ends once every walk of it ended:
+    /// whether the one begun last was taken in full and reached the
+    /// writer's state.
+    async fn refresh_pass(self: &Arc<Self>, ns: &Name, device: &Name, wake: &Arc<Notify>) -> bool {
+        let pass = Arc::new(Pass {
+            past: AtomicUsize::new(0),
+            head: AtomicU64::new(0),
+            wake: Arc::clone(wake),
+        });
+        let walk = |index: usize| {
+            let reach = Reach {
+                index,
+                pass: Arc::clone(&pass),
             };
-            if p.heard <= heard || p.walking >= WALKS_AT_ONCE {
-                return;
+            async move { (index, self.refresh(ns, device, Some(reach)).await) }
+        };
+        let mut walks = stream::FuturesUnordered::new();
+        // The walk begun now answers the notices before it.
+        let _ = self.noticed_again(ns, device);
+        walks.push(walk(0));
+        // The walk begun last, and whether it was taken in full once ended.
+        let (mut newest, mut outcome) = (0, None);
+        loop {
+            let ended = {
+                let woken = std::pin::pin!(wake.notified());
+                match futures::future::select(walks.next(), woken).await {
+                    futures::future::Either::Left((ended, _)) => ended,
+                    futures::future::Either::Right(_) => None,
+                }
+            };
+            if let Some((index, whole)) = ended
+                && index == newest
+            {
+                outcome = Some(whole);
+            }
+            let ready = outcome.is_some() || pass.past.load(Ordering::Relaxed) > newest;
+            if ready && walks.len() < WALKS_AT_ONCE && self.noticed_again(ns, device) {
+                newest += 1;
+                outcome = None;
+                walks.push(walk(newest));
+            }
+            if walks.is_empty() {
+                break;
             }
         }
-        let inner = Arc::clone(self);
-        rt::spawn(async move {
-            inner.refresh(&key.1, &key.0).await;
-        });
+        outcome.unwrap_or(false)
+    }
+
+    /// Whether a notice of `device` in `ns`'s group arrived since its
+    /// refresh loop's newest walk began ([`Busy::again`]), taken: the walk
+    /// about to begin answers it.
+    fn noticed_again(&self, ns: &Name, device: &Name) -> bool {
+        self.st
+            .lock()
+            .groups
+            .get_mut(ns)
+            .and_then(|g| g.busy.get_mut(device))
+            .is_some_and(|b| std::mem::take(&mut b.again))
     }
 
     /// Process a verified node (or page) of `writer`'s summary of `ns`,
@@ -10085,11 +10156,12 @@ impl Inner {
                 .collect::<Vec<_>>()
                 .await;
             let entries_taken = fetched.iter().chain(&fetched_versions).all(|ok| *ok);
-            // The walk reached the versions its root lists: a newer root the
-            // writer was announced at meanwhile is walked beside it.
-            if fetched_versions.iter().any(|ok| *ok) && !walk.reached.swap(true, Ordering::Relaxed)
+            // The walk reached the versions its root lists: its pass may
+            // begin a walk of a newer root beside it.
+            if let Some(reach) = &walk.reach
+                && fetched_versions.iter().any(|ok| *ok)
             {
-                self.walk_beside(ns, device, walk.heard);
+                reach.past();
             }
 
             let branch_results = stream::iter(
@@ -10131,11 +10203,18 @@ impl Inner {
                 // ([`Self::asked_once`]).
                 let exact = name.clone().append_implicit_digest(digest);
                 let branch = async {
-                    let data = in_rounds(|| async {
-                        match self.fetch_owed(exact.clone(), false).await {
-                            Some(d) => Some(d),
-                            None => self.ask_relays(&name, ns, device, Some(digest)).await,
+                    let (asked, node) = (&exact, &name);
+                    let data = in_rounds(|round| async move {
+                        let own = self.fetch_owed(asked.clone(), false);
+                        if round == 0 {
+                            return own.await;
                         }
+                        // A round on the way missed: a newer root may be the
+                        // quicker way to what was written since.
+                        if let Some(reach) = &walk.reach {
+                            reach.past();
+                        }
+                        first_some(own, self.ask_relays(node, ns, device, Some(digest))).await
                     })
                     .await;
                     let data = data?;
@@ -10228,13 +10307,14 @@ impl Inner {
         if decided(&self.st.lock()) {
             return true;
         }
-        let rounds = in_rounds(|| async {
-            if self.take_fetched(name.clone()).await {
+        let listed = &name;
+        let rounds = in_rounds(|round| async move {
+            if self.take_fetched(listed.clone(), Some(round)).await {
                 return Some(true);
             }
             let st = self.st.lock();
-            let ended = st.refused.contains_key(&name)
-                || parse_log_name(&name).is_some_and(|l| self.suspects_device(&st, &l.device));
+            let ended = st.refused.contains_key(listed)
+                || parse_log_name(listed).is_some_and(|l| self.suspects_device(&st, &l.device));
             ended.then_some(false)
         });
         self.asked_once((name.clone(), None), async {
@@ -10244,18 +10324,23 @@ impl Inner {
     }
 
     /// Fetch, verify and take one log entry — by its name, else from each
-    /// holder of a live lease on its collection ([`Self::fetch_entry`]);
+    /// holder of a live lease on its collection ([`Self::fetch_entry`]), or,
+    /// as round `round` of a walk's asks, as [`Self::fetch_listed`] asks —;
     /// whether it is now held or refused. One a removal cut keeps bound to
     /// bytes is asked for by its full name, so only those bytes answer
     /// ([`Self::kept_bytes`]). The log of a device whose key is suspected
     /// here is not fetched ([`Device::suspect`]).
-    async fn take_fetched(self: &Arc<Self>, name: Name) -> bool {
+    async fn take_fetched(self: &Arc<Self>, name: Name, round: Option<u32>) -> bool {
         if parse_log_name(&name).is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device)) {
             tracing::debug!(%name, "not fetched: its device's key is suspected here");
             return false;
         }
         let digest = self.kept_bytes(&name).await;
-        let Some(data) = self.fetch_entry(&name, digest).await else {
+        let fetched = match round {
+            None => self.fetch_entry(&name, digest).await,
+            Some(round) => self.fetch_listed(&name, digest, round).await,
+        };
+        let Some(data) = fetched else {
             return false;
         };
         match self.take_data(&name, data).await {
@@ -11409,7 +11494,7 @@ impl Inner {
 
     /// [`Self::fetch_kept`] of one name.
     async fn fetch_kept_one(self: &Arc<Self>, name: Name) {
-        let taken = self.take_fetched(name.clone()).await;
+        let taken = self.take_fetched(name.clone(), None).await;
         let retry = {
             let mut st = self.st.lock();
             st.bytes_fetching.remove(&name);
@@ -12357,14 +12442,42 @@ impl Inner {
     }
 
     /// Fetch the log entry `name` — exactly the packet whose implicit
-    /// digest is `digest`, if given — by its name, else from each holder of
-    /// a live lease on its collection, else from each other device heard
-    /// for its collection's namespace (spec §13.5).
+    /// digest is `digest`, if given — by its name, else as
+    /// [`Self::fetch_entry_held`] does (spec §13.5).
     async fn fetch_entry(&self, name: &Name, digest: Option<[u8; 32]>) -> Option<Data> {
         let exact = digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
         if let Some(d) = self.fetch_owed(exact, false).await {
             return Some(d);
         }
+        self.fetch_entry_held(name, digest).await
+    }
+
+    /// [`Self::fetch_entry`] for an entry a summary being walked lists, as
+    /// round `round` of its asks ([`in_rounds`], spec §17.1): of its
+    /// writer's device in the first round, and in each later one of the
+    /// writer and, at the same time, of the devices answering for it
+    /// ([`Self::fetch_entry_held`]). A writer that answers late is still
+    /// asked while they are, and devices that do not answer cost no time
+    /// beside it.
+    async fn fetch_listed(
+        &self,
+        name: &Name,
+        digest: Option<[u8; 32]>,
+        round: u32,
+    ) -> Option<Data> {
+        let exact = digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
+        let own = self.fetch_owed(exact, false);
+        if round == 0 {
+            return own.await;
+        }
+        first_some(own, self.fetch_entry_held(name, digest)).await
+    }
+
+    /// The log entry `name` — exactly the packet whose implicit digest is
+    /// `digest`, if given — from each holder of a live lease on its
+    /// collection in turn, else from each other device heard for its
+    /// collection's namespace at once (spec §13.5).
+    async fn fetch_entry_held(&self, name: &Name, digest: Option<[u8; 32]>) -> Option<Data> {
         let log = parse_log_name(name)?;
         let c = log.subject.as_ref()?;
         let holders = self.holders_of(&self.st.lock(), c);
@@ -12436,8 +12549,16 @@ impl Inner {
     /// costs neither the writer's newest root (a holder behind it walked
     /// instead, its writes since left to a later walk) nor a pass of the
     /// refresh loop; a writer away costs the lifetime it did before its
-    /// relays answer.
-    async fn fetch_root(&self, root: Name, ns: &Name, device: &Name) -> Option<(Data, bool)> {
+    /// relays answer. A relay's root must be above `above`, if given (a walk
+    /// begun beside walks of roots up to that head, [`Self::refresh_pass`]):
+    /// one that is not, the writer is asked again in the next round.
+    async fn fetch_root(
+        &self,
+        root: Name,
+        ns: &Name,
+        device: &Name,
+        above: Option<u64>,
+    ) -> Option<(Data, bool)> {
         if let Some(d) = self.fetch(root.clone(), true).await {
             return Some((d, false));
         }
@@ -12447,7 +12568,7 @@ impl Inner {
             }
             let (own, relayed) = futures::future::join(
                 self.fetch(root.clone(), true),
-                self.ask_relays_root(ns, device),
+                self.ask_relays_root(ns, device, above),
             )
             .await;
             if let Some(d) = own {
@@ -12464,8 +12585,9 @@ impl Inner {
     /// it holds ([`Self::held_packet`], spec §13.5), when the writer does
     /// not answer: the one with the highest head among its relays, asked at
     /// once, if that head is at least the highest verified here — an older
-    /// one is a holder that is behind, not the writer rolling back.
-    async fn ask_relays_root(&self, ns: &Name, device: &Name) -> Option<Data> {
+    /// one is a holder that is behind, not the writer rolling back — and
+    /// above `above`, if given.
+    async fn ask_relays_root(&self, ns: &Name, device: &Name, above: Option<u64>) -> Option<Data> {
         let prefix = root_prefix(device, ns);
         let (relays, seen) = {
             let st = self.st.lock();
@@ -12493,7 +12615,10 @@ impl Inner {
             else {
                 continue;
             };
-            if head >= seen && best.as_ref().is_none_or(|(h, _)| head > *h) {
+            if head >= seen
+                && above.is_none_or(|a| head > a)
+                && best.as_ref().is_none_or(|(h, _)| head > *h)
+            {
                 best = Some((head, root));
             }
         }
@@ -16790,13 +16915,14 @@ impl Inner {
                 }
                 if inner.unheld(&inner.st.lock(), &c, &at) > 0 {
                     let devices = inner.known_for(&inner.st.lock(), &ns);
-                    futures::future::join_all(devices.iter().map(|d| inner.refresh(&ns, d))).await;
+                    futures::future::join_all(devices.iter().map(|d| inner.refresh(&ns, d, None)))
+                        .await;
                     inner.wait_for(|st| inner.unheld(st, &c, &at) == 0).await;
                     // A walk that listed an entry but did not take it
                     // leaves it to this take: asked for by its name.
                     let names = inner.unheld_names(&inner.st.lock(), &c, &at);
                     stream::iter(names)
-                        .map(|n| inner.take_fetched(n))
+                        .map(|n| inner.take_fetched(n, None))
                         .buffer_unordered(inner.config.window)
                         .collect::<Vec<bool>>()
                         .await;
