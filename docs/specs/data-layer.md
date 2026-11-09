@@ -3932,6 +3932,14 @@ slice-2 `Cut` (0x056C) stays the members record's removal cut; the
 manifest its `CutBytes` names reuses the revocation cut's manifest form
 (trust-context.md §3.3.12), named under the record (§16.1).
 
+Round 3 adds no data-layer TLV either. A device serving what it holds
+(§13.5) answers with the packets as signed, under their own names and the
+existing `32=held` wrapper; a members change (§6.1) signs an ordinary
+`MembersRecord`; a basis (§5.2) is a version already on the wire; a
+writer's namespace adopted for one folder (§6.3) is fetched by the trust
+context's own names; asking again (§17.1) and the faulty mode (§18.1) put
+nothing on the wire. The odd numbers 0x0571–0x057F stay free.
+
 ### 16.3 Why these encodings
 
 - **Reused:** the Name TLV, NonNegativeInteger, typed name components
