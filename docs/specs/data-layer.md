@@ -5267,10 +5267,13 @@ the default seed and two more, each with `--check-determinism`.
   while it answers next step `RetryLater` — `Unavailable`, `NotReady`: a
   `put` racing the record or the epoch key that admits it, a `get` or a
   join whose first look races the network — every 500 ms for at most
-  120 s of virtual time (the harness's `AGAIN_PAUSE`, `AGAIN_FOR`), and
-  never on any other answer. Asking again is liveness only: a `RetryLater`
-  refusal decides nothing, and what the verb answers when it succeeds is
-  judged as on a first try.
+  120 s of virtual time (the harness's `AGAIN_PAUSE`, `AGAIN_FOR`); a
+  `release` answered next step `HoldFirst` (§13.3: no holder proved it
+  keeps the cover, perhaps only because its answers were lost) holds again
+  and releases again within the case's own limit; it does neither on any
+  other answer. Asking again is liveness only: a `RetryLater` or
+  `HoldFirst` refusal decides nothing, and what the verb answers when it
+  succeeds is judged as on a first try.
 - **A sustained-write case offers the load the path carries.** The one
   workload parameter that follows the path is the pace of a writer that
   never pauses (o4): every version is a packet a reader fetches by name,
