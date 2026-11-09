@@ -1892,7 +1892,9 @@ where
 /// is refused as [`adopt_by_name`] refuses it for a held namespace. The
 /// fetches, the walk and its bounds ([`MAX_CATCH_UP_MISSES`],
 /// [`MAX_CATCH_UP_TIME`]), a validating `forwarder`'s expectation and the
-/// refusals are [`adopt_by_name`]'s.
+/// refusals are [`adopt_by_name`]'s. The result carries the newest
+/// version's signed Data ([`ScopedContext::data`]), for the holder to keep
+/// and adopt from again after a restart, as `held`.
 pub async fn adopt_scoped<E>(
     forwarder: Option<&Validator>,
     exchange: &mut E,
@@ -1922,12 +1924,12 @@ where
         },
         Err(e) => e,
     };
-    match held {
+    let scoped = match held {
         Some(held) => {
             let newest = scratch
                 .held(namespace)
                 .unwrap_or_else(|| Arc::clone(held.context()));
-            held.moved_on(newest).map_err(reached)
+            held.moved_on(newest).map_err(reached)?
         }
         None => {
             let first = adoption
@@ -1935,9 +1937,14 @@ where
                 .first()
                 .map_or(&adoption.data, |step| &step.data);
             let genesis = Genesis::open_received(first).await?;
-            ScopedContext::new(genesis, Arc::clone(&adoption.context)).map_err(reached)
+            ScopedContext::new(genesis, Arc::clone(&adoption.context)).map_err(reached)?
         }
+    };
+    // The newest version's signed Data, for its holder to keep.
+    if scoped.context().version() == adoption.context.version() {
+        return scoped.with_data(&adoption.data).map_err(reached);
     }
+    Ok(scoped)
 }
 
 /// [`adopt_by_name`] of a namespace a link names, `inline_genesis` the

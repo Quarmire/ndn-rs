@@ -16,6 +16,9 @@ use portable_atomic::AtomicU64;
 use dashmap::DashMap;
 use ndn_packet::Name;
 
+use bytes::Bytes;
+use ndn_packet::Data;
+
 use crate::self_certifying::{Genesis, SelfCertifyingNameError, self_certifying_digest};
 use crate::trust_context::SignedTrustContext;
 
@@ -128,6 +131,11 @@ pub struct Keyring {
 pub struct ScopedContext {
     genesis: Arc<Genesis>,
     context: Arc<SignedTrustContext>,
+    /// The newest version's signed Data, as received, when known
+    /// ([`with_data`](Self::with_data)): what its holder keeps, to judge by
+    /// that version again after a restart and refresh from it. Version 1's
+    /// is the genesis's.
+    data: Option<Bytes>,
 }
 
 impl ScopedContext {
@@ -145,10 +153,38 @@ impl ScopedContext {
                 version: newest.version(),
             });
         }
+        let data = (newest.version() == 1).then(|| genesis.data().raw().clone());
         Ok(Self {
             genesis: Arc::new(genesis),
             context: newest,
+            data,
         })
+    }
+
+    /// The same, with `data` as the newest version's signed Data: it must
+    /// be named as that version (`<ns>/32=trust-context/v=<N>`) and carry
+    /// that very context, else [`AdoptRefusal::Fork`]. Its signature is the
+    /// caller's to have checked, as the version's continuity is.
+    pub fn with_data(mut self, data: &Data) -> Result<Self, AdoptRefusal> {
+        let same = *data.name == self.context.rdr_name()
+            && data
+                .content()
+                .and_then(|c| SignedTrustContext::decode_content(c, self.context.version()).ok())
+                .is_some_and(|c| c.encode_content() == self.context.encode_content());
+        if !same {
+            return Err(AdoptRefusal::Fork {
+                held_ctx: Arc::clone(&self.context),
+            });
+        }
+        self.data = Some(data.raw().clone());
+        Ok(self)
+    }
+
+    /// The newest version's signed Data, whole, when known: kept by a
+    /// holder that judges by this context again after a restart
+    /// (data-layer.md §6.3).
+    pub fn data(&self) -> Option<&Bytes> {
+        self.data.as_ref()
     }
 
     /// The person's namespace, `/user/<0xA1: …>`.
@@ -184,6 +220,7 @@ impl ScopedContext {
             std::cmp::Ordering::Greater => Ok(Self {
                 genesis: Arc::clone(&self.genesis),
                 context: newer,
+                data: None,
             }),
             std::cmp::Ordering::Equal if newer.encode_content() == held_ctx.encode_content() => {
                 Ok(self.clone())
