@@ -3,7 +3,9 @@
 //! for again after the pause, whatever ended the walk — a first look's wait
 //! running out, a fetch that missed — with no new notice from its writer;
 //! and a root no trust context held here judges yet is owed from the
-//! adoption that makes it judgeable.
+//! adoption that makes it judgeable; and a sync notice is answered only by a
+//! root its writer gave, newer than every root verified before it unless
+//! every round of the root brought nothing newer.
 
 use std::sync::atomic::AtomicBool;
 
@@ -717,5 +719,299 @@ async fn a_root_refused_before_its_namespace_is_held_is_walked_once_the_namespac
          adopted, walked without a new notice"
     );
     reader.shutdown();
+    writer.shutdown();
+}
+
+/// A reader's link to some devices, the writer first: an Interest under a
+/// device's name is answered with what that device serves — under its
+/// `32=held`, what it holds for others (spec §13.5). One for `root`, the
+/// writer's root prefix, is lost while `losing` holds, or answered once with
+/// `stale`, an old copy of the root the network delayed. `losing` ends once a
+/// device answered for the writer's root and the reader then asks the writer
+/// for something else: it walks the root that device gave.
+struct Net {
+    devices: Vec<Arc<Inner>>,
+    root: Name,
+    losing: AtomicBool,
+    relayed: AtomicBool,
+    stale: std::sync::Mutex<Option<Bytes>>,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+impl Net {
+    fn new(devices: &[&Device], root: Name) -> Arc<Self> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        Arc::new(Net {
+            devices: devices.iter().map(|d| Arc::clone(&d.inner)).collect(),
+            root,
+            losing: AtomicBool::new(false),
+            relayed: AtomicBool::new(false),
+            stale: std::sync::Mutex::new(None),
+            tx,
+            rx: futures::lock::Mutex::new(rx),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Net {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Ok(interest) = Interest::decode(wire) else {
+            return Ok(());
+        };
+        let name: &Name = &interest.name;
+        if name.has_prefix(&self.root) {
+            if self.losing.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if let Some(old) = self.stale.lock().unwrap().take() {
+                let _ = self.tx.unbounded_send(old);
+                return Ok(());
+            }
+        }
+        let Some(device) = self.devices.iter().find(|d| name.has_prefix(&d.device)) else {
+            return Ok(());
+        };
+        let reply = match parse_held_name(name) {
+            Some((holder, piece)) if holder == device.device => {
+                let reply = device
+                    .held_packet(&piece)
+                    .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256());
+                if reply.is_some() && piece.has_prefix(&self.root) {
+                    self.relayed.store(true, Ordering::Relaxed);
+                }
+                reply
+            }
+            _ => {
+                if self.relayed.load(Ordering::Relaxed) && device.device == self.devices[0].device {
+                    self.losing.store(false, Ordering::Relaxed);
+                }
+                device.packet_for(name, interest.selectors().can_be_prefix)
+            }
+        };
+        if let Some(reply) = reply {
+            let _ = self.tx.unbounded_send(reply);
+        }
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// Wendy's namespace, with `devices` certified in it: each one's key store,
+/// and a maker of validators trusting them all.
+async fn wendy(
+    devices: &[&Name],
+) -> (
+    Name,
+    Vec<Arc<SecurityManager>>,
+    impl Fn() -> Arc<Validator> + use<>,
+) {
+    let ns = n("/wendy");
+    let authority = SecurityManager::new();
+    let issuer = authority
+        .generate_ed25519(ns.clone().append("KEY").append("ns"))
+        .unwrap();
+    let public = authority
+        .get_signer_sync(&issuer)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let anchor = authority
+        .issue_self_signed_async(&issuer, public, VALIDITY_MS)
+        .await
+        .unwrap();
+    let (mut keys, mut certs) = (Vec::new(), Vec::new());
+    for d in devices {
+        let (k, cert) = device_key(&authority, &issuer, d).await;
+        keys.push(k);
+        certs.push(cert);
+    }
+    let context = ns.clone();
+    let validator = move || {
+        let v = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        let ctx = SignedTrustContext::hierarchical(context.clone());
+        assert!(ctx.add_anchor(anchor.clone()));
+        v.adopt_context(Arc::new(ctx)).unwrap();
+        for cert in &certs {
+            v.cert_cache().insert(cert.clone());
+        }
+        v
+    };
+    (ns, keys, validator)
+}
+
+/// Share `c` as a log collection Wendy's namespace writes, from `writer`.
+async fn share_log(writer: &Device, c: &Name, ns: &Name) {
+    writer
+        .share(
+            c,
+            crate::layer::Share {
+                rule: Rule::Log,
+                writers: vec![ns.clone()],
+                readers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Put version `i` into `c` from `writer` (device `device`) and wait until it
+/// is served (durable): its log entry name.
+async fn put_served(writer: &Device, device: &Name, c: &Name, i: usize) -> Name {
+    let options = PutOptions {
+        type_id: crate::TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    };
+    let content = Content::new().with("t", Bytes::from(i.to_string()));
+    let id = writer.put(c, content, options).await.unwrap();
+    let name = log_name(device, Some(c), id.seq.0);
+    for _ in 0..100 {
+        if writer.inner.packet_for(&name, false).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        writer.inner.packet_for(&name, false).is_some(),
+        "the writer serves its version once durable"
+    );
+    name
+}
+
+/// A sync notice that `device` moved.
+fn notice(device: &Name) -> SyncUpdate {
+    SyncUpdate {
+        publisher: device.to_string(),
+        name: device.clone(),
+        low_seq: 1,
+        high_seq: 1,
+        mapping: None,
+        serving_party: None,
+    }
+}
+
+/// Whether `dev` holds `version` within `secs` seconds.
+async fn held_within(dev: &Device, version: &Name, secs: u64) -> bool {
+    for _ in 0..secs {
+        if holds(dev, version) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    holds(dev, version)
+}
+
+/// The laptop writes a second version and announces it; the root that
+/// answers the phone's walk of that notice is an old copy of the laptop's
+/// root — a duplicate the network delayed — which the phone walked in full
+/// already. The laptop announces nothing more. The phone asks the laptop
+/// again in the root's next round and takes the second version: a notice is
+/// answered by a root newer than every root verified before it, or by the
+/// writer's own root once every round brought nothing newer (spec §17.1).
+#[tokio::test(start_paused = true)]
+async fn a_notice_answered_by_an_old_copy_of_the_writers_root_asks_the_writer_again() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let root = root_prefix(&laptop, &ns);
+    let net = Net::new(&[&writer], root.clone());
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+
+    let old = writer.inner.packet_for(&root, true).unwrap();
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    *net.stale.lock().unwrap() = Some(old);
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &second, 30).await,
+        "an old copy of the writer's root answering a notice does not end it: the writer is \
+         asked again"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
+/// The tablet holds the laptop's root of its second version; the phone
+/// walked the first. The laptop writes a third and announces it, but its
+/// root does not reach the phone in the walk's first two rounds, so the walk
+/// takes the tablet's root: newer than the one walked, yet behind what the
+/// laptop announced. The laptop announces nothing more. The phone's loop asks
+/// the laptop again and takes the third version: a root only a device
+/// answering for the writer gave does not answer the writer's notice (spec
+/// §17.1).
+#[tokio::test(start_paused = true)]
+async fn a_notice_answered_by_a_relays_root_behind_the_writer_asks_the_writer_again() {
+    let (laptop, tablet, phone) = (n("/wendy/laptop"), n("/wendy/tablet"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &tablet, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let first = put_served(&writer, &laptop, &c, 0).await;
+    let root = root_prefix(&laptop, &ns);
+    let to_writer = Net::new(&[&writer], n("/nothing"));
+    let relay = start_on(&tablet, Arc::clone(&keys[1]), validator(), to_writer).await;
+    let net = Net::new(&[&writer, &relay], root.clone());
+    let reader = start_on(&phone, Arc::clone(&keys[2]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    // The phone has heard the tablet in the group: it may answer for the
+    // laptop.
+    reader.inner.on_update(&ns, notice(&tablet));
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &first, 60).await,
+        "precondition: the phone takes the first version"
+    );
+
+    let second = put_served(&writer, &laptop, &c, 1).await;
+    relay.inner.follow(&c).await.unwrap();
+    relay.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&relay, &second, 60).await,
+        "precondition: the tablet takes the second version"
+    );
+    let third = put_served(&writer, &laptop, &c, 2).await;
+    net.losing.store(true, Ordering::Relaxed);
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &second, 30).await,
+        "precondition: the phone walks the tablet's root"
+    );
+    assert!(
+        held_within(&reader, &third, 30).await,
+        "a root only a device answering for the writer gave does not answer the writer's \
+         notice: the writer is asked again"
+    );
+    reader.shutdown();
+    relay.shutdown();
     writer.shutdown();
 }
