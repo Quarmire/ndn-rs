@@ -72,7 +72,7 @@ use ndn_security::{
     TrustError, ValidationResult, Validator, cut_manifest, cut_manifest::CutManifests,
     public_key_digest, sync_group,
 };
-use ndn_sync::{DataStore, MultiSvs, SvsConfig, SyncUpdate, spawn_multi_svs};
+use ndn_sync::{DataStore, MultiSvs, ObservedState, SvsConfig, SyncUpdate, spawn_multi_svs};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
@@ -1769,6 +1769,16 @@ struct SyncGroup {
     /// The group is asked again for its members' state while this device
     /// has heard no device that writes into the namespace ([`Inner::hail`]).
     hailing: bool,
+    /// This device's newest announcement goes out again while no member is
+    /// heard to have taken it ([`Inner::herald`]).
+    heralding: bool,
+    /// Asks this device answered for its own newest root of the namespace
+    /// (`<device>/32=summary/<O>/32=root`): a member walking it after an
+    /// announcement took what the announcement said ([`Inner::herald`]).
+    root_asks: u64,
+    /// The highest counter of each device the group's Sync Interests heard
+    /// here carried, this device's own among them ([`Inner::herald`]).
+    observed: Option<Arc<ObservedState>>,
 }
 
 /// A device whose refresh loop runs ([`Inner::refresh_loop`]).
@@ -1919,12 +1929,13 @@ struct St {
     /// Merge versions in pieces a fetch found whole: not fetched again
     /// while they wait to open (for their epoch's key, or to apply).
     walked: BTreeSet<Name>,
-    /// Merge versions in pieces a fetch did not find whole (yet): they no
-    /// longer hold back the pieces of the versions in their past
-    /// ([`St::wanted_pieces`]).
+    /// Merge versions in pieces a fetch did not find whole (yet): not
+    /// fetched again until [`Inner::retry_pieces`] asks.
     unfound: BTreeSet<Name>,
     /// Of those, how many fetches of each missed in a row: it is asked again
     /// after [`retry_pause`] of that, while it is still wanted (spec §17.1).
+    /// From [`REFRESH_TRIES`] on, it no longer holds back the pieces of the
+    /// versions in its past ([`St::wanted_pieces`]).
     piece_misses: HashMap<Name, u32>,
     /// Descents of summaries under way ([`Descending`]): the pieces of the
     /// merge versions they bring are fetched once none is.
@@ -6787,12 +6798,17 @@ impl St {
             .collect();
         // In the past of a later unopened version (spec §5.2: its parents
         // and its writer's earlier entries) whose pieces are neither found
-        // whole nor found missing yet.
+        // whole nor missed by every one of [`REFRESH_TRIES`] fetches: one
+        // lost packet is no evidence that the later version, maybe a
+        // checkpoint covering it, is not to be had (spec §17.1).
         let later_unopened = |v: &VersionId| {
             unopened.iter().any(|w| {
                 w.version.id != *v
                     && !self.walked.contains(&w.version.name)
-                    && !self.unfound.contains(&w.version.name)
+                    && self
+                        .piece_misses
+                        .get(&w.version.name)
+                        .is_none_or(|m| *m < REFRESH_TRIES)
                     && (w.version.parents.contains(v)
                         || (w.version.id.writer == v.writer && v.seq < w.version.id.seq))
             })
@@ -8672,6 +8688,9 @@ impl Inner {
                     confirmed: None,
                     announced: local_seq,
                     hailing: false,
+                    heralding: false,
+                    root_asks: 0,
+                    observed: None,
                 },
             );
             local_seq
@@ -8695,6 +8714,7 @@ impl Inner {
             let mut st = self.st.lock();
             let g = st.groups.get_mut(ns).expect("inserted above");
             g.tx = Some(handle.tx.clone());
+            g.observed = handle.observed_shared();
             g.pending
         };
         // What was published before the join completed is announced now.
@@ -8746,6 +8766,73 @@ impl Inner {
                 && let Some(g) = inner.st.lock().groups.get_mut(&ns)
             {
                 g.hailing = false;
+            }
+        });
+    }
+
+    /// Announce this device's newest change in `ns`'s group again while no
+    /// member is heard to have taken it (spec §17.1, a change announced):
+    /// the announcement, or every answer to it, may have been lost, and the
+    /// group's period is half a minute. A member took it once one of the
+    /// group's Sync Interests carries this device's counter at that
+    /// announcement, or once this device answered an ask for its root of
+    /// `ns` since (a member walking it takes what was announced). Up to
+    /// [`REFRESH_TRIES`] times after [`retry_pause`] of the announcements
+    /// made so far, counted afresh from a newer announcement; only in a
+    /// group in which some member was heard. One such run per group at a
+    /// time.
+    fn herald(self: &Arc<Self>, ns: &Name) {
+        // The announcement heralded, and the root asks answered before it.
+        let mut from = {
+            let mut st = self.st.lock();
+            match st.groups.get_mut(ns) {
+                Some(g) if !g.heralding && !g.members.is_empty() => {
+                    g.heralding = true;
+                    (g.announced, g.root_asks)
+                }
+                _ => return,
+            }
+        };
+        let weak = Arc::downgrade(self);
+        let ns = ns.clone();
+        rt::spawn(async move {
+            let mut asked = 0;
+            while asked < REFRESH_TRIES {
+                rt::sleep(retry_pause(asked)).await;
+                let Some(inner) = weak.upgrade() else { return };
+                if inner.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                let again = {
+                    let st = inner.st.lock();
+                    let Some(g) = st.groups.get(&ns) else { break };
+                    if g.announced != from.0 {
+                        // A newer announcement went out: it is heralded.
+                        from = (g.announced, g.root_asks);
+                        asked = 0;
+                        false
+                    } else {
+                        let carried = g
+                            .observed
+                            .as_ref()
+                            .and_then(|o| o.seq_for(&inner.device))
+                            .is_some_and(|s| s >= from.0);
+                        if carried || g.root_asks != from.1 {
+                            break;
+                        }
+                        true
+                    }
+                };
+                if again {
+                    tracing::debug!(me = %inner.device, %ns, asked, "no member heard to have taken this device's newest announcement: announced again");
+                    inner.svs.announce(sync_group(&ns)).await;
+                    asked += 1;
+                }
+            }
+            if let Some(inner) = weak.upgrade()
+                && let Some(g) = inner.st.lock().groups.get_mut(&ns)
+            {
+                g.heralding = false;
             }
         });
     }
@@ -9212,7 +9299,7 @@ impl Inner {
     /// next round, so an entry is published at most two flushes after its
     /// put. A flush that fails publishes nothing and is tried again, later,
     /// until it succeeds or the device stops.
-    async fn commit_rounds(&self) {
+    async fn commit_rounds(self: &Arc<Self>) {
         let mut pause = COMMIT_RETRY;
         loop {
             let (target, round, announce) = {
@@ -9248,6 +9335,7 @@ impl Inner {
                     self.progress.notify_waiters();
                     for (ns, tx) in announce {
                         let _ = tx.send((sync_group(&ns), None)).await;
+                        self.herald(&ns);
                     }
                     pause = COMMIT_RETRY;
                 }
@@ -14426,6 +14514,15 @@ impl Inner {
             return;
         }
         let reply = self.packet_for(&name, interest.selectors().can_be_prefix);
+        // An ask for this device's own newest root of a namespace: a member
+        // walking it takes what this device announced ([`Self::herald`]).
+        if reply.is_some()
+            && let Some(s) =
+                parse_summary_name(&name).filter(|s| s.device == self.device && s.head.is_none())
+            && let Some(g) = self.st.lock().groups.get_mut(&s.subject)
+        {
+            g.root_asks += 1;
+        }
         self.reply(&name, responder, reply).await;
     }
 
@@ -16440,6 +16537,7 @@ impl Inner {
         if !self.st.lock().fetching.insert(v.clone()) {
             return;
         }
+        tracing::trace!(me = %self.device, name = %v, "fetching the pieces of a version");
         let inner = Arc::clone(self);
         rt::spawn(async move {
             let c = parse_log_name(&v).and_then(|l| l.subject);
@@ -16458,7 +16556,7 @@ impl Inner {
                         None
                     }
                     _ => {
-                        tracing::debug!(name = %v, "not every piece of a held version is to be had yet; asked again while it waits for them");
+                        tracing::debug!(me = %inner.device, name = %v, "not every piece of a held version is to be had yet; asked again while it waits for them");
                         st.unfound.insert(v.clone());
                         let misses = st.piece_misses.entry(v.clone()).or_insert(0);
                         let pause = retry_pause(*misses);

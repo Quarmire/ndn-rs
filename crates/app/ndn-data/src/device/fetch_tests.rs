@@ -489,3 +489,71 @@ async fn a_first_look_into_a_group_heard_from_no_one_asks_the_group_again() {
     );
     dev.shutdown();
 }
+
+/// A Sync Interest of `group` from Alice's laptop at counter 1, carrying the
+/// phone's counter `phone`.
+fn laptop_heard(group: &Name, phone: u64) -> Bytes {
+    let vector = SvsConfig::default().dialect.encode_state_vector(&[
+        ndn_sync::StateEntry {
+            name: n("/alice/laptop"),
+            boot: 0,
+            seq: 1,
+        },
+        ndn_sync::StateEntry {
+            name: n("/alice/phone"),
+            boot: 0,
+            seq: phone,
+        },
+    ]);
+    InterestBuilder::new(group.clone().append_version(2))
+        .lifetime(Duration::from_secs(1))
+        .app_parameters(vector.to_vec())
+        .build()
+}
+
+/// A change announced in a group whose members were heard — the
+/// announcement, or every answer to it, lost — is announced again after the
+/// pause, not after the group's half-minute period (spec §17.1, a change
+/// announced); once a Sync Interest heard carries the change's counter, it
+/// stops.
+#[tokio::test(start_paused = true)]
+async fn a_change_no_member_is_heard_to_have_taken_is_announced_again() {
+    let ns = n("/alice");
+    let group = sync_group(&ns);
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner.join(&ns).await.expect("the group is joined");
+    // The laptop is heard, at the phone's counter before the change.
+    conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        dev.inner.st.lock().groups[&ns]
+            .members
+            .contains(&n("/alice/laptop")),
+        "the laptop is heard"
+    );
+    let before = conn.sent();
+    dev.inner.publish(&ns);
+    tokio::time::sleep(REFRESH_PAUSE_MAX * 2).await;
+    let announced = conn.sent() - before;
+    assert!(
+        announced >= 4,
+        "the change is announced again while no member is heard to have taken it: {announced} \
+         Sync Interests in {:?}",
+        REFRESH_PAUSE_MAX * 2
+    );
+    // The laptop's vector carries the change's counter.
+    let counter = dev.inner.st.lock().groups[&ns].announced;
+    conn.tx
+        .unbounded_send(laptop_heard(&group, counter))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = conn.sent();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(
+        conn.sent(),
+        before,
+        "once a member is heard to have taken the change, it is no longer announced again"
+    );
+    dev.shutdown();
+}

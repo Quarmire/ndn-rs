@@ -2727,6 +2727,11 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   collection at once). Until it is whole it waits as a
   missing parent does: later versions of its writer and versions naming it
   wait. Whole, it is opened (when sealed), checked and applied (§5.2).
+  A later version in pieces — maybe a checkpoint covering it, which only
+  its opened payload tells — holds back the fetch of the pieces in its
+  past (its parents and its writer's earlier entries) until it is found
+  whole or `REFRESH_TRIES` of its fetches missed (§17.1): one lost packet
+  is no evidence that it is not to be had.
 - Besides its writer and the holders, a reader asks for those pieces the
   devices whose versions held here are made over the version (their
   parents include it), each under its own name `<D>/32=held/<Name TLV>`:
@@ -4335,6 +4340,22 @@ announced). What is owed, and until when:
   seconds at 10–20 % loss, not periods. Hearing a device decides nothing
   (invariant 1): it lets the walks begin, and what they take is judged as
   always.
+- **A change announced (normative).** An announcement of a device's own
+  change (§12, made once the change is durable, §4.2) may be lost, or
+  every answer to it, and the members heard in the group would then learn
+  of the change only at the group's next period, half a minute on — and
+  at 20 % loss a period's exchange is lost as well about one time in
+  three. In a group in which it heard some member, the device announces
+  its state vector again after the pause below, `k` being the
+  announcements made so far since its newest change was announced, up to
+  `REFRESH_TRIES` (16) times, until a member is heard to have taken the
+  change: a Sync Interest of the group heard here carries the device's
+  counter at that announcement, or the device answered an ask for its own
+  root of the namespace since (a member walking it takes the change). A
+  newer change announced during the run counts `k` afresh. One such run
+  per group at a time. Being heard to have taken it decides nothing
+  (invariant 1): it only ends the announcing; what a member takes is
+  judged as always.
 - **Inside a walk (normative)**, a node, page, members record or version
   the walk lists that missed for want of an answer (or a refusal for now)
   is asked again in place, in rounds: the first round asks its writer's
@@ -4530,7 +4551,9 @@ that is followed with a lag that grows (§18.1). A version of `n` pieces
 costs one walk at most `n` · `FETCH_TRIES` asks per source, the bound
 above per piece, never more for being fetched at once. A first look in a
 group heard from no one costs at most `REFRESH_TRIES` Sync Interests more
-in that group, spread over about a minute, one run per group at a time.
+in that group, spread over about a minute, one run per group at a time;
+so does a change announced that no member is heard to have taken, the
+count starting afresh at each newer change.
 A verb's own asks are bounded per call: a one-key read makes at most
 `FETCH_TRIES` asks for the head and as many for the node it names; a verb
 waiting for an epoch key waits for at most `FETCH_TRIES` rounds of its

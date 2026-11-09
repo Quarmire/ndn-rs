@@ -802,6 +802,38 @@ async fn a_version_a_checkpoint_covers_is_never_fetched_when_both_arrive_in_one_
 }
 
 #[tokio::test]
+async fn a_checkpoint_a_fetch_missed_holds_back_what_it_may_cover_until_it_is_given_up() {
+    let dev = device(rules()).await;
+    let big = "e".repeat(3 * wire::INLINE_MAX);
+    let (covered, _) = in_pieces("/bob/laptop", 10, &[], edit(None, &big));
+    let (cp, _) = in_pieces("/bob/laptop", 11, &[tip(&covered)], checkpoint(&[&big]));
+    give(&dev, &covered);
+    give(&dev, &cp);
+    let wanted = |dev: &Device| -> Vec<Name> {
+        let st = dev.inner.st.lock();
+        st.wanted_pieces(&c()).into_iter().map(|(v, _)| v).collect()
+    };
+    assert_eq!(wanted(&dev), vec![cp.name.clone()]);
+    // A fetch of the newer version's pieces missed: one lost packet is no
+    // evidence it is not to be had, so what it may cover is not fetched.
+    {
+        let mut st = dev.inner.st.lock();
+        st.unfound.insert(cp.name.clone());
+        st.piece_misses.insert(cp.name.clone(), 1);
+    }
+    assert!(wanted(&dev).is_empty());
+    // Every one of REFRESH_TRIES fetches missed: the older version's pieces
+    // are fetched, so it does not wait for good on one never found.
+    dev.inner
+        .st
+        .lock()
+        .piece_misses
+        .insert(cp.name.clone(), REFRESH_TRIES);
+    assert_eq!(wanted(&dev), vec![covered.name.clone()]);
+    dev.shutdown();
+}
+
+#[tokio::test]
 async fn a_version_whose_past_is_held_but_not_applied_is_checked_only_once_it_is_ready() {
     let dev = device(rules()).await;
     // Carol's version waits for its pieces; Bob's note "x" waits for it.

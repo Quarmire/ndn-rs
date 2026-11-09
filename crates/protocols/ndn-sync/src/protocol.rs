@@ -169,6 +169,12 @@ impl SyncHandle {
         self.observed.as_deref()
     }
 
+    /// [`Self::observed`], shared: for a reader that outlives its borrow of
+    /// the handle (the handle moves into the task draining its updates).
+    pub fn observed_shared(&self) -> Option<Arc<ObservedState>> {
+        self.observed.clone()
+    }
+
     /// Like [`SyncHandle::new`], but with a subscription channel — used by
     /// the PSync Partial consumer so [`SyncHandle::subscribe`] is honored.
     pub fn with_subscribe(
