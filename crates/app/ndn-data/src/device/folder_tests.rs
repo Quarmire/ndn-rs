@@ -977,6 +977,56 @@ async fn a_put_under_a_record_not_admitting_the_key_is_refused_only_once_its_dev
     dev.shutdown();
 }
 
+/// A reader is refused a sealed version by signed data only (spec §15,
+/// §18.1): holding only a record of the collection that does not admit it,
+/// while a device of that namespace heard here was not walked toward the
+/// collection, the newer record admitting it — signed by a share, lost on
+/// its way — may still arrive, so `get` answers `NotReady`; once every one
+/// was walked, the record in force refuses it as `Sealed`.
+#[tokio::test]
+async fn a_sealed_version_is_refused_to_a_reader_only_once_its_devices_were_walked() {
+    let alice = device("/alice/laptop", &["/alice", "/bob"]).await;
+    let only = |readers| share(Rule::Log, &["/alice"], readers);
+    alice
+        .share(&plan(), only(vec![person("/alice")]))
+        .await
+        .unwrap();
+    let first = alice.inner.st.lock().head;
+    alice
+        .share(&plan(), only(vec![person("/alice"), person("/bob")]))
+        .await
+        .unwrap();
+    let id = alice.put(&plan(), reading(1), options()).await.unwrap();
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    let _ = dev.inner.join(&n("/alice")).await;
+    dev.inner
+        .st
+        .lock()
+        .groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(n("/alice/laptop"));
+    // The record that does not admit Bob, and the version sealed in the
+    // epoch of the one that does, which has not arrived.
+    assert_eq!(relay(&alice, &dev, &plan(), first), None);
+    assert_eq!(relay(&alice, &dev, &plan(), id.seq.0), None);
+    let v = log_name(alice.name(), Some(&plan()), id.seq.0);
+    not_ready(dev.get(&v).await.unwrap_err());
+    // Walked in full, it listed no record admitting Bob.
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .entry((n("/alice/laptop"), n("/alice")))
+        .or_default()
+        .root = Some([1; 32]);
+    let refused = dev.get(&v).await.unwrap_err();
+    assert!(matches!(refused, DataError::Sealed { .. }), "{refused}");
+    alice.shutdown();
+    dev.shutdown();
+}
+
 /// Whether `dev` still holds `other`'s summary of `/alice` as walked in full.
 fn still_walked(dev: &Device, other: &Name) -> bool {
     dev.inner.st.lock().peers[&(other.clone(), n("/alice"))]

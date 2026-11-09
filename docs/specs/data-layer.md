@@ -936,21 +936,43 @@ plus the duration the writer stated. What it promises, and no more:
   last listed first, then, each round, interpolating on the dates of the
   versions probed so far and bisecting in turn — fetching each probed
   version, each immutable and cacheable anywhere, from its store first.
-  Each round probes the seq it guessed; only when that probe is not
-  answered does the round probe at once the nearest others of the interval
-  not yet probed, up to the reader's fetch window, and go on from the
-  nearest that answers; when none of them answers, the rest of the
-  interval is not probed: it is taken into the range and its versions are
-  reported `missing`. A version it knows expired is placed by the dates its
-  tombstone keeps (§14.1); a version in pieces, by its `Dated`. It then
-  fetches the versions between, a window at once, and keeps the entries in
-  range. A range read answers within a bound the reader sets (eight first
-  looks in this implementation): versions it has not reached by then
+  Each round probes the seq it guessed. A probe not answered — every ask
+  of it missed, lost on the way or refused as not verifying (§17.1) — is
+  asked again in place, after the pause of §17.1, up to `SEARCH_TRIES`
+  probes of the seq, before the round looks anywhere else: loss costs a
+  search time, never other versions. Only a guess none of those probes
+  reached widens the round: it probes at once the nearest two others of
+  the interval not yet probed (`SEARCH_WIDEN`), each asked again in place
+  alike, then twice as many each time none of them answers, up to the
+  reader's fetch window, and goes on from the nearest that answers; when a
+  window of them answers none, the rest of the interval is not probed: it
+  is taken into the range and its versions are reported `missing`. A
+  search's cost is counted in distinct versions probed, not Interests:
+  asking a version again adds Interests and time, never a version. A
+  version it knows expired is placed by the dates its tombstone keeps
+  (§14.1); a version in pieces, by its `Dated`. It then fetches the
+  versions between, a window at once, each one not answered asked again
+  in place after the pause of §17.1 until the bound below, and keeps the
+  entries in range. A range read probes its versions within a bound the
+  reader sets,
+  counted from when it holds the node listing them — the records and the
+  head have bounds of their own (§15, §17.1), so a slow path to them does
+  not eat the probes' time. In this implementation the bound is eight
+  looks (`RANGE_LOOKS`), each the first-look time or four of the device's
+  retransmission timeouts (`RANGE_RTOS` · `RTO`, §17.1, once a round trip
+  was measured; the first-look time alone before), whichever is
+  longer: a search probes one version a round, so the bound covers as many
+  rounds on a path whose round trips near the lifetime as on a fast one.
+  As `RTO` never exceeds the lifetime, the bound is at most
+  `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime) — 64 s with the
+  defaults — however slow or hostile the path:
+  versions it has not reached by then
   are reported `missing`, so withheld or unreachable blocks cost it time,
   never more than the bound. The cost is the head, the node, `O(log n)`
   probes (two or three for a steady stream, where interpolation lands near
-  the answer) when probes answer — a probe that is not answered adds at
-  most one window of probes, run at once — and the versions in the range.
+  the answer) when probes answer — a lost probe is asked again at no cost
+  in versions; a guess no ask reaches adds probes in steps of two, four, …
+  up to a window, each step run at once — and the versions in the range.
 - **Why not a prefix or an index.** Selecting by a prefix of dated names
   would need range selectors NDN no longer has, and would put the writer's
   clock into names readers must guess. A range index as named data would be
@@ -1941,7 +1963,14 @@ key, signed with it by the namespace's root (§8.1).
     bytes have come. While a manifest packet on the path to its entry is
     not held, the version waits, neither applied nor refused, and the
     packet is fetched by full name; a packet of other bytes under that name
-    is never taken for it.
+    is never taken for it. A reader fetches the manifest packets of an
+    owner-signed members record's cuts before it takes the record — asked
+    again after the pause of §17.1, up to `FETCH_TRIES` (3) rounds — so its
+    cuts judge every version from the moment it is in force, and a version
+    a cut keeps that the reader applied under the record before stays
+    applied across the switch rather than waiting for a packet the new
+    record names; a record whose packets are still not to be had then is
+    taken without them, and what its cuts keep waits as above.
   - *Unbound cuts.* A removal cut keeping versions without `CutBytes` — one
     signed by a build from before cuts bound bytes — binds them to no
     bytes, and a reader refuses every version it keeps, `OutsideCut`
@@ -2676,6 +2705,21 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   lease it knows (§13.2) by the Interest `<H>/32=held/<Name TLV>`, which the
   holder answers (DigestSha256) with the packet inside; a piece that is not
   the one its parent lists is dropped and fetched elsewhere.
+- **Fetching pieces — round 3.** A read walks a version's pieces a window
+  at once: the manifest a level at a time, the nodes of one level at once,
+  then the chunks, at most `Config::window` (32 by default) pieces of one
+  walk in flight, each an owed fetch (§17.1: at most `FETCH_TRIES` asks
+  per source, each source tried in turn). The first chunk is asked alone,
+  to find which source answers; every other chunk is asked first of that
+  one. A piece not to be had neither ends the walk nor holds back the
+  pieces behind it: every other piece the walk can name (its parent node
+  came) is fetched, checked against its parent's digest and stored, so
+  reading again asks only for what is still missing. The payload is
+  assembled only when every piece is held, each chunk in its place by
+  index, never by when it came; a walk holds nothing beyond the window's
+  fetches in flight and, when it reads the payload, the chunks it
+  assembles (at most `PAYLOAD_MAX`). A holder's repair (§13.3) and a merge
+  version's pieces walk the same way.
 - **In a merge collection — slice 6.** A version in pieces is admitted,
   and its pieces fetched as above unless a checkpoint the reader holds
   whole and checked covers it (§5.2) and no version that checkpoint does
@@ -2748,8 +2792,12 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   whose Content is the lease's packet). The take runs in a task of its
   own, one per collection at a time, which outlives any one ask: over a
   lossy path a large collection takes longer than an ask lives. It goes in
-  rounds — while a writer's newest version inside `at` is not heard of,
-  it refreshes every device writing into the namespace; then it asks each
+  rounds — while a version inside `at` is not held, it refreshes every
+  device writing into the namespace, then asks by its name every entry
+  inside `at` it still does not hold, refuse or skip: each writer's newest
+  inside `at`, and every earlier one a summary listed (a walk that listed
+  an entry but did not take it under loss leaves it to the take, which
+  must not wait on summaries for it); then it asks each
   piece it lacks once of each source — asked again after the pause of
   §17.1, at most 16 rounds (`REPAIR_ROUNDS`), stopping after 3 rounds in a
   row that brought no version heard of and no piece (`REPAIR_IDLE`). An
@@ -3192,7 +3240,12 @@ housekeeping; it never decides whether anything verifies.
   asking again does not help). A range read lists it under `expired`
   (§5.4). A device checks expiry on every access and sweeps at the earliest
   keep it holds, or keep bound its writers' newest nodes state (§7),
-  reading its clock again when it wakes; a restart drops what the store
+  reading its clock again when it wakes; a version that waited for its
+  collection's members record counts from the moment the record admits it
+  — the sweep reads every collection's earliest keep again whenever a
+  members record is taken — so a holder that took versions before their
+  record (over a lossy path) drops them on time, unasked. A restart drops
+  what the store
   still keeps that has expired. Later versions do not wait for an expired
   one (§5.2), and the writer's node stops listing it once the node's
   reference date passes its keep (§7).
@@ -3326,12 +3379,23 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   newer was outstanding in `C`'s sync group (it heard the group with no
   refresh pending, or finished one), measured on its monotonic clock. Of a
   one-key collection it answers the newest version the writer's head names,
-  aged by the head's receipt and freshness (§5.3). The
+  aged by the head's receipt and freshness (§5.3); the head and the node it
+  names are asked in place as a walk's packets are (§17.1). The
   first `get` of a collection the device does not follow looks at what the
   devices known to write into its namespace hold first (§12); a reader of a
   sealed collection holding versions it has no key for yet waits as long
-  for the keys it asks for. Nothing held: `Unavailable`. Not of a sealed
-  collection's audience: `Sealed`. A merge collection whose rule the device
+  for the keys it asks for. Nothing held: `Unavailable` (next step
+  `RetryLater`: the first look's walks go on past the answer, §17.1, so
+  asking again reads what they bring). Not of a sealed collection's
+  audience: `Sealed`, judged by records held, never by how long the device
+  waited (§18.1), as `put` judges a writer: while no record held admits the
+  device to the audience — none is held, or the one in force seals without
+  it — and a device of the collection's namespace heard here has not been
+  walked toward the collection's folder, `NotReady` (next step
+  `RetryLater`, naming the devices), since the record a share or an
+  introduction signed admitting it may still be on its way; once every one
+  was walked, `Sealed`. Every `get` below that answers `Sealed` judges so.
+  A merge collection whose rule the device
   does not know: `RuleUnknown`, naming the collection and the rule (next
   step `UpdateProgram`), §5.1.
 - **`get(state name)`** answers that exact state (`Age::Exact`), §11; under
@@ -3384,7 +3448,8 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   (next step `RetryLater`, saying what it waits for), nothing signed. In a
   sealed collection it seals the payload
   (§9), asking for the epoch key first if it lacks it: `Sealed` when it is
-  not of the audience, `Unavailable` when no device granted the key, and
+  not of the audience, `Unavailable` (next step `RetryLater`) when no
+  device granted the key in the rounds it asks in place (§17.1), and
   `NotReady` when the epoch outgrew its audience (§6.1). Refused for any
   reason after the edit,
   it leaves no trace: nothing signed or stored, the log head unmoved, and
@@ -4088,6 +4153,7 @@ manifest its `CutBytes` names reuses the revocation cut's manifest form
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back. | §5, §6.1 |
+| Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal, never turns it into a read; a device marked suspected or revoked is not waited for. | §9, §15 |
 | Write refused after the edit (too large, rule refuses) | Nothing signed or stored, no default record, the log head unmoved; the collection is read again, so the refused edit is not in the state. | §5, §5.1, §15 |
 | Removed writer keeps its devices unreachable | The owner walks the writer's known devices as far as they are reachable and signs the cut over what it holds then; the removal is never held off, and versions only the unreachable devices hold fall outside the cut. | §6, §6.2 |
 | Folder epoch pruned | Erased once every writer under the folder left it and every collection under it known here is done with it; pending while the device does not follow the folder whole or has not walked every known device toward it; a prune by any writer in the folder's epoch in force makes an owner device of its audience move the folder to a new epoch first, owed again after a restart until signed. The erasure survives a restart. | §9, §14 |
@@ -4117,24 +4183,57 @@ A fetch **misses** when nothing answers within the Interest lifetime
 (`Config::lifetime`, 2 s by default), the forwarder refuses the packet for
 now (a certificate on its chain not to be had yet), a Nack comes, or what
 comes is refused as a packet (§4: it does not verify, or is not its name's
-packet). A miss decides nothing (invariant 1): it is the network's, and the
-device MUST ask again for what the fetch was for, for as long as what it
-holds still owes it, whether or not a new sync notice arrives (§12: the
-group counter does not move again for what was announced). What is owed,
-and until when:
+packet) — by the device, or by its forwarder, whose `bad-signature`
+refusal (forged or altered on the way) is final for that packet, never for
+the name: asking again may bring the genuine one, so it is a miss like a
+lost packet, asked again in place. A miss decides nothing (invariant 1):
+it is the network's, and the device MUST ask again for what the fetch was
+for, for as long as what it holds still owes it, whether or not a new sync
+notice arrives (§12: the group counter does not move again for what was
+announced). What is owed, and until when:
 
 - **A walk of a summary** (§7) — the writer's root, the nodes and pages on
   the way, and the members records and versions they list that the device
   follows or peeks at, with the cut manifest packets on the way to an
   entry (§8). Asked again of the writer's device, from its newest root,
-  skipping every branch processed in full. Owed while the head of the
-  newest root verified of that device is above the head it walked in full
-  (both kept across restarts, §7), until both meet. A device whose root
-  does not come, of which nothing verified says it owes more than was
-  walked (only a notice said it moved: it is offline, or a stranger named
-  it), is asked at most `REFRESH_TRIES` (16) times in a row per trigger —
-  a sync notice naming it, a watch of its namespace — then left until the
-  next one.
+  skipping every branch processed in full.
+
+  *What is owed after a walk ends (normative).* A walk of a device's
+  summary of a namespace is owed, by what the device holds and follows
+  alone, while something is followed or peeked at in the namespace and
+  either (a) the head of the newest root verified of that device is above
+  the head it walked in full (both kept across restarts, §7), or (b) a
+  name followed there lies under none that a walk in full of that device's
+  root went toward while the name was followed — a name only peeked at had
+  its records taken, not its versions; this is kept for the run, so after
+  a restart a name followed is walked toward anew. Every version a
+  verified root lists that the device follows and does not hold — not
+  pruned (§14) or released (§13), not shown expired by its writer's newest node
+  (§14.1), not cut or otherwise refused — then lies in a branch no walk
+  took in full, so the walk stays owed until one takes it or the version
+  is no longer wanted, **whatever ended the walk before**: an ask inside it
+  that missed every try, a refusal for now, a grant round or a reader that
+  stopped waiting, a restart. A walk that ends owing is asked again after
+  the pause, also when it was taken in full for less than is followed now
+  (a name followed meanwhile, or a newer root verified meanwhile). A walk
+  is taken in full only for what was followed and peeked at when it began:
+  when that changes — a name followed or peeked at anew, a version let go
+  for the bytes a cut keeps (§8) — the device forgets which branches on the
+  way to that name and under it were processed, and a walk begun before
+  records none of its branches, nor its root, as processed. A root that
+  only a relay answered with (§13.5), no newer than the head walked in
+  full, says nothing of what the writer did since: the writer counts as
+  not reached. A walk a reader starts itself — the first look of `get`,
+  `watch`, `put` or a hold (§15) — runs on its own: the reader stops
+  waiting after the first-look time, the walk goes on; one not taken in
+  full is walked again in place after the pause, up to `FETCH_TRIES` (3)
+  walks, then handed to the one loop of that device and namespace, which
+  asks again while the walk is owed. A device whose root does not come, of
+  which nothing verified says it owes more than was walked (only a notice
+  said it moved: it is offline, or a stranger named it), is asked at most
+  `REFRESH_TRIES` (16) times in a row per trigger — a sync notice naming
+  it, a watch of its namespace, a first look (its walks in place counted
+  among them) — then left until the next one.
 - **Inside a walk**, a node, page, members record or version that missed
   for want of an answer (or a refusal for now) is asked again in place, up
   to `FETCH_TRIES` (3) asks in all, so one lost packet costs the walk about
@@ -4150,9 +4249,35 @@ and until when:
   for as soon as the record is held, so a reader holds it before the first
   version sealed in it arrives. A device never stops after one try per
   granter. A watch of the namespace asks again for every key a held
-  version waits for, after a restart too.
+  version waits for, after a restart too. The first `FETCH_TRIES` rounds
+  of an ask are asked in place, with the pauses below between them, so a
+  `put` that needs the key (§15) waits for them and is answered by them
+  rather than by one lost packet — `Unavailable` (`RetryLater`) only once
+  all of them missed; the rounds after go on in the background, at the
+  same pace. A verb finding the ask already under way waits for it at most
+  the first-look time.
+- **A one-key read** (§5.3, §5.4) — the head of the one key and the node
+  it names, within the `get` that reads them, never past it: each asked
+  in place as a walk's packets are, a miss or a packet refused as not the
+  head or not its node (one that does not verify or match, a forgery on
+  the way) asked again after the pause below, up to `FETCH_TRIES` asks of
+  each; a head refused as a rollback is a decision, not asked again. A
+  version or entry a `get` fetches by name is asked as a walk's versions
+  are, up to `FETCH_TRIES` asks of its writer's device; so is each probe
+  of a block a range read makes, and a probe none of those asks answered
+  (a miss, or a reply refused as not verifying) is probed again in place
+  after the pause below (§5.4): a search's guess up to `SEARCH_TRIES`
+  probes before its search widens, a block in the range until the range
+  read's bound. A refusal kept against the name is not asked again.
 - **A merge version's pieces** (§5.2, §13.1) — while the version waits for
   them: not covered by a checkpoint held whole, not pruned, cut or let go.
+- **Inside a walk of a version's pieces** (§13.1) — a read, a holder's
+  repair, a merge version's pieces — each piece is an owed fetch, asked in
+  place up to `FETCH_TRIES` asks per source, at most `Config::window` of
+  one walk's pieces at once; a piece that missed at every source leaves
+  the others to be fetched and kept, and the walk ends without the
+  payload. A read asks again as its caller does; the loops above ask
+  again for merge pieces and a holder's take.
 - **A removal cut's manifest packet** a version waits for (§8) — by its full
   name, from any device, while a version waits for it. Re-admitted entries
   and the bytes a cut keeps (§8.2) keep their own schedule
@@ -4167,10 +4292,15 @@ and until when:
   bound leaves the audit unanswered, never broken; a holder still without
   a lease that counts is left to the next `hold`.
 - **A holder's take** of what an accepted hold record asks (§13.2) — in
-  rounds, while a version inside `at` is not heard of or a piece of one
+  rounds, while a version inside `at` is not held or a piece of one
   is missing: at most `REPAIR_ROUNDS` (16) rounds per take, ended by 3
   rounds in a row (`REPAIR_IDLE`) that brought nothing; the owner's next
-  hold ask starts the next take.
+  hold ask starts the next take. Each round asks each entry inside `at`
+  it can name and does not hold as an owed fetch (`FETCH_TRIES` asks).
+- **A members record's cut manifests** (§8), before the record is taken —
+  up to `FETCH_TRIES` (3) rounds over the record's manifest trees, after
+  the pause above; then the record is taken whether or not they came, so
+  a withheld manifest delays a removal by at most those rounds.
 
 **Re-expression within an ask (normative).** An ask is one fetch of one
 name within one Interest lifetime. An Interest of it that nothing answered
@@ -4222,17 +4352,37 @@ device.
 
 **Bound (normative).** At most one loop asks for one owed thing at a time:
 one per (device, namespace) for a walk — a notice for a device already
-being walked marks it to walk again, starting nothing beside it — one per
+being walked marks it to walk again, starting nothing beside it; a reader's
+first look walks beside it once, at most `FETCH_TRIES` passes, and hands
+it what it did not take, starting no second loop — one per
 (subject, epoch) for a key, one per version for pieces, one per name for a
 manifest packet. Each pass of a loop makes at most `FETCH_TRIES` asks per
 packet it misses (one per granter for a key), each of at most 1 +
 `REEXPRESS_MAX` Interests within one lifetime, and every fetch holds one of
-the device's `Config::window` slots. So one owed packet costs at most
-`FETCH_TRIES` asks — `FETCH_TRIES` · (1 + `REEXPRESS_MAX`) = 12 Interests —
-per source per (lifetime + pause): after the first misses, about one ask
-per source every 6 s; after 16 misses in a row, one a minute, until it is
-no longer owed. A name nothing verified owes costs at most
-`REFRESH_TRIES` root asks per trigger, at most 4 Interests each.
+the device's `Config::in_flight` slots (256 by default). So one owed
+packet costs at most `FETCH_TRIES` asks — `FETCH_TRIES` · (1 +
+`REEXPRESS_MAX`) = 12 Interests — per source per (lifetime + pause): after
+the first misses, about one ask per source every 6 s; after 16 misses in a
+row, one a minute, until it is no longer owed. A name nothing verified
+owes costs at most `REFRESH_TRIES` root asks per trigger, at most 4
+Interests each. One walk has at most `Config::window` (32) asks in flight
+— the nodes or entries one summary node lists, the pieces of one version,
+one round of probes — and the whole device at most `Config::in_flight`:
+its memory for fetching is bounded by that many pending Interests and
+replies, and on a path whose round trip is `R` it asks at most
+`in_flight` / `R` packets a second, so a writer that publishes faster than
+that is followed with a lag that grows (§18.1). A version of `n` pieces
+costs one walk at most `n` · `FETCH_TRIES` asks per source, the bound
+above per piece, never more for being fetched at once.
+A verb's own asks are bounded per call: a one-key read makes at most
+`FETCH_TRIES` asks for the head and as many for the node it names; a verb
+waiting for an epoch key waits for at most `FETCH_TRIES` rounds of its
+ask, one ask per granter each; a range read probes for at most
+`RANGE_LOOKS` · max(first look, `RANGE_RTOS` · `RTO`) (§5.4), never more
+than `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime), each probe
+an owed fetch as above, probed again in place up to `SEARCH_TRIES` times
+in a search and until that bound in the range; a search probes at most a
+window more versions for a guess no probe reached, never more for loss.
 Custody asks are bounded per call: one `hold` sends a holder at most
 `HOLD_TRIES` hold asks (each with a lifetime of three first looks and one
 Interest lifetime) and, per audit, `AUDIT_TRIES` asks for each of its
@@ -4253,8 +4403,12 @@ that lists what it never serves costs each reader the bounded rate above
 for as long as it stays a member; its owner ends it by removing it. (3) A
 cache or a forger answering with packets that do not verify makes a fetch
 miss, never a hold: the same bound, and the genuine copy is still taken
-when it comes (§4). (4) A granter is asked only for an epoch a record held
-here names and that admits this device; it answers only an asker the
+when it comes (§4). One on the path that forges every reply, so that the
+forwarder refuses each `bad-signature`, costs the asker exactly a lost
+path's asks — `FETCH_TRIES` per packet per source — and decides nothing;
+asking another source (a holder, §13.1) goes around it. (4) A granter is
+asked only for an epoch a record held here names and that admits this
+device; it answers only an asker the
 records it holds admit (§9), and fetches that asker's seal key with one
 ask per grant it makes, never asking again on the asker's behalf.
 (5) A holder is asked again only by its owner, within the call that asked
@@ -4267,6 +4421,13 @@ per ask: nothing another party sends makes one ask carry more than 1 +
 producer — raises `RTO`, or, by answering only after re-expressions, keeps
 it doubled; either lowers how often the device re-expresses. A forger that
 answers one of the Interests ends the ask with a packet refused as in (3).
+(7) Nothing another party sends ends a walk that is owed: owing is judged
+from the roots, records and versions the device verified and what it
+follows, never from whether an ask was answered. A relay answering with an
+older root its writer signed (§13.5) cannot stand in for the writer's
+state — no newer than the head walked, the writer counts as not reached —
+and a reader that stops waiting cuts no walk short; either costs at most
+the bounds above, never a version left unasked.
 
 ## 18. Conformance
 
@@ -4605,6 +4766,34 @@ the default seed and two more, each with `--check-determinism`.
   faults are never loosened to make a case pass, and a case is never made
   to tolerate a wrong answer. A failure under faults is a defect in the
   implementation (or the case) at its cause, fixed there.
+- **A host does what a refusal says.** A case's host asks a verb again
+  while it answers next step `RetryLater` — `Unavailable`, `NotReady`: a
+  `put` racing the record or the epoch key that admits it, a `get` or a
+  join whose first look races the network — every 500 ms for at most
+  120 s of virtual time (the harness's `AGAIN_PAUSE`, `AGAIN_FOR`), and
+  never on any other answer. Asking again is liveness only: a `RetryLater`
+  refusal decides nothing, and what the verb answers when it succeeds is
+  judged as on a first try.
+- **A sustained-write case offers the load the path carries.** The one
+  workload parameter that follows the path is the pace of a writer that
+  never pauses (o4): every version is a packet a reader fetches by name,
+  and a reader with `Config::in_flight` asks in flight (§17.1) fetches at
+  most that many per mean packet time, so a writer saving every 2 ms over
+  a path whose round trip is above a second outruns any bounded reader.
+  Under faults the case derives its writer's pace from the profile and
+  the reader's asks in flight: the packet time is the profile's mean round
+  trip (each arrival held half `delay`, a Data a further half `blocks`, a
+  reordered packet a further `max(delay, 50)` ms) plus, for each ask that
+  misses (`1 / ((1 − drop)² (1 − forge)) − 1` per packet), a lifetime and
+  its 500 ms slack; the writer takes a quarter of the packets that time
+  carries, two per version (the version and the node that lists it) —
+  about 89 ms a version on the faulty profile, against 2 ms clean. A later
+  catch-up's time bound follows the path by the same rule: a version just
+  saved reaches the reader through 7 exchanges in a row (the root, five
+  summary levels, the version), so the bound is 3 such chains of that
+  packet time, never less than its clean 10 s — about 60 s on the faulty
+  profile. Every assertion is unchanged, and both paces and both bounds
+  are recorded as measures.
 
 **Threat notes — faulty mode.** A forged packet — any Data whose
 signature fails — is refused by the device's verifier and is never
@@ -4614,6 +4803,18 @@ Interest with it. Nothing is kept against its name: a forged copy never
 makes a device refuse the genuine packet at that name, never counts as
 evidence (an equivocation, a breach, a refused version), and never stops
 the device asking again, from any holder, until the genuine one arrives.
+The same holds for the certificates that verify a packet: a copy of a
+signer's certificate whose own signature fails (forged on its way in,
+e.g. fetched through a forwarder that carries the writer's namespace in
+transit, §6.3) is evicted from the validator's certificate cache when a
+walk refuses it, and the certificate is fetched again; it never makes the
+device refuse the genuine packets that key signed (trust-context.md
+§6.5). Before this rule, n2 failed on the faulty profile: one forged copy
+of Bob's phone certificate, cached by Carol's tablet, refused every root
+Bob's phone signed. And for the trust-context versions an adoption by
+name fetches (§6.3): a copy whose signature fails is refused as forged
+(`bad-signature`) and asked for again, never taken as a version that does
+not follow (trust-context.md §8.1); n1 failed so before.
 A duplicated packet is idempotent: a version, group member, grant,
 members record, summary, head, ask or answer delivered twice is taken
 once, reported to watchers once, and counted once — a duplicated ask with

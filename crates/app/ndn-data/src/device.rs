@@ -138,8 +138,16 @@ pub struct Config {
     /// How long `get`, `put` and `watch` wait for a first look at a
     /// collection the device has not seen before.
     pub first_look: Duration,
-    /// Fetches in flight at once.
+    /// How many asks one walk has in flight at once: the nodes or entries
+    /// of one summary node, the pieces of one large version, one round of
+    /// a range read's probes (spec §5.4, §13.1).
     pub window: usize,
+    /// How many asks the whole device has in flight at once, every walk
+    /// and fetch together (its slots, spec §17.1): what bounds the memory
+    /// and the network the device's fetching takes. Where round trips are
+    /// long, a device asks at most this many per round trip. At least
+    /// [`Self::window`].
+    pub in_flight: usize,
     /// The namespaces whose collections this device keeps for their owners
     /// under custody leases (spec §13): it answers the hold asks and audits
     /// of the owner devices whose hold records name it a holder. Empty: the
@@ -190,7 +198,8 @@ pub struct Config {
 
 impl Config {
     /// Defaults: SVS's reference timing, the standard merge rules, the
-    /// system clock, 2 s Interests, a 4 s first look, 32 fetches in flight,
+    /// system clock, 2 s Interests, a 4 s first look, 32 asks in flight per
+    /// walk and 256 per device,
     /// not a holder, 16 pieces an audit, 8 asker proofs verified at once, a
     /// day of clock skew, the operating
     /// system's randomness, no introducer, the default introductions
@@ -210,6 +219,7 @@ impl Config {
             lifetime: Duration::from_secs(2),
             first_look: Duration::from_secs(4),
             window: 32,
+            in_flight: 256,
             hold_for: Vec::new(),
             audit_pieces: 16,
             asks_verifying: 8,
@@ -239,6 +249,7 @@ impl std::fmt::Debug for Config {
             .field("lifetime", &self.lifetime)
             .field("first_look", &self.first_look)
             .field("window", &self.window)
+            .field("in_flight", &self.in_flight)
             .field("hold_for", &self.hold_for)
             .field("audit_pieces", &self.audit_pieces)
             .field("asks_verifying", &self.asks_verifying)
@@ -1165,9 +1176,15 @@ fn covers(p: &Prune, id: &VersionId) -> bool {
 /// of them is kept until a date (spec §13): the most a lease holding them
 /// may promise. `None` when one is kept without a date, or none is inside
 /// (no cap). `Err(())` while a version inside it is not held here (nor
-/// known pruned), so the cap is not known. Versions that never apply (a
-/// cut, a refusal) do not count.
-fn keep_cap(coll: &Coll, holds: &Frontier) -> Result<Option<Timestamp>, ()> {
+/// known pruned or expired), so the cap is not known. A version that
+/// expired here counts by the keep its tombstone kept (`expired`): a lease
+/// holding only such versions promises nothing past their keep. Versions
+/// that never apply (a cut, a refusal) do not count.
+fn keep_cap(
+    coll: &Coll,
+    holds: &Frontier,
+    expired: impl Fn(&VersionId) -> Option<Keep>,
+) -> Result<Option<Timestamp>, ()> {
     let mut cap: Option<Timestamp> = None;
     for (w, upto) in holds.iter() {
         let Some(seqs) = coll.entries.get(w) else {
@@ -1184,8 +1201,11 @@ fn keep_cap(coll: &Coll, holds: &Frontier) -> Result<Option<Timestamp>, ()> {
                     Some((k, _)) => *k,
                     None => match coll.locked.iter().find(|l| l.writer == *w && l.seq == *s) {
                         Some(l) => l.body.keep,
-                        None if coll.skips(&id) => continue,
-                        None => return Err(()),
+                        None => match expired(&id) {
+                            Some(k) => k,
+                            None if coll.skips(&id) => continue,
+                            None => return Err(()),
+                        },
                     },
                 },
             };
@@ -1271,11 +1291,36 @@ const REPAIR_ROUNDS: u32 = 16;
 /// Rounds in a row that fetched no piece after which a holder stops asking
 /// for the rest, until the next hold ask ([`Inner::repair_held`]).
 const REPAIR_IDLE: u32 = 3;
-/// How long a range read takes at most, in first looks
-/// ([`Config::first_look`]): what withheld or unreachable blocks can cost a
-/// reader before the blocks it did not reach are answered `missing` (spec
-/// §5.4).
+/// How long a range read probes its blocks at most, in looks, from when
+/// the head's node lists them ([`range_bound`]): what withheld or
+/// unreachable blocks can cost a reader before the blocks it did not reach
+/// are answered `missing` (spec §5.4).
 const RANGE_LOOKS: u32 = 8;
+/// The round trips one look of a range read lasts at least, in the
+/// device's retransmission timeout ([`Rtt::rto`]): a search probes one
+/// block a round, so on a path whose round trips near the lifetime a look
+/// of a fixed first-look time would cover two or three rounds.
+const RANGE_RTOS: u32 = 4;
+/// The probes of its guess a range read's search makes before it looks
+/// anywhere else (spec §5.4, §17.1), each [`FETCH_TRIES`] asks: a probe
+/// lost on the way is probed again in place, so loss costs the search
+/// time, never other blocks.
+const SEARCH_TRIES: u32 = 2;
+/// The blocks a search probes at once beside a guess no probe reached
+/// (spec §5.4): twice as many each step none answers, at most the fetch
+/// window in all for one guess.
+const SEARCH_WIDEN: usize = 2;
+
+/// The bound of a range read's probing (spec §5.4, §17.1): [`RANGE_LOOKS`]
+/// looks, each the first-look time or [`RANGE_RTOS`] retransmission
+/// timeouts `rto`, whichever is longer. As `rto` never exceeds the
+/// Interest lifetime, it is at most `RANGE_LOOKS` · max(first look,
+/// `RANGE_RTOS` · lifetime), however slow or hostile the path.
+fn range_bound(first_look: Duration, rto: Duration) -> Duration {
+    first_look
+        .max(rto.saturating_mul(RANGE_RTOS))
+        .saturating_mul(RANGE_LOOKS)
+}
 /// The most entries one look at the held revocation cuts asks for (spec
 /// §8): a bound on what a cut's runs make a device fetch at once; the next
 /// adoption or new follow asks for the rest.
@@ -1414,6 +1459,12 @@ impl Rtt {
             .saturating_mul(1 << self.backoff)
             .clamp(RTO_MIN, lifetime.max(RTO_MIN))
     }
+
+    /// [`Self::rto`] once a round trip was measured; `None` on a path this
+    /// device has not measured (where `rto` is only the lifetime).
+    fn measured(&self, lifetime: Duration) -> Option<Duration> {
+        self.srtt.map(|_| self.rto(lifetime))
+    }
 }
 
 /// How long the committer waits before it asks the store again for a flush
@@ -1551,8 +1602,30 @@ struct Peer {
     /// walked that root: the walk took the folder records above these
     /// only, and the versions under them.
     toward: BTreeSet<Name>,
+    /// What this device followed in the namespace when it walked that root
+    /// in full, in this run: the walks took the versions under these (a
+    /// name only peeked at had its records taken, not its versions). Empty
+    /// after a restart, so a name followed then is walked toward anew.
+    followed: BTreeSet<Name>,
     /// Nodes and pages processed in full, by subject and page path.
     nodes: HashMap<(Name, Option<Bytes>), [u8; 32]>,
+    /// How many times what was processed was forgotten ([`Peer::forget`]):
+    /// a walk under way since before records nothing as processed, for it
+    /// went toward less than is followed or peeked at now.
+    resets: u64,
+}
+
+impl Peer {
+    /// Forget that walks took `subject` in full — what is followed or
+    /// peeked at under it changed, or a version of it was let go: the root,
+    /// and the nodes and pages on the way to it and under it, are walked
+    /// again, and no walk under way since before records any as processed.
+    fn forget(&mut self, subject: &Name) {
+        self.root = None;
+        self.nodes
+            .retain(|(s, _), _| !subject.has_prefix(s) && !s.has_prefix(subject));
+        self.resets += 1;
+    }
 }
 
 /// A namespace's sync group as this device takes part in it.
@@ -3399,6 +3472,41 @@ impl St {
         }
     }
 
+    /// What a walk of a summary of namespace `ns` goes toward: what is
+    /// followed or peeked at in `ns` now.
+    fn toward_in(&self, ns: &Name) -> BTreeSet<Name> {
+        self.follows
+            .iter()
+            .chain(&self.peeks)
+            .filter(|t| namespace_of(t).as_ref() == Some(ns))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a walk of `device`'s summary of `ns` is owed (spec §17.1):
+    /// something is followed or peeked at in `ns`, and a root of `device`
+    /// verified here is above the head walked in full ([`Peer::walked`],
+    /// both kept across restarts), or a name followed in `ns` lies under
+    /// none a walk of that device's root in full went toward with it
+    /// followed ([`Peer::followed`]: a name peeked at had its records
+    /// taken, not its versions). Every version such a root lists that the
+    /// device follows and holds not — not pruned, expired, cut, released or
+    /// refused — is in a branch no walk took in full, so the walk stays
+    /// owed until one takes it or it is no longer wanted, whatever ended
+    /// the walk before.
+    fn owes_walk(&self, device: &Name, ns: &Name) -> bool {
+        let Some(peer) = self.peers.get(&(device.clone(), ns.clone())) else {
+            return false;
+        };
+        let toward = self.toward_in(ns);
+        !toward.is_empty()
+            && (peer.head > peer.walked
+                || (peer.head > 0
+                    && toward.iter().any(|t| {
+                        self.follows.contains(t) && !peer.followed.iter().any(|w| t.has_prefix(w))
+                    })))
+    }
+
     fn page_relevant(&self, subject: &Name, path: &[u8]) -> bool {
         if self.inside(subject) {
             return true;
@@ -4267,8 +4375,7 @@ impl St {
                     if let (Some(l), Some(ns)) = (parse_log_name(name), namespace_of(&c))
                         && let Some(peer) = self.peers.get_mut(&(l.device, ns))
                     {
-                        peer.root = None;
-                        peer.nodes.retain(|(s, _), _| !c.has_prefix(s));
+                        peer.forget(&c);
                     }
                     return false;
                 }
@@ -6665,7 +6772,7 @@ impl Device {
         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
-        let window = config.window.max(1);
+        let in_flight = config.in_flight.max(config.window).max(1);
         let asks_verifying = config.asks_verifying.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
@@ -6764,7 +6871,7 @@ impl Device {
             sweep: Arc::new(Notify::new()),
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
-            slots: Semaphore::new(window),
+            slots: Semaphore::new(in_flight),
             rtt: Mutex::new(Rtt::default()),
             verifying: Semaphore::new(asks_verifying),
             signatures: AtomicU64::new(0),
@@ -8740,21 +8847,42 @@ impl Inner {
     /// Refresh `device`'s summary of `ns` in the background, coalescing
     /// requests that arrive while one runs.
     fn schedule(self: &Arc<Self>, ns: Name, device: Name) {
+        self.refresh_loop(ns, device, 0);
+    }
+
+    /// Hand a walk of `device`'s summary of `ns` that `missed` passes in a
+    /// row did not take in full (a first look's, [`Self::walk`]) to that
+    /// device's refresh loop: one starts, asking first after the pause
+    /// those misses earn, and counting them toward [`REFRESH_TRIES`] (spec
+    /// §17.1); a loop under way already asks again while the walk is owed,
+    /// so it is left as it is.
+    fn walk_again(self: &Arc<Self>, ns: Name, device: Name, missed: u32) {
+        self.refresh_loop(ns, device, missed.max(1));
+    }
+
+    /// The one refresh loop of (`device`, `ns`) ([`Self::schedule`]),
+    /// started after `missed` passes in a row missed (0: on a notice); a
+    /// notice arriving while it runs marks it to walk again, a walk that
+    /// missed does not (the loop asks again while owed).
+    fn refresh_loop(self: &Arc<Self>, ns: Name, device: Name, missed: u32) {
         {
             let mut st = self.st.lock();
             let Some(g) = st.groups.get_mut(&ns) else {
                 return;
             };
             if let Some(again) = g.busy.get_mut(&device) {
-                *again = true;
+                *again |= missed == 0;
                 return;
             }
             g.busy.insert(device.clone(), false);
         }
         let inner = Arc::clone(self);
         rt::spawn(async move {
-            // Asks of this device's summary that missed in a row.
-            let mut misses = 0;
+            // Passes in a row that left the walk owed or missed.
+            let mut misses = missed;
+            if missed > 0 {
+                rt::sleep(retry_pause(missed - 1)).await;
+            }
             loop {
                 let ok = inner.refresh(&ns, &device).await;
                 // Again now; again later; or done.
@@ -8766,17 +8894,17 @@ impl Inner {
                     // again, later: its group counter will not move again
                     // for what it already announced, so nothing else would
                     // ask (spec §12); and a member of a group held here
-                    // waits for it (spec §5.5). While a root of it verified
-                    // here is above the head walked in full (both kept),
-                    // what that root lists is owed, and asked for until it
-                    // is taken; otherwise only the notice says it moved, and
-                    // it is asked at most [`REFRESH_TRIES`] times in a row
-                    // (spec §17.1).
-                    let owed = st
-                        .peers
-                        .get(&(device.clone(), ns.clone()))
-                        .is_some_and(|p| p.head > p.walked);
-                    let waits = !ok && (owed || misses < REFRESH_TRIES);
+                    // waits for it (spec §5.5). While the walk is owed by
+                    // durable state ([`St::owes_walk`]: a root of it
+                    // verified here lists what is wanted and no walk took),
+                    // it is asked again after the pause until it is taken or
+                    // no longer wanted — whatever ended the pass, and also
+                    // after a pass taken in full that a name followed
+                    // meanwhile or a newer root left owing; otherwise only
+                    // the notice says it moved, and it is asked at most
+                    // [`REFRESH_TRIES`] times in a row (spec §17.1).
+                    let owed = st.owes_walk(&device, &ns);
+                    let waits = owed || (!ok && misses < REFRESH_TRIES);
                     match st.groups.get_mut(&ns) {
                         None => None,
                         Some(g) => match g.busy.get_mut(&device) {
@@ -9020,8 +9148,7 @@ impl Inner {
             if new {
                 for ((_, pns), peer) in st.peers.iter_mut() {
                     if *pns == ns {
-                        peer.root = None;
-                        peer.nodes.retain(|(s, _), _| !target.has_prefix(s));
+                        peer.forget(target);
                     }
                 }
             }
@@ -9037,17 +9164,46 @@ impl Inner {
     }
 
     /// Follow `target` and, the first time, look at what every device known
-    /// to write into its namespace holds of it, for at most the first-look
-    /// time.
+    /// to write into its namespace holds of it, waiting at most the
+    /// first-look time ([`Self::walk`]: a walk the wait outlasts goes on).
     async fn look(self: &Arc<Self>, target: &Name) -> Result<(), DataError> {
         if !self.follow(target).await? {
             return Ok(());
         }
         let ns = namespace_of(target).expect("followed names have a namespace");
         let devices = self.known_for(&self.st.lock(), &ns);
-        let all = futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d)));
+        let all = futures::future::join_all(devices.iter().map(|d| self.walk(&ns, d)));
         let _ = rt::timeout(self.config.first_look, all).await;
         Ok(())
+    }
+
+    /// Walk `device`'s summary of `ns` now ([`Self::refresh`]), in a task of
+    /// its own: a caller that stops waiting for it — a first look's time
+    /// passing — never cuts it short. A walk not taken in full is walked
+    /// again in place after the pause, up to [`FETCH_TRIES`] walks in all,
+    /// then handed to the device's refresh loop ([`Self::walk_again`]),
+    /// which asks again after the pause for as long as the walk is owed
+    /// ([`St::owes_walk`], spec §17.1). Whether it was taken in full.
+    async fn walk(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let inner = Arc::clone(self);
+        let (ns, device) = (ns.clone(), device.clone());
+        rt::spawn(async move {
+            let mut misses = 0;
+            let whole = loop {
+                if inner.refresh(&ns, &device).await {
+                    break true;
+                }
+                misses += 1;
+                if misses >= FETCH_TRIES {
+                    inner.walk_again(ns, device, misses);
+                    break false;
+                }
+                rt::sleep(retry_pause(misses - 1)).await;
+            };
+            let _ = tx.send(whole);
+        });
+        rx.await.unwrap_or(false)
     }
 
     /// The devices known to write into namespace `ns` that `relevant`
@@ -9105,7 +9261,7 @@ impl Inner {
         if missing.is_empty() {
             return missing;
         }
-        let all = futures::future::join_all(missing.iter().map(|d| self.refresh(ns, d)));
+        let all = futures::future::join_all(missing.iter().map(|d| self.walk(ns, d)));
         let _ = rt::timeout(self.config.first_look, all).await;
         self.not_walked(&self.st.lock(), ns, &relevant, &covers)
     }
@@ -9167,10 +9323,12 @@ impl Inner {
     }
 
     /// [`Self::fetch`], saying of a miss whether asking again may get the
-    /// packet: nothing answered in time, or the forwarder refused it for
-    /// now (a certificate on its chain not to be had yet). A Nack, a final
-    /// refusal or a closed connection is an answer. Re-expressed up to
-    /// [`REEXPRESS_MAX`] times ([`Self::fetch_expressed`]).
+    /// packet: nothing answered in time, the forwarder refused it for now
+    /// (a certificate on its chain not to be had yet), or it refused a
+    /// reply that does not verify (`bad-signature`: forged or altered on
+    /// the way, spec §17.1). A Nack, any other final refusal or a closed
+    /// connection is an answer. Re-expressed up to [`REEXPRESS_MAX`] times
+    /// ([`Self::fetch_expressed`]).
     async fn fetch_once(&self, name: Name, discover: bool) -> Result<Data, bool> {
         self.fetch_expressed(name, discover, REEXPRESS_MAX).await
     }
@@ -9223,7 +9381,12 @@ impl Inner {
                         self.rtt.lock().missed();
                         true
                     }
-                    ndn_app::AppError::Refused { reason } => !reason.is_final(),
+                    // A reply that does not verify was forged or altered on
+                    // the way: the verdict is final for that packet, not for
+                    // the name, whose genuine packet asking again may get.
+                    ndn_app::AppError::Refused { reason } => {
+                        reason == ndn_packet::Refusal::BadSignature || !reason.is_final()
+                    }
                     _ => false,
                 })
             }
@@ -9393,7 +9556,9 @@ impl Inner {
     /// Refresh `device`'s summary of `ns`: fetch its signed root and descend
     /// it, to the end, into what this device follows. A writer that moved
     /// meanwhile is refreshed again from its newer root, which skips every
-    /// branch processed in full here. Returns whether it completed.
+    /// branch processed in full here. Returns whether it completed and
+    /// reached the writer's state: not when only a relay answered, with a
+    /// root no newer than the head walked in full (spec §13.5, §17.1).
     async fn refresh(self: &Arc<Self>, ns: &Name, device: &Name) -> bool {
         if !self.st.lock().toward(ns) {
             return true;
@@ -9401,10 +9566,10 @@ impl Inner {
         tracing::trace!(me = %self.device, %ns, %device, "refresh");
         // A writer that does not answer is answered for by the devices that
         // hold its newest root (spec §13.5).
-        let data = match self.fetch(root_prefix(device, ns), true).await {
-            Some(d) => d,
+        let (data, relayed) = match self.fetch(root_prefix(device, ns), true).await {
+            Some(d) => (d, false),
             None => match self.ask_relays_root(ns, device).await {
-                Some(d) => d,
+                Some(d) => (d, true),
                 None => return false,
             },
         };
@@ -9421,8 +9586,25 @@ impl Inner {
         };
         let digest = wire::implicit_digest(data.raw());
         let key = (device.clone(), ns.clone());
-        if self.st.lock().peers.get(&key).and_then(|p| p.root) == Some(digest) {
-            return true;
+        // A relay holds the newest root it verified, which may be older than
+        // the writer's: one no newer than the head walked in full says
+        // nothing of what the writer did since, so the writer is not reached
+        // (asked again as §17.1 says), whatever the walk of it takes.
+        let stale = relayed
+            && self
+                .st
+                .lock()
+                .peers
+                .get(&key)
+                .is_some_and(|p| body.head <= p.walked);
+        // The root walked in full last time, and nothing it lists is owed
+        // still (a name followed since is walked toward anew).
+        {
+            let st = self.st.lock();
+            if st.peers.get(&key).and_then(|p| p.root) == Some(digest) && !st.owes_walk(device, ns)
+            {
+                return !stale;
+            }
         }
         // The pieces of merge versions it brings are fetched once it took
         // everything it lists: a checkpoint among them may cover the others
@@ -9430,17 +9612,21 @@ impl Inner {
         let descending = Descending::new(&self.st);
         let head = body.head;
         // What the descent goes toward: what is followed or peeked at in
-        // `ns` as it starts.
-        let toward: BTreeSet<Name> = {
+        // `ns` as it starts, and of that what is followed (its versions
+        // taken, not only its records); and how often what was processed
+        // had been forgotten then ([`Peer::forget`]).
+        let (toward, followed, since) = {
             let st = self.st.lock();
-            st.follows
+            let toward = st.toward_in(ns);
+            let followed: Vec<Name> = toward
                 .iter()
-                .chain(&st.peeks)
-                .filter(|t| namespace_of(t).as_ref() == Some(ns))
+                .filter(|t| st.follows.contains(*t))
                 .cloned()
-                .collect()
+                .collect();
+            let since = st.peers.get(&key).map_or(0, |p| p.resets);
+            (toward, followed, since)
         };
-        let whole = self.descend(device, ns, &writer, body).await;
+        let whole = self.descend(device, ns, &writer, body, since).await;
         if descending.end() {
             self.fetch_wanted(true);
         }
@@ -9449,7 +9635,18 @@ impl Inner {
         }
         let mut st = self.st.lock();
         let peer = st.peers.entry(key).or_default();
-        peer.root = Some(digest);
+        // Processed in full for what is followed or peeked at now, unless
+        // that changed meanwhile.
+        if peer.resets == since {
+            peer.root = Some(digest);
+        }
+        // What it was walked toward with versions taken, at this head.
+        if head > peer.walked {
+            peer.followed.clear();
+        }
+        if head >= peer.walked {
+            peer.followed.extend(followed);
+        }
         // What it was walked toward, at this head: more of the same head
         // adds to it.
         let wider = !toward.is_subset(&peer.toward);
@@ -9462,20 +9659,23 @@ impl Inner {
             self.store
                 .insert(walked_name(device, ns), encode_walked(head, &peer.toward));
         }
-        true
+        !stale
     }
 
     /// Process a verified node (or page) of `writer`'s summary of `ns`,
     /// published by `device`: its entries if followed, then its changed,
     /// relevant branches. Returns whether all of it was processed; what was
     /// is kept, so the next descent, from this root or a newer one, does not
-    /// fetch it again.
+    /// fetch it again — unless what was processed was forgotten since the
+    /// walk began (`since`, [`Peer::forget`]): a node processed for less
+    /// than is followed or peeked at now is not recorded as processed.
     fn descend<'a>(
         self: &'a Arc<Self>,
         device: &'a Name,
         ns: &'a Name,
         writer: &'a Writer,
         body: NodeBody,
+        since: u64,
     ) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             let subject = body.subject.clone();
@@ -9692,16 +9892,14 @@ impl Inner {
                 }
                 // Kept, the newest of its node, to answer for the writer.
                 self.store.insert(relayed_name(&name), data.raw().clone());
-                if !self.descend(device, ns, writer, child).await {
+                if !self.descend(device, ns, writer, child, since).await {
                     return None;
                 }
-                self.st
-                    .lock()
-                    .peers
-                    .entry((device.clone(), ns.clone()))
-                    .or_default()
-                    .nodes
-                    .insert(key, digest);
+                let mut st = self.st.lock();
+                let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
+                if peer.resets == since {
+                    peer.nodes.insert(key, digest);
+                }
                 Some(())
             })
             .buffer_unordered(self.config.window)
@@ -9891,6 +10089,33 @@ impl Inner {
                 .collect(),
             _ => Vec::new(),
         };
+        // They are fetched before the record is taken, when an owner device
+        // signed it (spec §8): its cuts judge every version of the collection the
+        // moment it is, and a version a cut keeps that this device applied
+        // under the record before stays applied across the switch, instead
+        // of waiting for a packet this record names. Asked again after
+        // [`retry_pause`], up to [`FETCH_TRIES`] rounds (spec §17.1); one
+        // still not to be had then is taken without, and what its cuts keep
+        // waits for it as any version does.
+        if !bound_by.is_empty()
+            && !self.st.lock().held.contains_key(name)
+            && let Record::Members(b) = &record
+            && owner_signed(self.validator.keyring(), name, &b.collection, &writer)
+        {
+            for tries in 0..FETCH_TRIES {
+                if tries > 0 {
+                    rt::sleep(retry_pause(tries - 1)).await;
+                }
+                let mut whole = true;
+                for root in &bound_by {
+                    whole &= self.hold_cut_tree(root).await;
+                }
+                if whole {
+                    break;
+                }
+                tracing::debug!(record = %name, "a removal cut's manifest not held whole before its record is taken; asked again");
+            }
+        }
         // A lease names a holder a missing member of a group may be fetched
         // from.
         let leased = match &record {
@@ -10248,6 +10473,11 @@ impl Inner {
                     let dropped = st.drop_pruned(&c);
                     self.entomb(&dropped);
                     self.erase(st, &c);
+                    // Versions taken before it waited, their keep not yet
+                    // a date the sweeper wakes for: admitted now, so it
+                    // reads every collection's earliest keep again (spec
+                    // §14.1).
+                    self.sweep.notify_one();
                 } else {
                     tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
                 }
@@ -12525,6 +12755,89 @@ impl Inner {
         })
     }
 
+    /// Why this device may not read `name` of sealed collection `c` while
+    /// no members record held admits it to `c`'s audience — none is held,
+    /// or the one in force seals without admitting it; `None` once one
+    /// admits it ([`Self::reads`]). Only signed data refuses a reader (spec
+    /// §15, §18.1), as [`Self::unadmitted`] a writer: while a device of
+    /// `c`'s namespace heard here was not walked toward `c`'s folder, the
+    /// record admitting it — one a share or an introduction signed, lost
+    /// on its way or not yet walked to — could still arrive
+    /// ([`DataError::NotReady`]: get again). Once every one was walked, the
+    /// records held decide ([`DataError::Sealed`]). With no device of the
+    /// namespace known at all, nothing can be asked: `Sealed` under a
+    /// record held, [`DataError::Unavailable`] with none.
+    async fn unreadable(self: &Arc<Self>, name: &Name, c: &Name) -> Option<DataError> {
+        let ns = namespace_of(c)?;
+        let recorded = |st: &St| st.colls.get(c).is_some_and(|x| x.members.is_some());
+        let owner = |d: &Name| self.namespace_of_name(d) == ns;
+        {
+            let st = self.st.lock();
+            if self.reads(&st, c) {
+                return None;
+            }
+            let heard = self.known_for(&st, &ns).iter().any(owner)
+                || st
+                    .peers
+                    .iter()
+                    .any(|((d, n), p)| *n == ns && p.kept > 0 && owner(d));
+            if !heard {
+                return Some(match recorded(&st) {
+                    true => DataError::Sealed { name: name.clone() },
+                    false => DataError::Unavailable { name: name.clone() },
+                });
+            }
+        }
+        let folder = folder_of(c);
+        let missing = self
+            .unsynced(&ns, owner, |t| {
+                t.has_prefix(&folder) || folder.has_prefix(t)
+            })
+            .await;
+        let st = self.st.lock();
+        if self.reads(&st, c) {
+            return None;
+        }
+        if missing.is_empty() {
+            return Some(DataError::Sealed { name: name.clone() });
+        }
+        let held = match recorded(&st) {
+            true => "the members record in force here seals it to an audience without this device",
+            false => {
+                "it holds sealed data of a collection whose members record it does not hold yet"
+            }
+        };
+        let devices: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        Some(DataError::NotReady {
+            name: name.clone(),
+            why: format!(
+                "{held}, and this device has not yet walked the summary of {}, which may hold \
+                 the record admitting it; get again once that device is reached",
+                devices.join(", ")
+            ),
+        })
+    }
+
+    /// `a`, a `get`'s answer about `name` of collection `c`, with a refusal
+    /// as sealed judged by signed data only ([`Self::unreadable`]):
+    /// `NotReady` while a device of the namespace heard here was not walked
+    /// toward `c`'s folder, then the records held. When a record admitting
+    /// this device arrived meanwhile, `Unavailable`: get again, as a reader.
+    async fn sealed_judged(
+        self: &Arc<Self>,
+        name: &Name,
+        c: &Name,
+        a: Result<Answer, DataError>,
+    ) -> Result<Answer, DataError> {
+        match a {
+            Err(DataError::Sealed { .. }) => Err(self
+                .unreadable(name, c)
+                .await
+                .unwrap_or_else(|| DataError::Unavailable { name: name.clone() })),
+            a => a,
+        }
+    }
+
     /// Whether `device` is ended here: a key of it is suspected
     /// ([`Self::suspects_device`]), or the trust context governing it
     /// revokes one of its keys (spec §8.1).
@@ -13912,10 +14225,13 @@ impl Inner {
     /// every other device known to write into `c`'s namespace
     /// ([`Self::ask_grants`]). A granted key is taken only if it matches the
     /// key check of the held record naming the epoch. Opens what it unlocks.
-    /// Whether the key is held now. A round no device granted is asked
-    /// again in the background, round after round with a capped backoff
-    /// ([`retry_pause`]), for as long as the key is owed here
-    /// ([`Self::key_owed`], spec §17.1): never one try per granter.
+    /// Whether the key is held now. The rounds run in one task of their
+    /// own, round after round with a capped backoff ([`retry_pause`]), for
+    /// as long as the key is owed here ([`Self::key_owed`], spec §17.1):
+    /// never one try per granter. The caller waits for the first
+    /// [`FETCH_TRIES`] of them, so a verb that needs the key is answered by
+    /// them rather than by one lost packet; the rest go on in the
+    /// background, and none is cut when the caller stops waiting.
     async fn obtain(self: &Arc<Self>, c: &Name, e: &Epoch) -> bool {
         let Some(ns) = namespace_of(c) else {
             return false;
@@ -13944,32 +14260,38 @@ impl Inner {
             collection: s.name.clone(),
             epoch: e.clone(),
         };
-        if self.ask_grants(&ns, &ask).await {
-            self.obtained(&ask, true).await;
-            return true;
-        }
-        if !self.key_owed(&self.st.lock(), &s, e) {
-            self.obtained(&ask, false).await;
-            return false;
-        }
-        // Asked again while owed; the ask stays under way meanwhile, so
-        // nothing starts a second round beside these.
+        let (tx, rx) = oneshot::channel::<()>();
         let inner = Arc::clone(self);
+        // The ask stays under way while this loop runs, so nothing starts a
+        // second round beside it.
         rt::spawn(async move {
+            let mut waiting = Some(tx);
             let mut misses = 0;
+            let owed = |inner: &Arc<Self>| inner.key_owed(&inner.st.lock(), &s, &ask.epoch);
             let got = loop {
-                rt::sleep(retry_pause(misses)).await;
-                misses = misses.saturating_add(1);
-                if !inner.key_owed(&inner.st.lock(), &s, &ask.epoch) {
-                    break inner.st.lock().keys.key(&s.name, &ask.epoch).is_some();
-                }
                 if inner.ask_grants(&ns, &ask).await {
                     break true;
+                }
+                misses += 1;
+                if misses >= FETCH_TRIES
+                    && let Some(tx) = waiting.take()
+                {
+                    let _ = tx.send(());
+                }
+                if !owed(&inner) {
+                    break inner.st.lock().keys.key(&s.name, &ask.epoch).is_some();
+                }
+                rt::sleep(retry_pause(misses - 1)).await;
+                if !owed(&inner) {
+                    break inner.st.lock().keys.key(&s.name, &ask.epoch).is_some();
                 }
             };
             inner.obtained(&ask, got).await;
         });
-        false
+        // Answered after the rounds in place, or once the loop ended (its
+        // sender dropped).
+        let _ = rx.await;
+        self.st.lock().keys.key(c, e).is_some()
     }
 
     /// One round of asks for the key `ask` names (spec §9): of the epoch's
@@ -14054,12 +14376,15 @@ impl Inner {
     }
 
     /// The key of `c`'s current epoch, for writing: obtained if this device
-    /// reads `c` and lacks it. `Ok(None)` when `c` is not sealed.
+    /// reads `c` and lacks it — the rounds asked in place
+    /// ([`Self::obtain`]), or, while another ask of it is under way, that
+    /// ask for at most the first-look time. `Ok(None)` when `c` is not
+    /// sealed.
     async fn write_key(
         self: &Arc<Self>,
         c: &Name,
     ) -> Result<Option<(Epoch, ContentKey)>, DataError> {
-        let epoch = {
+        let (epoch, under_way) = {
             let st = self.st.lock();
             let Some(e) = st
                 .colls
@@ -14075,9 +14400,11 @@ impl Inner {
             if let Some(k) = st.keys.key(c, &e) {
                 return Ok(Some((e, k)));
             }
-            e
+            let s = st.seal_subject(c, &e);
+            let under_way = st.asking.contains(&(s.name, e.clone()));
+            (e, under_way)
         };
-        if !self.obtain(c, &epoch).await {
+        if !self.obtain(c, &epoch).await && under_way {
             let (c2, e2) = (c.clone(), epoch.clone());
             self.wait_for(|st| st.keys.key(&c2, &e2).is_some()).await;
         }
@@ -14184,8 +14511,24 @@ impl Inner {
     /// not decode) is dropped and the next source asked
     /// ([`Self::take_data`]); a refusal kept against the name is a decision
     /// on the genuine writer's own packet. `follow`: follow its collection
-    /// first; else only peek at it, taking its records (spec §5.3).
+    /// first; else only peek at it, taking its records (spec §5.3). A
+    /// version sealed to an audience no record held admits this device to
+    /// is judged by signed data only ([`Self::sealed_judged`]).
     async fn log_entry(self: &Arc<Self>, name: &Name, follow: bool) -> Result<Answer, DataError> {
+        let a = self.log_entry_held(name, follow).await;
+        match parse_log_name(name).and_then(|p| p.subject) {
+            Some(c) => self.sealed_judged(name, &c, a).await,
+            None => a,
+        }
+    }
+
+    /// [`Self::log_entry`], a sealed version this device does not read by
+    /// the record in force answered [`DataError::Sealed`] as it is.
+    async fn log_entry_held(
+        self: &Arc<Self>,
+        name: &Name,
+        follow: bool,
+    ) -> Result<Answer, DataError> {
         let answer = |st: &mut St| -> Option<Result<Answer, DataError>> {
             // A version whose keep passed is dropped as it is asked for.
             st.expire_named(name);
@@ -14305,11 +14648,10 @@ impl Inner {
             {
                 let mut st = self.st.lock();
                 if let Some(peer) = st.peers.get_mut(&(parsed.device.clone(), ns.clone())) {
-                    peer.root = None;
-                    peer.nodes.retain(|(s, _), _| !c.has_prefix(s));
+                    peer.forget(c);
                 }
             }
-            let _ = rt::timeout(self.config.first_look, self.refresh(&ns, &parsed.device)).await;
+            let _ = rt::timeout(self.config.first_look, self.walk(&ns, &parsed.device)).await;
         }
         if let Some(c) = &parsed.subject {
             let c = c.clone();
@@ -14340,8 +14682,7 @@ impl Inner {
             if new || unknown {
                 for ((_, pns), peer) in st.peers.iter_mut() {
                     if *pns == ns {
-                        peer.root = None;
-                        peer.nodes.retain(|(s, _), _| !c.has_prefix(s));
+                        peer.forget(c);
                     }
                 }
             }
@@ -14350,7 +14691,7 @@ impl Inner {
         self.join(&ns).await?;
         if look {
             let devices = self.known_for(&self.st.lock(), &ns);
-            let all = futures::future::join_all(devices.iter().map(|d| self.refresh(&ns, d)));
+            let all = futures::future::join_all(devices.iter().map(|d| self.walk(&ns, d)));
             let _ = rt::timeout(self.config.first_look, all).await;
         }
         let c2 = c.clone();
@@ -14424,24 +14765,43 @@ impl Inner {
     /// (`<D>/32=summary/<C>/32=head`, MustBeFresh), take it
     /// ([`Self::accept_head`]), then fetch the node it names by name and
     /// check it against the head's digest. The seqs the node lists, and the
-    /// head's receipt, recorded only now that its node checked out.
+    /// head's receipt, recorded only now that its node checked out. Each
+    /// is asked in place as a walk's packets are (spec §17.1): a miss, or
+    /// a packet refused as not the head or not its node (one that does not
+    /// verify or match, a forgery on the way), is asked again after
+    /// [`retry_pause`], up to [`FETCH_TRIES`] asks; a rollback is a
+    /// decision, not asked again.
     async fn head_of(
         self: &Arc<Self>,
         c: &Name,
         key: &Writer,
         device: &Name,
     ) -> Option<(Vec<u64>, Receipt)> {
-        let data = self.fetch(head_prefix(device, c), true).await?;
-        let at = Instant::now();
-        let body = match self.accept_head(c, key, device, &data).await {
-            Ok(b) => b,
-            Err(HeadRefusal::Rollback { seq, seen }) => {
-                tracing::warn!(collection = %c, seq, seen, "refused: a head older than one verified, or than a version held (rollback)");
-                return None;
+        let mut tries = 0;
+        let (body, at) = loop {
+            if tries > 0 {
+                rt::sleep(retry_pause(tries - 1)).await;
             }
-            Err(why) => {
-                tracing::debug!(name = %data.name, ?why, "refused: a head of a one-key collection");
-                return None;
+            tries += 1;
+            let more = tries < FETCH_TRIES;
+            let data = match self.fetch_once(head_prefix(device, c), true).await {
+                Ok(d) => d,
+                Err(true) if more => continue,
+                Err(_) => return None,
+            };
+            let at = Instant::now();
+            match self.accept_head(c, key, device, &data).await {
+                Ok(b) => break (b, at),
+                Err(HeadRefusal::Rollback { seq, seen }) => {
+                    tracing::warn!(collection = %c, seq, seen, "refused: a head older than one verified, or than a version held (rollback)");
+                    return None;
+                }
+                Err(why) => {
+                    tracing::debug!(name = %data.name, ?why, "refused: a head of a one-key collection");
+                    if !more {
+                        return None;
+                    }
+                }
             }
         };
         let receipt = Receipt {
@@ -14450,18 +14810,40 @@ impl Inner {
         };
         let seq = body.seq;
         let node_name = node_name(device, c, seq);
-        let node = self.fetch(node_name.clone(), false).await?;
-        if wire::implicit_digest(node.raw()) != body.digest {
-            tracing::debug!(%node_name, "not the node its head names; ignored");
-            return None;
-        }
-        let nb = node
-            .content()
-            .and_then(|b| wire::decode_node(b.clone()).ok())?;
-        if nb.subject != *c || nb.writer != *key.key() || nb.head != seq || nb.page.is_some() {
-            tracing::debug!(%node_name, "a node that does not match its head; ignored");
-            return None;
-        }
+        let mut tries = 0;
+        let nb = loop {
+            if tries > 0 {
+                rt::sleep(retry_pause(tries - 1)).await;
+            }
+            tries += 1;
+            let more = tries < FETCH_TRIES;
+            let node = match self.fetch_once(node_name.clone(), false).await {
+                Ok(d) => d,
+                Err(true) if more => continue,
+                Err(_) => return None,
+            };
+            let nb = (wire::implicit_digest(node.raw()) == body.digest)
+                .then(|| {
+                    node.content()
+                        .and_then(|b| wire::decode_node(b.clone()).ok())
+                })
+                .flatten()
+                .filter(|nb| {
+                    nb.subject == *c
+                        && nb.writer == *key.key()
+                        && nb.head == seq
+                        && nb.page.is_none()
+                });
+            match nb {
+                Some(nb) => break nb,
+                None => {
+                    tracing::debug!(%node_name, "not the node its head names; ignored");
+                    if !more {
+                        return None;
+                    }
+                }
+            }
+        };
         let listed: Vec<u64> = seqs_of(&nb.entries).collect();
         let mut st = self.st.lock();
         if let Some(h) = st.seen.get_mut(&(c.clone(), key.clone()))
@@ -14625,6 +15007,17 @@ impl Inner {
                 _ => Probe::Missing,
             },
             Err(DataError::Pruned { .. }) => Probe::Pruned,
+            // No path answered, or only with a reply refused unkept (one
+            // that did not verify: forged or altered on the way): asking
+            // again may mend it (spec §17.1).
+            Err(DataError::Unavailable { .. }) => Probe::Lost,
+            Err(DataError::Refused { .. }) => {
+                let st = self.st.lock();
+                match st.refused.contains_key(&name) || st.cut_out.contains_key(&name) {
+                    true => Probe::Missing,
+                    false => Probe::Lost,
+                }
+            }
             _ => Probe::Missing,
         }
     }
@@ -14636,16 +15029,18 @@ impl Inner {
     /// alternating with bisection) for the first block whose last entry is
     /// `≥ from` and the last whose first is `< to`, each probe a block
     /// fetched and verified, then the blocks between. Only those blocks
-    /// are fetched: the collection is not followed. It answers within
-    /// [`RANGE_LOOKS`] first looks: what was not probed by then is missing.
+    /// are fetched: the collection is not followed. Its blocks are probed
+    /// within [`range_bound`] from when the head's node lists them (the
+    /// records and the head have bounds of their own, spec §17.1), a probe
+    /// lost on the way probed again in place: a search's up to
+    /// [`SEARCH_TRIES`] times, a block in range until then. What was not
+    /// probed by then is missing.
     async fn get_range(
         self: &Arc<Self>,
         name: &Name,
         c: &Name,
         range: Range,
     ) -> Result<Answer, DataError> {
-        let deadline =
-            Instant::now().checked_add(self.config.first_look.saturating_mul(RANGE_LOOKS));
         self.peek(c).await?;
         let (key, device) = {
             let st = self.st.lock();
@@ -14683,6 +15078,11 @@ impl Inner {
             true => None,
             false => self.head_of(c, &key, &device).await,
         };
+        // An unmeasured path keeps the first looks: its `rto` is only the
+        // lifetime, no evidence the path is slow.
+        let rto = self.rtt.lock().measured(self.config.lifetime);
+        let rto = rto.unwrap_or(Duration::ZERO);
+        let deadline = Instant::now().checked_add(range_bound(self.config.first_look, rto));
         let (seqs, age) = {
             let st = self.st.lock();
             let coll = st.colls.get(c);
@@ -14743,6 +15143,7 @@ impl Inner {
                         anchors.into_iter().collect(),
                         &mut probes,
                         deadline,
+                        SEARCH_TRIES,
                     )
                     .await;
                 }
@@ -14766,13 +15167,14 @@ impl Inner {
                 seqs[lo..hi].to_vec()
             }
         };
+        // A block a probe lost is asked again in place; what the deadline
+        // leaves unprobed is missing.
         let todo: Vec<u64> = picked
             .iter()
             .copied()
-            .filter(|s| !probes.contains_key(s))
+            .filter(|s| !settled(&probes, *s))
             .collect();
-        // What the deadline leaves unprobed is missing.
-        self.probe_all(c, &device, todo, &mut probes, deadline)
+        self.probe_all(c, &device, todo, &mut probes, deadline, u32::MAX)
             .await;
         let id = |s: u64| VersionId {
             writer: key.clone(),
@@ -14798,7 +15200,7 @@ impl Inner {
                 Probe::Large(vid, dated) if within(dated) => out.large.push(vid),
                 Probe::Large(..) => {}
                 Probe::Expired(..) => out.expired.push(id(s)),
-                Probe::Missing => out.missing.push(id(s)),
+                Probe::Missing | Probe::Lost => out.missing.push(id(s)),
                 // Its writer dropped it: no longer part of the stream.
                 Probe::Pruned => {}
             }
@@ -14811,8 +15213,11 @@ impl Inner {
 
     /// Probe the listed blocks `todo` of a range read (spec §5.4), the
     /// configured window of them at once, into `probes`, until `deadline`
-    /// (`None`: none this device's clock can hold). Whether every one was
-    /// probed by then.
+    /// (`None`: none this device's clock can hold). A block a probe lost
+    /// ([`Probe::Lost`]) is probed again in place after [`retry_pause`],
+    /// up to `tries` probes of it in all (spec §17.1). Whether every one
+    /// was probed by then.
+    #[allow(clippy::too_many_arguments)]
     async fn probe_all(
         self: &Arc<Self>,
         c: &Name,
@@ -14820,16 +15225,32 @@ impl Inner {
         todo: Vec<u64>,
         probes: &mut HashMap<u64, Probe>,
         deadline: Option<Instant>,
+        tries: u32,
     ) -> bool {
-        let mut fetching = stream::iter(todo)
-            .map(|s| async move { (s, self.probe(c, device, s).await) })
-            .buffer_unordered(self.config.window.max(1));
+        let ask = |s: u64, misses: u32| async move {
+            if misses > 0 {
+                rt::sleep(retry_pause(misses - 1)).await;
+            }
+            (s, misses, self.probe(c, device, s).await)
+        };
+        let window = self.config.window.max(1);
+        let mut todo = todo.into_iter();
+        let mut fetching = stream::FuturesUnordered::new();
         loop {
+            while fetching.len() < window
+                && let Some(s) = todo.next()
+            {
+                fetching.push(ask(s, 0));
+            }
             let left = deadline.map_or(Duration::MAX, |d| {
                 d.saturating_duration_since(Instant::now())
             });
             match rt::timeout(left, fetching.next()).await {
-                Ok(Some((s, p))) => {
+                Ok(Some((s, misses, Probe::Lost))) if misses + 1 < tries => {
+                    probes.insert(s, Probe::Lost);
+                    fetching.push(ask(s, misses + 1));
+                }
+                Ok(Some((s, _, p))) => {
                     probes.insert(s, p);
                 }
                 Ok(None) => return true,
@@ -14842,15 +15263,18 @@ impl Inner {
     /// `pred` (monotone along the stream for an honest writer), searched by
     /// probing blocks: interpolation on `target` between the nearest known
     /// dates, alternating with bisection so a skewed stream costs at most
-    /// twice the bisection's probes. Each round probes the guess alone; only
-    /// when it does not answer does the round widen, probing at once the
-    /// window's worth of indices nearest it not probed yet
-    /// ([`Self::probe_all`]), and take the nearest that answers. When none
-    /// answers, the rest of `lo..hi` is not probed: it is counted missing,
-    /// and the caller takes it in whole — so a round costs one probe while
-    /// probes answer, withheld blocks cost one window more, not a probe
-    /// each, and `deadline` bounds the whole. Returns `(lo, hi)` narrowed:
-    /// equal when found.
+    /// twice the bisection's probes. Each round probes the guess alone, a
+    /// probe lost on the way probed again in place up to [`SEARCH_TRIES`]
+    /// times, so loss costs the search time, never other blocks. Only when
+    /// no probe reached the guess does the round widen: it probes at once
+    /// the [`SEARCH_WIDEN`] indices nearest it not probed yet, twice as
+    /// many each step none answers, at most the window's worth for the
+    /// guess ([`Self::probe_all`]), and takes the nearest that answers.
+    /// When none answers, the rest of `lo..hi` is not probed: it is counted
+    /// missing, and the caller takes it in whole — so a round costs one
+    /// block while probes answer, withheld blocks cost at most one window
+    /// more, not a probe each, and `deadline` bounds the whole. Returns
+    /// `(lo, hi)` narrowed: equal when found.
     #[allow(clippy::too_many_arguments)]
     async fn search(
         self: &Arc<Self>,
@@ -14882,24 +15306,39 @@ impl Inner {
                 }
                 _ => lo + (hi - lo) / 2,
             };
-            // The guess; on a miss, the nearest indices in the interval, a
-            // window of them at once.
+            // The guess; when no probe reached it, the nearest indices in
+            // the interval, a step of them at once.
             let order = || (guess..hi).chain((lo..guess).rev());
-            if !probes.contains_key(&seqs[guess]) {
-                self.probe_all(c, device, vec![seqs[guess]], probes, deadline)
+            if !settled(probes, seqs[guess]) {
+                self.probe_all(c, device, vec![seqs[guess]], probes, deadline, SEARCH_TRIES)
                     .await;
             }
-            if known(guess, probes).is_none() {
+            let (mut step, mut widened) = (SEARCH_WIDEN, 0);
+            while widened < window && order().all(|i| known(i, probes).is_none()) {
                 let batch: Vec<u64> = order()
+                    .filter(|i| *i != guess)
                     .map(|i| seqs[i])
-                    .filter(|s| !probes.contains_key(s))
-                    .take(window)
+                    .filter(|s| !settled(probes, *s))
+                    .take(step.min(window - widened))
                     .collect();
-                self.probe_all(c, device, batch, probes, deadline).await;
+                if batch.is_empty() {
+                    break;
+                }
+                widened += batch.len();
+                if !self
+                    .probe_all(c, device, batch, probes, deadline, SEARCH_TRIES)
+                    .await
+                {
+                    break;
+                }
+                step *= 2;
             }
             let Some((i, d)) = order().find_map(|i| known(i, probes).map(|d| (i, d))) else {
                 for s in &seqs[lo..hi] {
-                    probes.entry(*s).or_insert(Probe::Missing);
+                    let p = probes.entry(*s).or_insert(Probe::Missing);
+                    if matches!(p, Probe::Lost) {
+                        *p = Probe::Missing;
+                    }
                 }
                 return (lo, hi);
             };
@@ -14939,8 +15378,13 @@ enum Probe {
     Expired(Timestamp, Option<Timestamp>),
     /// Pruned by its writer.
     Pruned,
-    /// No path answered with it, verified.
+    /// Not to be had verified, and asking again does not mend it: a
+    /// refusal kept against its name, or a search that stopped short of it.
     Missing,
+    /// No ask of the probe answered with it verified — lost on the way, or
+    /// answered with a reply that did not verify: asking again may mend it
+    /// (spec §17.1), and it is missing only if no probe of it does.
+    Lost,
 }
 
 impl Probe {
@@ -14953,9 +15397,15 @@ impl Probe {
             Probe::Read(v) => Some((v.dated, last_dated(v))),
             Probe::Large(_, d) => Some((*d, *d)),
             Probe::Expired(a, b) => Some((*a, b.unwrap_or(Timestamp(u64::MAX)))),
-            Probe::Pruned | Probe::Missing => None,
+            Probe::Pruned | Probe::Missing | Probe::Lost => None,
         }
     }
+}
+
+/// Whether a range read is done probing block `s`: probed, and not lost
+/// ([`Probe::Lost`] is probed again).
+fn settled(probes: &HashMap<u64, Probe>, s: u64) -> bool {
+    probes.get(&s).is_some_and(|p| !matches!(p, Probe::Lost))
 }
 
 /// How an audit checks one piece: the digest the holder's answer must have,
@@ -15171,6 +15621,14 @@ impl Inner {
     /// root against the record's. With `assemble`, the payload; without,
     /// an empty one once every piece is held. `None` when a piece is not to
     /// be had.
+    ///
+    /// Pieces are asked a window at once (spec §4.1, §17.1): the manifest
+    /// a level at a time, then the chunks, at most [`Config::window`] of
+    /// them in flight, each an owed fetch with its own bounded asks. A
+    /// piece not to be had neither stops the walk nor holds back the pieces
+    /// behind it: every other one this walk can name is fetched and kept,
+    /// so asking again costs only what is still missing. What came is
+    /// placed by its index, never by when it came.
     async fn walk_pieces(
         self: &Arc<Self>,
         v: &Name,
@@ -15179,52 +15637,87 @@ impl Inner {
         assemble: bool,
     ) -> Option<Vec<u8>> {
         let shape = Shape::of(chunks.size);
+        let window = self.config.window.max(1);
         let mut digests: HashMap<PieceKind, [u8; 32]> = HashMap::new();
         digests.insert(PieceKind::Manifest(0), chunks.root);
-        for k in shape.manifests() {
-            let kind = PieceKind::Manifest(k);
-            let expected = *digests.get(&kind)?;
-            let w = self.get_piece(c, &piece_name(v, kind), &expected).await?;
-            let listed = pieces::open_node(&shape, k, &w, &expected)?;
-            for (kid, d) in shape.children(k)?.into_iter().zip(listed) {
-                digests.insert(kid, d);
+        // A node not to be had, or not the one listed, leaves its children
+        // unknown: they are not asked, and the walk ends without the payload.
+        let mut level: Vec<u64> = vec![0];
+        while !level.is_empty() {
+            let listed: Vec<(u64, Option<Vec<[u8; 32]>>)> = {
+                let (digests, shape) = (&digests, &shape);
+                stream::iter(level)
+                    .map(|k| async move {
+                        let node = async {
+                            let expected = *digests.get(&PieceKind::Manifest(k))?;
+                            let w = self
+                                .get_piece(c, &piece_name(v, PieceKind::Manifest(k)), &expected)
+                                .await?;
+                            pieces::open_node(shape, k, &w, &expected)
+                        };
+                        (k, node.await)
+                    })
+                    .buffer_unordered(window)
+                    .collect()
+                    .await
+            };
+            let mut next = Vec::new();
+            for (k, listed) in listed {
+                let (Some(listed), Some(kids)) = (listed, shape.children(k)) else {
+                    continue;
+                };
+                for (kid, d) in kids.into_iter().zip(listed) {
+                    if let PieceKind::Manifest(m) = kid {
+                        next.push(m);
+                    }
+                    digests.insert(kid, d);
+                }
             }
+            next.sort_unstable();
+            level = next;
         }
+        let open = move |shape: &Shape, i: u64, w: Bytes, d: [u8; 32]| {
+            if assemble {
+                pieces::open_chunk(shape, i, &w, &d)
+            } else {
+                Some(Bytes::new())
+            }
+        };
+        let mut got: Vec<Option<Bytes>> = vec![None; shape.chunks as usize];
         // The source is chosen per version, from what answered: the first
         // chunk is asked alone (the writer first, then each holder), and
         // every other chunk goes first to whoever answered it — a writer that
-        // released its chunks costs one miss, not one per chunk.
-        let first_digest = *digests.get(&PieceKind::Chunk(0))?;
-        let (first_wire, source) = self
-            .get_piece_from(c, &piece_name(v, PieceKind::Chunk(0)), &first_digest, None)
-            .await?;
-        let first_chunk = if assemble {
-            pieces::open_chunk(&shape, 0, &first_wire, &first_digest)?
-        } else {
-            Bytes::new()
-        };
-        let digests = &digests;
-        let source = &source;
-        let rest: Vec<Option<Bytes>> = stream::iter(1..shape.chunks)
-            .map(|i| async move {
-                let kind = PieceKind::Chunk(i);
-                let d = *digests.get(&kind)?;
-                let (w, _) = self
-                    .get_piece_from(c, &piece_name(v, kind), &d, Some(source))
-                    .await?;
-                if assemble {
-                    pieces::open_chunk(&shape, i, &w, &d)
-                } else {
-                    Some(Bytes::new())
-                }
+        // released its chunks costs one miss, not one per chunk. When the
+        // first is not to be had, the others go in the usual order.
+        let mut first: Option<Option<Name>> = None;
+        if let Some(d) = digests.get(&PieceKind::Chunk(0)).copied()
+            && let Some((w, source)) = self
+                .get_piece_from(c, &piece_name(v, PieceKind::Chunk(0)), &d, None)
+                .await
+        {
+            got[0] = open(&shape, 0, w, d);
+            first = Some(source);
+        }
+        let todo: Vec<(u64, [u8; 32])> = (1..shape.chunks)
+            .filter_map(|i| Some((i, *digests.get(&PieceKind::Chunk(i))?)))
+            .collect();
+        let (first, shape) = (first.as_ref(), &shape);
+        let rest: Vec<(u64, Option<Bytes>)> = stream::iter(todo)
+            .map(|(i, d)| async move {
+                let w = self
+                    .get_piece_from(c, &piece_name(v, PieceKind::Chunk(i)), &d, first)
+                    .await;
+                (i, w.and_then(|(w, _)| open(shape, i, w, d)))
             })
-            .buffered(self.config.window)
+            .buffer_unordered(window)
             .collect()
             .await;
+        for (i, w) in rest {
+            got[i as usize] = w;
+        }
         let mut out = Vec::with_capacity(if assemble { chunks.size as usize } else { 0 });
-        out.extend_from_slice(&first_chunk);
-        for g in rest {
-            out.extend_from_slice(&g?);
+        for w in got {
+            out.extend_from_slice(&w?);
         }
         Some(out)
     }
@@ -15701,7 +16194,17 @@ impl Inner {
         let holds = self.held_frontier(st, c);
         let h = st.holding.get(c)?;
         let coll = st.colls.get(c)?;
-        let cap = keep_cap(coll, &holds).ok()?;
+        let expired = |id: &VersionId| {
+            let name = log_name(&device_of(id.writer.key())?, Some(c), id.seq.0);
+            match st.held.get(&name) {
+                Some(Held::Expired(t)) => Some(t.keep),
+                _ => None,
+            }
+        };
+        let Ok(cap) = keep_cap(coll, &holds, expired) else {
+            tracing::debug!(collection = %c, "no lease: a version it would hold is not held here, so its keep is not known");
+            return None;
+        };
         let until = cap.map_or(h.until, |t| t.min(h.until));
         if until <= (self.config.clock)() {
             tracing::debug!(collection = %c, "no lease: what it would hold is past its keep");
@@ -15852,13 +16355,48 @@ impl Inner {
             .sum()
     }
 
+    /// The log entries of `c` inside `at` that [`Self::unheld`] counts and
+    /// this device can name: each writer's newest inside `at`, and every
+    /// earlier one heard of (a summary listed it) — neither held, refused
+    /// nor never applying.
+    fn unheld_names(&self, st: &St, c: &Name, at: &Frontier) -> Vec<Name> {
+        let coll = st.colls.get(c);
+        let mut out = Vec::new();
+        for (w, s) in at.iter() {
+            let Some(device) = device_of(w.key()) else {
+                continue;
+            };
+            let heard = coll.and_then(|x| x.entries.get(w));
+            let seqs = heard
+                .into_iter()
+                .flat_map(|e| e.range(..s.0).copied())
+                .chain(std::iter::once(s.0));
+            for seq in seqs {
+                let id = VersionId {
+                    writer: w.clone(),
+                    seq: Seq(seq),
+                };
+                if coll.is_some_and(|x| x.skips(&id) || holds_entry(x, &id)) {
+                    continue;
+                }
+                let name = log_name(&device, Some(c), seq);
+                if !st.held.contains_key(&name) && !st.refused.contains_key(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
     /// Take what the accepted hold record of `c` asks, in a task of its
     /// own (one per collection at a time), so the work outlives any one
     /// hold ask (spec §13.2), in rounds: while a version inside the
-    /// record's `at` is not heard of yet, see what every device writing
-    /// into `ns` has now (the asker moved since a first look, and another
+    /// record's `at` is not held yet, see what every device writing into
+    /// `ns` has now (the asker moved since a first look, and another
     /// holder's lease names where a lost piece may still be:
-    /// re-replication), then fetch every piece it lacks
+    /// re-replication), then fetch by its name every entry inside `at`
+    /// still not held that it heard of, or that `at` names
+    /// ([`Self::unheld_names`]), and every piece it lacks
     /// ([`Self::repair_held`]). Asked again after [`retry_pause`] while it
     /// lacks any, up to [`REPAIR_ROUNDS`] rounds, stopping after
     /// [`REPAIR_IDLE`] rounds in a row that brought nothing (spec §17.1).
@@ -15887,6 +16425,14 @@ impl Inner {
                     let devices = inner.known_for(&inner.st.lock(), &ns);
                     futures::future::join_all(devices.iter().map(|d| inner.refresh(&ns, d))).await;
                     inner.wait_for(|st| inner.unheld(st, &c, &at) == 0).await;
+                    // A walk that listed an entry but did not take it
+                    // leaves it to this take: asked for by its name.
+                    let names = inner.unheld_names(&inner.st.lock(), &c, &at);
+                    stream::iter(names)
+                        .map(|n| inner.take_fetched(n))
+                        .buffer_unordered(inner.config.window)
+                        .collect::<Vec<bool>>()
+                        .await;
                 }
                 let missing = inner.repair_held(&c).await;
                 let unheld = inner.unheld(&inner.st.lock(), &c, &at);
@@ -16036,8 +16582,14 @@ impl Inner {
             return None;
         }
         if !self.st.lock().held.contains_key(record) {
-            let data = self.fetch_owed(record.clone(), false).await?;
-            self.take_data(record, data).await.ok()?;
+            let Some(data) = self.fetch_owed(record.clone(), false).await else {
+                tracing::debug!(%record, "hold not answered: the hold record was not to be had; the asker asks again");
+                return None;
+            };
+            if let Err(why) = self.take_data(record, data).await {
+                tracing::debug!(%record, "hold refused: the hold record is not taken here ({why})");
+                return None;
+            }
         }
         let body = {
             let st = self.st.lock();
@@ -16072,7 +16624,10 @@ impl Inner {
             h.until = body.until;
             h.at = body.at.clone();
         }
-        self.look(&c).await.ok()?;
+        if let Err(e) = self.look(&c).await {
+            tracing::debug!(collection = %c, "hold not answered: {e}");
+            return None;
+        }
         let at = body.at.clone();
         let whole = |st: &St| self.keeps_all(st, &c, &at);
         // Everything the record asks is in the store already — an ask asked
@@ -16093,9 +16648,9 @@ impl Inner {
                 return None;
             }
         }
-        let (lease, new) = {
-            let mut st = self.st.lock();
-            self.sign_lease(&mut st, &c)?
+        let Some((lease, new)) = self.sign_lease(&mut self.st.lock(), &c) else {
+            tracing::debug!(collection = %c, "hold not answered: no lease signed");
+            return None;
         };
         if new && let Err(e) = self.publish_about(&c, &[]).await {
             tracing::debug!(collection = %c, "the lease is not announced: {e}");
@@ -16847,7 +17402,7 @@ fn lease_refusal(coll: &Coll, holder: &Name, l: &LeaseBody) -> Option<&'static s
     if l.until > hold.until {
         return Some("it promises past the date the owner asked for");
     }
-    match keep_cap(coll, &l.holds) {
+    match keep_cap(coll, &l.holds, |_| None) {
         Err(()) => Some("a version it holds is not held here, so its keep is not known"),
         Ok(Some(cap)) if l.until > cap => Some("it promises past the keep of everything it holds"),
         Ok(_) => None,
@@ -17699,7 +18254,8 @@ impl DataLayer for Device {
             let me = inner.writer.clone();
             let value = |st: &St| st.value_at(&c, &at, &rules, &me);
             if inner.sealed_off(&inner.st.lock(), &c) {
-                return Err(DataError::Sealed { name: name.clone() });
+                let sealed = Err(DataError::Sealed { name: name.clone() });
+                return inner.sealed_judged(name, &c, sealed).await;
             }
             let unknown = |st: &St| st.rule_unknown(&c, &rules);
             if !inner
@@ -17730,7 +18286,10 @@ impl DataLayer for Device {
         }
         if let Some(range) = parse_range_name(name) {
             return match range {
-                Ok((c, range)) => inner.get_range(name, &c, range).await,
+                Ok((c, range)) => {
+                    let a = inner.get_range(name, &c, range).await;
+                    inner.sealed_judged(name, &c, a).await
+                }
                 Err(why) => Err(DataError::BadName {
                     name: name.clone(),
                     why: why.0,
@@ -17750,13 +18309,17 @@ impl DataLayer for Device {
         if peek {
             inner.peek(name).await?;
         }
-        let one = {
+        let (one, sealed) = {
             let st = inner.st.lock();
-            if inner.sealed_off(&st, name) {
-                return Err(DataError::Sealed { name: name.clone() });
-            }
-            st.colls.get(name).and_then(one_key)
+            (
+                st.colls.get(name).and_then(one_key),
+                inner.sealed_off(&st, name),
+            )
         };
+        if sealed {
+            let sealed = Err(DataError::Sealed { name: name.clone() });
+            return inner.sealed_judged(name, name, sealed).await;
+        }
         if let Some((key, device)) = one {
             let a = inner.newest_one_key(name, &key, &device).await;
             return inner.whole(a).await;
@@ -17774,11 +18337,15 @@ impl DataLayer for Device {
                 .wait_for(|st| st.colls.get(name).is_none_or(|x| x.locked.is_empty()))
                 .await;
         }
-        let (got, age) = {
+        let a = {
             let st = inner.st.lock();
-            (inner.newest(&st, name)?, inner.age(&st, name))
+            inner.newest(&st, name).map(|got| Answer {
+                got,
+                age: inner.age(&st, name),
+            })
         };
-        inner.whole(Ok(Answer { got, age })).await
+        let a = inner.sealed_judged(name, name, a).await;
+        inner.whole(a).await
     }
 
     async fn put(
@@ -20680,6 +21247,56 @@ mod tests {
         again.shutdown();
     }
 
+    /// A version taken before its collection's members record waits, so its
+    /// keep is no date the sweeper wakes for yet; once the record admits it,
+    /// the sweeper drops it on time, never asked for (spec §14.1).
+    #[tokio::test(start_paused = true)]
+    async fn a_version_admitted_by_a_later_record_is_dropped_on_time() {
+        let repo = n("/alice/repo");
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let dev = device_at(&repo, &keys_of(&repo), &store, &clock).await;
+        let c = n("/alice/32=data/readings");
+        let phone = n("/alice/phone");
+        let version = VersionBody {
+            keep: Keep::Until(Timestamp(2_000)),
+            dated: Timestamp(900),
+            ..version_body(&c, None)
+        };
+        let name = log_name(&phone, Some(&c), 2);
+        assert_eq!(hand(&dev, &phone, &c, 2, Record::Version(version)), None);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let members = MembersBody {
+            collection: c.clone(),
+            folder: false,
+            revision: 1,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: Vec::new(),
+            cuts: Vec::new(),
+            epoch: None,
+            key_check: None,
+            since: None,
+            parent: None,
+        };
+        assert_eq!(hand(&dev, &phone, &c, 1, Record::Members(members)), None);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            dev.inner.st.lock().colls[&c]
+                .versions
+                .values()
+                .any(|hv| hv.version.name == name),
+            "admitted once its record came"
+        );
+        clock.store(2_000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            matches!(dev.inner.st.lock().held.get(&name), Some(Held::Expired(_))),
+            "dropped by the sweeper at its keep"
+        );
+        dev.shutdown();
+    }
+
     fn reading(t: u64) -> Content {
         Content::new().with("t", Bytes::from(t.to_string()))
     }
@@ -20839,14 +21456,213 @@ mod tests {
             panic!("a range read answers entries");
         };
         let took = t0.elapsed();
+        // Its probes within their bound (an unmeasured path: the first
+        // looks), after the head's own bound of FETCH_TRIES asks (spec §5.4,
+        // §17.1).
+        let lifetime = dev.inner.config.lifetime + Duration::from_millis(500);
+        let head = lifetime * FETCH_TRIES + retry_pause(0) + retry_pause(1);
         assert!(
-            took <= dev.inner.config.first_look * RANGE_LOOKS,
+            took <= range_bound(dev.inner.config.first_look, Duration::ZERO) + head,
             "a range read answers within its bound: {took:?}"
         );
         let missing: BTreeSet<u64> = e.missing.iter().map(|id| id.seq.0).collect();
         assert_eq!(missing, listed, "what it did not reach is missing");
         assert!(e.entries.is_empty() && e.expired.is_empty() && e.large.is_empty());
         dev.shutdown();
+    }
+
+    /// A reader's link to one writer device: every Interest under the
+    /// writer's name is answered with what the writer serves, except that
+    /// for each name in `lossy` every Interest within `window` of the first
+    /// one asking for it is lost. It records when each name was first
+    /// asked for.
+    struct Lossy {
+        writer: Arc<Inner>,
+        lossy: BTreeSet<Name>,
+        window: Duration,
+        asked: std::sync::Mutex<HashMap<Name, Instant>>,
+        tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+        rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    impl Lossy {
+        fn new(writer: &Device, lossy: BTreeSet<Name>, window: Duration) -> Arc<Self> {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            Arc::new(Lossy {
+                writer: Arc::clone(&writer.inner),
+                lossy,
+                window,
+                asked: std::sync::Mutex::new(HashMap::new()),
+                tx,
+                rx: futures::lock::Mutex::new(rx),
+            })
+        }
+
+        /// Which of `names` were asked for.
+        fn asked<'a>(&self, names: impl IntoIterator<Item = &'a Name>) -> BTreeSet<Name> {
+            let asked = self.asked.lock().unwrap();
+            names
+                .into_iter()
+                .filter(|x| asked.contains_key(*x))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for Lossy {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            let Ok(interest) = Interest::decode(wire) else {
+                return Ok(());
+            };
+            if !interest.name.has_prefix(&self.writer.device) {
+                return Ok(());
+            }
+            let name = (*interest.name).clone();
+            let first = *self
+                .asked
+                .lock()
+                .unwrap()
+                .entry(name.clone())
+                .or_insert_with(Instant::now);
+            if self.lossy.contains(&name) && first.elapsed() < self.window {
+                return Ok(());
+            }
+            if let Some(reply) = self
+                .writer
+                .packet_for(&name, interest.selectors().can_be_prefix)
+            {
+                let _ = self.tx.unbounded_send(reply);
+            }
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.rx.lock().await.next().await
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// A range read asks a lost probe again in place (spec §5.4, §17.1): a
+    /// block whose first probe is lost — every ask of it, so a whole
+    /// [`FETCH_TRIES`] asks — is probed again, not replaced by its
+    /// neighbours. The search's first guess and a block in range lose their
+    /// first probe; the read probes exactly the blocks a read without loss
+    /// probes, answers every entry in range, none missing, within its bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_range_probe_is_asked_again_in_place_without_widening_the_search() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
+        let clock = Arc::new(AtomicU64::new(100));
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let writer = device_at(&sensor, &sensor_keys, &store, &clock).await;
+        let c = n("/sam/32=data/temps");
+        writer
+            .share(
+                &c,
+                crate::layer::Share {
+                    rule: Rule::OneKey,
+                    writers: vec![key.clone()],
+                    readers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        // Sixty-four blocks of one reading each, dated 100 apart.
+        let mut blocks = Vec::new();
+        for i in 1..=64u64 {
+            clock.store(i * 100, Ordering::Relaxed);
+            let id = writer
+                .put(&c, reading(i * 100), options(None))
+                .await
+                .unwrap();
+            blocks.push(log_name(&sensor, Some(&c), id.seq.0));
+        }
+        while writer.inner.packet_for(&blocks[63], false).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        validator.adopt_context(context("/rita")).unwrap();
+        validator.cert_cache().insert(cert);
+        let range = Range::Times(Timestamp(2_000), Timestamp(2_350));
+        let read = |link: Arc<Lossy>| {
+            let (reader, validator, c, key) = (
+                reader.clone(),
+                Arc::clone(&validator),
+                c.clone(),
+                key.clone(),
+            );
+            async move {
+                let conn: Arc<dyn Connection> = link;
+                let dev = Device::start(
+                    Transport {
+                        node: Node::from_connection(Arc::clone(&conn)),
+                        sync: conn,
+                    },
+                    reader.clone(),
+                    keys_of(&reader),
+                    validator,
+                    Arc::new(MemoryStore::new()),
+                    Config::new(),
+                )
+                .await
+                .unwrap();
+                one_key_record(&dev, &c, &key);
+                let t0 = Instant::now();
+                let got = dev.get(&wire::range_name(&c, &range)).await.unwrap().got;
+                let took = t0.elapsed();
+                let Got::Entries(e) = got else {
+                    panic!("a range read answers entries: {got:?}");
+                };
+                // However slow the path, never past the cap of its bound.
+                let bound = range_bound(dev.inner.config.first_look, dev.inner.config.lifetime);
+                dev.shutdown();
+                (e, took, bound)
+            }
+        };
+        let values = |e: &Entries| -> Vec<String> {
+            e.entries
+                .iter()
+                .map(|x| String::from_utf8(x.content.get("t").unwrap().to_vec()).unwrap())
+                .collect()
+        };
+
+        let clean = Lossy::new(&writer, BTreeSet::new(), Duration::ZERO);
+        let (e, _, _) = read(Arc::clone(&clean)).await;
+        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
+        let probed = clean.asked(&blocks);
+        // The search's first guess bisects the listed seqs.
+        let (guess, within) = (blocks[32].clone(), blocks[20].clone());
+        assert!(
+            probed.contains(&guess) && probed.contains(&within),
+            "a read without loss probes its first guess and the blocks in range"
+        );
+
+        // Every ask of a probe — FETCH_TRIES asks of a lifetime and the
+        // reply slack, and the pauses between them — is lost.
+        let lifetime = writer.inner.config.lifetime + ndn_app::consumer::REPLY_SLACK;
+        let probe =
+            lifetime * FETCH_TRIES + (0..FETCH_TRIES - 1).map(retry_pause).sum::<Duration>();
+        let lossy = Lossy::new(&writer, [guess, within].into(), probe);
+        let (e, took, bound) = read(Arc::clone(&lossy)).await;
+        assert_eq!(
+            lossy.asked(&blocks),
+            probed,
+            "a lost probe does not widen the search: it probes the blocks a read without loss \
+             probes"
+        );
+        assert!(
+            e.missing.is_empty(),
+            "a lost probe is asked again, not answered missing: {:?}",
+            e.missing
+        );
+        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
+        assert!(took <= bound, "within its bound's cap {bound:?}: {took:?}");
+        writer.shutdown();
     }
 
     #[tokio::test(start_paused = true)]
@@ -22762,3 +23578,6 @@ mod scoped;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fetch_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod walk_tests;
