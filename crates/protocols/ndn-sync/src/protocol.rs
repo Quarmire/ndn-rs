@@ -31,14 +31,23 @@ pub struct ObservedState {
 impl ObservedState {
     /// Record one advertised `(name, boot, seq)`, keeping the highest
     /// `(boot, seq)` seen (boot-major, matching the SVS ordering). Called by the
-    /// SVS task for every entry of every *authenticated* inbound Sync Interest —
-    /// including entries naming the local node.
+    /// SVS task for every entry of every *authenticated* inbound Sync Interest
+    /// that names the local node or a producer its state vector tracks.
     pub(crate) fn record(&self, name: &Name, boot: u64, seq: u64) {
         let mut map = self.map.write().expect("ObservedState poisoned");
         let slot = map.entry(name.clone()).or_insert((0, 0));
         if (boot, seq) > *slot {
             *slot = (boot, seq);
         }
+    }
+
+    /// Forget `name`: a producer the state vector no longer tracks
+    /// (`SvsConfig::max_producers`).
+    pub(crate) fn forget(&self, name: &Name) {
+        self.map
+            .write()
+            .expect("ObservedState poisoned")
+            .remove(name);
     }
 
     /// Highest observed seq for `name` (boot ignored), or `None` if never

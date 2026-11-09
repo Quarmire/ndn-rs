@@ -39,4 +39,4 @@ pub use codec::{
     NeighborAdvance, NeighborSeqState, NeighborSnapshot, StateEntry, SvsLocalError,
     decode_svs_data, encode_svs_data,
 };
-pub use core::{MAX_GAP_SPAN, MAX_TRACKED_PRODUCERS, StateVectorEntry, SvsCore};
+pub use core::{MAX_GAP_SPAN, MAX_TRACKED_PRODUCERS, StateVectorEntry, SvsCore, Vouch};

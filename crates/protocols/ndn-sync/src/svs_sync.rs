@@ -73,7 +73,19 @@ use ndn_packet::encode::InterestBuilder;
 use crate::dialect::WireDialect;
 use crate::protocol::{ObservedState, SyncHandle, SyncUpdate};
 use crate::security::{SyncSigner, SyncValidator};
-use crate::svs::{StateEntry, SvsNode};
+use crate::svs::{MAX_TRACKED_PRODUCERS, StateEntry, SvsNode};
+
+/// Whether the application vouches for a producer of the group
+/// ([`SvsConfig::vouch`]): one it vouches for is never displaced from the
+/// state vector by one it does not.
+#[derive(Clone)]
+pub struct ProducerVouch(pub Arc<dyn Fn(&Name) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for ProducerVouch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProducerVouch(..)")
+    }
+}
 
 // MappingData TLV codes per ndn-svs/ndn-svs/tlv.hpp (the piggyback
 // codec; the state-vector codec now lives in `crate::dialect`).
@@ -180,6 +192,17 @@ pub struct SvsConfig {
     /// consumer (a chain-replication gate) that must be able to reject a delivered item without
     /// poisoning convergence — a rejected item is simply never acked, and its gap stays visible.
     pub auto_ack: bool,
+    /// The most producers the group's state vector tracks besides this
+    /// node (default [`MAX_TRACKED_PRODUCERS`]). Every Sync Interest carries
+    /// the whole vector, and Sync Interests are unsigned by default: past
+    /// it, a new producer displaces the one that brought something longest
+    /// ago that [`Self::vouch`] does not vouch for, so names a Sync
+    /// Interest carries never grow the vector, the memory noted of the
+    /// group or what this node sends beyond it.
+    pub max_producers: usize,
+    /// The producers the application vouches for (from signed data it
+    /// holds): never displaced by one it does not ([`Self::max_producers`]).
+    pub vouch: Option<ProducerVouch>,
 }
 
 impl Default for SvsConfig {
@@ -196,6 +219,8 @@ impl Default for SvsConfig {
             signer: crate::security::default_signer(),
             validator: crate::security::default_validator(),
             auto_ack: true,
+            max_producers: MAX_TRACKED_PRODUCERS,
+            vouch: None,
         }
     }
 }
@@ -331,7 +356,12 @@ impl GroupCore {
         update_tx: mpsc::Sender<SyncUpdate>,
         observed: Arc<ObservedState>,
     ) -> Self {
-        let node = SvsNode::with_boot_seq(local_name, config.local_boot, config.local_seq);
+        let vouch = config.vouch.clone().map(|v| {
+            let v = v.0;
+            Box::new(move |n: &Name| v(n)) as crate::svs::Vouch
+        });
+        let node = SvsNode::with_boot_seq(local_name, config.local_boot, config.local_seq)
+            .with_bound(config.max_producers, vouch);
         let local_key = node.local_key().to_string();
         let next_send = Instant::now() + jitter_interval(&config);
         Self {
@@ -414,11 +444,6 @@ impl GroupCore {
         else {
             return;
         };
-        // N-9: record observed per-name high-water from every authenticated entry
-        // (incl. one naming us, which the merge below drops). Strictly observational.
-        for e in &remote_sv {
-            self.observed.record(&e.name, e.boot, e.seq);
-        }
         let snapshot = self.node.snapshot().await;
         let covers_local = remote_covers_local(&snapshot, &remote_sv);
         let local_ahead = local_ahead_of_remote(&snapshot, &remote_sv);
@@ -430,8 +455,26 @@ impl GroupCore {
         } else {
             self.node.merge_deferred(&remote_sv).await
         };
+        // N-9: record the observed per-name high-water of each authenticated
+        // entry naming this node (which the merge drops) or a producer the
+        // vector tracks — strictly observational; and forget the producers
+        // the merge displaced ([`SvsConfig::max_producers`]), so names a Sync
+        // Interest carries never grow what is noted beyond the vector.
+        for e in &remote_sv {
+            if e.name == *self.node.local_name() || self.node.tracks(&e.name).await {
+                self.observed.record(&e.name, e.boot, e.seq);
+            }
+        }
+        let mut displaced = std::collections::HashSet::new();
+        for gone in self.node.take_displaced().await {
+            self.observed.forget(&gone);
+            let key = gone.to_string();
+            self.pending.remove(&key);
+            displaced.insert(key);
+        }
         for (peer_key, low, high) in gaps {
-            if peer_key == self.local_key {
+            // A producer displaced in this very merge is not told of.
+            if peer_key == self.local_key || displaced.contains(&peer_key) {
                 continue;
             }
             let mapping = peer_mappings.get(&peer_key).cloned();

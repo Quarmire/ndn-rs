@@ -7,6 +7,7 @@
 //! semantics are identical because gaps are produced in *input* order and every
 //! comparison is per-key, never iteration-order dependent.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -15,12 +16,17 @@ use ndn_packet::Name;
 
 use crate::codec::StateEntry;
 
-/// Ceiling on distinct producers tracked in the local state vector (audit
-/// SY-1). Under the accept-all default validator a peer can pack a Sync Interest
-/// with thousands of fabricated producer names; this bounds the map so it can't
-/// grow without limit. Generous — far above any realistic group size — and
-/// existing producers always update even at the cap.
+/// Default ceiling on distinct producers tracked in the local state vector
+/// besides the node itself (audit SY-1). Under the accept-all default
+/// validator a peer can pack a Sync Interest with fabricated producer names;
+/// this bounds the map, and with it every Sync Interest the node sends,
+/// which carries the whole vector. An application that knows its group's
+/// members sets a tighter one ([`SvsCore::bound`]).
 pub const MAX_TRACKED_PRODUCERS: usize = 16_384;
+
+/// Whether the application vouches for a producer ([`SvsCore::bound`]): one
+/// it vouches for is never displaced by one it does not.
+pub type Vouch = Box<dyn Fn(&Name) -> bool + Send + Sync>;
 
 /// Maximum publications a single `merge` will advertise as a gap for one
 /// producer (audit SY-2). A forged state-vector entry with `SeqNo = u64::MAX`
@@ -58,6 +64,19 @@ pub struct SvsCore {
     local_name: Name,
     local_boot: u64,
     vector: BTreeMap<Name, (u64, u64)>,
+    /// When each producer besides this node last brought something to
+    /// fetch (a tick), and the producers by that tick: the order they are
+    /// displaced in ([`Self::bound`]).
+    heard: BTreeMap<Name, u64>,
+    order: BTreeMap<u64, Name>,
+    /// The tick of the newest producer heard bringing something.
+    tick: u64,
+    /// The most producers tracked besides this node ([`Self::bound`]).
+    cap: usize,
+    /// The producers the application vouches for ([`Self::bound`]).
+    vouch: Option<Vouch>,
+    /// The producers displaced since [`Self::take_displaced`] last ran.
+    displaced: Vec<Name>,
 }
 
 impl SvsCore {
@@ -78,7 +97,70 @@ impl SvsCore {
             local_name: local_name.clone(),
             local_boot,
             vector: map,
+            heard: BTreeMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            cap: MAX_TRACKED_PRODUCERS,
+            vouch: None,
+            displaced: Vec::new(),
         }
+    }
+
+    /// Track at most `cap` producers besides this node. Past it, a new
+    /// producer bringing something to fetch displaces the producer that
+    /// brought something longest ago that `vouch` does not vouch for — the
+    /// new one itself is refused when every other one is vouched for and it
+    /// is not — else the one longest ago. So a Sync Interest naming many
+    /// producers leaves the vector, and every Sync Interest carrying it,
+    /// bounded, and never displaces a producer the application vouches for
+    /// with one it does not. Without `vouch`, the one longest ago goes.
+    pub fn bound(&mut self, cap: usize, vouch: Option<Vouch>) {
+        self.cap = cap;
+        self.vouch = vouch;
+    }
+
+    /// The producers displaced from the vector since the last call
+    /// ([`Self::bound`]).
+    pub fn take_displaced(&mut self) -> Vec<Name> {
+        core::mem::take(&mut self.displaced)
+    }
+
+    /// Whether `name` is tracked in the vector (this node included).
+    pub fn tracks(&self, name: &Name) -> bool {
+        self.vector.contains_key(name)
+    }
+
+    /// Make room for `name`, a producer not tracked yet ([`Self::bound`]):
+    /// whether it may be tracked. The producers are read from the one that
+    /// brought something longest ago, until one `vouch` does not vouch for.
+    fn admit(&mut self, name: &Name) -> bool {
+        if self.vector.len() <= self.cap {
+            return true;
+        }
+        let vouched = |n: &Name| self.vouch.as_ref().is_some_and(|v| v(n));
+        let victim = match self.order.values().find(|n| !vouched(n)) {
+            Some(n) => n.clone(),
+            None if !vouched(name) => return false,
+            None => match self.order.values().next() {
+                Some(n) => n.clone(),
+                None => return false,
+            },
+        };
+        self.vector.remove(&victim);
+        if let Some(t) = self.heard.remove(&victim) {
+            self.order.remove(&t);
+        }
+        self.displaced.push(victim);
+        true
+    }
+
+    /// Note that `name` brought something to fetch now.
+    fn heard_now(&mut self, name: &Name) {
+        self.tick += 1;
+        if let Some(t) = self.heard.insert(name.clone(), self.tick) {
+            self.order.remove(&t);
+        }
+        self.order.insert(self.tick, name.clone());
     }
 
     /// v2 convenience: boot = 0.
@@ -148,13 +230,15 @@ impl SvsCore {
             if entry.name == self.local_name {
                 continue;
             }
-            // SY-1: bound the number of tracked producers. A new producer is
-            // ignored once the cap is hit; producers we already track still
-            // advance, so a flood of fabricated names can't grow the map.
-            if !self.vector.contains_key(&entry.name) && self.vector.len() >= MAX_TRACKED_PRODUCERS
+            // SY-1: bound the number of tracked producers ([`Self::bound`]).
+            // A new producer whose entry brings nothing to fetch (counter 0)
+            // is not tracked: it adds nothing a later entry of it would not.
+            if !self.vector.contains_key(&entry.name)
+                && (entry.seq == 0 || !self.admit(&entry.name))
             {
                 continue;
             }
+            let before = gaps.len();
             let slot = self.vector.entry(entry.name.clone()).or_insert((0, 0));
             let (lb, ls) = *slot;
             if entry.boot > lb {
@@ -179,6 +263,9 @@ impl SvsCore {
                     slot.1 = high;
                 }
             }
+            if gaps.len() > before {
+                self.heard_now(&entry.name);
+            }
         }
         gaps
     }
@@ -198,8 +285,9 @@ impl SvsCore {
             if seq > slot.1 {
                 slot.1 = seq;
             }
-        } else if self.vector.len() < MAX_TRACKED_PRODUCERS {
-            self.vector.insert(name, (0, seq));
+        } else if seq > 0 && self.admit(&name) {
+            self.vector.insert(name.clone(), (0, seq));
+            self.heard_now(&name);
         }
     }
 
@@ -308,6 +396,33 @@ mod tests {
             .collect();
         node.merge(&flood);
         assert!(node.snapshot().len() <= MAX_TRACKED_PRODUCERS + 1);
+    }
+
+    #[test]
+    fn a_bounded_vector_displaces_unvouched_producers_first() {
+        use alloc::format;
+        let mut node = SvsCore::new(&name("a"));
+        node.bound(4, Some(Box::new(|n: &Name| n.to_string() == "/v")));
+        node.merge(&[e("/v", 3)]);
+        let flood: Vec<StateEntry> = (0..100)
+            .map(|i| e(&format!("/p{i}"), u64::from(i % 2 == 0)))
+            .collect();
+        node.merge(&flood);
+        let snap = node.snapshot();
+        assert!(
+            snap.len() <= 5,
+            "at most the bound and the node: {}",
+            snap.len()
+        );
+        assert!(
+            node.tracks(&"/v".parse().unwrap()),
+            "a vouched producer stays"
+        );
+        assert!(
+            snap.iter().all(|s| s.seq > 0 || s.node == node.local_key()),
+            "a producer at counter 0 is never tracked"
+        );
+        assert_eq!(node.take_displaced().len(), 50 - 3);
     }
 
     #[test]

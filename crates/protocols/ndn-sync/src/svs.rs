@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use ndn_packet::Name;
 
-pub use ndn_svs_core::{MAX_TRACKED_PRODUCERS, StateVectorEntry, SvsCore};
+pub use ndn_svs_core::{MAX_TRACKED_PRODUCERS, StateVectorEntry, SvsCore, Vouch};
 // `StateEntry` continues to be reachable as `crate::svs::StateEntry` (its
 // canonical home moved to the core crate's codec module).
 pub use ndn_svs_core::StateEntry;
@@ -131,6 +131,24 @@ impl SvsNode {
     /// Returns 0 for unknown keys.
     pub async fn seq_for(&self, node_key: &str) -> u64 {
         self.core.read().await.seq_for(node_key)
+    }
+
+    /// This node, tracking at most `cap` producers besides itself, `vouch`
+    /// naming those never displaced by one it does not vouch for
+    /// ([`SvsCore::bound`]).
+    pub fn with_bound(mut self, cap: usize, vouch: Option<Vouch>) -> Self {
+        self.core.get_mut().bound(cap, vouch);
+        self
+    }
+
+    /// The producers displaced since the last call ([`SvsCore::bound`]).
+    pub async fn take_displaced(&self) -> Vec<Name> {
+        self.core.write().await.take_displaced()
+    }
+
+    /// Whether `name` is tracked in the vector (this node included).
+    pub async fn tracks(&self, name: &Name) -> bool {
+        self.core.read().await.tracks(name)
     }
 }
 
