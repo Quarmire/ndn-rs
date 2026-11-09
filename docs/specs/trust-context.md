@@ -1853,6 +1853,23 @@ reason for the adopter. A fetcher asks again for a `bad-signature` answer
 arrives does the adoption or refresh end, saying why. Before this rule one
 forged copy of a version under fault ended an adoption by name.
 
+**Asking again under loss (normative for ndn-rs).** Each fetch of steps 1
+and 4 — in an adoption by name, a scoped adoption and a refresh — is one
+*ask* lasting the Interest's lifetime (at least the consumer's 4.5 s),
+inside which the Interest is expressed again with a fresh nonce every
+1 s while at least 250 ms of it is left; every earlier Interest stays
+pending, so a late answer to it counts. An ask nothing answered is asked
+again, at most **3** such asks; an ask answered `bad-signature` is asked
+again at once; at most **8** asks in all. Then the fetch ends with no
+answer (a refresh's **Unreachable**). On the faulty network of
+data-layer.md §18.1 an ask goes unanswered under one time in twenty and
+three asks under one in ten thousand, while a path that is down costs a
+fetch three lifetimes (some 15 s) — before this rule, eight asks of one
+Interest each, some 36 s, which outlasted a person waiting at a recovery
+screen for the question that nothing answered (data-layer.md §17.1). A
+command to a CA (parameters or a signature) is never asked again behind
+its caller's back.
+
 ### 8.2 Refresh
 
 A node that does not hold the namespace root key refreshes each held context
