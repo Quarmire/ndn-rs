@@ -2,10 +2,12 @@
 //!
 //! `CertFetcher` retrieves certificates over NDN by expressing Interests
 //! for certificate names. It deduplicates concurrent requests for the same
-//! certificate, caches results in the shared `CertCache`, and remembers
-//! recent failures (a negative cache) so a stream of Data signed by an
-//! unfetchable key costs one cert Interest per backoff window rather than one
-//! per packet.
+//! certificate, holds results in the shared `CertCache` as unverified (a
+//! validator's walk vouches for them only by reaching an anchor through
+//! them, and drops a copy it cannot vouch for), and remembers recent
+//! failures (a negative cache) so a stream of Data signed by an unfetchable
+//! key costs one cert Interest per backoff window rather than one per
+//! packet.
 //!
 //! A fetcher may also ask the neighbour that delivered the Data being
 //! validated ([`CertFetcher::with_direct_fetch`], [`CertFetcher::fetch_from`]),
@@ -203,6 +205,21 @@ impl CertFetcher {
         self.failed
             .get(&(Arc::clone(cert_name), face))
             .is_some_and(|f| f.absent && tokio::time::Instant::now() < f.retry_at)
+    }
+
+    /// Whether the last fetch of `cert_name` — from any source, asked with
+    /// any face — brought no certificate, and the fetcher would not ask for
+    /// it again yet. A walk that waits for it drops the unverified
+    /// certificates below it, which nothing can vouch for while it cannot
+    /// be had (trust-context.md §6.5).
+    pub fn failed_recently(&self, cert_name: &Name) -> bool {
+        if self.failed.is_empty() {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        self.failed
+            .iter()
+            .any(|f| *f.key().0 == *cert_name && now < f.value().retry_at)
     }
 
     /// Fetch the certificate `cert_name` resolves to (a key name — the
@@ -434,7 +451,10 @@ impl CertFetcher {
             .into());
         }
         let cert = Certificate::decode(&data)?;
-        self.cert_cache.insert(cert.clone());
+        // Held unverified: a walk vouches for it only by reaching an anchor
+        // through it, and it never displaces a certificate vouched for
+        // under its name (trust-context.md §6.5).
+        self.cert_cache.insert_unverified(cert.clone());
         Ok(cert)
     }
 

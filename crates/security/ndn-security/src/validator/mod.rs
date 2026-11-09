@@ -220,17 +220,22 @@ impl Validator {
     }
 
     /// A validator that judges as this one does — the same certificate
-    /// cache, fetcher, chain depth and posture, over a live view of the
+    /// cache, fetcher, chain depth and refusals, over a live view of the
     /// same keyring — and also judges the names of `scoped`'s person's
     /// namespace by `scoped`'s context wherever this keyring holds none
     /// ([`Keyring::with_scoped_view`]): for one scope of its holder's
     /// (data-layer.md §6.3). This validator itself, and every other user of
     /// its keyring (a forwarder's validation stage), keep refusing that
     /// namespace as one not held. Expected-context admissions are this
-    /// validator's own and are not carried over. A certificate the view
-    /// fetches enters the shared cache, where it vouches for nothing by
-    /// itself: every walk ends at the anchors of the context judging the
-    /// packet.
+    /// validator's own and are not carried over.
+    ///
+    /// A view walks every chain to the anchors of the context judging the
+    /// packet, whatever this validator's posture: made from an
+    /// [`accept_signed`](Self::accept_signed) validator (a forwarder's, which
+    /// an embedded data layer verifies with), it still requires the anchors,
+    /// since the scoped writer's genesis is all that vouches for its keys
+    /// (trust-context.md §4.5.7). A certificate the view fetches vouches for
+    /// nothing by itself.
     pub fn scoped_view(&self, scoped: &crate::keyring::ScopedContext) -> Validator {
         Self {
             keyring: Arc::new(self.keyring.with_scoped_view(scoped)),
@@ -247,7 +252,7 @@ impl Validator {
             rejected_total: AtomicU64::new(0),
             expectations: Default::default(),
             expecting: Default::default(),
-            require_anchor: self.require_anchor,
+            require_anchor: true,
             refuse_without_anchors: self.refuse_without_anchors,
             refused_certs: DashMap::new(),
         }
@@ -263,9 +268,22 @@ impl Validator {
     /// The signer's certificate is trusted as resolved: on a forwarder it is
     /// itself a packet the engine validated this way (against its own
     /// signer) before the certificate fetch received it.
+    ///
+    /// A person's names (`/user/<h>`, held or judged through a scoped view)
+    /// are the exception: every walk for one ends at the anchors of the
+    /// namespace's context, as under the default posture, since nothing but
+    /// the namespace's genesis vouches for its keys (trust-context.md
+    /// §4.5.6 note 4).
     pub fn accept_signed(mut self) -> Self {
         self.require_anchor = false;
         self
+    }
+
+    /// Whether a walk for a packet named `name` must end at a trust anchor:
+    /// always but under [`Self::accept_signed`], and under it too for a name
+    /// in a person's self-certifying namespace.
+    pub(super) fn anchor_required(&self, name: &Name) -> bool {
+        self.require_anchor || crate::self_certifying::in_personal_namespace(name)
     }
 
     /// Refuse every packet that names a signer — with
@@ -288,7 +306,7 @@ impl Validator {
     /// `name` that names a signer, if the context governing `name` holds no
     /// trust anchor.
     pub(super) fn unanchored(&self, name: &Name) -> Option<TrustError> {
-        if !self.refuse_without_anchors || !self.require_anchor {
+        if !self.refuse_without_anchors || !self.anchor_required(name) {
             return None;
         }
         let ctx = self.keyring.context_for(name);

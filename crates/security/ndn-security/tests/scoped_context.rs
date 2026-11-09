@@ -277,3 +277,80 @@ async fn a_scoped_context_moves_on_only_forward() {
         Err(AdoptRefusal::NotFromGenesis { .. })
     ));
 }
+
+/// A key Mallory makes up under `ns` (`<ns>/m/KEY/1`), its certificate
+/// issued by Mallory herself and put in `cache` (as a fetch through a path
+/// that carries the namespace unvalidated would), and Data `<ns>/m/doc` it
+/// signs.
+fn made_up_device(ns: &Name, cache: &ndn_security::CertCache) -> Data {
+    let mallory = SecurityManager::new();
+    let key = ns.clone().append("m").append("KEY").append("1");
+    mallory.generate_ed25519(key.clone()).unwrap();
+    let pk = mallory.get_signer_sync(&key).unwrap().public_key().unwrap();
+    cache.insert(mallory.issue_self_signed(&key, pk, u64::MAX).unwrap());
+    let signer = mallory.get_signer_sync(&key).unwrap();
+    let name = ns.clone().append("m").append("doc");
+    let wire = DataBuilder::new(name, b"payload").sign_sync(
+        SignatureType::SignatureEd25519,
+        Some(&key),
+        |region| signer.sign_sync(region).unwrap(),
+    );
+    Data::decode(wire).unwrap()
+}
+
+/// A scoped view walks every packet to the anchors of the writer's context,
+/// whatever the posture of the validator it is made from: a view made from
+/// an accept-signed validator (a forwarder's, which an embedded data layer
+/// verifies with) refuses a device Mallory made up under Carol's namespace,
+/// whose certificate she issued herself, and accepts Carol's own phone
+/// (trust-context.md §4.5.7).
+#[tokio::test]
+async fn a_scoped_view_of_an_accept_signed_validator_walks_to_the_anchors() {
+    let carol = person(3).await;
+    let (bob, base) = bob(&[&carol]).await;
+    let base = base.accept_signed();
+    let forged = made_up_device(&carol.ns, bob.mgr.cert_cache());
+    let view = base.scoped_view(&carol.scoped().await);
+
+    let genuine = carol.data("phone/doc", &carol.mgr, &carol.phone);
+    let through_view = view.validate_durable(&genuine).await;
+    assert!(
+        matches!(through_view, ValidationResult::Valid(_)),
+        "Carol's genuine Data through the view: {through_view:?}"
+    );
+    not_accepted(
+        view.validate_durable(&forged).await,
+        "Data of a device Mallory made up under Carol's namespace, through the view",
+    );
+    not_accepted(
+        view.validate_chain(&forged).await,
+        "the same Data, by the live rule",
+    );
+}
+
+/// A held person's namespace is judged to its anchors under every posture:
+/// an accept-signed validator refuses a device Mallory made up under Bob's
+/// own namespace, whose certificate she issued herself, and accepts Bob's
+/// phone, certified by his root (trust-context.md §4.5.6 note 4).
+#[tokio::test]
+async fn a_held_personal_namespace_walks_to_its_anchors_under_accept_signed() {
+    let (bob, base) = bob(&[]).await;
+    let base = base.accept_signed();
+    let forged = made_up_device(&bob.ns, bob.mgr.cert_cache());
+    bob.mgr.cert_cache().insert(bob.phone_cert.clone());
+
+    let genuine = bob.data("phone/doc", &bob.mgr, &bob.phone);
+    let result = base.validate_durable(&genuine).await;
+    assert!(
+        matches!(result, ValidationResult::Valid(_)),
+        "Bob's phone in his own namespace: {result:?}"
+    );
+    not_accepted(
+        base.validate_durable(&forged).await,
+        "Data of a device Mallory made up under Bob's namespace",
+    );
+    not_accepted(
+        base.validate_chain(&forged).await,
+        "the same Data, by the live rule",
+    );
+}

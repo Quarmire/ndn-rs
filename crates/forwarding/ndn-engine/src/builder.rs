@@ -962,12 +962,15 @@ fn resolve_security_profile(
 
         (SecurityProfile::AcceptSigned, Some(mgr)) => {
             // Share the manager's keyring: its ambient context already
-            // holds the loaded anchors; just set the operative schema.
+            // holds the loaded anchors; just set the operative schema. The
+            // chain depth is the default's: a person's names (`/user/<h>`),
+            // and every scoped view made from this validator, walk to the
+            // anchors under this posture too (trust-context.md §4.5.6–7).
             mgr.keyring()
                 .ambient()
                 .set_schema(TrustSchema::accept_all());
             Some(Arc::new(
-                Validator::with_keyring(Arc::clone(mgr.keyring()), mgr.cert_cache_arc(), None, 1)
+                Validator::with_keyring(Arc::clone(mgr.keyring()), mgr.cert_cache_arc(), None, 5)
                     .accept_signed(),
             ))
         }

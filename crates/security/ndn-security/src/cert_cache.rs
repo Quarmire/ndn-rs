@@ -118,6 +118,18 @@ fn pick_newest(certs: impl IntoIterator<Item = Certificate>, now: u64) -> Option
     valid.or(any)
 }
 
+/// [`pick_newest`] among `certs` vouched for, else among the unverified
+/// ones, with whether the pick is vouched for.
+fn newest_by_kind(
+    certs: impl Iterator<Item = (Certificate, bool)>,
+    now: u64,
+) -> Option<(Certificate, bool)> {
+    let (vouched, unverified): (Vec<_>, Vec<_>) = certs.partition(|(_, vouched)| *vouched);
+    pick_newest(vouched.into_iter().map(|(c, _)| c), now)
+        .map(|c| (c, true))
+        .or_else(|| pick_newest(unverified.into_iter().map(|(c, _)| c), now).map(|c| (c, false)))
+}
+
 /// Parse `(valid_from_ns, valid_until_ns)` from the cert's `ValidityPeriod`
 /// sub-TLV. Falls back to `(0, u64::MAX)` when absent or malformed.
 fn decode_validity_period(signed_region: &[u8]) -> (u64, u64) {
@@ -175,11 +187,31 @@ fn decode_validity_period(signed_region: &[u8]) -> (u64, u64) {
 /// (named exactly after their key) are found the same way. A lookup only ever
 /// returns certificates of the key `name` names, never another key's
 /// certificate that merely lies under `name`.
+///
+/// Certificates are held in two kinds (trust-context.md §6.5):
+///
+/// - **vouched for**: inserted by their holder ([`insert`](Self::insert):
+///   its own certificates, its anchors, what it provisioned), or admitted
+///   by a validator's walk that reached a trust anchor through them;
+/// - **unverified**: fetched over the network
+///   ([`insert_unverified`](Self::insert_unverified), the
+///   [`CertFetcher`](crate::CertFetcher)), which no walk has vouched for
+///   yet. A walk takes one when no certificate vouched for answers, and a
+///   walk that cannot vouch for it drops it, so a forged copy never outlives
+///   the walk that met it. It never displaces a certificate vouched for
+///   under its name, and never answers a KeyDigest lookup.
+///
+/// Neither kind vouches for a packet by itself: every walk ends at the
+/// anchors of the context judging the packet.
 pub struct CertCache {
+    /// Certificates vouched for, by name.
     local: DashMap<Arc<Name>, Certificate>,
-    /// Key name → names of its cached certificates.
+    /// Fetched certificates no walk has vouched for yet, by name.
+    unverified: DashMap<Arc<Name>, Certificate>,
+    /// Key name → names of its cached certificates, of either kind.
     by_key: DashMap<Name, Vec<Arc<Name>>>,
-    /// SHA-256 of a public key → the key name it is certified under.
+    /// SHA-256 of a public key → the key name a certificate vouched for
+    /// certifies it under.
     by_digest: DashMap<[u8; 32], Name>,
     /// Cut-manifest packets, by full name: resolved and fetched like
     /// certificates by a durable walk ([`crate::cut_manifest`]).
@@ -190,6 +222,7 @@ impl CertCache {
     pub fn new() -> Self {
         Self {
             local: DashMap::new(),
+            unverified: DashMap::new(),
             by_key: DashMap::new(),
             by_digest: DashMap::new(),
             manifests: crate::cut_manifest::CutManifests::default(),
@@ -206,12 +239,12 @@ impl CertCache {
     /// The certificate `name` resolves to: among cached certificates of the
     /// key `name` names (a key name, a full certificate name, or a
     /// certificate name without its version) that start with `name`, the
-    /// newest one valid now; when
+    /// newest one valid now, one vouched for before an unverified one; when
     /// none is valid, the newest one regardless, so a caller can tell an
     /// expired certificate from a missing one. See
     /// [`get_valid`](Self::get_valid) for valid certificates only.
     pub fn get(&self, name: &Arc<Name>) -> Option<Certificate> {
-        pick_newest(self.matching(name), now_ns())
+        self.get_any(name).map(|(cert, _)| cert)
     }
 
     /// As [`get`](Self::get), but only a certificate valid now: `None` when
@@ -219,17 +252,42 @@ impl CertCache {
     /// valid), so the caller fetches a current one — e.g. the certificate a
     /// renewal issued in place of an expired one it still caches.
     pub fn get_valid(&self, name: &Name) -> Option<Certificate> {
+        self.resolve(name).map(|(cert, _)| cert)
+    }
+
+    /// [`get_valid`](Self::get_valid), and whether that certificate is
+    /// vouched for (else it is unverified): the newest valid one vouched
+    /// for, else the newest valid unverified one.
+    pub(crate) fn resolve(&self, name: &Name) -> Option<(Certificate, bool)> {
         let now = now_ns();
-        pick_newest(self.matching(name).filter(|c| c.is_valid_at(now)), now)
+        newest_by_kind(self.matching(name).filter(|(c, _)| c.is_valid_at(now)), now)
     }
 
-    /// Every cached certificate under `name` (see [`get`](Self::get)), in no
-    /// particular order.
+    /// [`get`](Self::get), and whether that certificate is vouched for.
+    pub(crate) fn get_any(&self, name: &Name) -> Option<(Certificate, bool)> {
+        self.resolve(name)
+            .or_else(|| newest_by_kind(self.matching(name), now_ns()))
+    }
+
+    /// Every cached certificate under `name` (see [`get`](Self::get)), of
+    /// either kind, in no particular order.
     pub fn all(&self, name: &Name) -> Vec<Certificate> {
-        self.matching(name).collect()
+        self.matching(name).map(|(c, _)| c).collect()
     }
 
-    fn matching(&self, name: &Name) -> impl Iterator<Item = Certificate> + '_ {
+    /// [`all`](Self::all), split into those vouched for and those unverified.
+    pub(crate) fn all_by_kind(&self, name: &Name) -> (Vec<Certificate>, Vec<Certificate>) {
+        let (vouched, unverified): (Vec<_>, Vec<_>) =
+            self.matching(name).partition(|(_, vouched)| *vouched);
+        (
+            vouched.into_iter().map(|(c, _)| c).collect(),
+            unverified.into_iter().map(|(c, _)| c).collect(),
+        )
+    }
+
+    /// The certificates `name` resolves to, each with whether it is vouched
+    /// for.
+    fn matching(&self, name: &Name) -> impl Iterator<Item = (Certificate, bool)> + '_ {
         let names: Vec<Arc<Name>> = key_candidates(name)
             .into_iter()
             .find_map(|key| self.by_key.get(&key).map(|r| r.value().clone()))
@@ -238,13 +296,18 @@ impl CertCache {
         names
             .into_iter()
             .filter(move |cn| resolves_to(&name, cn))
-            .filter_map(|cn| self.local.get(&cn).map(|r| r.value().clone()))
+            .filter_map(|cn| match self.local.get(&cn) {
+                Some(r) => Some((r.value().clone(), true)),
+                None => self.unverified.get(&cn).map(|r| (r.value().clone(), false)),
+            })
     }
 
     /// Look up a certificate by the SHA-256 of its public key: the newest
-    /// valid certificate of the key holding that public key. Only matches
-    /// certs already in the cache — `KeyDigest` cannot drive a network fetch
-    /// because the cert's name is not known to the caller.
+    /// valid certificate vouched for of the key holding that public key.
+    /// Only matches certs already in the cache — `KeyDigest` cannot drive a
+    /// network fetch because the cert's name is not known to the caller —
+    /// and never an unverified one, whose public key anyone could have
+    /// written under any key name.
     pub fn get_by_key_digest(&self, digest: &[u8]) -> Option<Certificate> {
         use sha2::{Digest, Sha256};
         let digest: &[u8; 32] = digest.try_into().ok()?;
@@ -252,21 +315,64 @@ impl CertCache {
         // A key name may (rarely) be certified for other public keys too;
         // only certificates of the digested public key answer.
         let of_key = |c: &Certificate| <[u8; 32]>::from(Sha256::digest(&c.public_key)) == *digest;
-        pick_newest(self.matching(&key_name).filter(of_key), now_ns())
+        pick_newest(
+            self.matching(&key_name)
+                .filter(|(c, vouched)| *vouched && of_key(c))
+                .map(|(c, _)| c),
+            now_ns(),
+        )
     }
 
+    /// Hold `cert` as vouched for: its holder inserts it (its own
+    /// certificate, an anchor, one it provisioned or checked itself). It
+    /// replaces any certificate cached under its name.
     pub fn insert(&self, cert: Certificate) {
         use sha2::{Digest, Sha256};
         let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
-        let key_name = cert.key_name();
-        self.by_digest.insert(digest, key_name.clone());
-        {
-            let mut names = self.by_key.entry(key_name).or_default();
-            if !names.contains(&cert.name) {
-                names.push(Arc::clone(&cert.name));
-            }
-        }
+        self.by_digest.insert(digest, cert.key_name());
+        self.index(&cert);
+        self.unverified.remove(&cert.name);
         self.local.insert(Arc::clone(&cert.name), cert);
+    }
+
+    /// Hold `cert`, fetched over the network, as unverified: a walk takes
+    /// it while no certificate vouched for answers, admits it once it
+    /// reaches a trust anchor through it, and drops it when it cannot vouch
+    /// for it. Not taken (`false`) while a certificate vouched for is held
+    /// under its name, which a fetched copy never displaces; it replaces an
+    /// unverified one.
+    pub fn insert_unverified(&self, cert: Certificate) -> bool {
+        if self.local.contains_key(&cert.name) {
+            return false;
+        }
+        self.index(&cert);
+        self.unverified.insert(Arc::clone(&cert.name), cert);
+        true
+    }
+
+    /// Vouch for `cert`, which a walk just verified up to a trust anchor:
+    /// held from now on as vouched for, in place of any unverified copy
+    /// under its name. A certificate vouched for under its name already
+    /// stays as it is.
+    pub(crate) fn admit(&self, cert: &Certificate) {
+        if self.local.contains_key(&cert.name) {
+            return;
+        }
+        self.insert(cert.clone());
+    }
+
+    /// Drop `cert` if it is held unverified as exactly this copy (the same
+    /// signed bytes and signature value): a walk could not vouch for it.
+    /// Returns whether it was dropped.
+    pub(crate) fn drop_unverified(&self, cert: &Certificate) -> bool {
+        let Some((_, dropped)) = self
+            .unverified
+            .remove_if(&cert.name, |_, held| same_copy(held, cert))
+        else {
+            return false;
+        };
+        self.unindex(&dropped, false);
+        true
     }
 
     /// Evict every certificate under `name` (e.g. once its key is revoked):
@@ -275,42 +381,72 @@ impl CertCache {
     pub fn remove(&self, name: &Name) -> Option<Certificate> {
         let removed: Vec<Certificate> = self
             .matching(name)
-            .filter_map(|cert| self.local.remove(&cert.name).map(|(_, c)| c))
+            .filter_map(|(cert, vouched)| {
+                let held = if vouched {
+                    &self.local
+                } else {
+                    &self.unverified
+                };
+                let (_, c) = held.remove(&cert.name)?;
+                self.unindex(&c, vouched);
+                Some(c)
+            })
             .collect();
-        for cert in &removed {
-            self.unindex(cert);
-        }
         pick_newest(removed, now_ns())
     }
 
     /// Evict `cert` if the cache holds exactly that copy under its name (the
-    /// same signed bytes and signature value): a copy a chain walk refused
-    /// is not kept to answer for its key again, while an honest copy cached
-    /// under that name since is left alone. Returns whether it was evicted.
+    /// same signed bytes and signature value), of either kind: a copy a
+    /// chain walk refused — its signature does not verify under its
+    /// issuer's key — is not kept to answer for its key again, while an
+    /// honest copy cached under that name since is left alone. Returns
+    /// whether it was evicted.
     pub fn evict(&self, cert: &Certificate) -> bool {
-        let Some((_, evicted)) = self.local.remove_if(&cert.name, |_, held| {
-            held.sig_value == cert.sig_value && held.signed_region == cert.signed_region
-        }) else {
-            return false;
-        };
-        self.unindex(&evicted);
-        true
+        if let Some((_, evicted)) = self
+            .local
+            .remove_if(&cert.name, |_, held| same_copy(held, cert))
+        {
+            self.unindex(&evicted, true);
+            return true;
+        }
+        self.drop_unverified(cert)
     }
 
-    /// Drop the indices of `cert`, just removed from `local`.
-    fn unindex(&self, cert: &Certificate) {
+    /// Index `cert`'s name under its key.
+    fn index(&self, cert: &Certificate) {
+        let mut names = self.by_key.entry(cert.key_name()).or_default();
+        if !names.contains(&cert.name) {
+            names.push(Arc::clone(&cert.name));
+        }
+    }
+
+    /// Drop the indices of `cert`, just removed from `local` (`vouched`) or
+    /// from `unverified`.
+    fn unindex(&self, cert: &Certificate, vouched: bool) {
         use sha2::{Digest, Sha256};
         let key_name = cert.key_name();
-        if let Some(mut names) = self.by_key.get_mut(&key_name) {
-            names.retain(|cn| *cn != cert.name);
+        if !self.local.contains_key(&cert.name) && !self.unverified.contains_key(&cert.name) {
+            if let Some(mut names) = self.by_key.get_mut(&key_name) {
+                names.retain(|cn| *cn != cert.name);
+            }
+            self.by_key
+                .remove_if(&key_name, |_, names| names.is_empty());
         }
-        self.by_key
-            .remove_if(&key_name, |_, names| names.is_empty());
-        if !self.by_key.contains_key(&key_name) {
+        let still_vouched = self
+            .by_key
+            .get(&key_name)
+            .is_some_and(|names| names.iter().any(|cn| self.local.contains_key(cn)));
+        if vouched && !still_vouched {
             let digest: [u8; 32] = Sha256::digest(&cert.public_key).into();
             self.by_digest.remove_if(&digest, |_, k| *k == key_name);
         }
     }
+}
+
+/// Whether `a` and `b` are the same copy of a certificate: the same signed
+/// bytes and signature value.
+fn same_copy(a: &Certificate, b: &Certificate) -> bool {
+    a.sig_value == b.sig_value && a.signed_region == b.signed_region
 }
 
 /// The key names a lookup for `name` can fall under: the key of a full
@@ -629,5 +765,44 @@ mod tests {
         assert!(cache.get(&own).is_some());
         let eve: Arc<Name> = Arc::new("/home/bob/eve/KEY/e".parse().unwrap());
         assert!(cache.get(&eve).is_some());
+    }
+
+    /// A fetched copy never displaces a certificate vouched for under its
+    /// name, never answers a KeyDigest lookup, and answers for its key only
+    /// while no certificate vouched for does (trust-context.md §6.5).
+    #[test]
+    fn a_fetched_copy_never_displaces_a_certificate_vouched_for() {
+        use sha2::{Digest, Sha256};
+        let cache = CertCache::new();
+        let honest = cert("/a/KEY/k/self/v=1", 1, u64::MAX);
+        cache.insert(honest.clone());
+        let mut forged = cert("/a/KEY/k/self/v=1", 1, u64::MAX);
+        forged.public_key = Bytes::from_static(&[9; 32]);
+        assert!(!cache.insert_unverified(forged.clone()));
+        let key: Arc<Name> = Arc::new("/a/KEY/k".parse().unwrap());
+        assert_eq!(cache.get(&key).unwrap().public_key, honest.public_key);
+
+        let mut newer = cert("/a/KEY/k/self/v=2", 2, u64::MAX);
+        newer.public_key = Bytes::from_static(&[9; 32]);
+        assert!(cache.insert_unverified(newer.clone()));
+        assert_eq!(
+            cache
+                .resolve(&key)
+                .map(|(c, vouched)| (c.public_key, vouched)),
+            Some((honest.public_key.clone(), true)),
+            "a newer fetched copy shadowed the certificate vouched for"
+        );
+        assert!(
+            cache
+                .get_by_key_digest(&Sha256::digest(&newer.public_key))
+                .is_none()
+        );
+        cache.remove(&honest.name);
+        assert_eq!(
+            cache.resolve(&key).map(|(c, vouched)| (c.name, vouched)),
+            Some((newer.name.clone(), false))
+        );
+        assert!(cache.drop_unverified(&newer));
+        assert!(cache.get(&key).is_none() && cache.all(&key).is_empty());
     }
 }

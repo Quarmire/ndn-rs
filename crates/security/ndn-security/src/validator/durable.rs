@@ -80,8 +80,13 @@ fn cut_admits(
 ///   digest must match `verifying`'s public key, an exact entry or a range
 ///   accepts it, and with a manifest the manifest lists its bytes).
 /// - Not revoked, of a device role listed in DataRequiresCut: accepted only
-///   while a cached certificate of the key with `verifying`'s public key is
-///   valid at `now` (the reader's clock, which can only refuse).
+///   while a certificate of the key with `verifying`'s public key is valid
+///   at `now` (the reader's clock, which can only refuse): `verifying`
+///   itself, or one the cache holds vouched for — an unverified one only
+///   when `unverified` is set (a walk that reaches for no anchor, which
+///   trusts a certificate as resolved). An unverified copy anyone could
+///   have served, with a later validity, never renews a lapsed key for a
+///   walk that must reach an anchor (trust-context.md §6.5).
 /// - Otherwise clear: no validity period counts.
 pub(crate) fn signer_rule(
     ctx: &SignedTrustContext,
@@ -90,6 +95,7 @@ pub(crate) fn signer_rule(
     locator: &Name,
     verifying: &Certificate,
     now: u64,
+    unverified: bool,
 ) -> SignerRule {
     let key = key_name_of(locator);
     let revoked = [locator, verifying.name.as_ref()]
@@ -111,7 +117,7 @@ pub(crate) fn signer_rule(
             Admit::Missing(name) => SignerRule::Missing(name),
         };
     }
-    if ctx.requires_cut_for(&key) && !valid_now(certs, &key, verifying, now) {
+    if ctx.requires_cut_for(&key) && !valid_now(certs, &key, verifying, now, unverified) {
         return SignerRule::Refused(TrustError::Revoked {
             name: key.to_string(),
             why: TrustError::REVOKED_LAPSED,
@@ -120,14 +126,22 @@ pub(crate) fn signer_rule(
     SignerRule::Clear
 }
 
-/// Whether a certificate of `key` with `verifying`'s public key (it, or
-/// one cached) is valid at `now`.
-pub(crate) fn valid_now(certs: &CertCache, key: &Name, verifying: &Certificate, now: u64) -> bool {
-    verifying.is_valid_at(now)
-        || certs
-            .all(key)
-            .iter()
-            .any(|c| c.public_key == verifying.public_key && c.is_valid_at(now))
+/// Whether a certificate of `key` with `verifying`'s public key is valid at
+/// `now`: `verifying`, or one cached vouched for (or unverified, with
+/// `unverified`).
+pub(crate) fn valid_now(
+    certs: &CertCache,
+    key: &Name,
+    verifying: &Certificate,
+    now: u64,
+    unverified: bool,
+) -> bool {
+    let renews = |c: &Certificate| c.public_key == verifying.public_key && c.is_valid_at(now);
+    if verifying.is_valid_at(now) {
+        return true;
+    }
+    let (vouched, fetched) = certs.all_by_kind(key);
+    vouched.iter().any(renews) || (unverified && fetched.iter().any(renews))
 }
 
 /// Of `certs` (certificates of one key), the newest (NotBefore, then name)
@@ -170,7 +184,8 @@ pub(crate) fn pick_verifying(
 /// clear when it reaches an anchor of `ctx`, or a certificate with no other
 /// issuer above it, without passing a revoked issuer or certificate, and
 /// the packet's own signer passes the durable rule the validator applies
-/// (cut with its key digest and manifest, DataRequiresCut). A packet that
+/// (cut with its key digest and manifest, DataRequiresCut, renewed only by
+/// a certificate vouched for). A packet that
 /// is a certificate `ctx` revokes is not clear, unless its key is revoked
 /// with a cut (in-cut Data needs it to verify). Not known clear: a chain
 /// `certs` cannot follow that far (a certificate not cached, none of them
@@ -226,7 +241,7 @@ pub fn chain_clear(ctx: &SignedTrustContext, certs: &CertCache, data: &Data) -> 
         };
         if depth == 0 {
             if !matches!(
-                signer_rule(ctx, certs, data, &key, &verifying, now),
+                signer_rule(ctx, certs, data, &key, &verifying, now, false),
                 SignerRule::Clear
             ) {
                 return false;
