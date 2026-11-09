@@ -820,6 +820,34 @@ fn parse_sync_interest(
     dialect: WireDialect,
 ) -> Option<ParsedSyncInterest> {
     let interest = ndn_packet::Interest::decode(Bytes::copy_from_slice(raw)).ok()?;
+    sync_interest_parts(group, &interest, dialect, true)
+}
+
+/// The state vector `interest` carries when it is a Sync Interest of
+/// `group` in `dialect` — named `<group>/v=N`, `N` the dialect's
+/// [`WireDialect::sync_version`] — as the group's driver reads it before
+/// it merges; `None` for any other Interest under the group's prefix,
+/// which carries no state of the group. It checks no signature: the
+/// group's [`SvsConfig::validator`] does.
+pub fn sync_interest_state(
+    group: &Name,
+    interest: &ndn_packet::Interest,
+    dialect: WireDialect,
+) -> Option<Vec<StateEntry>> {
+    if !interest.name.has_prefix(group) {
+        return None;
+    }
+    sync_interest_parts(group, interest, dialect, false).map(|(sv, _)| sv)
+}
+
+/// [`parse_sync_interest`] of a decoded Interest; its `MappingData` only
+/// when `with_mappings` asks for it.
+fn sync_interest_parts(
+    group: &Name,
+    interest: &ndn_packet::Interest,
+    dialect: WireDialect,
+    with_mappings: bool,
+) -> Option<ParsedSyncInterest> {
     let components = interest.name.components();
 
     let group_len = group.components().len();
@@ -848,7 +876,7 @@ fn parse_sync_interest(
         let full_tlv = &cursor[..consumed];
 
         match typ {
-            TLV_MAPPING_DATA => {
+            TLV_MAPPING_DATA if with_mappings => {
                 mappings = decode_mapping_data(full_tlv);
             }
             // The state-vector outer type 0xC9 (201) is shared by both

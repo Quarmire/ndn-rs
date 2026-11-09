@@ -1891,6 +1891,13 @@ struct SyncGroup {
     /// The highest counter of each device the group's Sync Interests heard
     /// here carried, this device's own among them ([`Inner::herald`]).
     observed: Option<Arc<ObservedState>>,
+    /// The highest `(boot, counter)` of each device a notice of the group
+    /// brought here ([`Inner::on_update`]), kept for the devices the
+    /// group's state vector tracks and dropped when the device's refresh
+    /// loop ends short of its state ([`Inner::refresh_loop`]): a Sync
+    /// Interest carrying none above them brings nothing newer than is held
+    /// ([`Inner::heard`]).
+    noticed: HashMap<Name, (u64, u64)>,
 }
 
 /// A device whose refresh loop runs ([`Inner::refresh_loop`]).
@@ -8953,6 +8960,7 @@ impl Inner {
                     heralding: false,
                     unheard: None,
                     observed: None,
+                    noticed: HashMap::new(),
                 },
             );
             local_seq
@@ -9127,13 +9135,53 @@ impl Inner {
         });
     }
 
+    /// A Sync Interest of a group joined, heard before the group's driver
+    /// merges it ([`ndn_sync::svs_sync::sync_interest_state`]): it confirms
+    /// that nothing newer is outstanding in the group (spec §15, `get`)
+    /// when the group's validator admits it, no refresh is pending, and its
+    /// state vector carries no device's counter above the highest a notice
+    /// of the group brought here that no refresh ended short of
+    /// ([`SyncGroup::noticed`]) — this device's own aside, which no notice
+    /// brings. A counter above them is news: the merge turns it into a
+    /// notice, whose refresh confirms once it ends having taken it. What
+    /// the notice of a device not kept among those heard brought counts as
+    /// held: such a device is not walked, so nothing of it is outstanding.
+    /// Any other Interest under the group's prefix — a signal (spec §20),
+    /// whoever pushed it, this device among them — carries no state of the
+    /// group and confirms nothing.
     fn heard(&self, interest: &Interest) {
+        let Some(ns) = self
+            .st
+            .lock()
+            .groups
+            .keys()
+            .find(|ns| interest.name.has_prefix(&sync_group(ns)))
+            .cloned()
+        else {
+            return;
+        };
+        let svs = &self.config.svs;
+        let Some(vector) =
+            ndn_sync::svs_sync::sync_interest_state(&sync_group(&ns), interest, svs.dialect)
+        else {
+            return;
+        };
+        if svs.validator.validate(interest.raw()).is_err() {
+            return;
+        }
         let mut st = self.st.lock();
-        let now = Instant::now();
-        for (ns, g) in st.groups.iter_mut() {
-            if interest.name.has_prefix(&sync_group(ns)) && g.busy.is_empty() {
-                g.confirmed = Some(now);
-            }
+        let Some(g) = st.groups.get_mut(&ns) else {
+            return;
+        };
+        let newer = vector.iter().any(|e| {
+            e.name != self.device
+                && e.seq > 0
+                && g.noticed
+                    .get(&e.name)
+                    .is_none_or(|held| (e.boot, e.seq) > *held)
+        });
+        if !newer && g.busy.is_empty() {
+            g.confirmed = Some(Instant::now());
         }
     }
 
@@ -9150,6 +9198,23 @@ impl Inner {
         }
         let targets = {
             let mut st = self.st.lock();
+            // What the notice brought, whether or not the device is walked
+            // ([`SyncGroup::noticed`]): of the boot the group's driver
+            // noted of it, which it noted before handing the notice on.
+            if let Some(g) = st.groups.get_mut(ns) {
+                let boot = g
+                    .observed
+                    .as_ref()
+                    .and_then(|o| o.get(&device))
+                    .map_or(0, |(boot, _)| boot);
+                let held = g.noticed.entry(device.clone()).or_default();
+                *held = (*held).max((boot, update.high_seq));
+                if g.noticed.len() > heard::HEARD_MAX
+                    && let Some(observed) = &g.observed
+                {
+                    g.noticed.retain(|d, _| observed.get(d).is_some());
+                }
+            }
             // Heard: kept among the devices heard unless every other one
             // is vouched for by signed data held here and it is not
             // (spec §12, §13.5); a name dropped is not walked.
@@ -9587,6 +9652,13 @@ impl Inner {
                                 g.busy.remove(&device);
                                 if ok && g.busy.is_empty() {
                                     g.confirmed = Some(Instant::now());
+                                }
+                                // Its loop ended short of the writer's
+                                // state: what the notices brought is not
+                                // held, so a Sync Interest carrying it
+                                // confirms nothing ([`Inner::heard`]).
+                                if !ok {
+                                    g.noticed.remove(&device);
                                 }
                                 None
                             }

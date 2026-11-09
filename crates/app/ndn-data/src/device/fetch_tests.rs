@@ -690,3 +690,145 @@ async fn a_sync_interest_naming_many_devices_leaves_the_state_vector_bounded() {
     );
     dev.shutdown();
 }
+
+/// A Sync Interest of `group` carrying `entries`, each a device and its
+/// counter.
+fn sync_interest(group: &Name, entries: &[(&str, u64)]) -> Bytes {
+    let vector = SvsConfig::default().dialect.encode_state_vector(
+        &entries
+            .iter()
+            .map(|(name, seq)| ndn_sync::StateEntry {
+                name: n(name),
+                boot: 0,
+                seq: *seq,
+            })
+            .collect::<Vec<_>>(),
+    );
+    InterestBuilder::new(group.clone().append_version(2))
+        .lifetime(Duration::from_secs(1))
+        .app_parameters(vector.to_vec())
+        .build()
+}
+
+/// How long the device says a log collection of `/alice` has not been
+/// known the newest ([`Inner::age`]).
+fn unconfirmed(dev: &Device) -> Duration {
+    match dev
+        .inner
+        .age(&dev.inner.st.lock(), &n("/alice/32=data/notes"))
+    {
+        Age::Newest { unconfirmed_for } => unconfirmed_for,
+        other => panic!("a log collection's answer is aged as the newest: {other:?}"),
+    }
+}
+
+/// Until no refresh of `ns`'s group is pending: nothing answers the walks
+/// notices start, so each ends once it spent its tries.
+async fn refreshes_end(dev: &Device, ns: &Name) {
+    for _ in 0..3600 {
+        if dev.inner.st.lock().groups[ns].busy.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("the refreshes of {ns}'s group never ended");
+}
+
+/// Signals ride the group's prefix (`<O>/32=sync/32=signal/<digest>`, spec
+/// §20) and carry no state of the group: a second of them at 60 Hz leaves a
+/// log collection's answer aged from the last time the device knew nothing
+/// newer was outstanding (spec §15, `get`) — whoever pushes them, the
+/// device's own included.
+#[tokio::test(start_paused = true)]
+async fn signals_pushed_into_the_group_confirm_nothing() {
+    let ns = n("/alice");
+    let group = sync_group(&ns);
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner.join(&ns).await.expect("the group is joined");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        dev.inner.st.lock().groups[&ns].busy.is_empty(),
+        "no refresh is pending"
+    );
+    let before = unconfirmed(&dev);
+    for seq in 0..60u64 {
+        let signal = InterestBuilder::new(group.clone().append_component(wire::kw(b"signal")))
+            .lifetime(Duration::from_secs(1))
+            .app_parameters(seq.to_be_bytes().to_vec())
+            .build();
+        conn.tx.unbounded_send(signal).unwrap();
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    let after = unconfirmed(&dev);
+    assert!(
+        after >= before,
+        "signals pushed into the group confirm nothing: unconfirmed for {after:?} after them, \
+         {before:?} before"
+    );
+    dev.shutdown();
+}
+
+/// Of the group's Sync Interests, only one whose state vector carries no
+/// device's counter above what notices heard here brought and refreshes
+/// took, while no refresh is pending, confirms that nothing newer is
+/// outstanding (spec §15, `get`): one carrying a newer counter does not,
+/// though no refresh was pending when it arrived — the refresh it starts
+/// is —, nor does it once that refresh ended short of the writer's state.
+#[tokio::test(start_paused = true)]
+async fn only_a_sync_interest_bringing_nothing_newer_confirms() {
+    let ns = n("/alice");
+    let group = sync_group(&ns);
+    let conn = Unheard::new(group.clone());
+    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    dev.inner.join(&ns).await.expect("the group is joined");
+
+    // Nothing of the namespace followed: the laptop's notice is taken at
+    // once. The same vector again, no refresh started, confirms.
+    let at_one = sync_interest(&group, &[("/alice/laptop", 1), ("/alice/phone", 0)]);
+    conn.tx.unbounded_send(at_one.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    refreshes_end(&dev, &ns).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    conn.tx.unbounded_send(at_one).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let confirmed = unconfirmed(&dev);
+    assert!(
+        confirmed < Duration::from_secs(1),
+        "a Sync Interest bringing nothing newer, no refresh pending, confirms: unconfirmed for \
+         {confirmed:?}"
+    );
+
+    // A collection of the namespace followed, which nothing answers for:
+    // the laptop moved on, news, though no refresh is pending.
+    dev.inner
+        .st
+        .lock()
+        .follows
+        .insert(n("/alice/32=data/notes"));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before = unconfirmed(&dev);
+    let moved = sync_interest(&group, &[("/alice/laptop", 2), ("/alice/phone", 0)]);
+    conn.tx.unbounded_send(moved.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = unconfirmed(&dev);
+    assert!(
+        after >= before,
+        "a Sync Interest carrying a newer counter confirms nothing: unconfirmed for {after:?} \
+         after it, {before:?} before"
+    );
+
+    // Its refresh spent its tries short of the laptop's state: the same
+    // vector still brings what is not held.
+    refreshes_end(&dev, &ns).await;
+    let before = unconfirmed(&dev);
+    conn.tx.unbounded_send(moved).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = unconfirmed(&dev);
+    assert!(
+        after >= before,
+        "a Sync Interest carrying a counter no refresh took confirms nothing: unconfirmed for \
+         {after:?} after it, {before:?} before"
+    );
+    dev.shutdown();
+}

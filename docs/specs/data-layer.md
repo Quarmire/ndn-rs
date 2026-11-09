@@ -3620,8 +3620,16 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   (the rule's not counted inside `at`, members of groups incomplete or
   unreadable here, §5.2, §5.5); of a log collection, its newest version
   (§5) — with `Age::Newest`: the time since the device last knew nothing
-  newer was outstanding in `C`'s sync group (it heard the group with no
-  refresh pending, or finished one), measured on its monotonic clock. Of a
+  newer was outstanding in `C`'s sync group, measured on its monotonic
+  clock: it finished a refresh that reached the writer's state with no
+  other pending, or heard one of the group's Sync Interests
+  (`<O>/32=sync/v=N`, admitted as the group's driver admits it) with none
+  pending whose state vector carried no device's counter above what
+  notices brought here and no refresh of that device ended short of (round
+  4 review; before, any Interest under `<O>/32=sync` confirmed, signals of
+  §20 included, so a stream of them kept the age near zero whatever was
+  outstanding). Signals and every other Interest under the group's prefix
+  confirm nothing. Of a
   one-key collection it answers the newest version the writer's head names,
   aged by the head's receipt and freshness (§5.3); the head and the node it
   names are asked in place as a walk's packets are (§17.1). The
