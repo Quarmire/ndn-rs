@@ -425,6 +425,158 @@ async fn a_version_missed_inside_a_walk_is_asked_again_in_place_not_after_the_wa
     writer.shutdown();
 }
 
+/// The laptop's notes folder holds a long collection `a`, which the
+/// phone's refresh loop walks a few versions at a time over a slow path,
+/// and a short one `b`. Once that walk took its first version, the laptop
+/// writes into `b` and is heard of again. The pass of the loop begins a
+/// walk of the newer root beside the long one (spec §17.1, walks of newer
+/// roots): the new version is held a few exchanges later, while the long
+/// walk is still taking `a`, not only once it ended.
+#[tokio::test(start_paused = true)]
+async fn a_version_written_during_a_long_walk_is_taken_by_a_walk_beside_it() {
+    let ns = n("/wendy");
+    let authority = SecurityManager::new();
+    let issuer = authority
+        .generate_ed25519(ns.clone().append("KEY").append("ns"))
+        .unwrap();
+    let public = authority
+        .get_signer_sync(&issuer)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let anchor = authority
+        .issue_self_signed_async(&issuer, public, VALIDITY_MS)
+        .await
+        .unwrap();
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (laptop_keys, laptop_cert) = device_key(&authority, &issuer, &laptop).await;
+    let (phone_keys, phone_cert) = device_key(&authority, &issuer, &phone).await;
+    let validator = || {
+        let v = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        let ctx = SignedTrustContext::hierarchical(ns.clone());
+        assert!(ctx.add_anchor(anchor.clone()));
+        v.adopt_context(Arc::new(ctx)).unwrap();
+        v.cert_cache().insert(laptop_cert.clone());
+        v.cert_cache().insert(phone_cert.clone());
+        v
+    };
+
+    let writer = start_on(&laptop, laptop_keys, validator(), Arc::new(Unconnected)).await;
+    let (a, b) = (n("/wendy/32=data/notes/a"), n("/wendy/32=data/notes/b"));
+    for c in [&a, &b] {
+        writer
+            .share(
+                c,
+                crate::layer::Share {
+                    rule: Rule::Log,
+                    writers: vec![ns.clone()],
+                    readers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let options = || PutOptions {
+        type_id: crate::TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    };
+    let put = |c: Name, i: usize| {
+        let (writer, laptop, options) = (&writer, &laptop, &options);
+        async move {
+            let content = Content::new().with("t", Bytes::from(i.to_string()));
+            let id = writer.put(&c, content, options()).await.unwrap();
+            let name = log_name(laptop, Some(&c), id.seq.0);
+            for _ in 0..100 {
+                if writer.inner.packet_for(&name, false).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                writer.inner.packet_for(&name, false).is_some(),
+                "the laptop serves its version once durable"
+            );
+            (name, id.seq.0)
+        }
+    };
+    // Versions enough that a walk takes them for far longer than a few
+    // exchanges: two at a time, one exchange each.
+    const VERSIONS: usize = 80;
+    let mut long = Vec::new();
+    for i in 0..VERSIONS {
+        long.push(put(a.clone(), i).await.0);
+    }
+    let (_, mut head) = put(b.clone(), 0).await;
+    let heard = |head: u64| SyncUpdate {
+        publisher: laptop.to_string(),
+        name: laptop.clone(),
+        low_seq: 1,
+        high_seq: head,
+        mapping: None,
+        serving_party: None,
+    };
+
+    // Each reply comes so near the end of its Interest's lifetime that no
+    // Interest is expressed again (spec §17.1): an exchange is one Interest.
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let link = Arc::new(SlowLink {
+        writer: Arc::clone(&writer.inner),
+        delay: Config::new().lifetime - RTO_MIN / 2,
+        lost: n("/nothing/lost"),
+        lose: std::sync::atomic::AtomicUsize::new(0),
+        tx,
+        rx: futures::lock::Mutex::new(rx),
+    });
+    let mut config = Config::new();
+    config.window = 2;
+    let reader = start_with(&phone, phone_keys, validator(), link.clone(), config).await;
+    // Followed without a first look: the refresh loop walks, on a notice.
+    for c in [&a, &b] {
+        reader.inner.follow(c).await.unwrap();
+    }
+    reader.inner.on_update(&ns, heard(head));
+    let mut waited = 0;
+    while !long.iter().any(|v| holds(&reader, v)) && waited < 60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        waited += 1;
+    }
+    assert!(
+        long.iter().any(|v| holds(&reader, v)),
+        "precondition: the loop's walk takes the long collection's versions"
+    );
+
+    let (newer, seq) = put(b.clone(), 1).await;
+    head = head.max(seq);
+    reader.inner.on_update(&ns, heard(head));
+    let started = tokio::time::Instant::now();
+    // The newer root, and the nodes on the way to `b` and its version, one
+    // exchange each: well within the time the long walk takes `a`.
+    let within = Duration::from_secs(25);
+    while !holds(&reader, &newer) && started.elapsed() < within {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        !holds(&reader, &long[VERSIONS - 1]),
+        "precondition: the long walk is still taking the long collection"
+    );
+    assert!(
+        holds(&reader, &newer),
+        "a version written during a long walk is taken by a walk of the newer root beside it, \
+         not only after the long walk"
+    );
+    tokio::time::sleep(Duration::from_secs(180)).await;
+    assert!(
+        long.iter().all(|v| holds(&reader, v)),
+        "the long walk takes every version"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
 /// A person's root key (from `seed`) in `mgr`: the namespace it names
 /// (`/user/<0xA1: …>`), the key's name and its self-signed anchor.
 fn person(mgr: &SecurityManager, seed: u8) -> (Name, Name, ndn_security::Certificate) {
