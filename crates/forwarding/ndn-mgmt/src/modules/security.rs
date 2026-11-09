@@ -294,7 +294,7 @@ impl MgmtModule for SecurityModule {
             return security_renew(ctx.trust_context_handler);
         }
         if verb == verb::TRANSIT {
-            return security_transit(params, ctx.trust_context_handler);
+            return security_transit(params, ctx.source_face, ctx.trust_context_handler);
         }
         if verb == verb::ENROLL_STATUS {
             return security_enroll_status(ctx.trust_context_handler);
@@ -442,11 +442,13 @@ fn security_renew(backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>) -> Mg
 /// `security/transit`: one mark more on the self-certifying namespace in
 /// `ControlParameters.name`, carried in transit for a local app that adopted
 /// it for one scope of its own — or one taken back ([`verb::TRANSIT_RELEASE`]
-/// in `Flags`). Already authorized by the trust-admin peer-credential gate
-/// (and refused over `/localhop`). Answered at once. Success: `200` with
-/// [`crate::TransitInfo`] as JSON status text.
+/// in `Flags`). The mark is owned by `source_face`, the face the command
+/// arrived on, and released when that face closes. Already authorized by
+/// the transit gate (and refused over `/localhop`). Answered at once.
+/// Success: `200` with [`crate::TransitInfo`] as JSON status text.
 fn security_transit(
     params: ControlParameters,
+    source_face: Option<ndn_transport::FaceId>,
     backend: Option<&Arc<dyn crate::TrustAdminMgmtBackend>>,
 ) -> MgmtResponse {
     let Some(backend) = backend else {
@@ -463,7 +465,7 @@ fn security_transit(
         ));
     };
     let carry = params.flags.unwrap_or(0) & verb::TRANSIT_RELEASE == 0;
-    json_answer(backend.transit(namespace, carry)).into()
+    json_answer(backend.transit(source_face, namespace, carry)).into()
 }
 
 /// `security/enroll-status`: the requests for an admin's approval this node
@@ -875,6 +877,7 @@ mod security_v1_handler_tests {
         assert_eq!(
             refused(security_transit(
                 ControlParameters::default(),
+                None,
                 Some(&backend)
             )),
             code::MISSING_PARAMETER.code
@@ -884,7 +887,7 @@ mod security_v1_handler_tests {
             ..Default::default()
         };
         assert_eq!(
-            refused(security_transit(carol, None)),
+            refused(security_transit(carol, None, None)),
             code::NOT_AT_RUNTIME.code
         );
     }

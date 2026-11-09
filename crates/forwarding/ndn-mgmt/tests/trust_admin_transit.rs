@@ -24,10 +24,12 @@ use tokio_util::sync::CancellationToken;
 
 const APP_FACE_ID: FaceId = FaceId(7500);
 
-/// Records each `transit` it is asked, and answers with the count so far.
+/// Records each `transit` it is asked (by which face), and answers with the
+/// count so far.
 #[derive(Default)]
 struct Marking {
     asked: Mutex<Vec<(Name, bool)>>,
+    faces: Mutex<Vec<Option<FaceId>>>,
 }
 
 #[async_trait::async_trait]
@@ -39,7 +41,13 @@ impl TrustAdminMgmtBackend for Marking {
         ))
     }
 
-    fn transit(&self, namespace: Name, carry: bool) -> Result<TransitInfo, TrustRefusal> {
+    fn transit(
+        &self,
+        face: Option<FaceId>,
+        namespace: Name,
+        carry: bool,
+    ) -> Result<TransitInfo, TrustRefusal> {
+        self.faces.lock().unwrap().push(face);
         let mut asked = self.asked.lock().unwrap();
         asked.push((namespace.clone(), carry));
         Ok(TransitInfo {
@@ -124,6 +132,11 @@ async fn transit_needs_a_local_operator() {
         *backend.asked.lock().unwrap(),
         vec![(ns.clone(), true), (ns.clone(), false)],
         "the flag carries mark or release to the backend"
+    );
+    let faces = backend.faces.lock().unwrap().clone();
+    assert!(
+        faces[0].is_some() && faces[0] == faces[1] && faces[0] != Some(APP_FACE_ID),
+        "each mark names the management face that asked, which owns it: {faces:?}"
     );
 
     // The same command on a face without peer credentials.

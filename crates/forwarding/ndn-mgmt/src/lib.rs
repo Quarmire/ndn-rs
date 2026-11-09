@@ -68,8 +68,8 @@ pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
 use auth::{
-    CommandAuth, authorize_command, authorize_trust_admin, effective_require_signed,
-    is_public_dataset_verb, is_trust_admin_verb, local_command_auth, resolve_control_parameters,
+    CommandAuth, authorize_command, authorize_trust_change, effective_require_signed,
+    is_public_dataset_verb, local_command_auth, resolve_control_parameters, trust_change,
 };
 use wire::{HeldDatasets, send_dataset, send_response};
 
@@ -677,10 +677,19 @@ pub trait TrustAdminMgmtBackend: Send + Sync {
     /// unvalidated to the Interests pending for it, caches none of it, runs
     /// its sync group with the multicast strategy — unless the node holds
     /// the namespace, whose Data is validated whatever the marks say. The
-    /// keyring is never touched. A release with no mark held changes
-    /// nothing (it never takes a mark a link holds).
-    fn transit(&self, namespace: Name, carry: bool) -> Result<TransitInfo, TrustRefusal> {
-        let _ = (namespace, carry);
+    /// keyring is never touched. A mark is owned by `face`, the management
+    /// face that asked (`None`: this node itself): only that face takes it
+    /// back, and every mark it holds is released when it closes, so an app
+    /// that ends, crashes or restarts leaves none behind. A release with no
+    /// mark of that face held changes nothing (it never takes another
+    /// face's mark, nor a link's).
+    fn transit(
+        &self,
+        face: Option<ndn_transport::FaceId>,
+        namespace: Name,
+        carry: bool,
+    ) -> Result<TransitInfo, TrustRefusal> {
+        let _ = (face, namespace, carry);
         Err(not_at_runtime(
             "transit",
             "this node carries no namespace in transit for an app",
@@ -985,9 +994,9 @@ pub async fn run_ndn_mgmt_handler(
         // a device that has no identity yet must still be able to adopt its
         // first trust context. Over `/localhop` they are refused outright: a
         // neighbour must never change this node's trust. See
-        // `auth::authorize_trust_admin`.
-        let is_trust_admin_command = is_trust_admin_verb(&parsed.module, &parsed.verb);
-        if is_localhop_command && is_trust_admin_command {
+        // `auth::authorize_trust_change`.
+        let gate = trust_change(&parsed.module, &parsed.verb);
+        if is_localhop_command && gate.is_some() {
             tracing::warn!(
                 target: "mgmt.security",
                 name = %interest.name,
@@ -1017,9 +1026,10 @@ pub async fn run_ndn_mgmt_handler(
             .await;
             continue;
         }
-        let is_trust_admin = is_trust_admin_command;
-        if is_trust_admin {
-            if let Err(refusal) = authorize_trust_admin(source_face, &engine, config.as_ref()) {
+        if let Some(change) = gate {
+            if let Err(refusal) =
+                authorize_trust_change(source_face, &engine, config.as_ref(), change)
+            {
                 tracing::warn!(
                     target: "mgmt.security",
                     name = %interest.name,

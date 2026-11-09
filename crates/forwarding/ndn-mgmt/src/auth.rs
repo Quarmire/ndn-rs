@@ -275,10 +275,12 @@ fn signature_refused(error: String) -> TrustRefusal {
 
 /// `(module, verb)` pairs that change this node's trust or signing identity
 /// (adopting, refreshing or updating a trust context, enrolling, renewing,
-/// carrying a namespace in transit).
+/// deciding who joins).
 /// Instead of the signed-command gate they require the caller to be a local
-/// trust administrator — see [`authorize_trust_admin`] — and they are refused
-/// over `/localhop`. Add every future trust-mutating verb here.
+/// trust administrator — see [`authorize_trust_change`] — and they are
+/// refused over `/localhop`. Add every future trust-mutating verb here.
+/// `security/transit` is a trust change with a narrower gate of its own
+/// ([`TrustChange::Transit`]).
 const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
@@ -303,12 +305,6 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     (
         ndn_mgmt_wire::nfd_command::module::SECURITY,
         ndn_mgmt_wire::nfd_command::verb::ENROLL_STATUS,
-    ),
-    // Carrying a person's namespace in transit lets its Data reach local
-    // apps unvalidated: a trust change too, though the keyring stays as is.
-    (
-        ndn_mgmt_wire::nfd_command::module::SECURITY,
-        ndn_mgmt_wire::nfd_command::verb::TRANSIT,
     ),
     // Deciding who joins the namespace is a trust change too, and the
     // pending requests (keys, devices, codes) stay with local operators.
@@ -344,12 +340,35 @@ const TRUST_ADMIN_VERBS: &[(&[u8], &[u8])] = &[
     ),
 ];
 
-/// `true` when `module/verb` changes this node's trust and must pass
-/// [`authorize_trust_admin`].
+/// `true` when `module/verb` changes this node's trust and needs a local
+/// operator ([`TrustChange::Admin`]).
 pub(crate) fn is_trust_admin_verb(module: &[u8], verb: &[u8]) -> bool {
     TRUST_ADMIN_VERBS
         .iter()
         .any(|&(m, v)| m == module && v == verb)
+}
+
+/// Who a trust-changing verb accepts on the local management socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrustChange {
+    /// A local operator: the daemon's user, root, or a member of a group
+    /// in `[security] trust_admin_groups`.
+    Admin,
+    /// `security/transit`: a local operator, or a member of a group in
+    /// `[security] transit_groups` — the narrow capability a data host runs
+    /// with, which enrolls, adopts, renews and approves nothing.
+    Transit,
+}
+
+/// The gate `module/verb` passes as a trust change, `None` for any other
+/// command. Every trust change is refused over `/localhop`.
+pub(crate) fn trust_change(module: &[u8], verb: &[u8]) -> Option<TrustChange> {
+    if module == ndn_mgmt_wire::nfd_command::module::SECURITY
+        && verb == ndn_mgmt_wire::nfd_command::verb::TRANSIT
+    {
+        return Some(TrustChange::Transit);
+    }
+    is_trust_admin_verb(module, verb).then_some(TrustChange::Admin)
 }
 
 /// Who the kernel says is on the other end of the face a command arrived on.
@@ -371,6 +390,8 @@ struct OperatorSet {
     daemon_uid: u32,
     /// The trust-admin groups configured, `, `-separated (empty: none).
     groups: String,
+    /// The transit groups configured, likewise.
+    transit_groups: String,
 }
 
 impl OperatorSet {
@@ -378,16 +399,27 @@ impl OperatorSet {
         Self {
             daemon_uid,
             groups: groups.join(", "),
+            transit_groups: String::new(),
         }
+    }
+
+    fn with_transit(mut self, groups: &[String]) -> Self {
+        self.transit_groups = groups.join(", ");
+        self
     }
 
     /// The groups as a refusal's sentence quotes them.
     fn configured(&self) -> String {
-        if self.groups.is_empty() {
-            "none configured".to_owned()
-        } else {
-            format!("currently: {}", self.groups)
-        }
+        quoted(&self.groups)
+    }
+}
+
+/// Configured groups as a refusal's sentence quotes them.
+fn quoted(groups: &str) -> String {
+    if groups.is_empty() {
+        "none configured".to_owned()
+    } else {
+        format!("currently: {groups}")
     }
 }
 
@@ -429,35 +461,119 @@ fn identify_caller(
             classify_caller(
                 peer,
                 daemon_uid,
-                |p| unix_ids::peer_in_any_group(p, groups),
+                |p| unix_ids::peer_in_any_group(p, groups, "trust_admin_groups"),
                 groups,
             ),
-            OperatorSet::new(daemon_uid, groups),
+            OperatorSet::new(daemon_uid, groups).with_transit(config.transit_groups()),
         )
     }
     #[cfg(not(unix))]
     {
         let _ = (fid, engine);
-        (Caller::Unidentified, OperatorSet::new(0, groups))
+        (
+            Caller::Unidentified,
+            OperatorSet::new(0, groups).with_transit(config.transit_groups()),
+        )
     }
 }
 
 /// Authorise a trust-changing verb by the kernel-attested credentials of the
 /// process connected to the management socket. Internally generated
 /// commands (`source_face == None`) pass. Otherwise the caller must be a
-/// local operator ([`Caller::Operator`]); a face without peer credentials
-/// (not the local socket) is refused (`trust-change-unidentified`, another
-/// user `trust-change-not-operator`).
-pub(crate) fn authorize_trust_admin(
+/// local operator ([`Caller::Operator`]) — or, for [`TrustChange::Transit`],
+/// a member of a transit group; a face without peer credentials (not the
+/// local socket) is refused (`trust-change-unidentified`), another user
+/// `trust-change-not-operator` (`transit-not-permitted` for transit).
+pub(crate) fn authorize_trust_change(
     source_face: Option<FaceId>,
     engine: &ForwarderEngine,
     config: &dyn MgmtConfig,
+    change: TrustChange,
 ) -> Result<(), TrustRefusal> {
     let Some(fid) = source_face else {
         return Ok(());
     };
     let (caller, set) = identify_caller(fid, engine, config);
-    trust_admin_decision(&caller, &set)
+    trust_change_decision(&caller, &set, change, || {
+        in_transit_group(fid, engine, config)
+    })
+}
+
+/// Whether the caller behind `fid` is in a `[security] transit_groups`
+/// group, by its local-socket peer credentials.
+fn in_transit_group(fid: FaceId, engine: &ForwarderEngine, config: &dyn MgmtConfig) -> bool {
+    let groups = config.transit_groups();
+    #[cfg(unix)]
+    {
+        !groups.is_empty()
+            && engine
+                .faces()
+                .get(fid)
+                .and_then(|face| face.peer_credentials())
+                .is_some_and(|p| unix_ids::peer_in_any_group(&p, groups, "transit_groups"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (fid, engine, groups);
+        false
+    }
+}
+
+/// The gate's decision for `change`; `in_transit_group` says whether the
+/// caller (another local user) is in a `[security] transit_groups` group,
+/// asked only for transit from such a user.
+fn trust_change_decision(
+    caller: &Caller,
+    set: &OperatorSet,
+    change: TrustChange,
+    in_transit_group: impl FnOnce() -> bool,
+) -> Result<(), TrustRefusal> {
+    match (change, caller) {
+        (TrustChange::Admin, _) | (TrustChange::Transit, Caller::Operator) => {
+            trust_admin_decision(caller, set)
+        }
+        (TrustChange::Transit, Caller::OtherUser { uid }) => {
+            if in_transit_group() {
+                return Ok(());
+            }
+            let daemon_uid = set.daemon_uid;
+            let (admins, transit) = (set.configured(), quoted(&set.transit_groups));
+            Err(TrustRefusal::new(
+                code::TRANSIT_NOT_PERMITTED,
+                format!(
+                    "refused: carrying a namespace in transit for an app is permitted to the \
+                     daemon's user (uid {daemon_uid}), root, members of the trust-admin groups of \
+                     its configuration ({admins}) and members of its transit groups ({transit}); \
+                     this request came from uid {uid}. Run the app as one of them — best, add a \
+                     group it belongs to to the transit groups in the daemon's configuration and \
+                     restart it: that group may carry namespaces in transit and change nothing \
+                     else of this node's trust."
+                ),
+            )
+            .with("uid", uid)
+            .with("daemon_uid", daemon_uid)
+            .with("groups", &set.groups)
+            .with("transit_groups", &set.transit_groups))
+        }
+        (TrustChange::Transit, Caller::Unidentified) => {
+            let daemon_uid = set.daemon_uid;
+            let (admins, transit) = (set.configured(), quoted(&set.transit_groups));
+            Err(TrustRefusal::new(
+                code::TRUST_CHANGE_UNIDENTIFIED,
+                format!(
+                    "refused: carrying a namespace in transit must be requested over the \
+                     forwarder's local management socket, where the kernel reports who is \
+                     asking; this request arrived on a face that carries no caller identity. \
+                     Ask on this node over that socket, as the daemon's user (uid {daemon_uid}), \
+                     root, or a member of the trust-admin groups ({admins}) or the transit \
+                     groups ({transit}) of its configuration."
+                ),
+            )
+            .with("daemon_uid", daemon_uid)
+            .with("groups", &set.groups)
+            .with("transit_groups", &set.transit_groups))
+        }
+    }
 }
 
 /// Who the kernel says sent a command on `source_face`, in words, for the
@@ -622,7 +738,8 @@ fn is_key_signed(interest: &ndn_packet::Interest) -> bool {
     )
 }
 
-/// User / group database lookups backing the `trust_admin_groups` check.
+/// User / group database lookups backing the `trust_admin_groups` and
+/// `transit_groups` checks.
 // Scoped exception to the workspace `deny(unsafe_code)`: libc user/group
 // database FFI (geteuid, getgrnam_r, getpwuid_r), return codes checked.
 #[cfg(unix)]
@@ -646,16 +763,21 @@ mod unix_ids {
         members: Vec<String>,
     }
 
-    /// `true` if `peer` belongs to any group named in `groups`: its primary
-    /// gid is the group's gid, its user name is in the group's member list,
-    /// or (Linux, pid known) the gid is among its supplementary groups.
-    pub(super) fn peer_in_any_group(peer: &PeerCredentials, groups: &[String]) -> bool {
+    /// `true` if `peer` belongs to any group named in `groups` (the
+    /// `[security] <key>` list): its primary gid is the group's gid, its
+    /// user name is in the group's member list, or (Linux, pid known) the
+    /// gid is among its supplementary groups.
+    pub(super) fn peer_in_any_group(peer: &PeerCredentials, groups: &[String], key: &str) -> bool {
         let mut user: Option<Option<String>> = None;
         #[cfg(target_os = "linux")]
         let mut supplementary: Option<Vec<u32>> = None;
         for name in groups {
             let Some(group) = lookup_group(name) else {
-                tracing::warn!(group = %name, "[security] trust_admin_groups names an unknown group");
+                tracing::warn!(
+                    group = %name,
+                    "[security] {key} names a group this system does not know: no one is let in \
+                     through it; create the group or remove it from the configuration"
+                );
                 continue;
             };
             if peer.gid == group.gid {
@@ -798,7 +920,16 @@ mod trust_admin_tests {
         assert!(is_trust_admin_verb(b"security", b"context-refresh"));
         assert!(is_trust_admin_verb(b"security", b"context-update"));
         assert!(is_trust_admin_verb(b"security", b"renew"));
-        assert!(is_trust_admin_verb(b"security", b"transit"));
+        assert!(!is_trust_admin_verb(b"security", b"transit"));
+        assert_eq!(
+            trust_change(b"security", b"transit"),
+            Some(TrustChange::Transit)
+        );
+        assert_eq!(
+            trust_change(b"security", b"context-adopt"),
+            Some(TrustChange::Admin)
+        );
+        assert_eq!(trust_change(b"security", b"anchor-list"), None);
         for verb in [
             b"invite-create" as &[u8],
             b"invite-list",
@@ -813,7 +944,8 @@ mod trust_admin_tests {
         assert!(!is_trust_admin_verb(b"faces", b"context-adopt"));
     }
 
-    /// Trust decision for a peer, as `authorize_trust_admin` makes it.
+    /// Trust decision for a peer, as `authorize_trust_change` makes it for
+    /// a trust-admin verb.
     fn trust(
         peer: Option<PeerCredentials>,
         in_group: impl Fn(&PeerCredentials) -> bool,
@@ -823,6 +955,50 @@ mod trust_admin_tests {
             &classify_caller(peer, DAEMON, in_group, g),
             &OperatorSet::new(DAEMON, g),
         )
+    }
+
+    /// `security/transit` has its own capability: a member of a transit
+    /// group marks, and that enrolls, adopts or approves nothing; a user in
+    /// no group is refused for transit saying who may and how to become
+    /// one; operators mark as before; a face with no caller identity never.
+    #[test]
+    fn the_transit_capability_marks_and_nothing_else() {
+        let admins = groups(&["ndnadmin"]);
+        let set = OperatorSet::new(DAEMON, &admins).with_transit(&groups(&["ndndata"]));
+        let host = classify_caller(peer(1000, 1000), DAEMON, |_| false, &admins);
+        assert!(
+            trust_change_decision(&host, &set, TrustChange::Transit, || true).is_ok(),
+            "a transit group's member marks"
+        );
+        for (module, verb) in [
+            (&b"security"[..], &b"enroll"[..]),
+            (b"security", b"context-adopt"),
+            (b"ca", b"approve"),
+        ] {
+            let change = trust_change(module, verb).expect("a trust change");
+            let refused = trust_change_decision(&host, &set, change, || true).unwrap_err();
+            assert!(refused.is(code::TRUST_CHANGE_NOT_OPERATOR), "{refused:?}");
+        }
+
+        let refused =
+            trust_change_decision(&host, &set, TrustChange::Transit, || false).unwrap_err();
+        assert!(refused.is(code::TRANSIT_NOT_PERMITTED), "{refused:?}");
+        assert_eq!(
+            (refused.param("uid"), refused.param("transit_groups")),
+            (Some("1000"), Some("ndndata"))
+        );
+        assert!(
+            refused.reason.contains("transit groups") && refused.reason.contains("restart"),
+            "the refusal says how to be given the capability: {}",
+            refused.reason
+        );
+
+        let operator = classify_caller(peer(DAEMON, 5), DAEMON, |_| false, &admins);
+        assert!(trust_change_decision(&operator, &set, TrustChange::Transit, || false).is_ok());
+        let refused =
+            trust_change_decision(&Caller::Unidentified, &set, TrustChange::Transit, || true)
+                .unwrap_err();
+        assert!(refused.is(code::TRUST_CHANGE_UNIDENTIFIED), "{refused:?}");
     }
 
     #[test]

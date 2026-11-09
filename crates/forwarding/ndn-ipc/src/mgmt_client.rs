@@ -1024,8 +1024,12 @@ impl MgmtClient {
     /// to take one mark back (`!carry`). While a mark is held the daemon,
     /// not holding the namespace, forwards its Data unvalidated to the
     /// Interests pending for it and caches none of it: the app validates
-    /// every packet itself. Local operators only (the trust-admin gate).
-    /// Answered at once. A refusal (`transit-not-personal`, the gate's) is
+    /// every packet itself. The mark is owned by this client's connection:
+    /// only it takes the mark back, and the daemon releases every mark it
+    /// holds when it closes — keep the client open as long as the marks are
+    /// needed. Local operators and members of the daemon's transit groups
+    /// only (the transit gate). Answered at once. A refusal
+    /// (`transit-not-personal`, the gate's) is
     /// [`ForwarderError::Command`] carrying a structured refusal
     /// ([`crate::trust_refusal_in`]).
     pub async fn security_transit(

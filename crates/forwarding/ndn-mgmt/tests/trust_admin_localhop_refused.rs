@@ -65,7 +65,12 @@ impl TrustAdminMgmtBackend for CountingBackend {
         Err(reached())
     }
 
-    fn transit(&self, _namespace: Name, _carry: bool) -> Result<TransitInfo, TrustRefusal> {
+    fn transit(
+        &self,
+        _face: Option<ndn_transport::FaceId>,
+        _namespace: Name,
+        _carry: bool,
+    ) -> Result<TransitInfo, TrustRefusal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Err(reached())
     }

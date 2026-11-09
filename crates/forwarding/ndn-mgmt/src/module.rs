@@ -67,6 +67,14 @@ pub trait MgmtConfig: Send + Sync {
     fn trust_admin_groups(&self) -> &[String] {
         &[]
     }
+
+    /// `[security] transit_groups` — Unix groups whose members may carry a
+    /// person's namespace in transit (`security/transit`) over the local
+    /// management socket, and run no other trust-changing verb. Default:
+    /// none.
+    fn transit_groups(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// NDNCERT CA configuration surfaced by `security/ca-info`. Borrows from the

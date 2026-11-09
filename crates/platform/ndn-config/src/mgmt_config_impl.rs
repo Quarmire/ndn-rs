@@ -80,6 +80,10 @@ impl MgmtConfig for ForwarderConfig {
         &self.security.trust_admin_groups
     }
 
+    fn transit_groups(&self) -> &[String] {
+        &self.security.transit_groups
+    }
+
     fn ca_info(&self) -> Option<CaInfo<'_>> {
         let sec = &self.security;
         sec.ca_prefix.as_deref().map(|prefix| CaInfo {

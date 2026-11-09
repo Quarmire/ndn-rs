@@ -2800,6 +2800,16 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub trust_admin_groups: Vec<String>,
 
+    /// Unix groups whose members may carry a person's namespace in transit
+    /// for a local app (`security/transit`: a data host's folders) and
+    /// nothing else of the trust changes: they enroll, adopt, refresh,
+    /// renew and decide approvals no more than any other local user. Run a
+    /// data host in such a group rather than as a trust admin. Operators
+    /// (the daemon's user, root, `trust_admin_groups`) may mark too. Empty
+    /// (default) = none.
+    #[serde(default)]
+    pub transit_groups: Vec<String>,
+
     /// How often, in seconds, the daemon checks each trust context it holds
     /// for a newer version (`/<ns>/32=trust-context/32=metadata`, fetched
     /// upstream) and adopts one signed by the held version's root — how a
@@ -2944,6 +2954,7 @@ impl Default for SecurityConfig {
             mgmt: MgmtSecurityConfig::default(),
             serve_contexts: default_serve_contexts(),
             trust_admin_groups: Vec::new(),
+            transit_groups: Vec::new(),
             context_refresh_secs: default_context_refresh_secs(),
             context_sync: false,
             renew_before: RenewBeforeConfig::default(),

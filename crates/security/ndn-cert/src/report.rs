@@ -848,6 +848,12 @@ pub mod code {
     /// `namespace`.
     pub const TRANSIT_NOT_PERSONAL: RefusalCode =
         RefusalCode::new("transit-not-personal", 400, false, NextStep::FixRequest);
+    /// `security/transit` from a local user who is neither an operator of
+    /// this node nor a member of a group given the transit capability
+    /// (`[security] transit_groups`). Params: `uid`, `daemon_uid`,
+    /// `groups` (trust-admin groups, as above), `transit_groups` (likewise).
+    pub const TRANSIT_NOT_PERMITTED: RefusalCode =
+        RefusalCode::new("transit-not-permitted", 403, false, NextStep::FixLocal);
 }
 
 /// Why a trust-admin operation changed nothing, as structured data: a
