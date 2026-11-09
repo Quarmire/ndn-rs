@@ -2805,7 +2805,12 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   not yet known) is answered at once; else it waits for the take for a
   hold ask's lifetime less one Interest lifetime and is answered when the
   take is done (whole, or out of rounds: the lease holds what is kept),
-  or not at all while it is still under way — the owner asks again.
+  or, the take still under way, when it brought nothing during the wait —
+  no record inside `at` and no piece of what it lacks came, as nothing in
+  reach has it — with the lease of what is kept, so the owner learns `H`
+  keeps less than asked instead of asking again a take that gets nowhere.
+  Only while the take still brings more is the ask not answered: the
+  owner asks again.
   It keeps its last 1,024 answers by
   name, so an ask asked again gets the same packet at no cost. It signs a
   new lease when what it holds grows. Holders join the groups of the
@@ -2837,7 +2842,15 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   again after the pause of §17.1, each time as a new ask: a fresh nonce,
   so a new name and a new proof. At most `AUDIT_TRIES` (8) asks are sent
   for one piece in one audit; only when none got an answer signed by `H`
-  is the piece unanswered. An answer counts only as the answer to the ask
+  is the piece unanswered. Once at least `AUDIT_TRIES` of the audit's asks,
+  all pieces counted, went unanswered and `H` answered none, a piece is
+  asked no more after `SILENT_ROUNDS` (3) asks: `H` is **silent** in this
+  audit, which is unanswered. A lossy
+  path (a fifth of the packets lost each way) leaves every one of eight
+  asks unanswered under one time in three thousand, and an audit of 16
+  pieces asks 48 before calling `H` silent; a path down costs the audit
+  three Interest lifetimes and two pauses, not eight and seven. An answer
+  counts only as the answer to the ask
   whose name it carries, judged under that ask's nonce, so a holder never
   passes with an answer to an earlier ask, and a retry is never evidence.
   A manifest node the
@@ -2890,7 +2903,10 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   less than the hold record's `at`, does not count. While fewer than
   `copies` count, `hold` asks every holder the record names whose lease
   does not count, all at once (a holder asked again fetches back what it
-  lost), and audits each lease that comes back. It asks no other device.
+  lost), and audits each lease that comes back — except a holder silent to
+  this call's audit of its live lease (above): it is listed unanswered
+  among the leases found before repair, not asked to hold in this call,
+  and asked again by the next. It asks no other device.
   A holder whose lease still does not count — no lease came back, as the
   ask or its answer was lost or the holder's take is still under way
   (§13.2), or the lease that came is not live, not audited kept, or holds
@@ -2901,7 +2917,8 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   taking a large collection over a lossy path — each lease that comes back
   audited afresh. It stops asking a holder that answers the same lease
   twice, audited kept: that holder keeps all it could take of what was
-  asked, and the next `hold` asks again.
+  asked (a take that brought nothing during an ask answers with the lease
+  of what is kept, §13.2), and the next `hold` asks again.
   Each such audit draws its pieces anew; it passes only with every piece
   answered, so a holder keeping a fraction `f` passes one `hold` call with
   probability at most about `HOLD_TRIES · f^16`, and staying silent on the
@@ -2983,7 +3000,8 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   only where the auditor's own records prove the piece should be there.
   Nor by a lossy path: a lost ask or answer is asked again, and an ask
   still unanswered after the bound leaves the lease unanswered, never
-  broken.
+  broken; a holder silent to an audit is unanswered, never broken, and is
+  asked again by the next `hold`.
 - It cannot read sealed data it holds without being of the audience: it
   stores and serves ciphertext (§9 lists the metadata it sees). A device of
   the namespace is an owner device (§3): it may sign the members record
@@ -4242,9 +4260,11 @@ announced). What is owed, and until when:
   records none of its branches, nor its root, as processed. A root that
   only a relay answered with (§13.5), no newer than the head walked in
   full, says nothing of what the writer did since: the writer counts as
-  not reached. A walk a reader starts itself — the first look of `get`,
-  `watch`, `put` or a hold (§15) — runs on its own: the reader stops
-  waiting after the first-look time, the walk goes on; one not taken in
+  not reached; so does one answering a sync notice of the writer, whatever
+  its head ("A notice answered", below). A walk a reader starts itself —
+  the first look of `get`, `watch`, `put` or a hold (§15) — runs on its
+  own: the reader stops waiting after the first-look time, the walk goes
+  on; one not taken in
   full is walked again in place after the pause, up to `FETCH_TRIES` (3)
   walks, then handed to the one loop of that device and namespace, which
   asks again while the walk is owed. A device whose root does not come, of
@@ -4276,6 +4296,37 @@ announced). What is owed, and until when:
   root — a holder's older root walked instead, the writes since left to a
   later walk — nor a pass of the refresh loop, and a writer away costs one
   Interest lifetime more than one that answers.
+- **A notice answered (normative).** A sync notice of a device says it
+  moved (§12): the walks of its summary that begin after the notice answer
+  it, and the loop of that device and namespace asks again until one does.
+  Only a root the device itself gave answers a notice. A root a device
+  answering for it gave (§13.5) may be behind what it announced: the walk
+  of it goes on, and what it lists is taken, but the writer counts as not
+  reached, and the loop asks again, at most `REFRESH_TRIES` (16) times in a
+  row as for a root that does not come. In a walk answering a notice the
+  root's rounds above take a device's root only above every root of the
+  writer verified before, and the writer's own root no newer than those is
+  asked for again in the next round, taken only once every round brought
+  nothing newer: a path may deliver an old copy of the root late — a
+  duplicate it delayed answers a later ask — and the notice may announce
+  no new root (a device announcing itself as it joins), which costs
+  `FETCH_TRIES` − 1 root asks more. Which root answered decides nothing
+  (invariant 1): what is held and owed follows from the roots and entries
+  verified, as above.
+- **A group heard from no one (normative).** A first look (§15, a peek
+  of §5.3 among them) that finds no device heard that writes into the
+  namespace — none heard in its group, none heard in another group that
+  writes into it by the records held (§12) — has nothing to walk: the
+  join announcement, or every answer to it, may have been lost, and a
+  group's period is half a minute. The device announces its state vector
+  in the group again after the pause below, `k` being the announcements
+  made so far, up to `REFRESH_TRIES` (16) times, until a device writing
+  into the namespace is heard; the notice that brings it begins its walk
+  as any notice does. One such run per group at a time: a first look that
+  finds one under way starts none. So a lost announcement costs a reader
+  seconds at 10–20 % loss, not periods. Hearing a device decides nothing
+  (invariant 1): it lets the walks begin, and what they take is judged as
+  always.
 - **Inside a walk (normative)**, a node, page, members record or version
   the walk lists that missed for want of an answer (or a refusal for now)
   is asked again in place, in rounds: the first round asks its writer's
@@ -4361,21 +4412,36 @@ announced). What is owed, and until when:
 - **Custody asks** (§13.3) — within one `hold` call or release, never
   past it: an audit ask no answer signed by the holder came back to, as a
   new ask under a fresh nonce, up to `AUDIT_TRIES` (8) asks per piece per
-  audit; a hold ask to a named holder whose lease does not count, under a
-  fresh nonce and proof, up to `HOLD_TRIES` (16) asks per holder per call,
-  while fewer than `copies` count. A piece still unanswered after its
-  bound leaves the audit unanswered, never broken; a holder still without
-  a lease that counts is left to the next `hold`.
+  audit — but, once at least `AUDIT_TRIES` of the audit's asks went
+  unanswered and the holder answered none, at most `SILENT_ROUNDS` (3)
+  per piece (the holder is silent in that audit); a hold ask to
+  a named holder whose lease does not count, under a fresh nonce and
+  proof, up to `HOLD_TRIES` (16) asks per holder per call, while fewer
+  than `copies` count — none to a holder silent to the call's audit of
+  its live lease. A piece still unanswered after its bound leaves the
+  audit unanswered, never broken; a holder still without a lease that
+  counts, or silent, is left to the next `hold`.
 - **A holder's take** of what an accepted hold record asks (§13.2) — in
   rounds, while a version inside `at` is not held or a piece of one
   is missing: at most `REPAIR_ROUNDS` (16) rounds per take, ended by 3
   rounds in a row (`REPAIR_IDLE`) that brought nothing; the owner's next
   hold ask starts the next take. Each round asks each entry inside `at`
-  it can name and does not hold as an owed fetch (`FETCH_TRIES` asks).
+  it can name and does not hold as an owed fetch (`FETCH_TRIES` asks). A
+  hold ask waiting for the take is answered, with the lease of what is
+  kept, once the take brought nothing during its wait, so an owner's
+  asks of a holder whose take gets nowhere end at the same lease twice.
 - **A members record's cut manifests** (§8), before the record is taken —
   up to `FETCH_TRIES` (3) rounds over the record's manifest trees, after
   the pause above; then the record is taken whether or not they came, so
   a withheld manifest delays a removal by at most those rounds.
+- **A trust context fetched by name** (§6.3, §19; trust-context.md §8.1)
+  — an adoption by name, a scoped adoption and a refresh: each fetch is
+  an ask of one Interest lifetime, expressed again every second inside
+  it; at most 3 asks nothing answered and 8 asks in all (an answer refused
+  as forged is asked again at once). A namespace nothing answers for is
+  reported unreachable within three lifetimes, so a recovery that asks
+  the person before vouching for the version held (`from_held`) asks
+  within some 15 s.
 
 **Re-expression within an ask (normative).** An ask is one fetch of one
 name within one Interest lifetime. An Interest of it that nothing answered
@@ -4454,7 +4520,9 @@ replies, and on a path whose round trip is `R` it asks at most
 `in_flight` / `R` packets a second, so a writer that publishes faster than
 that is followed with a lag that grows (§18.1). A version of `n` pieces
 costs one walk at most `n` · `FETCH_TRIES` asks per source, the bound
-above per piece, never more for being fetched at once.
+above per piece, never more for being fetched at once. A first look in a
+group heard from no one costs at most `REFRESH_TRIES` Sync Interests more
+in that group, spread over about a minute, one run per group at a time.
 A verb's own asks are bounded per call: a one-key read makes at most
 `FETCH_TRIES` asks for the head and as many for the node it names; a verb
 waiting for an epoch key waits for at most `FETCH_TRIES` rounds of its
@@ -4467,10 +4535,15 @@ window more versions for a guess no probe reached, never more for loss.
 Custody asks are bounded per call: one `hold` sends a holder at most
 `HOLD_TRIES` hold asks (each with a lifetime of three first looks and one
 Interest lifetime) and, per audit, `AUDIT_TRIES` asks for each of its
-`Config::audit_pieces` pieces; a release asks each candidate at most
-`AUDIT_TRIES` `Whole` asks. A holder runs one take per collection at a
-time, of at most `REPAIR_ROUNDS` rounds, each asking every missing piece
-once per source; hold asks arriving meanwhile start nothing beside it.
+`Config::audit_pieces` pieces — and a holder silent to the audit, as when
+its path is down, at most `SILENT_ROUNDS` asks per piece (three Interest
+lifetimes and two pauses in all, the pieces asked at once) and no hold
+ask; a holder whose take brings nothing answers each hold ask within
+its wait, so it costs a call two asks; a release asks each candidate at
+most `AUDIT_TRIES` `Whole` asks. A holder runs one take per collection at
+a time, of at most `REPAIR_ROUNDS` rounds, each asking every missing
+piece once per source; hold asks arriving meanwhile start nothing beside
+it.
 
 **Threat note: retry cost.** Who can make a device ask again? (1) A sync
 notice is unsigned (§12): a stranger naming a device that never answers
@@ -4481,7 +4554,10 @@ stranger's notices of a device being walked begin walks of its newest
 root only as the pass allows (at most `WALKS_AT_ONCE` under way, each
 once the one before is past its way or ended), each a root ask and what
 that root newly lists, what two walks share asked once; a root walked in
-full before ends its walk at once. (2)
+full before ends its walk at once, once the root's rounds brought nothing
+newer: a notice of a device whose root did not move costs `FETCH_TRIES`
+root asks of it, and `FETCH_TRIES` − 1 of each device answering for it ("A
+notice answered"). (2)
 What is owed for
 longer is named only by data the device verified: a root its writer
 signed, a record its owner signed, a version a writer signed. A member
@@ -4511,9 +4587,12 @@ answers one of the Interests ends the ask with a packet refused as in (3).
 from the roots, records and versions the device verified and what it
 follows, never from whether an ask was answered. A relay answering with an
 older root its writer signed (§13.5) cannot stand in for the writer's
-state — no newer than the head walked, the writer counts as not reached —
-and a reader that stops waiting cuts no walk short; either costs at most
-the bounds above, never a version left unasked.
+state — no newer than the head walked, or answering a notice of the
+writer, the writer counts as not reached — nor can an old copy of the
+writer's own root that a party on the path delays or replays: in a walk
+answering a notice it is asked past, at most `FETCH_TRIES` root asks. A
+reader that stops waiting cuts no walk short; each costs at most the
+bounds above, never a version left unasked.
 (8) Nothing another party sends makes a device stop asking for a walk: a
 root is left unasked only while no trust context held here judges its
 namespace, decided from the contexts held, never from a refusal or a
@@ -4521,6 +4600,16 @@ forged root (a forged root that names an anchor nobody holds is refused,
 as in (3), and asked again); and the adoption that ends it owes the walk
 without waiting for a notice, so a namespace adopted after its writer
 fell quiet is still read.
+(9) Only a first look of the device's own announces again in a group
+heard from no one ("A group heard from no one"): nothing another party
+sends starts a run, and each run is at most `REFRESH_TRIES` unsigned Sync
+Interests carrying what the device announces anyway, each costing the
+members that hear it at most one answer between them (the group's
+suppression, §12). A stranger heard in the group ends the run as any
+device does: the reader walks the stranger's root, which costs it the
+bounded asks of (1) and never a wrong answer, and hears the writers at
+the group's period, as it would without the run — a stranger can take
+back the time the run saves, never what is held.
 
 ## 18. Conformance
 
@@ -4536,7 +4625,7 @@ moment's versions, while the writer keeps putting and a second reader
 makes it sign a new root many times a second) and o5 (a sealed folder
 converges under loss: with one packet in five dropped on its way into each
 device, the first version Alice seals reaches Bob's folder watch, opened,
-within 8 s of virtual time, §17.1). The slice-2 cases are c2
+within 10 s of virtual time, §17.1). The slice-2 cases are c2
 (Bob removed while offline: his later edit is refused whatever its date),
 c4 (a note sealed to Alice opens for her host, and a device outside the
 audience cannot read it), c9 (a family chat under the log rule: members'
