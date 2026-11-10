@@ -15,9 +15,10 @@ use ndn_packet::{Data, Name};
 use ndn_security::cert_name::key_name_of;
 use ndn_security::safe_data::TrustPath;
 use ndn_security::{ValidationResult, sync_group};
+use ndn_sync::DataStore;
 use parking_lot::Mutex;
 
-use super::{Device, Inner, St, bad_name, local, signal_clock_name};
+use super::{Device, Inner, St, bad_name, local};
 use crate::collection::{Epoch, Members};
 use crate::error::DataError;
 use crate::layer::Share;
@@ -503,48 +504,123 @@ impl Inner {
     }
 }
 
-/// How far above the time a signal is dated by the signal clock floor is made durable (spec
-/// signals.md §3.5): the reserve inside which later sends need no write. At most 10 s, so a
-/// run that restarts at the floor starts within the clock skew a receiver allows.
-pub const SIGNAL_CLOCK_RESERVE: Duration = Duration::from_secs(5);
+/// Sequences the device makes durable at a time (spec signals.md §3.3, §3.5): a send inside the
+/// block it holds needs no write, and a crash loses at most one block of the 2^64 sequences.
+const SIGNAL_SEQ_BLOCK: u64 = 1 << 20;
 
-/// The signal clock floor: the highest value made durable, and the highest written (a write
-/// whose barrier may not have returned).
+/// How far a time a transport dated by must be from the hint held before the hint is written
+/// again (spec signals.md §3.5): the hint is a hint, so a write about once a second is enough.
+const SIGNAL_TIME_NOTE_EVERY_US: u64 = 1_000_000;
+
+/// Where the store keeps the signal sequence counter (`/localhost/ndn-data/signal-clock`, 8
+/// octets big-endian): a number this device made durable above every sequence it gave a signal,
+/// so a restart never gives one below it (spec signals.md §3.3, §3.5;
+/// [`Device::signal_sequences`]). Before the counter, the same name held a time in µs that
+/// bounded every sequence, which were µs times then: read as a counter it is above every
+/// sequence an older run gave.
+pub(super) fn signal_clock_name() -> Name {
+    "/localhost/ndn-data/signal-clock"
+        .parse()
+        .expect("a valid name")
+}
+
+/// Where the store keeps the signal time hint (`/localhost/ndn-data/signal-time`, 8 octets
+/// big-endian, µs since the Unix epoch): a time a transport dated signals by, written lazily
+/// and never waited for ([`Device::note_signal_time`]).
+fn signal_time_name() -> Name {
+    "/localhost/ndn-data/signal-time"
+        .parse()
+        .expect("a valid name")
+}
+
+/// What the device keeps of signals' clock: the sequence counter, and the time hint.
 pub(super) struct SignalClock {
-    pub(super) durable: u64,
-    pub(super) written: u64,
+    /// The counter made durable: every sequence given is below it.
+    durable: u64,
+    /// The highest counter written (a write whose barrier may not have returned).
+    written: u64,
+    /// The time hint, as last read or noted (µs since the Unix epoch).
+    hint: u64,
+}
+
+impl SignalClock {
+    /// What the last run left in `store`: the counter and the hint, 0 for each a device never
+    /// wrote.
+    pub(super) fn load(store: &dyn DataStore) -> SignalClock {
+        let read = |name: Name| {
+            store
+                .get(&name)
+                .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
+                .map_or(0, u64::from_be_bytes)
+        };
+        let counter = read(signal_clock_name());
+        SignalClock {
+            durable: counter,
+            written: counter,
+            hint: read(signal_time_name()),
+        }
+    }
 }
 
 impl Device {
-    /// The signal clock floor, µs since the Unix epoch (spec signals.md §3.5): a time at or above
-    /// every time this device dated a signal by, made durable ahead of them under the store's
-    /// barrier, so it survives a crash. 0 on a device that never dated a signal. A signal
-    /// transport starts every run above it and never lets its clock fall below it.
-    pub fn signal_clock_floor(&self) -> u64 {
+    /// The sequences the device makes durable at a time (spec signals.md §3.3, §3.5): a send
+    /// inside the block it holds needs no write, and a crash loses at most one block of the
+    /// 2^64 sequences. A transport asks for the next block once half of this is left.
+    pub const SIGNAL_SEQ_BLOCK: u64 = SIGNAL_SEQ_BLOCK;
+
+    /// The sequences a signal transport gives are above this: the counter this device made
+    /// durable, 0 on a device that never gave one (spec signals.md §3.3). A transport starts
+    /// its counter here, so a sequence is never given twice across a restart or a crash, and
+    /// whatever the clock did in between has no part in it.
+    pub fn signal_sequence_floor(&self) -> u64 {
         self.inner.signal_clock.lock().durable
     }
 
-    /// About to date a signal by `us` (µs since the Unix epoch): returns the floor once it is
-    /// at least `us` and durable. Below the floor already it answers at once with no write. Above
-    /// it, the floor moves to `us` plus the reserve (5 s), the store's barrier passes, and
-    /// only then does this return, so a crash can never leave the floor below a time any
-    /// signal was dated by. A transport calls it again before it nears the returned floor.
+    /// About to give sequences below `upto`: returns the counter once it is at least `upto`
+    /// and durable. Below it already, it answers at once with no write. Above it, the counter
+    /// moves to `upto` plus [`Device::SIGNAL_SEQ_BLOCK`], the store's barrier passes, and only then
+    /// does this return, so a crash can never leave the counter at or below a sequence given.
+    /// A transport calls it again before it nears the counter returned.
     ///
     /// [`DataError::Local`] when the device stopped, or its store can't make the write durable
-    /// (check the disk the store is on): the signal is not to be dated.
-    pub async fn signal_clock_dated(&self, us: u64) -> Result<u64, DataError> {
-        self.inner.signal_clock_dated(us).await
+    /// (check the disk the store is on): no sequence is to be given.
+    pub async fn signal_sequences(&self, upto: u64) -> Result<u64, DataError> {
+        self.inner.signal_sequences(upto).await
+    }
+
+    /// The time a transport last dated signals by, as the last run left it (µs since the Unix
+    /// epoch; 0 on a device that never dated one) or as noted since (spec signals.md §3.5). It
+    /// is a hint, not a floor: it was written without a barrier, so after a crash it may be as
+    /// old as the last barrier, and a transport that finds it far ahead of its clock does not
+    /// keep it.
+    pub fn signal_time_hint(&self) -> u64 {
+        self.inner.signal_clock.lock().hint
+    }
+
+    /// A transport dated a signal by `us` (µs since the Unix epoch). Held as the hint once it
+    /// differs from the hint by a second or more, in either direction: a clock corrected
+    /// after running ahead takes the hint back with it. Written to the store, never waited for.
+    pub fn note_signal_time(&self, us: u64) {
+        let mut c = self.inner.signal_clock.lock();
+        if c.hint.abs_diff(us) < SIGNAL_TIME_NOTE_EVERY_US {
+            return;
+        }
+        c.hint = us;
+        self.inner.store.insert(
+            signal_time_name(),
+            Bytes::copy_from_slice(&us.to_be_bytes()),
+        );
     }
 }
 
 impl Inner {
-    async fn signal_clock_dated(&self, us: u64) -> Result<u64, DataError> {
+    async fn signal_sequences(&self, upto: u64) -> Result<u64, DataError> {
         let write = {
             let mut c = self.signal_clock.lock();
-            if c.durable >= us {
+            if c.durable >= upto {
                 return Ok(c.durable);
             }
-            let target = us.saturating_add(SIGNAL_CLOCK_RESERVE.as_micros() as u64);
+            let target = upto.saturating_add(SIGNAL_SEQ_BLOCK);
             if c.written < target {
                 c.written = target;
                 self.store.insert(
@@ -556,7 +632,7 @@ impl Inner {
         };
         if !self.barrier().await {
             return Err(local(
-                "the device stopped before the signal clock floor was durable; start it again",
+                "the device stopped before the signal sequence counter was durable; start it again",
             ));
         }
         let mut c = self.signal_clock.lock();

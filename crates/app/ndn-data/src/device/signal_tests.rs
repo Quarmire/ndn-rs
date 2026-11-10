@@ -3,7 +3,7 @@
 //! headers signed and admitted, or refused saying why.
 
 use super::super::*;
-use super::SIGNAL_CLOCK_RESERVE;
+use super::{SIGNAL_SEQ_BLOCK, signal_clock_name, signal_time_name};
 use crate::layer::Share;
 use crate::signal::{SignalKey, SignalRefusal};
 use ndn_app::AppError;
@@ -726,8 +726,10 @@ struct Lossy {
     pending: Mutex<HashMap<Name, Bytes>>,
     held: std::sync::Mutex<bool>,
     let_go: std::sync::Condvar,
-    /// Writes of the signal clock floor.
+    /// Writes of the signal sequence counter.
     clock_writes: AtomicUsize,
+    /// Writes of the signal time hint.
+    time_writes: AtomicUsize,
 }
 
 impl Lossy {
@@ -748,6 +750,9 @@ impl DataStore for Lossy {
     fn insert(&self, name: Name, wire: Bytes) {
         if name == signal_clock_name() {
             self.clock_writes.fetch_add(1, Ordering::SeqCst);
+        }
+        if name == signal_time_name() {
+            self.time_writes.fetch_add(1, Ordering::SeqCst);
         }
         self.pending.lock().insert(name, wire);
     }
@@ -781,44 +786,48 @@ impl DataStore for Lossy {
     }
 }
 
-/// The signal clock floor (spec signals.md §3.5): `signal_clock_dated(t)` answers a floor above
-/// `t` by no more than the reserve, only once it is durable; a time below the floor writes
-/// nothing; a crash while the barrier is held leaves the floor at what was answered before, and
-/// no time above it was answered; and a restart reads the floor back.
+/// The signal sequence counter (spec signals.md §3.3, §3.5): `signal_sequences(n)` answers a
+/// counter above `n` by one block, only once it is durable; a number below the counter writes
+/// nothing; a crash while the barrier is held leaves the counter at what was answered before,
+/// so no sequence above it was given; and a restart reads the counter back, whatever time a
+/// store written under the name before the counter held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_signal_clock_floor_is_durable_before_it_is_answered_and_a_crash_never_lowers_it() {
+async fn the_signal_sequence_counter_is_durable_before_it_is_answered_and_a_crash_never_lowers_it()
+{
     let world = World::new().await;
     let store = Arc::new(Lossy::default());
     let laptop = world
         .device_on("/alice/laptop", Arc::clone(&store) as Arc<dyn DataStore>)
         .await;
-    assert_eq!(laptop.signal_clock_floor(), 0, "a new device has no floor");
-    let reserve = SIGNAL_CLOCK_RESERVE.as_micros() as u64;
-    assert!(reserve <= 10_000_000, "the reserve is at most 10 s");
-    let first = laptop.signal_clock_dated(1_000_000).await.unwrap();
-    assert_eq!(first, 1_000_000 + reserve);
-    assert_eq!(laptop.signal_clock_floor(), first);
+    assert_eq!(
+        laptop.signal_sequence_floor(),
+        0,
+        "a new device has given no sequence"
+    );
+    let first = laptop.signal_sequences(1_000).await.unwrap();
+    assert_eq!(first, 1_000 + SIGNAL_SEQ_BLOCK);
+    assert_eq!(laptop.signal_sequence_floor(), first);
 
     // What a power loss leaves holds it.
     let after = store.crash();
     let restarted = world
         .device_on("/alice/laptop", Arc::clone(&after) as Arc<dyn DataStore>)
         .await;
-    assert_eq!(restarted.signal_clock_floor(), first);
+    assert_eq!(restarted.signal_sequence_floor(), first);
     restarted.shutdown();
 
-    // Inside the reserve nothing is written.
+    // Inside the block nothing is written.
     let writes = store.clock_writes.load(Ordering::SeqCst);
-    assert_eq!(laptop.signal_clock_dated(first).await.unwrap(), first);
+    assert_eq!(laptop.signal_sequences(first).await.unwrap(), first);
     assert_eq!(store.clock_writes.load(Ordering::SeqCst), writes);
 
-    // Past it, with the barrier held: the answer waits, and a crash now leaves the floor where
-    // it was answered last, below the time asked, which no signal was dated by.
+    // Past it, with the barrier held: the answer waits, and a crash now leaves the counter
+    // where it was answered last, below the number asked, which no sequence was given from.
     store.hold(true);
     let asked = first + 1;
     let waiting = {
         let laptop = laptop.clone();
-        tokio::spawn(async move { laptop.signal_clock_dated(asked).await })
+        tokio::spawn(async move { laptop.signal_sequences(asked).await })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!waiting.is_finished(), "not answered before it is durable");
@@ -826,18 +835,85 @@ async fn the_signal_clock_floor_is_durable_before_it_is_answered_and_a_crash_nev
         .device_on("/alice/laptop", store.crash() as Arc<dyn DataStore>)
         .await;
     assert_eq!(
-        crashed.signal_clock_floor(),
+        crashed.signal_sequence_floor(),
         first,
-        "a restart after the dropped barrier is below the time asked, never below one answered"
+        "a restart after the dropped barrier is below the number asked, never below one answered"
     );
     crashed.shutdown();
     store.hold(false);
     let second = waiting.await.unwrap().unwrap();
-    assert_eq!(second, asked + reserve);
+    assert_eq!(second, asked + SIGNAL_SEQ_BLOCK);
     let restarted = world
         .device_on("/alice/laptop", store.crash() as Arc<dyn DataStore>)
         .await;
-    assert_eq!(restarted.signal_clock_floor(), second);
+    assert_eq!(restarted.signal_sequence_floor(), second);
+    restarted.shutdown();
+    laptop.shutdown();
+
+    // A store an older version left holds a time in µs under the name, above every sequence
+    // that version gave (they were µs times): read as a counter it is above them too.
+    let old = Arc::new(Lossy::default());
+    let old_floor: u64 = 1_700_000_005_000_000;
+    old.insert(
+        signal_clock_name(),
+        Bytes::copy_from_slice(&old_floor.to_be_bytes()),
+    );
+    old.sync().unwrap();
+    let upgraded = world
+        .device_on("/alice/laptop", Arc::clone(&old) as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(upgraded.signal_sequence_floor(), old_floor);
+    upgraded.shutdown();
+}
+
+/// The signal time hint (spec signals.md §3.5): noting a time never waits for the barrier and
+/// reserves nothing; a second's movement is written, less is not; it moves down as well as up,
+/// so a clock corrected after running ahead takes the hint with it; and a restart reads what
+/// was made durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_signal_time_hint_is_lazy_follows_the_clock_down_and_is_read_back() {
+    let world = World::new().await;
+    let store = Arc::new(Lossy::default());
+    let laptop = world
+        .device_on("/alice/laptop", Arc::clone(&store) as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(laptop.signal_time_hint(), 0, "a new device dated nothing");
+
+    // With the barrier held a note still returns at once, and writes the hint as it is.
+    store.hold(true);
+    let at = 1_700_000_000_000_000u64;
+    laptop.note_signal_time(at);
+    assert_eq!(
+        laptop.signal_time_hint(),
+        at,
+        "the hint is the time noted, with no reserve"
+    );
+    assert_eq!(store.time_writes.load(Ordering::SeqCst), 1);
+    store.hold(false);
+
+    // Within a second: nothing written. A second on: written.
+    laptop.note_signal_time(at + 999_999);
+    assert_eq!(store.time_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(laptop.signal_time_hint(), at);
+    laptop.note_signal_time(at + 1_000_000);
+    assert_eq!(store.time_writes.load(Ordering::SeqCst), 2);
+    assert_eq!(laptop.signal_time_hint(), at + 1_000_000);
+
+    // A clock corrected two hours back: the hint follows it.
+    let corrected = at - 7_200_000_000;
+    laptop.note_signal_time(corrected);
+    assert_eq!(laptop.signal_time_hint(), corrected);
+
+    // The hint moves no sequence: the counter is untouched by it.
+    assert_eq!(laptop.signal_sequence_floor(), 0);
+    assert_eq!(store.clock_writes.load(Ordering::SeqCst), 0);
+
+    // Made durable by the next barrier (here a sequence block's), a restart reads it back.
+    laptop.signal_sequences(1).await.unwrap();
+    let restarted = world
+        .device_on("/alice/laptop", store.crash() as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(restarted.signal_time_hint(), corrected);
     restarted.shutdown();
     laptop.shutdown();
 }
