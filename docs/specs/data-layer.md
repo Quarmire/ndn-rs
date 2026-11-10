@@ -3733,6 +3733,29 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   refuses as §5.5 says, writing nothing: the default records of new
   collections among them are signed only once every item passed, and as
   `put` signs them (§5).
+- **A put never waits on other devices** (round 4). `put`, `put_op`,
+  `put_group` and the batch forms return once the version is applied
+  locally and queued behind the durability barrier; publishing after the
+  barrier is the only wait. (1) A collection under a folder whose members
+  record this device holds, its own folder or another's, inherits that
+  record: no look runs before the put and no record of its own is signed.
+  (2) A collection of this namespace under no held record, not yet
+  followed, whose namespace has a device not walked yet: `NotReady`
+  (`RetryLater`) at once, `why` naming the device whose summary may hold a
+  record over it; the walk runs in the background, its result arrives
+  through `watch` as the record (or its absence) is learned, and when the
+  walks are done and no record governs it the owner device signs its
+  default record with the first version. An owner device that has not
+  walked its namespace never signs a default record that could narrow a
+  line it has not seen (§6.1). (3) A namespace with no other known device
+  has nothing to walk: the put proceeds and signs the default. (4) A
+  collection of another namespace whose members record, or the epoch's
+  key, is not held yet: `NotReady` at once, the walk or the grant asked in
+  the background; a device an offer admitted (§19.3 step 6) is never
+  answered `AskOwner` in that window. (5) `share_folder` creating a
+  folder's first record keeps one bounded look (at most `first_look`): only
+  that call waits, never the puts after it. (6) `get` is unchanged: a read
+  may look and wait for what it reads.
 - **`NotCounted`** is the type of every reason a held version is not in
   the value (`State::not_counted`, `Change::NotCounted::why`), two kinds
   that differ in whether they end by waiting, so a program shows a spinner

@@ -135,8 +135,9 @@ pub struct Config {
     /// of the ask nothing answered is expressed again within it after the
     /// device's measured retransmission timeout (spec §17.1).
     pub lifetime: Duration,
-    /// How long `get`, `put` and `watch` wait for a first look at a
-    /// collection the device has not seen before.
+    /// How long `get` and `watch` wait for a first look at a
+    /// collection the device has not seen before (a `put` never waits for
+    /// one: spec §15; `share_folder` creating a first record does).
     pub first_look: Duration,
     /// How many asks one walk has in flight at once: the nodes or entries
     /// of one summary node, the pieces of one large version, one round of
@@ -9974,6 +9975,24 @@ impl Inner {
         Ok(())
     }
 
+    /// [`Self::look`] for a verb that must not wait on other devices (a
+    /// put, spec §15): follow `target` and, the first time, start the walk
+    /// of every device known to write into its namespace in the background
+    /// ([`Self::walk_in_background`]); never wait for them. With no such
+    /// device heard, its group is asked again ([`Self::hail`]).
+    async fn look_behind(self: &Arc<Self>, target: &Name) -> Result<(), DataError> {
+        if !self.follow(target).await? {
+            return Ok(());
+        }
+        let ns = namespace_of(target).expect("followed names have a namespace");
+        let devices = self.known_for(&self.st.lock(), &ns);
+        if devices.is_empty() {
+            self.hail(&ns);
+        }
+        self.walk_in_background(&ns, devices);
+        Ok(())
+    }
+
     /// Walk `device`'s summary of `ns` now ([`Self::refresh`]), in a task of
     /// its own: a caller that stops waiting for it — a first look's time
     /// passing — never cuts it short. A walk not taken in full is walked
@@ -14015,23 +14034,37 @@ impl Inner {
         }
     }
 
+    /// [`Self::not_walked`] for a verb that must not wait on other devices:
+    /// each device it names is walked in the background
+    /// ([`Self::walk_in_background`]), and what it names is answered now.
+    fn not_walked_now(
+        self: &Arc<Self>,
+        ns: &Name,
+        relevant: impl Fn(&Name) -> bool,
+        covers: impl Fn(&Name) -> bool,
+    ) -> Vec<Name> {
+        let missing = self.not_walked(&self.st.lock(), ns, relevant, covers);
+        self.walk_in_background(ns, missing.clone());
+        missing
+    }
+
     /// Refuse the host's default record of `c`, a collection of this
     /// namespace with no record in force here, while a device of the
-    /// namespace known here has not been walked ([`Self::unsynced`]): a
+    /// namespace known here has not been walked ([`Self::not_walked`]): a
     /// folder record above `c` that device may hold governs `c`, and a
-    /// default record would narrow `c` for good (spec §6.1).
+    /// default record would narrow `c` for good (spec §6.1). Answered at
+    /// once, the walks running in the background — a put never waits on
+    /// other devices (spec §15).
     /// [`DataError::NotReady`]: put again once they are reached.
-    async fn default_allowed(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
+    fn default_allowed(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
         // A walk took the folder records above `c` only if it went toward
         // `c`'s folder: toward a name under it, or followed a folder above.
         let folder = folder_of(c);
-        let missing = self
-            .unsynced(
-                &self.ns,
-                |d| self.namespace_of_name(d) == self.ns,
-                |t| t.has_prefix(&folder) || folder.has_prefix(t),
-            )
-            .await;
+        let missing = self.not_walked_now(
+            &self.ns,
+            |d| self.namespace_of_name(d) == self.ns,
+            |t| t.has_prefix(&folder) || folder.has_prefix(t),
+        );
         if missing.is_empty() {
             return Ok(());
         }
@@ -14040,10 +14073,10 @@ impl Inner {
             name: c.clone(),
             why: format!(
                 "it has no members record here, and this device has not yet walked the summary \
-                 of {}, which may hold a folder record governing it; no default record is \
-                 signed, since one would narrow the collection for good. Bring that device \
-                 online and put again; if it is lost, mark its key suspected or revoke it \
-                 (it is not waited for then)",
+                 of {}, which may hold a folder record governing it (the walk runs in the \
+                 background); no default record is signed, since one would narrow the \
+                 collection for good. Put again once that device is reached; if it is lost, mark \
+                 its key suspected or revoke it (it is not waited for then)",
                 devices.join(", ")
             ),
         })
@@ -14076,7 +14109,7 @@ impl Inner {
     /// force refuses the write ([`Self::writable`], [`Self::write_key`]).
     /// With no device of `ns` known at all, nothing can be asked
     /// ([`DataError::Unavailable`] when no record is held).
-    async fn unadmitted(self: &Arc<Self>, c: &Name, ns: &Name) -> Option<DataError> {
+    fn unadmitted(self: &Arc<Self>, c: &Name, ns: &Name) -> Option<DataError> {
         let recorded = |st: &St| st.colls.get(c).is_some_and(|x| x.members.is_some());
         let owner = |d: &Name| self.namespace_of_name(d) == *ns;
         {
@@ -14094,9 +14127,8 @@ impl Inner {
             }
         }
         let folder = folder_of(c);
-        let missing = self
-            .unsynced(ns, owner, |t| t.has_prefix(&folder) || folder.has_prefix(t))
-            .await;
+        let missing =
+            self.not_walked_now(ns, owner, |t| t.has_prefix(&folder) || folder.has_prefix(t));
         let st = self.st.lock();
         if self.admitted(&st, c) || (missing.is_empty() && recorded(&st)) {
             return None;
@@ -14120,7 +14152,8 @@ impl Inner {
             name: c.clone(),
             why: format!(
                 "{held}, and this device has not yet walked the summary of {}, which may hold \
-                 the record admitting this key; put again once that device is reached",
+                 the record admitting this key (the walk runs in the background); put again \
+                 once that device is reached",
                 devices.join(", ")
             ),
         })
@@ -15813,16 +15846,14 @@ impl Inner {
             })
     }
 
-    /// The key of `c`'s current epoch, for writing: obtained if this device
-    /// reads `c` and lacks it — the rounds asked in place
-    /// ([`Self::obtain`]), or, while another ask of it is under way, that
-    /// ask for at most the first-look time. `Ok(None)` when `c` is not
-    /// sealed.
-    async fn write_key(
-        self: &Arc<Self>,
-        c: &Name,
-    ) -> Result<Option<(Epoch, ContentKey)>, DataError> {
-        let (epoch, under_way) = {
+    /// The key of `c`'s current epoch, for writing, as this device holds it
+    /// now: a put never waits on other devices (spec §15). When this device
+    /// reads `c` and lacks the key, the ask for the grant runs in the
+    /// background ([`Self::ask_for_key`]) and the put is
+    /// [`DataError::NotReady`] at once, naming the key. `Ok(None)` when `c`
+    /// is not sealed.
+    fn write_key(self: &Arc<Self>, c: &Name) -> Result<Option<(Epoch, ContentKey)>, DataError> {
+        let epoch = {
             let st = self.st.lock();
             let Some(e) = st
                 .colls
@@ -15838,19 +15869,10 @@ impl Inner {
             if let Some(k) = st.keys.key(c, &e) {
                 return Ok(Some((e, k)));
             }
-            let s = st.seal_subject(c, &e);
-            let under_way = st.asking.contains(&(s.name, e.clone()));
-            (e, under_way)
+            e
         };
-        if !self.obtain(c, &epoch).await && under_way {
-            let (c2, e2) = (c.clone(), epoch.clone());
-            self.wait_for(|st| st.keys.key(&c2, &e2).is_some()).await;
-        }
-        let st = self.st.lock();
-        match st.keys.key(c, &epoch) {
-            Some(k) => Ok(Some((epoch, k))),
-            None => Err(key_not_held(&st, c, &epoch)),
-        }
+        let _ = self.ask_for_key(c, &epoch);
+        Err(key_not_held(&self.st.lock(), c, &epoch))
     }
 
     // ---- answers ------------------------------------------------------------------------------
@@ -19459,14 +19481,10 @@ impl Device {
         let mut keys = Vec::with_capacity(items.len());
         for (c, _) in &items {
             let ns = namespace_of(c).expect("checked above");
-            inner.look(c).await?;
+            inner.look_behind(c).await?;
             inner.st.lock().ensure(c, &inner.config.rules, inner.me());
             if ns != inner.ns {
-                let c = c.clone();
-                inner.wait_for(|st| inner.admitted(st, &c)).await;
-            }
-            if ns != inner.ns {
-                if let Some(refused) = inner.unadmitted(c, &ns).await {
+                if let Some(refused) = inner.unadmitted(c, &ns) {
                     return Err(refused);
                 }
                 inner.release_joined(c);
@@ -19478,12 +19496,12 @@ impl Device {
             };
             // Another person's collection is held under its record by now.
             if has || ns != inner.ns {
-                keys.push(inner.write_key(c).await?);
+                keys.push(inner.write_key(c)?);
                 continue;
             }
             // Its default record waits until nothing a device of the
             // namespace holds can govern it (spec §6.1).
-            inner.default_allowed(c).await?;
+            inner.default_allowed(c)?;
             fresh.insert(c.clone());
             keys.push(None);
         }
@@ -19708,7 +19726,7 @@ impl Device {
             });
         }
         let ns = namespace_of(collection).expect("checked above");
-        inner.look(collection).await?;
+        inner.look_behind(collection).await?;
         // Under a folder in force the collection writes under the record in
         // force over it, and no default record of its own is signed (spec
         // §6).
@@ -19717,9 +19735,7 @@ impl Device {
             .lock()
             .ensure(collection, &inner.config.rules, inner.me());
         if ns != inner.ns {
-            let c = collection.clone();
-            inner.wait_for(|st| inner.admitted(st, &c)).await;
-            if let Some(refused) = inner.unadmitted(collection, &ns).await {
+            if let Some(refused) = inner.unadmitted(collection, &ns) {
                 return Err(refused);
             }
             inner.release_joined(collection);
@@ -19737,7 +19753,7 @@ impl Device {
         let draft = match fresh {
             false => draft,
             true => {
-                inner.default_allowed(collection).await?;
+                inner.default_allowed(collection)?;
                 let written = {
                     let mut st = inner.st.lock();
                     st.ensure(collection, &inner.config.rules, inner.me());
@@ -19773,7 +19789,7 @@ impl Device {
                 }
             }
         };
-        let key = inner.write_key(collection).await?;
+        let key = inner.write_key(collection)?;
         let PutOptions {
             type_id,
             keep,

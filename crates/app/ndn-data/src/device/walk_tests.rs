@@ -1389,7 +1389,7 @@ async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended
     let mut allowed = false;
     for _ in 0..80 {
         reader.inner.on_update(&ns, notice(&fake));
-        if reader.inner.default_allowed(&c).await.is_ok() {
+        if reader.inner.default_allowed(&c).is_ok() {
             allowed = true;
             break;
         }
@@ -1415,7 +1415,7 @@ async fn a_heard_name_nothing_vouches_for_does_not_hold_back_once_its_walk_ended
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert!(
         matches!(
-            reader.inner.default_allowed(&c).await,
+            reader.inner.default_allowed(&c),
             Err(DataError::NotReady { .. })
         ),
         "a device signed data vouches for, away, is still waited for"
@@ -1451,7 +1451,7 @@ async fn an_owner_device_away_for_a_walk_still_holds_back_until_its_tries_are_sp
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(
         matches!(
-            reader.inner.default_allowed(&c).await,
+            reader.inner.default_allowed(&c),
             Err(DataError::NotReady { .. })
         ),
         "a device of the namespace a walk did not reach is still waited for"
@@ -1459,7 +1459,7 @@ async fn an_owner_device_away_for_a_walk_still_holds_back_until_its_tries_are_sp
     net.losing.store(false, Ordering::Relaxed);
     let mut allowed = false;
     for _ in 0..30 {
-        if reader.inner.default_allowed(&c).await.is_ok() {
+        if reader.inner.default_allowed(&c).is_ok() {
             allowed = true;
             break;
         }
