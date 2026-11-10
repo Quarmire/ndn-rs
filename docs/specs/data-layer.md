@@ -5888,7 +5888,21 @@ reachable from a signal.
   chains again, so a revoked issuer ends the runs of the keys it
   certified (signals.md §7).
 - **Nothing kept.** A device MUST NOT store, serve, count or list anything
-  of a signal: no run header is kept in the store or a summary, given a
+  of a signal but the clock floor above: no run header is kept in the store or a summary, given a
   seq, counted as a version, a write or a holder's evidence, or answered
   to an Interest, and no signal packet reaches the layer at all. A signal
   never becomes a version; a commit of live work is an ordinary `put`.
+- **The clock floor.** The one thing of a signal the device keeps is a time:
+  `signal_clock_floor()` is a high-water mark, µs since the Unix epoch, at or
+  above every time a transport dated a signal by, held in the store under
+  `/localhost/ndn-data/signal-clock` (8 octets big-endian) and read at start
+  (0 on a device that never dated one). `signal_clock_dated(t)` answers the
+  floor once it is at least `t` and durable: below the floor it answers at
+  once and writes nothing; above it, the device writes `t` plus a reserve of
+  5 s (at most 10 s, so a run that restarts at the floor starts within the
+  skew a receiver allows), the store's barrier (§4.2) passes, and only then
+  does it answer. So a crash never leaves a restart below a time a signal was
+  dated by. The refusal is `Local` (the device stopped, or the store could
+  not make the write durable). The mark is a time, not a signal: it is no
+  packet, version or record, and nothing is served or counted for it
+  (signals.md §3.5, §13.8).
