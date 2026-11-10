@@ -4036,11 +4036,12 @@ Every name parses one way, and a reader MUST refuse one that does not:
 
 ### 16.2 TLV-TYPE numbers
 
-The data layer uses 0x0520–0x057F (registered in
-[README.md](README.md#tlv-type-numbers)). Every number is even: a decoder
-MUST skip an unknown even TLV inside these records and MUST refuse an
-unknown odd one, so a later revision can add fields old readers pass over
-(and fields they must not).
+The data layer uses 0x0520–0x057F, and 0x05B0–0x05BF for an introduction
+code's link hint (below), registered in
+[README.md](README.md#tlv-type-numbers). A number is even unless the notes
+below say it is odd: a decoder MUST skip an unknown even TLV inside these records
+and MUST refuse an unknown odd one, so a later revision can add fields old
+readers pass over (and fields they must not).
 
 | Type | Name | Value |
 |---|---|---|
@@ -4131,6 +4132,16 @@ unknown odd one, so a later revision can add fields old readers pass over
 | 0x056B | Tries | NonNegativeInteger: in an offer, the wrong tries that close it (≥ 1); in a refusal, those left |
 | 0x056D | IntroRefused | NonNegativeInteger: 1 unknown, 2 used, 3 expired, 4 closed, 5 wrong proof (then Tries, left), 6 conflict |
 | 0x056F | Credentials | octets: whole Data packets, a signed trust context then the certificates of its signer key's chain to that context's anchor, at most 8 |
+
+The link hint of an introduction code (§19.2) uses two even numbers of the
+block 0x05B0–0x05BF. They are the value of the `intro` envelope's
+`LinkHint` field (0x0478, [trust-envelope.md](trust-envelope.md)), not of a
+log record; a reader skips an unknown even TLV among them.
+
+| Type | Name | Value |
+|---|---|---|
+| 0x05B0 | LinkKey | 32 octets: SHA-256 of the inviter device's public key as a certificate carries it (an Ed25519 key's 32 octets); the key a link handshake must prove (ndn-link.md §3.3); exactly once |
+| 0x05B2 | LinkCandidate | one octet of kind (0 host, 1 reflexive, 2 advertised, 3 mapped), the IP address (4 octets for IPv4, 16 for IPv6), the UDP port (2 octets, big-endian); 7 or 19 octets; repeatable, at most 8 kept, in order of preference (§19.2) |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
@@ -4496,6 +4507,9 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Asker claims a namespace the inviter knows under another anchor, or overlapping the inviter's | Refused `Conflict`; nothing adopted. | §19.4 |
 | Offer asked of another device of the inviter | `Unknown`: only the offering device holds its proof key; its use mark is seen by every device of the inviter. | §19.7 |
 | Lying relay hint | Fails to reach; nothing it says is trusted. | §19.7 |
+| A link hint that does not read, names no key, or whose addresses all fail | Ignored: the join goes on by relay hints, else by name; a hint never makes a join fail, and nothing it says is trusted. | §19.3 step 0, §19.7 |
+| An address of a link hint that answers with another key | No link: the handshake proves the key the hint names; the other addresses are tried at once. | §19.3 step 0, §19.7 |
+| A joiner asks a closed offer again after the new member's answer was lost | Answered the acceptance it was given, until the offer expires, then `Expired`; any other key `Closed`. | §19.4 step 4 |
 
 ### 17.1 Asking again under loss
 
@@ -5244,15 +5258,19 @@ once Carol joined — or is the shared `/user` is refused `Conflict`
 code from `/carol/m` to a joiner trusting `/carol`, as a link or as words,
 is refused `InviterConflict` (`AskOwner`) and the joiner adopts and reads
 nothing of it), i10 (a member who joined by a code and was removed asks
-again with the code, before and after the inviter restarts: refused
-`Closed` — the removal closed the offer — and never reads what the owner
-writes afterwards), i11 (a stranger spending its own wrong tries is
+again with the code, before and after the inviter restarts: answered the
+acceptance it was given — the removal closed the offer, which still
+answers its user, §19.4 step 4 — and never reads what the owner writes
+afterwards), i11 (a stranger spending its own wrong tries is
 refused `Closed` while the code's holder still joins; on a used offer a
 stranger's guesses are refused `Used`, counted nowhere, and the user
-asking again is answered) and i12 (not among strangers, so the owner's
+asking again is answered), i12 (not among strangers, so the owner's
 other device reads the member's writes: a member removed by that device,
 which closes nothing, asks the offering device again: answered, never
-admitted again). Their feature is `Introduction`.
+admitted again) and i13 (the owner closes an offer as soon as the member
+appears: the member asking again is answered, another key is refused
+`Closed`, and after the offer's expiry the member is refused `Expired`).
+Their feature is `Introduction`.
 `ndn-data`'s `intro.rs` unit tests check the records, asks and answers
 round-trip, that malformed ones are refused, that each proof binds every
 field it covers (another offer, key, digest, nonce or secret fails it),
@@ -5354,7 +5372,10 @@ the default seed and two more, each with `--check-determinism`.
 signature fails — is refused by the device's verifier and is never
 applied, stored, served or cached as good: not by the data layer, and not
 by the device's forwarder, whose content store must not answer a later
-Interest with it. Nothing is kept against its name: a forged copy never
+Interest with it, whichever face the forgery came on: a forwarder validates
+Data on a TCP, UDP or WebTransport face even to a loopback address, so a
+member's connection on the same host is no exception (trust-context.md
+§6.6). Nothing is kept against its name: a forged copy never
 makes a device refuse the genuine packet at that name, never counts as
 evidence (an equivocation, a breach, a refused version), and never stops
 the device asking again, from any holder, until the genuine one arrives.
@@ -5403,10 +5424,10 @@ Nothing secret is in it: the secret is in the code only.
 A **use mark** (`IntroUsed`) is an entry in the offering device's log
 about the same folder naming the offer and either the key the offer was
 used by and its public key's digest (`Writer`, `Digest`) — the offer is
-used — or neither — a **closing mark**: the offer is closed for good, to
-everyone, its user too (all askers' wrong tries at the device's cap,
-§19.4; `close_offer`, §19.2; or a record it signs removing the member the
-offer brought, §19.7). The
+used — or neither — a **closing mark**: the offer admits no one new from
+then on, and answers its user alone, until it expires (all askers' wrong
+tries at the device's cap, §19.4; `close_offer`, §19.2; or a record it
+signs removing the member the offer brought, §19.7). The
 first mark naming a key stands and a device signs no second one; a closing
 mark closes the offer whenever it comes, used or not, and a device signs
 one at most. Only the offering device marks its offer: a reader takes an
@@ -5438,18 +5459,54 @@ members record of `F` is held:
 The **code** is a trust-envelope `intro` link
 ([trust-envelope.md](trust-envelope.md)): the inviter's namespace, its
 anchor fingerprint (SHA-256 of its root anchor's public key), the offer's
-name, the secret, and as many relay hints — the relays the inviter's trust
-context advertises, by device name — as keep the link within one QR code;
-the secret, the offer and the fingerprint are never dropped. The same code
-as **words**: the offer's name, then 24 BIP39 English words encoding the
-secret followed by the fingerprint's first 16 octets (its checksum catches
-a mistyped word).
+name, the secret, the inviter's link hint (below), and as many relay hints
+— the relays the inviter's trust context advertises, by device name — as
+keep the link within one QR code; the secret, the offer and the
+fingerprint are never dropped. The same code as **words**: the offer's
+name, then 24 BIP39 English words encoding the secret followed by the
+fingerprint's first 16 octets (its checksum catches a mistyped word); the
+words carry no hint and no relay.
+
+The **link hint** is what lets a joiner with no daemon, no route and no
+peer entry reach the inviter's device by its key. A host that listens for
+links gives it (`Introducer::link_hint`, once per `offer`): the device's
+**link key** — SHA-256 of its public key as a certificate carries it, 32
+octets, the fingerprint a link handshake proves (ndn-link.md §3.3) — and
+at most `LINK_HINT_CANDIDATES_MAX` = 8 **candidates**, the addresses of its
+listening link socket, most promising first, each a kind (ndn-link's: host,
+reflexive, advertised, mapped, §14.2), an IPv4 or IPv6 address and a UDP
+port. It is the value of the envelope's `LinkHint` (0x0478): the TLVs
+`LinkKey` (0x05B0, the 32 octets) and `LinkCandidate` (0x05B2, once per
+candidate: one octet of kind — 0 host, 1 reflexive, 2 advertised, 3 mapped —
+then the address, 4 or 16 octets, then the port, 2 octets big-endian).
+Even types: a reader skips what it does not know. A writer encodes each
+distinct dialable candidate once, up to the bound. A reader keeps the first
+8 distinct candidates whose kind it knows and whose address is dialable
+(not unspecified, multicast or broadcast, and port ≠ 0), and refuses a hint
+that names no key or two, or a candidate that is not 7 or 19 octets: the
+join then goes on without the hint, which only helps to reach.
+
+The code stays within one QR (`ndn_trust_envelope::qr::MAX_TEXT_LEN` =
+2331 characters). A hint costs 34 octets and 9 (IPv4) or 21 (IPv6) per
+candidate, a third more as base64url: eight IPv6 candidates take a code of
+388 characters (four relay hints, a namespace and an offer name of 60
+characters) to 686 (measured in `intro::tests`). When a code does not fit,
+the maker drops relay hints first, all of them, then the hint's last
+candidates one by one, then the hint itself; an offer name so long that
+the code does not fit without them is `Local`.
 
 `close_offer(offer)` on the device that made the offer signs its closing
-mark and returns once it is durable: every ask of the offer is then
-refused `Closed`, its user's too; what the offer granted stays until a
-members record removes it. Another device's offer, or a name that is no
-offer held, is `BadRequest`; closing a closed offer does nothing more.
+mark and returns once it is durable: the offer admits no one new — every
+ask by a key other than the one it was used by is refused `Closed`, even
+with the right secret — and still answers the key it admitted, with the
+acceptance kept for its use and nothing else, until the offer expires
+(§19.4, step 4). A host that closes an offer as soon as it sees the new
+member needs no pending close of its own for a joiner whose answer was
+lost. A record the offering device signs that drops the namespace an
+offer's user was admitted as closes the offer the same way (§19.7). What
+the offer granted stays until a members record removes it. Another
+device's offer, or a name that is no offer held, is `BadRequest`; closing a
+closed offer does nothing more.
 
 ### 19.3 Joining
 
@@ -5457,6 +5514,19 @@ offer held, is `BadRequest`; closing a closed offer does nothing more.
 code names is judged first, as in step 4, before anything is fetched or
 asked:
 
+0. **Dials the inviter by the code's link hint**, when the link form of the
+   code carries one, before any Interest: `Introducer::dial(hint, D,
+   within)`, `within` being `Config::first_look`, once per `join`. The
+   host's link layer tries the hint's candidates, links only to the device
+   whose key the hint names, and routes `D`'s names over the link
+   (ndn-link.md §13.3). `Ok`: the Interests of the steps below go over
+   that link by name, with no ForwardingHint. An error — the host has no
+   dialer, no candidate answered within the bound, an address presented
+   another key — is not a refusal: the join goes on at once as it would
+   without a hint, by the relays the code names, else those its own
+   namespace's trust context advertises, else by name. A hint that does
+   not read is ignored the same way. The dial carries no secret and judges
+   nothing of the code (§19.7).
 1. Fetches the offer as `<D>/32=held/<offer>` (§16.1; DigestSha256, so the
    joiner's forwarder needs no trust of the inviter), `D` the offer name's
    device. No answer after its retries: `NotReady` (`RetryLater`): the
@@ -5584,8 +5654,16 @@ checks, in this order:
    them. Else no answer.
 3. **The offer is its own and known**: named under this device, an offer
    record it holds, its proof key in its store. Else `Unknown`.
-4. **Not closed**: no closing mark, and fewer wrong tries counted toward
-   the overall cap than `Config::intro.wrong_tries_max`. Else `Closed`.
+4. **Not closed to this key.** An offer is *closed* when a closing mark is
+   held of it, or when at least `Config::intro.wrong_tries_max` wrong
+   tries are counted toward the overall cap. A closed offer admits no one
+   new: it answers `Closed`, except to the key a use mark names (not a use
+   a stop interrupted, which was never completed), which it answers as step
+   6 says — the acceptance kept for its use, and nothing else — while the
+   offer has not expired by this device's clock, and `Expired` after. So
+   closing never makes an offer answer more than it did: an open offer's
+   user is answered whenever it asks (step 6), a closed offer's until the
+   offer expires.
 5. **The asker's key chains to the anchor it sent**: the proof packet,
    named `<J>/32=ask/<binding>` for this ask, verifies by a validator that
    holds the presented context alone and the presented certificates (the
@@ -5659,7 +5737,7 @@ packet, and carries the answer proof.
 | `Unknown` | the offering device holds no such offer | `AskOwner` (a new code) | no |
 | `Used` | another key joined with this offer | `AskOwner` | no |
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
-| `Closed` | closed for good, even to the right secret: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a record the offering device signed | `AskOwner` | no |
+| `Closed` | closed to everyone but the key that used it: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a record the offering device signed (the key the offer was used by is still answered, until the offer expires, step 4) | `AskOwner` | no |
 | `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§19.4, the use) | `FixLocal` (renew the device's certificate when it is the last) | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer entry does not verify under the context the joiner holds (§19.3 step 5) | `AskOwner` (do not use the code) | no |
@@ -5693,10 +5771,17 @@ X25519-to-ChaCha20-Poly1305 wrap.
   the acceptance kept for its use and never admitted again (step 6), and
   no other key can use it, whichever owner device removed the member. A
   folder record the offering device signs removing a namespace also closes
-  every offer of that device a key under it used (or was using), so even
-  its acceptance is no longer answered; a record another device signed
-  closes nothing (only the offering device marks its offers).
-  `close_offer` closes an offer at any time. Keep expiries short.
+  every offer of that device a key under it used (or was using): the offer
+  then admits no one new, and its user alone is still answered, until the
+  offer expires, the acceptance kept for its use and nothing else (step 4):
+  nothing is adopted or signed, so asking does not make a removed member a
+  member again, and what the answer shows is what the code's holder already
+  had — the folder's name, the role and the inviter's public credentials.
+  A record another device signed closes nothing (only the offering device
+  marks its offers). `close_offer` closes an offer to everyone new at any
+  time, and keeps answering its user so: a host that closes an offer as
+  soon as the new member appears loses no joiner whose answer was lost.
+  Keep expiries short.
 - **Replay.** An ask replayed by anyone gets the answer kept for it: bound
   to the asker's key and digest, it admits only the asker's namespace,
   which the record already admits; it shows the replayer the folder's name,
@@ -5769,10 +5854,45 @@ X25519-to-ChaCha20-Poly1305 wrap.
   sooner; no other
   decision reads a clock, and certificate validity in the credentials is
   checked as a live exchange (§8.5).
-- **Unauthenticated hints.** Relay hints in the code, or the joiner's own
-  namespace's relays, are reachability only: a lying hint fails to reach,
-  and nothing a relay carries is trusted — the offer, the ask and the
-  answer are judged by the checks above.
+- **Unauthenticated hints.** Relay hints in the code, the joiner's own
+  namespace's relays and the link hint's addresses are reachability only: a
+  lying hint fails to reach, and nothing a relay or a dialled address
+  carries is trusted — the offer, the ask and the answer are judged by the
+  checks above.
+- **The link hint: the key is authenticated, the address is not.** The
+  dial's handshake proves the key (§19.3, step 0): an address whose device
+  presents another key is no link. So a joiner reaches the device holding
+  the key its code names, or nobody; an address an attacker substituted in
+  a code can only make the dial fail, or reach a party that lacks the key
+  and fails the same handshake. A code altered to name another key reaches
+  that key's holder, which is the inviter-impersonation case above: the
+  party learns the joiner's public credentials and can answer nothing the
+  code's anchor fingerprint and secret check (§19.3, step 3). The secret
+  never leaves in the dial: the dial carries a handshake and a hello, and
+  the secret travels only inside the sealed ask.
+- **Dialling candidates.** A hint holds at most
+  `LINK_HINT_CANDIDATES_MAX` (8) addresses, and a reader keeps no more. A
+  hostile code could aim a joiner's dial at third parties: at most that many
+  QUIC handshakes' first datagrams per join, every one unanswered unless
+  something there speaks QUIC, so nothing is amplified and no more is sent
+  than the join's own retries send. Unspecified, multicast and broadcast
+  addresses and port 0 are never dialled. The dial is bounded in time
+  (§19.3, step 0). A code can have a joiner send a handshake to an address
+  of its own host or network; that is all it can make it do.
+- **Privacy.** The code shows the inviter's device key, and the addresses
+  of its listening socket (its interfaces', reflexive and advertised ones),
+  to whoever sees it: the screen showing the QR, the message carrying it.
+  A host that does not want that gives no hint (`Introducer::link_hint`).
+- **The hint's lifetime is the offer's.** The addresses are those of the
+  moment the offer was made; once the offer expires (or is closed to
+  everyone new) the code admits nobody, whatever the addresses say. A joiner
+  dialling a stale address fails within its bound and goes on by relays
+  (step 0); an inviter whose address changed makes a new offer.
+- **A stranger's link.** The inviter answers a joiner it knows nothing of on
+  a link that carries the offer fetch and the ask and nothing else, within
+  slots and rates (ndn-link.md §8.6): what that link lets a stranger send is
+  what any party can already ask of the device by name, and the ask is
+  judged and bounded as §19.4 says.
 
 ## 20. Signals: the gate — round 4
 
@@ -5887,11 +6007,6 @@ reachable from a signal.
   that admitted headers under one count and reads another walks their
   chains again, so a revoked issuer ends the runs of the keys it
   certified (signals.md §7).
-- **Nothing kept.** A device MUST NOT store, serve, count or list anything
-  of a signal but the clock floor above: no run header is kept in the store or a summary, given a
-  seq, counted as a version, a write or a holder's evidence, or answered
-  to an Interest, and no signal packet reaches the layer at all. A signal
-  never becomes a version; a commit of live work is an ordinary `put`.
 - **The clock floor.** The one thing of a signal the device keeps is a time:
   `signal_clock_floor()` is a high-water mark, µs since the Unix epoch, at or
   above every time a transport dated a signal by, held in the store under
@@ -5906,3 +6021,8 @@ reachable from a signal.
   not make the write durable). The mark is a time, not a signal: it is no
   packet, version or record, and nothing is served or counted for it
   (signals.md §3.5, §13.8).
+- **Nothing kept.** A device MUST NOT store, serve, count or list anything
+  of a signal but the clock floor above: no run header is kept in the store or a summary, given a
+  seq, counted as a version, a write or a holder's evidence, or answered
+  to an Interest, and no signal packet reaches the layer at all. A signal
+  never becomes a version; a commit of live work is an ordinary `put`.

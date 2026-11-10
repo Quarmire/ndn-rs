@@ -49,11 +49,12 @@ here before using it.
 | 0x0403–0x040F | free (left below the trust-context block) |
 | 0x0410–0x042F | [trust-context.md](trust-context.md) |
 | 0x0440–0x046C | [ndn-link.md](ndn-link.md) (hello/verdict, punch) |
-| 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) (the `intro` kind's offer, relay hint and secret: 0x0475–0x0477) |
+| 0x0470–0x048F | [trust-envelope.md](trust-envelope.md) (the `intro` kind's offer, relay hint and secret: 0x0475–0x0477; its link hint, the octets of data-layer.md §19.2's hint: 0x0478) |
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
 | 0x0500–0x0509 | `cs/list` (`ndn-mgmt-wire`) |
 | 0x0520–0x057F | [data-layer.md](data-layer.md) (even numbers; odd ones for critical additions: slice 3's chunks, hold, lease, prune and audit records, 0x0521–0x0537, and its custody fields — holders, asker, whole, proof, pruned-by, refused-by — 0x0539–0x0543; slice 4's block, block entry, offset, head record, freshness, time range, the expired audit answer and a summary node's expiry runs, 0x0545–0x0553; slice 6's folder flag of a members record, a version's group and its count, 0x0555–0x0559, a removal cut's binding of what it keeps to its bytes (CutBytes, the full name of its cut manifest), 0x055B, and a folder cut's list per collection (CutIn), 0x055F; slice 6 reuses, in a version record, FrontierEntry 0x0524 with Digest 0x055E — each parent bound to its tip's packet — and Rule 0x0548, the merge rule an operation was made for; the introduction's offer and use-mark records, ask, answer, role, tries, refusal and credentials, 0x0561–0x056F, §19) |
 | 0x0580–0x05AF | [signals.md](signals.md) (even numbers; `ScopeDigest` 0x05A6 names a packet's scope after the run header, in place of the scope `Name` that `SignalBody` carried on the `ndn-signal/1` wire) |
+| 0x05B0–0x05BF | [data-layer.md](data-layer.md) §19.2 (even numbers; round 4: an introduction code's link hint, carried as the value of the intro envelope's `LinkHint` 0x0478 — `LinkKey` 0x05B0, `LinkCandidate` 0x05B2) |
 
 ### Name-component types
 

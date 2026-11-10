@@ -10,6 +10,7 @@
   - relays: whom a relay serves (its serving policy and quotas) and which relays a device uses (§15);
   - link modes (`always`, `on-demand`, `off`), idle close and the Interests that wait for a link (§16);
   - reachability while asleep: Interests a relay holds for a sleeping device, and the wake hook (§17).
+  - introduction links, and dialling a device by the key and addresses of an introduction code's link hint (§8.6, §13.3);
 
   The goal is an independent implementation (NDNts, python-ndn, …) that can dial an ndn-fwd link and accept one from ndn-fwd.
 - **Design context:** [personal-namespace.md](personal-namespace.md) §9 ("QUIC links"), F6 and F11. Where the two disagree on wire detail, this spec governs.
@@ -498,6 +499,7 @@ Rules are evaluated in order. The first that applies decides. *Identified* means
    - Otherwise, if its hello carries no certificate, it has no peer entry and the serving policy is `listed` or `open`: refuse **0x19** (a relay routes a served device by the device name its certificate gives).
    - Otherwise refuse **0x10**.
 7. Otherwise admit a **full link**: a key-expected peer, whether identified or not.
+8. **Introduction links** (§8.6). A refusal of rules 2, 5 or 6 with **0x10** or **0x19** is replaced by admitting the peer on an **introduction link**, when this side did not dial the link and takes introductions (its host named introduction prefixes). If no slot is free (§8.4), refuse **0x16** instead. No other refusal is replaced: a revoked key, a role the policy does not let link, a key a peer entry does not expect.
 
 The identities a link is admitted by are what the rest of this spec calls the peer's identities on the link: its routes (§10), presence (§14.8), revocation while linked (§12) and transit (§15.7) apply to each.
 
@@ -634,6 +636,27 @@ When the device's identities change — it enrolled (its link key changed, or a 
 
 ndn-rs does this in `Links::identities_changed`, which the host calls on each change of its signing identities or link key (ndn-fwd: the identity watch of its node identity; a mobile host: its identity core).
 
+### 8.6 Introduction links
+
+An introduction link lets a device that hands out introduction codes ([data-layer.md](data-layer.md) §19) answer the one exchange of a joiner it knows nothing of: the offer fetch, the ask, and their answers. Nothing else crosses it, in either direction.
+
+- **Taking them.** The host names the **introduction prefixes**: for a data-layer device `<D>/32=held` and `<D>/32=intro` (the offer fetch and the ask, data-layer.md §16.1; `ndn_data::intro::introduction_prefixes`). It may change or empty the list at any time (`Links::set_introductions`); a side with an empty list takes none, and links already up stay until they end.
+- **Admitted by.** Rule 8 of §7.3: a link this side did not dial, which no peer entry expects and no namespace held here, nor the serving policy, vouches for. It is admitted with no identity: nothing is known of the peer but its key, which the handshake proved. Its LinkVerdict is a full verdict (no EnrollmentLink).
+- **Scope** (§8.3):
+
+  | | |
+  |---|---|
+  | receives from the peer | Interests only |
+  | sends to the peer | answers only (Data and Nacks) |
+  | name filter | the name has a prefix among the introduction prefixes, judged at every packet |
+  | receive rate limit | `ENROLLMENT_INTERESTS` (burst 32, 4/s) |
+
+- **No routes**, presence or sync group: answers return the way their Interests came.
+- **Slots and idle close.** Introduction links share the enrollment links' slots (`ENROLLMENT_LINKS_MAX`, `ENROLLMENT_LINKS_PER_SOURCE`) and their idle close (`ENROLLMENT_IDLE`), §8.4.
+- **Replaced by a full link.** The joiner dials again (§13.3) once it holds the inviter's namespace. This side adopted the joiner's namespace answering its ask, so the new connection's hello identifies the joiner in a namespace this side holds the trust context of; it is a full link only if this side's serving policy serves it (§7.3 rule 5, §15.2): a device of another person's namespace, which this side holds but holds no certificate in, is refused with **0x19** under the default `own`, and so stays on an introduction link, which carries no sync. A host that introduces people it does not know yet therefore chooses `open` (within quotas) or `listed`. When served, the new link is admitted by rules 3 to 5 as a full link, and replaces the introduction link under the duplicate-link rule (§11: a newer link dialed the same way replaces the older).
+
+The scope is why a stranger needs no admission: what it can send is what anyone may ask of the device by name (an offer is a public log entry, an ask is judged by the data layer, which counts wrong tries and bounds the asks it holds, data-layer.md §19.4), within the enrollment links' bounds.
+
 ## 9. NDN packets: datagram framing
 
 1. NDN packets MUST travel in QUIC DATAGRAM frames ([RFC 9221]). Each datagram payload is exactly one NDNLPv2 frame: one LpPacket (0x64) TLV. No stream carries NDN packets, so there is no head-of-line blocking.
@@ -651,6 +674,7 @@ ndn-rs does this in `Links::identities_changed`, which the host calls on each ch
    - A receiver SHOULD acknowledge each TxSequence it receives with Ack (0x0344) headers, either piggybacked or in an Ack-only LpPacket. It MUST tolerate retransmitted duplicates. ndn-rs drops a duplicate before reassembly and forwarding.
 4. **Receiving.** A receiver MUST accept LpPackets with or without TxSequence, Sequence, FragIndex and FragCount, and MUST reassemble fragments keyed by `Sequence − FragIndex`. It SHOULD also accept a datagram that is a bare Interest or Data TLV; the enrollment-link scope does.
 5. Other NDNLPv2 fields follow the ndn-rs NDNLPv2 implementation for non-local faces. Examples are Nack 0x0320 / NackReason 0x0321, PitToken 0x62, and CongestionMark. A link face is a non-local face, so it never carries LocalFields.
+6. **Trust.** A link face is a **validated** face whatever its remote address, a peer on the same host (a loopback address) included: the forwarder validates the Data that arrives on it and caches only Data that passed (trust-context.md §6.6). A link is never a program face; a program of the same host that wants the program standing uses a Unix socket or shared memory. Threat: any process of any user on the host can open a loopback link, so what comes over it is no more believed than what a stranger sends. A served namespace carried in transit (§15.7) stays unvalidated and uncached, as before.
 
 ## 10. Routes
 
@@ -749,6 +773,19 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 - An attempt over a limit, or from a source in cooldown, is refused before its handshake (§6.2).
 - When at least half the total (32) are in flight, the listener first sends a QUIC Retry to any source whose address is not yet validated.
 - A refusal counts against the source when its handshake fails, when admission refuses it with a close code, or when its hello or verdict exchange fails (§6.3). Refusals older than the refusal window are forgotten: the count starts again at the first refusal after the window of the previous first refusal ends. It also resets when it reaches the threshold and the cooldown starts ([Decision 9](#20-decisions)).
+
+### 13.3 Dialing by key: a code's link hint
+
+A device that holds an introduction code whose link hint ([data-layer.md](data-layer.md) §19.2) names a device key and addresses dials the inviter's device by them: `Links::dial_by_key(key, device, addresses, within)`.
+
+1. It adds a peer entry `{key, device}`: not persistent, direct paths off, whose only paths are the hint's addresses in the order given (at most `CANDIDATES_MAX` = 8; the rest are dropped). The addresses are **where to try and nothing more**: no address is trusted for anything.
+2. It starts a handshake to **every address at once**, each expecting `key` (§3.4: the handshake fails unless the listener presents exactly that key), from the host's link socket when it has that address family, else a dial-only socket (§13.1). The first handshake to succeed becomes the link and is admitted as a dialed peer entry's link (§7.3 rule 7: the key is expected); the other attempts are dropped. When no handshake succeeds within `within`, or admission refuses, the dial fails saying, per address, why; the peer entry is removed. An address whose device presents another key is no link.
+3. The link routes the device's name (the entry's `device`) at cost 0 (§10), so Interests for it go over the link.
+4. **Made again once.** When this device adopts a trust context, each link to a device dialed by its key alone (no identity of it admitted) whose device name the keyring now covers is closed with **0x03** and dialed once more (§8.5): its hello is judged by what this side holds now, and the device is identified, so the link carries the namespace's sync group (§10). The entry is removed once its link ends, and is not dialed again (§13.1: not persistent).
+
+A dial sends only what every link sends: the handshake and the hello (§5). The secret of a code never passes through it: the secret travels only inside the sealed ask (data-layer.md §19.3), over the link or any other path.
+
+A device with no listening socket dials from a socket the system picks; a device that listens dials from its link socket, so the other device sees one address for it. Addresses to dial are bounded and tried once per join; a dial that fails leaves nothing behind.
 
 ## 14. Direct paths
 
@@ -923,7 +960,7 @@ The serving policy applies to links nobody asked for: no peer entry of the relay
 
 - **`own`** (the default): devices of the namespaces in which the relay holds a certificate (of its link key, or of a membership, §5.8). A device of a namespace whose trust context it holds but in which it holds no certificate, or of a namespace it does not hold, is refused with **0x19** — unless another of its identities is served (§7.3 rule 5): a device of A and C is served by a relay of C by its C membership.
 - **`listed`** (`roots`, optional quotas): those, and devices of the namespaces whose root key fingerprint is in `roots`. A device of a held namespace is checked as any device of it (revocations, link policy, §7.1 steps 1–11) and served when the fingerprint of one of the held context's anchors is listed. A device of a namespace the relay does not hold is checked offline against the root in its hello (§7.1 R1–R7) and served when that root's fingerprint is listed. Without quotas, only the one-root-per-name rule of §15.3 bounds them.
-- **`open`** (quotas): devices of any namespace whose hello chain ends in a self-signed root certificate that validates the device's certificate (§7.1 R1–R7), under the quotas of §15.3. The relay's own namespaces are never under quota.
+- **`open`** (quotas): devices of any namespace whose hello chain ends in a self-signed root certificate that validates the device's certificate (§7.1 R1–R7), under the quotas of §15.3. The relay's own namespaces are never under quota. A device of a namespace the relay holds the trust context of but holds no certificate in is served too, checked as any device of that namespace (revocations, link policy, §7.1 steps 1–11) and under the quotas, the namespace bound to the held context's anchor with the smallest fingerprint (§15.3): holding a namespace's context is what an inviter does for the person it introduced (§8.6), and `open` must not stop serving a person once it follows them.
 
 A refusal says whom the relay serves, which namespace and root key the device has, and what to do (use another relay, or ask the operator to serve the namespace by its root key fingerprint).
 
@@ -1505,6 +1542,7 @@ These points were open when this spec was first written. Each was decided, and c
 32. **A relay also routes the namespaces the device follows** (§10, §15.5). Two people's devices, each the root of its own namespace and each holding the other's trust context, reach each other through a relay both use without operator routes: the relay routes each linked device and its sync group, and each device routes the other's namespace (its devices and, by CHILD-INHERIT, its sync group) to the relay. A relay the namespace advertises does this as well as one the person added: the namespace's root chose it for the person's devices, so following someone needs no `[[relay]]`. The choice still counts certificate namespaces only, so following a namespace dials no more relays.
 33. **A relay carries a served namespace's sync group and chain** (§10, §15.7). A community relay needs nothing per person: holding the trust contexts of the people it carries would be a setup step for each of them. So a served device's link routes its namespace's group like a held one's, and while the namespace is in transit the relay runs the group with the multicast strategy, as a forwarder holding it would. The strategy is an ordinary choice made by the host's library that knows the namespace is carried; the forwarder treats no name specially. It stays for a namespace the relay holds, whose trust-context library chose it. A relay holding a namespace validates its Data, fetching and caching the chain; a relay carrying it in transit does neither, so the served device's link routes the key names of the issuers its hello showed, and consumers fetch the chain from the device. A namespace-wide route was the alternative; it would send every Interest under the namespace to whichever served device the strategy picks.
 34. **A followed namespace is routed at once; a relay is reachable by its name** (§10, §15.5). Two people who meet by an introduction code adopt each other's trust context while linked: routing a namespace followed later only from the next link path to the relay left them unreachable until a relink nobody asks for. The routes of a link path therefore follow the keyring on every adoption, as revocations already did (§12). Before adopting, a device reaches the other only by naming a relay both use, in a ForwardingHint: the generic NDN mechanism, with the relay's own name routed over its link and each forwarder stripping a hint that names one of its own device names or a name under one; the alternative — a route per namespace announced by the relay — would make a community relay keep state per person (§15.5 "What the relay needs"). The device names are not NFD producer regions: under NFD's rule a hint naming an ancestor of a region has reached it, so a hint `<ns>` toward the namespace's CA (a renewal's certificate fetch) was stripped at the renewing device itself, which then had no route for its own new certificate.
+35. **A stranger gets an introduction link, and the dial is by key** (§7.3 rule 8, §8.6, §13.3). An embedded device with no daemon has no relay and no route to a stranger, yet an introduction needs a path to the inviter's device before either side trusts the other. The alternative — a peer entry for every possible joiner, or an unauthenticated listener — would make the inviter either unreachable or open: the introduction link is open to the one exchange only, within the enrollment links' slots and rates, and carries nothing a stranger could not ask of the device by name. The key in the code authenticates the inviter (the handshake proves it); the addresses are only where to try (data-layer.md §19.7). Every address is tried at once so one dead address costs no more than the handshake timeout, and the first link whose handshake proved the key wins.
 
 ## Appendix A. Code references (non-normative)
 

@@ -85,7 +85,7 @@ in a URI is a routing hint that MUST match the `Kind` TLV (§5.2); the TLV is au
 | `recovery` | `4` | in | A recovery bundle (public history, no private keys) | restore (mobile) |
 | `bag` | `5` | in | A password-encrypted SafeBag and its key name; for a recovery kit also the namespace and expected fingerprint | key migration; file recovery kit (F7, F8) |
 | `capability` | `6` | out | A scoped, expiring capability request or grant | pairing (F9) |
-| `intro` | `7` | in | The inviter's namespace and expected fingerprint, a one-use offer's name and secret, relay hints | join a folder by a code ([data-layer.md](data-layer.md) §19) |
+| `intro` | `7` | in | The inviter's namespace and expected fingerprint, a one-use offer's name and secret, the inviter's link hint, relay hints | join a folder by a code ([data-layer.md](data-layer.md) §19) |
 
 The kind token is the lowercase ASCII string in the first column. The code is the one-byte
 value of the `Kind` TLV (§4.2). Codes `0` and `8`–`255` are unassigned. A parser MUST reject
@@ -119,7 +119,8 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0475` | Offer | in Body | NDN name string: the offer record's name, `<D>/32=log/<F>/seq=<n>` | intro |
 | `0x0476` | RelayHint | in Body, repeatable | NDN name string: the device name of a relay that reaches the inviter | intro (optional) |
 | `0x0477` | Secret | in Body | exactly 16 bytes: the offer's secret | intro |
-| `0x0478`–`0x0480` | — | — | unassigned | — |
+| `0x0478` | LinkHint | in Body | octets: the inviter's link hint — its device key and where to dial it — as [data-layer.md](data-layer.md) §19.2 encodes it (TLVs 0x05B0, 0x05B2, [README](README.md#tlv-type-numbers)); this format carries them and judges none of them. Even type: a reader that does not know it skips it | intro (optional) |
+| `0x0479`–`0x0480` | — | — | unassigned | — |
 | `0x0481` | Version | in Body | u64 (§4.4) | anchor: context version |
 | `0x0482` | Wire | in Body | opaque bytes | anchor: legacy unsigned context Content; delegation: signed delegation; recovery: bundle; bag: SafeBag |
 | `0x0483` | CaPrefix | in Body | NDN name string (§4.4) | invite |
@@ -158,7 +159,7 @@ and `*` a field that repeats zero or more times.
 | recovery | Wire |
 | bag | KeyName, Wire, Namespace?, AnchorFingerprint? |
 | capability | Direction, Namespace, ScopePattern*, TtlSecs, Nonce?, Grant? |
-| intro | Namespace?, AnchorFingerprint, Offer, Secret, RelayHint* |
+| intro | Namespace?, AnchorFingerprint, Offer, Secret, LinkHint?, RelayHint* |
 
 Further producer rules:
 - **anchor.** A producer MUST include at least one of AnchorFingerprint, ContextData or Wire.
@@ -171,8 +172,9 @@ Further producer rules:
     cryptographically secure RNG, fresh for every request.
   - A grant SHOULD carry the Nonce of the request it answers.
 - **intro.** A producer SHOULD include Namespace. The Secret is 16 bytes from a
-  cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). RelayHint elements
-  keep their order: the relays the inviter's trust context advertises, in its order.
+  cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). LinkHint, when
+  present, comes once, after Secret. RelayHint elements keep their order: the relays the
+  inviter's trust context advertises, in its order.
 - **No other fields.** A producer MUST NOT emit fields not listed for the kind, and MUST NOT
   emit a field twice, ScopePattern and RelayHint excepted.
 
@@ -349,11 +351,13 @@ Producer rules:
   that serves the context ([ndn-link.md](ndn-link.md)).
 - **Long introductions.** If the `trust-uri` of an `intro` exceeds the limit, the producer
   MUST drop RelayHint elements from the end, keeping the longest prefix of them that fits
-  (`TrustEnvelope::qr_uri`); Namespace, AnchorFingerprint, Offer and Secret are never dropped.
-  A joiner without hints reaches the inviter through its own namespace's relays
-  ([data-layer.md](data-layer.md) §19.3).
+  (`TrustEnvelope::qr_uri`); Namespace, AnchorFingerprint, Offer and Secret are never dropped,
+  and LinkHint is kept whole. A LinkHint that still does not fit is shortened by its maker,
+  who knows its encoding (data-layer.md §19.2: candidates from the end, then the hint), and
+  `qr_uri` then answers for the shorter one. A joiner without hints reaches the inviter
+  through its own namespace's relays ([data-layer.md](data-layer.md) §19.3).
 - Other kinds have no fallback: the producer refuses to render them, as it refuses an
-  `intro` that does not fit without relay hints.
+  `intro` that does not fit without relay hints and a link hint.
 
 Parser rules: a parser MUST accept any version, error-correction level and mode a standard
 decoder produces.
@@ -468,7 +472,7 @@ that the Kind defines (§4.3) is validated as it is read, and the first failure 
 - Direction: exactly 1 byte, else Malformed("capability direction length").
 - Secret: exactly 16 bytes, else Malformed("introduction secret length").
 - A second occurrence of any field but ScopePattern and RelayHint: Malformed("repeated field").
-  ScopePattern and RelayHint accumulate in order.
+  ScopePattern and RelayHint accumulate in order. LinkHint's octets are not read here.
 
 A field that the Kind does not define is unrecognized, whether its type is unassigned or
 defined for another kind (evolvability rule). For example:
@@ -604,6 +608,9 @@ These payload formats are outside this spec (§10, Q14).
 4. Secret is used only to derive the offer's proof key; it is never sent, logged or kept.
 5. RelayHint elements are reachability hints: the joiner's Interests carry them as their
    ForwardingHint, and nothing they say is trusted.
+6. LinkHint is a reachability hint too: its key is what the joiner's dial proves, its
+   addresses are where to try, and nothing in it is trusted for anything else (data-layer.md
+   §19.7). One that does not read is ignored, and the join goes on without it.
 
 ## 8. Test vectors
 
