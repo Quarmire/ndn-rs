@@ -1845,30 +1845,53 @@ questions.
 2. A **program face** is exactly one of: an in-process app face (a channel
    or callback between the forwarder and a program of its own process); a
    shared-memory face (its segment is created owner-only or as an anonymous
-   capability); a stream socket of the Unix domain whose peer the operating
-   system identified (`SO_PEERCRED`, `getpeereid`), whether the forwarder
-   accepted it or dialled it, including a socketpair descriptor handed to
-   it. Every other face is **validated**: TCP, UDP, WebSocket, WebTransport,
-   WebRTC, QUIC and every other network transport, **even to a loopback
-   address**; a Unix socket the operating system reported no peer for; a
-   Windows named pipe (it reports no peer credentials). A face standing in
-   for a network peer in a test or a simulation is validated like it.
+   capability; see rule 6 for one opened for a requester); a stream socket
+   of the Unix domain whose peer the operating system identified
+   (`SO_PEERCRED`, `getpeereid`) **and** whose peer is the daemon's own
+   user, root, or a member of a group the operator listed in `[security]
+   program_groups` (empty by default), whether the forwarder accepted the
+   socket or dialled it (a dialled socket: the peer is this process's user or
+   root), including a socketpair descriptor handed to it. Every other face
+   is **validated**: TCP, UDP, WebSocket, WebTransport, WebRTC, QUIC and
+   every other network transport, **even to a loopback address**; the Unix
+   socket of any other user (it is accepted, since the socket file is
+   world-connectable, and it keeps the peer credentials so management can
+   tell who asked, but its Data is validated); a Unix socket the operating
+   system reported no peer for; a Windows named pipe (it reports no peer
+   credentials). A face standing in for a network peer in a test or a
+   simulation is validated like it.
 3. Trust is a property the face's constructor sets from how the face was
-   opened (which OS facility produced it, what it attested), and a
-   forwarder MUST NOT derive it from the peer's address, a host name, the
-   face's scope or its configured URI. A transport that states nothing is
-   validated. A program that wants the program standing opens a Unix socket
-   or a shared-memory face, as `ndn-ipc` does; there is no setting that makes
-   a network face a program face.
+   opened (which OS facility produced it, what it attested) and from the
+   node's own policy on whom it trusts, and a forwarder MUST NOT derive it
+   from the peer's address, a host name, the face's scope or its configured
+   URI. A transport that states nothing is validated. A program that wants
+   the program standing opens a Unix socket as the daemon's user (or a member
+   of a program group) or a shared-memory face, as `ndn-ipc` does; there is
+   no setting that makes a network face a program face.
 4. An operator MAY make program faces validate too (ndn-fwd
    `[engine] require_local_validation = true`; per face
    `set_require_data_validation`), for a host whose local programs distrust
    each other: a program face so marked is validated, and its Data is
    dropped if no validator is configured. Nothing makes a validated face
-   skip validation.
+   skip validation. The one setting that widens who is a program peer is the
+   forwarder's `[security] program_groups` (rule 2): membership of such a
+   group skips Data validation for that user's sockets, so a node lists only
+   groups whose members it trusts as it trusts the daemon's own user. It is
+   separate from `trust_admin_groups`, who may change the node's trust
+   (mgmt-trust.md): neither list implies the other.
 5. A node whose Data is carried in transit (a served namespace it does not
    hold, mgmt-trust.md) forwards that Data unvalidated and uncached whatever
    face it arrives on; that is the transit mark's rule and is unchanged.
+6. A face the forwarder opens *for a requester* (a shared-memory face a
+   command asked for) has no more trust than the requester's own face: a
+   validated requester gets a validated face whatever transport it asked
+   for, and so does a requester that is gone by the time the face is
+   opened. A face carries the requester's require-validation flag too. The
+   NDNLPv2 LocalFields option, which lets a face choose the next hop of its
+   Interests (`NextHopFaceId`), is for program faces only: management refuses
+   to turn it on for any other face (`field=flags:local-fields
+   reason=not-a-program-face`), and the forwarder ignores `NextHopFaceId`
+   from a validated face whatever its flag says.
 
 *Management and `/localhop`.* An operator of the forwarder is identified by
 the kernel's peer credentials of a Unix socket (mgmt-trust.md), never by a
@@ -1890,13 +1913,18 @@ a file with an owner), so any process could feed the content store: a
 forged Data for a name was cached and then answered every later Interest
 for it, from every consumer of the forwarder — including another user's —
 so a device never saw the genuine packet (data-layer.md §18.1; the case
-was met by a member's own loopback face). Now only a face whose peer the
-operating system or the process itself vouches for is believed. What a
-program face still lets through is what it always did: the program on it
+was met by a member's own loopback face). A second hole was the same in
+Unix form: the face socket is world-connectable (`0666`), and every peer
+the kernel identified was a program, so another user's process could
+connect and feed the content store; it could also ask for a shared-memory
+face (a program face by its transport) and turn LocalFields on, which lets a
+face pick the next hop of its Interests. Now only a face whose peer the
+operating system or the process itself vouches for *and* the node trusts as
+its own is believed (rule 2): the peer credentials tell who connected, and
+the forwarder uses them to decide whether that user's Data is validated. What
+a program face still lets through is what it always did: the program on it
 is trusted by the host's access control, so on a host whose programs
-distrust each other the operator turns on rule 4 (the Unix socket's
-`0666` mode is what lets any local program connect; the peer credentials
-tell who connected, and the forwarder does not use them to authorize Data).
+distrust each other the operator turns on rule 4.
 Residual: a refusal Nack is told to a loopback consumer (it is local in
 scope), so a process of the host that opens a loopback face learns the
 forwarder's verdict on Data it forged, as a local app does; a network
@@ -2321,12 +2349,14 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   predates CutKeyDigest, CutManifest and DataRequiresCut keeps the
   residuals those fields close, for its own judgements, until updated.
 - A forwarder believes a face's Data unchecked only when the operating
-  system or the process itself vouches for the program on it (an in-process
-  face, shared memory, a Unix socket with peer credentials); a TCP, UDP or
-  WebTransport face to a loopback address is validated and cached-from
-  like any network face, because any process of any user on the host can
-  open one (§6.6). A node that ran a forwarder before that rule held, for
-  its forwarder, the old exposure: a forged Data from a loopback face in
+  system or the process itself vouches for the program on it *and* the node
+  trusts that program as its own (an in-process face, shared memory, a Unix
+  socket of the daemon's user, root or a `program_groups` member); a TCP, UDP
+  or WebTransport face to a loopback address, or the Unix socket of any
+  other user, is validated and cached-from like any network face, because
+  any process of any user on the host can open one (§6.6). A node that ran
+  a forwarder before that rule held, for its forwarder, the old exposure:
+  a forged Data from a loopback face in
   its content store, answered to every later Interest for the name.
 
 ## 11. Test vectors
