@@ -1132,13 +1132,16 @@ in any arrival order.
     and the keys granted. The requirement comes from the epochs used,
     never from the seal the writer declares.
   - **Never counted** — a member is kept otherwise than `Forever`: no
-    member counts and none is refused, at any reader; each waits, reported
-    not counted ("group never counts: … kept …"), and versions that depend
-    on a member — its writer's later versions in those collections among
-    them — wait. A reader that never learns of that member (it left its
-    writer's listing) finds the group incomplete and waits alike, so no
-    reader applies what follows it and no honest writer builds on it: only
-    the misbehaving writer's own later versions are held back.
+    member counts and none is refused, at any reader; each is reported not
+    counted, as an exclusion that waiting does not end ("group never
+    counts: … kept …"; `NotCounted::Excluded`, not `Waits`: no later
+    version brings a `Counted`, only the writer putting the items again as
+    a group kept `Forever`), and versions that depend on a member — its
+    writer's later versions in those collections among them — wait. A
+    reader that never learns of that member (it left its writer's listing)
+    finds the group incomplete and waits alike, so no reader applies what
+    follows it and no honest writer builds on it: only the misbehaving
+    writer's own later versions are held back.
   - **Unreadable here** — a member is held sealed and this device cannot
     open it: no member is shown — none delivered as a version, none in a
     value — each is reported not counted ("group not readable here"), and
@@ -3737,8 +3740,21 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   `put_group` and the batch forms return once the version is applied
   locally and queued behind the durability barrier; publishing after the
   barrier is the only wait. (1) A collection under a folder whose members
-  record this device holds, its own folder or another's, inherits that
-  record: no look runs before the put and no record of its own is signed.
+  record this device holds, its own folder or another's, and that has no
+  record of its own here, inherits the folder's record: no look runs
+  before the put and no record of its own is signed — once every device
+  of its namespace known here has been walked toward the folder. A device
+  not walked yet may hold a record of the collection of its own, which
+  narrows who reads or writes it (§6.1), and a version sealed or written
+  under the folder's record meanwhile would reach readers that record
+  leaves out, for good: until then the put answers `NotReady`
+  (`RetryLater`) at once, `why` naming the devices and saying to put again
+  once they are reached, or to mark a lost key suspected or revoke it; the
+  walk runs in the background. This is judged before the record admitting
+  a writer of another namespace, so a joiner's put waits for it too. Once
+  the folder was walked the put returns at once, and so does one into a
+  collection that has a record of its own here: it is written under the
+  record in force over it, its own narrowed by the folders above (§6.1).
   (2) A collection of this namespace under no held record, not yet
   followed, whose namespace has a device not walked yet: `NotReady`
   (`RetryLater`) at once, `why` naming the device whose summary may hold a
@@ -3766,7 +3782,8 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   arrives, and the version then counts (`Change::Counted`). **`Excluded(why)`**
   is a rule's own exclusion (the rule's `Counting::NotCounted`, an apply
   that failed, a group refused, a group member held back by a member its
-  rule excludes): it does not end by waiting for what the layer waits for
+  rule excludes, a group with a member kept otherwise than `Forever`
+  (§5.5)): it does not end by waiting for what the layer waits for
   (a later version the rule counts differently may still end it, as §5.2
   says, and `Change::Counted` follows then too). `Display` is the bare
   reason. A version whose reason moves from `Waits` to `Excluded`, or
@@ -4482,6 +4499,7 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back, nor does one nothing signed held vouches for once its walks spent their `REFRESH_TRIES` tries unreached; one a faulty path kept from a few walks is still waited for. | §5, §6.1, §13.5 |
+| Put into a collection that would inherit a folder's record before a device was walked toward the folder | `NotReady` (`RetryLater`) at once, naming the devices, and nothing is signed or sealed: a device not walked yet may hold a record of the collection of its own that narrows who reads or writes it, and a version sealed under the folder's record meanwhile would reach readers that record leaves out. The walk runs in the background; put again once it ends, or mark the lost key suspected or revoke it (it is not waited for then). Once the folder was walked, the put inherits its record and returns at once. | §6.1, §15 |
 | Reader holds sealed data before the record admitting it (lost on the way, or not walked to yet) | `get` answers `NotReady` (`RetryLater`), naming the devices, while a known device of the collection's namespace was not walked toward its folder; `Sealed` only once every one was walked and no record held admits the reader. Nothing is read meanwhile: reading takes a record admitting the device and the epoch key it grants. A name a stranger announced in the group delays the refusal by its walks' tries at most (nothing signed vouches for it), never turns it into a read; a device marked suspected or revoked is not waited for. | §5, §9, §15 |
 | Write refused after the edit (too large, rule refuses) | Nothing signed or stored, no default record, the log head unmoved; the collection is read again, so the refused edit is not in the state. | §5, §5.1, §15 |
 | Removed writer keeps its devices unreachable | The owner walks the writer's known devices as far as they are reachable and signs the cut over what it holds then; the removal is never held off, and versions only the unreachable devices hold fall outside the cut. | §6, §6.2 |

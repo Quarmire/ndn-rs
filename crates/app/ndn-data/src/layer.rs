@@ -66,8 +66,9 @@ pub enum NotCounted {
     /// and [`Change::Counted`] follows.
     Waits(String),
     /// A rule's own exclusion (its [`Counting::NotCounted`]), an apply that
-    /// failed, a group refused or held back by a member its rule excludes:
-    /// it does not end by waiting.
+    /// failed, a group refused or held back by a member its rule excludes,
+    /// or a group with a member kept otherwise than until pruned: it does
+    /// not end by waiting.
     ///
     /// [`Counting::NotCounted`]: crate::merge::Counting::NotCounted
     Excluded(String),

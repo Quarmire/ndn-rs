@@ -596,6 +596,51 @@ async fn a_group_member_still_arriving_waits_and_a_rule_exclusion_is_excluded() 
     dev.shutdown();
 }
 
+/// A group with a member kept otherwise than until pruned never counts, and
+/// waiting does not end that ([`NotCounted::Excluded`]): even with every
+/// member present it stays out, until its writer puts the items again as a
+/// group kept until pruned. Telling it a wait would promise a `Counted`
+/// that never comes.
+#[tokio::test]
+async fn a_group_with_a_member_not_kept_until_pruned_is_excluded_not_waiting() {
+    let dev = device().await;
+    let mut changes = dev
+        .watch(&n("/alice/32=data/trip"), &Frontier::new())
+        .await
+        .unwrap();
+    let kept = |c: &Name, seq: u64, keep: Keep| {
+        let Record::Version(mut body) = version("/bob/laptop", c, seq, &[], Some(PAIR)).record
+        else {
+            unreachable!("a version")
+        };
+        body.keep = keep;
+        made("/bob/laptop", c, seq, Record::Version(body))
+    };
+    let first = kept(&plan(), 10, Keep::LastN(3));
+    let second = kept(&budget(), 11, Keep::Forever);
+    give(&dev, &first);
+    give(&dev, &second);
+    let (first_id, second_id) = (id_of(&first), id_of(&second));
+    let seen = drain(&mut changes).await;
+    for id in [&first_id, &second_id] {
+        assert!(!counts(
+            &dev,
+            &if *id == first_id { plan() } else { budget() },
+            id
+        ));
+        let told = seen.iter().find_map(|c| match c {
+            Change::NotCounted { id: v, why, .. } if v == id => Some(why.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(&told, Some(NotCounted::Excluded(why)) if why.contains("group never counts")),
+            "a group with a member kept otherwise than until pruned is excluded, not a wait: \
+             {told:?} in {seen:?}"
+        );
+    }
+    dev.shutdown();
+}
+
 fn id_of(m: &Made) -> VersionId {
     VersionId {
         writer: Writer::new(m.key.clone()),

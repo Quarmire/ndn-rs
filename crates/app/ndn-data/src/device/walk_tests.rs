@@ -1702,6 +1702,102 @@ async fn a_put_under_no_held_record_is_not_ready_at_once_and_goes_through_once_t
     other.shutdown();
 }
 
+/// The laptop holds the record of Wendy's folder `docs`, and hears the phone,
+/// a device of her namespace whose answers are lost for now. The phone may
+/// hold a record of the collection `docs/secret` that narrows the folder's.
+/// A put into `docs/secret`, which the laptop holds no record of, is
+/// `NotReady` at once, naming the phone — never sealed or written under the
+/// folder's record, which the phone's record over it may narrow for good
+/// (spec §15, 2). Once the phone is reached, the put goes through under the
+/// collection's own record.
+#[tokio::test(start_paused = true)]
+async fn a_put_inheriting_a_folder_record_is_not_ready_until_the_phone_was_walked() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let other = start_on(
+        &phone,
+        Arc::clone(&keys[1]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let folder = n("/wendy/32=data/docs");
+    let c = folder.clone().append("secret");
+    let share = crate::layer::Share {
+        rule: Rule::Log,
+        writers: vec![ns.clone()],
+        readers: Vec::new(),
+    };
+    other.share(&c, share.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let net = Hostile::new(&[&other], &phone, None, &phone, &ns);
+    net.losing.store(true, Ordering::Relaxed);
+    let me = start_on(&laptop, Arc::clone(&keys[0]), validator(), net.clone()).await;
+    me.share_folder(&folder, share.into()).await.unwrap();
+    me.inner.on_update(&ns, notice(&phone));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let options = PutOptions {
+        type_id: crate::TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    };
+    let note = |i: usize| Content::new().with("t", Bytes::from(i.to_string()));
+    let head = me.inner.st.lock().head;
+    let began = tokio::time::Instant::now();
+    let refused = me.put(&c, note(1), options.clone()).await;
+    let spent = began.elapsed();
+    assert!(
+        spent < Duration::from_millis(5),
+        "the answer waited {spent:?} for the phone"
+    );
+    assert!(
+        matches!(&refused, Err(DataError::NotReady { why, .. }) if why.contains("/wendy/phone")),
+        "a put inheriting the folder's record while the phone was not walked toward it must be \
+         NotReady, naming the phone, not {refused:?}"
+    );
+    assert_eq!(
+        me.inner.st.lock().head,
+        head,
+        "nothing is signed under the folder's record meanwhile"
+    );
+    // The group put too.
+    let grouped = me.put_group(vec![(c.clone(), Edit::Fields(note(1)))], options.clone());
+    assert!(
+        matches!(grouped.await, Err(DataError::NotReady { .. })),
+        "a put_group inheriting the folder's record is NotReady alike"
+    );
+
+    // The phone is reached again; the look, in the background, ends.
+    net.losing.store(false, Ordering::Relaxed);
+    let mut put = None;
+    for _ in 0..60 {
+        match me.put(&c, note(1), options.clone()).await {
+            Ok(id) => {
+                put = Some(id);
+                break;
+            }
+            Err(DataError::NotReady { .. }) => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => panic!("the retry answered {e}"),
+        }
+    }
+    assert!(
+        put.is_some(),
+        "the put goes through once the phone is walked"
+    );
+    assert!(
+        me.inner.st.lock().colls[&c].line.own.is_some(),
+        "written under the collection's own record, which the phone held"
+    );
+    me.shutdown();
+    other.shutdown();
+}
+
 /// The phone hears a name nothing vouches for, and a notice of it arrives
 /// every second — faster than any walk of it ends. Each walk that ends with
 /// no root of it verified spends one of its tries (spec §17.1), as it
