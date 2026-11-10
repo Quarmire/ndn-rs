@@ -50,7 +50,7 @@ pub use any_map::AnyMap;
 pub use congestion::CongestionController;
 pub use face::{
     CongestionPolicy, Face, FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceScope,
-    LinkType, ip_face_uri,
+    FaceTrust, LinkType, ip_face_uri,
 };
 pub use face_event::{FaceEvent, FaceLifecycleSink};
 pub use face_factory::{FaceFactory, FaceParams};

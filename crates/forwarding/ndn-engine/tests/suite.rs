@@ -21,6 +21,8 @@ mod default_profile_without_manager;
 mod egress_scheduler;
 #[path = "face_factory.rs"]
 mod face_factory;
+#[path = "face_trust.rs"]
+mod face_trust;
 #[path = "fib_shadow_diagnostic.rs"]
 mod fib_shadow_diagnostic;
 #[path = "forwarding_conformance.rs"]

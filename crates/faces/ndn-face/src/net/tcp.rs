@@ -66,6 +66,20 @@ mod tests {
         )
     }
 
+    /// A TCP face to a loopback address is local in scope (`/localhost`
+    /// stays on this host) and still validated: any process of any user can
+    /// open a connection to it.
+    #[tokio::test]
+    async fn loopback_tcp_face_is_local_in_scope_and_validated() {
+        use ndn_transport::{FaceScope, FaceTrust};
+        let (client, server) = loopback_pair().await;
+        assert_eq!(client.scope(), FaceScope::Local);
+        assert_eq!(client.trust(), FaceTrust::Validated);
+        let accepted = Face::from_transport(server);
+        assert_eq!(accepted.scope(), FaceScope::Local);
+        assert_eq!(accepted.trust(), FaceTrust::Validated);
+    }
+
     #[tokio::test]
     async fn send_recv_single_packet() {
         let (client, server) = loopback_pair().await;

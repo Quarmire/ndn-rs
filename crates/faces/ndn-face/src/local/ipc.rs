@@ -21,8 +21,19 @@ type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
 
-fn make_face(id: FaceId, kind: FaceKind, uri: String, r: DynRead, w: DynWrite) -> IpcFace {
-    StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec)
+/// An IPC face. `creds` are the peer credentials the operating system
+/// reported for the socket, or `None` where it reports none (a Windows named
+/// pipe): they are what makes the face a program face
+/// ([`ndn_transport::FaceTrust::Program`]); without them its Data is validated.
+fn make_face(
+    id: FaceId,
+    kind: FaceKind,
+    uri: String,
+    r: DynRead,
+    w: DynWrite,
+    creds: Option<PeerCredentials>,
+) -> IpcFace {
+    StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec).with_peer_credentials(creds)
 }
 
 /// Kernel-attested credentials of the process at the other end of `stream`
@@ -71,7 +82,7 @@ impl IpcListener {
     /// through signed-command auth, not face-kind).
     pub async fn accept_as(&self, face_id: FaceId, kind: FaceKind) -> io::Result<IpcFace> {
         let (r, w, uri, creds) = self.inner.accept().await?;
-        Ok(make_face(face_id, kind, uri, r, w).with_peer_credentials(creds))
+        Ok(make_face(face_id, kind, uri, r, w, creds))
     }
 
     pub fn cleanup(&self) {
@@ -83,9 +94,12 @@ impl IpcListener {
     }
 }
 
+/// Dial the socket at `path` as a `FaceKind::Unix` face. The kernel reports
+/// who owns the far end ([`PeerCredentials`]), so the face is a program face
+/// where the platform reports it.
 pub async fn ipc_face_connect(id: FaceId, path: &str) -> io::Result<IpcFace> {
-    let (r, w, uri) = platform_connect(path).await?;
-    Ok(make_face(id, FaceKind::Unix, uri, r, w))
+    let (r, w, uri, creds) = platform_connect(path).await?;
+    Ok(make_face(id, FaceKind::Unix, uri, r, w, creds))
 }
 
 /// Adopt an already-connected `SOCK_STREAM` fd as an [`IpcFace`], taking
@@ -108,13 +122,16 @@ pub fn ipc_face_from_raw_fd(
     // fd; `UnixStream` becomes its sole owner and closes it on drop.
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
     std_stream.set_nonblocking(true)?;
-    let (r, w) = tokio::net::UnixStream::from_std(std_stream)?.into_split();
+    let stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let creds = unix_peer_credentials(&stream);
+    let (r, w) = stream.into_split();
     Ok(make_face(
         id,
         kind,
         format!("fd://{fd}"),
         Box::new(r),
         Box::new(w),
+        creds,
     ))
 }
 
@@ -170,11 +187,14 @@ impl PlatformListener {
 }
 
 #[cfg(unix)]
-async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)> {
+async fn platform_connect(
+    path: &str,
+) -> io::Result<(DynRead, DynWrite, String, Option<PeerCredentials>)> {
     let stream = tokio::net::UnixStream::connect(path).await?;
+    let creds = unix_peer_credentials(&stream);
     let (r, w) = stream.into_split();
     let uri = format!("unix://{path}");
-    Ok((Box::new(r), Box::new(w), uri))
+    Ok((Box::new(r), Box::new(w), uri, creds))
 }
 
 #[cfg(windows)]
@@ -228,7 +248,9 @@ impl PlatformListener {
 }
 
 #[cfg(windows)]
-async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)> {
+async fn platform_connect(
+    path: &str,
+) -> io::Result<(DynRead, DynWrite, String, Option<PeerCredentials>)> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     // ERROR_PIPE_BUSY: all server instances busy — retry.
@@ -244,7 +266,7 @@ async fn platform_connect(path: &str) -> io::Result<(DynRead, DynWrite, String)>
 
     let (r, w) = tokio::io::split(client);
     let uri = format!("pipe://{path}");
-    Ok((Box::new(r), Box::new(w), uri))
+    Ok((Box::new(r), Box::new(w), uri, None))
 }
 
 #[cfg(not(any(unix, windows)))]

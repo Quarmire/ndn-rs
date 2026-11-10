@@ -226,12 +226,47 @@ impl core::str::FromStr for FaceKind {
     }
 }
 
-/// Whether a face is local (same-host IPC) or non-local (network). Used to
-/// enforce that `/localhost` prefixes never cross non-local faces.
+/// Whether a face is local (same-host) or non-local (network): the *scope*
+/// of a face. Scope is NFD's notion and governs **reach** only: `/localhost`
+/// prefixes never cross a non-local face, `/localhop` Interests egress to a
+/// non-local face only when they arrived on a local one, `/ndn/local` stays on
+/// the link, and a refusal is reported only to local downstreams. A TCP, UDP
+/// or WebTransport face to a loopback address is `Local` in scope.
+///
+/// Scope says nothing about whom to *believe*. That is a face's
+/// [`FaceTrust`], which governs Data validation and caching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaceScope {
     Local,
     NonLocal,
+}
+
+/// Whether the forwarder believes the Data a face delivers without checking
+/// it: the *trust* of a face, separate from its [`FaceScope`].
+///
+/// Only a **program face** is trusted: the peer is a program on this host that
+/// the operating system, or the process itself, vouches for — an in-process
+/// app face, a shared-memory face, a Unix socket whose peer the kernel
+/// identified ([`PeerCredentials`]). Its Data is not validated and may enter
+/// the content store. Every other face is validated, however near its peer
+/// is: a TCP, UDP, WebSocket, WebTransport or QUIC face to `127.0.0.1` is
+/// reached by *any* process of *any* user on the host, so what arrives on it is
+/// no more believable than what arrives from the network, and a forged Data
+/// that a loopback face's cache admitted would be served to every later
+/// consumer of the name (data-layer.md §18.1, trust-context.md §6.6).
+///
+/// The face's constructor sets it ([`Transport::trust`]), from what it
+/// knows of how it was opened, never from the peer's address. The default is
+/// [`FaceTrust::Validated`]: a transport that says nothing is validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FaceTrust {
+    /// A program face: its Data is not validated (the fast path), unless the
+    /// forwarder is configured to validate program faces too (the engine's
+    /// `require_local_validation`, or `set_require_data_validation` per face).
+    Program,
+    /// Everything else: its Data goes through the validation stage, and only
+    /// Data that passed it is cached.
+    Validated,
 }
 
 /// How a [`FaceKind`]'s `FaceScope` is determined. NFD keeps locality
@@ -398,15 +433,21 @@ pub struct Face {
     /// ([`resolve_scope`]); cached so hot-path scope checks avoid re-parsing
     /// the FaceUri.
     scope: FaceScope,
+    /// Trust read once at construction from the transport
+    /// ([`Transport::trust`]): what the transport's constructor knew of how
+    /// the face was opened, never its peer's address.
+    trust: FaceTrust,
 }
 
 impl Face {
     pub fn new(transport: Arc<dyn ErasedTransport>, link_service: Arc<dyn LinkService>) -> Self {
         let scope = resolve_scope(transport.kind(), transport.remote_uri().as_deref());
+        let trust = transport.trust();
         Self {
             transport,
             link_service,
             scope,
+            trust,
         }
     }
 
@@ -434,10 +475,19 @@ impl Face {
         self.transport.kind()
     }
 
-    /// Per-face locality, resolved from kind + remote address at construction
-    /// (honors a loopback remote, unlike a kind-only classification).
+    /// Per-face locality (reach: `/localhost`, `/localhop`), resolved from kind +
+    /// remote address at construction: a loopback TCP face is `Local`. Not a
+    /// statement about trust, see [`Face::trust`].
     pub fn scope(&self) -> FaceScope {
         self.scope
+    }
+
+    /// Whether this face's Data is believed unchecked (a program face) or is
+    /// validated, set by the transport's constructor ([`Transport::trust`]).
+    /// Independent of [`Face::scope`]: a loopback TCP face is local in scope and
+    /// [`FaceTrust::Validated`].
+    pub fn trust(&self) -> FaceTrust {
+        self.trust
     }
 
     pub fn remote_uri(&self) -> Option<String> {

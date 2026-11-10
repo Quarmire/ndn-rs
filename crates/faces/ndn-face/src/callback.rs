@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{Mutex, mpsc};
 
 use ndn_packet::{Data, Interest, NackReason, lp::encode_lp_nack};
-use ndn_transport::{FaceError, FaceId, FaceKind, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
 
 const RESP_QUEUE_CAP: usize = 64;
 
@@ -66,6 +66,11 @@ impl Transport for CallbackFace {
 
     fn kind(&self) -> FaceKind {
         FaceKind::App
+    }
+
+    /// The callback is a program of this process.
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Program
     }
 
     /// Non-Interest packets are silently dropped (no response queued).
@@ -136,6 +141,11 @@ impl Transport for TapFace {
 
     fn kind(&self) -> FaceKind {
         FaceKind::App
+    }
+
+    /// An in-process tap.
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Program
     }
 
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {

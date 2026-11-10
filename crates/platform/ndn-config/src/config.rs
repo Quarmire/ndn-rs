@@ -1520,9 +1520,12 @@ pub struct EngineConfig {
     /// Worker count for the partitioned data plane. 0 = auto (physical cores).
     #[serde(default)]
     pub workers: usize,
-    /// Require Data signature validation even on Local faces (IPC/SHM), which
-    /// otherwise skip it. Default false. For multi-tenant hosts (or to stress
-    /// the validation path under load).
+    /// Require Data signature validation even on program faces (in-process,
+    /// shared memory, Unix sockets with peer credentials), which otherwise skip
+    /// it. Every other face (TCP, UDP, WebSocket, WebTransport, QUIC, even to a
+    /// loopback address) is always validated; this key cannot relax that.
+    /// Default false. For multi-tenant hosts (or to stress the validation path
+    /// under load).
     #[serde(default)]
     pub require_local_validation: bool,
 }
@@ -2773,7 +2776,8 @@ pub struct SecurityConfig {
     /// implies `validator_enabled = false`). Default `"default"` when the
     /// `[security]` table is present. `"default"` on an engine with no
     /// security manager has no trust anchors and fails closed: every
-    /// key-signed Data from a non-local face is refused `untrusted-root`
+    /// key-signed Data from a validated face (any face that is not a program
+    /// face, a loopback TCP/UDP face included) is refused `untrusted-root`
     /// (ndn-fwd always loads one, ephemeral at worst). When the table is
     /// absent entirely, `SecurityConfig::default()` applies, whose
     /// `validator_enabled` is `false`: Data is NOT validated (ndn-fwd warns

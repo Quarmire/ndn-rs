@@ -12,7 +12,7 @@ use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::face::{FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, LinkType};
+use crate::face::{FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, LinkType};
 
 /// Why a `Transport::set_send_mtu` call failed.
 ///
@@ -65,8 +65,10 @@ impl core::fmt::Display for PersistencyError {
 impl std::error::Error for PersistencyError {}
 
 /// OS-attested identity of the process on the other end of a local
-/// (Unix-domain) socket, captured at accept time (`SO_PEERCRED` /
-/// `getpeereid`). Used to authorize privileged management verbs.
+/// (Unix-domain) socket, captured when the socket was accepted or connected
+/// (`SO_PEERCRED` / `getpeereid`). Used to authorize privileged management
+/// verbs, and the evidence that makes a socket a program face
+/// ([`FaceTrust::Program`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerCredentials {
     pub uid: u32,
@@ -93,6 +95,16 @@ pub trait Transport: Send + Sync + 'static {
     /// `Local`. See [`crate::face::resolve_scope`].
     fn scope(&self) -> crate::face::FaceScope {
         crate::face::resolve_scope(self.kind(), self.remote_uri().as_deref())
+    }
+
+    /// Whether the forwarder believes the Data this transport delivers
+    /// without validating it. Set by the transport's constructor from how the
+    /// face was opened (an in-process channel, shared memory, a Unix socket
+    /// whose peer the kernel identified), never from the peer's address.
+    /// The default is [`FaceTrust::Validated`]: a transport must opt in to
+    /// being a program face. See [`FaceTrust`].
+    fn trust(&self) -> FaceTrust {
+        FaceTrust::Validated
     }
 
     /// Local URI (e.g. `unix:///run/nfd/nfd.sock`).
@@ -248,6 +260,7 @@ pub trait ErasedTransport: Send + Sync + 'static {
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError>;
     fn set_persistency(&self, persistency: FacePersistency) -> Result<(), PersistencyError>;
     fn peer_credentials(&self) -> Option<PeerCredentials>;
+    fn trust(&self) -> FaceTrust;
 }
 
 impl<T: Transport> ErasedTransport for T {
@@ -334,11 +347,39 @@ impl<T: Transport> ErasedTransport for T {
     fn peer_credentials(&self) -> Option<PeerCredentials> {
         Transport::peer_credentials(self)
     }
+
+    fn trust(&self) -> FaceTrust {
+        Transport::trust(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport that says nothing about trust is validated: being a
+    /// program face is something a constructor asserts, never a default.
+    #[test]
+    fn a_transport_that_says_nothing_is_validated() {
+        struct Silent;
+        impl Transport for Silent {
+            fn id(&self) -> FaceId {
+                FaceId(0)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::App
+            }
+            async fn send_bytes(&self, _w: Bytes) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+        assert_eq!(Transport::trust(&Silent), FaceTrust::Validated);
+        let erased: &dyn ErasedTransport = &Silent;
+        assert_eq!(erased.trust(), FaceTrust::Validated);
+    }
 
     #[test]
     fn mtu_default_errors_not_supported() {

@@ -161,13 +161,15 @@ pub struct FaceState {
     /// Set when the remote peer sends LP-wrapped packets (type 0x64). LP
     /// encoding is a per-link property determined by what the peer sends.
     pub uses_lp: AtomicBool,
-    /// Require cryptographic Data validation on this face even when it is
-    /// Local-scope. Default `false`: Local faces (IPC/SHM/loopback) are trusted
-    /// by OS access control and skip verification (the fast path). Set `true`
-    /// for a multi-tenant host where mutually-distrusting local apps share one
+    /// Require cryptographic Data validation on this face even though it is a
+    /// program face ([`ndn_transport::FaceTrust::Program`]). Default `false`:
+    /// program faces (in-process app faces, shared memory, Unix sockets with
+    /// peer credentials) skip verification (the fast path). Set `true` for a
+    /// multi-tenant host where mutually-distrusting local apps share one
     /// forwarder, so forged Data cannot poison the CS or spoof another app's
     /// namespace. Fail-closed: with no validator configured, required-validation
-    /// Data is dropped. NonLocal faces always validate regardless of this flag.
+    /// Data is dropped. Every other face is validated regardless of this flag,
+    /// whatever its scope or its peer's address.
     pub require_data_validation: AtomicBool,
     /// NFD `FaceFlags` bitmap (`FaceStatus.Flags`, TLV 0x6C), mutable via
     /// `faces/update` with `Flags`+`Mask`. External callers go through the
@@ -204,7 +206,7 @@ impl FaceState {
         }
     }
 
-    /// Whether this face requires Data validation even when Local-scope.
+    /// Whether this face requires Data validation although it is a program face.
     pub fn require_data_validation(&self) -> bool {
         self.require_data_validation.load(Ordering::Relaxed)
     }
@@ -286,7 +288,7 @@ pub struct EngineInner {
     /// `OnceLock` because the sender is created by `PacketDispatcher::spawn`
     /// after `Arc<EngineInner>` exists.
     pub(crate) pipeline_tx: OnceLock<mpsc::Sender<InboundPacket>>,
-    /// Force Data validation on Local faces as they are added (see
+    /// Force Data validation on program faces as they are added (see
     /// `EngineConfig::require_local_validation`).
     pub(crate) require_local_validation: bool,
     /// G4 egress QoS (opt-in): the per-face scheduler factory (strict-priority or DRR).
@@ -638,6 +640,7 @@ impl ForwarderEngine {
         // or tasks; cancelling the caller's token still stops the face.
         let cancel = cancel.child_token();
         let scope = erased.scope();
+        let trust = erased.trust();
         let congestion_policy = CongestionPolicy::default_for_scope(scope);
         let (send_tx, send_rx) = mpsc::channel(DEFAULT_SEND_QUEUE_CAP);
         let mut state = FaceState::new(
@@ -647,7 +650,7 @@ impl ForwarderEngine {
             congestion_policy,
             self.inner.runtime.unix_nanos(),
         );
-        if self.inner.require_local_validation && scope == ndn_transport::FaceScope::Local {
+        if self.inner.require_local_validation && trust == ndn_transport::FaceTrust::Program {
             state.set_require_data_validation(true);
         }
         // G4: install a per-face egress scheduler when QoS is configured (the factory
@@ -892,9 +895,10 @@ impl ForwarderEngine {
         }
     }
 
-    /// Require cryptographic Data validation on `face_id` even when it is
-    /// Local-scope. Off by default (Local faces are trusted by OS access
-    /// control and skip verification). Enable on a multi-tenant host so a
+    /// Require cryptographic Data validation on `face_id` even though it is a
+    /// program face. Off by default (program faces are trusted by OS access
+    /// control or by being in-process, and skip verification; every other face
+    /// is always validated). Enable on a multi-tenant host so a
     /// malicious/buggy local app cannot inject forged Data into the shared CS
     /// or satisfy another app's Interests. Fail-closed: with no validator
     /// configured, Data on a required-validation face is dropped. See

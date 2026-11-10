@@ -9,10 +9,16 @@ use ndn_transport::{FaceId, FaceKind, StreamFace, TlvCodec};
 /// LP-encoding is disabled — local transports pass raw NDN packets.
 pub type UnixFace = StreamFace<OwnedReadHalf, OwnedWriteHalf, TlvCodec>;
 
+/// A Unix-socket face over `stream`, carrying the peer credentials the kernel
+/// reports for it, which make it a program face
+/// ([`ndn_transport::FaceTrust::Program`]); a socket the kernel reports
+/// nothing for is validated like a network face.
 pub fn unix_face_from_stream(id: FaceId, stream: UnixStream, path: impl AsRef<Path>) -> UnixFace {
     let uri = format!("unix://{}", path.as_ref().display());
+    let creds = super::ipc::unix_peer_credentials(&stream);
     let (r, w) = stream.into_split();
     StreamFace::new(id, FaceKind::Unix, None, Some(uri), r, w, TlvCodec)
+        .with_peer_credentials(creds)
 }
 
 /// Like [`unix_face_from_stream`] but tags the face `FaceKind::Management`
@@ -97,6 +103,23 @@ mod tests {
         }
         for expected in &pkts {
             assert_eq!(&server.recv_bytes().await.unwrap(), expected);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A Unix socket the kernel reported the peer of is a program face, on
+    /// the accepting and the dialling side alike.
+    #[tokio::test]
+    async fn unix_faces_carry_kernel_credentials_and_are_program_faces() {
+        use ndn_transport::{Face, FaceTrust};
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_socket_path();
+        let (client, server) = loopback_pair(&path).await;
+        // The socket file is owned by this process's user, who is both peers.
+        let me = std::fs::metadata(&path).unwrap().uid();
+        for face in [Face::from_transport(client), Face::from_transport(server)] {
+            assert_eq!(face.peer_credentials().expect("kernel credentials").uid, me);
+            assert_eq!(face.trust(), FaceTrust::Program);
         }
         let _ = std::fs::remove_file(&path);
     }

@@ -12,7 +12,7 @@ use crate::pipeline::{
 };
 use ndn_discovery_core::InboundMeta;
 use ndn_store::PitToken;
-use ndn_transport::{FaceId, FaceScope};
+use ndn_transport::{FaceId, FaceScope, FaceTrust};
 
 use super::{InboundPacket, PacketDispatcher};
 
@@ -507,12 +507,14 @@ impl PacketDispatcher {
             }
             ForwardingAction::Nack(_reason) => {
                 if let Some((_, entry)) = self.strategy.pit.remove(&token) {
-                    // Only a local upstream (a forwarder on this host) may
-                    // say it refused the Data; from anyone else a refusal is
-                    // an unverified claim, passed on as NoRoute.
-                    let from_local = self.is_local_face(ctx.face_id);
+                    // Only a program face (a forwarder on this host reached
+                    // over its Unix socket, an in-process peer) may say it
+                    // refused the Data; from anyone else, a loopback TCP
+                    // face included, a refusal is an unverified claim,
+                    // passed on as NoRoute.
+                    let from_program = self.is_program_face(ctx.face_id);
                     let upstream_reason = match nack.reason {
-                        Some(r) if r.refusal().is_none() || from_local => r,
+                        Some(r) if r.refusal().is_none() || from_program => r,
                         _ => ndn_packet::NackReason::NoRoute,
                     };
                     let mut told: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
@@ -572,28 +574,32 @@ impl PacketDispatcher {
             fb.observe(ctx.face_id);
         }
 
-        // Local faces (IPC or a loopback remote) are trusted by OS-level
-        // access control; skip crypto for them. A remote WS/WT/WebRTC peer is
-        // NonLocal here, so its Data is verified — unlike the old kind-only
-        // classification, which trusted any browser peer.
+        // Validation is keyed by the face's TRUST, never its scope: only a
+        // program face (an in-process app face, shared memory, a Unix socket
+        // whose peer the kernel identified) is believed without a check, and
+        // its Data may be cached unverified. A TCP/UDP/WebSocket/WebTransport/
+        // QUIC face is validated even to a loopback address, which any process
+        // of any user on the host can reach. A face's scope (reach of
+        // `/localhost`, `/localhop`; here only the unsolicited-Data policy)
+        // is decided separately. See `ndn_transport::FaceTrust`,
+        // trust-context.md §6.6.
         //
-        // A face may opt OUT of the local fast-path via
+        // A program face may opt OUT of the fast path via
         // `require_data_validation` (multi-tenant host: forged Data from one
         // local app must not poison the shared CS or spoof another app's
-        // namespace). When required, validation runs as for a NonLocal face,
+        // namespace). When required, validation runs as for a validated face,
         // and fail-closes if no validator is configured.
-        let scope = self
+        let (scope, is_program) = self
             .face_table
             .get(ctx.face_id)
-            .map(|f| f.scope())
-            .unwrap_or(FaceScope::NonLocal);
-        let is_local = scope == FaceScope::Local;
-        let require_local_validation = is_local
+            .map(|f| (f.scope(), f.trust() == FaceTrust::Program))
+            .unwrap_or((FaceScope::NonLocal, false));
+        let require_program_validation = is_program
             && self
                 .face_states
                 .get(&ctx.face_id)
                 .is_some_and(|s| s.require_data_validation());
-        let validate = !is_local || require_local_validation;
+        let validate = !is_program || require_program_validation;
         // A Data that is validated may be refused: PIT match then keeps each
         // downstream's Interest, which the refusal Nack echoes.
         ctx.record_downstream = validate && self.validation.validator.is_some();
@@ -626,7 +632,7 @@ impl PacketDispatcher {
             ctx.verified = true;
             ctx
         } else {
-            if require_local_validation && self.validation.validator.is_none() {
+            if require_program_validation && self.validation.validator.is_none() {
                 debug!(
                     target: t::SECURITY,
                     face = %ctx.face_id,

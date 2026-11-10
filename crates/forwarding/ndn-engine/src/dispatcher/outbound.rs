@@ -11,7 +11,7 @@ use crate::pipeline::{Action, NackReason, PacketContext};
 use ndn_packet::Name;
 use ndn_packet::lp::LpHeaders;
 use ndn_store::CsEntry;
-use ndn_transport::{CongestionPolicy, FaceId, FaceScope, LinkType};
+use ndn_transport::{CongestionPolicy, FaceId, FaceScope, FaceTrust, LinkType};
 
 use super::PacketDispatcher;
 
@@ -40,11 +40,24 @@ impl PacketDispatcher {
     }
 
     /// Whether `face_id` is a local face (same host: an app, an internal
-    /// consumer, a loopback peer). A face gone from the table is not.
+    /// consumer, a loopback peer). A face gone from the table is not. Scope
+    /// only: who may be *told* a refusal, where `/localhost` may go. Whom to
+    /// *believe* is [`Self::is_program_face`].
     pub(super) fn is_local_face(&self, face_id: FaceId) -> bool {
         self.face_table
             .get(face_id)
             .is_some_and(|f| f.scope() == FaceScope::Local)
+    }
+
+    /// Whether `face_id` is a program face (an in-process app, shared memory,
+    /// a Unix socket whose peer the kernel identified): a peer whose word the
+    /// forwarder takes without a check, as it takes its Data. A loopback TCP
+    /// face is local in scope and not a program face. A face gone from the
+    /// table is not.
+    pub(super) fn is_program_face(&self, face_id: FaceId) -> bool {
+        self.face_table
+            .get(face_id)
+            .is_some_and(|f| f.trust() == FaceTrust::Program)
     }
 
     /// The validation stage refused `ctx`'s Data with a final verdict

@@ -7,8 +7,9 @@
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 
+use ndn_transport::face::ScopePolicy;
 use ndn_transport::{
-    FaceError, FaceId, FaceKind, FacePersistency, MtuError, PersistencyError, Transport,
+    FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PersistencyError, Transport,
 };
 
 /// Bytes plus optional source-face provenance, delivered to an in-process app
@@ -28,6 +29,14 @@ pub struct TaggedBytes {
 ///
 /// `InProcFace` is held by the forwarder pipeline; [`InProcHandle`] is given
 /// to the application.
+///
+/// **Trust.** The application on the other end of the channel is a program
+/// of this process: a face of an in-process kind ([`FaceKind::App`],
+/// [`FaceKind::Internal`], [`FaceKind::Compute`], …) is a
+/// [`FaceTrust::Program`] face. A face stamped with a network kind
+/// ([`InProcFace::new_kind`] with `Tcp`, `Udp`, `Multicast`, …) stands in for
+/// that network peer, as a test or a simulation does, and is validated like
+/// one.
 ///
 /// ```text
 ///   pipeline                 application
@@ -90,6 +99,13 @@ impl InProcFace {
 }
 
 impl Transport for InProcFace {
+    fn trust(&self) -> FaceTrust {
+        match self.kind.scope_policy() {
+            ScopePolicy::AlwaysLocal => FaceTrust::Program,
+            ScopePolicy::AlwaysNonLocal | ScopePolicy::ByRemoteAddress => FaceTrust::Validated,
+        }
+    }
+
     fn id(&self) -> FaceId {
         self.id
     }

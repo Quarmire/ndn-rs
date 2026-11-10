@@ -5,14 +5,21 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use crate::{
-    FaceError, FaceId, FaceKind, FacePersistency, MtuError, PeerCredentials, PersistencyError,
-    Transport,
+    FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PeerCredentials,
+    PersistencyError, Transport,
 };
 
 /// Generic stream-based `Transport` over any async read/write pair with a
 /// TLV codec. Reader/writer halves each sit behind a `Mutex`; the writer
 /// lock serialises concurrent `send_bytes()` calls. NDNLPv2 framing is
 /// applied by the paired [`LinkService`](crate::link_service::LinkService).
+///
+/// **Trust.** A stream face is [`FaceTrust::Validated`] (TCP, a Unix socket
+/// the kernel said nothing about, a named pipe) unless its constructor
+/// attached the peer's kernel-attested credentials
+/// ([`with_peer_credentials`](Self::with_peer_credentials)): the credentials
+/// are the evidence that a program of this host is on the other end, and only
+/// a constructor that read them from the operating system may supply them.
 pub struct StreamFace<R, W, C: Clone> {
     id: FaceId,
     kind: FaceKind,
@@ -44,9 +51,12 @@ impl<R, W, C: Clone> StreamFace<R, W, C> {
         }
     }
 
-    /// Attach the peer process credentials captured when the underlying
-    /// local socket was accepted (reported by
-    /// [`Transport::peer_credentials`]).
+    /// Attach the peer process credentials the operating system reported for
+    /// the underlying local socket (reported by
+    /// [`Transport::peer_credentials`]). `Some` makes the face a program face
+    /// ([`FaceTrust::Program`]); `None` leaves it validated. Call it only with
+    /// credentials read from the socket (`SO_PEERCRED`, `getpeereid`), never
+    /// with credentials the peer or a configuration states.
     pub fn with_peer_credentials(mut self, c: Option<PeerCredentials>) -> Self {
         self.peer_credentials = c;
         self
@@ -105,5 +115,13 @@ where
 
     fn peer_credentials(&self) -> Option<PeerCredentials> {
         self.peer_credentials
+    }
+
+    fn trust(&self) -> FaceTrust {
+        if self.peer_credentials.is_some() {
+            FaceTrust::Program
+        } else {
+            FaceTrust::Validated
+        }
     }
 }

@@ -81,10 +81,13 @@ pub struct EngineConfig {
     /// and requires the `partitioned-fwd` feature (otherwise it falls back to
     /// `Shared` with a warning). See `crate::dispatcher::DataPlane`.
     pub data_plane: crate::dispatcher::DataPlane,
-    /// Require cryptographic Data validation even on Local-scope faces
-    /// (IPC/SHM/loopback), which otherwise skip it. Default `false`. Set `true`
-    /// on a multi-tenant host so a local app cannot poison the CS or spoof
-    /// another namespace; applied to every Local face as it is added.
+    /// Require cryptographic Data validation even on program faces
+    /// ([`ndn_transport::FaceTrust::Program`]: in-process app faces, shared
+    /// memory, Unix sockets with peer credentials), which otherwise skip it.
+    /// Every other face — TCP, UDP, WebTransport, QUIC, even to a loopback
+    /// address — is always validated, whatever this says. Default `false`. Set
+    /// `true` on a multi-tenant host so a local app cannot poison the CS or spoof
+    /// another namespace; applied to every program face as it is added.
     pub require_local_validation: bool,
 }
 
@@ -938,15 +941,17 @@ fn resolve_security_profile(
         (SecurityProfile::Custom(v), _) => Some(v),
 
         // No SecurityManager: `Default` has no trust anchors, so it fails
-        // closed. Every Data from a non-local face that names a signer is
-        // refused at once, a final `untrusted-root` (local faces are exempt
+        // closed. Every Data from a validated face (any face that is not a
+        // program face, a loopback TCP/UDP face included) that names a signer is
+        // refused at once, a final `untrusted-root` (program faces are exempt
         // from validation as always; DigestSha256 Data still checks its
         // digest). Anchors added to this validator later are honoured.
         (SecurityProfile::Default, None) => {
             tracing::warn!(target: t::SECURITY,
                 "Security profile \"default\" without a SecurityManager: no trust anchors are \
-                 configured, so every signed Data arriving on a non-local face is REFUSED \
-                 (untrusted-root); local faces are unaffected. Configure a security manager \
+                 configured, so every signed Data arriving on a validated face (a network face, \
+                 a loopback one included) is REFUSED (untrusted-root); program faces (in-process, \
+                 shared memory, Unix sockets with peer credentials) are unaffected. Configure a security manager \
                  (a [security] identity whose PIB holds trust anchors, or adopt a trust \
                  context), or choose profile \"accept-signed\" (signature only) or \
                  \"disabled\" explicitly."
