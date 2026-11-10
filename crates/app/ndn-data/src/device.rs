@@ -9665,15 +9665,11 @@ impl Inner {
                     }
                     st.peers.get(&key).map_or(0, |p| p.head)
                 };
-                let ok = inner.refresh_pass(&ns, &device, &wake).await;
+                let ok = inner
+                    .refresh_pass(&ns, &device, &wake, &mut unverified)
+                    .await;
                 let moved = {
-                    let mut st = inner.st.lock();
-                    if !ok && !inner.vouched(&st, &device, &ns) {
-                        unverified = unverified.saturating_add(1);
-                        if unverified >= REFRESH_TRIES {
-                            inner.mark_unreached(&mut st, &device, &ns);
-                        }
-                    }
+                    let st = inner.st.lock();
                     st.peers.get(&key).is_some_and(|p| p.head > from)
                 };
                 // Whether something held here asked for the pass to come.
@@ -10683,8 +10679,18 @@ impl Inner {
     /// it: the notice is left to the loop, which walks again after the pause
     /// ([`Self::refresh_loop`]). The pass ends once every walk of it
     /// ended: whether the one begun last was taken in full and reached the
-    /// writer's state.
-    async fn refresh_pass(self: &Arc<Self>, ns: &Name, device: &Name, wake: &Arc<Notify>) -> bool {
+    /// writer's state. Each walk that ended without it, while nothing held
+    /// vouches for `device`, spends a try of `unverified` — as it ends, not
+    /// when the pass does: notices arriving while a walk runs begin the
+    /// next, so a pass may last as long as they keep coming — and at
+    /// [`REFRESH_TRIES`] the device is unreached ([`Self::mark_unreached`]).
+    async fn refresh_pass(
+        self: &Arc<Self>,
+        ns: &Name,
+        device: &Name,
+        wake: &Arc<Notify>,
+        unverified: &mut u32,
+    ) -> bool {
         let pass = Arc::new(Pass {
             past: AtomicUsize::new(0),
             head: AtomicU64::new(0),
@@ -10728,10 +10734,19 @@ impl Inner {
                     futures::future::Either::Right(_) => None,
                 }
             };
-            if let Some((index, whole)) = ended
-                && index == newest
-            {
-                outcome = Some(whole);
+            if let Some((index, whole)) = ended {
+                if !whole {
+                    let mut st = self.st.lock();
+                    if !self.vouched(&st, device, ns) {
+                        *unverified = unverified.saturating_add(1);
+                        if *unverified >= REFRESH_TRIES {
+                            self.mark_unreached(&mut st, device, ns);
+                        }
+                    }
+                }
+                if index == newest {
+                    outcome = Some(whole);
+                }
             }
             // A walk that reached the writer with nothing newer begins none
             // beside it; one that did not reach (a loss) begins one as before.

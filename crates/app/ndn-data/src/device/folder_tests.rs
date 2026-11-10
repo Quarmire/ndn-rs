@@ -1287,3 +1287,132 @@ async fn a_collection_a_walk_listed_under_a_followed_folder_is_read_under_the_fo
     dev.shutdown();
     owner.shutdown();
 }
+
+/// `dev` hears `other`, a device of its own namespace, in the namespace's
+/// sync group. Nothing `dev` can reach answers for it, so a look at what it
+/// holds never ends.
+async fn hears(dev: &Device, other: &str) {
+    let ns = dev.inner.ns.clone();
+    let _ = dev.inner.join(&ns).await;
+    dev.inner
+        .st
+        .lock()
+        .groups
+        .get_mut(&ns)
+        .expect("joined")
+        .members
+        .insert(n(other));
+}
+
+/// The virtual time `what` takes to finish.
+async fn took<T>(what: impl Future<Output = T>) -> (T, Duration) {
+    let began = tokio::time::Instant::now();
+    let out = what.await;
+    (out, began.elapsed())
+}
+
+/// What a put that never waits on another device may take in virtual time:
+/// far under the 50 ms first-look time a wait for the phone costs.
+const LOCAL: Duration = Duration::from_millis(5);
+
+/// The laptop holds the record of folder `docs` — written by Alice and
+/// Bob — and of a merge folder `ops`, and hears the phone, a device of its
+/// namespace whose summary nothing it reaches ever answers. A put, a
+/// `put_op` and a group of twelve into collections new to it, all under a
+/// held folder record, inherit that record and return at once (spec §15, 1):
+/// none looks at the phone first, so none costs the first-look time, and
+/// none signs a members record of its own. Before, each followed its
+/// collection and waited the first-look time for the phone.
+#[tokio::test(start_paused = true)]
+async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_a_device_that_cannot_be_reached()
+ {
+    let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
+    let ops = n("/alice/32=data/ops");
+    dev.share_folder(
+        &folder(),
+        share(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+    )
+    .await
+    .unwrap();
+    dev.share_folder(&ops, share(yrs(), &["/alice", "/bob"], Vec::new()).into())
+        .await
+        .unwrap();
+    hears(&dev, "/alice/phone").await;
+
+    let (first, spent) = took(dev.put(&plan(), reading(1), options())).await;
+    first.unwrap();
+    assert!(
+        spent < LOCAL,
+        "the first put into a new collection took {spent:?}"
+    );
+
+    let a = ops.clone().append("a");
+    let op = crate::merge::Yrs::new()
+        .start(&a, &Writer::new(key(dev.name())))
+        .edit(&reading(1))
+        .unwrap();
+    let (second, spent) = took(dev.put_op(&a, op, options())).await;
+    second.unwrap();
+    assert!(
+        spent < LOCAL,
+        "a put_op into a new collection took {spent:?}"
+    );
+
+    let items: Vec<(Name, Edit)> = (0..12)
+        .map(|i| {
+            (
+                folder().append(format!("paste{i}")),
+                Edit::Fields(reading(i)),
+            )
+        })
+        .collect();
+    let (group, spent) = took(dev.put_group(items.clone(), options())).await;
+    assert_eq!(group.unwrap().len(), 12);
+    assert!(
+        spent < LOCAL,
+        "a group of twelve new collections took {spent:?}"
+    );
+
+    // Each is written under the record of its folder: none signed its own.
+    let st = dev.inner.st.lock();
+    let mut all = vec![plan(), a];
+    all.extend(items.into_iter().map(|(c, _)| c));
+    for c in &all {
+        assert!(
+            st.colls[c].line.own.is_none(),
+            "{c} signed a record of its own"
+        );
+    }
+    drop(st);
+    dev.shutdown();
+}
+
+/// `share_folder` creating a folder's first record keeps its one bounded
+/// look (spec §15, 5): every device heard is walked, for at most the
+/// first-look time — an owner device that signs without looking can narrow
+/// a line it hasn't seen. Only that call waits: the put right after it,
+/// into a collection new to the laptop, does not.
+#[tokio::test(start_paused = true)]
+async fn share_folder_creating_a_first_record_looks_for_at_most_the_first_look_and_the_next_put_does_not()
+ {
+    let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
+    hears(&dev, "/alice/phone").await;
+    let first_look = dev.inner.config.first_look;
+    let (shared, spent) = took(dev.share_folder(
+        &folder(),
+        share(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+    ))
+    .await;
+    shared.unwrap();
+    assert!(
+        spent >= first_look && spent <= first_look + LOCAL,
+        "the first record of a folder took {spent:?}: one look, at most {first_look:?}"
+    );
+    let (put, spent) = took(dev.put(&plan(), reading(1), options())).await;
+    put.unwrap();
+    assert!(
+        spent < LOCAL,
+        "the put right after share_folder took {spent:?}"
+    );
+    dev.shutdown();
+}

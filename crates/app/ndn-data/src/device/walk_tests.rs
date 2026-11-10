@@ -1605,3 +1605,130 @@ async fn a_seal_key_a_grants_ask_missed_is_learned_for_the_next_round() {
     granter.shutdown();
     asker.shutdown();
 }
+
+/// The laptop hears the phone, a device of Wendy's namespace whose every
+/// answer is lost for now, and the phone holds the record of a folder over
+/// a collection new to the laptop. A put into that collection is `NotReady`
+/// at once — no waiting for the phone, nothing signed (a default record
+/// signed meanwhile could narrow what the phone's record allows, slice-6
+/// M8) — naming the device whose walk it waits for. The look runs in the
+/// background: once the phone is reached, the same put goes through under
+/// the phone's folder record, the collection signing none of its own, and
+/// the next put into it is immediate (spec §15, 2).
+#[tokio::test(start_paused = true)]
+async fn a_put_under_no_held_record_is_not_ready_at_once_and_goes_through_once_the_look_ended() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let other = start_on(
+        &phone,
+        Arc::clone(&keys[1]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let folder = n("/wendy/32=data/docs");
+    other
+        .share_folder(
+            &folder,
+            crate::layer::Share {
+                rule: Rule::Log,
+                writers: vec![ns.clone()],
+                readers: Vec::new(),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let net = Hostile::new(&[&other], &phone, None, &phone, &ns);
+    net.losing.store(true, Ordering::Relaxed);
+    let me = start_on(&laptop, Arc::clone(&keys[0]), validator(), net.clone()).await;
+    me.inner.on_update(&ns, notice(&phone));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let options = PutOptions {
+        type_id: crate::TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    };
+    let note = |i: usize| Content::new().with("t", Bytes::from(i.to_string()));
+    let c = folder.clone().append("note");
+    let head = me.inner.st.lock().head;
+    let began = tokio::time::Instant::now();
+    let refused = me.put(&c, note(1), options.clone()).await.unwrap_err();
+    let spent = began.elapsed();
+    assert!(
+        spent < Duration::from_millis(5),
+        "the refusal waited {spent:?} for the phone"
+    );
+    assert!(
+        matches!(&refused, DataError::NotReady { why, .. } if why.contains("/wendy/phone")),
+        "not ready, naming the phone's walk: {refused}"
+    );
+    assert_eq!(refused.next(), crate::error::NextStep::RetryLater);
+    assert_eq!(
+        me.inner.st.lock().head,
+        head,
+        "no default record is signed while the phone is not walked"
+    );
+
+    // The phone is reached again; the look, in the background, ends.
+    net.losing.store(false, Ordering::Relaxed);
+    let mut put = None;
+    for _ in 0..60 {
+        match me.put(&c, note(1), options.clone()).await {
+            Ok(id) => {
+                put = Some(id);
+                break;
+            }
+            Err(DataError::NotReady { .. }) => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => panic!("the retry answered {e}"),
+        }
+    }
+    assert!(put.is_some(), "the put goes through once the look ended");
+    assert!(
+        me.inner.st.lock().colls[&c].line.own.is_none(),
+        "written under the phone's folder record, not a default record of its own"
+    );
+    let began = tokio::time::Instant::now();
+    me.put(&c, note(2), options).await.unwrap();
+    assert!(began.elapsed() < Duration::from_millis(5));
+    me.shutdown();
+    other.shutdown();
+}
+
+/// The phone hears a name nothing vouches for, and a notice of it arrives
+/// every second — faster than any walk of it ends. Each walk that ends with
+/// no root of it verified spends one of its tries (spec §17.1), as it
+/// ends: a pass the notices keep alive never ends, so counting tries per
+/// pass would never reach [`REFRESH_TRIES`], and the name would hold back
+/// the default record for as long as anyone sends notices of it.
+#[tokio::test(start_paused = true)]
+async fn notices_that_keep_a_pass_alive_still_spend_the_tries_of_its_walks() {
+    let (tablet, phone, fake) = (n("/wendy/tablet"), n("/wendy/phone"), n("/wendy/fake"));
+    let (ns, keys, validator) = wendy(&[&tablet, &phone]).await;
+    let net = Hostile::new(&[], &n("/nothing"), None, &tablet, &ns);
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    let c = n("/wendy/32=data/notes");
+    reader.inner.follow(&c).await.unwrap();
+    let mut allowed = false;
+    for _ in 0..400 {
+        reader.inner.on_update(&ns, notice(&fake));
+        if reader.inner.default_allowed(&c).is_ok() {
+            allowed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        allowed,
+        "a name nothing vouches for holds the default record back for as long as notices of it \
+         come"
+    );
+    reader.shutdown();
+}
