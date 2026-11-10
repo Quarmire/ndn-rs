@@ -69,7 +69,7 @@ impl std::error::Error for PersistencyError {}
 /// (`SO_PEERCRED` / `getpeereid`). Used to authorize privileged management
 /// verbs, and part of the evidence a socket's constructor weighs in making it
 /// a program face ([`FaceTrust::Program`]): the face is a program face only
-/// if the node trusts that user ([`StreamFace::program_peer`]).
+/// if the node trusts that user ([`StreamFace::program_peer`](crate::StreamFace::program_peer)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerCredentials {
     pub uid: u32,
