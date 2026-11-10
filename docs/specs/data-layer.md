@@ -4144,7 +4144,7 @@ readers pass over (and fields they must not).
 | 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
 | 0x0563 | IntroUsed | Name (the offer), then Writer and Digest (the asker key it was used by and its public key's digest) when used, neither when closed; a log record (§19.1) |
 | 0x0565 | IntroAsk | EphemeralKey, Ciphertext (a content key wrapped to the offer's SealKey), Ciphertext (the AskBody — Name (offer), Nonce, Proof, Credentials, Asker — sealed under it); an ask Interest's ApplicationParameters (§19.3) |
-| 0x0567 | IntroAnswer | Name (offer), Writer (the asker key), Digest (its public key's digest), then Name (folder), Role, Credentials, Asker (the offering device's proof), Proof — or IntroRefused, with no Proof; an answer's Content (§19.3, §19.4) |
+| 0x0567 | IntroAnswer | Name (offer), Writer (the asker key), Digest (its public key's digest), then Name (folder), Role, optional Revision (0x052A: the members revision in force on the offering device once the asker was admitted; the joiner's note of the admission lets go at a held record of that revision or later that leaves it out, §19.3 step 6; an answer without it releases the note on expiry only), Credentials, Asker (the offering device's proof), Proof — or IntroRefused, with no Proof; an answer's Content (§19.3, §19.4) |
 | 0x0569 | Role | NonNegativeInteger: 0 reader, 1 writer |
 | 0x056B | Tries | NonNegativeInteger: in an offer, the wrong tries that close it (≥ 1); in a refusal, those left |
 | 0x056D | IntroRefused | NonNegativeInteger: 1 unknown, 2 used, 3 expired, 4 closed, 5 wrong proof (then Tries, left), 6 conflict |
@@ -5500,9 +5500,29 @@ then the address, 4 or 16 octets, then the port, 2 octets big-endian).
 Even types: a reader skips what it does not know. A writer encodes each
 distinct dialable candidate once, up to the bound. A reader keeps the first
 8 distinct candidates whose kind it knows and whose address is dialable
-(not unspecified, multicast or broadcast, and port ≠ 0), and refuses a hint
-that names no key or two, or a candidate that is not 7 or 19 octets: the
+(not unspecified, multicast or broadcast, and port ≠ 0) and, unless its
+policy allows them (`IntroPolicy::local_candidates`, off by default), not
+loopback (`127.0.0.0/8`, `::1`) or link-local (`169.254.0.0/16`,
+`fe80::/10`): the inviter's own gathering never offers those to a device
+elsewhere, and a stranger's code must not make a device send datagrams to
+services on itself or on its link. A device that is the inviter's on one
+machine (tests, a demo) turns the policy on. A reader refuses a hint that
+names no key or two, or a candidate that is not 7 or 19 octets: the
 join then goes on without the hint, which only helps to reach.
+
+**What the inviter's links serve.** A host that listens for links serves
+introductions over a link a stranger dialled through the device's
+**introduction surface** (`Device::introductions()`, held weakly, so the
+host's links never keep the device alive). The surface is **open** while an
+offer of the device has not expired by its clock — a closed offer counts,
+since it still answers the writer it admitted until it expires. With no
+offer open, a stranger is refused a link as any device nobody knows. Over
+the link it **carries** an Interest only for the ask (`<D>/32=intro/…`),
+while open, and for the offer's own record (`<D>/32=held/<e>`, `e` an
+unexpired offer in the device's own log): no other log entry, summary root
+or packet the device holds by name crosses it, though the device serves
+them to its members. This replaces serving the whole `<D>/32=held` and
+`<D>/32=intro` prefixes for good.
 
 The code stays within one QR (`ndn_trust_envelope::qr::MAX_TEXT_LEN` =
 2331 characters). A hint costs 34 octets and 9 (IPv4) or 21 (IPv6) per
@@ -5528,23 +5548,46 @@ closed offer does nothing more.
 
 ### 19.3 Joining
 
-`join(code)`, the link (or its https mirror) or the words. A namespace the
-code names is judged first, as in step 4, before anything is fetched or
-asked:
+`join(code)`, the link (or its https mirror) or the words. Before it dials,
+fetches or asks anything, the code is judged — the dial gives whoever holds
+the code's key a link, and the device name a code claims is only a claim:
+
+- A code that names a namespace the offer's device `D` is not under is
+  altered: `Forged`. Ask the inviter for a new code.
+- The namespace a code names is judged as in step 4.
+- A device `D` under a namespace this device already trusts is refused
+  `InviterConflict { inviter: <that namespace>, why }` (`AskOwner`: do not
+  use the code) unless the code names that very namespace, or none, and its
+  fingerprint is one of that namespace's anchors this device holds: the
+  same anchor is a party known already, and a second invitation from it is
+  welcome. Without the exception a code could claim a device of a namespace
+  this device trusts, and the link, with that namespace's Interests, would
+  go to whoever holds the key.
+
+Then:
 
 0. **Dials the inviter by the code's link hint**, when the link form of the
    code carries one, before any Interest: `Introducer::dial(hint, D,
    within)`, `within` being `Config::first_look`, once per `join`. The
-   host's link layer tries the hint's candidates, links only to the device
-   whose key the hint names, and routes `D`'s names over the link
-   (ndn-link.md §13.3). `Ok`: the Interests of the steps below go over
+   host's link layer tries the hint's candidates and links only to the
+   device whose key the hint names. Until that device shows a certificate
+   of a namespace this device holds, the link routes only `D`'s
+   introduction prefixes (`<D>/32=held`, `<D>/32=intro`) — never `D`'s other
+   names, which only the code claims (ndn-link.md §10, §13.3); once this
+   device holds its namespace the link is made again and the device is
+   identified. `Ok`: the Interests of the steps below go over
    that link by name, with no ForwardingHint. An error — the host has no
    dialer, no candidate answered within the bound, an address presented
    another key — is not a refusal: the join goes on at once as it would
    without a hint, by the relays the code names, else those its own
    namespace's trust context advertises, else by name. A hint that does
    not read is ignored the same way. The dial carries no secret and judges
-   nothing of the code (§19.7).
+   nothing of the code (§19.7). **A join that fails after its dial
+   succeeded** — for any reason, `NotReady` included — calls
+   `Introducer::undial(hint, D)` before it returns: the host takes down the
+   link the dial made, unless it was up before the dial or has been
+   identified since (the default does nothing: a host with no link layer
+   dialled nothing). A retry dials again.
 1. Fetches the offer as `<D>/32=held/<offer>` (§16.1; DigestSha256, so the
    joiner's forwarder needs no trust of the inviter), `D` the offer name's
    device. No answer after its retries: `NotReady` (`RetryLater`): the
@@ -5617,9 +5660,17 @@ asked:
 6. **Returns only once the joiner may write** (round 4). A device an
    acceptance admitted as a writer notes durably, in its store, that it was
    admitted to the folder (the note is local, never served), before step
-   5's look; the note lasts until a members record held admits the device
-   (a write went through, or `join` returned), so a put in that window is
-   `NotReady`, never `AskOwner` (§18.1). It then waits, for at most
+   5's look. The note holds the offer's expiry and the members **revision**
+   the acceptance carries. It lasts until a members record held admits the
+   device (a write went through, or `join` returned), so a put in that
+   window is `NotReady`, never `AskOwner` (§18.1) — and no longer: it lets go
+   when the offer has expired by this device's clock (an inviter that never
+   sends the record cannot keep a retrying program waiting for good), and
+   when the folder's record held here is of that revision or a later one and
+   does not admit the device (it was removed since; a removed joiner who
+   joins again, answered as it was, is told so, not to wait). A put is then
+   refused as for any device no record admits (`AskOwner`, or `Sealed` under
+   a record that leaves it out of a sealed audience). It then waits, for at most
    `Config::first_look * 3 + Config::lifetime` (the bound of every wait of a
    join), for the two things a write needs: the members record over `F`
    that admits it — for a writer role, one that lists its key as a writer;
@@ -6025,22 +6076,35 @@ reachable from a signal.
   that admitted headers under one count and reads another walks their
   chains again, so a revoked issuer ends the runs of the keys it
   certified (signals.md §7).
-- **The clock floor.** The one thing of a signal the device keeps is a time:
-  `signal_clock_floor()` is a high-water mark, µs since the Unix epoch, at or
-  above every time a transport dated a signal by, held in the store under
-  `/localhost/ndn-data/signal-clock` (8 octets big-endian) and read at start
-  (0 on a device that never dated one). `signal_clock_dated(t)` answers the
-  floor once it is at least `t` and durable: below the floor it answers at
-  once and writes nothing; above it, the device writes `t` plus a reserve of
-  5 s (at most 10 s, so a run that restarts at the floor starts within the
-  skew a receiver allows), the store's barrier (§4.2) passes, and only then
-  does it answer. So a crash never leaves a restart below a time a signal was
-  dated by. The refusal is `Local` (the device stopped, or the store could
-  not make the write durable). The mark is a time, not a signal: it is no
-  packet, version or record, and nothing is served or counted for it
-  (signals.md §3.5, §13.8).
+- **The sequence counter and the time hint.** The two things of a signal the
+  device keeps are numbers, no packet. The **sequence counter**:
+  `signal_sequence_floor()` is a number above every sequence a transport gave
+  a signal, held in the store under `/localhost/ndn-data/signal-clock` (8
+  octets big-endian) and read at start (0 on a device that never gave one).
+  `signal_sequences(upto)` answers the counter once it is at least `upto`
+  and durable: at or above it already, it answers at once and writes
+  nothing; below it, the device writes `upto` plus a block of 2^20
+  (`Device::SIGNAL_SEQ_BLOCK`), the store's barrier (§4.2) passes, and only
+  then does it answer. So a crash never leaves a restart at or below a
+  sequence given, and no sequence is given twice. A transport asks for the
+  next block once half of one is left. The refusal is `Local` (the device
+  stopped, or the store could not make the write durable). Before the
+  counter, the same name held a time in µs above every sequence an older
+  version gave (they were µs times): read as a counter it is above every
+  sequence of a run held from before the upgrade. The **time hint**:
+  `signal_time_hint()` is the time, µs since the Unix epoch, a transport last
+  dated signals by, held under `/localhost/ndn-data/signal-time` and read at
+  start (0 when never written). `note_signal_time(us)` holds `us` as the
+  hint once it differs from the hint by a second or more, upward or
+  downward, and writes it to the store; it returns at once, never waits for
+  the barrier and reserves nothing, so after a crash the hint may be as old as
+  the last barrier and quick restarts cannot move it ahead of the clock that
+  dated them. It is a hint: the transport does not keep one that is more than
+  its run lifetime ahead of its raw clock (signals.md §3.5, §13.8). Neither
+  number is a packet, version or record, and nothing is served or counted
+  for them (signals.md §3.3, §3.5, §13.8).
 - **Nothing kept.** A device MUST NOT store, serve, count or list anything
-  of a signal but the clock floor above: no run header is kept in the store or a summary, given a
+  of a signal but the two numbers above: no run header is kept in the store or a summary, given a
   seq, counted as a version, a write or a holder's evidence, or answered
   to an Interest, and no signal packet reaches the layer at all. A signal
   never becomes a version; a commit of live work is an ordinary `put`.

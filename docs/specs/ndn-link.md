@@ -638,9 +638,9 @@ ndn-rs does this in `Links::identities_changed`, which the host calls on each ch
 
 ### 8.6 Introduction links
 
-An introduction link lets a device that hands out introduction codes ([data-layer.md](data-layer.md) §19) answer the one exchange of a joiner it knows nothing of: the offer fetch, the ask, and their answers. Nothing else crosses it, in either direction.
+An introduction link lets a device that hands out introduction codes ([data-layer.md](data-layer.md) §19) answer the one exchange of a joiner it knows nothing of: the offer fetch, the ask, and their answers. Nothing else crosses it, in either direction, and none is taken unless an offer is open.
 
-- **Taking them.** The host names the **introduction prefixes**: for a data-layer device `<D>/32=held` and `<D>/32=intro` (the offer fetch and the ask, data-layer.md §16.1; `ndn_data::intro::introduction_prefixes`). It may change or empty the list at any time (`Links::set_introductions`); a side with an empty list takes none, and links already up stay until they end.
+- **Taking them.** The host gives its links the device's **introduction surface** (`Links::set_introductions`, the `Introductions` trait; for a data-layer device `Device::introductions()`, data-layer.md §19.2). A stranger is admitted on an introduction link only while the surface is **open**: some offer of the device has not expired by its clock, a closed offer included. With none open it is refused as any device nobody knows; the prefixes are cleared by the offer's expiry, with no timer of the links'. Links already up stay until they end.
 - **Admitted by.** Rule 8 of §7.3: a link this side did not dial, which no peer entry expects and no namespace held here, nor the serving policy, vouches for. It is admitted with no identity: nothing is known of the peer but its key, which the handshake proved. Its LinkVerdict is a full verdict (no EnrollmentLink).
 - **Scope** (§8.3):
 
@@ -648,14 +648,14 @@ An introduction link lets a device that hands out introduction codes ([data-laye
   |---|---|
   | receives from the peer | Interests only |
   | sends to the peer | answers only (Data and Nacks) |
-  | name filter | the name has a prefix among the introduction prefixes, judged at every packet |
+  | name filter | the surface carries the name, judged at every packet: an ask `<D>/32=intro/…` while an offer is open, or `<D>/32=held/<e>` where `e` is an unexpired offer in `D`'s own log. No other `<D>/32=held` piece (another log entry, a summary root, another device's data the device holds) |
   | receive rate limit | `ENROLLMENT_INTERESTS` (burst 32, 4/s) |
 
 - **No routes**, presence or sync group: answers return the way their Interests came.
 - **Slots and idle close.** Introduction links share the enrollment links' slots (`ENROLLMENT_LINKS_MAX`, `ENROLLMENT_LINKS_PER_SOURCE`) and their idle close (`ENROLLMENT_IDLE`), §8.4.
 - **Replaced by a full link.** The joiner dials again (§13.3) once it holds the inviter's namespace. This side adopted the joiner's namespace answering its ask, so the new connection's hello identifies the joiner in a namespace this side holds the trust context of; it is a full link only if this side's serving policy serves it (§7.3 rule 5, §15.2): a device of another person's namespace, which this side holds but holds no certificate in, is refused with **0x19** under the default `own`, and so stays on an introduction link, which carries no sync. A host that introduces people it does not know yet therefore chooses `open` (within quotas) or `listed`. When served, the new link is admitted by rules 3 to 5 as a full link, and replaces the introduction link under the duplicate-link rule (§11: a newer link dialed the same way replaces the older).
 
-The scope is why a stranger needs no admission: what it can send is what anyone may ask of the device by name (an offer is a public log entry, an ask is judged by the data layer, which counts wrong tries and bounds the asks it holds, data-layer.md §19.4), within the enrollment links' bounds.
+The scope is why a stranger needs no admission: what it can send is the offer record of an open offer (a public log entry) and an ask, which the data layer judges, counting wrong tries and bounding the asks it holds (data-layer.md §19.4), within the enrollment links' bounds. Earlier text served the whole `<D>/32=held` prefix, which also reached every packet the device holds by name; the surface narrows it to the offer.
 
 ## 9. NDN packets: datagram framing
 
@@ -691,8 +691,9 @@ When a link is up, the admitting side installs routes over its face. These are s
 
 1. P's `routes`, if configured;
 2. for each identity: `/<ns>` of the identity, if it is a `node` device and P is a peer this side dials, meaning the host gives P at least one path candidate (§13.1); else its device name `/<ns>/<role>/<device>` (also for a served device, §15.2: the relay routes it by the name its certificate gives). The `node` rule holds whichever side dialed this link: when both dial, the duplicate-link rule keeps one link (§11), and both sides still route the same way. A `node` whose peer entry this side does not dial (it only accepts that node's links) is routed by its device name ([Decision 8](#20-decisions));
-3. P's `device`, if the peer was not identified;
-4. otherwise none.
+3. P's `unidentified_routes`, if configured and the peer was not identified (a peer dialed by key from a code's link hint, §13.3: only the introduction's prefixes);
+4. P's `device`, if the peer was not identified;
+5. otherwise none.
 
 A device admitted by its A certificate and its C membership is thus routed by both of its device names, and loses the routes of one when that membership is revoked (§12).
 
@@ -776,12 +777,13 @@ A listener bounds the inbound connections that have not been admitted yet. A sou
 
 ### 13.3 Dialing by key: a code's link hint
 
-A device that holds an introduction code whose link hint ([data-layer.md](data-layer.md) §19.2) names a device key and addresses dials the inviter's device by them: `Links::dial_by_key(key, device, addresses, within)`.
+A device that holds an introduction code whose link hint ([data-layer.md](data-layer.md) §19.2) names a device key and addresses dials the inviter's device by them: `Links::dial_by_key(key, device, addresses, within, routes)`.
 
-1. It adds a peer entry `{key, device}`: not persistent, direct paths off, whose only paths are the hint's addresses in the order given (at most `CANDIDATES_MAX` = 8; the rest are dropped). The addresses are **where to try and nothing more**: no address is trusted for anything.
+1. It adds a peer entry `{key, device, unidentified_routes: routes}`: not persistent, direct paths off, whose only paths are the hint's addresses in the order given (at most `CANDIDATES_MAX` = 8; the rest are dropped). The addresses are **where to try and nothing more**: no address is trusted for anything. Nor is `device`: it is only what the code claims.
 2. It starts a handshake to **every address at once**, each expecting `key` (§3.4: the handshake fails unless the listener presents exactly that key), from the host's link socket when it has that address family, else a dial-only socket (§13.1). The first handshake to succeed becomes the link and is admitted as a dialed peer entry's link (§7.3 rule 7: the key is expected); the other attempts are dropped. When no handshake succeeds within `within`, or admission refuses, the dial fails saying, per address, why; the peer entry is removed. An address whose device presents another key is no link.
-3. The link routes the device's name (the entry's `device`) at cost 0 (§10), so Interests for it go over the link.
-4. **Made again once.** When this device adopts a trust context, each link to a device dialed by its key alone (no identity of it admitted) whose device name the keyring now covers is closed with **0x03** and dialed once more (§8.5): its hello is judged by what this side holds now, and the device is identified, so the link carries the namespace's sync group (§10). The entry is removed once its link ends, and is not dialed again (§13.1: not persistent).
+3. While the device is unidentified the link routes only `routes` at cost 0 (§10): for a data-layer join, the introduction prefixes `<device>/32=held` and `<device>/32=intro` (`LinkHints::dial`), so Interests for the one exchange go over the link and no other name of `device` does. A code naming a device of a namespace this device already holds must not steer that namespace's Interests to whoever holds the key.
+4. **Made again once.** When this device adopts a trust context, each link to a device dialed by its key alone (no identity of it admitted) whose device name the keyring now covers is closed with **0x03** and dialed once more (§8.5): its hello is judged by what this side holds now, and the device is identified, so the link carries the identity's routes and the namespace's sync group (§10). The entry is removed once its link ends, and is not dialed again (§13.1: not persistent).
+5. **Taken down when the join fails.** `Links::undial_by_key(key, why)`, called by the host when the join that dialled fails (data-layer.md §19.3 step 0, `Introducer::undial`), closes the link and removes the entry, but only if the entry is one `dial_by_key` added and its link is still unidentified. A link that was up before the dial, or that has been identified since, is kept.
 
 A dial sends only what every link sends: the handshake and the hello (§5). The secret of a code never passes through it: the secret travels only inside the sealed ask (data-layer.md §19.3), over the link or any other path.
 
