@@ -90,6 +90,19 @@ member of a configured transit group ([Transit](#transit)). Each is the
 key vault; a host without one (no trust-admin backend) refuses with
 `not-at-runtime`.
 
+**Who is a local operator is the kernel's word about a Unix socket, never a
+face's scope or address.** The caller is identified by the peer credentials
+(`SO_PEERCRED`, `getpeereid`) that the daemon read when it accepted the
+connection on its management socket; a face that carries none — a TCP, UDP,
+WebSocket or WebTransport face, **even to a loopback address**, which is local
+in scope but which any process of any user can open — has no caller identity
+and is refused `trust-change-unidentified`. A forwarder's face *trust*
+(trust-context.md §6.6: which faces' Data it believes) is a separate
+property: neither implies the other, and the operator check consults
+only the credentials. Every other management command over a face without
+credentials is decided by its signature, and a `/localhop` command is
+always signed.
+
 | verb | ControlParameters | answer (JSON in the status text) |
 |---|---|---|
 | `context-adopt` | Uri: an `ndn-trust://anchor` link | `AdoptedContextInfo` |
@@ -759,8 +772,10 @@ A Data the device's forwarder refuses (its pipeline validates Data from
 other devices) never reaches the inspection: the answer then carries only
 the name asked for, the trusted prefix, and the refusal (`data-refused`);
 the verdict is `invalid` for a final refusal and `pending` for
-`unverifiable`. Data from a local producer is not validated on the way, so
-the verdict is the inspection's own.
+`unverifiable`. Data from a program face (an in-process producer, shared
+memory, a Unix socket whose peer the kernel identified) is not validated on
+the way, so the verdict is the inspection's own; Data from a TCP or UDP face
+is validated even to a loopback address (trust-context.md §6.6).
 
 | code | where | params | meaning |
 |---|---|---|---|

@@ -29,14 +29,20 @@ The design is in [personal-namespace.md](personal-namespace.md).
   forwarders (`ndn-fwd`, and the engine embedded in apps and in `ndn-mobile`) work this way
   whenever a validator is configured.
 - **Local face**: a face whose other end is on the same host. §4.4 says exactly which faces
-  count as local. Every other face is a **non-local face**.
+  count as local. Every other face is a **non-local face**. Locality is the face's *scope*:
+  it decides who is told a refusal and where `/localhost` goes. It is not *trust*.
+- **Program face**: a face whose peer the operating system or the process itself vouches for
+  (an in-process app face, a shared-memory face, a Unix socket whose peer the kernel
+  identified), the faces a forwarder believes without a check
+  ([trust-context.md](trust-context.md) §6.6). A TCP, UDP or WebTransport face to a loopback
+  address is local and is not a program face.
 - **Downstream / upstream**: in the NDN sense. A downstream is a face an Interest arrived on
   and a Data or Nack is returned to. An upstream is a face an Interest was forwarded to.
 - **Local downstream**: a downstream that is a local face. Examples: an app connected over
   a Unix socket, an in-process app face, the forwarder's own internal consumers (certificate
   fetch, trust-context refresh, context sync, enrollment).
-- **Local upstream**: an upstream that is a local face, typically a second forwarder on the
-  same host.
+- **Local upstream**: an upstream that is a program face, typically a second forwarder on
+  the same host reached over its Unix socket.
 - **Refusal**: a Nack whose NackReason is one of `170`–`176`. It tells a local downstream that
   the forwarder received a Data answering its Interest and refused it after validation.
 - **Final refusal**: codes `170`–`175`. A verdict on the Data itself. Asking again returns
@@ -149,11 +155,14 @@ A forwarder validates a received Data, and so may refuse it, only when both of t
 
 1. A validator is configured. With `[security] profile = "disabled"` nothing is validated and
    nothing is refused.
-2. The Data arrived on a non-local face, or on a local face that requires validation. In
-   ndn-fwd, `[engine] require_local_validation = true` makes every local face require it. The
-   default is `false`.
+2. The Data arrived on a face that is not a program face (a TCP, UDP, WebSocket,
+   WebTransport or QUIC face, even to a loopback address, is not), or on a program face that
+   requires validation. In ndn-fwd, `[engine] require_local_validation = true` makes every
+   program face require it. The default is `false`.
 
-By default, Data from a local producer is not validated and never refused.
+By default, Data from a program face (an in-process app, shared memory, a Unix socket whose
+peer the kernel identified) is not validated and never refused. Data from a loopback TCP or
+UDP face is validated and refused like any network Data.
 
 A Data signed with DigestSha256 is accepted when the digest matches. When it does not match,
 it is refused with 172.
@@ -238,6 +247,13 @@ An app from another stack therefore receives refusals when it connects to an ndn
 forwarder over its Unix socket, or over TCP, UDP or WebSocket to a loopback address. An app
 connecting from another host never receives one.
 
+This table is *scope*: who is told a refusal. It does not say whom the forwarder believes.
+A face to a loopback address is local here and is a network face to trust: its Data is
+validated (§4.1) and a refusal it claims is not believed (§5). Which faces are believed is
+[trust-context.md](trust-context.md) §6.6. A process of the host that opens a loopback face
+can therefore learn the verdict on a Data it forged, as any local app can; a network peer
+learns nothing.
+
 ## 5. Relaying a received refusal
 
 A forwarder that receives a Nack carrying `170`–`176` from an upstream handles it as follows.
@@ -249,12 +265,14 @@ A forwarder that receives a Nack carrying `170`–`176` from an upstream handles
    know. If the strategy retries another upstream, no Nack goes downstream.
 3. If the strategy decides to Nack, the forwarder removes the PIT entry and chooses the reason
    to relay:
-   - **The refusal came from a local upstream** (a forwarder on this host): the refusal code
+   - **The refusal came from a program-face upstream** (a forwarder on this host, reached
+     over its Unix socket or in-process): the refusal code
      is kept for local downstreams. Each non-local downstream MUST get **NoRoute (150)**
      instead: to the network the path has nothing usable, as in the next case
      ([Decision 6](#8-decisions)).
-   - **The refusal came from a non-local upstream**: the code is an unverified claim. Anyone
-     could forge "revoked". The forwarder MUST relay it as **NoRoute (150)**, to every
+   - **The refusal came from any other upstream** (a network face, a loopback TCP or UDP face
+     included): the code is an unverified claim. Anyone, a process of this host too, could
+     forge "revoked". The forwarder MUST relay it as **NoRoute (150)**, to every
      point-to-point downstream, local and non-local alike.
 4. A relayed Nack is built per downstream face, like an originated refusal: it encloses that
    downstream's own Interest rebuilt from its PIT in-record (§2.2: its name, selectors, nonce
@@ -506,7 +524,7 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | `refuse`: local downstreams only, own Interest, PitToken; `nack_downstream` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:57-97` |
 | `Action::Refuse` dispatched to `refuse` | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/outbound.rs:260` |
 | Refused Data is never cached or forwarded | `ndn-rs/crates/forwarding/ndn-engine/src/pipeline/action.rs:40-43` |
-| Which Data is validated (non-local, or `require_data_validation`); downstream recording | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:583-650` |
+| Which Data is validated (not a program face, or `require_data_validation`); downstream recording | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:575-640` |
 | `require_local_validation` config | `ndn-rs/crates/platform/ndn-config/src/config.rs:1346-1350`; `ndn-rs/crates/forwarding/ndn-engine/src/builder.rs:86`, `100`; `ndn-rs/crates/forwarding/ndn-engine/src/engine.rs:634-636`; `ndn-fwd/binaries/ndn-fwd/src/main.rs:553` |
 | PIT match records downstreams (exact, digest-stripped, CanBePrefix) | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:463-602` |
 | In-records consumed (Data fan-out deduplicated by face; refusals recorded per face and Interest name), nonces into the Dead Nonce List | `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs:695-770` |
@@ -531,6 +549,7 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | Engine fetcher (timeout = negative TTL = 4 s; direct fetch) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:148-161` |
 | Face locality by kind | `ndn-rs/crates/core/ndn-transport/src/face.rs:111-135` |
 | Locality by remote address, loopback test | `ndn-rs/crates/core/ndn-transport/src/face.rs:258-293` |
+| Face trust (`FaceTrust`), set by the transport; `StreamFace` from peer credentials | `ndn-rs/crates/core/ndn-transport/src/face.rs` (`FaceTrust`), `transport.rs` (`Transport::trust`), `stream_face.rs` |
 
 **Forwarder: relaying a received refusal**
 
@@ -539,7 +558,7 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | Ingress Nack checks (point-to-point, PIT entry exists) | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:366-383` |
 | Strategy sees a refusal or unknown code as NoRoute | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:457-468` |
 | Failover sends no Nack | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:476-506` |
-| Relay: kept only from a local upstream for local downstreams, else NoRoute; each downstream's own Interest and PitToken | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:508-550` |
+| Relay: kept only from a program-face upstream for local downstreams, else NoRoute; each downstream's own Interest and PitToken | `ndn-rs/crates/forwarding/ndn-engine/src/dispatcher/pipeline.rs:508-555`; `is_program_face`: `dispatcher/outbound.rs` |
 
 **Consumers**
 

@@ -1817,6 +1817,91 @@ unverified copy of a lapsed guest key with a later ValidityPeriod — which
 anyone answering the renewal fetch could serve, signed by no CA — renewed
 the key: the guest's Data was accepted after its invitation ended.
 
+### 6.6 Face trust: which Data a forwarder validates
+
+A forwarder classes each face twice, and the two classes answer different
+questions.
+
+- **Scope** (`FaceScope`: local or non-local) is NFD's notion and governs
+  *reach*: a `/localhost` name never crosses a non-local face, a `/localhop`
+  Interest egresses to a non-local face only if it arrived on a local one,
+  `/ndn/local` stays on the link, and a refusal Nack (local-refusal.md) is told
+  to local downstreams only. A TCP, UDP, WebSocket, WebTransport, WebRTC or
+  QUIC face is local in scope iff its remote host is a loopback address or
+  `localhost`; a face of an IPC kind is always local. Scope is unchanged by
+  this section.
+- **Trust** (`FaceTrust`: program or validated) governs *belief*: whether
+  the Data a face delivers is validated (§6.1–§6.5) before it satisfies a
+  PIT entry, drives self-learning, or enters the content store.
+
+**Rules.**
+
+1. A forwarder MUST validate the Data that arrives on every face that is not
+   a **program face**, and MUST NOT admit to its content store, or answer
+   from it, Data that was refused or that no validator checked (an opt-in
+   for a node whose trust is enforced above the forwarder is the content
+   store's `admit_unverified`, which never admits Data a validator ran and
+   refused). Whatever scope the face has, and whatever address its peer has.
+2. A **program face** is exactly one of: an in-process app face (a channel
+   or callback between the forwarder and a program of its own process); a
+   shared-memory face (its segment is created owner-only or as an anonymous
+   capability); a stream socket of the Unix domain whose peer the operating
+   system identified (`SO_PEERCRED`, `getpeereid`), whether the forwarder
+   accepted it or dialled it, including a socketpair descriptor handed to
+   it. Every other face is **validated**: TCP, UDP, WebSocket, WebTransport,
+   WebRTC, QUIC and every other network transport, **even to a loopback
+   address**; a Unix socket the operating system reported no peer for; a
+   Windows named pipe (it reports no peer credentials). A face standing in
+   for a network peer in a test or a simulation is validated like it.
+3. Trust is a property the face's constructor sets from how the face was
+   opened (which OS facility produced it, what it attested), and a
+   forwarder MUST NOT derive it from the peer's address, a host name, the
+   face's scope or its configured URI. A transport that states nothing is
+   validated. A program that wants the program standing opens a Unix socket
+   or a shared-memory face, as `ndn-ipc` does; there is no setting that makes
+   a network face a program face.
+4. An operator MAY make program faces validate too (ndn-fwd
+   `[engine] require_local_validation = true`; per face
+   `set_require_data_validation`), for a host whose local programs distrust
+   each other: a program face so marked is validated, and its Data is
+   dropped if no validator is configured. Nothing makes a validated face
+   skip validation.
+5. A node whose Data is carried in transit (a served namespace it does not
+   hold, mgmt-trust.md) forwards that Data unvalidated and uncached whatever
+   face it arrives on; that is the transit mark's rule and is unchanged.
+
+*Management and `/localhop`.* An operator of the forwarder is identified by
+the kernel's peer credentials of a Unix socket (mgmt-trust.md), never by a
+face's scope, address or kind: a loopback TCP face carries no credentials, so
+a trust-changing verb over it is refused `trust-change-unidentified`, and
+every other management command over it is decided by its signature. A
+`/localhop` command is always a signed Interest checked against the
+localhop anchors, and a trust-changing verb over `/localhop` is refused
+outright. `/localhop` names are forwarded by scope (a local face's `/localhop`
+Interest may leave on a non-local face; one from a non-local face stays on
+local faces), and the Data that returns on a validated face is validated as
+any Data is.
+
+*Threat note.* Before this rule ndn-rs classed a face as local, and so
+unvalidated and cached-from, by its remote address: a TCP, UDP or
+WebTransport face to `127.0.0.1` skipped validation. Any process of any
+user on the host can open such a face (a listener is a network socket, not
+a file with an owner), so any process could feed the content store: a
+forged Data for a name was cached and then answered every later Interest
+for it, from every consumer of the forwarder — including another user's —
+so a device never saw the genuine packet (data-layer.md §18.1; the case
+was met by a member's own loopback face). Now only a face whose peer the
+operating system or the process itself vouches for is believed. What a
+program face still lets through is what it always did: the program on it
+is trusted by the host's access control, so on a host whose programs
+distrust each other the operator turns on rule 4 (the Unix socket's
+`0666` mode is what lets any local program connect; the peer credentials
+tell who connected, and the forwarder does not use them to authorize Data).
+Residual: a refusal Nack is told to a loopback consumer (it is local in
+scope), so a process of the host that opens a loopback face learns the
+forwarder's verdict on Data it forged, as a local app does; a network
+downstream learns nothing (local-refusal.md §4.3).
+
 ## 7. Publication (RDR)
 
 A node that keeps contexts SHOULD publish them. ndn-fwd does so unless
@@ -2235,6 +2320,14 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   in-cut ones too (§3.3.12): it fails safe. A node that knows cuts but
   predates CutKeyDigest, CutManifest and DataRequiresCut keeps the
   residuals those fields close, for its own judgements, until updated.
+- A forwarder believes a face's Data unchecked only when the operating
+  system or the process itself vouches for the program on it (an in-process
+  face, shared memory, a Unix socket with peer credentials); a TCP, UDP or
+  WebTransport face to a loopback address is validated and cached-from
+  like any network face, because any process of any user on the host can
+  open one (§6.6). A node that ran a forwarder before that rule held, for
+  its forwarder, the old exposure: a forged Data from a loopback face in
+  its content store, answered to every later Interest for the name.
 
 ## 11. Test vectors
 
