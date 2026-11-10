@@ -73,6 +73,7 @@ const T_DEVICE_NAME: u64 = 0x0474; // invite: the device name the inviter sugges
 const T_OFFER: u64 = 0x0475; // intro: the offer record's name
 const T_RELAY_HINT: u64 = 0x0476; // intro: a relay that reaches the inviter (repeatable)
 const T_SECRET: u64 = 0x0477; // intro: the offer's secret
+const T_LINK_HINT: u64 = 0x0478; // intro: the inviter's link hint (opaque here: data-layer.md §19.2)
 
 const T_U64_VERSION: u64 = 0x0481; // anchor: context version
 const T_WIRE: u64 = 0x0482; // primary signed-Data blob (delegation / bundle / safebag); anchor: legacy unsigned context Content
@@ -205,6 +206,7 @@ impl TrustKind {
                 T_ANCHOR_FINGERPRINT,
                 T_OFFER,
                 T_SECRET,
+                T_LINK_HINT,
                 T_RELAY_HINT,
             ],
         }
@@ -272,6 +274,11 @@ pub struct Introduction {
     pub offer: String,
     /// The offer's secret.
     pub secret: [u8; INTRO_SECRET_LEN],
+    /// The inviter's link hint — its device key and where to try dialling
+    /// it directly — as data-layer.md §19.2 encodes it; this crate carries
+    /// the octets and judges none of them. Reachability only, never trusted
+    /// for anything else.
+    pub link_hint: Option<Bytes>,
     /// Device names of relays that reach the inviter (the ones its trust
     /// context advertises): reachability hints, not trusted for anything
     /// else.
@@ -285,6 +292,7 @@ impl std::fmt::Debug for Introduction {
             .field("fingerprint", &self.fingerprint)
             .field("offer", &self.offer)
             .field("secret", &"<secret>")
+            .field("link_hint", &self.link_hint.as_ref().map(Bytes::len))
             .field("relays", &self.relays)
             .finish()
     }
@@ -532,6 +540,9 @@ impl TrustEnvelope {
                 w.write_tlv(T_ANCHOR_FINGERPRINT, &i.fingerprint);
                 w.write_tlv(T_OFFER, i.offer.as_bytes());
                 w.write_tlv(T_SECRET, &i.secret);
+                if let Some(hint) = &i.link_hint {
+                    w.write_tlv(T_LINK_HINT, hint);
+                }
                 for r in &i.relays {
                     w.write_tlv(T_RELAY_HINT, r.as_bytes());
                 }
@@ -602,6 +613,7 @@ impl TrustEnvelope {
         let mut offer: Option<String> = None;
         let mut secret: Option<[u8; INTRO_SECRET_LEN]> = None;
         let mut relays: Vec<String> = Vec::new();
+        let mut link_hint: Option<Bytes> = None;
 
         let fields = kind.body_fields();
         let mut r = TlvReader::new(body);
@@ -646,6 +658,7 @@ impl TrustEnvelope {
                         .try_into()
                         .map_err(|_| EnvelopeError::Malformed("introduction secret length"))?,
                 )?,
+                T_LINK_HINT => set_once(&mut link_hint, v)?,
                 T_RELAY_HINT => relays.push(read_str(&v)?),
                 _ => unreachable!("every type in body_fields() has an arm"),
             }
@@ -706,6 +719,7 @@ impl TrustEnvelope {
                 fingerprint: fingerprint.ok_or(need("anchor fingerprint"))?,
                 offer: offer.ok_or(need("offer"))?,
                 secret: secret.ok_or(need("secret"))?,
+                link_hint,
                 relays,
             }),
         })
@@ -735,7 +749,9 @@ impl TrustEnvelope {
     /// the same anchor by reference (namespace, expected fingerprint and
     /// version, no context: the adopting device fetches the context by name);
     /// for an introduction that does not, the same with as many of its
-    /// relay hints, in order, as fit. `None` when none fits.
+    /// relay hints, in order, as fit (its link hint stays whole: its maker,
+    /// which knows the encoding, offers a smaller one). `None` when none
+    /// fits.
     pub fn qr_uri(&self) -> Option<String> {
         let uri = self.to_uri();
         if uri.len() <= qr::MAX_TEXT_LEN {
@@ -1384,6 +1400,7 @@ mod tests {
             fingerprint: [0xA5; ANCHOR_FINGERPRINT_LEN],
             offer: "/home/alice/laptop/32=log/home/alice/32=data/notes/seq=12".into(),
             secret: [0x3C; INTRO_SECRET_LEN],
+            link_hint: None,
             relays: (0..relays)
                 .map(|i| format!("/community/node/relay-{i:04}"))
                 .collect(),
@@ -1400,6 +1417,11 @@ mod tests {
         round_trip(&TrustEnvelope::Intro(Introduction {
             namespace: None,
             relays: Vec::new(),
+            ..i.clone()
+        }));
+        // A link hint rides as the octets it was given, whatever they are.
+        round_trip(&TrustEnvelope::Intro(Introduction {
+            link_hint: Some(Bytes::from_static(&[0x01, 0x02, 0xFF])),
             ..i.clone()
         }));
         let words = IntroWords::parse(&i.to_words()).unwrap();
@@ -1474,5 +1496,45 @@ mod tests {
             },
             intro(0)
         );
+    }
+
+    /// A link hint stays while relay hints go: the relays are dropped first,
+    /// all of them, before the hint is judged too big.
+    #[test]
+    fn an_introduction_too_long_for_one_qr_keeps_its_link_hint_and_drops_relays_first() {
+        let hint = Bytes::from(vec![0x5A; 200]);
+        let with = |relays| Introduction {
+            link_hint: Some(hint.clone()),
+            ..intro(relays)
+        };
+        let many = TrustEnvelope::Intro(with(200));
+        assert!(many.to_uri().len() > qr::MAX_TEXT_LEN);
+        let TrustEnvelope::Intro(kept) = TrustEnvelope::from_uri(&many.qr_uri().unwrap()).unwrap()
+        else {
+            panic!("an introduction");
+        };
+        assert_eq!(kept.link_hint, Some(hint));
+        assert!(kept.relays.len() < 200);
+        // A hint no QR can hold beside the secret is not trimmed here: the
+        // data layer, which knows its encoding, offers a smaller one.
+        let huge = TrustEnvelope::Intro(Introduction {
+            link_hint: Some(Bytes::from(vec![0x5A; 4000])),
+            ..intro(0)
+        });
+        assert_eq!(huge.qr_uri(), None);
+    }
+
+    /// A reader that knows no link hint (an even type) skips it; the type is
+    /// not read by another kind.
+    #[test]
+    fn a_link_hint_is_ignored_by_kinds_that_do_not_read_it() {
+        let mut w = TlvWriter::new();
+        w.write_tlv(T_LINK_HINT, b"x");
+        w.write_tlv(T_NAMESPACE, b"/user/abc");
+        let body = w.finish();
+        assert!(matches!(
+            TrustEnvelope::decode_body(TrustKind::Anchor, body),
+            Ok(TrustEnvelope::Anchor { .. })
+        ));
     }
 }

@@ -302,6 +302,19 @@ pub mod tlv {
     /// Data packets, each whole: a signed trust context, then certificates
     /// of its signer key's chain.
     pub const CREDENTIALS: u64 = 0x056F;
+
+    // The link hint of an introduction's code (spec §19.2): even numbers, in
+    // the block 0x05B0–0x05BF, carried as the value of the intro envelope's
+    // `LinkHint` (0x0478, trust-envelope.md).
+
+    /// 32 octets: SHA-256 of the inviter device's public key as a
+    /// certificate carries it (an Ed25519 key's 32 octets): the key the link
+    /// handshake must prove.
+    pub const LINK_KEY: u64 = 0x05B0;
+    /// One direct-path candidate address, repeatable: one octet of kind
+    /// (0 host, 1 reflexive, 2 advertised, 3 mapped), the IP address (4
+    /// octets for IPv4, 16 for IPv6), the UDP port (2 octets, big-endian).
+    pub const LINK_CANDIDATE: u64 = 0x05B2;
 }
 
 /// Keyword components of the layer's names.
@@ -1136,6 +1149,11 @@ pub fn held_name(holder: &Name, piece: &Name) -> Name {
         .clone()
         .append_component(kw(HELD))
         .append_component(NameComponent::generic(piece.encode_to_tlv()))
+}
+
+/// `<holder>/32=held`: the prefix of every [`held_name`] of `holder`.
+pub fn held_prefix(holder: &Name) -> Name {
+    holder.clone().append_component(kw(HELD))
 }
 
 /// Parse `<holder>/32=held/<Name TLV>`.

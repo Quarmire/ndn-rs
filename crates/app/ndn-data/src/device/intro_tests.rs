@@ -168,6 +168,18 @@ async fn start(
     refuses: &[&str],
     hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
 ) -> Device {
+    start_clocked(person, device, keys, refuses, hold, None).await
+}
+
+/// [`start`] with the device's clock `clock`, when given.
+async fn start_clocked(
+    person: &Person,
+    device: &str,
+    keys: Option<Arc<SecurityManager>>,
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
@@ -202,7 +214,10 @@ async fn start(
         Config {
             first_look: Duration::from_millis(50),
             introducer: Some(Arc::new(host)),
-            ..Config::new()
+            ..clock.map_or_else(Config::new, |clock| Config {
+                clock,
+                ..Config::new()
+            })
         },
     )
     .await
@@ -215,8 +230,17 @@ async fn alice(
     refuses: &[&str],
     hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
 ) -> (Device, Name, [u8; crate::intro::SECRET_LEN]) {
+    alice_at(refuses, hold, None).await
+}
+
+/// [`alice`] with her laptop's clock `clock`, when given.
+async fn alice_at(
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+) -> (Device, Name, [u8; crate::intro::SECRET_LEN]) {
     let alice = Person::new("/alice");
-    let laptop = start(&alice, "/alice/laptop", None, refuses, hold).await;
+    let laptop = start_clocked(&alice, "/alice/laptop", None, refuses, hold, clock).await;
     let folder = n("/alice/32=data/notebook");
     laptop
         .share_folder(
@@ -383,20 +407,115 @@ async fn an_offer_is_not_spent_when_the_host_does_not_adopt_the_asker() {
     );
 }
 
+/// A device clock the test can move forward: the system's, plus a skew in
+/// milliseconds.
+fn skewed() -> (Clock, Arc<std::sync::atomic::AtomicU64>) {
+    let skew = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let by = Arc::clone(&skew);
+    let clock: Clock = Arc::new(move || {
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        Timestamp(now + by.load(std::sync::atomic::Ordering::SeqCst))
+    });
+    (clock, skew)
+}
+
+/// Spec §19.2: a closed offer admits no one new, and still answers a
+/// retry of the writer it admitted — its answer lost — until it expires.
+/// Another key is `Closed`; once the offer expired its user is `Expired`.
 #[tokio::test]
-async fn a_closed_offer_refuses_every_ask_its_users_too() {
+async fn a_closed_offer_admits_no_one_new_yet_answers_the_one_it_admitted_until_it_expires() {
+    let (clock, skew) = skewed();
+    let (laptop, offer, secret) = alice_at(&[], None, Some(clock)).await;
+    let bob = Person::new("/bob");
+    let bob_phone = start(&bob, "/bob/phone", None, &[], None).await;
+    let carol = Person::new("/carol");
+    let carol_phone = start(&carol, "/carol/phone", None, &[], None).await;
+    // Bob's answer is lost: the host closes the offer as soon as it sees
+    // the new member, and Bob asks again.
+    let first = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(accepted(&first), "bob was answered {first:?}");
+    laptop.close_offer(&offer).await.unwrap();
+    let again = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert_eq!(
+        again, first,
+        "the user of a closed offer asking again was not answered the acceptance it was given"
+    );
+    // Another key is refused as closed, even with the right secret.
+    let other = answer(&laptop, ask(&carol_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(
+        matches!(other, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "another key asking a closed offer was answered {other:?}"
+    );
+    // Past its expiry the offer answers nobody, its user included.
+    skew.store(2 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    let late = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(
+        matches!(late, Some(Outcome::Refused(IntroRefusal::Expired))),
+        "the user of a closed offer asking after its expiry was answered {late:?}"
+    );
+}
+
+/// An offer closed before anyone used it admits no one, whatever the key
+/// and the secret.
+#[tokio::test]
+async fn an_offer_closed_unused_refuses_every_ask() {
     let (laptop, offer, secret) = alice(&[], None).await;
     let bob = Person::new("/bob");
     let bob_phone = start(&bob, "/bob/phone", None, &[], None).await;
-    let got = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
-    assert!(accepted(&got), "bob was answered {got:?}");
     laptop.close_offer(&offer).await.unwrap();
     let got = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
     assert!(
         matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
-        "the user of a closed offer asking again was answered {got:?}"
+        "an unused closed offer was answered {got:?}"
     );
-    // Only the device that made an offer closes it.
+}
+
+/// Spec §19.2, §19.7: the automatic close of a record that drops the
+/// member answers its user as `close_offer` does — what it was given, kept
+/// — and admits it nowhere: no members record is signed again.
+#[tokio::test]
+async fn the_close_of_a_record_that_drops_the_member_still_answers_it_and_never_readmits_it() {
+    let (laptop, offer, secret) = alice(&[], None).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob = Person::new("/bob");
+    let bob_phone = start(&bob, "/bob/phone", None, &[], None).await;
+    let first = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(accepted(&first), "bob was answered {first:?}");
+    laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice")],
+                readers: vec![Audience::Person(n("/alice"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        laptop.inner.st.lock().intro.closed.contains(&offer),
+        "a record dropping the member did not close the offer it used"
+    );
+    let signed = laptop.inner.st.lock().head;
+    let again = answer(&laptop, ask(&bob_phone, &laptop, &offer, &secret, &[])).await;
+    assert_eq!(
+        again, first,
+        "the removed member's retry was not answered as kept"
+    );
+    assert_eq!(
+        laptop.inner.st.lock().head,
+        signed,
+        "answering the removed member's retry signed something: it was admitted again"
+    );
+}
+
+/// Only the device that made an offer closes it.
+#[tokio::test]
+async fn only_the_device_that_made_an_offer_closes_it() {
+    let (laptop, _, _) = alice(&[], None).await;
     let elsewhere = log_name(&n("/alice/phone"), Some(&n("/alice/32=data/notebook")), 1);
     assert!(matches!(
         laptop.close_offer(&elsewhere).await,

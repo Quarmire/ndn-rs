@@ -23,8 +23,8 @@ use super::{Device, Held, Inner, St, Subject, check_collection, local, open_gran
 use crate::collection::Epoch;
 use crate::error::DataError;
 use crate::intro::{
-    AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined, Offer,
-    OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof, answer_proves, ask_proof,
+    AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined, LinkHint,
+    Offer, OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof, answer_proves, ask_proof,
     ask_proves, commitment, intro_name, intro_prefix, proof_key,
 };
 use crate::layer::{ShareChange, Sharing};
@@ -304,6 +304,7 @@ struct Parsed {
     fingerprint: Fingerprint,
     namespace: Option<Name>,
     relays: Vec<String>,
+    link_hint: Option<LinkHint>,
 }
 
 /// Read a code: an `ndn-trust://intro/…` link (or its https mirror), or the
@@ -332,6 +333,7 @@ fn parse_code(code: &str) -> Result<Parsed, DataError> {
             fingerprint: Fingerprint::Half(w.fingerprint),
             namespace: None,
             relays: Vec::new(),
+            link_hint: None,
         });
     }
     match TrustEnvelope::from_uri(code) {
@@ -351,6 +353,10 @@ fn parse_code(code: &str) -> Result<Parsed, DataError> {
                 fingerprint: Fingerprint::Whole(i.fingerprint),
                 namespace,
                 relays: i.relays.clone(),
+                link_hint: i
+                    .link_hint
+                    .as_deref()
+                    .and_then(|v| LinkHint::decode(v).ok()),
             })
         }
         Ok(other) => Err(bad(
@@ -1033,7 +1039,11 @@ impl Inner {
         let Some((pk, ob, used, closed)) = held else {
             return Some(refuse(claimed, IntroRefusal::Unknown));
         };
-        if closed || self.overall_tries(offer).0 >= self.config.intro.wrong_tries_max {
+        let spent = self.overall_tries(offer).0 >= self.config.intro.wrong_tries_max;
+        let closed = closed || spent;
+        // A closed offer admits no one new: only the key a use mark names is
+        // still answered (below), until the offer expires (spec §19.4 step 4).
+        if closed && used.as_ref() != Some(&claimed) {
             return Some(refuse(claimed, IntroRefusal::Closed));
         }
         let (key, digest) = opened.signer(proof).await?;
@@ -1049,7 +1059,12 @@ impl Inner {
         // may have removed it (spec §19.7).
         match used.clone().or_else(|| self.using(offer)) {
             Some(user) if user != by => return Some(refuse(by, IntroRefusal::Used)),
-            Some(_) if used.is_some() => return self.accepted_again(offer, &ob, &pk, by),
+            Some(_) if used.is_some() => {
+                if closed && ob.until <= (self.config.clock)() {
+                    return Some(refuse(by, IntroRefusal::Expired));
+                }
+                return self.accepted_again(offer, &ob, &pk, by);
+            }
             _ => {}
         }
         if ob.until <= (self.config.clock)() {
@@ -1298,13 +1313,17 @@ impl Device {
             fingerprint: own.fingerprint(),
             offer: name.to_string(),
             secret,
+            link_hint: None,
             relays,
         };
         let words = intro.to_words().to_string();
-        let link = TrustEnvelope::Intro(intro).qr_uri().ok_or_else(|| {
+        // The host's link hint: this device's key and where to dial it,
+        // kept within one QR by dropping what does not fit (spec §19.2).
+        let hint = inner.introducer()?.link_hint();
+        let link = LinkHint::code_link(intro, hint.as_ref()).ok_or_else(|| {
             local(format!(
-                "the offer's link does not fit one QR even without relay hints (the offer name \
-                 {name} is too long): offer a folder of a shorter name"
+                "the offer's link does not fit one QR even without relay hints or a link hint \
+                 (the offer name {name} is too long): offer a folder of a shorter name"
             ))
         })?;
         Ok(Code {
@@ -1376,7 +1395,18 @@ impl Device {
                 "the device key {me} gives no public key, so an answer cannot be bound to it"
             ))
         })?;
-        let hints = inner.hints(&code.relays);
+        // The code's link hint, dialled before any Interest (spec §19.3,
+        // step 0): on success the Interests go by name over that link; any
+        // failure leaves the relay hints (or routing by name) as before.
+        let mut hints = inner.hints(&code.relays);
+        if let Some(hint) = &code.link_hint {
+            match introducer.dial(hint, &device, inner.config.first_look).await {
+                Ok(()) => hints.clear(),
+                Err(why) => {
+                    tracing::debug!(%offer, "the code's link hint was not dialled: {why}")
+                }
+            }
+        }
         let pk = proof_key(&code.secret, &offer);
 
         // The offer, as the offering device serves its own log entry.
@@ -1537,10 +1567,6 @@ impl Device {
                 inner.validator.cert_cache().insert(c);
             }
         }
-        inner.look(&folder).await?;
-        Ok(Joined {
-            folder,
-            role,
         // The joiner is no stranger from here on: it is noted until a members
         // record held admits it (a put in that window is `NotReady`, never
         // `AskOwner`), and `join` returns once the record that admits it and,
@@ -1550,8 +1576,12 @@ impl Device {
                 "the device stopped before the join was noted: join again with the same code",
             ));
         }
-            inviter,
+        inner.look(&folder).await?;
         inner.await_admission(&folder, role, &device).await?;
+        Ok(Joined {
+            folder,
+            role,
+            inviter,
         })
     }
 

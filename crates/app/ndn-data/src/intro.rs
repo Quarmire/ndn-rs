@@ -22,13 +22,16 @@
 //! [`Device::offer`]: crate::Device::offer
 //! [`Device::join`]: crate::Device::join
 
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
 use bytes::Bytes;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_security::ScopedContext;
 use ndn_tlv::{TlvReader, TlvWriter};
-use ndn_trust_envelope::TrustEnvelope;
+use ndn_trust_envelope::{Introduction, TrustEnvelope};
 use sha2::{Digest, Sha256};
 
 use crate::version::Timestamp;
@@ -311,6 +314,207 @@ impl IntroRefusal {
     }
 }
 
+/// The most direct-path candidate addresses a code carries, and a join
+/// dials: a hint is a few addresses of one device, and a code stays within
+/// one QR (spec §19.2).
+pub const LINK_HINT_CANDIDATES_MAX: usize = 8;
+
+/// How the inviter's device knows a candidate address of its own: the
+/// kinds of ndn-link (`ndn_link::CandidateKind`; ndn-link.md), by the same
+/// codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HintKind {
+    /// An address of one of its interfaces, on its link socket's port.
+    Host,
+    /// The address a linked device sees it at: beyond the NATs on that path.
+    Reflexive,
+    /// An address configured to reach its link socket (a port forward).
+    Advertised,
+    /// An address a port-mapping protocol mapped to its link socket.
+    Mapped,
+}
+
+impl HintKind {
+    /// The kind's octet on the wire.
+    pub fn code(self) -> u8 {
+        match self {
+            HintKind::Host => 0,
+            HintKind::Reflexive => 1,
+            HintKind::Advertised => 2,
+            HintKind::Mapped => 3,
+        }
+    }
+
+    /// The kind a code names; `None` for one this version does not know.
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => HintKind::Host,
+            1 => HintKind::Reflexive,
+            2 => HintKind::Advertised,
+            3 => HintKind::Mapped,
+            _ => return None,
+        })
+    }
+}
+
+/// One address where a device may be tried directly, over UDP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HintCandidate {
+    /// How the device knows it.
+    pub kind: HintKind,
+    /// The address and port.
+    pub addr: SocketAddr,
+}
+
+impl HintCandidate {
+    /// Whether a device can sensibly be dialled at this address: not the
+    /// unspecified, a multicast or the broadcast address, and not port 0.
+    /// A code from a stranger is not made to send datagrams to those.
+    fn dialable(&self) -> bool {
+        let ip = self.addr.ip().to_canonical();
+        self.addr.port() != 0
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+    }
+}
+
+/// The inviter's link hint (spec §19.2): the key of its device and where to
+/// try it directly. The key is what the dial's handshake proves; the
+/// addresses only say where to try (spec §19.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkHint {
+    /// SHA-256 of the device's public key as a certificate carries it: the
+    /// key the link must prove (the fingerprint of ndn-link's
+    /// `KeyFingerprint`).
+    pub key: [u8; 32],
+    /// Where to try, most promising first, at most
+    /// [`LINK_HINT_CANDIDATES_MAX`].
+    pub candidates: Vec<HintCandidate>,
+}
+
+impl LinkHint {
+    /// The hint's TLVs (the value of the intro envelope's `LinkHint`): the
+    /// key, then each of the first [`LINK_HINT_CANDIDATES_MAX`] candidates
+    /// once, in order.
+    pub fn encode(&self) -> Bytes {
+        self.encode_first(self.candidates.len())
+    }
+
+    /// [`encode`](Self::encode) with at most `keep` candidates.
+    fn encode_first(&self, keep: usize) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_tlv(tlv::LINK_KEY, &self.key);
+        let mut seen: Vec<&HintCandidate> = Vec::new();
+        for c in &self.candidates {
+            if seen.len() == keep.min(LINK_HINT_CANDIDATES_MAX) {
+                break;
+            }
+            if !c.dialable() || seen.contains(&c) {
+                continue;
+            }
+            seen.push(c);
+            let mut value = vec![c.kind.code()];
+            match c.addr.ip() {
+                IpAddr::V4(ip) => value.extend_from_slice(&ip.octets()),
+                IpAddr::V6(ip) => value.extend_from_slice(&ip.octets()),
+            }
+            value.extend_from_slice(&c.addr.port().to_be_bytes());
+            w.write_tlv(tlv::LINK_CANDIDATE, &value);
+        }
+        w.finish()
+    }
+
+    /// Read the value of an intro envelope's `LinkHint`: one key and its
+    /// candidates — the first [`LINK_HINT_CANDIDATES_MAX`] distinct ones
+    /// that name an address this device may dial and a kind this version
+    /// knows; the others are passed over. An error says what is wrong: a
+    /// join carries on without the hint (it only helps to reach).
+    pub fn decode(value: &[u8]) -> Result<Self, String> {
+        let mut key = None;
+        let mut candidates: Vec<HintCandidate> = Vec::new();
+        each(Bytes::copy_from_slice(value), |t, v| {
+            match t {
+                tlv::LINK_KEY => {
+                    if key.is_some() {
+                        return Err(bad("a link hint names two keys"));
+                    }
+                    key = Some(read_digest(&v)?);
+                }
+                tlv::LINK_CANDIDATE => {
+                    let ip_len = match v.len() {
+                        7 => 4,
+                        19 => 16,
+                        n => {
+                            return Err(bad(format!(
+                                "a link candidate is 7 or 19 octets (kind, address, port), not {n}"
+                            )));
+                        }
+                    };
+                    let Some(kind) = HintKind::from_code(v[0]) else {
+                        return Ok(true);
+                    };
+                    let ip = if ip_len == 4 {
+                        IpAddr::from(<[u8; 4]>::try_from(&v[1..5]).expect("4 octets"))
+                    } else {
+                        IpAddr::from(<[u8; 16]>::try_from(&v[1..17]).expect("16 octets"))
+                    };
+                    let port = u16::from_be_bytes([v[1 + ip_len], v[2 + ip_len]]);
+                    let c = HintCandidate {
+                        kind,
+                        addr: SocketAddr::new(ip, port),
+                    };
+                    if c.dialable()
+                        && candidates.len() < LINK_HINT_CANDIDATES_MAX
+                        && !candidates.contains(&c)
+                    {
+                        candidates.push(c);
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
+        .map_err(|e| e.0)?;
+        Ok(LinkHint {
+            key: key.ok_or("a link hint names no key")?,
+            candidates,
+        })
+    }
+
+    /// The link of an offer's code carrying `hint`, within one QR: the
+    /// secret, the offer and the fingerprint are never dropped; relay hints
+    /// go first (all of them), then the hint's last candidates one by one,
+    /// then the hint itself. `None` when even those do not fit.
+    pub(crate) fn code_link(intro: Introduction, hint: Option<&LinkHint>) -> Option<String> {
+        if let Some(hint) = hint.filter(|h| !h.candidates.is_empty()) {
+            let most = hint.candidates.len().min(LINK_HINT_CANDIDATES_MAX);
+            for keep in (1..=most).rev() {
+                let link = TrustEnvelope::Intro(Introduction {
+                    link_hint: Some(hint.encode_first(keep)),
+                    ..intro.clone()
+                })
+                .qr_uri();
+                if link.is_some() {
+                    return link;
+                }
+            }
+        }
+        TrustEnvelope::Intro(Introduction {
+            link_hint: None,
+            ..intro
+        })
+        .qr_uri()
+    }
+}
+
+/// The future of an [`Introducer::dial`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type Dialing<'a> = futures::future::BoxFuture<'a, Result<(), String>>;
+/// The future of an [`Introducer::dial`].
+#[cfg(target_arch = "wasm32")]
+pub type Dialing<'a> = futures::future::LocalBoxFuture<'a, Result<(), String>>;
+
 /// The future of an [`Introducer::adopt`].
 #[cfg(not(target_arch = "wasm32"))]
 pub type Adopting<'a> = futures::future::BoxFuture<'a, Result<(), String>>;
@@ -400,6 +604,41 @@ pub trait Introducer: Send + Sync {
     /// namespace the host does not carry does nothing.
     fn release_scoped(&self, namespace: &Name) {
         let _ = namespace;
+    }
+
+    /// This device's link hint for an offer's code (spec §19.2): its link
+    /// key's fingerprint and the direct-path addresses a joiner may try now
+    /// (at most [`LINK_HINT_CANDIDATES_MAX`] are kept, in this order), so a
+    /// joiner with no routes and no daemon dials this device by key. `None`
+    /// (the default): the code carries no hint; a host that listens for
+    /// links gives one. The layer calls it once per [`Device::offer`].
+    ///
+    /// [`Device::offer`]: crate::Device::offer
+    fn link_hint(&self) -> Option<LinkHint> {
+        None
+    }
+
+    /// Dial the inviter's device `inviter` by the hint its code carried
+    /// (spec §19.3): try `hint.candidates` in order, and link only to the
+    /// device whose key is `hint.key` (the handshake proves it; an address
+    /// that answers with another key is no link), within `within` in all.
+    /// `Ok` once a link to that device is up and carries Interests for
+    /// `inviter`'s names (the offer fetch and the ask) to it; an error
+    /// says why not — the unreachable addresses, a wrong key — and the join
+    /// carries on by the relays the code names, else by name. The dial
+    /// sends nothing of the code's secret: it is the host's link layer's,
+    /// and the secret only ever travels inside the sealed ask.
+    ///
+    /// The default dials nothing: a host with no link layer of its own says
+    /// so, and the join falls back as above.
+    fn dial<'a>(&'a self, hint: &'a LinkHint, inviter: &'a Name, within: Duration) -> Dialing<'a> {
+        let _ = (hint, within);
+        Box::pin(async move {
+            Err(format!(
+                "this host has no link layer to dial {inviter} with (Introducer::dial): route to \
+                 it, or run the device on a host that dials link hints"
+            ))
+        })
     }
 }
 
@@ -682,6 +921,13 @@ pub fn parse_intro_name(name: &Name) -> Option<Name> {
         && comps[at + 1].typ == tlv_type::PARAMETERS_SHA256
         && comps[at + 1].value.len() == 32)
         .then(|| name_of(&comps[..at]))
+}
+
+/// The name prefixes a stranger's link to `device` carries (spec §19.2): the
+/// offer fetch `<device>/32=held` and the ask `<device>/32=intro`, and
+/// nothing else of the device.
+pub fn introduction_prefixes(device: &Name) -> [Name; 2] {
+    [wire::held_prefix(device), intro_prefix(device)]
 }
 
 // ---- the answer -------------------------------------------------------------------------------
@@ -1176,5 +1422,205 @@ mod tests {
     /// A small Data packet's wire, distinct per `tag`.
     fn data_packet(tag: u8) -> Bytes {
         ndn_packet::encode::DataBuilder::new(n("/x").append(vec![tag]), &[tag]).sign_digest_sha256()
+    }
+
+    fn host(i: u8) -> HintCandidate {
+        HintCandidate {
+            kind: HintKind::Host,
+            addr: SocketAddr::from(([192, 168, 1, i], 7000 + u16::from(i))),
+        }
+    }
+
+    fn host6(i: u16) -> HintCandidate {
+        HintCandidate {
+            kind: HintKind::Advertised,
+            addr: SocketAddr::from((
+                [0x2001, 0xdb8, 0x1234, 0x5678, 0xaaaa, 0xbbbb, 0xcccc, i],
+                9000 + i,
+            )),
+        }
+    }
+
+    /// A hint round-trips; what a reader does not know — an even type, a
+    /// candidate kind of a later version — is passed over, and what makes
+    /// no sense — an odd type, two keys, a candidate of the wrong size, no
+    /// key — is refused.
+    #[test]
+    fn a_link_hint_round_trips_and_malformed_ones_are_refused() {
+        let hint = LinkHint {
+            key: [0x42; 32],
+            candidates: vec![host(2), host6(1), host(3)],
+        };
+        assert_eq!(LinkHint::decode(&hint.encode()).unwrap(), hint);
+
+        let mut w = TlvWriter::new();
+        w.write_tlv(tlv::LINK_KEY, &[1; 32]);
+        w.write_tlv(0x05BE, b"a later even field");
+        w.write_tlv(tlv::LINK_CANDIDATE, &[9, 10, 0, 0, 1, 0x1B, 0x58]);
+        w.write_tlv(tlv::LINK_CANDIDATE, &[0, 10, 0, 0, 2, 0x1B, 0x58]);
+        let got = LinkHint::decode(&w.finish()).unwrap();
+        assert_eq!(got.candidates.len(), 1, "an unknown kind is passed over");
+
+        let refused = |build: &dyn Fn(&mut TlvWriter)| {
+            let mut w = TlvWriter::new();
+            build(&mut w);
+            LinkHint::decode(&w.finish()).unwrap_err()
+        };
+        refused(&|w| {
+            w.write_tlv(tlv::LINK_KEY, &[1; 32]);
+            w.write_tlv(tlv::LINK_KEY, &[2; 32]);
+        });
+        refused(&|w| w.write_tlv(tlv::LINK_CANDIDATE, &[0, 10, 0, 0, 1, 0x1B, 0x58]));
+        refused(&|w| {
+            w.write_tlv(tlv::LINK_KEY, &[1; 32]);
+            w.write_tlv(tlv::LINK_CANDIDATE, &[0, 10, 0, 0, 1, 0x1B]);
+        });
+        refused(&|w| {
+            w.write_tlv(tlv::LINK_KEY, &[1; 31]);
+        });
+        refused(&|w| {
+            w.write_tlv(tlv::LINK_KEY, &[1; 32]);
+            w.write_tlv(0x05BF, b"a later critical field");
+        });
+    }
+
+    /// A code from a stranger is not made to send datagrams to addresses
+    /// nobody is at, and a hint's candidates are bounded and distinct.
+    #[test]
+    fn a_link_hint_keeps_only_dialable_distinct_candidates_up_to_its_bound() {
+        let unusable = [
+            HintCandidate {
+                kind: HintKind::Host,
+                addr: SocketAddr::from(([0, 0, 0, 0], 7000)),
+            },
+            HintCandidate {
+                kind: HintKind::Host,
+                addr: SocketAddr::from(([224, 0, 0, 1], 7000)),
+            },
+            HintCandidate {
+                kind: HintKind::Host,
+                addr: SocketAddr::from(([255, 255, 255, 255], 7000)),
+            },
+            HintCandidate {
+                kind: HintKind::Host,
+                addr: SocketAddr::from(([10, 0, 0, 1], 0)),
+            },
+            HintCandidate {
+                kind: HintKind::Host,
+                addr: SocketAddr::from(([0u16; 8], 7000)),
+            },
+        ];
+        let mut candidates: Vec<HintCandidate> = unusable.to_vec();
+        candidates.push(host(1));
+        candidates.push(host(1));
+        candidates.extend((2..40).map(host));
+        let hint = LinkHint {
+            key: [3; 32],
+            candidates,
+        };
+        let got = LinkHint::decode(&hint.encode()).unwrap();
+        assert_eq!(got.candidates.len(), LINK_HINT_CANDIDATES_MAX);
+        assert_eq!(got.candidates[0], host(1));
+        assert_eq!(got.candidates[1], host(2));
+        // The encoding keeps at most the bound whatever the host gave, so a
+        // hostile reader gets no more than a conforming one.
+        let encoded = hint.encode();
+        let mut count = 0;
+        let mut r = TlvReader::new(encoded);
+        while !r.is_empty() {
+            if r.read_tlv().unwrap().0 == tlv::LINK_CANDIDATE {
+                count += 1;
+            }
+        }
+        assert!(count <= LINK_HINT_CANDIDATES_MAX);
+    }
+
+    fn code_with(offer: String, relays: usize) -> Introduction {
+        Introduction {
+            namespace: Some("/home/alice".into()),
+            fingerprint: [0xA5; ndn_trust_envelope::ANCHOR_FINGERPRINT_LEN],
+            offer,
+            secret: [0x3C; SECRET_LEN],
+            link_hint: None,
+            relays: (0..relays)
+                .map(|i| format!("/community/node/relay-{i:04}"))
+                .collect(),
+        }
+    }
+
+    /// The code's size, with and without a full hint of the most candidates,
+    /// IPv6 (the longest), beside several relay hints: within one QR with
+    /// room to spare, so the bound on candidates is what keeps it there.
+    #[test]
+    fn a_code_with_a_full_link_hint_stays_within_one_qr() {
+        let offer = "/home/alice/laptop/32=log/home/alice/32=data/notebook/seq=12".to_string();
+        let hint = LinkHint {
+            key: [0x42; 32],
+            candidates: (0..LINK_HINT_CANDIDATES_MAX as u16).map(host6).collect(),
+        };
+        let without = LinkHint::code_link(code_with(offer.clone(), 4), None).unwrap();
+        let with = LinkHint::code_link(code_with(offer.clone(), 4), Some(&hint)).unwrap();
+        let max = ndn_trust_envelope::qr::MAX_TEXT_LEN;
+        assert!(without.len() < with.len() && with.len() <= max / 2);
+        eprintln!(
+            "code size: {} octets without a hint, {} with one of {} IPv6 candidates (a QR holds {max})",
+            without.len(),
+            with.len(),
+            LINK_HINT_CANDIDATES_MAX
+        );
+        let Ok(TrustEnvelope::Intro(i)) = TrustEnvelope::from_uri(&with) else {
+            panic!("an introduction link");
+        };
+        assert_eq!(
+            LinkHint::decode(&i.link_hint.unwrap()).unwrap(),
+            hint,
+            "a hint that fits is carried whole"
+        );
+    }
+
+    /// An offer name that leaves room for few candidates keeps the first
+    /// ones that fit and drops the relays first; one that leaves room for
+    /// none drops the hint and still gives a code; the secret, offer and
+    /// fingerprint are never dropped.
+    #[test]
+    fn a_code_that_cannot_hold_the_whole_hint_trims_it_and_never_the_secret() {
+        let max = ndn_trust_envelope::qr::MAX_TEXT_LEN;
+        let hint = LinkHint {
+            key: [0x42; 32],
+            candidates: (0..LINK_HINT_CANDIDATES_MAX as u16).map(host6).collect(),
+        };
+        // An offer name long enough that only some candidates fit beside it.
+        let mut trimmed = None;
+        for pad in (1400..1700).step_by(4) {
+            let offer = format!(
+                "/home/alice/laptop/32=log/home/alice/32=data/{}/seq=12",
+                "n".repeat(pad)
+            );
+            let Some(link) = LinkHint::code_link(code_with(offer.clone(), 40), Some(&hint)) else {
+                break;
+            };
+            assert!(
+                link.len() <= max,
+                "a code of {} octets is past one QR",
+                link.len()
+            );
+            let Ok(TrustEnvelope::Intro(i)) = TrustEnvelope::from_uri(&link) else {
+                panic!("an introduction link");
+            };
+            assert_eq!(i.offer, offer);
+            assert_eq!(i.secret, [0x3C; SECRET_LEN]);
+            assert_eq!(i.fingerprint, [0xA5; 32]);
+            if let Some(bytes) = &i.link_hint {
+                let got = LinkHint::decode(bytes).unwrap();
+                assert_eq!(got.candidates[..], hint.candidates[..got.candidates.len()]);
+                if got.candidates.len() < hint.candidates.len() {
+                    assert!(i.relays.is_empty(), "relays go before candidates");
+                    trimmed = Some(got.candidates.len());
+                }
+            } else {
+                trimmed.get_or_insert(0);
+            }
+        }
+        assert!(trimmed.is_some(), "no offer name length trimmed the hint");
     }
 }
