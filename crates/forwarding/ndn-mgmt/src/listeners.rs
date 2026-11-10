@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use ndn_engine::ForwarderEngine;
+use ndn_face::local::ProgramPeers;
 use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
@@ -13,10 +14,21 @@ use tokio_util::sync::CancellationToken;
 /// `FaceKind::Management` face (the NFD management socket; each command is
 /// authorized by the connection's peer credentials or by its signature).
 ///
+/// `peers` says whose connections are program faces: the daemon's user and
+/// root always, plus the members of `[security] program_groups`. The socket
+/// is world-connectable, so every other user's connection is accepted but
+/// gets a validated face: its Data is checked before it is cached. Membership
+/// of a program group skips that check for the user's sockets.
+///
 /// `path` is a Unix domain socket path on Unix (e.g. `/run/nfd/nfd.sock`)
 /// or a Named Pipe path on Windows (e.g. `\\.\pipe\ndn`).
-pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: CancellationToken) {
-    run_face_listener_as(path, FaceKind::Management, engine, cancel).await
+pub async fn run_face_listener(
+    path: &str,
+    peers: ProgramPeers,
+    engine: ForwarderEngine,
+    cancel: CancellationToken,
+) {
+    run_face_listener_as(path, FaceKind::Management, peers, engine, cancel).await
 }
 
 /// Like [`run_face_listener`] but accepts each connection with an explicit
@@ -31,11 +43,12 @@ pub async fn run_face_listener(path: &str, engine: ForwarderEngine, cancel: Canc
 pub async fn run_face_listener_as(
     path: &str,
     kind: FaceKind,
+    peers: ProgramPeers,
     engine: ForwarderEngine,
     cancel: CancellationToken,
 ) {
     let listener = match ndn_face::local::IpcListener::bind(path) {
-        Ok(l) => l,
+        Ok(l) => l.with_program_peers(peers),
         Err(e) => {
             tracing::error!(target: "face.system", path = %path, error = %e, "face-listener: bind failed");
             return;

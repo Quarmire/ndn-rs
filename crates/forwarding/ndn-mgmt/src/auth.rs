@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use ndn_engine::ForwarderEngine;
+#[cfg(unix)]
+use ndn_face::local::operators;
 use ndn_transport::{FaceId, PeerCredentials};
 
 use ndn_cert::report::{TrustRefusal, code};
@@ -456,12 +458,12 @@ fn identify_caller(
             .faces()
             .get(fid)
             .and_then(|face| face.peer_credentials());
-        let daemon_uid = unix_ids::daemon_euid();
+        let daemon_uid = operators::daemon_euid();
         (
             classify_caller(
                 peer,
                 daemon_uid,
-                |p| unix_ids::peer_in_any_group(p, groups, "trust_admin_groups"),
+                |p| operators::peer_in_any_group(p, groups, "trust_admin_groups"),
                 groups,
             ),
             OperatorSet::new(daemon_uid, groups).with_transit(config.transit_groups()),
@@ -510,7 +512,7 @@ fn in_transit_group(fid: FaceId, engine: &ForwarderEngine, config: &dyn MgmtConf
                 .faces()
                 .get(fid)
                 .and_then(|face| face.peer_credentials())
-                .is_some_and(|p| unix_ids::peer_in_any_group(&p, groups, "transit_groups"))
+                .is_some_and(|p| operators::peer_in_any_group(&p, groups, "transit_groups"))
     }
     #[cfg(not(unix))]
     {
@@ -590,7 +592,7 @@ pub(crate) fn caller_label(source_face: Option<FaceId>, engine: &ForwarderEngine
             .get(fid)
             .and_then(|face| face.peer_credentials())
         {
-            Some(peer) => match unix_ids::user_name(peer.uid) {
+            Some(peer) => match operators::user_name(peer.uid) {
                 Some(user) => format!("uid {} ({user})", peer.uid),
                 None => format!("uid {}", peer.uid),
             },
@@ -736,163 +738,6 @@ fn is_key_signed(interest: &ndn_packet::Interest) -> bool {
         interest.sig_info().map(|s| s.sig_type),
         None | Some(ndn_packet::SignatureType::DigestSha256)
     )
-}
-
-/// User / group database lookups backing the `trust_admin_groups` and
-/// `transit_groups` checks.
-// Scoped exception to the workspace `deny(unsafe_code)`: libc user/group
-// database FFI (geteuid, getgrnam_r, getpwuid_r), return codes checked.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-mod unix_ids {
-    use std::ffi::{CStr, CString};
-
-    use ndn_transport::PeerCredentials;
-
-    /// Upper bound for the getgrnam_r / getpwuid_r scratch buffer.
-    const MAX_BUF: usize = 1 << 20;
-
-    /// The forwarder's own effective uid.
-    pub(super) fn daemon_euid() -> u32 {
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        unsafe { libc::geteuid() }
-    }
-
-    struct Group {
-        gid: u32,
-        members: Vec<String>,
-    }
-
-    /// `true` if `peer` belongs to any group named in `groups` (the
-    /// `[security] <key>` list): its primary gid is the group's gid, its
-    /// user name is in the group's member list, or (Linux, pid known) the
-    /// gid is among its supplementary groups.
-    pub(super) fn peer_in_any_group(peer: &PeerCredentials, groups: &[String], key: &str) -> bool {
-        let mut user: Option<Option<String>> = None;
-        #[cfg(target_os = "linux")]
-        let mut supplementary: Option<Vec<u32>> = None;
-        for name in groups {
-            let Some(group) = lookup_group(name) else {
-                tracing::warn!(
-                    group = %name,
-                    "[security] {key} names a group this system does not know: no one is let in \
-                     through it; create the group or remove it from the configuration"
-                );
-                continue;
-            };
-            if peer.gid == group.gid {
-                return true;
-            }
-            if !group.members.is_empty()
-                && let Some(user) = user.get_or_insert_with(|| user_name(peer.uid)).as_deref()
-                && group.members.iter().any(|m| m == user)
-            {
-                return true;
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(pid) = peer.pid
-                && supplementary
-                    .get_or_insert_with(|| proc_supplementary_groups(pid, peer.uid))
-                    .contains(&group.gid)
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn lookup_group(name: &str) -> Option<Group> {
-        let cname = CString::new(name).ok()?;
-        let mut buf: Vec<libc::c_char> = vec![0; 1024];
-        loop {
-            // SAFETY: `group` is plain old data; getgrnam_r fills it, pointing
-            // its string fields into `buf`, which outlives every read below.
-            let mut grp: libc::group = unsafe { std::mem::zeroed() };
-            let mut result: *mut libc::group = std::ptr::null_mut();
-            let rc = unsafe {
-                libc::getgrnam_r(
-                    cname.as_ptr(),
-                    &mut grp,
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                    &mut result,
-                )
-            };
-            if rc == libc::ERANGE && buf.len() < MAX_BUF {
-                buf.resize(buf.len() * 2, 0);
-                continue;
-            }
-            if rc != 0 || result.is_null() {
-                return None;
-            }
-            let mut members = Vec::new();
-            let mut p = grp.gr_mem;
-            if !p.is_null() {
-                // SAFETY: `gr_mem` is a NULL-terminated array of C strings in `buf`.
-                unsafe {
-                    while !(*p).is_null() {
-                        members.push(CStr::from_ptr(*p).to_string_lossy().into_owned());
-                        p = p.add(1);
-                    }
-                }
-            }
-            return Some(Group {
-                gid: grp.gr_gid,
-                members,
-            });
-        }
-    }
-
-    pub(super) fn user_name(uid: u32) -> Option<String> {
-        let mut buf: Vec<libc::c_char> = vec![0; 1024];
-        loop {
-            // SAFETY: as in `lookup_group`; `pw_name` points into `buf`.
-            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-            let mut result: *mut libc::passwd = std::ptr::null_mut();
-            let rc = unsafe {
-                libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-            };
-            if rc == libc::ERANGE && buf.len() < MAX_BUF {
-                buf.resize(buf.len() * 2, 0);
-                continue;
-            }
-            if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
-                return None;
-            }
-            // SAFETY: non-null NUL-terminated string inside `buf`.
-            return Some(
-                unsafe { CStr::from_ptr(pwd.pw_name) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-    }
-
-    /// Supplementary gids from `/proc/<pid>/status` `Groups:`. Empty unless
-    /// the process's effective uid (`Uid:` 2nd field) still equals the
-    /// socket peer's uid, so a recycled pid cannot lend another process's
-    /// groups.
-    #[cfg(target_os = "linux")]
-    fn proc_supplementary_groups(pid: i32, uid: u32) -> Vec<u32> {
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            return Vec::new();
-        };
-        let field = |key: &str| {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(key))
-                .map(|rest| {
-                    rest.split_whitespace()
-                        .filter_map(|t| t.parse::<u32>().ok())
-                })
-        };
-        if field("Uid:").and_then(|mut ids| ids.nth(1)) != Some(uid) {
-            return Vec::new();
-        }
-        field("Groups:")
-            .map(|ids| ids.collect())
-            .unwrap_or_default()
-    }
 }
 
 #[cfg(test)]

@@ -67,8 +67,9 @@ impl std::error::Error for PersistencyError {}
 /// OS-attested identity of the process on the other end of a local
 /// (Unix-domain) socket, captured when the socket was accepted or connected
 /// (`SO_PEERCRED` / `getpeereid`). Used to authorize privileged management
-/// verbs, and the evidence that makes a socket a program face
-/// ([`FaceTrust::Program`]).
+/// verbs, and part of the evidence a socket's constructor weighs in making it
+/// a program face ([`FaceTrust::Program`]): the face is a program face only
+/// if the node trusts that user ([`StreamFace::program_peer`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerCredentials {
     pub uid: u32,
@@ -100,7 +101,8 @@ pub trait Transport: Send + Sync + 'static {
     /// Whether the forwarder believes the Data this transport delivers
     /// without validating it. Set by the transport's constructor from how the
     /// face was opened (an in-process channel, shared memory, a Unix socket
-    /// whose peer the kernel identified), never from the peer's address.
+    /// whose peer the kernel identified as a user the node trusts as its own),
+    /// never from the peer's address.
     /// The default is [`FaceTrust::Validated`]: a transport must opt in to
     /// being a program face. See [`FaceTrust`].
     fn trust(&self) -> FaceTrust {

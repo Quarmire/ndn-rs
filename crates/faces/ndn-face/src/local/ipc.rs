@@ -16,6 +16,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use ndn_transport::{FaceId, FaceKind, PeerCredentials, StreamFace, TlvCodec};
 
+use super::operators::ProgramPeers;
+
 type DynRead = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
@@ -23,8 +25,10 @@ pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
 
 /// An IPC face. `creds` are the peer credentials the operating system
 /// reported for the socket, or `None` where it reports none (a Windows named
-/// pipe): they are what makes the face a program face
-/// ([`ndn_transport::FaceTrust::Program`]); without them its Data is validated.
+/// pipe). The face is a program face
+/// ([`ndn_transport::FaceTrust::Program`]) only when the credentials exist
+/// and `peers` admits them; otherwise its Data is validated. The socket is
+/// world-connectable, so being identified is not enough.
 fn make_face(
     id: FaceId,
     kind: FaceKind,
@@ -32,8 +36,14 @@ fn make_face(
     r: DynRead,
     w: DynWrite,
     creds: Option<PeerCredentials>,
+    peers: &ProgramPeers,
 ) -> IpcFace {
-    StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec).with_peer_credentials(creds)
+    let face =
+        StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec).with_peer_credentials(creds);
+    match creds {
+        Some(c) if peers.contains(&c) => face.program_peer(),
+        _ => face,
+    }
 }
 
 /// Kernel-attested credentials of the process at the other end of `stream`
@@ -59,13 +69,24 @@ pub(crate) fn unix_peer_credentials(stream: &tokio::net::UnixStream) -> Option<P
 /// Windows: `path` is a named pipe (`\\.\pipe\…`); cleanup is automatic.
 pub struct IpcListener {
     inner: PlatformListener,
+    peers: ProgramPeers,
 }
 
 impl IpcListener {
     pub fn bind(path: &str) -> io::Result<Self> {
         Ok(Self {
             inner: PlatformListener::bind(path)?,
+            peers: ProgramPeers::this_user(),
         })
+    }
+
+    /// Decide whose connections are program faces ([`ProgramPeers`]); the
+    /// default is the process's own user and root. A peer the policy does not
+    /// admit still gets a face that carries its credentials, but its Data is
+    /// validated.
+    pub fn with_program_peers(mut self, peers: ProgramPeers) -> Self {
+        self.peers = peers;
+        self
     }
 
     /// Accept a connection as a `FaceKind::Management` face (the NFD
@@ -82,7 +103,7 @@ impl IpcListener {
     /// through signed-command auth, not face-kind).
     pub async fn accept_as(&self, face_id: FaceId, kind: FaceKind) -> io::Result<IpcFace> {
         let (r, w, uri, creds) = self.inner.accept().await?;
-        Ok(make_face(face_id, kind, uri, r, w, creds))
+        Ok(make_face(face_id, kind, uri, r, w, creds, &self.peers))
     }
 
     pub fn cleanup(&self) {
@@ -95,11 +116,20 @@ impl IpcListener {
 }
 
 /// Dial the socket at `path` as a `FaceKind::Unix` face. The kernel reports
-/// who owns the far end ([`PeerCredentials`]), so the face is a program face
-/// where the platform reports it.
+/// who owns the far end ([`PeerCredentials`]); the face is a program face
+/// when that is this process's user or root, and validated when it is any
+/// other user (whoever bound the path is who answers).
 pub async fn ipc_face_connect(id: FaceId, path: &str) -> io::Result<IpcFace> {
     let (r, w, uri, creds) = platform_connect(path).await?;
-    Ok(make_face(id, FaceKind::Unix, uri, r, w, creds))
+    Ok(make_face(
+        id,
+        FaceKind::Unix,
+        uri,
+        r,
+        w,
+        creds,
+        &ProgramPeers::this_user(),
+    ))
 }
 
 /// Adopt an already-connected `SOCK_STREAM` fd as an [`IpcFace`], taking
@@ -132,6 +162,7 @@ pub fn ipc_face_from_raw_fd(
         Box::new(r),
         Box::new(w),
         creds,
+        &ProgramPeers::this_user(),
     ))
 }
 

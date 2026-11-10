@@ -102,3 +102,60 @@ async fn next_hop_face_id_gated_on_local_fields() {
 
     shutdown.shutdown().await;
 }
+
+/// LocalFields lets a face choose the next hop, so only a program face may
+/// have it. A validated face (a loopback TCP client: any user of the host can
+/// open it) whose LocalFields bit is on anyway — set through any path other
+/// than the management gate, which refuses it — still does not pin the next
+/// hop: the Interest follows the FIB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_hop_face_id_is_ignored_from_a_validated_face_with_local_fields_on() {
+    let (face_b, handle_b) = InProcFace::new(FaceId(FACE_B), 128);
+    let (face_c, handle_c) = InProcFace::new(FaceId(FACE_C), 128);
+    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+        .face(face_b)
+        .face(face_c)
+        .build()
+        .await
+        .expect("engine build");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(
+        ndn_face::tcp_face_connect(FaceId(0), addr),
+        listener.accept()
+    );
+    let (stream, _) = accepted.unwrap();
+    engine.add_face(
+        ndn_face::tcp_face_from_stream(FaceId(FACE_A), stream),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let client = ndn_transport::Face::from_transport(client.unwrap());
+    engine.set_local_fields(FaceId(FACE_A), true);
+
+    let prefix: Name = "/nh".parse().unwrap();
+    engine.fib().add_nexthop(&prefix, FaceId(FACE_C), 0);
+
+    let pinned = InterestBuilder::new(ndn_packet::name!("/nh/validated"))
+        .lifetime(Duration::from_secs(2))
+        .pin_face(FACE_B)
+        .build();
+    client
+        .transport
+        .send_bytes(pinned)
+        .await
+        .expect("send the pinned Interest");
+    assert!(
+        recv_timeout(&handle_c)
+            .await
+            .as_ref()
+            .is_some_and(is_interest),
+        "the Interest from a validated face must follow the FIB to face C"
+    );
+    assert!(
+        recv_timeout(&handle_b).await.is_none(),
+        "a validated face pinned the next hop with NextHopFaceId"
+    );
+
+    shutdown.shutdown().await;
+}

@@ -12,7 +12,7 @@ use ndn_packet::lp::{LpPacket, extract_fragment, is_lp_packet};
 use ndn_packet::wire::ensure_nonce;
 use ndn_packet::{Data, Interest, Nack, Name, tlv_type};
 use ndn_store::NameHashes;
-use ndn_transport::{FaceId, FaceOptions, FaceScope, FaceTable};
+use ndn_transport::{FaceId, FaceOptions, FaceScope, FaceTable, FaceTrust};
 
 fn is_localhost_name(name: &Name) -> bool {
     name.components()
@@ -112,13 +112,21 @@ impl TlvDecodeStage {
         Arc::clone(&self.reassembly)
     }
 
-    /// Whether the ingress face opted into NDNLPv2 LocalFields. Gates
-    /// acceptance of privileged ingress fields (NextHopFaceId), mirroring
-    /// NFD's `allowLocalFields` check.
+    /// Whether the ingress face may use NDNLPv2 LocalFields: it opted in *and*
+    /// is a program face. Gates acceptance of privileged ingress fields
+    /// (NextHopFaceId), mirroring NFD's `allowLocalFields` check. LocalFields
+    /// lets the face choose the next hop, so a validated face (a TCP, UDP or
+    /// WebSocket peer, another user's Unix socket) never has it, whatever its
+    /// flag says; `faces/update` refuses to set the flag on such a face, and
+    /// this check holds should the flag be set any other way.
     fn ingress_local_fields(&self, face_id: FaceId) -> bool {
-        self.face_states
-            .get(&face_id)
-            .is_some_and(|s| s.local_fields_enabled())
+        self.face_table
+            .get(face_id)
+            .is_some_and(|f| f.trust() == FaceTrust::Program)
+            && self
+                .face_states
+                .get(&face_id)
+                .is_some_and(|s| s.local_fields_enabled())
     }
 
     /// Override the ingress options for `face_id`, taking precedence over

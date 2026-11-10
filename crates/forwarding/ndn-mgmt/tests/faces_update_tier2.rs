@@ -27,7 +27,9 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
 use ndn_mgmt::{MgmtHandles, mount_management};
 use ndn_packet::{Data, Name, encode::InterestBuilder};
-use ndn_transport::{BIT_CONGESTION_MARKING, BIT_LP_RELIABILITY, FaceId, FaceKind};
+use ndn_transport::{
+    BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceKind,
+};
 use tokio_util::sync::CancellationToken;
 
 const APP_FACE_ID: FaceId = FaceId(7000);
@@ -190,6 +192,89 @@ async fn faces_update_refused_option_carries_named_field() {
     assert!(
         cr.status_text.contains("reason=transport-not-eligible"),
         "named reason absent from body: {:?}",
+        cr.status_text,
+    );
+
+    env.cancel.cancel();
+}
+
+const TCP_FACE_ID: FaceId = FaceId(7003);
+
+/// A TCP face to a loopback address, and the far end of its connection (keep
+/// it alive: closing it removes the face).
+async fn loopback_tcp_face(id: FaceId) -> (ndn_face::TcpFace, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+    let (stream, _) = accepted.unwrap();
+    (ndn_face::tcp_face_from_stream(id, stream), client.unwrap())
+}
+
+/// LocalFields lets a face choose the next hop (NextHopFaceId), so only a
+/// program face may enable it. A TCP face to a loopback address is reachable
+/// by every user of the host: `faces/update` refuses with the named field
+/// and reason, says what to do, and leaves the bit off.
+#[tokio::test]
+async fn faces_update_refuses_local_fields_on_a_non_program_face() {
+    let (tcp_face, _peer) = loopback_tcp_face(TCP_FACE_ID).await;
+    let env = setup_with_extra(|builder| {
+        builder.add_face(tcp_face);
+    })
+    .await;
+
+    let cp = ControlParameters {
+        face_id: Some(TCP_FACE_ID.0),
+        flags: Some(BIT_LOCAL_FIELDS),
+        mask: Some(BIT_LOCAL_FIELDS),
+        ..Default::default()
+    };
+    let cr = dispatch(&env, &cp).await;
+
+    assert_eq!(
+        cr.status_code, 403,
+        "LocalFields on a non-program face must be refused; got {} {:?}",
+        cr.status_code, cr.status_text,
+    );
+    assert!(
+        cr.status_text
+            .contains("field=flags:local-fields reason=not-a-program-face"),
+        "named field and reason absent from body: {:?}",
+        cr.status_text,
+    );
+    assert!(
+        cr.status_text.contains("NextHopFaceId") && cr.status_text.contains("program_groups"),
+        "the refusal must say why and what to do: {:?}",
+        cr.status_text,
+    );
+    assert!(
+        !env._engine
+            .face_states()
+            .get(&TCP_FACE_ID)
+            .expect("face state")
+            .local_fields_enabled(),
+        "the refused LocalFields bit was set anyway",
+    );
+
+    env.cancel.cancel();
+}
+
+/// The refusal is about trust, not about every face: a program face (an
+/// in-process app face) is not told it is "not a program face" (its
+/// pass-through link service has no LocalFields feature, which is a
+/// different refusal).
+#[tokio::test]
+async fn faces_update_local_fields_on_a_program_face_is_not_refused_for_trust() {
+    let env = setup_with_extra(|_| {}).await;
+    let on = ControlParameters {
+        face_id: Some(APP_FACE_ID.0),
+        flags: Some(BIT_LOCAL_FIELDS),
+        mask: Some(BIT_LOCAL_FIELDS),
+        ..Default::default()
+    };
+    let cr = dispatch(&env, &on).await;
+    assert!(
+        !cr.status_text.contains("not-a-program-face"),
+        "a program face was refused as not a program face: {:?}",
         cr.status_text,
     );
 

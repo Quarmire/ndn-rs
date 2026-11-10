@@ -15,11 +15,11 @@ use crate::{
 /// applied by the paired [`LinkService`](crate::link_service::LinkService).
 ///
 /// **Trust.** A stream face is [`FaceTrust::Validated`] (TCP, a Unix socket
-/// the kernel said nothing about, a named pipe) unless its constructor
-/// attached the peer's kernel-attested credentials
-/// ([`with_peer_credentials`](Self::with_peer_credentials)): the credentials
-/// are the evidence that a program of this host is on the other end, and only
-/// a constructor that read them from the operating system may supply them.
+/// of any user the node does not trust as its own, a named pipe) unless its
+/// constructor called [`program_peer`](Self::program_peer). The peer's
+/// kernel-attested credentials ([`with_peer_credentials`](Self::with_peer_credentials))
+/// are recorded either way, so the management gate can still tell who sent a
+/// command, but a socket's peer being *identified* does not make it *trusted*.
 pub struct StreamFace<R, W, C: Clone> {
     id: FaceId,
     kind: FaceKind,
@@ -28,6 +28,7 @@ pub struct StreamFace<R, W, C: Clone> {
     reader: Mutex<FramedRead<R, C>>,
     writer: Mutex<FramedWrite<W, C>>,
     peer_credentials: Option<PeerCredentials>,
+    trust: FaceTrust,
 }
 
 impl<R, W, C: Clone> StreamFace<R, W, C> {
@@ -48,17 +49,31 @@ impl<R, W, C: Clone> StreamFace<R, W, C> {
             reader: Mutex::new(FramedRead::new(reader, codec.clone())),
             writer: Mutex::new(FramedWrite::new(writer, codec)),
             peer_credentials: None,
+            trust: FaceTrust::Validated,
         }
     }
 
-    /// Attach the peer process credentials the operating system reported for
+    /// Record the peer process credentials the operating system reported for
     /// the underlying local socket (reported by
-    /// [`Transport::peer_credentials`]). `Some` makes the face a program face
-    /// ([`FaceTrust::Program`]); `None` leaves it validated. Call it only with
+    /// [`Transport::peer_credentials`]). They say *who* is on the other end;
+    /// they do not make the face a program face — that is the constructor's
+    /// decision ([`program_peer`](Self::program_peer)), because a local
+    /// socket is reachable by every user of the host. Call it only with
     /// credentials read from the socket (`SO_PEERCRED`, `getpeereid`), never
     /// with credentials the peer or a configuration states.
     pub fn with_peer_credentials(mut self, c: Option<PeerCredentials>) -> Self {
         self.peer_credentials = c;
+        self
+    }
+
+    /// Make the face a program face ([`FaceTrust::Program`]): its Data is
+    /// believed without validation. Call it only when the operating system
+    /// identified the peer *and* that peer is one the node's policy trusts as
+    /// it trusts its own programs (the daemon's user, root, a member of a
+    /// `[security] program_groups` group), or when the process itself holds
+    /// both ends of the connection.
+    pub fn program_peer(mut self) -> Self {
+        self.trust = FaceTrust::Program;
         self
     }
 }
@@ -118,10 +133,6 @@ where
     }
 
     fn trust(&self) -> FaceTrust {
-        if self.peer_credentials.is_some() {
-            FaceTrust::Program
-        } else {
-            FaceTrust::Validated
-        }
+        self.trust
     }
 }

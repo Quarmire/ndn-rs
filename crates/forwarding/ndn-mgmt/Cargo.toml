@@ -69,7 +69,6 @@ ndn-face        = { workspace = true }
 # ndn-app powers the status_bridge.rs Producer mount (ARCH-6 / S11).
 ndn-app          = { workspace = true }
 tokio            = { workspace = true, features = ["net", "io-util"] }
-libc             = { workspace = true }
 
 [dev-dependencies]
 tempfile         = "3"
@@ -81,6 +80,8 @@ ndn-store        = { workspace = true }
 # IPC-seam witness (tests/ipc_seam.rs): a client rides a socketpair fd.
 ndn-ipc          = { workspace = true }
 parking_lot      = { workspace = true }
+# IPC-seam witness (tests/ipc_seam.rs) makes a socketpair.
+libc             = { workspace = true }
 
 [[test]]
 name = "suite"

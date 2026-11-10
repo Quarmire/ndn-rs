@@ -14,7 +14,10 @@ use ndn_transport::Transport;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_util::sync::CancellationToken;
 
-use super::update::{mtu_refusal_reason, persistency_refusal_reason, refusal_reason_text};
+use super::update::{
+    LOCAL_FIELDS_OPTION, NOT_A_PROGRAM_FACE, local_fields_needs_program_face, mtu_refusal_reason,
+    persistency_refusal_reason, refusal_reason_text,
+};
 
 pub(super) async fn faces_create(
     params: ControlParameters,
@@ -164,20 +167,31 @@ fn faces_create_idempotent(
             (BIT_LP_RELIABILITY, FaceOption::LpReliability),
             (BIT_CONGESTION_MARKING, FaceOption::CongestionMarking),
         ];
+        // A refused bit is not committed: it stays as it was.
+        let mut commit_mask = mask;
         for (bit, ctor) in bit_opts {
             if mask & bit == 0 {
                 continue;
             }
             let on = (flags & bit) != 0;
+            if local_fields_needs_program_face(&target, bit, on) {
+                partial_failures.push((
+                    LOCAL_FIELDS_OPTION.to_owned(),
+                    NOT_A_PROGRAM_FACE.to_owned(),
+                ));
+                commit_mask &= !bit;
+                continue;
+            }
             if let Err(err) = target.link_service.apply(ctor(on)) {
                 partial_failures.push((
                     format!("flags:{}", err.option()),
                     refusal_reason_text(&err).to_owned(),
                 ));
+                commit_mask &= !bit;
             }
         }
         if let Some(state) = engine.face_states().get(&face_id) {
-            applied_flags = Some(state.apply_face_flags_mask(flags, mask));
+            applied_flags = Some(state.apply_face_flags_mask(flags, commit_mask));
         }
     }
 

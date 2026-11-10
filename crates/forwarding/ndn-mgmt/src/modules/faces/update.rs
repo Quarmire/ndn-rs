@@ -6,7 +6,7 @@ use ndn_engine::ForwarderEngine;
 use ndn_mgmt_wire::{ControlParameters, ControlResponse, control_response::status};
 use ndn_transport::{
     BIT_CONGESTION_MARKING, BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId, FaceKind, FaceOption,
-    FaceOptionError, FacePersistency, MtuError, PersistencyError,
+    FaceOptionError, FacePersistency, FaceTrust, MtuError, PersistencyError,
 };
 
 use super::super::common::is_management_face;
@@ -80,6 +80,14 @@ pub(super) fn faces_update(
                 continue;
             }
             let on = (flags & bit) != 0;
+            if local_fields_needs_program_face(&target, bit, on) {
+                events.push(FaceEvent::OptionRefused {
+                    face_id,
+                    option: LOCAL_FIELDS_OPTION.to_owned(),
+                    reason: NOT_A_PROGRAM_FACE.to_owned(),
+                });
+                return (not_a_program_face_response(), events);
+            }
             if let Err(err) = target.link_service.apply(ctor(on)) {
                 events.push(FaceEvent::OptionRefused {
                     face_id,
@@ -222,6 +230,40 @@ pub(super) fn persistency_refusal_reason(err: &PersistencyError, kind: FaceKind)
         PersistencyError::Immutable => format!("immutable-on-{kind}"),
         PersistencyError::OutOfRange { reason } => (*reason).to_owned(),
     }
+}
+
+/// Reason a LocalFields request is refused when the face is not a program
+/// face (`field=flags:local-fields reason=not-a-program-face`).
+pub(super) const NOT_A_PROGRAM_FACE: &str = "not-a-program-face";
+
+/// `flags:local-fields`, the option name a LocalFields refusal is reported
+/// under (response, `partial_failures` and `OptionRefused` event alike).
+pub(super) const LOCAL_FIELDS_OPTION: &str = "flags:local-fields";
+
+/// Whether turning `bit` on for `target` must be refused because the face is
+/// not a program face. LocalFields lets a face choose the next hop of its
+/// Interests (`NextHopFaceId`), which no face the forwarder only validates
+/// may do. Turning it off is always allowed.
+pub(super) fn local_fields_needs_program_face(
+    target: &ndn_transport::Face,
+    bit: u64,
+    on: bool,
+) -> bool {
+    bit == BIT_LOCAL_FIELDS && on && target.trust() != FaceTrust::Program
+}
+
+fn not_a_program_face_response() -> ControlResponse {
+    ControlResponse::error(
+        status::UNAUTHORIZED,
+        format!(
+            "field={LOCAL_FIELDS_OPTION} reason={NOT_A_PROGRAM_FACE}: LocalFields lets a face \
+             choose the next hop of its Interests (NextHopFaceId), so only a program face may \
+             have it: an in-process face, shared memory, or a Unix socket of the daemon's user, \
+             root or a member of a [security] program_groups group. This face is a network \
+             face or another user's socket. Enable LocalFields from one of those faces, or \
+             leave it off."
+        ),
+    )
 }
 
 fn refused_flag_response(err: &FaceOptionError) -> ControlResponse {

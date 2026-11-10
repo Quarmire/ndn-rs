@@ -2,9 +2,12 @@
 //! (trust-context.md §6.6): a TCP face to a loopback address is local in
 //! scope (`/localhost` names stay on this host) but is a network face to
 //! trust — any process on the host can open it — so a forged Data arriving
-//! on it is refused, never cached and never served. A program face (an
-//! in-process app face, a Unix socket whose peer the kernel identified)
-//! keeps the fast path: its Data is not validated and is cached.
+//! on it is refused, never cached and never served. So is one on the Unix
+//! socket of another user (it is world-connectable). A program face (an
+//! in-process app face, a Unix socket whose peer is the daemon's user, root
+//! or a program-group member) keeps the fast path: its Data is not validated
+//! and is cached. A face the forwarder opens for a requester has no more
+//! trust than the requester.
 //!
 //! Each rig is a forwarder under the default profile with no trust anchors
 //! (every signed Data from a validated face is refused `untrusted-root`), a
@@ -18,7 +21,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
-use ndn_face::{IpcListener, ipc_face_connect, tcp_face_connect, tcp_face_from_stream};
+use ndn_face::local::operators::daemon_euid;
+use ndn_face::{
+    IpcListener, ProgramPeers, ipc_face_connect, tcp_face_connect, tcp_face_from_stream,
+};
 use ndn_face_local::{InProcFace, InProcHandle};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::lp::{LpPacket, encode_lp_nack};
@@ -321,6 +327,186 @@ async fn data_on_a_unix_socket_with_peer_credentials_is_served_and_cached() {
     assert!(is_data(&out.first.expect("Data delivered")));
     assert!(!out.asked_again, "the Unix face's Data was not cached");
     assert!(is_data(&out.second.expect("served from the content store")));
+    rig.shutdown.shutdown().await;
+}
+
+/// The upstream is a Unix socket accepted by a daemon of another user: the
+/// kernel gave the forwarder the peer's credentials, and the peer (this
+/// process's user) is neither that daemon's user nor root nor in a program
+/// group. `None` when this process is root, who is a program peer of every
+/// daemon.
+async fn rig_unix_foreign_uid() -> Option<Rig> {
+    let me = daemon_euid();
+    if me == 0 {
+        eprintln!(
+            "skipped: running as root (uid 0), who is a program peer of every daemon, so no \
+             Unix-socket peer of this process can be a foreign user; run as an unprivileged \
+             user to exercise this case"
+        );
+        return None;
+    }
+    let (engine, shutdown, consumer, _) = build(false).await;
+    let path = std::env::temp_dir().join(format!(
+        "ndn-face-trust-foreign-{}.sock",
+        std::process::id()
+    ));
+    let listener = IpcListener::bind(path.to_str().unwrap())
+        .unwrap()
+        .with_program_peers(ProgramPeers::with_daemon_uid(me + 1, &[]));
+    let (client, accepted) = tokio::join!(
+        ipc_face_connect(FaceId(0), path.to_str().unwrap()),
+        listener.accept_as(FaceId(UPSTREAM), FaceKind::App)
+    );
+    engine.add_face(accepted.unwrap(), CancellationToken::new());
+    listener.cleanup();
+    Some(Rig {
+        consumer,
+        peer: Peer::Wire(Face::from_transport(client.unwrap())),
+        engine,
+        shutdown,
+    })
+}
+
+/// A Unix socket whose peer is another user of the host is validated, not
+/// believed: the socket is world-connectable, so its credentials say who is
+/// speaking, not that they speak for the owner of the forwarder. A forged Data
+/// on it is refused and never cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_data_on_a_unix_socket_of_another_user_is_refused_and_never_cached() {
+    let Some(rig) = rig_unix_foreign_uid().await else {
+        return;
+    };
+    let out = forge_through(&rig).await;
+    let first = out.first.expect("the consumer hears back");
+    assert!(
+        !is_data(&first),
+        "forged Data on another user's Unix socket was delivered to the consumer"
+    );
+    assert_eq!(refusal_of(&first), Some(Refusal::UntrustedRoot));
+    assert!(
+        out.asked_again,
+        "the second Interest was answered from the content store: the forgery was cached"
+    );
+    rig.shutdown.shutdown().await;
+}
+
+const REQUESTER: u64 = 3;
+
+/// Whose command the forwarder is serving when it opens the upstream face.
+enum Requester {
+    /// A TCP client over the loopback interface: a validated face.
+    LoopbackTcp,
+    /// The consumer's own in-process face, a program face.
+    Program,
+    /// The same program face, with Data validation required of it.
+    ProgramRequiringValidation,
+    /// A face that closed before the forwarder opened the new one.
+    Gone,
+}
+
+/// A rig whose upstream is an in-process face (a transport that is a program
+/// in itself, as a shared-memory face is) added *for* `requester` with
+/// `add_face_inheriting`. The second value keeps the requester's peer end
+/// open.
+async fn rig_provisioned_for(requester: Requester) -> (Rig, Option<Face>) {
+    let (engine, shutdown, consumer, _) = build(false).await;
+    let mut keep = None;
+    let from = match requester {
+        Requester::LoopbackTcp => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) =
+                tokio::join!(tcp_face_connect(FaceId(0), addr), listener.accept());
+            let (stream, _) = accepted.unwrap();
+            engine.add_face(
+                tcp_face_from_stream(FaceId(REQUESTER), stream),
+                CancellationToken::new(),
+            );
+            keep = Some(Face::from_transport(client.unwrap()));
+            FaceId(REQUESTER)
+        }
+        Requester::Program => FaceId(CONSUMER),
+        Requester::ProgramRequiringValidation => {
+            engine.set_require_data_validation(FaceId(CONSUMER), true);
+            FaceId(CONSUMER)
+        }
+        Requester::Gone => FaceId(REQUESTER),
+    };
+    let (face, handle) = InProcFace::new(FaceId(UPSTREAM), 64);
+    engine.add_face_inheriting(
+        face,
+        CancellationToken::new(),
+        ndn_transport::FacePersistency::OnDemand,
+        from,
+    );
+    (
+        Rig {
+            consumer,
+            peer: Peer::InProc(handle),
+            engine,
+            shutdown,
+        },
+        keep,
+    )
+}
+
+async fn assert_forgery_refused(rig: &Rig, what: &str) {
+    let out = forge_through(rig).await;
+    let first = out.first.expect("the consumer hears back");
+    assert!(
+        !is_data(&first),
+        "forged Data on a face provisioned {what} was delivered to the consumer"
+    );
+    assert_eq!(refusal_of(&first), Some(Refusal::UntrustedRoot));
+    assert!(
+        out.asked_again,
+        "a face provisioned {what} cached forged Data"
+    );
+}
+
+/// A face the forwarder opens for a validated requester is validated, however
+/// trusted the transport it asked for: it must not launder forged Data into
+/// the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_face_provisioned_for_a_validated_requester_refuses_forged_data() {
+    let (rig, _requester_peer) = rig_provisioned_for(Requester::LoopbackTcp).await;
+    assert_forgery_refused(&rig, "for a loopback TCP requester").await;
+    rig.shutdown.shutdown().await;
+}
+
+/// When the requester is gone it can no longer be vouched for: the new face
+/// is validated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_face_provisioned_for_a_vanished_requester_refuses_forged_data() {
+    let (rig, _) = rig_provisioned_for(Requester::Gone).await;
+    assert_forgery_refused(&rig, "for a requester that vanished").await;
+    rig.shutdown.shutdown().await;
+}
+
+/// A face for a program requester that has Data validation required keeps
+/// that requirement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_face_provisioned_for_a_program_requiring_validation_keeps_the_flag() {
+    let (rig, _) = rig_provisioned_for(Requester::ProgramRequiringValidation).await;
+    assert!(
+        rig.engine
+            .face_states()
+            .get(&FaceId(UPSTREAM))
+            .expect("the provisioned face has state")
+            .require_data_validation(),
+        "the provisioned face did not inherit the requester's validation requirement"
+    );
+    assert_forgery_refused(&rig, "for a program that requires validation").await;
+    rig.shutdown.shutdown().await;
+}
+
+/// A plain program requester gets a plain program face: the fast path stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_face_provisioned_for_a_program_requester_is_a_program_face() {
+    let (rig, _) = rig_provisioned_for(Requester::Program).await;
+    let out = forge_through(&rig).await;
+    assert!(is_data(&out.first.expect("Data delivered")));
+    assert!(!out.asked_again, "the program's Data was not cached");
     rig.shutdown.shutdown().await;
 }
 

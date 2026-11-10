@@ -50,10 +50,11 @@ impl PacketDispatcher {
     }
 
     /// Whether `face_id` is a program face (an in-process app, shared memory,
-    /// a Unix socket whose peer the kernel identified): a peer whose word the
+    /// a Unix socket whose peer the kernel identified as the daemon's user,
+    /// root or a program-group member): a peer whose word the
     /// forwarder takes without a check, as it takes its Data. A loopback TCP
-    /// face is local in scope and not a program face. A face gone from the
-    /// table is not.
+    /// face, and another user's Unix socket, are not program faces. A face
+    /// gone from the table is not.
     pub(super) fn is_program_face(&self, face_id: FaceId) -> bool {
         self.face_table
             .get(face_id)

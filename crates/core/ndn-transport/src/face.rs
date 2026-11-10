@@ -245,15 +245,20 @@ pub enum FaceScope {
 /// it: the *trust* of a face, separate from its [`FaceScope`].
 ///
 /// Only a **program face** is trusted: the peer is a program on this host that
-/// the operating system, or the process itself, vouches for — an in-process
-/// app face, a shared-memory face, a Unix socket whose peer the kernel
-/// identified ([`PeerCredentials`]). Its Data is not validated and may enter
-/// the content store. Every other face is validated, however near its peer
-/// is: a TCP, UDP, WebSocket, WebTransport or QUIC face to `127.0.0.1` is
-/// reached by *any* process of *any* user on the host, so what arrives on it is
-/// no more believable than what arrives from the network, and a forged Data
-/// that a loopback face's cache admitted would be served to every later
-/// consumer of the name (data-layer.md §18.1, trust-context.md §6.6).
+/// the operating system, or the process itself, vouches for *and* the node
+/// trusts as its own — an in-process app face, a shared-memory face, a Unix
+/// socket whose peer the kernel identified as the daemon's user, root, or a
+/// member of a `[security] program_groups` group. Its Data is not validated
+/// and may enter the content store. Every other face is validated, however
+/// near its peer is: a TCP, UDP, WebSocket, WebTransport or QUIC face to
+/// `127.0.0.1` is reached by *any* process of *any* user on the host, and so
+/// is the Unix socket (it is world-connectable, so another user's program can
+/// open it); what arrives on those is no more believable than what arrives
+/// from the network, and a forged Data that such a face's cache admitted would
+/// be served to every later consumer of the name (data-layer.md §18.1,
+/// trust-context.md §6.6). A face the forwarder opens for a requester
+/// (a shared-memory face provisioned by a command) has no more trust than the
+/// requester's own face.
 ///
 /// The face's constructor sets it ([`Transport::trust`]), from what it
 /// knows of how it was opened, never from the peer's address. The default is
@@ -488,6 +493,16 @@ impl Face {
     /// [`FaceTrust::Validated`].
     pub fn trust(&self) -> FaceTrust {
         self.trust
+    }
+
+    /// This face with its trust lowered to `limit` if it is higher. It can
+    /// never raise trust: a face opened for a validated requester stays
+    /// [`FaceTrust::Validated`] whatever transport it rides on.
+    pub fn with_trust_at_most(mut self, limit: FaceTrust) -> Self {
+        if limit == FaceTrust::Validated {
+            self.trust = FaceTrust::Validated;
+        }
+        self
     }
 
     pub fn remote_uri(&self) -> Option<String> {

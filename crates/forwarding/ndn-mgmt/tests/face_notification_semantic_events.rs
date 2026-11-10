@@ -16,11 +16,12 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
 use ndn_mgmt::{FaceEvent, MgmtHandles, mount_management};
 use ndn_packet::{Data, Name, encode::InterestBuilder};
-use ndn_transport::{BIT_LP_RELIABILITY, FaceId};
+use ndn_transport::{BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId};
 use tokio_util::sync::CancellationToken;
 
 const APP_FACE_ID: FaceId = FaceId(8000);
 const SECOND_FACE_ID: FaceId = FaceId(8001);
+const TCP_FACE_ID: FaceId = FaceId(8002);
 
 struct TestEnv {
     _engine: ndn_engine::ForwarderEngine,
@@ -30,14 +31,20 @@ struct TestEnv {
 }
 
 async fn setup() -> TestEnv {
+    setup_with(None).await
+}
+
+/// The forwarder with its two in-process faces, plus `tcp` when given.
+async fn setup_with(tcp: Option<ndn_face::TcpFace>) -> TestEnv {
     let (app_face, app_handle) = InProcFace::new(APP_FACE_ID, 64);
     let (second_face, _second_handle) = InProcFace::new(SECOND_FACE_ID, 64);
-    let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+    let mut builder = EngineBuilder::new(EngineConfig::default())
         .face(app_face)
-        .face(second_face)
-        .build()
-        .await
-        .expect("engine build");
+        .face(second_face);
+    if let Some(tcp) = tcp {
+        builder = builder.face(tcp);
+    }
+    let (engine, shutdown) = builder.build().await.expect("engine build");
 
     let cancel = CancellationToken::new();
     let mgmt_handles = MgmtHandles {
@@ -164,6 +171,49 @@ async fn faces_update_refused_publishes_option_refused_event() {
             assert_eq!(face_id, SECOND_FACE_ID);
             assert_eq!(option, "flags:lp-reliability");
             assert_eq!(reason, "transport-not-eligible");
+        }
+        other => panic!("expected OptionRefused, got {other:?}"),
+    }
+
+    env.cancel.cancel();
+}
+
+/// A refused attempt to enable LocalFields on a non-program face (a TCP face
+/// to a loopback address) publishes an `OptionRefused` notification naming
+/// the same field and reason the response carries.
+#[tokio::test]
+async fn faces_update_local_fields_refusal_publishes_option_refused_event() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+    let (stream, _) = accepted.unwrap();
+    let _peer = client.unwrap();
+    let env = setup_with(Some(ndn_face::tcp_face_from_stream(TCP_FACE_ID, stream))).await;
+
+    let cp = ControlParameters {
+        face_id: Some(TCP_FACE_ID.0),
+        flags: Some(BIT_LOCAL_FIELDS),
+        mask: Some(BIT_LOCAL_FIELDS),
+        ..Default::default()
+    };
+    let cr = dispatch_faces_update(&env, &cp).await;
+    assert_eq!(cr.status_code, 403, "{:?}", cr.status_text);
+    assert!(
+        cr.status_text
+            .contains("field=flags:local-fields reason=not-a-program-face"),
+        "named field and reason absent: {:?}",
+        cr.status_text,
+    );
+
+    match fetch_face_event(&env, 1).await {
+        FaceEvent::OptionRefused {
+            face_id,
+            option,
+            reason,
+        } => {
+            assert_eq!(face_id, TCP_FACE_ID);
+            assert_eq!(option, "flags:local-fields");
+            assert_eq!(reason, "not-a-program-face");
         }
         other => panic!("expected OptionRefused, got {other:?}"),
     }

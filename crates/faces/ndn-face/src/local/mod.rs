@@ -11,6 +11,8 @@
 pub use ndn_face_local as in_proc;
 pub mod ipc;
 
+pub mod operators;
+
 #[cfg(unix)]
 pub mod unix;
 
@@ -20,6 +22,7 @@ pub type AppFace = InProcFace;
 #[cfg(unix)]
 pub use ipc::ipc_face_from_raw_fd;
 pub use ipc::{IpcFace, IpcListener, ipc_face_connect};
+pub use operators::ProgramPeers;
 
 #[cfg(unix)]
 pub use unix::{

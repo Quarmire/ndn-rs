@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine};
+use ndn_face::local::ProgramPeers;
 use ndn_ipc::MgmtClient;
 use ndn_mgmt::{MgmtHandles, mount_management, run_face_listener};
 use ndn_mgmt_wire::CsEntry;
@@ -43,7 +44,9 @@ async fn daemon(
     let sock_path = sock.to_str().expect("utf-8 path").to_owned();
     {
         let (path, engine, cancel) = (sock_path.clone(), engine.clone(), cancel.clone());
-        tokio::spawn(async move { run_face_listener(&path, engine, cancel).await });
+        tokio::spawn(async move {
+            run_face_listener(&path, ProgramPeers::this_user(), engine, cancel).await
+        });
     }
     for _ in 0..100 {
         if sock.exists() {

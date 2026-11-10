@@ -123,8 +123,9 @@ fn bench_unix_latency(c: &mut Criterion) {
             // socketpair(2) — no socket file on disk.
             let (fa, fb) = rt.block_on(async {
                 let (s1, s2) = UnixStream::pair().unwrap();
-                let fa = ndn_face::local::unix_face_from_stream(FaceId(20), s1, "pair-a");
-                let fb = ndn_face::local::unix_face_from_stream(FaceId(21), s2, "pair-b");
+                let peers = ndn_face::local::ProgramPeers::this_user();
+                let fa = ndn_face::local::unix_face_from_stream(FaceId(20), s1, "pair-a", &peers);
+                let fb = ndn_face::local::unix_face_from_stream(FaceId(21), s2, "pair-b", &peers);
                 (fa, fb)
             });
 
@@ -176,8 +177,9 @@ fn bench_unix_throughput(c: &mut Criterion) {
 
             let (fa, fb) = rt.block_on(async {
                 let (s1, s2) = UnixStream::pair().unwrap();
-                let fa = ndn_face::local::unix_face_from_stream(FaceId(22), s1, "pair-c");
-                let fb = ndn_face::local::unix_face_from_stream(FaceId(23), s2, "pair-d");
+                let peers = ndn_face::local::ProgramPeers::this_user();
+                let fa = ndn_face::local::unix_face_from_stream(FaceId(22), s1, "pair-c", &peers);
+                let fb = ndn_face::local::unix_face_from_stream(FaceId(23), s2, "pair-d", &peers);
                 (fa, fb)
             });
 

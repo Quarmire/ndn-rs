@@ -163,8 +163,9 @@ pub struct FaceState {
     pub uses_lp: AtomicBool,
     /// Require cryptographic Data validation on this face even though it is a
     /// program face ([`ndn_transport::FaceTrust::Program`]). Default `false`:
-    /// program faces (in-process app faces, shared memory, Unix sockets with
-    /// peer credentials) skip verification (the fast path). Set `true` for a
+    /// program faces (in-process app faces, shared memory, Unix sockets of
+    /// the daemon's user, root or a `[security] program_groups` member) skip
+    /// verification (the fast path). Set `true` for a
     /// multi-tenant host where mutually-distrusting local apps share one
     /// forwarder, so forged Data cannot poison the CS or spoof another app's
     /// namespace. Fail-closed: with no validator configured, required-validation
@@ -578,7 +579,7 @@ impl ForwarderEngine {
             .face_table
             .get(face_id)
             .expect("face was just inserted");
-        self.wire_face(wired, cancel, FacePersistency::OnDemand);
+        self.wire_face(wired, cancel, FacePersistency::OnDemand, false);
         Ok(face_id)
     }
 
@@ -600,7 +601,7 @@ impl ForwarderEngine {
             .face_table
             .get(face_id)
             .expect("face was just inserted");
-        self.wire_face(wired, cancel, persistency);
+        self.wire_face(wired, cancel, persistency, false);
         face_id
     }
 
@@ -617,7 +618,47 @@ impl ForwarderEngine {
             .face_table
             .get(face_id)
             .expect("face was just inserted");
-        self.wire_face(erased, cancel, persistency);
+        self.wire_face(erased, cancel, persistency, false);
+    }
+
+    /// Add a face that serves `from`'s client — a face the forwarder opens *for
+    /// a requester* (a shared-memory face provisioned for an app, say) — with
+    /// no more trust than the requester has. The new face takes `from`'s
+    /// [`FaceTrust`](ndn_transport::FaceTrust) at most (a validated requester
+    /// gets a validated face, however trusted the transport it asked for) and
+    /// `from`'s [`require_data_validation`](FaceState::require_data_validation)
+    /// flag. When `from` is gone the requester can no longer be vouched for:
+    /// the face is validated, with the flag set. Returns the assigned
+    /// [`FaceId`].
+    ///
+    /// Without this a validated peer could ask for a face of a trusted kind
+    /// and so launder its forged Data into the content store.
+    pub fn add_face_inheriting<F: ndn_transport::Transport + 'static>(
+        &self,
+        face: F,
+        cancel: CancellationToken,
+        persistency: FacePersistency,
+        from: FaceId,
+    ) -> FaceId {
+        let (trust, require) = match self.inner.face_table.get(from) {
+            Some(source) => (
+                source.trust(),
+                self.inner
+                    .face_states
+                    .get(&from)
+                    .is_some_and(|s| s.require_data_validation()),
+            ),
+            None => (ndn_transport::FaceTrust::Validated, true),
+        };
+        let composed = ndn_transport::Face::from_transport(face).with_trust_at_most(trust);
+        let face_id = self.inner.face_table.insert_arc(Arc::new(composed));
+        let wired = self
+            .inner
+            .face_table
+            .get(face_id)
+            .expect("face was just inserted");
+        self.wire_face(wired, cancel, persistency, require);
+        face_id
     }
 
     /// Wire an already-composed, table-resident face: register its `FaceState`
@@ -632,6 +673,7 @@ impl ForwarderEngine {
         erased: Arc<ndn_transport::Face>,
         cancel: CancellationToken,
         persistency: FacePersistency,
+        require_data_validation: bool,
     ) {
         let face_id = erased.id();
         // The face's own token, a child of the caller's: removing the face
@@ -650,7 +692,11 @@ impl ForwarderEngine {
             congestion_policy,
             self.inner.runtime.unix_nanos(),
         );
-        if self.inner.require_local_validation && trust == ndn_transport::FaceTrust::Program {
+        // Set before the reader task starts, so no Data of this face is ever
+        // judged under a weaker policy than the one it was added with.
+        if require_data_validation
+            || (self.inner.require_local_validation && trust == ndn_transport::FaceTrust::Program)
+        {
             state.set_require_data_validation(true);
         }
         // G4: install a per-face egress scheduler when QoS is configured (the factory

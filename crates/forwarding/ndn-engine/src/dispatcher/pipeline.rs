@@ -576,7 +576,8 @@ impl PacketDispatcher {
 
         // Validation is keyed by the face's TRUST, never its scope: only a
         // program face (an in-process app face, shared memory, a Unix socket
-        // whose peer the kernel identified) is believed without a check, and
+        // of the daemon's user, root or a `[security] program_groups` member)
+        // is believed without a check, and
         // its Data may be cached unverified. A TCP/UDP/WebSocket/WebTransport/
         // QUIC face is validated even to a loopback address, which any process
         // of any user on the host can reach. A face's scope (reach of

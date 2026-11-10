@@ -2703,7 +2703,9 @@ pub struct TrustRuleConfig {
 /// How management commands are authenticated. On the local Unix socket the
 /// kernel's peer credentials authenticate the caller: the daemon's user,
 /// root, and members of `[security] trust_admin_groups` are accepted
-/// without a signature. Every other caller must sign.
+/// without a signature. Every other caller must sign. (Which users' sockets
+/// count as program faces, whose Data is not validated, is a separate list:
+/// `[security] program_groups`.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MgmtSecurityConfig {
@@ -2836,6 +2838,20 @@ pub struct SecurityConfig {
     /// daemon's user and root.
     #[serde(default)]
     pub trust_admin_groups: Vec<String>,
+
+    /// Unix groups whose members' sockets to the face socket are **program
+    /// faces**, in addition to the daemon's own user and root. The face socket
+    /// is world-connectable, so any other local user's connection is
+    /// accepted but *validated*: its Data is checked and only Data that
+    /// passes is cached. A member of one of these groups skips that check:
+    /// anything a program of that user sends is believed and may be cached
+    /// and served to everyone, so list only groups whose members you trust as
+    /// you trust the daemon's own user. Separate from `trust_admin_groups`
+    /// (who may change this node's trust through the management socket):
+    /// being a program peer does not let a user do that. Empty (default) =
+    /// only the daemon's user and root. Read at startup.
+    #[serde(default)]
+    pub program_groups: Vec<String>,
 
     /// Unix groups whose members may carry a person's namespace in transit
     /// for a local app (`security/transit`: a data host's folders) and
@@ -2991,6 +3007,7 @@ impl Default for SecurityConfig {
             mgmt: MgmtSecurityConfig::default(),
             serve_contexts: default_serve_contexts(),
             trust_admin_groups: Vec::new(),
+            program_groups: Vec::new(),
             transit_groups: Vec::new(),
             context_refresh_secs: default_context_refresh_secs(),
             context_sync: false,
@@ -3253,6 +3270,25 @@ mod tests {
         }
         let cfg: ForwarderConfig = "[security]\n".parse().unwrap();
         assert_eq!(cfg.security.renew_before, RenewBeforeConfig::default());
+    }
+
+    /// `[security] program_groups` is empty by default and independent of
+    /// `trust_admin_groups`: listing a group as one does not list it as the
+    /// other.
+    #[test]
+    fn program_groups_default_to_none_and_are_separate_from_trust_admin_groups() {
+        let cfg: ForwarderConfig = "[security]\n".parse().unwrap();
+        assert!(cfg.security.program_groups.is_empty());
+        let cfg: ForwarderConfig =
+            "[security]\nprogram_groups = [\"ndn-apps\"]\ntrust_admin_groups = [\"ndn\"]\n"
+                .parse()
+                .unwrap();
+        assert_eq!(cfg.security.program_groups, ["ndn-apps"]);
+        assert_eq!(cfg.security.trust_admin_groups, ["ndn"]);
+        let cfg: ForwarderConfig = "[security]\ntrust_admin_groups = [\"ndn\"]\n"
+            .parse()
+            .unwrap();
+        assert!(cfg.security.program_groups.is_empty());
     }
 
     #[test]

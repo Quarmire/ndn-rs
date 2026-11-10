@@ -83,7 +83,8 @@ pub struct EngineConfig {
     pub data_plane: crate::dispatcher::DataPlane,
     /// Require cryptographic Data validation even on program faces
     /// ([`ndn_transport::FaceTrust::Program`]: in-process app faces, shared
-    /// memory, Unix sockets with peer credentials), which otherwise skip it.
+    /// memory, Unix sockets of the daemon's user, root or a `[security]
+    /// program_groups` member), which otherwise skip it.
     /// Every other face — TCP, UDP, WebTransport, QUIC, even to a loopback
     /// address — is always validated, whatever this says. Default `false`. Set
     /// `true` on a multi-tenant host so a local app cannot poison the CS or spoof
@@ -950,8 +951,8 @@ fn resolve_security_profile(
             tracing::warn!(target: t::SECURITY,
                 "Security profile \"default\" without a SecurityManager: no trust anchors are \
                  configured, so every signed Data arriving on a validated face (a network face, \
-                 a loopback one included) is REFUSED (untrusted-root); program faces (in-process, \
-                 shared memory, Unix sockets with peer credentials) are unaffected. Configure a security manager \
+                 a loopback one included, or another user's Unix socket) is REFUSED (untrusted-root); program faces (in-process, \
+                 shared memory, Unix sockets of the daemon's user, root or a program_groups member) are unaffected. Configure a security manager \
                  (a [security] identity whose PIB holds trust anchors, or adopt a trust \
                  context), or choose profile \"accept-signed\" (signature only) or \
                  \"disabled\" explicitly."

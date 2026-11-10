@@ -11,7 +11,7 @@ use ndn_engine::{EngineBuilder, EngineConfig};
 use ndn_face_local::InProcFace;
 use ndn_mgmt::{MgmtHandles, mount_management};
 use ndn_packet::{Data, Name, encode::InterestBuilder};
-use ndn_transport::{BIT_LP_RELIABILITY, FaceId};
+use ndn_transport::{BIT_LOCAL_FIELDS, BIT_LP_RELIABILITY, FaceId};
 use tokio_util::sync::CancellationToken;
 
 const APP_FACE_ID: FaceId = FaceId(9000);
@@ -189,6 +189,57 @@ async fn faces_create_idempotent_records_partial_failures() {
     assert!(
         failures.iter().any(|(opt, _)| opt == "mtu"),
         "mtu refusal must appear in partial_failures: {failures:?}",
+    );
+
+    env.cancel.cancel();
+}
+
+/// Re-attaching a UDP face to a loopback address (a validated face, reached
+/// by any user of the host) with LocalFields requested refuses that bit with
+/// `not-a-program-face` in `partial_failures`, and does not set it.
+#[tokio::test]
+async fn faces_create_idempotent_refuses_local_fields_on_a_non_program_face() {
+    let env = setup().await;
+    let cp = ControlParameters {
+        uri: Some("udp4://127.0.0.1:6365".to_owned()),
+        ..Default::default()
+    };
+    let first = dispatch(&env, b"create", &cp).await;
+    assert_eq!(first.status_code, 200, "{:?}", first.status_text);
+    let face_id = first
+        .body
+        .as_ref()
+        .and_then(|b| b.face_id)
+        .expect("face id");
+
+    let again = ControlParameters {
+        uri: Some("udp4://127.0.0.1:6365".to_owned()),
+        flags: Some(BIT_LOCAL_FIELDS),
+        mask: Some(BIT_LOCAL_FIELDS),
+        ..Default::default()
+    };
+    let second = dispatch(&env, b"create", &again).await;
+    assert_eq!(second.status_code, 200, "{:?}", second.status_text);
+    let body = second.body.as_ref().expect("body");
+    assert!(
+        body.partial_failures
+            .iter()
+            .any(|(opt, reason)| opt == "flags:local-fields" && reason == "not-a-program-face"),
+        "LocalFields refusal must appear in partial_failures: {:?}",
+        body.partial_failures,
+    );
+    assert_eq!(
+        body.flags.map(|f| f & BIT_LOCAL_FIELDS),
+        Some(0),
+        "the echoed flags carry the refused LocalFields bit",
+    );
+    assert!(
+        !env._engine
+            .face_states()
+            .get(&FaceId(face_id))
+            .expect("face state")
+            .local_fields_enabled(),
+        "the refused LocalFields bit was set anyway",
     );
 
     env.cancel.cancel();

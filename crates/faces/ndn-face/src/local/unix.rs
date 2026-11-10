@@ -5,20 +5,25 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use ndn_transport::{FaceId, FaceKind, StreamFace, TlvCodec};
 
+use super::operators::ProgramPeers;
+
 /// NDN face over a Unix domain socket with TLV length-prefix framing.
 /// LP-encoding is disabled — local transports pass raw NDN packets.
 pub type UnixFace = StreamFace<OwnedReadHalf, OwnedWriteHalf, TlvCodec>;
 
 /// A Unix-socket face over `stream`, carrying the peer credentials the kernel
-/// reports for it, which make it a program face
-/// ([`ndn_transport::FaceTrust::Program`]); a socket the kernel reports
-/// nothing for is validated like a network face.
-pub fn unix_face_from_stream(id: FaceId, stream: UnixStream, path: impl AsRef<Path>) -> UnixFace {
-    let uri = format!("unix://{}", path.as_ref().display());
-    let creds = super::ipc::unix_peer_credentials(&stream);
-    let (r, w) = stream.into_split();
-    StreamFace::new(id, FaceKind::Unix, None, Some(uri), r, w, TlvCodec)
-        .with_peer_credentials(creds)
+/// reports for it. It is a program face
+/// ([`ndn_transport::FaceTrust::Program`]) only when `peers` admits those
+/// credentials (the daemon's user, root, a program group); every other
+/// user's socket, and one the kernel reports nothing for, is validated like a
+/// network face.
+pub fn unix_face_from_stream(
+    id: FaceId,
+    stream: UnixStream,
+    path: impl AsRef<Path>,
+    peers: &ProgramPeers,
+) -> UnixFace {
+    face_from_stream(id, FaceKind::Unix, stream, path.as_ref(), peers)
 }
 
 /// Like [`unix_face_from_stream`] but tags the face `FaceKind::Management`
@@ -29,18 +34,40 @@ pub fn unix_management_face_from_stream(
     id: FaceId,
     stream: UnixStream,
     path: impl AsRef<Path>,
+    peers: &ProgramPeers,
 ) -> UnixFace {
-    let uri = format!("unix://{}", path.as_ref().display());
-    let creds = super::ipc::unix_peer_credentials(&stream);
-    let (r, w) = stream.into_split();
-    StreamFace::new(id, FaceKind::Management, None, Some(uri), r, w, TlvCodec)
-        .with_peer_credentials(creds)
+    face_from_stream(id, FaceKind::Management, stream, path.as_ref(), peers)
 }
 
+fn face_from_stream(
+    id: FaceId,
+    kind: FaceKind,
+    stream: UnixStream,
+    path: &Path,
+    peers: &ProgramPeers,
+) -> UnixFace {
+    let uri = format!("unix://{}", path.display());
+    let creds = super::ipc::unix_peer_credentials(&stream);
+    let (r, w) = stream.into_split();
+    let face =
+        StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec).with_peer_credentials(creds);
+    match creds {
+        Some(c) if peers.contains(&c) => face.program_peer(),
+        _ => face,
+    }
+}
+
+/// Dial the socket at `path`. The face is a program face when the kernel says
+/// its owner is this process's user or root, validated otherwise.
 pub async fn unix_face_connect(id: FaceId, path: impl AsRef<Path>) -> std::io::Result<UnixFace> {
     let path = path.as_ref();
     let stream = UnixStream::connect(path).await?;
-    Ok(unix_face_from_stream(id, stream, path))
+    Ok(unix_face_from_stream(
+        id,
+        stream,
+        path,
+        &ProgramPeers::this_user(),
+    ))
 }
 
 #[cfg(test)]
@@ -76,7 +103,8 @@ mod tests {
             let accept_fut = listener.accept();
             let (client, accepted) = tokio::join!(connect_fut, accept_fut);
             let (accepted_stream, _) = accepted.unwrap();
-            let server = unix_face_from_stream(FaceId(1), accepted_stream, path);
+            let server =
+                unix_face_from_stream(FaceId(1), accepted_stream, path, &ProgramPeers::this_user());
             (client.unwrap(), server)
         })
         .await;
@@ -124,6 +152,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A peer that is neither the daemon's user, nor root, nor in a program
+    /// group is identified (the credentials are kept, so management can say
+    /// who asked) but is not a program: its Data is validated.
+    #[tokio::test]
+    async fn a_user_outside_the_program_peers_gets_a_validated_face_with_credentials() {
+        use ndn_transport::{Face, FaceTrust};
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let me = std::fs::metadata(&path).unwrap().uid();
+        if me == 0 {
+            eprintln!("skipped: running as root, who is a program peer of every daemon");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let (client, accepted) = tokio::join!(UnixStream::connect(&path), listener.accept());
+        let _client = client.unwrap();
+        let (accepted_stream, _) = accepted.unwrap();
+        let elsewhere = ProgramPeers::with_daemon_uid(me + 1, &[]);
+        let server = Face::from_transport(unix_face_from_stream(
+            FaceId(1),
+            accepted_stream,
+            &path,
+            &elsewhere,
+        ));
+        assert_eq!(
+            server.peer_credentials().expect("kernel credentials").uid,
+            me
+        );
+        assert_eq!(server.trust(), FaceTrust::Validated);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn bidirectional_exchange() {
         let path = temp_socket_path();
@@ -149,7 +210,12 @@ mod tests {
         let accept_fut = listener.accept();
         let (stream, accepted) = tokio::join!(connect_fut, accept_fut);
         let (accepted_stream, _) = accepted.unwrap();
-        let server = unix_face_from_stream(FaceId(1), accepted_stream, &path);
+        let server = unix_face_from_stream(
+            FaceId(1),
+            accepted_stream,
+            &path,
+            &ProgramPeers::this_user(),
+        );
         drop(stream.unwrap());
         assert!(matches!(server.recv_bytes().await, Err(FaceError::Closed)));
         let _ = std::fs::remove_file(&path);

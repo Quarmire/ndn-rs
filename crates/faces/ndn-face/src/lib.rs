@@ -64,7 +64,7 @@ pub use net::{
 };
 
 #[cfg(feature = "local")]
-pub use local::{InProcFace, InProcHandle, IpcFace, IpcListener, ipc_face_connect};
+pub use local::{InProcFace, InProcHandle, IpcFace, IpcListener, ProgramPeers, ipc_face_connect};
 
 #[cfg(all(unix, feature = "local"))]
 pub use local::{

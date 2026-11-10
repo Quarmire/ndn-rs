@@ -433,7 +433,12 @@ impl WasmEngineBuilder {
         // builder-added face (e.g. the dioxus upstream WebTransport face) can
         // neither send nor receive.
         for face in pending_faces {
-            engine.wire_face(face, cancel.child_token(), FacePersistency::Permanent);
+            engine.wire_face(
+                face,
+                cancel.child_token(),
+                FacePersistency::Permanent,
+                false,
+            );
         }
         let handle = ShutdownHandle {
             cancel,

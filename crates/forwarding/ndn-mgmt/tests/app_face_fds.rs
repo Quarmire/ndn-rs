@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use ndn_engine::{APP_FACE_DRAIN, EngineBuilder, EngineConfig, ForwarderEngine};
+use ndn_face::local::ProgramPeers;
 use ndn_mgmt::listeners::run_face_listener_as;
 use ndn_transport::FaceKind;
 use tokio_util::sync::CancellationToken;
@@ -64,7 +65,16 @@ async fn reconnecting_local_clients_leak_no_face_and_no_socket() {
     tokio::spawn({
         let (engine, cancel) = (engine.clone(), cancel.clone());
         let path = path.to_str().expect("utf-8 path").to_owned();
-        async move { run_face_listener_as(&path, FaceKind::App, engine, cancel).await }
+        async move {
+            run_face_listener_as(
+                &path,
+                FaceKind::App,
+                ProgramPeers::this_user(),
+                engine,
+                cancel,
+            )
+            .await
+        }
     });
     for _ in 0..500 {
         if path.exists() {
