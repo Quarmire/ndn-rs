@@ -1400,7 +1400,10 @@ impl Device {
         // failure leaves the relay hints (or routing by name) as before.
         let mut hints = inner.hints(&code.relays);
         if let Some(hint) = &code.link_hint {
-            match introducer.dial(hint, &device, inner.config.first_look).await {
+            match introducer
+                .dial(hint, &device, inner.config.first_look)
+                .await
+            {
                 Ok(()) => hints.clear(),
                 Err(why) => {
                     tracing::debug!(%offer, "the code's link hint was not dialled: {why}")
