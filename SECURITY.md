@@ -54,3 +54,7 @@ Out of scope here (separate repositories, report there): `ndn-ext`, `ndn-fwd`,
   and keep `[security] trust_admin_groups` to the groups you mean: their
   members, like the daemon's user and root, manage the forwarder over the
   local socket without signing.
+- Keep `[security] program_groups` empty unless you mean it: the face socket
+  is world-connectable, and only the daemon's user, root and members of those
+  groups get a face whose Data is believed without validation. Every other
+  user's socket is validated.

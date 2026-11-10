@@ -78,6 +78,18 @@ Who may manage the forwarder is decided per command:
   refresh`, recovery) are accepted only from local operators, never from a
   signature alone, and never over `/localhop`.
 
+Operators and **program peers** are two lists. The face socket is
+world-connectable, so any local user can connect and ask for a face. Its
+Data is believed without validation (a *program face*) only when the peer is
+the daemon's own user, root, or a member of `[security] program_groups`;
+every other user's connection works, but the Data it delivers is validated
+and only Data that passes is cached. `trust_admin_groups` does not add
+program peers, and `program_groups` does not add operators. **Membership in
+`program_groups` skips Data validation for that user's sockets**: list only
+groups you trust as you trust the daemon's own user. A face the forwarder
+opens for a client at its request (a shared-memory face from `faces/create`)
+has the trust of that client's own socket, never more.
+
 To manage the forwarder from another user or host, bootstrap a command
 anchor **out-of-band**, once per forwarder:
 

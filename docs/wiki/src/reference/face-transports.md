@@ -386,8 +386,13 @@ a cache hit), readable from `LpInfo` (`Consumer::fetch_with_meta`); and
 `NextHopFaceId` (0x0330) is honoured on Interests arriving on it, pinning an
 Interest to an egress face past the FIB (`Consumer::fetch_on`). A face without
 LocalFields ignores `NextHopFaceId`, so an untrusted peer cannot steer
-forwarding. Local-scope only; the bundled routing protocol enables it on its
-own faces.
+forwarding. Only a program face may have LocalFields (an in-process face,
+shared memory, or a Unix socket of the daemon's user, root or a `[security]
+program_groups` member): `faces/update` and `faces/create` refuse to turn it
+on for any other face with `field=flags:local-fields
+reason=not-a-program-face`, and the forwarder ignores `NextHopFaceId` from a
+validated face whatever its flag says. Local-scope only; the bundled routing
+protocol enables it on its own faces.
 
 ## Compile-time gates
 

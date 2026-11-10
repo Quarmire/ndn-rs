@@ -32,10 +32,11 @@ The design is in [personal-namespace.md](personal-namespace.md).
   count as local. Every other face is a **non-local face**. Locality is the face's *scope*:
   it decides who is told a refusal and where `/localhost` goes. It is not *trust*.
 - **Program face**: a face whose peer the operating system or the process itself vouches for
-  (an in-process app face, a shared-memory face, a Unix socket whose peer the kernel
-  identified), the faces a forwarder believes without a check
+  and the node trusts as its own (an in-process app face, a shared-memory face, a Unix socket
+  whose peer the kernel identified as the daemon's user, root or a member of `[security]
+  program_groups`), the faces a forwarder believes without a check
   ([trust-context.md](trust-context.md) §6.6). A TCP, UDP or WebTransport face to a loopback
-  address is local and is not a program face.
+  address is local and is not a program face; nor is the Unix socket of another user.
 - **Downstream / upstream**: in the NDN sense. A downstream is a face an Interest arrived on
   and a Data or Nack is returned to. An upstream is a face an Interest was forwarded to.
 - **Local downstream**: a downstream that is a local face. Examples: an app connected over
@@ -156,13 +157,15 @@ A forwarder validates a received Data, and so may refuse it, only when both of t
 1. A validator is configured. With `[security] profile = "disabled"` nothing is validated and
    nothing is refused.
 2. The Data arrived on a face that is not a program face (a TCP, UDP, WebSocket,
-   WebTransport or QUIC face, even to a loopback address, is not), or on a program face that
+   WebTransport or QUIC face, even to a loopback address, is not; neither is the Unix socket
+   of a user who is not the daemon's, root or in `program_groups`), or on a program face that
    requires validation. In ndn-fwd, `[engine] require_local_validation = true` makes every
    program face require it. The default is `false`.
 
-By default, Data from a program face (an in-process app, shared memory, a Unix socket whose
-peer the kernel identified) is not validated and never refused. Data from a loopback TCP or
-UDP face is validated and refused like any network Data.
+By default, Data from a program face (an in-process app, shared memory, a Unix socket of the
+daemon's user, root or a member of `[security] program_groups`) is not validated and never
+refused. Data from a loopback TCP or UDP face, and from the Unix socket of any other user, is
+validated and refused like any network Data.
 
 A Data signed with DigestSha256 is accepted when the digest matches. When it does not match,
 it is refused with 172.
@@ -549,7 +552,7 @@ The paths are relative to the workspace root. Lines are as read on 2026-10-18. C
 | Engine fetcher (timeout = negative TTL = 4 s; direct fetch) | `ndn-rs/crates/app/ndn-app/src/cert_fetch.rs:148-161` |
 | Face locality by kind | `ndn-rs/crates/core/ndn-transport/src/face.rs:111-135` |
 | Locality by remote address, loopback test | `ndn-rs/crates/core/ndn-transport/src/face.rs:258-293` |
-| Face trust (`FaceTrust`), set by the transport; `StreamFace` from peer credentials | `ndn-rs/crates/core/ndn-transport/src/face.rs` (`FaceTrust`), `transport.rs` (`Transport::trust`), `stream_face.rs` |
+| Face trust (`FaceTrust`), set by the transport's constructor; `StreamFace` records peer credentials and is a program face only when its constructor says so (`program_peer`) | `ndn-rs/crates/core/ndn-transport/src/face.rs` (`FaceTrust`), `transport.rs` (`Transport::trust`), `stream_face.rs`; who is a program peer: `ndn-rs/crates/faces/ndn-face/src/local/operators.rs` (`ProgramPeers`) |
 
 **Forwarder: relaying a received refusal**
 

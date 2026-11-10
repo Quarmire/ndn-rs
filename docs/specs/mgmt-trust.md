@@ -99,7 +99,12 @@ in scope but which any process of any user can open — has no caller identity
 and is refused `trust-change-unidentified`. A forwarder's face *trust*
 (trust-context.md §6.6: which faces' Data it believes) is a separate
 property: neither implies the other, and the operator check consults
-only the credentials. Every other management command over a face without
+only the credentials. The two lists are separate too: `trust_admin_groups`
+names who may change this node's trust, and `[security] program_groups` names
+whose Unix sockets are program faces (the daemon's user and root are both). A
+user in only one of them gets that one: an operator's other-user group does not
+make its Data unvalidated, and a program peer cannot change this node's trust.
+Every other management command over a face without
 credentials is decided by its signature, and a `/localhop` command is
 always signed.
 
@@ -773,9 +778,9 @@ other devices) never reaches the inspection: the answer then carries only
 the name asked for, the trusted prefix, and the refusal (`data-refused`);
 the verdict is `invalid` for a final refusal and `pending` for
 `unverifiable`. Data from a program face (an in-process producer, shared
-memory, a Unix socket whose peer the kernel identified) is not validated on
-the way, so the verdict is the inspection's own; Data from a TCP or UDP face
-is validated even to a loopback address (trust-context.md §6.6).
+memory, a Unix socket of the daemon's user, root or a `program_groups` member) is not validated
+on the way, so the verdict is the inspection's own; Data from a TCP or UDP face, or from the
+Unix socket of any other user, is validated even to a loopback address (trust-context.md §6.6).
 
 | code | where | params | meaning |
 |---|---|---|---|
