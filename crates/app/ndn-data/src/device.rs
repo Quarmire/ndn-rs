@@ -692,8 +692,9 @@ struct Coll {
     /// every application here judges again (spec §5.5).
     txns: BTreeSet<(Writer, u64)>,
     /// The members held here of groups not counted yet, with why: the group
-    /// is incomplete or not readable here.
-    group_waits: BTreeMap<VersionId, String>,
+    /// is incomplete or not readable here ([`NotCounted::Waits`]), or never
+    /// counts as its writer made it ([`NotCounted::Excluded`]).
+    group_waits: BTreeMap<VersionId, NotCounted>,
     /// The applied members held here of groups (with each one's group id)
     /// that were last told not counted, with why: their own rule's reason,
     /// or the group waiting on another member ([`St::regroup`]). Kept
@@ -1054,7 +1055,7 @@ impl Coll {
         let mut all: BTreeMap<&VersionId, NotCounted> = self
             .group_waits
             .iter()
-            .map(|(id, why)| (id, NotCounted::Waits(why.clone())))
+            .map(|(id, why)| (id, why.clone()))
             .collect();
         all.extend(
             self.group_held
@@ -2226,7 +2227,8 @@ struct Inner {
     commit_wake: Arc<Notify>,
     /// Told after each commit round that moved [`St::durable`].
     committed: Notify,
-    /// The signal clock floor ([`Device::signal_clock_dated`]).
+    /// The signal sequence counter and time hint ([`Device::signal_sequences`],
+    /// [`Device::note_signal_time`]).
     signal_clock: Mutex<signal::SignalClock>,
     slots: Semaphore,
     /// The round-trip estimate re-expressions are timed from (spec §17.1).
@@ -3000,12 +3002,12 @@ impl GroupVerdict {
                 member: member.clone(),
                 why: why.clone(),
             }),
-            GroupVerdict::Unreadable => Gate::Wait(Some("group not readable here".into())),
-            GroupVerdict::Kept { member, keep } => Gate::Wait(Some(format!(
+            GroupVerdict::Unreadable => Gate::wait("group not readable here"),
+            GroupVerdict::Kept { member, keep } => Gate::Wait(Some(NotCounted::Excluded(format!(
                 "group never counts: its member {member} is kept {keep:?}, and a group's \
                  versions are kept until pruned, so that every reader judges it alike; its \
                  writer puts the items again as a group kept until pruned"
-            ))),
+            )))),
             GroupVerdict::Uncovered { member, epoch, out } => {
                 let out: Vec<String> = out
                     .iter()
@@ -3015,17 +3017,17 @@ impl GroupVerdict {
                         Audience::Group(n) => format!("group {n}"),
                     })
                     .collect();
-                Gate::Wait(Some(format!(
+                Gate::wait(format!(
                     "group waits: its member {member} is sealed in the epoch {} started at seq \
                      {}, whose readers do not include {}, whom its group declares; it counts \
                      once the owner adds them to that epoch, at every reader alike",
                     epoch.creator,
                     epoch.seq.0,
                     out.join(", ")
-                )))
+                ))
             }
             GroupVerdict::Incomplete { present, count } => {
-                Gate::Wait(Some(format!("group incomplete: {present} of {count}")))
+                Gate::wait(format!("group incomplete: {present} of {count}"))
             }
             GroupVerdict::Complete { next, .. } if *next == Some(seq) => Gate::Go,
             GroupVerdict::Complete { .. } => Gate::Wait(None),
@@ -3058,10 +3060,19 @@ enum MemberState {
 enum Gate {
     /// Apply when ready.
     Go,
-    /// Wait; with why it is not counted, if that is to be shown.
-    Wait(Option<String>),
+    /// Wait; with why it is not counted, if that is to be shown: a wait that
+    /// ends ([`NotCounted::Waits`]), or an exclusion that does not
+    /// ([`NotCounted::Excluded`]).
+    Wait(Option<NotCounted>),
     /// Never apply: refused for this reason.
     Stop(Refusal),
+}
+
+impl Gate {
+    /// A wait that ends once what it waits for arrives, with its reason.
+    fn wait(why: impl Into<String>) -> Gate {
+        Gate::Wait(Some(NotCounted::Waits(why.into())))
+    }
 }
 
 /// The folder a collection is in: its name but the last component.
@@ -5548,7 +5559,7 @@ impl St {
                     Change::NotCounted {
                         collection: c.clone(),
                         id: id.clone(),
-                        why: NotCounted::Waits(why.clone()),
+                        why: why.clone(),
                     },
                     Some(id.clone()),
                 ));
@@ -5566,9 +5577,7 @@ impl St {
             // Told not counted while it waited; applied now, its group
             // judges whether it counts ([`St::regroup`]).
             if applied_here && let (Some(why), Some(g)) = (why, group_of(versions, &id)) {
-                group_held
-                    .entry(id.clone())
-                    .or_insert((g, NotCounted::Waits(why)));
+                group_held.entry(id.clone()).or_insert((g, why));
                 touched.insert((id.writer.clone(), g));
             }
         }
@@ -7258,11 +7267,8 @@ impl Device {
             .signer
             .public_key()
             .map(|pk| public_key_digest(&pk));
-        // The floor of the times signals were dated by, as the last run made it durable.
-        let signal_floor = store
-            .get(&signal_clock_name())
-            .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
-            .map_or(0, u64::from_be_bytes);
+        // The signal sequence counter and time hint, as the last run left them.
+        let signal_clock = signal::SignalClock::load(store.as_ref());
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -7353,10 +7359,7 @@ impl Device {
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
-            signal_clock: Mutex::new(signal::SignalClock {
-                durable: signal_floor,
-                written: signal_floor,
-            }),
+            signal_clock: Mutex::new(signal_clock),
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
             slots: Semaphore::new(in_flight),
@@ -8380,16 +8383,6 @@ fn announced_name(ns: &Name) -> Name {
         .parse()
         .expect("a valid name");
     under(&prefix, ns)
-}
-
-/// Where the store keeps the signal clock floor (`/localhost/ndn-data/signal-clock`, 8
-/// octets big-endian, µs since the Unix epoch): a time this device made durable ahead of the
-/// times it dated signals by, so a restart never dates below one (spec signals.md §3.5;
-/// [`Device::signal_clock_dated`]).
-fn signal_clock_name() -> Name {
-    "/localhost/ndn-data/signal-clock"
-        .parse()
-        .expect("a valid name")
 }
 
 /// Where the store keeps a marker for each log entry withdrawn because the
@@ -14118,6 +14111,49 @@ impl Inner {
         })
     }
 
+    /// Refuse a put into `c`, a collection of namespace `ns` with no record of
+    /// its own here, that would inherit the record of a folder above it,
+    /// while a device of `ns` known here has not been walked toward `c`'s
+    /// folder ([`Self::not_walked`]): that device may hold a record of `c`
+    /// of its own, which narrows the folder's audience or writers, and a
+    /// version sealed or written under the folder's record meanwhile would
+    /// reach readers the narrower record leaves out, for good (spec §6.1,
+    /// §15). Answered at once, the walks running in the background — a put
+    /// never waits on other devices. Once the folder was walked the list is
+    /// empty and the put goes through without a look.
+    /// [`DataError::NotReady`]: put again once they are reached.
+    fn inherit_allowed(self: &Arc<Self>, c: &Name, ns: &Name) -> Result<(), DataError> {
+        {
+            let st = self.st.lock();
+            let own = st.colls.get(c).is_some_and(|x| x.line.own.is_some());
+            if own || st.folders_above(c).is_empty() {
+                return Ok(());
+            }
+        }
+        let folder = folder_of(c);
+        let missing = self.not_walked_now(
+            ns,
+            |d| self.namespace_of_name(d) == *ns,
+            |t| t.has_prefix(&folder) || folder.has_prefix(t),
+        );
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let devices: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        Err(DataError::NotReady {
+            name: c.clone(),
+            why: format!(
+                "it has no members record of its own here, so it would inherit its folder's, \
+                 and this device has not yet walked the summary of {}, which may hold a record \
+                 of {c} that narrows who reads or writes it (the walk runs in the background); \
+                 nothing is written under the folder's record meanwhile. Put again once that \
+                 device is reached; if it is lost, mark its key suspected or revoke it (it is \
+                 not waited for then)",
+                devices.join(", ")
+            ),
+        })
+    }
+
     /// Whether the members record in force over `c` here admits this
     /// device's key to write into it: lists it as a writer and, when it
     /// seals, admits this device to its audience.
@@ -19519,6 +19555,10 @@ impl Device {
             let ns = namespace_of(c).expect("checked above");
             inner.look_behind(c).await?;
             inner.st.lock().ensure(c, &inner.config.rules, inner.me());
+            // A collection inheriting a folder's record waits for the walk
+            // toward it: the device that has not been walked may hold a
+            // narrower record of the collection's own (spec §15).
+            inner.inherit_allowed(c, &ns)?;
             if ns != inner.ns {
                 if let Some(refused) = inner.unadmitted(c, &ns) {
                     return Err(refused);
@@ -19770,6 +19810,10 @@ impl Device {
             .st
             .lock()
             .ensure(collection, &inner.config.rules, inner.me());
+        // A collection inheriting a folder's record waits for the walk toward
+        // it: the device that has not been walked may hold a narrower record
+        // of the collection's own (spec §15).
+        inner.inherit_allowed(collection, &ns)?;
         if ns != inner.ns {
             if let Some(refused) = inner.unadmitted(collection, &ns) {
                 return Err(refused);
@@ -20134,7 +20178,7 @@ impl DataLayer for Device {
                         Change::NotCounted {
                             collection: c.clone(),
                             id: id.clone(),
-                            why: NotCounted::Waits(why.clone()),
+                            why: why.clone(),
                         },
                     ));
                 }
@@ -25884,6 +25928,7 @@ mod group_scale_tests;
 mod intro_tests;
 
 mod intro;
+pub use intro::IntroductionSurface;
 
 mod groups;
 
