@@ -441,6 +441,11 @@ enum Missing {
     Record(String),
     /// The content key of the epoch the folder seals in.
     Key(Epoch, String),
+    /// The devices of the folder's namespace not walked toward the folder
+    /// yet: one of them may hold a record of a collection under it that
+    /// narrows the folder's, so a first put there would be `NotReady`
+    /// ([`Inner::inherit_allowed`]).
+    Walk(Vec<Name>, String),
 }
 
 impl Inner {
@@ -545,7 +550,10 @@ impl Inner {
 
     /// What `join` still waits for before this device, admitted to `folder`
     /// as `role`, may write there: the folder's members record that admits
-    /// it and, sealed, the epoch's key (the grant). `None`: both are held.
+    /// it, the epoch's key (the grant) when sealed, and — for a writer — the
+    /// walk of every device of the folder's namespace known here toward the
+    /// folder, so that its first put into a new collection under it is not
+    /// `NotReady`. `None`: all are held.
     fn admission_missing(&self, st: &St, folder: &Name, role: Role) -> Option<Missing> {
         let Some(m) = st.folders.get(folder).and_then(|f| f.members.as_ref()) else {
             return Some(Missing::Record(format!(
@@ -563,26 +571,46 @@ impl Inner {
                  revision that does, signed when the offer admitted it, has not arrived"
             )));
         }
-        let epoch = m.epoch.as_ref()?;
-        if st.keys.key(folder, epoch).is_some() {
-            return None;
+        if let Some(epoch) = m.epoch.as_ref()
+            && st.keys.key(folder, epoch).is_none()
+        {
+            return Some(Missing::Key(
+                epoch.clone(),
+                format!(
+                    "this device is admitted to {folder}, but the epoch key of the folder (its \
+                     grant) is not held here yet: it is asked of the devices of the owner's \
+                     namespace and arrives once one answers"
+                ),
+            ));
         }
-        Some(Missing::Key(
-            epoch.clone(),
-            format!(
-                "this device is admitted to {folder}, but the epoch key of the folder (its \
-                 grant) is not held here yet: it is asked of the devices of the owner's \
-                 namespace and arrives once one answers"
-            ),
-        ))
+        if role == Role::Writer {
+            let ns = namespace_of(folder).expect("a joined folder is a data name");
+            let devices = self.not_walked_toward(st, &ns, folder);
+            if !devices.is_empty() {
+                let named: Vec<String> = devices.iter().map(ToString::to_string).collect();
+                let why = format!(
+                    "this device is admitted to {folder}, but has not yet walked the summary of \
+                     {}, which may hold a record of a collection under it that narrows who \
+                     reads or writes it (the walk runs in the background); a put there waits \
+                     for it too. Once that device is reached the join returns and the put goes \
+                     through; if it is lost, mark its key suspected or revoke it (it is not \
+                     waited for then)",
+                    named.join(", ")
+                );
+                return Some(Missing::Walk(devices, why));
+            }
+        }
+        None
     }
 
-    /// Wait until the record that admits this device to `folder` as `role`
-    /// and, sealed, the epoch's key are held, for at most `first_look * 3 +
-    /// lifetime` (the bound of every wait of a join); asking again what is
-    /// missing — the inviter's summary, the grant — as it waits.
-    /// [`DataError::NotReady`] naming what is missing when the bound passes:
-    /// join again with the same code, or put again; both are safe.
+    /// Wait until the record that admits this device to `folder` as `role`,
+    /// the epoch's key when sealed, and — for a writer — the walk of the
+    /// namespace's devices toward `folder` are held, for at most
+    /// `first_look * 3 + lifetime` (the bound of every wait of a join);
+    /// asking again what is missing — the inviter's summary, the grant — as
+    /// it waits. [`DataError::NotReady`] naming what is missing when the
+    /// bound passes: join again with the same code, or put again; both are
+    /// safe.
     pub(super) async fn await_admission(
         self: &Arc<Self>,
         folder: &Name,
@@ -598,7 +626,7 @@ impl Inner {
             };
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                let (Missing::Record(why) | Missing::Key(_, why)) = missing;
+                let (Missing::Record(why) | Missing::Key(_, why) | Missing::Walk(_, why)) = missing;
                 return Err(DataError::NotReady {
                     name: folder.clone(),
                     why: format!(
@@ -617,6 +645,13 @@ impl Inner {
                 }
                 Missing::Key(epoch, _) => {
                     let _ = self.ask_for_key(folder, epoch);
+                }
+                Missing::Walk(devices, _) => {
+                    let mut devices = devices.clone();
+                    if !devices.contains(inviter) {
+                        devices.push(inviter.clone());
+                    }
+                    self.walk_in_background(&ns, devices);
                 }
             }
             self.wait_within(left.min(self.config.first_look), |st| {
@@ -1551,8 +1586,10 @@ impl Device {
     /// secret, signed by the offering device under the anchor the code
     /// names); have the host adopt the inviter's anchor; follow the folder.
     /// Returns only once this device may write there: it holds the members
-    /// record that admits it and, sealed, the epoch's key (spec §19.3 step
-    /// 6), within `first_look * 3 + lifetime`. No answer, or the bound
+    /// record that admits it, the epoch's key when sealed, and, as a writer,
+    /// has walked the namespace's devices toward the folder so that its
+    /// first put there is not `NotReady` (spec §19.3 step 6), within
+    /// `first_look * 3 + lifetime`. No answer, or the bound
     /// passing: [`DataError::NotReady`], retry later, naming what is missing
     /// — the offer waits, and joining again with the same code is answered
     /// again.

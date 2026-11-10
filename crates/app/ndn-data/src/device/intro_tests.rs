@@ -941,6 +941,121 @@ async fn a_removed_joiner_who_joins_again_is_told_it_is_no_member_not_to_wait() 
     );
 }
 
+/// Spec §15, §19.3: `join` returns once the joiner may write, and a put into
+/// a new collection under the folder is `NotReady` while a device of the
+/// namespace was not walked toward the folder (it may hold a record of the
+/// collection that narrows the folder's). A join whose record came by the
+/// offer's answer, with the inviter's summary not walked yet, therefore does
+/// not return `Ok` and leave the first put `NotReady`: it waits for the walk
+/// within its bound, and says what it waits for when the bound passes.
+#[tokio::test(start_paused = true)]
+async fn a_join_returns_only_once_the_inviters_summary_was_walked_toward_the_folder() {
+    let alice = Person::new("/alice");
+    let laptop = start(&alice, "/alice/laptop", None, &[], None).await;
+    let folder = n("/alice/32=data/notebook");
+    let note = folder.clone().append("page-bob");
+    laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice")],
+                readers: Vec::new(),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    let code = laptop
+        .offer(
+            &folder,
+            Offer {
+                role: Role::Writer,
+                until: Timestamp((laptop.inner.config.clock)().0 + 3_600_000),
+                tries: 3,
+            },
+        )
+        .await
+        .unwrap();
+    let Ok(TrustEnvelope::Intro(intro)) = TrustEnvelope::from_uri(&code.link) else {
+        panic!("an offer's link is an introduction link");
+    };
+    let bob = Person::new("/bob");
+    let phone = start(&bob, "/bob/phone", None, &[], None).await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.ctx))
+        .unwrap();
+    let answered = answer(
+        &laptop,
+        ask(&phone, &laptop, &code.offer, &intro.secret, &[]),
+    )
+    .await;
+    let Some(Outcome::Accepted { revision, .. }) = answered else {
+        panic!("bob was answered {answered:?}");
+    };
+    let until = laptop.inner.st.lock().intro.offers[&code.offer].until;
+    assert!(phone.inner.note_joined(&folder, until, revision).await);
+    // The record that admits Bob arrived; the inviter's summary was heard in
+    // the group and not walked.
+    relay(&laptop, &phone, &folder);
+    phone.inner.follow(&folder).await.unwrap();
+    let _ = phone.inner.join(&n("/alice")).await;
+    phone
+        .inner
+        .st
+        .lock()
+        .groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(laptop.name().clone());
+
+    let joined = phone
+        .inner
+        .await_admission(&folder, Role::Writer, laptop.name())
+        .await;
+    match &joined {
+        Ok(()) => {
+            let put = phone.put(&note, Content::new(), options()).await;
+            assert!(
+                put.is_ok(),
+                "join returned Ok, yet the first put right after it is {put:?}"
+            );
+        }
+        Err(DataError::NotReady { why, .. }) => assert!(
+            why.contains("/alice/laptop") && why.contains("join again"),
+            "a join that waits for the walk names the device and what to do: {why}"
+        ),
+        other => panic!("the join answered {other:?}"),
+    }
+    assert!(
+        joined.is_err(),
+        "the join returned Ok while the inviter's summary was not walked"
+    );
+
+    // Walked toward the folder: the join returns, and the first put goes
+    // through.
+    {
+        let mut st = phone.inner.st.lock();
+        let peer = st
+            .peers
+            .entry((laptop.name().clone(), n("/alice")))
+            .or_default();
+        peer.head = 1;
+        peer.walked = 1;
+        peer.toward = std::iter::once(folder.clone()).collect();
+    }
+    phone
+        .inner
+        .await_admission(&folder, Role::Writer, laptop.name())
+        .await
+        .unwrap();
+    let put = phone.put(&note, Content::new(), options()).await;
+    assert!(put.is_ok(), "the first put after the join: {put:?}");
+}
+
 // ---- L4: what the introduction link carries -----------------------------------------------------
 
 /// The surface a host gives its link layer is open while an offer has not

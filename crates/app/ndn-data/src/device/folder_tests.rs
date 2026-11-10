@@ -1086,9 +1086,10 @@ async fn a_put_by_a_member_that_lacks_the_epochs_key_is_not_ready_naming_it() {
 }
 
 /// What `join` waits for (REPLY-13 point 9): the members record that admits
-/// the device and, sealed, the epoch's key — within `first_look * 3 +
-/// lifetime`, naming what is missing when the bound passes, and returning as
-/// soon as both are held.
+/// the device, the epoch's key when sealed, and the walk of the inviter's
+/// summary toward the folder — within `first_look * 3 + lifetime`, naming
+/// what is missing when the bound passes, and returning as soon as all are
+/// held.
 #[tokio::test(start_paused = true)]
 async fn a_join_returns_once_the_record_and_the_key_are_held_within_its_bound() {
     use crate::intro::Role;
@@ -1139,7 +1140,9 @@ async fn a_join_returns_once_the_record_and_the_key_are_held_within_its_bound() 
         matches!(&refused, DataError::NotReady { why, .. } if why.contains("key")),
         "{refused}"
     );
-    // The key arrives while the join waits: it returns at once, well inside its bound.
+    // The key arrives while the join waits, the inviter's summary walked
+    // toward the folder: it returns at once, well inside its bound.
+    walked(&dev, "/alice/laptop", &[folder()]);
     let (epoch, content_key) = folder_epoch(&alice, &folder());
     let inner = Arc::clone(&dev.inner);
     let f = folder();
@@ -1148,6 +1151,34 @@ async fn a_join_returns_once_the_record_and_the_key_are_held_within_its_bound() 
         assert!(inner.st.lock().take_key(&f, &epoch, content_key));
         inner.progress.notify_waiters();
     });
+    let (out, took) = wait(&dev).await;
+    out.unwrap();
+    assert!(took < bound, "{took:?} against {bound:?}");
+    // Record and key held, the inviter's summary not walked toward the
+    // folder: a first put there would be `NotReady`, so the join waits its
+    // bound for the walk and names the device.
+    dev.inner
+        .st
+        .lock()
+        .peers
+        .get_mut(&(inviter.clone(), n("/alice")))
+        .expect("heard")
+        .toward
+        .clear();
+    let (out, took) = wait(&dev).await;
+    let refused = out.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::NotReady { why, .. }
+            if why.contains("has not yet walked the summary of /alice/laptop")),
+        "{refused}"
+    );
+    assert_eq!(refused.next(), crate::error::NextStep::RetryLater);
+    assert!(
+        took >= bound && took < bound * 2,
+        "{took:?} against {bound:?}"
+    );
+    // Walked: it returns at once.
+    walked(&dev, "/alice/laptop", &[folder()]);
     let (out, took) = wait(&dev).await;
     out.unwrap();
     assert!(took < bound, "{took:?} against {bound:?}");
@@ -1312,17 +1343,16 @@ async fn took<T>(what: impl Future<Output = T>) -> (T, Duration) {
     (out, began.elapsed())
 }
 
-/// `dev` has walked the summary of `other`, a device of its own namespace it
+/// `dev` has walked the summary of `other`, a device of a namespace it
 /// heard, toward `folders`: what it may hold of them is held, and a name
 /// followed under them later needs no walk of its own.
 fn walked(dev: &Device, other: &str, folders: &[Name]) {
+    let other = n(other);
+    let ns = Name::from_components(other.components()[..1].iter().cloned());
     let mut st = dev.inner.st.lock();
-    let peer = st
-        .peers
-        .entry((n(other), dev.inner.ns.clone()))
-        .or_default();
-    peer.head = 1;
-    peer.walked = 1;
+    let peer = st.peers.entry((other, ns)).or_default();
+    peer.walked = peer.walked.max(peer.head).max(1);
+    peer.head = peer.walked;
     peer.toward = folders.iter().cloned().collect();
 }
 

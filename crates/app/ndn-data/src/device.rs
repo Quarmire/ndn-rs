@@ -14130,12 +14130,8 @@ impl Inner {
                 return Ok(());
             }
         }
-        let folder = folder_of(c);
-        let missing = self.not_walked_now(
-            ns,
-            |d| self.namespace_of_name(d) == *ns,
-            |t| t.has_prefix(&folder) || folder.has_prefix(t),
-        );
+        let missing = self.not_walked_toward(&self.st.lock(), ns, &folder_of(c));
+        self.walk_in_background(ns, missing.clone());
         if missing.is_empty() {
             return Ok(());
         }
@@ -14152,6 +14148,19 @@ impl Inner {
                 devices.join(", ")
             ),
         })
+    }
+
+    /// The devices of namespace `ns` known here that were not walked toward
+    /// `folder`: a record of a collection under it that one of them holds
+    /// has not been taken ([`Self::inherit_allowed`], and the readiness
+    /// wait of a join, [`Self::admission_missing`]).
+    fn not_walked_toward(&self, st: &St, ns: &Name, folder: &Name) -> Vec<Name> {
+        self.not_walked(
+            st,
+            ns,
+            |d| self.namespace_of_name(d) == *ns,
+            |t| t.has_prefix(folder) || folder.has_prefix(t),
+        )
     }
 
     /// Whether the members record in force over `c` here admits this

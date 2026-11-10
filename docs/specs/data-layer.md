@@ -3751,7 +3751,9 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   (`RetryLater`) at once, `why` naming the devices and saying to put again
   once they are reached, or to mark a lost key suspected or revoke it; the
   walk runs in the background. This is judged before the record admitting
-  a writer of another namespace, so a joiner's put waits for it too. Once
+  a writer of another namespace, so a joiner's put waits for it too: which
+  is why `join` returns only once it passes for the folder joined (§19.3
+  step 6), and its first put is not `NotReady`. Once
   the folder was walked the put returns at once, and so does one into a
   collection that has a record of its own here: it is written under the
   record in force over it, its own narrowed by the folders above (§6.1).
@@ -5672,27 +5674,34 @@ Then:
    refused as for any device no record admits (`AskOwner`, or `Sealed` under
    a record that leaves it out of a sealed audience). It then waits, for at most
    `Config::first_look * 3 + Config::lifetime` (the bound of every wait of a
-   join), for the two things a write needs: the members record over `F`
+   join), for the things a write needs: the members record over `F`
    that admits it — for a writer role, one that lists its key as a writer;
-   for a sealed folder, one whose audience admits its device — and, sealed,
-   the key of the epoch it seals in (the grant, §9). While the record is
-   missing it walks the summaries of the devices known to write into the
-   inviter's namespace and the inviter's own, in the background; while the
-   key is missing it asks for the grant (§9); neither wait ends the other's
-   asks. `Ok(Joined)` therefore means: the offer answered **and** both
-   are held, so a put in `F` is refused for want of neither. When the bound
-   passes: `NotReady { name: F, why }` with next step `RetryLater`, `why`
-   naming which is missing ("the members record of `F` is not held here
-   yet", "… held here does not admit this device yet", "the epoch key of
-   the folder (its grant) is not held here yet") and what to do: join again
-   with the same code, or put again; both are safe. **`join` is idempotent
+   for a sealed folder, one whose audience admits its device —, when sealed,
+   the key of the epoch it seals in (the grant, §9), and, for a writer, the
+   walk of every device of `F`'s namespace known here toward `F`. The walk is
+   the gate a put's inheriting of the folder's record has (§15, 2): a device
+   not walked yet may hold a record of a collection under `F` that narrows
+   `F`'s, so the writer's first put into a new collection there would be
+   `NotReady`; `join` waits for it so that it is not. While the record is
+   missing or a walk is owed it walks the summaries of the devices known to
+   write into the inviter's namespace and the inviter's own, in the
+   background; while the key is missing it asks for the grant (§9); no wait
+   ends the others' asks. `Ok(Joined)` therefore means: the offer answered
+   **and** all of them are held, so a put in `F` is refused for want of none.
+   When the bound passes: `NotReady { name: F, why }` with next step
+   `RetryLater`, `why` naming which is missing ("the members record of `F`
+   is not held here yet", "… held here does not admit this device yet", "the
+   epoch key of the folder (its grant) is not held here yet", "has not yet
+   walked the summary of `<device>`") and what to do: join again with the
+   same code, or put again; both are safe; a device that is lost is marked
+   suspected or revoked, and is not waited for then. **`join` is idempotent
    for the same code**: a second call by the key an offer admitted asks
    the offer again, which answers it as it answered the first (§19.4: the
    same key asking again is answered again, and a closed offer still
    answers the writer it admitted until it expires, §19.2), and then waits
-   for the same two things; it never
+   for the same things; it never
    answers "already used" to the device it admitted. A reader waits for the
-   record over `F` and, sealed, the key, the same.
+   record over `F` and, sealed, the key, the same; it needs no walk to read.
 
 Absent a dial that succeeded, the joiner's Interests carry a
 ForwardingHint: the relays the code names, else those its own namespace's
