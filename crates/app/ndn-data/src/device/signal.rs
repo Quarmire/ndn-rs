@@ -17,7 +17,7 @@ use ndn_security::safe_data::TrustPath;
 use ndn_security::{ValidationResult, sync_group};
 use parking_lot::Mutex;
 
-use super::{Device, Inner, St, bad_name};
+use super::{Device, Inner, St, bad_name, local, signal_clock_name};
 use crate::collection::{Epoch, Members};
 use crate::error::DataError;
 use crate::layer::Share;
@@ -500,6 +500,68 @@ impl Inner {
             groups: namespaces.iter().map(sync_group).collect(),
             listen: sync_group(&self.ns),
         }
+    }
+}
+
+/// How far above the time a signal is dated by the signal clock floor is made durable (spec
+/// signals.md §3.5): the reserve inside which later sends need no write. At most 10 s, so a
+/// run that restarts at the floor starts within the clock skew a receiver allows.
+pub const SIGNAL_CLOCK_RESERVE: Duration = Duration::from_secs(5);
+
+/// The signal clock floor: the highest value made durable, and the highest written (a write
+/// whose barrier may not have returned).
+pub(super) struct SignalClock {
+    pub(super) durable: u64,
+    pub(super) written: u64,
+}
+
+impl Device {
+    /// The signal clock floor, µs since the Unix epoch (spec signals.md §3.5): a time at or above
+    /// every time this device dated a signal by, made durable ahead of them under the store's
+    /// barrier, so it survives a crash. 0 on a device that never dated a signal. A signal
+    /// transport starts every run above it and never lets its clock fall below it.
+    pub fn signal_clock_floor(&self) -> u64 {
+        self.inner.signal_clock.lock().durable
+    }
+
+    /// About to date a signal by `us` (µs since the Unix epoch): returns the floor once it is
+    /// at least `us` and durable. Below the floor already it answers at once with no write. Above
+    /// it, the floor moves to `us` plus [`SIGNAL_CLOCK_RESERVE`], the store's barrier passes, and
+    /// only then does this return, so a crash can never leave the floor below a time any
+    /// signal was dated by. A transport calls it again before it nears the returned floor.
+    ///
+    /// [`DataError::Local`] when the device stopped, or its store can't make the write durable
+    /// (check the disk the store is on): the signal is not to be dated.
+    pub async fn signal_clock_dated(&self, us: u64) -> Result<u64, DataError> {
+        self.inner.signal_clock_dated(us).await
+    }
+}
+
+impl Inner {
+    async fn signal_clock_dated(&self, us: u64) -> Result<u64, DataError> {
+        let write = {
+            let mut c = self.signal_clock.lock();
+            if c.durable >= us {
+                return Ok(c.durable);
+            }
+            let target = us.saturating_add(SIGNAL_CLOCK_RESERVE.as_micros() as u64);
+            if c.written < target {
+                c.written = target;
+                self.store.insert(
+                    signal_clock_name(),
+                    Bytes::copy_from_slice(&target.to_be_bytes()),
+                );
+            }
+            c.written
+        };
+        if !self.barrier().await {
+            return Err(local(
+                "the device stopped before the signal clock floor was durable; start it again",
+            ));
+        }
+        let mut c = self.signal_clock.lock();
+        c.durable = c.durable.max(write);
+        Ok(c.durable)
     }
 }
 

@@ -3,6 +3,7 @@
 //! headers signed and admitted, or refused saying why.
 
 use super::super::*;
+use super::SIGNAL_CLOCK_RESERVE;
 use crate::layer::Share;
 use crate::signal::{SignalKey, SignalRefusal};
 use ndn_app::AppError;
@@ -127,6 +128,11 @@ impl World {
 
     /// Start `device`.
     async fn device(&self, device: &str) -> Device {
+        self.device_on(device, Arc::new(MemoryStore::new())).await
+    }
+
+    /// Start `device` on `store`.
+    async fn device_on(&self, device: &str, store: Arc<dyn DataStore>) -> Device {
         let device = n(device);
         let keys = self.keys(&device).await;
         let conn: Arc<dyn Connection> = Arc::new(Unconnected);
@@ -138,7 +144,7 @@ impl World {
             device,
             keys,
             Arc::clone(&self.validator),
-            Arc::new(MemoryStore::new()),
+            store,
             Config {
                 first_look: Duration::from_millis(50),
                 ..Config::new()
@@ -709,4 +715,129 @@ async fn a_device_whose_certificate_could_not_be_had_drives_no_fetch_per_key_id(
         );
     }
     alice.shutdown();
+}
+
+/// A store whose disk keeps only what a returned flush made durable: writes wait in `pending`
+/// until `sync` moves them to `durable`, and a crash is the store that `durable` is. While
+/// held, `sync` waits.
+#[derive(Default)]
+struct Lossy {
+    durable: Mutex<HashMap<Name, Bytes>>,
+    pending: Mutex<HashMap<Name, Bytes>>,
+    held: std::sync::Mutex<bool>,
+    let_go: std::sync::Condvar,
+    /// Writes of the signal clock floor.
+    clock_writes: AtomicUsize,
+}
+
+impl Lossy {
+    /// The store a power loss leaves: what was durable.
+    fn crash(&self) -> Arc<Lossy> {
+        let after = Lossy::default();
+        *after.durable.lock() = self.durable.lock().clone();
+        Arc::new(after)
+    }
+
+    fn hold(&self, on: bool) {
+        *self.held.lock().unwrap() = on;
+        self.let_go.notify_all();
+    }
+}
+
+impl DataStore for Lossy {
+    fn insert(&self, name: Name, wire: Bytes) {
+        if name == signal_clock_name() {
+            self.clock_writes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.pending.lock().insert(name, wire);
+    }
+    fn get(&self, name: &Name) -> Option<Bytes> {
+        let pending = self.pending.lock().get(name).cloned();
+        pending.or_else(|| self.durable.lock().get(name).cloned())
+    }
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        self.scan_under(prefix, 1).pop().map(|(_, w)| w)
+    }
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        let mut all: HashMap<Name, Bytes> = self.durable.lock().clone();
+        all.extend(self.pending.lock().clone());
+        all.into_iter()
+            .filter(|(n, _)| n.has_prefix(prefix))
+            .take(limit)
+            .collect()
+    }
+    fn remove(&self, name: &Name) {
+        self.pending.lock().remove(name);
+        self.durable.lock().remove(name);
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.let_go.wait(held).unwrap();
+        }
+        let moved: Vec<_> = self.pending.lock().drain().collect();
+        self.durable.lock().extend(moved);
+        Ok(())
+    }
+}
+
+/// The signal clock floor (spec signals.md §3.5): `signal_clock_dated(t)` answers a floor above
+/// `t` by no more than the reserve, only once it is durable; a time below the floor writes
+/// nothing; a crash while the barrier is held leaves the floor at what was answered before, and
+/// no time above it was answered; and a restart reads the floor back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_signal_clock_floor_is_durable_before_it_is_answered_and_a_crash_never_lowers_it() {
+    let world = World::new().await;
+    let store = Arc::new(Lossy::default());
+    let laptop = world
+        .device_on("/alice/laptop", Arc::clone(&store) as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(laptop.signal_clock_floor(), 0, "a new device has no floor");
+    let reserve = SIGNAL_CLOCK_RESERVE.as_micros() as u64;
+    assert!(reserve <= 10_000_000, "the reserve is at most 10 s");
+    let first = laptop.signal_clock_dated(1_000_000).await.unwrap();
+    assert_eq!(first, 1_000_000 + reserve);
+    assert_eq!(laptop.signal_clock_floor(), first);
+
+    // What a power loss leaves holds it.
+    let after = store.crash();
+    let restarted = world
+        .device_on("/alice/laptop", Arc::clone(&after) as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(restarted.signal_clock_floor(), first);
+    restarted.shutdown();
+
+    // Inside the reserve nothing is written.
+    let writes = store.clock_writes.load(Ordering::SeqCst);
+    assert_eq!(laptop.signal_clock_dated(first).await.unwrap(), first);
+    assert_eq!(store.clock_writes.load(Ordering::SeqCst), writes);
+
+    // Past it, with the barrier held: the answer waits, and a crash now leaves the floor where
+    // it was answered last, below the time asked, which no signal was dated by.
+    store.hold(true);
+    let asked = first + 1;
+    let waiting = {
+        let laptop = laptop.clone();
+        tokio::spawn(async move { laptop.signal_clock_dated(asked).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "not answered before it is durable");
+    let crashed = world
+        .device_on("/alice/laptop", store.crash() as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(
+        crashed.signal_clock_floor(),
+        first,
+        "a restart after the dropped barrier is below the time asked, never below one answered"
+    );
+    crashed.shutdown();
+    store.hold(false);
+    let second = waiting.await.unwrap().unwrap();
+    assert_eq!(second, asked + reserve);
+    let restarted = world
+        .device_on("/alice/laptop", store.crash() as Arc<dyn DataStore>)
+        .await;
+    assert_eq!(restarted.signal_clock_floor(), second);
+    restarted.shutdown();
+    laptop.shutdown();
 }

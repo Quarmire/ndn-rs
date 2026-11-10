@@ -2226,6 +2226,8 @@ struct Inner {
     commit_wake: Arc<Notify>,
     /// Told after each commit round that moved [`St::durable`].
     committed: Notify,
+    /// The signal clock floor ([`Device::signal_clock_dated`]).
+    signal_clock: Mutex<signal::SignalClock>,
     slots: Semaphore,
     /// The round-trip estimate re-expressions are timed from (spec §17.1).
     rtt: Mutex<Rtt>,
@@ -7256,6 +7258,11 @@ impl Device {
             .signer
             .public_key()
             .map(|pk| public_key_digest(&pk));
+        // The floor of the times signals were dated by, as the last run made it durable.
+        let signal_floor = store
+            .get(&signal_clock_name())
+            .and_then(|w| w.get(..8).and_then(|b| b.try_into().ok()))
+            .map_or(0, u64::from_be_bytes);
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -7346,6 +7353,10 @@ impl Device {
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
+            signal_clock: Mutex::new(signal::SignalClock {
+                durable: signal_floor,
+                written: signal_floor,
+            }),
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
             slots: Semaphore::new(in_flight),
@@ -8369,6 +8380,16 @@ fn announced_name(ns: &Name) -> Name {
         .parse()
         .expect("a valid name");
     under(&prefix, ns)
+}
+
+/// Where the store keeps the signal clock floor (`/localhost/ndn-data/signal-clock`, 8
+/// octets big-endian, µs since the Unix epoch): a time this device made durable ahead of the
+/// times it dated signals by, so a restart never dates below one (spec signals.md §3.5;
+/// [`Device::signal_clock_dated`]).
+fn signal_clock_name() -> Name {
+    "/localhost/ndn-data/signal-clock"
+        .parse()
+        .expect("a valid name")
 }
 
 /// Where the store keeps a marker for each log entry withdrawn because the
