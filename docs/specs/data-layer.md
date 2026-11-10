@@ -5501,12 +5501,40 @@ asked:
    validator the certificates on
    the chain from the key that signed the inviter's proof packet to its
    anchor, named under the inviter's namespace — no other certificate the
-   answer carries — follows `F` (§15, `watch`'s first look), and returns
-   the folder, the role and the inviter's namespace.
+   answer carries — follows `F` (§15, `watch`'s first look), and goes on
+   with 6.
+6. **Returns only once the joiner may write** (round 4). A device an
+   acceptance admitted as a writer notes durably, in its store, that it was
+   admitted to the folder (the note is local, never served), before step
+   5's look; the note lasts until a members record held admits the device
+   (a write went through, or `join` returned), so a put in that window is
+   `NotReady`, never `AskOwner` (§18.1). It then waits, for at most
+   `Config::first_look * 3 + Config::lifetime` (the bound of every wait of a
+   join), for the two things a write needs: the members record over `F`
+   that admits it — for a writer role, one that lists its key as a writer;
+   for a sealed folder, one whose audience admits its device — and, sealed,
+   the key of the epoch it seals in (the grant, §9). While the record is
+   missing it walks the summaries of the devices known to write into the
+   inviter's namespace and the inviter's own, in the background; while the
+   key is missing it asks for the grant (§9); neither wait ends the other's
+   asks. `Ok(Joined)` therefore means: the offer answered **and** both
+   are held, so a put in `F` is refused for want of neither. When the bound
+   passes: `NotReady { name: F, why }` with next step `RetryLater`, `why`
+   naming which is missing ("the members record of `F` is not held here
+   yet", "… held here does not admit this device yet", "the epoch key of
+   the folder (its grant) is not held here yet") and what to do: join again
+   with the same code, or put again; both are safe. **`join` is idempotent
+   for the same code**: a second call by the key an offer admitted asks
+   the offer again, which answers it as it answered the first (§19.4: the
+   same key asking again is answered again, and a closed offer still
+   answers the writer it admitted until it expires, §19.2), and then waits
+   for the same two things; it never
+   answers "already used" to the device it admitted. A reader waits for the
+   record over `F` and, sealed, the key, the same.
 
-The joiner's Interests carry a ForwardingHint: the relays the code names,
-else those its own namespace's trust context advertises; none, routed by
-name. Hints only reach (§19.7).
+Absent a dial that succeeded, the joiner's Interests carry a
+ForwardingHint: the relays the code names, else those its own namespace's
+trust context advertises; none, routed by name. Hints only reach (§19.7).
 
 ### 19.4 Answering
 

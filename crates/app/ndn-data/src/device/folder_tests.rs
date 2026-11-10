@@ -977,6 +977,183 @@ async fn a_put_under_a_record_not_admitting_the_key_is_refused_only_once_its_dev
     dev.shutdown();
 }
 
+// ---- REPLY-13 point 9: a device an offer admitted is not a stranger ---------------------------
+
+/// `dev` hears Alice's laptop in her namespace's group, and has walked its
+/// summary in full when `walked`.
+async fn hears_alice(dev: &Device, walked: bool) {
+    let _ = dev.inner.join(&n("/alice")).await;
+    let mut st = dev.inner.st.lock();
+    st.groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(n("/alice/laptop"));
+    if walked {
+        st.peers
+            .entry((n("/alice/laptop"), n("/alice")))
+            .or_default()
+            .root = Some([1; 32]);
+    }
+}
+
+/// A device that really is no member is refused `AskOwner`; one an offer's
+/// answer admitted, that holds no record admitting it yet — none held, or
+/// an older revision — is `NotReady`: the record is on its way, so it puts
+/// again or joins again with the same code. Once a record admits it the
+/// note is let go, so a later removal is refused as it is for anyone.
+#[tokio::test]
+async fn a_put_by_a_device_an_offer_admitted_is_not_ready_until_its_record_is_held() {
+    let alice = device("/alice/laptop", &["/alice", "/bob"]).await;
+    alice
+        .share_folder(&folder(), share(Rule::Log, &["/alice"], Vec::new()).into())
+        .await
+        .unwrap();
+    let first = alice.inner.st.lock().head;
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    hears_alice(&dev, false).await;
+    // Not walked yet: not ready, whoever it is.
+    not_ready(dev.put(&plan(), reading(1), options()).await.unwrap_err());
+    // Every device walked, no record held: a stranger is told to ask the owner.
+    hears_alice(&dev, true).await;
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(matches!(refused, DataError::NotAllowed { .. }), "{refused}");
+    assert_eq!(refused.next(), crate::error::NextStep::AskOwner);
+    // Admitted by an offer, the record not held yet.
+    assert!(dev.inner.note_joined(&folder()).await);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("join again"),
+        "it says what to do: {refused}"
+    );
+    not_ready(refused);
+    // Held, but the revision before the one that admits it.
+    assert_eq!(relay(&alice, &dev, &folder(), first), None);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    not_ready(refused);
+    // The revision admitting Bob arrives: written, and the note is let go.
+    alice
+        .share_folder(
+            &folder(),
+            share(Rule::Log, &["/alice", "/bob"], Vec::new()).into(),
+        )
+        .await
+        .unwrap();
+    let second = alice.inner.st.lock().head;
+    assert_eq!(relay(&alice, &dev, &folder(), second), None);
+    dev.put(&plan(), reading(1), options()).await.unwrap();
+    assert!(
+        dev.inner
+            .store
+            .get(&super::intro::joined_name(&folder()))
+            .is_none(),
+        "the note of the admission is let go once a record admits the device"
+    );
+    alice.shutdown();
+    dev.shutdown();
+}
+
+/// A member the record in force admits that does not hold the epoch's key
+/// yet — the grant is on its way — is `NotReady`, saying which key.
+#[tokio::test]
+async fn a_put_by_a_member_that_lacks_the_epochs_key_is_not_ready_naming_it() {
+    let alice = device("/alice/laptop", &["/alice", "/bob"]).await;
+    alice
+        .share_folder(
+            &folder(),
+            share(
+                Rule::Log,
+                &["/alice", "/bob"],
+                vec![person("/alice"), person("/bob")],
+            )
+            .into(),
+        )
+        .await
+        .unwrap();
+    let seq = alice.inner.st.lock().head;
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    hears_alice(&dev, true).await;
+    assert_eq!(relay(&alice, &dev, &folder(), seq), None);
+    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::NotReady { why, .. } if why.contains("key")),
+        "{refused}"
+    );
+    assert_eq!(refused.next(), crate::error::NextStep::RetryLater);
+    alice.shutdown();
+    dev.shutdown();
+}
+
+/// What `join` waits for (REPLY-13 point 9): the members record that admits
+/// the device and, sealed, the epoch's key — within `first_look * 3 +
+/// lifetime`, naming what is missing when the bound passes, and returning as
+/// soon as both are held.
+#[tokio::test(start_paused = true)]
+async fn a_join_returns_once_the_record_and_the_key_are_held_within_its_bound() {
+    use crate::intro::Role;
+    let alice = device("/alice/laptop", &["/alice", "/bob"]).await;
+    alice
+        .share_folder(
+            &folder(),
+            share(
+                Rule::Log,
+                &["/alice", "/bob"],
+                vec![person("/alice"), person("/bob")],
+            )
+            .into(),
+        )
+        .await
+        .unwrap();
+    let seq = alice.inner.st.lock().head;
+    let dev = device("/bob/laptop", &["/alice", "/bob"]).await;
+    hears_alice(&dev, false).await;
+    let bound = dev.inner.config.first_look * 3 + dev.inner.config.lifetime;
+    let inviter = n("/alice/laptop");
+    let wait = |dev: &Device| {
+        let inner = Arc::clone(&dev.inner);
+        let (folder, inviter) = (folder(), inviter.clone());
+        async move {
+            let start = rt::Instant::now();
+            let out = inner.await_admission(&folder, Role::Writer, &inviter).await;
+            (out, start.elapsed())
+        }
+    };
+    // Nothing held: the bound passes, and the record is named.
+    let (out, took) = wait(&dev).await;
+    let refused = out.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::NotReady { why, .. } if why.contains("members record")),
+        "{refused}"
+    );
+    assert_eq!(refused.next(), crate::error::NextStep::RetryLater);
+    assert!(
+        took >= bound && took < bound * 2,
+        "{took:?} against {bound:?}"
+    );
+    // The record held, its key not: the key is named.
+    assert_eq!(relay(&alice, &dev, &folder(), seq), None);
+    let (out, _) = wait(&dev).await;
+    let refused = out.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::NotReady { why, .. } if why.contains("key")),
+        "{refused}"
+    );
+    // The key arrives while the join waits: it returns at once, well inside its bound.
+    let (epoch, content_key) = folder_epoch(&alice, &folder());
+    let inner = Arc::clone(&dev.inner);
+    let f = folder();
+    rt::spawn(async move {
+        rt::sleep(Duration::from_millis(300)).await;
+        assert!(inner.st.lock().take_key(&f, &epoch, content_key));
+        inner.progress.notify_waiters();
+    });
+    let (out, took) = wait(&dev).await;
+    out.unwrap();
+    assert!(took < bound, "{took:?} against {bound:?}");
+    alice.shutdown();
+    dev.shutdown();
+}
+
 /// A reader is refused a sealed version by signed data only (spec §15,
 /// §18.1): holding only a record of the collection that does not admit it,
 /// while a device of that namespace heard here was not walked toward the

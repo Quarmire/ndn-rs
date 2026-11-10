@@ -20,6 +20,7 @@ use ndn_security::{
 use ndn_trust_envelope::{INTRO_WORDS_FINGERPRINT_LEN, IntroWords, Introduction, TrustEnvelope};
 
 use super::{Device, Held, Inner, St, Subject, check_collection, local, open_grant, owner_signed};
+use crate::collection::Epoch;
 use crate::error::DataError;
 use crate::intro::{
     AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined, Offer,
@@ -27,6 +28,7 @@ use crate::intro::{
     ask_proves, commitment, intro_name, intro_prefix, proof_key,
 };
 use crate::layer::{ShareChange, Sharing};
+use crate::rt::Instant;
 use crate::version::{Audience, Writer};
 use crate::wire::{self, LogName, Record, device_of, namespace_of, parse_log_name};
 
@@ -377,6 +379,166 @@ fn offline(offer: &Name, device: &Name) -> DataError {
             "the inviter's device {device} does not answer (offline or unreachable): retry \
              later; the offer waits for you until it expires"
         ),
+    }
+}
+
+/// Where the store keeps that an offer's answer admitted this device to
+/// `folder` as a writer, until a members record held admits it
+/// ([`Inner::admitted_by_offer`]): a device in that window is no stranger.
+pub(super) fn joined_name(folder: &Name) -> Name {
+    local_name("joined", folder)
+}
+
+/// What a join still waits for ([`Inner::admission_missing`]).
+enum Missing {
+    /// The members record over the folder that admits this device.
+    Record(String),
+    /// The content key of the epoch the folder seals in.
+    Key(Epoch, String),
+}
+
+impl Inner {
+    /// Note durably that an offer's answer admitted this device to `folder`
+    /// as a writer: whether the note is durable.
+    pub(super) async fn note_joined(&self, folder: &Name) -> bool {
+        self.store
+            .insert(joined_name(folder), Bytes::from_static(&[1]));
+        self.barrier().await
+    }
+
+    /// The folder over `c` (or `c`) that an offer's answer admitted this
+    /// device to as a writer while no members record held admits it yet, if
+    /// any. A record that admits it lets the note go (`None`): a removal
+    /// signed later is refused as it is for anyone.
+    fn joined_hold(&self, st: &St, c: &Name) -> Option<Name> {
+        let at = wire::data_marker(c).ok()?;
+        let marked: Vec<Name> = (at + 2..=c.len())
+            .map(|k| Name::from_components(c.components()[..k].to_vec()))
+            .filter(|f| self.store.get(&joined_name(f)).is_some())
+            .collect();
+        if marked.is_empty() {
+            return None;
+        }
+        if self.admitted(st, c) {
+            for f in &marked {
+                self.store.remove(&joined_name(f));
+            }
+            return None;
+        }
+        marked.into_iter().next()
+    }
+
+    /// `refused`, a refusal to write into `c` for want of an admission, as it
+    /// stands for this device (spec §19.4): [`DataError::NotAllowed`] —
+    /// "ask the owner" — becomes [`DataError::NotReady`] when an offer's
+    /// answer admitted the device to a folder over `c` and no record held
+    /// admits it yet: the record is on its way. Only a device that really is
+    /// no member is told to ask the owner.
+    pub(super) fn admitted_by_offer(&self, st: &St, c: &Name, refused: DataError) -> DataError {
+        if !matches!(refused, DataError::NotAllowed { .. }) {
+            return refused;
+        }
+        match self.joined_hold(st, c) {
+            Some(folder) => DataError::NotReady {
+                name: c.clone(),
+                why: format!(
+                    "an offer's answer admitted this device to {folder}, but no members record \
+                     held here admits it yet (the revision that does, signed when the offer \
+                     admitted it, has not arrived): put again, or join again with the same code \
+                     (the offer answers the device it admitted)"
+                ),
+            },
+            None => refused,
+        }
+    }
+
+    /// Let go the notes of an admission over `c` once a record held admits
+    /// this device: a write into `c` went through.
+    pub(super) fn release_joined(&self, c: &Name) {
+        let _ = self.joined_hold(&self.st.lock(), c);
+    }
+
+    /// What `join` still waits for before this device, admitted to `folder`
+    /// as `role`, may write there: the folder's members record that admits
+    /// it and, sealed, the epoch's key (the grant). `None`: both are held.
+    fn admission_missing(&self, st: &St, folder: &Name, role: Role) -> Option<Missing> {
+        let Some(m) = st.folders.get(folder).and_then(|f| f.members.as_ref()) else {
+            return Some(Missing::Record(format!(
+                "the members record of {folder} is not held here yet: it is asked of the \
+                 inviter's summary and arrives once it answers"
+            )));
+        };
+        let listed = match role {
+            Role::Writer => m.writers.iter().any(|p| self.writer.key().has_prefix(p)),
+            Role::Reader => true,
+        };
+        if !listed || (m.epoch.is_some() && !self.admits_record(st, m, &self.device, &self.ns)) {
+            return Some(Missing::Record(format!(
+                "the members record of {folder} held here does not admit this device yet: the \
+                 revision that does, signed when the offer admitted it, has not arrived"
+            )));
+        }
+        let epoch = m.epoch.as_ref()?;
+        if st.keys.key(folder, epoch).is_some() {
+            return None;
+        }
+        Some(Missing::Key(
+            epoch.clone(),
+            format!(
+                "this device is admitted to {folder}, but the epoch key of the folder (its \
+                 grant) is not held here yet: it is asked of the devices of the owner's \
+                 namespace and arrives once one answers"
+            ),
+        ))
+    }
+
+    /// Wait until the record that admits this device to `folder` as `role`
+    /// and, sealed, the epoch's key are held, for at most `first_look * 3 +
+    /// lifetime` (the bound of every wait of a join); asking again what is
+    /// missing — the inviter's summary, the grant — as it waits.
+    /// [`DataError::NotReady`] naming what is missing when the bound passes:
+    /// join again with the same code, or put again; both are safe.
+    pub(super) async fn await_admission(
+        self: &Arc<Self>,
+        folder: &Name,
+        role: Role,
+        inviter: &Name,
+    ) -> Result<(), DataError> {
+        let ns = namespace_of(folder).expect("a joined folder is a data name");
+        let deadline = Instant::now() + self.config.first_look * 3 + self.config.lifetime;
+        loop {
+            let Some(missing) = self.admission_missing(&self.st.lock(), folder, role) else {
+                self.store.remove(&joined_name(folder));
+                return Ok(());
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let (Missing::Record(why) | Missing::Key(_, why)) = missing;
+                return Err(DataError::NotReady {
+                    name: folder.clone(),
+                    why: format!(
+                        "{why}; join again with the same code (the offer answers the device it \
+                         admitted) or put again: both are safe"
+                    ),
+                });
+            }
+            match &missing {
+                Missing::Record(_) => {
+                    let mut devices = self.known_for(&self.st.lock(), &ns);
+                    if !devices.contains(inviter) {
+                        devices.push(inviter.clone());
+                    }
+                    self.walk_in_background(&ns, devices);
+                }
+                Missing::Key(epoch, _) => {
+                    let _ = self.ask_for_key(folder, epoch);
+                }
+            }
+            self.wait_within(left.min(self.config.first_look), |st| {
+                self.admission_missing(st, folder, role).is_none()
+            })
+            .await;
+        }
     }
 }
 
@@ -1159,7 +1321,12 @@ impl Device {
     /// check the answer against the code (bound to this key, proving the
     /// secret, signed by the offering device under the anchor the code
     /// names); have the host adopt the inviter's anchor; follow the folder.
-    /// No answer: [`DataError::NotReady`], retry later — the offer waits.
+    /// Returns only once this device may write there: it holds the members
+    /// record that admits it and, sealed, the epoch's key (spec §19.3 step
+    /// 6), within `first_look * 3 + lifetime`. No answer, or the bound
+    /// passing: [`DataError::NotReady`], retry later, naming what is missing
+    /// — the offer waits, and joining again with the same code is answered
+    /// again.
     pub async fn join(&self, code: &str) -> Result<Joined, DataError> {
         let inner = &self.inner;
         let code = parse_code(code)?;
@@ -1374,7 +1541,17 @@ impl Device {
         Ok(Joined {
             folder,
             role,
+        // The joiner is no stranger from here on: it is noted until a members
+        // record held admits it (a put in that window is `NotReady`, never
+        // `AskOwner`), and `join` returns once the record that admits it and,
+        // sealed, the epoch's key are held.
+        if role == Role::Writer && !inner.note_joined(&folder).await {
+            return Err(local(
+                "the device stopped before the join was noted: join again with the same code",
+            ));
+        }
             inviter,
+        inner.await_admission(&folder, role, &device).await?;
         })
     }
 

@@ -639,6 +639,24 @@ fn outgrown(m: &Members, epochs: &BTreeMap<Epoch, Named>) -> bool {
         })
 }
 
+/// Why `c` cannot be written now: this device is of its audience, but the
+/// content key of epoch `e` is not held here yet. The grant is asked of the
+/// devices of the owner's namespace and arrives once one answers: not a
+/// refusal ([`DataError::NotReady`]).
+fn key_not_held(st: &St, c: &Name, e: &Epoch) -> DataError {
+    let subject = st.seal_subject(c, e);
+    DataError::NotReady {
+        name: c.clone(),
+        why: format!(
+            "this device is of the audience of {c}, but the epoch key of {} (its grant) is not \
+             held here yet: it is asked of the devices of the owner's namespace and arrives \
+             once one answers; put again, or join again with the same code if the folder was \
+             joined",
+            subject.name
+        ),
+    }
+}
+
 /// One collection as this device knows it.
 #[derive(Default)]
 struct Coll {
@@ -2061,6 +2079,10 @@ struct St {
     /// Askers' seal keys a grant's ask in place did not get, asked again in
     /// the background ([`Inner::learn_seal_key`]): one run per key.
     seal_learning: BTreeSet<Name>,
+    /// The walks started in the background of a put or a join that are
+    /// under way, by (namespace, device): one at a time for each
+    /// ([`Inner::walk_in_background`]).
+    walking: BTreeSet<(Name, Name)>,
     /// The device's seal key packet, once signed.
     seal_key: Option<Bytes>,
     /// Collections and folders of this namespace this device owes a new
@@ -7279,6 +7301,7 @@ impl Device {
                 grants: Kept::new(GRANTS_KEPT),
                 seal_keys: Kept::new(SEAL_KEYS_KEPT),
                 seal_learning: BTreeSet::new(),
+                walking: BTreeSet::new(),
                 seal_key: None,
                 owed: BTreeMap::new(),
                 to_follow: BTreeSet::new(),
@@ -9983,6 +10006,25 @@ impl Inner {
             let _ = tx.send(whole);
         });
         rx.await.unwrap_or(false)
+    }
+
+    /// Walk in the background the summary of each of `devices` of `ns`,
+    /// each in a task of its own that nothing waits for ([`Self::walk`]),
+    /// one walk at a time for each (namespace, device): a verb that must not
+    /// wait on other devices — a put, a join looking for its record — starts
+    /// them and answers what it holds.
+    fn walk_in_background(self: &Arc<Self>, ns: &Name, devices: Vec<Name>) {
+        for device in devices {
+            let key = (ns.clone(), device.clone());
+            if !self.st.lock().walking.insert(key.clone()) {
+                continue;
+            }
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                inner.walk(&key.0, &key.1).await;
+                inner.st.lock().walking.remove(&key);
+            });
+        }
     }
 
     /// The devices known to write into namespace `ns` that `relevant`
@@ -13889,10 +13931,14 @@ impl Inner {
             .iter()
             .any(|p| self.writer.key().has_prefix(p))
         {
-            return Err(DataError::NotAllowed {
-                collection: c.clone(),
-                writer: self.writer.clone(),
-            });
+            return Err(self.admitted_by_offer(
+                st,
+                c,
+                DataError::NotAllowed {
+                    collection: c.clone(),
+                    writer: self.writer.clone(),
+                },
+            ));
         }
         if epoch != members.epoch.as_ref() {
             return Err(DataError::Unavailable { name: c.clone() });
@@ -14056,10 +14102,14 @@ impl Inner {
             return None;
         }
         if missing.is_empty() {
-            return Some(DataError::NotAllowed {
-                collection: c.clone(),
-                writer: self.writer.clone(),
-            });
+            return Some(self.admitted_by_offer(
+                &st,
+                c,
+                DataError::NotAllowed {
+                    collection: c.clone(),
+                    writer: self.writer.clone(),
+                },
+            ));
         }
         let held = match recorded(&st) {
             true => "the members record in force here does not admit this key",
@@ -15614,13 +15664,26 @@ impl Inner {
     /// them rather than by one lost packet; the rest go on in the
     /// background, and none is cut when the caller stops waiting.
     async fn obtain(self: &Arc<Self>, c: &Name, e: &Epoch) -> bool {
-        let Some(ns) = namespace_of(c) else {
-            return false;
-        };
+        if let Some(rx) = self.ask_for_key(c, e) {
+            // Answered after the rounds in place, or once the loop ended
+            // (its sender dropped).
+            let _ = rx.await;
+        }
+        self.st.lock().keys.key(c, e).is_some()
+    }
+
+    /// Start the ask for the key of epoch `e` of `c` ([`Self::obtain`])
+    /// and do not wait for it: a verb that must not wait on other devices —
+    /// a put, a join's own wait — asks and answers what it holds. `None`:
+    /// the key is held, nothing held names the epoch, or an ask for it is
+    /// under way already; else the receiver that is answered after the
+    /// first rounds, or once the loop ended.
+    fn ask_for_key(self: &Arc<Self>, c: &Name, e: &Epoch) -> Option<oneshot::Receiver<()>> {
+        let ns = namespace_of(c)?;
         let (s, seal_key) = {
             let mut st = self.st.lock();
             if st.keys.key(c, e).is_some() {
-                return true;
+                return None;
             }
             let s = st.seal_subject(c, e);
             if !st
@@ -15628,10 +15691,10 @@ impl Inner {
                 .is_some_and(|(epochs, _)| epochs.contains_key(e))
             {
                 // Nothing to check a key against: no record held names it.
-                return false;
+                return None;
             }
             if !st.asking.insert((s.name.clone(), e.clone())) {
-                return false;
+                return None;
             }
             (s, seal_key_name(&self.device, &st.keys.recipient.public()))
         };
@@ -15669,10 +15732,7 @@ impl Inner {
             };
             inner.obtained(&ask, got).await;
         });
-        // Answered after the rounds in place, or once the loop ended (its
-        // sender dropped).
-        let _ = rx.await;
-        self.st.lock().keys.key(c, e).is_some()
+        Some(rx)
     }
 
     /// One round of asks for the key `ask` names (spec §9): of the epoch's
@@ -15789,7 +15849,7 @@ impl Inner {
         let st = self.st.lock();
         match st.keys.key(c, &epoch) {
             Some(k) => Ok(Some((epoch, k))),
-            None => Err(DataError::Unavailable { name: c.clone() }),
+            None => Err(key_not_held(&st, c, &epoch)),
         }
     }
 
@@ -19405,10 +19465,11 @@ impl Device {
                 let c = c.clone();
                 inner.wait_for(|st| inner.admitted(st, &c)).await;
             }
-            if ns != inner.ns
-                && let Some(refused) = inner.unadmitted(c, &ns).await
-            {
-                return Err(refused);
+            if ns != inner.ns {
+                if let Some(refused) = inner.unadmitted(c, &ns).await {
+                    return Err(refused);
+                }
+                inner.release_joined(c);
             }
             let has = {
                 let mut st = inner.st.lock();
@@ -19661,6 +19722,7 @@ impl Device {
             if let Some(refused) = inner.unadmitted(collection, &ns).await {
                 return Err(refused);
             }
+            inner.release_joined(collection);
         }
         // Another person's collection is held under its record by now.
         let fresh = {
