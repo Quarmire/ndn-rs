@@ -63,6 +63,8 @@ The body binds:
 
 The device key signs the header only while the device is a member of the scope ([data-layer.md](data-layer.md) §20). The header is never published under its name and never answered for. It travels only inside packets (§4).
 
+The run header's name is the **only** place a scope's Name travels in a signal (§4.1): every later packet names its scope by a digest of it. A receiver learns a run's scope from this device-signed header, so the header binds the RunId to the scope. The header, with its signer's key name twice (in its name and its KeyLocator), MUST fit a packet of its own, which bounds a scope's name (§4.3).
+
 ### 3.3 Sequences
 
 A run's first signal takes `RunStart`; each next signal takes the next integer. Sequences are **per sender**. A renewal (§3.4) starts the new run at the sequence after the old run's last. A new run that continues nothing (a restart, another scope's run) starts at the sender's clock in microseconds at its opening, so above every sequence of an earlier run, as long as a sender makes fewer than a million signals per second and its clock doesn't step back. A receiver orders a sender's signals by sequence across its runs (§8.3). A sequence is at most 2^64 − 2. The replay window counts one above the highest sequence it has seen, so a receiver refuses 2^64 − 1 at decode (`malformed`), and a sender refuses (`TooLarge`) a batch that would run past it. Every receiver's arithmetic on sequences is checked: no packet, verified or not, can make it overflow.
@@ -78,20 +80,24 @@ A sender SHOULD open a new run (a new run key, a new header) once 90 % of a run'
 ### 4.1 The body
 
 A **SignalBody** carries, in order:
-1. the scope's Name;
+1. the **ScopeDigest** of the packet's scope;
 2. the RunId;
 3. optionally the run's header (`RunHeader`, the header's whole Data wire);
 4. zero to 32 `Signal`s, each with its sequence, address, `Expires` and payload, in ascending sequence order with no repeated sequence; at least one unless the RunHeader rides;
-5. the `RunSignature`: Ed25519 by the run key over the octets `"ndn-signal/1"` followed by every octet of the SignalBody's TLV-VALUE that precedes the RunSignature TLV.
+5. the `RunSignature`: Ed25519 by the run key over the octets `"ndn-signal/2"` followed by every octet of the SignalBody's TLV-VALUE that precedes the RunSignature TLV, so the ScopeDigest, the RunId, the header and the signals are all covered.
 
-The signature covers the scope's name, so a packet can't be replayed into another scope. The header rides in a run's first packet, and again in the first packet sent once 1 s has passed since it last rode. When the header is due and doesn't fit beside the signals within the packet limit (§4.3), the sender first pushes a **header-only** packet (the header and no signal, signed by the run key, counted against its rate) and then the signals. A receiver takes a header-only packet as the run's admission only and delivers nothing from it. A receiver that lost the header holds the run's packets as unknown until the next one (§8.1).
+**The scope digest.** `ScopeDigest` is the first 16 octets of SHA-256 over the octets `"ndn-signal/2 scope"` followed by the scope's Name TLV: TLV-TYPE 0x07, TLV-LENGTH and the components, each in the minimal encoding (a `Name` decoded from a run header's name and re-encoded gives the same octets). **The scope's Name never rides in a packet.** It lives in one place, the run header's name `<device>/32=signal/<scope>/32=run/<RunId>` (§3.2), which the device key signs. After the header, a packet names its run by RunId and its scope by digest alone. So a long scope name costs one header packet and no signal anything (§4.3).
+
+A receiver resolves a digest to a scope it subscribes to (§8.1 step 3): the digests of its subscribed scopes are held in a table, and it refuses to subscribe to a scope whose digest another subscribed scope holds, a collision that costs about 2^64 SHA-256 evaluations to find and that only the owner of both scopes could make (§13.9). It learns a run's scope from the run's admitted header and checks that the header's scope has the packet's digest. Why the digest binds the packet to its scope, and why a packet replayed into another scope fails, is §13.9.
+
+The header rides in a run's first packet, and again in the first packet sent once 1 s has passed since it last rode. When the header is due and doesn't fit beside the signals within the packet limit (§4.3), the sender first pushes a **header-only** packet (the header and no signal, signed by the run key, counted against its rate) and then the signals. A receiver takes a header-only packet as the run's admission only and delivers nothing from it. A receiver that lost the header holds the run's packets as unknown until the next one (§8.1).
 
 ### 4.2 The seal
 
 In a sealed scope the packet is a **SignalSealed** instead:
 - `KeyId`: the 8-octet id of the signal key used ([data-layer.md](data-layer.md) §20);
 - `SealNonce`: 24 random octets;
-- `Ciphertext`: XChaCha20-Poly1305 under the signal key and the nonce, over the plaintext `SignalBody [SignalPadding]`, with AAD `"ndn-signal/1"` followed by the KeyId octets, its 16-octet tag appended.
+- `Ciphertext`: XChaCha20-Poly1305 under the signal key and the nonce, over the plaintext `SignalBody [SignalPadding]`, with AAD `"ndn-signal/2"` followed by the KeyId octets, its 16-octet tag appended.
 
 **Padding.** A sender pads every sealed packet, so that its whole encoding is a multiple of 128 octets, never above 1,024. It does this with one `SignalPadding` of zero octets after the SignalBody, inside the plaintext. A packet within 3 octets of 1,024 stays unpadded, because no padding element is shorter than 4 octets. A receiver accepts at most one `SignalPadding` after the body and ignores its octets. It refuses anything else after the body (`malformed`). The padding lies outside the run signature, but the AEAD tag covers it, so nobody can alter it unnoticed, and it carries nothing. A relay then learns a sealed packet's size only to within 128 octets. Unsealed packets are not padded: their contents are plain anyway. The cost is at most 127 octets per sealed packet, and no copy.
 
@@ -102,6 +108,30 @@ The body is signed first and then sealed. A sender seals under the first key `si
 ### 4.3 Size
 
 A packet's whole encoding is at most 1,024 octets. An address is at most 64 octets and a payload at most 768. A packet carries at most 32 signals.
+
+**Room.** A packet names its scope by a 16-octet digest, never by the scope's Name (§4.1), so what a signal can take does not depend on how the scope is called. The fixed parts of a packet, each with its TLV-LENGTHs in their longest form, are:
+
+| Part | Octets |
+|---|---|
+| `SignalSealed` around its plaintext (key id 12, nonce 28, the ciphertext's framing 6 and tag 16, its own framing 6); a sealed packet is then padded (§4.2) | 68 |
+| `SignalBody`'s own framing (6), ScopeDigest (20), RunId (20), RunSignature (68) | 114 |
+| each `Signal` beside its address and payload: its framing (6), SignalSeq (12), Expires (12), the address's framing (4) and the payload's (6), with the 8-octet integers of a clock in µs and ms | 40 |
+| a `RunHeader` element beside the header's Data wire | 6 |
+
+So a signal of **address + payload up to 802 octets** (1,024 − 68 − 114 − 40), with an address of at most 64 and a payload of at most 768, always fits one packet, sealed or not, whatever its scope is called. This is the **room** of a packet; a sender counts it without the scope's name (`Signals::room(scope)` answers it, and 0 for a scope that no run can be opened in, below). A signal of 512 octets always fits. A batch takes at most 40 octets of framing per signal.
+
+**The header-only packet.** The run header rides in a packet of its own when it doesn't fit beside the signals (§4.1). Sealed, that packet takes 68 + 114 + 6 octets beside the header, so **a run header of at most 836 octets** fits. A header holds the scope's Name once and the signing device's key name twice (in its name and in its KeyLocator), plus about 200 octets of Data fields, a 64-octet signature and the run's key, times and ring secret. A scope's name of at most **`SCOPE_MAX` = 384 encoded octets** (its Name TLV) therefore fits, for a device whose key name (`<device>/KEY/<id>`) is up to 140 octets: the conformance tests hold to exactly this. A scope longer than that is refused at `subscribe` and `open` with `ScopeTooLong`, which states the limit and says to name the folder or collection shorter. A device with a longer key name than 140 octets can have less scope to spend: its `open` refuses a scope its own header would not fit, with `ScopeTooLong` stating the length its header does allow. No signal's room depends on the scope: only whether a run can be opened at all.
+
+**Measured sizes** (ndn-surface `examples/signals_bench.rs`, address `cursor` of 6 octets, payload of 16, a short scope, the group `/alice/32=sync`, a device `/alice/laptop`), packet / push Interest in octets, independent of how long the scope is called:
+
+| Case | Unsealed | Sealed (padded, §4.2) |
+|---|---|---|
+| 1 signal | 170 / 244 | 256 / 334 |
+| 1 signal, run header riding (once a second) | 410 / 488 | 512 / 590 |
+| batch of 8, per signal | 72.2 / 82.0 | 96.0 / 105.8 |
+| batch of 8 with the header, per signal | 102.0 / 111.8 | 112.0 / 121.8 |
+
+The run header is 240 octets here. A packet costs one push Interest per group (§5.2).
 
 ## 5. The push
 
@@ -156,13 +186,13 @@ A device sends and receives the signals of a scope only while it is a member by 
 
 For each push Interest under its group, and each frame off a ring it attached, a receiver:
 1. takes only `<group>/32=sync/32=signal/<digest>` whose digest is the SHA-256 of the ApplicationParameters (a ring frame is taken as is), at most 1,024 octets, else `malformed`;
-2. if sealed: looks the KeyId up among the signal keys of the scopes it subscribes to (asking `signal_scope` of every subscribed scope again when the id is unknown, at most once a second, and every 5 s while known ids arrive), else `unknown_key`, dropped undecrypted, as is a packet under a superseded epoch's key past its grace (§4.2); opens the seal and decodes the body, else `malformed`; refuses a body naming another scope than the key's (`malformed`);
-3. decodes the SignalBody, else `malformed`. It drops one for a scope nobody here subscribes to (`unsubscribed`), and refuses an unsealed body for a sealed scope (`malformed`);
+2. if sealed: looks the KeyId up among the signal keys of the scopes it subscribes to (asking `signal_scope` of every subscribed scope again when the id is unknown, at most once a second, and every 5 s while known ids arrive), else `unknown_key`, dropped undecrypted, as is a packet under a superseded epoch's key past its grace (§4.2); opens the seal and decodes the body, else `malformed`; the key gives the scope, and a body whose ScopeDigest is not that scope's is refused (`malformed`);
+3. decodes the SignalBody, else `malformed` (an unknown critical element, a ScopeDigest of another length, or a `/1` body that starts with the scope's Name are `malformed`). An unsealed body names its scope by ScopeDigest: the scope is the one subscribed here with that digest, and a digest of no subscribed scope is `unsubscribed`. It refuses an unsealed body for a sealed scope (`malformed`);
 4. finds the run by RunId:
    - while the run's header is being admitted, the packet waits behind it, in arrival order, at most 32 packets per run (beyond: `unknown_run`). Once the run is held they are processed in that order from step 5; if the header is refused, each is counted with the header's refusal;
    - if no run is held and the body carries a header, the receiver admits nothing before the packet proves possession of the run key. In order:
      1. it checks that `RunId` is SHA-256 of `RunKey` truncated to 16 octets (else `bad_signature`);
-     2. it checks that the header's name is the run header of this RunId and scope (else `malformed`);
+     2. it checks that the header's name is the run header of this RunId and of the scope the packet's digest resolved to in step 3 (else `malformed`): the header's scope is where the run is held, so a header of S1 carried in a packet claiming S2 is refused here (§13.9);
      3. it checks that `RunNotAfter` plus the clock skew allowed is not past (else `expired`) and is at most 24 h plus that skew ahead (else `malformed`);
      4. it takes one signature check from the scope's and the process's budgets for packets not verified yet (§10, else `flood`);
      5. it verifies the packet's `RunSignature` under the header's `RunKey`, else `bad_signature`. This is the proof of possession (§3.1);
@@ -172,7 +202,7 @@ For each push Interest under its group, and each frame off a ring it attached, a
 
      A refusal is counted (`bad_signature`, `not_member`, `malformed`; `unknown_run` when the record isn't held yet or the certificate isn't to be had now) and the run is not held. Holding it obeys §8.4. The packet that carried the header verified at sub-step 5, and is not verified again;
    - if no run is held and no header rides: `unknown_run`, dropped unverified;
-   - a held run's packet naming another scope is `malformed`; a header-only packet of a held run is done; a packet past its run's `RunNotAfter` plus the skew is `expired`; a sequence below `RunStart` is `malformed`;
+   - a held run's packet whose digest is not its scope's is `malformed`; a header-only packet of a held run is done; a packet past its run's `RunNotAfter` plus the skew is `expired`; a sequence below `RunStart` is `malformed`;
 5. applies the replay window (§8.2, `replayed`), then takes one signature check from the scope's and the process's budgets for packets not verified yet (§10, `flood`). A flood of copies costs no verification. A flood of forgeries spends only the budgets of unverified checks, never the budgets of verified traffic;
 6. verifies the RunSignature, else `bad_signature`;
 7. checks `signal_member(scope, sender)`, else `not_member`, and the run is let go;
@@ -212,7 +242,8 @@ A run's own signals are never delivered to its own process: the forwarder never 
 
 | What | Limit | Over it |
 |---|---|---|
-| Address / payload / packet | 64 / 768 / 1,024 octets; 32 signals per packet | sender `TooLarge`; receiver `malformed` |
+| Address / payload / packet | 64 / 768 / 1,024 octets; 32 signals per packet; address + payload at most 802 | sender `TooLarge`; receiver `malformed` |
+| Scope name | at most `SCOPE_MAX` = 384 encoded octets (§4.3); a signal's room (address + payload) is 802 octets in every scope within it | `ScopeTooLong` at `open` and `subscribe` |
 | Expires | at most 60 s after now | sender `TooLarge`; receiver `expired` |
 | Run lifetime | at most 24 h (1 h by default), renewed at 90 % | receiver: a header past its `RunNotAfter`, `expired` |
 | Sender rate | 120 packets/s per run, burst 30, and the push budget | `RateLimited { retry_after }`: send after it, batch with `send_batch`, or send less |
@@ -234,7 +265,7 @@ TLV-TYPE numbers 0x0580–0x05AF ([README.md](README.md#tlv-type-numbers)). Ever
 
 | Type | Name | Value |
 |---|---|---|
-| 0x0580 | SignalBody | Name (scope), RunId, [RunHeader], Signal* (0–32; at least one unless RunHeader rides), RunSignature |
+| 0x0580 | SignalBody | ScopeDigest, RunId, [RunHeader], Signal* (0–32; at least one unless RunHeader rides), RunSignature |
 | 0x0582 | SignalSealed | KeyId, SealNonce, Ciphertext |
 | 0x0584 | KeyId | 8 octets |
 | 0x0586 | SealNonce | 24 octets |
@@ -253,10 +284,11 @@ TLV-TYPE numbers 0x0580–0x05AF ([README.md](README.md#tlv-type-numbers)). Ever
 | 0x05A0 | RunNotAfter | NonNegativeInteger, ms since the Unix epoch |
 | 0x05A2 | LocalRing | 32 octets |
 | 0x05A4 | SignalPadding | octets, ignored (zero when sent); only inside a Ciphertext, after the SignalBody |
+| 0x05A6 | ScopeDigest | 16 octets: the first 16 of SHA-256 over `"ndn-signal/2 scope"` and the scope's Name TLV (§4.1) |
 
 ```
 SignalPacket  = SignalBody / SignalSealed
-SignalBody    = SIGNAL-BODY TLV-LENGTH Name RunId [RunHeader] *32Signal RunSignature
+SignalBody    = SIGNAL-BODY TLV-LENGTH ScopeDigest RunId [RunHeader] *32Signal RunSignature
                 ; at least one Signal unless RunHeader is present
 SignalSealed  = SIGNAL-SEALED TLV-LENGTH KeyId SealNonce Ciphertext
 SealedPlain   = SignalBody [SignalPadding]   ; the plaintext of Ciphertext
@@ -273,6 +305,8 @@ Run header name: `<device>/32=signal/<scope>/32=run/<RunId>`. Local ring surface
 | `NotMember { scope, why }` | this device is not a member by the record in force, or its key is revoked | ask the scope's owner to share it with this person or device |
 | `NotReady { scope, why }` | no record over the scope held yet; or sealed and the key of the epoch in force not held yet (its ask is started) | ask again later (`NextStep::RetryLater`) |
 | `TooLarge { what, size, max }` | an address, payload, batch or ttl over its limit, or a batch whose sequences would run past 2^64 − 2 | send less, or put a version |
+| `ScopeTooLong { scope, size, max }` | the scope's name is over `SCOPE_MAX` (384) encoded octets, or over what this device's own run header leaves (§4.3) | name the folder or collection with a shorter name (`NextStep::FixName`) |
+| `ScopeDigestCollision { scope, other }` | `subscribe`: another subscribed scope has the same 16-octet scope digest (§4.1) | drop the subscription to `other` first, or name `scope` otherwise (`NextStep::FixName`) |
 | `RateLimited { retry_after }` | over the run's sending rate, or over the process's push budget (packets × groups, §5.2) | send after `retry_after`, batch with `send_batch`, or send less |
 | `Closed` | the run or the process's signals ended | open a new run |
 | `Io(why)` | the forwarder connection or the local ring failed | reconnect |
@@ -288,7 +322,7 @@ A member can't make signals that are delivered as another member's. A packet is 
 
 ### 13.2 Replay
 
-Within a held run, the window refuses every sequence it has seen, and a sequence only counts as seen after its packet verified. So a copy, from a relay or the forwarder's second path, is delivered at most once. Across a receiver's restart (or a run it let go), a replayed packet of a run whose header still rides in the replayed traffic can be admitted again. Its signals are still dropped once their `Expires` (plus the clock skew allowed) is past. A replay can thus show a signal at most once more, and only within its own validity: by default 2 s plus 30 s of skew. An application whose signals must never be replayed, even this way, uses versions instead. A replay into another scope fails the signature, which covers the scope name.
+Within a held run, the window refuses every sequence it has seen, and a sequence only counts as seen after its packet verified. So a copy, from a relay or the forwarder's second path, is delivered at most once. Across a receiver's restart (or a run it let go), a replayed packet of a run whose header still rides in the replayed traffic can be admitted again. Its signals are still dropped once their `Expires` (plus the clock skew allowed) is past. A replay can thus show a signal at most once more, and only within its own validity: by default 2 s plus 30 s of skew. An application whose signals must never be replayed, even this way, uses versions instead. A replay into another scope fails (§13.9).
 
 ### 13.3 A removed member
 
@@ -296,7 +330,7 @@ A removal is a members record. A receiver checks membership on every packet agai
 
 ### 13.4 A stolen run key
 
-A run key lives only in its sender's memory. A thief who takes it can sign packets of that run until `RunNotAfter` (1 h by default, at most 24 h). It can send sequences the honest sender hasn't used yet, and receivers keep whichever packet arrives first for a sequence. It can't open a new run or extend this one: that takes the device key. It can't move the run into another scope: the header names the scope, and the signature covers it. Removing the device, or revoking its key or an issuer above it, ends the stolen run on every receiver that holds the record or revocation (§13.3, §7). Short runs bound the exposure: a sender that suspects its process memory SHOULD open a new run and let the old one lapse. A stolen **device** key is the data layer's revocation case. Once a receiver holds the revocation, `signal_member` refuses the key's runs at once, and `signal_admit` admits no new header signed by it. Once it holds an issuer's revocation, every run is let go and admitted again from its next header (§7), and those certified by the revoked issuer are refused.
+A run key lives only in its sender's memory. A thief who takes it can sign packets of that run until `RunNotAfter` (1 h by default, at most 24 h). It can send sequences the honest sender hasn't used yet, and receivers keep whichever packet arrives first for a sequence. It can't open a new run or extend this one: that takes the device key. It can't move the run into another scope: the device-signed header names the scope, and the run signature covers the scope's digest (§13.9). Removing the device, or revoking its key or an issuer above it, ends the stolen run on every receiver that holds the record or revocation (§13.3, §7). Short runs bound the exposure: a sender that suspects its process memory SHOULD open a new run and let the old one lapse. A stolen **device** key is the data layer's revocation case. Once a receiver holds the revocation, `signal_member` refuses the key's runs at once, and `signal_admit` admits no new header signed by it. Once it holds an issuer's revocation, every run is let go and admitted again from its next header (§7), and those certified by the revoked issuer are refused.
 
 ### 13.5 Flooding and denial of service
 
@@ -324,7 +358,7 @@ A relay forwarding a push Interest sees:
 - the packet's timing and rate, and its size: exact in an unsealed scope; in a sealed scope only to its 128-octet bucket (§4.2), so a cursor and a presence update of similar size look alike;
 - in a sealed scope, the 8-octet KeyId (constant over an epoch, so packets of one scope and epoch can be linked to each other), the nonce and the ciphertext.
 
-In a sealed scope it doesn't see the scope's name, the sender's key (beyond what the first hop knows of the device), the run, the addresses or the payloads: the run header travels inside the seal. In an **unsealed** scope everything in the packet, the scope name and the sender's key name included, is plain to every forwarder on the path. An unsealed scope's signals are as public as its versions: seal the scope to keep them private. A relay can drop or delay packets, or replay them (§13.2), and can't forge or alter one (§13.1).
+In a sealed scope it doesn't see the scope's name, nor its digest (inside the seal, as the name was on the `/1` wire), the sender's key (beyond what the first hop knows of the device), the run, the addresses or the payloads: the run header travels inside the seal. In an **unsealed** scope everything in the packet is plain to every forwarder on the path. That is now a **digest** of the scope name in every packet, and the scope's Name itself only in the packets that carry the run header (about once a second per run, in the header's name `<device>/32=signal/<scope>/32=run/<RunId>`), together with the sender's key name. On the `/1` wire every packet carried the Name. A relay that has seen one header packet of a run reads the scope's name for every packet of that run, as before. A relay that has seen none and holds a candidate name can confirm it against the digest, and can't invert the digest. An unsealed scope's signals are as public as its versions: seal the scope to keep them private. A relay can drop or delay packets, or replay them (§13.2, §13.9), and can't forge or alter one (§13.1).
 
 On the host, the forwarder's multicast delivers the push to every local face that registered the group, so any local process can register it. In a sealed scope it learns what a relay learns. In an unsealed scope it reads the packets, as a relay could.
 
@@ -339,6 +373,28 @@ Signals never travel as Data. A future signal answer (for example a header asked
 The clock decides two more things, both about liveness, never about who is a member:
 - **Live admission.** A header is admitted only while the signer's certificate chain is valid on the receiver's clock (§15). A run admitted earlier is held until its `RunNotAfter`, at most 24 h, even if the certificate expires in between. Its renewal needs a valid certificate.
 - **Superseded epochs.** A superseded epoch's key opens packets only for 60 s after this receiver first saw the epoch superseded (§4.2).
+
+### 13.9 The scope digest
+
+After a run's header, a packet names its scope by a 16-octet digest (§4.1) and the scope's Name travels only in the device-signed header's name (§3.2). This is what each party binds, and why a packet can't be used in another scope.
+
+**What binds what.**
+1. The **run signature** covers the packet's ScopeDigest, RunId and signals (domain `"ndn-signal/2"`, §4.1). Nobody without the run's secret key can change the digest of a packet, or put another's signals under a digest.
+2. The **run header**, signed by the sender's device key, binds the RunId (the hash of the run key) to the scope: its name holds the scope, and its content holds the run key. A receiver admits it only from a packet the run key signed (§3.1).
+3. A **receiver holds a run in one scope only**, the scope of the header it admitted: a packet of that run is judged only if its digest is that scope's (§8.1 step 4), and a run is held only if the header's name gives the scope the packet's digest resolves to (§8.1 step 4).
+
+**A packet replayed into another scope fails.** Take a packet P of run R in scope S1, replayed so that it claims S2.
+- *If the receiver holds R*, it holds it in S1. P's digest resolves to S2 (the receiver subscribes to both), and S2 is not R's scope: `malformed`. The signature isn't reached, and if it were, altering the digest invalidates it (`bad_signature`).
+- *If the receiver doesn't hold R* and P carries R's header: the header's name says S1, the packet says S2: `malformed`, before anything is verified or admitted.
+- *If it carries no header*: the run isn't held, `unknown_run`.
+- *A member who signs a header of his own for S2 that binds R's run key* gets nowhere: he can't sign a packet under R, so his header is refused (§3.1, §13.1).
+- *Sealed scopes*: the key gives the scope, so a packet sealed under S1's signal key is opened only as S1's; a member of both scopes can re-seal the plaintext under S2's key, but can't re-sign it, and the digest inside names S1.
+
+So the property `/1` had by signing the scope's name, that a packet can't move to another scope, is kept by the signed digest and the device-signed header together, and nothing about a replay within S1 changes (§13.2).
+
+**Collisions.** The digest is the first 16 octets of SHA-256 over a domain tag and the scope's Name TLV. The tag keeps it apart from every other use of SHA-256 here (RunId, parameters digests). Two scope names with one digest cost about 2^64 evaluations to find, and only a party that owns both names (their data markers sit in the owner's namespace, so a scope name chosen by one owner) could find one for its own two scopes; a collision with another's existing scope is a second preimage, 2^128. A receiver subscribes to at most one scope per digest (`ScopeDigestCollision`), so even such a pair confuses no receiver: both would need the same subscriber.
+
+**What it doesn't do.** The digest hides nothing: in an unsealed scope a relay that holds a candidate name confirms it; in a sealed scope the digest is inside the seal. It doesn't make a header cheaper to forge or to admit (§8.1 step 4, §13.5). And a receiver that never saw a header of a run can't tell which scope an unsealed packet of it is meant for beyond the digest, so it holds the packet as unknown (`unknown_run`), as before.
 
 ## 14. Conformance
 
@@ -362,6 +418,9 @@ Cases added after the round-4 review:
 - **e15:** a packet at sequence 2^64−1 breaks nothing;
 - **e16:** a revoked issuer ends the runs of the keys it certified.
 
+Case added with the scope digest wire (`ndn-signal/2`):
+- **e17:** a scope named with as many octets as `SCOPE_MAX` allows, sealed and unsealed, still carries a signal of 512 octets from sender to receivers, and a scope one octet over is refused at `open` and `subscribe` with the limit stated.
+
 ndn-surface's tests cover the local leg over shared memory and one link between two engines. The real-daemon end-to-end scenario `signals` (ndn-fwd `testbed/e2e`) carries cursors between two people through a relay that holds no context of theirs and has no route set by hand.
 
 ## 15. Decisions
@@ -378,6 +437,8 @@ ndn-surface's tests cover the local leg over shared memory and one link between 
 - **Caps per namespace, not per key.** Keys and devices are free for a person listed by prefix, and namespaces are not. A removal or a revocation frees slots through `signal_member` and `signal_revocations`: signed data, read at the moment a slot is needed.
 - **A push budget per process, counted per group.** Each packet is one Interest per group, and a relay under quotas counts each. Budgeting packets × groups below the relay's default quota keeps a 60 Hz sender from crowding out its own device's Data and sync. The alternative, batching automatically inside `send`, would need a flush timer per run and would hide latency from the application. With the budget, the application sees `RateLimited` and batches itself.
 - **Pad sealed packets to 128-octet buckets.** It costs at most 127 octets and no copy, and it hides which kind of small signal a packet carries. Larger buckets (powers of two) would double the octets of a 60 Hz stream for little more. The header's size and the rate of headers still show the number of runs (§13.6).
+- **Name the scope by digest after the header (round 4, N9).** On the `/1` wire every packet carried the scope's whole Name, so a scope named in words left a 512-octet signal no room, and an application had to count the name's octets itself. The Name now rides once, in the device-signed run header; later packets carry a 16-octet digest of it. A signal's room is then the same in every scope (802 octets of address and payload), and a scope's length costs only the header packet, bounded by `SCOPE_MAX` (§4.3). The alternatives each lose something. A numeric scope id assigned by the sender would need a binding that the signature covers anyway, which is the digest, but would not be checkable by a receiver from the scope it subscribes to. A shorter header, by dropping the scope from its name, would break the rule that a validator picks the trust context by the packet's name (§3.2). A digest checked against the name in the signed header, the run signature covering the digest, and a receiver that holds a run in one scope only, bind every packet to its scope with no new trust (§13.9).
+- **Sixteen octets of digest.** The digest is not a secret and need not resist more than a collision between two scopes that someone owns: 2^64 work for a collision of two chosen names, 2^128 for a second preimage of a victim's scope. A receiver refuses to subscribe to a second scope of an equal digest, so even an owner who found one gains nothing at a receiver. More octets would cost every packet, 60 times a second, for no gain.
 
 [RFC 2119]: https://www.rfc-editor.org/rfc/rfc2119
 [RFC 8174]: https://www.rfc-editor.org/rfc/rfc8174

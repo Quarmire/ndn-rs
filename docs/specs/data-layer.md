@@ -5827,7 +5827,10 @@ reachable from a signal.
   signs it, the run id 16 octets, its Content the transport's run header
   body (signals.md), signed by `D`'s device key, with no FreshnessPeriod.
   It is named under its signer's device, as every signed packet of the
-  layer is, so the trust context governing its name is the signer's.
+  layer is, so the trust context governing its name is the signer's. The
+  header's name is the one place a scope's Name travels in a signal: the
+  transport's packets after it name the scope by a 16-octet digest of it
+  (signals.md §4.1, §13.9), so the header binds the run to its scope.
 - **The sender.** `signal_sender(S, header)` answers a run header's signer
   before anything is verified — its key name, its device and its
   namespace (the one whose group the device notices in, §12, else the
