@@ -526,7 +526,7 @@ impl Device {
 
     /// About to date a signal by `us` (µs since the Unix epoch): returns the floor once it is
     /// at least `us` and durable. Below the floor already it answers at once with no write. Above
-    /// it, the floor moves to `us` plus [`SIGNAL_CLOCK_RESERVE`], the store's barrier passes, and
+    /// it, the floor moves to `us` plus the reserve (5 s), the store's barrier passes, and
     /// only then does this return, so a crash can never leave the floor below a time any
     /// signal was dated by. A transport calls it again before it nears the returned floor.
     ///
