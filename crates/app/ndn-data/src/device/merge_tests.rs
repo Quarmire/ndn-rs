@@ -593,7 +593,7 @@ async fn a_version_that_counted_stops_counting_alike_in_any_order() {
     let seen = drain(&mut changes).await;
     assert!(
         seen.iter()
-            .any(|ch| matches!(ch, Change::NotCounted { id, why, .. } if *id == w.id() && !why.is_empty())),
+            .any(|ch| matches!(ch, Change::NotCounted { id, why: NotCounted::Excluded(why), .. } if *id == w.id() && !why.is_empty())),
         "it stops counting, and is told so: {seen:?}"
     );
     // The pair and its unpairing first: it never counts.

@@ -433,11 +433,11 @@ async fn state_of(dev: &Device, c: &Name) -> State {
 }
 
 /// Why `s` holds `id` without counting it, if it does.
-fn why_not<'s>(s: &'s State, id: &VersionId) -> Option<&'s str> {
+fn why_not<'s>(s: &'s State, id: &VersionId) -> Option<&'s NotCounted> {
     s.not_counted
         .iter()
         .find(|(v, _)| v == id)
-        .map(|(_, why)| why.as_str())
+        .map(|(_, why)| why)
 }
 
 /// A group counts only while every member counts (spec §5.5): a member its
@@ -478,14 +478,19 @@ async fn a_member_its_rule_does_not_count_holds_its_whole_group_back() {
     let own = why_not(&plan_state, &held_id).expect("its rule does not count it");
     let waits = why_not(&budget_state, &other_id).expect("held back by its group");
     assert!(
-        waits.contains(&held.name.to_string()) && waits.contains(own),
+        matches!(own, NotCounted::Excluded(_)) && matches!(waits, NotCounted::Excluded(_)),
+        "a rule's exclusion, and the group held back by it, are exclusions: {own:?} {waits:?}"
+    );
+    let (own, waits) = (own.to_string(), waits.to_string());
+    assert!(
+        waits.contains(&held.name.to_string()) && waits.contains(&own),
         "the reason names the member it waits on, with that member's reason: {waits:?}"
     );
     assert!(budget_state.at.contains(&other_id), "applied");
     assert!(!notes(&budget_state).contains(&"b".to_owned()), "not shown");
     let seen = drain(&mut changes).await;
     assert!(seen.iter().any(
-        |c| matches!(c, Change::NotCounted { id, why, .. } if *id == other_id && why == waits)
+        |c| matches!(c, Change::NotCounted { id, why, .. } if *id == other_id && *why == NotCounted::Excluded(waits.clone()))
     ));
     assert!(
         !seen
@@ -511,6 +516,83 @@ async fn a_member_its_rule_does_not_count_holds_its_whole_group_back() {
             "{id:?} told counted: {seen:?}"
         );
     }
+    dev.shutdown();
+}
+
+/// A group member still arriving is the layer's own wait ([`NotCounted::Waits`]):
+/// it ends, and `Counted` follows; a rule's exclusion is [`NotCounted::Excluded`]
+/// and does not end by waiting. A version whose reason moves from one to the
+/// other is told again.
+#[tokio::test]
+async fn a_group_member_still_arriving_waits_and_a_rule_exclusion_is_excluded() {
+    use super::merge_tests::{RULE, edit, hold, notes, pair, rules};
+    let dev = device_with(
+        rules(),
+        Share {
+            rule: Rule::Merge { function: n(RULE) },
+            ..log_share()
+        },
+    )
+    .await;
+    let mut changes = dev
+        .watch(&n("/alice/32=data/trip"), &Frontier::new())
+        .await
+        .unwrap();
+    // One member of a pair, its partner still arriving.
+    let first = op_version("/bob/laptop", &plan(), 10, &[], Some(PAIR), edit(None, "a"));
+    give(&dev, &first);
+    let first_id = id_of(&first);
+    let seen = drain(&mut changes).await;
+    let told = seen.iter().find_map(|c| match c {
+        Change::NotCounted { id, why, .. } if *id == first_id => Some(why.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        told,
+        Some(NotCounted::Waits("group incomplete: 1 of 2".into())),
+        "a group still arriving is a wait: {seen:?}"
+    );
+    assert_eq!(told.unwrap().to_string(), "group incomplete: 1 of 2");
+    // The partner arrives, and the wait ends: counted.
+    let second = op_version(
+        "/bob/laptop",
+        &budget(),
+        11,
+        &[],
+        Some(PAIR),
+        edit(None, "b"),
+    );
+    give(&dev, &second);
+    let seen = drain(&mut changes).await;
+    assert!(
+        seen.iter()
+            .any(|c| matches!(c, Change::Counted { id, .. } if *id == first_id)),
+        "the wait that ends is told counted: {seen:?}"
+    );
+    assert!(state_of(&dev, &plan()).await.not_counted.is_empty());
+    // A rule's exclusion, alone in no group: an exclusion, in the change and
+    // in the state.
+    let held = op_version("/carol/laptop", &plan(), 5, &[], None, hold("w"));
+    give(&dev, &held);
+    let held_id = id_of(&held);
+    let seen = drain(&mut changes).await;
+    assert!(
+        seen.iter().any(|c| matches!(
+            c,
+            Change::NotCounted { id, why: NotCounted::Excluded(_), .. } if *id == held_id
+        )),
+        "a rule's exclusion is excluded: {seen:?}"
+    );
+    let state = state_of(&dev, &plan()).await;
+    assert!(matches!(
+        why_not(&state, &held_id),
+        Some(NotCounted::Excluded(_))
+    ));
+    assert!(!notes(&state).contains(&"w".to_owned()));
+    // Its pair arrives: counted.
+    let p = op_version("/bob/laptop", &plan(), 12, &[], None, pair("w"));
+    give(&dev, &p);
+    assert!(state_of(&dev, &plan()).await.not_counted.is_empty());
     dev.shutdown();
 }
 

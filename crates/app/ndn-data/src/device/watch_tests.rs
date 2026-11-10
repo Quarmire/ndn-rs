@@ -99,8 +99,8 @@ async fn a_watch_lists_a_member_waiting_for_its_group_as_not_counted() {
     let seen = drain(&mut changes).await;
     assert!(
         seen.iter().any(
-            |c| matches!(c, Change::NotCounted { collection, id: i, why }
-            if *collection == plan() && *i == id("/bob/laptop", 10) && !why.is_empty())
+            |c| matches!(c, Change::NotCounted { collection, id: i, why: NotCounted::Waits(why) }
+            if *collection == plan() && *i == id("/bob/laptop", 10) && why.starts_with("group incomplete"))
         ),
         "the listing shows a held version not counted, with why: {seen:?}"
     );

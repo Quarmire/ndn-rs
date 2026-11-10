@@ -52,6 +52,42 @@ pub struct PutOptions {
     pub batch: Option<Duration>,
 }
 
+/// Why a held, verified version is not in a state's value (spec §15).
+///
+/// The two kinds differ in how they end: the layer's own wait ends when
+/// what it waits for arrives, and the version then counts
+/// ([`Change::Counted`]); a rule's exclusion does not end by waiting.
+/// `Display` is the bare reason.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NotCounted {
+    /// The layer's own wait: its group is incomplete ("group incomplete: 1
+    /// of 2"), not readable here, or waits for its readers' epoch, or a
+    /// basis or pieces are still arriving. It ends: the version then counts
+    /// and [`Change::Counted`] follows.
+    Waits(String),
+    /// A rule's own exclusion (its [`Counting::NotCounted`]), an apply that
+    /// failed, a group refused or held back by a member its rule excludes:
+    /// it does not end by waiting.
+    ///
+    /// [`Counting::NotCounted`]: crate::merge::Counting::NotCounted
+    Excluded(String),
+}
+
+impl NotCounted {
+    /// The reason, as a bare string, whichever kind it is.
+    pub fn reason(&self) -> &str {
+        match self {
+            NotCounted::Waits(why) | NotCounted::Excluded(why) => why,
+        }
+    }
+}
+
+impl std::fmt::Display for NotCounted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
 /// A merged value at a frontier, for a collection with a merge rule (model
 /// change M10). Filled by slice 1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -66,9 +102,10 @@ pub struct State {
     /// The merged value, as the collection's rule defines it.
     pub value: Value,
     /// Versions of the collection held here that are not in `value`, with
-    /// why (sorted by id): the rule's `NotCounted` (inside `at`) and members
-    /// of incomplete or unreadable groups.
-    pub not_counted: Vec<(VersionId, String)>,
+    /// why (sorted by id): the rule's `NotCounted` (inside `at`), as
+    /// [`NotCounted::Excluded`], and members of incomplete or unreadable
+    /// groups, as [`NotCounted::Waits`].
+    pub not_counted: Vec<(VersionId, NotCounted)>,
 }
 
 /// One entry of a block (or the one entry of a version that is no block),
@@ -224,14 +261,16 @@ pub enum Change {
     },
     /// A held, verified version that is not in the state: the rule's
     /// [`NotCounted`](crate::merge::Counting::NotCounted), or its group is
-    /// incomplete or not readable here. Shown, never dropped.
+    /// incomplete or not readable here. Shown, never dropped. A version
+    /// whose reason moves from a [`NotCounted::Waits`] to an
+    /// [`NotCounted::Excluded`] (or back) is told again.
     NotCounted {
         /// The version's collection.
         collection: Name,
         /// The version.
         id: VersionId,
         /// Why it is not in the state.
-        why: String,
+        why: NotCounted,
     },
     /// A version reported [`NotCounted`](Change::NotCounted) now counts.
     Counted {

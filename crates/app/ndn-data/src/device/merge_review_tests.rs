@@ -80,7 +80,8 @@ async fn a_state_another_writer_made_never_refuses_a_version_nor_withdraws_its_g
     assert!(st.colls[&plan].not_counted.contains_key(&claim.id()));
     let waits = &st.colls[&budget].group_held[&other.id()].1;
     assert!(
-        st.colls[&budget].at().contains(&other.id()) && waits.contains(&claim.name.to_string()),
+        st.colls[&budget].at().contains(&other.id())
+            && waits.reason().contains(&claim.name.to_string()),
         "applied, held back by its group, naming the member it waits on: {waits:?}"
     );
     drop(st);

@@ -3617,8 +3617,9 @@ joiner's; the joiner then uses the folder with the verbs as any member.
 - **`get(C)`** of a merge collection answers its state now — `State` with a
   state name, `at`, the value (typed by the rule, §5.1) and `not_counted`:
   the versions held that are not in the value, sorted by id, each with why
-  (the rule's not counted inside `at`, members of groups incomplete or
-  unreadable here, §5.2, §5.5); of a log collection, its newest version
+  as a `NotCounted` (`Excluded`: the rule's not counted inside `at`;
+  `Waits`: members of groups incomplete or unreadable here, §5.2, §5.5; see
+  the `NotCounted` bullet below); of a log collection, its newest version
   (§5) — with `Age::Newest`: the time since the device last knew nothing
   newer was outstanding in `C`'s sync group, measured on its monotonic
   clock: it finished a refresh that reached the writer's state with no
@@ -3732,6 +3733,23 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   refuses as §5.5 says, writing nothing: the default records of new
   collections among them are signed only once every item passed, and as
   `put` signs them (§5).
+- **`NotCounted`** is the type of every reason a held version is not in
+  the value (`State::not_counted`, `Change::NotCounted::why`), two kinds
+  that differ in whether they end by waiting, so a program shows a spinner
+  for one and a mark for the other: **`Waits(why)`** is the layer's own
+  wait — the group of the version is incomplete (`group incomplete: 1 of
+  2`), not readable here, waits for the epoch its readers are in, or a
+  basis or pieces of it are still arriving; it ends when what it waits for
+  arrives, and the version then counts (`Change::Counted`). **`Excluded(why)`**
+  is a rule's own exclusion (the rule's `Counting::NotCounted`, an apply
+  that failed, a group refused, a group member held back by a member its
+  rule excludes): it does not end by waiting for what the layer waits for
+  (a later version the rule counts differently may still end it, as §5.2
+  says, and `Change::Counted` follows then too). `Display` is the bare
+  reason. A version whose reason moves from `Waits` to `Excluded`, or
+  back, is told again with `Change::NotCounted`; the same reason of the
+  same kind is told once. The rule's own `Counting::NotCounted(String)` is
+  unchanged: the layer wraps it as `Excluded`.
 - **`watch(C, since F)`** reports every held version of `C` (or of the
   collections under folder `C`, which may be `<O>/32=data`) outside `F`,
   then every version applied later, the summaries of §7, each outside `F`,

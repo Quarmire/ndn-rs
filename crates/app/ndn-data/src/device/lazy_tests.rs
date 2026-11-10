@@ -211,7 +211,7 @@ async fn state(dev: &Device, c: &Name) -> State {
 }
 
 /// What a state shows: its frontier, value and versions not counted.
-fn shown(s: &State) -> (Frontier, Value, Vec<(VersionId, String)>) {
+fn shown(s: &State) -> (Frontier, Value, Vec<(VersionId, NotCounted)>) {
     (s.at.clone(), s.value.clone(), s.not_counted.clone())
 }
 
@@ -487,9 +487,8 @@ async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
                 "it is in the store"
             );
             assert!(
-                coll.not_counted_list()
-                    .iter()
-                    .any(|(x, why)| *x == id && why.contains("group incomplete")),
+                coll.not_counted_list().iter().any(|(x, why)| *x == id
+                    && matches!(why, NotCounted::Waits(w) if w.contains("group incomplete"))),
                 "and listed not counted, with why"
             );
         }

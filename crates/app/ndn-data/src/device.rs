@@ -80,7 +80,7 @@ use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rul
 use crate::error::{DataError, Refusal};
 use crate::layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
-    PutOptions, State,
+    NotCounted, PutOptions, State,
 };
 use crate::merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value,
@@ -679,7 +679,7 @@ struct Coll {
     /// that were last told not counted, with why: their own rule's reason,
     /// or the group waiting on another member ([`St::regroup`]). Kept
     /// across a rebuild of the state, so that only changes are told.
-    group_held: BTreeMap<VersionId, (u64, String)>,
+    group_held: BTreeMap<VersionId, (u64, NotCounted)>,
     /// The applied members held back only by their group: left out of the
     /// value ([`MergeState::value`]) and of the newest, while the rule
     /// still sees them.
@@ -1031,13 +1031,23 @@ impl Coll {
     /// Its versions held that are not in the state's value, with why,
     /// by id: the rule's `NotCounted`, applies that failed, and members of
     /// groups not counted.
-    fn not_counted_list(&self) -> Vec<(VersionId, String)> {
-        let mut all: BTreeMap<&VersionId, &String> = self.group_waits.iter().collect();
-        all.extend(self.group_held.iter().map(|(id, (_, why))| (id, why)));
-        all.extend(self.not_counted.iter());
-        all.into_iter()
-            .map(|(id, why)| (id.clone(), why.clone()))
-            .collect()
+    fn not_counted_list(&self) -> Vec<(VersionId, NotCounted)> {
+        let mut all: BTreeMap<&VersionId, NotCounted> = self
+            .group_waits
+            .iter()
+            .map(|(id, why)| (id, NotCounted::Waits(why.clone())))
+            .collect();
+        all.extend(
+            self.group_held
+                .iter()
+                .map(|(id, (_, why))| (id, why.clone())),
+        );
+        all.extend(
+            self.not_counted
+                .iter()
+                .map(|(id, why)| (id, NotCounted::Excluded(why.clone()))),
+        );
+        all.into_iter().map(|(id, why)| (id.clone(), why)).collect()
     }
 
     /// The applied versions the value leaves out besides those its rule
@@ -4649,7 +4659,7 @@ impl St {
                     told.push(Change::NotCounted {
                         collection: c.clone(),
                         id: id.clone(),
-                        why: why.clone(),
+                        why: NotCounted::Excluded(why.clone()),
                     });
                 }
             }
@@ -5392,7 +5402,7 @@ impl St {
                                     Change::NotCounted {
                                         collection: c.clone(),
                                         id: id.clone(),
-                                        why,
+                                        why: NotCounted::Excluded(why),
                                     },
                                     Some(id),
                                 ));
@@ -5413,7 +5423,7 @@ impl St {
                                 Change::NotCounted {
                                     collection: c.clone(),
                                     id,
-                                    why: format!("group refused: {why}"),
+                                    why: NotCounted::Excluded(format!("group refused: {why}")),
                                 },
                                 None,
                             ));
@@ -5447,7 +5457,7 @@ impl St {
                                             Change::NotCounted {
                                                 collection: c.clone(),
                                                 id: id.clone(),
-                                                why,
+                                                why: NotCounted::Excluded(why),
                                             },
                                             Some(id),
                                         ));
@@ -5487,7 +5497,7 @@ impl St {
                         Change::NotCounted {
                             collection: c.clone(),
                             id: id.clone(),
-                            why,
+                            why: NotCounted::Excluded(why),
                         },
                         Some(id),
                     ),
@@ -5513,7 +5523,7 @@ impl St {
                     Change::NotCounted {
                         collection: c.clone(),
                         id: id.clone(),
-                        why: why.clone(),
+                        why: NotCounted::Waits(why.clone()),
                     },
                     Some(id.clone()),
                 ));
@@ -5531,7 +5541,9 @@ impl St {
             // Told not counted while it waited; applied now, its group
             // judges whether it counts ([`St::regroup`]).
             if applied_here && let (Some(why), Some(g)) = (why, group_of(versions, &id)) {
-                group_held.entry(id.clone()).or_insert((g, why));
+                group_held
+                    .entry(id.clone())
+                    .or_insert((g, NotCounted::Waits(why)));
                 touched.insert((id.writer.clone(), g));
             }
         }
@@ -5668,7 +5680,10 @@ impl St {
         }
         let own = coll.not_counted.get(id).cloned();
         let exclude = own.is_none() && blocker.is_some();
-        let why = own.or_else(|| blocker.clone());
+        // A member's own rule excludes it, or the rule excludes the member
+        // its group waits on: neither ends by waiting for what the layer
+        // waits for.
+        let why = own.or_else(|| blocker.clone()).map(NotCounted::Excluded);
         let last = coll.group_held.get(id).map(|(_, w)| w);
         let tell = match &why {
             Some(why) => last != Some(why),
@@ -6876,7 +6891,7 @@ impl St {
         at: &Frontier,
         rules: &MergeRules,
         me: &Writer,
-    ) -> Option<(Value, Vec<(VersionId, String)>)> {
+    ) -> Option<(Value, Vec<(VersionId, NotCounted)>)> {
         let coll = self.colls.get(c)?;
         let members = coll.members.as_ref()?;
         let Rule::Merge { function } = &members.rule else {
@@ -6957,7 +6972,7 @@ impl St {
             match r {
                 Ran::Applied(id, Counting::NotCounted(why))
                 | Ran::Counting(id, Counting::NotCounted(why)) => {
-                    not_counted.insert(id, why);
+                    not_counted.insert(id, NotCounted::Excluded(why));
                 }
                 Ran::Counting(id, Counting::Counted) => {
                     not_counted.remove(&id);
@@ -6976,7 +6991,7 @@ impl St {
             .collect();
         for id in versions.keys().filter(|id| at.contains(id)) {
             if let Some(Some(why)) = cover.counting(id) {
-                not_counted.insert(id.clone(), why);
+                not_counted.insert(id.clone(), NotCounted::Excluded(why));
                 excluded.insert(id.clone());
             }
         }
@@ -14569,7 +14584,7 @@ impl Inner {
                     let change = Change::NotCounted {
                         collection: c.clone(),
                         id: id.clone(),
-                        why,
+                        why: NotCounted::Excluded(why),
                     };
                     told.push((change, id.clone()));
                 }
@@ -14604,7 +14619,7 @@ impl Inner {
                             Change::NotCounted {
                                 collection: c.clone(),
                                 id: other.clone(),
-                                why,
+                                why: NotCounted::Excluded(why),
                             }
                         })
                     }
@@ -14634,7 +14649,7 @@ impl Inner {
                         Some(why) => Change::NotCounted {
                             collection: c.clone(),
                             id: other.clone(),
-                            why,
+                            why: NotCounted::Excluded(why),
                         },
                     };
                     told.push((change, other));
@@ -19980,7 +19995,8 @@ impl DataLayer for Device {
                     let why = coll
                         .not_counted
                         .get(&v.id)
-                        .or_else(|| coll.group_held.get(&v.id).map(|(_, why)| why));
+                        .map(|why| NotCounted::Excluded(why.clone()))
+                        .or_else(|| coll.group_held.get(&v.id).map(|(_, why)| why.clone()));
                     if let Some(why) = why {
                         listed.push((
                             c,
@@ -19988,7 +20004,7 @@ impl DataLayer for Device {
                             Change::NotCounted {
                                 collection: c.clone(),
                                 id: v.id.clone(),
-                                why: why.clone(),
+                                why,
                             },
                         ));
                     }
@@ -20004,7 +20020,7 @@ impl DataLayer for Device {
                         Change::NotCounted {
                             collection: c.clone(),
                             id: id.clone(),
-                            why: why.clone(),
+                            why: NotCounted::Waits(why.clone()),
                         },
                     ));
                 }
