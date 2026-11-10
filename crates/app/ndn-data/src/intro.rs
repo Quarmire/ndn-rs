@@ -128,6 +128,14 @@ pub struct IntroPolicy {
     /// their turn to be judged; one more gets no answer (a Nack) at once,
     /// and its asker retries.
     pub asks_queued: usize,
+    /// Whether a code's link hint may name this machine's own addresses —
+    /// loopback (`127.0.0.1`, `::1`) and link-local (`169.254.0.0/16`,
+    /// `fe80::/10`) — which a join then dials. Off by default: a code from a
+    /// stranger must not make this device send datagrams to services on
+    /// itself or on its link, and the inviter's own gathering never offers
+    /// such an address to a device elsewhere (ndn-link `HostCandidates`).
+    /// Turn it on for two devices of one machine (tests, a demo).
+    pub local_candidates: bool,
 }
 
 impl IntroPolicy {
@@ -143,6 +151,7 @@ impl IntroPolicy {
             wrong_tries_max: 16,
             backoff: std::time::Duration::from_secs(1),
             asks_queued: 32,
+            local_candidates: false,
         }
     }
 
@@ -368,14 +377,25 @@ pub struct HintCandidate {
 
 impl HintCandidate {
     /// Whether a device can sensibly be dialled at this address: not the
-    /// unspecified, a multicast or the broadcast address, and not port 0.
-    /// A code from a stranger is not made to send datagrams to those.
-    fn dialable(&self) -> bool {
+    /// unspecified, a multicast or the broadcast address, not port 0, and,
+    /// unless `include_local`, not a loopback or link-local one. A code from
+    /// a stranger is not made to send datagrams to those.
+    fn dialable(&self, include_local: bool) -> bool {
         let ip = self.addr.ip().to_canonical();
         self.addr.port() != 0
             && !ip.is_unspecified()
             && !ip.is_multicast()
             && !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+            && (include_local || !is_local(ip))
+    }
+}
+
+/// Whether `ip` is a loopback or link-local address (the ones ndn-link's
+/// candidate gathering leaves out).
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -396,7 +416,9 @@ pub struct LinkHint {
 impl LinkHint {
     /// The hint's TLVs (the value of the intro envelope's `LinkHint`): the
     /// key, then each of the first [`LINK_HINT_CANDIDATES_MAX`] candidates
-    /// once, in order.
+    /// once, in order. The inviter's own gathering chose which addresses to
+    /// offer, so loopback and link-local ones it was given are written as
+    /// they are.
     pub fn encode(&self) -> Bytes {
         self.encode_first(self.candidates.len())
     }
@@ -410,7 +432,7 @@ impl LinkHint {
             if seen.len() == keep.min(LINK_HINT_CANDIDATES_MAX) {
                 break;
             }
-            if !c.dialable() || seen.contains(&c) {
+            if !c.dialable(true) || seen.contains(&c) {
                 continue;
             }
             seen.push(c);
@@ -428,9 +450,13 @@ impl LinkHint {
     /// Read the value of an intro envelope's `LinkHint`: one key and its
     /// candidates — the first [`LINK_HINT_CANDIDATES_MAX`] distinct ones
     /// that name an address this device may dial and a kind this version
-    /// knows; the others are passed over. An error says what is wrong: a
-    /// join carries on without the hint (it only helps to reach).
-    pub fn decode(value: &[u8]) -> Result<Self, String> {
+    /// knows; the others are passed over. Loopback and link-local addresses
+    /// are passed over unless `include_local`
+    /// ([`IntroPolicy::local_candidates`]): a stranger's code does not make
+    /// this device send datagrams to itself or its link. An error says what
+    /// is wrong: a join carries on without the hint (it only helps to
+    /// reach).
+    pub fn decode(value: &[u8], include_local: bool) -> Result<Self, String> {
         let mut key = None;
         let mut candidates: Vec<HintCandidate> = Vec::new();
         each(Bytes::copy_from_slice(value), |t, v| {
@@ -464,7 +490,7 @@ impl LinkHint {
                         kind,
                         addr: SocketAddr::new(ip, port),
                     };
-                    if c.dialable()
+                    if c.dialable(include_local)
                         && candidates.len() < LINK_HINT_CANDIDATES_MAX
                         && !candidates.contains(&c)
                     {
@@ -639,6 +665,20 @@ pub trait Introducer: Send + Sync {
                  it, or run the device on a host that dials link hints"
             ))
         })
+    }
+
+    /// The join that dialled `inviter` by `hint` ([`dial`](Self::dial))
+    /// failed: take down what the dial made. What answered at the hint's key
+    /// proved nothing the join could check, so the link to it — which only
+    /// carried the introduction — is not kept; a link that was up before the
+    /// dial, or that has been identified since (the join went on, and this
+    /// host holds the inviter's namespace), is left as it is. Called once
+    /// for each failed join whose dial succeeded, before the join's error is
+    /// returned.
+    ///
+    /// The default does nothing: a host with no link layer dialled nothing.
+    fn undial(&self, hint: &LinkHint, inviter: &Name) {
+        let _ = (hint, inviter);
     }
 }
 
@@ -947,6 +987,13 @@ pub enum Outcome {
         /// The offering device's proof packet `<D>/32=ask/<binding>`,
         /// signed by its key ([`AnswerBody::binding`]).
         inviter: Bytes,
+        /// The revision of the folder's members record in force on the
+        /// offering device once the asker was admitted: the first revision
+        /// that admits it. The joiner lets its note of the admission go when
+        /// a record of this revision or a later one that it holds leaves it
+        /// out (spec §19.3). `None` in an answer kept from before the field
+        /// existed.
+        revision: Option<u64>,
     },
     /// Refused, and why ([`IntroRefusal::Forged`] never travels).
     Refused(IntroRefusal),
@@ -984,9 +1031,13 @@ impl AnswerBody {
                 role,
                 credentials,
                 inviter,
+                revision,
             } => {
                 write_name(w, folder);
                 write_nni(w, tlv::ROLE, role.code());
+                if let Some(revision) = revision {
+                    write_nni(w, tlv::REVISION, *revision);
+                }
                 write_credentials(w, credentials);
                 if with_inviter {
                     w.write_tlv(tlv::ASKER, inviter);
@@ -1041,6 +1092,7 @@ impl AnswerBody {
         let mut names = Vec::new();
         let (mut asker, mut digest, mut role, mut credentials, mut inviter) =
             (None, None, None, None, None);
+        let mut revision = None;
         let (mut refused, mut left, mut proof) = (None, None, None);
         each(value, |t, v| {
             match t {
@@ -1048,6 +1100,7 @@ impl AnswerBody {
                 tlv::WRITER => asker = Some(read_writer(v)?),
                 tlv::DIGEST => digest = Some(read_digest(&v)?),
                 tlv::ROLE => role = Some(Role::from_code(read_nni(&v)?)?),
+                tlv::REVISION => revision = Some(read_nni(&v)?),
                 tlv::CREDENTIALS => credentials = Some(read_credentials(v)?),
                 tlv::ASKER => inviter = Some(v),
                 tlv::INTRO_REFUSED => refused = Some(read_nni(&v)?),
@@ -1069,6 +1122,7 @@ impl AnswerBody {
                 credentials: credentials
                     .ok_or_else(|| bad("an answer carries the inviter's credentials"))?,
                 inviter: inviter.ok_or_else(|| bad("an answer carries the inviter's proof"))?,
+                revision,
             },
             _ => {
                 return Err(bad(
@@ -1342,6 +1396,7 @@ mod tests {
                 role: Role::Reader,
                 credentials: vec![data_packet(1)],
                 inviter: data_packet(4),
+                revision: Some(3),
             },
             proof: None,
         };
@@ -1355,6 +1410,37 @@ mod tests {
             ..accepted.clone()
         };
         assert!(!answer_proves(&key, &carol));
+        // The revision the admission was signed at is covered, and an answer
+        // without one reads as one: a kept answer from before the field.
+        let at = |revision: Option<u64>| {
+            let Outcome::Accepted {
+                folder,
+                role,
+                credentials,
+                inviter,
+                ..
+            } = accepted.outcome.clone()
+            else {
+                unreachable!("an acceptance")
+            };
+            AnswerBody {
+                outcome: Outcome::Accepted {
+                    folder,
+                    role,
+                    credentials,
+                    inviter,
+                    revision,
+                },
+                ..accepted.clone()
+            }
+        };
+        assert!(
+            !answer_proves(&key, &at(Some(2))),
+            "the revision is not proven"
+        );
+        let mut kept = at(None);
+        kept.proof = Some(answer_proof(&key, &kept));
+        assert_eq!(AnswerBody::decode(kept.encode()).unwrap(), kept);
         let unproven = AnswerBody {
             proof: None,
             ..accepted.clone()
@@ -1451,20 +1537,20 @@ mod tests {
             key: [0x42; 32],
             candidates: vec![host(2), host6(1), host(3)],
         };
-        assert_eq!(LinkHint::decode(&hint.encode()).unwrap(), hint);
+        assert_eq!(LinkHint::decode(&hint.encode(), false).unwrap(), hint);
 
         let mut w = TlvWriter::new();
         w.write_tlv(tlv::LINK_KEY, &[1; 32]);
         w.write_tlv(0x05BE, b"a later even field");
         w.write_tlv(tlv::LINK_CANDIDATE, &[9, 10, 0, 0, 1, 0x1B, 0x58]);
         w.write_tlv(tlv::LINK_CANDIDATE, &[0, 10, 0, 0, 2, 0x1B, 0x58]);
-        let got = LinkHint::decode(&w.finish()).unwrap();
+        let got = LinkHint::decode(&w.finish(), false).unwrap();
         assert_eq!(got.candidates.len(), 1, "an unknown kind is passed over");
 
         let refused = |build: &dyn Fn(&mut TlvWriter)| {
             let mut w = TlvWriter::new();
             build(&mut w);
-            LinkHint::decode(&w.finish()).unwrap_err()
+            LinkHint::decode(&w.finish(), false).unwrap_err()
         };
         refused(&|w| {
             w.write_tlv(tlv::LINK_KEY, &[1; 32]);
@@ -1518,7 +1604,7 @@ mod tests {
             key: [3; 32],
             candidates,
         };
-        let got = LinkHint::decode(&hint.encode()).unwrap();
+        let got = LinkHint::decode(&hint.encode(), false).unwrap();
         assert_eq!(got.candidates.len(), LINK_HINT_CANDIDATES_MAX);
         assert_eq!(got.candidates[0], host(1));
         assert_eq!(got.candidates[1], host(2));
@@ -1533,6 +1619,40 @@ mod tests {
             }
         }
         assert!(count <= LINK_HINT_CANDIDATES_MAX);
+    }
+
+    /// A stranger's code does not make this device send datagrams to itself
+    /// or its link: loopback and link-local addresses are dropped when a
+    /// hint is read, unless the policy allows them; the inviter's own
+    /// encoding keeps what its gathering gave.
+    #[test]
+    fn a_link_hint_drops_loopback_and_link_local_addresses_unless_the_policy_allows() {
+        let at = |ip: std::net::IpAddr| HintCandidate {
+            kind: HintKind::Host,
+            addr: SocketAddr::new(ip, 7000),
+        };
+        let local = [
+            at("127.0.0.1".parse().unwrap()),
+            at("::1".parse().unwrap()),
+            at("169.254.7.7".parse().unwrap()),
+            at("fe80::1".parse().unwrap()),
+            at("::ffff:127.0.0.1".parse().unwrap()),
+        ];
+        let mut candidates = local.to_vec();
+        candidates.push(host(1));
+        let hint = LinkHint {
+            key: [5; 32],
+            candidates,
+        };
+        let encoded = hint.encode();
+        assert_eq!(
+            LinkHint::decode(&encoded, false).unwrap().candidates,
+            vec![host(1)],
+            "only the address that reaches beyond this machine and its link is kept"
+        );
+        let kept = LinkHint::decode(&encoded, true).unwrap().candidates;
+        assert_eq!(kept.len(), local.len() + 1, "{kept:?}");
+        assert!(local.iter().all(|c| kept.contains(c)), "{kept:?}");
     }
 
     fn code_with(offer: String, relays: usize) -> Introduction {
@@ -1572,7 +1692,7 @@ mod tests {
             panic!("an introduction link");
         };
         assert_eq!(
-            LinkHint::decode(&i.link_hint.unwrap()).unwrap(),
+            LinkHint::decode(&i.link_hint.unwrap(), false).unwrap(),
             hint,
             "a hint that fits is carried whole"
         );
@@ -1611,7 +1731,7 @@ mod tests {
             assert_eq!(i.secret, [0x3C; SECRET_LEN]);
             assert_eq!(i.fingerprint, [0xA5; 32]);
             if let Some(bytes) = &i.link_hint {
-                let got = LinkHint::decode(bytes).unwrap();
+                let got = LinkHint::decode(bytes, false).unwrap();
                 assert_eq!(got.candidates[..], hint.candidates[..got.candidates.len()]);
                 if got.candidates.len() < hint.candidates.len() {
                     assert!(i.relays.is_empty(), "relays go before candidates");

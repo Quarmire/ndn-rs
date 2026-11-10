@@ -99,9 +99,28 @@ impl Person {
     }
 }
 
+/// What a host was asked to dial and to take down, and whether its dial
+/// succeeds.
+#[derive(Default)]
+struct Calls {
+    dialled: std::sync::Mutex<Vec<Name>>,
+    undialled: std::sync::Mutex<Vec<Name>>,
+    dial_succeeds: std::sync::atomic::AtomicBool,
+}
+
+impl Calls {
+    fn dialled(&self) -> Vec<Name> {
+        self.dialled.lock().unwrap().clone()
+    }
+
+    fn undialled(&self) -> Vec<Name> {
+        self.undialled.lock().unwrap().clone()
+    }
+}
+
 /// A host's introducer: gives its person's signed context; adopts a link
 /// into its validator — unless it refuses the namespace, or holds every
-/// adoption until let go.
+/// adoption until let go; records what it is asked to dial.
 struct Host {
     anchor: Bytes,
     validator: Arc<Validator>,
@@ -109,11 +128,36 @@ struct Host {
     refuses: Vec<Name>,
     /// Hold adoptions: told as one starts, let go one per permit.
     hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    calls: Arc<Calls>,
 }
 
 impl Introducer for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
+    }
+
+    fn dial<'a>(
+        &'a self,
+        _hint: &'a crate::intro::LinkHint,
+        inviter: &'a Name,
+        _within: Duration,
+    ) -> crate::intro::Dialing<'a> {
+        self.calls.dialled.lock().unwrap().push(inviter.clone());
+        let ok = self
+            .calls
+            .dial_succeeds
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if ok {
+                Ok(())
+            } else {
+                Err("this test host links nothing".to_string())
+            }
+        })
+    }
+
+    fn undial(&self, _hint: &crate::intro::LinkHint, inviter: &Name) {
+        self.calls.undialled.lock().unwrap().push(inviter.clone());
     }
 
     fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> crate::intro::Adopting<'a> {
@@ -180,6 +224,29 @@ async fn start_clocked(
     hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
     clock: Option<Clock>,
 ) -> Device {
+    start_recording(
+        person,
+        device,
+        keys,
+        refuses,
+        hold,
+        clock,
+        Arc::new(Calls::default()),
+    )
+    .await
+}
+
+/// [`start_clocked`] with a host that records what it is asked to dial and
+/// take down in `calls`.
+async fn start_recording(
+    person: &Person,
+    device: &str,
+    keys: Option<Arc<SecurityManager>>,
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+    calls: Arc<Calls>,
+) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
@@ -200,6 +267,7 @@ async fn start_clocked(
         validator: Arc::clone(&validator),
         refuses: refuses.iter().map(|s| n(s)).collect(),
         hold,
+        calls,
     };
     let conn: Arc<dyn Connection> = Arc::new(Unconnected);
     Device::start(
@@ -239,6 +307,21 @@ async fn alice_at(
     hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
     clock: Option<Clock>,
 ) -> (Device, Name, [u8; crate::intro::SECRET_LEN]) {
+    let (laptop, code, secret, _) = alice_person(refuses, hold, clock).await;
+    (laptop, code.offer, secret)
+}
+
+/// [`alice_at`], with the person and the whole code.
+async fn alice_person(
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+) -> (
+    Device,
+    crate::intro::Code,
+    [u8; crate::intro::SECRET_LEN],
+    Person,
+) {
     let alice = Person::new("/alice");
     let laptop = start_clocked(&alice, "/alice/laptop", None, refuses, hold, clock).await;
     let folder = n("/alice/32=data/notebook");
@@ -268,7 +351,8 @@ async fn alice_at(
     let Ok(TrustEnvelope::Intro(intro)) = TrustEnvelope::from_uri(&code.link) else {
         panic!("an offer's link is an introduction link");
     };
-    (laptop, code.offer, intro.secret)
+    let secret = intro.secret;
+    (laptop, code, secret, alice)
 }
 
 /// The ask `joiner` sends `inviter` for `offer`, as [`Device::join`] builds
@@ -552,4 +636,362 @@ async fn asks_beyond_the_queue_get_no_answer_at_once() {
     }
     gate.add_permits(1);
     assert!(accepted(&held.await.unwrap()));
+}
+
+// ---- M2: a code is judged before anything is dialled -------------------------------------------
+
+/// `code`'s link with the namespace it names replaced by `namespace`, and a
+/// link hint to an address beyond this machine added: what a join would dial.
+fn altered(code: &crate::intro::Code, namespace: Option<&str>) -> String {
+    use crate::intro::{HintCandidate, HintKind, LinkHint};
+    let Ok(TrustEnvelope::Intro(mut intro)) = TrustEnvelope::from_uri(&code.link) else {
+        panic!("an introduction link");
+    };
+    intro.namespace = namespace.map(str::to_string);
+    intro.link_hint = Some(
+        LinkHint {
+            key: [0x42; 32],
+            candidates: vec![HintCandidate {
+                kind: HintKind::Host,
+                addr: "192.0.2.7:6363".parse().unwrap(),
+            }],
+        }
+        .encode(),
+    );
+    TrustEnvelope::Intro(intro).to_uri()
+}
+
+/// Bob's phone, its host recording what it is asked to dial.
+async fn bobs_phone(calls: &Arc<Calls>) -> Device {
+    let bob = Person::new("/bob");
+    start_recording(&bob, "/bob/phone", None, &[], None, None, Arc::clone(calls)).await
+}
+
+/// A code that names a namespace its device is not under is altered: the
+/// join refuses it before it dials, since the dial gives whoever holds the
+/// key a link.
+#[tokio::test]
+async fn a_code_whose_device_is_outside_the_namespace_it_names_dials_nothing() {
+    let (_laptop, code, _secret, _alice) = alice_person(&[], None, None).await;
+    let calls = Arc::new(Calls::default());
+    let phone = bobs_phone(&calls).await;
+    let got = phone.join(&altered(&code, Some("/evil"))).await;
+    assert!(
+        calls.dialled().is_empty(),
+        "the join dialled {:?} for a code naming a namespace its device is not under (got {got:?})",
+        calls.dialled()
+    );
+    assert!(
+        matches!(
+            got,
+            Err(DataError::Introduction {
+                why: IntroRefusal::Forged,
+                ..
+            })
+        ),
+        "{got:?}"
+    );
+}
+
+/// A code whose device is under a namespace this device trusts, naming none
+/// or another anchor of it, dials nothing: whoever holds its key would get
+/// that namespace's Interests over the link.
+#[tokio::test]
+async fn a_code_whose_device_is_under_a_held_namespace_of_another_anchor_dials_nothing() {
+    let (_laptop, code, _secret, _alice) = alice_person(&[], None, None).await;
+    let calls = Arc::new(Calls::default());
+    let phone = bobs_phone(&calls).await;
+    // This device holds the real /alice, rooted in another key.
+    let real = Person::new("/alice");
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&real.ctx))
+        .unwrap();
+    for named in [None, Some("/alice")] {
+        let got = phone.join(&altered(&code, named)).await;
+        assert!(
+            calls.dialled().is_empty(),
+            "the join dialled {:?} for a device under a held namespace the code does not \
+             anchor (code names {named:?}; got {got:?})",
+            calls.dialled()
+        );
+        assert!(
+            matches!(
+                got,
+                Err(DataError::Introduction {
+                    why: IntroRefusal::InviterConflict { .. },
+                    ..
+                })
+            ),
+            "{got:?}"
+        );
+    }
+}
+
+/// A second invitation from a namespace this device already holds, by the
+/// anchor it holds, is still joined: the same anchor is a party known
+/// already.
+#[tokio::test]
+async fn a_code_from_a_held_namespace_by_its_own_anchor_is_still_dialled() {
+    let (laptop, code, _secret, alice) = alice_person(&[], None, None).await;
+    let calls = Arc::new(Calls::default());
+    let phone = bobs_phone(&calls).await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.ctx))
+        .unwrap();
+    for named in [None, Some("/alice")] {
+        let got = phone.join(&altered(&code, named)).await;
+        assert_eq!(
+            calls.dialled().last(),
+            Some(laptop.name()),
+            "the code names {named:?}; the join answered {got:?}"
+        );
+        // Past the dial it goes on to ask: nobody answers here, which is
+        // `NotReady`, not a refusal of the code.
+        assert!(matches!(got, Err(DataError::NotReady { .. })), "{got:?}");
+    }
+    assert!(
+        calls.undialled().is_empty(),
+        "a dial that failed made nothing to take down: {:?}",
+        calls.undialled()
+    );
+}
+
+/// A join that fails after its dial succeeded takes the dial's link down.
+#[tokio::test]
+async fn a_join_that_fails_after_its_dial_takes_the_link_down() {
+    let (laptop, code, _secret, _alice) = alice_person(&[], None, None).await;
+    let calls = Arc::new(Calls::default());
+    calls
+        .dial_succeeds
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let phone = bobs_phone(&calls).await;
+    let got = phone.join(&altered(&code, Some("/alice"))).await;
+    assert!(matches!(got, Err(DataError::NotReady { .. })), "{got:?}");
+    assert_eq!(
+        calls.undialled(),
+        vec![laptop.name().clone()],
+        "the failed join left its dial's link up"
+    );
+}
+
+// ---- L2: the joined note ------------------------------------------------------------------------
+
+/// Alice's namespace heard in its sync group, her laptop's summary walked
+/// in full once `dev` follows `c`: a first put follows it, and a walk that
+/// came before would not count for it.
+async fn walked_alice(dev: &Device, laptop: &Name, c: &Name) {
+    let _ = dev.put(c, Content::new(), options()).await;
+    let _ = dev.inner.join(&n("/alice")).await;
+    let mut st = dev.inner.st.lock();
+    st.groups
+        .get_mut(&n("/alice"))
+        .expect("joined")
+        .members
+        .insert(laptop.clone());
+    st.peers
+        .entry((laptop.clone(), n("/alice")))
+        .or_default()
+        .root = Some([1; 32]);
+}
+
+fn options() -> PutOptions {
+    PutOptions {
+        type_id: TypeId {
+            name: n("/types/note"),
+            revision: 1,
+        },
+        keep: Keep::Forever,
+        batch: None,
+    }
+}
+
+/// Hand `to` every log entry of `from` about `c` (its members records and
+/// its offers' marks), as `from` signed them.
+fn relay(from: &Device, to: &Device, c: &Name) {
+    let head = from.inner.st.lock().head;
+    for seq in 1..=head {
+        let name = log_name(from.name(), Some(c), seq);
+        let Some(wire) = from.inner.store.get(&name) else {
+            continue;
+        };
+        let content = Data::decode(wire).unwrap().content().unwrap().clone();
+        let record = wire::decode_record(content).unwrap();
+        let k = key(from.name());
+        let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
+            ndn_packet::SignatureType::SignatureEd25519,
+            Some(&k),
+            |_| Bytes::from_static(&[0; 64]),
+        );
+        let mut st = to.inner.st.lock();
+        to.inner
+            .take(&mut st, name.clone(), packet, Writer::new(k), record, false);
+        assert_eq!(st.refused.get(&name), None, "the record was refused");
+    }
+}
+
+/// Spec §19.2, §19.3: an offer's answer admitted this device, and its record
+/// is on its way — a put is `NotReady`. An inviter that never sends it
+/// cannot keep the device waiting for good: once the offer has expired the
+/// device is told it is no member, and to ask the owner.
+#[tokio::test]
+async fn a_joiner_whose_inviter_never_sends_the_record_is_told_it_is_no_member_once_the_offer_expired()
+ {
+    let (clock, skew) = skewed();
+    let (laptop, offer, _secret, alice) = {
+        let (laptop, code, secret, alice) = alice_person(&[], None, None).await;
+        (laptop, code.offer, secret, alice)
+    };
+    let bob = Person::new("/bob");
+    let phone = start_clocked(&bob, "/bob/phone", None, &[], None, Some(clock)).await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.ctx))
+        .unwrap();
+    let folder = n("/alice/32=data/notebook");
+    let note = folder.clone().append("note");
+    walked_alice(&phone, laptop.name(), &note).await;
+    let until = laptop.inner.st.lock().intro.offers[&offer].until;
+    assert!(phone.inner.note_joined(&folder, until, Some(2)).await);
+
+    let waiting = phone.put(&note, Content::new(), options()).await;
+    assert!(
+        matches!(waiting, Err(DataError::NotReady { .. })),
+        "while the offer stands the record is on its way: {waiting:?}"
+    );
+    skew.store(2 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    let past = phone.put(&note, Content::new(), options()).await;
+    assert!(
+        matches!(past, Err(DataError::NotAllowed { .. })),
+        "past the offer's expiry a device no record admits is no member: {past:?}"
+    );
+    assert_eq!(
+        past.unwrap_err().next(),
+        crate::error::NextStep::AskOwner,
+        "and it is told to ask the owner"
+    );
+}
+
+/// A joiner the folder's members record removed, joining again with its
+/// code (the offer answers it as it was, the revision it was admitted at
+/// with it), is no member once it holds the record that removed it — not
+/// `NotReady` for good.
+#[tokio::test]
+async fn a_removed_joiner_who_joins_again_is_told_it_is_no_member_not_to_wait() {
+    let (laptop, code, secret, alice) = alice_person(&[], None, None).await;
+    let offer = code.offer.clone();
+    let folder = n("/alice/32=data/notebook");
+    let note = folder.clone().append("note");
+    let bob = Person::new("/bob");
+    let phone = start(&bob, "/bob/phone", None, &[], None).await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.ctx))
+        .unwrap();
+    walked_alice(&phone, laptop.name(), &note).await;
+    let until = laptop.inner.st.lock().intro.offers[&offer].until;
+
+    let first = answer(&laptop, ask(&phone, &laptop, &offer, &secret, &[])).await;
+    let Some(Outcome::Accepted { revision, .. }) = first.clone() else {
+        panic!("bob was answered {first:?}");
+    };
+    let admitted = revision.expect("the answer carries the revision that admits the joiner");
+    assert_eq!(
+        admitted,
+        laptop.inner.st.lock().folders[&folder]
+            .members
+            .as_ref()
+            .unwrap()
+            .revision
+            .0
+    );
+    // Alice removes Bob: the next record leaves him out.
+    laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice")],
+                readers: vec![Audience::Person(n("/alice"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    // He joins again with the same code: answered as he was, admitted at the
+    // revision before the removal.
+    let again = answer(&laptop, ask(&phone, &laptop, &offer, &secret, &[])).await;
+    assert_eq!(again, first, "the removed joiner was not answered as kept");
+    assert!(phone.inner.note_joined(&folder, until, revision).await);
+    relay(&laptop, &phone, &folder);
+
+    let put = phone.put(&note, Content::new(), options()).await;
+    assert!(
+        matches!(
+            put,
+            Err(DataError::NotAllowed { .. } | DataError::Sealed { .. })
+        ),
+        "a joiner the record in hand removes is refused as any non-member, and does not wait: \
+         {put:?}"
+    );
+}
+
+// ---- L4: what the introduction link carries -----------------------------------------------------
+
+/// The surface a host gives its link layer is open while an offer has not
+/// expired — a closed one included, as it still answers the writer it
+/// admitted — and carries the ask and the offer's own record, no other
+/// piece the device holds by name.
+#[tokio::test]
+async fn the_introduction_surface_is_open_while_an_offer_stands_and_carries_only_it() {
+    let (clock, skew) = skewed();
+    let (laptop, offer, _secret) = alice_at(&[], None, Some(clock)).await;
+    let surface = laptop.introductions();
+    let device = laptop.name().clone();
+    let folder = n("/alice/32=data/notebook");
+    let ask = intro_prefix(&device).append("digest");
+    let held_offer = wire::held_name(&device, &offer);
+    let other = log_name(&device, Some(&folder), 1);
+    assert_ne!(other, offer, "the folder's own record is another entry");
+
+    assert!(surface.open(), "an unexpired offer is open");
+    assert!(surface.carries(&held_offer), "the offer's record");
+    assert!(surface.carries(&ask), "an ask");
+    assert!(
+        !surface.carries(&wire::held_name(&device, &other)),
+        "a held piece that is no offer is carried"
+    );
+    assert!(
+        !surface.carries(&wire::held_prefix(&device).append("anything")),
+        "a name under the held prefix that names no offer is carried"
+    );
+    assert!(
+        !surface.carries(&wire::held_name(&n("/alice/phone"), &offer)),
+        "another device's held piece is carried"
+    );
+
+    laptop.close_offer(&offer).await.unwrap();
+    assert!(
+        surface.open(),
+        "a closed offer still answers the writer it admitted until it expires"
+    );
+    skew.store(2 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    assert!(!surface.open(), "an expired offer is not open");
+    assert!(!surface.carries(&held_offer), "an expired offer's record");
+    assert!(!surface.carries(&ask), "an ask, with no offer open");
+}
+
+/// A device that has made no offer takes no stranger's introduction link.
+#[tokio::test]
+async fn a_device_with_no_offer_has_no_open_surface() {
+    let alice = Person::new("/alice");
+    let laptop = start(&alice, "/alice/laptop", None, &[], None).await;
+    let surface = laptop.introductions();
+    assert!(!surface.open());
+    assert!(!surface.carries(&intro_prefix(laptop.name()).append("digest")));
 }

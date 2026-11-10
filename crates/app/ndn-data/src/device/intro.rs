@@ -3,7 +3,7 @@
 //! proofs are [`crate::intro`]'s.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use ndn_app::Consumer;
@@ -29,8 +29,10 @@ use crate::intro::{
 };
 use crate::layer::{ShareChange, Sharing};
 use crate::rt::Instant;
-use crate::version::{Audience, Writer};
-use crate::wire::{self, LogName, Record, device_of, namespace_of, parse_log_name};
+use crate::version::{Audience, Timestamp, Writer};
+use crate::wire::{
+    self, LogName, Record, device_of, namespace_of, parse_held_name, parse_log_name,
+};
 
 /// How many times a join sends its ask (the same parameters each time, so a
 /// retry is answered from the answer the inviter device keeps for it) before
@@ -308,8 +310,10 @@ struct Parsed {
 }
 
 /// Read a code: an `ndn-trust://intro/…` link (or its https mirror), or the
-/// words form (an offer name, then the words).
-fn parse_code(code: &str) -> Result<Parsed, DataError> {
+/// words form (an offer name, then the words). A link hint's loopback and
+/// link-local addresses are dropped unless `local_candidates`
+/// ([`IntroPolicy::local_candidates`](crate::intro::IntroPolicy)).
+fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
     let bad = |name: Name, why: String| DataError::BadRequest { name, why };
     let code = code.trim();
     let offer_of = |s: &str| {
@@ -356,7 +360,7 @@ fn parse_code(code: &str) -> Result<Parsed, DataError> {
                 link_hint: i
                     .link_hint
                     .as_deref()
-                    .and_then(|v| LinkHint::decode(v).ok()),
+                    .and_then(|v| LinkHint::decode(v, local_candidates).ok()),
             })
         }
         Ok(other) => Err(bad(
@@ -391,8 +395,44 @@ fn offline(offer: &Name, device: &Name) -> DataError {
 /// Where the store keeps that an offer's answer admitted this device to
 /// `folder` as a writer, until a members record held admits it
 /// ([`Inner::admitted_by_offer`]): a device in that window is no stranger.
+/// The note holds when the offer expires (8 octets, milliseconds) and the
+/// revision the inviter admitted this device at (8 octets, 0 for none).
 pub(super) fn joined_name(folder: &Name) -> Name {
     local_name("joined", folder)
+}
+
+/// What a note of an admission says ([`joined_name`]).
+struct JoinedNote {
+    /// When the offer that admitted this device expires by the inviter's
+    /// clock: past it, no record is on its way for want of an answer, so the
+    /// note lets go.
+    until: Timestamp,
+    /// The revision of the folder's members record the inviter signed or
+    /// held when it admitted this device: a record held at this revision or a
+    /// later one that leaves this device out says the admission was undone
+    /// since, so the note lets go. `None`: the answer carried none.
+    revision: Option<u64>,
+}
+
+impl JoinedNote {
+    fn encode(&self) -> Bytes {
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&self.until.0.to_be_bytes());
+        out.extend_from_slice(&self.revision.unwrap_or(0).to_be_bytes());
+        Bytes::from(out)
+    }
+
+    /// The note `bytes` hold; `None` for a note of another form (one kept
+    /// before notes carried an expiry), which holds nothing.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 16] = bytes.try_into().ok()?;
+        let until = u64::from_be_bytes(bytes[..8].try_into().ok()?);
+        let revision = u64::from_be_bytes(bytes[8..].try_into().ok()?);
+        Some(Self {
+            until: Timestamp(until),
+            revision: (revision != 0).then_some(revision),
+        })
+    }
 }
 
 /// What a join still waits for ([`Inner::admission_missing`]).
@@ -405,33 +445,72 @@ enum Missing {
 
 impl Inner {
     /// Note durably that an offer's answer admitted this device to `folder`
-    /// as a writer: whether the note is durable.
-    pub(super) async fn note_joined(&self, folder: &Name) -> bool {
+    /// as a writer, the offer expiring at `until` and the inviter having
+    /// admitted it at members revision `revision`: whether the note is
+    /// durable.
+    pub(super) async fn note_joined(
+        &self,
+        folder: &Name,
+        until: Timestamp,
+        revision: Option<u64>,
+    ) -> bool {
         self.store
-            .insert(joined_name(folder), Bytes::from_static(&[1]));
+            .insert(joined_name(folder), JoinedNote { until, revision }.encode());
         self.barrier().await
     }
 
     /// The folder over `c` (or `c`) that an offer's answer admitted this
     /// device to as a writer while no members record held admits it yet, if
-    /// any. A record that admits it lets the note go (`None`): a removal
-    /// signed later is refused as it is for anyone.
+    /// any. The note lets go (`None`) when a record admits the device (a
+    /// removal signed later is refused as it is for anyone); when the offer
+    /// has expired (the inviter that never sends the record answers nothing
+    /// more); and when the folder's record held, at the revision that
+    /// admitted the device or a later one, leaves it out (it was removed
+    /// since). Past those the device is no member, and a put is told so.
     fn joined_hold(&self, st: &St, c: &Name) -> Option<Name> {
         let at = wire::data_marker(c).ok()?;
-        let marked: Vec<Name> = (at + 2..=c.len())
-            .map(|k| Name::from_components(c.components()[..k].to_vec()))
-            .filter(|f| self.store.get(&joined_name(f)).is_some())
-            .collect();
+        let mut marked: Vec<(Name, JoinedNote)> = Vec::new();
+        for k in at + 2..=c.len() {
+            let f = Name::from_components(c.components()[..k].to_vec());
+            let Some(bytes) = self.store.get(&joined_name(&f)) else {
+                continue;
+            };
+            match JoinedNote::decode(&bytes) {
+                Some(note) => marked.push((f, note)),
+                None => {
+                    self.store.remove(&joined_name(&f));
+                }
+            }
+        }
         if marked.is_empty() {
             return None;
         }
-        if self.admitted(st, c) {
-            for f in &marked {
-                self.store.remove(&joined_name(f));
+        let admitted = self.admitted(st, c);
+        let now = (self.config.clock)();
+        let mut held = None;
+        for (f, note) in marked {
+            if admitted || note.until <= now || self.left_out_since(st, &f, note.revision) {
+                self.store.remove(&joined_name(&f));
+            } else if held.is_none() {
+                held = Some(f);
             }
-            return None;
         }
-        marked.into_iter().next()
+        held
+    }
+
+    /// Whether the members record of `folder` held here is of revision
+    /// `since` or later and does not admit this device as a writer: the
+    /// admission made at `since` was undone.
+    fn left_out_since(&self, st: &St, folder: &Name, since: Option<u64>) -> bool {
+        let Some(since) = since else { return false };
+        st.folders
+            .get(folder)
+            .and_then(|f| f.members.as_ref())
+            .is_some_and(|m| m.revision.0 >= since)
+            && matches!(
+                self.admission_missing(st, folder, Role::Writer),
+                Some(Missing::Record(_))
+            )
     }
 
     /// `refused`, a refusal to write into `c` for want of an admission, as it
@@ -897,6 +976,57 @@ impl Inner {
         None
     }
 
+    /// Why a join refuses `code` before it dials or asks anything, if it
+    /// does (spec §19.3). The code names the offering `device`, and the
+    /// dial gives whoever holds the code's key a link, so both are judged
+    /// first:
+    /// - a code that names a namespace `device` is not under is altered
+    ///   ([`IntroRefusal::Forged`]);
+    /// - the namespace it names is judged as an inviter's ([`Self::overlap`]);
+    /// - a `device` under a namespace this device already trusts is refused,
+    ///   unless the code names that very namespace (or none) and its
+    ///   fingerprint is one of that namespace's anchors: the same anchor is
+    ///   a party known already, and a second invitation from it is welcome.
+    ///   A code that claims a device of a namespace this device trusts under
+    ///   another anchor would have the link, and with it the namespace's
+    ///   Interests, go to whoever holds the key.
+    fn refuse_before_dial(&self, code: &Parsed, device: &Name) -> Option<IntroRefusal> {
+        if let Some(ns) = &code.namespace {
+            if !device.has_prefix(ns) {
+                return Some(IntroRefusal::Forged);
+            }
+            if let Fingerprint::Whole(fp) = &code.fingerprint
+                && let Some(why) = self.overlap(ns, fp)
+            {
+                return Some(IntroRefusal::InviterConflict {
+                    inviter: ns.clone(),
+                    why,
+                });
+            }
+        }
+        for ctx in self.validator.keyring().contexts() {
+            let held = ctx.namespace();
+            if !device.has_prefix(held) {
+                continue;
+            }
+            let named = code.namespace.as_ref().is_none_or(|ns| ns == held);
+            let anchored = ctx
+                .anchors()
+                .iter()
+                .any(|a| code.fingerprint.matches(&anchor_fingerprint(a.value())));
+            if !(named && anchored) {
+                return Some(IntroRefusal::InviterConflict {
+                    inviter: held.clone(),
+                    why: format!(
+                        "is a namespace this device trusts already, and the code does not name \
+                         one of its anchors, yet it offers {device}, a device under it"
+                    ),
+                });
+            }
+        }
+        None
+    }
+
     /// Make `ns` a member of `folder` as `role` (spec §19.4): the next
     /// members record of the folder adds it as a writer (a writer's role)
     /// and as a reader (a sealed folder's), unless the record in force
@@ -1142,7 +1272,8 @@ impl Inner {
             self.release(offer).await;
             return None;
         }
-        let answer = self.acceptance(offer, &ob, &pk, by.clone())?;
+        let revision = self.folder_revision(&ob.folder);
+        let answer = self.acceptance(offer, &ob, &pk, by.clone(), revision)?;
         // Kept with the use mark: the store's barrier under the mark makes
         // both durable before the answer.
         self.store.insert(accepted_name(offer), answer.encode());
@@ -1157,14 +1288,27 @@ impl Inner {
         Some(answer)
     }
 
+    /// The revision of `folder`'s members record held here: in force once the
+    /// admission of an asker was signed, the first that admits it.
+    fn folder_revision(&self, folder: &Name) -> Option<u64> {
+        self.st
+            .lock()
+            .folders
+            .get(folder)
+            .and_then(|f| f.members.as_ref())
+            .map(|m| m.revision.0)
+    }
+
     /// The acceptance of `offer` for its asker key `by`: the folder, the
-    /// role, this device's credentials and proof packet, the answer proof.
+    /// role, this device's credentials and proof packet, the members
+    /// revision that admitted the asker (`revision`), the answer proof.
     fn acceptance(
         &self,
         offer: &Name,
         ob: &OfferBody,
         pk: &[u8; 32],
         (key, digest): (Name, [u8; 32]),
+        revision: Option<u64>,
     ) -> Option<AnswerBody> {
         let credentials = self.credentials().ok()?;
         let mut answer = AnswerBody {
@@ -1176,6 +1320,7 @@ impl Inner {
                 role: ob.role,
                 credentials,
                 inviter: Bytes::new(),
+                revision,
             },
             proof: None,
         };
@@ -1205,12 +1350,77 @@ impl Inner {
             .filter(|a| a.asker == by.0 && a.digest == by.1);
         match kept {
             Some(a) => Some(a),
-            None => self.acceptance(offer, ob, pk, by),
+            None => self.acceptance(offer, ob, pk, by, None),
         }
     }
 }
 
+/// What this device's introductions serve over a link a stranger dialled
+/// (spec §19.2, ndn-link §8.6): the host's link layer asks it whether to take
+/// such a link at all and which names that link carries, so a stranger gets
+/// the one exchange an open offer needs and nothing else the device holds by
+/// name. It holds the device weakly: a host whose links outlive the device
+/// serves nothing.
+#[derive(Clone)]
+pub struct IntroductionSurface {
+    inner: Weak<Inner>,
+}
+
+impl IntroductionSurface {
+    /// Whether some offer of this device has not expired by its clock: a
+    /// stranger's introduction link is worth taking. A closed offer counts,
+    /// since it still answers the writer it admitted until it expires (spec
+    /// §19.2); with none, a stranger gets no link at all.
+    pub fn open(&self) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let now = (inner.config.clock)();
+        let st = inner.st.lock();
+        inner.offers_open(&st, now)
+    }
+
+    /// Whether an Interest for `name` may cross an introduction link: an
+    /// ask (`<D>/32=intro/…`) while an offer is open, or the offer record
+    /// itself (`<D>/32=held/<e>`, `e` an unexpired offer of this device's own
+    /// log). Another log entry, a summary root or any other packet this
+    /// device holds by name is not carried.
+    pub fn carries(&self, name: &Name) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let now = (inner.config.clock)();
+        let st = inner.st.lock();
+        if name.has_prefix(&intro_prefix(&inner.device)) {
+            return inner.offers_open(&st, now);
+        }
+        parse_held_name(name).is_some_and(|(holder, piece)| {
+            holder == inner.device
+                && st.intro.offers.get(&piece).is_some_and(|ob| ob.until > now)
+                && parse_log_name(&piece).is_some_and(|l| l.device == inner.device)
+        })
+    }
+}
+
+impl Inner {
+    /// Whether this device holds an own offer that has not expired at `now`.
+    fn offers_open(&self, st: &St, now: Timestamp) -> bool {
+        st.intro.offers.iter().any(|(name, ob)| {
+            ob.until > now && parse_log_name(name).is_some_and(|l| l.device == self.device)
+        })
+    }
+}
+
 impl Device {
+    /// What this device's introductions serve over a link a stranger
+    /// dialled: a host that takes such links gives it to its link layer
+    /// (ndn-link's `LinkHints::serve`). It holds this device weakly.
+    pub fn introductions(&self) -> IntroductionSurface {
+        IntroductionSurface {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Make a one-use offer of `folder` (spec §19.2): a folder of this
     /// device's namespace whose members record is held here. Its record —
     /// the folder, the role, the expiry, the wrong tries that close it, a
@@ -1348,7 +1558,7 @@ impl Device {
     /// again.
     pub async fn join(&self, code: &str) -> Result<Joined, DataError> {
         let inner = &self.inner;
-        let code = parse_code(code)?;
+        let code = parse_code(code, inner.config.intro.local_candidates)?;
         let offer = code.offer.clone();
         let bad = |why: &str| DataError::BadRequest {
             name: offer.clone(),
@@ -1367,18 +1577,13 @@ impl Device {
                 "the code offers a folder of this device's own namespace: it is yours already",
             ));
         }
-        // A namespace the code names is judged before anything is asked:
-        // this device trusts none of it yet, and never one overlapping a
-        // namespace it trusts (spec §19.3).
-        if let (Some(ns), Fingerprint::Whole(fp)) = (&code.namespace, &code.fingerprint)
-            && let Some(why) = inner.overlap(ns, fp)
-        {
+        // What the code says is judged before anything is dialled or asked
+        // (spec §19.3): the dial gives whoever holds the key a link, and a
+        // code's device name is only what it claims.
+        if let Some(why) = inner.refuse_before_dial(&code, &device) {
             return Err(DataError::Introduction {
                 offer: offer.clone(),
-                why: IntroRefusal::InviterConflict {
-                    inviter: ns.clone(),
-                    why,
-                },
+                why,
             });
         }
         let introducer = Arc::clone(inner.introducer()?);
@@ -1399,193 +1604,211 @@ impl Device {
         // step 0): on success the Interests go by name over that link; any
         // failure leaves the relay hints (or routing by name) as before.
         let mut hints = inner.hints(&code.relays);
+        let mut dialled = None;
         if let Some(hint) = &code.link_hint {
             match introducer
                 .dial(hint, &device, inner.config.first_look)
                 .await
             {
-                Ok(()) => hints.clear(),
+                Ok(()) => {
+                    hints.clear();
+                    dialled = Some(hint);
+                }
                 Err(why) => {
                     tracing::debug!(%offer, "the code's link hint was not dialled: {why}")
                 }
             }
         }
         let pk = proof_key(&code.secret, &offer);
-
-        // The offer, as the offering device serves its own log entry.
-        let held = wire::held_name(&device, &offer);
-        let mut wrapped = None;
-        for _ in 0..OFFER_TRIES {
-            wrapped = inner.fetch_hinted(held.clone(), &hints, None).await;
-            if wrapped.is_some() {
-                break;
+        // A join that fails after its dial takes the dial's link down
+        // ([`Introducer::undial`]): what answered at the hint's key proved
+        // nothing, and the link is kept only once the inviter's namespace is
+        // held and the link identified.
+        let joined: Result<Joined, DataError> = async {
+            // The offer, as the offering device serves its own log entry.
+            let held = wire::held_name(&device, &offer);
+            let mut wrapped = None;
+            for _ in 0..OFFER_TRIES {
+                wrapped = inner.fetch_hinted(held.clone(), &hints, None).await;
+                if wrapped.is_some() {
+                    break;
+                }
             }
-        }
-        let wrapped = wrapped.ok_or_else(|| offline(&offer, &device))?;
-        let entry = wrapped
-            .content()
-            .and_then(|c| Data::decode(c.clone()).ok())
-            .filter(|e| *wrapped.name == held && *e.name == offer)
-            .ok_or_else(forged)?;
-        let Some(Record::Intro(IntroRecord::Offer(ob))) = entry
-            .content()
-            .and_then(|c| wire::decode_record(c.clone()).ok())
-        else {
-            return Err(DataError::Introduction {
-                offer: offer.clone(),
-                why: IntroRefusal::Unknown,
-            });
-        };
-
-        // The ask.
-        let nonce = inner.nonce();
-        let mut body = AskBody {
-            offer: offer.clone(),
-            nonce,
-            proof: ask_proof(&pk, &offer, &me, &digest, &nonce),
-            credentials,
-            asker: Bytes::new(),
-        };
-        body.asker = inner
-            .ask_proof(&body.binding(&device))
-            .ok_or_else(|| local(format!("the device key {me} did not sign the ask")))?;
-        let mine = Data::decode(body.asker.clone()).map_err(|e| local(e.to_string()))?;
-        if own.signer(&mine).await != Some((me.clone(), digest)) {
-            return Err(local(format!(
-                "the anchor the host gives does not certify this device's key {me} (no chain \
-                 of valid certificates to it): renew the certificate or fix the enrollment"
-            )));
-        }
-        let aad = intro_prefix(&device).encode_to_tlv();
-        let ck = ContentKey::generate();
-        let (ephemeral, key) = wrap_ck_to(&ob.seal_key, &ck, &aad)
-            .map_err(|e| local(format!("the ask could not be sealed: {e}")))?;
-        let params = IntroAsk {
-            ephemeral,
-            key: key.to_bytes(),
-            sealed: ck.seal(&body.encode(), &aad).to_bytes(),
-        }
-        .encode();
-        let name = intro_name(&device, &params);
-        let prefix = intro_prefix(&device);
-        let mut answered = None;
-        for _ in 0..ASK_TRIES {
-            answered = inner
-                .fetch_hinted(prefix.clone(), &hints, Some(&params))
-                .await;
-            if answered.is_some() {
-                break;
-            }
-        }
-        let data = answered.ok_or_else(|| offline(&offer, &device))?;
-
-        // The answer, checked against the code.
-        let answer = data
-            .content()
-            .filter(|_| *data.name == name)
-            .and_then(|c| AnswerBody::decode(c.clone()).ok())
-            .filter(|a| a.offer == offer && a.asker == me && a.digest == digest)
-            .ok_or_else(forged)?;
-        let (folder, role, credentials, signed) = match &answer.outcome {
-            Outcome::Refused(why) => {
+            let wrapped = wrapped.ok_or_else(|| offline(&offer, &device))?;
+            let entry = wrapped
+                .content()
+                .and_then(|c| Data::decode(c.clone()).ok())
+                .filter(|e| *wrapped.name == held && *e.name == offer)
+                .ok_or_else(forged)?;
+            let Some(Record::Intro(IntroRecord::Offer(ob))) = entry
+                .content()
+                .and_then(|c| wire::decode_record(c.clone()).ok())
+            else {
                 return Err(DataError::Introduction {
                     offer: offer.clone(),
-                    why: why.clone(),
+                    why: IntroRefusal::Unknown,
+                });
+            };
+
+            // The ask.
+            let nonce = inner.nonce();
+            let mut body = AskBody {
+                offer: offer.clone(),
+                nonce,
+                proof: ask_proof(&pk, &offer, &me, &digest, &nonce),
+                credentials,
+                asker: Bytes::new(),
+            };
+            body.asker = inner
+                .ask_proof(&body.binding(&device))
+                .ok_or_else(|| local(format!("the device key {me} did not sign the ask")))?;
+            let mine = Data::decode(body.asker.clone()).map_err(|e| local(e.to_string()))?;
+            if own.signer(&mine).await != Some((me.clone(), digest)) {
+                return Err(local(format!(
+                    "the anchor the host gives does not certify this device's key {me} (no chain \
+                 of valid certificates to it): renew the certificate or fix the enrollment"
+                )));
+            }
+            let aad = intro_prefix(&device).encode_to_tlv();
+            let ck = ContentKey::generate();
+            let (ephemeral, key) = wrap_ck_to(&ob.seal_key, &ck, &aad)
+                .map_err(|e| local(format!("the ask could not be sealed: {e}")))?;
+            let params = IntroAsk {
+                ephemeral,
+                key: key.to_bytes(),
+                sealed: ck.seal(&body.encode(), &aad).to_bytes(),
+            }
+            .encode();
+            let name = intro_name(&device, &params);
+            let prefix = intro_prefix(&device);
+            let mut answered = None;
+            for _ in 0..ASK_TRIES {
+                answered = inner
+                    .fetch_hinted(prefix.clone(), &hints, Some(&params))
+                    .await;
+                if answered.is_some() {
+                    break;
+                }
+            }
+            let data = answered.ok_or_else(|| offline(&offer, &device))?;
+
+            // The answer, checked against the code.
+            let answer = data
+                .content()
+                .filter(|_| *data.name == name)
+                .and_then(|c| AnswerBody::decode(c.clone()).ok())
+                .filter(|a| a.offer == offer && a.asker == me && a.digest == digest)
+                .ok_or_else(forged)?;
+            let (folder, role, credentials, signed, revision) = match &answer.outcome {
+                Outcome::Refused(why) => {
+                    return Err(DataError::Introduction {
+                        offer: offer.clone(),
+                        why: why.clone(),
+                    });
+                }
+                Outcome::Accepted {
+                    folder,
+                    role,
+                    credentials,
+                    inviter,
+                    revision,
+                } => (folder.clone(), *role, credentials, inviter, *revision),
+            };
+            if !answer_proves(&pk, &answer) {
+                return Err(forged());
+            }
+            let theirs = open_credentials(credentials).await.ok_or_else(forged)?;
+            let inviter = theirs.ctx.namespace().clone();
+            let signed = Data::decode(signed.clone()).map_err(|_| forged())?;
+            let by_device = |k: &Option<(Name, [u8; 32])>| {
+                k.as_ref()
+                    .is_some_and(|(k, _)| device_of(k).as_ref() == Some(&device))
+            };
+            let signer = theirs.signer(&signed).await;
+            if !code.fingerprint.matches(&theirs.fingerprint())
+                || code.namespace.as_ref().is_some_and(|ns| *ns != inviter)
+                || !device.has_prefix(&inviter)
+                || *signed.name != wire::ask_name(&device, &answer.binding())
+                || !by_device(&signer)
+                || !by_device(&theirs.signer(&entry).await)
+                || ob.commitment != commitment(&code.secret)
+                || ob.folder != folder
+                || ob.role != role
+            {
+                return Err(forged());
+            }
+            // The inviter proved the code: its namespace is judged as one the
+            // code named would have been — the words name none.
+            if let Some(why) = inner.overlap(&inviter, &theirs.fingerprint()) {
+                return Err(DataError::Introduction {
+                    offer: offer.clone(),
+                    why: IntroRefusal::InviterConflict { inviter, why },
                 });
             }
-            Outcome::Accepted {
-                folder,
-                role,
-                credentials,
-                inviter,
-            } => (folder.clone(), *role, credentials, inviter),
-        };
-        if !answer_proves(&pk, &answer) {
-            return Err(forged());
-        }
-        let theirs = open_credentials(credentials).await.ok_or_else(forged)?;
-        let inviter = theirs.ctx.namespace().clone();
-        let signed = Data::decode(signed.clone()).map_err(|_| forged())?;
-        let by_device = |k: &Option<(Name, [u8; 32])>| {
-            k.as_ref()
-                .is_some_and(|(k, _)| device_of(k).as_ref() == Some(&device))
-        };
-        let signer = theirs.signer(&signed).await;
-        if !code.fingerprint.matches(&theirs.fingerprint())
-            || code.namespace.as_ref().is_some_and(|ns| *ns != inviter)
-            || !device.has_prefix(&inviter)
-            || *signed.name != wire::ask_name(&device, &answer.binding())
-            || !by_device(&signer)
-            || !by_device(&theirs.signer(&entry).await)
-            || ob.commitment != commitment(&code.secret)
-            || ob.folder != folder
-            || ob.role != role
-        {
-            return Err(forged());
-        }
-        // The inviter proved the code: its namespace is judged as one the
-        // code named would have been — the words name none.
-        if let Some(why) = inner.overlap(&inviter, &theirs.fingerprint()) {
-            return Err(DataError::Introduction {
-                offer: offer.clone(),
-                why: IntroRefusal::InviterConflict { inviter, why },
-            });
-        }
-        introducer.adopt(&theirs.link()).await.map_err(|why| {
+            introducer.adopt(&theirs.link()).await.map_err(|why| {
             local(format!(
                 "this device's host did not adopt {inviter}'s anchor ({why}): fix that and join \
                  again with the same code (the offer is yours: asking again is answered again)"
             ))
         })?;
-        if !theirs.vouched_by(inner.validator.keyring()) {
-            return Err(DataError::Introduction {
-                offer: offer.clone(),
-                why: IntroRefusal::InviterConflict {
-                    inviter,
-                    why: "carries anchors its namespace, adopted from its genesis, does not \
+            if !theirs.vouched_by(inner.validator.keyring()) {
+                return Err(DataError::Introduction {
+                    offer: offer.clone(),
+                    why: IntroRefusal::InviterConflict {
+                        inviter,
+                        why: "carries anchors its namespace, adopted from its genesis, does not \
                           hold"
-                        .into(),
-                },
-            });
-        }
-        // Its signatures again, judged by what this device now holds of
-        // the namespace: a key the held version revokes, shown with an
-        // older version, does not answer for it.
-        let keyring = inner.validator.keyring();
-        if theirs.signer_held(keyring, &signed).await != signer
-            || !by_device(&theirs.signer_held(keyring, &entry).await)
-        {
-            return Err(DataError::Introduction {
-                offer: offer.clone(),
-                why: IntroRefusal::InviterConflict {
-                    inviter,
-                    why: "answered with a key its namespace, as this device holds it, does not \
-                          certify (a key the held version revokes, or credentials older than it)"
-                        .into(),
-                },
-            });
-        }
-        if let Some((key, _)) = &signer {
-            for c in theirs.chain(key, &inviter) {
-                inner.validator.cert_cache().insert(c);
+                            .into(),
+                    },
+                });
             }
+            // Its signatures again, judged by what this device now holds of
+            // the namespace: a key the held version revokes, shown with an
+            // older version, does not answer for it.
+            let keyring = inner.validator.keyring();
+            if theirs.signer_held(keyring, &signed).await != signer
+                || !by_device(&theirs.signer_held(keyring, &entry).await)
+            {
+                return Err(DataError::Introduction {
+                    offer: offer.clone(),
+                    why: IntroRefusal::InviterConflict {
+                        inviter,
+                        why:
+                            "answered with a key its namespace, as this device holds it, does not \
+                          certify (a key the held version revokes, or credentials older than it)"
+                                .into(),
+                    },
+                });
+            }
+            if let Some((key, _)) = &signer {
+                for c in theirs.chain(key, &inviter) {
+                    inner.validator.cert_cache().insert(c);
+                }
+            }
+            // The joiner is no stranger from here on: it is noted until a members
+            // record held admits it (a put in that window is `NotReady`, never
+            // `AskOwner`), and `join` returns once the record that admits it and,
+            // sealed, the epoch's key are held.
+            if role == Role::Writer && !inner.note_joined(&folder, ob.until, revision).await {
+                return Err(local(
+                    "the device stopped before the join was noted: join again with the same code",
+                ));
+            }
+            inner.look(&folder).await?;
+            inner.await_admission(&folder, role, &device).await?;
+            Ok(Joined {
+                folder,
+                role,
+                inviter,
+            })
         }
-        // The joiner is no stranger from here on: it is noted until a members
-        // record held admits it (a put in that window is `NotReady`, never
-        // `AskOwner`), and `join` returns once the record that admits it and,
-        // sealed, the epoch's key are held.
-        if role == Role::Writer && !inner.note_joined(&folder).await {
-            return Err(local(
-                "the device stopped before the join was noted: join again with the same code",
-            ));
+        .await;
+        if joined.is_err()
+            && let Some(hint) = dialled
+        {
+            introducer.undial(hint, &device);
         }
-        inner.look(&folder).await?;
-        inner.await_admission(&folder, role, &device).await?;
-        Ok(Joined {
-            folder,
-            role,
-            inviter,
-        })
+        joined
     }
 
     /// Close the offer `offer` this device made, for good (spec §19.2):
