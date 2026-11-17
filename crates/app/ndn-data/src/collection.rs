@@ -618,6 +618,17 @@ impl Accepted {
         self.highest_at_most(c, &id.writer, id.seq.0) == Some(id.seq.0)
     }
 
+    /// How many versions are accepted, over every collection and key.
+    pub fn count(&self) -> u64 {
+        self.0
+            .values()
+            .flat_map(|ws| ws.values())
+            .flat_map(|k| k.runs.iter())
+            .fold(0u64, |n, (lo, hi)| {
+                n.saturating_add(hi.saturating_sub(*lo).saturating_add(1))
+            })
+    }
+
     /// Accept `id` in collection `c`.
     pub fn insert(&mut self, c: &Name, id: &VersionId) {
         self.insert_range(c, &id.writer, id.seq.0, id.seq.0);

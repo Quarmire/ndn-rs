@@ -78,6 +78,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
+use crate::events::{EntryKind, EntryRef, EventDetail, WithdrawnBy};
 use crate::layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     NotCounted, PutOptions, State,
@@ -195,6 +196,16 @@ pub struct Config {
     /// collections followed by their own name or with a members record of
     /// their own, are not counted.
     pub writer_collections: usize,
+    /// The most distinct `(kind, subject)` events this device keeps
+    /// unacknowledged for its host ([`Device::events`], spec §21.5): a new
+    /// one past it, or past half of it of one kind, is counted in the
+    /// single overflow event, never kept and never silent; what is kept is
+    /// never evicted. At least 1.
+    pub events_unacked: usize,
+    /// How many acknowledged events' ids this device remembers, so that
+    /// evidence it derives again after a restart is not reported again
+    /// once acknowledged ([`Device::acknowledge`], spec §21.4).
+    pub events_acked: usize,
 }
 
 impl Config {
@@ -232,6 +243,8 @@ impl Config {
             intro: crate::intro::IntroPolicy::new(),
             watch_queue: 4096,
             writer_collections: 1024,
+            events_unacked: 256,
+            events_acked: 1024,
         }
     }
 }
@@ -259,6 +272,8 @@ impl std::fmt::Debug for Config {
             .field("intro", &self.intro)
             .field("watch_queue", &self.watch_queue)
             .field("writer_collections", &self.writer_collections)
+            .field("events_unacked", &self.events_unacked)
+            .field("events_acked", &self.events_acked)
             .finish_non_exhaustive()
     }
 }
@@ -2203,6 +2218,8 @@ struct St {
     /// The persons' namespaces the records in force list as writers, and
     /// what is adopted of them for those records' subjects (spec §6.3).
     scopes: scoped::Scopes,
+    /// The events no folder owns, kept for the host ([`events::Book`]).
+    events: events::Book,
 }
 
 struct Inner {
@@ -4077,6 +4094,7 @@ impl St {
         me: &Writer,
     ) {
         let c = body.collection.clone();
+        let revision = body.revision;
         if body.folder && wire::check_collection_name(&c).is_err() {
             // A folder has a component after `32=data` (spec §6).
             tracing::debug!(folder = %c, "a folder record of a name with no path; ignored");
@@ -4116,6 +4134,18 @@ impl St {
             return;
         };
         let resolve = line.resolve;
+        // The cuts the record in force took that it did not hold before.
+        let new_cuts: Vec<Cut> = line
+            .own
+            .as_ref()
+            .map(|m| {
+                m.cuts
+                    .iter()
+                    .filter(|k| !before.as_ref().is_some_and(|b| b.cuts.contains(k)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         // The persons' namespaces it lists are adopted for it (spec §6.3),
         // within the caps; what is left out is told.
         let excess = self.scopes.note(&subject, line.own.as_ref());
@@ -4129,6 +4159,24 @@ impl St {
                 .collect()
         };
         let after = line.own.as_ref().map(groups).unwrap_or_default();
+        // Told on the device, whoever watches (spec §21): a writer removed. Not one this device
+        // signed, which its host asked for; nothing while records are made again from those held.
+        if !self.quiet_members && signer != me {
+            for cut in new_cuts {
+                let Some(device) = device_of(signer.key()) else {
+                    continue;
+                };
+                self.report_event(EventDetail::Cut {
+                    subject: c.clone(),
+                    folder: subject.folder,
+                    of: cut.of.clone(),
+                    signer: signer.key().clone(),
+                    record: wire::log_name(&device, Some(&c), seq),
+                    revision,
+                    kept: cut.accept.count(),
+                });
+            }
+        }
         for x in excess {
             tracing::warn!(subject = %x.subject.name, folder = x.subject.folder, left_out = x.namespaces.len(), "{}", x.why);
             self.tell(
@@ -4713,6 +4761,7 @@ impl St {
         }
         for (id, why) in withdrawn {
             tracing::info!(?id, collection = %c, %why, "withdrawn");
+            self.report_withdrawn(c, &id, &why);
             self.tell(
                 c,
                 &Change::Withdrawn {
@@ -5787,6 +5836,19 @@ impl St {
         }
         names.push(name.clone());
         tracing::warn!(%first, second = %name, "two log entries of one key at one seq: equivocation");
+        // Told on the device whatever the kinds of the two entries (spec §21): a members record
+        // against a version is equivocation too, which no folder's watch can carry.
+        let detail = EventDetail::Equivocation {
+            writer: writer.key().clone(),
+            seq,
+            first: self.entry_ref(&first),
+            second: EntryRef {
+                name: name.clone(),
+                kind: Some(EntryKind::of(record)),
+                digest: Some(wire::implicit_digest(wire)),
+            },
+        };
+        self.report_event(detail);
         if let Record::Version(body) = record
             && let Some(first) = self.held_version(&first)
         {
@@ -7269,6 +7331,13 @@ impl Device {
             .map(|pk| public_key_digest(&pk));
         // The signal sequence counter and time hint, as the last run left them.
         let signal_clock = signal::SignalClock::load(store.as_ref());
+        // The events the last run left unacknowledged, before the store is read back.
+        let events = events::Book::load(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            config.events_unacked,
+            config.events_acked,
+        );
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -7356,6 +7425,7 @@ impl Device {
                 to_apply: Vec::new(),
                 sleeping: BTreeSet::new(),
                 scopes: scoped::Scopes::default(),
+                events,
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -7789,6 +7859,7 @@ impl Device {
         // The committer stops, and whatever waits for the barrier is let go.
         self.inner.commit_wake.notify_one();
         self.inner.committed.notify_waiters();
+        self.inner.st.lock().events.wake().notify_waiters();
     }
 
     /// Drop this device's own copies of the chunks of the large versions
@@ -8564,6 +8635,10 @@ impl Inner {
         let mut twins = Vec::new();
         let mut scoped_newest = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
+            // The device's own events, loaded before ([`events::Book::load`]).
+            if events::is_stored(&name) {
+                continue;
+            }
             if let Some(entry) = over(&verified_prefix(), &name) {
                 match decode_verified(&wire) {
                     Some(v) => {
@@ -11514,6 +11589,7 @@ impl Inner {
                     self.store.insert(equivocal_name(&name), wire.clone());
                     st.twins.insert(name.clone(), wire.clone());
                 }
+                st.report_twin(&name, &writer, &record, &wire);
                 let change = Change::Equivocation {
                     collection: body.collection.clone(),
                     first: Equivocal::Here(Box::new(first)),
@@ -11527,10 +11603,15 @@ impl Inner {
                     ))),
                 };
                 st.emit(&body.collection, &change, &writer, seq.saturating_sub(1));
+            } else {
+                // Another kind under the name of a version held, or another packet: told on the
+                // device (spec §21), though no watch can carry it.
+                st.report_twin(&name, &writer, &record, &wire);
             }
             return None;
         }
         if st.held.contains_key(&name) {
+            st.report_twin(&name, &writer, &record, &wire);
             return None;
         }
         let parsed = parse_log_name(&name)?;
@@ -12450,7 +12531,28 @@ impl Inner {
         let (readmit, more) = {
             let mut st = self.st.lock();
             let more = refuses_more(st.contexts.get(&ns).map(|c| &**c), ctx);
+            // Names this context revokes that the one before it for the namespace did not (a
+            // first context of a namespace reports none of its own: what it refuses is told as
+            // withdrawals).
+            let newly: Vec<Name> = st
+                .contexts
+                .get(&ns)
+                .map(|old| {
+                    ctx.revocations()
+                        .iter()
+                        .filter(|r| !old.revocations().contains(r))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             st.contexts.insert(ns.clone(), Arc::clone(ctx));
+            for revoked in newly {
+                st.report_event(EventDetail::Revocation {
+                    namespace: ns.clone(),
+                    revoked,
+                    version: ctx.version(),
+                });
+            }
             let keyring = self.validator.keyring();
             let revoked: Vec<Name> = st
                 .suspected
@@ -12577,6 +12679,21 @@ impl Inner {
             // ([`St::admit_one`]), which reports it if it was delivered.
             if !matches!(st.held.get(&name), Some(Held::Version(_))) {
                 st.refused.insert(name.clone(), why.clone());
+            }
+            // A held record or snapshot is no version a watcher is told of: told on the device
+            // alone (spec §21).
+            if matches!(
+                st.held.get(&name),
+                Some(Held::Record { .. } | Held::Snapshot(_))
+            ) && let Some(by) = WithdrawnBy::of(&why)
+            {
+                let entry = st.entry_ref(&name);
+                st.report_event(EventDetail::Withdrawal {
+                    writer: writer.key().clone(),
+                    collection: parse_log_name(&name).and_then(|l| l.subject),
+                    entry,
+                    by,
+                });
             }
             if let Refusal::Untrusted { why } = &why {
                 self.store.insert(
@@ -13061,6 +13178,7 @@ impl Inner {
                 .is_some_and(|coll| coll.versions.contains_key(&id));
             if !told && !admitted {
                 tracing::info!(?id, collection = %x, "withdrawn: the members record that admitted it is refused");
+                st.report_withdrawn(&x, &id, why);
                 st.tell(
                     &x,
                     &Change::Withdrawn {
@@ -24579,6 +24697,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revocation_adopted_is_an_event_and_so_is_the_withdrawal_it_makes_once_across_restarts()
+     {
+        use crate::events::{EventDetail, EventKind, WithdrawnBy};
+        let r = Revoking::new(VALIDITY_MS).await;
+        for seq in 1..=3 {
+            let (name, data) = r.version(seq, seq);
+            r.dev
+                .inner
+                .take_data(&name, data)
+                .await
+                .expect("before the revocation");
+        }
+        assert!(r.dev.pending_events().is_empty());
+        // No one watches: the revocation and what it refuses are told on the device.
+        r.revoke(2, r.cut(1, 2, &[]));
+        let three = log_name(&r.phone, Some(&r.c), 3);
+        until(&r.dev, |st| st.refused.contains_key(&three)).await;
+        let events = r.dev.pending_events();
+        let revocations: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind() == EventKind::Revocation)
+            .collect();
+        assert_eq!(
+            revocations.len(),
+            1,
+            "a trust context revoking the phone's key is an event; pending: {events:?}"
+        );
+        assert_eq!(
+            revocations[0].detail,
+            EventDetail::Revocation {
+                namespace: n("/sam"),
+                revoked: r.key.clone(),
+                version: 2,
+            }
+        );
+        assert_eq!(revocations[0].meaning(), crate::events::Meaning::KeyRefused);
+        let withdrawals: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind() == EventKind::Withdrawal)
+            .collect();
+        assert_eq!(withdrawals.len(), 1, "{events:?}");
+        assert!(
+            matches!(&withdrawals[0].detail, EventDetail::Withdrawal { writer, collection, entry, by: WithdrawnBy::Cut { of, .. } }
+                if *writer == r.key && collection.as_ref() == Some(&r.c) && entry.name == three && *of == r.key),
+            "{:?}",
+            withdrawals[0]
+        );
+        assert!(revocations[0].cursor < withdrawals[0].cursor);
+
+        // A restart judges what is held again: the same events, once, not new ones.
+        r.dev.shutdown();
+        let again = start(&n("/rita/tab"), &r.tab_keys, &r.validator, &r.store)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.pending_events(),
+            events,
+            "the events outlive the restart, each once"
+        );
+        let ids: Vec<_> = events.iter().map(|e| e.id).collect();
+        again.acknowledge(&ids).await.unwrap();
+        again.shutdown();
+        let last = start(&n("/rita/tab"), &r.tab_keys, &r.validator, &r.store)
+            .await
+            .unwrap();
+        assert!(
+            last.pending_events().is_empty(),
+            "acknowledged, and judged again at start: not reported again: {:?}",
+            last.pending_events()
+        );
+        last.shutdown();
+    }
+
+    #[tokio::test]
     async fn an_exact_re_admission_admits_exactly_that_version() {
         let r = Revoking::new(VALIDITY_MS).await;
         r.revoke(2, r.cut(1, 2, &[]));
@@ -25942,6 +26134,11 @@ pub use intro::IntroductionSurface;
 mod groups;
 
 mod scoped;
+
+mod events;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod events_tests;
 
 mod signal;
 

@@ -65,6 +65,7 @@
 pub mod collection;
 pub mod device;
 pub mod error;
+pub mod events;
 pub mod intro;
 pub mod layer;
 pub mod merge;
@@ -82,6 +83,10 @@ pub use device::{
     Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Released, Transport,
 };
 pub use error::{DataError, NextStep, Refusal};
+pub use events::{
+    Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId, EventKind,
+    EventSubject, Meaning, WithdrawnBy,
+};
 pub use intro::{Code, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
