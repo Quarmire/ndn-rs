@@ -97,6 +97,28 @@ impl Inner {
 
     // ---- evidence -----------------------------------------------------------------------------
 
+    /// Evidence of the read-set `fault` against the signer of each answer of `signed`, except one
+    /// this device signed itself: that one was made before something this device holds changed
+    /// (an evaluator upgraded under the same name), is no fault of any key, and is reproducible,
+    /// so it is dropped and never blamed nor blocked (answers.md §8.2).
+    fn blame(&self, signed: &[Opened], fault: ReadSetFault) {
+        for o in signed {
+            if self.is_own_key(&o.signer) {
+                let mut st = self.st.lock();
+                self.drop_own(&mut st, &o.id);
+                continue;
+            }
+            self.raise_evidence(
+                &o.data,
+                o.kind,
+                &o.signer,
+                o.id,
+                o.body.binding.reads.0,
+                AnswerFault::ReadSet(fault),
+            );
+        }
+    }
+
     /// Keep `data`, a verified answer packet, as evidence against `signer` and report it as the
     /// device-wide event `AnswerEvidence` (answers.md §8.2): stored whole first, once.
     pub(super) fn raise_evidence(
@@ -320,6 +342,20 @@ impl Inner {
         };
         if first == o.result_digest {
             return Ok(());
+        }
+        if self.is_own_key(&o.signer) {
+            // A packet this device's key signed, whose result is not what this device holds at
+            // its name: a copy made before an evaluator changed its output (answers.md §8.2).
+            // No fault of the key, so no evidence and no block.
+            return Err(answer_error(
+                &o.name,
+                AnswerRefusal::Untrusted {
+                    why: "it is signed by this device's own key with a result other than the one \
+                          this device holds at that name (a copy made before an evaluator \
+                          changed its output); this device recomputes instead"
+                        .into(),
+                },
+            ));
         }
         if let Some(wire) = self.stored_answer(&o.name)
             && let Ok(d) = Data::decode(wire)
@@ -883,28 +919,10 @@ impl Inner {
                     // The signed answer's read set is not the evaluator's reading of its
                     // definition: evidence against its signer, and the answer is refused.
                     if let EvalFail::NotItsReads(_) | EvalFail::Refused(_) = &f {
-                        for o in &signed {
-                            self.raise_evidence(
-                                &o.data,
-                                o.kind,
-                                &o.signer,
-                                o.id,
-                                o.body.binding.reads.0,
-                                AnswerFault::ReadSet(ReadSetFault::NotItsReads),
-                            );
-                        }
+                        self.blame(&signed, ReadSetFault::NotItsReads);
                     }
                     if let EvalFail::Conflict(_) = &f {
-                        for o in &signed {
-                            self.raise_evidence(
-                                &o.data,
-                                o.kind,
-                                &o.signer,
-                                o.id,
-                                o.body.binding.reads.0,
-                                AnswerFault::ReadSet(ReadSetFault::HeldConflict),
-                            );
-                        }
+                        self.blame(&signed, ReadSetFault::HeldConflict);
                     }
                     let is_signed = !signed.is_empty();
                     let f = match f {
@@ -943,6 +961,13 @@ impl Inner {
         for o in &seen {
             if o.result_digest == digest {
                 confirmed_by.push(o.signer.clone());
+            } else if self.is_own_key(&o.signer) {
+                // An answer this device signed before its evaluator changed its output under
+                // the same name (a host upgrade): no fault of any key, so no evidence and no
+                // block. It is reproducible, so it is dropped and the recomputed value stands.
+                tracing::info!(name = %o.name, "an own answer differs from the recomputed result: dropped");
+                let mut st = self.st.lock();
+                self.drop_own(&mut st, &o.id);
             } else {
                 disagreed_with.push(o.signer.clone());
                 self.raise_evidence(
@@ -1075,6 +1100,13 @@ impl Inner {
                 .find(|b| found[**b].result_digest != found[a].result_digest)
         {
             let (x, y) = (&found[a], &found[b]);
+            // Never evidence against this device's own key (answers.md §8.2): of two, blame
+            // the other.
+            let (x, y) = if self.is_own_key(&y.signer) {
+                (y, x)
+            } else {
+                (x, y)
+            };
             self.raise_evidence(
                 &y.data,
                 y.kind,

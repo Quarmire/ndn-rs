@@ -27,7 +27,7 @@ use crate::answer::{AnswerKind, AnswerStore};
 use crate::error::DataError;
 use crate::pieces::Piece;
 use crate::version::Writer;
-use crate::wire::{self, parse_answer_name, parse_answer_piece_name};
+use crate::wire::{self, device_of, parse_answer_name, parse_answer_piece_name};
 use ndn_packet::{Data, Name};
 
 fn answers_prefix() -> Name {
@@ -251,6 +251,11 @@ impl Inner {
         )
     }
 
+    /// Whether `signer` is a key of this very device: what it signed is its own answer.
+    pub(super) fn is_own_key(&self, signer: &Writer) -> bool {
+        device_of(signer.key()).as_ref() == Some(&self.device)
+    }
+
     /// The answer packet stored under `name`: its wire, if this device holds it (an own answer
     /// not yet behind the barrier included: this device may use it, it just does not serve it).
     pub(super) fn stored_answer(&self, name: &Name) -> Option<Bytes> {
@@ -336,7 +341,9 @@ impl Inner {
         }
     }
 
-    fn drop_own(&self, st: &mut St, id: &[u8; 32]) {
+    /// Drop this device's own answer at `id`, with its pieces: no longer stored, served or kept
+    /// as what it signed.
+    pub(super) fn drop_own(&self, st: &mut St, id: &[u8; 32]) {
         if let Some(o) = st.answer_book.own.remove(id) {
             st.answer_book.total = st.answer_book.total.saturating_sub(o.size);
             st.answer_book.served.remove(&o.name);

@@ -2211,3 +2211,57 @@ async fn a_suspected_key_is_neither_taken_nor_served_for_answers_until_unsuspect
     assert!(ask(&phone, &name).await.is_ok());
     assert!(matches!(phone.inner.answer_packet(&name), Some(Some(_))));
 }
+
+#[tokio::test]
+async fn an_own_answer_made_before_an_evaluator_changed_is_dropped_and_recomputed_not_blamed() {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, knowing(vec![sum(1)])).await;
+    let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
+    let name = laptop.publish_answer(&q).await.unwrap();
+    assert_eq!(
+        ask(&laptop, &q).await.unwrap().result,
+        Bytes::from_static(b"3")
+    );
+    assert!(laptop.inner.stored_answer(&name).is_some());
+
+    // The host is upgraded, and the evaluator of the same name and version now gives another
+    // output.
+    let laptop = w.restart("/alice/laptop", knowing(vec![lax_sum(1)])).await;
+    let got = ask(&laptop, &name).await.unwrap();
+    assert_eq!(
+        got.result,
+        Bytes::from_static(b"4"),
+        "the value is the recomputed one"
+    );
+    assert!(
+        matches!(&got.how, Provenance::Recomputed { confirmed_by, disagreed_with }
+        if confirmed_by.is_empty() && disagreed_with.is_empty()),
+        "{:?}",
+        got.how
+    );
+    assert!(
+        events_of(&laptop, EventKind::AnswerEvidence).is_empty(),
+        "no evidence against this device's own key: {:?}",
+        laptop.pending_events()
+    );
+    assert!(
+        !laptop.inner.st.lock().answer_book.is_blocked_name(&name),
+        "the name is not blocked"
+    );
+    assert!(
+        laptop.inner.stored_answer(&name).is_none(),
+        "the stale answer is dropped, not kept as evidence nor served"
+    );
+    assert_eq!(laptop.inner.answer_packet(&name), Some(None));
+    assert_eq!(
+        ask(&laptop, &q).await.unwrap().result,
+        Bytes::from_static(b"4")
+    );
+    assert!(
+        laptop
+            .inner
+            .store
+            .scan_under(&n("/localhost/ndn-data/answer-evidence"), 0)
+            .is_empty()
+    );
+}
