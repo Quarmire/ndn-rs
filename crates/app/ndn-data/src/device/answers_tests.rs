@@ -24,6 +24,9 @@ use crate::layer::Share;
 
 const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
 
+#[path = "answer_padding_tests.rs"]
+mod padding;
+
 fn now_ns() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)

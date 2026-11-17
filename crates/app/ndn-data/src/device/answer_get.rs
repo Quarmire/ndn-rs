@@ -259,6 +259,11 @@ impl Inner {
                 }
             }
         };
+        // A sealed body is its AnswerBody and the padding it is due (answers.md §13.3).
+        let plain = match keys {
+            Some(_) => crate::answer::unpad_body(plain).map_err(refuse)?,
+            None => plain,
+        };
         // Evidence of what this device holds is kept against this signer's answer at this name
         // ([`Cause::Reads`]): the answer is judged afresh, and the evidence ends when it no
         // longer yields the fault (answers.md §8.2). A fault judged again is not told again.
@@ -1290,11 +1295,23 @@ impl Inner {
         if body.len() as u64 > PAYLOAD_MAX {
             return Err(too_large("the answer", body.len() as u64, PAYLOAD_MAX));
         }
-        // What goes in the packet, and what in pieces.
+        // What goes in the packet, and what in pieces. A sealed body is padded to its size bucket
+        // first (answers.md §13.3), so the packet's size tells a relay the bucket and not the
+        // number of reads.
         let carried = match keys {
-            Some(k) => seal::seal_answer(k, &name, binding.kind, epochs, &body),
+            Some(k) => {
+                let padded = crate::answer::pad_body(&body);
+                seal::seal_answer(k, &name, binding.kind, epochs, &padded)
+            }
             None => body.clone(),
         };
+        if carried.len() as u64 > PAYLOAD_MAX {
+            return Err(too_large(
+                "the sealed answer, padded",
+                carried.len() as u64,
+                PAYLOAD_MAX,
+            ));
+        }
         let (content, pieces) = if carried.len() <= INLINE_MAX {
             (
                 match keys {

@@ -36,7 +36,7 @@ pub const SEAL_EPOCHS_MAX: usize = 256;
 pub const QUESTION_MAX: usize = 65_536;
 
 /// TLV-TYPE numbers of answers (0x05C0–0x05DF, all odd: every field changes what an answer
-/// means). Registered in `docs/specs/README.md`; 0x05DD–0x05DF are held for the ask exchange.
+/// means). Registered in `docs/specs/README.md`; 0x05DE–0x05DF are held for the ask exchange.
 pub mod tlv {
     /// An answer's Content: `AnswerKind`, then one of `AnswerBody`; `AnswerSealed` with a
     /// `Ciphertext`; `Chunks`; `AnswerSealed` without a `Ciphertext`, then `Chunks`.
@@ -59,7 +59,8 @@ pub mod tlv {
     pub const READ_STATE: u64 = 0x05CF;
     /// The evaluator's or function's octets.
     pub const RESULT: u64 = 0x05D1;
-    /// `SealEpoch+` in ascending order, then a `Ciphertext`: the `AnswerBody` sealed.
+    /// `SealEpoch+` in ascending order, then a `Ciphertext`: the `AnswerBody` and its
+    /// `AnswerPadding`, sealed.
     pub const ANSWER_SEALED: u64 = 0x05D3;
     /// A question: `AnswerKind`, the definition (pure), `AnswerBy`, a `ReadSet` the asker
     /// states, if any. In a question's name only, never on a packet.
@@ -71,6 +72,9 @@ pub mod tlv {
     pub const ANSWER_FAULT: u64 = 0x05D9;
     /// 0–8 (NonNegativeInteger).
     pub const FAULT_KIND: u64 = 0x05DB;
+    /// Zero octets after the `AnswerBody`, inside a sealed answer's plaintext only: they make the
+    /// plaintext the size of its bucket (answers.md §5.3).
+    pub const ANSWER_PADDING: u64 = 0x05DD;
 }
 
 /// The label of the read-set digest.
@@ -796,6 +800,143 @@ impl Body {
         }
         Ok(body)
     }
+}
+
+// ---- padding a sealed body -----------------------------------------------------------------------
+
+/// A sealed answer's plaintext grows in steps of this many octets up to [`PAD_LINEAR_MAX`].
+const PAD_STEP: usize = 128;
+/// Above this many octets the steps are an eighth of the plaintext's power of two (answers.md
+/// §13.3), so the padding is at most 12.5% of the body.
+const PAD_LINEAR_MAX: usize = 1024;
+
+/// The octets of `x` as a TLV-TYPE or TLV-LENGTH number.
+fn number_len(x: usize) -> usize {
+    match x {
+        0..=252 => 1,
+        253..=0xFFFF => 3,
+        0x1_0000..=0xFFFF_FFFF => 5,
+        _ => 9,
+    }
+}
+
+/// The octets of the `AnswerPadding` TLV with exactly `total` octets, as its value's length; none
+/// when there is no such element: the length number takes 1, 3 or 5 octets, so no element is of
+/// 1 to 3 octets, of 257 or 258 or of 65,542 or 65,543.
+fn padding_value_len(total: usize) -> Option<usize> {
+    [1, 3, 5, 9].into_iter().find_map(|length| {
+        let value = total.checked_sub(number_len(tlv::ANSWER_PADDING as usize) + length)?;
+        (number_len(value) == length).then_some(value)
+    })
+}
+
+/// The least size of a bucket that holds `n` octets (answers.md §13.3).
+fn bucket_at_least(n: usize) -> usize {
+    let step = match n <= PAD_LINEAR_MAX {
+        true => PAD_STEP,
+        false => 1 << (n.ilog2() - 3),
+    };
+    n.div_ceil(step).max(1) * step
+}
+
+/// The size a sealed answer's plaintext has when its `AnswerBody` is `n` octets: the least bucket
+/// that is `n` itself or leaves room for an `AnswerPadding` element (answers.md §13.3). Buckets are
+/// the multiples of 128 octets up to 1,024 and above that the multiples of an eighth of the
+/// plaintext's power of two. A bucket that would leave a gap no element fills (1 to 3 octets, 257
+/// or 258, 65,542 or 65,543) is passed over for the next.
+pub(crate) fn padded_len(n: usize) -> usize {
+    let mut size = bucket_at_least(n);
+    while size != n && padding_value_len(size - n).is_none() {
+        size = bucket_at_least(size + 1);
+    }
+    size
+}
+
+/// `body` (an `AnswerBody` TLV) followed by the `AnswerPadding` that makes it [`padded_len`]
+/// octets: zeros, none when the body is that size already.
+pub(crate) fn pad_body(body: &Bytes) -> Vec<u8> {
+    let size = padded_len(body.len());
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(body);
+    if size > body.len() {
+        let zeros = padding_value_len(size - body.len()).expect("padded_len leaves room");
+        let mut w = TlvWriter::new();
+        w.write_varu64(tlv::ANSWER_PADDING);
+        w.write_varu64(zeros as u64);
+        out.extend_from_slice(&w.finish());
+        out.resize(size, 0);
+    }
+    out
+}
+
+/// The `AnswerBody` of a sealed answer's decrypted plaintext, which MUST be that body and the one
+/// `AnswerPadding` of zeros [`pad_body`] makes of it: padding that is missing, not last, repeated,
+/// not of the length it is due, not minimally encoded or not zero is refused.
+pub(crate) fn unpad_body(plain: Bytes) -> Result<Bytes, AnswerRefusal> {
+    let refuse = |why: String| {
+        AnswerRefusal::Malformed(format!(
+            "{why}; a signer pads a sealed answer as answers.md §13.3 says, so this packet is \
+             not a conforming answer: ask another holder of it"
+        ))
+    };
+    let mut r = TlvReader::new(plain.clone());
+    let (typ, _) = r
+        .read_tlv()
+        .map_err(|e| refuse(format!("its sealed body does not start with a TLV: {e:?}")))?;
+    if typ == tlv::ANSWER_PADDING {
+        return Err(refuse(
+            "its AnswerPadding comes before its AnswerBody; the padding is last".into(),
+        ));
+    }
+    if typ != tlv::ANSWER_BODY {
+        return Err(refuse(format!(
+            "its sealed body starts with TLV-TYPE {typ:#x}, not an AnswerBody"
+        )));
+    }
+    let end = r.position();
+    let body = plain.slice(..end);
+    let due = padded_len(end);
+    if r.is_empty() {
+        return match due == end {
+            true => Ok(body),
+            false => Err(refuse(format!(
+                "its AnswerBody of {end} octets has no AnswerPadding, and is due one up to {due} \
+                 octets"
+            ))),
+        };
+    }
+    let (typ, zeros) = r
+        .read_tlv()
+        .map_err(|e| refuse(format!("its AnswerPadding is not a well-formed TLV: {e:?}")))?;
+    if typ != tlv::ANSWER_PADDING {
+        return Err(refuse(format!(
+            "TLV-TYPE {typ:#x} follows its AnswerBody; only one AnswerPadding does"
+        )));
+    }
+    if !r.is_empty() {
+        return Err(refuse(
+            "more follows its AnswerPadding; the padding is one TLV, the last".into(),
+        ));
+    }
+    if due == end {
+        return Err(refuse(format!(
+            "its AnswerBody of {end} octets is a bucket already, and no AnswerPadding is due"
+        )));
+    }
+    if plain.len() != due || Some(zeros.len()) != padding_value_len(due - end) {
+        return Err(refuse(format!(
+            "its AnswerBody of {end} octets has an AnswerPadding that makes it {} octets, not the \
+             {due} octets of its bucket, or does not encode it minimally",
+            plain.len()
+        )));
+    }
+    if zeros.iter().any(|b| *b != 0) {
+        return Err(refuse(
+            "its AnswerPadding carries non-zero octets; padding is zeros and carries nothing"
+                .into(),
+        ));
+    }
+    Ok(body)
 }
 
 /// What an answer's content carries after its kind (answers.md §3.4).

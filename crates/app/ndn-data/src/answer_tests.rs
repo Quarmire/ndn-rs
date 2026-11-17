@@ -726,3 +726,161 @@ fn an_answer_evidence_event_has_its_helpers_and_a_codec_that_round_trips() {
         );
     }
 }
+
+// ---- the padding of a sealed body (answers.md §13.3) --------------------------------------------
+
+/// Whether `t` is a size bucket: a multiple of 128 up to 1,024, then of an eighth of its power of
+/// two.
+fn is_bucket(t: usize) -> bool {
+    match t <= 1024 {
+        true => t.is_multiple_of(128),
+        false => t.is_multiple_of(1 << (t.ilog2() - 3)),
+    }
+}
+
+/// Whether an `AnswerPadding` element (a three-octet type, a one-, three- or five-octet length) is
+/// of exactly `e` octets.
+fn element_of(e: usize) -> bool {
+    (4..=256).contains(&e) || (259..=65_541).contains(&e) || e >= 65_544
+}
+
+/// An `AnswerBody` TLV of exactly `total` octets, if one is.
+fn body_of(total: usize) -> Option<Bytes> {
+    for (header, lo, hi) in [(4, 0, 252), (6, 253, 65_535), (8, 65_536, usize::MAX)] {
+        if let Some(v) = total.checked_sub(header)
+            && (lo..=hi).contains(&v)
+        {
+            let mut w = TlvWriter::new();
+            w.write_tlv(tlv::ANSWER_BODY, &vec![7u8; v]);
+            return Some(w.finish());
+        }
+    }
+    None
+}
+
+#[test]
+fn a_sealed_body_pads_to_the_buckets_the_spec_lists_and_skips_the_sizes_no_element_fills() {
+    use crate::answer::padded_len;
+    // 128-octet steps to 1,024.
+    for (n, t) in [
+        (4, 128),
+        (124, 128),
+        (128, 128),
+        (129, 256),
+        (256, 256),
+        (257, 384),
+        (1000, 1024),
+        (1024, 1024),
+    ] {
+        assert_eq!(padded_len(n), t, "a body of {n} octets");
+    }
+    // 125 to 127 octets leave 3 to 1 octets to 128, no element: the next bucket.
+    for n in [125, 126, 127] {
+        assert_eq!(padded_len(n), 256, "a body of {n} octets");
+    }
+    // Then steps of 2^(floor(log2 n) - 3).
+    for (n, t) in [
+        (1025, 1152),
+        (2044, 2048),
+        (2047, 2560),
+        (2048, 2048),
+        (2049, 2304),
+        (4097, 4608),
+        (65_535, 73_728),
+        (65_537, 73_728),
+    ] {
+        assert_eq!(padded_len(n), t, "a body of {n} octets");
+    }
+    // 1,021 to 1,023 leave 3 to 1 octets to 1,024: the next bucket, 1,152.
+    for n in [1021, 1022, 1023] {
+        assert_eq!(padded_len(n), 1152, "a body of {n} octets");
+    }
+    // No element is of 257 or 258 octets: a body that would leave that many to its bucket goes up
+    // one bucket. 4,608 is a bucket of 512-octet steps.
+    for (n, t) in [
+        (4349, 4608),
+        (4350, 5120),
+        (4351, 5120),
+        (4352, 4608),
+        (4353, 4608),
+        (252, 256),
+        (253, 384),
+        (255, 384),
+    ] {
+        assert_eq!(padded_len(n), t, "a body of {n} octets");
+    }
+    // No element is of 65,542 or 65,543 octets: the bucket 1,179,648 is passed over for the next
+    // (steps of 131,072) by a body of 65,542 or 65,543 octets less, and not by one of 65,541.
+    let bucket = 1_179_648;
+    for (gap, t) in [
+        (65_541, bucket),
+        (65_542, bucket + 131_072),
+        (65_543, bucket + 131_072),
+        (65_544, bucket),
+    ] {
+        let n = bucket - gap;
+        assert_eq!(
+            padded_len(n),
+            t,
+            "a body of {n} octets, {gap} below a bucket"
+        );
+        let body = body_of(n).unwrap();
+        let padded = crate::answer::pad_body(&body);
+        assert_eq!(padded.len(), t);
+        assert_eq!(
+            crate::answer::unpad_body(Bytes::from(padded)).unwrap(),
+            body
+        );
+    }
+}
+
+#[test]
+fn every_body_length_pads_to_the_least_bucket_with_room_and_decodes_and_nothing_else_does() {
+    use crate::answer::{pad_body, padded_len, unpad_body};
+    for n in 4..=70_000usize {
+        let t = padded_len(n);
+        assert!(is_bucket(t), "{n} octets pad to {t}, not a bucket");
+        assert!(
+            t == n || element_of(t - n),
+            "{n} octets pad to {t}: no element fills it"
+        );
+        for b in n..t {
+            assert!(
+                !(is_bucket(b) && (b == n || element_of(b - n))),
+                "{n} octets pad to {t}, but the bucket {b} holds them"
+            );
+        }
+        let over = t - n;
+        match n <= 1024 {
+            true => assert!(over <= 131, "{n} octets pad by {over}"),
+            false => assert!(over * 100 <= n * 26, "{n} octets pad by {over}"),
+        }
+        // The sizes of an AnswerBody TLV are not all there are; those that are, round trip.
+        let Some(body) = body_of(n) else { continue };
+        let padded = pad_body(&body);
+        assert_eq!(padded.len(), t, "a body of {n} octets");
+        let padded = Bytes::from(padded);
+        assert_eq!(
+            unpad_body(padded.clone()).unwrap(),
+            body,
+            "a body of {n} octets"
+        );
+        // The padding is due: one octet more or less is refused, and so is none.
+        if t > n {
+            assert!(unpad_body(padded.slice(..t - 1)).is_err(), "{n}");
+            assert!(unpad_body(body.clone()).is_err(), "{n}");
+        }
+    }
+    // The sizes above 70,000, where the steps grow: bucket, and an element that fills it.
+    for e in 17..=26u32 {
+        for d in [
+            0usize, 1, 2, 3, 255, 256, 257, 258, 259, 65_541, 65_542, 65_543, 65_544,
+        ] {
+            let n = (1usize << e) - d;
+            let t = padded_len(n);
+            assert!(t >= n && is_bucket(t), "{n} octets pad to {t}");
+            assert!(t == n || element_of(t - n), "{n} octets pad to {t}");
+            assert!(t * 100 <= n * 126, "{n} octets pad to {t}");
+        }
+    }
+}
