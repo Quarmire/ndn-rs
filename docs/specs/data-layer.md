@@ -34,6 +34,10 @@
   their wire format (§16). Sections marked with a later slice are not yet
   normative beyond what they state; a section marked *open* has no
   normative content beyond its text.
+- **Answers (round 5, item F):** named, checkable, sealed readings over signed
+  data are specified in [answers.md](answers.md) (the interim of slice 8, a
+  service that `put`s its answer into a collection of its own, is replaced by
+  it); this document names where they touch it.
 - **Scope:** the data model shared by files, databases and network
   exchanges — versions, collections, members, summaries, cuts, snapshots,
   custody, prune, seals and types — and the seven verbs over it. The Rust
@@ -88,6 +92,10 @@ Every implementation MUST hold all of these.
 9. **Forward-only, said plainly.** Revocation and deletion stop future
    reads; an implementation MUST NOT claim to recall copies already made.
 
+10. **Answers say what they read.** An answer is immutable and named by the
+    exact versions it read; a mismatch with a recomputation is evidence
+    (answers.md).
+
 No validity decision may accept anything because of a wall clock, nor
 compare a certificate's validity period with one, with one exception that
 can only refuse: a key of a role the trust context lists in DataRequiresCut
@@ -126,7 +134,8 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   where a collection is asked for, or another keyword or digest component —
   answers `BadName`, saying which and how the name must be formed
   (`NextStep::FixName`). `get` also takes log entry and state names
-  (§11), and entry and range names (§4.1, §5.4).
+  (§11), entry and range names (§4.1, §5.4), and answer and question names
+  (answers.md §3.3, §7.1).
 - A **device** `D` is the identity of one key: the key is named
   `<D>/KEY/<key-id>` (NDN key naming). `D` is the device's name in seals
   and the prefix it serves; it has no KeywordNameComponent or digest
@@ -420,6 +429,11 @@ a put. Batching is there for atomicity, and for engines that pay per write.
   after a kill, or none is. A group of `GROUP_MAX` versions is a batch of
   that many entries with their pieces and markers, held in memory until it
   is handed over, as the signed group already is.
+
+An answer is served, announced and listed only behind the same barrier as a log
+entry (answers.md §6.2), and a provider keeps every answer it signed, so after a
+restart or a power loss it serves what it signed or nothing, never another
+result at the name.
 
 ## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name, groups)
 
@@ -2301,6 +2315,11 @@ always did.
   and forwarders and validators keep them and the cut's manifest, for that
   use only (trust-context.md §5.1, §6.3).
 
+**Answers.** A revocation cut never lists an answer (an answer is not a log
+entry and has no seq): like summary roots, one-key heads, seal keys, grants,
+audit answers and an asker's proofs, answers by a revoked key are refused once
+the revocation is held (answers.md §13.9).
+
 ### 8.2 Re-admission — slice 5
 
 A cut can drop honest work: a stolen device's offline edits nobody had
@@ -2721,6 +2740,12 @@ forward ciphertext. Erasure is the destruction of the key.
   names the asker's seal key, the collection or folder and the epoch), and
   when.
 
+**Answers (answers.md §5).** An answer over sealed collections is sealed under
+an audience key derived (HKDF-SHA256) from the content keys of every epoch of
+its read set, so only a device in the audience of every one of them holds it;
+erasing an epoch's key erases the answers that read in it. What a relay sees of
+an answer: its name, kind, the size of its ciphertext and its epoch list.
+
 ## 10. Type — slice 1
 
 A type is a named, versioned content schema (`/types/note`, revision 2).
@@ -2753,6 +2778,10 @@ entry name or a state name. Publishing it makes a set of versions and
 merged states citable together: a link carries the snapshot's name. It
 does not hold the versions it pins back — a reader may count them before
 the snapshot arrives; versions counted all or none are a group (§5.5).
+
+A state read by an answer is bound by the digest of each of its tips and by the
+applied-set digest, the versions of the collection inside the frontier that no
+applied checkpoint covers (answers.md §3.1).
 
 ## 12. Sync notice — slices 1, 2
 
@@ -2946,6 +2975,10 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
 - A reader does not keep an applied operation in pieces in memory: it is
   opened again from the pieces when the state is computed anew. A version
   found not whole is not looked for again until its pieces arrive.
+
+An answer's body travels in pieces as a version's payload does, under the
+answer's name, `<A>/seg=<i>` and `<A>/32=manifest/seg=<k>`
+(answers.md §5.4); no custody applies to answers.
 
 ### 13.2 Hold records and leases
 
@@ -3420,6 +3453,10 @@ of that pass took; otherwise it asks the writer again in the next round.
   orphan pieces of a pruned version serves none of them (the prune
   records are restored, not only the versions held).
 
+A device also serves, under its own `32=held` name, the answers it holds
+verified, as signed: never one of a key it holds evidence against, one a
+revocation refuses, or one it cannot keep (answers.md §6.2, §8.2).
+
 ## 14. Prune and expiry — slices 2 (scope), 3, 4 (expiry), 6 (folder epochs)
 
 A prune is an entry of the pruner's log about collection `C` (Content
@@ -3508,6 +3545,9 @@ A prune is an entry of the pruner's log about collection `C` (Content
 - **What a pruner can and cannot do.** It drops only its own versions; it
   cannot end another writer's data or another holder's promise for it, and
   it cannot recall copies already made.
+
+An answer has no keep: devices drop the answers they hold of others by their
+quota, per signer and in all (answers.md §10).
 
 ### 14.1 Retention by expiry — slice 4
 
@@ -3993,6 +4033,12 @@ decides anything, and a watch keeps telling every `Change` it tells.
   writer, makes the folder move to a new epoch (§14).
 - A verb given a name it cannot take answers `BadName` (§3).
 
+`get` of an answer name `<D>/32=answer/<id>` or a question name
+`<X>/32=question/<AnswerAsk>` answers `Got::Answer` (answers.md §7); the host
+surface adds `Device::answer_id`, `publish_answer`, `provide`, `current_read` and
+`read_ref`; `DataError` gains `CannotCheck` and `Answer`, `NextStep` gains
+`SetPolicy`.
+
 ## 16. Wire format — slices 1–4, 6 (slice 5 adds none)
 
 ### 16.1 Names
@@ -4300,6 +4346,12 @@ existing `32=held` wrapper; a members change (§6.1) signs an ordinary
 writer's namespace adopted for one folder (§6.3) is fetched by the trust
 context's own names; asking again (§17.1) and the faulty mode (§18.1) put
 nothing on the wire. The odd numbers 0x0571–0x057F stay free.
+
+**Answers (round 5).** Names: an answer `<D>/32=answer/<id>` (one component of 32
+octets), a piece of one `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, a question
+`<X>/32=question/<AnswerAsk>` (never fetched), and a held answer
+`<H>/32=held/<Name TLV>` (answers.md §11.1). Round 5 adds the TLV numbers
+0x05C0–0x05DF for answers (answers.md §11.2); every number is odd.
 
 ### 16.3 Why these encodings
 
@@ -5078,6 +5130,10 @@ one that acknowledges what it never saw is refused whole (§21.4). A device that
 stops ends every stream; one that starts again delivers what was not
 acknowledged (§21.6).
 
+An answer asked for by id is an owed fetch: at most `FETCH_TRIES` per candidate
+and `RELAYS_ASKED` candidates (answers.md §7.2); each piece of an answer in
+pieces is asked in rounds.
+
 ## 18. Conformance
 
 `ndn-data-conformance` (ndn-sim) runs the study's use cases against an
@@ -5383,6 +5439,9 @@ check that only the certificates of the verified chain are cached, that a
 joiner whose key is its own anchor is answered, that an offer is not spent
 when the host does not adopt the asker, that a closed offer refuses its
 user too, and that asks past `asks_queued` get no answer at once.
+
+Answers: cases `a1`–`a18` (answers.md §14); case `c12` is rewritten over a
+provider answer.
 
 ### 18.1 Faulty mode
 
@@ -6495,6 +6554,11 @@ evidence give it the same id.
   key or a faulty device does; the layer's refusal of what a cut or a
   revocation excludes was already made without it. The next step a host takes
   (suspect, revoke, re-admit) is the owner's, signed as any other.
+
+The device event `AnswerEvidence` (kind `AnswerEvidence`, detail
+`EventDetail::Answer`, meaning `AnswerKept`) is the evidence of a signed answer
+that a recomputation, a second answer at its name, its binding or its read set
+contradicts (answers.md §8). It coalesces per signer key as every event does.
 
 ### 21.9 Conformance
 

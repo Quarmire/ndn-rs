@@ -1,6 +1,6 @@
 # Answers: named, checkable readings over signed data
 
-- **Status:** Draft (round 5, item F). Normative once built; a section marked `[PENDING F-QUESTIONS #n]` has no normative content beyond its text until the owner answers that question.
+- **Status:** Built (round 5, item F; ndn-rs `ndn-data`, ndn-sim cases `a1`–`a18`). The two pending decisions are closed to their conservative choices (§15): no computation on request (F-QUESTIONS #1, option c; case `a19` is not written and TLV `0x05DD`–`0x05DF` stay free) and policy as a value the host passes (#2, option a).
 - **Scope:** an **answer** is the result of a definition or a function read over exact, signed versions of the data layer, published under a name that binds what was asked and what was read, signed by one device, and sealed to the readers of everything it read. This spec defines:
   - the two kinds of answer, **pure** (any holder of the definition and the inputs can recompute it) and **provider** (trusted because of the provider's authority);
   - the read set, its canonical bytes and its digest;
@@ -197,6 +197,8 @@ where `E` is the exact encoding of the answer's `SealEpoch*` list (the TLVs of �
 
 A key that is not held is asked for as a sealed read asks (data-layer.md §9, §17.1): a device that is to open or make an answer and lacks the key of an epoch of its set asks for it through the same grant, from the devices that grant it; the answer is `NotReady` (retry) while it asks and `Sealed` once the epoch's creator and the devices that grant it refuse.
 
+**An exact name of a sealed answer, as built.** The `SealEpoch` list of an answer names epochs, not collections, so a device that is handed an exact name and holds no key of an epoch in it has no collection to ask a grant for: it answers `Sealed`. A device asks for keys by reading: a question is planned, so its reads chase the keys (§7.2), and a device that read the collections first holds them and opens the exact name.
+
 ### 5.3 What is sealed, and what is clear
 
 When the read set has an epoch, the signer encrypts the **plaintext `AnswerBody`** with ChaCha20-Poly1305 under `seal_key`, a random 96-bit nonce and as associated data the octets of `"ndn-answer/1 aad\0"`, the answer's own name as a Name TLV, the `AnswerKind` octet and the `SealEpoch*` list `E`; `Ciphertext` is `nonce ‖ tag ‖ ciphertext` as in data-layer.md §9. Binding the name, the kind and the epochs to the ciphertext means none of them can be changed, moved to another name, or replayed under another signer's name by a holder without breaking it (they are also signed; the AEAD makes a holder who cannot sign unable to splice). A payload that does not open under the key is refused as `BadSignature`, as for a version.
@@ -351,7 +353,7 @@ Evidence is a **verified** signed answer (it passed §7.3.3 steps 1 to 4) togeth
 |---|---|
 | `Mismatch` | A reader that knows the evaluator recomputed the read set and got a result with a different digest than a signed answer's. Evidence: the signed answer, its signer, the id, the read-set digest, both result digests, the evaluator. |
 | `Equivocation` | **Two verified answers at one name, by one key, whose opened results have different digests.** A name has one result (§2.1). Two packets that open to the same result (a sealed answer made twice has different nonces and so different bytes) are not equivocation. A device that cannot open an answer cannot tell. |
-| `Conflict` | Two verified answers with **one id**, by **two signers** a reader's policy trusts, with different results, where the reader cannot recompute (§7.3). A reader that can recompute has `Mismatch` for whichever is wrong. |
+| `Conflict` | Two verified answers with **one id**, by **two signers** a reader's policy trusts, with different results, where the reader cannot recompute (§7.3). A reader that can recompute has `Mismatch` for whichever is wrong. As built, the reader keeps the second as evidence and returns no result: the error is `Answer` / `Equivocal`. |
 | `Binding` | A signed answer whose content does not give the id in its name (§3.4): the signer put a binding in a name that is not its. |
 | `ReadSet` | A signed answer whose read set is not canonical, whose digest is not the binding's, whose epoch list is not its reads', or that conflicts with a version the reader holds (§7.3.1), or whose reads are not the reads the evaluator makes (§7.3, 1). |
 
@@ -458,7 +460,7 @@ Each says why in its message and what to do in `DataError::next()`; `retry()` te
 | ↳ `ReadsChanged(String)` | A read no longer holds here (§7.3.1): ask again | `RetryLater` |
 | ↳ `NotProvider { signer, function }` | A provider answer by a signer the policy does not name for the function (§7.3) | `SetPolicy` |
 | ↳ `Untrusted { why }` | Its signer's key or issuer is revoked, or the chain no longer verifies (§7.3.3, §13.9) | `AskOwner` |
-| ↳ `Equivocal` | Two answers at this name by this key have different results (§8.1) | `AskOwner` |
+| ↳ `Equivocal` | Evidence is kept against the answer at this name: its result differs from another answer's at this name by this key (§8.1), from a recomputation (a mismatching answer is refused, §8.2), or two trusted signers disagree and the reader cannot recompute. Never served, never taken again | `AskOwner` |
 | ↳ `TooLarge { what, size, limit }` | More reads, epochs or octets than §10 allows | `FixRequest` |
 | ↳ `OverBudget { what }` | An evaluation would exceed the host's budget (§4.1, §10) | `FixLocal` |
 | ↳ `Busy` | A provider answer that must be kept cannot be (§6.2) | `FixLocal` |
@@ -578,6 +580,8 @@ The cases the implementer writes, each failing first on the code before the feat
 c12's part 2 (a summary service) is rewritten as a provider answer over the note (a12, a6); its other parts stay.
 
 ## 15. Pending decisions
+
+Both are decided, to the conservative choices the spec marked. Nothing below is built; the text remains as the record of what was not chosen.
 
 ### `[PENDING F-QUESTIONS #1]` Asking a signer to compute
 
