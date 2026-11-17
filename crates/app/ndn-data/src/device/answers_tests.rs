@@ -249,6 +249,11 @@ fn writer(key: &Name) -> Writer {
 
 /// Every log entry `from` signed, taken by `to` as a peer's.
 fn sync_all(from: &Device, to: &Device) {
+    sync_except(from, to, None);
+}
+
+/// [`sync_all`] but for the entry named `skip`.
+fn sync_except(from: &Device, to: &Device, skip: Option<&Name>) {
     let prefix =
         from.name()
             .clone()
@@ -256,6 +261,9 @@ fn sync_all(from: &Device, to: &Device) {
                 Bytes::from_static(b"log"),
             ));
     for (name, wire) in from.inner.store.scan_under(&prefix, 0) {
+        if skip == Some(&name) {
+            continue;
+        }
         let Ok(data) = Data::decode(wire.clone()) else {
             continue;
         };
@@ -1349,8 +1357,11 @@ async fn the_audience_of_an_answer_is_the_intersection_of_the_epochs_it_reads() 
         let st = laptop.inner.st.lock();
         epochs.push(st.colls[c].members.as_ref().unwrap().epoch.clone().unwrap());
     }
-    let (held, all) = laptop.inner.held_epochs(&got.reads);
-    assert!(all);
+    let Ok(checked) = laptop.inner.check_reads(&got.reads) else {
+        panic!("the reads of its own answer hold");
+    };
+    assert_eq!(checked.unverified, 0, "it holds every read");
+    let held = checked.epochs;
     assert!(
         epochs.iter().all(|e| held.contains(e)),
         "every epoch read is listed"
@@ -2264,4 +2275,317 @@ async fn an_own_answer_made_before_an_evaluator_changed_is_dropped_and_recompute
             .scan_under(&n("/localhost/ndn-data/answer-evidence"), 0)
             .is_empty()
     );
+}
+
+// ---- round 5: evidence blames only a signer at fault -------------------------------------------
+
+/// Two packets of one writer at one name: `from`'s only version of `c` (its name, packet and
+/// writer) and a second, signed by the same key with another date.
+fn twin_of(from: &Device, c: &Name) -> (Name, Bytes, Writer, Bytes) {
+    let (name, wire, writer) = {
+        let st = from.inner.st.lock();
+        let hv = st.colls[c].versions.values().next().expect("a version");
+        (
+            hv.version.name.clone(),
+            hv.wire.clone(),
+            hv.version.id.writer.clone(),
+        )
+    };
+    let data = Data::decode(wire.clone()).unwrap();
+    let Record::Version(mut body) = wire::decode_record(data.content().unwrap().clone()).unwrap()
+    else {
+        panic!("a version")
+    };
+    body.dated = Timestamp(body.dated.0 + 1);
+    let twin = from
+        .inner
+        .sign(DataBuilder::new(
+            name.clone(),
+            &wire::encode_record(&Record::Version(body)),
+        ))
+        .unwrap();
+    (name, wire, writer, twin)
+}
+
+/// `wire`, a packet of the log entry `name`, taken by `to` as a peer's.
+fn take_entry(to: &Device, name: &Name, wire: Bytes, writer: &Writer) {
+    let data = Data::decode(wire.clone()).unwrap();
+    let record = wire::decode_record(data.content().unwrap().clone()).unwrap();
+    let mut st = to.inner.st.lock();
+    to.inner
+        .take(&mut st, name.clone(), wire, writer.clone(), record, false);
+}
+
+#[tokio::test]
+async fn a_read_of_a_version_its_writer_signed_twice_is_no_evidence_against_the_signer() {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, knowing(vec![sum(1)])).await;
+    let (name, _, writer_key, twin) = twin_of(&laptop, &budget());
+    // The signer holds the writer's second packet at the name, and answers honestly over it.
+    let phone = w.start("/alice/phone", knowing(vec![sum(1)])).await;
+    sync_except(&laptop, &phone, Some(&name));
+    take_entry(&phone, &name, twin.clone(), &writer_key);
+    let q = pure_question(newest(&phone, &plan()).await, &sum_v(1));
+    let signed = phone.publish_answer(&q).await.unwrap();
+    let packet = phone.inner.stored_answer(&signed).unwrap();
+
+    // A reader that holds the first packet, and then learns of the second: the read it holds
+    // differs, and the writer is the one at fault.
+    let tablet = w.start("/alice/tablet", knowing(vec![])).await;
+    sync_all(&laptop, &tablet);
+    take_entry(&tablet, &name, twin, &writer_key);
+    assert_eq!(
+        events_of(&tablet, EventKind::Equivocation).len(),
+        1,
+        "the writer's equivocation is told"
+    );
+    let refused = plant(&tablet, packet).await.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::Answer { why: AnswerRefusal::ReadsChanged(m), .. } if m.contains("equivocation")),
+        "refused for what it is, not blamed on its signer: {refused:?}"
+    );
+    assert!(
+        events_of(&tablet, EventKind::AnswerEvidence).is_empty(),
+        "no evidence against the honest signer: {:?}",
+        tablet.pending_events()
+    );
+    assert!(!tablet.inner.st.lock().answer_book.is_blocked_name(&signed));
+}
+
+#[tokio::test]
+async fn evidence_of_what_a_device_holds_ends_when_the_equivocation_is_found_or_the_read_is_withdrawn()
+ {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, knowing(vec![sum(1)])).await;
+    let (name, _, writer_key, twin) = twin_of(&laptop, &budget());
+    let phone = w.start("/alice/phone", knowing(vec![sum(1)])).await;
+    sync_except(&laptop, &phone, Some(&name));
+    take_entry(&phone, &name, twin.clone(), &writer_key);
+    let q = pure_question(newest(&phone, &plan()).await, &sum_v(1));
+    let signed = phone.publish_answer(&q).await.unwrap();
+    let packet = phone.inner.stored_answer(&signed).unwrap();
+    let is_kept = |dev: &Device| {
+        !dev.inner
+            .store
+            .scan_under(&n("/localhost/ndn-data/answer-evidence"), 0)
+            .is_empty()
+    };
+
+    // Held the first packet only, a read of the second is a conflict: evidence, and a block.
+    let tablet = w.start("/alice/tablet", knowing(vec![])).await;
+    sync_all(&laptop, &tablet);
+    let e = plant(&tablet, packet.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            DataError::Answer {
+                why: AnswerRefusal::ReadSet(_),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert_eq!(events_of(&tablet, EventKind::AnswerEvidence).len(), 1);
+    assert!(tablet.inner.st.lock().answer_book.is_blocked_name(&signed));
+    assert!(is_kept(&tablet));
+    // Met again while the fault stands: refused as blocked, and not told again.
+    let again = plant(&tablet, packet.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            &again,
+            DataError::Answer {
+                why: AnswerRefusal::Equivocal,
+                ..
+            }
+        ),
+        "{again:?}"
+    );
+    assert_eq!(events_of(&tablet, EventKind::AnswerEvidence).len(), 1);
+
+    // The writer's second packet arrives: the signer is no longer at fault, and the block ends.
+    take_entry(&tablet, &name, twin, &writer_key);
+    let lifted = plant(&tablet, packet.clone()).await.unwrap_err();
+    assert!(
+        matches!(&lifted, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        "judged afresh, no longer the signer's fault: {lifted:?}"
+    );
+    assert!(!tablet.inner.st.lock().answer_book.is_blocked_name(&signed));
+    assert!(!is_kept(&tablet), "the evidence is gone from the store too");
+
+    // The same ending when the version read is withdrawn since (a cut, a revocation).
+    let mut w2 = World::new();
+    let laptop2 = alice_with_data(&mut w2, knowing(vec![sum(1)])).await;
+    let phone2 = w2.start("/alice/phone", knowing(vec![sum(1)])).await;
+    sync_all(&laptop2, &phone2);
+    let q2 = pure_question(newest(&laptop2, &plan()).await, &sum_v(1));
+    let honest = ask(&laptop2, &q2).await.unwrap();
+    let def = honest.binding.definition.clone().unwrap();
+    let mut wrong: Vec<ReadRef> = honest.reads.reads().to_vec();
+    let mut budget_version = None;
+    for r in &mut wrong {
+        if let ReadRef::Version { name, digest } = r
+            && name.to_string().contains("budget")
+        {
+            *digest = Hash([9; 32]);
+            budget_version = Some(name.clone());
+        }
+    }
+    let conflicting = ReadSet::new(wrong).unwrap();
+    let (forged_name, conflict) = forged_answer(
+        &phone2,
+        AnswerBinding {
+            kind: AnswerKind::Pure,
+            definition: Some(def),
+            by: sum_v(1),
+            reads: conflicting.digest(),
+        },
+        conflicting.encode(),
+        b"3",
+        &[],
+    );
+    assert!(plant(&laptop2, conflict.clone()).await.is_err());
+    assert_eq!(events_of(&laptop2, EventKind::AnswerEvidence).len(), 1);
+    assert!(is_kept(&laptop2));
+    laptop2
+        .inner
+        .st
+        .lock()
+        .refused
+        .insert(budget_version.unwrap(), Refusal::NotMember);
+    let gone = plant(&laptop2, conflict).await.unwrap_err();
+    assert!(
+        matches!(&gone, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        "{gone:?}"
+    );
+    assert!(!is_kept(&laptop2), "durably: nothing is kept to load again");
+    let laptop2 = w2.restart("/alice/laptop", knowing(vec![sum(1)])).await;
+    assert!(
+        !laptop2
+            .inner
+            .st
+            .lock()
+            .answer_book
+            .is_blocked_name(&forged_name)
+    );
+}
+
+#[tokio::test]
+async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_changed_read_not_a_fault() {
+    use super::merge_tests as m;
+    let f = function(1);
+    let tune = |policy: AnswerPolicy| {
+        move |c: Config| Config {
+            rules: m::rules(),
+            answers: AnswerConfig {
+                policy,
+                ..AnswerConfig::default()
+            },
+            ..c
+        }
+    };
+    let named = || AnswerPolicy {
+        providers: vec![(f.clone(), Signers::Devices(vec![n("/alice/phone")]))],
+        ..AnswerPolicy::default()
+    };
+    let mut w = World::new();
+    let c = m::c();
+    let laptop = w.start("/alice/laptop", tune(named())).await;
+    let sealed_to = |readers: &[&str]| Share {
+        rule: Rule::Merge { function: n(m::RULE) },
+        writers: vec![n("/alice")],
+        readers: readers.iter().map(|r| Audience::Person(n(r))).collect(),
+    };
+    laptop.share(&c, sealed_to(&["/alice", "/bob"])).await.unwrap();
+    let first_epoch = laptop.inner.st.lock().colls[&c].members.as_ref().unwrap().epoch.clone();
+    let first_key = laptop
+        .inner
+        .st
+        .lock()
+        .keys
+        .key(&c, first_epoch.as_ref().unwrap())
+        .unwrap();
+    // The phone writes one version in the first epoch.
+    let phone = w.start("/alice/phone", tune(named())).await;
+    sync_all(&laptop, &phone);
+    give_keys(&laptop, &phone, &[&c]);
+    phone.put_op(&c, m::edit(None, "one"), options()).await.unwrap();
+    // A reader is removed: a second epoch. The phone writes its next version in it.
+    sync_all(&phone, &laptop);
+    laptop.share(&c, sealed_to(&["/alice"])).await.unwrap();
+    let second_epoch = laptop.inner.st.lock().colls[&c].members.as_ref().unwrap().epoch.clone();
+    let second_key = laptop
+        .inner
+        .st
+        .lock()
+        .keys
+        .key(&c, second_epoch.as_ref().unwrap())
+        .unwrap();
+    assert_ne!(first_epoch, second_epoch, "removing a reader starts an epoch");
+    sync_all(&laptop, &phone);
+    give_keys(&laptop, &phone, &[&c]);
+    phone.put_op(&c, m::edit(None, "two"), options()).await.unwrap();
+
+    // The phone signs an answer of the function over the state it holds, in both epochs.
+    let (state, _) = phone.current_read(&c).await.unwrap();
+    let inputs = ReadSet::new([state]).unwrap();
+    let name = phone
+        .provide(&f, inputs, Bytes::from_static(b"summary"))
+        .await
+        .unwrap();
+
+    // A reader holds all of it, with the keys of both epochs, and takes the answer.
+    let tablet = w.start("/alice/tablet", tune(named())).await;
+    for (e, key) in [(&first_epoch, &first_key), (&second_epoch, &second_key)] {
+        let e = e.clone().expect("an epoch");
+        tablet
+            .inner
+            .st
+            .lock()
+            .keys
+            .edit()
+            .hold(c.clone(), e, key.clone());
+    }
+    sync_all(&laptop, &tablet);
+    sync_all(&phone, &tablet);
+    hand(&phone, &name, &tablet).await.expect("both epochs are held, and the answer opens");
+    let answered = ask(&tablet, &name).await.expect("a provider the policy names");
+    assert!(matches!(answered.how, Provenance::Provider { .. }));
+
+    // The reader withdraws the version of the first epoch (a cut, a revocation): the epochs the
+    // state is computed from change, and the signer listed the right ones when it signed.
+    let (v1_name, v1_writer, v1_digest) = {
+        let st = tablet.inner.st.lock();
+        let versions = &st.colls[&c].versions;
+        let hv = versions
+            .values()
+            .filter(|hv| hv.version.id.writer.key().has_prefix(&n("/alice/phone")))
+            .min_by_key(|hv| hv.version.id.seq.0)
+            .unwrap_or_else(|| panic!("the first version, among {} held", versions.len()));
+        (hv.version.name.clone(), hv.version.id.writer.clone(), hv.digest)
+    };
+    {
+        let mut st = tablet.inner.st.lock();
+        tablet.inner.withdraw(
+            &mut st,
+            vec![(
+                v1_name,
+                v1_writer,
+                v1_digest,
+                Refusal::Untrusted { why: "a cut".into() },
+            )],
+        );
+    }
+    let before = events_of(&tablet, EventKind::AnswerEvidence).len();
+    let changed = ask(&tablet, &name).await.unwrap_err();
+    assert!(
+        matches!(&changed, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        "a read withdrawn since, not a fault of the signer: {changed:?}"
+    );
+    assert_eq!(
+        events_of(&tablet, EventKind::AnswerEvidence).len(),
+        before,
+        "{:?}",
+        tablet.pending_events()
+    );
+    assert!(!tablet.inner.st.lock().answer_book.is_blocked_name(&name));
 }

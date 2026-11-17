@@ -61,6 +61,15 @@ pub(super) enum ReadFail {
     Changed(String),
 }
 
+/// What checking the reads of an answer this device holds found, none in conflict.
+#[derive(Default)]
+pub(super) struct ReadsChecked {
+    /// How many of its reads this device does not hold, so did not check.
+    pub(super) unverified: u32,
+    /// The epochs of the reads it holds, ascending.
+    pub(super) epochs: Vec<Epoch>,
+}
+
 /// Add `e` to `epochs`, ascending and once each.
 pub(super) fn add_epoch(epochs: &mut Vec<Epoch>, e: &Epoch) {
     if let Err(at) = epochs.binary_search_by(|x| epoch_order(x, e)) {
@@ -69,6 +78,32 @@ pub(super) fn add_epoch(epochs: &mut Vec<Epoch>, e: &Epoch) {
 }
 
 impl St {
+    /// Whether `name` has equivocation evidence here: two packets of its writer at it, or two
+    /// entries of the writer at its seq (data-layer.md §21). What this device holds at such a
+    /// name is the first of them, not the one a signer read.
+    pub(super) fn equivocal_name(&self, name: &Name) -> bool {
+        self.twins.contains_key(name)
+            || self
+                .equivocal
+                .values()
+                .any(|by_seq| by_seq.values().any(|names| names.contains(name)))
+    }
+
+    /// What a read that names another digest than the version held at `name` is: a conflict
+    /// (evidence against whoever signed it), unless `name` has equivocation evidence, when a
+    /// signer may have read the other packet of its writer: then it is a read that no longer
+    /// holds here, no fault of the signer (answers.md §8.1).
+    pub(super) fn conflict(&self, name: &Name, why: String) -> ReadFail {
+        match self.equivocal_name(name) {
+            true => ReadFail::Changed(format!(
+                "{why}; the writer of {name} signed two packets at it (equivocation evidence is \
+                 held), so this device cannot tell which one the answer read: ask again once the \
+                 writer's key is revoked or the equivocation is settled"
+            )),
+            false => ReadFail::Conflict(why),
+        }
+    }
+
     /// What is held of the version `name`.
     pub(super) fn version_fact(&self, name: &Name) -> VersionFact {
         let Some(c) = parse_log_name(name).and_then(|l| l.subject) else {
@@ -274,10 +309,13 @@ impl Inner {
                     }));
                 };
                 if v.digest != digest.0 {
-                    return Err(ReadFail::Conflict(format!(
-                        "the read names {name} with the digest {digest:?} and the version held \
-                         here has another"
-                    )));
+                    return Err(self.st.lock().conflict(
+                        name,
+                        format!(
+                            "the read names {name} with the digest {digest:?} and the version held \
+                             here has another"
+                        ),
+                    ));
                 }
                 let epochs = match self.st.lock().version_fact(name) {
                     VersionFact::Held { epoch, .. } => epoch.into_iter().collect(),
@@ -305,12 +343,15 @@ impl Inner {
                             if let (Some(hv), Some(d)) = (coll.versions.get(&id), d)
                                 && hv.digest != *d
                             {
-                                return Err(ReadFail::Conflict(format!(
-                                    "the read names the tip {} seq {} of {collection} with \
-                                     another digest than the version held here",
-                                    w.key(),
-                                    s.0
-                                )));
+                                return Err(st.conflict(
+                                    &hv.version.name,
+                                    format!(
+                                        "the read names the tip {} seq {} of {collection} with \
+                                         another digest than the version held here",
+                                        w.key(),
+                                        s.0
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -344,28 +385,36 @@ impl Inner {
         }
     }
 
-    /// Check each read of `set` this device holds (answers.md §7.3.2, §7.3.1), without fetching:
-    /// a conflict of digests is evidence, a read that no longer holds is not. Returns how many
-    /// reads are not held here.
-    pub(super) fn check_held_reads(&self, set: &ReadSet) -> Result<u32, ReadFail> {
+    /// Check each read of `set` this device holds (answers.md §7.3.2, §7.3.1), without fetching,
+    /// and collect the epochs they are sealed in. A conflict of digests is evidence, unless the
+    /// version it concerns has equivocation evidence of its own ([`St::equivocal_name`]); a read
+    /// that no longer holds is not.
+    pub(super) fn check_reads(&self, set: &ReadSet) -> Result<ReadsChecked, ReadFail> {
         let st = self.st.lock();
-        let mut unverified = 0u32;
+        let mut checked = ReadsChecked::default();
         for r in set.reads() {
             match r {
                 ReadRef::Version { name, digest } => match st.version_fact(name) {
                     VersionFact::Held { digest: held, .. } if held != digest.0 => {
-                        return Err(ReadFail::Conflict(format!(
-                            "it names {name} with the digest {digest:?} and this device holds \
-                             that version with another"
-                        )));
+                        return Err(st.conflict(
+                            name,
+                            format!(
+                                "it names {name} with the digest {digest:?} and this device holds \
+                                 that version with another"
+                            ),
+                        ));
                     }
-                    VersionFact::Held { .. } => {}
+                    VersionFact::Held { epoch, .. } => {
+                        if let Some(e) = &epoch {
+                            add_epoch(&mut checked.epochs, e);
+                        }
+                    }
                     VersionFact::Refused => {
                         return Err(ReadFail::Changed(format!(
                             "the version {name} it read is refused here since"
                         )));
                     }
-                    VersionFact::Unknown => unverified += 1,
+                    VersionFact::Unknown => checked.unverified += 1,
                 },
                 ReadRef::State {
                     collection,
@@ -374,11 +423,11 @@ impl Inner {
                     applied,
                 } => {
                     let Some(coll) = st.colls.get(collection) else {
-                        unverified += 1;
+                        checked.unverified += 1;
                         continue;
                     };
                     let Some(members) = coll.members.as_ref() else {
-                        unverified += 1;
+                        checked.unverified += 1;
                         continue;
                     };
                     for (w, s, d) in at.tips() {
@@ -389,12 +438,15 @@ impl Inner {
                         if let (Some(hv), Some(d)) = (coll.versions.get(&id), d)
                             && hv.digest != *d
                         {
-                            return Err(ReadFail::Conflict(format!(
-                                "it names the tip {} seq {} of {collection} with another digest \
-                                 than the version this device holds",
-                                w.key(),
-                                s.0
-                            )));
+                            return Err(st.conflict(
+                                &hv.version.name,
+                                format!(
+                                    "it names the tip {} seq {} of {collection} with another \
+                                     digest than the version this device holds",
+                                    w.key(),
+                                    s.0
+                                ),
+                            ));
                         }
                     }
                     if let Rule::Merge { function } = &members.rule
@@ -417,45 +469,13 @@ impl Inner {
                                  expired since"
                             )));
                         }
-                        Some(_) => {}
-                        None => unverified += 1,
+                        Some(f) => f.epochs.iter().for_each(|e| add_epoch(&mut checked.epochs, e)),
+                        None => checked.unverified += 1,
                     }
                 }
             }
         }
-        Ok(unverified)
-    }
-
-    /// The epochs of `set`'s reads this device holds, ascending, and whether it holds every read
-    /// (answers.md §5.1).
-    pub(super) fn held_epochs(&self, set: &ReadSet) -> (Vec<Epoch>, bool) {
-        let st = self.st.lock();
-        let mut epochs = Vec::new();
-        let mut all = true;
-        for r in set.reads() {
-            match r {
-                ReadRef::Version { name, .. } => match st.version_fact(name) {
-                    VersionFact::Held { epoch, .. } => {
-                        if let Some(e) = &epoch {
-                            add_epoch(&mut epochs, e);
-                        }
-                    }
-                    _ => all = false,
-                },
-                ReadRef::State { collection, at, .. } => {
-                    match st.state_facts(
-                        collection,
-                        at.frontier(),
-                        &self.config.rules,
-                        &self.writer,
-                    ) {
-                        Some(f) => f.epochs.iter().for_each(|e| add_epoch(&mut epochs, e)),
-                        None => all = false,
-                    }
-                }
-            }
-        }
-        (epochs, all)
+        Ok(checked)
     }
 }
 

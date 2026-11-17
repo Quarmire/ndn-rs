@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use super::{Inner, St, rt::Instant};
 use crate::answer::{AnswerKind, AnswerStore};
 use crate::error::DataError;
+use crate::events::{AnswerFault, ReadSetFault};
 use crate::pieces::Piece;
 use crate::version::Writer;
 use crate::wire::{self, device_of, parse_answer_name, parse_answer_piece_name};
@@ -104,6 +105,55 @@ struct Held {
     tick: u64,
 }
 
+/// Why evidence was kept against a signer's answer, which says whether it can end (answers.md
+/// §8.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cause {
+    /// The signed packets alone show it (two results at a name, a binding that is not the
+    /// name's, a read set that is not canonical): it never ends.
+    Signed,
+    /// What this device holds decides it (a read whose digest differs from the version held,
+    /// the epochs the reads are sealed in): judged again whenever the answer is met, and it ends
+    /// when the answer no longer yields the fault.
+    Reads,
+}
+
+impl Cause {
+    /// The cause of `fault`.
+    pub(super) fn of(fault: &AnswerFault) -> Cause {
+        match fault {
+            AnswerFault::ReadSet(ReadSetFault::HeldConflict | ReadSetFault::Epochs) => {
+                Cause::Reads
+            }
+            _ => Cause::Signed,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Cause::Signed => 0,
+            Cause::Reads => 1,
+        }
+    }
+
+    fn of_code(c: u8) -> Option<Cause> {
+        match c {
+            0 => Some(Cause::Signed),
+            1 => Some(Cause::Reads),
+            _ => None,
+        }
+    }
+}
+
+/// What is kept against one signer's answer at one name: the packets, whole in the store, never
+/// served nor taken again while it stands.
+struct Evidence {
+    kind: AnswerKind,
+    cause: Cause,
+    /// The implicit digests of the packets kept.
+    packets: BTreeSet<[u8; 32]>,
+}
+
 /// What a device holds of answers: its own, others' it keeps for serving, the evidence it keeps.
 #[derive(Default)]
 pub(super) struct Book {
@@ -116,9 +166,7 @@ pub(super) struct Book {
     /// Every stored piece of an answer.
     pieces: HashSet<Name>,
     /// `(answer name, signer's key)`: what evidence is kept against, never served nor taken again.
-    blocked: HashSet<(Name, Name)>,
-    /// The digests of the packets kept as evidence, by answer name.
-    evidenced: HashMap<Name, BTreeSet<[u8; 32]>>,
+    evidence: HashMap<(Name, Name), Evidence>,
     /// When this device signed its recent answers, for its signing rate.
     signed: VecDeque<Instant>,
     /// Counts recency of use.
@@ -135,12 +183,28 @@ impl Book {
 
     /// Whether evidence is kept against `signer`'s answer at `name`.
     pub(super) fn is_blocked(&self, name: &Name, signer: &Name) -> bool {
-        self.blocked.contains(&(name.clone(), signer.clone()))
+        self.evidence.contains_key(&(name.clone(), signer.clone()))
     }
 
-    /// Whether evidence is kept against any signer's answer at `name`: it is not taken again.
+    /// Why evidence is kept against `signer`'s answer at `name`, if it is.
+    pub(super) fn cause_of(&self, name: &Name, signer: &Name) -> Option<Cause> {
+        self.evidence
+            .get(&(name.clone(), signer.clone()))
+            .map(|e| e.cause)
+    }
+
+    /// Whether evidence that never ends ([`Cause::Signed`]) is kept against any signer's answer
+    /// at `name`: it is not taken again.
+    pub(super) fn is_blocked_for_good(&self, name: &Name) -> bool {
+        self.evidence
+            .iter()
+            .any(|((n, _), e)| n == name && e.cause == Cause::Signed)
+    }
+
+    /// Whether evidence of any cause is kept against any signer's answer at `name`.
+    #[cfg(test)]
     pub(super) fn is_blocked_name(&self, name: &Name) -> bool {
-        self.blocked.iter().any(|(n, _)| n == name)
+        self.evidence.keys().any(|(n, _)| n == name)
     }
 
     /// The digest of the result of the own answer at `id`, and its name.
@@ -460,7 +524,8 @@ impl Inner {
     }
 
     /// Keep `wire`, an answer packet this device verified, as evidence against its signer
-    /// (answers.md §8.2): stored whole before it is reported, never served nor taken again.
+    /// (answers.md §8.2): stored whole before it is reported, never served nor taken again while
+    /// it stands. The store's record is the packet behind one octet, its [`Cause`].
     pub(super) fn keep_evidence(
         &self,
         st: &mut St,
@@ -468,23 +533,49 @@ impl Inner {
         kind: AnswerKind,
         signer: &Name,
         wire: &Bytes,
+        cause: Cause,
     ) {
         let digest = wire::implicit_digest(wire);
+        let mut record = Vec::with_capacity(1 + wire.len());
+        record.push(cause.code());
+        record.extend_from_slice(wire);
         self.store
-            .insert(evidence_name(name, kind, &digest), wire.clone());
-        st.answer_book
-            .evidenced
-            .entry(name.clone())
-            .or_default()
-            .insert(digest);
-        st.answer_book
-            .blocked
-            .insert((name.clone(), signer.clone()));
+            .insert(evidence_name(name, kind, &digest), Bytes::from(record));
+        let held = st
+            .answer_book
+            .evidence
+            .entry((name.clone(), signer.clone()))
+            .or_insert_with(|| Evidence {
+                kind,
+                cause,
+                packets: BTreeSet::new(),
+            });
+        // One cause that never ends is enough to keep it.
+        if cause == Cause::Signed {
+            held.cause = Cause::Signed;
+        }
+        held.packets.insert(digest);
         // Never served, never held: whatever this device held at the name by that signer goes.
         if st.answer_book.held.contains_key(name) {
             self.drop_held(st, name);
         }
         st.answer_book.served.remove(name);
+    }
+
+    /// End the evidence kept against `signer`'s answer at `name`, its cause gone (answers.md
+    /// §8.2): the packets are removed from the store, so it stays ended across a restart, and
+    /// the answer is judged afresh the next time it is met.
+    pub(super) fn lift_evidence(&self, st: &mut St, name: &Name, signer: &Name) {
+        if let Some(e) = st
+            .answer_book
+            .evidence
+            .remove(&(name.clone(), signer.clone()))
+        {
+            tracing::info!(%name, %signer, "evidence lifted: what it rested on no longer holds");
+            for digest in &e.packets {
+                self.store.remove(&evidence_name(name, e.kind, digest));
+            }
+        }
     }
 
     /// Read back what an earlier run kept: answers verified again (a key may have been revoked
@@ -597,21 +688,40 @@ impl Inner {
             }
         }
         let mut st = self.st.lock();
-        for (_, wire) in self.store.scan_under(&evidence_prefix(), 0) {
+        for (stored, record) in self.store.scan_under(&evidence_prefix(), 0) {
+            // The cause behind the packet; a record this version did not write is dropped.
+            let Some((cause, wire)) = record
+                .split_first()
+                .and_then(|(c, w)| Some((Cause::of_code(*c)?, Bytes::copy_from_slice(w))))
+            else {
+                self.store.remove(&stored);
+                continue;
+            };
             let Ok(data) = Data::decode(wire.clone()) else {
+                self.store.remove(&stored);
                 continue;
             };
-            let Some(key) = data.sig_info().and_then(|s| s.key_locator_name()) else {
+            let (Some(key), Some(kind)) = (
+                data.sig_info().and_then(|s| s.key_locator_name()),
+                data.content()
+                    .and_then(|c| crate::answer::Record::decode(c.clone()).ok())
+                    .map(|r| r.kind),
+            ) else {
                 continue;
             };
-            st.answer_book
-                .blocked
-                .insert(((*data.name).clone(), (*key).clone()));
-            st.answer_book
-                .evidenced
-                .entry((*data.name).clone())
-                .or_default()
-                .insert(wire::implicit_digest(&wire));
+            let held = st
+                .answer_book
+                .evidence
+                .entry(((*data.name).clone(), (*key).clone()))
+                .or_insert_with(|| Evidence {
+                    kind,
+                    cause,
+                    packets: BTreeSet::new(),
+                });
+            if cause == Cause::Signed {
+                held.cause = Cause::Signed;
+            }
+            held.packets.insert(wire::implicit_digest(&wire));
         }
     }
 

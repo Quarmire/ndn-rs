@@ -16,6 +16,7 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 
 use super::answer_reads::{EvalFail, Evaluated, ReadFail, VersionFact, add_epoch};
+use super::answers::Cause;
 use super::heard::RELAYS_ASKED;
 use super::{Device, Inner, local};
 use crate::answer::{
@@ -132,7 +133,8 @@ impl Inner {
     ) {
         let name = (*data.name).clone();
         let mut st = self.st.lock();
-        self.keep_evidence(&mut st, &name, kind, signer.key(), data.raw());
+        let cause = Cause::of(&fault);
+        self.keep_evidence(&mut st, &name, kind, signer.key(), data.raw(), cause);
         st.report_event(EventDetail::Answer {
             answer: name,
             signer: signer.key().clone(),
@@ -198,9 +200,14 @@ impl Inner {
                 ),
             }));
         }
-        if self.st.lock().answer_book.is_blocked(&name, signer.key()) {
+        // Evidence that never ends refuses the packet at once; evidence of what this device
+        // holds (a read's digest, the epochs) is judged again below, since what it holds may
+        // have changed since.
+        let blocked = self.st.lock().answer_book.cause_of(&name, signer.key());
+        if blocked == Some(Cause::Signed) {
             return Err(refuse(AnswerRefusal::Equivocal));
         }
+        let rejudging = blocked.is_some();
         // 2. Exact decoding, and the kind asked for.
         let Some(content) = data.content().cloned() else {
             return Err(refuse(AnswerRefusal::Malformed("it has no content".into())));
@@ -252,15 +259,26 @@ impl Inner {
                 }
             }
         };
-        let evidence = |fault: AnswerFault, readset: [u8; 32]| {
-            self.raise_evidence(&data, record.kind, &signer, id, readset, fault);
+        // Evidence of what this device holds is kept against this signer's answer at this name
+        // ([`Cause::Reads`]): the answer is judged afresh, and the evidence ends when it no
+        // longer yields the fault (answers.md §8.2). A fault judged again is not told again.
+        let evidence = |fault: AnswerFault, readset: [u8; 32], why: AnswerRefusal| match rejudging
+        {
+            true => refuse(AnswerRefusal::Equivocal),
+            false => {
+                self.raise_evidence(&data, record.kind, &signer, id, readset, fault);
+                refuse(why)
+            }
         };
         // 4. The binding against the name, the read set and the epochs.
         let body = match Body::decode(plain) {
             Ok(b) => b,
             Err(AnswerRefusal::ReadSet(why)) => {
-                evidence(AnswerFault::ReadSet(ReadSetFault::NotCanonical), [0; 32]);
-                return Err(refuse(AnswerRefusal::ReadSet(why)));
+                return Err(evidence(
+                    AnswerFault::ReadSet(ReadSetFault::NotCanonical),
+                    [0; 32],
+                    AnswerRefusal::ReadSet(why),
+                ));
             }
             Err(e) => return Err(refuse(e)),
         };
@@ -271,44 +289,68 @@ impl Inner {
             )));
         }
         if body.reads.digest() != body.binding.reads {
-            evidence(AnswerFault::ReadSet(ReadSetFault::Digest), readset);
-            return Err(refuse(AnswerRefusal::ReadSet(
-                "the digest of its read set is not the one its binding names".into(),
-            )));
+            return Err(evidence(
+                AnswerFault::ReadSet(ReadSetFault::Digest),
+                readset,
+                AnswerRefusal::ReadSet(
+                    "the digest of its read set is not the one its binding names".into(),
+                ),
+            ));
         }
         if let Some(def) = &body.binding.definition
             && !body.reads.contains(def)
         {
-            evidence(AnswerFault::ReadSet(ReadSetFault::NotItsReads), readset);
-            return Err(refuse(AnswerRefusal::ReadSet(
-                "its definition is not one of its reads".into(),
-            )));
+            return Err(evidence(
+                AnswerFault::ReadSet(ReadSetFault::NotItsReads),
+                readset,
+                AnswerRefusal::ReadSet("its definition is not one of its reads".into()),
+            ));
         }
         if seal::answer_id(&body.binding, keys.as_ref()) != id {
-            evidence(AnswerFault::Binding, readset);
-            return Err(refuse(AnswerRefusal::Binding));
+            return Err(evidence(
+                AnswerFault::Binding,
+                readset,
+                AnswerRefusal::Binding,
+            ));
         }
-        let (held, every) = self.held_epochs(&body.reads);
-        let listed_right = match every {
-            true => held == epochs,
-            false => held.iter().all(|e| epochs.contains(e)),
-        };
-        if !listed_right {
-            evidence(AnswerFault::ReadSet(ReadSetFault::Epochs), readset);
-            return Err(refuse(AnswerRefusal::ReadSet(
-                "the epochs it lists are not the epochs its reads are sealed in".into(),
-            )));
-        }
-        // 5. The reads this device holds.
-        let unverified = match self.check_held_reads(&body.reads) {
-            Ok(n) => n,
+        // 5. The reads this device holds, and then the epochs they are sealed in: a read that no
+        // longer holds here (a version withdrawn since) changes the epochs a state is computed
+        // from, and is no fault of the signer, so it is classified before the epochs are.
+        let checked = match self.check_reads(&body.reads) {
+            Ok(c) => c,
             Err(ReadFail::Conflict(why)) => {
-                evidence(AnswerFault::ReadSet(ReadSetFault::HeldConflict), readset);
-                return Err(refuse(AnswerRefusal::ReadSet(why)));
+                return Err(evidence(
+                    AnswerFault::ReadSet(ReadSetFault::HeldConflict),
+                    readset,
+                    AnswerRefusal::ReadSet(why),
+                ));
             }
-            Err(ReadFail::Changed(why)) => return Err(refuse(AnswerRefusal::ReadsChanged(why))),
+            Err(ReadFail::Changed(why)) => {
+                if rejudging {
+                    self.lift_evidence(&mut self.st.lock(), &name, signer.key());
+                }
+                return Err(refuse(AnswerRefusal::ReadsChanged(why)));
+            }
             Err(ReadFail::Data(e)) => return Err(e),
         };
+        let listed_right = match checked.unverified {
+            0 => checked.epochs == epochs,
+            _ => checked.epochs.iter().all(|e| epochs.contains(e)),
+        };
+        if !listed_right {
+            return Err(evidence(
+                AnswerFault::ReadSet(ReadSetFault::Epochs),
+                readset,
+                AnswerRefusal::ReadSet(
+                    "the epochs it lists are not the epochs its reads are sealed in".into(),
+                ),
+            ));
+        }
+        if rejudging {
+            // The answer no longer yields the fault it was blocked for.
+            self.lift_evidence(&mut self.st.lock(), &name, signer.key());
+        }
+        let unverified = checked.unverified;
         let result_digest = seal::result_digest(&body.result, keys.as_ref());
         Ok(Opened {
             kind: record.kind,
@@ -361,7 +403,7 @@ impl Inner {
             && let Ok(d) = Data::decode(wire)
         {
             let mut st = self.st.lock();
-            self.keep_evidence(&mut st, &o.name, o.kind, o.signer.key(), d.raw());
+            self.keep_evidence(&mut st, &o.name, o.kind, o.signer.key(), d.raw(), Cause::Signed);
         }
         self.raise_evidence(
             &o.data,
@@ -831,8 +873,9 @@ impl Inner {
 
     async fn get_answer_by_name(self: &Arc<Self>, name: &Name) -> Result<Answer, DataError> {
         let (device, id) = parse_answer_name(name).expect("checked by the caller");
-        if self.st.lock().answer_book.is_blocked_name(name) {
-            // Evidence is kept against it (answers.md §8.2): never taken again.
+        if self.st.lock().answer_book.is_blocked_for_good(name) {
+            // Evidence that never ends is kept against it (answers.md §8.2): never taken again.
+            // Evidence of what this device holds is judged again when the packet is opened.
             return Err(answer_error(name, AnswerRefusal::Equivocal));
         }
         let (signers, relays) = {
