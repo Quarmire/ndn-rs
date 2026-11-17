@@ -351,7 +351,44 @@ transaction, committed with fsync), so after a power loss the store is as
 it was at some moment at or after its last returned barrier, and a device
 restarted on it is that device stopped at that moment — which restore
 already handles (§8.3). Everything it published was at or below the
-durable head, so behind the barrier, so held.
+durable head, so behind the barrier, so held. A batch is applied whole on an
+atomic store, so the same holds of every put and group; on one that is not,
+the order of the batch leaves only prefixes restore accepts.
+
+**One batch per put (store write batching).** The writes of one put go to
+the store as one `DataStore::apply`, not one call each: the markers (the
+written marker, saying this device signed the entry, and the verified
+marker), the pieces of an entry larger than a packet, then the entry
+itself; for `put_group`, every record the group's fresh collections need
+and every member with its markers, as one batch; a commit round's
+announcement counters likewise. A device MUST hand a batch to the store
+before the `put` that made it returns, and MUST NOT defer it to a
+background writer: the guarantees above (a write that returned survives
+`kill -9`) hold for the batch as for a single write. A device MUST write
+a batch in the order markers, pieces, entry, and records before the
+versions that need them; and MUST apply the batches of puts in the order
+the puts numbered their seqs, so publication, which follows the log head
+read under the same lock, follows put order. A batch changes nothing
+about publication: what a batch holds is published only after a barrier
+that began after the batch was handed over has returned. A store MAY
+apply a batch atomically (all of it survives a kill and a power loss, or
+none of it; `BackendStore` over fjall, redb and the memory and flash
+backends does), and one that cannot MAY apply it one write at a time in
+order (the default); the order above is what makes that safe. A device
+never needs one write of a put durable before another: the barrier makes
+all of the put durable at once. The announcement counter is the one write
+that does have to precede a barrier: it is applied by the commit round
+before the barrier it announces, and the announcement is sent after the
+barrier returned, as before. No further coalescing of barriers is
+specified: a burst of puts already shares a flush per round.
+
+Measured, not guaranteed (ext4 on NVMe, release build, medians; one put at
+a time, before and after batching): redb `put` 1.74 ms and 0.71 ms,
+`put_group` of 10 21.3 ms and 3.2–4.2 ms, of 100 210 ms and 14.2–14.5 ms;
+fjall `put` 146 µs and 155–168 µs (59.7 and 55–60 µs back to back),
+`put_group` of 100 8.9 ms and 8.5–8.9 ms, unchanged within noise, a put on a
+store that costs nothing being 49 µs: on fjall the writes were never most of
+a put. Batching is there for atomicity, and for engines that pay per write.
 
 **Threat notes.**
 
@@ -369,6 +406,20 @@ durable head, so behind the barrier, so held.
 - A program's own unsigned state (an editor's transaction log) belongs in a
   store of its own, not the device's: the device serves from its store
   only, so nothing in another store reaches the network by a naming slip.
+- A batch cut short (a kill, a failing disk) on a store whose `apply` is
+  atomic leaves none of it: the restarted device finds the log as before
+  the put, and signs that seq afresh; nobody saw the cut put (it was not
+  durable, so not published). On a store that applies a batch one write at
+  a time, a prefix of it is what is left, and the order of the batch
+  (markers, pieces, entry last) makes every prefix a state restore accepts:
+  a marker or a piece with no entry is ignored or dropped, never an entry
+  taken for another writer's. A store that returns from `apply` having kept
+  only some of the batch, or that reports a batch durable before it is,
+  defeats the barrier as a disk that lies about a flush does (first note).
+- A group is one batch: every member and every record it makes are there
+  after a kill, or none is. A group of `GROUP_MAX` versions is a batch of
+  that many entries with their pieces and markers, held in memory until it
+  is handed over, as the signed group already is.
 
 ## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name, groups)
 
@@ -5266,7 +5317,23 @@ its flush, after a power loss that takes everything not durable, never
 serves a different entry or root at a name a peer was served) is in
 `ndn-data`'s `device/durability_tests.rs`, with the in-process checks that
 nothing is served, listed or announced before its flush returns and that
-each store instance has its own barrier.
+each store instance has its own barrier. The batching cases (§4.2, one batch
+per put) are d4 to d8: d4 (a batch, `DataStore::apply` or
+`SyncBackend::write_batch`, that returned survives `kill -9`, with nothing
+written after it) and d5 (a child killed at a random moment inside a large
+batch, then inside a `put_group`: after reopening each batch, each group, is
+whole or absent, in order) run on both engines in `ndn-sync`'s
+`tests/durability.rs` and `ndn-data`'s `device/batching_tests.rs`; the
+power-loss case d2 also commits `apply` batches. d6 (a put, a `put_group`
+reach the store as one batch, markers before pieces before the entry; for
+every prefix of a batch on a store that does not apply it atomically a
+restarted device is sound) and d7 (a burst of puts reaches the store in seq
+order and is served identically after a restart) are in `ndn-data`'s
+`device/batching_tests.rs`; d3's in-process check also covers a burst, whose
+batches are all stored before any `put` returns and none published before
+its flush. d8 runs in the conformance runner, clean and `--faulty`: a burst
+of puts and groups, each one batch, converges among devices and survives a
+restart.
 
 The introduction cases (§19) are run among strangers — each device's
 forwarder holds its own person's trust context and certificates only,
