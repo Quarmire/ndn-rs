@@ -114,6 +114,15 @@ fn recover_seq(store: &dyn DataStore, data_prefix: &Name) -> u64 {
         .unwrap_or(0)
 }
 
+/// One change of a [`DataStore::apply`] batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreOp {
+    /// Store the encoded Data under the name.
+    Insert(Name, Bytes),
+    /// Delete what is stored under exactly the name.
+    Remove(Name),
+}
+
 /// Pluggable storage for published Data, keyed by full Data name.
 ///
 /// # Durability
@@ -130,6 +139,10 @@ fn recover_seq(store: &dyn DataStore, data_prefix: &Name) -> u64 {
 ///   loss.** Writes after it may be lost to one; the store then opens at a
 ///   whole earlier state, never part of a write, and never refuses to open
 ///   for a torn tail.
+///
+/// A batch ([`apply`](Self::apply)) returns once all of it was handed over,
+/// and is durable at the next returned barrier; whether a kill or a power
+/// loss can leave part of it depends on the store (see `apply`).
 ///
 /// Nothing may be published from a store before it is behind the barrier:
 /// what a power loss can take must be what nobody else saw.
@@ -168,6 +181,30 @@ pub trait DataStore: Send + Sync {
     /// is. Used by stores that drop data on purpose: a pruned entry, a
     /// payload the device released to a holder, an erased epoch key.
     fn remove(&self, name: &Name);
+    /// Apply `ops`, in order, as one batch: what a caller that must keep
+    /// several writes together hands over at once. It returns once all of
+    /// it was handed to the store — the guarantee of [`insert`](Self::insert)
+    /// and [`remove`](Self::remove) returning: it survives the process being
+    /// killed — and is durable at the next returned [`sync`](Self::sync),
+    /// like any write before it. An empty `ops` does nothing.
+    ///
+    /// **The default is not atomic.** It makes the calls one by one, in
+    /// order, so a kill or a failure part-way leaves a prefix of `ops`,
+    /// exactly as the same calls made separately would; a caller whose
+    /// batch must be safe on such a store orders it so that every prefix is
+    /// a state it accepts (what makes the rest visible last). A store whose
+    /// engine has an atomic batch overrides this to hand `ops` over as one
+    /// ([`MemoryStore`] under one lock; `BackendStore` as one engine batch
+    /// on fjall, redb and the memory and flash backends): after a kill or a
+    /// power loss all of it is there or none of it.
+    fn apply(&self, ops: Vec<StoreOp>) {
+        for op in ops {
+            match op {
+                StoreOp::Insert(name, wire) => self.insert(name, wire),
+                StoreOp::Remove(name) => self.remove(&name),
+            }
+        }
+    }
     /// The durability barrier: returns once everything this store accepted
     /// before the call — every [`insert`](Self::insert) and
     /// [`remove`](Self::remove) that returned — is durable (kept across a
@@ -249,6 +286,21 @@ impl DataStore for MemoryStore {
 
     fn remove(&self, name: &Name) {
         self.map.write().expect("MemoryStore poisoned").remove(name);
+    }
+
+    /// All of `ops` under one write lock, so no reader sees half of it.
+    fn apply(&self, ops: Vec<StoreOp>) {
+        let mut map = self.map.write().expect("MemoryStore poisoned");
+        for op in ops {
+            match op {
+                StoreOp::Insert(name, wire) => {
+                    map.insert(name, wire);
+                }
+                StoreOp::Remove(name) => {
+                    map.remove(&name);
+                }
+            }
+        }
     }
 
     /// Returns `Ok` at once. A memory store keeps nothing across a restart,

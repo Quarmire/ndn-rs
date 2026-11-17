@@ -74,6 +74,26 @@
 //!
 //! Not simulated: a disk that loses data it acknowledged as flushed, bit rot,
 //! or a write torn inside a sector other than a file's last.
+//!
+//! # Cases d4 and d5 — batches (`DataStore::apply`, `SyncBackend::write_batch`)
+//!
+//! d4: a child writes batches (inserts and a removal each) one after another,
+//! reports each once it returned, then writes nothing more; the parent
+//! SIGKILLs it and requires every batch whole after reopening, on both
+//! engines, through `apply` and through `write_batch`. With nothing written
+//! after it, a batch left in a user-space buffer would be lost.
+//!
+//! d5: a child writes batches of 20,000 changes one after another, reporting
+//! each before it is handed over and after it returned; the parent SIGKILLs
+//! it at a random moment inside one (ten times per engine, at least one
+//! inside a batch), and requires of what the reopened store holds: the
+//! newest batch there is whole, every batch before it whole too (each lost
+//! one key to the next), none missing that was reported done, and no batch
+//! without the one before it. `NDN_DURABILITY_BATCH_VIA=loop` hands the
+//! changes over one `insert` at a time instead, which shows the case fail.
+//!
+//! Case 2 also commits `DataStore::apply` batches (inserts and a removal),
+//! which each power-loss image must hold whole or not at all.
 
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::ffi::OsString;
@@ -87,6 +107,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use ndn_packet::Name;
 use ndn_storage::{FjallBackend, RedbBackend, SyncBackend, WriteOp, name_key};
+use ndn_sync::StoreOp;
 use ndn_sync::store::BackendStore;
 use ndn_sync::svsync::DataStore;
 
@@ -403,9 +424,20 @@ enum Commit {
     Insert(Name, Bytes),
     Remove(Name),
     Batch(Vec<(Name, Bytes)>),
+    /// A `DataStore::apply`: inserts and a removal, whole or not at all.
+    Apply(Vec<StoreOp>),
 }
 
 fn commit(i: u64) -> Commit {
+    if i % 8 == 5 {
+        return Commit::Apply(vec![
+            StoreOp::Insert(n(&format!("/dur/a/{i:08}/a")), value(i, "a")),
+            // Drop an earlier insert (commit i - 3 inserted it).
+            StoreOp::Remove(n(&format!("/dur/s/{:08}", i - 3))),
+            StoreOp::Insert(n(&format!("/dur/a/{i:08}/b")), value(i, "b")),
+            StoreOp::Insert(n("/dur/head"), value(i, "head")),
+        ]);
+    }
     match i % 4 {
         0 | 2 => Commit::Insert(n(&format!("/dur/s/{i:08}")), value(i, "s")),
         1 => Commit::Batch(vec![
@@ -419,12 +451,13 @@ fn commit(i: u64) -> Commit {
 }
 
 /// The sync to call after commit `i`, if any: `DataStore::sync` after an
-/// insert (it covers the store's own writes), `SyncBackend::sync` after a
-/// batch made directly on the backend (which the store does not count).
-/// Each is the only sync at its point, so neither hides the other's fault.
+/// insert or an `apply` (it covers the store's own writes), `SyncBackend::sync`
+/// after a batch made directly on the backend (which the store does not
+/// count) or an `apply`. Each is the only sync at its point, so neither hides
+/// the other's fault.
 fn sync_after(i: u64) -> Option<Barrier> {
     match i % 24 {
-        2 => Some(Barrier::Store),
+        2 | 21 => Some(Barrier::Store),
         13 => Some(Barrier::Backend),
         _ => None,
     }
@@ -446,6 +479,14 @@ fn apply(map: &mut BTreeMap<Vec<u8>, Bytes>, c: &Commit) {
         Commit::Batch(puts) => {
             for (name, v) in puts {
                 map.insert(name_key(name), v.clone());
+            }
+        }
+        Commit::Apply(ops) => {
+            for op in ops {
+                match op {
+                    StoreOp::Insert(name, v) => map.insert(name_key(name), v.clone()),
+                    StoreOp::Remove(name) => map.remove(&name_key(name)),
+                };
             }
         }
     }
@@ -471,6 +512,7 @@ fn child_power_writer() {
                         .collect(),
                 )
                 .expect("write_batch"),
+            Commit::Apply(ops) => store.data().apply(ops),
         }
         say(format!("c {i}"));
         match sync_after(i) {
@@ -825,6 +867,313 @@ fn power_loss_keeps_everything_before_sync_fjall() {
 #[test]
 fn power_loss_keeps_everything_before_sync_redb() {
     power_loss_keeps_everything_before_sync(Engine::Redb);
+}
+
+// -------------------------------------------------- cases d4 and d5 ----
+//
+// Batches (`DataStore::apply`, `SyncBackend::write_batch`): the writes of a
+// device's put, handed to the engine as one.
+
+/// How the batch writer hands a batch over: `apply` (`DataStore::apply`),
+/// `backend` (`SyncBackend::write_batch`) or `loop` (one `insert` per change,
+/// what `apply` replaced: with it the cases below show how they fail).
+const ENV_VIA: &str = "NDN_DURABILITY_BATCH_VIA";
+/// How many batches the d4 writer makes before it idles.
+const ENV_BATCHES: &str = "NDN_DURABILITY_BATCHES";
+
+/// Changes of batch `i`: `size` inserts and, after the first batch, the
+/// removal of the previous batch's first key.
+fn batch_changes(prefix: &str, i: u64, size: u64) -> Vec<StoreOp> {
+    let key = |i: u64, j: u64| n(&format!("/dur/{prefix}/{i:06}/{j:06}"));
+    let mut ops: Vec<StoreOp> = (0..size)
+        .map(|j| StoreOp::Insert(key(i, j), value(i * size + j, prefix)))
+        .collect();
+    if i > 0 {
+        ops.push(StoreOp::Remove(key(i - 1, 0)));
+    }
+    ops
+}
+
+/// Hand `ops` to `store` the way `via` says.
+fn hand_over(store: &Store, via: &str, ops: Vec<StoreOp>) {
+    match via {
+        "apply" => store.data().apply(ops),
+        "loop" => {
+            for op in ops {
+                match op {
+                    StoreOp::Insert(name, v) => store.data().insert(name, v),
+                    StoreOp::Remove(name) => store.data().remove(&name),
+                }
+            }
+        }
+        "backend" => store
+            .backend()
+            .write_batch(
+                ops.into_iter()
+                    .map(|op| match op {
+                        StoreOp::Insert(name, v) => WriteOp::Put(name_key(&name), v),
+                        StoreOp::Remove(name) => WriteOp::Delete(name_key(&name)),
+                    })
+                    .collect(),
+            )
+            .expect("write_batch"),
+        other => panic!("{ENV_VIA}={other:?} names no way; use apply, backend or loop"),
+    }
+}
+
+/// Child of d4: a few batches, each reported once it returned, then nothing
+/// more is written: what a batch that returned is, is whatever the engine
+/// holds of it with no later write to carry it out of a buffer.
+#[test]
+#[ignore = "child process of a_batch_that_returned_survives_kill_9_*; run by it, not alone"]
+fn child_batch_writer() {
+    let Some((engine, dir)) = child_env() else {
+        return;
+    };
+    let via = std::env::var(ENV_VIA).unwrap_or_else(|_| "apply".into());
+    let count: u64 = std::env::var(ENV_BATCHES)
+        .expect("the batch count")
+        .parse()
+        .expect("a number");
+    let store = Store::open(engine, &engine.path(&dir, "store")).expect("open store");
+    for i in 0..count {
+        hand_over(&store, &via, batch_changes("k", i, 5));
+        say(format!("ok {i}"));
+    }
+    say("idle".into());
+    std::thread::sleep(Duration::from_secs(3600));
+}
+
+fn a_batch_that_returned_survives_kill_9(engine: Engine, via: &str) {
+    let mut rng = fastrand::Rng::with_seed(0x6234 ^ engine as u64);
+    for round in 0..4 {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let count = rng.u64(1..12);
+        let mut w = Writer::spawn(
+            "child_batch_writer",
+            engine,
+            dir,
+            &[
+                (ENV_VIA, via.into()),
+                (ENV_BATCHES, count.to_string().into()),
+            ],
+        );
+        loop {
+            let line = w.next();
+            if line == "idle" {
+                break;
+            }
+            if !line.starts_with("ok ") {
+                w.other.push(line);
+            }
+        }
+        let (_, other) = w.kill();
+
+        let mut want = BTreeMap::new();
+        for i in 0..count {
+            for op in batch_changes("k", i, 5) {
+                match op {
+                    StoreOp::Insert(name, v) => want.insert(name_key(&name), v),
+                    StoreOp::Remove(name) => want.remove(&name_key(&name)),
+                };
+            }
+        }
+        let store = Store::open(engine, &engine.path(dir, "store"))
+            .unwrap_or_else(|e| panic!("{engine:?} round {round}: reopen after kill -9: {e}"));
+        let held = store.contents().expect("contents after kill -9");
+        let lost: Vec<String> = want
+            .iter()
+            .filter(|(k, v)| held.get(*k) != Some(*v))
+            .map(|(k, _)| show(k))
+            .collect();
+        let extra: Vec<String> = held
+            .keys()
+            .filter(|k| !want.contains_key(*k))
+            .map(|k| show(k))
+            .collect();
+        assert!(
+            lost.is_empty() && extra.is_empty(),
+            "{engine:?} ({via}) round {round}: of {count} batches that returned before kill -9, \
+             {} keys are missing or changed ({:?}…) and {} are left that a batch removed \
+             ({:?}…) after reopening; the writer's other output: {other:?}",
+            lost.len(),
+            &lost[..lost.len().min(5)],
+            extra.len(),
+            &extra[..extra.len().min(5)],
+        );
+    }
+}
+
+/// d4: the batch of a `DataStore::apply` that returned survives `kill -9`.
+#[test]
+fn a_batch_that_returned_survives_kill_9_apply_fjall() {
+    a_batch_that_returned_survives_kill_9(Engine::Fjall, "apply");
+}
+
+#[test]
+fn a_batch_that_returned_survives_kill_9_apply_redb() {
+    a_batch_that_returned_survives_kill_9(Engine::Redb, "apply");
+}
+
+/// d4: so does a `SyncBackend::write_batch` made on the backend itself.
+#[test]
+fn a_batch_that_returned_survives_kill_9_backend_fjall() {
+    a_batch_that_returned_survives_kill_9(Engine::Fjall, "backend");
+}
+
+#[test]
+fn a_batch_that_returned_survives_kill_9_backend_redb() {
+    a_batch_that_returned_survives_kill_9(Engine::Redb, "backend");
+}
+
+/// How many changes a d5 batch holds: enough that writing one takes
+/// milliseconds, so a kill at a random moment lands inside one.
+const BIG: u64 = 20_000;
+
+/// Child of d5: large batches one after the other, each announced before it
+/// is handed over and reported after it returned.
+#[test]
+#[ignore = "child process of a_kill_in_the_middle_of_a_batch_*; run by it, not alone"]
+fn child_big_batches() {
+    let Some((engine, dir)) = child_env() else {
+        return;
+    };
+    let via = std::env::var(ENV_VIA).unwrap_or_else(|_| "apply".into());
+    let store = Store::open(engine, &engine.path(&dir, "store")).expect("open store");
+    for i in 0u64.. {
+        say(format!("start {i}"));
+        hand_over(&store, &via, batch_changes("big", i, BIG));
+        say(format!("done {i}"));
+    }
+}
+
+/// d5: the child is killed at a random moment inside a batch, ten times;
+/// each time the reopened store holds every batch it reported done, whole,
+/// and of the others, whole batches or none, in order: never part of one.
+fn a_kill_in_the_middle_of_a_batch_leaves_all_or_none(engine: Engine, via: &str) {
+    let mut rng = fastrand::Rng::with_seed(0x6235 ^ engine as u64);
+    let mut mid_batch = 0;
+    for round in 0..10 {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let mut w = Writer::spawn("child_big_batches", engine, dir, &[(ENV_VIA, via.into())]);
+        // How long a batch takes, from the first two.
+        let mut began = None;
+        let mut lines = Vec::new();
+        let took = loop {
+            let line = w.next();
+            if line == "start 1" {
+                began = Some(Instant::now());
+            }
+            if line == "done 1" {
+                lines.push(line);
+                break began.expect("start 1 came first").elapsed();
+            }
+            if line.starts_with("start ") || line.starts_with("done ") {
+                lines.push(line);
+            } else {
+                w.other.push(line);
+            }
+        };
+        // Some batch after them is in progress now; cut it at a random point.
+        std::thread::sleep(took.mul_f64(rng.f64() * 2.0));
+        let (rest, other) = w.kill();
+        lines.extend(rest.into_iter().filter(|l| !l.starts_with("[cut")));
+        let started = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("start ")?.parse::<u64>().ok())
+            .max()
+            .expect("a batch started");
+        let done = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("done ")?.parse::<u64>().ok())
+            .max()
+            .expect("a batch finished");
+        if started > done {
+            mid_batch += 1;
+        }
+
+        let store = Store::open(engine, &engine.path(dir, "store"))
+            .unwrap_or_else(|e| panic!("{engine:?} round {round}: reopen after kill -9: {e}"));
+        let held = store.contents().expect("contents after kill -9");
+        // Per batch, how many of its keys the store holds (the first key
+        // of each batch but the last is removed by the next one).
+        let mut per_batch: BTreeMap<u64, u64> = BTreeMap::new();
+        for key in held.keys() {
+            let name = show(key);
+            let i: u64 = name
+                .split('/')
+                .nth(3)
+                .and_then(|b| b.parse().ok())
+                .unwrap_or_else(|| panic!("{engine:?} round {round}: stray key {name}"));
+            *per_batch.entry(i).or_default() += 1;
+        }
+        let present = |i: u64| per_batch.get(&i).copied().unwrap_or(0);
+        // The newest batch there is holds every key (nothing after it removed
+        // one): a batch the kill cut shows here.
+        let last = per_batch.keys().next_back().copied();
+        if let Some(m) = last {
+            assert_eq!(
+                present(m),
+                BIG,
+                "{engine:?} ({via}) round {round}: batch {m} (of {started} started, {done} \
+                 done) holds {} of its {BIG} keys after kill -9: part of a batch survived; the \
+                 writer's other output: {other:?}",
+                present(m)
+            );
+        }
+        let mut seen_none = false;
+        for i in 0..=started {
+            let held_now = present(i);
+            if held_now == 0 {
+                seen_none = true;
+                assert!(
+                    i > done,
+                    "{engine:?} ({via}) round {round}: batch {i} was reported done before \
+                     kill -9 and is missing after reopening; the writer's other output: {other:?}"
+                );
+                continue;
+            }
+            assert!(
+                !seen_none,
+                "{engine:?} ({via}) round {round}: batch {i} is there but an earlier batch is \
+                 not: batches must land in order"
+            );
+            // An earlier batch lost its first key to the next one, whole.
+            if Some(i) != last {
+                assert_eq!(
+                    held_now,
+                    BIG - 1,
+                    "{engine:?} ({via}) round {round}: batch {i} holds {held_now} keys, not {} \
+                     (it lost one to batch {}, which landed whole)",
+                    BIG - 1,
+                    i + 1
+                );
+            }
+        }
+    }
+    assert!(
+        mid_batch >= 1,
+        "{engine:?} ({via}): none of ten kills landed inside a batch, so the case shows nothing; \
+         make the batches bigger"
+    );
+}
+
+#[test]
+fn a_kill_in_the_middle_of_a_batch_leaves_all_or_none_fjall() {
+    a_kill_in_the_middle_of_a_batch_leaves_all_or_none(Engine::Fjall, &via());
+}
+
+#[test]
+fn a_kill_in_the_middle_of_a_batch_leaves_all_or_none_redb() {
+    a_kill_in_the_middle_of_a_batch_leaves_all_or_none(Engine::Redb, &via());
+}
+
+/// The way d5 hands its batches over: `apply`, unless the environment names
+/// [`ENV_VIA`] (`loop` shows the case fail).
+fn via() -> String {
+    std::env::var(ENV_VIA).unwrap_or_else(|_| "apply".into())
 }
 
 // ------------------------------------------------------------ latency ----

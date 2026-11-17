@@ -30,6 +30,18 @@
 //! made directly on [`backend`](crate::store::BackendStore::backend) are not
 //! counted; make them durable with the backend's own `sync`.
 //!
+//! [`apply`](crate::svsync::DataStore::apply) hands several changes to the
+//! backend as one [`SyncBackend::write_batch`](ndn_storage::SyncBackend::write_batch)
+//! and counts it as one accepted write. On fjall (one engine batch), redb (one
+//! write transaction) and the memory and flash backends it is atomic: after a
+//! kill or a power loss all of it is there or none of it, and the next `sync`
+//! covers all of it or none. Like a single write it has returned, and
+//! survives `kill -9`, once the backend call returned (fjall's batch is
+//! committed with `PersistMode::Buffer`, as a single insert is). A backend
+//! with the trait's sequential default `write_batch` leaves a prefix, as the
+//! same writes made one by one would. A failed batch is sticky like a failed
+//! write.
+//!
 //! ```no_run
 //! # #[cfg(feature = "store-fjall")]
 //! # fn main() -> std::io::Result<()> {
@@ -51,9 +63,9 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_storage::{SyncBackend, name_key};
+use ndn_storage::{SyncBackend, WriteOp, name_key};
 
-use crate::svsync::DataStore;
+use crate::svsync::{DataStore, StoreOp};
 
 /// A [`DataStore`] backed by any `ndn-storage` [`SyncBackend`]
 /// ([`SyncMemoryBackend`](ndn_storage::SyncMemoryBackend), `FjallBackend`,
@@ -189,6 +201,37 @@ impl<S: SyncBackend> DataStore for BackendStore<S> {
         self.record(result, || format!("the removal of {name}"));
     }
 
+    /// One [`SyncBackend::write_batch`], counted as one accepted write: the
+    /// next [`sync`](DataStore::sync) covers all of it or none. Atomic on
+    /// the backends whose `write_batch` is (fjall: one engine batch; redb:
+    /// one write transaction; the memory and flash backends), so after a
+    /// kill or a power loss every change of `ops` is there or none is; on a
+    /// backend with the sequential default it leaves a prefix. A failure is
+    /// sticky, as for a single write.
+    fn apply(&self, ops: Vec<StoreOp>) {
+        let Some(first) = ops.first() else {
+            return;
+        };
+        let (count, first) = (
+            ops.len(),
+            match first {
+                StoreOp::Insert(name, _) => format!("the insert of {name}"),
+                StoreOp::Remove(name) => format!("the removal of {name}"),
+            },
+        );
+        let ops = ops
+            .into_iter()
+            .map(|op| match op {
+                StoreOp::Insert(name, wire) => WriteOp::Put(name_key(&name), wire),
+                StoreOp::Remove(name) => WriteOp::Delete(name_key(&name)),
+            })
+            .collect();
+        let result = self.backend.write_batch(ops);
+        self.record(result, || {
+            format!("the batch of {count} changes, the first {first},")
+        });
+    }
+
     /// Group commit: returns at once when every write accepted before the
     /// call is already durable; otherwise the leader flushes the backend for
     /// everything accepted so far, and callers that waited on it re-check.
@@ -215,7 +258,7 @@ impl<S: SyncBackend> DataStore for BackendStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn n(s: &str) -> Name {
         s.parse().unwrap()
@@ -254,6 +297,13 @@ mod tests {
         log: Mutex<(Vec<Vec<u8>>, usize)>,
         fail_put: AtomicBool,
         fail_sync: AtomicBool,
+        /// Calls of `write_batch`.
+        batches: AtomicUsize,
+        /// `write_batch` makes its writes one by one, as the trait's
+        /// default does (not atomic); otherwise it lands whole.
+        sequential: AtomicBool,
+        /// The disk fails every write once the log holds this many keys.
+        dies_after: Mutex<Option<usize>>,
     }
 
     impl Ledger {
@@ -268,11 +318,46 @@ mod tests {
             self.inner.get(key)
         }
         fn put(&self, key: &[u8], value: Bytes) -> ndn_storage::StorageResult<()> {
-            if self.fail_put.load(Ordering::SeqCst) {
+            let dead = self
+                .dies_after
+                .lock()
+                .unwrap()
+                .is_some_and(|k| self.log.lock().unwrap().0.len() >= k);
+            if self.fail_put.load(Ordering::SeqCst) || dead {
                 return Err(ndn_storage::StorageError::backend("disk full"));
             }
             self.inner.put(key, value)?;
             self.log.lock().unwrap().0.push(key.to_vec());
+            Ok(())
+        }
+        fn write_batch(&self, ops: Vec<WriteOp>) -> ndn_storage::StorageResult<()> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            if self.sequential.load(Ordering::SeqCst) {
+                for op in ops {
+                    match op {
+                        WriteOp::Put(k, v) => self.put(&k, v)?,
+                        WriteOp::Delete(k) => self.delete(&k)?,
+                    }
+                }
+                return Ok(());
+            }
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(ndn_storage::StorageError::backend("disk full"));
+            }
+            // Whole: the keys join the log in one step, so a flush covers all or none.
+            let mut log = self.log.lock().unwrap();
+            for op in ops {
+                match op {
+                    WriteOp::Put(k, v) => {
+                        self.inner.put(&k, v)?;
+                        log.0.push(k);
+                    }
+                    WriteOp::Delete(k) => {
+                        self.inner.delete(&k)?;
+                        log.0.push(k);
+                    }
+                }
+            }
             Ok(())
         }
         fn delete(&self, key: &[u8]) -> ndn_storage::StorageResult<()> {
@@ -348,5 +433,186 @@ mod tests {
         // may have dropped (an fsync error can discard dirty pages).
         store.insert(n("/a/2"), Bytes::from_static(b"two"));
         store.sync().expect_err("still failed");
+    }
+
+    fn batch(group: &str, k: usize) -> Vec<StoreOp> {
+        let mut ops: Vec<StoreOp> = (0..k)
+            .map(|i| StoreOp::Insert(n(&format!("/{group}/{i}")), Bytes::from_static(b"v")))
+            .collect();
+        ops.push(StoreOp::Remove(n(&format!("/{group}/gone"))));
+        ops
+    }
+
+    #[test]
+    fn a_batch_is_one_accepted_unit_the_next_flush_covers_whole() {
+        let store = BackendStore::new(Ledger::default());
+        store.apply(batch("b", 3));
+        assert_eq!(
+            store.backend().batches.load(Ordering::SeqCst),
+            1,
+            "a batch is handed to the backend as one write_batch, not one call per change"
+        );
+        assert_eq!(
+            store.accepted.load(Ordering::SeqCst),
+            1,
+            "a batch is one accepted write for the group commit"
+        );
+        for i in 0..3 {
+            assert!(
+                !store
+                    .backend()
+                    .is_durable(&name_key(&n(&format!("/b/{i}"))))
+            );
+        }
+        store.sync().expect("sync");
+        for i in 0..3 {
+            let key = name_key(&n(&format!("/b/{i}")));
+            assert!(
+                store.backend().is_durable(&key),
+                "/b/{i} is covered by the sync"
+            );
+        }
+        assert!(store.backend().is_durable(&name_key(&n("/b/gone"))));
+        // An empty batch does nothing and counts nothing.
+        store.apply(Vec::new());
+        assert_eq!(store.backend().batches.load(Ordering::SeqCst), 1);
+        assert_eq!(store.accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_batch_leaves_nothing_and_fails_every_later_sync() {
+        let store = BackendStore::new(Ledger::default());
+        store.insert(n("/a/1"), Bytes::from_static(b"one"));
+        store.sync().expect("nothing failed yet");
+        store.backend().fail_put.store(true, Ordering::SeqCst);
+        store.apply(batch("b", 3));
+        store.backend().fail_put.store(false, Ordering::SeqCst);
+        store.insert(n("/a/2"), Bytes::from_static(b"two"));
+        for _ in 0..2 {
+            let e = store.sync().expect_err("a batch was lost");
+            assert!(
+                e.to_string().contains("batch of 4 changes"),
+                "names the lost batch: {e}"
+            );
+        }
+        assert!(
+            (0..3).all(|i| store.get(&n(&format!("/b/{i}"))).is_none()),
+            "a batch that failed left none of its changes"
+        );
+    }
+
+    #[test]
+    fn a_batch_under_concurrent_sync_is_covered() {
+        let store = BackendStore::new(Ledger::default());
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let store = &store;
+                s.spawn(move || {
+                    for i in 0..100 {
+                        let group = format!("t{t}x{i}");
+                        store.apply(batch(&group, 3));
+                        store.sync().expect("sync");
+                        for j in 0..3 {
+                            let key = name_key(&n(&format!("/{group}/{j}")));
+                            assert!(
+                                store.backend().is_durable(&key),
+                                "/{group}/{j} was in a batch applied before a sync that returned \
+                                 Ok, yet no flush covered it"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            store.backend().batches.load(Ordering::SeqCst),
+            800,
+            "one write_batch per batch"
+        );
+    }
+
+    #[test]
+    fn a_backend_without_an_atomic_batch_leaves_the_in_order_prefix() {
+        let store = BackendStore::new(Ledger::default());
+        store.backend().sequential.store(true, Ordering::SeqCst);
+        *store.backend().dies_after.lock().unwrap() = Some(2);
+        store.apply(batch("b", 4));
+        assert!(
+            store.get(&n("/b/0")).is_some() && store.get(&n("/b/1")).is_some(),
+            "the changes before the failure were made, in order"
+        );
+        assert!(
+            store.get(&n("/b/2")).is_none() && store.get(&n("/b/3")).is_none(),
+            "none after the failure was made: a prefix, never a gap"
+        );
+        store.sync().expect_err("the failed batch fails the sync");
+    }
+
+    /// A store that only keeps a log of the calls made on it.
+    #[derive(Default)]
+    struct Calls(Mutex<Vec<String>>);
+
+    impl DataStore for Calls {
+        fn insert(&self, name: Name, _: Bytes) {
+            self.0.lock().unwrap().push(format!("insert {name}"));
+        }
+        fn get(&self, _: &Name) -> Option<Bytes> {
+            None
+        }
+        fn remove(&self, name: &Name) {
+            self.0.lock().unwrap().push(format!("remove {name}"));
+        }
+        fn sync(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_default_apply_makes_the_calls_one_by_one_in_order() {
+        let store = Calls::default();
+        store.apply(vec![
+            StoreOp::Insert(n("/x/2"), Bytes::new()),
+            StoreOp::Remove(n("/x/1")),
+            StoreOp::Insert(n("/x/1"), Bytes::new()),
+        ]);
+        assert_eq!(
+            *store.0.lock().unwrap(),
+            ["insert /x/2", "remove /x/1", "insert /x/1"]
+        );
+    }
+
+    #[test]
+    fn a_memory_store_applies_a_batch_whole_under_one_lock() {
+        let store = crate::svsync::MemoryStore::new();
+        store.insert(n("/m/gone"), Bytes::from_static(b"old"));
+        std::thread::scope(|s| {
+            let store = &store;
+            s.spawn(move || {
+                for _ in 0..2000 {
+                    store.apply(vec![
+                        StoreOp::Insert(n("/m/a"), Bytes::from_static(b"1")),
+                        StoreOp::Insert(n("/m/b"), Bytes::from_static(b"1")),
+                        StoreOp::Remove(n("/m/gone")),
+                    ]);
+                    store.apply(vec![
+                        StoreOp::Remove(n("/m/a")),
+                        StoreOp::Remove(n("/m/b")),
+                        StoreOp::Insert(n("/m/gone"), Bytes::from_static(b"old")),
+                    ]);
+                }
+            });
+            s.spawn(move || {
+                for _ in 0..20_000 {
+                    let seen = store.scan_under(&n("/m"), 0);
+                    let (a, b) = (
+                        seen.iter().any(|(k, _)| *k == n("/m/a")),
+                        seen.iter().any(|(k, _)| *k == n("/m/b")),
+                    );
+                    assert_eq!(a, b, "a reader saw half of a batch");
+                    let gone = seen.iter().any(|(k, _)| *k == n("/m/gone"));
+                    assert_ne!(a, gone, "a reader saw half of a batch");
+                }
+            });
+        });
     }
 }

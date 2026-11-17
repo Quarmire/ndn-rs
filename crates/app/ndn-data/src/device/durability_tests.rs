@@ -31,6 +31,7 @@ use super::*;
 use crate::layer::Share;
 use ndn_app::AppError;
 use ndn_security::TrustSchema;
+use ndn_sync::StoreOp;
 use ndn_sync::store::BackendStore;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,13 +48,13 @@ const ROLE: &str = "NDN_DATA_POWER_CUT";
 const CHILD_LIMIT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug)]
-enum Engine {
+pub(super) enum Engine {
     Fjall,
     Redb,
 }
 
 impl Engine {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Engine::Fjall => "fjall",
             Engine::Redb => "redb",
@@ -69,7 +70,7 @@ impl Engine {
     }
 
     /// The store's files under `dir`: fjall's directory, redb's file.
-    fn live(self, dir: &Path) -> PathBuf {
+    pub(super) fn live(self, dir: &Path) -> PathBuf {
         match self {
             Engine::Fjall => dir.join("live"),
             Engine::Redb => dir.join("live.redb"),
@@ -163,6 +164,9 @@ impl DataStore for PowerCut {
     fn remove(&self, name: &Name) {
         self.write(|| self.inner.remove(name));
     }
+    fn apply(&self, ops: Vec<StoreOp>) {
+        self.write(|| self.inner.apply(ops));
+    }
     fn sync(&self) -> std::io::Result<()> {
         while self.frozen.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(1));
@@ -174,12 +178,12 @@ impl DataStore for PowerCut {
     }
 }
 
-fn collection() -> Name {
+pub(super) fn collection() -> Name {
     n("/alice/32=data/notes")
 }
 
 /// `/alice/laptop`, its key the same in every run, on `store`.
-async fn laptop(store: Arc<dyn DataStore>) -> Device {
+pub(super) async fn laptop(store: Arc<dyn DataStore>) -> Device {
     device_on("/alice/laptop", store).await
 }
 
@@ -190,7 +194,11 @@ async fn device_on(device: &str, store: Arc<dyn DataStore>) -> Device {
 
 /// Alice's device `device`, its key the same in every run, on `store`,
 /// sending over `conn`.
-async fn device_over(device: &str, store: Arc<dyn DataStore>, conn: Arc<dyn Connection>) -> Device {
+pub(super) async fn device_over(
+    device: &str,
+    store: Arc<dyn DataStore>,
+    conn: Arc<dyn Connection>,
+) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator
@@ -442,6 +450,8 @@ struct Held {
     inner: ndn_sync::MemoryStore,
     held: std::sync::Mutex<bool>,
     let_go: std::sync::Condvar,
+    /// Calls of `apply`.
+    batches: std::sync::atomic::AtomicUsize,
 }
 
 impl Held {
@@ -525,6 +535,10 @@ impl DataStore for Held {
     }
     fn remove(&self, name: &Name) {
         self.inner.remove(name);
+    }
+    fn apply(&self, ops: Vec<StoreOp>) {
+        self.batches.fetch_add(1, Ordering::SeqCst);
+        self.inner.apply(ops);
     }
     fn sync(&self) -> std::io::Result<()> {
         let mut held = self.held.lock().unwrap();
@@ -620,6 +634,119 @@ async fn an_entry_is_served_listed_and_announced_only_once_its_flush_returned() 
     dev.shutdown();
 }
 
+/// The same barrier on the batched path (spec §4.2, Batching): a burst of
+/// puts is handed to the store at once, a batch each, before any `put`
+/// returns — and not one of them is served, listed or announced until the
+/// flush that follows returned, then all are, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_batched_puts_is_stored_at_once_and_published_only_after_the_flush() {
+    let store = Arc::new(Held::default());
+    let (seq, mut announced) = tokio::sync::watch::channel(0);
+    let sent: Arc<dyn Connection> = Arc::new(Announced {
+        group: sync_group(&n("/alice")),
+        device: n("/alice/laptop"),
+        seq,
+    });
+    let dev = device_over(
+        "/alice/laptop",
+        Arc::clone(&store) as Arc<dyn DataStore>,
+        sent,
+    )
+    .await;
+    let c = collection();
+    dev.share(
+        &c,
+        Share {
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    dev.inner.flushed().await;
+    let ns = dev.namespace().clone();
+    let root_head = || {
+        let wire = dev
+            .inner
+            .packet_for(&root_prefix(dev.name(), &ns), true)
+            .unwrap();
+        parse_summary_name(&Data::decode(wire).unwrap().name)
+            .and_then(|s| s.head)
+            .unwrap()
+    };
+    let listed = root_head();
+
+    let holding = store.hold();
+    let may_go_out = dev.inner.st.lock().groups[&ns].announced;
+    let batches = store.batches.load(Ordering::SeqCst);
+    let mut ids = Vec::new();
+    for i in 0..25 {
+        let id = dev
+            .put(&c, Content::new().with("k", format!("{i:04}")), options())
+            .await
+            .expect("a put applies locally whatever the disk does");
+        // Handed to the store, whole, before the put returned.
+        let entry = log_name(dev.name(), Some(&c), id.seq.0);
+        assert!(
+            store.inner.get(&entry).is_some()
+                && store.inner.get(&written_name(&entry)).is_some()
+                && store.inner.get(&verified_name(&entry)).is_some(),
+            "put {i} returned before its entry and markers reached the store"
+        );
+        ids.push(id);
+    }
+    assert!(
+        store.batches.load(Ordering::SeqCst) - batches >= ids.len(),
+        "each put hands the store one batch: {} batches for {} puts",
+        store.batches.load(Ordering::SeqCst) - batches,
+        ids.len()
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for id in &ids {
+        assert!(
+            dev.inner
+                .packet_for(&log_name(dev.name(), Some(&c), id.seq.0), false)
+                .is_none(),
+            "seq {} is served before its flush returned",
+            id.seq.0
+        );
+    }
+    assert!(
+        root_head() < ids[0].seq.0,
+        "a summary lists an entry before its flush returned"
+    );
+    assert!(
+        *announced.borrow() <= may_go_out,
+        "a burst is announced before its flush returned"
+    );
+
+    drop(holding);
+    let last = ids.last().unwrap().seq.0;
+    assert!(dev.inner.published(last).await);
+    dev.inner.flushed().await;
+    for id in &ids {
+        assert!(
+            dev.inner
+                .packet_for(&log_name(dev.name(), Some(&c), id.seq.0), false)
+                .is_some(),
+            "seq {} is not served once its flush returned",
+            id.seq.0
+        );
+    }
+    assert!(root_head() >= last && root_head() > listed);
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        announced.wait_for(|seq| *seq > may_go_out),
+    )
+    .await;
+    assert!(
+        out.is_ok_and(|seen| seen.is_ok()),
+        "the burst is announced once its flush returned"
+    );
+    dev.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_store_instance_has_its_own_barrier() {
     let (held, free) = (Arc::new(Held::default()), Arc::new(Held::default()));
@@ -661,7 +788,7 @@ async fn each_store_instance_has_its_own_barrier() {
 }
 
 /// Median and 99th percentile of `samples`, in microseconds.
-fn percentiles(samples: &mut [Duration]) -> (f64, f64) {
+pub(super) fn percentiles(samples: &mut [Duration]) -> (f64, f64) {
     samples.sort();
     let at = |q: f64| {
         let i = ((samples.len() as f64 - 1.0) * q).round() as usize;

@@ -2232,6 +2232,9 @@ struct Inner {
     node: Node,
     sync: Arc<dyn Connection>,
     store: Arc<dyn DataStore>,
+    /// `store`, as the stage that keeps a put's writes together
+    /// ([`stage::Stage::batch`]).
+    stage: Arc<stage::Stage>,
     config: Config,
     svs: MultiSvs,
     st: Mutex<St>,
@@ -7329,6 +7332,10 @@ impl Device {
             .signer
             .public_key()
             .map(|pk| public_key_digest(&pk));
+        // The host's store behind a stage: the writes of one put reach it as
+        // one batch ([`stage::Stage`]); everything else goes through as made.
+        let stage = stage::Stage::new(store);
+        let store: Arc<dyn DataStore> = stage.clone();
         // The signal sequence counter and time hint, as the last run left them.
         let signal_clock = signal::SignalClock::load(store.as_ref());
         // The events the last run left unacknowledged, before the store is read back.
@@ -7348,6 +7355,7 @@ impl Device {
             node: transport.node,
             sync: transport.sync,
             store: Arc::clone(&store),
+            stage,
             config,
             svs,
             st: Mutex::new(St {
@@ -9865,6 +9873,8 @@ impl Inner {
             let (target, round, announce) = {
                 let mut st = self.st.lock();
                 let mut announce = Vec::new();
+                // The counters of the announcements wanted, one batch.
+                let _batch = self.stage.batch();
                 for (ns, g) in st.groups.iter_mut() {
                     let Some(tx) = g.tx.clone().filter(|_| g.pending) else {
                         continue;
@@ -13918,6 +13928,7 @@ impl Inner {
 
     /// Keep `entry`, an own entry signed: the log's head, stored, taken.
     fn keep_entry(&self, st: &mut St, entry: LogEntry) -> (Name, u64) {
+        let _batch = self.stage.batch();
         let LogEntry {
             name,
             seq,
@@ -14069,6 +14080,7 @@ impl Inner {
     /// of the epoch it starts, and its cuts' manifest: stored, so this
     /// device serves it, and held, so it judges by it.
     fn keep_members(&self, st: &mut St, c: &Name, (entry, made, manifest): SignedMembers) {
+        let _batch = self.stage.batch();
         for wire in manifest {
             if let Ok(data) = Data::decode(wire.clone()) {
                 st.store.insert((*data.name).clone(), wire);
@@ -14569,6 +14581,7 @@ impl Inner {
         draft: Draft,
         options: (TypeId, Keep),
     ) -> Result<VersionId, DataError> {
+        let _batch = self.stage.batch();
         self.fresh(st, c)?;
         let base = self.next_seq(st)?;
         let Some(seq) = base.checked_add(1) else {
@@ -14826,6 +14839,7 @@ impl Inner {
         batch: Duration,
         judged: Option<Ruled>,
     ) -> VersionId {
+        let _batch = self.stage.batch();
         let Signed {
             c,
             seq,
@@ -14939,11 +14953,16 @@ impl Inner {
             }
         }
         st.head = st.head.max(seq);
+        // Written together (one batch): the markers first, then the pieces,
+        // the entry that makes the version visible last. On a store that
+        // cannot apply a batch whole, a prefix of these writes is at worst a
+        // marker or a piece of no entry, which a restart ignores, never an
+        // entry a restart takes as another writer's (spec §4.2, Batching).
+        self.note_written(st, &name, &held.wire);
         for p in pieces {
             self.store.insert(p.name, p.wire);
         }
         self.store.insert(name.clone(), held.wire.clone());
-        self.note_written(st, &name, &held.wire);
         st.held.insert(name, Held::Version(id.clone()));
         let retain = match log {
             true => Retain { keep, dated },
@@ -19884,6 +19903,9 @@ impl Device {
                 }
             }
         }
+        // One batch for the whole group: its records, then every version with
+        // its markers, reach the store together (spec §4.2, Batching).
+        let _batch = inner.stage.batch();
         // Kept: the records, then the group; nothing fails from here.
         for (c, entry) in entries {
             inner.keep_members(&mut st, &c, entry);
@@ -26144,6 +26166,8 @@ mod signal;
 
 mod heard;
 
+mod stage;
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fetch_tests;
 
@@ -26152,3 +26176,6 @@ mod walk_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod basis_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod batching_tests;
