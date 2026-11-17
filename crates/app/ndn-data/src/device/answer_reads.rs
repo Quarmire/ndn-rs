@@ -469,7 +469,10 @@ impl Inner {
                                  expired since"
                             )));
                         }
-                        Some(f) => f.epochs.iter().for_each(|e| add_epoch(&mut checked.epochs, e)),
+                        Some(f) => f
+                            .epochs
+                            .iter()
+                            .for_each(|e| add_epoch(&mut checked.epochs, e)),
                         None => checked.unverified += 1,
                     }
                 }

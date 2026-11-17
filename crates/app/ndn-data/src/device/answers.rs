@@ -122,9 +122,7 @@ impl Cause {
     /// The cause of `fault`.
     pub(super) fn of(fault: &AnswerFault) -> Cause {
         match fault {
-            AnswerFault::ReadSet(ReadSetFault::HeldConflict | ReadSetFault::Epochs) => {
-                Cause::Reads
-            }
+            AnswerFault::ReadSet(ReadSetFault::HeldConflict | ReadSetFault::Epochs) => Cause::Reads,
             _ => Cause::Signed,
         }
     }
@@ -574,8 +572,7 @@ impl Inner {
         if cause == Cause::Signed {
             held.cause = Cause::Signed;
         }
-        if !held.packets.contains_key(&digest) && held.packets.len() < EVIDENCE_PACKETS_PER_ANSWER
-        {
+        if !held.packets.contains_key(&digest) && held.packets.len() < EVIDENCE_PACKETS_PER_ANSWER {
             let mut record = Vec::with_capacity(1 + wire.len());
             record.push(cause.code());
             record.extend_from_slice(wire);

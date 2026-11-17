@@ -2091,7 +2091,13 @@ async fn devices_that_took_a_checkpoints_past_in_other_orders_agree_on_the_state
 fn give_keys(from: &Device, to: &Device, cs: &[&Name]) {
     for c in cs {
         let st = from.inner.st.lock();
-        let e = st.colls[*c].members.as_ref().unwrap().epoch.clone().unwrap();
+        let e = st.colls[*c]
+            .members
+            .as_ref()
+            .unwrap()
+            .epoch
+            .clone()
+            .unwrap();
         let k = st.keys.key(c, &e).unwrap();
         drop(st);
         to.inner.st.lock().keys.edit().hold((*c).clone(), e, k);
@@ -2171,8 +2177,14 @@ async fn a_reader_only_member_is_not_trusted_for_an_answer_by_default_but_a_writ
             }
         }
         // The host names the signer: trusted, whatever the folder's record says.
-        let named = ask(&readers[1], &forged).await.expect("a signer the policy names");
-        assert!(matches!(&named.how, Provenance::Trusted { .. }), "{:?}", named.how);
+        let named = ask(&readers[1], &forged)
+            .await
+            .expect("a signer the policy names");
+        assert!(
+            matches!(&named.how, Provenance::Trusted { .. }),
+            "{:?}",
+            named.how
+        );
     }
 }
 
@@ -2406,7 +2418,13 @@ async fn evidence_of_what_a_device_holds_ends_when_the_equivocation_is_found_or_
     take_entry(&tablet, &name, twin, &writer_key);
     let lifted = plant(&tablet, packet.clone()).await.unwrap_err();
     assert!(
-        matches!(&lifted, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        matches!(
+            &lifted,
+            DataError::Answer {
+                why: AnswerRefusal::ReadsChanged(_),
+                ..
+            }
+        ),
         "judged afresh, no longer the signer's fault: {lifted:?}"
     );
     assert!(!tablet.inner.st.lock().answer_book.is_blocked_name(&signed));
@@ -2454,7 +2472,13 @@ async fn evidence_of_what_a_device_holds_ends_when_the_equivocation_is_found_or_
         .insert(budget_version.unwrap(), Refusal::NotMember);
     let gone = plant(&laptop2, conflict).await.unwrap_err();
     assert!(
-        matches!(&gone, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        matches!(
+            &gone,
+            DataError::Answer {
+                why: AnswerRefusal::ReadsChanged(_),
+                ..
+            }
+        ),
         "{gone:?}"
     );
     assert!(!is_kept(&laptop2), "durably: nothing is kept to load again");
@@ -2470,7 +2494,8 @@ async fn evidence_of_what_a_device_holds_ends_when_the_equivocation_is_found_or_
 }
 
 #[tokio::test]
-async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_changed_read_not_a_fault() {
+async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_changed_read_not_a_fault()
+{
     use super::merge_tests as m;
     let f = function(1);
     let tune = |policy: AnswerPolicy| {
@@ -2491,12 +2516,22 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
     let c = m::c();
     let laptop = w.start("/alice/laptop", tune(named())).await;
     let sealed_to = |readers: &[&str]| Share {
-        rule: Rule::Merge { function: n(m::RULE) },
+        rule: Rule::Merge {
+            function: n(m::RULE),
+        },
         writers: vec![n("/alice")],
         readers: readers.iter().map(|r| Audience::Person(n(r))).collect(),
     };
-    laptop.share(&c, sealed_to(&["/alice", "/bob"])).await.unwrap();
-    let first_epoch = laptop.inner.st.lock().colls[&c].members.as_ref().unwrap().epoch.clone();
+    laptop
+        .share(&c, sealed_to(&["/alice", "/bob"]))
+        .await
+        .unwrap();
+    let first_epoch = laptop.inner.st.lock().colls[&c]
+        .members
+        .as_ref()
+        .unwrap()
+        .epoch
+        .clone();
     let first_key = laptop
         .inner
         .st
@@ -2508,11 +2543,19 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
     let phone = w.start("/alice/phone", tune(named())).await;
     sync_all(&laptop, &phone);
     give_keys(&laptop, &phone, &[&c]);
-    phone.put_op(&c, m::edit(None, "one"), options()).await.unwrap();
+    phone
+        .put_op(&c, m::edit(None, "one"), options())
+        .await
+        .unwrap();
     // A reader is removed: a second epoch. The phone writes its next version in it.
     sync_all(&phone, &laptop);
     laptop.share(&c, sealed_to(&["/alice"])).await.unwrap();
-    let second_epoch = laptop.inner.st.lock().colls[&c].members.as_ref().unwrap().epoch.clone();
+    let second_epoch = laptop.inner.st.lock().colls[&c]
+        .members
+        .as_ref()
+        .unwrap()
+        .epoch
+        .clone();
     let second_key = laptop
         .inner
         .st
@@ -2520,10 +2563,16 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
         .keys
         .key(&c, second_epoch.as_ref().unwrap())
         .unwrap();
-    assert_ne!(first_epoch, second_epoch, "removing a reader starts an epoch");
+    assert_ne!(
+        first_epoch, second_epoch,
+        "removing a reader starts an epoch"
+    );
     sync_all(&laptop, &phone);
     give_keys(&laptop, &phone, &[&c]);
-    phone.put_op(&c, m::edit(None, "two"), options()).await.unwrap();
+    phone
+        .put_op(&c, m::edit(None, "two"), options())
+        .await
+        .unwrap();
 
     // The phone signs an answer of the function over the state it holds, in both epochs.
     let (state, _) = phone.current_read(&c).await.unwrap();
@@ -2547,8 +2596,12 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
     }
     sync_all(&laptop, &tablet);
     sync_all(&phone, &tablet);
-    hand(&phone, &name, &tablet).await.expect("both epochs are held, and the answer opens");
-    let answered = ask(&tablet, &name).await.expect("a provider the policy names");
+    hand(&phone, &name, &tablet)
+        .await
+        .expect("both epochs are held, and the answer opens");
+    let answered = ask(&tablet, &name)
+        .await
+        .expect("a provider the policy names");
     assert!(matches!(answered.how, Provenance::Provider { .. }));
 
     // The reader withdraws the version of the first epoch (a cut, a revocation): the epochs the
@@ -2561,7 +2614,11 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
             .filter(|hv| hv.version.id.writer.key().has_prefix(&n("/alice/phone")))
             .min_by_key(|hv| hv.version.id.seq.0)
             .unwrap_or_else(|| panic!("the first version, among {} held", versions.len()));
-        (hv.version.name.clone(), hv.version.id.writer.clone(), hv.digest)
+        (
+            hv.version.name.clone(),
+            hv.version.id.writer.clone(),
+            hv.digest,
+        )
     };
     {
         let mut st = tablet.inner.st.lock();
@@ -2571,14 +2628,22 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
                 v1_name,
                 v1_writer,
                 v1_digest,
-                Refusal::Untrusted { why: "a cut".into() },
+                Refusal::Untrusted {
+                    why: "a cut".into(),
+                },
             )],
         );
     }
     let before = events_of(&tablet, EventKind::AnswerEvidence).len();
     let changed = ask(&tablet, &name).await.unwrap_err();
     assert!(
-        matches!(&changed, DataError::Answer { why: AnswerRefusal::ReadsChanged(_), .. }),
+        matches!(
+            &changed,
+            DataError::Answer {
+                why: AnswerRefusal::ReadsChanged(_),
+                ..
+            }
+        ),
         "a read withdrawn since, not a fault of the signer: {changed:?}"
     );
     assert_eq!(
@@ -2669,7 +2734,11 @@ async fn evidence_kept_against_signers_is_capped_per_signer_in_all_and_the_oldes
     for i in 0..fit + 3 {
         keep(&laptop, &named(i), &hostile, vec![i as u8; packet]);
     }
-    assert_eq!(evidence_stored(&laptop).0, fit, "octets kept per signer are capped");
+    assert_eq!(
+        evidence_stored(&laptop).0,
+        fit,
+        "octets kept per signer are capped"
+    );
     assert!(!blocked(&laptop, &named(0)) && blocked(&laptop, &named(fit + 2)));
 
     // The signers evidence is kept against.
@@ -2678,7 +2747,12 @@ async fn evidence_kept_against_signers_is_capped_per_signer_in_all_and_the_oldes
     let answer = |i: usize| wire::answer_name(&n(&format!("/hostile{i}/laptop")), &[1; 32]);
     let last = EVIDENCE_SIGNERS + 5;
     for i in 0..=last {
-        keep(&laptop, &answer(i), &signer(i), vec![i as u8, (i >> 8) as u8]);
+        keep(
+            &laptop,
+            &answer(i),
+            &signer(i),
+            vec![i as u8, (i >> 8) as u8],
+        );
     }
     assert_eq!(
         evidence_stored(&laptop).0,

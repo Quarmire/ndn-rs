@@ -262,8 +262,7 @@ impl Inner {
         // Evidence of what this device holds is kept against this signer's answer at this name
         // ([`Cause::Reads`]): the answer is judged afresh, and the evidence ends when it no
         // longer yields the fault (answers.md §8.2). A fault judged again is not told again.
-        let evidence = |fault: AnswerFault, readset: [u8; 32], why: AnswerRefusal| match rejudging
-        {
+        let evidence = |fault: AnswerFault, readset: [u8; 32], why: AnswerRefusal| match rejudging {
             true => refuse(AnswerRefusal::Equivocal),
             false => {
                 self.raise_evidence(&data, record.kind, &signer, id, readset, fault);
@@ -403,7 +402,14 @@ impl Inner {
             && let Ok(d) = Data::decode(wire)
         {
             let mut st = self.st.lock();
-            self.keep_evidence(&mut st, &o.name, o.kind, o.signer.key(), d.raw(), Cause::Signed);
+            self.keep_evidence(
+                &mut st,
+                &o.name,
+                o.kind,
+                o.signer.key(),
+                d.raw(),
+                Cause::Signed,
+            );
         }
         self.raise_evidence(
             &o.data,
