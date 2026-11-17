@@ -1136,8 +1136,9 @@ pub enum Signers {
     None,
     /// Devices of this device's own namespace.
     Own,
-    /// Own, or a member of EVERY collection the answer read, by the records held (the
-    /// definition of data-layer.md §20).
+    /// Own, or a writer of EVERY collection the answer read, by the records held, no context
+    /// held revoking its key (a device that only reads a collection is not trusted: it could
+    /// not have changed what the answer read; list it in [`Signers::Devices`] to trust it).
     OwnAndMembers,
     /// These device names; a name also matches the devices under it.
     Devices(Vec<Name>),

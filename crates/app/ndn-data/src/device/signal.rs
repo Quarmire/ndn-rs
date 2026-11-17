@@ -449,15 +449,27 @@ impl Inner {
         if !listed {
             return Err(NotMember::Unlisted);
         }
-        let revoked = self
-            .judge_signer(st, key, scope)
-            .keyring()
-            .context_for(key)
-            .is_revoked(key);
-        match revoked {
+        match self.revoked_for(st, key, scope) {
             true => Err(NotMember::Revoked),
             false => Ok(()),
         }
+    }
+
+    /// Whether `key` is a writer of `scope` by `m`, the record in force over it, for an answer
+    /// (answers.md §9): a writer prefix `m` lists covers it, and the trust context governing it
+    /// does not revoke it. Not the audience: a device that only reads `scope` could not have
+    /// changed what an answer read.
+    pub(super) fn writer_by(&self, st: &St, m: &Members, scope: &Name, key: &Name) -> bool {
+        m.lists_writer(key) && !self.revoked_for(st, key, scope)
+    }
+
+    /// Whether the trust context governing `key` — as this device judges the key's packets about
+    /// `scope` — revokes it.
+    fn revoked_for(&self, st: &St, key: &Name, scope: &Name) -> bool {
+        self.judge_signer(st, key, scope)
+            .keyring()
+            .context_for(key)
+            .is_revoked(key)
     }
 
     /// The signal keys of `scope`, sealed in epoch `e` (spec §20): `e`'s

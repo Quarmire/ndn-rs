@@ -2073,3 +2073,94 @@ async fn devices_that_took_a_checkpoints_past_in_other_orders_agree_on_the_state
         "covered versions are not in the applied set"
     );
 }
+
+// ---- round 5: who the default policy trusts ----------------------------------------------------
+
+/// The content keys of `cs` that `from` holds, held by `to` as well: `to` is then in their audience.
+fn give_keys(from: &Device, to: &Device, cs: &[&Name]) {
+    for c in cs {
+        let st = from.inner.st.lock();
+        let e = st.colls[*c].members.as_ref().unwrap().epoch.clone().unwrap();
+        let k = st.keys.key(c, &e).unwrap();
+        drop(st);
+        to.inner.st.lock().keys.edit().hold((*c).clone(), e, k);
+    }
+}
+
+#[tokio::test]
+async fn a_reader_only_member_is_not_trusted_for_an_answer_by_default_but_a_writer_and_a_named_signer_are()
+ {
+    for (writers, trusted_by_default) in [
+        (vec![n("/alice")], false),
+        (vec![n("/alice"), n("/bob")], true),
+    ] {
+        let mut w = World::new();
+        let laptop = w.start("/alice/laptop", knowing(vec![sum(1)])).await;
+        for c in [plan(), budget()] {
+            laptop
+                .share(
+                    &c,
+                    Share {
+                        rule: Rule::Log,
+                        writers: writers.clone(),
+                        readers: ["/alice", "/bob", "/dave"]
+                            .iter()
+                            .map(|r| Audience::Person(n(r)))
+                            .collect(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        put_n(&laptop, &budget(), 3).await;
+        put_def(&laptop, &plan(), &[&budget()]).await;
+        let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
+
+        // Bob's device reads the folder, with every key, and signs a wrong answer at the right id.
+        let bob = w.start("/bob/laptop", knowing(vec![lax_sum(1)])).await;
+        give_keys(&laptop, &bob, &[&plan(), &budget()]);
+        sync_all(&laptop, &bob);
+        let forged = bob.publish_answer(&q).await.unwrap();
+
+        // Dave's reader does not know the evaluator, so it cannot recompute: it trusts by policy.
+        let mut readers = Vec::new();
+        for (name, policy) in [
+            ("/dave/default", AnswerPolicy::default()),
+            (
+                "/dave/named",
+                AnswerPolicy {
+                    pure: Signers::Devices(vec![n("/bob/laptop")]),
+                    ..AnswerPolicy::default()
+                },
+            ),
+        ] {
+            let reader = w.start(name, with_policy(policy, vec![])).await;
+            give_keys(&laptop, &reader, &[&plan(), &budget()]);
+            sync_all(&laptop, &reader);
+            hand(&bob, &forged, &reader).await.unwrap();
+            readers.push(reader);
+        }
+        let by_default = ask(&readers[0], &forged).await;
+        match trusted_by_default {
+            true => {
+                let got = by_default.expect("a writer of the folder is trusted by default");
+                assert!(
+                    matches!(&got.how, Provenance::Trusted { signer, .. }
+                    if *signer == writer(&w.key_of("/bob/laptop"))),
+                    "{:?}",
+                    got.how
+                );
+            }
+            false => {
+                let e = by_default.expect_err(
+                    "a member who only reads the folder could not have changed its data, and is \
+                     not trusted by default",
+                );
+                assert!(matches!(&e, DataError::CannotCheck { .. }), "{e:?}");
+            }
+        }
+        // The host names the signer: trusted, whatever the folder's record says.
+        let named = ask(&readers[1], &forged).await.expect("a signer the policy names");
+        assert!(matches!(&named.how, Provenance::Trusted { .. }), "{:?}", named.how);
+    }
+}

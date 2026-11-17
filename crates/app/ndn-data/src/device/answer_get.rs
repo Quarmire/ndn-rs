@@ -437,7 +437,8 @@ impl Inner {
     // ---- policy -------------------------------------------------------------------------------
 
     /// Whether `s` covers `signer` for an answer over `reads` (answers.md §9): this device's own
-    /// namespace, or a member of every collection read by the records held, or a listed device.
+    /// namespace, or a WRITER of every collection read by the records held (a reader of one is no
+    /// writer: it could not have changed what the answer read), or a listed device.
     fn covers(&self, s: &Signers, signer: &Writer, reads: &ReadSet) -> bool {
         let Some(device) = device_of(signer.key()) else {
             return false;
@@ -461,9 +462,8 @@ impl Inner {
                     .peekable();
                 collections.peek().is_some()
                     && collections.all(|c| {
-                        st.record_in_force(&c).is_some_and(|m| {
-                            self.signal_member_by(&st, &m, &c, signer.key()).is_ok()
-                        })
+                        st.record_in_force(&c)
+                            .is_some_and(|m| self.writer_by(&st, &m, &c, signer.key()))
                     })
             }
         }
