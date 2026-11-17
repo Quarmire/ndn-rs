@@ -1762,10 +1762,13 @@ enum Held {
     /// A version whose payload is sealed and not opened here.
     Locked,
     /// A members, hold or lease record, or a prune record: the key that
-    /// signed it and its implicit digest.
+    /// signed it, its implicit digest and the digest of its signed region
+    /// ([`wire::signed_digest`]), which says whether another packet at its name is another
+    /// thing the key signed.
     Record {
         writer: Writer,
         digest: [u8; 32],
+        signed: [u8; 32],
     },
     Snapshot(Snapshot),
     /// A version its writer pruned: dropped here, never served.
@@ -11628,11 +11631,14 @@ impl Inner {
         if let Some(Held::Version(id)) = st.held.get(&name) {
             let seq = id.seq.0;
             if let Record::Version(body) = &record
-                && held_wire(st, &name).is_some_and(|first| first != wire)
+                && st
+                    .held_signed(&name)
+                    .is_some_and(|first| Some(first) != wire::signed_digest(&wire))
                 && let Some(first) = st.held_version(&name)
             {
                 // Kept first, then reported, so the evidence outlives a
-                // restart: one second packet per name.
+                // restart: one second packet per name. Another signature value over what
+                // the key signed is no second thing (it is not kept: `wire::signed_digest`).
                 if !st.twins.contains_key(&name) {
                     self.store.insert(equivocal_name(&name), wire.clone());
                     st.twins.insert(name.clone(), wire.clone());
@@ -11791,8 +11797,16 @@ impl Inner {
         // A record a revocation refuses is held as refused and not taken
         // (a version is admitted as refused, [`St::admit_one`]).
         let digest = wire::implicit_digest(&wire);
+        let signed = wire::signed_digest(&wire)?;
         if st.cut_out.contains_key(&name) && !matches!(record, Record::Version(_)) {
-            st.held.insert(name, Held::Record { writer, digest });
+            st.held.insert(
+                name,
+                Held::Record {
+                    writer,
+                    digest,
+                    signed,
+                },
+            );
             return None;
         }
         match record {
@@ -11802,6 +11816,7 @@ impl Inner {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
+                        signed,
                     },
                 );
                 let c = body.collection.clone();
@@ -11961,6 +11976,7 @@ impl Inner {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
+                        signed,
                     },
                 );
                 let c = body.collection.clone();
@@ -11985,6 +12001,7 @@ impl Inner {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
+                        signed,
                     },
                 );
                 let c = body.collection.clone();
@@ -12036,7 +12053,7 @@ impl Inner {
                 None
             }
             Record::Intro(body) => {
-                self.take_intro(st, name, &parsed, wire, writer, body, digest);
+                self.take_intro(st, name, &parsed, wire, writer, body, (digest, signed));
                 None
             }
             Record::Prune(body) => {
@@ -12045,6 +12062,7 @@ impl Inner {
                     Held::Record {
                         writer: writer.clone(),
                         digest,
+                        signed,
                     },
                 );
                 let c = parsed.subject.clone()?;
@@ -12680,7 +12698,7 @@ impl Inner {
                 continue;
             }
             let refused = match held {
-                Held::Record { writer, digest } => self
+                Held::Record { writer, digest, .. } => self
                     .refusing(name, writer, || Some(*digest))
                     .map(|r| (writer, r)),
                 Held::Snapshot(s) => self
@@ -23310,6 +23328,171 @@ mod tests {
         );
         assert!(entries[0].dated < entries[1].dated);
         drop(st);
+        dev.shutdown();
+    }
+
+    /// The order of the P-256 group.
+    const P256_ORDER: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    /// The `(r, s)` of a DER ECDSA signature, each as 32 octets big-endian.
+    fn der_scalars(der: &[u8]) -> ([u8; 32], [u8; 32]) {
+        assert_eq!(der[0], 0x30, "a DER sequence");
+        assert_eq!(der[1] as usize + 2, der.len(), "a short-form length");
+        let mut at = 2;
+        let mut out = [[0u8; 32]; 2];
+        for scalar in &mut out {
+            assert_eq!(der[at], 0x02, "a DER integer");
+            let len = der[at + 1] as usize;
+            let int = &der[at + 2..at + 2 + len];
+            let int = int.strip_prefix(&[0u8][..]).unwrap_or(int);
+            scalar[32 - int.len()..].copy_from_slice(int);
+            at += 2 + len;
+        }
+        assert_eq!(at, der.len());
+        (out[0], out[1])
+    }
+
+    /// `n - s`, the other `S` that verifies with the same `r`.
+    fn other_s(s: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = P256_ORDER[i] as i16 - s[i] as i16 - borrow;
+            borrow = i16::from(d < 0);
+            out[i] = d.rem_euclid(256) as u8;
+        }
+        out
+    }
+
+    fn der_ecdsa(r: &[u8; 32], s: &[u8; 32]) -> Bytes {
+        let int = |x: &[u8; 32]| {
+            let start = x.iter().position(|b| *b != 0).unwrap_or(31);
+            let mut v = Vec::new();
+            if x[start] & 0x80 != 0 {
+                v.push(0);
+            }
+            v.extend_from_slice(&x[start..]);
+            let mut out = vec![0x02, v.len() as u8];
+            out.extend(v);
+            out
+        };
+        let mut body = int(r);
+        body.extend(int(s));
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend(body);
+        Bytes::from(der)
+    }
+
+    #[tokio::test]
+    async fn a_high_s_copy_of_a_held_ecdsa_entry_is_not_an_equivocation() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let sensor_keys = Arc::new(SecurityManager::new());
+        let key = sensor_keys
+            .generate_ecdsa_p256(sensor.clone().append("KEY").append("1"))
+            .unwrap();
+        let public = sensor_keys
+            .get_signer_sync(&key)
+            .unwrap()
+            .public_key()
+            .unwrap();
+        let cert = authority
+            .certify(&key, public, &issuer, VALIDITY_MS)
+            .await
+            .unwrap();
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        validator.adopt_context(context("/rita")).unwrap();
+        validator.cert_cache().insert(cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let a = log_name(&sensor, Some(&c), 4);
+        let content = wire::encode_version(&version_body(&c, None));
+
+        // What this crate's own signer guarantees: it does not normalise S (the `ecdsa` crate's
+        // RFC 6979 signing keeps whichever S it computes), so about half of its signatures are
+        // high-S, and every verifier accepts both: malleability is in the signature value only.
+        let signer = sensor_keys.get_signer_sync(&key).unwrap();
+        let high_s = |sig: &[u8]| {
+            let (_, s) = der_scalars(sig);
+            s > other_s(&s)
+        };
+        let mut seen = [0usize; 2];
+        for i in 0..32u8 {
+            seen[usize::from(high_s(&signer.sign_sync(&[i; 16]).unwrap()))] += 1;
+        }
+        assert!(
+            seen[0] > 0 && seen[1] > 0,
+            "the signer's S is not normalised: {seen:?} (low, high)"
+        );
+
+        let (original, sig) = signed(&sensor_keys, &key, &a, &content);
+        let (r, s) = der_scalars(&sig);
+        let flipped = der_ecdsa(&r, &other_s(&s));
+        assert_ne!(flipped, sig, "n - s is another signature value");
+        let copy =
+            DataBuilder::new(a.clone(), &content)
+                .sign_sync(signer.sig_type(), Some(&key), |_| flipped.clone());
+        let (orig_d, copy_d) = (
+            Data::decode(original.clone()).unwrap(),
+            Data::decode(copy.clone()).unwrap(),
+        );
+        assert_eq!(orig_d.signed_region(), copy_d.signed_region());
+        assert_ne!(
+            wire::implicit_digest(&original),
+            wire::implicit_digest(&copy),
+            "the copy is another packet"
+        );
+
+        dev.inner
+            .take_data(&a, orig_d)
+            .await
+            .expect("the original is taken");
+        assert!(matches!(
+            dev.inner.st.lock().held.get(&a),
+            Some(Held::Version(_))
+        ));
+        dev.inner
+            .take_data(&a, copy_d)
+            .await
+            .expect("the copy verifies: S is malleable and the verifier accepts both");
+        assert!(
+            dev.pending_events().is_empty(),
+            "a high-S copy is the same signed object, not equivocation: {:?}",
+            dev.pending_events()
+        );
+        assert!(
+            dev.inner.st.lock().twins.is_empty() && store.get(&equivocal_name(&a)).is_none(),
+            "no second packet is kept as evidence"
+        );
+
+        // Another content signed at the name is equivocation, as before.
+        let other = wire::encode_version(&VersionBody {
+            fields: Content::new().with("t", "another"),
+            ..version_body(&c, None)
+        });
+        let (second, _) = signed(&sensor_keys, &key, &a, &other);
+        dev.inner
+            .take_data(&a, Data::decode(second.clone()).unwrap())
+            .await
+            .expect("verified");
+        let events = dev.pending_events();
+        assert!(
+            matches!(
+                &events[..],
+                [e] if matches!(&e.detail, EventDetail::Equivocation { second: s, .. }
+                    if s.digest == Some(wire::implicit_digest(&second)))
+            ),
+            "two contents signed at one name are equivocation: {events:?}"
+        );
         dev.shutdown();
     }
 

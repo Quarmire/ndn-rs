@@ -676,13 +676,14 @@ impl Inner {
         wire: Bytes,
         writer: Writer,
         record: IntroRecord,
-        digest: [u8; 32],
+        (digest, signed): ([u8; 32], [u8; 32]),
     ) {
         st.held.insert(
             name.clone(),
             Held::Record {
                 writer: writer.clone(),
                 digest,
+                signed,
             },
         );
         let Some(folder) = record.subject() else {

@@ -3554,6 +3554,21 @@ pub fn implicit_digest(wire: &[u8]) -> [u8; 32] {
     Sha256::digest(wire).into()
 }
 
+/// The digest of what the signer of `wire` signed: SHA-256 over its signed region, the Name
+/// through the `SignatureInfo`, which excludes the signature value; `None` for a packet that
+/// does not decode as Data.
+///
+/// Two packets with one signed digest are one signed object. They differ only in the signature
+/// value, which an ECDSA signature leaves malleable (`S` and `n - S` both verify; a signer that
+/// randomizes signs the same content to another value each time), and which no one but the
+/// signer's key may be held to. Equivocation is decided by this digest; the implicit digest
+/// ([`implicit_digest`]) names exact wire bytes.
+pub fn signed_digest(wire: &Bytes) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let data = ndn_packet::Data::decode(wire.clone()).ok()?;
+    Some(Sha256::digest(data.signed_region()).into())
+}
+
 /// How many seqs `ranges` (checked: disjoint, at most [`NODE_SEQS`]) hold.
 fn seqs_in(ranges: &[(u64, u64)]) -> usize {
     ranges.iter().map(|(lo, hi)| (hi - lo) as usize + 1).sum()

@@ -204,6 +204,27 @@ it is one of a group of versions counted all or none, its group (§5.5).
   key gains nothing by signing an accepted seq again elsewhere. An entry
   the trust context refuses (§8.1) is no evidence against its key: a copy
   of a revoked key wrote it.
+- **What two entries are.** Two packets are different entries of a key when
+  the digest of their signed region — the Name through the `SignatureInfo`,
+  not the signature value — differs (ndn-data: `wire::signed_digest`). A copy
+  that differs only in its signature value is the same signed object and is
+  never equivocation: no second packet is stored, no `Change::Equivocation`
+  is told and no event is made (§21.3). ECDSA signatures are malleable in the
+  signature value (`S` and `n - S` verify under one key and content;
+  signers that randomize give another value for each signing; OpenSSL,
+  ndn-cxx and python-ndn do not normalise `S`, and neither does ndn-data's
+  own P-256 signer, which keeps whichever `S` its RFC 6979 computation
+  gives, so about half of its signatures are high-S), so a verifier that
+  refused high-S would refuse valid packets of other implementations and
+  this one does not: **acceptance is malleable in the signature value for
+  ECDSA, and nothing may depend on it.** An object named by an implicit
+  digest names exact wire bytes: a high-S sibling is another implicit digest
+  of the same signed object and is never evidence against the key. The
+  implicit digest is the identity of a packet's bytes (a tip's `Digest`, the
+  bytes a removal cut lists, §8), not of what a key signed: nothing that
+  decides whether a key signed two things reads it. A relay, or a
+  re-signing device, cannot make a key equivocate by changing the signature
+  value.
 - Parents are the frontier (writer → highest seq) of the collection's state
   the writer had applied when it wrote (§5.2), each **tip** `(y, t)` bound
   to the implicit digest of `y`'s packet at `t` (`Digest` in its
@@ -3462,8 +3483,10 @@ of that pass took; otherwise it asks the writer again in the next round.
   may have one held at one device and the other elsewhere; a reader
   takes the first that verifies, and the second, met later from any
   source, is the equivocation §4 reports and §5.5 refuses a group for. A
-  holder cannot make one: it cannot sign for the writer. A removal cut
-  bound to bytes (§8) decides which packet stays, whoever serves it.
+  holder cannot make one: it cannot sign for the writer, and the same
+  signed region under another signature value, which an ECDSA signature
+  leaves malleable, is no second thing the writer signed (§4). A removal
+  cut bound to bytes (§8) decides which packet stays, whoever serves it.
 - *Erasure.* Prune and expiry are checked as a packet is asked for, by the
   prune records held and the device's clock; a device restarted with
   orphan pieces of a pruned version serves none of them (the prune
@@ -6377,13 +6400,18 @@ are read back with it).
   before under another entry name (§4: one sequence across collections and
   kinds); and a different packet under a log entry name the key signed
   another packet under, of any kinds (a version and a members record of one
-  collection at one seq have one name). The evidence is the entry first taken
+  collection at one seq have one name), different meaning that the digests of
+  the two signed regions (name through `SignatureInfo`) differ: another
+  signature value over the same signed region — a flipped ECDSA `S`, a
+  re-signing — is the same signed object and reports nothing (§4). The
+  evidence is the entry first taken
   and this one, each by name, kind (`None` when the device never held it
   whole, as the members record of a signer who is not the owner, which it does
   not store) and digest of the packet verified (`None` when it holds no bytes
-  to give one). For two packets under one name, an event needs the first
-  packet's bytes to compare: a device that holds none of the first reports
-  nothing for it. A watch of a folder keeps telling `Change::Equivocation` for
+  to give one). For two packets under one name, an event needs the digest of
+  the first one's signed region to compare, which a device that holds the
+  first packet, or noted a record it did not store, has: a device that has
+  neither reports nothing for it. A watch of a folder keeps telling `Change::Equivocation` for
   the versions among them (§15); the event is additional. A third entry at
   the seq is another occurrence for the same subject (§21.5).
 - **Withdrawal.** A version delivered and refused again, exactly as
@@ -6553,8 +6581,12 @@ evidence give it the same id.
   forged entry, a forged copy of a certificate or a replayed root is refused
   before it is noted (§8, §17.1) and makes no event; an entry whose
   signature verifies is the signer's, so what the event says the key
-  signed it did sign. The digest is that of the packet verified here; a
-  packet a relay changed is not that packet. An event naming a cut or a
+  signed it did sign. The digest is that of the packet verified here (exact
+  wire bytes, as an implicit digest names them); a packet a relay changed is
+  not that packet, and a relay that changes only a packet's signature value
+  (an ECDSA `S` flipped to `n - S`, which still verifies) makes no
+  equivocation: two packets are two things the key signed only when the
+  digests of their signed regions differ (§4). An event naming a cut or a
   revocation is made from a record or a context judged as the layer judges
   them before. The evidence carries no content, so a peer cannot use an
   event to learn, or to make a device tell its host, what it cannot read.
@@ -6587,7 +6619,9 @@ contradicts (answers.md §8). It coalesces per signer key as every event does.
 
 `ndn-data`'s tests (`device/events_tests.rs`, and the revocation case in
 `device.rs`) hold: a members record against a version at one seq, under two
-names and under one, in either order; a withdrawal with no watcher, three
+names and under one, in either order; another signature value over the same
+signed region (a high-S copy of a held ECDSA entry, a re-signing) no
+equivocation, and two contents at one name still one; a withdrawal with no watcher, three
 of one key coalesced into one event with the first and the last evidence; a
 cut with nothing withdrawn, and the cut this device signed not reported; an
 event delivered, not acknowledged, delivered again after a restart,

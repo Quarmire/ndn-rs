@@ -258,6 +258,100 @@ async fn a_members_record_under_the_name_of_a_held_version_is_an_event_in_either
     }
 }
 
+/// `m` again with another signature value over the same signed region (name through
+/// `SignatureInfo`): what a flipped ECDSA `S`, or a fresh randomized ECDSA signature of the same
+/// content, gives. Its implicit digest differs; what the key signed does not.
+fn resigned(m: &Made, sig: u8) -> Made {
+    let packet = DataBuilder::new(m.name.clone(), &wire::encode_record(&m.record)).sign_sync(
+        ndn_packet::SignatureType::SignatureEd25519,
+        Some(&m.key),
+        move |_| Bytes::from(vec![sig; 64]),
+    );
+    assert_ne!(
+        packet, m.packet,
+        "another signature value is another packet"
+    );
+    Made {
+        packet,
+        name: m.name.clone(),
+        key: m.key.clone(),
+        record: m.record.clone(),
+    }
+}
+
+#[tokio::test]
+async fn another_signature_value_over_the_same_signed_region_is_not_an_equivocation() {
+    // A version, a members record the owner stores, and one it does not store (Bob is no device
+    // of the plan's namespace): each is held, and then arrives again with another signature.
+    let probes = |dev: &Device| {
+        [
+            version("/alice/phone", &plan(), 5, &[], None),
+            made(
+                "/alice/phone",
+                &plan(),
+                6,
+                Record::Members(record(
+                    dev,
+                    &plan(),
+                    2,
+                    &["/alice", "/bob", "/carol"],
+                    Vec::new(),
+                )),
+            ),
+            made(
+                "/bob/laptop",
+                &plan(),
+                7,
+                Record::Members(record(dev, &plan(), 2, &["/alice", "/bob"], Vec::new())),
+            ),
+        ]
+    };
+    let (dev, ..) = started(|c| c).await;
+    let mut changes = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    for first in probes(&dev) {
+        give(&dev, &first);
+        let copy = resigned(&first, 7);
+        give(&dev, &copy);
+        give(&dev, &resigned(&first, 9));
+    }
+    assert!(
+        of_kind(&dev, EventKind::Equivocation).is_empty(),
+        "the same signed region under another signature value is the same signed object, not \
+         two things one key signed; pending: {:?}",
+        dev.pending_events()
+    );
+    assert!(
+        dev.inner.st.lock().twins.is_empty(),
+        "no second packet is kept as evidence of what the key never signed twice"
+    );
+    let seen = super::group_tests::drain(&mut changes).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|c| matches!(c, Change::Equivocation { .. })),
+        "a watcher is not told of an equivocation either: {seen:?}"
+    );
+    // Two different contents at one name still are.
+    let (dev2, ..) = started(|c| c).await;
+    let first = version("/alice/phone", &plan(), 5, &[], None);
+    let mut body = match &first.record {
+        Record::Version(body) => body.clone(),
+        other => panic!("{other:?}"),
+    };
+    body.fields = Content::new().with("t", "another");
+    let other = made("/alice/phone", &plan(), 5, Record::Version(body));
+    give(&dev2, &first);
+    give(&dev2, &other);
+    assert_eq!(
+        of_kind(&dev2, EventKind::Equivocation).len(),
+        1,
+        "two different contents signed at one name are equivocation; pending: {:?}",
+        dev2.pending_events()
+    );
+    dev.shutdown();
+    dev2.shutdown();
+}
+
 #[tokio::test]
 async fn a_withdrawal_is_an_event_with_no_watcher_and_later_ones_coalesce() {
     let (dev, ..) = started(|c| c).await;

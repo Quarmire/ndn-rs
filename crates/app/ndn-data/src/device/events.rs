@@ -35,22 +35,26 @@ impl St {
     }
 
     /// Report that `wire`, a packet of `writer` of kind `record` under the log entry name `name`
-    /// held already, differs from the packet held there: two packets of one key at one name,
-    /// of any kinds (spec §21). The same packet again, or one whose first packet this device
-    /// holds no bytes of to compare, reports nothing.
+    /// held already, is another thing than the packet held there: two packets of one key at one
+    /// name, of any kinds, whose signed regions (name through `SignatureInfo`) differ (spec
+    /// §21). The same packet again, a copy that differs only in its signature value, or one
+    /// whose first packet this device holds no bytes of to compare, reports nothing.
     pub(super) fn report_twin(
         &mut self,
         name: &Name,
         writer: &Writer,
         record: &Record,
-        wire: &[u8],
+        wire: &Bytes,
     ) {
         let first = self.entry_ref(name);
-        let digest = wire::implicit_digest(wire);
-        let (Some(held), Some(log)) = (first.digest, wire::parse_log_name(name)) else {
+        let (Some(held), Some(signed), Some(log)) = (
+            self.held_signed(name),
+            wire::signed_digest(wire),
+            wire::parse_log_name(name),
+        ) else {
             return;
         };
-        if held == digest {
+        if held == signed {
             return;
         }
         self.report_event(EventDetail::Equivocation {
@@ -60,9 +64,22 @@ impl St {
             second: EntryRef {
                 name: name.clone(),
                 kind: Some(EntryKind::of(record)),
-                digest: Some(digest),
+                digest: Some(wire::implicit_digest(wire)),
             },
         });
+    }
+
+    /// The digest of what the key signed in the entry held at `name` ([`wire::signed_digest`]),
+    /// as far as this device holds it: of a members, hold, lease, prune or introduction record
+    /// that it does not store too, which it noted when it took it.
+    pub(super) fn held_signed(&self, name: &Name) -> Option<[u8; 32]> {
+        match self.held.get(name)? {
+            Held::Version(_) | Held::Locked | Held::Pruned(_) | Held::Expired(_) => {
+                held_wire(self, name).and_then(|w| wire::signed_digest(&w))
+            }
+            Held::Snapshot(_) => self.store.get(name).and_then(|w| wire::signed_digest(&w)),
+            Held::Record { signed, .. } => Some(*signed),
+        }
     }
 
     /// Report that version `id` of `c`, delivered before, is refused now for `why` (what
