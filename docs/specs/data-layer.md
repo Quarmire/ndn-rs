@@ -375,7 +375,9 @@ before the `put` that made it returns, and MUST NOT defer it to a
 background writer: the guarantees above (a write that returned survives
 `kill -9`) hold for the batch as for a single write. A device MUST write
 a batch in the order markers, pieces, entry, and records before the
-versions that need them; and MUST apply the batches of puts in the order
+versions that need them, and the key of an epoch that a members record
+starts (made by this device) before the record that names it; and MUST
+apply the batches of puts in the order
 the puts numbered their seqs, so publication, which follows the log head
 read under the same lock, follows put order. A batch changes nothing
 about publication: what a batch holds is published only after a barrier
@@ -383,7 +385,13 @@ that began after the batch was handed over has returned. A store MAY
 apply a batch atomically (all of it survives a kill and a power loss, or
 none of it; `BackendStore` over fjall, redb and the memory and flash
 backends does), and one that cannot MAY apply it one write at a time in
-order (the default); the order above is what makes that safe. A device
+order (the default); the order above is what makes that safe. A read by
+prefix that a device makes while a batch is open (erasing an epoch's key
+scans the store for its grants; dropping a pruned version scans for its
+pieces) MUST answer as the store would with the batch applied (what the
+batch stores appears, what it removes does not, in the store's order) and
+MUST NOT hand a part of the batch to the store: a batch is one `apply`
+whatever it reads. A device
 never needs one write of a put durable before another: the barrier makes
 all of the put durable at once. The announcement counter is the one write
 that does have to precede a barrier: it is applied by the commit round
@@ -420,11 +428,19 @@ a put. Batching is there for atomicity, and for engines that pay per write.
   the put, and signs that seq afresh; nobody saw the cut put (it was not
   durable, so not published). On a store that applies a batch one write at
   a time, a prefix of it is what is left, and the order of the batch
-  (markers, pieces, entry last) makes every prefix a state restore accepts:
+  (markers, pieces, entry last, and the key of an epoch before the record
+  that starts it) makes every prefix a state restore accepts:
   a marker or a piece with no entry is ignored or dropped, never an entry
   taken for another writer's. A store that returns from `apply` having kept
   only some of the batch, or that reports a batch durable before it is,
   defeats the barrier as a disk that lies about a flush does (first note).
+  A key stored without its record is no authority: restore takes a stored
+  made key only if a held members record names its epoch and its key check
+  matches, and ignores it otherwise; it is one small entry per cut put on
+  such a store (none on an atomic one), overwritten if that seq is signed
+  again. The reverse state, a record this device made without the key it
+  made for its epoch, which left the creator unable to write into the
+  collection (`NotReady`, no other device having the key), is never left.
 - A group is one batch: every member and every record it makes are there
   after a kill, or none is. A group of `GROUP_MAX` versions is a batch of
   that many entries with their pieces and markers, held in memory until it
@@ -5389,7 +5405,14 @@ order and is served identically after a restart) are in `ndn-data`'s
 batches are all stored before any `put` returns and none published before
 its flush. d8 runs in the conformance runner, clean and `--faulty`: a burst
 of puts and groups, each one batch, converges among devices and survives a
-restart.
+restart. d9 (a members record's batch holds the key of the epoch it starts
+before the record, and the erasure of the old epoch's key in the same
+batch, as one `apply`; a child killed at a random moment inside rotations
+leaves, on both engines, a record of a collection only where its epoch's
+key is held and the device writes into it; and on a store without atomic
+batches, cut after every number of writes, the same) is in `ndn-data`'s
+`device/batching_tests.rs`, with the check that a read by prefix inside a
+batch sees what it stores, not what it removes, and applies nothing.
 
 The introduction cases (§19) are run among strangers — each device's
 forwarder holds its own person's trust context and certificates only,

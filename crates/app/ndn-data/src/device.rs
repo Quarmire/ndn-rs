@@ -14117,9 +14117,13 @@ impl Inner {
 
     /// Keep a members record of `c` [`Self::sign_members`] signed, the key
     /// of the epoch it starts, and its cuts' manifest: stored, so this
-    /// device serves it, and held, so it judges by it.
+    /// device serves it, and held, so it judges by it. The key is stored
+    /// first ([`Self::store_made_key`]) and held once the record is taken.
     fn keep_members(&self, st: &mut St, c: &Name, (entry, made, manifest): SignedMembers) {
         let _batch = self.stage.batch();
+        if let Some((e, key)) = &made {
+            self.store_made_key(st, c, e, key);
+        }
         for wire in manifest {
             if let Ok(data) = Data::decode(wire.clone()) {
                 st.store.insert((*data.name).clone(), wire);
@@ -14128,7 +14132,7 @@ impl Inner {
         }
         self.keep_entry(st, entry);
         if let Some((e, key)) = made {
-            self.keep_made_key(st, c, e, key);
+            st.keys.edit().hold(c.clone(), e, key);
         }
     }
 
@@ -15195,12 +15199,16 @@ impl Inner {
         });
     }
 
-    /// Hold `key`, which this device made as the key of epoch `e` of `c`,
-    /// and keep it with what it holds: wrapped to its own recipient key,
-    /// under a local name ([`made_key_name`]).
-    fn keep_made_key(&self, st: &mut St, c: &Name, e: Epoch, key: ContentKey) {
-        let name = made_key_name(&self.device, c, &e);
-        match wrap_ck_to(&st.keys.recipient.public(), &key, &name.encode_to_tlv()) {
+    /// Keep `key`, which this device made as the key of epoch `e` of `c`,
+    /// with what the store holds: wrapped to its own recipient key, under a
+    /// local name ([`made_key_name`]). Stored before the members record that
+    /// names the epoch ([`Self::keep_members`]), so that no prefix of what a
+    /// put writes is a record whose key was never kept: a key stored without
+    /// its record is no authority ([`St::take_key`] refuses it, there being
+    /// no record to check it against) and costs one small entry.
+    fn store_made_key(&self, st: &St, c: &Name, e: &Epoch, key: &ContentKey) {
+        let name = made_key_name(&self.device, c, e);
+        match wrap_ck_to(&st.keys.recipient.public(), key, &name.encode_to_tlv()) {
             Ok((ephemeral, wrapped)) => self
                 .store
                 .insert(name, wire::encode_grant(&ephemeral, &wrapped.to_bytes())),
@@ -15208,7 +15216,6 @@ impl Inner {
                 tracing::warn!(collection = %c, epoch = ?e, "an epoch key made here is not kept for a restart: {why}");
             }
         }
-        st.keys.edit().hold(c.clone(), e, key);
     }
 
     /// A new epoch of `c` that the members record at this device's log seq

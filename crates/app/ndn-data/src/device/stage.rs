@@ -13,8 +13,12 @@
 //! a stretch with no `await`, and ends before that lock is released: no
 //! other thread publishes (the committer reads the log head under that
 //! lock) what a batch of this thread still holds. Writes of any thread
-//! with no batch open go straight through, in the order made.
+//! with no batch open go straight through, in the order made. A read by
+//! prefix ([`DataStore::scan_under`], [`DataStore::find_under`]) inside a
+//! batch answers as the store would with the batch applied, and does not
+//! apply it: no part of a put reaches the store before all of it does.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread::ThreadId;
 
@@ -108,18 +112,63 @@ impl Stage {
         })
     }
 
-    /// Hand what this thread's open batch holds so far to the store (a
-    /// boundary: a read by prefix must see it), and go on keeping.
-    fn settle(&self) {
-        let ops = {
-            let mut open = self.open.lock();
-            match open.as_mut() {
-                Some(o) if o.owner == std::thread::current().id() => std::mem::take(&mut o.ops),
-                _ => return,
-            }
+    /// What this thread's open batch says of each name under `prefix`, the
+    /// last write of a name standing: `Some` it stores it, `None` it removes
+    /// it. Empty when this thread has no batch open, or its batch says
+    /// nothing under `prefix` (read the store).
+    fn staged_under(&self, prefix: &Name) -> BTreeMap<Name, Option<Bytes>> {
+        let open = self.open.lock();
+        let Some(o) = open
+            .as_ref()
+            .filter(|o| o.owner == std::thread::current().id())
+        else {
+            return BTreeMap::new();
         };
-        if !ops.is_empty() {
-            self.store.apply(ops);
+        let mut staged = BTreeMap::new();
+        for op in &o.ops {
+            match op {
+                StoreOp::Insert(n, wire) if n.has_prefix(prefix) => {
+                    staged.insert(n.clone(), Some(wire.clone()));
+                }
+                StoreOp::Remove(n) if n.has_prefix(prefix) => {
+                    staged.insert(n.clone(), None);
+                }
+                _ => {}
+            }
+        }
+        staged
+    }
+
+    /// The first `limit` (`0` = all) `(name, wire)` pairs under `prefix` in
+    /// ascending name order, as the store would answer once the open batch
+    /// was applied: what it stores appears (over the store's own at that
+    /// name), what it removes does not. The batch is not applied: a read is
+    /// not a point to hand a part of a put to the store, which a kill would
+    /// leave half done.
+    fn merged(
+        &self,
+        prefix: &Name,
+        limit: usize,
+        staged: BTreeMap<Name, Option<Bytes>>,
+    ) -> Vec<(Name, Bytes)> {
+        // Each staged name hides at most one of the store's, so asking for
+        // that many more leaves `limit` of the store's that stand.
+        let ask = if limit == 0 { 0 } else { limit + staged.len() };
+        let mut found: BTreeMap<Name, Bytes> = self
+            .store
+            .scan_under(prefix, ask)
+            .into_iter()
+            .filter(|(name, _)| !staged.contains_key(name))
+            .collect();
+        found.extend(
+            staged
+                .into_iter()
+                .filter_map(|(name, wire)| Some((name, wire?))),
+        );
+        let found = found.into_iter();
+        match limit {
+            0 => found.collect(),
+            limit => found.take(limit).collect(),
         }
     }
 }
@@ -166,13 +215,22 @@ impl DataStore for Stage {
     }
 
     fn find_under(&self, prefix: &Name) -> Option<Bytes> {
-        self.settle();
-        self.store.find_under(prefix)
+        let staged = self.staged_under(prefix);
+        if staged.is_empty() {
+            return self.store.find_under(prefix);
+        }
+        self.merged(prefix, 1, staged)
+            .into_iter()
+            .next()
+            .map(|(_, wire)| wire)
     }
 
     fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
-        self.settle();
-        self.store.scan_under(prefix, limit)
+        let staged = self.staged_under(prefix);
+        if staged.is_empty() {
+            return self.store.scan_under(prefix, limit);
+        }
+        self.merged(prefix, limit, staged)
     }
 
     fn remove(&self, name: &Name) {

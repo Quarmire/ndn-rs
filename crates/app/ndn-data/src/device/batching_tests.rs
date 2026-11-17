@@ -5,9 +5,10 @@
 //! and in `handoff-ndf-rs/SHAPES-R5.md`.
 
 use super::durability_tests::{Engine, collection, laptop, percentiles};
-use super::group_tests::{n, options};
+use super::group_tests::{Unconnected, n, options};
 use super::*;
 use crate::layer::Share;
+use ndn_security::TrustSchema;
 use ndn_sync::store::BackendStore;
 use ndn_sync::{MemoryStore, StoreOp};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1029,7 +1030,7 @@ fn a_batch_of_the_stage_is_handed_to_the_store_whole_when_it_ends() {
 }
 
 #[test]
-fn another_threads_writes_do_not_join_a_batch_and_a_prefix_read_settles_it() {
+fn another_threads_writes_do_not_join_a_batch_and_do_not_see_it() {
     let rec = Recording::over(Arc::new(MemoryStore::new()));
     let stage = stage::Stage::new(Arc::clone(&rec) as Arc<dyn DataStore>);
     let batch = stage.batch();
@@ -1040,6 +1041,11 @@ fn another_threads_writes_do_not_join_a_batch_and_a_prefix_read_settles_it() {
             assert!(
                 stage.get(&n("/s/mine")).is_none(),
                 "another thread does not see a batch it did not open"
+            );
+            assert_eq!(
+                stage.scan_under(&n("/s"), 0).len(),
+                1,
+                "nor does its read by prefix: it sees the store's"
             );
             // And a batch of its own, while one is open, writes through.
             let _other = stage.batch();
@@ -1054,14 +1060,538 @@ fn another_threads_writes_do_not_join_a_batch_and_a_prefix_read_settles_it() {
         2,
         "the other thread's writes went straight to the store"
     );
-    // A read by prefix must see what the batch holds: it hands it over first.
-    let under = stage.scan_under(&n("/s"), 0);
-    assert_eq!(under.len(), 3);
-    assert!(matches!(rec.since(0).last(), Some(Call::Batch(ops)) if ops.len() == 1));
+    drop(batch);
+    let calls = rec.since(0);
+    assert_eq!(
+        calls.len(),
+        3,
+        "the batch ends as one apply, and an ended batch with nothing left makes no call: {calls:?}"
+    );
+    assert!(matches!(calls.last(), Some(Call::Batch(ops)) if ops.len() == 1));
+}
+
+/// What `stage` and a model of the store (the same writes made on a store
+/// with no stage) answer to every read by prefix.
+fn same_reads(stage: &stage::Stage, model: &MemoryStore, what: &str) {
+    for prefix in ["/", "/s", "/s/b", "/s/b/x", "/s/zz", "/t", "/s/new"] {
+        let prefix = if prefix == "/" {
+            Name::root()
+        } else {
+            n(prefix)
+        };
+        for limit in [0, 1, 2, 3, 100] {
+            assert_eq!(
+                stage.scan_under(&prefix, limit),
+                model.scan_under(&prefix, limit),
+                "{what}: the scan of {prefix} (limit {limit}) through the open batch is not what \
+                 the store would answer with the batch applied"
+            );
+        }
+        assert_eq!(
+            stage.find_under(&prefix),
+            model.find_under(&prefix),
+            "{what}: the find under {prefix} through the open batch is not what the store would \
+             answer with the batch applied"
+        );
+    }
+}
+
+#[test]
+fn a_read_by_prefix_through_an_open_batch_sees_its_writes_hides_its_removals_and_applies_nothing() {
+    let value = |s: &'static str| Bytes::from_static(s.as_bytes());
+    let base = [
+        ("/s/a", "old a"),
+        ("/s/b", "old b"),
+        ("/s/b/x", "old b x"),
+        ("/s/c", "old c"),
+        ("/t/a", "old t"),
+    ];
+    let rec = Recording::over(Arc::new(MemoryStore::new()));
+    let model = MemoryStore::new();
+    for (name, v) in base {
+        rec.inner.insert(n(name), value(v));
+        model.insert(n(name), value(v));
+    }
+    let stage = stage::Stage::new(Arc::clone(&rec) as Arc<dyn DataStore>);
+    same_reads(&stage, &model, "before any write");
+
+    let batch = stage.batch();
+    // Every kind of change a batch holds: a new name before, between and
+    // after the store's; a removal of a stored name; one overwritten; one
+    // written and removed; one removed and written again; a removal of a
+    // name nothing stores.
+    let ops = [
+        StoreOp::Insert(n("/s/0"), value("new 0")),
+        StoreOp::Insert(n("/s/bb"), value("new bb")),
+        StoreOp::Insert(n("/s/new"), value("new new")),
+        StoreOp::Insert(n("/s/new/deep"), value("new deep")),
+        StoreOp::Remove(n("/s/a")),
+        StoreOp::Insert(n("/s/c"), value("new c")),
+        StoreOp::Insert(n("/s/gone"), value("written, then removed")),
+        StoreOp::Remove(n("/s/gone")),
+        StoreOp::Remove(n("/s/b")),
+        StoreOp::Insert(n("/s/b"), value("new b")),
+        StoreOp::Remove(n("/s/nothing")),
+        StoreOp::Insert(n("/t/a"), value("new t")),
+        StoreOp::Remove(n("/t/a")),
+    ];
+    for op in ops.clone() {
+        match op {
+            StoreOp::Insert(name, wire) => stage.insert(name, wire),
+            StoreOp::Remove(name) => stage.remove(&name),
+        }
+    }
+    model.apply(ops.to_vec());
+    same_reads(&stage, &model, "inside the batch");
+    assert_eq!(
+        rec.mark(),
+        0,
+        "a read by prefix inside an open batch handed the store a part of it (an `apply` before the \
+         batch ended): a kill after that leaves a half of a put"
+    );
+    // The same through a nested batch, and after the removal of every name
+    // under a prefix.
+    {
+        let _inner = stage.batch();
+        for name in [
+            "/s/0",
+            "/s/b",
+            "/s/b/x",
+            "/s/bb",
+            "/s/c",
+            "/s/new",
+            "/s/new/deep",
+        ] {
+            stage.remove(&n(name));
+            model.remove(&n(name));
+        }
+        same_reads(&stage, &model, "after removing what was left under /s");
+        assert!(stage.scan_under(&n("/s"), 0).is_empty());
+        assert!(stage.find_under(&n("/s")).is_none());
+    }
+    assert_eq!(rec.mark(), 0, "a nested batch ended: the outer one is open");
     drop(batch);
     assert_eq!(
         rec.since(0).len(),
-        3,
-        "an ended batch with nothing left makes no call"
+        1,
+        "one apply when the batch ends: {:?}",
+        rec.since(0)
     );
+    for prefix in ["/s", "/t", "/s/b"] {
+        assert_eq!(
+            rec.scan_under(&n(prefix), 0),
+            model.scan_under(&n(prefix), 0),
+            "the store ends where the model does"
+        );
+    }
+}
+
+// ---- a members record and the key of the epoch it starts ---------------------------------------
+
+/// `/alice/laptop`'s key store, the same in every run: its signing key and
+/// its recipient secret (the epoch keys it makes are wrapped to that), so
+/// that a run started on what a killed run left can open them.
+fn laptop_keys() -> Arc<SecurityManager> {
+    let device = n("/alice/laptop");
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519_from_seed(device.clone().append("KEY").append("1"), &[7; 32])
+        .unwrap();
+    keys.put_secret(secret_name(&device), &[9; 32]).unwrap();
+    keys
+}
+
+async fn laptop_on(keys: &Arc<SecurityManager>, store: Arc<dyn DataStore>) -> Device {
+    let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+    let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+    validator
+        .adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
+        .unwrap();
+    Device::start(
+        Transport {
+            node: Node::from_connection(Arc::clone(&conn)),
+            sync: conn,
+        },
+        n("/alice/laptop"),
+        Arc::clone(keys),
+        validator,
+        store,
+        Config {
+            first_look: Duration::from_millis(50),
+            ..Config::new()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Share `c` as a log its owner's namespace writes and `readers` read: a
+/// members record that starts an epoch, and the epoch's key, made here.
+async fn share_sealed(dev: &Device, c: &Name, readers: &[&str]) {
+    dev.share(
+        c,
+        Share {
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: readers.iter().map(|r| Audience::Person(n(r))).collect(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Share `c` with Bob ([`share_sealed`]), put a version into it and prune
+/// it, and share it again without Bob: a reader removed is a new epoch, and
+/// the old one's key is erased, its version being pruned
+/// ([`Inner::destroy_key`], which scans the store) — in the very put that
+/// signs the new members record.
+async fn rotate(dev: &Device, c: &Name) {
+    share_sealed(dev, c, &["/alice", "/bob"]).await;
+    let id = dev
+        .put(c, Content::new().with("k", "one"), options())
+        .await
+        .unwrap();
+    dev.prune(c, &[id].into_iter().collect()).await.unwrap();
+    share_sealed(dev, c, &["/alice"]).await;
+}
+
+/// The epoch `dev` holds in force over `c` that it made itself, if it is one.
+fn made_here(dev: &Device, c: &Name) -> Option<Epoch> {
+    let st = dev.inner.st.lock();
+    st.colls
+        .get(c)?
+        .members
+        .as_ref()?
+        .epoch
+        .clone()
+        .filter(|e| e.creator == *dev.name())
+}
+
+/// The names `ops` writes, in order, for a message.
+fn short(ops: &[StoreOp]) -> String {
+    ops.iter()
+        .map(|op| match op {
+            StoreOp::Insert(n, _) => format!("+{n}"),
+            StoreOp::Remove(n) => format!("-{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The one batch of `calls` that stores the key `dev` made of epoch `e` of
+/// `c`; no other call stores it.
+fn the_batch_with_key(calls: &[Call], dev: &Device, c: &Name, e: &Epoch) -> Vec<StoreOp> {
+    let made = made_key_name(dev.name(), c, e);
+    let holding: Vec<&Vec<StoreOp>> = calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Batch(ops)
+                if ops
+                    .iter()
+                    .any(|op| matches!(op, StoreOp::Insert(n, _) if *n == made)) =>
+            {
+                Some(ops)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        holding.len(),
+        1,
+        "the key of {e:?} was stored by {} batches, not one with the record that names it: \
+         {calls:?}",
+        holding.len()
+    );
+    holding[0].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_record_is_stored_in_one_batch_with_its_key_before_it() {
+    let store = Recording::over(Arc::new(MemoryStore::new()));
+    let keys = laptop_keys();
+    let dev = laptop_on(&keys, Arc::clone(&store) as Arc<dyn DataStore>).await;
+    let c = collection();
+    let mark = store.mark();
+    share_sealed(&dev, &c, &["/alice", "/bob"]).await;
+    let first = made_here(&dev, &c).expect("the device made the first epoch");
+    let ops = the_batch_with_key(&store.since(mark), &dev, &c, &first);
+    let record = ops
+        .iter()
+        .position(|op| {
+            matches!(op, StoreOp::Insert(n, _)
+            if parse_log_name(n).is_some_and(|l| l.subject.as_ref() == Some(&c)))
+        })
+        .expect("the batch stores the members record");
+    assert!(
+        at(&ops, &made_key_name(dev.name(), &c, &first)) < record,
+        "the key of the epoch is stored before the record that names it, so that a prefix of the \
+         batch is never a record with no key: {}",
+        short(&ops)
+    );
+
+    // The same when the record erases an epoch key: it scans the store.
+    let id = dev
+        .put(&c, Content::new().with("k", "one"), options())
+        .await
+        .unwrap();
+    dev.prune(&c, &[id].into_iter().collect()).await.unwrap();
+    let mark = store.mark();
+    share_sealed(&dev, &c, &["/alice"]).await;
+    let second = made_here(&dev, &c).expect("the device made the second epoch");
+    assert_ne!(first, second, "a reader removed: a new epoch");
+    let ops = the_batch_with_key(&store.since(mark), &dev, &c, &second);
+    let record = ops
+        .iter()
+        .position(|op| {
+            matches!(op, StoreOp::Insert(n, _)
+            if parse_log_name(n).is_some_and(|l| l.subject.as_ref() == Some(&c)))
+        })
+        .expect("the batch stores the members record");
+    assert!(
+        at(&ops, &made_key_name(dev.name(), &c, &second)) < record,
+        "the key is stored before the record that names it: {}",
+        short(&ops)
+    );
+    assert!(
+        ops.iter().any(
+            |op| matches!(op, StoreOp::Remove(n) if *n == made_key_name(dev.name(), &c, &first))
+        ),
+        "the old epoch's key is erased in the same batch: {}",
+        short(&ops)
+    );
+    dev.shutdown();
+}
+
+/// A store that does not batch atomically, cut off after any `k` writes of
+/// a rotation: whenever the members record that names an epoch this device
+/// made is there, so is the epoch's key, and the device writes into the
+/// collection (it is not [`DataError::NotReady`] for a key it made and lost).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_prefix_of_a_rotation_on_a_store_without_atomic_batches_holds_the_key_of_a_stored_record()
+ {
+    let c = collection();
+    let rotated = |budget: usize| {
+        let c = c.clone();
+        async move {
+            let keys = laptop_keys();
+            let inner = Arc::new(MemoryStore::new());
+            let dying = Arc::new(Dying {
+                inner: Arc::clone(&inner),
+                budget: AtomicUsize::new(usize::MAX),
+                writes: AtomicUsize::new(0),
+            });
+            let dev = laptop_on(&keys, Arc::clone(&dying) as Arc<dyn DataStore>).await;
+            share_sealed(&dev, &c, &["/alice", "/bob"]).await;
+            let id = dev
+                .put(&c, Content::new().with("k", "one"), options())
+                .await
+                .unwrap();
+            dev.prune(&c, &[id].into_iter().collect()).await.unwrap();
+            dev.inner.flushed().await;
+            dying.budget.store(budget, Ordering::SeqCst);
+            let before = dying.writes.load(Ordering::SeqCst);
+            share_sealed(&dev, &c, &["/alice"]).await;
+            let writes = dying.writes.load(Ordering::SeqCst) - before;
+            dev.shutdown();
+            drop(dev);
+            (keys, inner, writes)
+        }
+    };
+    let (_, _, writes) = rotated(usize::MAX).await;
+    assert!(
+        writes > 4,
+        "a rotation writes a record, a key, markers: {writes}"
+    );
+    for k in 0..=writes + 2 {
+        let (keys, kept, _) = rotated(k).await;
+        let again = laptop_on(&keys, Arc::clone(&kept) as Arc<dyn DataStore>).await;
+        if let Some(e) = made_here(&again, &c) {
+            assert!(
+                again.inner.st.lock().keys.key(&c, &e).is_some(),
+                "after {k} of the rotation's {writes} writes the store holds the members record \
+                 that names {e:?}, made by this device, and the epoch's key was never stored: \
+                 the restarted device cannot write into {c}"
+            );
+        }
+        let next = again
+            .put(&c, Content::new().with("k", "after"), options())
+            .await;
+        assert!(
+            next.is_ok(),
+            "after {k} of the rotation's {writes} writes the restarted device cannot write into \
+             {c}: {next:?}"
+        );
+        again.shutdown();
+    }
+}
+
+// ---- a kill in the middle of a rotation, on a real engine --------------------------------------
+
+/// The environment variable that makes [`rotation_kill_child`] run:
+/// `<engine>|<directory>`.
+const ROTATION_ROLE: &str = "NDN_DATA_ROTATION_KILL";
+
+/// One run of a device in a process of its own, rotating the key of one
+/// collection after another, each announced before and reported after.
+/// Nothing when no case started it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a child process of the kill case; it runs only when it starts it"]
+async fn rotation_kill_child() {
+    use std::io::Write;
+    let Ok(role) = std::env::var(ROTATION_ROLE) else {
+        return;
+    };
+    let (engine, dir) = role.split_once('|').expect("<engine>|<directory>");
+    let engine = match engine {
+        "fjall" => Engine::Fjall,
+        "redb" => Engine::Redb,
+        other => panic!("{ROTATION_ROLE} names engine {other:?}; it is fjall or redb"),
+    };
+    let dev = laptop_on(
+        &laptop_keys(),
+        open_engine(engine, std::path::Path::new(dir)),
+    )
+    .await;
+    for i in 0.. {
+        println!("start {i}");
+        std::io::stdout().flush().unwrap();
+        rotate(&dev, &n(&format!("/alice/32=data/rot{i}"))).await;
+        println!("done {i}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+
+fn a_kill_in_the_middle_of_a_rotation_leaves_a_record_only_with_its_key(engine: Engine) {
+    use std::io::{BufRead, BufReader};
+    let mut rng = std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        engine.label(),
+    );
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng % 1000) as f64 / 1000.0
+    };
+    let mut mid_rotation = 0;
+    for round in 0..8 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "device::batching_tests::rotation_kill_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                ROTATION_ROLE,
+                format!("{}|{}", engine.label(), dir.path().display()),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        // How long a rotation takes, from the second; then cut one inside.
+        let (mut lines, mut began) = (Vec::new(), None);
+        let took = loop {
+            let line = rx
+                .recv_timeout(Duration::from_secs(120))
+                .unwrap_or_else(|e| {
+                    let _ = child.kill();
+                    panic!("the {} child said nothing for 120 s ({e})", engine.label())
+                });
+            if line == "start 1" {
+                began = Some(std::time::Instant::now());
+            }
+            if line == "done 1" {
+                lines.push(line);
+                break began.expect("start 1 came first").elapsed();
+            }
+            if line.starts_with("start ") || line.starts_with("done ") {
+                lines.push(line);
+            }
+        };
+        std::thread::sleep(took.mul_f64(next() * 6.0));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        lines.extend(rx.iter());
+        let number = |what: &str| {
+            lines
+                .iter()
+                .filter_map(|l| l.strip_prefix(what)?.parse::<usize>().ok())
+                .max()
+                .unwrap()
+        };
+        let (started, done) = (number("start "), number("done "));
+        if started > done {
+            mid_rotation += 1;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = open_engine(engine, dir.path());
+            let dev = laptop_on(&laptop_keys(), Arc::clone(&store)).await;
+            let mut seen = 0;
+            for i in 0..=started {
+                let c = n(&format!("/alice/32=data/rot{i}"));
+                let Some(e) = made_here(&dev, &c) else {
+                    continue;
+                };
+                seen += 1;
+                assert!(
+                    dev.inner.st.lock().keys.key(&c, &e).is_some(),
+                    "{} round {round}: after kill -9 (rotation {started} started, {done} \
+                     reported done) the store holds the members record of {c} that names {e:?}, \
+                     made by this device, and not the epoch's key",
+                    engine.label()
+                );
+                let put = dev
+                    .put(&c, Content::new().with("k", "after"), options())
+                    .await;
+                assert!(
+                    put.is_ok(),
+                    "{} round {round}: after kill -9 the restarted device cannot write into {c}: \
+                     {put:?}",
+                    engine.label()
+                );
+            }
+            assert!(
+                seen > done,
+                "{} round {round}: {} rotations were reported done before kill -9; the store \
+                 holds {seen} collections with a record of their own",
+                engine.label(),
+                done + 1
+            );
+            dev.shutdown();
+        });
+    }
+    assert!(
+        mid_rotation >= 1,
+        "{}: none of eight kills landed while a rotation was under way, so the case shows nothing",
+        engine.label()
+    );
+}
+
+#[test]
+fn a_kill_in_the_middle_of_a_rotation_leaves_a_record_only_with_its_key_on_fjall() {
+    a_kill_in_the_middle_of_a_rotation_leaves_a_record_only_with_its_key(Engine::Fjall);
+}
+
+#[test]
+fn a_kill_in_the_middle_of_a_rotation_leaves_a_record_only_with_its_key_on_redb() {
+    a_kill_in_the_middle_of_a_rotation_leaves_a_record_only_with_its_key(Engine::Redb);
 }
