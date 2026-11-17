@@ -145,13 +145,34 @@ impl Cause {
     }
 }
 
+/// Records of evidence (an answer name a signer is blocked at) kept against one signer: past
+/// it the oldest are dropped, and with them their block (answers.md §10).
+pub(super) const EVIDENCE_PER_SIGNER_ANSWERS: usize = 64;
+/// Octets of evidence packets kept against one signer (answers.md §10).
+pub(super) const EVIDENCE_PER_SIGNER_BYTES: u64 = 256 << 10;
+/// Signers evidence is kept against: past it, all of the signer whose newest evidence is oldest
+/// are dropped (answers.md §10).
+pub(super) const EVIDENCE_SIGNERS: usize = 256;
+/// Packets kept at one answer name of one signer: past it the block stands and the event is
+/// told with the packet, but no more is stored (answers.md §10).
+pub(super) const EVIDENCE_PACKETS_PER_ANSWER: usize = 8;
+
 /// What is kept against one signer's answer at one name: the packets, whole in the store, never
 /// served nor taken again while it stands.
 struct Evidence {
     kind: AnswerKind,
     cause: Cause,
-    /// The implicit digests of the packets kept.
-    packets: BTreeSet<[u8; 32]>,
+    /// The implicit digests of the packets kept, and their octets.
+    packets: BTreeMap<[u8; 32], u64>,
+    /// When it was last kept to, to drop the oldest first.
+    tick: u64,
+}
+
+impl Evidence {
+    /// The octets of its packets.
+    fn size(&self) -> u64 {
+        self.packets.values().sum()
+    }
 }
 
 /// What a device holds of answers: its own, others' it keeps for serving, the evidence it keeps.
@@ -525,7 +546,8 @@ impl Inner {
 
     /// Keep `wire`, an answer packet this device verified, as evidence against its signer
     /// (answers.md §8.2): stored whole before it is reported, never served nor taken again while
-    /// it stands. The store's record is the packet behind one octet, its [`Cause`].
+    /// it stands. The store's record is the packet behind one octet, its [`Cause`]. What is kept
+    /// against one signer is bounded (answers.md §10): the oldest evidence goes first.
     pub(super) fn keep_evidence(
         &self,
         st: &mut St,
@@ -536,11 +558,7 @@ impl Inner {
         cause: Cause,
     ) {
         let digest = wire::implicit_digest(wire);
-        let mut record = Vec::with_capacity(1 + wire.len());
-        record.push(cause.code());
-        record.extend_from_slice(wire);
-        self.store
-            .insert(evidence_name(name, kind, &digest), Bytes::from(record));
+        let tick = st.answer_book.touch();
         let held = st
             .answer_book
             .evidence
@@ -548,32 +566,99 @@ impl Inner {
             .or_insert_with(|| Evidence {
                 kind,
                 cause,
-                packets: BTreeSet::new(),
+                packets: BTreeMap::new(),
+                tick,
             });
+        held.tick = tick;
         // One cause that never ends is enough to keep it.
         if cause == Cause::Signed {
             held.cause = Cause::Signed;
         }
-        held.packets.insert(digest);
+        if !held.packets.contains_key(&digest) && held.packets.len() < EVIDENCE_PACKETS_PER_ANSWER
+        {
+            let mut record = Vec::with_capacity(1 + wire.len());
+            record.push(cause.code());
+            record.extend_from_slice(wire);
+            self.store
+                .insert(evidence_name(name, kind, &digest), Bytes::from(record));
+            held.packets.insert(digest, wire.len() as u64);
+        }
         // Never served, never held: whatever this device held at the name by that signer goes.
         if st.answer_book.held.contains_key(name) {
             self.drop_held(st, name);
         }
         st.answer_book.served.remove(name);
+        self.trim_evidence(st, signer);
     }
 
-    /// End the evidence kept against `signer`'s answer at `name`, its cause gone (answers.md
-    /// §8.2): the packets are removed from the store, so it stays ended across a restart, and
-    /// the answer is judged afresh the next time it is met.
-    pub(super) fn lift_evidence(&self, st: &mut St, name: &Name, signer: &Name) {
+    /// End the evidence kept against `signer`'s answer at `name`: its packets are removed from
+    /// the store, so it stays ended across a restart, and with it the block.
+    fn end_evidence(&self, st: &mut St, name: &Name, signer: &Name) {
         if let Some(e) = st
             .answer_book
             .evidence
             .remove(&(name.clone(), signer.clone()))
         {
-            tracing::info!(%name, %signer, "evidence lifted: what it rested on no longer holds");
-            for digest in &e.packets {
+            for digest in e.packets.keys() {
                 self.store.remove(&evidence_name(name, e.kind, digest));
+            }
+        }
+    }
+
+    /// End the evidence kept against `signer`'s answer at `name`, its cause gone (answers.md
+    /// §8.2): the answer is judged afresh the next time it is met.
+    pub(super) fn lift_evidence(&self, st: &mut St, name: &Name, signer: &Name) {
+        if st.answer_book.is_blocked(name, signer) {
+            tracing::info!(%name, %signer, "evidence lifted: what it rested on no longer holds");
+            self.end_evidence(st, name, signer);
+        }
+    }
+
+    /// Keep the evidence against `signer` within [`EVIDENCE_PER_SIGNER_ANSWERS`] records and
+    /// [`EVIDENCE_PER_SIGNER_BYTES`] octets, and against all within [`EVIDENCE_SIGNERS`]
+    /// signers, dropping the oldest first (answers.md §10). What is dropped is no longer
+    /// blocked: the answer is judged afresh, and the fault found again if it stands.
+    fn trim_evidence(&self, st: &mut St, signer: &Name) {
+        loop {
+            let mine: Vec<(Name, u64, u64)> = st
+                .answer_book
+                .evidence
+                .iter()
+                .filter(|((_, s), _)| s == signer)
+                .map(|((n, _), e)| (n.clone(), e.tick, e.size()))
+                .collect();
+            let bytes: u64 = mine.iter().map(|(_, _, size)| size).sum();
+            if mine.len() <= EVIDENCE_PER_SIGNER_ANSWERS && bytes <= EVIDENCE_PER_SIGNER_BYTES {
+                break;
+            }
+            let Some((oldest, _, _)) = mine.into_iter().min_by_key(|(_, tick, _)| *tick) else {
+                break;
+            };
+            tracing::debug!(%oldest, %signer, "evidence dropped: over what is kept against one signer");
+            self.end_evidence(st, &oldest, signer);
+        }
+        loop {
+            let mut newest: HashMap<Name, u64> = HashMap::new();
+            for ((_, s), e) in &st.answer_book.evidence {
+                let t = newest.entry(s.clone()).or_default();
+                *t = (*t).max(e.tick);
+            }
+            if newest.len() <= EVIDENCE_SIGNERS {
+                break;
+            }
+            let Some((oldest, _)) = newest.into_iter().min_by_key(|(_, tick)| *tick) else {
+                break;
+            };
+            tracing::debug!(signer = %oldest, "evidence dropped: over the signers evidence is kept against");
+            let names: Vec<Name> = st
+                .answer_book
+                .evidence
+                .keys()
+                .filter(|(_, s)| *s == oldest)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in names {
+                self.end_evidence(st, &name, &oldest);
             }
         }
     }
@@ -709,6 +794,7 @@ impl Inner {
             ) else {
                 continue;
             };
+            let tick = st.answer_book.touch();
             let held = st
                 .answer_book
                 .evidence
@@ -716,12 +802,24 @@ impl Inner {
                 .or_insert_with(|| Evidence {
                     kind,
                     cause,
-                    packets: BTreeSet::new(),
+                    packets: BTreeMap::new(),
+                    tick,
                 });
             if cause == Cause::Signed {
                 held.cause = Cause::Signed;
             }
-            held.packets.insert(wire::implicit_digest(&wire));
+            held.packets
+                .insert(wire::implicit_digest(&wire), wire.len() as u64);
+        }
+        // What an earlier run kept stays within the caps, whatever they were then.
+        let signers: BTreeSet<Name> = st
+            .answer_book
+            .evidence
+            .keys()
+            .map(|(_, s)| s.clone())
+            .collect();
+        for signer in signers {
+            self.trim_evidence(&mut st, &signer);
         }
     }
 

@@ -2589,3 +2589,109 @@ async fn a_version_withdrawn_since_changes_the_epochs_of_a_state_and_is_a_change
     );
     assert!(!tablet.inner.st.lock().answer_book.is_blocked_name(&name));
 }
+
+// ---- round 5: evidence is bounded ---------------------------------------------------------------
+
+/// How many packets of evidence `dev` holds in its store, and their octets.
+fn evidence_stored(dev: &Device) -> (usize, usize) {
+    let all = dev
+        .inner
+        .store
+        .scan_under(&n("/localhost/ndn-data/answer-evidence"), 0);
+    (all.len(), all.iter().map(|(_, w)| w.len()).sum())
+}
+
+#[tokio::test]
+async fn evidence_kept_against_signers_is_capped_per_signer_in_all_and_the_oldest_goes_first() {
+    use super::answers::{
+        Cause, EVIDENCE_PACKETS_PER_ANSWER, EVIDENCE_PER_SIGNER_ANSWERS, EVIDENCE_PER_SIGNER_BYTES,
+        EVIDENCE_SIGNERS,
+    };
+    let keep = |dev: &Device, name: &Name, signer: &Name, wire: Vec<u8>| {
+        let mut st = dev.inner.st.lock();
+        dev.inner.keep_evidence(
+            &mut st,
+            name,
+            AnswerKind::Pure,
+            signer,
+            &Bytes::from(wire),
+            Cause::Signed,
+        );
+    };
+    let blocked = |dev: &Device, name: &Name| dev.inner.st.lock().answer_book.is_blocked_name(name);
+
+    // A hostile signer answers one question after another with a read set that is not its own:
+    // each is a fault, and each is kept as evidence, but only so many.
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, knowing(vec![sum(1)])).await;
+    let phone = w.start("/alice/phone", knowing(vec![sum(1)])).await;
+    sync_all(&laptop, &phone);
+    let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
+    let honest = ask(&laptop, &q).await.unwrap();
+    let def = honest.binding.definition.clone().unwrap();
+    let asked = EVIDENCE_PER_SIGNER_ANSWERS + 6;
+    let mut names = Vec::new();
+    for i in 0..asked {
+        let (name, wire) = forged_answer(
+            &phone,
+            AnswerBinding {
+                kind: AnswerKind::Pure,
+                definition: Some(def.clone()),
+                by: sum_v(1),
+                reads: Hash([i as u8 + 1; 32]),
+            },
+            honest.reads.encode(),
+            b"3",
+            &[],
+        );
+        assert!(plant(&laptop, wire).await.is_err());
+        names.push(name);
+    }
+    assert_eq!(
+        evidence_stored(&laptop).0,
+        EVIDENCE_PER_SIGNER_ANSWERS,
+        "evidence against one signer is capped"
+    );
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(
+            blocked(&laptop, name),
+            i >= asked - EVIDENCE_PER_SIGNER_ANSWERS,
+            "the oldest go first: answer {i} of {asked}"
+        );
+    }
+
+    // The octets kept against one signer, whole packets of 64 KiB.
+    let laptop = alice_with_data(&mut World::new(), knowing(vec![])).await;
+    let hostile = n("/hostile/KEY/1");
+    let named = |i: usize| wire::answer_name(&n("/hostile/laptop"), &[i as u8; 32]);
+    let packet = 64 << 10;
+    let fit = EVIDENCE_PER_SIGNER_BYTES as usize / packet;
+    for i in 0..fit + 3 {
+        keep(&laptop, &named(i), &hostile, vec![i as u8; packet]);
+    }
+    assert_eq!(evidence_stored(&laptop).0, fit, "octets kept per signer are capped");
+    assert!(!blocked(&laptop, &named(0)) && blocked(&laptop, &named(fit + 2)));
+
+    // The signers evidence is kept against.
+    let laptop = alice_with_data(&mut World::new(), knowing(vec![])).await;
+    let signer = |i: usize| n(&format!("/hostile{i}/KEY/1"));
+    let answer = |i: usize| wire::answer_name(&n(&format!("/hostile{i}/laptop")), &[1; 32]);
+    let last = EVIDENCE_SIGNERS + 5;
+    for i in 0..=last {
+        keep(&laptop, &answer(i), &signer(i), vec![i as u8, (i >> 8) as u8]);
+    }
+    assert_eq!(
+        evidence_stored(&laptop).0,
+        EVIDENCE_SIGNERS,
+        "signers evidence is kept against are capped"
+    );
+    assert!(!blocked(&laptop, &answer(0)) && blocked(&laptop, &answer(last)));
+
+    // The packets kept at one answer name of one signer.
+    let laptop = alice_with_data(&mut World::new(), knowing(vec![])).await;
+    for i in 0..EVIDENCE_PACKETS_PER_ANSWER + 4 {
+        keep(&laptop, &named(0), &hostile, vec![i as u8; 8]);
+    }
+    assert_eq!(evidence_stored(&laptop).0, EVIDENCE_PACKETS_PER_ANSWER);
+    assert!(blocked(&laptop, &named(0)), "the block stands past the cap");
+}

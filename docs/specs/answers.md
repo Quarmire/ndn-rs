@@ -394,6 +394,10 @@ Policy is read at the moment an answer is used and never cached across a change 
 | Budget (host) | reads 65,536; octets read `PAYLOAD_MAX`; result octets `PAYLOAD_MAX` | What one evaluation may spend (`Budget`); exceeded is `OverBudget`, never a different result. |
 | Held answers (host) | per signer 1,024 answers and 64 MiB; all 1 GiB | What a device keeps of others' answers (`AnswerStore`); past it, the oldest not-recently-asked of a signer is dropped first, never one it signed that is not reproducible (§6.2). |
 | Answers signed (host) | 16 per second per device | A limit on a device's own signing (a flood of its own questions). |
+| `EVIDENCE_PER_SIGNER_ANSWERS` | 64 | Answer names a device keeps evidence at against one signer (§8.2): past it the oldest evidence of that signer is dropped, and with it its block. |
+| `EVIDENCE_PER_SIGNER_BYTES` | 262,144 (256 KiB) | Octets of evidence packets kept against one signer; the oldest is dropped first. |
+| `EVIDENCE_SIGNERS` | 256 | Signers a device keeps evidence against: past it, all the evidence of the signer whose newest is oldest is dropped. At most 256 × 256 KiB = 64 MiB of evidence is kept in all. |
+| `EVIDENCE_PACKETS_PER_ANSWER` | 8 | Packets kept at one answer name of one signer: past it the block stands and the event still carries the packet, but no more is stored. |
 | Asks | `FETCH_TRIES` per candidate; at most `RELAYS_ASKED` (8) candidates | As §7.2 step 5 and data-layer.md §17.1. |
 
 The host's values are `Config::answers`; the layer enforces what is above, never a value that changes a result.
@@ -540,6 +544,7 @@ A revocation cut lists the log entries of the revoked key that stay valid (data-
 - A signer's answers a device **keeps** are bounded per signer and in total (§10); a signer cannot push its own out. What a device **signs** is bounded (§10).
 - Checking is cheap before it is dear: name parse, signature, then the open and the digests; a flood of answers from signers a device's policy does not trust costs a verify each and is dropped at §7.3, nothing stored.
 - Large read sets and bodies are bounded (§10); pieces fetched only for answers asked for.
+- **Evidence is bounded too (§10).** A hostile signer that answers every ask with a faulty packet adds a record of evidence per distinct name, whole packets in the store. What is kept against one signer is capped in records and octets, the signers evidence is kept against are capped, and the oldest goes first. What is dropped is no longer blocked: the packet is judged again when met, and the fault found again if it stands, at the cost of one verify and one judgement. A signer that can mint many keys under a namespace the reader accepts (a collaborator who is her own authority) can push the evidence of older signers out; the events of §8.2 are bounded separately (SHAPES-R5 §D), and the host that has acted on an event needs nothing more of the packet.
 
 ### 13.11 Cheap forgeries of ids
 
