@@ -198,9 +198,9 @@ pub struct Config {
     pub writer_collections: usize,
     /// The most distinct `(kind, subject)` events this device keeps
     /// unacknowledged for its host ([`Device::events`], spec §21.5): a new
-    /// one past it, or past half of it of one kind, is counted in the
-    /// single overflow event, never kept and never silent; what is kept is
-    /// never evicted. At least 1.
+    /// one past it, past a fifth of it of one kind, or past a quarter of it about
+    /// one namespace, is counted in the single overflow event, never kept and
+    /// never silent; what is kept is never evicted. At least 1.
     pub events_unacked: usize,
     /// How many acknowledged events' ids this device remembers, so that
     /// evidence it derives again after a restart is not reported again
@@ -7402,6 +7402,12 @@ impl Device {
             Arc::clone(&clock),
             config.events_unacked,
             config.events_acked,
+            {
+                let validator = Arc::clone(&validator);
+                Arc::new(move |name: &Name| {
+                    validator.keyring().context_for(name).namespace().clone()
+                })
+            },
         );
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),

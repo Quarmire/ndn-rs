@@ -6488,9 +6488,13 @@ MUST NOT be able to push out an event already kept.
   nothing. The first occurrence's evidence stays until the event is
   acknowledged; a flood of one subject is one event.
 - **The cap.** At most `events_unacked` (default 256, at least 1) events are
-  kept unacknowledged, and at most half of it, rounded up, of one kind, so
-  that a flood of one kind cannot take the room of the others. A new
-  `(kind, subject)` past either limit is not kept: it is counted in the one
+  kept unacknowledged, at most the cap divided by the number of kinds events
+  are kept for (five: equivocation, withdrawal, cut, revocation, answer
+  evidence; at least 1) of one kind, and at most a quarter of the cap (at least
+  1) about one namespace (the one that governs the key or name the event
+  names, else its first component), so that a flood of one or two kinds, or
+  of the keys of one namespace, cannot take the room of the others. A new
+  `(kind, subject)` past any of these limits is not kept: it is counted in the one
   **overflow notice**, an event of its own that carries, per kind, how many
   occurrences were not kept. The notice is outside the cap, is made once with
   its own cursor and delivered as any event, is updated in place as more are
@@ -6627,15 +6631,22 @@ evidence give it the same id.
   entries at the seqs of its own earlier ones, a writer's entries a cut then
   withdraws, many cuts and revocations by an owner or authority that goes
   hostile — is limited by §21.5: per `(kind, subject)` one event however many
-  occurrences; at most the cap of events and half of it per kind, and one
-  overflow notice; one record per kept event in the store; and nothing kept is
-  evicted, so the attacker cannot hide the first event of another subject or
-  kind behind its own. What it can do is fill the cap with subjects of its own
-  choosing and make later honest subjects only counted; the host then reads the
-  evidence from what is held and acknowledges, which makes room. A subject is
-  a key that signed something this device verified or a name an authority
-  revoked: an attacker needs keys the namespace's context trusts, or the
-  authority, for each.
+  occurrences; at most the cap of events, at most an equal share of it per
+  kind (the cap over the five kinds events are kept for) and at most a
+  quarter of it about one namespace, and one overflow notice; one record per
+  kept event in the store; and nothing kept is evicted, so the attacker cannot
+  hide the first event of another subject or kind behind its own. What it can
+  do is fill the shares of its subjects' kinds and namespace with subjects of
+  its own choosing and make later honest subjects of those only counted; the
+  host then reads the evidence from what is held and acknowledges, which makes
+  room. A subject is a key that signed something this device verified or a name
+  an authority revoked, and the key need not be one a context the device holds
+  for the folder trusts: the namespace of a foreign person who is her own
+  authority is hers to mint device keys in without end, each a subject of an
+  equivocation or a withdrawal. That is why the limits are per kind and per
+  namespace: such a flood fills at most its namespace's quarter and its two
+  kinds' shares, and a later cut, revocation or answer evidence, of another
+  namespace or kind, is named, not only counted.
 - **Forged evidence.** An event is made from verified data only (§21.1). A
   forged entry, a forged copy of a certificate or a replayed root is refused
   before it is noted (§8, §17.1) and makes no event; an entry whose

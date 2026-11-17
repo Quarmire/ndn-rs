@@ -562,7 +562,7 @@ async fn an_event_not_acknowledged_comes_again_after_a_restart_and_one_acknowled
 #[tokio::test]
 async fn a_flood_is_bounded_and_the_first_event_of_each_kind_and_subject_survives() {
     let (dev, _keys, store) = started(|c| Config {
-        events_unacked: 4,
+        events_unacked: 10,
         ..c
     })
     .await;
@@ -595,7 +595,7 @@ async fn a_flood_is_bounded_and_the_first_event_of_each_kind_and_subject_survive
     assert_eq!(
         eq.len(),
         2,
-        "a kind keeps at most half of the cap of 4: {eq:?}"
+        "a kind keeps at most a fifth of the cap of 10: {eq:?}"
     );
     for (i, e) in eq.iter().enumerate() {
         assert_eq!(
@@ -1309,4 +1309,113 @@ fn a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none_on_fjall() {
 #[test]
 fn a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none_on_redb() {
     a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none(Engine::Redb);
+}
+
+// ---- the quota of the book (spec §21.5) --------------------------------------------------------
+
+fn entry_of(device: &str, digest: Option<[u8; 32]>) -> crate::events::EntryRef {
+    crate::events::EntryRef {
+        name: log_name(&n(device), Some(&plan()), 1),
+        kind: Some(EntryKind::Version),
+        digest,
+    }
+}
+
+#[test]
+fn a_flood_of_two_kinds_under_one_namespace_cannot_hide_a_cut_a_revocation_or_answer_evidence() {
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let clock: Clock = Arc::new(|| Timestamp(1));
+    let mut book = book_over(store, clock);
+    // A collaborator who is her own authority mints keys without end under her own namespace.
+    for i in 0..400 {
+        let dev = format!("/carol/dev{i}");
+        book.report(EventDetail::Equivocation {
+            writer: key(&dev),
+            seq: 1,
+            first: entry_of(&dev, Some([1; 32])),
+            second: entry_of(&dev, Some([2; 32])),
+        });
+        book.report(EventDetail::Withdrawal {
+            writer: key(&dev),
+            collection: Some(plan()),
+            entry: entry_of(&dev, Some([1; 32])),
+            by: WithdrawnBy::Cut {
+                of: n("/carol"),
+                signer: key("/alice/phone"),
+            },
+        });
+    }
+    // Honest events after it.
+    book.report(EventDetail::Cut {
+        subject: plan(),
+        folder: false,
+        of: n("/bob"),
+        signer: key("/alice/phone"),
+        record: log_name(&n("/alice/phone"), Some(&plan()), 1),
+        revision: 2,
+        kept: 0,
+    });
+    book.report(EventDetail::Revocation {
+        namespace: n("/bob"),
+        revoked: key("/bob/lost"),
+        version: 2,
+    });
+    book.report(EventDetail::Answer {
+        answer: n("/dave/laptop/32=answer/x"),
+        signer: key("/dave/laptop"),
+        id: [1; 32],
+        readset: [2; 32],
+        fault: crate::events::AnswerFault::Equivocation {
+            other_result: [3; 32],
+        },
+    });
+    let pending = book.pending();
+    let named = |k: EventKind| pending.iter().filter(|e| e.kind() == k).count();
+    for k in [
+        EventKind::Cut,
+        EventKind::Revocation,
+        EventKind::AnswerEvidence,
+    ] {
+        assert_eq!(
+            named(k),
+            1,
+            "a later {k} event is named, not only counted in the overflow notice, whatever two \
+             other kinds flooded; pending: {} events",
+            pending.len()
+        );
+    }
+    let carol = named(EventKind::Equivocation) + named(EventKind::Withdrawal);
+    assert!(
+        carol <= 64,
+        "one namespace keeps at most a quarter of the cap: {carol}"
+    );
+    let dropped = pending.iter().find_map(|e| match &e.detail {
+        EventDetail::Overflow { dropped } => Some(dropped.clone()),
+        _ => None,
+    });
+    assert!(
+        dropped.is_some_and(|d| d
+            .iter()
+            .all(|(k, _)| matches!(k, EventKind::Equivocation | EventKind::Withdrawal))),
+        "only the flooded kinds are counted as not kept"
+    );
+}
+
+/// A book of the default caps over `store`.
+fn book_over(store: Arc<dyn DataStore>, clock: Clock) -> super::events::Book {
+    super::events::Book::load(
+        store,
+        clock,
+        256,
+        1024,
+        Arc::new(|name: &Name| {
+            Name::from_components(
+                name.components()
+                    .iter()
+                    .take(1)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    )
 }

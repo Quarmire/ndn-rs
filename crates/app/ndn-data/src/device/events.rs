@@ -375,6 +375,13 @@ pub(super) fn is_stored(name: &Name) -> bool {
     name.has_prefix(&events_prefix())
 }
 
+/// A way to find the namespace that governs a key or name.
+pub(super) type NamespaceOf = Arc<dyn Fn(&Name) -> Name + Send + Sync>;
+
+/// A namespace's share of the cap is this fraction: no namespace takes more than a quarter of the
+/// events kept (a kind's is `1 /` the kinds kept, [`EventKind::KEPT`]).
+const NAMESPACE_SHARE: usize = 4;
+
 /// The events of a device: unacknowledged ones, the tombstones of acknowledged ones, and the
 /// counter that orders them (spec §21.4, §21.5).
 pub(super) struct Book {
@@ -408,6 +415,12 @@ pub(super) struct Book {
     fact_cap: usize,
     /// Whether the store held no ledger when this run began ([`Book::baseline`]).
     baseline: bool,
+    /// The namespace governing a key or name: the context held for it, which an event's subject
+    /// is counted under (the limit per namespace, [`Book::namespace_cap`]).
+    namespace_of: NamespaceOf,
+    /// How many retained events there are about each namespace, the overflow notice not counted.
+    per_ns: HashMap<Name, usize>,
+    ns_of: HashMap<Cursor, Name>,
     /// Told when an event is created, and when the device stops.
     wake: Arc<Notify>,
 }
@@ -420,6 +433,7 @@ impl Book {
         clock: Clock,
         cap: usize,
         tomb_cap: usize,
+        namespace_of: NamespaceOf,
     ) -> Book {
         let mut book = Book {
             store: Arc::clone(&store),
@@ -438,6 +452,9 @@ impl Book {
             next_fact: 1,
             fact_cap: cap.max(1).saturating_add(tomb_cap),
             baseline: false,
+            namespace_of,
+            per_ns: HashMap::new(),
+            ns_of: HashMap::new(),
             wake: Arc::new(Notify::new()),
         };
         let (mut next, mut began) = (1, false);
@@ -493,6 +510,25 @@ impl Book {
         Arc::clone(&self.wake)
     }
 
+    /// The namespace an event is about: what governs the key or name it names, else its first
+    /// component. `None` for the overflow notice.
+    fn namespace(&self, detail: &EventDetail) -> Option<Name> {
+        let about = detail.about()?;
+        let ns = (self.namespace_of)(about);
+        Some(if ns.is_empty() {
+            Name::from_components(
+                about
+                    .components()
+                    .iter()
+                    .take(1)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            ns
+        })
+    }
+
     /// Index `e` as retained.
     fn hold(&mut self, e: DeviceEvent) {
         let kind = e.kind();
@@ -500,13 +536,24 @@ impl Book {
         self.by_id.insert(e.id, e.cursor);
         if kind != EventKind::Overflow {
             *self.per_kind.entry(kind).or_default() += 1;
+            if let Some(ns) = self.namespace(&e.detail) {
+                *self.per_ns.entry(ns.clone()).or_default() += 1;
+                self.ns_of.insert(e.cursor, ns);
+            }
         }
         self.pending.insert(e.cursor, e);
     }
 
-    /// The most of one kind kept: half the cap, rounded up, so no kind takes the room of all.
+    /// The most of one kind kept: the cap shared among the kinds events are kept for, so that no
+    /// two kinds take the room of the rest.
     fn kind_cap(&self) -> usize {
-        self.cap.div_ceil(2)
+        (self.cap / EventKind::KEPT.len()).max(1)
+    }
+
+    /// The most events about one namespace kept: a quarter of the cap, so that a namespace whose
+    /// keys one party mints without end cannot take the room of the others.
+    fn namespace_cap(&self) -> usize {
+        (self.cap / NAMESPACE_SHARE).max(1)
     }
 
     /// Report one occurrence (spec §21.5): coalesced into the event kept for its `(kind,
@@ -547,7 +594,13 @@ impl Book {
             return;
         }
         let kept = self.per_kind.get(&kind).copied().unwrap_or(0);
-        let room = self.per_kind.values().sum::<usize>() < self.cap && kept < self.kind_cap();
+        let in_ns = self
+            .namespace(&detail)
+            .and_then(|ns| self.per_ns.get(&ns).copied())
+            .unwrap_or(0);
+        let room = self.per_kind.values().sum::<usize>() < self.cap
+            && kept < self.kind_cap()
+            && in_ns < self.namespace_cap();
         if room {
             let e = self.create(detail, id, ops);
             tracing::info!(id = %e.id, kind = %e.kind(), "{}", e.why());
@@ -704,10 +757,15 @@ impl Book {
             };
             let e = self.pending.remove(&c).expect("indexed events are kept");
             self.by_subject.remove(&(e.kind(), e.subject()));
-            if e.kind() != EventKind::Overflow
-                && let Some(n) = self.per_kind.get_mut(&e.kind())
-            {
-                *n = n.saturating_sub(1);
+            if e.kind() != EventKind::Overflow {
+                if let Some(n) = self.per_kind.get_mut(&e.kind()) {
+                    *n = n.saturating_sub(1);
+                }
+                if let Some(ns) = self.ns_of.remove(&c)
+                    && let Some(n) = self.per_ns.get_mut(&ns)
+                {
+                    *n = n.saturating_sub(1);
+                }
             }
             self.store.remove(&event_name(c));
             self.store

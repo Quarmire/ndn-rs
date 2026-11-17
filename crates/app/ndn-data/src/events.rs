@@ -136,6 +136,16 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// The kinds events are kept for: every kind but [`EventKind::Overflow`], the notice of what
+    /// was not kept. A kind's share of the cap is one of these.
+    pub(crate) const KEPT: [EventKind; 5] = [
+        EventKind::Equivocation,
+        EventKind::Withdrawal,
+        EventKind::Cut,
+        EventKind::Revocation,
+        EventKind::AnswerEvidence,
+    ];
+
     fn code(self) -> u64 {
         match self {
             EventKind::Equivocation => 0,
@@ -486,6 +496,20 @@ impl EventDetail {
             EventDetail::Revocation { .. } => EventKind::Revocation,
             EventDetail::Overflow { .. } => EventKind::Overflow,
             EventDetail::Answer { .. } => EventKind::AnswerEvidence,
+        }
+    }
+
+    /// The key or name whose namespace the event is counted under (spec §21.5): the writer, the
+    /// signer of a cut or of an answer, the namespace of a revocation; none for the overflow
+    /// notice.
+    pub(crate) fn about(&self) -> Option<&Name> {
+        match self {
+            EventDetail::Equivocation { writer, .. } | EventDetail::Withdrawal { writer, .. } => {
+                Some(writer)
+            }
+            EventDetail::Cut { signer, .. } | EventDetail::Answer { signer, .. } => Some(signer),
+            EventDetail::Revocation { namespace, .. } => Some(namespace),
+            EventDetail::Overflow { .. } => None,
         }
     }
 
@@ -1184,4 +1208,22 @@ pub(crate) fn decode_event(cursor: Cursor, value: Bytes) -> Result<DeviceEvent, 
         count: count.ok_or_else(|| bad("a stored event has a count"))?,
         last,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_kinds_events_are_kept_for_are_every_kind_but_the_overflow_notice() {
+        let kept: Vec<EventKind> = (0..64)
+            .filter_map(|c| EventKind::of_code(c).ok())
+            .filter(|k| *k != EventKind::Overflow)
+            .collect();
+        assert_eq!(
+            kept,
+            EventKind::KEPT,
+            "a kind was added: list it in EventKind::KEPT, which a kind's share of the cap counts"
+        );
+    }
 }
