@@ -12,10 +12,12 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use ndn_foundation_types::NameComponent;
 use ndn_packet::{Data, Name};
-use ndn_sync::DataStore;
+use ndn_sync::{DataStore, StoreOp};
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
-use super::{Clock, Device, Held, St, held_wire, local};
+use super::{Clock, Device, Held, Inner, Line, St, held_signer, held_wire, local};
+use crate::collection::Cut;
 use crate::error::{DataError, Refusal};
 use crate::events::{
     Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId, EventKind,
@@ -129,6 +131,161 @@ impl St {
             digest,
         }
     }
+
+    /// The events that the state this device holds implies, for [`Device::derive_events`]: the
+    /// revocations of the trust contexts held, the cuts of the records in force that this device
+    /// did not sign, and the withdrawal of each entry held and stored that a cut or its chain
+    /// refuses (what was stored was delivered, so its withdrawal was told). In the order the live
+    /// reports make them: revocations, cuts, withdrawals.
+    pub(super) fn derived_events(&self, me: &Writer) -> Vec<EventDetail> {
+        let mut out = Vec::new();
+        let mut namespaces: Vec<&Name> = self.contexts.keys().collect();
+        namespaces.sort();
+        for ns in namespaces {
+            let ctx = &self.contexts[ns];
+            for revoked in ctx.revocations() {
+                out.push(EventDetail::Revocation {
+                    namespace: ns.clone(),
+                    revoked: revoked.clone(),
+                    version: ctx.version(),
+                });
+            }
+        }
+        let mut lines: Vec<(&Name, bool, &Line)> = self
+            .colls
+            .iter()
+            .map(|(c, x)| (c, false, &x.line))
+            .chain(self.folders.iter().map(|(f, x)| (f, true, &x.line)))
+            .collect();
+        lines.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        for (subject, folder, line) in lines {
+            for cut in line.own.iter().flat_map(|own| &own.cuts) {
+                out.extend(cut_event(line, subject, folder, cut, me, None));
+            }
+        }
+        let mut refused: Vec<(&Name, &Refusal)> = self
+            .refused
+            .iter()
+            .filter(|(_, why)| matches!(why, Refusal::OutsideCut(_) | Refusal::Untrusted { .. }))
+            .collect();
+        refused.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, why) in refused {
+            let (Some(held), Some(by), Some(log)) = (
+                self.held.get(name),
+                WithdrawnBy::of(why),
+                wire::parse_log_name(name),
+            ) else {
+                continue;
+            };
+            let Some(writer) = held_signer(self, name, held) else {
+                continue;
+            };
+            if !self.store.contains(name) {
+                continue;
+            }
+            out.push(EventDetail::Withdrawal {
+                writer: writer.key().clone(),
+                collection: log.subject,
+                entry: self.entry_ref(name),
+                by,
+            });
+        }
+        out
+    }
+}
+
+/// The `Cut` event of `cut`, a removal of the record in force of `subject` (`folder`: of a folder),
+/// named after the held record of its signer that carries it first, or after `taken`, the seq and
+/// revision of a record just taken. `None` for a cut this device signed (its host made the
+/// gesture; another device of the owner reports it, spec §21.3) and for one no held record
+/// carries.
+pub(super) fn cut_event(
+    line: &Line,
+    subject: &Name,
+    folder: bool,
+    cut: &Cut,
+    me: &Writer,
+    taken: Option<(u64, u64)>,
+) -> Option<EventDetail> {
+    if cut.signer == *me {
+        return None;
+    }
+    let device = device_of(cut.signer.key())?;
+    let (seq, revision) = line.cut_record(cut).or(taken)?;
+    Some(EventDetail::Cut {
+        subject: subject.clone(),
+        folder,
+        of: cut.of.clone(),
+        signer: cut.signer.key().clone(),
+        record: wire::log_name(&device, Some(subject), seq),
+        revision,
+        kept: cut.accept.count(),
+    })
+}
+
+/// The ledger's key for what an event of `detail` reports, when the layer can derive that from
+/// what it holds ([`St::derived_events`]): a revocation by namespace and name (not by the context's
+/// version: a later context that keeps the revocation is not another one), a cut by its subject,
+/// key prefix, signer and how many versions it keeps, a withdrawal by the entry's name. Equivocation
+/// and answer evidence are not derived: their entries are the evidence, and the book keeps theirs.
+pub(super) fn fact_of(detail: &EventDetail) -> Option<Fact> {
+    match detail {
+        EventDetail::Revocation {
+            namespace, revoked, ..
+        } => Some(revocation_fact(namespace, revoked)),
+        EventDetail::Cut {
+            subject,
+            folder,
+            of,
+            signer,
+            kept,
+            ..
+        } => Some(cut_fact(subject, *folder, of, signer, *kept)),
+        EventDetail::Withdrawal { entry, .. } => Some(withdrawal_fact(&entry.name)),
+        EventDetail::Equivocation { .. }
+        | EventDetail::Overflow { .. }
+        | EventDetail::Answer { .. } => None,
+    }
+}
+
+fn fact(kind: u8, names: &[&Name], tail: &[u8]) -> Fact {
+    let mut h = Sha256::new();
+    h.update(b"ndn-data/ledger/1");
+    h.update([kind]);
+    for n in names {
+        h.update((n.len() as u64).to_be_bytes());
+        for c in n.components() {
+            h.update(c.typ.to_be_bytes());
+            h.update((c.value.len() as u64).to_be_bytes());
+            h.update(&c.value);
+        }
+    }
+    h.update(tail);
+    let d = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d[..16]);
+    out
+}
+
+pub(super) fn revocation_fact(namespace: &Name, revoked: &Name) -> Fact {
+    fact(b'r', &[namespace, revoked], &[])
+}
+
+pub(super) fn cut_fact(subject: &Name, folder: bool, of: &Name, signer: &Name, kept: u64) -> Fact {
+    let mut tail = [0u8; 9];
+    tail[0] = u8::from(folder);
+    tail[1..].copy_from_slice(&kept.to_be_bytes());
+    fact(b'c', &[subject, of, signer], &tail)
+}
+
+pub(super) fn withdrawal_fact(entry: &Name) -> Fact {
+    fact(b'w', &[entry], &[])
+}
+
+/// The fact that this device holds a trust context of `namespace`: the ledger's way of knowing
+/// whether a context it meets is the first of its namespace.
+pub(super) fn namespace_fact(namespace: &Name) -> Fact {
+    fact(b'n', &[namespace], &[])
 }
 
 /// `/localhost/ndn-data/events`: the device's own reserved namespace for its events, under no
@@ -154,6 +311,22 @@ fn tomb_name(c: Cursor) -> Name {
     sub(&events_prefix(), b"a", Some(c))
 }
 
+/// Where the mark that the store has a ledger is kept (`<events>/lb`): written when a store has
+/// none, before anything else of this run is.
+fn begun_name() -> Name {
+    sub(&events_prefix(), b"lb", None)
+}
+
+/// Where the ledger's fact entered `n`th is kept (`<events>/l/<8 octets>`; its value the fact's 16
+/// octets).
+fn fact_name(n: u64) -> Name {
+    sub(&events_prefix(), b"l", Some(Cursor(n)))
+}
+
+/// A fact the ledger records: the first 16 octets of SHA-256 over what an event of it reports
+/// ([`fact_of`]).
+pub(super) type Fact = [u8; 16];
+
 fn sub(prefix: &Name, dir: &'static [u8], c: Option<Cursor>) -> Name {
     let mut comps: Vec<NameComponent> = prefix.components().to_vec();
     comps.push(NameComponent::generic(Bytes::from_static(dir)));
@@ -170,6 +343,10 @@ enum Stored {
     Head,
     Event(Cursor),
     Tomb(Cursor),
+    /// The mark that this store has a ledger.
+    Begun,
+    /// The ledger's fact entered `n`th.
+    Fact(u64),
 }
 
 fn parse(name: &Name) -> Option<Stored> {
@@ -185,8 +362,10 @@ fn parse(name: &Name) -> Option<Stored> {
     };
     match rest {
         [h] if h.value[..] == *b"head" => Some(Stored::Head),
+        [h] if h.value[..] == *b"lb" => Some(Stored::Begun),
         [d, c] if d.value[..] == *b"e" => cursor(c).map(Stored::Event),
         [d, c] if d.value[..] == *b"a" => cursor(c).map(Stored::Tomb),
+        [d, c] if d.value[..] == *b"l" => cursor(c).map(|c| Stored::Fact(c.0)),
         _ => None,
     }
 }
@@ -219,6 +398,16 @@ pub(super) struct Book {
     per_kind: HashMap<EventKind, usize>,
     acked: BTreeMap<Cursor, EventId>,
     acked_ids: HashSet<EventId>,
+    /// The ledger: the facts whose event was reported (or had none to report), each with its place
+    /// in the order they were entered (spec §21.6).
+    facts: HashMap<Fact, u64>,
+    order: BTreeMap<u64, Fact>,
+    next_fact: u64,
+    /// Most facts kept: `events_unacked + events_acked`, so that what the book still remembers
+    /// is in the ledger too.
+    fact_cap: usize,
+    /// Whether the store held no ledger when this run began ([`Book::baseline`]).
+    baseline: bool,
     /// Told when an event is created, and when the device stops.
     wake: Arc<Notify>,
 }
@@ -244,9 +433,14 @@ impl Book {
             per_kind: HashMap::new(),
             acked: BTreeMap::new(),
             acked_ids: HashSet::new(),
+            facts: HashMap::new(),
+            order: BTreeMap::new(),
+            next_fact: 1,
+            fact_cap: cap.max(1).saturating_add(tomb_cap),
+            baseline: false,
             wake: Arc::new(Notify::new()),
         };
-        let mut next = 1;
+        let (mut next, mut began) = (1, false);
         for (name, wire) in store.scan_under(&events_prefix(), 0) {
             match parse(&name) {
                 Some(Stored::Head) => {
@@ -272,10 +466,25 @@ impl Book {
                     }
                     Err(_) => store.remove(&name),
                 },
+                Some(Stored::Begun) => began = true,
+                Some(Stored::Fact(at)) => match Fact::try_from(&wire[..]) {
+                    Ok(fact) => {
+                        book.next_fact = book.next_fact.max(at.saturating_add(1));
+                        book.facts.insert(fact, at);
+                        book.order.insert(at, fact);
+                    }
+                    Err(_) => store.remove(&name),
+                },
                 None => store.remove(&name),
             }
         }
         book.next = next;
+        // A store with no ledger is one of an earlier revision or a new one: this run notes what
+        // it holds without reporting it, and the ledger is there from now on.
+        if !began {
+            book.baseline = true;
+            store.insert(begun_name(), Bytes::from_static(&[1]));
+        }
         book
     }
 
@@ -303,7 +512,21 @@ impl Book {
     /// Report one occurrence (spec §21.5): coalesced into the event kept for its `(kind,
     /// subject)`, else kept as a new event if there is room for it, else counted in the overflow
     /// notice. Nothing kept is ever evicted. Evidence already acknowledged is not reported again.
+    /// What a derivable event reports ([`fact_of`]) is entered in the ledger with it, whichever of
+    /// these happens to it, and the event and the ledger are written as one batch (spec §21.6).
     pub(super) fn report(&mut self, detail: EventDetail) {
+        let fact = fact_of(&detail);
+        let mut ops = Vec::new();
+        self.report_into(detail, &mut ops);
+        if let Some(fact) = fact {
+            self.note_into(fact, &mut ops);
+        }
+        if !ops.is_empty() {
+            self.store.apply(ops);
+        }
+    }
+
+    fn report_into(&mut self, detail: EventDetail, ops: &mut Vec<StoreOp>) {
         let kind = detail.kind();
         if kind == EventKind::Overflow {
             return;
@@ -316,7 +539,7 @@ impl Book {
             }
             e.count = e.count.saturating_add(1);
             e.last = Some(detail);
-            self.store.insert(event_name(c), encode_event(e));
+            ops.push(StoreOp::Insert(event_name(c), encode_event(e)));
             return;
         }
         let id = EventId::of(&detail, Cursor(self.next));
@@ -326,23 +549,85 @@ impl Book {
         let kept = self.per_kind.get(&kind).copied().unwrap_or(0);
         let room = self.per_kind.values().sum::<usize>() < self.cap && kept < self.kind_cap();
         if room {
-            let e = self.create(detail, id);
+            let e = self.create(detail, id, ops);
             tracing::info!(id = %e.id, kind = %e.kind(), "{}", e.why());
             self.hold(e);
             self.wake.notify_waiters();
         } else {
-            self.overflow(kind);
+            self.overflow(kind, ops);
         }
     }
 
+    /// Whether the ledger holds `fact`: its event was reported, or there was none to report.
+    pub(super) fn covered(&self, fact: &Fact) -> bool {
+        self.facts.contains_key(fact)
+    }
+
+    /// Whether the store held no ledger when this run began: a store of an earlier revision, or a
+    /// new one. What it holds then is the baseline, not news ([`Device::derive_events`]).
+    pub(super) fn baseline(&self) -> bool {
+        self.baseline
+    }
+
+    /// Enter `fact` in the ledger, which keeps at most `events_unacked + events_acked` facts: the
+    /// oldest goes when there are more. A fact entered already stays where it is.
+    pub(super) fn note(&mut self, fact: Fact) {
+        let mut ops = Vec::new();
+        self.note_into(fact, &mut ops);
+        if !ops.is_empty() {
+            self.store.apply(ops);
+        }
+    }
+
+    fn note_into(&mut self, fact: Fact, ops: &mut Vec<StoreOp>) {
+        if self.facts.contains_key(&fact) {
+            return;
+        }
+        let at = self.next_fact;
+        self.next_fact += 1;
+        self.facts.insert(fact, at);
+        self.order.insert(at, fact);
+        ops.push(StoreOp::Insert(
+            fact_name(at),
+            Bytes::copy_from_slice(&fact),
+        ));
+        while self.order.len() > self.fact_cap {
+            let Some((old, fact)) = self.order.pop_first() else {
+                break;
+            };
+            self.facts.remove(&fact);
+            ops.push(StoreOp::Remove(fact_name(old)));
+        }
+    }
+
+    /// Take `fact` out of the ledger: what it records is lifted, so a later occurrence is news.
+    pub(super) fn forget(&mut self, fact: &Fact) {
+        let Some(at) = self.facts.remove(fact) else {
+            return;
+        };
+        self.order.remove(&at);
+        self.store.remove(&fact_name(at));
+    }
+
+    /// Enter `fact`, or enter it again if it is there, so that it is the newest.
+    pub(super) fn renew(&mut self, fact: Fact) {
+        let mut ops = Vec::new();
+        if let Some(at) = self.facts.remove(&fact) {
+            self.order.remove(&at);
+            ops.push(StoreOp::Remove(fact_name(at)));
+        }
+        self.note_into(fact, &mut ops);
+        self.store.apply(ops);
+    }
+
     /// A new event at the next cursor, stored (the counter first).
-    fn create(&mut self, detail: EventDetail, id: EventId) -> DeviceEvent {
+    fn create(&mut self, detail: EventDetail, id: EventId, ops: &mut Vec<StoreOp>) -> DeviceEvent {
         let cursor = Cursor(self.next);
         self.next += 1;
-        self.store.insert(
+        ops.push(StoreOp::Insert(
             head_name(),
             Bytes::copy_from_slice(&self.next.to_be_bytes()),
-        );
+        ));
         let e = DeviceEvent {
             id,
             cursor,
@@ -351,12 +636,12 @@ impl Book {
             count: 1,
             last: None,
         };
-        self.store.insert(event_name(cursor), encode_event(&e));
+        ops.push(StoreOp::Insert(event_name(cursor), encode_event(&e)));
         e
     }
 
     /// Count one occurrence of `kind` not kept, in the overflow notice: made if there is none.
-    fn overflow(&mut self, kind: EventKind) {
+    fn overflow(&mut self, kind: EventKind, ops: &mut Vec<StoreOp>) {
         let key = (EventKind::Overflow, EventSubject::Device);
         if let Some(&c) = self.by_subject.get(&key) {
             let e = self.pending.get_mut(&c).expect("indexed events are kept");
@@ -370,14 +655,14 @@ impl Book {
                 }
             }
             e.count = e.count.saturating_add(1);
-            self.store.insert(event_name(c), encode_event(e));
+            ops.push(StoreOp::Insert(event_name(c), encode_event(e)));
             return;
         }
         let detail = EventDetail::Overflow {
             dropped: vec![(kind, 1)],
         };
         let id = EventId::of(&detail, Cursor(self.next));
-        let e = self.create(detail, id);
+        let e = self.create(detail, id, ops);
         tracing::warn!(id = %e.id, "{}", e.why());
         self.hold(e);
         self.wake.notify_waiters();
@@ -504,5 +789,47 @@ impl Device {
             ));
         }
         Ok(())
+    }
+}
+
+impl Inner {
+    /// Report, once the store is read back and judged again, the events whose cause the held state
+    /// holds and the ledger does not cover (spec §21.6): a revocation of a trust context held, a
+    /// cut of a record in force this device did not sign, the withdrawal of a stored entry a
+    /// cut or its chain refuses. What an earlier run did not get to report — it stopped, or was
+    /// killed, after the cause was held and before its event was written — is reported now; what
+    /// it reported, acknowledged or not, is in the ledger and is not reported again. On a store
+    /// with no ledger (an earlier revision's, or a new one) what is held is the baseline: entered
+    /// in the ledger and not reported, as the first context of a namespace reports none of its own.
+    /// The events and the ledger entries are one batch.
+    pub(super) fn derive_events(&self) {
+        let mut st = self.st.lock();
+        let _batch = self.stage.batch();
+        let derived = st.derived_events(self.me());
+        let baseline = st.events.baseline();
+        // The namespaces whose first context an earlier run had already entered: a revocation
+        // of any other is no news (the first context of a namespace reports none of its own).
+        let namespaces: Vec<Name> = st.contexts.keys().cloned().collect();
+        let known: HashSet<Name> = namespaces
+            .iter()
+            .filter(|ns| st.events.covered(&namespace_fact(ns)))
+            .cloned()
+            .collect();
+        for detail in derived {
+            let Some(fact) = fact_of(&detail) else {
+                continue;
+            };
+            let first = matches!(&detail, EventDetail::Revocation { namespace, .. }
+                if !known.contains(namespace));
+            if baseline || first {
+                st.events.note(fact);
+            } else if !st.events.covered(&fact) {
+                st.events.report(detail);
+            }
+        }
+        // Entered (or entered again, so that it is the last the ledger lets go).
+        for ns in &namespaces {
+            st.events.renew(namespace_fact(ns));
+        }
     }
 }

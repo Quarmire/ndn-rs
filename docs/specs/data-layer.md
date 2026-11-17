@@ -6392,7 +6392,9 @@ marked non-exhaustive: a host's `match` gains an arm when a round adds one.
 A device MUST report each of these, as it notes the cause, whether or not
 anything watches, and MUST NOT report while it reads its store back at start
 (§21.6: what it held was reported when it arrived, and the events of that run
-are read back with it).
+are read back with it). After that read it MUST report the revocations, cuts
+and withdrawals below that its held state implies and its ledger does not
+cover (§21.6), whichever run held the cause first.
 
 - **Equivocation.** A verified entry of any kind — a version, a members
   record, a snapshot, a hold record, a lease, a prune record, an
@@ -6463,10 +6465,15 @@ are read back with it).
   stopped before the acknowledgement was behind the barrier: acknowledge again
   after it starts.
 - **Tombstones.** The last `events_acked` (default 1024) acknowledged ids are
-  kept, so that evidence the device derives again — the start-up judgement of
-  held entries re-withdraws what a revocation refused — is not reported again
-  once acknowledged. When more are kept the oldest goes; its event may then be
-  reported again, with the same id, if its cause is derived again.
+  kept, so that an event acknowledged is not delivered again when its cause is
+  met again with the same evidence (the id is that of the evidence, §21.2).
+  The start-up judgement of held entries does not report what a revocation
+  refused: those entries come back refused, silently, and the events a host is
+  owed for them are derived from the held state and the ledger (§21.6), which
+  an acknowledgement does not touch: an acknowledged event is not made again
+  because its fact is entered, tombstone or not. When more tombstones are kept
+  the oldest goes; its event may then be reported again, with the same id, if
+  its cause is met again and the ledger no longer holds its fact.
 
 ### 21.5 Flooding
 
@@ -6518,19 +6525,71 @@ published (§21.1), and skipped by the log's restore.
 | `/localhost/ndn-data/events/head` | 8 octets big-endian: the next cursor; written before an event takes a cursor below it, so a restart never gives a cursor twice |
 | `/localhost/ndn-data/events/e/<cursor>` (8 octets) | an unacknowledged event, an `EventRecord` (§21.7) |
 | `/localhost/ndn-data/events/a/<cursor>` (8 octets) | a tombstone: the 16-octet id of an acknowledged event |
+| `/localhost/ndn-data/events/lb` | one octet: the mark that this store has a ledger, written (before anything else of the run) when a store has none |
+| `/localhost/ndn-data/events/l/<n>` (8 octets) | a ledger fact, the `n`th entered: 16 octets (below). Not TLV: a hash, with no field a later revision could add |
 
 At start, before the store is read back, a device MUST read its events
 (dropping a record that does not decode). It MUST write an event before the
 entry it reports where the entry is taken after it (equivocation: the event
 precedes the entry), so that a store that keeps a prefix of its writes never
-holds the second entry without the event; for the other kinds the cause —
-a record, a context — is held first, and a crash between it and its event
-loses the event while the evidence stays held (§21.5). An event is stored
-with the device's writes and is behind the barrier (§4.2) with them; it is
-delivered at once and not after the barrier, so a power loss can take an event
-a host saw together with the entries it reported (neither is then held, and
-nobody else saw them), and an acknowledgement that was not yet durable is
-delivered again. `acknowledge` waits for the barrier for exactly this reason.
+holds the second entry without the event. An event is stored with the
+device's writes and is behind the barrier (§4.2) with them; it is delivered
+at once and not after the barrier, so a power loss can take an event a host
+saw together with the entries it reported (neither is then held, and nobody
+else saw them), and an acknowledgement that was not yet durable is delivered
+again. `acknowledge` waits for the barrier for exactly this reason.
+
+**The ledger.** A revocation, a cut and a withdrawal by a cut or by its chain
+are made of state the device holds: a trust context its keyring adopted, a
+members record stored, a marker (§8) written. The cause is held first and
+the event after, and a stop between them — a kill, a crash, a shutdown
+before the adoption task ran — leaves a device that holds what it would hold
+had it told the event, and has no event: nothing else derives it again. So a
+device keeps a **ledger** of the facts it reported, under the names above, and
+derives what the ledger does not cover.
+
+- A **fact** is 16 octets of SHA-256 over what an event of these kinds
+  reports: for a revocation the namespace and the name revoked (not the
+  version of the context: a later context that keeps a revocation revokes
+  nothing new); for a cut its subject, whether a folder, the key prefix cut,
+  the signer and how many versions it keeps; for a withdrawal the name of the
+  entry. An equivocation and an answer's evidence have none: the entries that
+  are their evidence are held and are the record (§21.5).
+- A fact is **entered with its event, in the same batch** (§4.2), whatever
+  becomes of the event: made, coalesced into one kept, counted in the
+  overflow notice, or not made because its id was acknowledged. The members
+  record that takes a cut is in that batch with the events and facts of its
+  cuts, and the markers of entries a context withdraws for their chain with
+  the events and facts of their withdrawals, so that on a store with atomic
+  batches a cause is held with its event or not at all. The first context of
+  a namespace reports none of its own, and enters what it revokes.
+- The ledger does not depend on acknowledgement: an event acknowledged, whose
+  tombstone is gone, is not made again because its fact is entered. It keeps
+  at most `events_unacked` + `events_acked` facts, the oldest going; and a fact
+  leaves it when what it records is lifted — a context that no longer revokes
+  the name, a record that no longer carries the cut, an entry taken back or
+  re-admitted — so that the fact occurring again is news.
+- After the store is read back and every entry held is judged again (§8), a
+  device MUST **derive** the events of what it holds: each revocation of the
+  trust contexts held, each cut of a record in force that it did not sign, and
+  each entry stored and refused by a cut or for its chain (a stored entry was
+  delivered, so its withdrawal is told; one refused as it arrived is not),
+  and report each whose fact the ledger does not hold, in the order the live
+  reports are made, entering its fact. What an earlier run did not get to
+  report is reported now; so is a revocation in a context a host adopted while
+  the device was off. The evidence of a derived event is that of one reported
+  as the cause arrived, except that a cut names the first record of its signer
+  held that carries it.
+- A store with **no ledger** — no `lb`: one of a revision before the ledger,
+  or a new one — holds a baseline: the device derives as above and enters the
+  facts without reporting them, as the first context of a namespace reports
+  none of its own, and the mark is there from then on.
+
+What is still lost: an event whose fact the ledger no longer holds (past its
+cap) may be reported again, with the same id, once its tombstone is also gone
+(§21.4); and a stop on a store whose batch is not atomic (the default
+`apply` writes one change after another, §4.2) can leave the cause with no
+event, which the next start derives.
 
 ### 21.7 Wire: the store's event records
 
@@ -6629,7 +6688,15 @@ acknowledged and not delivered again, an id never seen refused, an
 acknowledgement idempotent; a flood bounded with the first of each kind and
 subject kept, an overflow notice counting the rest, one subject's flood
 coalesced, the store's records not growing; a revocation and its withdrawal
-reported once across restarts. `ndn-data-conformance` has v1 (a members record
+reported once across restarts. The ledger (§21.6) is held by cases on the
+memory store and, with a real process killed, on fjall and redb
+(`device/events_tests.rs`, `device.rs`): a cut whose record is stored and
+whose event is not, a revocation adopted and the entries it refuses, and a
+withdrawal for the chain whose marker is stored, each reported after a
+restart, once; the same acknowledged, with no tombstone kept, not reported
+again; one reported before the stop reported once; a store with no ledger
+holding what it has as a baseline, not news; a members record and the events
+of its cuts in one batch. `ndn-data-conformance` has v1 (a members record
 and a version at one seq, told on two readers' devices), v2 (a cut and the
 version it withdraws told on every device that takes the cut, no watcher), v3
 (a revocation adopted and what it withdraws, told on a device no one watches),

@@ -6,7 +6,10 @@
 
 use futures::StreamExt;
 use ndn_security::TrustSchema;
-use ndn_sync::MemoryStore;
+use ndn_sync::store::BackendStore;
+use ndn_sync::{MemoryStore, StoreOp};
+
+use super::durability_tests::Engine;
 
 use super::group_tests::{
     Made, Unconnected, budget, give, id, key, log_share, made, n, plan, version,
@@ -667,4 +670,643 @@ async fn a_flood_is_bounded_and_the_first_event_of_each_kind_and_subject_survive
         "an equivocation whose event was not kept is still listed by a watch"
     );
     dev.shutdown();
+}
+
+// ---- what a stop leaves between a cause and its event (spec §21.6) ---------------------------
+
+/// What an [`EventGate`] does to the writes made through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Gate {
+    /// Everything goes through; a batch whole.
+    Open,
+    /// Writes under the events' namespace are dropped, the rest go through: the store as a stop
+    /// just before the events were written leaves it.
+    Drop,
+    /// The process aborts at the first write of an event of the kind, after what was made before
+    /// it in its batch was written: a stop on a store whose batches are not atomic.
+    AbortAt(EventKind),
+    /// The process aborts before any of the batch that holds an event of the kind is written: a
+    /// stop on a store whose batches are atomic.
+    AbortBatchAt(EventKind),
+}
+
+/// A store that can be made to stop between a cause and its event, as a kill does: it forwards
+/// every call to the store under it, as its [`Gate`] says.
+pub(super) struct EventGate {
+    inner: Arc<dyn DataStore>,
+    gate: Mutex<Gate>,
+    /// The names of what each batch handed over held, once [`Self::keep_batches`] was called.
+    batches: Mutex<Option<Vec<Vec<Name>>>>,
+}
+
+fn events_namespace() -> Name {
+    n("/localhost/ndn-data/events")
+}
+
+/// The kind of the event that `wire` is, if `name` is the name of a stored event.
+fn event_written(name: &Name, wire: &Bytes) -> Option<EventKind> {
+    let events = events_namespace();
+    if !name.has_prefix(&events) {
+        return None;
+    }
+    match &name.components()[events.len()..] {
+        [dir, at] if dir.value[..] == *b"e" => {
+            let at = <[u8; 8]>::try_from(&at.value[..]).ok()?;
+            crate::events::decode_event(Cursor(u64::from_be_bytes(at)), wire.clone())
+                .ok()
+                .map(|e| e.kind())
+        }
+        _ => None,
+    }
+}
+
+fn op_name(op: &StoreOp) -> &Name {
+    match op {
+        StoreOp::Insert(name, _) | StoreOp::Remove(name) => name,
+    }
+}
+
+impl EventGate {
+    pub(super) fn over(inner: Arc<dyn DataStore>, gate: Gate) -> Arc<EventGate> {
+        Arc::new(EventGate {
+            inner,
+            gate: Mutex::new(gate),
+            batches: Mutex::new(None),
+        })
+    }
+
+    pub(super) fn set(&self, gate: Gate) {
+        *self.gate.lock() = gate;
+    }
+
+    fn keep_batches(&self) {
+        *self.batches.lock() = Some(Vec::new());
+    }
+
+    fn batches(&self) -> Vec<Vec<Name>> {
+        self.batches.lock().clone().unwrap_or_default()
+    }
+
+    /// Whether the write of `name` (with `wire`) is made at all; aborts the process where the
+    /// gate says so.
+    fn admits(&self, name: &Name, wire: Option<&Bytes>) -> bool {
+        match *self.gate.lock() {
+            Gate::Open => true,
+            Gate::Drop => !name.has_prefix(&events_namespace()),
+            Gate::AbortAt(kind) | Gate::AbortBatchAt(kind) => {
+                if wire.is_some_and(|w| event_written(name, w) == Some(kind)) {
+                    std::process::abort();
+                }
+                true
+            }
+        }
+    }
+}
+
+impl DataStore for EventGate {
+    fn insert(&self, name: Name, wire: Bytes) {
+        if self.admits(&name, Some(&wire)) {
+            self.inner.insert(name, wire);
+        }
+    }
+    fn get(&self, name: &Name) -> Option<Bytes> {
+        self.inner.get(name)
+    }
+    fn contains(&self, name: &Name) -> bool {
+        self.inner.contains(name)
+    }
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        self.inner.find_under(prefix)
+    }
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        self.inner.scan_under(prefix, limit)
+    }
+    fn remove(&self, name: &Name) {
+        if self.admits(name, None) {
+            self.inner.remove(name);
+        }
+    }
+    fn apply(&self, ops: Vec<StoreOp>) {
+        if let Some(kept) = self.batches.lock().as_mut() {
+            kept.push(ops.iter().map(|op| op_name(op).clone()).collect());
+        }
+        let gate = *self.gate.lock();
+        match gate {
+            Gate::Open => self.inner.apply(ops),
+            Gate::Drop => self.inner.apply(
+                ops.into_iter()
+                    .filter(|op| !op_name(op).has_prefix(&events_namespace()))
+                    .collect(),
+            ),
+            Gate::AbortBatchAt(kind) => {
+                let held = ops.iter().any(|op| {
+                    matches!(op, StoreOp::Insert(name, wire) if event_written(name, wire) == Some(kind))
+                });
+                if held {
+                    std::process::abort();
+                }
+                self.inner.apply(ops);
+            }
+            // One by one, so that a stop in the middle leaves a prefix of the batch.
+            Gate::AbortAt(_) => {
+                for op in ops {
+                    match op {
+                        StoreOp::Insert(name, wire) => self.insert(name, wire),
+                        StoreOp::Remove(name) => self.remove(&name),
+                    }
+                }
+            }
+        }
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+    fn sync_is_immediate(&self) -> bool {
+        self.inner.sync_is_immediate()
+    }
+}
+
+/// Alice's laptop on `store`, its key the same in every run.
+async fn laptop_on(store: &Arc<dyn DataStore>, tune: impl FnOnce(Config) -> Config) -> Device {
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519_from_seed(n("/alice/laptop/KEY/1"), &[7; 32])
+        .unwrap();
+    on(&keys, store, tune).await
+}
+
+/// Alice's laptop on `store`, owning the plan and the budget.
+async fn laptop_sharing(store: &Arc<dyn DataStore>, tune: impl FnOnce(Config) -> Config) -> Device {
+    let dev = laptop_on(store, tune).await;
+    for c in [plan(), budget()] {
+        dev.share(&c, log_share()).await.unwrap();
+    }
+    dev
+}
+
+/// The record of Alice's phone that removes Bob from the plan.
+fn phone_removes_bob(dev: &Device) -> Made {
+    made(
+        "/alice/phone",
+        &plan(),
+        1,
+        Record::Members(removing_bob(dev, &plan())),
+    )
+}
+
+/// Tell the device's events to a test the way the host sees them: the ids, in cursor order.
+fn ids_of(dev: &Device) -> Vec<EventId> {
+    dev.pending_events().iter().map(|e| e.id).collect()
+}
+
+/// Alice's laptop on `store`, its keyring also holding `contexts` (of other namespaces).
+async fn laptop_also_holding(
+    store: &Arc<dyn DataStore>,
+    contexts: Vec<Arc<SignedTrustContext>>,
+) -> Device {
+    let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+    for ns in ["/alice", "/bob", "/carol"] {
+        validator
+            .adopt_context(Arc::new(SignedTrustContext::hierarchical(n(ns))))
+            .unwrap();
+    }
+    for ctx in contexts {
+        validator.adopt_context(ctx).unwrap();
+    }
+    let keys = Arc::new(SecurityManager::new());
+    keys.generate_ed25519_from_seed(n("/alice/laptop/KEY/1"), &[7; 32])
+        .unwrap();
+    let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+    Device::start(
+        Transport {
+            node: Node::from_connection(Arc::clone(&conn)),
+            sync: conn,
+        },
+        n("/alice/laptop"),
+        keys,
+        validator,
+        Arc::clone(store),
+        Config::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_first_context_of_a_namespace_held_at_start_reports_no_revocation_of_its_own() {
+    let dave = |version: u64, revoked: &[&str]| {
+        let mut ctx = SignedTrustContext::hierarchical(n("/dave")).with_version(version);
+        for r in revoked {
+            ctx = ctx.with_revocation(n(r));
+        }
+        Arc::new(ctx)
+    };
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let dev = laptop_on(&store, |c| c).await;
+    dev.shutdown();
+    drop(dev);
+    // The host adopted a context of a namespace this device held none of, while it was off: its
+    // revocation is no news, as a first context adopted while it ran is none.
+    let dev = laptop_also_holding(&store, vec![dave(1, &["/dave/phone/KEY/1"])]).await;
+    assert!(
+        dev.pending_events().is_empty(),
+        "the first context of /dave reports none of its own: {:?}",
+        dev.pending_events()
+    );
+    dev.shutdown();
+    drop(dev);
+    // A later one that revokes one more reports that one, and not the first again.
+    let dev = laptop_also_holding(
+        &store,
+        vec![dave(2, &["/dave/phone/KEY/1", "/dave/tab/KEY/1"])],
+    )
+    .await;
+    let revoked: Vec<_> = of_kind(&dev, EventKind::Revocation)
+        .into_iter()
+        .map(|e| e.detail)
+        .collect();
+    assert_eq!(
+        revoked,
+        vec![EventDetail::Revocation {
+            namespace: n("/dave"),
+            revoked: n("/dave/tab/KEY/1"),
+            version: 2,
+        }],
+        "a context adopted while the device was off, revoking one name more than the one it \
+         held: that one is reported, at the next start"
+    );
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_cut_whose_record_is_held_and_whose_event_was_never_written_is_reported_after_a_restart()
+{
+    let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
+    let store: Arc<dyn DataStore> = gate.clone();
+    let dev = laptop_sharing(&store, |c| c).await;
+    // The stop comes after the record was stored and before the event was.
+    gate.set(Gate::Drop);
+    let record = phone_removes_bob(&dev);
+    give(&dev, &record);
+    let told = of_kind(&dev, EventKind::Cut);
+    assert_eq!(
+        told.len(),
+        1,
+        "told while it ran: {:?}",
+        dev.pending_events()
+    );
+    assert!(
+        backing.get(&record.name).is_some(),
+        "the record is stored: this is the state a kill leaves"
+    );
+    dev.shutdown();
+    drop(dev);
+    gate.set(Gate::Open);
+
+    let dev = laptop_on(&store, |c| c).await;
+    let cuts = of_kind(&dev, EventKind::Cut);
+    assert_eq!(
+        cuts.len(),
+        1,
+        "the record is held and no event was written for it: the restart reports the cut; \
+         pending: {:?}",
+        dev.pending_events()
+    );
+    assert_eq!(cuts[0].id, told[0].id, "the same evidence, the same id");
+    assert_eq!(
+        (cuts[0].count, cuts[0].subject()),
+        (1, EventSubject::Writer(n("/bob")))
+    );
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_cut_event_is_not_reported_again_after_acknowledgement_whether_or_not_its_tombstone_is_kept()
+ {
+    for tombstones in [1024, 0] {
+        let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
+        let store: Arc<dyn DataStore> = gate.clone();
+        let dev = laptop_sharing(&store, |c| Config {
+            events_acked: tombstones,
+            ..c
+        })
+        .await;
+        give(&dev, &phone_removes_bob(&dev));
+        let told = ids_of(&dev);
+        assert_eq!(told.len(), 1);
+        dev.shutdown();
+        drop(dev);
+
+        // Reported before the stop: once after the restart, not twice.
+        let dev = laptop_on(&store, |c| Config {
+            events_acked: tombstones,
+            ..c
+        })
+        .await;
+        assert_eq!(
+            ids_of(&dev),
+            told,
+            "tombstones {tombstones}: an event reported before the stop is not derived again"
+        );
+        dev.acknowledge(&told).await.unwrap();
+        dev.shutdown();
+        drop(dev);
+
+        let dev = laptop_on(&store, |c| Config {
+            events_acked: tombstones,
+            ..c
+        })
+        .await;
+        assert!(
+            dev.pending_events().is_empty(),
+            "tombstones {tombstones}: acknowledged, and the record is held at every start: \
+             not reported again: {:?}",
+            dev.pending_events()
+        );
+        dev.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn a_store_with_no_ledger_reports_what_it_holds_as_no_news_and_keeps_a_ledger_from_then_on() {
+    let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
+    let store: Arc<dyn DataStore> = gate.clone();
+    let dev = laptop_sharing(&store, |c| c).await;
+    gate.set(Gate::Drop);
+    give(&dev, &phone_removes_bob(&dev));
+    dev.shutdown();
+    drop(dev);
+    gate.set(Gate::Open);
+    // An earlier revision's store has no ledger: what it holds is the baseline.
+    for (name, _) in backing.scan_under(&events_namespace(), 0) {
+        backing.remove(&name);
+    }
+    let dev = laptop_on(&store, |c| c).await;
+    assert!(
+        dev.pending_events().is_empty(),
+        "a store with no ledger: the cut it holds is no news: {:?}",
+        dev.pending_events()
+    );
+    dev.shutdown();
+    drop(dev);
+    let dev = laptop_on(&store, |c| c).await;
+    assert!(
+        dev.pending_events().is_empty(),
+        "the baseline was entered in the ledger: {:?}",
+        dev.pending_events()
+    );
+    dev.shutdown();
+}
+
+#[tokio::test]
+async fn a_members_record_and_the_events_of_its_cuts_reach_the_store_in_one_batch() {
+    let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
+    let store: Arc<dyn DataStore> = gate.clone();
+    let dev = laptop_sharing(&store, |c| c).await;
+    gate.keep_batches();
+    let record = phone_removes_bob(&dev);
+    give(&dev, &record);
+    let batches = gate.batches();
+    let batch = batches
+        .iter()
+        .find(|b| b.contains(&record.name))
+        .unwrap_or_else(|| panic!("the record is written in a batch: {batches:?}"));
+    assert!(
+        batch.iter().any(|n| n.has_prefix(&n_events_e())),
+        "the record of a cut and its event are one batch, so a store with atomic batches never \
+         holds the record without it: {batch:?}"
+    );
+    assert!(
+        batch.iter().any(|n| n.has_prefix(&n_events_l())),
+        "and the ledger entry of the cut is in it: {batch:?}"
+    );
+    dev.shutdown();
+}
+
+fn n_events_e() -> Name {
+    events_namespace().append("e")
+}
+
+fn n_events_l() -> Name {
+    events_namespace().append("l")
+}
+
+// ---- the same, with a real process killed between them ---------------------------------------
+
+/// The environment variable that makes the children of the kill cases run:
+/// `<engine>|<directory>|<scenario>`.
+pub(super) const KILL_ROLE: &str = "NDN_DATA_EVENTS_KILL";
+
+pub(super) fn open_engine(engine: Engine, dir: &std::path::Path) -> Arc<dyn DataStore> {
+    let live = engine.live(dir);
+    match engine {
+        Engine::Fjall => Arc::new(BackendStore::open_fjall(&live).unwrap()),
+        Engine::Redb => Arc::new(BackendStore::open_redb(&live).unwrap()),
+    }
+}
+
+/// The engine, directory and scenario a child was started for.
+pub(super) fn role() -> Option<(Engine, std::path::PathBuf, String)> {
+    let role = std::env::var(KILL_ROLE).ok()?;
+    let mut parts = role.splitn(3, '|');
+    let engine = match parts.next()? {
+        "fjall" => Engine::Fjall,
+        "redb" => Engine::Redb,
+        other => panic!("{KILL_ROLE} names engine {other:?}; it is fjall or redb"),
+    };
+    let dir = std::path::PathBuf::from(parts.next()?);
+    Some((engine, dir, parts.next()?.to_string()))
+}
+
+/// Run the test `path` (ignored: a child of a kill case) in a process of its own, for the
+/// scenario `scenario` on `engine` in `dir`; how it ended. A child that does not end in two
+/// minutes is killed and fails the case.
+pub(super) fn run_child(
+    path: &str,
+    engine: Engine,
+    dir: &std::path::Path,
+    scenario: &str,
+) -> std::process::ExitStatus {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            path,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            KILL_ROLE,
+            format!("{}|{}|{scenario}", engine.label(), dir.display()),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if began.elapsed() > Duration::from_secs(120) {
+            let _ = child.kill();
+            panic!(
+                "the {} child of {path} ({scenario}) did not end in 120 s",
+                engine.label()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// One run of Alice's laptop in a process of its own, which a cut record's event ends
+/// ([`Gate`]). Nothing when no case started it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a child process of the kill cases; it runs only when they start it"]
+async fn events_cut_kill_child() {
+    let Some((engine, dir, scenario)) = role() else {
+        return;
+    };
+    let gate = EventGate::over(open_engine(engine, &dir), Gate::Open);
+    let store: Arc<dyn DataStore> = gate.clone();
+    let dev = laptop_sharing(&store, |c| c).await;
+    match scenario.as_str() {
+        // The record is stored, and the process dies as its event is written.
+        "cut" => gate.set(Gate::AbortAt(EventKind::Cut)),
+        // The same, on a store whose batch is atomic: the record dies with its event.
+        "cut-atomic" => gate.set(Gate::AbortBatchAt(EventKind::Cut)),
+        // The event is written, and the process dies after it.
+        "cut-reported" => {}
+        other => panic!("{KILL_ROLE} names scenario {other:?}"),
+    }
+    give(&dev, &phone_removes_bob(&dev));
+    if scenario == "cut-reported" {
+        std::process::abort();
+    }
+    // Not reached: the gate stops the process in `give`.
+    std::process::exit(0);
+}
+
+fn a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none(engine: Engine) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let child = "device::events_tests::events_cut_kill_child";
+    let record = log_name(&n("/alice/phone"), Some(&plan()), 1);
+
+    // (a) Killed between the record stored and its event written: the event is there after the
+    // restart, once; acknowledged, it does not come again, though no tombstone is kept.
+    let dir = tempfile::tempdir().unwrap();
+    let status = run_child(child, engine, dir.path(), "cut");
+    assert!(
+        !status.success(),
+        "{}: the child was to be killed: {status:?}",
+        engine.label()
+    );
+    rt.block_on(async {
+        let store = open_engine(engine, dir.path());
+        assert!(
+            store.get(&record).is_some(),
+            "{}: the record was stored before the kill",
+            engine.label()
+        );
+        let tune = |c: Config| Config {
+            events_acked: 0,
+            ..c
+        };
+        let dev = laptop_on(&store, tune).await;
+        let cuts = of_kind(&dev, EventKind::Cut);
+        assert_eq!(
+            cuts.len(),
+            1,
+            "{}: killed between a members record and the event of its cut: the cut is reported \
+             after the restart; pending: {:?}",
+            engine.label(),
+            dev.pending_events()
+        );
+        let EventDetail::Cut {
+            subject,
+            of,
+            signer,
+            record: named,
+            revision,
+            ..
+        } = &cuts[0].detail
+        else {
+            panic!("{:?}", cuts[0])
+        };
+        assert_eq!(
+            (subject, of, signer, named, *revision),
+            (&plan(), &n("/bob"), &key("/alice/phone"), &record, 2)
+        );
+        dev.acknowledge(&[cuts[0].id]).await.unwrap();
+        dev.shutdown();
+        drop(dev);
+        let dev = laptop_on(&store, tune).await;
+        assert!(
+            dev.pending_events().is_empty(),
+            "{}: acknowledged: not reported again at the next start: {:?}",
+            engine.label(),
+            dev.pending_events()
+        );
+        dev.shutdown();
+    });
+
+    // (d) Killed after the event was written: the cut is reported once, not twice.
+    let dir = tempfile::tempdir().unwrap();
+    let status = run_child(child, engine, dir.path(), "cut-reported");
+    assert!(!status.success(), "{}: {status:?}", engine.label());
+    rt.block_on(async {
+        let store = open_engine(engine, dir.path());
+        let dev = laptop_on(&store, |c| c).await;
+        let cuts = of_kind(&dev, EventKind::Cut);
+        assert_eq!(
+            (
+                cuts.len(),
+                cuts.first().map(|e| e.count),
+                dev.pending_events().len()
+            ),
+            (1, Some(1), 1),
+            "{}: reported before the kill: once after the restart, not twice: {:?}",
+            engine.label(),
+            dev.pending_events()
+        );
+        dev.shutdown();
+    });
+
+    // A store whose batches are atomic holds the record and its event, or neither.
+    let dir = tempfile::tempdir().unwrap();
+    let status = run_child(child, engine, dir.path(), "cut-atomic");
+    assert!(!status.success(), "{}: {status:?}", engine.label());
+    rt.block_on(async {
+        let store = open_engine(engine, dir.path());
+        assert!(
+            store.get(&record).is_none(),
+            "{}: killed with the batch of the record and its event not yet written: the record is \
+             not there without its event",
+            engine.label()
+        );
+        let dev = laptop_on(&store, |c| c).await;
+        assert!(
+            dev.pending_events().is_empty(),
+            "{:?}",
+            dev.pending_events()
+        );
+        dev.shutdown();
+    });
+}
+
+#[test]
+fn a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none_on_fjall() {
+    a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none(Engine::Fjall);
+}
+
+#[test]
+fn a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none_on_redb() {
+    a_kill_around_the_event_of_a_cut_loses_none_and_repeats_none(Engine::Redb);
 }
