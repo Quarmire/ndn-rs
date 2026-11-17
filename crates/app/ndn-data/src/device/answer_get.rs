@@ -166,6 +166,16 @@ impl Inner {
                 signer.key()
             ))));
         }
+        if let Some(since) = self.suspected_key(&self.st.lock(), signer.key()) {
+            return Err(refuse(AnswerRefusal::Untrusted {
+                why: format!(
+                    "its signer's key {} is marked suspected here since {}, so no answer of it is \
+                     taken or served; unsuspect the key if it is not lost, or revoke it",
+                    signer.key(),
+                    since.0
+                ),
+            }));
+        }
         if self.st.lock().answer_book.is_blocked(&name, signer.key()) {
             return Err(refuse(AnswerRefusal::Equivocal));
         }

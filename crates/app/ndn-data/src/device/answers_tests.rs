@@ -2164,3 +2164,50 @@ async fn a_reader_only_member_is_not_trusted_for_an_answer_by_default_but_a_writ
         assert!(matches!(&named.how, Provenance::Trusted { .. }), "{:?}", named.how);
     }
 }
+
+#[tokio::test]
+async fn a_suspected_key_is_neither_taken_nor_served_for_answers_until_unsuspected() {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, knowing(vec![sum(1)])).await;
+    let phone = w.start("/alice/phone", knowing(vec![])).await;
+    sync_all(&laptop, &phone);
+    let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
+    let name = laptop.publish_answer(&q).await.unwrap();
+    let key = w.key_of("/alice/laptop");
+    hand(&laptop, &name, &phone).await.unwrap();
+    assert!(
+        ask(&phone, &name).await.is_ok(),
+        "the person's own device is trusted"
+    );
+    assert!(matches!(phone.inner.answer_packet(&name), Some(Some(_))));
+
+    // The owner marks the key suspected, as log entries of it are refused (Device::suspect).
+    phone.suspect(&key, Timestamp(1)).unwrap();
+    let wire = laptop.inner.stored_answer(&name).unwrap();
+    let refused = plant(&phone, wire.clone()).await.unwrap_err();
+    assert!(
+        matches!(&refused, DataError::Answer { why: AnswerRefusal::Untrusted { why }, .. } if why.contains("suspected")),
+        "a suspected key's answer is not taken: {refused:?}"
+    );
+    let by_name = ask(&phone, &name).await.unwrap_err();
+    assert!(
+        matches!(
+            &by_name,
+            DataError::Answer {
+                why: AnswerRefusal::Untrusted { .. },
+                ..
+            }
+        ),
+        "{by_name:?}"
+    );
+    assert_eq!(
+        phone.inner.answer_packet(&name),
+        Some(None),
+        "and the one held is not served onward"
+    );
+
+    // Unsuspected, it is taken and served again.
+    assert!(phone.unsuspect(&key));
+    assert!(ask(&phone, &name).await.is_ok());
+    assert!(matches!(phone.inner.answer_packet(&name), Some(Some(_))));
+}

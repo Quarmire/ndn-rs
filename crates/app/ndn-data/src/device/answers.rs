@@ -221,8 +221,8 @@ impl Inner {
     /// What this device answers for `name` when it is an answer's or a piece of one's
     /// (answers.md §6.2, §8.2, §13.9): `None` when the name is neither. An own answer is served
     /// once it is behind the barrier; another's held verified, as signed; never one with evidence
-    /// kept against it, one whose signer a trust context held here revokes, or a piece of one of
-    /// them.
+    /// kept against it, one whose signer a trust context held here revokes or whose key is marked
+    /// suspected here ([`Device::suspect`](crate::Device::suspect)), or a piece of one of them.
     pub(super) fn answer_packet(&self, name: &Name) -> Option<Option<Bytes>> {
         let answer = match parse_answer_name(name) {
             Some(_) => name.clone(),
@@ -241,6 +241,7 @@ impl Inner {
         let servable = signer.is_some_and(|key| {
             !book.is_blocked(&answer, &key)
                 && !self.validator.keyring().context_for(&key).is_revoked(&key)
+                && self.suspected_key(&st, &key).is_none()
         });
         let known = answer == *name || book.pieces.contains(name);
         Some(

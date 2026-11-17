@@ -311,7 +311,7 @@ When a reader takes an answer on trust it MAY not hold every read. It MUST check
 
 Before anything of an answer is used, in this order, a reader:
 
-1. verifies its signature by its trust context as a log entry is verified (data-layer.md §4: the key locator names a key of `D`, the context governing `D`, the chain; a revoked key or issuer **refuses it** whatever it carries, §13.9). `Answer` / `Untrusted` or `BadSignature`;
+1. verifies its signature by its trust context as a log entry is verified (data-layer.md §4: the key locator names a key of `D`, the context governing `D`, the chain; a revoked key or issuer **refuses it** whatever it carries, §13.9), and refuses it when the key is **marked suspected** on this device (data-layer.md §8, `Device::suspect`: no new entry of such a key is taken, and nor is an answer, until the mark ends by `unsuspect` or by a revocation). `Answer` / `Untrusted` or `BadSignature`;
 2. decodes it exactly (`Malformed`), checks the kind against the question;
 3. opens it with the audience key (§5.3), or answers the error of §5.2;
 4. checks the binding against the name's id, the read-set digest, the definition among the reads, the epoch list (§3.4, §5.1);
@@ -528,6 +528,7 @@ The format cannot list an unsigned input: a read is a version name with its dige
 A revocation cut lists the log entries of the revoked key that stay valid (data-layer.md §8.1); an answer is not a log entry and has no seq, so **no cut lists one**: it is in the same class as a summary root, a head, a seal key or a grant, all of which a revocation refuses once held (§8.1 of data-layer.md). So:
 
 - A reader that holds the revocation **refuses** every answer signed by the revoked key (`Untrusted`) at its next check, fail closed, whatever the answer's age and whatever a cut accepts of the key's log entries. A device that holds such answers stops serving them as soon as it holds the revocation.
+- **A suspected key, before any revocation.** The owner who fears a key lost marks it suspected on a device (`Device::suspect`, data-layer.md §8), which takes no new log entry of it. An answer is treated the same: a reader refuses an answer of a suspected key (`Untrusted`, §7.3.3 step 1) and a device does not serve one it holds, until the mark ends by `unsuspect` or because a revocation is held (the paragraph above then decides). Otherwise following the advice of an evidence event, "suspect the key", would change nothing for answers.
 - **Nothing is lost that cannot be remade.** A pure answer is recomputed by anyone, so the audience loses nothing but the cache entry; a recomputing reader never used the signature. A provider answer is lost until another device of the provider (or the provider after re-keying) signs the function over the same inputs: a new signer, a new name, the same id; a reader's policy then names the new signer.
 - A provider key lost to a thief is also a risk **before** revocation: the thief signs wrong provider answers. The evidence of §8 and the owner's revocation are the response; the cut's bound does not help because answers have none.
 
