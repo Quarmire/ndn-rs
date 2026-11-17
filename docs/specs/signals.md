@@ -217,7 +217,7 @@ For each push Interest under its group, and each frame off a ring it attached, a
      8. it admits the header through `signal_admit`, which verifies the chain (§7).
 
      A refusal is counted (`bad_signature`, `not_member`, `malformed`; `unknown_run` when the record isn't held yet or the certificate isn't to be had now) and the run is not held. Holding it obeys §8.4. The packet that carried the header verified at sub-step 5, and is not verified again;
-   - if no run is held and no header rides: `unknown_run`, dropped unverified;
+  - if no run is held and no header rides, the packet may have overtaken the header-only packet that was pushed before it (the forwarder runs packets in parallel, so consecutive Interests from one face can swap). It is held, unverified, for at most 500 ms, with at most 32 per run and 64 in all (the oldest goes first at the cap). When the run's header is admitted, held packets are processed in arrival order from step 5. A held packet nobody claims is counted `unknown_run` when it expires. Nothing is verified for a held packet, so a flood of them costs memory only, bounded as stated;
    - a held run's packet whose digest is not its scope's is `malformed`; a header-only packet of a held run is done; a packet past its run's `RunNotAfter` plus the skew is `expired`; a sequence below `RunStart` is `malformed`;
 5. applies the replay window (§8.2, `replayed`), then takes one signature check from the scope's and the process's budgets for packets not verified yet (§10, `flood`). A flood of copies costs no verification. A flood of forgeries spends only the budgets of unverified checks, never the budgets of verified traffic;
 6. verifies the RunSignature, else `bad_signature`;
