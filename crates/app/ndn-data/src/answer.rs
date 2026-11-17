@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::{Hash, Name, tlv_type};
@@ -1215,6 +1216,12 @@ pub trait ReadView {
     fn current(&self, collection: &Name) -> Result<&ReadRef, EvalError>;
     /// What `r` opened to; `r` MUST be a read of the set.
     fn read(&self, r: &ReadRef) -> Result<&Got, EvalError>;
+    /// Whether this evaluation is over its time ([`Budget::time`]): it is abandoned and its
+    /// result will not be used, so an evaluator that runs long checks this between its steps
+    /// and returns early (with any error).
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// A named, versioned pure function of a definition and the contents of a read set
@@ -1334,12 +1341,18 @@ pub enum Publish {
 /// [`AnswerRefusal::OverBudget`], never a different result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
-    /// Reads.
+    /// Reads of distinct versions and states, and calls of [`Reads::current`] (each is a
+    /// lookup of what this device holds, and a plan that calls it again and again spends it).
     pub reads: usize,
     /// Octets read.
     pub read_bytes: u64,
     /// Octets of the result.
     pub result_bytes: u64,
+    /// Wall-clock time to evaluate, and to check the reads of a signed answer against what
+    /// this device holds. Over it the work is abandoned and refused as
+    /// [`AnswerRefusal::OverBudget`]: the clock only ever makes a refusal, never a result or a
+    /// trust decision.
+    pub time: Duration,
 }
 
 /// What a device keeps of others' answers (answers.md §10).
@@ -1360,8 +1373,8 @@ pub struct AnswerConfig {
     pub policy: AnswerPolicy,
     /// Whether `get` signs what it computed. Default [`Publish::Never`].
     pub publish: Publish,
-    /// What one evaluation may spend. Default: 65,536 reads, `PAYLOAD_MAX` octets read and
-    /// returned.
+    /// What one evaluation may spend. Default: 65,536 reads and `current` calls,
+    /// `PAYLOAD_MAX` octets read and returned, 10 s.
     pub budget: Budget,
     /// What is kept of others' answers. Default: 1,024 answers and 64 MiB per signer, 1 GiB in
     /// all.
@@ -1379,6 +1392,7 @@ impl Default for AnswerConfig {
                 reads: READS_MAX,
                 read_bytes: PAYLOAD_MAX,
                 result_bytes: PAYLOAD_MAX,
+                time: Duration::from_secs(10),
             },
             store: AnswerStore {
                 per_signer_answers: 1_024,

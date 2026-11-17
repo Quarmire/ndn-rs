@@ -22,6 +22,8 @@ use crate::error::AnswerRefusal;
 use crate::events::{AnswerFault, EventDetail, EventKind, Meaning, ReadSetFault};
 use crate::layer::Share;
 
+mod budget_tests;
+
 const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
 
 #[path = "answer_padding_tests.rs"]
@@ -1360,7 +1362,7 @@ async fn the_audience_of_an_answer_is_the_intersection_of_the_epochs_it_reads() 
         let st = laptop.inner.st.lock();
         epochs.push(st.colls[c].members.as_ref().unwrap().epoch.clone().unwrap());
     }
-    let Ok(checked) = laptop.inner.check_reads(&got.reads) else {
+    let Ok(checked) = laptop.inner.check_reads(&name_ab, &got.reads, &[]).await else {
         panic!("the reads of its own answer hold");
     };
     assert_eq!(checked.unverified, 0, "it holds every read");

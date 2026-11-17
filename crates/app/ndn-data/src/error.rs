@@ -533,6 +533,14 @@ pub enum AnswerRefusal {
         /// The most allowed.
         limit: u64,
     },
+    /// A signed answer lists more reads of merge states than this device checks against what
+    /// it holds, so it is not used (answers.md §10).
+    TooManyStates {
+        /// How many reads of merge states it lists.
+        states: u64,
+        /// The most this device checks.
+        limit: u64,
+    },
     /// An evaluation would exceed the host's budget; never a different result.
     OverBudget {
         /// Which budget.
@@ -557,7 +565,9 @@ impl AnswerRefusal {
             AnswerRefusal::ReadsChanged(_) => NextStep::RetryLater,
             AnswerRefusal::NotProvider { .. } => NextStep::SetPolicy,
             AnswerRefusal::Untrusted { .. } | AnswerRefusal::Equivocal => NextStep::AskOwner,
-            AnswerRefusal::TooLarge { .. } => NextStep::FixRequest,
+            AnswerRefusal::TooLarge { .. } | AnswerRefusal::TooManyStates { .. } => {
+                NextStep::FixRequest
+            }
             AnswerRefusal::OverBudget { .. } | AnswerRefusal::Busy => NextStep::FixLocal,
         }
     }
@@ -610,10 +620,18 @@ impl std::fmt::Display for AnswerRefusal {
                 "{what} is {size}, more than the {limit} an answer carries; ask a smaller \
                  question, or split the reading into several"
             ),
+            AnswerRefusal::TooManyStates { states, limit } => write!(
+                f,
+                "it lists {states} reads of merge states, and this device checks at most {limit} \
+                 against what it holds (each is a replay of the collection's merge), so it does \
+                 not use the answer; ask its signer for an answer over fewer states, or ask the \
+                 question so that this device recomputes it"
+            ),
             AnswerRefusal::OverBudget { what } => write!(
                 f,
-                "the evaluation would exceed this device's budget for {what}, so there is no \
-                 result (never a different one); raise Config::answers.budget on this device"
+                "this device's budget for {what} would be exceeded, so there is no result \
+                 (never a different one); raise Config::answers.budget on this device, or ask \
+                 for less"
             ),
             AnswerRefusal::Busy => f.write_str(
                 "this device cannot keep one more provider answer, and a provider keeps every \

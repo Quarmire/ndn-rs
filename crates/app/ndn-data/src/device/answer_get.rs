@@ -320,7 +320,7 @@ impl Inner {
         // 5. The reads this device holds, and then the epochs they are sealed in: a read that no
         // longer holds here (a version withdrawn since) changes the epochs a state is computed
         // from, and is no fault of the signer, so it is classified before the epochs are.
-        let checked = match self.check_reads(&body.reads) {
+        let checked = match self.check_reads(&name, &body.reads, &epochs).await {
             Ok(c) => c,
             Err(ReadFail::Conflict(why)) => {
                 return Err(evidence(
@@ -337,11 +337,7 @@ impl Inner {
             }
             Err(ReadFail::Data(e)) => return Err(e),
         };
-        let listed_right = match checked.unverified {
-            0 => checked.epochs == epochs,
-            _ => checked.epochs.iter().all(|e| epochs.contains(e)),
-        };
-        if !listed_right {
+        if !checked.lists(&epochs) {
             return Err(evidence(
                 AnswerFault::ReadSet(ReadSetFault::Epochs),
                 readset,
