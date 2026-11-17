@@ -51,7 +51,8 @@ pub(crate) enum Stopped {
 }
 
 /// Run `work`, CPU-bound and synchronous, within `limit` of wall-clock time, without holding
-/// up the executor: on its own thread, with a watchdog that raises [`Cancel`] at the deadline
+/// up the executor: on the runtime's blocking pool (its own thread when there is no tokio
+/// runtime), with a watchdog that raises [`Cancel`] at the deadline
 /// and ends the wait (the work is abandoned: it stops at its next [`Cancel::cancelled`] check,
 /// and what it returns is dropped). On wasm32, which has no threads, it runs inline and only
 /// its own checks of [`Cancel::cancelled`] bound it.
@@ -75,15 +76,24 @@ pub(crate) async fn blocking<T: Send + 'static>(
     let finished = Arc::new((Mutex::new(false), Condvar::new()));
     {
         let (cancel, finished) = (cancel.clone(), Arc::clone(&finished));
-        std::thread::Builder::new()
-            .name("ndn-data-work".into())
-            .spawn(move || {
-                let out = catch_unwind(AssertUnwindSafe(|| work(&cancel)));
-                *finished.0.lock() = true;
-                finished.1.notify_all();
-                let _ = done_tx.send(out);
-            })
-            .map_err(|_| Stopped::NoThread)?;
+        let job = move || {
+            let out = catch_unwind(AssertUnwindSafe(|| work(&cancel)));
+            *finished.0.lock() = true;
+            finished.1.notify_all();
+            let _ = done_tx.send(out);
+        };
+        match tokio::runtime::Handle::try_current() {
+            // On the runtime's blocking pool, as the store's flush is: a paused (virtual)
+            // tokio clock does not auto-advance while a blocking task runs, so a simulated
+            // run is as deterministic with this work as without it.
+            Ok(runtime) => drop(runtime.spawn_blocking(job)),
+            Err(_) => {
+                std::thread::Builder::new()
+                    .name("ndn-data-work".into())
+                    .spawn(job)
+                    .map_err(|_| Stopped::NoThread)?;
+            }
+        }
     }
     {
         let (watched, finished) = (cancel.clone(), Arc::clone(&finished));
