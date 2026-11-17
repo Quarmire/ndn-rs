@@ -337,6 +337,8 @@ const RANGE: &[u8] = b"range";
 const CUT: &[u8] = b"cut";
 const SIGNAL: &[u8] = b"signal";
 const RUN: &[u8] = b"run";
+const ANSWER: &[u8] = b"answer";
+const QUESTION: &[u8] = b"question";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces, whatever the collection's rule (a block never).
@@ -812,14 +814,14 @@ pub struct GrantAsk {
     pub epoch: Epoch,
 }
 
-fn write_epoch(w: &mut TlvWriter, e: &Epoch) {
+pub(crate) fn write_epoch(w: &mut TlvWriter, e: &Epoch) {
     w.write_nested(tlv::SEAL_EPOCH, |w| {
         write_name(w, &e.creator);
         write_nni(w, tlv::SEQ, e.seq.0);
     });
 }
 
-fn read_epoch(value: Bytes) -> Result<Epoch, WireError> {
+pub(crate) fn read_epoch(value: Bytes) -> Result<Epoch, WireError> {
     let (mut creator, mut seq) = (None, None);
     each(value, |t, v| {
         match t {
@@ -1169,6 +1171,101 @@ pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
         return None;
     }
     Some((name_of(&comps[..at]), read_name(value).ok()?))
+}
+
+// ---- round 5: answers (answers.md §3.3, §7.1, §11.1) ---------------------------------------------
+
+/// The octets of an answer id.
+pub const ANSWER_ID_LEN: usize = 32;
+
+/// Whether `name` has an answer or question keyword: `get` takes it as a name of answers
+/// (answers.md §7.1) and answers `BadName` saying how to form it if it is not one.
+pub(crate) fn names_an_answer(name: &Name) -> bool {
+    name.components()
+        .iter()
+        .any(|c| is_kw(c, ANSWER) || is_kw(c, QUESTION))
+}
+
+/// An answer's name: `<D>/32=answer/<id>`, `D` the signer's device name, `id` one component of
+/// the 32 octets of the answer id (answers.md §3.3).
+pub fn answer_name(device: &Name, id: &[u8; ANSWER_ID_LEN]) -> Name {
+    device
+        .clone()
+        .append_component(kw(ANSWER))
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(id)))
+}
+
+/// Parse `<D>/32=answer/<id>`: `D` is everything before the first `32=answer` (a device name:
+/// no keyword, no digest), and exactly one generic component of 32 octets follows.
+pub fn parse_answer_name(name: &Name) -> Option<(Name, [u8; ANSWER_ID_LEN])> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, ANSWER))?;
+    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
+        return None;
+    }
+    let id = &comps[at + 1];
+    if id.typ != tlv_type::GENERIC_NAME_COMPONENT {
+        return None;
+    }
+    Some((
+        name_of(&comps[..at]),
+        <[u8; ANSWER_ID_LEN]>::try_from(&id.value[..]).ok()?,
+    ))
+}
+
+/// Parse a piece of an answer in pieces: `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, `A` an
+/// answer's name (answers.md §5.4, §11.1): the answer's name and which piece. No custody applies
+/// to answers.
+pub fn parse_answer_piece_name(name: &Name) -> Option<(Name, PieceKind)> {
+    let comps = name.components();
+    let (last, rest) = comps.split_last()?;
+    let n = last.as_segment()?;
+    let (rest, kind) = match rest.split_last() {
+        Some((m, before)) if is_kw(m, MANIFEST) => (before, PieceKind::Manifest(n)),
+        _ => (rest, PieceKind::Chunk(n)),
+    };
+    let answer = name_of(rest);
+    parse_answer_name(&answer)?;
+    Some((answer, kind))
+}
+
+/// A question's name: `<X>/32=question/<AnswerAsk TLV>`, one generic component whose value is
+/// exactly the `AnswerAsk` (answers.md §7.1). Local, never sent. `X` is the definition's
+/// collection (pure) or the provider device (provider); `AnswerAsk::name` checks that.
+pub fn question_name(x: &Name, ask: &crate::answer::AnswerAsk) -> Name {
+    x.clone()
+        .append_component(kw(QUESTION))
+        .append_component(NameComponent::generic(ask.encode()))
+}
+
+/// Parse `<X>/32=question/<AnswerAsk TLV>`: `None` when the name is not of that form (no
+/// `32=question` as the next-to-last component); `Some(Err(..))` when it is, and its last
+/// component is not exactly one decodable `AnswerAsk` of at most `QUESTION_MAX` octets.
+pub fn parse_question_name(
+    name: &Name,
+) -> Option<Result<(Name, crate::answer::AnswerAsk), WireError>> {
+    let comps = name.components();
+    let (last, rest) = comps.split_last()?;
+    let (marker, x) = rest.split_last()?;
+    if !is_kw(marker, QUESTION) {
+        return None;
+    }
+    if x.iter().any(|c| is_kw(c, QUESTION)) {
+        return Some(Err(bad("a question name has one 32=question component")));
+    }
+    if last.typ != tlv_type::GENERIC_NAME_COMPONENT {
+        return Some(Err(bad(
+            "the last component of a question is one generic component holding an AnswerAsk",
+        )));
+    }
+    if last.value.len() > crate::answer::QUESTION_MAX {
+        return Some(Err(bad(format!(
+            "a question is at most {} octets, this one is {}",
+            crate::answer::QUESTION_MAX,
+            last.value.len()
+        ))));
+    }
+    Some(crate::answer::AnswerAsk::decode(last.value.clone()).map(|ask| (name_of(x), ask)))
 }
 
 // ---- slice 4: heads, entries, range reads -------------------------------------------------------
@@ -1653,7 +1750,7 @@ fn read_frontier(value: Bytes) -> Result<Frontier, WireError> {
 
 /// A version's parents: a `Frontier` whose entries each carry, after the
 /// seq, the `Digest` of that writer's packet at that seq (spec §4).
-fn write_parents(w: &mut TlvWriter, p: &Parents) {
+pub(crate) fn write_parents(w: &mut TlvWriter, p: &Parents) {
     w.write_nested(tlv::FRONTIER, |w| {
         for (writer, seq, digest) in p.tips() {
             w.write_nested(tlv::FRONTIER_ENTRY, |w| {
@@ -1667,7 +1764,7 @@ fn write_parents(w: &mut TlvWriter, p: &Parents) {
     });
 }
 
-fn read_parents(value: Bytes) -> Result<Parents, WireError> {
+pub(crate) fn read_parents(value: Bytes) -> Result<Parents, WireError> {
     let mut p = Parents::new();
     read_tips(value, |id, digest| {
         if p.get(&id.writer).is_some() {

@@ -162,6 +162,9 @@ pub enum Got {
     /// (`<C>/32=range/<R>`, [`crate::wire::range_name`]), or one entry by
     /// its name.
     Entries(Entries),
+    /// An answer, asked by its exact name `<D>/32=answer/<id>` or by a question
+    /// `<X>/32=question/<AnswerAsk>` (`docs/specs/answers.md` §7).
+    Answer(crate::answer::Answered),
 }
 
 /// How old an answer may be (model invariant 5, "stale, never wrong").

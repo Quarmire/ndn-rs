@@ -331,7 +331,7 @@ const NO_RECORD: &str = "no members record over it is held here yet; follow it (
                          a collection under it) so its owner's record arrives, then ask again";
 
 /// Why a key is no member of a scope for signals.
-enum NotMember {
+pub(super) enum NotMember {
     /// No writer prefix covers it and the audience does not admit it.
     Unlisted,
     /// The trust context governing it revokes it.
@@ -434,7 +434,7 @@ impl Inner {
     /// by a cut is not), or `m`'s audience admits its device; and the trust
     /// context governing it — as this device judges the key's packets
     /// about `scope` — does not revoke it.
-    fn signal_member_by(
+    pub(super) fn signal_member_by(
         &self,
         st: &St,
         m: &Members,

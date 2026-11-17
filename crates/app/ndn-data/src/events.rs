@@ -16,8 +16,10 @@
 //! is capped ([`Config::events_unacked`](crate::Config::events_unacked)), and a single
 //! [`EventDetail::Overflow`] event counts what was not kept.
 //!
-//! A later round adds a variant (an answer that differs from a signed one, F): the enums are
-//! exhaustive, and each new variant adds one arm to [`EventDetail`]'s helpers and its codec.
+//! Round 5's item F adds the answer arm ([`EventDetail::Answer`], kind
+//! [`EventKind::AnswerEvidence`]): a signed answer and what contradicts it
+//! (`docs/specs/answers.md` §8). The enums are exhaustive, and each new variant adds one arm to
+//! [`EventDetail`]'s helpers and its codec.
 
 use std::fmt;
 use std::pin::Pin;
@@ -129,6 +131,8 @@ pub enum EventKind {
     Revocation,
     /// Events not kept for want of room.
     Overflow,
+    /// A signed answer and what contradicts it (answers.md §8).
+    AnswerEvidence,
 }
 
 impl EventKind {
@@ -139,6 +143,7 @@ impl EventKind {
             EventKind::Cut => 2,
             EventKind::Revocation => 3,
             EventKind::Overflow => 4,
+            EventKind::AnswerEvidence => 5,
         }
     }
 
@@ -149,6 +154,7 @@ impl EventKind {
             2 => EventKind::Cut,
             3 => EventKind::Revocation,
             4 => EventKind::Overflow,
+            5 => EventKind::AnswerEvidence,
             _ => return Err(bad("an unknown event kind")),
         })
     }
@@ -162,6 +168,7 @@ impl fmt::Display for EventKind {
             EventKind::Cut => "cut",
             EventKind::Revocation => "revocation",
             EventKind::Overflow => "overflow",
+            EventKind::AnswerEvidence => "answer evidence",
         })
     }
 }
@@ -370,6 +377,85 @@ pub enum EventDetail {
         /// How many occurrences of each kind were not kept, in kind order.
         dropped: Vec<(EventKind, u64)>,
     },
+    /// A verified signed answer and what contradicts it (answers.md §8): names, digests and
+    /// kinds only. Digests of results are keyed when anything read is sealed, so an event that
+    /// reaches a device outside the audience confirms no guess of a result.
+    Answer {
+        /// The answer's full name, `<device>/32=answer/<id>`.
+        answer: Name,
+        /// The key that signed it.
+        signer: Name,
+        /// The answer id.
+        id: [u8; 32],
+        /// The digest of its read set.
+        readset: [u8; 32],
+        /// What contradicts it.
+        fault: AnswerFault,
+    },
+}
+
+/// What contradicts a signed answer (answers.md §8.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AnswerFault {
+    /// A recomputation (known evaluator, same read set) differs from the signed result.
+    Mismatch {
+        /// The result digest of the signed answer.
+        signed: [u8; 32],
+        /// The result digest this device recomputed.
+        recomputed: [u8; 32],
+        /// The evaluator.
+        evaluator: Name,
+    },
+    /// Two verified answers at one name by one key whose opened results differ.
+    Equivocation {
+        /// The result digest of the other answer.
+        other_result: [u8; 32],
+    },
+    /// Two trusted signers' answers with one id and different results, where the reader cannot
+    /// recompute.
+    Conflict {
+        /// The other answer's name.
+        other: Name,
+        /// The other signer's key.
+        other_signer: Name,
+        /// The other result's digest.
+        other_result: [u8; 32],
+    },
+    /// The content does not give the id in the name.
+    Binding,
+    /// The read set is wrong.
+    ReadSet(ReadSetFault),
+}
+
+/// How a signed answer's read set is wrong (answers.md §8.1, `ReadSet` kind).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReadSetFault {
+    /// Not canonical.
+    NotCanonical,
+    /// Its digest is not the binding's.
+    Digest,
+    /// Its epoch list is not its reads'.
+    Epochs,
+    /// It conflicts with a version this device holds.
+    HeldConflict,
+    /// The reads are not the reads the evaluator makes of its definition.
+    NotItsReads,
+}
+
+impl AnswerFault {
+    fn code(&self) -> u64 {
+        match self {
+            AnswerFault::Mismatch { .. } => 0,
+            AnswerFault::Equivocation { .. } => 1,
+            AnswerFault::Conflict { .. } => 2,
+            AnswerFault::Binding => 3,
+            AnswerFault::ReadSet(ReadSetFault::NotCanonical) => 4,
+            AnswerFault::ReadSet(ReadSetFault::Digest) => 5,
+            AnswerFault::ReadSet(ReadSetFault::Epochs) => 6,
+            AnswerFault::ReadSet(ReadSetFault::HeldConflict) => 7,
+            AnswerFault::ReadSet(ReadSetFault::NotItsReads) => 8,
+        }
+    }
 }
 
 /// What this device already did about an event's cause (spec §21): the event reports it.
@@ -385,6 +471,9 @@ pub enum Meaning {
     KeyRefused,
     /// Events were not kept; the evidence is still held.
     ReportsDropped,
+    /// An answer is kept whole as evidence, refused and never served; the reader used its own
+    /// value when it could.
+    AnswerKept,
 }
 
 impl EventDetail {
@@ -396,6 +485,7 @@ impl EventDetail {
             EventDetail::Cut { .. } => EventKind::Cut,
             EventDetail::Revocation { .. } => EventKind::Revocation,
             EventDetail::Overflow { .. } => EventKind::Overflow,
+            EventDetail::Answer { .. } => EventKind::AnswerEvidence,
         }
     }
 
@@ -408,6 +498,7 @@ impl EventDetail {
             EventDetail::Cut { of, .. } => EventSubject::Writer(of.clone()),
             EventDetail::Revocation { revoked, .. } => EventSubject::Revoked(revoked.clone()),
             EventDetail::Overflow { .. } => EventSubject::Device,
+            EventDetail::Answer { signer, .. } => EventSubject::Writer(signer.clone()),
         }
     }
 
@@ -419,6 +510,7 @@ impl EventDetail {
             EventDetail::Cut { .. } => Meaning::WriterCut,
             EventDetail::Revocation { .. } => Meaning::KeyRefused,
             EventDetail::Overflow { .. } => Meaning::ReportsDropped,
+            EventDetail::Answer { .. } => Meaning::AnswerKept,
         }
     }
 
@@ -432,6 +524,7 @@ impl EventDetail {
             },
             EventDetail::Cut { .. } | EventDetail::Revocation { .. } => NextStep::None,
             EventDetail::Overflow { .. } => NextStep::None,
+            EventDetail::Answer { .. } => NextStep::UseOwnerDevice,
         }
     }
 
@@ -473,6 +566,12 @@ impl EventDetail {
                  force)"
                     .to_owned()
             }
+            EventDetail::Answer { signer, answer, .. } => format!(
+                "on a device that holds the owner's authority, look at the key {signer}: if it was \
+                 stolen or its program is faulty, mark it suspected (Device::suspect) and revoke \
+                 it; nothing is lost meanwhile, {answer} is kept whole as evidence, never served \
+                 and never taken again, and a recomputing reader used its own value"
+            ),
         }
     }
 
@@ -540,6 +639,50 @@ impl EventDetail {
                      acknowledgement"
                 )
             }
+            EventDetail::Answer {
+                answer,
+                signer,
+                fault,
+                ..
+            } => match fault {
+                AnswerFault::Mismatch { evaluator, .. } => format!(
+                    "{signer} signed {answer} with a result that differs from the one this \
+                     device recomputed under the evaluator {evaluator} over the same reads: a \
+                     wrong or hostile program signed it, and this device returned its own value"
+                ),
+                AnswerFault::Equivocation { .. } => format!(
+                    "{signer} signed two answers at the name {answer} whose results differ: a \
+                     name has one result, so a copy of the key is signing, or the function is \
+                     not reproducible and its provider did not keep what it signed; both are \
+                     kept as evidence"
+                ),
+                AnswerFault::Conflict {
+                    other,
+                    other_signer,
+                    ..
+                } => format!(
+                    "{signer} signed {answer} and {other_signer} signed {other}: one id, two \
+                     signers this device's policy trusts, two results, and this device cannot \
+                     recompute to tell which is right; both are kept as evidence"
+                ),
+                AnswerFault::Binding => format!(
+                    "{signer} signed {answer} with a content that does not give the id in its \
+                     name: it put a binding in a name that is not its; it is kept as evidence"
+                ),
+                AnswerFault::ReadSet(why) => format!(
+                    "{signer} signed {answer} with a read set that {}; it is kept as evidence and \
+                     never used",
+                    match why {
+                        ReadSetFault::NotCanonical => "is not canonical",
+                        ReadSetFault::Digest => "does not have the digest its binding names",
+                        ReadSetFault::Epochs => "does not list the epochs its reads are sealed in",
+                        ReadSetFault::HeldConflict =>
+                            "names a version with another digest than the one this device holds",
+                        ReadSetFault::NotItsReads =>
+                            "is not the reads the named evaluator makes of its definition",
+                    }
+                ),
+            },
         }
     }
 }
@@ -697,6 +840,19 @@ fn write_detail(w: &mut TlvWriter, d: &EventDetail) {
                 });
             }
         }),
+        EventDetail::Answer {
+            answer,
+            signer,
+            id,
+            readset,
+            fault,
+        } => w.write_nested(crate::answer::tlv::ANSWER_EVIDENCE, |w| {
+            write_name(w, answer);
+            write_name(w, signer);
+            w.write_tlv(wire::tlv::DIGEST, id);
+            w.write_tlv(wire::tlv::DIGEST, readset);
+            write_fault(w, fault);
+        }),
     }
 }
 
@@ -715,6 +871,7 @@ fn is_detail(t: u64) -> bool {
             | tlv::CUT_EVENT
             | tlv::REVOCATION_EVENT
             | tlv::OVERFLOW
+            | crate::answer::tlv::ANSWER_EVIDENCE
     )
 }
 
@@ -863,7 +1020,117 @@ fn read_detail(typ: u64, value: Bytes) -> Result<EventDetail, WireError> {
             })?;
             Ok(EventDetail::Overflow { dropped })
         }
+        crate::answer::tlv::ANSWER_EVIDENCE => {
+            let (mut names, mut digests, mut fault) = (Vec::new(), Vec::new(), None);
+            each(value, |t, v| {
+                match t {
+                    tlv_type::NAME => names.push(read_name(v)?),
+                    wire::tlv::DIGEST => digests.push(read_digest(&v)?),
+                    crate::answer::tlv::ANSWER_FAULT => fault = Some(read_fault(v)?),
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+            match (names.as_slice(), digests.as_slice(), fault) {
+                ([answer, signer], [id, readset], Some(fault)) => Ok(EventDetail::Answer {
+                    answer: answer.clone(),
+                    signer: signer.clone(),
+                    id: *id,
+                    readset: *readset,
+                    fault,
+                }),
+                _ => Err(bad(
+                    "an answer evidence names the answer and its signer, the id and the read-set \
+                     digest, and a fault",
+                )),
+            }
+        }
         _ => Err(bad("not an event detail")),
+    }
+}
+
+fn write_fault(w: &mut TlvWriter, f: &AnswerFault) {
+    use crate::answer::tlv as a;
+    w.write_nested(a::ANSWER_FAULT, |w| {
+        write_nni(w, a::FAULT_KIND, f.code());
+        match f {
+            AnswerFault::Mismatch {
+                signed,
+                recomputed,
+                evaluator,
+            } => {
+                w.write_tlv(wire::tlv::DIGEST, signed);
+                w.write_tlv(wire::tlv::DIGEST, recomputed);
+                w.write_nested(a::ANSWER_BY, |w| write_name(w, evaluator));
+            }
+            AnswerFault::Equivocation { other_result } => {
+                w.write_tlv(wire::tlv::DIGEST, other_result);
+            }
+            AnswerFault::Conflict {
+                other,
+                other_signer,
+                other_result,
+            } => {
+                write_name(w, other);
+                write_name(w, other_signer);
+                w.write_tlv(wire::tlv::DIGEST, other_result);
+            }
+            AnswerFault::Binding | AnswerFault::ReadSet(_) => {}
+        }
+    });
+}
+
+fn read_fault(value: Bytes) -> Result<AnswerFault, WireError> {
+    use crate::answer::tlv as a;
+    let (mut kind, mut digests, mut names, mut by) = (None, Vec::new(), Vec::new(), None);
+    each(value, |t, v| {
+        match t {
+            a::FAULT_KIND => kind = Some(read_nni(&v)?),
+            wire::tlv::DIGEST => digests.push(read_digest(&v)?),
+            tlv_type::NAME => names.push(read_name(v)?),
+            a::ANSWER_BY => {
+                let mut inner = None;
+                each(v, |t, v| {
+                    if t != tlv_type::NAME {
+                        return Ok(false);
+                    }
+                    inner = Some(read_name(v)?);
+                    Ok(true)
+                })?;
+                by = inner;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    let fault = |why| Err(bad(format!("a fault of that kind carries {why}")));
+    match (kind, digests.as_slice(), names.as_slice(), by) {
+        (Some(0), [signed, recomputed], [], Some(evaluator)) => Ok(AnswerFault::Mismatch {
+            signed: *signed,
+            recomputed: *recomputed,
+            evaluator,
+        }),
+        (Some(0), ..) => fault("two digests and the evaluator"),
+        (Some(1), [other_result], [], None) => Ok(AnswerFault::Equivocation {
+            other_result: *other_result,
+        }),
+        (Some(1), ..) => fault("one digest"),
+        (Some(2), [other_result], [other, other_signer], None) => Ok(AnswerFault::Conflict {
+            other: other.clone(),
+            other_signer: other_signer.clone(),
+            other_result: *other_result,
+        }),
+        (Some(2), ..) => fault("two names and one digest"),
+        (Some(3), [], [], None) => Ok(AnswerFault::Binding),
+        (Some(k @ 4..=8), [], [], None) => Ok(AnswerFault::ReadSet(match k {
+            4 => ReadSetFault::NotCanonical,
+            5 => ReadSetFault::Digest,
+            6 => ReadSetFault::Epochs,
+            7 => ReadSetFault::HeldConflict,
+            _ => ReadSetFault::NotItsReads,
+        })),
+        (Some(3..=8), ..) => fault("nothing more"),
+        _ => Err(bad("an answer fault has a kind from 0 to 8")),
     }
 }
 

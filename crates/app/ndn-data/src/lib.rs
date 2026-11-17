@@ -53,7 +53,7 @@
 //! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
 //! | 4 | signed blocks of small entries under a producer's delay, the one-key rule (a signed head with a freshness bound, rollback refused), retention by expiry (summaries listed by keep), range reads by seq and by time |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
-//! | 6 | named functions whose answers are sealed to their inputs' audience |
+//! | 6 | named functions whose answers are sealed to their inputs' audience: [`answer`] (round 5, `docs/specs/answers.md`) |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
 //!
 //! [`Device`] answers a verb or option of a later slice with
@@ -62,6 +62,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+pub mod answer;
+#[cfg(test)]
+mod answer_tests;
 pub mod collection;
 pub mod device;
 pub mod error;
@@ -78,14 +81,20 @@ mod tree;
 pub mod version;
 pub mod wire;
 
+pub use answer::{
+    AnswerAsk, AnswerBinding, AnswerConfig, AnswerKind, AnswerPolicy, AnswerStore, Answered,
+    Budget, Definition, EvalError, Evaluator, Evaluators, PlanError, Provenance, Publish,
+    QUESTION_MAX, READS_MAX, ReadRef, ReadSet, ReadView, Reads, SEAL_EPOCHS_MAX, Signers,
+    applied_digest,
+};
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{
     Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Released, Transport,
 };
-pub use error::{DataError, NextStep, Refusal};
+pub use error::{AnswerRefusal, DataError, NextStep, Refusal};
 pub use events::{
-    Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId, EventKind,
-    EventSubject, Meaning, WithdrawnBy,
+    AnswerFault, Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId,
+    EventKind, EventSubject, Meaning, ReadSetFault, WithdrawnBy,
 };
 pub use intro::{Code, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{

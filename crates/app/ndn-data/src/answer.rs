@@ -1,0 +1,1249 @@
+//! Answers: named, checkable readings over signed data (`docs/specs/answers.md`).
+//!
+//! An **answer** is the result of a definition or a function read over exact, signed versions,
+//! published as one immutable packet `<D>/32=answer/<id>` signed by one device and sealed to the
+//! readers of everything it read. This module holds its types and its bytes: the read set and
+//! its digest ([`ReadSet`]), the binding ([`AnswerBinding`]), the question a reader asks
+//! ([`AnswerAsk`]), the typed result of a `get` ([`Answered`], [`Provenance`]), the evaluators a
+//! program brings ([`Evaluator`], [`Evaluators`]) and the host's policy ([`AnswerConfig`]). The
+//! verbs and the checks are the [`Device`](crate::Device)'s.
+//!
+//! Every TLV of an answer is odd (critical): a decoder refuses an unknown TLV, a non-minimal
+//! length, an unsorted or repeated read, so equal content has equal bytes and equal digests.
+
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ndn_foundation_types::{Hash, Name, tlv_type};
+use ndn_tlv::{TlvReader, TlvWriter};
+use sha2::{Digest, Sha256};
+
+use crate::collection::Epoch;
+use crate::error::{AnswerRefusal, DataError};
+use crate::layer::{Age, Got};
+use crate::version::{Parents, Writer};
+use crate::wire::{
+    self, INLINE_MAX, PAYLOAD_MAX, WireError, bad, parse_log_name, read_digest, read_name,
+    read_nni, write_name, write_nni,
+};
+
+/// The most reads in one read set (answers.md §3.1).
+pub const READS_MAX: usize = 65_536;
+/// The most distinct epochs in one read set (answers.md §5.1).
+pub const SEAL_EPOCHS_MAX: usize = 256;
+/// The most octets of an [`AnswerAsk`] (answers.md §7.1).
+pub const QUESTION_MAX: usize = 65_536;
+
+/// TLV-TYPE numbers of answers (0x05C0–0x05DF, all odd: every field changes what an answer
+/// means). Registered in `docs/specs/README.md`; 0x05DD–0x05DF are held for the ask exchange.
+pub mod tlv {
+    /// An answer's Content: `AnswerKind`, then one of `AnswerBody`; `AnswerSealed` with a
+    /// `Ciphertext`; `Chunks`; `AnswerSealed` without a `Ciphertext`, then `Chunks`.
+    pub const ANSWER_RECORD: u64 = 0x05C1;
+    /// 0 pure, 1 provider (NonNegativeInteger).
+    pub const ANSWER_KIND: u64 = 0x05C3;
+    /// The plaintext: `AnswerBinding`, `ReadSet`, `Result`.
+    pub const ANSWER_BODY: u64 = 0x05C5;
+    /// `AnswerKind`, the definition (`ReadVersion` or `ReadState`, pure only), `AnswerBy`,
+    /// `Digest` (the read-set digest).
+    pub const ANSWER_BINDING: u64 = 0x05C7;
+    /// A `Name`: the evaluator (pure) or the function (provider), full and versioned.
+    pub const ANSWER_BY: u64 = 0x05C9;
+    /// `(ReadVersion | ReadState)*`, in canonical order.
+    pub const READ_SET: u64 = 0x05CB;
+    /// `Name` (the version's log entry name), `Digest` (the implicit digest of its packet).
+    pub const READ_VERSION: u64 = 0x05CD;
+    /// `Name` (the merge collection), `Rule`, `Frontier` (every tip with its `Digest`), `Digest`
+    /// (the applied-set digest).
+    pub const READ_STATE: u64 = 0x05CF;
+    /// The evaluator's or function's octets.
+    pub const RESULT: u64 = 0x05D1;
+    /// `SealEpoch+` in ascending order, then a `Ciphertext`: the `AnswerBody` sealed.
+    pub const ANSWER_SEALED: u64 = 0x05D3;
+    /// A question: `AnswerKind`, the definition (pure), `AnswerBy`, a `ReadSet` the asker
+    /// states, if any. In a question's name only, never on a packet.
+    pub const ANSWER_ASK: u64 = 0x05D5;
+    /// A record of the device's own event store: the answer's name, the signer's key, the id,
+    /// the read-set digest, an `AnswerFault`. Never on a packet.
+    pub const ANSWER_EVIDENCE: u64 = 0x05D7;
+    /// `FaultKind`, then by kind the digests and names of its evidence.
+    pub const ANSWER_FAULT: u64 = 0x05D9;
+    /// 0–8 (NonNegativeInteger).
+    pub const FAULT_KIND: u64 = 0x05DB;
+}
+
+/// The label of the read-set digest.
+pub(crate) const LABEL_READSET: &[u8] = b"ndn-answer/1 readset\0";
+/// The label of the applied-set digest.
+pub(crate) const LABEL_APPLIED: &[u8] = b"ndn-answer/1 applied\0";
+/// The label of an answer id.
+pub(crate) const LABEL_ID: &[u8] = b"ndn-answer/1 id\0";
+/// The label of a result digest.
+pub(crate) const LABEL_RESULT: &[u8] = b"ndn-answer/1 result\0";
+/// The label of the seal key.
+pub(crate) const LABEL_SEAL: &[u8] = b"ndn-answer/1 seal\0";
+/// The label of the name key.
+pub(crate) const LABEL_NAME: &[u8] = b"ndn-answer/1 name\0";
+/// The label of the AEAD's associated data.
+pub(crate) const LABEL_AAD: &[u8] = b"ndn-answer/1 aad\0";
+
+/// Which kind of answer: judged by recomputation (pure) or by the provider's authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AnswerKind {
+    /// An evaluator and a definition are named: any holder of the definition and the inputs
+    /// recomputes it.
+    Pure,
+    /// A function is named, no evaluator: only its provider computes it.
+    Provider,
+}
+
+impl AnswerKind {
+    pub(crate) fn code(self) -> u64 {
+        match self {
+            AnswerKind::Pure => 0,
+            AnswerKind::Provider => 1,
+        }
+    }
+
+    pub(crate) fn of_code(c: u64) -> Result<Self, WireError> {
+        match c {
+            0 => Ok(AnswerKind::Pure),
+            1 => Ok(AnswerKind::Provider),
+            _ => Err(bad("an answer is of kind 0 (pure) or 1 (provider)")),
+        }
+    }
+}
+
+// ---- strict TLV reading -------------------------------------------------------------------------
+
+/// The TLVs of `value`, in order, none left out or skipped: an answer's records have no
+/// non-critical TLVs.
+struct Parts(VecDeque<(u64, Bytes)>);
+
+impl Parts {
+    fn of(value: Bytes) -> Result<Self, WireError> {
+        let mut r = TlvReader::new(value);
+        let mut all = VecDeque::new();
+        while !r.is_empty() {
+            all.push_back(r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?);
+        }
+        Ok(Parts(all))
+    }
+
+    /// The next TLV's value if it is of `typ`.
+    fn next_if(&mut self, typ: u64) -> Option<Bytes> {
+        if self.0.front().is_some_and(|(t, _)| *t == typ) {
+            return self.0.pop_front().map(|(_, v)| v);
+        }
+        None
+    }
+
+    fn expect(&mut self, typ: u64, what: &str) -> Result<Bytes, WireError> {
+        self.next_if(typ)
+            .ok_or_else(|| bad(format!("expected {what}")))
+    }
+
+    fn end(&self) -> Result<(), WireError> {
+        match self.0.front() {
+            None => Ok(()),
+            Some((t, _)) => Err(bad(format!(
+                "an unexpected or misplaced TLV-TYPE {t:#x}: a decoder refuses an unknown TLV \
+                 in an answer"
+            ))),
+        }
+    }
+}
+
+/// The value of `tlv`, one TLV of type `typ` and nothing else.
+fn unwrap_tlv(tlv: Bytes, typ: u64, what: &str) -> Result<Bytes, WireError> {
+    let mut p = Parts::of(tlv)?;
+    let v = p.expect(typ, what)?;
+    p.end()?;
+    Ok(v)
+}
+
+fn tlv_of(typ: u64, value: &[u8]) -> Bytes {
+    let mut w = TlvWriter::new();
+    w.write_tlv(typ, value);
+    w.finish()
+}
+
+fn read_by(value: Bytes) -> Result<Name, WireError> {
+    let mut p = Parts::of(value)?;
+    let name = read_name(p.expect(tlv_type::NAME, "the evaluator's or function's name")?)?;
+    p.end()?;
+    Ok(name)
+}
+
+// ---- reads --------------------------------------------------------------------------------------
+
+/// One read: one version, or one merge collection's state (answers.md §3.1).
+///
+/// The order is that of the octets of the read's TLV encoding, the canonical order of a
+/// [`ReadSet`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReadRef {
+    /// One version: its log entry name `<D>/32=log/<C>/seq=<n>` and the implicit digest of its
+    /// packet.
+    Version {
+        /// The version's name.
+        name: Name,
+        /// SHA-256 of the version's whole Data packet.
+        digest: Hash,
+    },
+    /// A merge collection's state: the rule it was computed under (full name), the frontier
+    /// with every tip's digest (never empty), and the applied-set digest (SHA-256 over
+    /// `"ndn-answer/1 applied\0"` and the versions the state is computed from,
+    /// [`applied_digest`]).
+    State {
+        /// The merge collection.
+        collection: Name,
+        /// The merge rule's full name.
+        rule: Name,
+        /// The frontier, each tip bound to its packet's digest.
+        at: Parents,
+        /// The applied-set digest.
+        applied: Hash,
+    },
+}
+
+impl ReadRef {
+    /// The collection this read is of: a version's, parsed from its name.
+    pub fn collection(&self) -> Result<Name, DataError> {
+        match self {
+            ReadRef::State { collection, .. } => Ok(collection.clone()),
+            ReadRef::Version { name, .. } => parse_log_name(name)
+                .and_then(|l| l.subject)
+                .ok_or_else(|| DataError::BadName {
+                    name: name.clone(),
+                    why: "a read of a version names a log entry of a collection, \
+                          <device>/32=log/<collection>/seq=<n>"
+                        .into(),
+                }),
+        }
+    }
+
+    /// Its TLV: `ReadVersion` (0x05CD) or `ReadState` (0x05CF).
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        match self {
+            ReadRef::Version { name, digest } => w.write_nested(tlv::READ_VERSION, |w| {
+                write_name(w, name);
+                w.write_tlv(wire::tlv::DIGEST, &digest.0);
+            }),
+            ReadRef::State {
+                collection,
+                rule,
+                at,
+                applied,
+            } => w.write_nested(tlv::READ_STATE, |w| {
+                write_name(w, collection);
+                w.write_nested(wire::tlv::RULE, |w| {
+                    write_nni(w, wire::tlv::RULE_KIND, 2);
+                    write_name(w, rule);
+                });
+                wire::write_parents(w, at);
+                w.write_tlv(wire::tlv::DIGEST, &applied.0);
+            }),
+        }
+        w.finish()
+    }
+
+    /// Decode one read, exactly: minimal lengths, no unknown TLV, the bytes it encodes again.
+    pub fn decode(tlv: Bytes) -> Result<Self, WireError> {
+        let mut p = Parts::of(tlv.clone())?;
+        let (typ, value) = p.0.pop_front().ok_or_else(|| bad("expected a read"))?;
+        p.end()?;
+        let read = Self::of_value(typ, value)?;
+        if read.encode() != tlv {
+            return Err(bad("a read is not in its minimal encoding"));
+        }
+        Ok(read)
+    }
+
+    fn of_value(typ: u64, value: Bytes) -> Result<Self, WireError> {
+        let mut p = Parts::of(value)?;
+        match typ {
+            tlv::READ_VERSION => {
+                let name = read_name(p.expect(tlv_type::NAME, "the version's name")?)?;
+                let digest = Hash(read_digest(&p.expect(wire::tlv::DIGEST, "its digest")?)?);
+                p.end()?;
+                if parse_log_name(&name).is_none_or(|l| l.subject.is_none()) {
+                    return Err(bad(
+                        "a read of a version names a log entry of a collection, \
+                         <device>/32=log/<collection>/seq=<n>",
+                    ));
+                }
+                Ok(ReadRef::Version { name, digest })
+            }
+            tlv::READ_STATE => {
+                let collection = read_name(p.expect(tlv_type::NAME, "the collection")?)?;
+                let rule = {
+                    let mut r = Parts::of(p.expect(wire::tlv::RULE, "the rule")?)?;
+                    let kind = read_nni(&r.expect(wire::tlv::RULE_KIND, "the rule's kind")?)?;
+                    let name = read_name(r.expect(tlv_type::NAME, "the rule's name")?)?;
+                    r.end()?;
+                    if kind != 2 {
+                        return Err(bad("a state is read under a merge rule (kind 2)"));
+                    }
+                    name
+                };
+                let at = wire::read_parents(p.expect(wire::tlv::FRONTIER, "the frontier")?)?;
+                let applied = Hash(read_digest(
+                    &p.expect(wire::tlv::DIGEST, "the applied-set digest")?,
+                )?);
+                p.end()?;
+                if at.is_empty() {
+                    return Err(bad(
+                        "a read of a collection whose frontier is empty is not a read",
+                    ));
+                }
+                if at.tips().any(|(_, _, d)| d.is_none()) {
+                    return Err(bad("every tip of a state read carries its digest"));
+                }
+                if !wire::is_collection_name(&collection) {
+                    return Err(bad("a state read names a collection"));
+                }
+                Ok(ReadRef::State {
+                    collection,
+                    rule,
+                    at,
+                    applied,
+                })
+            }
+            t => Err(bad(format!("expected a read, found TLV-TYPE {t:#x}"))),
+        }
+    }
+}
+
+impl PartialOrd for ReadRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReadRef {
+    /// The order of the octets of the TLV encodings.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.encode().cmp(&other.encode())
+    }
+}
+
+/// A read set: reads in canonical order, no repeats, at most one version per name and one state
+/// per collection, at most [`READS_MAX`] reads (answers.md §3.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReadSet(Vec<ReadRef>);
+
+impl ReadSet {
+    /// A read set of `reads`: sorted canonically, exact repeats made one. Refused: two reads of
+    /// one version name with other digests, two states of one collection, more than
+    /// [`READS_MAX`] reads or an encoding over `PAYLOAD_MAX` octets.
+    pub fn new(reads: impl IntoIterator<Item = ReadRef>) -> Result<Self, AnswerRefusal> {
+        let mut keyed: Vec<(Bytes, ReadRef)> = reads.into_iter().map(|r| (r.encode(), r)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+        let set = ReadSet(keyed.into_iter().map(|(_, r)| r).collect());
+        set.check_shape()?;
+        Ok(set)
+    }
+
+    fn check_shape(&self) -> Result<(), AnswerRefusal> {
+        if self.0.len() > READS_MAX {
+            return Err(AnswerRefusal::TooLarge {
+                what: "the reads of one answer".into(),
+                size: self.0.len() as u64,
+                limit: READS_MAX as u64,
+            });
+        }
+        let mut versions: BTreeSet<&Name> = BTreeSet::new();
+        let mut states: BTreeSet<&Name> = BTreeSet::new();
+        for r in &self.0 {
+            let fresh = match r {
+                ReadRef::Version { name, .. } => versions.insert(name),
+                ReadRef::State { collection, .. } => states.insert(collection),
+            };
+            if !fresh {
+                return Err(AnswerRefusal::ReadSet(match r {
+                    ReadRef::Version { name, .. } => {
+                        format!("two reads of the version {name} with different digests")
+                    }
+                    ReadRef::State { collection, .. } => {
+                        format!("two reads of the state of {collection}")
+                    }
+                }));
+            }
+        }
+        let size: usize = self.0.iter().map(|r| r.encode().len()).sum();
+        if size as u64 > PAYLOAD_MAX {
+            return Err(AnswerRefusal::TooLarge {
+                what: "the read set's encoding".into(),
+                size: size as u64,
+                limit: PAYLOAD_MAX,
+            });
+        }
+        Ok(())
+    }
+
+    /// The reads, in canonical order.
+    pub fn reads(&self) -> &[ReadRef] {
+        &self.0
+    }
+
+    /// Whether `r` is one of the reads.
+    pub fn contains(&self, r: &ReadRef) -> bool {
+        self.0.contains(r)
+    }
+
+    /// The one read of `collection`; `None` when there is none or several.
+    pub fn current(&self, collection: &Name) -> Option<&ReadRef> {
+        let mut of = self
+            .0
+            .iter()
+            .filter(|r| r.collection().is_ok_and(|c| c == *collection));
+        let one = of.next()?;
+        of.next().is_none().then_some(one)
+    }
+
+    /// The `ReadSet` TLV (0x05CB): the reads' TLVs in canonical order.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::READ_SET, |w| {
+            for r in &self.0 {
+                w.write_raw(&r.encode());
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode a `ReadSet` TLV, refusing what is not canonical: an unknown TLV, a non-minimal
+    /// length, an unsorted or repeated read, two reads of one version or state, too many reads.
+    pub fn decode(tlv: Bytes) -> Result<Self, AnswerRefusal> {
+        let malformed = |e: WireError| AnswerRefusal::Malformed(e.0);
+        let body = unwrap_tlv(tlv.clone(), tlv::READ_SET, "a ReadSet").map_err(malformed)?;
+        let mut reads: Vec<ReadRef> = Vec::new();
+        let mut p = Parts::of(body).map_err(malformed)?;
+        while let Some((typ, value)) = p.0.pop_front() {
+            if reads.len() >= READS_MAX {
+                return Err(AnswerRefusal::TooLarge {
+                    what: "the reads of one answer".into(),
+                    size: reads.len() as u64 + 1,
+                    limit: READS_MAX as u64,
+                });
+            }
+            reads.push(ReadRef::of_value(typ, value).map_err(malformed)?);
+        }
+        let set = ReadSet(reads);
+        for pair in set.0.windows(2) {
+            let (a, b) = (pair[0].encode(), pair[1].encode());
+            if a >= b {
+                return Err(AnswerRefusal::ReadSet(
+                    "not canonical: the reads are not in strictly ascending order of their \
+                     encodings (unsorted or repeated)"
+                        .into(),
+                ));
+            }
+        }
+        set.check_shape()?;
+        if set.encode() != tlv {
+            return Err(AnswerRefusal::ReadSet(
+                "not canonical: a length or a read is not in its minimal encoding".into(),
+            ));
+        }
+        Ok(set)
+    }
+
+    /// SHA-256 over `"ndn-answer/1 readset\0"` and the `ReadSet` TLV as it is on the wire.
+    pub fn digest(&self) -> Hash {
+        let mut h = Sha256::new();
+        h.update(LABEL_READSET);
+        h.update(self.encode());
+        Hash(h.finalize().into())
+    }
+}
+
+/// The applied-set digest of a state (answers.md §3.1): SHA-256 over `"ndn-answer/1 applied\0"`
+/// and, for every version the state is computed from, in ascending order of the octets of the
+/// writer's key Name TLV and then of seq, the writer's Name TLV, the seq as 8 octets big-endian
+/// and the version's implicit digest.
+pub fn applied_digest(versions: impl IntoIterator<Item = (Writer, u64, [u8; 32])>) -> Hash {
+    let mut all: Vec<(Bytes, u64, [u8; 32])> = versions
+        .into_iter()
+        .map(|(w, s, d)| (w.key().encode_to_tlv(), s, d))
+        .collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut h = Sha256::new();
+    h.update(LABEL_APPLIED);
+    for (writer, seq, digest) in &all {
+        h.update(writer);
+        h.update(seq.to_be_bytes());
+        h.update(digest);
+    }
+    Hash(h.finalize().into())
+}
+
+// ---- the binding, the question, the result -----------------------------------------------------
+
+/// What an answer is an answer to (answers.md §3.2): its kind, its definition (pure), its
+/// evaluator or function, and the digest of its read set.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AnswerBinding {
+    /// Pure or provider.
+    pub kind: AnswerKind,
+    /// Pure only: the definition's exact read; MUST be one of the read set's reads.
+    pub definition: Option<ReadRef>,
+    /// The evaluator (pure) or the function (provider): full, versioned, matched exactly.
+    pub by: Name,
+    /// [`ReadSet::digest`].
+    pub reads: Hash,
+}
+
+impl AnswerBinding {
+    /// The `AnswerBinding` TLV (0x05C7).
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::ANSWER_BINDING, |w| {
+            write_nni(w, tlv::ANSWER_KIND, self.kind.code());
+            if let Some(d) = &self.definition {
+                w.write_raw(&d.encode());
+            }
+            w.write_nested(tlv::ANSWER_BY, |w| write_name(w, &self.by));
+            w.write_tlv(wire::tlv::DIGEST, &self.reads.0);
+        });
+        w.finish()
+    }
+
+    /// Decode an `AnswerBinding` TLV exactly.
+    pub fn decode(tlv: Bytes) -> Result<Self, WireError> {
+        let value = unwrap_tlv(tlv.clone(), tlv::ANSWER_BINDING, "an AnswerBinding")?;
+        let mut p = Parts::of(value)?;
+        let kind = AnswerKind::of_code(read_nni(&p.expect(tlv::ANSWER_KIND, "the kind")?)?)?;
+        let definition = match p.0.front().map(|(t, _)| *t) {
+            Some(t @ (tlv::READ_VERSION | tlv::READ_STATE)) => {
+                let (_, v) = p.0.pop_front().expect("just seen");
+                Some(ReadRef::of_value(t, v)?)
+            }
+            _ => None,
+        };
+        let by = read_by(p.expect(tlv::ANSWER_BY, "the evaluator or function")?)?;
+        let reads = Hash(read_digest(
+            &p.expect(wire::tlv::DIGEST, "the read-set digest")?,
+        )?);
+        p.end()?;
+        if definition.is_some() != (kind == AnswerKind::Pure) {
+            return Err(bad(
+                "a pure answer's binding names its definition and a provider answer's does not",
+            ));
+        }
+        let b = AnswerBinding {
+            kind,
+            definition,
+            by,
+            reads,
+        };
+        if b.encode() != tlv {
+            return Err(bad("a binding is not in its minimal encoding"));
+        }
+        Ok(b)
+    }
+}
+
+/// What is asked: the value of a question name `<X>/32=question/<AnswerAsk>` (answers.md §7.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AnswerAsk {
+    /// Pure or provider.
+    pub kind: AnswerKind,
+    /// Pure only: the exact definition the asker means.
+    pub definition: Option<ReadRef>,
+    /// The evaluator (pure) or function (provider).
+    pub by: Name,
+    /// Provider: required, the inputs. Pure: `Some` when the asker states the reads, `None` to
+    /// have them planned.
+    pub reads: Option<ReadSet>,
+}
+
+impl AnswerAsk {
+    /// A pure question: the answer of `definition` under `evaluator`, its reads planned from
+    /// what this device holds.
+    pub fn pure(definition: ReadRef, evaluator: Name) -> Self {
+        AnswerAsk {
+            kind: AnswerKind::Pure,
+            definition: Some(definition),
+            by: evaluator,
+            reads: None,
+        }
+    }
+
+    /// A provider question: the answer of `function` over exactly `inputs`.
+    pub fn provider(function: Name, inputs: ReadSet) -> Self {
+        AnswerAsk {
+            kind: AnswerKind::Provider,
+            definition: None,
+            by: function,
+            reads: Some(inputs),
+        }
+    }
+
+    /// This question, stating the reads: it names an answer without evaluating.
+    pub fn stating(mut self, reads: ReadSet) -> Self {
+        self.reads = Some(reads);
+        self
+    }
+
+    /// The `AnswerAsk` TLV (0x05D5).
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::ANSWER_ASK, |w| {
+            write_nni(w, tlv::ANSWER_KIND, self.kind.code());
+            if let Some(d) = &self.definition {
+                w.write_raw(&d.encode());
+            }
+            w.write_nested(tlv::ANSWER_BY, |w| write_name(w, &self.by));
+            if let Some(r) = &self.reads {
+                w.write_raw(&r.encode());
+            }
+        });
+        w.finish()
+    }
+
+    /// Decode one `AnswerAsk` TLV, exactly.
+    pub fn decode(tlv: Bytes) -> Result<Self, WireError> {
+        let value = unwrap_tlv(tlv.clone(), tlv::ANSWER_ASK, "an AnswerAsk")?;
+        let mut p = Parts::of(value)?;
+        let kind = AnswerKind::of_code(read_nni(&p.expect(tlv::ANSWER_KIND, "the kind")?)?)?;
+        let definition = match p.0.front().map(|(t, _)| *t) {
+            Some(t @ (tlv::READ_VERSION | tlv::READ_STATE)) => {
+                let (_, v) = p.0.pop_front().expect("just seen");
+                Some(ReadRef::of_value(t, v)?)
+            }
+            _ => None,
+        };
+        let by = read_by(p.expect(tlv::ANSWER_BY, "the evaluator or function")?)?;
+        let reads = match p.next_if(tlv::READ_SET) {
+            Some(v) => {
+                let whole = tlv_of(tlv::READ_SET, &v);
+                Some(ReadSet::decode(whole).map_err(|e| bad(e.to_string()))?)
+            }
+            None => None,
+        };
+        p.end()?;
+        if definition.is_some() != (kind == AnswerKind::Pure) {
+            return Err(bad(
+                "a pure question names its definition and a provider question does not",
+            ));
+        }
+        if kind == AnswerKind::Provider && reads.is_none() {
+            return Err(bad("a provider question states the inputs it asks about"));
+        }
+        let ask = AnswerAsk {
+            kind,
+            definition,
+            by,
+            reads,
+        };
+        if ask.encode() != tlv {
+            return Err(bad("a question is not in its minimal encoding"));
+        }
+        Ok(ask)
+    }
+
+    /// The question's name, `<X>/32=question/<AnswerAsk TLV>`: `X` is the definition's
+    /// collection (pure) or `provider`, the provider device asked (required for a provider
+    /// question, refused for a pure one).
+    pub fn name(&self, provider: Option<&Name>) -> Result<Name, DataError> {
+        let bad_request = |why: String| DataError::BadRequest {
+            name: self.by.clone(),
+            why,
+        };
+        let x = match (self.kind, provider) {
+            (AnswerKind::Pure, None) => self
+                .definition
+                .as_ref()
+                .ok_or_else(|| bad_request("a pure question names its definition".into()))?
+                .collection()?,
+            (AnswerKind::Pure, Some(_)) => {
+                return Err(bad_request(
+                    "a pure question is asked of the definition's collection, never of a \
+                     provider device: give no provider"
+                        .into(),
+                ));
+            }
+            (AnswerKind::Provider, Some(p)) => {
+                if !wire::is_device_name(p) {
+                    return Err(bad_request(format!(
+                        "{p} is not a device name; a provider question is asked of the \
+                         provider device, <namespace>/<device>"
+                    )));
+                }
+                p.clone()
+            }
+            (AnswerKind::Provider, None) => {
+                return Err(bad_request(
+                    "a provider question names the provider device it asks of: give it".into(),
+                ));
+            }
+        };
+        let name = wire::question_name(&x, self);
+        let size = self.encode().len();
+        if size > QUESTION_MAX {
+            return Err(DataError::Answer {
+                name,
+                why: AnswerRefusal::TooLarge {
+                    what: "the question".into(),
+                    size: size as u64,
+                    limit: QUESTION_MAX as u64,
+                },
+            });
+        }
+        Ok(name)
+    }
+
+    /// Parse a question name; `BadName` says how a question is formed.
+    pub fn parse(name: &Name) -> Result<Self, DataError> {
+        Self::parse_with_x(name).map(|(_, ask)| ask)
+    }
+
+    /// [`Self::parse`], and `X`: the definition's collection, or the provider device.
+    pub(crate) fn parse_with_x(name: &Name) -> Result<(Name, Self), DataError> {
+        let bad_name = |why: String| DataError::BadName {
+            name: name.clone(),
+            why: format!(
+                "{why}; a question is <X>/32=question/<AnswerAsk>, one generic component holding \
+                 one AnswerAsk, X the definition's collection (pure) or the provider device \
+                 (provider); build it with AnswerAsk::name"
+            ),
+        };
+        let (x, ask) = match wire::parse_question_name(name) {
+            None => return Err(bad_name("it has no 32=question component".into())),
+            Some(Err(e)) => return Err(bad_name(e.0)),
+            Some(Ok(parsed)) => parsed,
+        };
+        match ask.kind {
+            AnswerKind::Pure => {
+                if !wire::is_collection_name(&x) {
+                    return Err(bad_name(format!(
+                        "{x} is not a collection, and a pure question is asked of its \
+                         definition's collection"
+                    )));
+                }
+                let of = ask
+                    .definition
+                    .as_ref()
+                    .expect("a decoded pure question has its definition")
+                    .collection()?;
+                if of != x {
+                    return Err(bad_name(format!("its definition is of {of}, not of {x}")));
+                }
+            }
+            AnswerKind::Provider => {
+                if !wire::is_device_name(&x) {
+                    return Err(bad_name(format!(
+                        "{x} is not a device, and a provider question is asked of the provider \
+                         device"
+                    )));
+                }
+            }
+        }
+        Ok((x, ask))
+    }
+}
+
+// ---- the record ----------------------------------------------------------------------------------
+
+/// The plaintext of an answer (answers.md §3.4): the binding, the read set and the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Body {
+    pub(crate) binding: AnswerBinding,
+    pub(crate) reads: ReadSet,
+    pub(crate) result: Bytes,
+}
+
+impl Body {
+    /// The `AnswerBody` TLV (0x05C5).
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::ANSWER_BODY, |w| {
+            w.write_raw(&self.binding.encode());
+            w.write_raw(&self.reads.encode());
+            w.write_tlv(tlv::RESULT, &self.result);
+        });
+        w.finish()
+    }
+
+    pub(crate) fn decode(tlv: Bytes) -> Result<Self, AnswerRefusal> {
+        let malformed = |e: WireError| AnswerRefusal::Malformed(e.0);
+        let value =
+            unwrap_tlv(tlv.clone(), tlv::ANSWER_BODY, "an AnswerBody").map_err(malformed)?;
+        let mut p = Parts::of(value).map_err(malformed)?;
+        let binding = p
+            .expect(tlv::ANSWER_BINDING, "the binding")
+            .map_err(malformed)?;
+        let binding =
+            AnswerBinding::decode(tlv_of(tlv::ANSWER_BINDING, &binding)).map_err(malformed)?;
+        let reads = p.expect(tlv::READ_SET, "the read set").map_err(malformed)?;
+        let reads = ReadSet::decode(tlv_of(tlv::READ_SET, &reads))?;
+        let result = p.expect(tlv::RESULT, "the result").map_err(malformed)?;
+        p.end().map_err(malformed)?;
+        let body = Body {
+            binding,
+            reads,
+            result,
+        };
+        if body.encode() != tlv {
+            return Err(AnswerRefusal::Malformed(
+                "an answer body is not in its minimal encoding".into(),
+            ));
+        }
+        Ok(body)
+    }
+}
+
+/// What an answer's content carries after its kind (answers.md §3.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Content {
+    /// No sealed read, one packet: the `AnswerBody` TLV.
+    Plain(Bytes),
+    /// Sealed, one packet: the epochs and the ciphertext of the body.
+    Sealed {
+        epochs: Vec<Epoch>,
+        ciphertext: Bytes,
+    },
+    /// In pieces: the size of the body (or its ciphertext) and the digest of the root node;
+    /// `epochs` when sealed.
+    Pieces {
+        epochs: Option<Vec<Epoch>>,
+        size: u64,
+        root: [u8; 32],
+    },
+}
+
+/// The Content of an answer packet, an `AnswerRecord` (0x05C1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Record {
+    pub(crate) kind: AnswerKind,
+    pub(crate) content: Content,
+}
+
+/// Epochs in the order of §5.1: the octets of the creator's Name TLV, then seq.
+pub(crate) fn epoch_order(a: &Epoch, b: &Epoch) -> std::cmp::Ordering {
+    a.creator
+        .encode_to_tlv()
+        .cmp(&b.creator.encode_to_tlv())
+        .then(a.seq.cmp(&b.seq))
+}
+
+fn check_epochs(epochs: &[Epoch]) -> Result<(), WireError> {
+    if epochs.is_empty() {
+        return Err(bad("a sealed answer names the epochs it reads in"));
+    }
+    if epochs.len() > SEAL_EPOCHS_MAX {
+        return Err(bad(format!(
+            "an answer reads in at most {SEAL_EPOCHS_MAX} epochs, this one in {}",
+            epochs.len()
+        )));
+    }
+    if epochs
+        .windows(2)
+        .any(|w| epoch_order(&w[0], &w[1]) != std::cmp::Ordering::Less)
+    {
+        return Err(bad("the epochs of an answer are strictly ascending"));
+    }
+    Ok(())
+}
+
+impl Record {
+    pub(crate) fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::ANSWER_RECORD, |w| {
+            write_nni(w, tlv::ANSWER_KIND, self.kind.code());
+            match &self.content {
+                Content::Plain(body) => w.write_raw(body),
+                Content::Sealed { epochs, ciphertext } => w.write_nested(tlv::ANSWER_SEALED, |w| {
+                    for e in epochs {
+                        wire::write_epoch(w, e);
+                    }
+                    w.write_tlv(wire::tlv::CIPHERTEXT, ciphertext);
+                }),
+                Content::Pieces { epochs, size, root } => {
+                    if let Some(epochs) = epochs {
+                        w.write_nested(tlv::ANSWER_SEALED, |w| {
+                            for e in epochs {
+                                wire::write_epoch(w, e);
+                            }
+                        });
+                    }
+                    w.write_nested(wire::tlv::CHUNKS, |w| {
+                        write_nni(w, wire::tlv::SIZE, *size);
+                        w.write_tlv(wire::tlv::DIGEST, root);
+                    });
+                }
+            }
+        });
+        w.finish()
+    }
+
+    pub(crate) fn decode(tlv: Bytes) -> Result<Self, WireError> {
+        let value = unwrap_tlv(tlv.clone(), tlv::ANSWER_RECORD, "an AnswerRecord")?;
+        let mut p = Parts::of(value)?;
+        let kind = AnswerKind::of_code(read_nni(&p.expect(tlv::ANSWER_KIND, "the kind")?)?)?;
+        let epochs_of = |v: Bytes| -> Result<(Vec<Epoch>, Option<Bytes>), WireError> {
+            let mut q = Parts::of(v)?;
+            let mut epochs = Vec::new();
+            while let Some(e) = q.next_if(wire::tlv::SEAL_EPOCH) {
+                epochs.push(wire::read_epoch(e)?);
+            }
+            let ct = q.next_if(wire::tlv::CIPHERTEXT);
+            q.end()?;
+            check_epochs(&epochs)?;
+            Ok((epochs, ct))
+        };
+        let chunks_of = |v: Bytes| -> Result<(u64, [u8; 32]), WireError> {
+            let mut q = Parts::of(v)?;
+            let size = read_nni(&q.expect(wire::tlv::SIZE, "its size")?)?;
+            let root = read_digest(&q.expect(wire::tlv::DIGEST, "its root digest")?)?;
+            q.end()?;
+            if size <= INLINE_MAX as u64 {
+                return Err(bad(format!(
+                    "a body of {size} octets travels in its packet, not in pieces"
+                )));
+            }
+            if size > PAYLOAD_MAX {
+                return Err(bad(format!(
+                    "a body of {size} octets is larger than the {PAYLOAD_MAX} an answer carries"
+                )));
+            }
+            Ok((size, root))
+        };
+        let content = match p.0.front().map(|(t, _)| *t) {
+            Some(tlv::ANSWER_BODY) => {
+                let (_, v) = p.0.pop_front().expect("just seen");
+                Content::Plain(tlv_of(tlv::ANSWER_BODY, &v))
+            }
+            Some(tlv::ANSWER_SEALED) => {
+                let (_, v) = p.0.pop_front().expect("just seen");
+                let (epochs, ct) = epochs_of(v)?;
+                match (ct, p.next_if(wire::tlv::CHUNKS)) {
+                    (Some(ciphertext), None) => Content::Sealed { epochs, ciphertext },
+                    (None, Some(c)) => {
+                        let (size, root) = chunks_of(c)?;
+                        Content::Pieces {
+                            epochs: Some(epochs),
+                            size,
+                            root,
+                        }
+                    }
+                    _ => {
+                        return Err(bad(
+                            "a sealed answer carries its ciphertext, or, with none, its pieces",
+                        ));
+                    }
+                }
+            }
+            Some(wire::tlv::CHUNKS) => {
+                let (_, v) = p.0.pop_front().expect("just seen");
+                let (size, root) = chunks_of(v)?;
+                Content::Pieces {
+                    epochs: None,
+                    size,
+                    root,
+                }
+            }
+            _ => return Err(bad("an answer carries a body, a sealed body or pieces")),
+        };
+        p.end()?;
+        let rec = Record { kind, content };
+        if rec.encode() != tlv {
+            return Err(bad("an answer record is not in its minimal encoding"));
+        }
+        Ok(rec)
+    }
+}
+
+// ---- what a get returns --------------------------------------------------------------------------
+
+/// The result of a `get` of a question or an exact answer name (answers.md §7.4). The same type
+/// whether the answer was recomputed here, found in this device's store or fetched: [`how`]
+/// tells how, and is information, never a different shape.
+///
+/// [`how`]: Answered::how
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Answered {
+    /// The exact answer name used: `<D>/32=answer/<id>`, the signed answer's or, when computed
+    /// here, the one this device's own signature gives or would give.
+    pub name: Name,
+    /// The answer id (answers.md §3.2).
+    pub id: Hash,
+    /// Pure or provider.
+    pub kind: AnswerKind,
+    /// What it answers.
+    pub binding: AnswerBinding,
+    /// What it read: always present, the answer is opened.
+    pub reads: ReadSet,
+    /// The evaluator's or function's octets, canonical.
+    pub result: Bytes,
+    /// Its digest (answers.md §3.4), keyed when anything read is sealed.
+    pub result_digest: Hash,
+    /// How it was obtained.
+    pub how: Provenance,
+}
+
+/// How an answer was obtained (answers.md §7.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    /// This device ran the evaluator over exactly the read set. `confirmed_by`: signers of
+    /// verified answers whose result digest equals the recomputed one; `disagreed_with`: signers
+    /// of those that differ, each of them evidence. Both empty: nobody had answered.
+    Recomputed {
+        /// Signers whose answers equal this device's.
+        confirmed_by: Vec<Writer>,
+        /// Signers whose answers differ: evidence.
+        disagreed_with: Vec<Writer>,
+    },
+    /// A signed answer taken on trust: the evaluator is unknown here, or the policy lists it in
+    /// `trust`, and `signer` is trusted for pure answers. `unverified_reads`: the reads this
+    /// device did not hold, so did not check.
+    Trusted {
+        /// Who signed it.
+        signer: Writer,
+        /// How many reads were not held here.
+        unverified_reads: u32,
+    },
+    /// A provider answer from a signer the policy names for the function.
+    Provider {
+        /// Who signed it.
+        signer: Writer,
+        /// How many reads were not held here.
+        unverified_reads: u32,
+    },
+}
+
+// ---- evaluators ---------------------------------------------------------------------------------
+
+/// The definition an evaluator is given: its exact read and what it opened to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Definition {
+    /// The read of the definition, one of the read set's reads.
+    pub reference: ReadRef,
+    /// What it opened to: [`Got::Version`] or [`Got::State`].
+    pub got: Got,
+}
+
+/// Why an evaluation fails.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EvalError {
+    /// The definition or an input is not one this evaluator takes: a pure function of them,
+    /// the same on every device.
+    #[error("{0}")]
+    Refused(String),
+    /// A read outside the read set, or a read of the set that is never used (a recompute only).
+    #[error("the reads are not this evaluator's reading of its definition: {0}")]
+    NotItsReads(String),
+}
+
+/// Why a plan fails: a read the layer refuses, or the evaluator.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanError {
+    /// A read the layer refuses: the error `get` of it answers.
+    #[error(transparent)]
+    Data(#[from] DataError),
+    /// The evaluator refuses its definition or its inputs.
+    #[error(transparent)]
+    Eval(#[from] EvalError),
+}
+
+/// The planning phase's reads (answers.md §4.1). Every read is of a version or state this
+/// device holds verified (fetching, asking for keys and opening sealed versions as `get` does),
+/// so an unsigned input cannot be named. In a recompute it serves exactly the read set.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait Reads: Send {
+    /// The newest this device holds of `collection`, as an exact read (a merge collection: its
+    /// state; a log or one-key collection: its newest version), and how old it may be. Records
+    /// nothing. In a recompute: the set's one read of the collection
+    /// ([`EvalError::NotItsReads`] as a [`DataError::BadRequest`] if none or many).
+    async fn current(&mut self, collection: &Name) -> Result<(ReadRef, Age), DataError>;
+
+    /// Read exactly `r` and record it. The error is the one `get` of it answers (`Sealed`,
+    /// `NotReady`, `Unavailable`, `Refused`, `Pruned`, `Expired`, `RuleUnknown`).
+    async fn read(&mut self, r: &ReadRef) -> Result<Got, DataError>;
+}
+
+/// The evaluation phase's reads: fully fetched, in memory, no I/O.
+pub trait ReadView {
+    /// The read set's one read of `collection`.
+    fn current(&self, collection: &Name) -> Result<&ReadRef, EvalError>;
+    /// What `r` opened to; `r` MUST be a read of the set.
+    fn read(&self, r: &ReadRef) -> Result<&Got, EvalError>;
+}
+
+/// A named, versioned pure function of a definition and the contents of a read set
+/// (answers.md §4.1). Brought by the program, like a merge rule.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait Evaluator: Send + Sync {
+    /// Its full, versioned name, e.g. `/ndf/eval/v=3`; matched exactly, never by prefix. A
+    /// change of meaning is a new name.
+    fn evaluator(&self) -> &Name;
+
+    /// Make exactly the reads `evaluate` will make: `reads.current(..)`, `reads.read(..)`;
+    /// compute nothing else. MUST be a function of the definition and what the reads return.
+    async fn plan(&self, definition: &Definition, reads: &mut dyn Reads) -> Result<(), PlanError>;
+
+    /// A pure function of the definition and the contents of the reads: the same bytes on every
+    /// device that registers this name. No clock, randomness, environment, file, network, other
+    /// local or unsigned state; iteration order by contents only; canonical result octets.
+    fn evaluate(&self, definition: &Definition, view: &dyn ReadView) -> Result<Bytes, EvalError>;
+}
+
+/// The evaluators a device knows, by exact name (as [`MergeRules`](crate::MergeRules)).
+#[derive(Clone, Default)]
+pub struct Evaluators(Vec<Arc<dyn Evaluator>>);
+
+impl Evaluators {
+    /// No evaluator.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// With `e`, replacing one of the same name.
+    #[must_use]
+    pub fn with(mut self, e: Arc<dyn Evaluator>) -> Self {
+        self.0.retain(|x| x.evaluator() != e.evaluator());
+        self.0.push(e);
+        self
+    }
+
+    /// The evaluator named exactly `name`.
+    pub fn get(&self, name: &Name) -> Option<&Arc<dyn Evaluator>> {
+        self.0.iter().find(|e| e.evaluator() == name)
+    }
+}
+
+impl std::fmt::Debug for Evaluators {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|e| e.evaluator()))
+            .finish()
+    }
+}
+
+// ---- policy, limits, config ---------------------------------------------------------------------
+
+/// Whom to trust (answers.md §9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signers {
+    /// Nobody: recompute, or [`DataError::CannotCheck`].
+    None,
+    /// Devices of this device's own namespace.
+    Own,
+    /// Own, or a member of EVERY collection the answer read, by the records held (the
+    /// definition of data-layer.md §20).
+    OwnAndMembers,
+    /// These device names; a name also matches the devices under it.
+    Devices(Vec<Name>),
+}
+
+impl Signers {
+    /// Whether the list names `device`: itself, or a prefix of it. `Own` and `OwnAndMembers` are
+    /// decided against the device's own namespace and records, not here.
+    pub fn names(&self, device: &Name) -> bool {
+        match self {
+            Signers::Devices(names) => names.iter().any(|n| device.has_prefix(n)),
+            Signers::None | Signers::Own | Signers::OwnAndMembers => false,
+        }
+    }
+}
+
+/// The host's policy for answers, a value it holds and passes (answers.md §9): which signers a
+/// reader trusts without recomputing, and which devices provide which function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerPolicy {
+    /// Whom to trust for pure answers. Default [`Signers::OwnAndMembers`].
+    pub pure: Signers,
+    /// Function name (exact) to who provides it. Default none: a provider answer is refused
+    /// unless an entry names its function and its signer.
+    pub providers: Vec<(Name, Signers)>,
+    /// Evaluators for which this host takes a trusted signer's answer without recomputing.
+    /// Default none: a known evaluator is recomputed.
+    pub trust: BTreeSet<Name>,
+}
+
+impl Default for AnswerPolicy {
+    fn default() -> Self {
+        AnswerPolicy {
+            pure: Signers::OwnAndMembers,
+            providers: Vec::new(),
+            trust: BTreeSet::new(),
+        }
+    }
+}
+
+/// Whether `get` signs what it computed (answers.md §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publish {
+    /// `get` never signs; [`Device::publish_answer`](crate::Device::publish_answer) and
+    /// [`Device::provide`](crate::Device::provide) do.
+    Never,
+    /// A pure answer this device computed in a `get` is also signed, stored and served.
+    Computed,
+}
+
+/// What one evaluation may spend (answers.md §10): exceeded is
+/// [`AnswerRefusal::OverBudget`], never a different result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Reads.
+    pub reads: usize,
+    /// Octets read.
+    pub read_bytes: u64,
+    /// Octets of the result.
+    pub result_bytes: u64,
+}
+
+/// What a device keeps of others' answers (answers.md §10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnswerStore {
+    /// Answers kept per signer.
+    pub per_signer_answers: usize,
+    /// Octets kept per signer.
+    pub per_signer_bytes: u64,
+    /// Octets kept in all.
+    pub total_bytes: u64,
+}
+
+/// A device's settings for answers (`Config::answers`).
+#[derive(Clone, Debug)]
+pub struct AnswerConfig {
+    /// Whom to trust. Default [`AnswerPolicy::default`].
+    pub policy: AnswerPolicy,
+    /// Whether `get` signs what it computed. Default [`Publish::Never`].
+    pub publish: Publish,
+    /// What one evaluation may spend. Default: 65,536 reads, `PAYLOAD_MAX` octets read and
+    /// returned.
+    pub budget: Budget,
+    /// What is kept of others' answers. Default: 1,024 answers and 64 MiB per signer, 1 GiB in
+    /// all.
+    pub store: AnswerStore,
+    /// The most answers this device signs per second. Default 16.
+    pub sign_per_second: u32,
+}
+
+impl Default for AnswerConfig {
+    fn default() -> Self {
+        AnswerConfig {
+            policy: AnswerPolicy::default(),
+            publish: Publish::Never,
+            budget: Budget {
+                reads: READS_MAX,
+                read_bytes: PAYLOAD_MAX,
+                result_bytes: PAYLOAD_MAX,
+            },
+            store: AnswerStore {
+                per_signer_answers: 1_024,
+                per_signer_bytes: 64 << 20,
+                total_bytes: 1 << 30,
+            },
+            sign_per_second: 16,
+        }
+    }
+}

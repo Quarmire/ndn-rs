@@ -12,12 +12,18 @@
 
 use std::collections::HashMap;
 
+use hmac::{Hmac, KeyInit, Mac};
+use zeroize::Zeroizing;
+
 use bytes::Bytes;
 use hkdf::Hkdf;
 use ndn_foundation_types::Name;
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed};
 use sha2::Sha256;
 
+use crate::answer::{
+    AnswerBinding, AnswerKind, LABEL_AAD, LABEL_ID, LABEL_NAME, LABEL_RESULT, LABEL_SEAL,
+};
 use crate::collection::Epoch;
 use crate::version::Content;
 use crate::wire::{self, Inline};
@@ -62,6 +68,13 @@ impl Keys {
             recipient,
             held: HashMap::new(),
         }
+    }
+
+    /// The content key of `epoch`, whichever collection or folder's record names it: an
+    /// epoch is one record's, and so has one key. What an answer, which names no collection in
+    /// the clear, opens with (answers.md §5.2).
+    pub(crate) fn key_of_epoch(&self, epoch: &Epoch) -> Option<ContentKey> {
+        self.held.get(epoch)?.first().map(|(_, k)| k.clone())
     }
 
     /// The content key of `epoch` of `c`, if held: `c`'s own, or that of a
@@ -119,6 +132,123 @@ pub(crate) fn open_payload(key: &ContentKey, name: &Name, ciphertext: &[u8]) -> 
     let sealed = Sealed::from_bytes(ciphertext).ok()?;
     let plain = key.open(&sealed, &name.encode_to_tlv()).ok()?;
     wire::decode_inline(Bytes::from(plain)).ok()
+}
+
+// ---- answers (answers.md §5) --------------------------------------------------------------------
+
+/// The keys an answer is sealed and named under: derived from the content keys of every epoch of
+/// its read set, so only a device that holds all of them has them (answers.md §5.2).
+pub(crate) struct AudienceKeys {
+    /// Encrypts the answer's body (ChaCha20-Poly1305).
+    pub(crate) seal: ContentKey,
+    /// Keys the answer id and the result digest (HMAC-SHA256).
+    pub(crate) name: [u8; 32],
+}
+
+/// The `SealEpoch*` list `E` of an answer: the TLV of each epoch, in the order given (ascending,
+/// answers.md §5.1).
+pub(crate) fn epochs_tlv(epochs: &[Epoch]) -> Bytes {
+    let mut w = ndn_tlv::TlvWriter::new();
+    for e in epochs {
+        wire::write_epoch(&mut w, e);
+    }
+    w.finish()
+}
+
+/// `PRK = HKDF-Extract(salt none, IKM = k1 ‖ … ‖ kn)`, then `seal_key` and `name_key`
+/// `= HKDF-Expand(PRK, label ‖ E, 32)`: `keys` are the content keys of `epochs`, which are
+/// ascending, one key each (answers.md §5.2).
+pub(crate) fn audience_keys(keys: &[ContentKey], epochs: &[Epoch]) -> AudienceKeys {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(keys.len() * 32));
+    for k in keys {
+        ikm.extend_from_slice(k.expose());
+    }
+    let e = epochs_tlv(epochs);
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut seal_key = Zeroizing::new([0u8; 32]);
+    let mut name = [0u8; 32];
+    hk.expand_multi_info(&[LABEL_SEAL, &e], &mut *seal_key)
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    hk.expand_multi_info(&[LABEL_NAME, &e], &mut name)
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    AudienceKeys {
+        seal: ContentKey::from_bytes(*seal_key),
+        name,
+    }
+}
+
+fn keyed(key: &[u8; 32], label: &[u8], octets: &[u8]) -> [u8; 32] {
+    let mut m =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
+    m.update(label);
+    m.update(octets);
+    m.finalize().into_bytes().into()
+}
+
+fn plain(label: &[u8], octets: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(label);
+    h.update(octets);
+    h.finalize().into()
+}
+
+/// The answer id: `SHA-256("ndn-answer/1 id\0" ‖ AnswerBinding)` when nothing read is sealed, the
+/// keyed `HMAC-SHA256(name_key, …)` otherwise (answers.md §3.2).
+pub(crate) fn answer_id(binding: &AnswerBinding, keys: Option<&AudienceKeys>) -> [u8; 32] {
+    let octets = binding.encode();
+    match keys {
+        None => plain(LABEL_ID, &octets),
+        Some(k) => keyed(&k.name, LABEL_ID, &octets),
+    }
+}
+
+/// The result digest (answers.md §3.4): keyed when anything read is sealed, so a device outside
+/// the audience cannot confirm a guess of a result from a digest that reaches it.
+pub(crate) fn result_digest(result: &[u8], keys: Option<&AudienceKeys>) -> [u8; 32] {
+    match keys {
+        None => plain(LABEL_RESULT, result),
+        Some(k) => keyed(&k.name, LABEL_RESULT, result),
+    }
+}
+
+/// The associated data of a sealed answer: the label, its name as a Name TLV, its kind and its
+/// `SealEpoch*` list, so none can be changed or moved by a holder (answers.md §5.3).
+fn answer_aad(name: &Name, kind: AnswerKind, epochs: &[Epoch]) -> Vec<u8> {
+    let mut aad = LABEL_AAD.to_vec();
+    aad.extend_from_slice(&name.encode_to_tlv());
+    aad.push(kind.code() as u8);
+    aad.extend_from_slice(&epochs_tlv(epochs));
+    aad
+}
+
+/// Seal an answer's `AnswerBody` TLV: `nonce ‖ tag ‖ ciphertext` under the audience seal key.
+pub(crate) fn seal_answer(
+    k: &AudienceKeys,
+    name: &Name,
+    kind: AnswerKind,
+    epochs: &[Epoch],
+    body: &[u8],
+) -> Bytes {
+    k.seal
+        .seal(body, &answer_aad(name, kind, epochs))
+        .to_bytes()
+}
+
+/// Open a sealed answer's ciphertext; `None` if it is not this audience's, or not this name's,
+/// kind's and epochs'.
+pub(crate) fn open_answer(
+    k: &AudienceKeys,
+    name: &Name,
+    kind: AnswerKind,
+    epochs: &[Epoch],
+    ciphertext: &[u8],
+) -> Option<Bytes> {
+    let sealed = Sealed::from_bytes(ciphertext).ok()?;
+    k.seal
+        .open(&sealed, &answer_aad(name, kind, epochs))
+        .ok()
+        .map(Bytes::from)
 }
 
 #[cfg(test)]

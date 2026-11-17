@@ -206,6 +206,13 @@ pub struct Config {
     /// evidence it derives again after a restart is not reported again
     /// once acknowledged ([`Device::acknowledge`], spec §21.4).
     pub events_acked: usize,
+    /// The evaluators this device knows, by exact name (spec `answers.md` §4.1): what it
+    /// recomputes a pure answer with. Default none.
+    pub evaluators: crate::answer::Evaluators,
+    /// What this device does with answers: its policy, whether `get` signs what it computed, its
+    /// budget, what it keeps of others' answers and how fast it signs (spec `answers.md` §9,
+    /// §10).
+    pub answers: crate::answer::AnswerConfig,
 }
 
 impl Config {
@@ -245,6 +252,8 @@ impl Config {
             writer_collections: 1024,
             events_unacked: 256,
             events_acked: 1024,
+            evaluators: crate::answer::Evaluators::none(),
+            answers: crate::answer::AnswerConfig::default(),
         }
     }
 }
@@ -274,6 +283,8 @@ impl std::fmt::Debug for Config {
             .field("writer_collections", &self.writer_collections)
             .field("events_unacked", &self.events_unacked)
             .field("events_acked", &self.events_acked)
+            .field("evaluators", &self.evaluators)
+            .field("answers", &self.answers)
             .finish_non_exhaustive()
     }
 }
@@ -2220,6 +2231,8 @@ struct St {
     scopes: scoped::Scopes,
     /// The events no folder owns, kept for the host ([`events::Book`]).
     events: events::Book,
+    /// What this device holds of answers, serves, and keeps as evidence ([`answers::Book`]).
+    answer_book: answers::Book,
 }
 
 struct Inner {
@@ -6991,16 +7004,34 @@ impl St {
         rules: &MergeRules,
         me: &Writer,
     ) -> Option<(Value, Vec<(VersionId, NotCounted)>)> {
+        self.value_and_cover_at(c, at, rules, me)
+            .map(|(value, not_counted, _)| (value, not_counted))
+    }
+
+    /// [`Self::value_at`], and the per-writer highest seq inside the cover of a checkpoint
+    /// applied at `at` ([`Cover::join`]): what an answer's applied-set digest leaves out
+    /// (`docs/specs/answers.md` §3.1).
+    #[allow(clippy::type_complexity)]
+    fn value_and_cover_at(
+        &self,
+        c: &Name,
+        at: &Frontier,
+        rules: &MergeRules,
+        me: &Writer,
+    ) -> Option<(Value, Vec<(VersionId, NotCounted)>, BTreeMap<Writer, u64>)> {
         let coll = self.colls.get(c)?;
         let members = coll.members.as_ref()?;
         let Rule::Merge { function } = &members.rule else {
             return None;
         };
         if *at == coll.at() {
-            return coll
-                .state
-                .as_ref()
-                .map(|s| (s.value(&coll.held_back()), coll.not_counted_list()));
+            return coll.state.as_ref().map(|s| {
+                (
+                    s.value(&coll.held_back()),
+                    coll.not_counted_list(),
+                    coll.cover.join.clone(),
+                )
+            });
         }
         let mut state = rules.get(function)?.start(c, me);
         let mut versions = coll.versions.clone();
@@ -7099,7 +7130,11 @@ impl St {
                 not_counted.entry(id.clone()).or_insert_with(|| why.clone());
             }
         }
-        Some((state.value(&excluded), not_counted.into_iter().collect()))
+        Some((
+            state.value(&excluded),
+            not_counted.into_iter().collect(),
+            cover.join,
+        ))
     }
 
     /// The devices, besides its writer's, whose versions of `c` held here
@@ -7434,6 +7469,7 @@ impl Device {
                 sleeping: BTreeSet::new(),
                 scopes: scoped::Scopes::default(),
                 events,
+                answer_book: answers::Book::default(),
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -7485,6 +7521,8 @@ impl Device {
             let mut st = inner.st.lock();
             st.durable = st.head;
         }
+        // Answers an earlier run kept, verified again, and the evidence kept against signers.
+        inner.load_answers().await;
         inner.spawn_committer();
         let weak = Arc::downgrade(&inner);
         rt::spawn(async move {
@@ -8644,7 +8682,7 @@ impl Inner {
         let mut scoped_newest = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             // The device's own events, loaded before ([`events::Book::load`]).
-            if events::is_stored(&name) {
+            if events::is_stored(&name) || answers::is_stored(&name) {
                 continue;
             }
             if let Some(entry) = over(&verified_prefix(), &name) {
@@ -12591,6 +12629,7 @@ impl Inner {
             false => Rejudge::Withdrawn(None),
         })
         .await;
+        self.rejudge_answers().await;
         self.fetch_cut_runs();
         self.settle().await;
         self.progress.notify_waiters();
@@ -15458,6 +15497,10 @@ impl Inner {
     }
 
     fn packet_for(&self, name: &Name, can_be_prefix: bool) -> Option<Bytes> {
+        // An answer, or a piece of one (answers.md §6.2).
+        if let Some(reply) = self.answer_packet(name) {
+            return reply;
+        }
         // A name ending in an implicit digest asks for exactly that packet
         // (a re-admission fetches so, spec §8): the packet of the name
         // before it, if its digest is that one.
@@ -20121,6 +20164,10 @@ impl Device {
 impl DataLayer for Device {
     async fn get(&self, name: &Name) -> Result<Answer, DataError> {
         let inner = &self.inner;
+        // An exact answer name, or a question (answers.md §7.1).
+        if wire::names_an_answer(name) {
+            return inner.get_answer(name).await;
+        }
         // A version or entry of a merge collection whose state is not built
         // yet is read from it: built now (spec §5.2). A collection or state
         // name is followed, which builds it ([`Inner::follow`]).
@@ -20378,6 +20425,15 @@ impl DataLayer for Device {
                         name: name.clone(),
                         why: "a range read's answer grows with its stream, so a snapshot cannot \
                               pin it; pin the blocks it read, by their names"
+                            .into(),
+                    });
+                }
+                Got::Answer(_) => {
+                    return Err(DataError::BadRequest {
+                        name: name.clone(),
+                        why: "a snapshot pins versions and states, not answers; pin the versions \
+                              the answer read (its read set lists them), and ask the question \
+                              again from the snapshot"
                             .into(),
                     });
                 }
@@ -26158,6 +26214,15 @@ mod groups;
 mod scoped;
 
 mod events;
+
+mod answer_get;
+
+mod answer_reads;
+
+mod answers;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod answers_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod events_tests;
