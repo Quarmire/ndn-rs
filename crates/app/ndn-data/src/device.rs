@@ -8713,7 +8713,7 @@ impl Inner {
         let mut scoped_newest = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             // The device's own events, loaded before ([`events::Book::load`]).
-            if events::is_stored(&name) || answers::is_stored(&name) {
+            if events::is_stored(&name) || answers::is_stored(&name) || notes::is_stored(&name) {
                 continue;
             }
             if let Some(entry) = over(&verified_prefix(), &name) {
@@ -26943,6 +26943,9 @@ mod signal;
 mod heard;
 
 mod stage;
+
+mod notes;
+pub use notes::{LocalNotes, NOTE_PART_MAX, NOTE_VALUE_MAX, NOTES_PER_AREA_MAX};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fetch_tests;
