@@ -110,7 +110,7 @@ jobs:
           cargo check --target wasm32-unknown-unknown \
             -p ndn-foundation-types -p ndn-tlv -p ndn-transport -p ndn-store \
             -p ndn-strategy -p ndn-runtime -p ndn-mgmt-wire -p ndn-fwd-core \
-            -p ndn-signals-core -p ndn-discovery-core -p ndn-engine
+            -p ndn-signals-core -p ndn-discovery-core -p ndn-engine -p ndn-faults
           cargo check --target wasm32-unknown-unknown \
             -p ndn-packet --no-default-features --features std-wasm
 
