@@ -571,6 +571,8 @@ A punch refused for an admission reason carries that refusal's detail
 | `not-served-uncertified` | — | — | — | `device`, `namespace`, `own`?, `listed`?, `roots`? | the relay holds the namespace's trust context but no certificate in it, and does not serve it |
 | `not-served-unlisted` | — | — | — | `listed`, `device`, `namespace`, `root`, `own`? | the namespace's root is not listed by this relay |
 | `not-served-own` | — | — | — | `device`, `namespace`, `root`, `own`? | this relay serves its own namespaces only |
+| `grant-ended` | — | — | — | `key`, `namespaces`, `until`, `ended` (`expired`, `revoked`, `replaced`) | the grant of a link to this key (ndn-link §8.7) ended: the close sentence of a link it admitted, and a cause appended to the refusal of the key's next link; the inviter invites the person again |
+| `grant-unmatched` | — | — | — | `key`, `namespaces`, `shown` | (appended to a not-served refusal) the key is granted a link as a person of `namespaces`, and the certificates it showed are of `shown`, none of them listed |
 | `enrollment-links-full` | — | — | — | `links`, `from_source`, `max`, `max_per_source` | the relay's enrollment links are full; the device dials again by itself |
 | `enrollment-possible` | — | — | — | `namespaces` | (appended to a not-served refusal) a device enrolls in these namespaces over this relay while its hello holds no certificate of another namespace |
 | `path-not-taken` | — | — | — | `session` | the other device did not take the dialled direct path as one |

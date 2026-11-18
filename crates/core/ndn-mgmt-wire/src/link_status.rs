@@ -224,6 +224,8 @@ pub mod link_code {
     pub const NOT_SERVED_UNCERTIFIED: &str = "not-served-uncertified";
     pub const NOT_SERVED_UNLISTED: &str = "not-served-unlisted";
     pub const NOT_SERVED_OWN: &str = "not-served-own";
+    pub const GRANT_ENDED: &str = "grant-ended";
+    pub const GRANT_UNMATCHED: &str = "grant-unmatched";
     pub const ENROLLMENT_LINKS_FULL: &str = "enrollment-links-full";
     pub const ENROLLMENT_POSSIBLE: &str = "enrollment-possible";
     pub const PATH_NOT_TAKEN: &str = "path-not-taken";
@@ -360,6 +362,8 @@ pub mod link_code {
         NOT_SERVED_UNCERTIFIED,
         NOT_SERVED_UNLISTED,
         NOT_SERVED_OWN,
+        GRANT_ENDED,
+        GRANT_UNMATCHED,
         ENROLLMENT_LINKS_FULL,
         ENROLLMENT_POSSIBLE,
         PATH_NOT_TAKEN,
