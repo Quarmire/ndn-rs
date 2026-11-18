@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::intro::{
-    AnswerBody, AskBody, IntroAsk, IntroRefusal, Introducer, Offer, Outcome, Role, ask_proof,
-    intro_name, intro_prefix, proof_key,
+    AnswerBody, AskBody, Grant, IntroAsk, IntroPolicy, IntroRefusal, Introducer, Offer, Outcome,
+    Role, ask_proof, intro_name, intro_prefix, proof_key,
 };
 use crate::layer::Share;
 use ndn_app::AppError;
@@ -106,6 +106,8 @@ struct Calls {
     dialled: std::sync::Mutex<Vec<Name>>,
     undialled: std::sync::Mutex<Vec<Name>>,
     dial_succeeds: std::sync::atomic::AtomicBool,
+    granted: std::sync::Mutex<Vec<Grant>>,
+    revoked: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 impl Calls {
@@ -115,6 +117,14 @@ impl Calls {
 
     fn undialled(&self) -> Vec<Name> {
         self.undialled.lock().unwrap().clone()
+    }
+
+    fn granted(&self) -> Vec<Grant> {
+        self.granted.lock().unwrap().clone()
+    }
+
+    fn revoked(&self) -> Vec<[u8; 32]> {
+        self.revoked.lock().unwrap().clone()
     }
 }
 
@@ -134,6 +144,14 @@ struct Host {
 impl Introducer for Host {
     fn anchor(&self) -> Option<Bytes> {
         Some(self.anchor.clone())
+    }
+
+    fn grant(&self, grant: &Grant) {
+        self.calls.granted.lock().unwrap().push(grant.clone());
+    }
+
+    fn revoke_grant(&self, key: &[u8; 32]) {
+        self.calls.revoked.lock().unwrap().push(*key);
     }
 
     fn dial<'a>(
@@ -247,6 +265,35 @@ async fn start_recording(
     clock: Option<Clock>,
     calls: Arc<Calls>,
 ) -> Device {
+    start_policy(
+        person,
+        device,
+        keys,
+        refuses,
+        hold,
+        clock,
+        calls,
+        IntroPolicy::new(),
+        Arc::new(MemoryStore::new()),
+    )
+    .await
+}
+
+/// [`start_recording`] with the device's introduction policy `intro` and its
+/// durable store `store`: a device started again over the same store and keys
+/// is a restart.
+#[allow(clippy::too_many_arguments)]
+async fn start_policy(
+    person: &Person,
+    device: &str,
+    keys: Option<Arc<SecurityManager>>,
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+    calls: Arc<Calls>,
+    intro: IntroPolicy,
+    store: Arc<MemoryStore>,
+) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
@@ -278,10 +325,11 @@ async fn start_recording(
         device,
         keys,
         validator,
-        Arc::new(MemoryStore::new()),
+        store,
         Config {
             first_look: Duration::from_millis(50),
             introducer: Some(Arc::new(host)),
+            intro,
             ..clock.map_or_else(Config::new, |clock| Config {
                 clock,
                 ..Config::new()
@@ -324,6 +372,21 @@ async fn alice_person(
 ) {
     let alice = Person::new("/alice");
     let laptop = start_clocked(&alice, "/alice/laptop", None, refuses, hold, clock).await;
+    alice_offers(laptop, alice, Role::Writer).await
+}
+
+/// Alice's `laptop`, her notebook shared with herself alone, and an offer of
+/// it as `role`.
+async fn alice_offers(
+    laptop: Device,
+    alice: Person,
+    role: Role,
+) -> (
+    Device,
+    crate::intro::Code,
+    [u8; crate::intro::SECRET_LEN],
+    Person,
+) {
     let folder = n("/alice/32=data/notebook");
     laptop
         .share_folder(
@@ -341,7 +404,7 @@ async fn alice_person(
         .offer(
             &folder,
             Offer {
-                role: Role::Writer,
+                role,
                 until: Timestamp((laptop.inner.config.clock)().0 + 3_600_000),
                 tries: 3,
             },
@@ -1109,4 +1172,506 @@ async fn a_device_with_no_offer_has_no_open_surface() {
     let surface = laptop.introductions();
     assert!(!surface.open());
     assert!(!surface.carries(&intro_prefix(laptop.name()).append("digest")));
+}
+
+// ---- the grant (spec §19.8) --------------------------------------------------------------------
+
+const NINETY_DAYS_MS: u64 = 90 * 24 * 3600 * 1000;
+
+/// The secret of a code.
+fn secret_of(code: &crate::intro::Code) -> [u8; crate::intro::SECRET_LEN] {
+    let Ok(TrustEnvelope::Intro(intro)) = TrustEnvelope::from_uri(&code.link) else {
+        panic!("an offer's link is an introduction link");
+    };
+    intro.secret
+}
+
+/// `device`'s keys, its key certified by `person`'s root.
+async fn keyed(person: &Person, device: &str) -> Arc<SecurityManager> {
+    let device = n(device);
+    let keys = Arc::new(SecurityManager::new());
+    let k = keys.generate_ed25519(key(&device)).unwrap();
+    let public = keys.get_signer_sync(&k).unwrap().public_key().unwrap();
+    keys.cert_cache().insert(person.certify(&k, &public).await);
+    keys
+}
+
+/// Alice's laptop on a store and keys that outlive it, its host recording in
+/// `calls`, and its notebook offered as `role`.
+struct Inviter {
+    laptop: Device,
+    alice: Person,
+    keys: Arc<SecurityManager>,
+    store: Arc<MemoryStore>,
+    calls: Arc<Calls>,
+    clock: Clock,
+    skew: Arc<std::sync::atomic::AtomicU64>,
+    offer: Name,
+    secret: [u8; crate::intro::SECRET_LEN],
+}
+
+impl Inviter {
+    async fn new(role: Role, grant_for: Duration, refuses: &[&str]) -> Inviter {
+        let (clock, skew) = skewed();
+        let alice = Person::new("/alice");
+        let keys = keyed(&alice, "/alice/laptop").await;
+        let store = Arc::new(MemoryStore::new());
+        let calls = Arc::new(Calls::default());
+        let laptop = start_policy(
+            &alice,
+            "/alice/laptop",
+            Some(Arc::clone(&keys)),
+            refuses,
+            None,
+            Some(Arc::clone(&clock)),
+            Arc::clone(&calls),
+            IntroPolicy {
+                grant_for,
+                ..IntroPolicy::new()
+            },
+            Arc::clone(&store),
+        )
+        .await;
+        let (laptop, code, secret, alice) = alice_offers(laptop, alice, role).await;
+        Inviter {
+            laptop,
+            alice,
+            keys,
+            store,
+            calls,
+            clock,
+            skew,
+            offer: code.offer,
+            secret,
+        }
+    }
+
+    /// Alice's laptop stopped and started again over its store and keys: a
+    /// restart, its host a new one recording in `calls`.
+    async fn restart(&mut self) -> Arc<Calls> {
+        self.laptop.shutdown();
+        let calls = Arc::new(Calls::default());
+        self.laptop = start_policy(
+            &self.alice,
+            "/alice/laptop",
+            Some(Arc::clone(&self.keys)),
+            &[],
+            None,
+            Some(Arc::clone(&self.clock)),
+            Arc::clone(&calls),
+            IntroPolicy::new(),
+            Arc::clone(&self.store),
+        )
+        .await;
+        calls
+    }
+
+    /// What the laptop answers `joiner`'s ask for the first offer.
+    async fn answers(&self, joiner: &Device) -> Option<Outcome> {
+        answer(
+            &self.laptop,
+            ask(joiner, &self.laptop, &self.offer, &self.secret, &[]),
+        )
+        .await
+    }
+
+    /// Another offer of the notebook, as a writer: its name and secret.
+    async fn another_offer(&self) -> (Name, [u8; crate::intro::SECRET_LEN]) {
+        let code = self
+            .laptop
+            .offer(
+                &n("/alice/32=data/notebook"),
+                Offer {
+                    role: Role::Writer,
+                    until: Timestamp((self.clock)().0 + 3_600_000),
+                    tries: 3,
+                },
+            )
+            .await
+            .unwrap();
+        let secret = secret_of(&code);
+        (code.offer, secret)
+    }
+}
+
+/// A person's phone, its host recording nothing of interest.
+async fn phone_of(ns: &str) -> Device {
+    let person = Person::new(ns);
+    start(&person, &format!("{ns}/phone"), None, &[], None).await
+}
+
+async fn a_grant_is_made_once_for_the_admitted_key(role: Role) {
+    let alice = Inviter::new(role, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    let before = (alice.clock)().0;
+    let first = alice.answers(&bob_phone).await;
+    let after = (alice.clock)().0;
+    assert!(accepted(&first), "bob was answered {first:?}");
+    let granted = alice.calls.granted();
+    assert_eq!(
+        granted.len(),
+        1,
+        "an admitted asker was granted {} times, not once",
+        granted.len()
+    );
+    let g = &granted[0];
+    assert_eq!(
+        g.key,
+        bob_phone.inner.own_key.unwrap(),
+        "the grant names another key than the asker's"
+    );
+    assert_eq!(
+        g.namespaces,
+        vec![n("/bob")],
+        "the grant names other namespaces than the asker's"
+    );
+    assert_eq!(g.folder, n("/alice/32=data/notebook"));
+    assert_eq!(g.role, role, "the grant does not carry the offer's role");
+    assert!(
+        (before + NINETY_DAYS_MS..=after + NINETY_DAYS_MS).contains(&g.until.0),
+        "the grant ends at {:?}, not grant_for after the admission",
+        g.until
+    );
+    assert_eq!(
+        alice.laptop.grants(),
+        granted,
+        "Device::grants is not what the host was told"
+    );
+
+    // The same key asking again is answered as before: no second grant, and
+    // the end is not moved.
+    alice.skew.store(5_000, std::sync::atomic::Ordering::SeqCst);
+    let again = alice.answers(&bob_phone).await;
+    assert_eq!(again, first, "the retry was not answered as kept");
+    assert_eq!(
+        alice.calls.granted(),
+        granted,
+        "a retry of the admitted key was granted again"
+    );
+    assert_eq!(
+        alice.laptop.grants(),
+        granted,
+        "a retry moved the end of the grant"
+    );
+
+    // Another key finds the offer used: refused, and granted nothing.
+    let carol_phone = phone_of("/carol").await;
+    let other = alice.answers(&carol_phone).await;
+    assert!(
+        matches!(other, Some(Outcome::Refused(IntroRefusal::Used))),
+        "another key asking a used offer was answered {other:?}"
+    );
+    assert_eq!(
+        alice.calls.granted(),
+        granted,
+        "a refused ask was granted a link"
+    );
+    assert_eq!(alice.laptop.grants(), granted);
+}
+
+/// Spec §19.8: an offer's admission makes one grant, for the admitted key and
+/// the asker's namespace, with the offer's role; a retry and a refused ask
+/// make none.
+#[tokio::test]
+async fn a_writers_admission_is_granted_once_and_only_to_its_key() {
+    a_grant_is_made_once_for_the_admitted_key(Role::Writer).await;
+}
+
+#[tokio::test]
+async fn a_readers_admission_is_granted_once_with_the_readers_role() {
+    a_grant_is_made_once_for_the_admitted_key(Role::Reader).await;
+}
+
+/// Spec §19.8: no ask that is refused or not completed grants anything.
+#[tokio::test]
+async fn a_refused_or_unfinished_ask_grants_nothing() {
+    let alice = Inviter::new(
+        Role::Writer,
+        Duration::from_millis(NINETY_DAYS_MS),
+        &["/dave"],
+    )
+    .await;
+    let bob_phone = phone_of("/bob").await;
+    // A wrong secret.
+    let wrong = ask(
+        &bob_phone,
+        &alice.laptop,
+        &alice.offer,
+        &[9; crate::intro::SECRET_LEN],
+        &[],
+    );
+    let got = answer(&alice.laptop, wrong).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::WrongProof { .. }))),
+        "a wrong secret was answered {got:?}"
+    );
+    // A namespace that overlaps the inviter's own.
+    let mallory = Person::new("/alice");
+    let mallory_phone = start(&mallory, "/alice/mallory", None, &[], None).await;
+    let got = alice.answers(&mallory_phone).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Conflict))),
+        "a namespace over the inviter's own was answered {got:?}"
+    );
+    // A host that does not adopt the asker: the offer is not spent.
+    let dave = Person::new("/dave");
+    let dave_phone = start(&dave, "/dave/phone", None, &[], None).await;
+    let got = alice.answers(&dave_phone).await;
+    assert_eq!(got, None, "an asker the host does not adopt was answered");
+    assert_eq!(
+        alice.calls.granted(),
+        Vec::new(),
+        "an ask that was refused or not completed was granted a link"
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    // Once closed, a new key is refused, and granted nothing either.
+    alice.laptop.close_offer(&alice.offer).await.unwrap();
+    let got = alice.answers(&bob_phone).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "an asker of a closed offer was answered {got:?}"
+    );
+    // Past its expiry, too.
+    alice
+        .skew
+        .store(2 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    let got = alice.answers(&bob_phone).await;
+    assert!(
+        matches!(
+            got,
+            Some(Outcome::Refused(
+                IntroRefusal::Closed | IntroRefusal::Expired
+            ))
+        ),
+        "an asker of an expired offer was answered {got:?}"
+    );
+    assert_eq!(alice.calls.granted(), Vec::new());
+    assert_eq!(alice.laptop.grants(), Vec::new());
+}
+
+/// Spec §19.8: `grant_for` zero: the asker is admitted, nothing is kept, and
+/// the host is told nothing.
+#[tokio::test]
+async fn a_zero_grant_for_makes_no_grant_and_keeps_no_note() {
+    let alice = Inviter::new(Role::Writer, Duration::ZERO, &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    let got = alice.answers(&bob_phone).await;
+    assert!(accepted(&got), "bob was answered {got:?}");
+    assert_eq!(
+        alice.calls.granted(),
+        Vec::new(),
+        "grant_for = 0 granted a link"
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    let kept = alice
+        .store
+        .scan_under(&super::intro::local_name_base("grant"), 0);
+    assert!(
+        kept.is_empty(),
+        "grant_for = 0 kept {} grant notes",
+        kept.len()
+    );
+}
+
+/// Spec §19.8: a grant is lapsed when its time passes by the device's clock: not
+/// in force, and not announced as revoked (the link layer judges expiry itself).
+#[tokio::test]
+async fn a_grant_lapses_with_its_time_and_is_not_announced_as_revoked() {
+    let alice = Inviter::new(Role::Writer, Duration::from_secs(3600), &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert_eq!(alice.laptop.grants().len(), 1);
+    alice
+        .skew
+        .store(3 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "a grant past its time is still in force"
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(alice.calls.revoked(), Vec::<[u8; 32]>::new());
+}
+
+/// The folder's members record that leaves `drop` out, signed by Alice's phone
+/// at the revision above the laptop's record in force, as that device's view of
+/// the line: the person's writer entry cut, its reader entry gone.
+fn phone_leaves_out(laptop: &Device, folder: &Name, drop: &Name) -> MembersBody {
+    let m = laptop.inner.st.lock().folders[folder]
+        .members
+        .clone()
+        .expect("a record is held");
+    let epoch = Epoch {
+        creator: n("/alice/phone"),
+        seq: Seq(1),
+    };
+    MembersBody {
+        collection: folder.clone(),
+        folder: true,
+        revision: m.revision.0 + 1,
+        rule: m.rule.clone(),
+        writers: m.writers.iter().filter(|w| *w != drop).cloned().collect(),
+        readers: m
+            .readers
+            .iter()
+            .filter(|r| !matches!(r, Audience::Person(p) if p == drop))
+            .cloned()
+            .collect(),
+        cuts: vec![CutBody {
+            of: drop.clone(),
+            accept: Accepted::new(),
+        }],
+        epoch: Some(epoch.clone()),
+        key_check: Some(seal::key_check(&ContentKey::generate(), folder, &epoch)),
+        since: None,
+        parent: Some(m.as_parent()),
+    }
+}
+
+/// `body`, as Alice's phone signed it at seq 1 of its log, handed to `to`.
+fn from_the_phone(to: &Device, body: MembersBody) {
+    let phone = n("/alice/phone");
+    let name = log_name(&phone, Some(&body.collection), 1);
+    let record = Record::Members(body);
+    let k = key(&phone);
+    let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
+        ndn_packet::SignatureType::SignatureEd25519,
+        Some(&k),
+        |_| Bytes::from_static(&[0; 64]),
+    );
+    let mut st = to.inner.st.lock();
+    to.inner
+        .take(&mut st, name.clone(), packet, Writer::new(k), record, false);
+    assert_eq!(
+        st.refused.get(&name),
+        None,
+        "the phone's record was refused"
+    );
+}
+
+/// Spec §19.8: a members record held that leaves the person out ends the
+/// grant — signed by another device of the inviter's person too — once and
+/// durably; the others' grants stand, and after a restart `Device::grants` is
+/// the same less the ended.
+#[tokio::test]
+async fn a_record_of_another_device_that_leaves_the_person_out_revokes_the_grant() {
+    let mut alice = Inviter::new(Role::Writer, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    let carol_phone = phone_of("/carol").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let (offer2, secret2) = alice.another_offer().await;
+    let got = answer(
+        &alice.laptop,
+        ask(&carol_phone, &alice.laptop, &offer2, &secret2, &[]),
+    )
+    .await;
+    assert!(accepted(&got), "carol was answered {got:?}");
+    let both = alice.laptop.grants();
+    assert_eq!(both.len(), 2, "two admissions, {} grants", both.len());
+    let carols = both
+        .iter()
+        .find(|g| g.namespaces == [n("/carol")])
+        .cloned()
+        .expect("carol is granted");
+
+    // The phone's record drops Bob. No record of this device is signed for it.
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.calls.revoked(),
+        vec![bob_phone.inner.own_key.unwrap()],
+        "a held record signed by another device that leaves bob out did not revoke exactly bob's grant"
+    );
+    assert_eq!(
+        alice.laptop.grants(),
+        vec![carols.clone()],
+        "Device::grants after a record that leaves bob out is not carol's grant alone"
+    );
+    // Not again: the end is noted, however often records are settled.
+    alice.laptop.inner.settle().await;
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.calls.revoked().len(),
+        1,
+        "the end of a grant was announced more than once"
+    );
+
+    // After a restart the grants are the same, less the ended; the host is not
+    // told to revoke what is not granted, nor to grant what the device installs.
+    let again = alice.restart().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        vec![carols],
+        "Device::grants after a restart is not what it was"
+    );
+    assert_eq!(
+        again.granted(),
+        Vec::new(),
+        "a restart granted again by itself"
+    );
+    assert_eq!(
+        again.revoked(),
+        Vec::<[u8; 32]>::new(),
+        "a restart revoked again"
+    );
+
+    // Bob, readmitted by a later record, is not granted again by that.
+    alice
+        .laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice"), n("/bob")],
+                readers: vec![
+                    Audience::Person(n("/alice")),
+                    Audience::Person(n("/bob")),
+                    Audience::Person(n("/carol")),
+                ],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .laptop
+            .grants()
+            .iter()
+            .all(|g| g.key != bob_phone.inner.own_key.unwrap()),
+        "a person a record readmitted was granted again by it"
+    );
+}
+
+/// Spec §19.8: the record this device signs itself, leaving the person out,
+/// ends the grant as well.
+#[tokio::test]
+async fn a_record_this_device_signs_that_leaves_the_person_out_revokes_the_grant() {
+    let alice = Inviter::new(Role::Reader, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert_eq!(alice.laptop.grants().len(), 1);
+    alice
+        .laptop
+        .share_folder(
+            &n("/alice/32=data/notebook"),
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice")],
+                readers: vec![Audience::Person(n("/alice"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.calls.revoked(),
+        vec![bob_phone.inner.own_key.unwrap()],
+        "a record this device signed that leaves bob out did not revoke his grant"
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
 }

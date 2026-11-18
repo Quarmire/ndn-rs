@@ -59,6 +59,9 @@ pub(super) struct Intros {
     pub(super) used: BTreeMap<Name, (Name, [u8; 32])>,
     /// Offers a closing mark is held of: closed for good, used or not.
     pub(super) closed: BTreeSet<Name>,
+    /// Offers whose grant a held record left out, being ended now
+    /// ([`Inner::end_grants`]): one run ends a grant, a run meanwhile skips it.
+    pub(super) ending: BTreeSet<Name>,
     /// Asks are judged one at a time: a use, a wrong try counted, a
     /// closing mark each see what the one before wrote.
     serial: Arc<tokio::sync::Mutex<()>>,
@@ -73,6 +76,7 @@ impl Intros {
             offers: BTreeMap::new(),
             used: BTreeMap::new(),
             closed: BTreeSet::new(),
+            ending: BTreeSet::new(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             queued: 0,
         }
@@ -89,13 +93,18 @@ impl Drop for Queued<'_> {
     }
 }
 
+/// `/localhost/ndn-data/intro/<what>`: the local names of what an own offer
+/// needs live under it.
+pub(super) fn local_name_base(what: &str) -> Name {
+    format!("/localhost/ndn-data/intro/{what}")
+        .parse()
+        .expect("a valid name")
+}
+
 /// `/localhost/ndn-data/intro/<what>/<offer's Name TLV>`: where the store
 /// keeps what an own offer needs, under a local name no device serves.
-fn local_name(what: &str, offer: &Name) -> Name {
-    let base: Name = format!("/localhost/ndn-data/intro/{what}")
-        .parse()
-        .expect("a valid name");
-    base.append_component(NameComponent::generic(offer.encode_to_tlv()))
+pub(super) fn local_name(what: &str, offer: &Name) -> Name {
+    local_name_base(what).append_component(NameComponent::generic(offer.encode_to_tlv()))
 }
 
 /// Where the store keeps an own offer's proof key, wrapped to the device's
@@ -1310,9 +1319,15 @@ impl Inner {
         }
         let revision = self.folder_revision(&ob.folder);
         let answer = self.acceptance(offer, &ob, &pk, by.clone(), revision)?;
-        // Kept with the use mark: the store's barrier under the mark makes
-        // both durable before the answer.
+        // The grant (spec §19.8) is kept with the acceptance and the use
+        // mark: the store's barrier under the mark makes all three durable
+        // before the answer. It is made only here: an asker answered again
+        // (above) is granted nothing more, and its `until` is not extended.
+        let grant = self.grant_note(offer, by.1, &theirs, &ob.folder, ob.role);
         self.store.insert(accepted_name(offer), answer.encode());
+        if let Some(note) = &grant {
+            self.keep_grant(note);
+        }
         let mark = UsedBody {
             offer: offer.clone(),
             by: Some(by),
@@ -1321,6 +1336,9 @@ impl Inner {
             return None;
         }
         self.store.remove(&using_name(offer));
+        if let Some(note) = grant {
+            introducer.grant(&note.grant());
+        }
         Some(answer)
     }
 

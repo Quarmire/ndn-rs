@@ -52,6 +52,8 @@ const PROOF_KEY: &[u8] = b"ndn-data/intro/proof/1";
 const ASK_PROOF: &[u8] = b"ndn-data/intro/ask/1";
 const ANSWER_PROOF: &[u8] = b"ndn-data/intro/answer/1";
 
+/// The days a grant lasts by default ([`IntroPolicy::grant_for`]).
+const GRANT_DAYS: u64 = 90;
 type HmacSha256 = Hmac<Sha256>;
 
 // ---- what callers see -------------------------------------------------------------------------
@@ -98,6 +100,30 @@ pub struct Offer {
     pub tries: u32,
 }
 
+/// A **grant** (spec §19.8): an offer of this device admitted a person, and
+/// the host's link layer may link with the device holding `key` as a person
+/// of `namespaces`, until `until`. What [`Introducer::grant`] is told and
+/// [`Device::grants`](crate::Device::grants) lists.
+///
+/// A grant is authority to *link*, not to read: it informs, never widens. The
+/// folder's members record and the epoch keys still decide what a link is
+/// answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    /// The asker's key's public-key digest: what a link's handshake proves
+    /// (ndn-link's `KeyFingerprint`). A person's other keys are not granted.
+    pub key: [u8; 32],
+    /// The namespaces the person may be identified in: the asker's
+    /// namespace, as the join adopted it.
+    pub namespaces: Vec<Name>,
+    /// The folder the offer admitted the person to.
+    pub folder: Name,
+    /// The offer's role.
+    pub role: Role,
+    /// When the grant ends, by the inviter's clock.
+    pub until: Timestamp,
+}
+
 /// What a device's introductions allow and cost it (`Config::intro`, spec
 /// §19.4, §19.7): which namespaces an introduction may bring, either way,
 /// and how wrong tries and a crowd of asks are bounded.
@@ -136,12 +162,18 @@ pub struct IntroPolicy {
     /// such an address to a device elsewhere (ndn-link `HostCandidates`).
     /// Turn it on for two devices of one machine (tests, a demo).
     pub local_candidates: bool,
+    /// How long a grant lasts after the admission it follows (spec §19.8),
+    /// by the offering device's clock; zero: no grant is made (nothing is
+    /// kept, [`Introducer::grant`] is never called) and the host links with
+    /// the person by its serving policy alone.
+    pub grant_for: Duration,
 }
 
 impl IntroPolicy {
     /// Defaults: one component at least (`/alice`); `/localhost` and
     /// `/localhop` reserved; `/user` shared; 16 wrong tries in all, the
-    /// pause after each counted from 1 s doubling; 32 asks held.
+    /// pause after each counted from 1 s doubling; 32 asks held; a grant lasts
+    /// 90 days.
     pub fn new() -> Self {
         let n = |s: &str| s.parse::<Name>().expect("a valid name");
         Self {
@@ -152,6 +184,7 @@ impl IntroPolicy {
             backoff: std::time::Duration::from_secs(1),
             asks_queued: 32,
             local_candidates: false,
+            grant_for: Duration::from_secs(GRANT_DAYS * 24 * 3600),
         }
     }
 
@@ -679,6 +712,33 @@ pub trait Introducer: Send + Sync {
     /// The default does nothing: a host with no link layer dialled nothing.
     fn undial(&self, hint: &LinkHint, inviter: &Name) {
         let _ = (hint, inviter);
+    }
+
+    /// An offer of this device admitted a person: the host's link layer may
+    /// link with `grant.key` as a person of `grant.namespaces`, until
+    /// `grant.until` (spec §19.8). Called once the acceptance and the grant
+    /// note are durable, never for a retry of the same asker, a refused ask,
+    /// or when [`IntroPolicy::grant_for`] is zero; and again with the same
+    /// value, for each grant in force, by whoever installs
+    /// [`Device::grants`](crate::Device::grants) after a restart. A grant
+    /// informs the link layer, never widens what the layer serves: the
+    /// members record and the epoch keys still decide what is answered.
+    ///
+    /// The default does nothing: a host with no link layer, or one that
+    /// serves by policy.
+    fn grant(&self, grant: &Grant) {
+        let _ = grant;
+    }
+
+    /// The grant of `key` has ended before its time: a members record held
+    /// here — signed by any device of the inviter's namespace — leaves the
+    /// person out of the grant's folder (spec §19.8). Called once for each
+    /// such grant, after the end is durable; a grant that merely expired is
+    /// not announced (the link layer judges `until` by its own clock).
+    ///
+    /// The default does nothing.
+    fn revoke_grant(&self, key: &[u8; 32]) {
+        let _ = key;
     }
 }
 

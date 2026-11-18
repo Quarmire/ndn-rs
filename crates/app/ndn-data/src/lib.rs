@@ -96,7 +96,7 @@ pub use events::{
     AnswerFault, Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId,
     EventKind, EventSubject, Meaning, ReadSetFault, WithdrawnBy,
 };
-pub use intro::{Code, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
+pub use intro::{Code, Grant, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     NotCounted, PutOptions, Share, ShareChange, Sharing, State,
