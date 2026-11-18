@@ -11,6 +11,7 @@
   - link modes (`always`, `on-demand`, `off`), idle close and the Interests that wait for a link (§16);
   - reachability while asleep: Interests a relay holds for a sleeping device, and the wake hook (§17).
   - introduction links, and dialling a device by the key and addresses of an introduction code's link hint (§8.6, §13.3);
+  - the test-only fault layer: a seeded drop/duplicate/forge/delay profile on the packets arriving on a link, behind the cargo feature `fault-injection` (§17B).
 
   The goal is an independent implementation (NDNts, python-ndn, …) that can dial an ndn-fwd link and accept one from ndn-fwd.
 - **Design context:** [personal-namespace.md](personal-namespace.md) §9 ("QUIC links"), F6 and F11. Where the two disagree on wire detail, this spec governs.
@@ -493,7 +494,8 @@ Rules are evaluated in order. The first that applies decides. *Identified* means
 4. If the peer was identified and a peer entry exists: admit a **full link**, by the remaining identities (served identities do not count here, §7.1).
 5. If the peer was identified and no peer entry exists, the serving policy decides (§15.2), for each remaining identity:
    - the peer is admitted on a **full link** by every identity the policy serves (for a namespace other than this side's own, under its quotas, §15.3). Identities of this side's own namespaces come first, then those served without limits, then those under quotas; the first decides the link (its quotas, if any, bound the link, §15.3);
-   - when the policy serves none, refuse with the refusal of the first (**0x19**, or **0x16** for a full quota). A served device gets no enrollment link: it proved who it is, and this side does not serve it. When this side is eligible to relay enrollments (§8.1), the 0x19 reason says the device can enroll over it by linking with a hello that holds no certificate of another namespace (rule 6).
+   - when the policy serves none, and declined at least one identity (not for a quota or a name collision), and the policy is not `open`: a live **grant** (§8.7) of the peer's key admits it by the identities in the namespaces the grant lists, under the quotas, in the grant's role's scope;
+   - otherwise, when the policy serves none, refuse with the refusal of the first (**0x19**, or **0x16** for a full quota), naming an ended grant of the key if there was one. A served device gets no enrollment link: it proved who it is, and this side does not serve it. When this side is eligible to relay enrollments (§8.1), the 0x19 reason says the device can enroll over it by linking with a hello that holds no certificate of another namespace (rule 6).
 6. If the peer is Unknown and not key-expected:
    - If the link was not dialed by this side, has no peer entry, and this side is eligible to relay enrollments (§8.1), admit as a **relay-side enrollment link**. If no enrollment slot is free, refuse **0x16** instead (§8.4).
    - Otherwise, if its hello carries no certificate, it has no peer entry and the serving policy is `listed` or `open`: refuse **0x19** (a relay routes a served device by the device name its certificate gives).
@@ -505,7 +507,7 @@ The identities a link is admitted by are what the rest of this spec calls the pe
 
 A revoked key or issuer is refused in §7.1 before any of these rules, unless another certificate or membership identifies the peer, so it never reaches an enrollment link through them. This includes a peer that sends no certificate, when the side knows a revoked certificate of its key (§7.1).
 
-Under the default serving policy `own`, rule 5 admits unasked only the devices of the namespaces this side holds a certificate in. A device of a held namespace this side has no certificate in, which earlier versions admitted, is refused with 0x19 unless a peer entry names it ([Decision 20](#20-decisions)).
+Under the default serving policy `own`, rule 5 admits unasked only the devices of the namespaces this side holds a certificate in, and, by a **grant** of their key (§8.7), the one device and namespaces an introduction admitted. A device of a held namespace this side has no certificate in, which earlier versions admitted, is refused with 0x19 unless a peer entry or a grant names it ([Decision 20](#20-decisions), [Decision 36](#20-decisions)).
 
 ### 7.4 Link policy semantics
 
@@ -653,9 +655,32 @@ An introduction link lets a device that hands out introduction codes ([data-laye
 
 - **No routes**, presence or sync group: answers return the way their Interests came.
 - **Slots and idle close.** Introduction links share the enrollment links' slots (`ENROLLMENT_LINKS_MAX`, `ENROLLMENT_LINKS_PER_SOURCE`) and their idle close (`ENROLLMENT_IDLE`), §8.4.
-- **Replaced by a full link.** The joiner dials again (§13.3) once it holds the inviter's namespace. This side adopted the joiner's namespace answering its ask, so the new connection's hello identifies the joiner in a namespace this side holds the trust context of; it is a full link only if this side's serving policy serves it (§7.3 rule 5, §15.2): a device of another person's namespace, which this side holds but holds no certificate in, is refused with **0x19** under the default `own`, and so stays on an introduction link, which carries no sync. A host that introduces people it does not know yet therefore chooses `open` (within quotas) or `listed`. When served, the new link is admitted by rules 3 to 5 as a full link, and replaces the introduction link under the duplicate-link rule (§11: a newer link dialed the same way replaces the older).
+- **Replaced by a full link.** The joiner dials again (§13.3) once it holds the inviter's namespace. This side adopted the joiner's namespace answering its ask, so the new connection's hello identifies the joiner in a namespace this side holds the trust context of; it is a full link only if this side's serving policy serves it (§7.3 rule 5, §15.2) or a **grant** of its key serves it (§8.7): a device of another person's namespace, which this side holds but holds no certificate in, is refused with **0x19** under the default `own`, and without a grant stays on an introduction link, which carries no sync. An inviter therefore keeps `own` and grants the person it introduced (a data-layer device does it by itself on admitting the joiner, data-layer.md §19.8). The earlier advice, that an inviter which wants to sync with the people it introduced chooses `open` (within quotas) or `listed`, is **withdrawn**: `own` plus the grant is tighter and enough, and `open` stays what it was (§8.7 rule 4). When served, the new link is admitted by rules 3 to 5 as a full link, and replaces the introduction link under the duplicate-link rule (§11: a newer link dialed the same way replaces the older).
 
 The scope is why a stranger needs no admission: what it can send is the offer record of an open offer (a public log entry) and an ask, which the data layer judges, counting wrong tries and bounding the asks it holds (data-layer.md §19.4), within the enrollment links' bounds. Earlier text served the whole `<D>/32=held` prefix, which also reached every packet the device holds by name; the surface narrows it to the offer.
+
+### 8.7 Grants
+
+A **grant** says: *the device holding link key K may link here, as a person of the namespaces N₁…Nₖ, until U*. It exists so that a device that keeps the default serving policy `own` (§15.2) still links with the one person it introduced (§8.6), and with no one else it merely holds a context of. The person's namespace is held here, but no certificate of it is, so `own` refuses it (0x19, §7.3 rule 5); the grant serves exactly that key in exactly those namespaces.
+
+1. **The table.** `Links::grant(Grant { key, namespaces, role, until })` makes a grant, replacing an earlier one of the same key; `Links::revoke_grant(&key) -> bool` ends it now (`true` when one was in force); `Links::grants()` lists the ones in force. The table is in memory and the host's: ndn-link persists none. A data-layer device is the single source of its grants: `LinkHints::serve(&device)` installs `Device::grants()` at start, and the host forwards the device's `Introducer::grant` and `revoke_grant` to `LinkHints::grant` and `LinkHints::revoke_grant` (data-layer.md §19.8), so a grant survives a restart without ndn-link keeping it. A grant that replaces another of the same scope (the same namespaces and role) moves its `until` and leaves the links it admitted; one of other namespaces or another role closes them (rule 6), and the device links again to be judged by the new one.
+2. **Where it is consulted.** Only in rule 5 of §7.3, where the serving policy serves none of the peer's identities and *declines* at least one (0x19: the sentence of `not-served-own`, `not-served-unlisted` or `not-served-uncertified`), never for a refusal of a quota (0x16) or a name collision, and never under `open`. A link the policy already serves is as before: the grant adds nothing to it and is not recorded on it.
+3. **By key and namespace, both.** The grant admits the peer when the key the handshake proved is the grant's key *and* the peer has an identity in a held namespace the grant lists: that identity was validated as for any device (offline, revocations and the namespace's link policy judged first, §7.1, §7.4). An identity served by a root this side does not hold (`served`, §7.1) never qualifies. Only the identities in the grant's namespaces are admitted: the routes, presence and sync groups of the other namespaces the hello showed are not added (§10). Another key of the same namespace gets nothing; the same key showing another namespace gets the link for the granted one only.
+4. **Never wider.** A grant link counts against the quotas of the serving policy (`Listed`'s, when it has them) or `Quotas::default()` (§15.3) and is rate-limited per link and per namespace like any served link; the quota or the name collision that refuses it refuses the link (0x16, 0x19). **Under `serve = open` a grant changes nothing:** `open` serves any held namespace already, under its quotas, and the link is the one an open relay gives. The round-4 `open` posture (§8.6) is unchanged. `own` plus grants is the tighter choice, which this spec recommends to an inviter, and the advice that an inviter must choose `open` or `listed` to sync with the people it introduced is withdrawn.
+5. **The role narrows the scope** (§8.3). The link's admission carries a `LinkScope`:
+
+   | | writer | reader |
+   |---|---|---|
+   | receives from the peer | everything | Interests, and answers (Data, Nacks) only under the peer's own device names |
+   | sends to the peer | everything | everything |
+   | name filter | every name | every name |
+   | receive rate limit | the quotas' (per key and per namespace, §15.3) | the same |
+
+   A reader writes nothing, so what it sends toward this side is Interests; the Data it pushes under any other name is dropped at the link. The answers *under its own device names* pass, because the layer fetches them from the reader: its certificates (a signed request of the reader is validated by fetching its chain by name) and the seal the owner fetches to wrap a folder's epoch key for it (data-layer.md §19.8: without them a reader's join cannot complete, which the reader case proves). The layer's own gating still decides what is answered.
+6. **It ends** at `until` (judged on this side's clock at every admission, and by one task that sleeps until the earliest `until` and wakes when a grant is made or ended, so a link closes at `until` with no polling), on `revoke_grant`, and when it is replaced by a grant of other namespaces or another role. A link whose only admission was the grant is then closed with **0x19**, the sentence saying what ended and what to do (`grant-ended`: *"your key K was granted a link here as a person of N, until U, and the grant ended: it expired | it was revoked … | it was replaced …. Ask the person who invited you to invite you again"*). Links another rule also admits stay.
+7. **Refusals say why and what to do.** A device refused under `own` or `listed` with no grant is told, besides what it was told before, that its inviter can grant it by inviting it ("inviting you", §8.7). A device whose key had a grant that ended is told so in the refusal of the next link of that key, as a cause (`grant-ended`, with `ended` = `expired`, `revoked` or `replaced`); the last 64 ended grants are remembered. A device whose key is granted but whose certificates are of none of the granted namespaces is told which it showed and which are listed (`grant-unmatched`). `Links::report()` lists the grants in force (`LinkReport::grants`) and shows, for each link a grant alone admitted, that grant (`LinkStatus::granted`, `granted until … as a writer in …`).
+8. **Hosts with another link key.** The data layer's grant names the asker *device's* key. A host whose link key is another key calls `Links::grant` itself with that key (a host step, as for a `PeerSpec`).
+9. **No wire change.** A grant is local to a process: no TLV-TYPE, close code or message is added or changed. The two details it adds are `LinkDetail` codes (mgmt-trust.md), not registered wire numbers.
 
 ## 9. NDN packets: datagram framing
 
@@ -788,6 +813,18 @@ A device that holds an introduction code whose link hint ([data-layer.md](data-l
 A dial sends only what every link sends: the handshake and the hello (§5). The secret of a code never passes through it: the secret travels only inside the sealed ask (data-layer.md §19.3), over the link or any other path.
 
 A device with no listening socket dials from a socket the system picks; a device that listens dials from its link socket, so the other device sees one address for it. Addresses to dial are bounded and tried once per join; a dial that fails leaves nothing behind.
+
+### 13.4 Grants: threat notes
+
+A grant (§8.7) is host-supplied authority to *link*, never to read: what a link carries is what the layer above serves it, and the layer's own gating (the folder's members record, the epoch keys) still decides what is answered.
+
+- **No address, no name.** A grant is made for a key and consulted only against a key the handshake proved and a certificate that validates in a held namespace (offline, revocations and the namespace's link policy judged first, §7.1, §7.4). A stale or hostile address in a code's link hint (§13.3), a device name a code claims, or a name an Interest carries decides nothing: the worst such an address does is a failed dial.
+- **One key, its namespaces.** A person's other keys are not granted: a stolen second device does not link. The same key showing another namespace than the granted one (a membership, §5.8) links for the granted one only, and its other memberships' routes, presence and sync groups are not added. A device of a namespace this side does not hold, whose chain ends in a root its own hello carries, is never served by a grant: nothing proves that root.
+- **Never wider than the policy and the quotas.** A grant is consulted only where the policy declines the whole link, never under `open` (which already serves any held namespace, under quotas), and its links count against the quotas of the policy (or the defaults, §15.3): it cannot lift a quota, a revocation or a namespace's link policy. The reader's scope (§8.7 rule 5) is as narrow as the layer lets it be, not narrower: a reader's Interests, and the answers under its own device names.
+- **Ended grants close links.** A grant outliving the person's removal is closed by (a) the data layer's check on every held members record, which revokes it ([data-layer.md](data-layer.md) §19.8), (b) its expiry, judged on this side's clock at every admission and by one task that wakes at the earliest `until` (no polling), and (c) `revoke_grant`. A link whose only admission was the grant is closed with **0x19**, the sentence saying what ended and what to do; a link another rule admits is not.
+- **A leaked offer secret** gives the thief one use of the offer, and with it the grant for the thief's key and the person's namespace; the grant adds only the link, and ends with the membership.
+- **The host that calls `Links::grant` is trusted** as it is for a `PeerSpec`: the key it names links. A host with a link key other than the device's key (§8.7 rule 8) calls it itself.
+- **Memory is bounded.** The table holds the grants the host made, and the last 64 that ended (to name them in refusals); a refusal that names an ended grant says only what the grant's key already knows.
 
 ## 14. Direct paths
 
@@ -1172,6 +1209,194 @@ A woken device is expected to link (its host becomes active, or an Interest of i
 
 Sleeping devices and their held Interests live in the relay's memory only. A relay that restarts forgets them: every link with it ended, and a device registers again on its next link, since it sends its Reachability on every new link (§17.1). Until a device links again, the restarted relay has no route for it.
 
+## 17A. Link status
+
+*(Numbered 17A while the sections of round 6 are placed: SHAPES-R6 calls it §17, and §17–§18 are Reachability and Constants above. Nothing in it is on the wire.)*
+
+A host that shows its links (a status screen, a log) needs the state of each peer **as it changes**, not a poll of `Links::report` (§14.10, unchanged). `Links::watch()` gives it a `LinkWatch`: the state of every peer now, then each change.
+
+### 17A.1 The shape
+
+```rust
+pub enum Direction { Dialed, Accepted }                      // who made the link
+pub enum Next { Redialling { within: Duration }, WaitingForAddress, WhenWanted, Gone }
+pub enum LinkState {
+    Up   { direction: Direction, since: SystemTime },
+    Down { direction: Option<Direction>, why: LinkDetail, next: Next },
+}
+pub struct PeerLink { pub key: KeyFingerprint, pub device: Option<Name>, pub state: LinkState }
+impl Links     { pub fn watch(&self) -> LinkWatch }
+impl LinkWatch {
+    pub fn current(&self) -> Vec<PeerLink>;                  // the table now
+    pub async fn changed(&mut self) -> Option<Vec<PeerLink>>;
+}
+pub const LINK_STATES_MAX: usize = 256;
+```
+
+1. **Keyed by key.** A peer is its link key's fingerprint (§3.3). A peer is keyed when its key is known: a configured peer with an expected `key` from its first dial (a failed first dial is a `Down` state of that key); any other peer when its handshake shows the key. A dial that fails for a peer with no key known yet has no state to show. `device` is the device name of the identity the peer's certificates proved (§7.1), kept once known; a name only claimed (a code's link hint, a configured `device` the peer has not proved) is not shown.
+2. **Up.** An entry is `Up` from the moment a path of its link is admitted (§7.3), whichever side dialled it and whichever path (a link, or a direct path that is the only path). A direct path joining a link that is up changes nothing; a link that replaces another (§11) is `Up` again, with a new `since`, and never shows `Down` between.
+3. **Down.** An entry is `Down` when the last path of its link ended. `direction` is the lost link's (`None`: no link of the key was ever up here, as after a refused first dial). `why` is a `LinkDetail` (§14.10) of the close or of the failed dial, in plain words. The state is decided in one place per event and never overwrites a link that came up again meanwhile.
+4. **Next.** What this device does about a `Down` peer, as the decision is made where the device redials (§13.1):
+   - `Redialling { within }`: it dials again, within `within` (the backoff: `BACKOFF_FIRST` after a drop; the doubled wait after a failure; `BACKOFF_REFUSED` after a refusal, §13.1; zero when a link it closed must be made again at once);
+   - `WaitingForAddress`: the peer has no path to dial (it links in; the host or a relay gives an address later);
+   - `WhenWanted`: the peer is dialled when the link is wanted — the host asks, traffic waits for it, the relay is needed (§16.1, §16.2, §15.6) — and the link was closed here for that reason;
+   - `Gone`: this device does not dial it again: a peer entry that is not `persistent` and links `always` is dialled once (§13.1), a peer dialled by a code's key (§13.3) once, and a link no peer entry of this device expected is never dialled from this table.
+5. **Reasons.** `why` carries the codes of §14.10: `link-closed-by-peer` with the words the other device closed with (including its shutdown, "refused" and the reason it gave for a refusal, and an ended grant it closed for), `link-closed-here` with the words this device closed with (the mode turned the link off or to sleep, the host removed it, a more preferred relay, a grant ended or a member left), `link-timeout` or `link-connect` for a link or dial that went unanswered, `link-unexpected-key` for a dial that met another key, and the refusals of §7.3 as causes of those. A reason says what happened and what to do, in terms of no host.
+
+### 17A.2 Bounded, coalesced, no queue
+
+1. The table holds at most `LINK_STATES_MAX` = 256 peers. A peer beyond it takes the place of the entry longest unchanged among those that are `Down` with `next = Gone`; if none, among those `Down` for any other `next`; if none, among those `Up`. An entry given up this way is not reported.
+2. A watcher holds a **cursor**: the table's version when it last looked (a counter that grows with each change). It holds no queue of changes, so a watcher that never reads costs no memory and a slow watcher cannot grow it; wake-ups carry no data (a notification that something changed).
+3. The first `changed()` returns the whole table now, at once, even when empty: a watcher started late is told the state first. Each later call waits until a peer changed since the watcher last looked and returns exactly those peers, **one entry per peer, in its newest state**, the longest unchanged first. A peer that went down and up between two looks shows once, `Up`. A change that does not alter a peer's state (the same failure again with the same reason and `next`) is no change.
+4. `changed()` returns `None` once the `Links` are dropped or cancelled. `current()` is the table now, in the same order.
+
+### 17A.3 Hooks (non-normative)
+
+The state is written at four places and nowhere else: a link or direct path coming up (`establish`), the end of the last path of a link (the task that unregisters it), the dial loop's decision (`next`; a failed dial), and the dial by key's failure. An internal observer hook (`Links::observe`, crate-private) tells the link memory (SHAPES-R6 item 2) of each admitted path (key, device, the address it came from, direction, whether an identity admitted it) and of each loss; it is inline, not a queue, and persists nothing.
+
+### 17A.4 Threat notes
+
+- A watcher is the host's own code. It sees keys (public), device names (those the peer's certificates proved), directions, times and `why` texts. It never sees an address: socket addresses, IP addresses and `host:port` endpoints in a reason or in its facts are replaced by "an address" before the reason is recorded. Reasons are the sentences the link layer already writes for logs and reports (§14.10): they hold no key material, no token, no certificate and no secret.
+- The words of a peer's close are the peer's: a hostile peer chooses the text of its own `link-closed-by-peer` reason, which a host MUST show as text, never as markup or a command. Its length is bounded by the QUIC close frame.
+- The table is bounded (§17A.2), so peers cannot grow it by dialling with many keys, a code's hint naming many keys, or flapping; a flood of keys evicts the entries of dead peers before those of live links, and a live peer that was evicted is shown again by its next change.
+- No wire TLV is added or changed (the registry of §5.1 is unchanged).
+
+## 17B. The fault layer
+
+*(Numbered 17B while the sections of round 6 are placed: SHAPES-R6 calls it §18, and §18 is Constants above. Nothing in it is on the wire.)*
+
+The conformance's `--faulty` profile (drop, duplicate, forge, delay, reorder, block loss) is the network a host's faulty test suite must meet on its **real** links too. ndn-link carries a **test-only** fault layer for it: a wrapper on each link's face that applies a seeded profile to the packets arriving on it. **It is for tests only.** A build that has it says so (§17B.6), and it is kept out of shipped binaries (§17B.7).
+
+### 17B.1 The feature
+
+1. The layer MUST be compiled only with the cargo feature `fault-injection` of `ndn-link`. The feature MUST NOT be in `default`, MUST NOT be enabled by the default features of any other crate, and MUST be documented *for tests only*. A crate that needs it for a test asks for it as a dev-dependency feature or on the cargo command line (`cargo test -p ndn-link --features fault-injection`).
+2. Without the feature nothing of the layer exists in the build: no wrapper, no counters, no dependency (its one dependency, `ndn-faults`, is optional and pulled by the feature). `LinkReport::fault_injection: Option<FaultReport>` and the type `FaultReport` are in **every** build, so that a host's code does not change with the feature; the field is `None` without it.
+3. API (feature on): `FaultPlan { profile: Faults, pass: Option<FaultPass> }` (`FaultPlan::new(profile)`, `.only(predicate)`), `FaultFrame`, `FaultKind`, `Links::inject_faults(&self, FaultPlan)`, `Links::clear_faults(&self)`, and the profile type re-exported (`ndn_link::Faults`, `ndn_link::FAULTY`).
+
+### 17B.2 The profile, and its one definition
+
+1. The profile is `Faults`: `drop`, `dup`, `forge` (probabilities 0–1), `delay` (ms, a uniform hold of 0..=`delay`), `reorder` (probability of a further hold of `max(delay, 50)` ms), `blocks` (ms: a Data is held a further 0..=`blocks`), and `seed`. Its text form is comma-separated `key=value` pairs (`drop=0.2,dup=0.1,…`); `FAULTY` is the conformance's `drop=0.2,dup=0.1,forge=0.05,delay=400,reorder=0.1,blocks=1500`. A **Data** for `forge` and `blocks` is a frame carrying a whole Data, bare or as the fragment of an NDNLPv2 packet; a fragment of a larger Data, an Interest, a Nack and a link-service frame are not. A forged Data has one byte of its signature value flipped.
+2. The draws are a xorshift64 sequence per **link direction**, seeded from the profile's `seed` and the direction's two ends; each packet draws, in this order: drop; delay; reorder; (a Data) block hold; duplicate; (a Data) forgery. The same seed and the same packets on the same direction give the same fates.
+3. **One definition (result of the sharing check).** The profile, the draws, the text form, `FAULTY` and the frame reading live in the crate `ndn-faults` of ndn-rs (`crates/core/ndn-faults`; scope `extension`; its only runtime dependency is `bytes`; no tokio). The dependency-direction guard (`testbed/dep-direction-guard.py`) allows it — it constrains only what `spec` crates depend on, and no `spec` crate depends on `ndn-faults` — and `ndn-sim` (which re-exports it: `ndn_sim::Faults`, `ndn_sim::faults::…` are unchanged and bit-identical) and `ndn-link` (optionally, behind the feature) depend on it. So `--faulty` and the face wrapper share every draw; the sequence of `FAULTY` at seed 3 on the direction 1 → 2 is pinned in `ndn-faults` and, through the re-export, in `ndn-sim`. A `spec` crate that came to depend on `ndn-faults` would be refused by the guard (a spec crate may not depend on an `extension` crate): the profile is test support and MUST NOT enter the library closure.
+
+### 17B.3 Where, and when
+
+1. **On arrival, once.** The wrapper sits on the receive side of the face of each link (a link, or a direct path), between the QUIC datagram and the forwarder. Each packet the face yields meets the profile once: it is dropped, or delivered once or twice, after its delay, as the profile says. What this device sends is not faulted here: the other device's layer faults it when it arrives there, as the simulator faults what a node receives.
+2. **Only what crosses links.** The layer sees only link faces. The host's local faces (its applications, its management socket, the signalling and waiting faces of the library) are never wrapped. The link's own handshake and control messages (hello, verdict, presence, reachability; §4, §5) travel on the QUIC control stream, not through the face, and are never faulted.
+3. **Ends and determinism.** The draws of an arrival direction are `profile.stream(from, to)` with `from` = the first eight bytes, big-endian, of the sending device's key fingerprint (§3.3) and `to` = those of the receiving device's, so a device pair with fixed keys draws the same sequence in every run, and each direction its own. A link made again after a loss starts the sequence again.
+4. **Links already up and links made later.** `inject_faults` applies to **every** link of the `Links`, those already up included, from the next packet that arrives, and to every link made afterwards; every link's wrapper reads the plan the `Links` holds. It replaces an earlier plan, starts its counters at zero and its draws again; `clear_faults` ends it (packets already held are delivered at their time). Delays use tokio timers, so held packets overtake each other as the profile says. A link that ends delivers what the layer holds before the face reports the end.
+
+### 17B.4 The predicate
+
+1. A plan's `pass` is `Fn(&FaultFrame) -> bool + Send + Sync`: the profile applies to a packet only when it says yes (default: every packet). A packet it refuses is delivered at once, untouched, and counted as `passed`.
+2. `FaultFrame { direction, peer, kind, name, len }`: `direction` is which side opened the link (`Dialed` when this device did); `peer` the key of the device the packet came from; `kind` is `Interest`, `Data`, `Nack` or `Other` (a link-service frame with no network packet, a later fragment, bytes that are no packet); `name` the packet's name for the first three (of a fragmented packet, the first fragment's; a Nack carries its Interest's); `len` the frame's length as it crossed the link. A host that wants "the versions of the first collection, while a file exists" says it here; ndn-link knows no file.
+3. The predicate runs on the link's receive path: it SHOULD be short and MUST NOT block. A predicate that **panics** does not end the link's receive task: the panic is caught, the packet is delivered untouched, and the report counts it (`predicate_panics`) — the layer fails open and says so.
+
+### 17B.5 A forged packet is still refused
+
+The layer only flips a byte of a Data's signature value; it never signs, never adds a certificate and never touches a name or content. A consumer that validates (a data-layer device, `Unverified::verify`) MUST refuse the packet it forged, and a forwarder that validates drops it. The conformance case demonstrates it through a real link, with a consumer that does not validate as the control that the packet really was forged.
+
+### 17B.6 The notice and the report
+
+1. `Links::start` of a build with the feature MUST log, at `warn`, once: "ndn-link was built with `fault-injection`: it can drop, duplicate, forge and delay packets; this is for tests and must not be in a production build"; `inject_faults` logs a `warn` with the profile.
+2. `LinkReport::fault_injection` is `Some(FaultReport)` in a build with the feature (even with no plan installed: `profile: None`), `None` otherwise. `FaultReport { profile (the text form), met, dropped, duplicated, forged, delayed, passed, predicate_panics }`: `met` counts the packets that arrived and met the profile (no predicate, or the predicate chose them), and `dropped`, `duplicated`, `forged`, `delayed` count what the profile did to them; `passed` counts those the predicate left alone. The counters are those of the installed plan, over all links.
+
+### 17B.7 Keeping it out of production
+
+`tools/check-shipped-features.sh` (workspace root) lists `fault-injection` among the **forbidden features** and fails when (1) any `Cargo.toml` but ndn-link's own declares or enables it outside `[dev-dependencies]`, or (2) the resolved feature graph of a shipped package (the forwarder binary `ndn-fwd`, the mobile library `ndn-boltffi`), by default features or `--all-features`, with no dev edges, holds it. (`--forbidden-only` runs just these checks; they need no build.) The script's `ndn-ext: all-features` build does turn the feature on, as a compile check of the crate, not as a shipped artifact.
+
+### 17B.8 Threat notes
+
+- **In a production binary by accident.** The feature is off by default, no crate default-features it, a build that has it logs a warning at every start and says so in `Links::report()` (a host SHOULD show the field, and MAY refuse to run when it is `Some`), and the guard of §17B.7 fails a shipped graph that holds it. A plan still has to be installed by host code: the compiled-in layer touches nothing until `inject_faults`.
+- **A predicate that panics or is slow.** A panic is caught and fails open (§17B.4); a slow predicate delays that link's receive path (and so its packets): it is the host's test code, bounded by its own discipline, and no part of the layer waits for it elsewhere.
+- **Only what crosses links.** The layer wraps link faces only: it cannot fault a host's local faces, the control stream or the handshake, so it cannot make a link admit a device it would refuse, nor change who a link's peer is (admission is §7 and is unchanged); it only perturbs the NDN packets that arrive after admission.
+- **It adds no capability.** A forged Data is refused by validation (§17B.5); a dropped, duplicated or delayed packet is what the network already does. Held packets are bounded by the profile's delay, not unbounded: a profile with a large `delay` or `blocks` and a fast sender holds memory in proportion; test profiles keep them small.
+- No wire TLV is added or changed (the registry of §5.1 is unchanged).
+
+## 17C. Link memory
+
+*(Numbered 17C like §17A and §17B: SHAPES-R6 calls it §16, which is Link modes above. Nothing in it is on the wire: no TLV is registered or changed, and the registry of §5.1 is unchanged. Every record here is local to a device.)*
+
+A device that restarts has lost what it learned of its peers: who they were, and where they were reached. A host that wants them back keeps a list, or a relay brings them. **Link memory** keeps, in a store the host gives, what the links themselves learned — each peer's key, its device and the addresses that worked — and dials the peers again from it: no peer entry, no relay, no list of the host's. It is **a hint to dial, never a reason to admit**: what a record says is checked again by the handshake and by admission (§7) at every dial, and nothing in the store admits anyone.
+
+### 17C.1 The shape
+
+```rust
+pub trait LinkMemory: Send + Sync {
+    fn load(&self) -> Result<Vec<PeerRecord>, String>;                                   // sync, at start
+    fn save<'a>(&'a self, r: &'a PeerRecord) -> MemoryFuture<'a, Result<(), String>>;    // returns once durable
+    fn remove<'a>(&'a self, k: &'a KeyFingerprint) -> MemoryFuture<'a, Result<(), String>>;
+}
+pub struct PeerRecord {
+    pub key: KeyFingerprint,        // the key the peer proves in the handshake
+    pub device: Name,               // the device it proved to be, in a namespace this device held
+    pub addresses: Vec<SocketAddr>, // most recent first, at most addresses_max: hints
+    pub last_contact: SystemTime,
+    pub origin: Direction,          // who FIRST made the link: Dialed | Accepted (§17A.1)
+}
+pub struct MemoryOptions {
+    pub peers_max: usize,           // 64: one more evicts the peer least recently in contact
+    pub addresses_max: usize,       // 4
+    pub expires: Duration,          // 30 days without contact
+    pub redial: Backoff,            // the dial backoff (§13.1) by default
+}
+impl Links {
+    pub fn remember(self: &Arc<Self>, memory: Arc<dyn LinkMemory>, options: MemoryOptions);
+    pub async fn forget(&self, key: &KeyFingerprint);
+}
+pub struct MemoryReport { pub peers: Vec<RememberedPeer>, pub store_error: Option<String> }   // LinkReport::memory
+```
+
+`MemoryFuture` is a boxed, `Send` future (the crate takes no async-trait or futures dependency). `PeerSpec` gains one field, `remembered: bool` (false by default), which only the link memory sets (§17C.4). `Links::remember` is called once; a second call is ignored and logs that it was.
+
+### 17C.2 The rules
+
+1. **The key is authenticated and an address is a hint.** A record is made only for a link that an **identity validated in a namespace this device holds** admitted (§7.3): not an enrollment link or an introduction link (§8), not a link admitted by the expected key alone, not a direct path, not a peer the host's `LinkSetup` or `add_peer` lists, not a relay a namespace advertises (§15.5). The record keeps what worked: the address dialled, or, for a link the peer opened, the address it came from (a hint only: a dial-only device's source port is of no use, and costs one failed dial). A redial pins the key in the handshake (§3.4, §13.3: it accepts only the holder of the key): an address answered by another key is no link and costs a failed dial.
+2. **Redial in the background**, at `remember` and after each loss, with `MemoryOptions::redial`: the handshakes to every address of the record at once (at most `addresses_max`), as §13.3. A peer with **no address** is *waiting for a new address* (`RememberedState::WaitingForAddress`, `Next::WaitingForAddress`, §17A.1); it learns one at the next contact — the peer dials in, a relay reports it — and dials it then. A peer that is linked is not dialled; when its link ends, the loop waits the first backoff and dials again. A dial that fails waits the doubling backoff; the refusal wait of §13.1 is not distinguished (a record's dial is bounded by the backoff either way).
+3. **Not redialled when no held context admits it.** A record's peer is dialled, and a contact is remembered, only when **both** hold:
+   - the record's **device is under a namespace this device holds** (`Keyring::held_for`, §7.1);
+   - and this device may link with the peer by its own rules: a peer it dialled itself (`origin = Dialed`) in a held namespace; or a peer that dialled in (`origin = Accepted`) that is a device of a namespace this device holds a certificate in (the serving policy `own` serves it, §15.2), **or** a person this device introduced, **only while a live grant covers its key** (§8.7: `Links::grants`).
+
+   A record that fails this is **not dialled and not admitted**: it says why in the report (`RememberedState::NotDialled { why }`, in words that say what to do), is looked at again when a trust context is adopted or a grant is made, and is dropped at expiry (rule 5). The `origin` is that of the **first** contact and is never changed by a later one, so a peer that dialled in cannot become a peer this device dialled.
+4. **A remembered peer is never admitted by its key alone.** The expected-key path of a `PeerSpec` (§7.3 rule 7) is for hosts that list peers. The entry the redial dials as has `remembered = true`, and then: (a) its `key` pins the dial and a different key is refused (`not-expected-key`); (b) it is admitted **only as an identified device** — a certificate that validates in a namespace this device holds, proves the record's `device` (else `not-expected-device`) and passes that namespace's link policy and any revocation; a hello with no usable certificate, or one whose namespace is not held, is refused (`expected-device-unconfirmed`, saying so and what to do), never admitted by the key, and never as an enrollment link; (c) it is a peer entry **only for the dial this device made**: a link that came in with the same key is judged as any stranger's, by the serving policy and the grants (§15.2, §8.7), so a record never makes the serving policy more permissive. A member who was removed and still holds its key is therefore refused by the rules of rule 3, and by the other device's rules when the removal is the other device's.
+5. **Bounds and expiry are `MemoryOptions`.** At most `peers_max` records (a new peer past it evicts the one least recently in contact, and removes it from the store) and `addresses_max` addresses each (most recent first; an address already held moves to the front). A record with no contact for `expires` is removed at the next prune, which runs at start (a record already expired is never dialled) and after each write; **a peer whose link is up is in contact**, and is never pruned. `Links::forget(key)` is how a host says a member left: the record is removed from memory and **from the store before it returns** (`LinkMemory::remove` returned), its redial stops, its addresses are dropped; a link already up **stays up** while a held context admits it (the layer, not this call, ends the links of removed members: §8.7, §12). A peer that links in again is remembered again.
+6. **Durability.** A record is saved after a contact **once something the store should hold changed**: a new peer, another address list or device name, or a `last_contact` that the store's is a quarter of `expires` behind (so a peer that is always in contact does not expire at a restart, and the store is not written at every link). Saves are written **in the background, one store operation at a time** (a save never lands after the removal that follows it, and a save reads the record when the store is its turn, so a removal that came first is never undone); **nothing waits on the store**, and `Links::shutdown` writes what is owed first. A store that fails (on load, save or remove) is logged and shown in `LinkReport::memory.store_error` in words; the links work without it, and what is learned stays in memory until the store works again.
+
+### 17C.3 What a contact is
+
+The memory subscribes to the links' events (§17A.3). **An address is learned** when a path of a link is admitted (`Up`) with these all true: it is a link, not a direct path; an identity admitted it; the peer's device is known from that identity; the peer is not one the host lists or a namespace relay (a peer this device dialled by a code's hint, §13.3, and the memory's own redials are *not* host-listed: the join's identified link is how a joiner learns its inviter); and rule 3 holds for the contact (with the record's `origin`, else the link's direction). A contact is also noted when a link **ends** (`last_contact`), and while a link is up every `expires / 8`. Addresses are IPv4-mapped IPv6 addresses shown as IPv4, and an address with port 0, unspecified or multicast is not kept. A record loaded from the store is cleaned the same way, its addresses cut to `addresses_max`, the newest of two records of one key kept, and the records beyond `peers_max` (the least recent) and those expired are dropped and removed from the store.
+
+### 17C.4 The device's store (`DeviceMemory`)
+
+With the cargo feature `introductions`, `DeviceMemory::new(&device)` keeps one record per key in the data layer device's **local notes** (data-layer.md §19.9), area `link-memory`, key the peer's key fingerprint in 64 lowercase hex digits. The value, version 1, big-endian:
+
+| octets | |
+|---|---|
+| 1 | version `1` |
+| 1 | origin: `0` this device dialled, `1` the peer dialled in |
+| 8 | last contact, seconds since the Unix epoch |
+| 32 | the key fingerprint |
+| 2 + *n* | the device name as a Name TLV, *n* octets |
+| 1 + … | address count (≤ 255), then each: `4` or `6`, the address (4 or 16 octets), the port (2) |
+
+A reader MUST refuse, without panicking, a value that is another version, ends short, has octets after the last address, has a bad origin or address family, a time that does not fit, or a name that is not a Name; the record is **dropped**, and so is a record whose key is not the one its note is named by (a record is only ever read as the key it names). The notes that cannot be read are removed from the store, behind. A device's notes are written behind the device's store barrier (`put` returns once it passed), so a record saved survives a power loss; it lives in the device's own store and is never served, announced or trusted.
+
+### 17C.5 The report
+
+`LinkReport::memory` is `None` until `remember` is called, then `Some(MemoryReport { peers, store_error })`: each remembered peer's record and what this device does about it (`Linked`, `Dialling`, `Redialling { within }`, `WaitingForAddress`, `NotDialled { why }`), most recently in contact first. The entries the redials keep as peers (rule 4) also appear among `links` like any peer entry, labelled with the device name.
+
+### 17C.6 Threat notes
+
+- **Stale or hostile addresses.** An address in a record is where to try, nothing more. The handshake accepts only the holder of the key (§3.4), so an address that another key answers at costs **a failed dial and no link**, and that device learns of this device only the TLS handshake of a dial it cannot complete. The cost is bounded: at most `addresses_max` dials per peer per attempt, in one race of `MESSAGE_DEADLINE`, under the backoff of `MemoryOptions::redial` (default 500 ms doubling to 30 s). A peer that opened a link chooses the address a record keeps for it (its source address): a hostile peer can make this device dial an address of its choosing, once per attempt, with a handshake expecting that peer's own key (a reflection of at most `addresses_max` handshakes per backoff step; the address list is bounded and a record is made only for a peer that an identity in a held namespace admitted).
+- **Persistence of a removed peer.** A record outlives the peer's membership: a removed member's key is still in the store. It cannot link it back: rule 3 refuses to dial it once no held context or live grant covers it (a grant ends with the members record, §8.7), and rule 4 refuses to admit it by its key whoever dials. The record is dropped at expiry, or at once by `forget`; a host that removes a member SHOULD call `forget`.
+- **A tampered store.** The store holds keys (public), device names and addresses: nothing secret. A party with write access to a device's local store already holds the device. What it can do: add addresses (failed dials, bounded as above), add or change keys and devices — the handshake then proves the key and rules 3 and 4 decide, so a planted record admits no one and dials only a device a held context admits; change `origin` from `Accepted` to `Dialed` — which lets this device dial a peer in a held namespace that dialled it first: a dial, still admitted only as an identified device. Garbage is dropped (§17C.4). The store is not integrity-protected by this crate; a host that needs that gives a `LinkMemory` that is.
+- **A flood of peers.** `peers_max` bounds the records, and a record is made only for a peer a held namespace's identity admitted *and* that rule 3 lets this device dial (an open relay does not fill its memory with strangers: a device of a held namespace it is not in, with no grant, is not remembered).
+- **Redial storms.** One loop per record, so at most `peers_max` loops; each waits its backoff; a link that comes up and is gone at once waits too.
+
+### 17C.7 Conformance cases
+
+`tests/memory.rs` (real QUIC, real forwarders, real data-layer devices): two hosts joined by a code restart over their stores and keyrings and link and sync again with no relay, no peer entry and no list (Bob redials Ann from his device's notes; Ann accepts him by the grant her device re-derives); a fresh record is dialled at start and linked as an identified device; an expired record is not dialled and is removed; `forget` removes durably and ends the redial; a record whose namespace is not held is not dialled until it is; an address another key answers at is a failed dial and no link; a peer with no address waits and learns one when the peer dials in; a remembered peer whose grant was revoked is refused saying so and the inviter does not dial it; a removed member's remembered key is refused, also after a restart; notes that are not records are dropped. Unit tests of admission (`a_remembered_peer_is_never_admitted_by_its_key_alone`, and its siblings) pin rule 4 against the same entry listed by a host, which is admitted by its key.
+
 ## 18. Constants
 
 | Name | Value | Section |
@@ -1216,6 +1441,9 @@ Sleeping devices and their held Interests live in the relay's memory only. A rel
 | `HoldLimits` default | 64 per device, 4096 in total, 60 s | §17.3 |
 | `asleep_max` default | 24 h | §17.2 |
 | `WAKE_INTERVAL` | 30 s | §17.4 |
+| `LINK_STATES_MAX` | 256 peers in the status table | §17A.2 |
+| `MemoryOptions` default | 64 peers, 4 addresses each, expire after 30 days without contact, redial with the dial backoff | §17C.1 |
+| link memory record | version 1, 32-octet key, ≤ 255 addresses | §17C.4 |
 
 ## 19. Test vectors
 
@@ -1545,6 +1773,7 @@ These points were open when this spec was first written. Each was decided, and c
 33. **A relay carries a served namespace's sync group and chain** (§10, §15.7). A community relay needs nothing per person: holding the trust contexts of the people it carries would be a setup step for each of them. So a served device's link routes its namespace's group like a held one's, and while the namespace is in transit the relay runs the group with the multicast strategy, as a forwarder holding it would. The strategy is an ordinary choice made by the host's library that knows the namespace is carried; the forwarder treats no name specially. It stays for a namespace the relay holds, whose trust-context library chose it. A relay holding a namespace validates its Data, fetching and caching the chain; a relay carrying it in transit does neither, so the served device's link routes the key names of the issuers its hello showed, and consumers fetch the chain from the device. A namespace-wide route was the alternative; it would send every Interest under the namespace to whichever served device the strategy picks.
 34. **A followed namespace is routed at once; a relay is reachable by its name** (§10, §15.5). Two people who meet by an introduction code adopt each other's trust context while linked: routing a namespace followed later only from the next link path to the relay left them unreachable until a relink nobody asks for. The routes of a link path therefore follow the keyring on every adoption, as revocations already did (§12). Before adopting, a device reaches the other only by naming a relay both use, in a ForwardingHint: the generic NDN mechanism, with the relay's own name routed over its link and each forwarder stripping a hint that names one of its own device names or a name under one; the alternative — a route per namespace announced by the relay — would make a community relay keep state per person (§15.5 "What the relay needs"). The device names are not NFD producer regions: under NFD's rule a hint naming an ancestor of a region has reached it, so a hint `<ns>` toward the namespace's CA (a renewal's certificate fetch) was stripped at the renewing device itself, which then had no route for its own new certificate.
 35. **A stranger gets an introduction link, and the dial is by key** (§7.3 rule 8, §8.6, §13.3). An embedded device with no daemon has no relay and no route to a stranger, yet an introduction needs a path to the inviter's device before either side trusts the other. The alternative — a peer entry for every possible joiner, or an unauthenticated listener — would make the inviter either unreachable or open: the introduction link is open to the one exchange only, within the enrollment links' slots and rates, and carries nothing a stranger could not ask of the device by name. The key in the code authenticates the inviter (the handshake proves it); the addresses are only where to try (data-layer.md §19.7). Every address is tried at once so one dead address costs no more than the handshake timeout, and the first link whose handshake proved the key wins.
+36. **The grant is the tighter choice, and it is consulted only where the policy declines** (§8.7). An inviter keeping `own` still links with the one person it introduced: the grant names a key and the namespaces it may link as, ends with its date, a revocation or the person's removal, and never widens the policy, the quotas, a revocation or a namespace's link policy; under `open` it changes nothing. The round-4 advice to choose `open` or `listed` is withdrawn. A reader's link carries Interests and the answers under its own device names, not Interests alone: the layer fetches a reader's certificates and its seal by name (§8.7 rule 5).
 
 ## Appendix A. Code references (non-normative)
 
