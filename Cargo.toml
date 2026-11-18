@@ -10,6 +10,7 @@ members = [
     "crates/core/ndn-signals-core",
     "crates/core/ndn-time",
     "crates/core/ndn-ble-framing",
+    "crates/core/ndn-faults",
     "crates/core/ndn-mgmt-wire",
     "crates/core/ndn-transport",
     "crates/forwarding/ndn-store",
@@ -54,6 +55,7 @@ default-members = [
     "crates/core/ndn-signals-core",
     "crates/core/ndn-time",
     "crates/core/ndn-ble-framing",
+    "crates/core/ndn-faults",
     "crates/core/ndn-mgmt-wire",
     "crates/core/ndn-transport",
     "crates/forwarding/ndn-store",
@@ -120,6 +122,7 @@ ndn-crypto-core = { path = "crates/core/ndn-crypto-core" }
 ndn-signals-core = { path = "crates/core/ndn-signals-core", default-features = false }
 ndn-time      = { path = "crates/core/ndn-time", default-features = false }
 ndn-ble-framing = { path = "crates/core/ndn-ble-framing" }
+ndn-faults   = { path = "crates/core/ndn-faults" }
 ndn-mgmt-wire = { path = "crates/core/ndn-mgmt-wire" }
 ndn-transport = { path = "crates/core/ndn-transport" }
 ndn-store     = { path = "crates/forwarding/ndn-store" }

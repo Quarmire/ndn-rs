@@ -1,0 +1,27 @@
+[package]
+name = "ndn-faults"
+description = "The seeded fault profile (drop, duplicate, forge, delay, reorder, block loss) shared by the simulator's conformance --faulty runs and ndn-link's test-only fault layer: one definition, one deterministic draw sequence. For tests only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.scope]
+# Test support with no NDN spec basis: not in the library closure. Nothing in
+# the `spec` set depends on it (the dep-direction guard would refuse); its one
+# runtime dependency is `bytes`.
+classification = "extension"
+
+[dependencies]
+bytes = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# Unit tests build real Data, Interest and NDNLPv2 frames.
+ndn-packet = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

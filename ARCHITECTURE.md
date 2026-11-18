@@ -104,6 +104,7 @@ scope = spec        NDN community specs implemented faithfully
 
 scope = extension   Pragmatic engineering, no NDN spec basis
   ndn-runtime                   Spawn/Sleep/Now trait abstraction; TokioRuntime / WasmRuntime
+  ndn-faults                    Seeded fault profile (drop/dup/forge/delay/reorder/block loss) shared by ndn-sim's conformance `--faulty` runs and ndn-link's test-only `fault-injection` layer; leaf, only `bytes`; for tests only
   ndn-acme                      ACME (RFC 8555) DNS-01 for the WT listener
   ndn-config                    TOML config + NFD management protocol
   ndn-pib-idb                   IndexedDB-backed PIB (browser persistence)

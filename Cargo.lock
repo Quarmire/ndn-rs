@@ -1855,6 +1855,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndn-faults"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ndn-packet",
+]
+
+[[package]]
 name = "ndn-foundation-types"
 version = "0.1.0"
 dependencies = [
