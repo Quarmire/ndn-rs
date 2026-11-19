@@ -5478,14 +5478,19 @@ appears: the member asking again is answered, another key is refused
 `Closed`, and after the offer's expiry the member is refused `Expired`),
 i15 (round 6, §19.8: an offer's admission tells the inviter's host of one
 grant naming the admitted key, the asker's namespace, the folder and the
-offer's role, ending `grant_for` on; `Device::grants` lists it; the same key
+offer's role, with no date; `Device::grants` lists it; the same key
 asking again, another key refused, a code forged without its secret, and a
-host whose policy has `grant_for` zero tell the host nothing and move no
-end) and i16 (round 6, §19.8: a held members record signed by another
+host whose policy has `grant_for` `Some(ZERO)` tell the host nothing and move
+no end), i16 (round 6, §19.8: a held members record signed by another
 device of the inviter's person that leaves a granted person out ends that
 grant, once, and the other person's stays; after a restart of the inviter
 `Device::grants` lists the same grants less the ended, and the host is told
-nothing again). Their feature is `Introduction`; their provider surface is
+nothing again) and i17 (round 6, §19.8 rule 6: a held record signed by
+another device that demotes a granted writer to a reader changes the grant:
+`Device::grants` lists it as a reader's, the host is told it again, once,
+with the reader's role and never that it ended, and after a restart the
+grant is the reader's and the host is told nothing again). Their feature is
+`Introduction`; their provider surface is
 `Provider::link_grants` and `Provider::link_key`, and a plan may give a
 device a policy of no grants (`Plan::no_link_grants`).
 `ndn-data`'s `intro.rs` unit tests check the records, asks and answers
@@ -5499,11 +5504,19 @@ user too, and that asks past `asks_queued` get no answer at once; and the
 grant (§19.8): one grant per admission for the admitted key with the
 asker's namespace and the offer's role (writer and reader), none for a
 retry (its end not moved), for any ask refused or not completed, or with
-`grant_for` zero (no note kept); a grant past its time is not in force and
-is not announced as revoked; a held record that leaves the person out —
-signed by this device or by another device of the inviter's person — ends
-the grant once, durably, with the other person's grant standing, across a
-restart, and a person readmitted by a later record is not granted again.
+`grant_for` `Some(ZERO)` (no note kept); a grant with no date (the default)
+outlasts the clock and follows the record, and one with a date is not in force
+past it and is not announced as revoked; a held record that leaves the
+person out — signed by this device or by another device of the inviter's
+person — ends the grant once, durably, with the other person's grant
+standing, across a restart, and a person readmitted by a later record is not
+granted again; the host's `end_grant` and `renew_grant` are durable across a
+restart (a renewal only of a grant a held record admits, to a date after the
+clock); a note changed in the store (the `ended` flag cleared, a date
+extended or removed) fails its MAC and is not read, so no grant is
+resurrected; a writer demoted to a reader is granted as a reader at once and
+the host told again once; and the host is told of an end before it is
+durable (a frozen disk does not delay it).
 
 Answers: cases `a1`–`a18` (answers.md §14); case `c12` is rewritten over a
 provider answer.
@@ -6198,19 +6211,23 @@ X25519-to-ChaCha20-Poly1305 wrap.
   the epoch keys still decide what a link is answered, so a grant never
   widens what the person reads or writes. A leaked code gives its thief the
   one use, and so the membership, whoever uses it first; the grant adds the
-  link of that key, and ends with the membership (a removal) or by its time.
-  A grant names one key: a person's other keys, including a stolen second
-  device, have none, and the same key presenting another namespace is not
-  granted it (the grant lists the asker's namespace alone). A grant that
-  outlives a removal is closed three ways: the check on every members record
-  held, whoever signed it (the removal need not come from the offering
-  device); its time; `Introducer::revoke_grant`. A removal whose record this
-  device has not yet taken leaves the person linked until it is taken, and
-  at most until the grant's time (`grant_for`, 90 days by default; shorten it
-  where that is too long). A grant is never
-  made for an ask refused, for a retry or when the policy makes none, and no
-  grant is made from an address or a name: only the asker's key that the
-  exchange proved.
+  link of that key, and ends with the membership (a removal), by the host's
+  end, or by its date if one is set (by default none). A grant names one
+  key: a person's other keys, including a stolen second device, have none,
+  and the same key presenting another namespace is not granted it (the grant
+  lists the asker's namespace alone). A grant that outlives a removal is
+  closed three ways: the check on every members record held, whoever signed
+  it (the removal need not come from the offering device); its date;
+  `Introducer::revoke_grant`, called before the end is durable. A removal
+  whose record this device has not yet taken leaves the person linked until
+  it is taken (and, with a `grant_for` set, at most until the date). The
+  grant's role is re-derived from the record in force, so a demotion narrows
+  it at once. The grant note is MAC'd under a key from the device's recipient
+  secret: a writer of the data store alone cannot clear its `ended` flag or
+  extend it; rollback to an older genuine copy is bounded by the record and
+  the use mark (§19.8 rule 11). A grant is never made for an ask refused,
+  for a retry or when the policy makes none, and no grant is made from an
+  address or a name: only the asker's key that the exchange proved.
 
 ### 19.8 Grants — round 6
 
@@ -6220,22 +6237,29 @@ the narrow policy (serve devices of the namespaces it holds a certificate
 in) still links with the one person it admitted and with no other it merely
 holds a context of. The link layer is the host's (ndn-link.md §8.7); the
 device only tells it, durably, whom. A **grant** says: the device holding
-link key `K` may link, as a person of namespace `N`, until `U`.
+link key `K` may link, as a person of namespace `N`, in the role `R` the
+folder's members record in force gives it, for as long as that record admits
+it — and, only if a date `U` is set, until `U`.
 
 ```rust
 pub struct Grant {
     pub key: [u8; 32],         // the asker key's public-key digest
     pub namespaces: Vec<Name>, // the asker's namespace, as the join adopted it
     pub folder: Name,          // what the offer admitted it to
-    pub role: Role,            // the offer's role
-    pub until: Timestamp,      // the inviter's clock
+    pub role: Role,            // the role the record in force gives it NOW
+    pub until: Option<Timestamp>, // the inviter's clock; None: no date
 }
 trait Introducer {
     fn grant(&self, grant: &Grant) {}          // default: nothing
     fn revoke_grant(&self, key: &[u8; 32]) {}  // default: nothing
 }
-IntroPolicy { grant_for: Duration /* 90 days; ZERO: none */, .. }
+IntroPolicy { grant_for: Option<Duration>
+    /* None (default): no date; Some(d): also ends d after the admission;
+       Some(ZERO): no grant is made */, .. }
 Device::grants(&self) -> Vec<Grant>
+Device::end_grant(&self, key: &[u8; 32]) -> Result<bool, DataError>             // async
+Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
+    -> Result<Option<Grant>, DataError>                                       // async
 ```
 
 1. **When it is made.** A device MUST make a grant when it answers an ask
@@ -6244,26 +6268,36 @@ Device::grants(&self) -> Vec<Grant>
    and as the same durable step that keeps the acceptance and signs the use
    mark. It MUST NOT make one for an ask refused for any reason, for an ask
    whose use fails before the mark (the offer is not spent, §19.4), or when
-   `IntroPolicy::grant_for` is zero (nothing is kept, nothing is told).
-2. **What it names.** The key is the public-key digest of the asker's key
-   as the exchange proved it (§19.4 steps 5–9); `namespaces` is the one
-   namespace the join adopted (never one the asker merely claims over
-   another); `folder` and `role` are the offer's; `until` is the device's
-   clock when it answered plus `grant_for`.
+   `IntroPolicy::grant_for` is `Some(Duration::ZERO)` (nothing is kept,
+   nothing is told).
+2. **What it names, and its date.** The key is the public-key digest of the
+   asker's key as the exchange proved it (§19.4 steps 5–9); `namespaces` is
+   the one namespace the join adopted (never one the asker merely claims over
+   another); `folder` is the offer's; `role` is the offer's at the admission
+   and, from then on, whatever the members record in force makes of the
+   namespace (rule 6). **By default a grant has no date** (`grant_for`
+   `None`, `until` `None`): it follows the members record, lasting while a
+   held record admits the person and ending when one leaves them out, so
+   removal is the control and there is no day on which every link silently
+   stops. `Some(d)` bounds it as well: its `until` is the device's clock when
+   it answered plus `d`, and the host may [renew](#renew) it (rule 10).
 3. **Durable before the answer, told after.** The device keeps a grant note
    under `/localhost/ndn-data/intro/grant/<offer's Name TLV>` in its local
    store: the offer, the key's digest, the namespace, the folder, the role,
-   `until` and whether it ended. The note is written with the acceptance
-   under the barrier the use mark waits for, so a durable use mark means a
-   durable note; the device then calls `Introducer::grant` once, and only
-   then sends the answer. A note is the device's own and never served or
-   published. **No TLV-TYPE is registered or used for it:** its value is a
-   fixed-width local form (a version octet, flags, the role, `until` and the
-   key digest, then three length-prefixed Names), like the other notes
-   under `/localhost/ndn-data/intro/`. A note this version does not read is
-   ignored.
+   whether it has a date and `until`, whether it ended, and a MAC (rule 11).
+   The note is written with the acceptance under the barrier the use mark
+   waits for, so a durable use mark means a durable note; the device then
+   calls `Introducer::grant` once, and only then sends the answer. A note is
+   the device's own and never served or published. **No TLV-TYPE is
+   registered or used for it:** its value is a fixed-width local form (a
+   version octet (2), flags (ended, dated), the role, `until`, the key
+   digest, three length-prefixed Names, then the 32-octet MAC), like the
+   other notes under `/localhost/ndn-data/intro/`. A note this version does
+   not read, or whose MAC does not check, is ignored, and the device logs
+   which and why (a person whose note is ignored has no grant: offer the
+   folder to them again).
 4. **A retry grants nothing.** An asker answered again (§19.4 step 4: the
-   acceptance kept) MUST NOT be granted again and its `until` MUST NOT move,
+   acceptance kept) MUST NOT be granted again and its date MUST NOT move,
    however many times it asks and after any restart or close of the offer.
    Another key presenting a used offer is refused and granted nothing.
 5. **Never wider.** A grant informs; it MUST NOT change what the members
@@ -6273,33 +6307,86 @@ Device::grants(&self) -> Vec<Grant>
    more. The host MUST use a grant only to link with the named key as a
    person of the named namespaces, never for the person's other keys or
    namespaces.
-6. **In force.** [`Device::grants`] lists the grants whose offer this device
-   made and used by the very key the note names, that have not ended, whose
-   `until` has not passed by the device's clock, and whose folder's members
-   record in force (as held) lists the namespace as a writer or as a reader.
-   It is derived from the notes and the records held, so it is the same
-   after a restart, less what ended. While no record of the folder is held
-   no grant is in force. A host that links installs the grants at start and
-   after each restart (the device does not call `grant` again by itself).
-7. **It ends** at `until` (the link layer judges it by its own clock; the
-   device does not announce a lapse), or when a members record held for the
-   grant's folder leaves the namespace out as both writer and reader. The
-   device checks this on every record it takes for a folder, and at start,
-   whoever of the folder's owner namespace signed it, not only the offering
-   device. It MUST then mark the note ended durably, and only after that
-   call `Introducer::revoke_grant` once with the key: a stop in between
-   leaves a note that is ended and a host that is told no more, never one
-   told twice. An ended grant never returns: a person readmitted by a later
-   record is no longer granted by the old offer (they join again with a new
-   code). A record that drops the person also closes the offers that
-   person used (§19.7).
+6. **In force, in the role the record gives.** [`Device::grants`] lists the
+   grants whose offer this device made and used by the very key the note
+   names, that have not ended, whose date (if it has one) has not passed by
+   the device's clock, and whose folder's members record in force (as held)
+   lists the namespace as a writer or as a reader. Its `role` is **derived
+   from that record at every call**: a writer if the record lists the
+   namespace as a writer, else a reader — never the role the offer had. When
+   a record taken changes the role of a grant, the device updates the note
+   durably and calls `Introducer::grant` again with the grant as it now
+   stands (the host replaces its grant; ndn-link closes a link made under
+   the old scope); a writer demoted to a reader is a reader at once, not at
+   the grant's end. It is derived from the notes and the records held, so it
+   is the same after a restart, less what ended. While no record of the
+   folder is held no grant is in force. A host that links installs the grants
+   at start and after each restart (the device does not call `grant` again
+   by itself for a grant whose role did not change).
+7. **It ends** at its date, if it has one (the link layer judges it by its
+   own clock; the device does not announce a lapse), when the host ends it
+   (rule 9), or when a members record held for the grant's folder leaves the
+   namespace out as both writer and reader. The device checks this on every
+   record it takes for a folder, and at start, whoever of the folder's owner
+   namespace signed it, not only the offering device. It MUST then call
+   `Introducer::revoke_grant` once with the key **first** — in memory, and
+   the safe direction, so that a slow or failing flush never delays the link
+   layer's end — and only then mark the note ended durably: a stop in
+   between leaves a note not yet ended, which the next start judges again
+   (the host revokes again, harmlessly), never a link that outlives its
+   removal for want of a flush. An ended grant never returns: a person
+   readmitted by a later record is no longer granted by the old offer (they
+   join again with a new code). A record that drops the person also closes
+   the offers that person used (§19.7).
 8. **The host's part.** `grant` and `revoke_grant` are called from the
    device's tasks and MUST NOT block or call back into the device. A host
    whose link key is not the key the device knows (the asker's *device* key)
    adopts the grant itself with the link key it knows. A host with no link
    layer ignores both.
-9. **Faulty networks.** A lost answer is the joiner's retry (rule 4); a
-   grant is made once per admission, on a clean or a faulty network.
+9. **The host ends a grant.** `Device::end_grant(key)` marks every grant
+   note of that key not yet ended as ended, durably (behind the store
+   barrier, before it returns), so a restart does not bring it back; it
+   returns `true` if there was one not yet ended (past its date or not),
+   `false` if none. It tells the host nothing: the host that calls it ends
+   its link layer's grant itself. The person stays a member of the folder —
+   removing them is a members record, which also ends the grant. A host that
+   only calls the link layer's own revoke (`Links::revoke_grant`) has made an
+   in-memory change that a restart undoes; ndn-link's `LinkHints` calls this.
+10. <a id="renew"></a>**The host renews a grant.** `Device::renew_grant(key,
+    until)` sets the date of every grant of that key not ended **and** that a
+    held members record still admits the person for — one past its old date
+    is renewable, one a record left out or the host ended is not (offer the
+    folder again) — durably, and returns the grant as it now stands (the first
+    by offer when several offers admitted the key) or `None` when there was
+    none to renew. `Some(t)` is the new date and MUST be after the device's
+    clock (else `BadRequest`, saying so: give a later date, `None`, or end
+    the grant); `None` gives it no date, so it follows the record. It tells
+    the host nothing: the caller installs the returned grant. ndn-link's
+    `LinkHints::grant` calls it when it is given a later date than the one in
+    force.
+11. **Notes are authenticated.** Of what a grant rests on only the use mark is
+    signed (it names the key), not the note's `ended` flag, date or role, so
+    the note carries a MAC: HMAC-SHA256 over every octet before
+    it under a key derived (HKDF-SHA256, the domain label
+    `ndn-data/grant-note/mac-key/1`) from the device's recipient secret, which
+    the key store keeps and the data store does not. A party that can write
+    the data store but not the key store therefore cannot clear `ended`,
+    extend or remove a date, change a role or move a note to another name: the
+    note fails its check and is ignored, with a logged warning that says so
+    (rule 3) — so a removed person is not resurrected by an edited store. The
+    MAC is the choice over deriving the ended state from signed records
+    because the host's end (rule 9) has no signed record behind it to derive
+    from. **What it does not do:** it does not detect *rollback*. A party
+    that restores an older, genuine copy of a note (one whose `ended` flag was
+    clear, or whose date was earlier or later) brings back an older state of
+    that note. That is bounded by what the device holds besides the note: a
+    grant a held members record leaves out is not in force whatever the note
+    says (the record, not the note, is the judge, and the end is told again),
+    and no note can name a person whose key no use mark names. What rollback
+    can bring back is a grant the *host* ended while a record still admits
+    the person, or an older date: end it again.
+12. **Faulty networks.** A lost answer is the joiner's retry (rule 4); a
+    grant is made once per admission, on a clean or a faulty network.
 
 No wire TLV is added by this section: grants are local notes and host calls,
 and the registry (README) is unchanged.
@@ -6351,6 +6438,18 @@ of the host's**, not a data-layer record.
    (`/localhost/ndn-data/<other>/…`): the layer's prefix is `host`. A note is
    not secret: public keys, device names and addresses belong there; a secret
    does not (the device keeps its own secrets in its key store, not in notes).
+7. **Notes are in the clear, at rest.** Rules 5 and 6 are about integrity and
+   about what a note may decide; confidentiality is not a property of a note.
+   A note is written to the device's store as its octets, and the link
+   memory's notes (ndn-link §17C.4) hold each peer's key, its device name and
+   the addresses it was last seen at: whoever can read the store reads who
+   this device talks to and where. **The permissions of the file or database
+   the store lives in are the host's to set** (this crate has none to set: the
+   only `DataStore` it brings is `MemoryStore`), readable by the device's own
+   user only. A host that does not want the addresses on disk gives the link
+   memory `MemoryOptions::persist_addresses = false` (ndn-link §17C.6), which
+   writes the notes without them; it does not make the rest secret, and a
+   host that needs a note encrypted encrypts it before `put`.
 
 No wire TLV is added by this section; the registry (README) is unchanged.
 

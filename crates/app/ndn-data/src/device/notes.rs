@@ -1,6 +1,8 @@
 //! Host notes (spec §19.9): a small durable key-value surface a host keeps in the device's local
 //! store, for what it learned and wants after a restart: the addresses a link layer reached its
 //! peers at, say. Never served, announced or trusted: a note is local, unauthenticated host data.
+//! A note is also **in the clear at rest** (spec §19.9 rule 7): the store's file permissions are the
+//! host's to set, and a note that must be secret is encrypted by the host before `put`.
 //!
 //! Layout in the store: `/localhost/ndn-data/host/<area>/<key>`, the value the note's octets as
 //! given, under a local name no device serves ([`Inner::packet_for`] answers no such name, and
