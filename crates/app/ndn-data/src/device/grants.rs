@@ -30,7 +30,7 @@ use super::{Device, Inner, St, local};
 use crate::error::DataError;
 use crate::intro::{Departure, Grant, Role};
 use crate::version::{Audience, Timestamp};
-use crate::wire::{device_of, is_data_name, log_name, parse_log_name};
+use crate::wire::{device_of, log_name, parse_log_name};
 
 /// Where the store keeps the grant the own offer `offer`'s admission made:
 /// a [`GrantNote`]. Written under the same store barrier as the kept
@@ -321,31 +321,55 @@ impl GrantNote {
     }
 
     /// The held members record of the folder's line that lets the person go
-    /// (spec §19.8), by its log entry name: among the records of the highest
-    /// revision held, the one — lowest signer key first — whose own writers and
-    /// readers leave the namespace out; failing that (a merge removed the
-    /// person through a cut), the highest-revision record, lowest signer first,
-    /// with a cut of a prefix of the namespace. `None` when no held record
-    /// does either: no mark is made then.
+    /// (spec §19.8), by its log entry name: the record that **first** left the
+    /// namespace out of the run that stands. Reading the revisions held from the
+    /// highest down, while a revision holds a record whose own writers and
+    /// readers leave the namespace out (lowest signer key first), that record is
+    /// the candidate; the run ends at the first revision below whose records all
+    /// list the namespace, which is where the person was last a member. The
+    /// lowest revision of the run is the record: a later record of the run that
+    /// leaves them out as well may list the others' later admissions (a
+    /// membership the person must not be handed), and one that readmits them ends
+    /// the run and is never named. Failing a record that leaves them out by its
+    /// own lists (a merge removed the person through a cut), the same over the
+    /// records with a cut of a prefix of the namespace, from the highest revision
+    /// that has one. `None` when no held record does either: no mark is made then.
     fn letting_go_record(&self, st: &St) -> Option<Name> {
+        use std::collections::BTreeMap;
+
+        use crate::collection::Members;
+        use crate::version::Writer;
+
+        type Signers = BTreeMap<Writer, super::LineRecord>;
+        // The lowest revision of the run `groups` (highest first) begins with, of
+        // the records `leaves` picks, lowest signer first in a revision.
+        fn first_of_run<'a>(
+            groups: impl Iterator<Item = &'a Signers>,
+            leaves: impl Fn(&Members) -> bool,
+        ) -> Option<(&'a Writer, u64)> {
+            let mut found = None;
+            for signers in groups {
+                let Some((writer, held)) = signers.iter().find(|(_, h)| leaves(&h.record)) else {
+                    break;
+                };
+                found = Some((writer, held.seq));
+            }
+            found
+        }
         let line = &st.folders.get(&self.folder)?.line;
         let ns = &self.namespace;
-        let named = |writer: &crate::version::Writer, seq: u64| {
-            device_of(writer.key()).map(|d| log_name(&d, Some(&self.folder), seq))
-        };
-        let (_, top) = line.records.iter().next_back()?;
-        if let Some((writer, held)) = top
-            .iter()
-            .find(|(_, h)| standing_in(&h.record, ns) == Standing::Out)
-        {
-            return named(writer, held.seq);
-        }
-        line.records
-            .values()
-            .rev()
-            .flat_map(|signers| signers.iter())
-            .find(|(_, h)| h.record.cuts.iter().any(|c| ns.has_prefix(&c.of)))
-            .and_then(|(writer, held)| named(writer, held.seq))
+        let by_lists = |m: &Members| standing_in(m, ns) == Standing::Out;
+        let by_cut = |m: &Members| m.cuts.iter().any(|c| ns.has_prefix(&c.of));
+        let (writer, seq) = first_of_run(line.records.values().rev(), by_lists).or_else(|| {
+            first_of_run(
+                line.records
+                    .values()
+                    .rev()
+                    .skip_while(|signers| !signers.values().any(|h| by_cut(&h.record))),
+                by_cut,
+            )
+        })?;
+        device_of(writer.key()).map(|d| log_name(&d, Some(&self.folder), seq))
     }
 }
 
@@ -616,7 +640,8 @@ impl Inner {
     /// The departed person's side ([`Device::take_departure`]): fetch `record`,
     /// a members record of `folder`, and take it as any held record.
     ///
-    /// Only when this device holds a members record line for `folder` (it is,
+    /// Only when the device that told it (`from`) lies under the namespace of
+    /// `folder`, this device holds a members record line for `folder` (it is,
     /// or was, a member), `record` is a log entry name whose subject is
     /// `folder` and whose device lies under a namespace this device holds a
     /// trust context of, no other take for `folder` is in flight, and fewer
@@ -626,6 +651,7 @@ impl Inner {
     /// that the member could not have fetched by any other path.
     pub(super) async fn take_departure(
         self: &Arc<Self>,
+        from: &Name,
         folder: &Name,
         record: &Name,
     ) -> Result<(), DataError> {
@@ -633,10 +659,18 @@ impl Inner {
             name: record.clone(),
             why,
         };
-        if !is_data_name(folder) {
+        let Some(owner) = crate::wire::namespace_of(folder) else {
             return Err(refuse(format!(
                 "{folder} is no folder name (<namespace>/32=data[/<path>]); a departure names the \
                  folder the members record governs: ignore a hint with another name"
+            )));
+        };
+        if !from.has_prefix(&owner) {
+            return Err(refuse(format!(
+                "the hint came from {from}, which lies under no namespace of {folder} ({owner}): \
+                 only a device of the folder's own namespace lets a member go of it, so this \
+                 device ignores a hint from another; ask the person who invited you (a device of \
+                 {owner}) to invite you again if you were let go"
             )));
         }
         let Some(log) = parse_log_name(record).filter(|l| l.subject.as_ref() == Some(folder))
@@ -855,6 +889,13 @@ impl Device {
     /// as ever, so this device's own folder then no longer lists it and it
     /// withdraws what it wrote after the cut. The name carries no authority.
     ///
+    /// `from` is the **authenticated device** of the peer that told it (its
+    /// certificate validated in a namespace this device holds, on a full link:
+    /// never an enrollment or introduction link). Only a device under the
+    /// folder's own namespace (`<namespace>/32=data[/<path>]`) can let this
+    /// device go of the folder, so a hint from any other is refused before it
+    /// can hold the folder's fetch or spend the minute's bound.
+    ///
     /// Taken only when this device holds a members record line of `folder`,
     /// `record` is a log entry of `folder` (`<device>/32=log/<folder>/seq=<n>`)
     /// whose device lies under a namespace this device holds a trust context of,
@@ -862,12 +903,18 @@ impl Device {
     /// `folder` is in flight, and a bounded number begin in a minute.
     ///
     /// # Errors
-    /// [`DataError::BadRequest`] for a hint that is none of those (ignore it);
+    /// [`DataError::BadRequest`] for a hint that is none of those, or told by a
+    /// device outside the folder's namespace (ignore it);
     /// [`DataError::NotReady`] while another take of `folder` is under way, when
     /// the minute's bound is used up, or when the record could not be fetched:
     /// ask again.
-    pub async fn take_departure(&self, folder: &Name, record: &Name) -> Result<(), DataError> {
-        self.inner.take_departure(folder, record).await
+    pub async fn take_departure(
+        &self,
+        from: &Name,
+        folder: &Name,
+        record: &Name,
+    ) -> Result<(), DataError> {
+        self.inner.take_departure(from, folder, record).await
     }
 
     /// Set the date of the grants of `key`, durably: `Some(t)` makes it

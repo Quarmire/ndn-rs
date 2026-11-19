@@ -71,44 +71,46 @@ pub fn folder_carries(folder: &Name, name: &Name) -> bool {
 /// Whether a packet named `name` may also cross the grant link of a person
 /// admitted to `folder` because a **co-writer** of the folder is listed
 /// (spec §19.8, ndn-link §8.7): the **summary root** (`<D>/32=summary/<W>/32=root`,
-/// with or without its head) of the namespace `W` of each writer in `writers` —
-/// the writer prefixes the folder's members record in force lists — so that a
-/// writer who never met another walks to the other's devices through this
-/// device's copy. Only the root: a root's nodes and pages of the folder, and
-/// every entry, piece, head and cut manifest of a collection under the folder,
-/// whatever device wrote it, are [`folder_carries`]'s already; nothing of a
-/// writer's outside the folder is added (not an entry of her other
+/// with or without its head) of each namespace `W` in `namespaces` — the
+/// namespaces of the writer prefixes the folder's members record in force
+/// lists — so that a writer who never met another walks to the other's devices
+/// through this device's copy. Only the root: a root's nodes and pages of the
+/// folder, and every entry, piece, head and cut manifest of a collection under
+/// the folder, whatever device wrote it, are [`folder_carries`]'s already;
+/// nothing of a writer's outside the folder is added (not an entry of her other
 /// collections, not a node of her other folders), and the folder's own
 /// namespace's root is [`folder_carries`]'s, not added again. `false` for a
 /// `folder` that is no folder name.
 ///
-/// `W` is the namespace of a writer prefix `p` when `p` is `W` or lies under
-/// it (a writer listed by a device's name belongs to the namespace above it).
-/// A pure function of its arguments: the caller passes the writers the record
-/// in force lists **at the packet**, so a writer removed from the record drops
-/// out at the next one; a prefix only a cut keeps is not a writer and is not
-/// passed.
+/// The caller derives `namespaces` from the record, as the device does for a
+/// writer prefix `p` (`IntroductionSurface::writer_namespaces`): the namespace
+/// of the trust context governing `p` where one is held, `p` itself otherwise.
+/// A name is a root of `W` only when its subject **is** one of them — never
+/// when a writer's name merely starts with the subject: a writer
+/// `/home/carol/member/x` does not unlock the root of the broader `/home`. A
+/// pure function of its arguments: the caller passes the namespaces of the
+/// writers the record in force lists **at the packet**, so a writer removed from
+/// the record drops out at the next one; a prefix only a cut keeps is not a
+/// writer and is not passed.
 ///
 /// A **held** packet (`<H>/32=held/<name>`, how a device asks another that
 /// answers for a writer for that writer's root) is carried when the name it
 /// wraps is, to the depth [`folder_carries`] unwraps to.
-pub fn writer_carries(folder: &Name, writers: &[Name], name: &Name) -> bool {
-    is_data_name(folder) && writer_root(folder, writers, name, HELD_DEPTH)
+pub fn writer_carries(folder: &Name, namespaces: &[Name], name: &Name) -> bool {
+    is_data_name(folder) && writer_root(folder, namespaces, name, HELD_DEPTH)
 }
 
-fn writer_root(folder: &Name, writers: &[Name], name: &Name, held_depth: u8) -> bool {
+fn writer_root(folder: &Name, namespaces: &[Name], name: &Name, held_depth: u8) -> bool {
     let name = &undigested(name);
     if let Some((_, inner)) = parse_held_name(name) {
-        return held_depth > 0 && writer_root(folder, writers, &inner, held_depth - 1);
+        return held_depth > 0 && writer_root(folder, namespaces, &inner, held_depth - 1);
     }
     let Some(summary) = parse_summary_name(name) else {
         return false;
     };
     // A root's subject is a namespace; a node's or page's is a data name.
     let ns = &summary.subject;
-    is_namespace(ns)
-        && namespace_of(folder).as_ref() != Some(ns)
-        && writers.iter().any(|w| w.has_prefix(ns))
+    is_namespace(ns) && namespace_of(folder).as_ref() != Some(ns) && namespaces.contains(ns)
 }
 
 /// Whether a packet named `name` is traffic of the **sync group** of a listed
@@ -116,12 +118,13 @@ fn writer_root(folder: &Name, writers: &[Name], name: &Name, held_depth: u8) -> 
 /// devices say they wrote (§12) — that a grant link of a person admitted to
 /// `folder` may carry, both ways, so a writer invited by an invitation of its
 /// own hears the other writers' devices and can walk to them (spec §19.8,
-/// ndn-link §8.7). `W` is the namespace of a writer in `writers` as for
-/// [`writer_carries`]; the folder's own namespace's group is the host's, not
-/// added here, and nothing under any other namespace is. A pure function of
-/// its arguments, derived per packet from the record in force like
+/// ndn-link §8.7). `W` is a namespace in `namespaces`, derived from the
+/// writers as for [`writer_carries`] (equal to it, not merely a prefix of a
+/// writer's name); the folder's own namespace's group is the host's, not added
+/// here, and nothing under any other namespace is. A pure function of its
+/// arguments, derived per packet from the record in force like
 /// [`writer_carries`]. `false` for a `folder` that is no folder name.
-pub fn writer_sync(folder: &Name, writers: &[Name], name: &Name) -> bool {
+pub fn writer_sync(folder: &Name, namespaces: &[Name], name: &Name) -> bool {
     if !is_data_name(folder) {
         return false;
     }
@@ -130,9 +133,7 @@ pub fn writer_sync(folder: &Name, writers: &[Name], name: &Name) -> bool {
         return false;
     };
     let ns = Name::from_components(comps[..at].iter().cloned());
-    is_namespace(&ns)
-        && namespace_of(folder).as_ref() != Some(&ns)
-        && writers.iter().any(|w| w.has_prefix(&ns))
+    is_namespace(&ns) && namespace_of(folder).as_ref() != Some(&ns) && namespaces.contains(&ns)
 }
 
 /// Whether a packet named `name` may cross the **departure link** of a person
@@ -432,8 +433,10 @@ mod tests {
         assert!(!folder_carries(&n("/alice/notebook"), &entry));
     }
 
-    fn writers() -> Vec<Name> {
-        vec![n("/alice"), n("/bob"), n("/carol/member/phone")]
+    /// The namespaces of the writers a record lists: Alice's own, Bob's, and
+    /// Carol's (listed by a device's name, her namespace is the person's).
+    fn namespaces() -> Vec<Name> {
+        vec![n("/alice"), n("/bob"), n("/carol")]
     }
 
     #[test]
@@ -441,16 +444,16 @@ mod tests {
         use crate::wire::{root_name, root_prefix};
         let folder = folder();
         let device = n("/alice/member/laptop");
-        let writers = writers();
+        let namespaces = namespaces();
         // Bob's root, with and without its head and with the digest an Interest
-        // may name; Carol's, listed by a device's name, belongs to her namespace.
+        // may name; Carol's likewise.
         for ns in [n("/bob"), n("/carol")] {
             for name in [
                 root_prefix(&device, &ns),
                 root_name(&device, &ns, 4),
                 root_name(&device, &ns, 4).append_implicit_digest([5; 32]),
             ] {
-                assert!(writer_carries(&folder, &writers, &name), "{name}");
+                assert!(writer_carries(&folder, &namespaces, &name), "{name}");
                 // Not a thing `folder_carries` carries: the addition is the root's alone.
                 assert!(
                     !folder_carries(&folder, &name),
@@ -461,13 +464,13 @@ mod tests {
         // The folder's own namespace is `folder_carries`'s, not added again.
         assert!(!writer_carries(
             &folder,
-            &writers,
+            &namespaces,
             &root_name(&device, &n("/alice"), 4)
         ));
         // A namespace nobody lists.
         assert!(!writer_carries(
             &folder,
-            &writers,
+            &namespaces,
             &root_name(&device, &n("/dave"), 4)
         ));
         assert!(!writer_carries(
@@ -482,7 +485,7 @@ mod tests {
         use crate::wire::{node_name, page_name, root_name};
         let folder = folder();
         let device = n("/alice/member/laptop");
-        let writers = writers();
+        let namespaces = namespaces();
         let bob = n("/bob/member/phone");
         for name in [
             // Her other collection's entry, piece, head and node; her other folder's page.
@@ -502,7 +505,7 @@ mod tests {
             n("/bob/member/phone"),
         ] {
             assert!(
-                !writer_carries(&folder, &writers, &name),
+                !writer_carries(&folder, &namespaces, &name),
                 "{name} of a writer outside the folder was added"
             );
         }
@@ -510,11 +513,11 @@ mod tests {
         // `writer_carries`'s to add.
         let inside = log_name(&bob, Some(&n("/alice/32=data/notebook/ch")), 3);
         assert!(folder_carries(&folder, &inside));
-        assert!(!writer_carries(&folder, &writers, &inside));
+        assert!(!writer_carries(&folder, &namespaces, &inside));
         // A folder that is no folder name has no writers' roots.
         assert!(!writer_carries(
             &n("/alice/notebook"),
-            &writers,
+            &namespaces,
             &root_name(&device, &n("/bob"), 4)
         ));
     }
@@ -525,7 +528,7 @@ mod tests {
         let folder = folder();
         let holder = n("/alice/member/laptop");
         let carol = n("/carol/member/tablet");
-        let writers = writers();
+        let namespaces = namespaces();
         // How a walk asks the device that answers for Carol: the holder's `32=held`
         // wrapping her root, by prefix or by name, with or without a digest.
         for wrapped in [
@@ -534,7 +537,7 @@ mod tests {
             root_name(&carol, &n("/carol"), 4).append_implicit_digest([5; 32]),
         ] {
             let held = held_name(&holder, &wrapped);
-            assert!(writer_carries(&folder, &writers, &held), "{held}");
+            assert!(writer_carries(&folder, &namespaces, &held), "{held}");
             assert!(
                 !folder_carries(&folder, &held),
                 "{held} was carried already"
@@ -545,30 +548,30 @@ mod tests {
         // An unlisted namespace's root, one outside the folder, the folder's own
         // namespace, and nesting beyond the depth `folder_carries` allows.
         let dave = held_name(&holder, &root_name(&carol, &n("/dave"), 4));
-        assert!(!writer_carries(&folder, &writers, &dave));
+        assert!(!writer_carries(&folder, &namespaces, &dave));
         let entry = log_name(&carol, Some(&n("/carol/32=data/diary")), 3);
         assert!(!writer_carries(
             &folder,
-            &writers,
+            &namespaces,
             &held_name(&holder, &entry)
         ));
         let own = held_name(&holder, &root_name(&carol, &n("/alice"), 4));
-        assert!(!writer_carries(&folder, &writers, &own));
+        assert!(!writer_carries(&folder, &namespaces, &own));
         let root = root_name(&carol, &n("/bob"), 4);
         let deep = held_name(&holder, &held_name(&holder, &held_name(&holder, &root)));
-        assert!(!writer_carries(&folder, &writers, &deep), "{deep}");
+        assert!(!writer_carries(&folder, &namespaces, &deep), "{deep}");
         let twice = held_name(&holder, &held_name(&holder, &root));
-        assert!(writer_carries(&folder, &writers, &twice));
+        assert!(writer_carries(&folder, &namespaces, &twice));
     }
 
     #[test]
     fn the_sync_group_of_each_listed_writers_namespace_is_added_and_no_other() {
         let folder = folder();
-        let writers = writers();
-        // Bob's and Carol's (listed by a device's name) groups, bare and with a notice.
+        let namespaces = namespaces();
+        // Bob's and Carol's groups, bare and with a notice.
         for group in [n("/bob/32=sync"), n("/carol/32=sync")] {
             for name in [group.clone(), group.clone().append("vector")] {
-                assert!(writer_sync(&folder, &writers, &name), "{name}");
+                assert!(writer_sync(&folder, &namespaces, &name), "{name}");
                 assert!(
                     !folder_carries(&folder, &name),
                     "{name} was carried already"
@@ -577,30 +580,38 @@ mod tests {
         }
         // The folder's own namespace's group is the host's; an unlisted one, a removed
         // writer's, and a name that is no group are refused.
-        assert!(!writer_sync(&folder, &writers, &n("/alice/32=sync/vector")));
-        assert!(!writer_sync(&folder, &writers, &n("/dave/32=sync/vector")));
+        assert!(!writer_sync(
+            &folder,
+            &namespaces,
+            &n("/alice/32=sync/vector")
+        ));
+        assert!(!writer_sync(
+            &folder,
+            &namespaces,
+            &n("/dave/32=sync/vector")
+        ));
         assert!(!writer_sync(
             &folder,
             &[n("/alice")],
             &n("/carol/32=sync/vector")
         ));
-        assert!(!writer_sync(&folder, &writers, &n("/bob/notes")));
+        assert!(!writer_sync(&folder, &namespaces, &n("/bob/notes")));
         assert!(!writer_sync(
             &folder,
-            &writers,
+            &namespaces,
             &n("/bob/member/phone/32=sync")
         ));
-        assert!(!writer_sync(&folder, &writers, &n("/32=sync")));
+        assert!(!writer_sync(&folder, &namespaces, &n("/32=sync")));
         // A folder that is no folder name has no writers' groups.
         assert!(!writer_sync(
             &n("/alice/notebook"),
-            &writers,
+            &namespaces,
             &n("/bob/32=sync")
         ));
     }
 
     #[test]
-    fn a_writer_taken_out_of_the_list_is_out_and_a_cut_prefix_is_not_a_writer() {
+    fn a_namespace_taken_out_of_the_list_is_out_and_only_the_namespace_itself_is_matched() {
         use crate::wire::root_name;
         let folder = folder();
         let device = n("/alice/member/laptop");
@@ -608,15 +619,23 @@ mod tests {
         let with = [n("/alice"), n("/carol")];
         let without = [n("/alice")];
         assert!(writer_carries(&folder, &with, &root));
-        // The caller passes what the record in force lists at the packet: a removed
-        // writer, only a cut now, is not in the list and her root is not carried.
+        // The caller passes the namespaces of what the record in force lists at the
+        // packet: a removed writer, only a cut now, is not in the list and her root is
+        // not carried.
         assert!(!writer_carries(&folder, &without, &root));
-        // A namespace longer than the writer prefix is not that writer's, nor is a
-        // namespace that merely shares letters with it.
+        // A namespace is matched whole: neither a longer one under the listed one, nor
+        // a shorter one above it (a writer `/home/carol/member/x` whose namespace is its
+        // own prefix does not unlock `/home`), nor one that merely shares letters.
         assert!(!writer_carries(
             &folder,
             &[n("/carol")],
             &root_name(&device, &n("/carol/member/phone"), 4)
+        ));
+        assert!(!writer_carries(&folder, &[n("/carol/member/phone")], &root));
+        assert!(!writer_sync(
+            &folder,
+            &[n("/carol/member/phone")],
+            &n("/carol/32=sync/vector")
         ));
         assert!(!writer_carries(
             &folder,

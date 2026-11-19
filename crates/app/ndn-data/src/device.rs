@@ -14425,6 +14425,15 @@ impl Inner {
     /// fetched from that very node. The rule reads signed, durable data held
     /// here (the line's records), no flag and no clock, so it is the same after a
     /// restart. A folder of this device's own namespace is never left out.
+    ///
+    /// A device **invited again** is not left out either, while the new
+    /// admission is pending ([`Inner::admission_pending`]): it holds the record
+    /// that once admitted it and the one that left it out (in force), and the
+    /// answer to its join names a revision above that one, signed since and held
+    /// nowhere here yet. That revision is listed only in the node a walk would
+    /// skip, so the join would never complete. The pending admission is the
+    /// joined note the answer left, read against the record in force: signed
+    /// data, no clock where the answer named a revision.
     fn left_out(&self, st: &St, c: &Name) -> bool {
         if namespace_of(c).is_none_or(|ns| ns == self.ns) {
             return false;
@@ -14446,7 +14455,7 @@ impl Inner {
                     .values()
                     .flat_map(|signers| signers.values())
                     .any(|held| admits(&held.record))
-        })
+        }) && !self.admission_pending(st, c)
     }
 
     /// Whether the members record in force over `c` here admits this

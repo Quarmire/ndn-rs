@@ -413,10 +413,12 @@ fn offline(offer: &Name, device: &Name) -> DataError {
 }
 
 /// Where the store keeps that an offer's answer admitted this device to
-/// `folder` as a writer, until a members record held admits it
-/// ([`Inner::admitted_by_offer`]): a device in that window is no stranger.
-/// The note holds when the offer expires (8 octets, milliseconds) and the
-/// revision the inviter admitted this device at (8 octets, 0 for none).
+/// `folder`, until a members record held admits it
+/// ([`Inner::admitted_by_offer`], and the pending admission of
+/// [`Inner::admission_pending`]): a device in that window is no stranger, and
+/// no person let go. The note holds when the offer expires (8 octets,
+/// milliseconds), the revision the inviter admitted this device at (8 octets,
+/// 0 for none) and the role (1 octet: 0 writer, 1 reader).
 pub(super) fn joined_name(folder: &Name) -> Name {
     local_name("joined", folder)
 }
@@ -432,25 +434,36 @@ struct JoinedNote {
     /// later one that leaves this device out says the admission was undone
     /// since, so the note lets go. `None`: the answer carried none.
     revision: Option<u64>,
+    /// The role the offer admitted this device in. Only a writer's note holds
+    /// a put `NotReady` ([`Inner::joined_hold`]); a reader's only marks the
+    /// admission pending ([`Inner::admission_pending`]).
+    role: Role,
 }
 
 impl JoinedNote {
     fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(16);
+        let mut out = Vec::with_capacity(17);
         out.extend_from_slice(&self.until.0.to_be_bytes());
         out.extend_from_slice(&self.revision.unwrap_or(0).to_be_bytes());
+        out.push(u8::from(self.role == Role::Reader));
         Bytes::from(out)
     }
 
     /// The note `bytes` hold; `None` for a note of another form (one kept
-    /// before notes carried an expiry), which holds nothing.
+    /// before notes carried a role), which holds nothing.
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; 16] = bytes.try_into().ok()?;
+        let bytes: &[u8; 17] = bytes.try_into().ok()?;
         let until = u64::from_be_bytes(bytes[..8].try_into().ok()?);
-        let revision = u64::from_be_bytes(bytes[8..].try_into().ok()?);
+        let revision = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
+        let role = match bytes[16] {
+            0 => Role::Writer,
+            1 => Role::Reader,
+            _ => return None,
+        };
         Some(Self {
             until: Timestamp(until),
             revision: (revision != 0).then_some(revision),
+            role,
         })
     }
 }
@@ -470,7 +483,7 @@ enum Missing {
 
 impl Inner {
     /// Note durably that an offer's answer admitted this device to `folder`
-    /// as a writer, the offer expiring at `until` and the inviter having
+    /// as `role`, the offer expiring at `until` and the inviter having
     /// admitted it at members revision `revision`: whether the note is
     /// durable.
     pub(super) async fn note_joined(
@@ -478,10 +491,89 @@ impl Inner {
         folder: &Name,
         until: Timestamp,
         revision: Option<u64>,
+        role: Role,
     ) -> bool {
-        self.store
-            .insert(joined_name(folder), JoinedNote { until, revision }.encode());
+        self.store.insert(
+            joined_name(folder),
+            JoinedNote {
+                until,
+                revision,
+                role,
+            }
+            .encode(),
+        );
         self.barrier().await
+    }
+
+    /// Make the walks of `folder`'s namespace go down toward `folder` again,
+    /// for a join waiting on the record that admits this device while the
+    /// admission is pending ([`Self::admission_pending`]). A walk that ended
+    /// before — while the device was let go of the folder, or not yet admitted,
+    /// a notice of the inviter's new entry heard before its answer arrived —
+    /// skipped the folder's node (or took it as it then was) and recorded the
+    /// inviter's root as taken in full, and the same root again is answered with
+    /// nothing walked: the record that admits the device, listed in that very
+    /// node, would never be fetched while the root stood. So the walks of the
+    /// namespace forget the folder ([`Peer::forget`](super::Peer)): the root and
+    /// the nodes on the way to it are walked again, and a walk under way since
+    /// before records none as taken. Once, at the start of the wait: forgetting
+    /// again would keep a walk from ever recording its progress.
+    pub(super) fn descend_again_toward(&self, folder: &Name) {
+        let Some(ns) = namespace_of(folder) else {
+            return;
+        };
+        let mut st = self.st.lock();
+        if !self.admission_pending(&st, folder) {
+            return;
+        }
+        for ((_, n), peer) in &mut st.peers {
+            if *n == ns {
+                peer.forget(folder);
+            }
+        }
+    }
+
+    /// Whether an admission of this device to a folder over `c` (a data name of
+    /// another person's namespace) is **pending**: an offer's answer admitted it
+    /// ([`note_joined`](Self::note_joined)) and no record held yet shows the
+    /// admission, or shows its undoing, so the record that admits it is still to
+    /// be fetched. Read from the note and the record in force alone — signed
+    /// durable data, no flag and no clock where the answer named a revision:
+    /// pending while the folder's record in force here is of a revision below
+    /// the one the answer named (none held counts as below); when the answer
+    /// named none, while the offer's own date has not passed. A record held at
+    /// that revision or above settles it either way: it admits the device, or it
+    /// is the removal that undid the admission ([`Self::left_out_since`]).
+    ///
+    /// A device let go that is invited again holds the old admitting record and
+    /// the record that left it out: while the new admission is pending it is no
+    /// person let go ([`Self::left_out`]), or a walk would skip the one node
+    /// that lists the new record (spec §19.8). Read-only; a note that has lost
+    /// its hold is removed by [`Self::joined_hold`] and
+    /// [`Self::await_admission`].
+    pub(super) fn admission_pending(&self, st: &St, c: &Name) -> bool {
+        let Ok(at) = wire::data_marker(c) else {
+            return false;
+        };
+        let now = (self.config.clock)();
+        (at + 2..=c.len()).any(|k| {
+            let f = Name::from_components(c.components()[..k].to_vec());
+            let Some(note) = self
+                .store
+                .get(&joined_name(&f))
+                .and_then(|bytes| JoinedNote::decode(&bytes))
+            else {
+                return false;
+            };
+            match note.revision {
+                Some(named) => st
+                    .folders
+                    .get(&f)
+                    .and_then(|x| x.members.as_ref())
+                    .is_none_or(|m| m.revision.0 < named),
+                None => note.until > now,
+            }
+        })
     }
 
     /// The folder over `c` (or `c`) that an offer's answer admitted this
@@ -501,7 +593,9 @@ impl Inner {
                 continue;
             };
             match JoinedNote::decode(&bytes) {
-                Some(note) => marked.push((f, note)),
+                Some(note) if note.role == Role::Writer => marked.push((f, note)),
+                // A reader's note holds no put: it only marks the admission pending.
+                Some(_) => {}
                 None => {
                     self.store.remove(&joined_name(&f));
                 }
@@ -536,6 +630,37 @@ impl Inner {
                 self.admission_missing(st, folder, Role::Writer),
                 Some(Missing::Record(_))
             )
+    }
+
+    /// The namespaces of the writers the members record in force for `folder`
+    /// lists, as this device derives them (spec §19.8): for each writer prefix
+    /// `p`, the namespace of the trust context governing it here (or the
+    /// person's own namespace once adopted for a folder), and `p` itself when
+    /// none is held; kept when `p` is that namespace or lies under it; the
+    /// folder's own namespace excluded. The one derivation the summary roots
+    /// ([`writer_carries`](crate::writer_carries)) and the sync groups
+    /// ([`writer_sync`](crate::writer_sync)) a grant link carries and
+    /// [`IntroductionSurface::writer_namespaces`] share, so a writer
+    /// `/home/carol/member/x` unlocks `/home/carol` or its own prefix and never
+    /// the broader `/home` its name merely starts with. Empty when no record of
+    /// `folder` is held.
+    fn writer_namespaces_of(&self, st: &St, folder: &Name) -> Vec<Name> {
+        if !wire::is_data_name(folder) {
+            return Vec::new();
+        }
+        let own = namespace_of(folder);
+        let Some(record) = st.folders.get(folder).and_then(|f| f.members.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = BTreeSet::new();
+        for p in &record.writers {
+            let held = self.group_namespace_of(st, p);
+            let ns = if held.is_empty() { p.clone() } else { held };
+            if wire::is_namespace(&ns) && p.has_prefix(&ns) && own.as_ref() != Some(&ns) {
+                out.insert(ns);
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// `refused`, a refusal to write into `c` for want of an admission, as it
@@ -639,6 +764,7 @@ impl Inner {
     ) -> Result<(), DataError> {
         let ns = namespace_of(folder).expect("a joined folder is a data name");
         let deadline = Instant::now() + self.config.first_look * 3 + self.config.lifetime;
+        self.descend_again_toward(folder);
         loop {
             let Some(missing) = self.admission_missing(&self.st.lock(), folder, role) else {
                 self.store.remove(&joined_name(folder));
@@ -1473,10 +1599,11 @@ impl IntroductionSurface {
     /// lists ([`writer_carries`](crate::writer_carries): the summary root of
     /// each listed writer's namespace, held-wrapped or not;
     /// [`writer_sync`](crate::writer_sync): that namespace's sync group, so the
-    /// member hears the other writers' devices). Read **live on every call**
-    /// from the record in force, nothing cached: a writer the record no longer
-    /// lists drops out at the next call, one it lists appears at the next.
-    /// `false` once the device is gone.
+    /// member hears the other writers' devices), both for the namespaces
+    /// [`writer_namespaces`](Self::writer_namespaces) derives. Read **live on
+    /// every call** from the record in force, nothing cached: a writer the
+    /// record no longer lists drops out at the next call, one it lists appears
+    /// at the next. `false` once the device is gone.
     pub fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
@@ -1485,12 +1612,9 @@ impl IntroductionSurface {
             return true;
         }
         let st = inner.st.lock();
-        let writers = st
-            .folders
-            .get(folder)
-            .and_then(|f| f.members.as_ref())
-            .map_or(&[][..], |m| m.writers.as_slice());
-        crate::writer_carries(folder, writers, name) || crate::writer_sync(folder, writers, name)
+        let namespaces = inner.writer_namespaces_of(&st, folder);
+        crate::writer_carries(folder, &namespaces, name)
+            || crate::writer_sync(folder, &namespaces, name)
     }
 
     /// Whether `name` may cross the departure link of a person let go by the
@@ -1499,35 +1623,22 @@ impl IntroductionSurface {
         crate::departure_carries(record, name)
     }
 
-    /// The namespaces `W` whose sync group a grant link of a person admitted to
-    /// `folder` carries ([`writer_sync`](crate::writer_sync)): the namespace of
-    /// each writer prefix the members record in force for `folder` lists (the
-    /// namespace of the trust context governing it here, or the prefix itself
-    /// when none is held), kept when the prefix is `W` or lies under it,
-    /// deduplicated, the folder's own namespace excluded; sorted. Read **live**
-    /// from the record, as [`grant_carries`](Self::grant_carries) is. Empty once
-    /// the device is gone, or when no record of `folder` is held.
+    /// The namespaces `W` whose summary roots and sync groups a grant link of a
+    /// person admitted to `folder` carries
+    /// ([`writer_carries`](crate::writer_carries),
+    /// [`writer_sync`](crate::writer_sync)): the namespace of each writer prefix
+    /// the members record in force for `folder` lists (the namespace of the trust
+    /// context governing it here, or the prefix itself when none is held), kept
+    /// when the prefix is `W` or lies under it, deduplicated, the folder's own
+    /// namespace excluded; sorted. Read **live** from the record, as
+    /// [`grant_carries`](Self::grant_carries) is, which uses this very list.
+    /// Empty once the device is gone, or when no record of `folder` is held.
     pub fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
         let Some(inner) = self.inner.upgrade() else {
             return Vec::new();
         };
-        if !wire::is_data_name(folder) {
-            return Vec::new();
-        }
-        let own = namespace_of(folder);
         let st = inner.st.lock();
-        let Some(record) = st.folders.get(folder).and_then(|f| f.members.as_ref()) else {
-            return Vec::new();
-        };
-        let mut out: BTreeSet<Name> = BTreeSet::new();
-        for p in &record.writers {
-            let held = inner.group_namespace_of(&st, p);
-            let ns = if held.is_empty() { p.clone() } else { held };
-            if wire::is_namespace(&ns) && p.has_prefix(&ns) && own.as_ref() != Some(&ns) {
-                out.insert(ns);
-            }
-        }
-        out.into_iter().collect()
+        inner.writer_namespaces_of(&st, folder)
     }
 
     /// [`Device::take_departure`](crate::Device::take_departure) through the weak
@@ -1536,13 +1647,18 @@ impl IntroductionSurface {
     /// # Errors
     /// As [`Device::take_departure`](crate::Device::take_departure), and
     /// [`DataError::Local`] once the device is gone.
-    pub async fn take_departure(&self, folder: &Name, record: &Name) -> Result<(), DataError> {
+    pub async fn take_departure(
+        &self,
+        from: &Name,
+        folder: &Name,
+        record: &Name,
+    ) -> Result<(), DataError> {
         let Some(inner) = self.inner.upgrade() else {
             return Err(local(
                 "this device has stopped: a departure is taken by a device that runs",
             ));
         };
-        inner.take_departure(folder, record).await
+        inner.take_departure(from, folder, record).await
     }
 }
 
@@ -1933,9 +2049,11 @@ impl Device {
             }
             // The joiner is no stranger from here on: it is noted until a members
             // record held admits it (a put in that window is `NotReady`, never
-            // `AskOwner`), and `join` returns once the record that admits it and,
-            // sealed, the epoch's key are held.
-            if role == Role::Writer && !inner.note_joined(&folder, ob.until, revision).await {
+            // `AskOwner`, for a writer; and a walk descends into the folder's node
+            // whatever record it held before, for either role: the admission is
+            // pending, [`Inner::admission_pending`]), and `join` returns once the
+            // record that admits it and, sealed, the epoch's key are held.
+            if !inner.note_joined(&folder, ob.until, revision, role).await {
                 return Err(local(
                     "the device stopped before the join was noted: join again with the same code",
                 ));

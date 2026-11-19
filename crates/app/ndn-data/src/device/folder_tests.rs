@@ -1021,7 +1021,11 @@ async fn a_put_by_a_device_an_offer_admitted_is_not_ready_until_its_record_is_he
     assert_eq!(refused.next(), crate::error::NextStep::AskOwner);
     // Admitted by an offer, the record not held yet.
     let until = Timestamp((dev.inner.config.clock)().0 + 3_600_000);
-    assert!(dev.inner.note_joined(&folder(), until, Some(2)).await);
+    assert!(
+        dev.inner
+            .note_joined(&folder(), until, Some(2), crate::Role::Writer)
+            .await
+    );
     let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
     assert!(
         refused.to_string().contains("join again"),

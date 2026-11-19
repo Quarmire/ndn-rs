@@ -945,7 +945,12 @@ async fn a_joiner_whose_inviter_never_sends_the_record_is_told_it_is_no_member_o
     let note = folder.clone().append("note");
     walked_alice(&phone, laptop.name(), &note).await;
     let until = laptop.inner.st.lock().intro.offers[&offer].until;
-    assert!(phone.inner.note_joined(&folder, until, Some(2)).await);
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, Some(2), Role::Writer)
+            .await
+    );
 
     let waiting = phone.put(&note, Content::new(), options()).await;
     assert!(
@@ -1016,7 +1021,12 @@ async fn a_removed_joiner_who_joins_again_is_told_it_is_no_member_not_to_wait() 
     // revision before the removal.
     let again = answer(&laptop, ask(&phone, &laptop, &offer, &secret, &[])).await;
     assert_eq!(again, first, "the removed joiner was not answered as kept");
-    assert!(phone.inner.note_joined(&folder, until, revision).await);
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, revision, Role::Writer)
+            .await
+    );
     relay(&laptop, &phone, &folder);
 
     let put = phone.put(&note, Content::new(), options()).await;
@@ -1085,7 +1095,12 @@ async fn a_join_returns_only_once_the_inviters_summary_was_walked_toward_the_fol
         panic!("bob was answered {answered:?}");
     };
     let until = laptop.inner.st.lock().intro.offers[&code.offer].until;
-    assert!(phone.inner.note_joined(&folder, until, revision).await);
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, revision, Role::Writer)
+            .await
+    );
     // The record that admits Bob arrived; the inviter's summary was heard in
     // the group and not walked.
     relay(&laptop, &phone, &folder);
@@ -2479,6 +2494,67 @@ async fn the_mark_names_the_record_with_the_cut_when_only_the_merge_leaves_the_p
     );
 }
 
+/// Spec §19.8 (which record, the first of the run): when later records arrive
+/// with the one that let the person go — each leaving them out too, and listing
+/// a person admitted since — the mark names the first of them: the record that
+/// actually left Bob out, not a later one that hands him the later membership.
+#[tokio::test]
+async fn the_mark_names_the_record_that_first_left_the_person_out_not_a_later_one() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let first = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    let mut later = first.clone();
+    later.revision += 1;
+    later.writers.push(n("/carol"));
+    later.readers.push(Audience::Person(n("/carol")));
+    let left = from_device(&alice.laptop, "/alice/phone", first);
+    from_device(&alice.laptop, "/alice/zzz", later);
+    alice.laptop.inner.judge_grants().await;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0].record, left,
+        "the mark names {} and not the record that first left Bob out, {left}",
+        marks[0].record
+    );
+}
+
+/// Spec §19.8 (which record, the run ends at a readmission): a record that
+/// readmits the person ends the run, and is never named; let go again by a later
+/// record, the person is let go by that one, not the first removal.
+#[tokio::test]
+async fn the_mark_never_names_a_record_before_a_readmission() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let admitted = alice.laptop.inner.st.lock().folders[&folder]
+        .members
+        .clone()
+        .unwrap();
+    let out = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    let mut again = out.clone();
+    again.revision += 1;
+    again.writers = admitted.writers.clone();
+    again.readers = admitted.readers.clone();
+    again.cuts = Vec::new();
+    let mut out_again = out.clone();
+    out_again.revision += 2;
+    from_device(&alice.laptop, "/alice/phone", out);
+    from_device(&alice.laptop, "/alice/aaa", again);
+    let last = from_device(&alice.laptop, "/alice/bbb", out_again);
+    alice.laptop.inner.judge_grants().await;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0].record, last,
+        "the mark names {} and not the record that let Bob go again, {last}",
+        marks[0].record
+    );
+}
+
 /// Spec §19.8 (notes are MAC'd, the mark with them): a mark added to a note
 /// the host ended, cleared from one a record ended, or moved (its date pushed
 /// out) fails the note's check; nothing is listed from it.
@@ -2581,6 +2657,7 @@ async fn take_departure_takes_only_a_members_record_of_a_folder_it_is_a_member_o
     // Not a folder name.
     let e = phone
         .take_departure(
+            &laptop,
             &n("/alice/notebook"),
             &log_name(&laptop, Some(&n("/alice/notebook")), 1),
         )
@@ -2590,30 +2667,34 @@ async fn take_departure_takes_only_a_members_record_of_a_folder_it_is_a_member_o
     // A record of another folder, a snapshot, a name that is no entry.
     let other = n("/alice/32=data/diary");
     let e = phone
-        .take_departure(&folder, &log_name(&laptop, Some(&other), 1))
+        .take_departure(&laptop, &folder, &log_name(&laptop, Some(&other), 1))
         .await
         .unwrap_err();
     refused(e, "no log entry of");
     let e = phone
-        .take_departure(&folder, &log_name(&laptop, None, 1))
+        .take_departure(&laptop, &folder, &log_name(&laptop, None, 1))
         .await
         .unwrap_err();
     refused(e, "no log entry of");
     let e = phone
-        .take_departure(&folder, &folder.clone().append("x"))
+        .take_departure(&laptop, &folder, &folder.clone().append("x"))
         .await
         .unwrap_err();
     refused(e, "no log entry of");
     // A device that holds no record of the folder is no member of it.
     let carol = phone_of("/carol").await;
     let e = carol
-        .take_departure(&folder, &log_name(&laptop, Some(&folder), 1))
+        .take_departure(&laptop, &folder, &log_name(&laptop, Some(&folder), 1))
         .await
         .unwrap_err();
     refused(e, "no members record");
     // Signed under a namespace no context of which is held.
     let e = phone
-        .take_departure(&folder, &log_name(&n("/mallory/phone"), Some(&folder), 1))
+        .take_departure(
+            &laptop,
+            &folder,
+            &log_name(&n("/mallory/phone"), Some(&folder), 1),
+        )
         .await
         .unwrap_err();
     refused(e, "no namespace this device holds");
@@ -2633,9 +2714,19 @@ async fn take_departure_takes_only_a_members_record_of_a_folder_it_is_a_member_o
         .cloned()
         .expect("a record of the folder is held");
     phone
-        .take_departure(&folder, &log_name(&device, Some(&folder), seq))
+        .take_departure(&laptop, &folder, &log_name(&device, Some(&folder), seq))
         .await
         .expect("a record held is taken");
+    // Told by a device outside the folder's namespace: refused before anything
+    // is looked at, even for a record held (what the link layer passes is the
+    // peer's authenticated device, and only the folder's namespace lets a
+    // member go of it).
+    let stranger = n("/carol/member/phone");
+    let e = phone
+        .take_departure(&stranger, &folder, &log_name(&device, Some(&folder), seq))
+        .await
+        .unwrap_err();
+    refused(e, "lies under no namespace of");
 }
 
 /// Spec §19.8: once a held record leaves this device out of a folder, a walk of
@@ -2712,6 +2803,139 @@ async fn a_joiner_holding_the_pre_admission_record_is_not_left_out_until_let_go(
     assert!(node(&phone), "a person let go still walks into the folder");
 }
 
+/// Spec §19.8 (re-invited): a member let go holds the record that admitted it
+/// (r1) and the one that left it out (r2, in force). Invited again, the offer's
+/// answer names the revision that admits it (r3) and the join notes it: until a
+/// record held admits it the admission is pending, and a walk of the inviter's
+/// summary MUST descend into the folder's node — the only place r3 is listed —
+/// not skip it as it does for a person let go. Once r3 is held it is a member.
+async fn let_go_and_invited_again(role: Role) {
+    let alice = Inviter::new(role, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let phone = phone_of("/bob").await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.alice.ctx))
+        .unwrap();
+    assert!(accepted(&alice.answers(&phone).await));
+    relay(&alice.laptop, &phone, &folder);
+    let node = |d: &Device| {
+        let st = d.inner.st.lock();
+        d.inner.left_out(&st, &folder)
+    };
+    // Let go (r2): Bob's phone and Alice's laptop both hold the record.
+    let out = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    from_the_phone(&phone, out.clone());
+    from_the_phone(&alice.laptop, out);
+    assert!(node(&phone), "a person let go still walks into the folder");
+    // Invited again (r3): the answer carries the revision above r2.
+    let (offer, secret) = alice.another_offer().await;
+    let got = answer(
+        &alice.laptop,
+        ask(&phone, &alice.laptop, &offer, &secret, &[]),
+    )
+    .await;
+    let Some(Outcome::Accepted { revision, .. }) = got else {
+        panic!("bob was invited again and answered {got:?}");
+    };
+    let in_force = phone.inner.st.lock().folders[&folder]
+        .members
+        .as_ref()
+        .unwrap()
+        .revision
+        .0;
+    assert!(
+        revision.is_some_and(|r| r > in_force),
+        "the new admission {revision:?} is not above the record in force ({in_force})"
+    );
+    let until = alice.laptop.inner.st.lock().intro.offers[&offer].until;
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, revision, role)
+            .await
+    );
+    assert!(
+        !node(&phone),
+        "a member invited again, whose new admission is not held yet, is left out: its walk \
+         would skip the node that lists the record and the join would never complete"
+    );
+    // r3 held: a member.
+    relay(&alice.laptop, &phone, &folder);
+    assert!(!node(&phone), "a member admitted again is left out");
+}
+
+#[tokio::test]
+async fn a_let_go_member_invited_again_is_not_left_out_while_the_new_admission_is_pending() {
+    let_go_and_invited_again(Role::Writer).await;
+}
+
+/// The same for a reader: the audience, not the writers, is what the records
+/// admit and leave out, and the join of a reader is noted too.
+#[tokio::test]
+async fn a_let_go_reader_invited_again_is_not_left_out_while_the_new_admission_is_pending() {
+    let_go_and_invited_again(Role::Reader).await;
+}
+
+/// Spec §19.8 (re-invited, the walk): a walk of the inviter's summary that ended
+/// while the device was let go skipped the folder's node and recorded its root as
+/// taken in full; the same root again would be answered with nothing walked, and
+/// the record that admits the device — in that very node — never fetched. A join
+/// waiting for its record while the admission is pending makes the walks of the
+/// folder's namespace go down again: the root is forgotten, and a walk under way
+/// since before records none. Not when no admission is pending (the record that
+/// admits the device, or the one that undid it, is held).
+#[tokio::test]
+async fn a_join_waiting_for_its_record_makes_the_walks_of_its_namespace_descend_again() {
+    let (alice, phone, folder) = bob_holding_the_folder().await;
+    let key = (alice.laptop.name().clone(), n("/alice"));
+    let walked = |d: &Device| {
+        let mut st = d.inner.st.lock();
+        let peer = st.peers.entry(key.clone()).or_default();
+        peer.root = Some([7; 32]);
+        peer.resets
+    };
+    let until = Timestamp((alice.clock)().0 + 3_600_000);
+    // The admission named a revision the folder's record in force is below.
+    let resets = walked(&phone);
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, Some(u64::MAX), Role::Writer)
+            .await
+    );
+    phone.inner.descend_again_toward(&folder);
+    {
+        let st = phone.inner.st.lock();
+        let peer = &st.peers[&key];
+        assert_eq!(
+            peer.root, None,
+            "a root walked while the device was let go is still taken for walked in full"
+        );
+        assert!(
+            peer.resets > resets,
+            "a walk under way since before the admission would still record its root"
+        );
+    }
+    // The record in force is at the revision the answer named: nothing is pending.
+    let resets = walked(&phone);
+    assert!(
+        phone
+            .inner
+            .note_joined(&folder, until, Some(1), Role::Writer)
+            .await
+    );
+    phone.inner.descend_again_toward(&folder);
+    let st = phone.inner.st.lock();
+    assert_eq!(
+        st.peers[&key].root,
+        Some([7; 32]),
+        "walked again with nothing pending"
+    );
+    assert_eq!(st.peers[&key].resets, resets);
+}
+
 /// Spec §19.8 (`take_departure`, bounds): a record that cannot be fetched is
 /// `NotReady`, saying what to do; one take of a folder at a time; a bounded
 /// number begin a minute.
@@ -2721,7 +2945,7 @@ async fn take_departure_is_one_at_a_time_for_a_folder_and_bounded_a_minute() {
     let laptop = alice.laptop.name().clone();
     let missing = |seq: u64| log_name(&laptop, Some(&folder), 900 + seq);
     let e = phone
-        .take_departure(&folder, &missing(0))
+        .take_departure(&laptop, &folder, &missing(0))
         .await
         .unwrap_err();
     assert!(
@@ -2732,8 +2956,8 @@ async fn take_departure_is_one_at_a_time_for_a_folder_and_bounded_a_minute() {
     // Two at once for one folder: the second is told one is under way.
     let (one, two) = (missing(1), missing(2));
     let (first, second) = tokio::join!(
-        phone.take_departure(&folder, &one),
-        phone.take_departure(&folder, &two),
+        phone.take_departure(&laptop, &folder, &one),
+        phone.take_departure(&laptop, &folder, &two),
     );
     assert!(
         matches!(&first, Err(DataError::NotReady { why, .. }) if why.contains("could not be fetched")),
@@ -2747,7 +2971,7 @@ async fn take_departure_is_one_at_a_time_for_a_folder_and_bounded_a_minute() {
     // Two begun so far; the bound is six a minute, whatever the names.
     for seq in 3..7 {
         let e = phone
-            .take_departure(&folder, &missing(seq))
+            .take_departure(&laptop, &folder, &missing(seq))
             .await
             .unwrap_err();
         assert!(
@@ -2756,7 +2980,7 @@ async fn take_departure_is_one_at_a_time_for_a_folder_and_bounded_a_minute() {
         );
     }
     let e = phone
-        .take_departure(&folder, &missing(8))
+        .take_departure(&laptop, &folder, &missing(8))
         .await
         .unwrap_err();
     assert!(
@@ -2879,4 +3103,58 @@ async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
 
     // A folder this device holds no record of lists no writer.
     assert!(!surface.grant_carries(&n("/alice/32=data/diary"), &carol_root));
+}
+
+/// Spec §19.8 (co-writers, which namespace): the namespace a listed writer
+/// unlocks is the one `writer_namespaces` derives (the trust context's, or the
+/// writer's own prefix when none is held), never any name the writer's name
+/// merely starts with: a writer `/home/carol/member/x` does not unlock the
+/// summary root or the sync group of the broader `/home`.
+#[tokio::test]
+async fn a_writer_below_a_namespace_unlocks_only_its_own_namespace_not_the_broader_one() {
+    use crate::wire::root_name;
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let surface = alice.laptop.introductions();
+    let device = n("/alice/laptop");
+    let writer = n("/home/carol/member/x");
+    alice
+        .laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice"), writer.clone()],
+                readers: vec![Audience::Person(n("/alice"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    let namespaces = surface.writer_namespaces(&folder);
+    assert_eq!(
+        namespaces,
+        vec![writer.clone()],
+        "the case needs the writer's own prefix as its namespace"
+    );
+    for ns in &namespaces {
+        assert!(
+            surface.grant_carries(&folder, &root_name(&device, ns, 4)),
+            "the root of {ns}, a namespace of a listed writer, was not carried"
+        );
+        assert!(
+            surface.grant_carries(&folder, &n(&format!("{ns}/32=sync/vector"))),
+            "the sync group of {ns}, a namespace of a listed writer, was not carried"
+        );
+    }
+    for above in [n("/home"), n("/home/carol"), n("/home/carol/member")] {
+        assert!(
+            !surface.grant_carries(&folder, &root_name(&device, &above, 4)),
+            "the root of {above}, above the writer's namespace, crossed"
+        );
+        assert!(
+            !surface.grant_carries(&folder, &n(&format!("{above}/32=sync/vector"))),
+            "the sync group of {above}, above the writer's namespace, crossed"
+        );
+    }
 }
