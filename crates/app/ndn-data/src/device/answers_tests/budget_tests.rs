@@ -197,19 +197,24 @@ async fn a_device_operation_completes_while_an_evaluation_runs() {
 
 #[tokio::test]
 async fn an_evaluation_over_its_time_is_refused_and_is_told_to_stop() {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let hook = {
-        let stopped = Arc::clone(&stopped);
-        move |view: &dyn ReadView| {
-            for _ in 0..POLLS {
-                if view.cancelled() {
-                    stopped.store(true, Ordering::SeqCst);
-                    return Err(EvalError::Refused("cancelled".into()));
+    // The evaluation waits for the cancel with no count of polls: it ends at the cancel, or at a
+    // bound a minute away that only a failure reaches. It tells the case when it sees the cancel,
+    // and the case waits for that told, not for any number of milliseconds, so a machine starved
+    // of CPU or threads only makes the case slower, never wrong.
+    let (told, stopped) = tokio::sync::oneshot::channel::<()>();
+    let told = std::sync::Mutex::new(Some(told));
+    let hook = move |view: &dyn ReadView| {
+        let give_up = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < give_up {
+            if view.cancelled() {
+                if let Some(told) = told.lock().unwrap().take() {
+                    let _ = told.send(());
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                return Err(EvalError::Refused("cancelled".into()));
             }
-            Ok(())
+            std::thread::sleep(Duration::from_millis(1));
         }
+        Ok(())
     };
     let tiny = Budget {
         time: Duration::from_millis(20),
@@ -231,13 +236,10 @@ async fn an_evaluation_over_its_time_is_refused_and_is_told_to_stop() {
         e.to_string().contains("raise Config::answers.budget"),
         "the refusal says what to do: {e}"
     );
-    for _ in 0..POLLS {
-        if stopped.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    panic!("the evaluation was never told to stop");
+    tokio::time::timeout(Duration::from_secs(60), stopped)
+        .await
+        .expect("the evaluation was never told to stop")
+        .expect("the evaluation ended without seeing the cancel");
 }
 
 #[tokio::test]
