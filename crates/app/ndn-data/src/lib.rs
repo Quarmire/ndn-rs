@@ -69,6 +69,7 @@ pub mod collection;
 pub mod device;
 pub mod error;
 pub mod events;
+pub mod folder_scope;
 pub mod intro;
 pub mod layer;
 pub mod merge;
@@ -96,6 +97,7 @@ pub use events::{
     AnswerFault, Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId,
     EventKind, EventSubject, Meaning, ReadSetFault, WithdrawnBy,
 };
+pub use folder_scope::folder_carries;
 pub use intro::{Code, Grant, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
