@@ -2289,6 +2289,12 @@ struct Inner {
     asking: Mutex<HashMap<(Name, Option<u64>), WalkAsk>>,
     /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
+    /// Asks for an answer being worked on, all askers together
+    /// ([`AnswerConfig::asks_at_once`](crate::answer::AnswerConfig)).
+    asks_at_once: Arc<Semaphore>,
+    /// Where the provider asks of authenticated devices go: what
+    /// [`Device::provider_asks`] gave out. `None` until a host takes it.
+    provider_asks: Mutex<Option<mpsc::Sender<crate::answer::ProviderAsk>>>,
     signatures: AtomicU64,
     /// Epoch keys asked for ([`Device::grants_asked`]).
     grants_asked: AtomicU64,
@@ -7381,6 +7387,7 @@ impl Device {
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
         let in_flight = config.in_flight.max(config.window).max(1);
         let asks_verifying = config.asks_verifying.max(1);
+        let asks_at_once = config.answers.asks_at_once.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
         let clock = Arc::clone(&config.clock);
@@ -7509,6 +7516,8 @@ impl Device {
             rtt: Mutex::new(Rtt::default()),
             asking: Mutex::new(HashMap::new()),
             verifying: Semaphore::new(asks_verifying),
+            asks_at_once: Arc::new(Semaphore::new(asks_at_once)),
+            provider_asks: Mutex::new(None),
             signatures: AtomicU64::new(0),
             grants_asked: AtomicU64::new(0),
             grants_answered: AtomicU64::new(0),
@@ -15567,6 +15576,21 @@ impl Inner {
             });
             return;
         }
+        if crate::answer::parse_answer_ask_name(&name).is_some_and(|d| d == self.device) {
+            // Answering an ask for an answer opens the ask, verifies the
+            // asker and may compute: its own task (answers.md §15). An ask
+            // that does not authenticate gets no reply at all, not even a
+            // Nack: the Interest is dropped.
+            let params = interest.app_parameters().cloned();
+            let lifetime = interest.lifetime();
+            rt::spawn(async move {
+                match self.answer_ask(&name, params, lifetime).await {
+                    Some(wire) => self.reply(&name, responder, Some(wire)).await,
+                    None => drop(responder),
+                }
+            });
+            return;
+        }
         if let Some((holder, piece)) = parse_held_name(&name)
             && holder == self.device
         {
@@ -15751,6 +15775,12 @@ impl Inner {
             let w = self.store.get(&relayed_name(name))?;
             let kept = Data::decode(w.clone()).ok()?;
             return (*kept.name == *name).then_some(w);
+        }
+        // This device's seal key by its device name alone, as one asked for
+        // by prefix: whoever seals an ask to this device (answers.md §15)
+        // learns the key from the packet it signed, and verifies it so.
+        if can_be_prefix && *name == wire::seal_key_prefix(&self.device) {
+            return self.seal_key_packet(&mut self.st.lock());
         }
         if let Some((device, public)) = parse_seal_key_name(name)
             && device == self.device
@@ -17290,13 +17320,7 @@ struct AskSlot<'a> {
 
 impl Drop for AskSlot<'_> {
     fn drop(&mut self) {
-        let mut st = self.inner.st.lock();
-        if let Some(n) = st.asks.get_mut(&self.asker) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                st.asks.remove(&self.asker);
-            }
-        }
+        self.inner.release_ask(&self.asker);
     }
 }
 
@@ -18423,17 +18447,34 @@ impl Inner {
     /// Count one more ask of `asker` in progress, if it has fewer than
     /// `limit`; the slot is given back when dropped.
     fn ask_slot(&self, asker: &Name, limit: usize) -> Option<AskSlot<'_>> {
+        self.take_ask(asker, limit).then(|| AskSlot {
+            inner: self,
+            asker: asker.clone(),
+        })
+    }
+
+    /// Count one more ask of `asker` in progress, if it has fewer than
+    /// `limit`: whether it was counted. [`Self::release_ask`] gives it back.
+    fn take_ask(&self, asker: &Name, limit: usize) -> bool {
         let mut st = self.st.lock();
         let n = st.asks.entry(asker.clone()).or_default();
         if *n >= limit {
             tracing::debug!(%asker, "ask refused: the asker has as many in progress as it may");
-            return None;
+            return false;
         }
         *n += 1;
-        Some(AskSlot {
-            inner: self,
-            asker: asker.clone(),
-        })
+        true
+    }
+
+    /// Give back an ask [`Self::take_ask`] counted.
+    fn release_ask(&self, asker: &Name) {
+        let mut st = self.st.lock();
+        if let Some(n) = st.asks.get_mut(asker) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.asks.remove(asker);
+            }
+        }
     }
 
     /// [`Self::ask_slot`] for a hold ask of `asker`. While another ask of
@@ -26978,6 +27019,8 @@ mod scoped;
 mod events;
 
 mod answer_get;
+
+mod answer_ask;
 
 mod answer_reads;
 

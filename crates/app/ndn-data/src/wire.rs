@@ -778,6 +778,12 @@ pub fn parse_state_name(name: &Name) -> Option<(Name, Frontier)> {
         .map(|f| (collection, f))
 }
 
+/// `<device>/32=seal`: what a device's seal key packet is asked for by when its public key is not
+/// known yet (a prefix of [`seal_key_name`]).
+pub fn seal_key_prefix(device: &Name) -> Name {
+    device.clone().append_component(kw(SEAL))
+}
+
 /// A device's seal key's name: `<device>/32=seal/<public key>`, the last
 /// component the 32 octets of its X25519 public key.
 pub fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
@@ -1026,15 +1032,18 @@ pub enum AskProtocol {
     IntroAsk,
     /// An introduction answer ([`crate::intro::AnswerBody`]).
     IntroAnswer,
+    /// An ask for an answer ([`crate::answer::AnswerAskBody`]).
+    AnswerAsk,
 }
 
 impl AskProtocol {
     /// Every protocol.
-    pub const ALL: [AskProtocol; 4] = [
+    pub const ALL: [AskProtocol; 5] = [
         AskProtocol::Hold,
         AskProtocol::Audit,
         AskProtocol::IntroAsk,
         AskProtocol::IntroAnswer,
+        AskProtocol::AnswerAsk,
     ];
 
     /// The octets opening its bindings: ASCII ending in a zero octet, so
@@ -1045,6 +1054,7 @@ impl AskProtocol {
             AskProtocol::Audit => b"ndn-data audit ask\0",
             AskProtocol::IntroAsk => b"ndn-data intro ask\0",
             AskProtocol::IntroAnswer => b"ndn-data intro answer\0",
+            AskProtocol::AnswerAsk => b"ndn-data answer ask\0",
         }
     }
 }

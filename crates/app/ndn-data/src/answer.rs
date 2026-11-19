@@ -16,12 +16,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_foundation_types::{Hash, Name, tlv_type};
+use ndn_foundation_types::{Hash, Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 use sha2::{Digest, Sha256};
 
 use crate::collection::Epoch;
-use crate::error::{AnswerRefusal, DataError};
+use crate::error::{AnswerRefusal, DataError, NextStep};
 use crate::layer::{Age, Got};
 use crate::version::{Parents, Writer};
 use crate::wire::{
@@ -36,8 +36,8 @@ pub const SEAL_EPOCHS_MAX: usize = 256;
 /// The most octets of an [`AnswerAsk`] (answers.md §7.1).
 pub const QUESTION_MAX: usize = 65_536;
 
-/// TLV-TYPE numbers of answers (0x05C0–0x05DF, all odd: every field changes what an answer
-/// means). Registered in `docs/specs/README.md`; 0x05DE–0x05DF are held for the ask exchange.
+/// TLV-TYPE numbers of answers (0x05C0–0x05DF, all odd but the two of the ask exchange: every
+/// field changes what an answer means). Registered in `docs/specs/README.md`.
 pub mod tlv {
     /// An answer's Content: `AnswerKind`, then one of `AnswerBody`; `AnswerSealed` with a
     /// `Ciphertext`; `Chunks`; `AnswerSealed` without a `Ciphertext`, then `Chunks`.
@@ -76,6 +76,13 @@ pub mod tlv {
     /// Zero octets after the `AnswerBody`, inside a sealed answer's plaintext only: they make the
     /// plaintext the size of its bucket (answers.md §5.3).
     pub const ANSWER_PADDING: u64 = 0x05DD;
+    /// An ask for an answer, the Interest's ApplicationParameters: the ephemeral key, the wrapped
+    /// content key and the sealed body, as an introduction's ask carries them
+    /// ([`AnswerAskEnvelope`](super::AnswerAskEnvelope)).
+    pub const ANSWER_ASK_ENVELOPE: u64 = 0x05DE;
+    /// A signer's refusal of an ask, the reply's Content: a reason code, a number and an
+    /// explanation ([`AnswerAskRefusal`](super::AnswerAskRefusal)).
+    pub const ANSWER_ASK_REFUSAL: u64 = 0x05DF;
 }
 
 /// The label of the read-set digest.
@@ -1381,6 +1388,13 @@ pub struct AnswerConfig {
     pub store: AnswerStore,
     /// The most answers this device signs per second. Default 16.
     pub sign_per_second: u32,
+    /// Whose asks for an answer this device answers (answers.md §15). Default
+    /// [`AskServing::Own`].
+    pub serve_asks: AskServing,
+    /// The most asks for an answer this device works on at once, for all askers together; one
+    /// more is refused [`AskRefusal::Busy`] (each asker also has one in progress at most).
+    /// Default 4.
+    pub asks_at_once: usize,
 }
 
 impl Default for AnswerConfig {
@@ -1400,6 +1414,344 @@ impl Default for AnswerConfig {
                 total_bytes: 1 << 30,
             },
             sign_per_second: 16,
+            serve_asks: AskServing::Own,
+            asks_at_once: 4,
         }
     }
+}
+
+// ---- the ask exchange (answers.md §15) ---------------------------------------------------------
+
+/// TLV-TYPE of a Data packet: the asker's proof rides in an ask's plaintext as one.
+const DATA_TLV: u64 = 0x06;
+
+/// Whose asks for an answer a device answers ([`AnswerConfig::serve_asks`], answers.md §15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AskServing {
+    /// None: every ask is refused [`AskRefusal::NotServed`].
+    Off,
+    /// Asks of devices of this device's own namespace.
+    Own,
+    /// Own, and a device that is a listed writer or reader of every collection the ask reads.
+    OwnAndMembers,
+}
+
+/// Why a signer does not answer an ask with an answer (answers.md §15): the reason code of an
+/// [`AnswerAskRefusal`]. An ask that does not authenticate gets no reply at all, so none of
+/// these is ever told to a stranger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AskRefusal {
+    /// 1: a read of the question is sealed to an audience the asker is not in. `index` is the
+    /// position, in the read set, of the first such read.
+    NotAudience {
+        /// The first read the asker may not read.
+        index: u64,
+    },
+    /// 2: the signer works on as many asks as it may, or on one of the asker's already.
+    Busy {
+        /// How long to wait before asking again.
+        retry_after: Duration,
+    },
+    /// 3: the answer is being computed and was not ready within the ask's lifetime; asking the
+    /// same question again gets it once it is.
+    Pending {
+        /// How long to wait before asking again.
+        retry_after: Duration,
+    },
+    /// 4: the signer does not know the evaluator the question names.
+    CannotCheck,
+    /// 5: the signer does not provide the function, or its host delivered no result in time.
+    NotProvided,
+    /// 6: computing the answer would exceed the signer's budget.
+    OverBudget,
+    /// 7: the signer serves no asks from this asker ([`AskServing`]).
+    NotServed,
+}
+
+impl AskRefusal {
+    /// The reason code on the wire, 1 to 7.
+    pub fn code(&self) -> u64 {
+        match self {
+            AskRefusal::NotAudience { .. } => 1,
+            AskRefusal::Busy { .. } => 2,
+            AskRefusal::Pending { .. } => 3,
+            AskRefusal::CannotCheck => 4,
+            AskRefusal::NotProvided => 5,
+            AskRefusal::OverBudget => 6,
+            AskRefusal::NotServed => 7,
+        }
+    }
+
+    /// The one number a reason carries: the read's index, or the wait in milliseconds; 0 for the
+    /// others.
+    fn param(&self) -> u64 {
+        match self {
+            AskRefusal::NotAudience { index } => *index,
+            AskRefusal::Busy { retry_after } | AskRefusal::Pending { retry_after } => {
+                u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX)
+            }
+            _ => 0,
+        }
+    }
+
+    fn of(code: u64, param: u64) -> Result<Self, WireError> {
+        let wait = Duration::from_millis(param);
+        let none = |r: AskRefusal| match param {
+            0 => Ok(r),
+            _ => Err(bad("this reason of an ask's refusal carries no number")),
+        };
+        match code {
+            1 => Ok(AskRefusal::NotAudience { index: param }),
+            2 => Ok(AskRefusal::Busy { retry_after: wait }),
+            3 => Ok(AskRefusal::Pending { retry_after: wait }),
+            4 => none(AskRefusal::CannotCheck),
+            5 => none(AskRefusal::NotProvided),
+            6 => none(AskRefusal::OverBudget),
+            7 => none(AskRefusal::NotServed),
+            _ => Err(bad("an ask's refusal has a reason code from 1 to 7")),
+        }
+    }
+
+    /// How long to wait before asking again, if asking again can help.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            AskRefusal::Busy { retry_after } | AskRefusal::Pending { retry_after } => {
+                Some(*retry_after)
+            }
+            _ => None,
+        }
+    }
+
+    /// What to do about it, by class.
+    pub fn next(&self) -> NextStep {
+        match self {
+            AskRefusal::NotAudience { .. } => NextStep::AskOwner,
+            AskRefusal::Busy { .. } | AskRefusal::Pending { .. } => NextStep::RetryLater,
+            AskRefusal::CannotCheck | AskRefusal::NotProvided | AskRefusal::NotServed => {
+                NextStep::SetPolicy
+            }
+            AskRefusal::OverBudget => NextStep::FixRequest,
+        }
+    }
+
+    /// Why, and what to do: what a signer says with the reason code.
+    pub fn explain(&self) -> String {
+        match self {
+            AskRefusal::NotAudience { index } => format!(
+                "read {index} of the question is sealed to an audience the asker is not in, so \
+                 the signer neither computes nor tells it; ask the owner of that collection to \
+                 add the asker's device to its readers"
+            ),
+            AskRefusal::Busy { retry_after } => format!(
+                "the signer works on as many asks as it may, or on one of this asker's already; \
+                 ask again after {} ms",
+                retry_after.as_millis()
+            ),
+            AskRefusal::Pending { retry_after } => format!(
+                "the answer is being computed and was not ready within the ask's lifetime; ask \
+                 the same question again after {} ms: the signer keeps the answer once it has \
+                 it",
+                retry_after.as_millis()
+            ),
+            AskRefusal::CannotCheck => "the signer does not know the evaluator the question \
+                 names, so it cannot compute the answer; name a signer that knows it in the \
+                 policy, or run a program that knows it"
+                .into(),
+            AskRefusal::NotProvided => "the signer does not provide this function, or its host \
+                 delivered no result for it in time; name a device that provides it in \
+                 AnswerPolicy::providers"
+                .into(),
+            AskRefusal::OverBudget => "computing the answer would exceed the signer's budget; \
+                 state a smaller read set, or raise Config::answers.budget on the signer"
+                .into(),
+            AskRefusal::NotServed => "the signer serves no asks from this device \
+                 (Config::answers.serve_asks there); name another signer in the policy, or set \
+                 serve_asks on the signer to include this device"
+                .into(),
+        }
+    }
+}
+
+/// A signer's refusal of an ask, the Content of the reply Data (TLV 0x05DF, answers.md §15).
+/// Its value is the reason code as a one-octet NonNegativeInteger, the one number the reason
+/// carries ([`AskRefusal`]) as an eight-octet NonNegativeInteger, and, to the end, the
+/// explanation in UTF-8: why, and what to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerAskRefusal {
+    /// The reason.
+    pub why: AskRefusal,
+    /// Why, and what to do, in words.
+    pub explanation: String,
+}
+
+impl AnswerAskRefusal {
+    /// The refusal for `why`, with the explanation of [`AskRefusal::explain`].
+    pub fn new(why: AskRefusal) -> Self {
+        AnswerAskRefusal {
+            explanation: why.explain(),
+            why,
+        }
+    }
+
+    /// The `AnswerAskRefusal` TLV (0x05DF).
+    pub fn encode(&self) -> Bytes {
+        let mut v = Vec::with_capacity(9 + self.explanation.len());
+        v.push(self.why.code() as u8);
+        v.extend_from_slice(&self.why.param().to_be_bytes());
+        v.extend_from_slice(self.explanation.as_bytes());
+        tlv_of(tlv::ANSWER_ASK_REFUSAL, &v)
+    }
+
+    /// Decode one `AnswerAskRefusal` TLV, exactly.
+    pub fn decode(tlv: Bytes) -> Result<Self, WireError> {
+        let value = unwrap_tlv(tlv, tlv::ANSWER_ASK_REFUSAL, "an AnswerAskRefusal")?;
+        let (Some(code), Some(param)) = (
+            value.first().copied(),
+            value.get(1..9).and_then(|p| <[u8; 8]>::try_from(p).ok()),
+        ) else {
+            return Err(bad(
+                "an ask's refusal is a reason code, a number and an explanation",
+            ));
+        };
+        let explanation = std::str::from_utf8(&value[9..])
+            .map_err(|_| bad("an ask's refusal explains itself in UTF-8"))?
+            .to_owned();
+        Ok(AnswerAskRefusal {
+            why: AskRefusal::of(u64::from(code), u64::from_be_bytes(param))?,
+            explanation,
+        })
+    }
+}
+
+/// An ask for an answer as it travels (TLV 0x05DE, answers.md §15): sealed to the signer's seal
+/// key like an introduction's ask, with the same fields: the asker's ephemeral X25519 public
+/// key, a fresh content key wrapped to the signer's key, and the [`AnswerAskBody`] sealed under
+/// it. The Interest's ApplicationParameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerAskEnvelope {
+    /// The asker's ephemeral X25519 public key.
+    pub ephemeral: [u8; 32],
+    /// A fresh content key, wrapped to the signer's seal key.
+    pub key: Bytes,
+    /// The [`AnswerAskBody`], sealed under that content key.
+    pub sealed: Bytes,
+}
+
+impl AnswerAskEnvelope {
+    /// Its `AnswerAskEnvelope` TLV: an ask Interest's ApplicationParameters.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::ANSWER_ASK_ENVELOPE, |w| {
+            w.write_tlv(wire::tlv::EPHEMERAL_KEY, &self.ephemeral);
+            w.write_tlv(wire::tlv::CIPHERTEXT, &self.key);
+            w.write_tlv(wire::tlv::CIPHERTEXT, &self.sealed);
+        });
+        w.finish()
+    }
+
+    /// Read an ask Interest's ApplicationParameters: one `AnswerAskEnvelope`.
+    pub fn decode(params: Bytes) -> Result<Self, WireError> {
+        let value = unwrap_tlv(params, tlv::ANSWER_ASK_ENVELOPE, "an AnswerAskEnvelope")?;
+        let mut p = Parts::of(value)?;
+        let ephemeral = read_digest(&p.expect(wire::tlv::EPHEMERAL_KEY, "the ephemeral key")?)?;
+        let key = p.expect(wire::tlv::CIPHERTEXT, "the wrapped content key")?;
+        let sealed = p.expect(wire::tlv::CIPHERTEXT, "the sealed body")?;
+        p.end()?;
+        Ok(AnswerAskEnvelope {
+            ephemeral,
+            key,
+            sealed,
+        })
+    }
+}
+
+/// What an ask for an answer holds once opened: the question, the asking device and its proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerAskBody {
+    /// The question: what is asked.
+    pub ask: AnswerAsk,
+    /// The asking device.
+    pub asker: Name,
+    /// The asker's proof packet `<asker>/32=ask/<binding>`, signed by its device key, a whole
+    /// Data packet. `binding` is [`AnswerAskBody::binding`].
+    pub proof: Bytes,
+}
+
+impl AnswerAskBody {
+    /// What the asker's proof packet names: the label of this protocol, the signer's Name TLV,
+    /// the `AnswerAsk` TLV and the ephemeral public key the ask is sealed with
+    /// ([`wire::ask_binding`]).
+    pub fn binding(signer: &Name, ask: &AnswerAsk, ephemeral: &[u8; 32]) -> [u8; 32] {
+        wire::ask_binding(
+            wire::AskProtocol::AnswerAsk,
+            &[&signer.encode_to_tlv(), &ask.encode(), ephemeral],
+        )
+    }
+
+    /// Its plaintext: the `AnswerAsk` TLV, the asker's Name TLV, the proof Data packet.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_raw(&self.ask.encode());
+        write_name(&mut w, &self.asker);
+        w.write_raw(&self.proof);
+        w.finish()
+    }
+
+    /// Read a plaintext, exactly.
+    pub fn decode(plain: Bytes) -> Result<Self, WireError> {
+        let mut p = Parts::of(plain)?;
+        let ask = AnswerAsk::decode(tlv_of(
+            tlv::ANSWER_ASK,
+            &p.expect(tlv::ANSWER_ASK, "the question")?,
+        ))?;
+        let asker = read_name(p.expect(tlv_type::NAME, "the asker's name")?)?;
+        let proof = tlv_of(DATA_TLV, &p.expect(DATA_TLV, "the asker's proof packet")?);
+        p.end()?;
+        Ok(AnswerAskBody { ask, asker, proof })
+    }
+}
+
+/// `<signer>/32=ask-answer`: an ask for an answer's name before its parameters digest, and what
+/// its sealing binds as associated data.
+pub fn answer_ask_prefix(signer: &Name) -> Name {
+    signer.clone().append_component(wire::kw(b"ask-answer"))
+}
+
+/// An ask's name: `<signer>/32=ask-answer/<ParametersSha256Digest>`, the digest over the
+/// ApplicationParameters TLV that carries `params` (an [`AnswerAskEnvelope`] TLV), as the
+/// Interest carries it and the reply is named.
+pub fn answer_ask_name(signer: &Name, params: &[u8]) -> Name {
+    let mut w = TlvWriter::new();
+    w.write_tlv(ndn_packet::tlv_type::APP_PARAMETERS, params);
+    let digest = Sha256::digest(w.finish());
+    answer_ask_prefix(signer).append_component(NameComponent::new(
+        tlv_type::PARAMETERS_SHA256,
+        Bytes::copy_from_slice(&digest),
+    ))
+}
+
+/// The signer `<signer>/32=ask-answer/<ParametersSha256Digest>` asks.
+pub fn parse_answer_ask_name(name: &Name) -> Option<Name> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| wire::is_kw(c, b"ask-answer"))?;
+    (wire::is_device_comps(&comps[..at])
+        && at + 2 == comps.len()
+        && comps[at + 1].typ == tlv_type::PARAMETERS_SHA256
+        && comps[at + 1].value.len() == 32)
+        .then(|| wire::name_of(&comps[..at]))
+}
+
+/// A function's call a host is asked to compute (answers.md §15): delivered on
+/// [`Device::provider_asks`](crate::Device::provider_asks) when an authenticated device in the
+/// audience of every input asks this device for a provider answer it does not hold. The host
+/// computes the result and calls [`Device::provide`](crate::Device::provide) with `function`,
+/// `inputs` and it; the asker's next ask finds the answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAsk {
+    /// The function, full and versioned.
+    pub function: Name,
+    /// The inputs: signed reads the asker may read.
+    pub inputs: ReadSet,
+    /// The asking device.
+    pub asker: Name,
 }

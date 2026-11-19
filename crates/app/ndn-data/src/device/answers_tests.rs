@@ -22,6 +22,7 @@ use crate::error::AnswerRefusal;
 use crate::events::{AnswerFault, EventDetail, EventKind, Meaning, ReadSetFault};
 use crate::layer::Share;
 
+mod ask_tests;
 mod budget_tests;
 
 const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;
@@ -112,6 +113,9 @@ struct World {
     people: Vec<Person>,
     certs: Vec<Certificate>,
     nodes: Vec<Node>,
+    /// The connection the next device started fetches over, once: what hands its Interests to
+    /// another device ([`ask_tests`]); else a forwarder that delivers nothing.
+    link: std::sync::Mutex<Option<Arc<dyn Connection>>>,
 }
 
 impl World {
@@ -120,6 +124,7 @@ impl World {
             people: ["/alice", "/bob", "/dave"].map(Person::new).into(),
             certs: Vec::new(),
             nodes: Vec::new(),
+            link: std::sync::Mutex::new(None),
         }
     }
 
@@ -180,11 +185,17 @@ impl World {
         store: &Arc<dyn DataStore>,
         config: Config,
     ) -> Device {
-        let conn: Arc<dyn Connection> = Arc::new(Unconnected);
+        let sync: Arc<dyn Connection> = Arc::new(Unconnected);
+        let fetch = self
+            .link
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| Arc::clone(&sync));
         Device::start(
             Transport {
-                node: Node_::from_connection(Arc::clone(&conn)),
-                sync: conn,
+                node: Node_::from_connection(fetch),
+                sync,
             },
             name.clone(),
             Arc::clone(keys),

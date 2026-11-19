@@ -2,9 +2,10 @@
 //! checking it (§7.3.3), resolving a question (§7.2), recompute-or-trust (§7.3), evidence (§8) and
 //! signing an answer (§6.2).
 //!
-//! Nothing here computes for a remote requester: an answer is made only for this device's own
-//! host, by [`Device::publish_answer`] and [`Device::provide`] (or by a `get` when
-//! `Config::answers.publish` says so), never because an Interest asked (§13.2).
+//! Nothing here computes for a remote requester: an answer is made for this device's own host, by
+//! [`Device::publish_answer`] and [`Device::provide`] (or by a `get` when
+//! `Config::answers.publish` says so), and for no Interest but an authenticated ask of an asker
+//! of the audience of every read, which `answer_ask` serves by those same calls (§15).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -603,7 +604,12 @@ impl Inner {
     /// packets of others (answers.md §7.2 step 5): for a pure answer those the policy trusts
     /// that this device knows; for a provider answer the devices the policy names for the
     /// function. Never this device.
-    fn candidates(&self, kind: AnswerKind, by: &Name, reads: &ReadSet) -> (Vec<Name>, Vec<Name>) {
+    pub(super) fn candidates(
+        &self,
+        kind: AnswerKind,
+        by: &Name,
+        reads: &ReadSet,
+    ) -> (Vec<Name>, Vec<Name>) {
         let st = self.st.lock();
         let policy = &self.config.answers.policy;
         let own = self.relays(&st, &self.ns, &self.device, &[]);
@@ -865,12 +871,28 @@ impl Inner {
             });
         }
         let run = self.recomputes(&ask);
-        let r = self.resolve_question(qname, &ask, run).await?;
+        let r = match self.resolve_question(qname, &ask, run).await {
+            Ok(r) => r,
+            // Nothing here plans the reads (the evaluator is not known and none are stated):
+            // the signers the policy names may be asked (answers.md §15).
+            Err(e @ DataError::CannotCheck { .. }) => {
+                return self.asked_answer(qname, &ask, e).await;
+            }
+            Err(e) => return Err(e),
+        };
         let age = r.age;
         let answered = if run {
             self.finish_recomputed(qname, None, r, Vec::new()).await?
         } else {
-            self.finish_trusted(qname, &ask, r, None).await?
+            match self.finish_trusted(qname, &ask, r, None).await {
+                Ok(a) => a,
+                // No answer is published where this device looks, and none is held: ask the
+                // signers the policy names (answers.md §15).
+                Err(e @ DataError::Unavailable { .. }) => {
+                    return self.asked_answer(qname, &ask, e).await;
+                }
+                Err(e) => return Err(e),
+            }
         };
         Ok(Answer {
             got: Got::Answer(answered),
@@ -914,30 +936,41 @@ impl Inner {
             by: opened.body.binding.by.clone(),
             reads: Some(opened.body.reads.clone()),
         };
+        let answered = self
+            .finish_opened(name, &ask, opened, Some(name.clone()))
+            .await?;
+        Ok(Answer {
+            got: Got::Answer(answered),
+            age: Age::Exact,
+        })
+    }
+
+    /// An answer packet that passed [`Self::open_packet`] and the equivocation check, judged as
+    /// every answer is (answers.md §7.3): recomputed when the evaluator is known here, else
+    /// taken on trust. `asked` is the name the caller asked for and `exact` the exact answer
+    /// name it asked for, if it did; `ask` is what the packet answers.
+    pub(super) async fn finish_opened(
+        self: &Arc<Self>,
+        asked: &Name,
+        ask: &AnswerAsk,
+        opened: Opened,
+        exact: Option<Name>,
+    ) -> Result<Answered, DataError> {
         let r = Resolved {
             kind: opened.kind,
             binding: opened.body.binding.clone(),
             reads: opened.body.reads.clone(),
             epochs: opened.epochs.clone(),
-            keys: None,
-            id,
+            keys: self.audience(&opened.epochs, asked)?,
+            id: opened.id,
             age: Age::Exact,
             computed: None,
         };
-        let r = Resolved {
-            keys: self.audience(&opened.epochs, name)?,
-            ..r
-        };
-        let answered = if self.recomputes(&ask) {
-            self.finish_recomputed(name, Some(name.clone()), r, vec![opened])
-                .await?
+        if self.recomputes(ask) {
+            self.finish_recomputed(asked, exact, r, vec![opened]).await
         } else {
-            self.finish_trusted(name, &ask, r, Some(opened)).await?
-        };
-        Ok(Answer {
-            got: Got::Answer(answered),
-            age: Age::Exact,
-        })
+            self.finish_trusted(asked, ask, r, Some(opened)).await
+        }
     }
 
     /// A pure answer this device recomputes (answers.md §7.3, 1): the result is its own, each

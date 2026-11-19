@@ -540,6 +540,9 @@ impl Inner {
     /// The own answer `name` is behind the barrier: serve it (answers.md §6.2).
     pub(super) fn serve_own(&self, name: &Name) {
         self.st.lock().answer_book.served.insert(name.clone());
+        // A signer waiting for a host to provide an answer to an ask
+        // (answers.md §15) goes on.
+        self.progress.notify_waiters();
     }
 
     /// Keep `wire`, an answer packet this device verified, as evidence against its signer

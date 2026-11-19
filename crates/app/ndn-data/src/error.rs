@@ -444,7 +444,11 @@ impl DataError {
             DataError::Introduction { why, .. } => {
                 matches!(why, crate::intro::IntroRefusal::Forged)
             }
-            DataError::Answer { why, .. } => matches!(why, AnswerRefusal::ReadsChanged(_)),
+            DataError::Answer { why, .. } => match why {
+                AnswerRefusal::ReadsChanged(_) => true,
+                AnswerRefusal::AskRefused { why, .. } => why.retry_after().is_some(),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -552,6 +556,15 @@ pub enum AnswerRefusal {
     /// This device already signed a different result at this name: it serves that one and
     /// signs no other.
     AlreadySigned,
+    /// A device it asked for the answer (answers.md §15) refused the ask, and said why.
+    AskRefused {
+        /// The device asked.
+        signer: Name,
+        /// The reason code it gave.
+        why: crate::answer::AskRefusal,
+        /// What it said: why, and what to do.
+        said: String,
+    },
 }
 
 impl AnswerRefusal {
@@ -569,6 +582,7 @@ impl AnswerRefusal {
                 NextStep::FixRequest
             }
             AnswerRefusal::OverBudget { .. } | AnswerRefusal::Busy => NextStep::FixLocal,
+            AnswerRefusal::AskRefused { why, .. } => why.next(),
         }
     }
 }
@@ -642,6 +656,9 @@ impl std::fmt::Display for AnswerRefusal {
                  one and signs no other, and a function whose result is not reproducible puts \
                  into its inputs a signed version that tells two calls apart",
             ),
+            AnswerRefusal::AskRefused { signer, said, .. } => {
+                write!(f, "{signer} refused the ask for the answer: {said}")
+            }
         }
     }
 }

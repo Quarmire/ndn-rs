@@ -10,7 +10,7 @@ use ndn_app::Consumer;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Name, NameComponent};
 use ndn_security::cert_name::key_name_of;
-use ndn_security::confidentiality::{ContentKey, Sealed, wrap_ck_to};
+use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
 use ndn_security::safe_data::TrustPath;
 use ndn_security::self_certifying::self_certifying_digest;
 use ndn_security::{
@@ -29,6 +29,7 @@ use crate::intro::{
 };
 use crate::layer::{ShareChange, Sharing};
 use crate::rt::Instant;
+use crate::seal::{open_ask, seal_ask};
 use crate::version::{Audience, Timestamp, Writer};
 use crate::wire::{
     self, LogName, Record, device_of, namespace_of, parse_held_name, parse_log_name,
@@ -1278,16 +1279,13 @@ impl Inner {
             let _verifying = self.verifying.acquire().await.ok()?;
             let ask = IntroAsk::decode(params).ok()?;
             let aad = intro_prefix(&self.device).encode_to_tlv();
-            let plain = {
-                let st = self.st.lock();
-                let wrapped = Sealed::from_bytes(&ask.key).ok()?;
-                let ck = st
-                    .keys
-                    .recipient
-                    .unwrap_ck(&ask.ephemeral, &wrapped, &aad)
-                    .ok()?;
-                ck.open(&Sealed::from_bytes(&ask.sealed).ok()?, &aad).ok()?
-            };
+            let plain = open_ask(
+                &self.st.lock().keys.recipient,
+                &aad,
+                &ask.ephemeral,
+                &ask.key,
+                &ask.sealed,
+            )?;
             let body = AskBody::decode(Bytes::from(plain)).ok()?;
             let (proof, asker) = Self::claimed_asker(&body.asker)?;
             let opened = open_credentials(&body.credentials).await?;
@@ -1932,13 +1930,12 @@ impl Device {
                 )));
             }
             let aad = intro_prefix(&device).encode_to_tlv();
-            let ck = ContentKey::generate();
-            let (ephemeral, key) = wrap_ck_to(&ob.seal_key, &ck, &aad)
+            let sealed = seal_ask(&ob.seal_key, &aad, &body.encode())
                 .map_err(|e| local(format!("the ask could not be sealed: {e}")))?;
             let params = IntroAsk {
-                ephemeral,
-                key: key.to_bytes(),
-                sealed: ck.seal(&body.encode(), &aad).to_bytes(),
+                ephemeral: sealed.ephemeral,
+                key: sealed.key,
+                sealed: sealed.sealed,
             }
             .encode();
             let name = intro_name(&device, &params);

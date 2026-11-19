@@ -18,7 +18,9 @@ use zeroize::Zeroizing;
 use bytes::Bytes;
 use hkdf::Hkdf;
 use ndn_foundation_types::Name;
-use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed};
+use ndn_security::confidentiality::{
+    ConfidentialityError, ContentKey, RecipientKey, Sealed, wrap_ck_to,
+};
 use sha2::Sha256;
 
 use crate::answer::{
@@ -132,6 +134,76 @@ pub(crate) fn open_payload(key: &ContentKey, name: &Name, ciphertext: &[u8]) -> 
     let sealed = Sealed::from_bytes(ciphertext).ok()?;
     let plain = key.open(&sealed, &name.encode_to_tlv()).ok()?;
     wire::decode_inline(Bytes::from(plain)).ok()
+}
+
+// ---- asks (spec §19.4, answers.md §15) ----------------------------------------------------------
+
+/// An ask sealed to a device's seal key: a fresh content key wrapped to that key with a fresh
+/// ephemeral X25519 key, and the ask's plaintext sealed under the content key, both bound to
+/// `aad`, the Interest's name without its parameters digest.
+pub(crate) struct SealedAsk {
+    /// The asker's ephemeral X25519 public key.
+    pub(crate) ephemeral: [u8; 32],
+    /// The content key, wrapped to the seal key.
+    pub(crate) key: Bytes,
+    /// The plaintext, sealed under the content key.
+    pub(crate) sealed: Bytes,
+}
+
+/// A content key wrapped to a seal key, before the plaintext is sealed under it: an ask whose
+/// proof binds the ephemeral key needs the key to make its plaintext
+/// (`answers.md` §15).
+pub(crate) struct AskKey {
+    ck: ContentKey,
+    /// The asker's ephemeral X25519 public key.
+    pub(crate) ephemeral: [u8; 32],
+    key: Bytes,
+}
+
+impl AskKey {
+    /// Make a content key and wrap it to `seal_key`, bound to `aad`.
+    pub(crate) fn to(seal_key: &[u8; 32], aad: &[u8]) -> Result<Self, ConfidentialityError> {
+        let ck = ContentKey::generate();
+        let (ephemeral, wrapped) = wrap_ck_to(seal_key, &ck, aad)?;
+        Ok(AskKey {
+            ck,
+            ephemeral,
+            key: wrapped.to_bytes(),
+        })
+    }
+
+    /// Seal `plain` under the content key, bound to `aad`.
+    pub(crate) fn seal(self, plain: &[u8], aad: &[u8]) -> SealedAsk {
+        SealedAsk {
+            ephemeral: self.ephemeral,
+            key: self.key,
+            sealed: self.ck.seal(plain, aad).to_bytes(),
+        }
+    }
+}
+
+/// Seal an ask's `plain` to the seal key `to`, bound to `aad`.
+pub(crate) fn seal_ask(
+    to: &[u8; 32],
+    aad: &[u8],
+    plain: &[u8],
+) -> Result<SealedAsk, ConfidentialityError> {
+    Ok(AskKey::to(to, aad)?.seal(plain, aad))
+}
+
+/// Open an ask sealed to `recipient`: the plaintext, or `None` if the key does not unwrap, the
+/// ciphertext does not open, or either is not bound to `aad`.
+pub(crate) fn open_ask(
+    recipient: &RecipientKey,
+    aad: &[u8],
+    ephemeral: &[u8; 32],
+    key: &[u8],
+    sealed: &[u8],
+) -> Option<Vec<u8>> {
+    let ck = recipient
+        .unwrap_ck(ephemeral, &Sealed::from_bytes(key).ok()?, aad)
+        .ok()?;
+    ck.open(&Sealed::from_bytes(sealed).ok()?, aad).ok()
 }
 
 // ---- answers (answers.md §5) --------------------------------------------------------------------
