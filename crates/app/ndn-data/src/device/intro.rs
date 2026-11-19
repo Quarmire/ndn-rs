@@ -23,9 +23,9 @@ use super::{Device, Held, Inner, St, Subject, check_collection, local, open_gran
 use crate::collection::Epoch;
 use crate::error::DataError;
 use crate::intro::{
-    AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined, LinkHint,
-    Offer, OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof, answer_proves, ask_proof,
-    ask_proves, commitment, intro_name, intro_prefix, proof_key,
+    AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined,
+    JoinedFolder, LinkHint, Offer, OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof,
+    answer_proves, ask_proof, ask_proves, commitment, intro_name, intro_prefix, proof_key,
 };
 use crate::layer::{ShareChange, Sharing};
 use crate::rt::Instant;
@@ -78,6 +78,13 @@ pub(super) struct Intros {
     /// When the takes begun in the last minute began, by this device's clock,
     /// oldest first: the bound on how many a minute begins.
     pub(super) departures_begun: std::collections::VecDeque<Timestamp>,
+    /// The generation of [`Device::joined_folders`](crate::Device::joined_folders)
+    /// ([`Device::joined_changes`](crate::Device::joined_changes)): raised only
+    /// by [`Inner::publish_joined`], when the list it derives differs from
+    /// `joined_seen`.
+    pub(super) joined_changes: tokio::sync::watch::Sender<u64>,
+    /// The list the generation stands for.
+    pub(super) joined_seen: Vec<crate::intro::JoinedFolder>,
 }
 
 impl Intros {
@@ -91,6 +98,8 @@ impl Intros {
             queued: 0,
             departing: BTreeSet::new(),
             departures_begun: std::collections::VecDeque::new(),
+            joined_changes: tokio::sync::watch::channel(0).0,
+            joined_seen: Vec::new(),
         }
     }
 }
@@ -645,7 +654,7 @@ impl Inner {
     /// `/home/carol/member/x` unlocks `/home/carol` or its own prefix and never
     /// the broader `/home` its name merely starts with. Empty when no record of
     /// `folder` is held.
-    fn writer_namespaces_of(&self, st: &St, folder: &Name) -> Vec<Name> {
+    pub(super) fn writer_namespaces_of(&self, st: &St, folder: &Name) -> Vec<Name> {
         if !wire::is_data_name(folder) {
             return Vec::new();
         }
@@ -1658,6 +1667,30 @@ impl IntroductionSurface {
         };
         inner.take_departure(from, folder, record).await
     }
+
+    /// [`Device::joined_folders`](crate::Device::joined_folders) through the weak
+    /// surface, for a link layer that must not keep the device alive: the folders
+    /// this device joined and what its link to each inviter must route. Derived
+    /// live on every call. Empty once the device is gone.
+    pub fn joined_folders(&self) -> Vec<JoinedFolder> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Vec::new();
+        };
+        let st = inner.st.lock();
+        inner.joined_list(&st)
+    }
+
+    /// [`Device::joined_changes`](crate::Device::joined_changes) through the weak
+    /// surface: the generation of [`joined_folders`](Self::joined_folders), which
+    /// changes whenever that list does. Once the device is gone the receiver is
+    /// of a channel nothing sends on any more: its value never changes and its
+    /// `changed()` returns an error at once, which ends a watcher that follows it.
+    pub fn joined_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        match self.inner.upgrade() {
+            Some(inner) => inner.st.lock().intro.joined_changes.subscribe(),
+            None => tokio::sync::watch::channel(0).1,
+        }
+    }
 }
 
 impl Inner {
@@ -1816,6 +1849,16 @@ impl Device {
     /// passing: [`DataError::NotReady`], retry later, naming what is missing
     /// — the offer waits, and joining again with the same code is answered
     /// again.
+    ///
+    /// Then, durably, the join keeps the **mirror note** (the inviter's end of
+    /// the grant, spec §19.8): the inviter's key (the one that signed the
+    /// answer, verified above), its namespace as the folder's owner and the
+    /// folder. The host is told ([`Introducer::grant`]) and the device lists it
+    /// in [`grants`](Device::grants) and [`joined_folders`](Device::joined_folders)
+    /// for as long as the folder's members record in force lists this device; a
+    /// second join of the same folder by the same inviter key replaces the
+    /// note. If the device stopped before the note was durable the join says
+    /// so ([`DataError::Local`]): join again with the same code.
     pub async fn join(&self, code: &str) -> Result<Joined, DataError> {
         let inner = &self.inner;
         let code = parse_code(code, inner.config.intro.local_candidates)?;
@@ -2057,6 +2100,11 @@ impl Device {
             }
             inner.look(&folder).await?;
             inner.await_admission(&folder, role, &device).await?;
+            // The grant's other end (spec §19.8): the inviter, by the key that
+            // signed the answer verified above, may link back for this folder
+            // while the record in force lists this device.
+            let (_, inviter_key) = signer.ok_or_else(forged)?;
+            inner.keep_mirror(inviter_key, &inviter, &folder).await?;
             Ok(Joined {
                 folder,
                 role,

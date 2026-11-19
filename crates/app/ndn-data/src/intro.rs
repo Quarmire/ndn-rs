@@ -133,6 +133,44 @@ pub struct Grant {
     pub until: Option<Timestamp>,
 }
 
+/// Writers listed per joined folder: [`JoinedFolder::writers`] keeps at most this
+/// many namespaces (sorted, the first ones), so a hostile inviter's record that
+/// lists a crowd of writers makes the link layer route no more than this many
+/// prefixes for one folder.
+pub const JOINED_WRITERS_MAX: usize = 16;
+
+/// A folder this device **joined** (spec §19.8, the mirror grant), and what its
+/// link to the inviter must route for it: what
+/// [`Device::joined_folders`](crate::Device::joined_folders) lists, one for each
+/// live mirror entry whose folder's members record in force still lists this
+/// device.
+///
+/// It is derived on every call from the members record in force and the
+/// device's own MAC'd mirror note, never cached, and it carries no authority of
+/// its own: the link layer routes by it, the inviter's per-packet filter still
+/// decides what crosses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinedFolder {
+    /// The inviter's device key's digest: the mirror grant's key. Under a host
+    /// whose link key is its device key, the inviter's ndn-link `KeyFingerprint`;
+    /// a host with another link key maps it itself, as it does for grants.
+    pub inviter: [u8; 32],
+    /// The folder's namespace, which is the inviter's namespace.
+    pub owner: Name,
+    /// The folder the offer admitted this device to.
+    pub folder: Name,
+    /// This device's role in the members record in force now: a writer when the
+    /// record lists the device's key as one, else a reader.
+    pub role: Role,
+    /// The namespaces of the other writers the record in force lists, as
+    /// [`IntroductionSurface::writer_namespaces`](crate::IntroductionSurface::writer_namespaces)
+    /// derives them, minus this device's own namespace and every namespace
+    /// above or below it (a hostile inviter's record cannot make this device
+    /// route its own names, or a broad parent of them, toward the inviter);
+    /// only namespaces; sorted; at most [`JOINED_WRITERS_MAX`].
+    pub writers: Vec<Name>,
+}
+
 /// What a person who was **let go** is to be told (spec §19.8): a held
 /// members record left a granted person out of `folder`, and the grant's
 /// note keeps a **departure mark** (MAC'd with it) for

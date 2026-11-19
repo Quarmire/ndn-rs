@@ -100,7 +100,8 @@ pub use events::{
 };
 pub use folder_scope::{departure_carries, folder_carries, writer_carries, writer_sync};
 pub use intro::{
-    Code, Departure, Grant, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role,
+    Code, Departure, Grant, IntroPolicy, IntroRefusal, Introducer, JOINED_WRITERS_MAX, Joined,
+    JoinedFolder, Offer, Role,
 };
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
