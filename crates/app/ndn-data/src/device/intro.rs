@@ -70,6 +70,13 @@ pub(super) struct Intros {
     /// Asks held now, verifying or waiting for their turn
     /// ([`IntroPolicy::asks_queued`](crate::intro::IntroPolicy::asks_queued)).
     queued: usize,
+    /// Folders a departure record is being fetched for
+    /// ([`Device::take_departure`](crate::Device::take_departure)): one take at
+    /// a time for each.
+    pub(super) departing: BTreeSet<Name>,
+    /// When the takes begun in the last minute began, by this device's clock,
+    /// oldest first: the bound on how many a minute begins.
+    pub(super) departures_begun: std::collections::VecDeque<Timestamp>,
 }
 
 impl Intros {
@@ -81,6 +88,8 @@ impl Intros {
             notes: Arc::new(tokio::sync::Mutex::new(())),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             queued: 0,
+            departing: BTreeSet::new(),
+            departures_begun: std::collections::VecDeque::new(),
         }
     }
 }
@@ -1455,6 +1464,85 @@ impl IntroductionSurface {
                 && st.intro.offers.get(&piece).is_some_and(|ob| ob.until > now)
                 && parse_log_name(&piece).is_some_and(|l| l.device == inner.device)
         })
+    }
+
+    /// Whether an Interest for `name`, or the Data answering it, may cross the
+    /// grant link of a person admitted to `folder` (spec §19.8, ndn-link §8.7):
+    /// [`folder_carries`](crate::folder_carries), or a name that lets a member
+    /// walk to the **other writers** the members record in force for `folder`
+    /// lists ([`writer_carries`](crate::writer_carries): the summary root of
+    /// each listed writer's namespace, held-wrapped or not;
+    /// [`writer_sync`](crate::writer_sync): that namespace's sync group, so the
+    /// member hears the other writers' devices). Read **live on every call**
+    /// from the record in force, nothing cached: a writer the record no longer
+    /// lists drops out at the next call, one it lists appears at the next.
+    /// `false` once the device is gone.
+    pub fn grant_carries(&self, folder: &Name, name: &Name) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        if crate::folder_carries(folder, name) {
+            return true;
+        }
+        let st = inner.st.lock();
+        let writers = st
+            .folders
+            .get(folder)
+            .and_then(|f| f.members.as_ref())
+            .map_or(&[][..], |m| m.writers.as_slice());
+        crate::writer_carries(folder, writers, name) || crate::writer_sync(folder, writers, name)
+    }
+
+    /// Whether `name` may cross the departure link of a person let go by the
+    /// members record `record` ([`departure_carries`](crate::departure_carries)).
+    pub fn departure_carries(&self, record: &Name, name: &Name) -> bool {
+        crate::departure_carries(record, name)
+    }
+
+    /// The namespaces `W` whose sync group a grant link of a person admitted to
+    /// `folder` carries ([`writer_sync`](crate::writer_sync)): the namespace of
+    /// each writer prefix the members record in force for `folder` lists (the
+    /// namespace of the trust context governing it here, or the prefix itself
+    /// when none is held), kept when the prefix is `W` or lies under it,
+    /// deduplicated, the folder's own namespace excluded; sorted. Read **live**
+    /// from the record, as [`grant_carries`](Self::grant_carries) is. Empty once
+    /// the device is gone, or when no record of `folder` is held.
+    pub fn writer_namespaces(&self, folder: &Name) -> Vec<Name> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Vec::new();
+        };
+        if !wire::is_data_name(folder) {
+            return Vec::new();
+        }
+        let own = namespace_of(folder);
+        let st = inner.st.lock();
+        let Some(record) = st.folders.get(folder).and_then(|f| f.members.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out: BTreeSet<Name> = BTreeSet::new();
+        for p in &record.writers {
+            let held = inner.group_namespace_of(&st, p);
+            let ns = if held.is_empty() { p.clone() } else { held };
+            if wire::is_namespace(&ns) && p.has_prefix(&ns) && own.as_ref() != Some(&ns) {
+                out.insert(ns);
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// [`Device::take_departure`](crate::Device::take_departure) through the weak
+    /// surface, for a link layer that must not keep the device alive.
+    ///
+    /// # Errors
+    /// As [`Device::take_departure`](crate::Device::take_departure), and
+    /// [`DataError::Local`] once the device is gone.
+    pub async fn take_departure(&self, folder: &Name, record: &Name) -> Result<(), DataError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(local(
+                "this device has stopped: a departure is taken by a device that runs",
+            ));
+        };
+        inner.take_departure(folder, record).await
     }
 }
 

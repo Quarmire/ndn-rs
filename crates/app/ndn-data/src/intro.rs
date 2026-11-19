@@ -43,6 +43,10 @@ use crate::wire::{
 /// Octets of an offer's secret ([`ndn_trust_envelope::INTRO_SECRET_LEN`]).
 pub const SECRET_LEN: usize = ndn_trust_envelope::INTRO_SECRET_LEN;
 
+/// How long a departure mark lasts by default ([`IntroPolicy::departure_for`]):
+/// seven days.
+pub const DEPARTURE_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// The keyword of an ask's name: `<D>/32=intro/<IntroAsk>`.
 const INTRO: &[u8] = b"intro";
 
@@ -129,6 +133,34 @@ pub struct Grant {
     pub until: Option<Timestamp>,
 }
 
+/// What a person who was **let go** is to be told (spec §19.8): a held
+/// members record left a granted person out of `folder`, and the grant's
+/// note keeps a **departure mark** (MAC'd with it) for
+/// [`IntroPolicy::departure_for`], so that the link layer can show the person
+/// — online now or back later — the one record that lets them go, and nothing
+/// else. What [`Introducer::departure`] is told and
+/// [`Device::departures`](crate::Device::departures) lists.
+///
+/// A mark is a hint of *which name to fetch*; it carries no authority: the
+/// person validates the record by its signatures
+/// ([`Device::take_departure`](crate::Device::take_departure)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Departure {
+    /// The person's device key (the grant's key).
+    pub key: [u8; 32],
+    /// The namespaces the grant admitted the key in.
+    pub namespaces: Vec<Name>,
+    /// The folder the person was let go of.
+    pub folder: Name,
+    /// The log entry name of the held members record that leaves the person
+    /// out: `<signer device>/32=log/<folder>/seq=<n>`. Its pieces and its cut
+    /// manifests (`<record>/32=cut/seg=<i>`) are named by it and carried
+    /// with it ([`departure_carries`](crate::departure_carries)).
+    pub record: Name,
+    /// By this device's clock: the mark is no longer served after it.
+    pub until: Timestamp,
+}
+
 /// What a device's introductions allow and cost it (`Config::intro`, spec
 /// §19.4, §19.7): which namespaces an introduction may bring, either way,
 /// and how wrong tries and a crowd of asks are bounded.
@@ -177,13 +209,23 @@ pub struct IntroPolicy {
     /// [`Introducer::grant`] is never called) and the host links with the
     /// person by its serving policy alone.
     pub grant_for: Option<Duration>,
+    /// How long a **departure mark** lasts (spec §19.8): when a held members
+    /// record ends a grant (it leaves the person out of the folder), the grant's
+    /// note keeps a mark of the record's name for this long after, by this
+    /// device's clock, so the link layer can tell a person who was offline
+    /// (or whose link was open) which record let them go. Default seven days.
+    /// `Duration::ZERO`: no mark is made ([`Introducer::departure`] is never
+    /// called) and the link just closes. The host's own
+    /// [`Device::end_grant`](crate::Device::end_grant) never makes a mark.
+    pub departure_for: Duration,
 }
 
 impl IntroPolicy {
     /// Defaults: one component at least (`/alice`); `/localhost` and
     /// `/localhop` reserved; `/user` shared; 16 wrong tries in all, the
     /// pause after each counted from 1 s doubling; 32 asks held; a grant has
-    /// no date (it follows the members record).
+    /// no date (it follows the members record); a departure mark lasts seven
+    /// days.
     pub fn new() -> Self {
         let n = |s: &str| s.parse::<Name>().expect("a valid name");
         Self {
@@ -195,6 +237,7 @@ impl IntroPolicy {
             asks_queued: 32,
             local_candidates: false,
             grant_for: None,
+            departure_for: DEPARTURE_FOR,
         }
     }
 
@@ -745,19 +788,40 @@ pub trait Introducer: Send + Sync {
         let _ = grant;
     }
 
-    /// The grant of `key` has ended before its date: a members record held
-    /// here — signed by any device of the inviter's namespace — leaves the
-    /// person out of the grant's folder (spec §19.8). Called once for each
-    /// such grant, **before** the end is made durable (in memory only, and
+    /// The grant of `key` **for `folder`** has ended before its date: a members
+    /// record held here — signed by any device of the inviter's namespace —
+    /// leaves the person out of that folder (spec §19.8). Called once for each
+    /// such grant (so once for each folder a person was let into and is now left
+    /// out of, naming that folder only: the person's grant of another folder
+    /// stands), **before** the end is made durable (in memory only, and
     /// conservative: should the durable write fail, the record is judged
     /// again and the grant ended again); a grant that merely expired is not
     /// announced (the link layer judges `until` by its own clock). Not called
     /// for an end the host made
     /// ([`Device::end_grant`](crate::Device::end_grant)): the host knows.
+    /// When the policy keeps a departure mark
+    /// ([`IntroPolicy::departure_for`]), [`departure`](Self::departure) is
+    /// called **just before** it, so a link layer that narrows a link on its last
+    /// grant's end already holds the mark.
     ///
     /// The default does nothing.
-    fn revoke_grant(&self, key: &[u8; 32]) {
-        let _ = key;
+    fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
+        let _ = (key, folder);
+    }
+
+    /// The person of `departure.key` was **let go** of `departure.folder` by
+    /// the held members record `departure.record` (spec §19.8): called once,
+    /// **just before** [`revoke_grant`](Self::revoke_grant) for the same grant,
+    /// in memory and before the mark is made durable, and again with the same
+    /// value for each mark in force by whoever installs
+    /// [`Device::departures`](crate::Device::departures) after a restart. The
+    /// link layer may show the person that record and nothing else until
+    /// `departure.until`. Not called when
+    /// [`IntroPolicy::departure_for`] is zero, nor for an end the host made.
+    ///
+    /// The default does nothing.
+    fn departure(&self, departure: &Departure) {
+        let _ = departure;
     }
 }
 

@@ -107,7 +107,10 @@ struct Calls {
     undialled: std::sync::Mutex<Vec<Name>>,
     dial_succeeds: std::sync::atomic::AtomicBool,
     granted: std::sync::Mutex<Vec<Grant>>,
-    revoked: std::sync::Mutex<Vec<[u8; 32]>>,
+    revoked: std::sync::Mutex<Vec<([u8; 32], Name)>>,
+    departed: std::sync::Mutex<Vec<crate::intro::Departure>>,
+    /// Every `departure` and `revoke_grant` call, in the order made.
+    order: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl Calls {
@@ -124,7 +127,20 @@ impl Calls {
     }
 
     fn revoked(&self) -> Vec<[u8; 32]> {
+        self.revoked.lock().unwrap().iter().map(|r| r.0).collect()
+    }
+
+    /// What `revoke_grant` was told: the key and the folder, in order.
+    fn revoked_in(&self) -> Vec<([u8; 32], Name)> {
         self.revoked.lock().unwrap().clone()
+    }
+
+    fn departed(&self) -> Vec<crate::intro::Departure> {
+        self.departed.lock().unwrap().clone()
+    }
+
+    fn order(&self) -> Vec<&'static str> {
+        self.order.lock().unwrap().clone()
     }
 }
 
@@ -150,8 +166,18 @@ impl Introducer for Host {
         self.calls.granted.lock().unwrap().push(grant.clone());
     }
 
-    fn revoke_grant(&self, key: &[u8; 32]) {
-        self.calls.revoked.lock().unwrap().push(*key);
+    fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {
+        self.calls.order.lock().unwrap().push("revoke_grant");
+        self.calls
+            .revoked
+            .lock()
+            .unwrap()
+            .push((*key, folder.clone()));
+    }
+
+    fn departure(&self, departure: &crate::intro::Departure) {
+        self.calls.order.lock().unwrap().push("departure");
+        self.calls.departed.lock().unwrap().push(departure.clone());
     }
 
     fn dial<'a>(
@@ -1222,6 +1248,20 @@ impl Inviter {
         refuses: &[&str],
         store: Arc<dyn DataStore>,
     ) -> Inviter {
+        let policy = IntroPolicy {
+            grant_for,
+            ..IntroPolicy::new()
+        };
+        Self::over_policy(role, policy, refuses, store).await
+    }
+
+    /// [`Inviter::new`] with the introduction policy `policy`.
+    async fn over_policy(
+        role: Role,
+        policy: IntroPolicy,
+        refuses: &[&str],
+        store: Arc<dyn DataStore>,
+    ) -> Inviter {
         let (clock, skew) = skewed();
         let alice = Person::new("/alice");
         let keys = keyed(&alice, "/alice/laptop").await;
@@ -1234,10 +1274,7 @@ impl Inviter {
             None,
             Some(Arc::clone(&clock)),
             Arc::clone(&calls),
-            IntroPolicy {
-                grant_for,
-                ..IntroPolicy::new()
-            },
+            policy,
             Arc::clone(&store),
         )
         .await;
@@ -1551,12 +1588,19 @@ fn phone_leaves_out(laptop: &Device, folder: &Name, drop: &Name) -> MembersBody 
     }
 }
 
-/// `body`, as Alice's phone signed it at seq 1 of its log, handed to `to`.
-fn from_the_phone(to: &Device, body: MembersBody) {
-    let phone = n("/alice/phone");
-    let name = log_name(&phone, Some(&body.collection), 1);
+/// `body`, as Alice's phone signed it at seq 1 of its log, handed to `to`:
+/// the record's name.
+fn from_the_phone(to: &Device, body: MembersBody) -> Name {
+    from_device(to, "/alice/phone", body)
+}
+
+/// `body`, as `device` (a device of Alice's) signed it at seq 1 of its log
+/// (about the collection it names), handed to `to`: the record's name.
+fn from_device(to: &Device, device: &str, body: MembersBody) -> Name {
+    let device = n(device);
+    let name = log_name(&device, Some(&body.collection), 1);
     let record = Record::Members(body);
-    let k = key(&phone);
+    let k = key(&device);
     let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
         ndn_packet::SignatureType::SignatureEd25519,
         Some(&k),
@@ -1568,8 +1612,9 @@ fn from_the_phone(to: &Device, body: MembersBody) {
     assert_eq!(
         st.refused.get(&name),
         None,
-        "the phone's record was refused"
+        "the record of {device} was refused"
     );
+    name
 }
 
 /// Spec §19.8: a members record held that leaves the person out ends the
@@ -2046,4 +2091,792 @@ async fn the_host_is_told_of_an_end_before_it_is_durable() {
         vec![bob_phone.inner.own_key.unwrap()],
         "the host was not told of the end while the disk was stopped"
     );
+}
+
+// ---- round 7: a grant for each folder, and the departure of a person let go (spec §19.8) -------
+
+/// Alice's laptop shares `folder` with herself when it holds no record of it,
+/// offers it as `role`, and `who` is admitted by that offer: its name.
+async fn invite_to(alice: &Inviter, folder: &Name, role: Role, who: &Device) -> Name {
+    let held = alice
+        .laptop
+        .inner
+        .st
+        .lock()
+        .folders
+        .get(folder)
+        .is_some_and(|f| f.line.own.is_some());
+    if !held {
+        alice
+            .laptop
+            .share_folder(
+                folder,
+                Share {
+                    rule: Rule::Log,
+                    writers: vec![n("/alice")],
+                    readers: vec![Audience::Person(n("/alice"))],
+                }
+                .into(),
+            )
+            .await
+            .unwrap();
+    }
+    let code = alice
+        .laptop
+        .offer(
+            folder,
+            Offer {
+                role,
+                until: Timestamp((alice.clock)().0 + 3_600_000),
+                tries: 3,
+            },
+        )
+        .await
+        .unwrap();
+    let got = answer(
+        &alice.laptop,
+        ask(who, &alice.laptop, &code.offer, &secret_of(&code), &[]),
+    )
+    .await;
+    assert!(accepted(&got), "{} was answered {got:?}", who.name());
+    code.offer
+}
+
+/// Alice's notebook and diary, Bob (one phone, one key) let into both as a
+/// writer by two offers: the inviter, Bob's phone, his key.
+async fn bob_in_two_folders() -> (Inviter, Device, [u8; 32], Name, Name) {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let diary = n("/alice/32=data/diary");
+    invite_to(&alice, &diary, Role::Writer, &bob_phone).await;
+    let bob = bob_phone.inner.own_key.unwrap();
+    (alice, bob_phone, bob, n("/alice/32=data/notebook"), diary)
+}
+
+const SEVEN_DAYS_MS: u64 = 7 * 24 * 3600 * 1000;
+
+/// Spec §19.8 (a second folder): two offers to one person are two grants of
+/// one key; a record that lets the person go of one folder ends that
+/// folder's grant alone and tells the host which.
+#[tokio::test]
+async fn two_offers_to_one_person_are_two_grants_and_a_record_ends_one_folders_alone() {
+    let (alice, _bob_phone, bob, notebook, diary) = bob_in_two_folders().await;
+    let grants = alice.laptop.grants();
+    assert_eq!(grants.len(), 2, "two offers, {grants:?}");
+    assert!(grants.iter().all(|g| g.key == bob));
+    let folders: std::collections::BTreeSet<Name> =
+        grants.iter().map(|g| g.folder.clone()).collect();
+    assert_eq!(
+        folders,
+        std::collections::BTreeSet::from([notebook.clone(), diary.clone()]),
+        "the two grants of one key are not one for each folder"
+    );
+    assert_eq!(alice.calls.granted().len(), 2);
+
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &notebook, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.calls.revoked_in(),
+        vec![(bob, notebook.clone())],
+        "a record that lets Bob go of the notebook did not revoke exactly (his key, the notebook)"
+    );
+    let left = alice.laptop.grants();
+    assert_eq!(
+        left.iter().map(|g| g.folder.clone()).collect::<Vec<_>>(),
+        vec![diary.clone()],
+        "letting Bob go of the notebook ended his grant of the diary"
+    );
+    // Once, however often records are settled.
+    alice.laptop.inner.settle().await;
+    assert_eq!(alice.calls.revoked_in().len(), 1);
+
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &diary, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.calls.revoked_in(),
+        vec![(bob, notebook), (bob, diary)],
+        "the second folder's end was not told by itself, naming it"
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
+}
+
+/// Spec §19.8 (the departure): a held record that lets the person go leaves a
+/// mark in the grant's note — the record's name and a date — that the host is
+/// told of before the end, that `Device::departures` lists, that a restart
+/// keeps, and that the clock ends.
+#[tokio::test]
+async fn a_record_that_lets_the_person_go_leaves_a_departure_mark() {
+    let mut alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    let bob = bob_phone.inner.own_key.unwrap();
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert_eq!(
+        alice.laptop.departures(),
+        Vec::new(),
+        "a mark before a record"
+    );
+
+    let before = (alice.clock)().0;
+    let record = from_device(
+        &alice.laptop,
+        "/alice/phone",
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    let after = (alice.clock)().0;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    let mark = &marks[0];
+    assert_eq!(mark.key, bob);
+    assert_eq!(mark.namespaces, vec![n("/bob")]);
+    assert_eq!(mark.folder, folder);
+    assert_eq!(mark.record, record, "the mark names another record");
+    assert!(
+        (before + SEVEN_DAYS_MS..=after + SEVEN_DAYS_MS).contains(&mark.until.0),
+        "the mark ends at {:?}, not seven days after the end of the grant",
+        mark.until
+    );
+    assert_eq!(
+        alice.calls.departed(),
+        marks,
+        "the host was told another mark"
+    );
+    assert_eq!(
+        alice.calls.order(),
+        vec!["departure", "revoke_grant"],
+        "the host is told of the departure just before the end of the grant"
+    );
+
+    // Durable: the same marks after a restart; the device tells the host
+    // nothing by itself (whoever installs `departures` does).
+    let again = alice.restart().await;
+    assert_eq!(alice.laptop.departures(), marks, "a restart lost the mark");
+    assert_eq!(again.departed(), Vec::new());
+    assert_eq!(again.revoked_in(), Vec::new());
+
+    // The clock ends it: not listed after its date.
+    alice
+        .skew
+        .store(SEVEN_DAYS_MS + 5_000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        alice.laptop.departures(),
+        Vec::new(),
+        "a mark past its date is still listed"
+    );
+}
+
+/// Spec §19.8 (`departure_for`): zero makes no mark and the host is told of
+/// the end alone.
+#[tokio::test]
+async fn a_zero_departure_for_makes_no_mark() {
+    let policy = IntroPolicy {
+        departure_for: Duration::ZERO,
+        ..IntroPolicy::new()
+    };
+    let alice = Inviter::over_policy(Role::Writer, policy, &[], Arc::new(MemoryStore::new())).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    assert_eq!(alice.laptop.departures(), Vec::new());
+    assert_eq!(alice.calls.departed(), Vec::new());
+    assert_eq!(alice.calls.order(), vec!["revoke_grant"]);
+}
+
+/// Spec §19.8: the host's own end makes no mark (the person was not let go by
+/// a record), and `end_grant_in` ends one folder's grants alone.
+#[tokio::test]
+async fn the_hosts_own_end_makes_no_mark_and_end_grant_in_ends_one_folder() {
+    let (mut alice, _bob_phone, bob, notebook, diary) = bob_in_two_folders().await;
+    assert!(alice.laptop.end_grant_in(&bob, &notebook).await.unwrap());
+    assert!(
+        !alice.laptop.end_grant_in(&bob, &notebook).await.unwrap(),
+        "an ended grant was ended again"
+    );
+    assert!(
+        !alice
+            .laptop
+            .end_grant_in(&bob, &n("/alice/32=data/other"))
+            .await
+            .unwrap(),
+        "a folder nobody granted was ended"
+    );
+    assert_eq!(
+        alice
+            .laptop
+            .grants()
+            .iter()
+            .map(|g| g.folder.clone())
+            .collect::<Vec<_>>(),
+        vec![diary.clone()],
+        "ending one folder's grant did not leave the other's"
+    );
+    assert_eq!(
+        alice.laptop.departures(),
+        Vec::new(),
+        "the host's end left a mark"
+    );
+    assert!(alice.laptop.end_grant(&bob).await.unwrap());
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    assert_eq!(alice.laptop.departures(), Vec::new());
+    alice.restart().await;
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    assert_eq!(alice.laptop.departures(), Vec::new());
+    assert_eq!(alice.calls.departed(), Vec::new());
+    assert_eq!(
+        alice.calls.revoked_in(),
+        Vec::new(),
+        "the device told the host of the host's own end"
+    );
+}
+
+/// Spec §19.8 (two notes of one key): the marks of two notes are two marks,
+/// each of its folder's record, listed by folder; the grant that stands is not
+/// affected; a person invited again to the folder they were let go of has no
+/// mark of it.
+#[tokio::test]
+async fn two_notes_of_one_key_keep_a_mark_each_and_an_invitation_again_supersedes_one() {
+    let (alice, bob_phone, bob, notebook, diary) = bob_in_two_folders().await;
+    let r1 = from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &notebook, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1);
+    assert_eq!((&marks[0].folder, &marks[0].record), (&notebook, &r1));
+    assert_eq!(alice.laptop.grants().len(), 1, "the diary's grant stands");
+
+    let r2 = from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &diary, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 2, "{marks:?}");
+    for (folder, record) in [(&notebook, &r1), (&diary, &r2)] {
+        assert!(
+            marks
+                .iter()
+                .any(|m| m.key == bob && &m.folder == folder && &m.record == record),
+            "no mark of {folder} by {record}: {marks:?}"
+        );
+    }
+
+    // Invited into the notebook again: the old mark of the notebook is no
+    // longer shown (the person holds a grant of it); the diary's stands.
+    alice
+        .laptop
+        .share_folder(
+            &notebook,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice"), n("/bob")],
+                readers: vec![Audience::Person(n("/alice")), Audience::Person(n("/bob"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    let (offer, secret) = alice.another_offer().await;
+    let got = answer(
+        &alice.laptop,
+        ask(&bob_phone, &alice.laptop, &offer, &secret, &[]),
+    )
+    .await;
+    assert!(accepted(&got), "bob was invited again and answered {got:?}");
+    let marks = alice.laptop.departures();
+    assert_eq!(
+        marks.iter().map(|m| m.folder.clone()).collect::<Vec<_>>(),
+        vec![diary],
+        "a person invited again still has the mark of the folder"
+    );
+    assert_eq!(
+        alice
+            .laptop
+            .grants()
+            .iter()
+            .filter(|g| g.folder == notebook)
+            .count(),
+        1
+    );
+}
+
+/// Spec §19.8 (which record): among the records of the highest revision held,
+/// the one whose own writers and readers leave the person out — lowest signer
+/// first.
+#[tokio::test]
+async fn the_mark_names_the_lowest_signers_record_that_leaves_the_person_out() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let body = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    let high = from_device(&alice.laptop, "/alice/phone", body.clone());
+    let low = from_device(&alice.laptop, "/alice/aaa", body);
+    assert!(low < high, "the test names the lower signer first");
+    // Judged as the records stand: the laptop's own resolving record, which a
+    // settle signs, would be the highest revision (and leave Bob out too).
+    alice.laptop.inner.judge_grants().await;
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0].record, low,
+        "the mark names {} and not the lowest signer's record {low}",
+        marks[0].record
+    );
+}
+
+/// Spec §19.8 (which record, by a cut): when no record of the revision leaves
+/// the person out by its own lists — one removed the writer and another the
+/// reader, and only the merge leaves them out — the mark names the record with
+/// a cut of their prefix.
+#[tokio::test]
+async fn the_mark_names_the_record_with_the_cut_when_only_the_merge_leaves_the_person_out() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let out = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    // The phone cuts the writer but keeps the reader; the other device drops the
+    // reader but keeps the writer and cuts nothing.
+    let m = alice.laptop.inner.st.lock().folders[&folder]
+        .members
+        .clone()
+        .unwrap();
+    let mut cut_only = out.clone();
+    cut_only.readers = m.readers.clone();
+    let mut reader_only = out;
+    reader_only.writers = m.writers.clone();
+    reader_only.cuts = Vec::new();
+    let with_cut = from_device(&alice.laptop, "/alice/phone", cut_only);
+    from_device(&alice.laptop, "/alice/aaa", reader_only);
+    alice.laptop.inner.judge_grants().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "the merge of the two records did not leave Bob out: the case does not hold"
+    );
+    let marks = alice.laptop.departures();
+    assert_eq!(marks.len(), 1, "{marks:?}");
+    assert_eq!(
+        marks[0].record, with_cut,
+        "the mark names {} and not the record with the cut, {with_cut}",
+        marks[0].record
+    );
+}
+
+/// Spec §19.8 (notes are MAC'd, the mark with them): a mark added to a note
+/// the host ended, cleared from one a record ended, or moved (its date pushed
+/// out) fails the note's check; nothing is listed from it.
+#[tokio::test]
+async fn a_mark_added_cleared_or_moved_in_the_store_is_ignored() {
+    for how in ["added", "cleared", "moved"] {
+        let alice = Inviter::new(Role::Writer, None, &[]).await;
+        let folder = n("/alice/32=data/notebook");
+        let bob_phone = phone_of("/bob").await;
+        let bob = bob_phone.inner.own_key.unwrap();
+        assert!(accepted(&alice.answers(&bob_phone).await));
+        if how == "added" {
+            assert!(alice.laptop.end_grant(&bob).await.unwrap());
+        } else {
+            from_the_phone(
+                &alice.laptop,
+                phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+            );
+            alice.laptop.inner.settle().await;
+            assert_eq!(
+                alice.laptop.departures().len(),
+                1,
+                "{how}: the control has a mark"
+            );
+        }
+        let until = alice.laptop.departures().first().map(|m| m.until);
+        tamper(&*alice.store, |b| match how {
+            // The flag, and a date and a name where the mark would be.
+            "added" => {
+                b[NOTE_FLAGS] |= 4;
+                let at = b.len() - 32;
+                let mut mark = u64::MAX.to_be_bytes().to_vec();
+                let name = n("/alice/phone/32=log/alice/32=data/notebook").encode_to_tlv();
+                mark.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                mark.extend_from_slice(&name);
+                b.splice(at..at, mark);
+            }
+            "cleared" => b[NOTE_FLAGS] &= !4,
+            _ => {
+                let old = until.unwrap().0.to_be_bytes();
+                let at = b
+                    .windows(8)
+                    .position(|w| w == old)
+                    .expect("the mark's date is in the note");
+                b[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+            }
+        });
+        assert_eq!(
+            alice.laptop.departures(),
+            Vec::new(),
+            "{how}: a note whose mark was changed in the store still lists a mark"
+        );
+        assert_eq!(alice.laptop.grants(), Vec::new(), "{how}");
+    }
+
+    // The note unchanged: its mark is listed (the check is not a refusal of all).
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(alice.laptop.departures().len(), 1);
+}
+
+/// Bob's phone, a member of Alice's notebook by one admission: it holds Alice's
+/// namespace and every record of the folder her laptop signed. The inviter, the
+/// phone, the folder.
+async fn bob_holding_the_folder() -> (Inviter, Device, Name) {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let phone = phone_of("/bob").await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.alice.ctx))
+        .unwrap();
+    assert!(accepted(&alice.answers(&phone).await));
+    relay(&alice.laptop, &phone, &folder);
+    (alice, phone, folder)
+}
+
+/// Spec §19.8 (`take_departure`, what it refuses): a hint that is no folder, no
+/// record of the folder, for a folder this device holds no record of, or signed
+/// under a namespace this device holds no context of, is refused with why and
+/// what to do; a record already held is Ok at once.
+#[tokio::test(start_paused = true)]
+async fn take_departure_takes_only_a_members_record_of_a_folder_it_is_a_member_of() {
+    let (alice, phone, folder) = bob_holding_the_folder().await;
+    let laptop = alice.laptop.name().clone();
+    let refused = |e: DataError, says: &str| {
+        assert!(
+            matches!(&e, DataError::BadRequest { why, .. } if why.contains(says) && why.contains(':')),
+            "expected a refusal saying {says:?}, got {e:?}"
+        );
+    };
+    // Not a folder name.
+    let e = phone
+        .take_departure(
+            &n("/alice/notebook"),
+            &log_name(&laptop, Some(&n("/alice/notebook")), 1),
+        )
+        .await
+        .unwrap_err();
+    refused(e, "no folder name");
+    // A record of another folder, a snapshot, a name that is no entry.
+    let other = n("/alice/32=data/diary");
+    let e = phone
+        .take_departure(&folder, &log_name(&laptop, Some(&other), 1))
+        .await
+        .unwrap_err();
+    refused(e, "no log entry of");
+    let e = phone
+        .take_departure(&folder, &log_name(&laptop, None, 1))
+        .await
+        .unwrap_err();
+    refused(e, "no log entry of");
+    let e = phone
+        .take_departure(&folder, &folder.clone().append("x"))
+        .await
+        .unwrap_err();
+    refused(e, "no log entry of");
+    // A device that holds no record of the folder is no member of it.
+    let carol = phone_of("/carol").await;
+    let e = carol
+        .take_departure(&folder, &log_name(&laptop, Some(&folder), 1))
+        .await
+        .unwrap_err();
+    refused(e, "no members record");
+    // Signed under a namespace no context of which is held.
+    let e = phone
+        .take_departure(&folder, &log_name(&n("/mallory/phone"), Some(&folder), 1))
+        .await
+        .unwrap_err();
+    refused(e, "no namespace this device holds");
+    // A record already held: nothing to do.
+    let held: Vec<(u64, Name)> = {
+        let st = phone.inner.st.lock();
+        st.folders[&folder]
+            .line
+            .records
+            .values()
+            .flat_map(|s| s.iter())
+            .map(|(w, h)| (h.seq, device_of(w.key()).unwrap()))
+            .collect()
+    };
+    let (seq, device) = held
+        .first()
+        .cloned()
+        .expect("a record of the folder is held");
+    phone
+        .take_departure(&folder, &log_name(&device, Some(&folder), seq))
+        .await
+        .expect("a record held is taken");
+}
+
+/// Spec §19.8: once a held record leaves this device out of a folder, a walk of
+/// the inviter's summary does not descend into that folder's node (it waits for
+/// nothing there, so the namespace's other folders are not held back); a member
+/// still listed, and the owner's own devices, are never left out.
+#[tokio::test]
+async fn a_device_a_held_record_leaves_out_does_not_walk_into_the_folder() {
+    let (alice, phone, folder) = bob_holding_the_folder().await;
+    let node = |d: &Device| {
+        let st = d.inner.st.lock();
+        d.inner.left_out(&st, &folder)
+    };
+    assert!(!node(&phone), "a member is left out of its folder");
+    assert!(
+        !alice
+            .laptop
+            .inner
+            .left_out(&alice.laptop.inner.st.lock(), &folder),
+        "the owner's own device is left out of its folder"
+    );
+    from_the_phone(&phone, phone_leaves_out(&alice.laptop, &folder, &n("/bob")));
+    assert!(
+        node(&phone),
+        "a held record leaves bob out, and his walk still descends"
+    );
+    // A collection under the folder, and a folder this device holds no record of.
+    {
+        let st = phone.inner.st.lock();
+        assert!(phone.inner.left_out(&st, &folder.clone().append("page")));
+        assert!(!phone.inner.left_out(&st, &n("/alice/32=data/diary")));
+    }
+}
+
+/// Spec §19.8: a joiner is not "let go". It holds the folder's sealed record from
+/// before the offer admitted it — which lists it neither as a writer nor a reader —
+/// and the revision that admits it is still to be fetched from the very node a walk
+/// would skip, so the walk MUST descend (the join waits for it); it is let go only
+/// once a held record of the line has admitted it and a later one leaves it out.
+#[tokio::test]
+async fn a_joiner_holding_the_pre_admission_record_is_not_left_out_until_let_go() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let phone = phone_of("/bob").await;
+    phone
+        .inner
+        .validator
+        .adopt_context(Arc::clone(&alice.alice.ctx))
+        .unwrap();
+    // Before the admission: Alice's sealed record, which does not list Bob.
+    relay(&alice.laptop, &phone, &folder);
+    let sealed = phone.inner.st.lock().folders[&folder]
+        .members
+        .clone()
+        .expect("the pre-admission record is held");
+    assert!(
+        sealed.epoch.is_some(),
+        "the case needs a sealed pre-admission record"
+    );
+    let node = |d: &Device| {
+        let st = d.inner.st.lock();
+        d.inner.left_out(&st, &folder)
+    };
+    assert!(
+        !node(&phone),
+        "a joiner holding the record from before its admission is left out: its walk would never fetch the revision that admits it"
+    );
+    // Admitted, and the record that admits it held: still a member.
+    assert!(accepted(&alice.answers(&phone).await));
+    relay(&alice.laptop, &phone, &folder);
+    assert!(!node(&phone), "an admitted member is left out");
+    // Let go: a held record admitted it, and the one in force no longer does.
+    from_the_phone(&phone, phone_leaves_out(&alice.laptop, &folder, &n("/bob")));
+    assert!(node(&phone), "a person let go still walks into the folder");
+}
+
+/// Spec §19.8 (`take_departure`, bounds): a record that cannot be fetched is
+/// `NotReady`, saying what to do; one take of a folder at a time; a bounded
+/// number begin a minute.
+#[tokio::test(start_paused = true)]
+async fn take_departure_is_one_at_a_time_for_a_folder_and_bounded_a_minute() {
+    let (alice, phone, folder) = bob_holding_the_folder().await;
+    let laptop = alice.laptop.name().clone();
+    let missing = |seq: u64| log_name(&laptop, Some(&folder), 900 + seq);
+    let e = phone
+        .take_departure(&folder, &missing(0))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, DataError::NotReady { why, .. } if why.contains("could not be fetched") && why.contains("ask again")),
+        "a record nobody serves was answered {e:?}"
+    );
+
+    // Two at once for one folder: the second is told one is under way.
+    let (one, two) = (missing(1), missing(2));
+    let (first, second) = tokio::join!(
+        phone.take_departure(&folder, &one),
+        phone.take_departure(&folder, &two),
+    );
+    assert!(
+        matches!(&first, Err(DataError::NotReady { why, .. }) if why.contains("could not be fetched")),
+        "{first:?}"
+    );
+    assert!(
+        matches!(&second, Err(DataError::NotReady { why, .. }) if why.contains("being fetched already")),
+        "a second take of one folder was answered {second:?}"
+    );
+
+    // Two begun so far; the bound is six a minute, whatever the names.
+    for seq in 3..7 {
+        let e = phone
+            .take_departure(&folder, &missing(seq))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, DataError::NotReady { why, .. } if why.contains("could not be fetched")),
+            "{e:?}"
+        );
+    }
+    let e = phone
+        .take_departure(&folder, &missing(8))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, DataError::NotReady { why, .. } if why.contains("departure fetches in the last minute")),
+        "past the minute's bound a take was answered {e:?}"
+    );
+}
+
+/// Spec §19.8 (co-writers): `IntroductionSurface::grant_carries` reads the
+/// members record in force on every call: the root of a listed writer's
+/// namespace is carried while the record lists them and not at the next call
+/// after a record without them; the folder's names and a name of a listed
+/// writer outside the folder follow `folder_carries` throughout.
+#[tokio::test]
+async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
+    use crate::wire::{root_name, root_prefix};
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let surface = alice.laptop.introductions();
+    let device = n("/alice/laptop");
+    let carol_root = root_name(&device, &n("/carol"), 4);
+    let carol_prefix = root_prefix(&device, &n("/carol"));
+    let carol_sync = n("/carol/32=sync/vector");
+    let dave_sync = n("/dave/32=sync/vector");
+    let dave_root = root_name(&device, &n("/dave"), 4);
+    // A name of Carol's outside the folder: an entry of her other collection.
+    let carol_other = log_name(
+        &n("/carol/member/laptop"),
+        Some(&n("/carol/32=data/diary")),
+        3,
+    );
+    // An entry of the folder by her device, which the collection carries.
+    let carol_entry = log_name(
+        &n("/carol/member/laptop"),
+        Some(&folder.clone().append("page")),
+        3,
+    );
+
+    assert!(
+        !surface.grant_carries(&folder, &carol_root),
+        "a stranger's root crossed"
+    );
+    assert!(surface.grant_carries(&folder, &carol_entry));
+
+    // A record that lists Carol as a writer.
+    alice
+        .laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice"), n("/bob"), n("/carol")],
+                readers: vec![
+                    Audience::Person(n("/alice")),
+                    Audience::Person(n("/bob")),
+                    Audience::Person(n("/carol")),
+                ],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        surface.grant_carries(&folder, &carol_root),
+        "a listed writer's root was not carried"
+    );
+    assert!(surface.grant_carries(&folder, &carol_prefix));
+    assert!(
+        surface.grant_carries(&folder, &carol_sync),
+        "a listed writer's sync group was not carried"
+    );
+    assert_eq!(
+        surface.writer_namespaces(&folder),
+        vec![n("/bob"), n("/carol")],
+        "the writers' namespaces are not the listed writers', less the folder's own"
+    );
+    assert!(!surface.grant_carries(&folder, &dave_sync));
+    assert!(
+        !surface.grant_carries(&folder, &dave_root),
+        "an unlisted namespace's root crossed"
+    );
+    assert!(
+        !surface.grant_carries(&folder, &carol_other),
+        "a writer's name outside the folder crossed"
+    );
+    assert!(surface.grant_carries(&folder, &carol_entry));
+
+    // A record without Carol: her root is out at the next call, her entry of
+    // the folder (a name of the collection) is still carried.
+    alice
+        .laptop
+        .share_folder(
+            &folder,
+            Share {
+                rule: Rule::Log,
+                writers: vec![n("/alice"), n("/bob")],
+                readers: vec![Audience::Person(n("/alice")), Audience::Person(n("/bob"))],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !surface.grant_carries(&folder, &carol_root),
+        "a removed writer's root is still carried"
+    );
+    assert!(!surface.grant_carries(&folder, &carol_prefix));
+    assert!(
+        !surface.grant_carries(&folder, &carol_sync),
+        "a removed writer's sync group is still carried"
+    );
+    assert_eq!(surface.writer_namespaces(&folder), vec![n("/bob")]);
+    assert_eq!(
+        surface.writer_namespaces(&n("/alice/32=data/diary")),
+        Vec::new()
+    );
+    assert!(surface.grant_carries(&folder, &carol_entry));
+
+    // A folder this device holds no record of lists no writer.
+    assert!(!surface.grant_carries(&n("/alice/32=data/diary"), &carol_root));
 }

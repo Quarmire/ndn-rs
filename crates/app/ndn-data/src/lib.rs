@@ -97,8 +97,10 @@ pub use events::{
     AnswerFault, Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId,
     EventKind, EventSubject, Meaning, ReadSetFault, WithdrawnBy,
 };
-pub use folder_scope::folder_carries;
-pub use intro::{Code, Grant, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role};
+pub use folder_scope::{departure_carries, folder_carries, writer_carries, writer_sync};
+pub use intro::{
+    Code, Departure, Grant, IntroPolicy, IntroRefusal, Introducer, Joined, Offer, Role,
+};
 pub use layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     NotCounted, PutOptions, Share, ShareChange, Sharing, State,

@@ -11045,6 +11045,7 @@ impl Inner {
                                 // any other child names no data of `ns`.
                                 wire::data_marker(&sub) == Ok(ns.len())
                                     && (st.inside(&sub) || st.toward(&sub))
+                                    && !self.left_out(&st, &sub)
                                     && !seen(&st, &(sub, None), &c.digest)
                             })
                             .cloned()
@@ -14405,6 +14406,47 @@ impl Inner {
             |d| self.namespace_of_name(d) == *ns,
             |t| t.has_prefix(folder) || folder.has_prefix(t),
         )
+    }
+
+    /// Whether this device was **let go** of the folder over `c`, a data name of
+    /// another person's namespace: the folder's record in force here (the longest
+    /// folder at or above `c` this device holds one of) is sealed and lists this
+    /// key neither as a writer nor in the audience, **and** a held record of that
+    /// folder's line admits it — at some revision, as a writer or in the
+    /// audience: it was a member, and a record signed since leaves it out. A
+    /// walk of another writer's summary then does not descend into `c`'s node:
+    /// this device reads nothing new there and writes nothing, and a link layer
+    /// that let the person go no longer carries the node, so waiting for it would
+    /// hold every other folder of the namespace not walked (spec §19.8).
+    ///
+    /// A device **not yet admitted** — a joiner that holds the folder's sealed
+    /// record from before the offer admitted it — is never left out: no held
+    /// record of the line admits it, and the revision that does has still to be
+    /// fetched from that very node. The rule reads signed, durable data held
+    /// here (the line's records), no flag and no clock, so it is the same after a
+    /// restart. A folder of this device's own namespace is never left out.
+    fn left_out(&self, st: &St, c: &Name) -> bool {
+        if namespace_of(c).is_none_or(|ns| ns == self.ns) {
+            return false;
+        }
+        let folder = (1..=c.len()).rev().find_map(|n| {
+            let at = Name::from_components(c.components()[..n].iter().cloned());
+            st.folders.get(&at).filter(|f| f.members.is_some())
+        });
+        let admits = |m: &Members| {
+            m.writers.iter().any(|p| self.writer.key().has_prefix(p))
+                || self.admits_record(st, m, &self.device, &self.ns)
+        };
+        folder.is_some_and(|f| {
+            f.members
+                .as_ref()
+                .is_some_and(|m| m.epoch.is_some() && !admits(m))
+                && f.line
+                    .records
+                    .values()
+                    .flat_map(|signers| signers.values())
+                    .any(|held| admits(&held.record))
+        })
     }
 
     /// Whether the members record in force over `c` here admits this
