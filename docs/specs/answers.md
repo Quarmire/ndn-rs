@@ -1,6 +1,6 @@
 # Answers: named, checkable readings over signed data
 
-- **Status:** Built (round 5, item F; ndn-rs `ndn-data`, ndn-sim cases `a1`–`a18`). The two pending decisions are closed to their conservative choices (§15): no computation on request (F-QUESTIONS #1, option c; case `a19` is not written and TLV `0x05DE`–`0x05DF` stay free) and policy as a value the host passes (#2, option a).
+- **Status:** Built (round 5, item F; ndn-rs `ndn-data`, ndn-sim cases `a1`–`a18`; round 8 adds the ask exchange of §15 and the cases `a19`–`a22`). The two decisions that were open are settled by the owner (2026-11-19): asking another device for an answer is built as the sealed ask exchange of §15 (F-QUESTIONS #1, option (a)), and the policy of §9 stays a value the host passes (#2, option (a)), to be revisited when the first provider is deployed.
 - **Scope:** an **answer** is the result of a definition or a function read over exact, signed versions of the data layer, published under a name that binds what was asked and what was read, signed by one device, and sealed to the readers of everything it read. This spec defines:
   - the two kinds of answer, **pure** (any holder of the definition and the inputs can recompute it) and **provider** (trusted because of the provider's authority);
   - the read set, its canonical bytes and its digest;
@@ -33,7 +33,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | signer | The device key that signed an answer. |
 | pure answer | An answer of kind pure: evaluator and definition named. Any device that knows the evaluator and holds the reads recomputes it. |
 | provider answer | An answer of kind provider: function named, no evaluator. Only the provider computes it (§4.2). |
-| question | A name `<X>/32=question/<AnswerAsk>` that `get` takes (§7.1). Local: never sent, like a state name (data-layer.md §11). |
+| question | A name `<X>/32=question/<AnswerAsk>` that `get` takes (§7.1). Local as a name: never sent, like a state name (data-layer.md §11); the `AnswerAsk` it holds travels only inside the sealed body of an ask (§15.2). |
+| ask | The sealed Interest `<D>/32=ask-answer/<ParametersSha256Digest>` by which a reader asks a signer for the answer to a question, carrying the asker's proof (§15). |
 | audience key | The key an answer is sealed under, derived from the epoch keys of every sealed collection it read (§5.2). Only a device in every one of those audiences holds it. |
 | recompute | Run the evaluator over exactly the read set, with nothing else readable (§7.3). |
 | policy | Which signers a reader trusts without recomputing, and which devices are the providers of a function (§9). Data the host holds; mechanism is code. |
@@ -227,7 +228,7 @@ A refusal MUST NOT tell a device more than a plain `get` of what the answer read
 
 - **A question** is judged by planning (§7.2), which reads the collections the evaluation reads: a device outside the audience of any of them gets the error `get` of that collection answers (`Sealed`, or `NotReady` while a grant or a record is awaited, data-layer.md §15), before any answer is looked for. It is told nothing about whether an answer exists, who signed one, or what it read beyond what it has already named itself.
 - **A name** `<D>/32=answer/<id>` of a sealed answer cannot be derived by a device outside the audience (§3.2), so it cannot probe for the existence of an answer. A device that is *handed* the name (it saw it in a relay's Interest) and asks for the packet gets what any holder serves: the ciphertext, as for a version of a sealed collection, and `Sealed` as it cannot open it; or `Unavailable` when no holder answers. The packet's existence is therefore known to anyone who can see the name. It is not known to anyone who cannot, and the existence of a sealed version is known to such parties anyway (names and summaries are clear, data-layer.md §9).
-- **A provider asked to compute** (`[PENDING F-QUESTIONS #1]`) for a read set the requester cannot read MUST answer exactly as a plain `get` of the first read the requester may not read would, in canonical order, and MUST NOT compute (§13.2).
+- **A signer asked to compute** (§15) for a read set the requester cannot read MUST tell the requester no more than a plain `get` of the first read it may not read would, in canonical order (`NotAudience` with that read's index, §15.6), and only after the requester authenticated: an ask that does not authenticate gets no reply at all (§15.5). It MUST NOT compute (§13.2).
 - **Absence is not told by timing**: a question's refusal for lack of access is local and immediate; the network is asked only after planning has passed, which only a device in the audience can do.
 
 ## 6. Making an answer
@@ -250,7 +251,7 @@ To **publish** an answer a device signs the `AnswerRecord` as the Data packet of
 - hold what it signed for as long as it serves that function: such an answer is not dropped to make room (§10), and a device that cannot keep a new one refuses to make it (`Busy`) rather than drop an old one;
 - not make an answer over more than `READS_MAX` reads, `SEAL_EPOCHS_MAX` epochs or `PAYLOAD_MAX` octets (`TooLarge`).
 
-A device **never publishes without being told to**: whether a device publishes what it computed is the host's configuration (§10), never a consequence of a `get`.
+A device **never publishes without being told to**: whether a device publishes what it computed is the host's configuration (§10), never a consequence of a `get`. The one other thing that makes a device sign an answer is an authenticated ask it serves (§15.4, §15.7): `AnswerConfig::serve_asks` is the host's choice, and `Off` stops it.
 
 ## 7. Getting an answer
 
@@ -261,7 +262,7 @@ The seven verbs stay seven: an answer is read with `get`, as data-layer.md §15 
 `get` takes two names of answers, and answers `Got::Answer` (§7.4) to both:
 
 - **An exact name** `<D>/32=answer/<id>` (§3.3): the answer with that id by `D`, when its reader has the id from somewhere (another answer's listing, a link, a snapshot's note, a host). The result has `Age::Exact`.
-- **A question** `<X>/32=question/<AnswerAsk>`, one GenericNameComponent whose value is exactly one `AnswerAsk` TLV (§11.2), nothing else, at most `QUESTION_MAX` (65,536) octets. It names *what is asked*, not which signer answers, and is never sent: like a state name it is local (data-layer.md §11). A question has the `AnswerAsk`'s:
+- **A question** `<X>/32=question/<AnswerAsk>`, one GenericNameComponent whose value is exactly one `AnswerAsk` TLV (§11.2), nothing else, at most `QUESTION_MAX` (65,536) octets. It names *what is asked*, not which signer answers, and is never sent as a name: like a state name it is local (data-layer.md §11); the `AnswerAsk` it holds is what an ask carries, sealed, to a signer (§15). A question has the `AnswerAsk`'s:
   - `AnswerKind`;
   - for pure, the **definition**: the `ReadVersion` or `ReadState` of the exact version (or merge state) of the definition the asker means; `X` is the definition's collection;
   - `AnswerBy`: the evaluator's name (pure) or the function's (provider); for a provider `X` is the **provider device** the asker asks of;
@@ -283,7 +284,7 @@ A device resolves a question in this order. Each step that fails answers the err
 4. **The binding and the id** (§3.2): the keyed id of a sealed read set, the plain one otherwise. This is the one place that computes ids, and only a device holding the keys gets here.
 5. **Look for signed answers**, in this order, each judged by §7.3:
    - the device's own store, by id, under any signer;
-   - the **candidate signers**: for a pure answer, the devices its policy trusts that this device knows (the devices of its own namespace known to write into it, at most `RELAYS_ASKED`, and the devices the policy lists by name, `Signers::Devices`); for a provider answer, the devices its policy names as providers of the function. Each candidate `D` is asked for `<D>/32=answer/<id>`, and, by the device that holds it, `<H>/32=held/<Name TLV>` (data-layer.md §13.5). Asks are owed fetches (data-layer.md §17.1: at most `FETCH_TRIES` per candidate, each tried in turn, a capped backoff), and an answer is **never computed on a candidate's behalf**: asking a device for an answer it has not made makes no work for it (§13.2). A pure question whose evaluator is known and `Check` is `Recompute` (§7.3) does not wait for them: it recomputes.
+   - the **candidate signers**: for a pure answer, the devices its policy trusts that this device knows (the devices of its own namespace known to write into it, at most `RELAYS_ASKED`, and the devices the policy lists by name, `Signers::Devices`); for a provider answer, the devices its policy names as providers of the function. Each candidate `D` is asked for `<D>/32=answer/<id>`, and, by the device that holds it, `<H>/32=held/<Name TLV>` (data-layer.md §13.5). Asks are owed fetches (data-layer.md §17.1: at most `FETCH_TRIES` per candidate, each tried in turn, a capped backoff), and a fetch by name **never makes a device compute**: asking a device for an answer it has not made makes no work for it (§13.2). A pure question whose evaluator is known and `Check` is `Recompute` (§7.3) does not wait for them, and never asks: it recomputes. When no candidate has the answer published, and only then, the reader may send each candidate signer the **ask** of §15, in this step's order: the one request that can make a device work, bound as §13.2 says (§15.9).
 6. **Decide** by §7.3, and answer §7.4.
 
 ### 7.3 Recompute or trust
@@ -380,7 +381,7 @@ Policy says **which signers a reader trusts without recomputing**, and **which d
 - **Providers.** `providers: Vec<(function name, Signers)>`. No default: a provider answer is refused unless a policy entry names its function, by exact name, and the signer is covered by that entry's device names (a device name matches itself and, as a prefix, the devices under it). A host that wants "the person's own devices provide function F" says so.
 - **Check.** `Check::Recompute` for every known evaluator unless the policy lists it in `trust` (evaluators for which this host takes a trusted signer's answer without recomputing): an explicit, per-evaluator, per-host choice for evaluators whose recomputation is costly. It is never inferred.
 - **The default is a choice made with eyes open.** Under the default, an answer signed by one of the person's own devices under an evaluator this program does not know is taken as `Trusted`, because the person's devices are the person (data-layer.md §3). A host that refuses that sets `Signers::None`.
-- **Policy lives in data.** The layer takes a value; where the host keeps it (a collection it reads, the person's settings) is the host's. Whether the layer should define a signed record of its own for it is `[PENDING F-QUESTIONS #2]`.
+- **Policy lives in data, and the host holds it.** The layer takes a value; where the host keeps it (a collection it reads, the person's settings) is the host's. By the owner's decision of 2026-11-19 the layer defines no signed record of its own for it: nothing in a folder says who its providers are, each host decides, and two members of a folder may trust different providers. The owner revisits this at the first deployment of a real provider (a summary service), because that is when a folder needs to say who its providers are; the shapes that were weighed, a field of the members record or a record of its own, are in `handoff-ndf-rs/F-QUESTIONS.md` #2. The same value says whom a reader **asks** for an answer nothing published: the signers it names, in the order of §7.2 step 5 (§15.9).
 
 Policy is read at the moment an answer is used and never cached across a change of the records it is computed from (a member removed stops being trusted at the next question once the record is held).
 
@@ -401,7 +402,10 @@ Policy is read at the moment an answer is used and never cached across a change 
 | `EVIDENCE_PER_SIGNER_BYTES` | 262,144 (256 KiB) | Octets of evidence packets kept against one signer; the oldest is dropped first. |
 | `EVIDENCE_SIGNERS` | 256 | Signers a device keeps evidence against: past it, all the evidence of the signer whose newest is oldest is dropped. At most 256 × 256 KiB = 64 MiB of evidence is kept in all. |
 | `EVIDENCE_PACKETS_PER_ANSWER` | 8 | Packets kept at one answer name of one signer: past it the block stands and the event still carries the packet, but no more is stored. |
-| Asks | `FETCH_TRIES` per candidate; at most `RELAYS_ASKED` (8) candidates | As §7.2 step 5 and data-layer.md §17.1. |
+| Fetches | `FETCH_TRIES` per candidate; at most `RELAYS_ASKED` (8) candidates | As §7.2 step 5 and data-layer.md §17.1. |
+| Asks served (host) | per asker 1 in progress; `asks_at_once` (default 4, at least 1) for all askers together | `Busy` beyond either (§15.7). `retry_after` is 1 s. |
+| Provider asks queued (host) | 64 | Calls awaiting the host on `Device::provider_asks` (§15.10); one more is `NotProvided`. |
+| Asks sent (asker) | at most 3 attempts per signer on `Busy` or `Pending`, each waiting the stated `retry_after` (at most 10 s); at most 3 sends of one ask when nothing replies | §15.9. |
 
 The host's values are `Config::answers`; the layer enforces what is above, never a value that changes a result.
 
@@ -417,16 +421,19 @@ The host's values are `Config::answers`; the layer enforces what is above, never
 | piece of an answer in pieces | `<A>/seg=<i>`; manifest node `<A>/32=manifest/seg=<k>` (data-layer.md §13.1) | DigestSha256 |
 | question (never fetched) | `<X>/32=question/<AnswerAsk TLV>` | — |
 | held answer | `<H>/32=held/<Name TLV of A>`, answered with the packet inside (data-layer.md §13.5) | DigestSha256 |
+| ask for an answer | Interest `<D>/32=ask-answer/<ParametersSha256Digest>`, ApplicationParameters `AnswerAskEnvelope`; the reply is Data of this exact name, FreshnessPeriod 0 (§15) | device key of `D` (the reply) |
+| seal key | `<D>/32=seal/<public key>` (data-layer.md §9, §16.1); also served for `<D>/32=seal` with CanBePrefix (§15.8) | device key |
 
 Every name parses one way, and a reader MUST refuse one that does not:
 
 - **Answer.** `D` is the components before the first `32=answer` (`D` is a device name: no keyword, no digest component, data-layer.md §3); exactly one GenericNameComponent of 32 octets follows, the id, and nothing else.
 - **Piece of an answer.** The last component is `seg=<i>` (a SegmentNameComponent), the next-to-last `32=manifest` for a manifest node; what precedes is an answer name. This extends the parse of a piece name (§16.1, §13.1 of data-layer.md), whose `V` is a log entry name, to an answer name.
 - **Question.** `32=question` is the next-to-last component; `X` precedes it; the last is one GenericNameComponent whose value is exactly one `AnswerAsk` TLV. For a pure `AnswerAsk`, `X` is a collection name (§3 of data-layer.md) and equals the collection of the definition read; for a provider, `X` is a device name.
+- **Ask.** `D` is the components before the first `32=ask-answer`, a device name; exactly one ParametersSha256DigestComponent of 32 octets follows, the SHA-256 of the Interest's ApplicationParameters TLV, whose value is one `AnswerAskEnvelope` (§15.2); nothing else. A name whose digest is not that of its parameters is no ask and gets no reply (§15.5).
 
 ### 11.2 TLV-TYPE numbers
 
-Answers use `0x05C0`–`0x05DF`, registered in [README.md](README.md#tlv-type-numbers). **Every number is odd**, because every field changes what an answer means: a reader that passes over a `ReadState` field would check an answer against less than it read, one that passes over `Digest` of a read would accept bytes it did not read, one that passes over an `AnswerKind` would judge a provider answer as a pure one. A decoder MUST refuse an unknown TLV in these records, so a reader that does not know a field cannot decode, check or use an answer that carries it; it drops it as a packet it cannot read (data-layer.md §16.2, §17) and asks the next source, and a question that no source can answer for that reason ends `Unavailable`.
+Answers use `0x05C0`–`0x05DF`, registered in [README.md](README.md#tlv-type-numbers). **Every number of a field of an answer is odd**, because every field changes what an answer means: a reader that passes over a `ReadState` field would check an answer against less than it read, one that passes over `Digest` of a read would accept bytes it did not read, one that passes over an `AnswerKind` would judge a provider answer as a pure one. A decoder MUST refuse an unknown TLV in these records, so a reader that does not know a field cannot decode, check or use an answer that carries it; it drops it as a packet it cannot read (data-layer.md §16.2, §17) and asks the next source, and a question that no source can answer for that reason ends `Unavailable`. The two numbers of the ask exchange, `0x05DE` and `0x05DF`, are even: each is the whole value of one message (an Interest's parameters, a reply's Content) and no field of an answer, and a decoder of either refuses an unknown TLV inside it (§15.2, §15.6), so an even number makes nothing skippable.
 
 | Type | Name | Value |
 |---|---|---|
@@ -440,19 +447,23 @@ Answers use `0x05C0`–`0x05DF`, registered in [README.md](README.md#tlv-type-nu
 | 0x05CF | ReadState | Name (the merge collection), Rule (0x0548, kind 2 and the rule's name), Frontier (0x0522, every FrontierEntry with its tip's Digest), Digest (the applied-set digest) |
 | 0x05D1 | Result | octets |
 | 0x05D3 | AnswerSealed | SealEpoch+ (0x056E), ascending (§5.1), at most `SEAL_EPOCHS_MAX`; then [Ciphertext (0x0574): the AnswerBody and its AnswerPadding, §5.3] |
-| 0x05D5 | AnswerAsk | AnswerKind, [ReadVersion \| ReadState] (the definition, pure), AnswerBy, [ReadSet] (the read set the asker states, §7.1); in a question name only, never on a packet |
+| 0x05D5 | AnswerAsk | AnswerKind, [ReadVersion \| ReadState] (the definition, pure), AnswerBy, [ReadSet] (the read set the asker states, §7.1); in a question name, and inside the sealed body of an ask (§15.2); never on a packet a device signs |
 | 0x05D7 | AnswerEvidence | Name (the answer's full name), Name (the signer's key), Digest (the id), Digest (the read-set digest), AnswerFault; a record of the device's own event store (§8.2), never on a packet |
 | 0x05D9 | AnswerFault | FaultKind, then by kind: 0 `Mismatch`: Digest (signed result), Digest (recomputed), AnswerBy; 1 `Equivocation`: Digest (the other result); 2 `Conflict`: Name (the other answer), Name (the other signer's key), Digest (its result); 3 `Binding`: nothing; 4 to 8 `ReadSet`, nothing more: 4 not canonical, 5 digest not the binding's, 6 epochs not the reads', 7 conflicts with a version held, 8 not the evaluator's reads |
 | 0x05DB | FaultKind | NonNegativeInteger, 0–8 as above |
 | 0x05DD | AnswerPadding | zero octets; only in a sealed answer's plaintext, once, after the AnswerBody, of exactly the length §5.3 gives |
+| 0x05DE | AnswerAskEnvelope | EphemeralKey (0x057C, 32 octets), Ciphertext (0x0574, the content key wrapped to the signer's seal key), Ciphertext (0x0574, the sealed `AnswerAskBody`). An ask Interest's ApplicationParameters (§15.2) |
+| 0x05DF | AnswerAskRefusal | reason code (1 octet, 1 to 7), number (8 octets, big-endian), explanation (UTF-8, to the end). A reply's Content (§15.6) |
 
-`0x05DE`–`0x05DF` are held for the ask exchange (§15). `Digest` (0x055E), `Frontier` (0x0522), `FrontierEntry` (0x0524), `Rule` (0x0548), `SealEpoch` (0x056E), `Ciphertext` (0x0574), `Chunks` (0x0521), `Size` (0x0523) are reused as data-layer.md §16.2 defines them. Names are the Name TLV (0x07). Inside a record fields appear in the order the table lists them; lists are sorted as stated, so equal content encodes to equal bytes and equal digests. `AnswerEvidence` and `AnswerFault` are records of the device-wide event store (SHAPES-R5 §D.4: `/localhost/ndn-data/events/`), local to that store and never served; D's own event records use `0x05E0`–`0x05FE`, so the two blocks do not meet.
+`Digest` (0x055E), `Frontier` (0x0522), `FrontierEntry` (0x0524), `Rule` (0x0548), `SealEpoch` (0x056E), `Ciphertext` (0x0574), `EphemeralKey` (0x057C), `Chunks` (0x0521), `Size` (0x0523) are reused as data-layer.md §16.2 defines them. Names are the Name TLV (0x07). Inside a record fields appear in the order the table lists them; lists are sorted as stated, so equal content encodes to equal bytes and equal digests. `AnswerEvidence` and `AnswerFault` are records of the device-wide event store (SHAPES-R5 §D.4: `/localhost/ndn-data/events/`), local to that store and never served; D's own event records use `0x05E0`–`0x05FE`, so the two blocks do not meet.
 
 Round 5's other items add their own numbers elsewhere; answers add no name-component type.
 
 ### 11.3 Cryptography
 
 Every primitive is an audited crate the layer already uses: SHA-256, HKDF-SHA256 (RFC 5869), HMAC-SHA256, ChaCha20-Poly1305, Ed25519 (the device key's signature). No primitive is new, and no key is made, stored or granted for answers: the audience key is derived from epoch keys the layer already holds. Labels are ASCII, each ending in a zero octet so none is a prefix of another: `ndn-answer/1 readset\0`, `ndn-answer/1 applied\0`, `ndn-answer/1 id\0`, `ndn-answer/1 result\0`, `ndn-answer/1 seal\0`, `ndn-answer/1 name\0`, `ndn-answer/1 aad\0`. A digest made for one purpose never verifies as another's, whatever its fields.
+
+The ask exchange (§15) uses the primitives of an introduction's ask (data-layer.md §19.3) and nothing else: an X25519 wrap of a content key to the signer's seal key, ChaCha20-Poly1305, SHA-256 and the device keys' signatures. It is the one place a key is made for answers: a fresh content key and a fresh ephemeral X25519 key for each ask, which nobody keeps after it. Its proof's binding opens with the label `ndn-data answer ask\0` of the asker's proofs (data-layer.md §16.1).
 
 **The signature domain** is the Data signature (name, MetaInfo, Content, SignatureInfo, as the layer signs everything) by the signer's device key. The name's keyword `answer` and the first TLV `0x05C1` of its content separate an answer from every other signed packet of the layer: no other packet has that name form or that content type. The binding and the read-set digest lie inside the signed content, so the signature covers what was read and what it was an answer to.
 
@@ -476,6 +487,7 @@ Each says why in its message and what to do in `DataError::next()`; `retry()` te
 | ↳ `TooManyStates { states, limit }` | A signed answer lists more reads of merge states than this device checks (§10): it is not used; ask its signer for fewer, or ask the question so that this device recomputes it | `FixRequest` |
 | ↳ `Busy` | A provider answer that must be kept cannot be (§6.2) | `FixLocal` |
 | ↳ `AlreadySigned` | This device already signed a different result at this name (§6.2): it serves that one, and signs no other | `None` |
+| ↳ `AskRefused { signer, why: AskRefusal, said }` | A signer that authenticated this device's ask refused it (§15.6): `why` is its reason (`NotAudience`, `Busy`, `Pending`, `CannotCheck`, `NotProvided`, `OverBudget`, `NotServed`), `said` its explanation | by reason: `NotAudience` `AskOwner`; `Busy`, `Pending` `RetryLater`; `CannotCheck`, `NotProvided`, `NotServed` `SetPolicy`; `OverBudget` `FixRequest` |
 | `Sealed { name }` | Not in the audience of a sealed collection read, or of the answer (§5.2, §5.6) | `AskOwner` |
 | `NotReady { name, why }` | A key, a record or a walk is awaited (§5.2) | `RetryLater` |
 | `BadRequest { name, why }` | A stated read set is not canonical or not held, the definition is not among the reads, a function is given an input it does not hold verified (§6.1), a stated read set is not the evaluator's reads, or the evaluator refuses its definition or inputs (its reason in `why`) | `FixRequest` |
@@ -483,17 +495,26 @@ Each says why in its message and what to do in `DataError::next()`; `retry()` te
 
 `NextStep` gains `SetPolicy`: "change the host's answer policy, or ask the person who sets it" (a signer to name for a function). `DataError::next` and `DataError::retry` gain the arms above.
 
+An ask that no signer replies to is `Unavailable`, and a signer whose seal key this device cannot obtain is `NotReady` (§15.8, §15.9). `retry()` is true for an `AskRefused` of `Busy` or `Pending`.
+
 ## 13. Threat notes
 
 ### 13.1 Name binding: can a signer bind one name to two results?
 
 It can try, and it leaves evidence. A name is `<D>/32=answer/<id>`; the id binds the definition's version, the evaluator or function, and the digest of every read. Two different results at that name by the same key are **equivocation** (§8.1) and are routed to events (§8.2). A holder in the audience sees it when it holds both. A holder outside it sees two ciphertexts it cannot tell apart from one answer made twice (nonces differ) and cannot judge: it relays both, and the first reader inside the audience that holds both reports it. A signer that wants to give two readers two results can: each sees one packet. A reader that recomputes (pure) catches it alone; a reader that trusts a provider (provider kind) catches it only when both packets reach it, which is why provider answers MUST carry in their read set whatever tells two calls apart (§4.2) and why a provider MUST keep what it signed (§6.2). Providers are trusted on exactly this: that they sign one result per name.
 
-### 13.2 The recompute oracle: cost and access
+### 13.2 The ask oracle: cost and access
 
-- **A device that recomputes on request is a cost oracle and an access oracle.** So a device **never computes for a remote requester** in this spec: it computes only for its own host's `get` (the host's own CPU), and a device asked by name for an answer it does not hold makes no answer (§7.2 step 5). This closes the cost oracle: a stranger cannot make a device work by asking.
-- **Where computation on request is ever specified** (`[PENDING F-QUESTIONS #1]`), it MUST be bound by: (a) the request authenticates the requester's device (the asker's proof of data-layer.md §13.2), (b) the provider checks that device is in the audience of **every** read of the set at the epochs read, by the records it holds, before it reads or computes anything, and answers a requester outside it exactly as a plain `get` of the first read it cannot read would, in canonical order, never computing (§5.6), (c) a per-requester and global rate and a budget (§10), (d) the answer is the one a holder in the audience would get: nothing is added to it.
-- **Timing and size.** A refusal for lack of access happens before any read of the data and before any network traffic (§5.6). The size of a sealed answer is visible (§13.3).
+A device that works on request is a cost oracle and an access oracle. A fetch by name never makes a device compute: a device asked for `<D>/32=answer/<id>` or `<H>/32=held/…` for an answer it does not hold makes no answer (§7.2 step 5). The one request that can make a device work for a remote requester is the ask of §15, and it MUST be bound by these four things, each a check the signer makes before it spends what the next would cost:
+
+1. **The requester is authenticated by a proof (§15.3).** An ask whose proof does not verify as a key of the asker's device, for this signer, this question and this envelope, gets no reply at all (§15.5). The only cost such an ask puts on the signer is opening the envelope and verifying the proof, at most `Config::asks_verifying` at a time: no read, no computation, no answer.
+2. **The audience is checked before anything is computed (§15.4).** The signer judges, by the members records it holds, that the asker is of the audience of **every** read of the set, at the epochs read, and answers a requester outside it `NotAudience` with the index of the first read it may not read, in canonical order (§5.6), never computing. When the asker states the read set, the check precedes every read of the data; when it leaves the reads to be planned, the evaluator's plan, which makes the reads and never the result, runs first within `Budget`, and the check of the planned set precedes the evaluation.
+3. **Two caps and the budget (§15.7).** One ask in progress per asking device, and `asks_at_once` for all askers together; a computation that outlives the Interest holds both until it ends, and `Budget::time` (§10) ends it. Beyond either cap the ask is refused `Busy`. No other rate is specified.
+4. **The answer is the one a holder in the audience gets (§15.5).** The reply is the signed answer packet unchanged, sealed under the audience key when anything read is sealed, or a refusal that carries a code, a number and a fixed explanation. Nothing is added to the answer: no plaintext about the reads, and no result in a refusal.
+
+A provider's function is computed by the signer's **host**, never by the layer: the layer hands the call to the host (§15.10) only for an authenticated asker of the audience of every input, when it holds no answer for it, and the host's result becomes a signed answer through `Device::provide` under §6.2 and §8.
+
+- **Timing and size.** A refusal for lack of access happens before any evaluation of a result and, for stated reads, before any read of the data and before any network traffic of the signer's (§5.6). The size of a sealed answer is visible (§13.3).
 
 ### 13.3 Access leaks
 
@@ -565,9 +586,19 @@ A member holding the audience key can seal and sign a wrong answer, whether or n
 
 A provider that restarts, or loses power, between signing an answer and its durable write (or after serving it) must not sign another result at the name: it serves only what is behind the barrier (§6.2), and a non-reproducible provider keeps every answer it signed. The storage cases of data-layer.md §4.2 apply to answers as to log entries.
 
+### 13.14 Asks for answers
+
+- **Unauthenticated asks get silence.** An ask whose digest is not its parameters', whose envelope does not open or decode, whose body is malformed, or whose proof does not verify as the asker's for this very ask (a stranger's key, no signature, a proof made for another signer, another question, another envelope or another protocol, a revoked key) gets no Data and no Nack (§15.5), and a line at `debug`. A prober learns nothing from a signer's answer to it, not whether the device serves asks, holds a function or reads a collection. What a prober can still do is cost the signer one open and, when the envelope opens, one proof verification (§13.2, 1): the signer's seal key is public, so anyone can seal an envelope that opens.
+- **`NotAudience` tells an authenticated asker only what a plain `get` of that read tells it** (`Sealed`, §5.6), and a position: read `index` is sealed to an audience the asker is not in. When the asker states the read set it named the read itself. When it leaves the reads to be planned, the index is a position in the set the **signer** planned, which the asker did not state: it learns that the plan has at least `index + 1` reads and that the first of them it cannot read is that one, and no name. That is stated and accepted. `NotServed`, given before any read is judged, says nothing about reads, except under `OwnAndMembers`, where it says an asker of another namespace is not a listed writer or reader of some collection read.
+- **The reply is not sealed to the asker.** A refusal is Data content in the clear, so a relay that sees the reply sees its code, its number and its explanation (a fixed text for the code, with the index or the wait): never a name, a read or a result. An answer packet in a reply is as sealed as the published one is (§5.3): a relay that holds no key of the epochs learns what the published packet already tells it (§13.3).
+- **Asks cannot make a device compute for a non-audience asker.** The audience check (§15.4 steps 5 and 6) precedes `publish_answer` and the call to the host. Case `a20` counts evaluations and finds none. The one thing an asker outside the audience, with a valid proof, can make a signer do when it leaves the reads to be planned is the evaluator's plan, within `Budget`, never the result; and not beyond the caps (a refused ask holds them only until it is refused).
+- **Pending work is bounded by the caps.** A computation that outlives the Interest goes on in a task that holds the asker's slot and one of `asks_at_once` until it ends, answered or not, and it ends within `Budget::time` (§13.10). A re-ask during it gets `Busy`; a re-ask after it gets the stored answer at once, with no second evaluation. A provider ask holds the caps only while the signer waits for the host (at most `min(lifetime − 200 ms, Budget::time)`); once it has answered `Pending` the host's work is no longer counted by them, the host sees the same call again on a re-ask (it MAY key its work by `function` and `inputs`), and at most 64 calls wait on the stream.
+- **A flood of asks from one device is limited to one in progress.** Another ask of that device, while one is worked on, costs the signer an open, a proof verification and a signed `Busy`, and no work. The counter is the one hold asks use (data-layer.md §13.2): a hold ask in progress counts.
+- **Replay of an envelope is harmless to what it asks, and no more than a nuisance to the asker.** An ask carries neither a nonce nor a date, so a copy of an Interest a relay saw verifies as the asker's again. The proof binds the signer's name, the question and the envelope's ephemeral key, and the envelope's sealing binds the name `<D>/32=ask-answer`, so a copy cannot be turned into another question, another signer's ask or another protocol's. What a replayer gets is the reply, signed by the signer: the published answer (sealed under the audience key when anything read is sealed, so unreadable to it, and otherwise what any holder serves) or a refusal. The signer judges the replay afresh, by the records it holds when it arrives: an asker since left out of an audience or of `serve_asks` is refused `NotAudience` or `NotServed`. A computation a replay starts is the computation the asker's own ask would have started, and `publish_answer` is idempotent, so one id is computed once however many replays come. What a replayer can do is occupy the asker's one slot while the work goes on, so that the real asker's ask is told `Busy` and asks again after `retry_after` (§15.9): bounded by the work (`Budget::time`) and no stronger than a flood from the asker's own device. The reply of an ask has FreshnessPeriod 0 and each attempt of an asker carries a fresh envelope, so a cached `Busy` or `Pending` is never what the next attempt meets.
+
 ## 14. Conformance cases
 
-The cases the implementer writes, each failing first on the code before the feature, in `ndn-data-conformance` (ndn-sim), ids `a1`…`a18`, feature `Answers` (case c12 keeps `Functions` and is rewritten to the F surface). All run in the clean and the `--faulty` mode (data-layer.md §18.1).
+The cases the implementer writes, each failing first on the code before the feature, in `ndn-data-conformance` (ndn-sim), ids `a1`…`a22`, feature `Answers` (case c12 keeps `Functions` and is rewritten to the F surface). All run in the clean and the `--faulty` mode (data-layer.md §18.1).
 
 | Id | Guards |
 |---|---|
@@ -589,22 +620,106 @@ The cases the implementer writes, each failing first on the code before the feat
 | a16 | **Read-set faults.** A read whose digest conflicts with a held version is refused `ReadSet` with evidence; a read set not canonical, a digest not matching, an epoch list too short or long are refused; a version withdrawn by a cut after the answer gives `ReadsChanged`, not evidence. |
 | a17 | **Limits.** Over `READS_MAX` reads or `SEAL_EPOCHS_MAX` epochs is `TooLarge`; a budget exceeded is `OverBudget` and not a result (calls of `current` spend the reads budget like reads; an evaluation or a held-reads check that runs past `Budget::time` is abandoned and refused, and a device operation completes while either runs); a signed answer listing more than `STATE_READS_CHECKED_MAX` reads of merge states is refused `TooManyStates`; unsolicited forged answers are dropped without being stored; a signer's answers kept are capped; a provider answer that must be kept is refused with `Busy` rather than evicting one. |
 | a18 | **Pieces.** A result of 200 KiB, sealed, is made, fetched in pieces and recomputed alike, equal across the three paths of a10, the pieces DigestSha256-verified and no custody asked. |
-| a19 | `[PENDING F-QUESTIONS #1]` **No computation for a requester who cannot read.** A device asked for an answer by a requester outside the audience answers as a plain `get` of the first unreadable read would and computes nothing; a requester inside is answered within the rate. Written only if #1 is adopted. |
+| a19 | **A phone asks the laptop of the same person.** A phone with no evaluator and no inputs, whose policy names the person's laptop, asks it a pure question: the ask is sealed to the laptop's seal key and proves the phone's key, the laptop plans, computes and signs, and the phone returns `Got::Answer` with the result, reads, binding and id a device holding everything gets, and a provenance of `Trusted` by the policy, naming the laptop. With the evaluator known on the phone, it recomputes what the laptop signed and agrees. |
+| a20 | **A device outside the audience is refused and nothing is evaluated.** A device outside the audience of one read of a question asks the laptop for it: it is refused `NotAudience` (next step `AskOwner`) with the index of that read, and the laptop's evaluation counter is unchanged. |
+| a21 | **One ask in progress.** Eight concurrent asks from one device for one slow computation: one is in progress, the rest are refused `Busy`, and every one is answered within 3 retries. |
+| a22 | **A forged proof gets silence.** An ask with a forged proof (a stranger's key, or a proof that does not name the ask) gets no Data within the Interest's lifetime, and the signer's evaluation counter is unchanged. |
 | unit | Canonical encoding and the digest: every read set round-trips and is independent of the order the reads were made in; two labels never collide; a decoder refuses an unknown TLV, a non-minimal length, an unsorted or repeated read; a keyed id differs for two audiences and agrees for two members; key derivation is order-fixed and gives the same bytes on two devices. |
+| unit (ask) | The envelope, its body and every refusal round-trip and a decoder refuses what is not exact; a provider ask is delivered on `provider_asks` and answered once the host provides; `Pending` and then a re-ask returns the stored answer with no second evaluation; `serve_asks` `Off` gives `NotServed`; `asks_at_once` bounds all askers together; a proof of another signer's or another question's does not verify. |
 
 c12's part 2 (a summary service) is rewritten as a provider answer over the note (a12, a6); its other parts stay.
 
-## 15. Pending decisions
+## 15. Asking another device for an answer
 
-Both are decided, to the conservative choices the spec marked. Nothing below is built; the text remains as the record of what was not chosen.
+A reader may need an answer from a device that holds the data it does not: a phone asking the person's laptop, a person asking a provider (`summarize` over this note). Readers fetch by id from signers that have already made the answer (§7.2 step 5), or recompute; a signer that has not made one publishes nothing for them. The **ask** is the one request by which a device makes an answer for another. It is sealed to the signer, authenticated by the asker's proof, and bound as §13.2 says. It is built by the owner's decision of 2026-11-19 (F-QUESTIONS #1, option (a)). The Rust shapes are `ndn_data::{AnswerAskEnvelope, AnswerAskBody, AnswerAskRefusal, AskRefusal, AskServing, ProviderAsk}`, `Device::ask_answer` and `Device::provider_asks`, and the settings are `AnswerConfig::serve_asks` and `asks_at_once`.
 
-### `[PENDING F-QUESTIONS #1]` Asking a signer to compute
+### 15.1 The exchange
 
-A reader may need an answer from a device that holds the data it does not (a phone asking the person's laptop; a person asking a provider, `summarize` over this note). Nothing in this spec makes a device compute for anyone but its own host: readers fetch by id from signers that have already made the answer, or recompute. The recommended addition, in `handoff-ndf-rs/F-QUESTIONS.md` #1, is a sealed ask, an Interest `<D>/32=ask-answer/<ParametersSha256Digest>` whose ApplicationParameters is an `AnswerAsk` (§11.2) sealed to the signer's seal key as an introduction ask is (data-layer.md §19.3), carrying the asker's proof (data-layer.md §13.2), answered by the signed answer packet wrapped as `32=held` wraps a packet, under the bounds of §13.2. The numbers `0x05DE`–`0x05DF` are held for it. Until the owner decides, none of it is implemented, `a19` is not written, and a device that wants an answer from another device waits for that device to publish it.
+1. The asker holds a question (§7.1) and names a signer `D`, a device its policy names (§15.9). It has `D`'s seal key (§15.8), builds an `AnswerAskBody` (§15.2) of the question's `AnswerAsk`, its own device name and its proof (§15.3), seals the body to `D`'s seal key, and sends one Interest named `<D>/32=ask-answer/<ParametersSha256Digest>` whose ApplicationParameters are the `AnswerAskEnvelope`.
+2. `D` decides by §15.4 and replies with one Data packet named exactly as the Interest, signed by `D`'s device key, with FreshnessPeriod 0, whose Content is the signed answer packet (§15.5) or an `AnswerAskRefusal` (§15.6); or it does not reply at all (§15.5).
+3. The asker judges what came back as it judges an answer it fetched (§15.9). Nothing in an answer is taken because it came as the reply to an ask.
 
-### `[PENDING F-QUESTIONS #2]` Policy as signed data
+### 15.2 The name, the envelope and the body
 
-The policy (§9) is a value the host passes. The recommended addition is an owner-signed record, a field of the members record (or a record of its own), saying which devices provide which function for a folder and which signers its readers may trust for pure answers: a reader then takes it from the folder's data and no host decides alone. Until the owner decides the layer takes the host's value and the defaults of §9.
+- **The name** is `<D>/32=ask-answer/<ParametersSha256Digest>` (§11.1): `D` the signer's device name, then the SHA-256 of the Interest's ApplicationParameters TLV as a ParametersSha256DigestComponent. It is the Interest's name, and the reply's (so a reply is for this ask and no other).
+- **The envelope**, the value of the ApplicationParameters, is one `AnswerAskEnvelope` (0x05DE): an `EphemeralKey` (the asker's ephemeral X25519 public key, 32 octets), a `Ciphertext` (a fresh content key wrapped to `D`'s seal key, as an epoch grant wraps one, data-layer.md §9) and a `Ciphertext` (the body, sealed under that content key). These are the fields and the encoding of `IntroAsk` (data-layer.md §19.3), and the code that seals and opens is the same. A decoder refuses an unknown, missing or repeated field.
+- **The sealing.** The body is encrypted with ChaCha20-Poly1305 under the content key; the associated data of both the wrap and the encryption is the Name TLV of `<D>/32=ask-answer`, the Interest's name without its digest. An envelope therefore opens only with `D`'s recipient key and only as an ask of `D`'s: moved to another device's name, or to an introduction ask, it does not open.
+- **The body** is, in this order and with nothing after, the `AnswerAsk` TLV (0x05D5, §11.2: the kind, for a pure question the definition, the evaluator or function, and the read set when the question states it), the asker's device `Name` TLV, and the asker's proof, one whole Data packet (§15.3). A body that does not decode exactly gets no reply (§15.5). A provider question MUST state its read set (§7.1); one that does not is refused `NotProvided`.
+
+### 15.3 The asker's proof
+
+- **The proof** is the packet `<A>/32=ask/<binding>` (data-layer.md §13.2, §16.1) with empty Content and FreshnessPeriod 0, signed by a key of the asker's device `A`, the device named in the body. It carries no nonce: it is tied to its ask by its binding alone.
+- **The binding** is the SHA-256 of: the label `ndn-data answer ask\0` (the label of this protocol among those of data-layer.md §16.1), the Name TLV of the signer `D`, the `AnswerAsk` TLV as the body carries it, and the 32 octets of the envelope's ephemeral public key. So a proof made for one signer, one question and one envelope verifies for that and no other: not as an ask of another signer, not for another question, not carried in another envelope, not as a hold, audit or introduction ask.
+- **The signer verifies** that the proof's name is `<A>/32=ask/<binding>` for the binding it computes from what it opened, and that the signature verifies by the trust context of `A` as every signature does (a revoked key does not verify), by a key of the device `A`; at most `Config::asks_verifying` proofs are verified at once. Anything else is silence (§15.5).
+
+### 15.4 The signer's order
+
+A device that receives an Interest under `<self>/32=ask-answer` decides in this order, and each step that fails answers what it says and goes no further:
+
+1. **The digest and the envelope.** The name's digest is the digest of the parameters; the envelope decodes and opens with this device's seal key and the associated data of §15.2; the body decodes exactly. Otherwise: silence.
+2. **The proof** (§15.3). Otherwise: silence. After this step the asker is **authenticated**: its device name is known to be a device whose key signed this ask.
+3. **Serving** (§15.7). `serve_asks` `Off` is `NotServed`; under `Own`, an asker whose namespace is not this device's is `NotServed`.
+4. **The caps** (§15.7). The asker has an ask in progress here, or this device works on `asks_at_once` asks: `Busy`. The two are taken together and given back together, wherever the work ends.
+5. **The audience of the stated reads.** When the ask states a read set: for `OwnAndMembers` and an asker of another namespace, the asker MUST be a listed writer or reader of every collection read by the record in force over it, else `NotServed`; then, for every read in canonical order, the asker MUST be of the audience of the read (below), else `NotAudience` with the index of the first it is not. This step reads and computes nothing and sends nothing.
+6. **Planning.** A pure question that states no reads, with an evaluator this device does not know, is `CannotCheck`. Otherwise the signer resolves the question as `get` does up to the id (§7.2 steps 1 to 4: it reads the reads a question states, or plans the reads of one that does not, never evaluating), within `Budget`. A refusal here is mapped: a budget, size or state limit is `OverBudget`; a read or key not yet to be had is `Pending`; anything else, `CannotCheck` for a pure question and `NotProvided` for a provider one. When the reads were not stated the planned set is checked as in step 5 now, before the evaluator runs.
+7. **The stored answer.** An answer this device signed at the id, durable and served (§6.2), is the reply at once: no computation, whoever asks.
+8. **Computing.** *Pure:* the signer calls `publish_answer` (idempotent) in a task of its own that holds the caps until it ends, and waits for it for `wait`; the answer is the reply; if it is not ready, `Pending`, and the work goes on, so a re-ask finds it. *Provider:* the signer hands a `ProviderAsk` to the host (§15.10) and waits, for `wait`, for the answer it finds at the id once the host has provided it; if it does not appear, `Pending`; no host that took the stream, or a full stream, is `NotProvided`.
+
+`wait` is the shorter of the Interest's lifetime less 200 ms (4 s less 200 ms when it states none) and `Budget::time`.
+
+**The audience of a read.** An asker is of the audience of a read when it may hold the key of every epoch the read is sealed in, by the members record that started the epoch and by the record in force, never by the record in force alone, which could admit a reader later than the read (data-layer.md §9). A read of an epoch this device does not hold is judged by the record in force of its collection; a collection with no record in force held here, or whose record has no epoch, has nothing sealed, and its reads admit anyone. The test is the one that decides whether this device would grant the asker the key (data-layer.md §9), so the audience of an ask is the audience of a grant.
+
+### 15.5 The reply, and silence
+
+- **The reply** is one Data packet named exactly as the Interest (digest included), signed by `D`'s device key, with FreshnessPeriod 0. Its Content is exactly one of:
+  - **the signed answer packet**, a whole Data TLV (0x06), the packet this device serves as `<D>/32=answer/<id>` (§3.3), unchanged: an answer over sealed reads is the packet sealed under the audience key (§5.3), and the reply adds nothing about the reads;
+  - **an `AnswerAskRefusal`** (0x05DF, §15.6).
+- **The asker takes a reply** only if its name is the ask's and its signature verifies as a key of the signer `D`; anything else is dropped as no reply.
+- **Silence** is no Data and no Nack: the Interest is dropped and goes unanswered. It is the signer's only answer to an ask whose digest is not its parameters', whose envelope does not open or decode, whose body is malformed, or whose proof does not verify (§15.4 steps 1 and 2); it is logged at `debug` and nothing else is done. A signer that is not reached is silent too, so an asker cannot tell the two apart: it ends `Unavailable` (§15.9).
+
+### 15.6 Refusals
+
+The Content of a refusal is one `AnswerAskRefusal` (0x05DF): a **reason code** of one octet (1 to 7), a **number** of eight octets big-endian, and the **explanation** in UTF-8 to the end of the value (what happened and what to do). The number is the index for code 1 and the wait in milliseconds for codes 2 and 3; for 4 to 7 it is 0, and a reader refuses a refusal whose number is not. A reader also refuses a code outside 1 to 7, a value shorter than 9 octets and an explanation that is not UTF-8.
+
+| Code | Reason | Number | A signer says it when | `NextStep` of the asker |
+|---|---|---|---|---|
+| 1 | `NotAudience` | the index, from 0, of the first read in canonical order the asker is not of the audience of (§15.4) | step 5, or step 6 for a planned set | `AskOwner` |
+| 2 | `Busy` | `retry_after`, 1000 | the asker has an ask in progress, or the signer works on `asks_at_once` | `RetryLater` |
+| 3 | `Pending` | `retry_after`, 1000 | the answer is not ready within `wait`, or a read or key it needs is not yet to be had | `RetryLater` |
+| 4 | `CannotCheck` | 0 | a pure question the signer cannot plan or compute: its evaluator is unknown here and the reads are not stated, or planning failed for another reason | `SetPolicy` |
+| 5 | `NotProvided` | 0 | a provider ask this device cannot have computed: no host took `provider_asks`, its stream is full, the inputs were not stated, or planning failed for another reason | `SetPolicy` |
+| 6 | `OverBudget` | 0 | planning or computing would exceed the signer's `Budget`, `PAYLOAD_MAX`, `READS_MAX` or `STATE_READS_CHECKED_MAX` | `FixRequest` |
+| 7 | `NotServed` | 0 | `serve_asks` is `Off`, or `Own` and the asker is of another namespace, or `OwnAndMembers` and the asker is of another namespace and not a listed writer or reader of every collection read | `SetPolicy` |
+
+A refusal is told only to an authenticated asker (§15.4 step 2). It is signed Data of the ask's name, and it tells no more than a plain `get` of the same read tells (§5.6, §13.14).
+
+### 15.7 Serving, and the caps
+
+- **`AnswerConfig::serve_asks`** (`AskServing`, default `Own`) says whose asks a device answers:
+  - `Off`: none; every authenticated ask is `NotServed`.
+  - `Own`: asks of devices of this device's own namespace, the namespace of the trust context that governs the asker's name here (the person's other devices, data-layer.md §3).
+  - `OwnAndMembers`: also a device of another namespace that is a listed writer or reader of every collection the ask reads, by the record in force over each, held here.
+
+  Serving is judged before the caps, so an asker that is not served takes none.
+- **`AnswerConfig::asks_at_once`** (default 4, at least 1) is the most asks this device works on at once, all askers together. Each asker also has **one ask in progress** at most; the counter is the one hold asks use (data-layer.md §13.2). Beyond either, the ask is refused `Busy` with `retry_after` of 1 s. A pure computation that outlives the Interest keeps both until it ends (§15.4 step 8).
+- **No other rate is specified.** The two caps and `Budget::time` (§10) bound what an authenticated asker can make the signer spend, and the layer has no token bucket of its own.
+
+### 15.8 The signer's seal key
+
+An asker seals to the signer's seal key, the packet `<D>/32=seal/<public key>` signed by `D`'s device key (data-layer.md §9, §16.1). A device answers an Interest for `<D>/32=seal` with CanBePrefix for its own `D` with that packet, so an asker that does not know the key fetches it by the device's name alone. The asker takes the key only from a packet that names `D` and is signed by a key of `D`, held already or fetched, never from the reply to an ask; a device whose key it cannot obtain is `NotReady` (`RetryLater`): "the signer's seal key is not held yet".
+
+### 15.9 What the asker does
+
+- **When it asks.** A `get` of a question asks only after §7.2 found nothing: when the question is not recomputed here (the evaluator is unknown, `Check` is `Trust`, or it is a provider question) and no answer is published where this device looks or held; and when a pure question that states no reads has an evaluator this device does not know, so it cannot plan, and its policy trusts some signer for pure answers. A question this device recomputes is never asked.
+- **Whom.** The candidate signers of §7.2 step 5, in that order, never this device: for a pure question the signers its policy trusts, for a provider question the devices its policy names as providers of the function (§9). A policy that names none asks none.
+- **How.** For each signer it obtains the seal key (§15.8), builds one ask with a fresh envelope and proof, and sends it with the device's lifetime, at most 3 times (the same Interest, so a lost packet costs a send and the signer's work is not repeated). On `Busy` or `Pending` it waits `retry_after` (at most 10 s) and asks again with a fresh envelope, at most 3 attempts per signer. A refusal after that, or any other refusal, ends that signer. Silence after the sends goes to the next signer. The first answer wins.
+- **What it does with an answer.** The packet passes the checks of every answer (§7.3.3 steps 1 to 5: signature, decoding, opening, binding, held reads) and the check for equivocation (§8.1), MUST answer the question asked (its evaluator or function, its definition and, when the question states them, its reads are the question's; else `Answer` / `Malformed`, and it is dropped), and is judged as one fetched is (§7.3): recomputed when the evaluator is known and `Check` is `Recompute`, else taken on the policy's trust with `Provenance` saying so. Verification, `CannotCheck` and evidence apply unchanged; a signer the policy does not trust is as untrusted as when it publishes. The result has `Age::Exact`.
+- **What it returns when none answers.** The first refusal as `Answer` / `AskRefused` (§12), or the first error of judging a packet a signer gave; else, when none replied, the error the question had before it asked (`Unavailable`, `CannotCheck`).
+
+### 15.10 The host's surface
+
+- **`Device::ask_answer(signer, question) -> Result<Got, DataError>`** asks one named device, as §15.9 does for each signer and without the policy's loop. `question` is `AnswerAsk::name(None)` (pure) or `AnswerAsk::name(Some(&signer))` (provider); `signer` MUST be another device's name (`BadRequest` otherwise). It returns `Got::Answer`; a refusal as `Answer` / `AskRefused` (with `next()`); silence as `Unavailable`; a seal key not obtained as `NotReady`.
+- **`Device::provider_asks() -> tokio::sync::mpsc::Receiver<ProviderAsk>`** hands a host the calls it is asked to compute: `ProviderAsk { function, inputs, asker }`, delivered for an authenticated asker of the audience of every input whose answer this device does not hold. The stream holds 64; taking it again replaces it, and the earlier receiver ends. The host computes and calls `Device::provide(function, inputs, result)` (§6.2): the answer is signed, and the asker's next ask finds it. A re-ask before the host provides delivers the same call again.
 
 ## 16. Cross-references to apply
 
@@ -626,14 +741,14 @@ The implementer applies these when the code lands; this spec edits none of them.
 - **§16.1 (names):** table rows for answer, piece of an answer, question (answers.md §11.1) and the parse rules for them; the piece-name rule gains "or an answer's name".
 - **§16.2:** one paragraph: "Round 5 adds 0x05C0–0x05DF for answers (answers.md §11.2); every number is odd."
 - **§17.1:** an answer asked for by id is an owed fetch (`FETCH_TRIES` per candidate, `RELAYS_ASKED` candidates).
-- **§18 (conformance):** list a1–a18 (a19 when #1 lands) and state that c12 is rewritten to the F surface.
+- **§18 (conformance):** list a1–a22 and state that c12 is rewritten to the F surface.
 - **§20:** none; answers use the gate's definition of a member only for the default policy (answers.md §9).
 - **D's section (device-wide events):** add the `AnswerEvidence` event (SHAPES-R5 §F, §8.2 of answers.md).
 
 **README.md**
 
 - *Other specifications* table, a row: `| [answers.md](answers.md) | Answers: named, checkable readings over signed data; pure answers (recomputed by any holder of the definition and the inputs) and provider answers (trusted by the provider's authority); the read set, its canonical bytes and digest, the binding, the keyed answer id, the name `<D>/32=answer/<id>`, sealing to the audience intersection of what was read, evaluators named and versioned like merge rules, the verb (`get` of an exact name or a question), recompute-or-trust, evidence, policy, threat notes; TLV 0x05C0–0x05DF |`
-- *TLV-TYPE numbers* table, a row after the `0x05B0–0x05BF` one: `| 0x05C0–0x05DF | [answers.md](answers.md) §11.2 (odd numbers only: every field of an answer is critical. AnswerRecord 0x05C1, AnswerKind 0x05C3, AnswerBody 0x05C5, AnswerBinding 0x05C7, AnswerBy 0x05C9, ReadSet 0x05CB, ReadVersion 0x05CD, ReadState 0x05CF, Result 0x05D1, AnswerSealed 0x05D3, AnswerAsk 0x05D5, and two records of the device's event store, AnswerEvidence 0x05D7, AnswerFault 0x05D9, FaultKind 0x05DB, AnswerPadding 0x05DD; 0x05DE–0x05DF held for the ask exchange, answers.md §15) |`
+- *TLV-TYPE numbers* table, a row after the `0x05B0–0x05BF` one: `| 0x05C0–0x05DF | [answers.md](answers.md) §11.2, §15 (odd numbers only for the fields of an answer: every field of an answer is critical. AnswerRecord 0x05C1, AnswerKind 0x05C3, AnswerBody 0x05C5, AnswerBinding 0x05C7, AnswerBy 0x05C9, ReadSet 0x05CB, ReadVersion 0x05CD, ReadState 0x05CF, Result 0x05D1, AnswerSealed 0x05D3, AnswerAsk 0x05D5, and two records of the device's event store, AnswerEvidence 0x05D7, AnswerFault 0x05D9, FaultKind 0x05DB, AnswerPadding 0x05DD; the ask exchange takes 0x05DE `AnswerAskEnvelope` and 0x05DF `AnswerAskRefusal`, answers.md §15) |`
 - *Name-component types*: no new type; the keyword components `32=answer` and `32=question` are of the layer's own (data-layer.md §16.1).
 
 ---

@@ -4077,8 +4077,9 @@ decides anything, and a watch keeps telling every `Change` it tells.
 
 `get` of an answer name `<D>/32=answer/<id>` or a question name
 `<X>/32=question/<AnswerAsk>` answers `Got::Answer` (answers.md §7); the host
-surface adds `Device::answer_id`, `publish_answer`, `provide`, `current_read` and
-`read_ref`; `DataError` gains `CannotCheck` and `Answer`, `NextStep` gains
+surface adds `Device::answer_id`, `publish_answer`, `provide`, `current_read`,
+`read_ref`, `ask_answer` and `provider_asks` (the sealed ask exchange, answers.md
+§15); `DataError` gains `CannotCheck` and `Answer`, `NextStep` gains
 `SetPolicy`.
 
 ## 16. Wire format — slices 1–4, 6 (slice 5 adds none)
@@ -4169,7 +4170,8 @@ Every name parses one way, and a reader MUST refuse one that does not:
   `SeqRange` (low ≤ high) or one `TimeRange` (from < to) TLV, nothing else.
 - **Seal key.** `D` is the components before the first `32=seal`; one
   GenericNameComponent of 32 octets follows, the X25519 public key, equal
-  to the `SealKey` the packet carries.
+  to the `SealKey` the packet carries. A device also answers an Interest for
+  its own `<D>/32=seal` with CanBePrefix by that packet (answers.md §15.8).
 - **Grant.** `G` is the components before the first `32=grant`; one
   GenericNameComponent follows whose value is one `GrantAsk` TLV: a seal key
   name, a collection Name (or, for a folder epoch, the folder's, §9) and a
@@ -4183,10 +4185,13 @@ Every name parses one way, and a reader MUST refuse one that does not:
   SHA-256 of the protocol's label, then the holder's Name TLV followed by
   the ask's TLV without its `Asker` (§13.2, §13.3); in an introduction,
   the offering device's Name TLV followed by the ask's fields before its
-  `Asker`, or the answer's fields before its `Asker` (§19.3). The labels,
+  `Asker`, or the answer's fields before its `Asker` (§19.3); in an ask for
+  an answer, the signer's Name TLV, the `AnswerAsk` TLV and the ask's
+  ephemeral key (answers.md §15.3). The labels,
   ASCII each ending in a zero octet so none is a prefix of another, are
-  `ndn-data hold ask\0`, `ndn-data audit ask\0`, `ndn-data intro ask\0`
-  and `ndn-data intro answer\0`. A receiver computes the binding with the
+  `ndn-data hold ask\0`, `ndn-data audit ask\0`, `ndn-data intro ask\0`,
+  `ndn-data intro answer\0` and `ndn-data answer ask\0`. A receiver computes
+  the binding with the
   label of the protocol it expects, so a proof made for one protocol
   never verifies as another's, whatever its fields.
 - **Introduction ask.** `D` is the components before the first
@@ -5529,7 +5534,7 @@ resurrected; a writer demoted to a reader is granted as a reader at once and
 the host told again once; and the host is told of an end before it is
 durable (a frozen disk does not delay it).
 
-Answers: cases `a1`–`a18` (answers.md §14); case `c12` is rewritten over a
+Answers: cases `a1`–`a22` (answers.md §14); case `c12` is rewritten over a
 provider answer.
 
 ### 18.1 Faulty mode
