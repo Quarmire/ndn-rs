@@ -99,7 +99,7 @@ Every implementation MUST hold all of these.
 No validity decision may accept anything because of a wall clock, nor
 compare a certificate's validity period with one, with one exception that
 can only refuse: a key of a role the trust context lists in DataRequiresCut
-(a guest's, by default) whose certificate lapsed is refused until its
+(every role, by default) whose certificate lapsed is refused until its
 revocation cut is held (§8.5). Dates are display, indexing (range reads,
 §5.4) and retention (§14.1) only. The root device's own clock also bounds
 which entries it puts in a cut it makes (§8.1); a reader never reads it.
@@ -2472,8 +2472,8 @@ update are taken as the device's own by that migration (residual).
   (`held_before` = the first NotBefore of the new key's certificates).
   Until that is signed, the old key stays valid for Data; the root's
   tools list it as a key to end, with the cut to make.
-- **Expiry of a guest.** A key of a role the trust context lists in
-  DataRequiresCut — `guest`, by default — fails closed once its
+- **Expiry of a device.** A key of a role the trust context lists in
+  DataRequiresCut — every role, by default — fails closed once its
   certificate lapsed by the reader's clock (§8.5), and is ended the same
   way, with a cut bounded at its certificate's NotAfter. Its entries the
   root verified before that stay valid; the rest the owner re-admits one
@@ -2536,22 +2536,25 @@ the owner's revocation with a cut.
 
 **What the clock does now: DataRequiresCut.** Some keys are meant to end by
 the calendar. A guest's certificate is short-lived to end the invitation,
-and guests do not renew. For a role the trust context lists in
-DataRequiresCut (trust-context.md §3.3.13; `guest` in every context
+and guests do not renew; a member, admin or node device renews before its
+certificate lapses, so one that did not is gone, lost or no longer
+trusted. For a role the trust context lists in
+DataRequiresCut (trust-context.md §3.3.13; every role, in every context
 `ndn-fwd init` makes), a version signed by such a key is accepted only
 while a certificate of that key is valid by the reader's clock, or once
 the key is revoked with a cut, which then decides alone. In between it is
 refused, fail-closed, as revoked without a cut: the key's certificate
 lapsed and the owner's cut is awaited. The owner's root device makes that
 cut bounded at the certificate's NotAfter and signs it (§8.4), and it
-accepts what the guest wrote while invited, as far as the root saw it.
+accepts what the device wrote while trusted, as far as the root saw it.
 The clock can only refuse here: a fast
-reader clock refuses a guest's versions early until the cut arrives; a
+reader clock refuses a lapsed key's versions early until the cut arrives; a
 slow one accepts them a little longer, as a reader that has not adopted a
-revocation does; neither makes a reader accept what a cut refuses. Roles
-that renew (member, admin, node, relay) are not listed by default:
-listing them would refuse a device's honest versions whenever its renewal
-is late or a reader's clock runs fast.
+revocation does; neither makes a reader accept what a cut refuses. A
+device that renews (member, admin, node) is refused only when its renewal
+fails, so an honest one never waits. A context made before this default
+lists `guest` alone and keeps doing so, since a context is root-signed
+data; `ndn-fwd status` names the command that lists the other roles.
 
 **What the root's clock does: the bound of a cut.** The producer of a cut
 reads its own clock twice: when it first verifies an entry, and when the
@@ -2648,7 +2651,7 @@ device's next seq wrap around and sign over seqs it used (§8.3).
   residual above).
 
 **A leaked, expired, unrevoked key.** For a role the context lists in
-DataRequiresCut (guests, by default), its versions are refused once its
+DataRequiresCut (every role, by default), its versions are refused once its
 certificate lapsed, until the root's cut. A key replaced by a new
 enrollment stays valid for Data until the owner ends it with a cut; the
 root lists it until then (§8.4). For any other key — a
@@ -4562,7 +4565,7 @@ octets), a piece of one `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, a question
 | Partition / offline | Reads and writes continue locally under each device's key; collections reconcile from summaries when a path returns. | §4, §7 |
 | Lost device | Its leases lapse; repair asks the other holders the hold record names; the owner marks its key suspected on the root device, says when it was lost, and revokes it with a cut of what the root first verified before then; the entries left out are printed, and any honest one is re-admitted by exact name and digest. | §8.1, §8.2, §13 |
 | Compromised key | The revocation cut keeps exactly the versions it lists, with the bytes its manifest lists, and refuses the rest, whatever dates they claim; the key's summaries, heads, seal keys and grants are refused; sealed data re-keys forward. | §8.1, §9 |
-| Bad or lying clock | Never makes a version accepted: Data is judged without certificate validity periods, and the cut, not a date, ends a key; for a role listed in DataRequiresCut (guest) a reader's clock only decides when a lapsed key's versions start being refused until its cut. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing; the root's clock moves only which entries the cuts it makes list, and it prints those left out. A wrong clock refuses live exchanges, loudly. | invariant 1, §8.1, §8.5, §14.1 |
+| Bad or lying clock | Never makes a version accepted: Data is judged without certificate validity periods, and the cut, not a date, ends a key; for a role listed in DataRequiresCut (every role, by default) a reader's clock only decides when a lapsed key's versions start being refused until its renewal or its cut. Under expiry it moves only that device's own retention: a slow clock holds and serves longer, a fast one drops its own copy early; a writer's clock moves only its own dates and listing; the root's clock moves only which entries the cuts it makes list, and it prints those left out. A wrong clock refuses live exchanges, loudly. | invariant 1, §8.1, §8.5, §14.1 |
 | Thief writes between the theft and the revocation | Writes the root first verified before the loss time the owner states stay accepted (residual); later ones are left out of the cut and refused everywhere; once the key is marked suspected, the root takes none. | §8.1, §8.6 |
 | Thief backdates or fills a gap with a revoked key | Refused wherever the revoking version is held: the cut lists names, and no date or seq outside it counts. | §8.1 |
 | Thief reuses an accepted seq in another collection | Refused: the cut's ranges are per collection prefix. | §8.1 |
@@ -4571,10 +4574,10 @@ octets), a piece of one `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, a question
 | Revocation arrives after a thief's version was accepted | On adopting the revoking context the reader withdraws it and tells every watcher; in-cut versions stay. | §8.3 |
 | Issuer revoked after its keys' versions were held | On adopting the revoking context, and on restore, every held version is judged again with the whole walk; those whose chain passes the revoked issuer are withdrawn, saying an issuer refuses them (no re-admission). | §8.3 |
 | Honest work outside the cut | Refused and reported with its full name and digest; the root re-admits it by exact name and digest, and every device holding or following it then applies it; no neighbour seq and no other bytes come with it. | §8.2 |
-| Certificate renewed, or expired | The key's versions verify alike under the old and the new certificate, before and after either expires; the log continues. A role listed in DataRequiresCut (guest) is the exception: lapsed, its versions are refused until its cut. | §8.4, §8.5 |
-| Guest's certificate lapses | Its versions are refused, fail-closed, until the root's revocation with a cut bounded at the NotAfter, which keeps what it wrote while invited. | §8.4, §8.5 |
+| Certificate renewed, or expired | The key's versions verify alike under the old and the new certificate, before and after either expires; the log continues. A key whose certificate lapsed without a renewal is the exception, for every role the context lists in DataRequiresCut (all of them, by default): its versions are refused until its renewal or its cut. | §8.4, §8.5 |
+| A device's certificate lapses without renewal | Its versions are refused, fail-closed, whatever its role (a guest, member, admin or node), until the key is renewed or the root's revocation with a cut bounded at the NotAfter, which keeps what it wrote while trusted. A device that renews before expiry is never refused. | §8.4, §8.5 |
 | Device key replaced by a new enrollment | Its versions stay accepted until the owner ends it: the root's tools list it with the cut to make (bounded at the replacement's enrollment), and `ndn-fwd end-keys` revokes it with that cut. | §8.4 |
-| Leaked key, certificate expired, never revoked | For a role not listed in DataRequiresCut, never replaced, its thief's versions are accepted (residual), and nothing lists it: revocation with a cut ends it. | §8.5, §8.6 |
+| Leaked key, certificate expired, never revoked | For a role not listed in DataRequiresCut (every role is, in a context `ndn-fwd init` makes now; an older context lists `guest` alone), never replaced, its thief's versions are accepted (residual), and nothing lists it: revocation with a cut ends it. | §8.5, §8.6 |
 | Copy of the device's own key writes under its name | The device takes such an entry as another writer's, never as its own at restore; its log head moves only for what it wrote, its seqs never wrap, and an entry far above its head is refused. | §8.3 |
 | Power loss | The device loses only what it had not published: its store opens at a whole state at or after its last flush, a torn tail rolled back without error; its log head is at or above every seq it served, listed or announced, so it never signs a different entry at a seq a peer holds; local writes since the flush are gone, nobody saw them. | invariant 2, §4.2 |
 | Process killed (no power loss) | Every write that returned is kept; the restarted device flushes the store before it publishes any of it. | §4.2 |

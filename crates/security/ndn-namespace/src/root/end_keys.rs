@@ -1,7 +1,8 @@
 //! Ending, on the root device, the keys whose authority over Data has ended
 //! but which no version revokes yet ([`ndn_cert::ending_keys`]): lapsed keys
-//! of a role the trust context lists in `DataRequiresCut` (`guest` by
-//! default) and keys replaced by a newer key of the same device identity.
+//! of a role the trust context lists in `DataRequiresCut` (every role, in a
+//! context `ndn-fwd init` makes; an older one lists `guest` alone) and keys
+//! replaced by a newer key of the same device identity.
 //!
 //! [`pending`] lists them, read from the PIB (the namespace CA's issued
 //! certificates and the held version), each with the moment its authority
@@ -15,8 +16,8 @@
 //! without one would refuse forever what the key published honestly; it is
 //! listed instead. Meanwhile a lapsed key fails closed by itself (its Data
 //! is refused once no certificate of it is valid by the reader's clock),
-//! while a replaced key of an unlisted role keeps signing accepted Data
-//! until it is ended.
+//! while a replaced key keeps signing accepted Data until it is ended (or,
+//! for a listed role, until its certificate lapses).
 //!
 //! The running device never unlocks the root, and the data layer runs
 //! beside it, so ending keys is a root operation like any other: a host
@@ -46,6 +47,11 @@ pub struct Pending {
     pub namespace: Name,
     /// The held version.
     pub version: u64,
+    /// The device roles the held version lists in `DataRequiresCut`, sorted:
+    /// the roles whose lapsed keys' Data is refused (and whose lapsed keys
+    /// are listed in `ending`). A context made before every role was listed
+    /// lists fewer.
+    pub data_requires_cut: Vec<String>,
     pub ending: Vec<EndingKey>,
 }
 
@@ -76,6 +82,7 @@ fn pending_of(pib_dir: &Path, root: &RootDevice, now: u64) -> Result<Pending, Ro
     Ok(Pending {
         ending: ending_keys(&root.context, &issued, now),
         version: root.context.version(),
+        data_requires_cut: root.context.data_requires_cut().to_vec(),
         namespace,
     })
 }

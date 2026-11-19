@@ -1000,6 +1000,30 @@ mod tests {
         assert_eq!(signer.name, init.anchor.name);
     }
 
+    /// A namespace the creation path makes refuses the Data of a lapsed key
+    /// until it is ended, for every role: its context lists all four.
+    #[test]
+    fn init_namespace_lists_every_role_in_data_requires_cut() {
+        let mgr = SecurityManager::new();
+        let init = init_namespace(&mgr, &n("/home/bob")).unwrap();
+        let mut every: Vec<String> = Role::ALL.iter().map(|r| r.as_str().to_string()).collect();
+        every.sort();
+        assert_eq!(init.context.data_requires_cut(), every.as_slice());
+        for role in ["admin", "member", "node", "guest"] {
+            let key = n(&format!("/home/bob/{role}/dev/KEY/k"));
+            assert!(
+                init.context.requires_cut_for(&key),
+                "a {role} key's lapsed Data is accepted without a cut"
+            );
+        }
+        // …and the signed context says so, not only the in-memory one.
+        let opened =
+            futures::executor::block_on(SignedTrustContext::open_signed(&init.context_data))
+                .unwrap()
+                .0;
+        assert_eq!(opened.data_requires_cut(), every.as_slice());
+    }
+
     fn root_public_key(pib: &FilePib, ns: &Name) -> bytes::Bytes {
         pib.get_signer(&root_key_name(ns))
             .unwrap()

@@ -25,8 +25,9 @@ trust context's revocations and revocation cuts decide, not the reader's
 clock, so honest old Data stays valid after its certificate expires, and a
 revoked key's Data is accepted exactly where its cut accepts it. The one
 clock check is a refusal: a key of a role the context lists in
-`DataRequiresCut` (guests) is refused once its certificate lapsed, until
-its cut. For the reply to a request you just sent and act on at once (a
+`DataRequiresCut` (every role, in a namespace `ndn-fwd init` makes) is
+refused once its certificate lapsed, until it is renewed or its cut is held.
+For the reply to a request you just sent and act on at once (a
 remote call's answer), where the signer's certificate must be valid now,
 use `.verify_live(&validator)`.
 

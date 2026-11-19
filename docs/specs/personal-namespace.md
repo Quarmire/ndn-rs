@@ -130,8 +130,9 @@ unattended. A relay never holds the root.
   manifest, plus later exact re-admissions (name and implicit digest)
   (trust-context.md §3.3.12, data-layer.md §8.1, §8.2). Data is judged by
   revocations and cuts, never accepted because of a certificate's validity
-  period; a role the context lists in DataRequiresCut (`guest` by default)
-  is refused once its certificate lapsed until its cut is held. Live uses
+  period; a role the context lists in DataRequiresCut (every role, in a
+  context `ndn-fwd init` makes) is refused once its certificate lapsed
+  until its key is renewed or its cut is held. Live uses
   (links, signed Interests, enrollment, renewal) keep validity periods
   (trust-context.md §3.3.13, §6.3).
 - **Recovery kit** — a separate recovery key whose anchor the context lists
@@ -542,9 +543,10 @@ kept serves only the versions held since.
    the shared scope (confidentiality module; ABE optional).
 3. Expiry needs no action for the live uses: the guest's links, signed
    Interests and renewal end with its certificate. Data the guest's key
-   signs ends too: every context `ndn-fwd init` makes lists `guest` in
-   **DataRequiresCut** (trust-context.md §3.3.13), so once the guest's
-   certificate lapsed by a reader's clock, the reader refuses Data the key
+   signs ends too: every context `ndn-fwd init` makes lists every role,
+   `guest` among them, in **DataRequiresCut** (trust-context.md §3.3.13),
+   so once the guest's certificate lapsed by a reader's clock, the reader
+   refuses Data the key
    signs (fail closed) until the key is revoked with a cut. The guest's
    key is then **lapsed**, a key to end: every root command, `ndn-fwd
    status` (`ending_key = <key> (lapsed at <time>)`, with the data host's
@@ -557,10 +559,15 @@ kept serves only the versions held since.
    guest wrote while invited, as far as the root saw it before the
    NotAfter, stays valid; the rest the owner re-admits one by one (F4). A
    key to end is never revoked without a cut, and the daemon never unlocks
-   the root to do it. Early end = F4. An owner may list other roles in
-   DataRequiresCut (`ndn-fwd schema data-requires-cut
-   <role>[,<role>…]|none`, a version changing only that); renewable roles are not listed by default,
-   since a late renewal would otherwise refuse a device's honest Data.
+   the root to do it. Early end = F4. The same holds for every role, not
+   guests alone: every context `ndn-fwd init` makes lists all four roles
+   in DataRequiresCut, so a member, admin or node device that failed to
+   renew is refused once its certificate lapsed, until the owner renews or
+   ends it; a device that renews before expiry (F10) never waits. An owner
+   may change the list (`ndn-fwd schema data-requires-cut
+   <role>[,<role>…]|none`, a version changing only that), and a namespace
+   made before this default, whose context lists `guest` alone, is told so
+   by `ndn-fwd status`, which names that command.
 
 ### F10 Rotate keys
 Device certificates renew before expiry without an invite (**have**:

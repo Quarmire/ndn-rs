@@ -3,7 +3,8 @@
 //! holding a current certificate renews without a token and keeps its key; a
 //! revoked key, an expired certificate, a non-renewable role (guest, by
 //! default) and a proof by another key are refused; each role's certificates
-//! last what the policy sets for that role.
+//! last what the policy sets for that role; a member that renews before its
+//! certificate lapses keeps its Data accepted, one that does not is refused.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,14 +15,17 @@ use ndn_cert::ca::{CaConfig, CaState};
 use ndn_cert::challenge::ChallengeHandler;
 use ndn_cert::roles::Role;
 use ndn_cert::{
-    CaExchange, CertError, HierarchicalPolicy, InviteLink, RENEWAL_CHALLENGE, RenewalError,
-    RolePolicy, TokenChallenge, TokenStore, adopt_with_tofu, anchor_fingerprint, ca_key_name,
-    enroll_with_invite, init_namespace, new_device_key_name, renew_certificate,
+    CaExchange, CertError, HierarchicalPolicy, InviteLink, NewRootStore, RENEWAL_CHALLENGE,
+    RenewalError, RolePolicy, TokenChallenge, TokenStore, adopt_with_tofu, anchor_fingerprint,
+    ca_key_name, enroll_with_invite, init_namespace_in_pib, new_device_key_name, renew_certificate,
     renewal_proof_message,
 };
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, Name};
-use ndn_security::{Ed25519Signer, Keyring, SecurityManager, Signer};
+use ndn_security::{
+    CertCache, Ed25519Signer, FilePib, Keyring, SecurityManager, Signer, TrustError,
+    ValidationResult, Validator,
+};
 use ndn_trust_envelope::TrustEnvelope;
 
 fn ns() -> Name {
@@ -62,21 +66,27 @@ impl CaExchange for CaWire {
 
 struct Namespace {
     ca: Arc<CaState>,
+    ca_cert: ndn_security::Certificate,
     context: Data,
     fingerprint: [u8; 32],
+    _dir: tempfile::TempDir,
 }
 
-/// A namespace `/home/bob` whose CA redeems a member and a guest token and
-/// issues under `policy` (a `RolePolicy` unless the test says otherwise).
+/// A namespace `/home/bob` made as `ndn-fwd init` makes it (its context names
+/// the CA and lists every role in `DataRequiresCut`) whose CA redeems a member
+/// and a guest token and issues under `policy` (a `RolePolicy` unless the
+/// test says otherwise).
 async fn namespace(policy: impl FnOnce(Name) -> Box<dyn ndn_cert::IssuancePolicy>) -> Namespace {
-    let mgr = SecurityManager::new();
-    let root = init_namespace(&mgr, &ns()).unwrap();
-    let ca_key = ca_key_name(&ns());
-    mgr.generate_ed25519(ca_key.clone()).unwrap();
-    let ca_pub = mgr.get_signer_sync(&ca_key).unwrap().public_key().unwrap();
-    mgr.certify(&ca_key, ca_pub, &root.anchor_key, 3_650 * 86_400 * 1_000)
+    let dir = tempfile::tempdir().unwrap();
+    let pib = FilePib::new(dir.path()).unwrap();
+    let root = init_namespace_in_pib(&pib, &ns(), "desk", false, &NewRootStore::File)
         .await
         .unwrap();
+    let ca_key = ca_key_name(&ns());
+    let mgr = SecurityManager::new();
+    mgr.register_signer(ca_key.clone(), pib.get_signer(&ca_key).unwrap());
+    mgr.cert_cache().insert(root.ca_cert.clone());
+    let ca_cert = root.ca_cert.clone();
     let store = TokenStore::new();
     for (token, role) in [
         ("member-aa", "member"),
@@ -100,8 +110,10 @@ async fn namespace(policy: impl FnOnce(Name) -> Box<dyn ndn_cert::IssuancePolicy
     config.issuance = policy(ns());
     Namespace {
         ca: Arc::new(CaState::new(config, Arc::new(mgr))),
-        context: Data::decode(root.context_data.raw().clone()).unwrap(),
-        fingerprint: anchor_fingerprint(&root.anchor),
+        ca_cert,
+        context: Data::decode(root.init.context_data.raw().clone()).unwrap(),
+        fingerprint: anchor_fingerprint(&root.init.anchor),
+        _dir: dir,
     }
 }
 
@@ -265,6 +277,94 @@ async fn per_role_lifetimes_are_honoured() {
     assert!(
         (7 * 86_400 - 60..=7 * 86_400 + 60).contains(&guest_secs),
         "{guest_secs}"
+    );
+}
+
+/// The Data `device` signs under its own name, for the reader's `validate_durable`.
+fn signed_by(device: &Device, who: &str) -> Data {
+    let key = device.key.as_ref();
+    let wire = DataBuilder::new(
+        format!("/home/bob/member/{who}/msg")
+            .parse::<Name>()
+            .unwrap(),
+        b"payload",
+    )
+    .sign_sync(key.sig_type(), Some(key.key_name()), |region| {
+        key.sign_sync(region).unwrap()
+    });
+    Data::decode(wire).unwrap()
+}
+
+/// Every role's lapsed keys are refused until ended (the context a namespace
+/// makes lists all four), so a device that renews before its certificate
+/// lapses must never wait: a member that renewed keeps its Data accepted past
+/// the old certificate's NotAfter by the reader's clock, while one that did
+/// not renew is refused from then on.
+#[tokio::test]
+async fn a_member_that_renews_before_expiry_keeps_its_data_accepted_across_the_old_not_after() {
+    let ns = namespace(|ns| {
+        Box::new(RolePolicy::new(ns).with_validity(Role::Member, Duration::from_secs(3)))
+    })
+    .await;
+    let phone = enroll(&ns, "member", "member-aa", "phone", 1).await;
+    let tablet = enroll(&ns, "member", "member-bb", "tablet", 2).await;
+    let old = cert_of(&phone.cert);
+    // Validity periods are stored to the second: renewing later gives a
+    // later NotAfter.
+    std::thread::sleep(Duration::from_millis(1_100));
+    let renewed = renew(&ns, &phone)
+        .await
+        .expect("a current member certificate renews");
+    assert!(renewed.cert.valid_until > old.valid_until);
+
+    // A reader of the namespace: its keyring holds the context, its cache the
+    // CA's certificate and the members' certificates.
+    let keyring = Arc::new(Keyring::new());
+    adopt_with_tofu(&keyring, &ns.context, &self::ns(), &ns.fingerprint).unwrap();
+    let certs = Arc::new(CertCache::new());
+    certs.insert(ns.ca_cert.clone());
+    certs.insert(cert_of(&phone.cert));
+    certs.insert(renewed.cert.clone());
+    certs.insert(cert_of(&tablet.cert));
+    let reader = Validator::with_keyring(keyring, certs, None, 5);
+    let from_phone = signed_by(&phone, "phone");
+    let from_tablet = signed_by(&tablet, "tablet");
+    for (who, data) in [("phone", &from_phone), ("tablet", &from_tablet)] {
+        let result = reader.validate_durable(data).await;
+        assert!(
+            matches!(result, ValidationResult::Valid(_)),
+            "{who} before any certificate lapsed: {result:?}"
+        );
+    }
+
+    // Past the old certificate's NotAfter (the reader's clock), before the
+    // renewed one's.
+    let now_ns = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    };
+    while now_ns() <= old.valid_until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        renewed.cert.is_valid_at(now_ns()),
+        "the renewed certificate is still valid"
+    );
+    let result = reader.validate_durable(&from_phone).await;
+    assert!(
+        matches!(result, ValidationResult::Valid(_)),
+        "an honest member that renewed was refused: {result:?}"
+    );
+    let result = reader.validate_durable(&from_tablet).await;
+    assert!(
+        matches!(
+            result,
+            ValidationResult::Invalid(TrustError::Revoked { why, .. })
+                if why == TrustError::REVOKED_LAPSED
+        ),
+        "a member that did not renew was accepted past its certificate: {result:?}"
     );
 }
 

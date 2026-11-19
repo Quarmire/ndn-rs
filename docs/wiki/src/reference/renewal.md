@@ -30,14 +30,16 @@ per role, and renewal keeps every renewable device enrolled.
   `[ca] renewable_roles` says which roles renew. Guests do not by default:
   guest access — links, signed Interests, renewal — ends at expiry, and so
   does a guest key's authority over Data, because every namespace
-  `ndn-fwd init` makes lists `guest` in the trust context's
-  `DataRequiresCut`: once a guest's certificate has lapsed, Data its key
-  signs is refused until the owner revokes the key with a cut bounded at
-  its NotAfter, which keeps what the guest wrote while invited (`ndn-fwd
-  end-keys`, [keys to end](./revocation.md#keys-to-end)). If you turn
-  renewal off for another role, list it too (`ndn-fwd schema
-  data-requires-cut guest,<role>,…`). A role that renews is not listed: a late
-  renewal must not refuse a device's honest Data.
+  `ndn-fwd init` makes lists every role in the trust context's
+  `DataRequiresCut`: once a device's certificate has lapsed, Data its key
+  signs is refused until the owner renews it or revokes the key with a cut
+  bounded at its NotAfter, which keeps what the device wrote while trusted
+  (`ndn-fwd end-keys`, [keys to end](./revocation.md#keys-to-end)). A
+  member, admin or node device renews before expiry, so an honest one never
+  waits; one that failed to renew is refused until it is renewed or ended.
+  A namespace made before this default lists `guest` alone: `ndn-fwd
+  status` names the command that lists the others (`ndn-fwd schema
+  data-requires-cut admin,member,node,guest`).
 - **Rotating to a new key** is a new enrollment, not a renewal. When the
   CA enrolls a new key for a device that already has one, the old key is
   a key to end: revoke it with a cut bounded at the new key's enrollment

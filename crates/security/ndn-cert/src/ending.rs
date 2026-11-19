@@ -6,7 +6,8 @@
 //! Two kinds of keys must end even though nobody lost them:
 //!
 //! - **Lapsed**: a key of a role the trust context lists in
-//!   `DataRequiresCut` (`guest` by default) whose newest certificate's
+//!   `DataRequiresCut` (every role, in a context `ndn-fwd init` makes; an
+//!   older one lists `guest` alone) whose newest certificate's
 //!   NotAfter has passed. Until the revocation exists, every node refuses
 //!   its Data once no certificate of it is valid by the node's clock (fails
 //!   closed); the cut then re-admits what it wrote before NotAfter.
@@ -179,6 +180,48 @@ mod tests {
         // A key the held version revokes is not listed again.
         let revoked = ctx().with_revocation(n("/home/bob/guest/ann/KEY/a"));
         assert!(ending_keys(&revoked, &issued, now).is_empty());
+    }
+
+    /// `/home/bob` listing every role, as a namespace the creation path makes
+    /// now does.
+    fn ctx_every_role() -> SignedTrustContext {
+        ["admin", "member", "node", "guest"].into_iter().fold(
+            SignedTrustContext::hierarchical(n("/home/bob")),
+            |ctx, role| ctx.with_data_requires_cut(role),
+        )
+    }
+
+    #[test]
+    fn a_lapsed_key_of_any_role_ends_when_its_context_lists_every_role() {
+        let now = 1_000;
+        let issued = [
+            cert("/home/bob/member/tv/KEY/t", 100, 500),
+            cert("/home/bob/admin/desk/KEY/d", 100, 500),
+            cert("/home/bob/node/vps/KEY/v", 100, 500),
+            cert("/home/bob/guest/ann/KEY/a", 100, 500),
+            // A device that renewed before it lapsed does not end.
+            cert("/home/bob/member/phone/KEY/p", 100, 500),
+            cert("/home/bob/member/phone/KEY/p", 400, 5_000),
+            // Never the CA's keys.
+            cert("/home/bob/CA/KEY/ca", 100, 500),
+        ];
+        let lapsed = |key: &str| EndingKey {
+            key: n(key),
+            why: Ending::Lapsed { not_after: 500 },
+            held_before: 500,
+        };
+        let mut want = [
+            lapsed("/home/bob/admin/desk/KEY/d"),
+            lapsed("/home/bob/guest/ann/KEY/a"),
+            lapsed("/home/bob/member/tv/KEY/t"),
+            lapsed("/home/bob/node/vps/KEY/v"),
+        ];
+        want.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(ending_keys(&ctx_every_role(), &issued, now), want);
+        // A context made before this rule lists guest alone: the member
+        // key's lapse is not listed (and `ndn-fwd status` says so).
+        let only_member = ending_keys(&ctx(), &issued, now);
+        assert_eq!(only_member, [lapsed("/home/bob/guest/ann/KEY/a")]);
     }
 
     #[test]

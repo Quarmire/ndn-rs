@@ -755,32 +755,39 @@ early, until it holds the cut; one whose clock runs slow accepts it a
 little longer, as a reader that has not yet adopted a revocation does.
 
 **Why.** Without this field, Data ignores expiry entirely (§6.3), so a key
-keeps its authority over Data until the owner revokes it. That is right for
-a key that renews: its certificate is replaced before it lapses, and a
-device that misses a renewal must not lose its honest Data because a
-reader's clock passed a date. It is wrong for a key whose certificate is
-short-lived precisely to end access, as a guest's is: after its expiry the
-guest's links and signed Interests end, and with this field its Data
-authority ends too. A listed key whose certificate lapsed fails closed
-until the root signs its revocation with a cut; the cut then keeps what the
-key wrote while it was trusted ([personal-namespace.md](personal-namespace.md)
-F9; the owner ends it with `ndn-fwd end-keys`, with a cut bounded at the
-certificate's NotAfter, §5.3).
+keeps its authority over Data until the owner revokes it. A key that
+renews is never refused by this field: its certificate is replaced before
+it lapses, so some certificate of it is inside its ValidityPeriod at every
+reader's clock but a badly slow or fast one. A key whose certificate
+lapsed without a renewal is not honest, running: a guest's certificate is
+short-lived precisely to end access, and a member, admin or node device
+that stopped renewing is gone, lost or no longer trusted by its owner.
+After the expiry the device's links and signed Interests end, and with
+this field its Data authority ends too. A listed key whose certificate
+lapsed fails closed until the root signs its revocation with a cut, or
+the key is renewed; the cut then keeps what the key wrote while it was
+trusted ([personal-namespace.md](personal-namespace.md) F9; the owner
+ends it with `ndn-fwd end-keys`, with a cut bounded at the certificate's
+NotAfter, §5.3).
 
-**Per-role defaults.** A context made by `ndn-fwd init` lists:
+**Per-role defaults.** A context made by `ndn-fwd init` lists every role:
 
 | Role | Listed | Why |
 |---|---|---|
 | `guest` | yes | a guest does not renew by default (`[ca] renewable_roles`); its certificate's end is the end of the invitation |
-| `member` | no | renews before expiry; listed, a late renewal or a fast reader clock would refuse its honest Data until a cut, and a cut ends the key |
-| `admin` | no | as `member` |
-| `node`, `relay` | no | as `member`; their keys renew with the node |
+| `member` | yes | renews before expiry, so an honest one never waits; one that failed to renew is refused until the owner renews or ends it |
+| `admin` | yes | as `member` |
+| `node` | yes | as `member`; its key renews with the node |
 
-An owner MAY list any role by a schema or policy update (§5.3), and SHOULD
-list every role whose renewal it turns off. A producer carries the entries
-into every later version verbatim unless the owner changes them. An entry
-added for a role makes the version refuse more Data than the one before
-(§5.1).
+A context made before this default (it lists `guest` alone) keeps listing
+what it lists: a context is root-signed data, and nothing rewrites it. The
+owner lists the other roles on the root device by a schema or policy update
+(§5.3): `ndn-fwd schema data-requires-cut admin,member,node,guest`, which
+`ndn-fwd status` prints for a namespace whose held context lists fewer. An
+owner MAY list any set of roles, and SHOULD list every role whose renewal
+it turns off. A producer carries the entries into every later version
+verbatim unless the owner changes them. An entry added for a role makes
+the version refuse more Data than the one before (§5.1).
 
 **Decoding.** A decoder MUST reject the context when an entry's value is
 empty or not UTF-8: skipping it would make the node refuse less than the
@@ -1416,7 +1423,7 @@ cut, and only a re-admission bump adds to one.
   without a key digest, or with ranges and no manifest.
 - **Ending a key without a renewal:** two kinds of keys must end although
   nobody lost them. A key of a role the context lists in DataRequiresCut
-  (a guest's) whose last certificate reached its NotAfter is **lapsed**;
+  (every role, by default) whose last certificate reached its NotAfter is **lapsed**;
   the key of a device identity for which the CA enrolled a newer key (one
   key per device) is **replaced**. The root ends each with a revocation
   bump and a cut bounded at that moment (the last NotAfter of the key's
@@ -1428,8 +1435,8 @@ cut, and only a re-admission bump adds to one.
   without one (`--yes`, for a timer) when the root store opens without a
   secret. Until then every root command, `ndn-fwd status` and the admin
   TUI list the keys to end, with the data-host command that makes each
-  cut. Meanwhile a lapsed guest's Data already fails closed (§3.3.13); a
-  replaced key's does not, so it should be ended soon.
+  cut. Meanwhile a lapsed key of a listed role already fails closed
+  (§3.3.13); a replaced key's does not, so it should be ended soon.
 - **Re-admission bump:** `N+1` is `N` with CutExact entries added to the cut
   of a key `N` revokes with a cut, signed by an anchor of `N`. Nothing else
   changes. A key revoked without a cut gets none this way: its cut can only
@@ -1691,8 +1698,8 @@ signed by its issuer, proves the key was authorized, and the cut, signed by
 the root, proves where that authority stopped. Renewing a certificate of the
 same key therefore continues everything the key signs; ending a key is a
 revocation. DataRequiresCut lets a context use the clock for one thing
-only, refusing a lapsed key of a role that does not renew until its cut is
-signed; it never makes a clock accept anything. The residual — a key of
+only, refusing a lapsed key of a listed role until its renewal or its cut
+is signed; it never makes a clock accept anything. The residual — a key of
 a role not listed, whose certificate expired and that nobody revoked,
 still signs Data that is accepted — is in §10.
 
@@ -2305,12 +2312,14 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   bytes at that name, so it cannot be turned into a range.
 - Data ignores validity periods (§6.3), except that a role listed in
   DataRequiresCut (§3.3.13) is refused once its certificate lapsed until
-  its cut is held. A guest's authority over Data therefore ends at its
+  its cut is held. A device's authority over Data therefore ends at its
   expiry by default, and the owner's root device then revokes it with a
   cut bounded at its NotAfter (§5.3); a key replaced by a new enrollment
   is ended the same way, and both are listed as keys to end until then (a
   replaced key's Data is accepted meanwhile). Residual: a key of a role
-  not listed (member, admin, node, relay), never replaced, whose
+  the context does not list (every role is listed in a context `ndn-fwd
+  init` makes; an older one lists `guest` alone and is told so by `ndn-fwd
+  status`), never replaced, whose
   certificate expired and that nobody revoked, still signs Data that is
   accepted if it leaked; nothing lists it, and ending it is the owner's
   revocation, with a cut. Live uses (links, signed Interests, renewal) end
@@ -2887,11 +2896,15 @@ is open.
   needs a clock, which §6.3 keeps out of Data because a clock can refuse
   honest old Data and lets whoever sets it decide. The field allows the
   clock in one direction only — refusing — and only for roles the owner
-  lists, by default `guest`, which does not renew: an honest guest's Data
-  is refused after its expiry only until the root's cut, which keeps what
-  it wrote while invited. Renewable roles are not listed, since a late
-  renewal or a fast reader clock would otherwise refuse honest Data. It is
-  a context field rather than a CA setting because every validator must
+  lists, by default every role. A guest does not renew: an honest guest's
+  Data is refused after its expiry only until the root's cut, which keeps
+  what it wrote while invited. A member, admin or node device renews
+  before expiry, so listing it never refuses an honest one; one that
+  failed to renew is refused until the owner renews or ends it, so a
+  device that stopped renewing is not left trusted for Data by silence
+  (the owner's decision, 2026-11-19). A fast reader clock refuses a
+  listed key's Data early until the cut or the renewal is held. It is a
+  context field rather than a CA setting because every validator must
   apply it alike, and it is even (skippable) because a node that cannot
   read it then behaves as before rather than rejecting the version.
 - **Q19 Shrinking is revoking.** An adopter treats any version that

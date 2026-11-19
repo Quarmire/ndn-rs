@@ -152,17 +152,20 @@ entries by full name from it, so only the honest bytes can answer.
 certificate: the certificate proves the key was authorized, the cut proves
 where that ended. So an expired certificate does not refuse Data, and a
 key ends for Data by a revocation — with one exception: a role the trust
-context lists in `DataRequiresCut` (`guest`, in every namespace `ndn-fwd
+context lists in `DataRequiresCut` (every role, in every namespace `ndn-fwd
 init` makes) is refused once its certificate has lapsed, until its key is
-revoked with a cut. Revoke a lost or retired device's key even when its
+renewed or revoked with a cut. A namespace made before this default lists
+`guest` alone; `ndn-fwd status` says so and names the command that lists the
+other roles. Revoke a lost or retired device's key even when its
 certificate has expired. Live uses — links, signed Interests, enrollment,
 renewal — still end at expiry.
 
 ## Keys to end
 
 Two kinds of keys must be revoked although nobody lost them: a **lapsed**
-key (its role is listed in `DataRequiresCut` and its last certificate's
-NotAfter has passed: a guest whose invitation ended) and a **replaced** key
+key (its role is listed in `DataRequiresCut`, every role by default, and its
+last certificate's NotAfter has passed: a guest whose invitation ended, a
+member that stopped renewing) and a **replaced** key
 (the CA enrolled a newer key for the same device name). The root device
 lists them — at the end of every root command, in `ndn-fwd status`, and
 under "Keys to end" in the admin TUI's root screen (key `e` opens the End

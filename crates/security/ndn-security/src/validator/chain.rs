@@ -3548,6 +3548,66 @@ mod tests {
             assert!(valid(&bob.validator.validate_durable(&data).await));
         }
 
+        /// A listed role is refused once lapsed whatever the role: under
+        /// `DataRequiresCut member`, Data of a member key whose only
+        /// certificate lapsed is refused as `REVOKED_LAPSED`, and accepted
+        /// again once the key is revoked with a cut that accepts it; a
+        /// certificate still valid refuses nothing.
+        #[tokio::test]
+        async fn data_requires_cut_ends_a_lapsed_member_key_until_its_cut() {
+            let lapsed = |result: &ValidationResult| {
+                matches!(
+                    result,
+                    ValidationResult::Invalid(TrustError::Revoked { why, .. })
+                        if *why == TrustError::REVOKED_LAPSED
+                )
+            };
+
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_data_requires_cut("member")
+            })
+            .await;
+            let data = signed(log_name("notes", 2), b"v", &bob.phone);
+            assert!(
+                valid(&bob.validator.validate_durable(&data).await),
+                "a member key with a valid certificate"
+            );
+
+            let bob = bob_with_member_cut(None).await;
+            let data = signed(log_name("notes", 2), b"v", &bob.phone);
+            for result in [
+                bob.validator.validate_durable(&data).await,
+                bob.validator.validate_durable_cached(&data).await.0,
+            ] {
+                assert!(lapsed(&result), "a lapsed member key: {result:?}");
+                assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+            }
+
+            let bob = bob_with_member_cut(Some(phone_cut())).await;
+            assert!(
+                valid(&bob.validator.validate_durable(&data).await),
+                "after a cut that accepts it, the lapsed member's Data in range"
+            );
+            let outside = bob
+                .validator
+                .validate_durable(&signed(log_name("notes", 4), b"v", &bob.phone))
+                .await;
+            assert_eq!(revoked_key(&outside), Some(n(PHONE)), "{outside:?}");
+        }
+
+        /// Bob with `DataRequiresCut member` and a phone whose only certificate
+        /// lapsed; `cut` revokes the phone key with that cut, when given.
+        async fn bob_with_member_cut(cut: Option<RevocationCut>) -> Bob {
+            bob(u64::MAX, (PAST, EXPIRED), true, |c| {
+                let c = c.with_data_requires_cut("member");
+                match cut {
+                    Some(cut) => c.with_revocation(n(PHONE)).with_revocation_cut(cut),
+                    None => c,
+                }
+            })
+            .await
+        }
+
         /// A lapsed guest key is renewed only by a certificate vouched for:
         /// an unverified copy of the key with a later validity — Mallory's,
         /// signed as if by the CA — leaves its Data refused as lapsed, and is
