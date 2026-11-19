@@ -127,7 +127,8 @@ pub mod fault_tlv {
     pub const PROFILE: u64 = 0x050E;
     /// NonNegativeInteger: packets that met the profile.
     pub const MET: u64 = 0x0510;
-    /// NonNegativeInteger: of those, dropped.
+    /// NonNegativeInteger: packets dropped, by the profile (of those that met it) or by the
+    /// plan's verdict (which never met the profile), so it can exceed `MET`.
     pub const DROPPED: u64 = 0x0512;
     /// NonNegativeInteger: of those, delivered twice.
     pub const DUPLICATED: u64 = 0x0514;
@@ -135,9 +136,9 @@ pub mod fault_tlv {
     pub const FORGED: u64 = 0x0516;
     /// NonNegativeInteger: of those, held back.
     pub const DELAYED: u64 = 0x0518;
-    /// NonNegativeInteger: packets the plan's predicate left alone.
+    /// NonNegativeInteger: packets the plan's verdict let pass.
     pub const PASSED: u64 = 0x051A;
-    /// NonNegativeInteger: times the plan's predicate panicked.
+    /// NonNegativeInteger: times the plan's verdict function panicked.
     pub const PREDICATE_PANICS: u64 = 0x051C;
 }
 
@@ -215,6 +216,10 @@ pub mod link_code {
     pub const DOWN_DIALLING: &str = "down-dialling";
     pub const DIAL_FAILED: &str = "dial-failed";
     pub const PEER_SHUTTING_DOWN: &str = "peer-shutting-down";
+    /// This device is offline (`Links::set_online(false)`): it makes no link and no attempt.
+    pub const OFFLINE: &str = "offline";
+    /// Every address kept for a remembered peer failed, and no relay both devices use is linked.
+    pub const NO_PATH: &str = "no-path";
 
     // --- why a link did not come up, or ended
     pub const LINK_NO_KEY: &str = "link-no-key";
@@ -253,6 +258,7 @@ pub mod link_code {
     pub const NOT_SERVED_OWN: &str = "not-served-own";
     pub const GRANT_ENDED: &str = "grant-ended";
     pub const GRANT_UNMATCHED: &str = "grant-unmatched";
+    pub const LET_GO: &str = "let-go";
     pub const ENROLLMENT_LINKS_FULL: &str = "enrollment-links-full";
     pub const ENROLLMENT_POSSIBLE: &str = "enrollment-possible";
     pub const PATH_NOT_TAKEN: &str = "path-not-taken";
@@ -358,6 +364,8 @@ pub mod link_code {
         DOWN_DIALLING,
         DIAL_FAILED,
         PEER_SHUTTING_DOWN,
+        OFFLINE,
+        NO_PATH,
         LINK_NO_KEY,
         LINK_TLS,
         LINK_CONNECT,
@@ -391,6 +399,7 @@ pub mod link_code {
         NOT_SERVED_OWN,
         GRANT_ENDED,
         GRANT_UNMATCHED,
+        LET_GO,
         ENROLLMENT_LINKS_FULL,
         ENROLLMENT_POSSIBLE,
         PATH_NOT_TAKEN,
@@ -695,7 +704,8 @@ pub struct LinkFaultReport {
     pub profile: Option<String>,
     /// Packets that arrived on a link and met the profile.
     pub met: u64,
-    /// Of those, packets dropped.
+    /// Packets dropped: by the profile (of those that met it) or by the plan's verdict
+    /// (which never met the profile), so it can exceed `met`.
     pub dropped: u64,
     /// Of those, packets delivered twice.
     pub duplicated: u64,
@@ -703,9 +713,9 @@ pub struct LinkFaultReport {
     pub forged: u64,
     /// Of those, packets held back.
     pub delayed: u64,
-    /// Packets the plan's predicate left alone.
+    /// Packets the plan's verdict let pass.
     pub passed: u64,
-    /// Times the plan's predicate panicked.
+    /// Times the plan's verdict function panicked.
     pub predicate_panics: u64,
 }
 
