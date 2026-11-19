@@ -440,6 +440,11 @@ fn invalid_reason(e: &TrustError) -> (Refusal, &'static str) {
             Refusal::Revoked,
             "REFUSED — certificate revoked in trust context",
         ),
+        TrustError::Lapsed { .. } => (
+            Refusal::Revoked,
+            "REFUSED — certificate expired by this node's clock and its role needs a cut \
+             (DataRequiresCut)",
+        ),
         TrustError::InvalidSignature
         | TrustError::InvalidKey
         | TrustError::NotPublicKeySignature { .. } => {

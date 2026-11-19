@@ -359,11 +359,7 @@ async fn a_member_that_renews_before_expiry_keeps_its_data_accepted_across_the_o
     );
     let result = reader.validate_durable(&from_tablet).await;
     assert!(
-        matches!(
-            result,
-            ValidationResult::Invalid(TrustError::Revoked { why, .. })
-                if why == TrustError::REVOKED_LAPSED
-        ),
+        matches!(result, ValidationResult::Invalid(TrustError::Lapsed { .. })),
         "a member that did not renew was accepted past its certificate: {result:?}"
     );
 }
@@ -428,17 +424,24 @@ async fn an_expired_certificate_cannot_renew() {
     std::thread::sleep(Duration::from_millis(3_100));
 
     let refused = renew(&ns, &device).await;
-    assert!(
-        matches!(refused, Err(RenewalError::Expired { .. })),
-        "{refused:?}"
-    );
+    match &refused {
+        Err(e @ RenewalError::Expired { .. }) => {
+            assert!(e.to_string().contains("re-enrol"), "{e}");
+        }
+        other => panic!("{other:?}"),
+    }
 
     let cert_name = (*cert_of(&device.cert).name).clone();
     let at_ca = raw_renewal(&ns, Arc::clone(&device.key), &cert_name).await;
-    assert!(
-        matches!(at_ca, Err(CertError::ChallengeFailed(_))),
-        "{at_ca:?}"
-    );
+    match &at_ca {
+        Err(CertError::ChallengeFailed(why)) => {
+            assert!(
+                why.contains("re-enrol") && !why.contains("renews"),
+                "an expired device re-enrols, it does not renew: {why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Renewal proves possession of the certified key: another key cannot renew

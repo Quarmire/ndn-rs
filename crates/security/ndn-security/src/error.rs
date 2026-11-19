@@ -65,11 +65,24 @@ pub enum TrustError {
     )]
     NotPublicKeySignature { sig_type: String, why: &'static str },
     /// The trust context refuses what `name` (a key or certificate name)
-    /// signed: `why` says which rule (a revocation without a cut, outside
-    /// the key's cut, a lapsed key whose role needs a cut — see the
-    /// `REVOKED*` constants) and what to do.
+    /// signed: `why` says which rule (a revocation without a cut, or outside
+    /// the key's cut — see the `REVOKED*` constants) and what to do. A lapsed
+    /// key is [`TrustError::Lapsed`].
     #[error("refused by the trust context: {name} {why}")]
     Revoked { name: String, why: &'static str },
+    /// The key `name` signed it, its device role is listed in the trust
+    /// context's `DataRequiresCut` (no Revocation covers the key), and no
+    /// certificate of the key that verifies the packet is valid by this
+    /// node's clock. `not_after` is the latest NotAfter of those
+    /// certificates and `now` the clock that judged, both in ms since the
+    /// Unix epoch. Only the reader's clock refuses it, so a clock that runs
+    /// ahead lapses a key too early ([`TrustError::lapse_text`]).
+    #[error("refused by the trust context: {name} lapsed: {}", TrustError::lapse_text(*not_after, *now))]
+    Lapsed {
+        name: String,
+        not_after: u64,
+        now: u64,
+    },
     /// A trust context arrived for a namespace the validator expects one for
     /// (an adoption in progress) and failed the expectation.
     #[error("trust context for {namespace} refused while adopting it: {reason}")]
@@ -100,9 +113,33 @@ impl TrustError {
     /// key than the cut's).
     pub const REVOKED_OUTSIDE_CUT: &'static str = "is revoked with a cut that does not accept this packet; the owner can re-admit it by \
          its full name (`ndn-fwd readmit`)";
-    /// [`TrustError::Revoked`] `why`: no Revocation covers the key, but its
-    /// device role is listed in DataRequiresCut and no certificate of the
-    /// key that verifies the packet is valid now.
-    pub const REVOKED_LAPSED: &'static str = "lapsed: its certificate expired and its role needs a cut (DataRequiresCut), so its Data \
-         waits for the owner to revoke the key with a cut that keeps what it signed";
+    /// What a [`TrustError::Lapsed`] key or reader is told, for the
+    /// certificate's last NotAfter and the clock's reading (both ms since
+    /// the Unix epoch, shown as UTC date-times, as the CA's own errors show
+    /// them): the certificate expired by this node's clock, or has not
+    /// started by it (a clock behind the CA's). Either way the clock may be
+    /// the cause, so it is named first; the owner's remedy is to end the key
+    /// (its cut keeps what it signed before NotAfter) and the device enrols
+    /// again.
+    pub fn lapse_text(not_after: u64, now: u64) -> String {
+        let iso = |ms: u64| {
+            let basic = crate::iso8601::format_iso_basic(ms.saturating_mul(1_000_000));
+            format!("{}Z", String::from_utf8_lossy(&basic))
+        };
+        if now > not_after {
+            format!(
+                "certificate expired at {} by this device's clock (now {}): check the clock, or \
+                 ask the owner to end the key or re-enrol the device",
+                iso(not_after),
+                iso(now)
+            )
+        } else {
+            format!(
+                "certificate is not valid yet by this device's clock (now {}; it is valid until \
+                 {}): check the clock",
+                iso(now),
+                iso(not_after)
+            )
+        }
+    }
 }

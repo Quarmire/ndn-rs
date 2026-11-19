@@ -181,6 +181,11 @@ impl Inner {
                         .into(),
                 }));
             }
+            Err(lapsed @ Refusal::Lapsed { .. }) => {
+                return Err(refuse(AnswerRefusal::Untrusted {
+                    why: lapsed.to_string(),
+                }));
+            }
             Err(_) => {
                 return Err(refuse(AnswerRefusal::Untrusted {
                     why: "its signature, or the certificate chain of its key, does not verify \

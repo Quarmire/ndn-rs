@@ -117,31 +117,47 @@ pub(crate) fn signer_rule(
             Admit::Missing(name) => SignerRule::Missing(name),
         };
     }
-    if ctx.requires_cut_for(&key) && !valid_now(certs, &key, verifying, now, unverified) {
-        return SignerRule::Refused(TrustError::Revoked {
+    if ctx.requires_cut_for(&key)
+        && let Some(not_after) = lapsed_at(certs, &key, verifying, now, unverified)
+    {
+        return SignerRule::Refused(TrustError::Lapsed {
             name: key.to_string(),
-            why: TrustError::REVOKED_LAPSED,
+            not_after: not_after / NS_PER_MS,
+            now: now / NS_PER_MS,
         });
     }
     SignerRule::Clear
 }
 
-/// Whether a certificate of `key` with `verifying`'s public key is valid at
-/// `now`: `verifying`, or one cached vouched for (or unverified, with
-/// `unverified`).
-pub(crate) fn valid_now(
+const NS_PER_MS: u64 = 1_000_000;
+
+/// `None` when a certificate of `key` with `verifying`'s public key is valid
+/// at `now`: `verifying`, or one cached vouched for (or unverified, with
+/// `unverified`). Otherwise the latest NotAfter (ns) of those certificates,
+/// which tells an expired key (it is before `now`) from one not valid yet.
+fn lapsed_at(
     certs: &CertCache,
     key: &Name,
     verifying: &Certificate,
     now: u64,
     unverified: bool,
-) -> bool {
-    let renews = |c: &Certificate| c.public_key == verifying.public_key && c.is_valid_at(now);
+) -> Option<u64> {
     if verifying.is_valid_at(now) {
-        return true;
+        return None;
     }
     let (vouched, fetched) = certs.all_by_kind(key);
-    vouched.iter().any(renews) || (unverified && fetched.iter().any(renews))
+    let held = vouched
+        .iter()
+        .chain(unverified.then_some(&fetched).into_iter().flatten())
+        .filter(|c| c.public_key == verifying.public_key);
+    let mut latest = verifying.valid_until;
+    for c in held {
+        if c.is_valid_at(now) {
+            return None;
+        }
+        latest = latest.max(c.valid_until);
+    }
+    Some(latest)
 }
 
 /// Of `certs` (certificates of one key), the newest (NotBefore, then name)

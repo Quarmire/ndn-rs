@@ -562,8 +562,12 @@ kept serves only the versions held since.
    the root to do it. Early end = F4. The same holds for every role, not
    guests alone: every context `ndn-fwd init` makes lists all four roles
    in DataRequiresCut, so a member, admin or node device that failed to
-   renew is refused once its certificate lapsed, until the owner renews or
-   ends it; a device that renews before expiry (F10) never waits. An owner
+   renew is refused once its certificate lapsed (the refusal says "certificate
+   expired at T by this device's clock", so a wrong clock is visible), until
+   the owner ends its key and the device enrols again; Data it signed offline
+   after NotAfter lies outside the cut and stays refused until the owner
+   re-admits exact packets (`ndn-fwd readmit`); a device that renews before
+   expiry (F10) never waits. An owner
    may change the list (`ndn-fwd schema data-requires-cut
    <role>[,<role>…]|none`, a version changing only that), and a namespace
    made before this default, whose context lists `guest` alone, is told so

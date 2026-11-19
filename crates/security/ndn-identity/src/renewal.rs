@@ -318,7 +318,9 @@ pub fn start_renewal(
                             certificate = %cert.name,
                             expired_secs_ago = now_ns().saturating_sub(cert.valid_until) / 1_000_000_000,
                             "certificate expired and was not renewed in time: renewal needs a \
-                             current certificate, so this device needs a new invite to enroll again"
+                             current certificate, so this device re-enrols with a new invite; \
+                             until then other nodes may refuse the Data it signs (a role listed \
+                             in DataRequiresCut)"
                         ),
                         Failed::Retry {
                             attempts,

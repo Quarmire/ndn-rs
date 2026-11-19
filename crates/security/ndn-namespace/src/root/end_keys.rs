@@ -29,11 +29,11 @@ use std::path::Path;
 
 use ndn_cert::report::code;
 use ndn_cert::{
-    BumpError, CutFile, EndingKey, FileCaStore, RootDevice, bump_context_revoking, ca_dir,
-    check_cuts, ending_keys,
+    BumpError, CutFile, EndingKey, FileCaStore, Role, RootDevice, bump_context_revoking, ca_dir,
+    check_cuts, ending_keys, load_persisted_contexts,
 };
 use ndn_packet::Name;
-use ndn_security::{Certificate, FilePib};
+use ndn_security::{Certificate, FilePib, Keyring};
 
 use super::device::{check_device, hand_over, settle};
 use super::revoke::store_manifest;
@@ -55,9 +55,87 @@ pub struct Pending {
     pub ending: Vec<EndingKey>,
 }
 
-/// The certificates the namespace CA of `namespace` issued, as recorded in
-/// its store in the PIB at `pib_dir` (none when it has no store).
-fn issued(pib_dir: &Path, namespace: &Name) -> Result<Vec<Certificate>, RootError> {
+/// What a host says of a held root context that lists fewer than every
+/// device role in `DataRequiresCut`: such a context was made before
+/// `ndn-fwd init` listed every role, and a context is root-signed data that
+/// nothing rewrites, so the owner is told the one command that does. `None`
+/// when `listed` (the roles the held version lists) holds every role.
+pub fn data_requires_cut_notice(namespace: &Name, listed: &[String]) -> Option<String> {
+    if Role::ALL
+        .iter()
+        .all(|role| listed.iter().any(|l| l == role.as_str()))
+    {
+        return None;
+    }
+    let every = Role::ALL.map(Role::as_str).join(",");
+    let refused = if listed.is_empty() {
+        "for no role".to_string()
+    } else {
+        format!("only for roles {}", listed.join(","))
+    };
+    Some(format!(
+        "{namespace}: Data of lapsed keys is refused {refused}; to refuse it for every role, \
+         run on the root device: ndn-fwd schema data-requires-cut {every} --namespace {namespace}"
+    ))
+}
+
+/// A key in a device's own PIB whose certificate lapsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnLapse {
+    pub key: Name,
+    /// The latest NotAfter of its certificates (ms since the Unix epoch).
+    pub not_after: u64,
+}
+
+/// The keys in the PIB at `pib_dir` (a relay's or member's as much as a root
+/// device's) whose device role a held trust context lists in
+/// `DataRequiresCut` and none of whose certificates is valid at `now` (ms
+/// since the Unix epoch): every node refuses the Data they sign until they
+/// are enrolled again, and nothing but this says so on the device itself.
+pub fn lapsed_own_keys(pib_dir: &Path, now: u64) -> Result<Vec<OwnLapse>, RootError> {
+    let Ok(pib) = FilePib::open(pib_dir) else {
+        return Ok(Vec::new());
+    };
+    let local = |what: &'static str, e: &dyn std::fmt::Display| {
+        RootError::new(code::ROOT_LOCAL_FAILURE, what)
+            .with("error", e)
+            .with("read", pib_dir.display())
+    };
+    let keyring = Keyring::new();
+    load_persisted_contexts(pib_dir, &keyring)
+        .map_err(|e| local("the held contexts could not be read", &e))?;
+    let now_ns = now.saturating_mul(1_000_000);
+    let mut lapsed = Vec::new();
+    for key in pib
+        .list_keys()
+        .map_err(|e| local("the PIB's keys could not be listed", &e))?
+    {
+        if !keyring.context_for(&key).requires_cut_for(&key) {
+            continue;
+        }
+        let certs = pib
+            .certs(&key)
+            .map_err(|e| local("the key's certificates could not be read", &e))?;
+        if certs.iter().any(|c| c.is_valid_at(now_ns)) {
+            continue;
+        }
+        if let Some(latest) = certs.iter().map(|c| c.valid_until).max() {
+            lapsed.push(OwnLapse {
+                key,
+                not_after: latest / 1_000_000,
+            });
+        }
+    }
+    lapsed.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(lapsed)
+}
+
+/// The certificates of the device keys of `namespace` that the PIB at
+/// `pib_dir` knows: what the namespace CA issued, as recorded in its store,
+/// and the root device's own admin certificate, which `init` writes beside
+/// the store ([`ndn_cert::namespace::DEVICE_CERT_FILE`]) without recording it
+/// there (none when the PIB holds no CA directory).
+pub(super) fn issued(pib_dir: &Path, namespace: &Name) -> Result<Vec<Certificate>, RootError> {
     let dir = ca_dir(pib_dir, namespace);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -69,11 +147,25 @@ fn issued(pib_dir: &Path, namespace: &Name) -> Result<Vec<Certificate>, RootErro
                 .with("dir", dir.display())
                 .caused_by(e)
         })?;
-    Ok(loaded
+    let mut certs: Vec<Certificate> = loaded
         .issued
         .iter()
         .filter_map(|(_, wire)| ndn_cert::ca::deserialize_cert(wire))
-        .collect())
+        .collect();
+    let own = dir.join(ndn_cert::namespace::DEVICE_CERT_FILE);
+    match std::fs::read(&own) {
+        Ok(wire) => certs.extend(ndn_cert::ca::deserialize_cert(&wire)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(RootError::new(
+                code::ROOT_LOCAL_FAILURE,
+                "the root device's certificate cannot be read",
+            )
+            .with("file", own.display())
+            .caused_by(e));
+        }
+    }
+    Ok(certs)
 }
 
 fn pending_of(pib_dir: &Path, root: &RootDevice, now: u64) -> Result<Pending, RootError> {

@@ -409,7 +409,8 @@ impl CaState {
             };
             return deny(format!(
                 "{cert_name} is not valid now (valid from {} until {}): renewal needs a current \
-                 certificate, so an expired device needs a new invite",
+                 certificate, so an expired device re-enrols with a new invite (its old Data \
+                 stays accepted only as far as the owner's cut keeps it)",
                 iso(cert.valid_from),
                 iso(cert.valid_until)
             ));

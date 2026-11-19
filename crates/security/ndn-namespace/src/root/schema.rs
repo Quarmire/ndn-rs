@@ -413,6 +413,27 @@ impl DataRequiresCutPlan {
     pub fn is_unchanged(&self) -> bool {
         self.before == self.after
     }
+
+    /// The keys of the namespace whose certificates have lapsed at `now`
+    /// (ms since the Unix epoch) and that the next version would refuse the
+    /// Data of although the held one does not: lapsed keys of the roles it
+    /// newly lists, the CA's records and the root device's own certificate
+    /// read from the PIB at `pib_dir`. Every node refuses them as soon as it
+    /// holds the next version; only keys that have a cut file can then be
+    /// ended ([`super::end_keys`]). A key a revocation covers is not listed.
+    pub fn newly_refused(
+        &self,
+        pib_dir: &Path,
+        now: u64,
+    ) -> Result<Vec<ndn_cert::EndingKey>, RootError> {
+        let issued = super::end_keys::issued(pib_dir, self.root.context.namespace())?;
+        Ok(
+            ndn_cert::lapsed_for_roles(&self.root.context, &issued, now, &self.after)
+                .into_iter()
+                .filter(|lapsed| !self.root.context.requires_cut_for(&lapsed.key))
+                .collect(),
+        )
+    }
 }
 
 /// Plan listing exactly `roles` in the DataRequiresCut of the namespace

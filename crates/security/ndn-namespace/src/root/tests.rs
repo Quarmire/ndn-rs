@@ -691,3 +691,33 @@ async fn a_recovery_is_refused_only_where_the_namespace_root_is_held() {
     assert!(secrets.asked().is_empty());
     assert_eq!(versions(&pib), (1, 1));
 }
+
+/// Round-8 L-d: the root device's own admin key lapses like any other key of
+/// a listed role (its certificate is the one `init` wrote beside the CA's
+/// store, not one the CA's store records) and is listed to end once its
+/// certificate's NotAfter has passed; before then nothing is. The CA's own
+/// key is never listed.
+#[tokio::test]
+async fn the_root_devices_own_lapsed_key_is_listed_to_end() {
+    let (_dir, pib) = two_roots().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let a = n("/a");
+    assert!(
+        end_keys::pending(&pib, Some(&a), now)
+            .unwrap()
+            .ending
+            .is_empty()
+    );
+
+    let eleven_years = 11 * 365 * 24 * 3600 * 1000;
+    let later = end_keys::pending(&pib, Some(&a), now + eleven_years).unwrap();
+    let keys: Vec<String> = later.ending.iter().map(|e| e.key.to_string()).collect();
+    assert_eq!(keys, ["/a/admin/desk/KEY/device"]);
+    assert!(matches!(
+        later.ending[0].why,
+        ndn_cert::Ending::Lapsed { .. }
+    ));
+}

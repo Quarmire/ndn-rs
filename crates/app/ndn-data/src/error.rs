@@ -53,6 +53,20 @@ pub enum Refusal {
     /// Its key was cut and the cut does not list it, whatever date or seq
     /// it claims.
     OutsideCut(Cut),
+    /// Its key's role needs a cut for Data (the trust context lists it in
+    /// `DataRequiresCut`) and no certificate of the key is valid by this
+    /// device's clock: the newest ended at `not_after`, and the clock reads
+    /// `now`. Only this device's clock refuses it (a clock that runs ahead
+    /// lapses a key early), so it is not kept as refused: it is judged again
+    /// when fetched again, and accepted once the clock is right, a renewed
+    /// certificate arrives, or the owner ends the key with a cut that keeps
+    /// it.
+    Lapsed {
+        /// The last NotAfter of the key's certificates, by its CA's clock.
+        not_after: Timestamp,
+        /// What this device's clock read when it judged.
+        now: Timestamp,
+    },
     /// Its key is not a writer of the collection, by the members record and
     /// the trust schema.
     NotMember,
@@ -174,6 +188,9 @@ impl std::fmt::Display for Refusal {
                         accepted.join(", ")
                     }
                 )
+            }
+            Refusal::Lapsed { not_after, now } => {
+                f.write_str(&ndn_security::TrustError::lapse_text(not_after.0, now.0))
             }
             Refusal::NotMember => f.write_str(
                 "its key is not a writer of the collection by its members record; ask the owner",
@@ -463,6 +480,7 @@ impl DataError {
             DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_)
+                | Refusal::Lapsed { .. }
                 | Refusal::NotMember
                 | Refusal::Suspected { .. }
                 | Refusal::Untrusted { .. }

@@ -1290,9 +1290,7 @@ impl Validator {
                         return rule;
                     }
                 }
-                (SignerRule::Refused(TrustError::Revoked { why, .. }), _)
-                    if *why == TrustError::REVOKED_LAPSED && !renewal_asked =>
-                {
+                (SignerRule::Refused(TrustError::Lapsed { .. }), _) if !renewal_asked => {
                     renewal_asked = true;
                     if require_anchor {
                         match self.vouch_renewal(locator, verifying, fetch).await {
@@ -3178,12 +3176,12 @@ mod tests {
             matches!(result, ValidationResult::Valid(_))
         }
 
-        /// The key a `Revoked` refusal names, if that is the refusal.
+        /// The key a `Revoked` or `Lapsed` refusal names, if that is the refusal.
         fn revoked_key(result: &ValidationResult) -> Option<Name> {
             match result {
-                ValidationResult::Invalid(TrustError::Revoked { name, .. }) => {
-                    Some(key_name_of(&name.parse().unwrap()))
-                }
+                ValidationResult::Invalid(
+                    TrustError::Revoked { name, .. } | TrustError::Lapsed { name, .. },
+                ) => Some(key_name_of(&name.parse().unwrap())),
                 _ => None,
             }
         }
@@ -3550,16 +3548,17 @@ mod tests {
 
         /// A listed role is refused once lapsed whatever the role: under
         /// `DataRequiresCut member`, Data of a member key whose only
-        /// certificate lapsed is refused as `REVOKED_LAPSED`, and accepted
-        /// again once the key is revoked with a cut that accepts it; a
-        /// certificate still valid refuses nothing.
+        /// certificate lapsed is refused as `Lapsed` (carrying that
+        /// certificate's NotAfter and the reader's clock, in ms), and
+        /// accepted again once the key is revoked with a cut that accepts
+        /// it; a certificate still valid refuses nothing.
         #[tokio::test]
         async fn data_requires_cut_ends_a_lapsed_member_key_until_its_cut() {
             let lapsed = |result: &ValidationResult| {
                 matches!(
                     result,
-                    ValidationResult::Invalid(TrustError::Revoked { why, .. })
-                        if *why == TrustError::REVOKED_LAPSED
+                    ValidationResult::Invalid(TrustError::Lapsed { not_after, now, .. })
+                        if *not_after == EXPIRED / 1_000_000 && *now > *not_after
                 )
             };
 

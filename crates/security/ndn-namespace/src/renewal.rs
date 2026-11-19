@@ -28,7 +28,8 @@
 //! the certificate has left; a vault that cannot be read is logged as a WARN
 //! and retried likewise. A certificate that expired, a key the CA revoked
 //! and a role it does not renew (guest, by default) cannot be renewed: the
-//! device needs a new invite. An expired one is reported once, as an ERROR.
+//! device re-enrols with a new invite. An expired one is reported once, as an
+//! ERROR.
 
 use std::sync::Arc;
 use std::time::Duration;

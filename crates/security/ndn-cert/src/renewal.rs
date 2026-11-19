@@ -27,7 +27,8 @@
 //! - the certificate is for the key the request certifies, with the same
 //!   public key — renewal never certifies a new key; a new key is a new
 //!   enrollment;
-//! - the certificate is valid now: an **expired** device needs a new invite;
+//! - the certificate is valid now: an **expired** device re-enrols with a new
+//!   invite;
 //! - no certificate it issued for that key is **revoked** (nor, for an
 //!   earlier CA's certificate, does the trust context revoke it);
 //! - the proof verifies under the certificate's key;
@@ -125,7 +126,7 @@ pub enum RenewalError {
     NoIssuingCa { cert: String, issuer: String },
     #[error(
         "certificate {cert} expired at {expired_at}; renewal needs a current certificate, so \
-         this device needs a new invite to enroll again"
+         this device re-enrols with a new invite"
     )]
     Expired { cert: String, expired_at: String },
     #[error(

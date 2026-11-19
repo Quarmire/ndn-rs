@@ -742,11 +742,17 @@ under the durable rule (§6.3) only:
 2. once the context revokes the key with a cut (§3.3.12): the cut then
    decides alone, whatever the clock says.
 
-Otherwise the Data is refused as a key revoked without a cut would be
-(ndn-rs: `TrustError::Revoked`, saying that the key's certificate lapsed,
-that its role needs a cut, and that the owner's revocation with a cut is
-awaited). Only the signing key's own certificates (depth 0) are compared
-with the clock; issuers' validity periods are still not, as §6.3 says.
+Otherwise the Data is refused as a key revoked without a cut would be, but
+the refusal says what it is, because the reader's own clock may be the
+cause (ndn-rs: `TrustError::Lapsed`, and `Refusal::Lapsed` in the data
+layer: "certificate expired at T by this device's clock (now N): check the
+clock, or ask the owner to end the key or re-enrol the device", with T the
+key's last NotAfter; a certificate not valid yet says so instead). It is
+not "revoked" and not "cut": no revocation or cut exists, and the reader
+keeps no decision about the packet, so the same name is judged again when
+fetched again. Only the signing key's own certificates (depth 0) are
+compared with the clock; issuers' validity periods are still not, as §6.3
+says.
 
 The clock here can only refuse. Data that case 1 lets through, the durable
 rule accepts anyway; a revocation or a cut refuses what it refuses whatever
@@ -775,7 +781,7 @@ NotAfter, §5.3).
 | Role | Listed | Why |
 |---|---|---|
 | `guest` | yes | a guest does not renew by default (`[ca] renewable_roles`); its certificate's end is the end of the invitation |
-| `member` | yes | renews before expiry, so an honest one never waits; one that failed to renew is refused until the owner renews or ends it |
+| `member` | yes | renews before expiry, so an honest one never waits; one that was offline across its NotAfter cannot renew, and is refused until the owner ends its key and the device enrols again |
 | `admin` | yes | as `member` |
 | `node` | yes | as `member`; its key renews with the node |
 
@@ -787,7 +793,20 @@ owner lists the other roles on the root device by a schema or policy update
 owner MAY list any set of roles, and SHOULD list every role whose renewal
 it turns off. A producer carries the entries into every later version
 verbatim unless the owner changes them. An entry added for a role makes
-the version refuse more Data than the one before (§5.1).
+the version refuse more Data than the one before (§5.1). The owner's
+`ndn-fwd schema data-requires-cut` lists, before it signs, the keys whose
+certificates have lapsed already and that the new version would refuse on
+every node, and asks to confirm (`--yes` skips the question): such a key is
+refused the moment a node holds the version.
+
+**A device that was offline across its NotAfter** cannot renew: the CA
+renews only a current certificate, so the device enrols again with a new
+invite. Its old key is ended by the owner (§5.3) with a cut bounded at that
+NotAfter, so what it signed before NotAfter stays accepted. What it signed
+offline after NotAfter lies outside the cut and stays refused, until the
+owner re-admits those exact packets (`ndn-fwd readmit`, §3.3.12). Until the
+owner ends the key, every packet of it is refused, with the lapse as the
+reason.
 
 **Decoding.** A decoder MUST reject the context when an entry's value is
 empty or not UTF-8: skipping it would make the node refuse less than the
@@ -1436,7 +1455,10 @@ cut, and only a re-admission bump adds to one.
   secret. Until then every root command, `ndn-fwd status` and the admin
   TUI list the keys to end, with the data-host command that makes each
   cut. Meanwhile a lapsed key of a listed role already fails closed
-  (§3.3.13); a replaced key's does not, so it should be ended soon.
+  (§3.3.13); a replaced key's does not, so it should be ended soon. The
+  root device's own admin key is listed and ended like any other once its
+  certificate lapses; a relay's or member's `ndn-fwd status` says when its
+  own certificate lapsed.
 - **Re-admission bump:** `N+1` is `N` with CutExact entries added to the cut
   of a key `N` revokes with a cut, signed by an anchor of `N`. Nothing else
   changes. A key revoked without a cut gets none this way: its cut can only
@@ -2900,7 +2922,7 @@ is open.
   Data is refused after its expiry only until the root's cut, which keeps
   what it wrote while invited. A member, admin or node device renews
   before expiry, so listing it never refuses an honest one; one that
-  failed to renew is refused until the owner renews or ends it, so a
+  failed to renew (offline across its NotAfter) is refused until the owner ends its key and the device enrols again, so a
   device that stopped renewing is not left trusted for Data by silence
   (the owner's decision, 2026-11-19). A fast reader clock refuses a
   listed key's Data early until the cut or the renewal is held. It is a
@@ -2961,10 +2983,10 @@ may move.
 - Revocation cuts (by symbol; the line numbers above predate them): `tlv.rs` REVOCATION_CUT 0x0428, CUT_RANGE 0x042A, CUT_RUN 0x042C, CUT_EXACT 0x042E; `RevocationCut::{new, add_seq, add_run, readmit, accepts, encode, decode}`, `CutRange`; `SignedTrustContext::{with_revocation_cut, revocation_cuts, revocation_cut, refuses_data}`; encode_content writes the cuts after the Revocation entries; decode_content rejects a malformed cut and a second cut for one key; tests `spec_vector_t8_revocation_cut`, `spec_vector_t2_is_unchanged`.
 - Cut key digest, manifest and DataRequiresCut (by symbol): `tlv.rs` CUT_KEY_DIGEST 0x0430, CUT_MANIFEST 0x0432, DATA_REQUIRES_CUT 0x0434, MANIFEST_NODE 0x0436 and the MANIFEST_* children 0x0438–0x043E; `RevocationCut::{set_key_digest, key_digest, set_manifest, manifest, range_seq, accepts_exactly, covers}` (`accepts` admits a range only when the cut has no manifest: fails closed); `ndn_security::public_key_digest` (SHA-256 of `Certificate::public_key` as stored); `SignedTrustContext::{with_data_requires_cut, without_data_requires_cut, data_requires_cut, role_of, requires_cut_for, without_revocation_cuts}`.
 - `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `build_under` (the same tree, its packets named `<prefix>/seg=<i>`: the data layer's removal cuts name theirs under the members record, `<R>/32=cut`, data-layer.md §8), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
-- `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT, REVOKED_LAPSED}`; `Unverified::{verify, verify_live}` (`unverified.rs`).
+- `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT}`, and `TrustError::Lapsed { name, not_after, now }` for a lapsed key; `Unverified::{verify, verify_live}` (`unverified.rs`).
 - `ndn-rs/crates/security/ndn-security/src/validator/chain.rs` (§6.5): `Validator::walk_to_anchor` (one more walk after a refused copy, or after dropping certificates an earlier walk fetched, when fetching; `Pending` naming a refused copy when cache-only), `walk_once` with `reached_anchor` (admits the unverified certificates verified up to the anchor), `bad_signature` / `forged` (a signature failing under a key vouched for condemns the signed bytes; under an unverified one the walk goes on with it as the `Suspect`), `unvouched` (a walk not reaching an anchor drops what it took; a cache-only walk waiting on a fetch that has not failed, `CertFetcher::failed_recently`, keeps it), `durable_cached` (vouched for first), and the refused-certificate memory skipping `InvalidSignature` (`validate_chain_inner`); `CertCache::{insert, insert_unverified, evict}` and the crate's `resolve`, `get_any`, `all_by_kind`, `admit`, `drop_unverified` (`cert_cache.rs`: two kinds, a copy matched by its signed bytes and signature value); `CertFetcher::do_fetch` holds what it fetches unverified.
 - §4.5.6 note 4 and §4.5.7, anchors under every profile: `Validator::anchor_required` (`validator/mod.rs`: a person's names, under `accept_signed` too), `Validator::scoped_view` (always requires anchors); ndn-engine `resolve_security_profile` (`builder.rs`: the accept-signed validator's chain depth is the default's, 5).
-- §3.3.13 case 1 and §6.5 rule 1, a renewal vouched for: `signer_rule` / `valid_now` (`validator/durable.rs`: other certificates of the key count when vouched for, unverified ones only for a walk that reaches for no anchor; `chain_clear` counts vouched ones only), `Validator::durable_signer` and `vouch_renewal` (`validator/chain.rs`: an unverified renewal held or fetched is walked to the anchors as a certificate, `walk_to_anchor`'s `cert_walk`, then admitted or dropped).
+- §3.3.13 case 1 and §6.5 rule 1, a renewal vouched for: `signer_rule` / `lapsed_at` (`validator/durable.rs`: other certificates of the key count when vouched for, unverified ones only for a walk that reaches for no anchor; `chain_clear` counts vouched ones only; a refusal is `TrustError::Lapsed` with the key's last NotAfter), `Validator::durable_signer` and `vouch_renewal` (`validator/chain.rs`: an unverified renewal held or fetched is walked to the anchors as a certificate, `walk_to_anchor`'s `cert_walk`, then admitted or dropped).
 - `ndn-rs/crates/security/ndn-security/src/keyring.rs`: the revocation epoch moves, and listeners are told, when a version revokes a new name, when a held cut is not `covers`-ed by the new one (the key's name), or when a DataRequiresCut role is added (`/<ns>/<role>`).
 - `ndn-rs/crates/forwarding/ndn-engine/src/stages/pit.rs`: InterestLifetime clamped to one hour for PIT expiry and the per-PIT full-name deadline.
 

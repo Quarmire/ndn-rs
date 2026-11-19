@@ -11,7 +11,7 @@
 //! - [`readmit`]: a new version re-admitting single packets (full names) of
 //!   a key revoked with a cut.
 //! - [`end_keys`]: a new version ending, each with its cut, the keys whose
-//!   authority over Data ended (lapsed guests, replaced keys).
+//!   authority over Data ended (lapsed keys of a listed role, replaced keys).
 //! - [`kit`]: recovery kits — create (24 words, a sealed file, or a key on a
 //!   second YubiKey, listed as a recovery anchor by a new version), list,
 //!   check, revoke.

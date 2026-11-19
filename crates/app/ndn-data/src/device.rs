@@ -10507,7 +10507,10 @@ impl Inner {
     /// signed data. When the context holds a cut for the key, the validator
     /// verified the signature and chain first, so the packet is authentic
     /// and a caller may keep the decision ([`Self::refuse_outside_cut`]); a
-    /// key revoked without a cut is refused unverified.
+    /// key revoked without a cut is refused unverified. A key of a role the
+    /// context lists in `DataRequiresCut` whose certificates are none valid
+    /// by this clock is [`Refusal::Lapsed`]: kept by no decision, since only
+    /// the clock refuses it.
     async fn verify(&self, data: &Data) -> Result<Writer, Refusal> {
         let key = data
             .sig_info()
@@ -10537,6 +10540,16 @@ impl Inner {
                     &writer,
                     &log_prefix(&data.name),
                 )))
+            }
+            // The signing key's role needs a cut and no certificate of it is
+            // valid by this clock: only the clock refuses (a signer's own
+            // key alone is judged so).
+            ValidationResult::Invalid(TrustError::Lapsed { not_after, now, .. }) => {
+                tracing::debug!(name = %data.name, key = %key, "refused: its key's certificate lapsed by this device's clock");
+                Err(Refusal::Lapsed {
+                    not_after: Timestamp(not_after),
+                    now: Timestamp(now),
+                })
             }
             other => {
                 tracing::debug!(name = %data.name, "not verified: {other:?}");
@@ -13134,11 +13147,14 @@ impl Inner {
                 if ctx.is_revoked(writer.key()) {
                     Verdict::Cut(revocation_cut_for(&ctx, writer, &log_prefix(name)))
                 } else {
-                    // Its key lapsed where Data of its role needs a cut.
+                    // Only a certificate of its key is revoked, not the key.
                     Verdict::Chain(e.to_string())
                 }
             }
+            // Its key lapsed where Data of its role needs a cut: withdrawn
+            // with the lapse as its reason, taken back with a renewal.
             TrustError::Revoked { .. }
+            | TrustError::Lapsed { .. }
             | TrustError::CertNotAuthorized { .. }
             | TrustError::SchemaMismatch
             | TrustError::UntrustedSelfSigned { .. }
@@ -13623,7 +13639,7 @@ impl Inner {
         // Boxed: a validation's future is large, and this one sits inside
         // every walk's asks for entries.
         match Box::pin(self.verify(data)).await {
-            Ok(_) | Err(Refusal::OutsideCut(_)) => true,
+            Ok(_) | Err(Refusal::OutsideCut(_) | Refusal::Lapsed { .. }) => true,
             Err(_) => {
                 tracing::debug!(%name, "refused: a device answering for the writer gave a packet its writer did not sign; the next answer is read");
                 false
@@ -24908,8 +24924,12 @@ mod tests {
 
         /// [`Self::new`], the reader on the forwarder `conn`.
         async fn new_on(validity_ms: u64, conn: Arc<dyn Connection>) -> Self {
+            Self::new_for(n("/sam/phone"), validity_ms, conn).await
+        }
+
+        /// [`Self::new_on`] for a writer device named `phone`.
+        async fn new_for(phone: Name, validity_ms: u64, conn: Arc<dyn Connection>) -> Self {
             let (authority, issuer, anchor) = authority(&n("/sam")).await;
-            let phone = n("/sam/phone");
             let phone_keys = Arc::new(SecurityManager::new());
             let key = phone_keys
                 .generate_ed25519(phone.clone().append("KEY").append("1"))
@@ -25956,6 +25976,55 @@ mod tests {
         );
         drop(st);
         assert!(r.dev.refused_by_revocation(&r.key).is_empty());
+        r.dev.shutdown();
+    }
+
+    /// Round-8 L-a: a packet of a key whose role needs a cut and whose only
+    /// certificate lapsed is refused as lapsed by this device's clock, not as
+    /// "revoked" or "cut": the text names the expiry, the clock, and the way
+    /// out; the next step is the owner's; and the refusal is not kept (only
+    /// the clock refuses), so the same name is judged again when fetched again.
+    #[tokio::test]
+    async fn a_lapsed_keys_packet_is_refused_as_lapsed_by_this_devices_clock() {
+        // The member phone's certificate is valid for one millisecond.
+        let r = Revoking::new_for(n("/sam/member/phone"), 1, Arc::new(Unconnected)).await;
+        let ctx = SignedTrustContext::hierarchical(n("/sam"))
+            .with_version(2)
+            .with_data_requires_cut("member");
+        assert!(ctx.add_anchor(r.anchor.clone()));
+        r.validator.keyring().adopt_update(Arc::new(ctx)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (one, d1) = r.version(1, 1);
+        let refused = r.dev.inner.take_data(&one, d1).await;
+        let Err(why @ Refusal::Lapsed { not_after, now }) = refused else {
+            panic!("a lapsed key's packet must be Refusal::Lapsed: {refused:?}");
+        };
+        assert!(now > not_after, "{now:?} is after {not_after:?}");
+        let text = why.to_string();
+        for want in [
+            "certificate expired at",
+            "by this device's clock",
+            "check the clock",
+            "end the key",
+            "re-enrol",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from: {text}");
+        }
+        assert!(
+            !text.contains("lies under") && !text.contains("revoked"),
+            "a lapse is not a cut or a revocation: {text}"
+        );
+        let error = DataError::Refused {
+            id: r.id(1),
+            why: why.clone(),
+        };
+        assert_eq!(error.next(), crate::NextStep::AskOwner);
+        let st = r.dev.inner.st.lock();
+        assert!(
+            !st.refused.contains_key(&one) && !st.cut_out.contains_key(&one),
+            "only the clock refused it: the name is not"
+        );
+        drop(st);
         r.dev.shutdown();
     }
 

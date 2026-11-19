@@ -82,7 +82,7 @@ pub use context_update::{
 };
 pub use cut_file::{CutFile, CutFileError};
 pub use ecdh::{EcdhKeypair, SessionKey};
-pub use ending::{Ending, EndingKey, ending_keys};
+pub use ending::{Ending, EndingKey, ending_keys, lapsed_for_roles};
 pub use enroll_target::{EnrollTarget, EnrollTargetError};
 pub use error::CertError;
 pub use invite::{

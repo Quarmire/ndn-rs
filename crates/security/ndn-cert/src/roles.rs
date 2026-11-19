@@ -85,10 +85,15 @@ impl Role {
     /// reader's clock, or once the key is revoked with a cut that accepts it
     /// ([`crate::ending_keys`] lists the keys so lapsed, for the root to end).
     /// `admin`, `member` and `node` devices renew before their certificates
-    /// expire, so an honest one never waits; a device that failed to renew is
-    /// refused until the owner ends or renews its key. A `guest` does not
-    /// renew, and its short certificate is what ends its access. An owner may
-    /// narrow the list (`ndn-fwd schema data-requires-cut`,
+    /// expire, so an honest one never waits. A device that was offline across
+    /// its NotAfter cannot renew (the CA renews only a current certificate):
+    /// it re-enrols with a new invite. Its old key's Data from before NotAfter
+    /// is kept once the owner ends the key (the cut is bounded at NotAfter);
+    /// Data it signed after NotAfter is outside that cut and stays refused
+    /// until the owner re-admits the exact packets (`ndn-fwd readmit`). A
+    /// `guest` does not renew, and its short certificate is what ends its
+    /// access. An owner may narrow the list (`ndn-fwd schema
+    /// data-requires-cut`,
     /// [`crate::bump_context_data_requires_cut`]).
     pub const DATA_REQUIRES_CUT: [Role; 4] = Role::ALL;
 

@@ -10,7 +10,11 @@
 //!   older one lists `guest` alone) whose newest certificate's
 //!   NotAfter has passed. Until the revocation exists, every node refuses
 //!   its Data once no certificate of it is valid by the node's clock (fails
-//!   closed); the cut then re-admits what it wrote before NotAfter.
+//!   closed); the cut then re-admits what it wrote before NotAfter. A
+//!   device that was offline across NotAfter cannot renew (the CA renews
+//!   only a current certificate): it enrols again, and what it signed after
+//!   NotAfter is outside the cut, so it stays refused until the owner
+//!   re-admits exact packets (`ndn-fwd readmit`).
 //! - **Replaced**: a key of a device identity the CA certified a newer key
 //!   for (one key per device name): the old key's Data stays accepted until
 //!   it is revoked.
@@ -23,7 +27,7 @@
 //! so it cannot drift: a key leaves it once a version revokes it.
 
 use ndn_packet::Name;
-use ndn_security::{Certificate, KeyRole, SignedTrustContext};
+use ndn_security::{Certificate, SignedTrustContext};
 
 use crate::context_update::key_name_of;
 
@@ -50,17 +54,12 @@ pub struct EndingKey {
 
 const NS_PER_MS: u64 = 1_000_000;
 
-/// The keys of `ctx`'s namespace whose authority over Data ended by `now`
-/// (ms since the Unix epoch) and that `ctx` does not revoke, from the
-/// certificates `issued` (what the namespace CA issued): lapsed keys of a
-/// role `ctx` lists in `DataRequiresCut`, and keys replaced by a newer key
-/// of the same identity. A key both lapsed and replaced ends at the
-/// earlier of the two. Never an anchor's key, a root-device key or a key
-/// under `<ns>/CA`. Ordered by key name.
-pub fn ending_keys(ctx: &SignedTrustContext, issued: &[Certificate], now: u64) -> Vec<EndingKey> {
+/// Per key of `ctx`'s namespace that ending may list, from the certificates
+/// `issued`: its first NotBefore and its last NotAfter, in ms. Never a key
+/// `ctx` revokes, an anchor's key or a key under `<ns>/CA`.
+fn key_spans(ctx: &SignedTrustContext, issued: &[Certificate]) -> Vec<(Name, u64, u64)> {
     let namespace = ctx.namespace();
     let ca = namespace.clone().append("CA");
-    // Per key: its first NotBefore and its last NotAfter, in ms.
     let mut keys: Vec<(Name, u64, u64)> = Vec::new();
     for cert in issued {
         let Some(key) = key_name_of(&cert.name) else {
@@ -69,7 +68,6 @@ pub fn ending_keys(ctx: &SignedTrustContext, issued: &[Certificate], now: u64) -
         if !key.has_prefix(namespace)
             || key.has_prefix(&ca)
             || ctx.is_revoked(&key)
-            || ctx.has_key_role(&key, KeyRole::ROOT_DEVICE)
             || ctx.anchors().iter().any(|a| a.key().has_prefix(&key))
         {
             continue;
@@ -83,6 +81,48 @@ pub fn ending_keys(ctx: &SignedTrustContext, issued: &[Certificate], now: u64) -
             None => keys.push((key, from, until)),
         }
     }
+    keys
+}
+
+/// The keys of `ctx`'s namespace, from the certificates `issued`, that are
+/// lapsed at `now` (ms since the Unix epoch) and of a device role among
+/// `roles` (role names), whatever `ctx` itself lists in `DataRequiresCut`:
+/// the keys a context listing exactly `roles` would refuse the Data of.
+/// Ordered by key name.
+pub fn lapsed_for_roles(
+    ctx: &SignedTrustContext,
+    issued: &[Certificate],
+    now: u64,
+    roles: &[String],
+) -> Vec<EndingKey> {
+    let mut lapsed: Vec<EndingKey> = key_spans(ctx, issued)
+        .into_iter()
+        .filter(|(key, _, last)| {
+            *last < now
+                && ctx
+                    .role_of(key)
+                    .is_some_and(|role| roles.iter().any(|r| r.as_bytes() == role))
+        })
+        .map(|(key, _, last)| EndingKey {
+            key,
+            why: Ending::Lapsed { not_after: last },
+            held_before: last,
+        })
+        .collect();
+    lapsed.sort_by(|a, b| a.key.cmp(&b.key));
+    lapsed
+}
+
+/// The keys of `ctx`'s namespace whose authority over Data ended by `now`
+/// (ms since the Unix epoch) and that `ctx` does not revoke, from the
+/// certificates `issued` (what the namespace CA issued): lapsed keys of a
+/// role `ctx` lists in `DataRequiresCut`, and keys replaced by a newer key
+/// of the same identity. A key both lapsed and replaced ends at the
+/// earlier of the two. Never an anchor's key or a key under `<ns>/CA`; the
+/// root device's own admin key is listed like any other once it lapses.
+/// Ordered by key name.
+pub fn ending_keys(ctx: &SignedTrustContext, issued: &[Certificate], now: u64) -> Vec<EndingKey> {
+    let keys = key_spans(ctx, issued);
     let identity = |key: &Name| {
         let comps = key.components();
         Name::from_components(comps[..comps.len().saturating_sub(2)].iter().cloned())
@@ -125,6 +165,8 @@ pub fn ending_keys(ctx: &SignedTrustContext, issued: &[Certificate], now: u64) -
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use ndn_security::KeyRole;
 
     use super::*;
 
@@ -280,5 +322,59 @@ mod tests {
         let ending = ending_keys(&ctx(), &lapsed_first, now);
         assert_eq!(ending.len(), 1);
         assert_eq!(ending[0].why, Ending::Lapsed { not_after: 300 });
+    }
+
+    /// Round-8 L-d: the root device's own admin key lapses like any other
+    /// key of a listed role, and the owner ends it from the list (its Data is
+    /// refused meanwhile). The CA's key, also a root-device key, is never
+    /// listed.
+    #[test]
+    fn the_root_devices_own_lapsed_key_is_listed_to_end() {
+        let desk = "/home/bob/admin/desk/KEY/device";
+        let ctx = ctx_every_role()
+            .with_key_role(KeyRole::ROOT_DEVICE, n(desk))
+            .with_key_role(KeyRole::ROOT_DEVICE, n("/home/bob/CA/KEY/ca"));
+        let issued = [
+            cert(desk, 100, 500),
+            cert("/home/bob/CA/KEY/ca", 100, 500),
+            // Still valid: not listed.
+            cert("/home/bob/admin/phone/KEY/p", 100, 5_000),
+        ];
+        assert_eq!(
+            ending_keys(&ctx, &issued, 1_000),
+            [EndingKey {
+                key: n(desk),
+                why: Ending::Lapsed { not_after: 500 },
+                held_before: 500,
+            }]
+        );
+    }
+
+    /// Round-8 L-c: which keys a context listing exactly `roles` would
+    /// refuse the Data of, whatever the held context lists: lapsed keys of
+    /// those roles only (a replaced key is not refused, a valid one is not
+    /// lapsed, the CA's key is never listed).
+    #[test]
+    fn lapsed_for_roles_lists_the_lapsed_keys_of_those_roles_only() {
+        let issued = [
+            cert("/home/bob/member/tv/KEY/t", 100, 500),
+            cert("/home/bob/guest/ann/KEY/a", 100, 500),
+            cert("/home/bob/node/vps/KEY/v", 100, 5_000),
+            // Replaced, not lapsed: refused by nobody.
+            cert("/home/bob/member/phone/KEY/a", 100, 5_000),
+            cert("/home/bob/member/phone/KEY/b", 300, 5_000),
+            cert("/home/bob/CA/KEY/ca", 100, 500),
+        ];
+        let roles = |r: &[&str]| r.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        let held = ctx();
+        assert_eq!(
+            lapsed_for_roles(&held, &issued, 1_000, &roles(&["member", "node"])),
+            [EndingKey {
+                key: n("/home/bob/member/tv/KEY/t"),
+                why: Ending::Lapsed { not_after: 500 },
+                held_before: 500,
+            }]
+        );
+        assert!(lapsed_for_roles(&held, &issued, 1_000, &[]).is_empty());
     }
 }
