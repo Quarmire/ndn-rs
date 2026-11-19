@@ -6017,8 +6017,12 @@ checks, in this order:
     namespace, the root never), equal to, under or over a name of
     `Config::intro.reserved` (by default `/localhost`, `/localhop`: scopes,
     never a person's), or equal to or over a name of
-    `Config::intro.shared` (by default `/user`: its `/user/<hash>` names
-    are people's, so `/user/<hash>` is fine and `/user` is not); not the
+    `Config::intro.shared` (by default `/user` and the broad top-level
+    names `/com`, `/org`, `/net`, `/edu`, `/gov`, `/mil`, `/int`, `/info`,
+    `/biz`, `/arpa`, `/ndn`, `/example`, `/test`, `/local`, `/invalid`: a
+    name under one is a person's, so `/user/<hash>` and `/com/acme` are
+    fine and `/user` and `/com` are not; a deployment frees a name by
+    removing it from the list); not the
     inviter's own nor under or over it; not under or over any namespace
     this device trusts; and not one it trusts under another anchor. The
     same namespace under the same anchor is a party it knows already, and
@@ -6157,11 +6161,14 @@ X25519-to-ChaCha20-Poly1305 wrap.
   joiner's longer context), become the trust root over the shared `/user`
   or a scope, nor shadow names of the inviter's own. A joiner can claim any
   namespace that overlaps none the inviter trusts — that is what a
-  stranger is; the owner sees which one joined. A broad one (`/com`) is
-  the joiner's root over every name under it the inviter does not trust
-  yet, and a later introduction under it is refused `Conflict` while this
-  device trusts it: a deployment whose people's namespaces sit under such
-  a prefix lists it in `Config::intro.shared`.
+  stranger is; the owner sees which one joined. A broad name would be the
+  joiner's root over every name under it the inviter does not trust yet,
+  so by default a stranger cannot claim `/com`, `/org` or any other name
+  of the default `Config::intro.shared` list (§19.4 step 10); a name under
+  one (`/com/acme`) is a person's and is refused `Conflict` only while
+  this device trusts an overlapping namespace under another anchor. A
+  deployment whose people's namespaces sit under a prefix not on the list
+  adds it to `Config::intro.shared`.
 - **Inviter impersonation of a namespace the joiner trusts.** A code is
   made by anyone. The joiner judges the inviter's namespace as the inviter
   judges the joiner's (§19.3 step 4) before it adopts anything, so a

@@ -172,10 +172,13 @@ pub struct IntroPolicy {
     /// Names no introduction brings, nor a name under or over one: scopes
     /// that are never a person's (`/localhost`, `/localhop`).
     pub reserved: Vec<Name>,
-    /// Typed prefixes shared by many people's namespaces (`/user`, whose
-    /// `/user/<hash>` names are people's): no introduction brings one of
-    /// them or a name over it; a name under one is a person's like any
-    /// other.
+    /// Names shared by many people's namespaces, held by no one: typed
+    /// prefixes (`/user`, whose `/user/<hash>` names are people's) and broad
+    /// top-level names (`/com`, `/org`, `/ndn`, `/test`, ...). No introduction
+    /// brings one of them or a name over it; a name under one (`/user/<hash>`,
+    /// `/com/acme`) is a person's like any other. A deployment that wants one
+    /// of them for a person's namespace frees it by removing it from
+    /// `Config::intro.shared`.
     pub shared: Vec<Name>,
     /// Wrong tries of one offer, all askers' together, that close it for
     /// everyone, durably: the backstop under per-asker counting
@@ -222,7 +225,10 @@ pub struct IntroPolicy {
 
 impl IntroPolicy {
     /// Defaults: one component at least (`/alice`); `/localhost` and
-    /// `/localhop` reserved; `/user` shared; 16 wrong tries in all, the
+    /// `/localhop` reserved; shared: `/user`, the original generic top-level
+    /// domains (`/com`, `/org`, `/net`, `/edu`, `/gov`, `/mil`, `/int`,
+    /// `/info`, `/biz`, `/arpa`), `/ndn`, and the special-use names
+    /// (`/example`, `/test`, `/local`, `/invalid`); 16 wrong tries in all, the
     /// pause after each counted from 1 s doubling; 32 asks held; a grant has
     /// no date (it follows the members record); a departure mark lasts seven
     /// days.
@@ -231,7 +237,13 @@ impl IntroPolicy {
         Self {
             min_components: 1,
             reserved: vec![n("/localhost"), n("/localhop")],
-            shared: vec![n("/user")],
+            shared: [
+                "/user", "/com", "/org", "/net", "/edu", "/gov", "/mil", "/int", "/info", "/biz",
+                "/arpa", "/ndn", "/example", "/test", "/local", "/invalid",
+            ]
+            .into_iter()
+            .map(n)
+            .collect(),
             wrong_tries_max: 16,
             backoff: std::time::Duration::from_secs(1),
             asks_queued: 32,

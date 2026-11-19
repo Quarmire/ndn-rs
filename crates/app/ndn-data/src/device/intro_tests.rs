@@ -1524,6 +1524,56 @@ async fn a_refused_or_unfinished_ask_grants_nothing() {
     assert_eq!(alice.laptop.grants(), Vec::new());
 }
 
+/// Broad names are reserved for introductions by the default policy: a
+/// stranger cannot bring `/com`, yet `/com/acme` is a person's like any other.
+#[test]
+fn the_default_policy_refuses_broad_names_and_welcomes_names_under_them() {
+    let policy = IntroPolicy::new();
+    let why = policy
+        .refuses(&n("/com"))
+        .expect("the default policy refuses /com");
+    assert!(
+        why.contains("/com") && why.contains("IntroPolicy::shared"),
+        "the refusal of /com does not name the name and the field to change: {why}"
+    );
+    for broad in [
+        "/user", "/com", "/org", "/net", "/edu", "/gov", "/mil", "/int", "/info", "/biz", "/arpa",
+        "/ndn", "/example", "/test", "/local", "/invalid",
+    ] {
+        assert!(
+            policy.refuses(&n(broad)).is_some(),
+            "the default policy brings {broad}"
+        );
+    }
+    assert_eq!(
+        policy.refuses(&n("/com/acme")),
+        None,
+        "a name under a broad one is a person's like any other"
+    );
+    assert!(
+        policy.refuses(&n("/localhost/x")).is_some(),
+        "a name under a reserved scope is brought"
+    );
+    // A deployment frees a broad name by removing it from `shared`.
+    let mut freed = IntroPolicy::new();
+    freed.shared.retain(|s| s != &n("/com"));
+    assert_eq!(freed.refuses(&n("/com")), None);
+}
+
+/// A joiner whose namespace is a broad name is refused as a conflict, in the
+/// round trip, not only by the policy's own check.
+#[tokio::test]
+async fn a_joiner_claiming_a_broad_name_is_answered_conflict() {
+    let (laptop, offer, secret) = alice(&[], None).await;
+    let org = Person::new("/org");
+    let org_phone = start(&org, "/org/phone", None, &[], None).await;
+    let got = answer(&laptop, ask(&org_phone, &laptop, &offer, &secret, &[])).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Conflict))),
+        "a joiner claiming /org was answered {got:?}"
+    );
+}
+
 /// Spec §19.8: `grant_for` `Some(ZERO)`: the asker is admitted, nothing is kept, and
 /// the host is told nothing.
 #[tokio::test]
