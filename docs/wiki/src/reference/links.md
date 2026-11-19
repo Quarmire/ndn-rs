@@ -274,6 +274,12 @@ The output is one item per line, for scripts as much as for people:
 - `serve <policy>` — this device's relay serving policy (when it reports
   one); `held-total`, `wakes-sent` — Interests it holds now for sleeping
   devices, and wakes it has sent since it started.
+- `fault-injection profile=<p|none> met=… dropped=… duplicated=… forged=…
+  delayed=… passed=… predicate-panics=…` and a `WARNING` line — only when the
+  daemon was built with ndn-link's test-only fault layer (it starts only with
+  `[links] allow_fault_injection = true`): the installed profile and what it
+  has done. No shipped daemon prints them; rebuild without the
+  `fault-injection` feature.
 - `link <label>` — one block per device, named by its `[[peer]]` label,
   else its device name, else its key. Its `key` and `device` lines show `-`
   until they are known.

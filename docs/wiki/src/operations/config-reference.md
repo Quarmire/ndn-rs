@@ -312,6 +312,7 @@ webhook, …).
 | `idle_timeout_secs` | `30` | Seconds of silence after which a link counts as lost: at least 3 × `keep_alive_secs` (so two lost keep-alives do not drop it), at most 600. |
 | `max_links` | `1024` | Most links other devices dialed here, admitted and up at once, counting the attempts in progress (≥ 1). Beyond it an attempt is refused before its handshake, logged with the reason, until a link closes; raise it to admit more devices. Links this device dials do not count. |
 | `quiet_close_secs` | `300` | A link another device dialed here that carries no NDN packet for this long (keep-alives do not count), while no route on this device points at its face and it carries no namespace in transit, is closed with reason idle; the other device dials again when it has something to send or serve (≥ 1). A link with routes — a listening device's — stays however quiet, and links this device dials follow their own mode. |
+| `allow_fault_injection` | `false` | For test runs only. A daemon built with ndn-link's test-only fault layer (cargo feature `fault-injection`, which drops, duplicates, forges and delays packets on its links) refuses to start unless this is `true`; the error says why and what to do. A shipped daemon has no such build, and this does nothing to it. `ndn-ctl link list` and the terminal UI show a warning and the layer's counters while it runs. |
 
 ## `[direct]` — direct paths by membership
 

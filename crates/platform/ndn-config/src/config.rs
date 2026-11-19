@@ -2445,6 +2445,13 @@ pub struct LinksConfig {
     /// transit, before it is closed (≥ 1).
     #[serde(default = "default_quiet_close_secs")]
     pub quiet_close_secs: u64,
+    /// Let a daemon that was built with the link library's test-only fault
+    /// layer (cargo feature `fault-injection` of ndn-link, which drops,
+    /// duplicates, forges and delays packets) start. Without this the
+    /// daemon refuses to start with such a build. For test runs only; a
+    /// shipped daemon has no such build, and the setting does nothing to it.
+    #[serde(default)]
+    pub allow_fault_injection: bool,
 }
 
 fn default_keep_alive_secs() -> u64 {
@@ -2467,6 +2474,7 @@ impl Default for LinksConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             max_links: default_max_links(),
             quiet_close_secs: default_quiet_close_secs(),
+            allow_fault_injection: false,
         }
     }
 }
@@ -3813,6 +3821,18 @@ channel = 161
         assert_eq!(cfg.relay_service.quotas(), None);
         let open: ForwarderConfig = "[relay_service]\nserve = \"open\"\n".parse().unwrap();
         assert_eq!(open.relay_service.quotas(), Some(QuotasConfig::default()));
+    }
+
+    /// `[links] allow_fault_injection` is off unless the operator sets it.
+    #[test]
+    fn fault_injection_is_allowed_only_when_the_operator_says_so() {
+        assert!(!ForwarderConfig::default().links.allow_fault_injection);
+        let off: ForwarderConfig = "[links]\nkeep_alive_secs = 20\nidle_timeout_secs = 60\n"
+            .parse()
+            .unwrap();
+        assert!(!off.links.allow_fault_injection);
+        let on: ForwarderConfig = "[links]\nallow_fault_injection = true\n".parse().unwrap();
+        assert!(on.links.allow_fault_injection);
     }
 
     #[test]

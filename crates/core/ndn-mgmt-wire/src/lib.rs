@@ -37,8 +37,9 @@ pub use control_response::ControlResponse;
 pub use control_surface::{ControlInfo, ControlStats, ControlSurface, render_pairs};
 pub use cs_listing::{CsEntry, CsListing};
 pub use link_status::{
-    LinkAsleepEntry, LinkCommandError, LinkDetail, LinkEntry, LinkListing, LinkModeArg,
-    LinkPathEntry, LinkRelayEntry, LinkWords, link_code, link_command, parse_link_command,
+    LinkAsleepEntry, LinkCommandError, LinkDetail, LinkEntry, LinkFaultReport, LinkListing,
+    LinkModeArg, LinkPathEntry, LinkRelayEntry, LinkWords, link_code, link_command,
+    parse_link_command,
 };
 pub use nfd_command::{ParsedCommand, command_name, dataset_name, parse_command_name};
 pub use nfd_dataset::{FaceStatus, FibEntry, NextHopRecord, RibEntry, Route, StrategyChoice};

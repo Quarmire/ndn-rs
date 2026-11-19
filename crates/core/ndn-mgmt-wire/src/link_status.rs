@@ -8,6 +8,7 @@
 //! no host's commands or configuration. A client words the codes it knows
 //! ([`LinkDetail::render`]) and shows the neutral sentence for the others.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -112,6 +113,32 @@ pub mod link_tlv {
     /// Nested detail, top level, optional: this device's relay serving
     /// policy.
     pub const SERVE: u64 = 0x04F2;
+}
+
+/// `links/list` TLV-TYPE codes of the fault-layer notice
+/// ([`LinkListing::fault_injection`]): 0x050C–0x051E, clear of `cs/list`
+/// (0x0500–0x0509) and the data layer (0x0520…). All even (non-critical).
+pub mod fault_tlv {
+    /// Nested, top level, optional: present exactly when the daemon was built
+    /// with the link library's test-only fault layer.
+    pub const FAULT_INJECTION: u64 = 0x050C;
+    /// UTF-8 string, optional: the installed profile's text form; absent
+    /// while no plan is installed.
+    pub const PROFILE: u64 = 0x050E;
+    /// NonNegativeInteger: packets that met the profile.
+    pub const MET: u64 = 0x0510;
+    /// NonNegativeInteger: of those, dropped.
+    pub const DROPPED: u64 = 0x0512;
+    /// NonNegativeInteger: of those, delivered twice.
+    pub const DUPLICATED: u64 = 0x0514;
+    /// NonNegativeInteger: of those, Data packets forged.
+    pub const FORGED: u64 = 0x0516;
+    /// NonNegativeInteger: of those, held back.
+    pub const DELAYED: u64 = 0x0518;
+    /// NonNegativeInteger: packets the plan's predicate left alone.
+    pub const PASSED: u64 = 0x051A;
+    /// NonNegativeInteger: times the plan's predicate panicked.
+    pub const PREDICATE_PANICS: u64 = 0x051C;
 }
 
 /// The codes of [`LinkDetail`]s, documented with their parameters in
@@ -651,6 +678,35 @@ pub struct LinkListing {
     pub held_total: u64,
     /// Wakes this device has sent, in total.
     pub wakes_sent: u64,
+    /// The link library's test-only fault layer: `Some` exactly when the
+    /// daemon was built with it, which no shipped daemon is (it refuses to
+    /// start so unless told to, and says why). A client shows it loudly.
+    /// Boxed: it is rare, and the listing is carried in client messages.
+    pub fault_injection: Option<Box<LinkFaultReport>>,
+}
+
+/// What the fault layer of a build that has it reports
+/// ([`LinkListing::fault_injection`]): the installed profile and what it
+/// did, in total over every link.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LinkFaultReport {
+    /// The installed profile in its text form; `None` while no plan is
+    /// installed (the layer is compiled in and touches nothing).
+    pub profile: Option<String>,
+    /// Packets that arrived on a link and met the profile.
+    pub met: u64,
+    /// Of those, packets dropped.
+    pub dropped: u64,
+    /// Of those, packets delivered twice.
+    pub duplicated: u64,
+    /// Of those, Data packets forged (one signature byte flipped).
+    pub forged: u64,
+    /// Of those, packets held back.
+    pub delayed: u64,
+    /// Packets the plan's predicate left alone.
+    pub passed: u64,
+    /// Times the plan's predicate panicked.
+    pub predicate_panics: u64,
 }
 
 /// One device this device links with (or is configured to, or punched with).
@@ -861,6 +917,9 @@ impl LinkListing {
         write_detail(&mut w, link_tlv::SERVE, self.serve.as_ref());
         write_nni(&mut w, link_tlv::HELD, self.held_total);
         write_nni(&mut w, link_tlv::WAKES, self.wakes_sent);
+        if let Some(fault) = &self.fault_injection {
+            w.write_nested(fault_tlv::FAULT_INJECTION, |w| fault.encode_into(w));
+        }
         w.finish()
     }
 
@@ -878,6 +937,43 @@ impl LinkListing {
                 link_tlv::SERVE => out.serve = Some(LinkDetail::decode(v)?),
                 link_tlv::HELD => out.held_total = nni(&v)?,
                 link_tlv::WAKES => out.wakes_sent = nni(&v)?,
+                fault_tlv::FAULT_INJECTION => {
+                    out.fault_injection = Some(Box::new(LinkFaultReport::decode(v)?))
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl LinkFaultReport {
+    fn encode_into(&self, w: &mut TlvWriter) {
+        if let Some(profile) = &self.profile {
+            w.write_tlv(fault_tlv::PROFILE, profile.as_bytes());
+        }
+        write_nni(w, fault_tlv::MET, self.met);
+        write_nni(w, fault_tlv::DROPPED, self.dropped);
+        write_nni(w, fault_tlv::DUPLICATED, self.duplicated);
+        write_nni(w, fault_tlv::FORGED, self.forged);
+        write_nni(w, fault_tlv::DELAYED, self.delayed);
+        write_nni(w, fault_tlv::PASSED, self.passed);
+        write_nni(w, fault_tlv::PREDICATE_PANICS, self.predicate_panics);
+    }
+
+    fn decode(bytes: Bytes) -> Result<LinkFaultReport, DecodeError> {
+        let mut out = LinkFaultReport::default();
+        for tlv in tlvs(bytes) {
+            let (typ, v) = tlv?;
+            match typ {
+                fault_tlv::PROFILE => out.profile = Some(text(&v)?),
+                fault_tlv::MET => out.met = nni(&v)?,
+                fault_tlv::DROPPED => out.dropped = nni(&v)?,
+                fault_tlv::DUPLICATED => out.duplicated = nni(&v)?,
+                fault_tlv::FORGED => out.forged = nni(&v)?,
+                fault_tlv::DELAYED => out.delayed = nni(&v)?,
+                fault_tlv::PASSED => out.passed = nni(&v)?,
+                fault_tlv::PREDICATE_PANICS => out.predicate_panics = nni(&v)?,
                 _ => {}
             }
         }
@@ -1189,12 +1285,55 @@ mod tests {
             serve: Some(LinkDetail::new(link_code::SERVE_OPEN, "open").with("links_total", 256)),
             held_total: 4,
             wakes_sent: 2,
+            fault_injection: None,
         };
         assert_eq!(LinkListing::decode(listing.encode()).unwrap(), listing);
         assert_eq!(
             LinkListing::decode(LinkListing::default().encode()).unwrap(),
             LinkListing::default()
         );
+    }
+
+    /// The fault-layer notice survives the wire, with and without a plan, and
+    /// a listing of a build without the layer carries none of it.
+    #[test]
+    fn the_fault_layer_notice_round_trips_and_is_absent_without_the_layer() {
+        let mut listing = LinkListing {
+            fault_injection: Some(Box::default()),
+            ..Default::default()
+        };
+        assert_eq!(LinkListing::decode(listing.encode()).unwrap(), listing);
+        listing.fault_injection = Some(Box::new(LinkFaultReport {
+            profile: Some("drop=0.2,dup=0.1,seed=3".into()),
+            met: 100,
+            dropped: 20,
+            duplicated: 10,
+            forged: 3,
+            delayed: 7,
+            passed: 5,
+            predicate_panics: 1,
+        }));
+        assert_eq!(LinkListing::decode(listing.encode()).unwrap(), listing);
+        let none = LinkListing::default();
+        assert_eq!(
+            LinkListing::decode(none.encode()).unwrap().fault_injection,
+            None
+        );
+        // Every code of the notice is even, so a decoder that predates it skips it.
+        for code in [
+            fault_tlv::FAULT_INJECTION,
+            fault_tlv::PROFILE,
+            fault_tlv::MET,
+            fault_tlv::DROPPED,
+            fault_tlv::DUPLICATED,
+            fault_tlv::FORGED,
+            fault_tlv::DELAYED,
+            fault_tlv::PASSED,
+            fault_tlv::PREDICATE_PANICS,
+        ] {
+            assert_eq!(code % 2, 0);
+            assert!((0x050C..=0x051E).contains(&code));
+        }
     }
 
     #[test]
