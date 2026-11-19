@@ -292,7 +292,7 @@ async fn start_policy(
     clock: Option<Clock>,
     calls: Arc<Calls>,
     intro: IntroPolicy,
-    store: Arc<MemoryStore>,
+    store: Arc<dyn DataStore>,
 ) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
@@ -1202,7 +1202,7 @@ struct Inviter {
     laptop: Device,
     alice: Person,
     keys: Arc<SecurityManager>,
-    store: Arc<MemoryStore>,
+    store: Arc<dyn DataStore>,
     calls: Arc<Calls>,
     clock: Clock,
     skew: Arc<std::sync::atomic::AtomicU64>,
@@ -1211,11 +1211,20 @@ struct Inviter {
 }
 
 impl Inviter {
-    async fn new(role: Role, grant_for: Duration, refuses: &[&str]) -> Inviter {
+    async fn new(role: Role, grant_for: Option<Duration>, refuses: &[&str]) -> Inviter {
+        Self::over(role, grant_for, refuses, Arc::new(MemoryStore::new())).await
+    }
+
+    /// [`Inviter::new`] over `store`.
+    async fn over(
+        role: Role,
+        grant_for: Option<Duration>,
+        refuses: &[&str],
+        store: Arc<dyn DataStore>,
+    ) -> Inviter {
         let (clock, skew) = skewed();
         let alice = Person::new("/alice");
         let keys = keyed(&alice, "/alice/laptop").await;
-        let store = Arc::new(MemoryStore::new());
         let calls = Arc::new(Calls::default());
         let laptop = start_policy(
             &alice,
@@ -1300,8 +1309,8 @@ async fn phone_of(ns: &str) -> Device {
     start(&person, &format!("{ns}/phone"), None, &[], None).await
 }
 
-async fn a_grant_is_made_once_for_the_admitted_key(role: Role) {
-    let alice = Inviter::new(role, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+async fn a_grant_is_made_once_for_the_admitted_key(role: Role, grant_for: Option<Duration>) {
+    let alice = Inviter::new(role, grant_for, &[]).await;
     let bob_phone = phone_of("/bob").await;
     let before = (alice.clock)().0;
     let first = alice.answers(&bob_phone).await;
@@ -1327,11 +1336,21 @@ async fn a_grant_is_made_once_for_the_admitted_key(role: Role) {
     );
     assert_eq!(g.folder, n("/alice/32=data/notebook"));
     assert_eq!(g.role, role, "the grant does not carry the offer's role");
-    assert!(
-        (before + NINETY_DAYS_MS..=after + NINETY_DAYS_MS).contains(&g.until.0),
-        "the grant ends at {:?}, not grant_for after the admission",
-        g.until
-    );
+    match grant_for {
+        Some(d) => {
+            let ms = d.as_millis() as u64;
+            assert!(
+                g.until
+                    .is_some_and(|t| (before + ms..=after + ms).contains(&t.0)),
+                "the grant ends at {:?}, not grant_for after the admission",
+                g.until
+            );
+        }
+        None => assert_eq!(
+            g.until, None,
+            "a grant with no grant_for bound carries a date: it follows the members record"
+        ),
+    }
     assert_eq!(
         alice.laptop.grants(),
         granted,
@@ -1374,12 +1393,16 @@ async fn a_grant_is_made_once_for_the_admitted_key(role: Role) {
 /// make none.
 #[tokio::test]
 async fn a_writers_admission_is_granted_once_and_only_to_its_key() {
-    a_grant_is_made_once_for_the_admitted_key(Role::Writer).await;
+    a_grant_is_made_once_for_the_admitted_key(
+        Role::Writer,
+        Some(Duration::from_millis(NINETY_DAYS_MS)),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn a_readers_admission_is_granted_once_with_the_readers_role() {
-    a_grant_is_made_once_for_the_admitted_key(Role::Reader).await;
+    a_grant_is_made_once_for_the_admitted_key(Role::Reader, None).await;
 }
 
 /// Spec §19.8: no ask that is refused or not completed grants anything.
@@ -1387,7 +1410,7 @@ async fn a_readers_admission_is_granted_once_with_the_readers_role() {
 async fn a_refused_or_unfinished_ask_grants_nothing() {
     let alice = Inviter::new(
         Role::Writer,
-        Duration::from_millis(NINETY_DAYS_MS),
+        Some(Duration::from_millis(NINETY_DAYS_MS)),
         &["/dave"],
     )
     .await;
@@ -1449,18 +1472,18 @@ async fn a_refused_or_unfinished_ask_grants_nothing() {
     assert_eq!(alice.laptop.grants(), Vec::new());
 }
 
-/// Spec §19.8: `grant_for` zero: the asker is admitted, nothing is kept, and
+/// Spec §19.8: `grant_for` `Some(ZERO)`: the asker is admitted, nothing is kept, and
 /// the host is told nothing.
 #[tokio::test]
 async fn a_zero_grant_for_makes_no_grant_and_keeps_no_note() {
-    let alice = Inviter::new(Role::Writer, Duration::ZERO, &[]).await;
+    let alice = Inviter::new(Role::Writer, Some(Duration::ZERO), &[]).await;
     let bob_phone = phone_of("/bob").await;
     let got = alice.answers(&bob_phone).await;
     assert!(accepted(&got), "bob was answered {got:?}");
     assert_eq!(
         alice.calls.granted(),
         Vec::new(),
-        "grant_for = 0 granted a link"
+        "grant_for = Some(ZERO) granted a link"
     );
     assert_eq!(alice.laptop.grants(), Vec::new());
     let kept = alice
@@ -1468,7 +1491,7 @@ async fn a_zero_grant_for_makes_no_grant_and_keeps_no_note() {
         .scan_under(&super::intro::local_name_base("grant"), 0);
     assert!(
         kept.is_empty(),
-        "grant_for = 0 kept {} grant notes",
+        "grant_for = Some(ZERO) kept {} grant notes",
         kept.len()
     );
 }
@@ -1477,7 +1500,7 @@ async fn a_zero_grant_for_makes_no_grant_and_keeps_no_note() {
 /// in force, and not announced as revoked (the link layer judges expiry itself).
 #[tokio::test]
 async fn a_grant_lapses_with_its_time_and_is_not_announced_as_revoked() {
-    let alice = Inviter::new(Role::Writer, Duration::from_secs(3600), &[]).await;
+    let alice = Inviter::new(Role::Writer, Some(Duration::from_secs(3600)), &[]).await;
     let bob_phone = phone_of("/bob").await;
     assert!(accepted(&alice.answers(&bob_phone).await));
     assert_eq!(alice.laptop.grants().len(), 1);
@@ -1555,7 +1578,7 @@ fn from_the_phone(to: &Device, body: MembersBody) {
 /// the same less the ended.
 #[tokio::test]
 async fn a_record_of_another_device_that_leaves_the_person_out_revokes_the_grant() {
-    let mut alice = Inviter::new(Role::Writer, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+    let mut alice = Inviter::new(Role::Writer, None, &[]).await;
     let folder = n("/alice/32=data/notebook");
     let bob_phone = phone_of("/bob").await;
     let carol_phone = phone_of("/carol").await;
@@ -1651,7 +1674,7 @@ async fn a_record_of_another_device_that_leaves_the_person_out_revokes_the_grant
 /// ends the grant as well.
 #[tokio::test]
 async fn a_record_this_device_signs_that_leaves_the_person_out_revokes_the_grant() {
-    let alice = Inviter::new(Role::Reader, Duration::from_millis(NINETY_DAYS_MS), &[]).await;
+    let alice = Inviter::new(Role::Reader, None, &[]).await;
     let bob_phone = phone_of("/bob").await;
     assert!(accepted(&alice.answers(&bob_phone).await));
     assert_eq!(alice.laptop.grants().len(), 1);
@@ -1674,4 +1697,353 @@ async fn a_record_this_device_signs_that_leaves_the_person_out_revokes_the_grant
         "a record this device signed that leaves bob out did not revoke his grant"
     );
     assert_eq!(alice.laptop.grants(), Vec::new());
+}
+
+/// The only grant note an inviter's store keeps, changed in place by `edit`
+/// as a party that can write the store would.
+fn tamper(store: &dyn DataStore, edit: impl FnOnce(&mut Vec<u8>)) {
+    let base = super::intro::local_name_base("grant");
+    let mut notes = store.scan_under(&base, 0);
+    assert_eq!(notes.len(), 1, "one admission, one grant note");
+    let (name, value) = notes.pop().unwrap();
+    let mut bytes = value.to_vec();
+    edit(&mut bytes);
+    store.insert(name, Bytes::from(bytes));
+}
+
+/// The octet of a grant note that holds its flags (version, flags, role, ...),
+/// and the octets of its date.
+const NOTE_FLAGS: usize = 1;
+const NOTE_UNTIL: std::ops::Range<usize> = 3..11;
+
+/// A store whose flush does not finish while it is frozen: a disk that has
+/// stopped answering.
+struct Frozen {
+    inner: MemoryStore,
+    frozen: std::sync::atomic::AtomicBool,
+}
+
+impl Frozen {
+    fn new() -> Arc<Frozen> {
+        Arc::new(Frozen {
+            inner: MemoryStore::new(),
+            frozen: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn freeze(&self, on: bool) {
+        self.frozen.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl DataStore for Frozen {
+    fn insert(&self, name: Name, wire: Bytes) {
+        self.inner.insert(name, wire);
+    }
+    fn get(&self, name: &Name) -> Option<Bytes> {
+        self.inner.get(name)
+    }
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        self.inner.scan_under(prefix, limit)
+    }
+    fn remove(&self, name: &Name) {
+        self.inner.remove(name);
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        while self.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+}
+
+const TEN_YEARS_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
+
+/// Spec §19.8 (no cliff): a grant with no date lasts as long as the members record
+/// admits the person, however far the clock goes; a held record that leaves the
+/// person out ends it.
+#[tokio::test]
+async fn a_grant_with_no_date_follows_the_members_record_not_the_clock() {
+    let mut alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let told = alice.calls.granted();
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].until, None, "the default grant carries a date");
+    alice
+        .skew
+        .store(TEN_YEARS_MS, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        alice.laptop.grants(),
+        told,
+        "a grant with no date ended with the clock"
+    );
+    alice.restart().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        told,
+        "a grant with no date ended with the clock across a restart"
+    );
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "a record that leaves the person out did not end a grant with no date"
+    );
+}
+
+/// Spec §19.8 (host control): the host's end of a grant is durable — a restart
+/// does not bring it back — and its renewal sets a date durably, for a grant
+/// the record still admits, past its old date or not; the Device tells the host
+/// nothing itself.
+#[tokio::test]
+async fn the_host_ends_and_renews_a_grant_durably() {
+    let mut alice = Inviter::new(Role::Writer, Some(Duration::from_secs(3600)), &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    let bob = bob_phone.inner.own_key.unwrap();
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let first = alice.laptop.grants();
+    assert_eq!(first.len(), 1);
+
+    // Past its date the grant is over; the host renews it: it is back, and
+    // stays back across a restart.
+    alice
+        .skew
+        .store(3 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    let now = (alice.clock)().0;
+    let later = Timestamp(now + 3_600_000);
+    let renewed = alice
+        .laptop
+        .renew_grant(&bob, Some(later))
+        .await
+        .expect("a renewal of a grant a held record admits")
+        .expect("a grant past its date is renewable");
+    assert_eq!(renewed.until, Some(later));
+    assert_eq!(renewed.key, bob);
+    assert_eq!(alice.laptop.grants(), vec![renewed.clone()]);
+    alice.restart().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        vec![renewed.clone()],
+        "a renewal did not survive a restart"
+    );
+
+    // A date not after the clock is refused, saying what to do; nothing moves.
+    let e = alice
+        .laptop
+        .renew_grant(&bob, Some(Timestamp(now - 1)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, DataError::BadRequest { why, .. } if why.contains("give a later date")),
+        "a renewal to a past date was answered {e:?}"
+    );
+    assert_eq!(alice.laptop.grants(), vec![renewed]);
+
+    // No date: the grant follows the record from now on.
+    let undated = alice.laptop.renew_grant(&bob, None).await.unwrap().unwrap();
+    assert_eq!(undated.until, None);
+    alice
+        .skew
+        .store(TEN_YEARS_MS, std::sync::atomic::Ordering::SeqCst);
+    alice.restart().await;
+    assert_eq!(alice.laptop.grants(), vec![undated]);
+
+    // The host ends it: durably, once; a key nobody granted is none.
+    assert!(alice.laptop.end_grant(&bob).await.unwrap());
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    assert!(
+        !alice.laptop.end_grant(&bob).await.unwrap(),
+        "an ended grant was ended again"
+    );
+    assert_eq!(alice.laptop.renew_grant(&bob, None).await.unwrap(), None);
+    assert!(!alice.laptop.end_grant(&[7; 32]).await.unwrap());
+    let again = alice.restart().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "the host's end of a grant did not survive a restart"
+    );
+    assert_eq!(again.granted(), Vec::new());
+    // The Device itself told the host nothing of all of it.
+    assert_eq!(alice.calls.revoked(), Vec::<[u8; 32]>::new());
+    assert_eq!(alice.calls.granted().len(), 1);
+}
+
+/// Spec §19.8: a grant a held record ended is not renewed — the person is out;
+/// offer the folder again.
+#[tokio::test]
+async fn a_grant_a_record_ended_is_not_renewed() {
+    let alice = Inviter::new(Role::Writer, Some(Duration::from_secs(3600)), &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    let bob = bob_phone.inner.own_key.unwrap();
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    assert_eq!(
+        alice
+            .laptop
+            .renew_grant(&bob, Some(Timestamp((alice.clock)().0 + 1_000_000)))
+            .await
+            .unwrap(),
+        None,
+        "a person a held record leaves out was renewed a grant"
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
+}
+
+/// Spec §19.8 (notes are checked): a party that can write the data store, but
+/// not the key store, cannot bring an ended grant back or lengthen a lapsed
+/// one: a note that was changed fails its MAC and is ignored.
+#[tokio::test]
+async fn a_tampered_grant_note_is_ignored_not_resurrected() {
+    // The ended flag cleared on a grant the host ended.
+    let mut alice = Inviter::new(Role::Writer, None, &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert!(
+        alice
+            .laptop
+            .end_grant(&bob_phone.inner.own_key.unwrap())
+            .await
+            .unwrap()
+    );
+    assert_eq!(alice.laptop.grants(), Vec::new());
+    tamper(&*alice.store, |b| b[NOTE_FLAGS] &= !1);
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "a note with its ended flag cleared in the store brought the grant back"
+    );
+    let again = alice.restart().await;
+    assert_eq!(
+        alice.laptop.grants(),
+        Vec::new(),
+        "a note with its ended flag cleared in the store brought the grant back at a restart"
+    );
+    assert_eq!(again.granted(), Vec::new());
+
+    // The date pushed out, or taken off, on a grant that lapsed.
+    for how in ["extended", "removed"] {
+        let alice = Inviter::new(Role::Writer, Some(Duration::from_secs(3600)), &[]).await;
+        let bob_phone = phone_of("/bob").await;
+        assert!(accepted(&alice.answers(&bob_phone).await));
+        alice
+            .skew
+            .store(3 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(alice.laptop.grants(), Vec::new());
+        tamper(&*alice.store, |b| {
+            if how == "extended" {
+                b[NOTE_UNTIL].copy_from_slice(&u64::MAX.to_be_bytes());
+            } else {
+                b[NOTE_FLAGS] &= !2;
+            }
+        });
+        assert_eq!(
+            alice.laptop.grants(),
+            Vec::new(),
+            "a note whose date was {how} in the store brought a lapsed grant back"
+        );
+    }
+
+    // An unchanged note is read: the check is not a refusal of everything.
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert_eq!(alice.laptop.grants().len(), 1);
+}
+
+/// Spec §19.8 (role re-derived): the grant's role is the one the members record
+/// in force gives the person, at every judgement — a writer demoted to a
+/// reader is listed as a reader at once, and the host is told again, once; the
+/// note then bears it across a restart.
+#[tokio::test]
+async fn a_writer_demoted_to_a_reader_is_granted_as_a_reader() {
+    let mut alice = Inviter::new(Role::Writer, None, &[]).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    let bob = bob_phone.inner.own_key.unwrap();
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    assert_eq!(alice.laptop.grants()[0].role, Role::Writer);
+
+    let mut demoted = phone_leaves_out(&alice.laptop, &folder, &n("/bob"));
+    demoted.readers.push(Audience::Person(n("/bob")));
+    from_the_phone(&alice.laptop, demoted);
+    let now = alice.laptop.grants();
+    assert_eq!(now.len(), 1, "a demoted person lost the grant: {now:?}");
+    assert_eq!(
+        now[0].role,
+        Role::Reader,
+        "a writer a held record demoted to a reader is still granted as a writer"
+    );
+    alice.laptop.inner.settle().await;
+    let told = alice.calls.granted();
+    assert_eq!(
+        told.len(),
+        2,
+        "the host was told {told:?}: the admission and, once, the new role"
+    );
+    assert_eq!(told[1].role, Role::Reader);
+    assert_eq!(told[1].key, bob);
+    assert_eq!(alice.calls.revoked(), Vec::<[u8; 32]>::new());
+    alice.laptop.inner.settle().await;
+    assert_eq!(
+        alice.calls.granted().len(),
+        2,
+        "the new role was told twice"
+    );
+
+    // Durable: after a restart the grant is a reader's and nothing is told again.
+    let again = alice.restart().await;
+    assert_eq!(alice.laptop.grants(), now);
+    assert_eq!(
+        again.granted(),
+        Vec::new(),
+        "the demotion was not in the note: a restart told the host again"
+    );
+}
+
+/// Spec §19.8 (host first): a record that leaves the person out tells the host
+/// before the end is made durable — a disk that has stopped answering does not
+/// delay the link layer's end.
+#[tokio::test]
+async fn the_host_is_told_of_an_end_before_it_is_durable() {
+    let store = Frozen::new();
+    let alice = Inviter::over(Role::Writer, None, &[], store.clone()).await;
+    let folder = n("/alice/32=data/notebook");
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    from_the_phone(
+        &alice.laptop,
+        phone_leaves_out(&alice.laptop, &folder, &n("/bob")),
+    );
+    // A failing assertion must not leave the disk frozen: the runtime would wait for it.
+    struct Thaw(Arc<Frozen>);
+    impl Drop for Thaw {
+        fn drop(&mut self) {
+            self.0.freeze(false);
+        }
+    }
+    store.freeze(true);
+    let _thaw = Thaw(store.clone());
+    let stuck = tokio::time::timeout(
+        Duration::from_millis(300),
+        alice.laptop.inner.judge_grants(),
+    )
+    .await;
+    assert!(stuck.is_err(), "the durable end finished on a frozen disk");
+    assert_eq!(
+        alice.calls.revoked(),
+        vec![bob_phone.inner.own_key.unwrap()],
+        "the host was not told of the end while the disk was stopped"
+    );
 }

@@ -52,8 +52,6 @@ const PROOF_KEY: &[u8] = b"ndn-data/intro/proof/1";
 const ASK_PROOF: &[u8] = b"ndn-data/intro/ask/1";
 const ANSWER_PROOF: &[u8] = b"ndn-data/intro/answer/1";
 
-/// The days a grant lasts by default ([`IntroPolicy::grant_for`]).
-const GRANT_DAYS: u64 = 90;
 type HmacSha256 = Hmac<Sha256>;
 
 // ---- what callers see -------------------------------------------------------------------------
@@ -102,8 +100,10 @@ pub struct Offer {
 
 /// A **grant** (spec §19.8): an offer of this device admitted a person, and
 /// the host's link layer may link with the device holding `key` as a person
-/// of `namespaces`, until `until`. What [`Introducer::grant`] is told and
-/// [`Device::grants`](crate::Device::grants) lists.
+/// of `namespaces`, for as long as the members record in force for `folder`
+/// admits them (and, if `until` is set, not past it). What
+/// [`Introducer::grant`] is told and [`Device::grants`](crate::Device::grants)
+/// lists.
 ///
 /// A grant is authority to *link*, not to read: it informs, never widens. The
 /// folder's members record and the epoch keys still decide what a link is
@@ -118,10 +118,15 @@ pub struct Grant {
     pub namespaces: Vec<Name>,
     /// The folder the offer admitted the person to.
     pub folder: Name,
-    /// The offer's role.
+    /// The person's role in the folder **now**: derived from the members
+    /// record in force for it (a writer demoted to a reader is a reader), not
+    /// the offer's.
     pub role: Role,
-    /// When the grant ends, by the inviter's clock.
-    pub until: Timestamp,
+    /// A date after which the grant is over, by the inviter's clock; `None`:
+    /// no date, the grant lasts while a held members record admits the person
+    /// and ends when one leaves them out (the default,
+    /// [`IntroPolicy::grant_for`]).
+    pub until: Option<Timestamp>,
 }
 
 /// What a device's introductions allow and cost it (`Config::intro`, spec
@@ -162,18 +167,23 @@ pub struct IntroPolicy {
     /// such an address to a device elsewhere (ndn-link `HostCandidates`).
     /// Turn it on for two devices of one machine (tests, a demo).
     pub local_candidates: bool,
-    /// How long a grant lasts after the admission it follows (spec §19.8),
-    /// by the offering device's clock; zero: no grant is made (nothing is
-    /// kept, [`Introducer::grant`] is never called) and the host links with
-    /// the person by its serving policy alone.
-    pub grant_for: Duration,
+    /// An optional hard bound on how long a grant lasts after the admission
+    /// it follows (spec §19.8), by the offering device's clock. `None` (the
+    /// default): the grant has no date, it follows the members record in
+    /// force: it lasts while a held record admits the person and ends when a
+    /// held record leaves them out. `Some(d)`: it is also over `d` after the
+    /// admission; the host can [renew](crate::Device::renew_grant) it.
+    /// `Some(Duration::ZERO)`: no grant is made (nothing is kept,
+    /// [`Introducer::grant`] is never called) and the host links with the
+    /// person by its serving policy alone.
+    pub grant_for: Option<Duration>,
 }
 
 impl IntroPolicy {
     /// Defaults: one component at least (`/alice`); `/localhost` and
     /// `/localhop` reserved; `/user` shared; 16 wrong tries in all, the
-    /// pause after each counted from 1 s doubling; 32 asks held; a grant lasts
-    /// 90 days.
+    /// pause after each counted from 1 s doubling; 32 asks held; a grant has
+    /// no date (it follows the members record).
     pub fn new() -> Self {
         let n = |s: &str| s.parse::<Name>().expect("a valid name");
         Self {
@@ -184,7 +194,7 @@ impl IntroPolicy {
             backoff: std::time::Duration::from_secs(1),
             asks_queued: 32,
             local_candidates: false,
-            grant_for: Duration::from_secs(GRANT_DAYS * 24 * 3600),
+            grant_for: None,
         }
     }
 
@@ -715,13 +725,18 @@ pub trait Introducer: Send + Sync {
     }
 
     /// An offer of this device admitted a person: the host's link layer may
-    /// link with `grant.key` as a person of `grant.namespaces`, until
-    /// `grant.until` (spec §19.8). Called once the acceptance and the grant
-    /// note are durable, never for a retry of the same asker, a refused ask,
-    /// or when [`IntroPolicy::grant_for`] is zero; and again with the same
-    /// value, for each grant in force, by whoever installs
-    /// [`Device::grants`](crate::Device::grants) after a restart. A grant
-    /// informs the link layer, never widens what the layer serves: the
+    /// link with `grant.key` as a person of `grant.namespaces` in the role
+    /// `grant.role`, until `grant.until` if it has one (else for as long as
+    /// a held members record admits them) (spec §19.8). Called once the
+    /// acceptance and the grant note are durable, never for a retry of the
+    /// same asker, a refused ask, or when
+    /// [`IntroPolicy::grant_for`] is `Some(Duration::ZERO)`; **again** with the
+    /// grant as it now stands when a members record taken changes the
+    /// person's role in the folder (a writer demoted to a reader: the host
+    /// replaces the grant, and a link made under the old role is closed);
+    /// and again with the same value, for each grant in force, by whoever
+    /// installs [`Device::grants`](crate::Device::grants) after a restart. A
+    /// grant informs the link layer, never widens what the layer serves: the
     /// members record and the epoch keys still decide what is answered.
     ///
     /// The default does nothing: a host with no link layer, or one that
@@ -730,11 +745,15 @@ pub trait Introducer: Send + Sync {
         let _ = grant;
     }
 
-    /// The grant of `key` has ended before its time: a members record held
+    /// The grant of `key` has ended before its date: a members record held
     /// here — signed by any device of the inviter's namespace — leaves the
     /// person out of the grant's folder (spec §19.8). Called once for each
-    /// such grant, after the end is durable; a grant that merely expired is
-    /// not announced (the link layer judges `until` by its own clock).
+    /// such grant, **before** the end is made durable (in memory only, and
+    /// conservative: should the durable write fail, the record is judged
+    /// again and the grant ended again); a grant that merely expired is not
+    /// announced (the link layer judges `until` by its own clock). Not called
+    /// for an end the host made
+    /// ([`Device::end_grant`](crate::Device::end_grant)): the host knows.
     ///
     /// The default does nothing.
     fn revoke_grant(&self, key: &[u8; 32]) {

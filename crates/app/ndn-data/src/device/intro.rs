@@ -59,9 +59,11 @@ pub(super) struct Intros {
     pub(super) used: BTreeMap<Name, (Name, [u8; 32])>,
     /// Offers a closing mark is held of: closed for good, used or not.
     pub(super) closed: BTreeSet<Name>,
-    /// Offers whose grant a held record left out, being ended now
-    /// ([`Inner::end_grants`]): one run ends a grant, a run meanwhile skips it.
-    pub(super) ending: BTreeSet<Name>,
+    /// Held while a grant note is changed ([`Inner::judge_grants`],
+    /// [`Device::end_grant`](crate::Device::end_grant),
+    /// [`Device::renew_grant`](crate::Device::renew_grant)): each reads the
+    /// notes as the one before left them, so one change is made once.
+    pub(super) notes: Arc<tokio::sync::Mutex<()>>,
     /// Asks are judged one at a time: a use, a wrong try counted, a
     /// closing mark each see what the one before wrote.
     serial: Arc<tokio::sync::Mutex<()>>,
@@ -76,7 +78,7 @@ impl Intros {
             offers: BTreeMap::new(),
             used: BTreeMap::new(),
             closed: BTreeSet::new(),
-            ending: BTreeSet::new(),
+            notes: Arc::new(tokio::sync::Mutex::new(())),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             queued: 0,
         }

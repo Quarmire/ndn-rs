@@ -9714,9 +9714,9 @@ impl Inner {
                 tracing::debug!(collection = %c, "the record owed is not announced: {e}");
             }
         }
-        // A person a record held leaves out has no grant to link any more, whoever signed it
-        // (spec §19.8).
-        self.end_grants().await;
+        // A person a record held leaves out has no grant to link any more, and one whose
+        // role it changes has the grant re-told, whoever signed it (spec §19.8).
+        self.judge_grants().await;
     }
 
     /// Refresh `device`'s summary of `ns` in the background, coalescing
