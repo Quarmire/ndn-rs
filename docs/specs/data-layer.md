@@ -6302,6 +6302,17 @@ Device::take_departure(&self, from: &Name, folder: &Name, record: &Name)
     -> Result<(), DataError>                                                  // async
 IntroductionSurface::grant_carries(&self, folder: &Name, name: &Name) -> bool
 ndn_data::{folder_carries, writer_carries, departure_carries}
+// round 9: the joiner's end of a grant
+Device::joined_folders(&self) -> Vec<JoinedFolder>        // one per live mirror entry
+Device::joined_changes(&self) -> tokio::sync::watch::Receiver<u64>
+IntroductionSurface::{joined_folders, joined_changes}     // the same two, weak
+pub struct JoinedFolder {
+    pub inviter: [u8; 32],  // the inviter's device key's digest (the mirror grant's key)
+    pub owner: Name,        // the folder's namespace = the inviter's
+    pub folder: Name,
+    pub role: Role,         // THIS device's role in the record in force
+    pub writers: Vec<Name>, // the other writers' namespaces (<= JOINED_WRITERS_MAX = 16)
+}
 ```
 
 1. **When it is made.** A device MUST make a grant when it answers an ask
@@ -6604,6 +6615,90 @@ ndn_data::{folder_carries, writer_carries, departure_carries}
     device wrote them. A prefix only a cut keeps is not a writer. A reader-role
     grant gains nothing by it: the link layer's push scope stays the person's
     own devices'.
+17. **The mirror grant: the joiner's end** (round 9). A grant was built at one
+    end only, and a device that joined a folder could not be linked to by the
+    person who invited it once that person's address changed (REPLY-18, F4).
+    A successful `join` therefore keeps, after the record that admits the device
+    is held (`await_admission`), a **mirror note** — durable before `join`
+    returns, the host told after (`Introducer::grant`): the inviter's **key**
+    (the digest of the key that signed the answer, which the join verified
+    belongs to the offering device under the anchor the code named), the
+    **folder**, and the inviter's namespace as the folder's **owner**. It is the
+    mirror of the inviter's note (rule 2) and is kept the same way: a fixed-width
+    local value under `/localhost/ndn-data/intro/mirror/<folder's Name TLV><key>`
+    (never served, never on the wire, **no TLV-TYPE registered**), ending in an
+    HMAC-SHA256 under a key derived (HKDF) from the device's recipient secret
+    **with labels of its own** (`ndn-data/mirror-note/mac-key/1`,
+    `ndn-data/mirror-note/mac/1`), so a mirror note is never read as an inviter's
+    note nor the reverse; a note that fails its check, or is of a version not
+    read, is ignored with a warning that says why and what to do (join again with
+    a new offer). The note names **no role the device trusts**: the entry's role
+    is **re-derived from the record in force at every judgement** — the
+    inviter's: a writer when its namespace has a listed writer prefix, else a
+    reader, never wider than the record says — and the entry **stands only
+    while the record in force lists this device**, by the predicates a join
+    waits on (§19.3: a writer when a listed writer prefix is a prefix of its
+    key, else a reader; a sealed folder also needs the record's audience to
+    admit it; an unsealed folder lists every device as a reader). No record held
+    for the folder: no entry (nothing to judge by, so nothing is granted). The
+    note is kept **only for a folder under the inviter's own namespace**
+    (`namespace_of(folder) == owner`): a hostile offer that names a folder of the
+    joiner's own namespace — whose record lists the joiner — would otherwise
+    grant the inviter a link into it; the join says so and keeps nothing.
+    `Device::grants()` lists a live mirror entry like any grant (key = the
+    inviter's, `namespaces = [owner]`, `folder`, the inviter's role, `until =
+    None`: it follows the record); `Introducer::grant` is called once the note is
+    durable and again when a record changes the inviter's role;
+    `Introducer::revoke_grant(key, folder)` when a held record leaves this device
+    out (in memory first, then the note is marked ended durably);
+    **`Introducer::departure` is never called for a mirror**: the person who is
+    let go is told by the inviter (rules 14–15), and a mirror only admits the
+    inviter's own link. The entry **ends** with the record that no longer lists
+    this device, or with the host: `Device::end_grant(key)` ends the key's
+    inviter notes *and* mirror notes, `end_grant_in(key, folder)` those of the
+    folder (durable, no mark, the host is not told, as for the inviter's notes);
+    `renew_grant` never touches a mirror (it has no date). One entry for each
+    `(inviter key, folder)`: a second join of the same folder by the same key
+    replaces the entry (a re-invitation after a let-go starts it again), another
+    key of the same person is another entry, and the entries of other folders
+    stand (round 7's per-entry ends; the link layer closes the link when the last
+    entry of the key ends, ndn-link §8.7 rule 6). **Mutual invitations**: Ann
+    invites Bob to A and Bob invites Ann to B; each device holds an inviter's
+    note of one folder and a mirror note of the other for the same peer key, and
+    they are entries of different folders (a folder has one owner, so an
+    inviter's note and a mirror of one `(key, folder)` cannot both exist):
+    neither replaces the other, `end_grant_in` ends one, `end_grant(key)` ends
+    both. A host whose link key is not its device key calls `Links::grant` for
+    the inviter's link key itself, as it does for the grants it makes.
+18. **The folders joined, and what the link routes for them** (round 9).
+    `Device::joined_folders()` lists, for each live mirror entry whose record in
+    force still lists this device, a `JoinedFolder`: the inviter's key, the
+    owner, the folder, **this device's** role, and the **other writers'
+    namespaces** the record lists — `writer_namespaces_of` (rule 16) **minus**
+    the owner's, this device's own namespace and every namespace **above or
+    below** it (a hostile inviter's record cannot make the joiner route its own
+    names, or `/` or a broad parent of them, toward the inviter), only names
+    that are namespaces, at most `JOINED_WRITERS_MAX` (16) in the order of
+    `Name`, sorted by folder then inviter. It is **derived on every call** from
+    the record in force and the MAC'd note, never cached, and carries no
+    authority: the link layer routes by it (ndn-link §8.7 rule 18: the prefix
+    `W` of each writer namespace over the link of exactly that inviter, and,
+    **only when this device's role is writer**, `<W>/32=sync` beside it — the
+    writers' groups are the writer-push route, and a reader is routed `W`
+    only), and the inviter's per-packet filter still decides what crosses.
+    `Device::joined_changes()` is the **change notification**: a
+    `tokio::sync::watch::Receiver<u64>` whose value is raised, and never repeats
+    within a run, whenever the list derived differs from the one the value stands
+    for — at a join, after every record taken (where the grants are judged:
+    `judge_grants` now runs for a device with no host introducer and no offer
+    used, since a joiner's routes follow the record on their own), at a host's
+    end — and **only then** (a settle that changed nothing moves nothing). A
+    watcher reads `joined_folders()` after each change; a surface whose device
+    is gone yields a receiver whose sender is dropped (`changed()` errors at once
+    and ends the watcher). The existing grants have a pull surface
+    (`Device::grants()`) and a push the host forwards (`Introducer::grant` /
+    `revoke_grant`); the joiner's routes need no host forwarding, so a host that
+    already calls `LinkHints::serve(&device)` does nothing more.
 
 Threat notes (round 7):
 
@@ -6635,6 +6730,42 @@ Threat notes (round 7):
   certificate names of a listed writer's namespace cross too; they are public by
   design (a hello already carries the chain), carry no data and name no
   collection, and are bounded the same way (ndn-link.md §13.5).
+
+Threat notes (round 9):
+
+- **Can a writer of a folder make Bob route a name he should not?** A writer
+  cannot change the record: only devices of the folder's own namespace sign its
+  members records (§19.4), and the device derives `writers` from the record in
+  force, whose signatures it verified. The owner can list any writer prefix;
+  the device never lists the joiner's own namespace or anything above or below
+  it, only namespaces, at most 16 a folder; the link layer routes only over the
+  inviter's identified link, at a cost above every real path, at most 64
+  namespaces (ndn-link §13.5). A hostile inviter can make Bob send Interests for
+  a *foreign* namespace toward her, where Bob had no route: she can blackhole
+  them, or answer with data Bob validates by that namespace's own trust, which
+  nothing she answers can fake.
+- **Can the inviter's link, as Bob holds it, be used by a different key?** No:
+  the mirror holds one key (the one that signed the verified answer); the link
+  is admitted only when the handshake proves that key *and* an identity that
+  validates in the owner's namespace (ndn-link §8.7 rule 3). The MAC keeps a
+  writer of the store from adding an entry.
+- **Can a hostile inviter use the mirror to make Bob serve more than the
+  folder?** The grant is for her own key and the folder, kept only for a
+  folder under her own namespace; the link carries the folder's names (live,
+  from Bob's record), the public names of the namespaces and her own devices'
+  names; her pushes pass only under her own devices unless the record lists
+  her namespace as a writer. A hostile inviter who also signs a record that
+  lists other writers makes Bob carry their public names and roots toward her:
+  names, heads and digests that those writers make public, nothing of Bob's
+  own collections outside the folder. In an **unsealed** folder every device
+  counts as a reader, so a reader-role mirror stands while a record is held and
+  the folder is unsealed; it ends with the host (`end_grant`) or when the folder
+  is sealed and the record leaves the device out.
+- **The mirror note.** MAC'd under a key derived from the recipient secret (in
+  the key store, not the data store), with labels of its own; a store-writer who
+  changes it makes it unread and the device admits no one on its account (join
+  again with a new offer); rolling back to an older genuine copy cannot widen,
+  because the entry exists only while the record in force lists this device.
 
 No wire TLV is added by this section: grants and marks are local notes and host
 calls, and the registry (README) is unchanged.
@@ -6707,6 +6838,19 @@ of the host's**, not a data-layer record.
    `persist_addresses` option (off: it is not written, and one written
    before is removed). The link memory's record notes carry the peer's
    last-known port too (record version 2; version 1 notes are still read).
+9. **Round 9: what a host keeps, and does not.** The mirror note (rule 17 of
+   §19.8) is the device's own and lives under `/localhost/ndn-data/intro/mirror/`,
+   not in a host's `local_notes` area: a host cannot write it. A host keeps no
+   FIB entry for the folders its device joined: `LinkHints::serve(&device)`
+   follows `Device::joined_changes()` and the link layer routes the other
+   writers' namespaces over the link of the inviter (ndn-link §8.7 rule 18);
+   a host whose link key is not its device key maps `JoinedFolder::inviter` to
+   its link key itself and calls `Links::set_joined_routes` and `Links::grant`.
+   The link memory brings a peer's record **up to date** from a link the
+   identified peer opened to this device, with the port the record holds (the
+   source port of an accepted link stays unrecorded), under the same
+   `persist_addresses` option and bounds (ndn-link §17C rule 7): a host does
+   nothing for it.
 
 No wire TLV is added by this section; the registry (README) is unchanged.
 
