@@ -3140,13 +3140,25 @@ mod tests {
 
         async fn bob(
             anchor_until: u64,
+            leaf: (u64, u64),
+            cache_leaf: bool,
+            edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
+        ) -> Bob {
+            bob_of(PHONE, anchor_until, leaf, cache_leaf, edit).await
+        }
+
+        /// [`bob`] with the key of the device `phone_key` (a key name) instead of
+        /// the member phone's.
+        async fn bob_of(
+            phone_key: &str,
+            anchor_until: u64,
             (leaf_from, leaf_until): (u64, u64),
             cache_leaf: bool,
             edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
         ) -> Bob {
             let root = signer("/home/bob/KEY/root", 70);
             let ca = signer(CA, 71);
-            let phone = signer(PHONE, 72);
+            let phone = signer(phone_key, 72);
             let anchor = decoded(&cert(&root, &root, "self", PAST, anchor_until).await);
             let ca_cert = decoded(&cert(&ca, &root, "root", PAST, u64::MAX).await);
             let leaf = cert(&phone, &ca, "CA", leaf_from, leaf_until).await;
@@ -3592,6 +3604,55 @@ mod tests {
                 .validate_durable(&signed(log_name("notes", 4), b"v", &bob.phone))
                 .await;
             assert_eq!(revoked_key(&outside), Some(n(PHONE)), "{outside:?}");
+        }
+
+        /// Round-8 L4: a key with no role in its name (`/home/bob/laptop/KEY/..`, which the
+        /// namespace's role policy never issues) does not escape the lapsed rule in a namespace
+        /// that declares the role layout: its Data is refused as `Lapsed` once its certificate
+        /// lapsed, and accepted again after a cut that accepts it. A namespace that lists no
+        /// role has no role layout, and judges it as before.
+        #[tokio::test]
+        async fn a_lapsed_role_less_key_is_refused_until_its_cut_in_a_role_layout_namespace() {
+            const LAPTOP: &str = "/home/bob/laptop/KEY/k1";
+            let notes = n("/home/bob/laptop")
+                .append_component(NameComponent::keyword(Bytes::from_static(b"log")))
+                .append("notes");
+            let mut cut = RevocationCut::new(n(LAPTOP));
+            cut.add_run(&notes, 1, 3);
+
+            let bob = bob_of(LAPTOP, u64::MAX, (PAST, EXPIRED), true, |c| {
+                c.with_data_requires_cut("member")
+            })
+            .await;
+            let data = signed(notes.clone().append_sequence_num(2), b"v", &bob.phone);
+            let result = bob.validator.validate_durable(&data).await;
+            assert!(
+                matches!(
+                    result,
+                    ValidationResult::Invalid(TrustError::Lapsed { not_after, .. })
+                        if not_after == EXPIRED / 1_000_000
+                ),
+                "a lapsed role-less key in a role-layout namespace: {result:?}"
+            );
+
+            let bob = bob_of(LAPTOP, u64::MAX, (PAST, EXPIRED), true, |c| {
+                c.with_data_requires_cut("member")
+                    .with_revocation(n(LAPTOP))
+                    .with_revocation_cut(cut)
+            })
+            .await;
+            let data = signed(notes.clone().append_sequence_num(2), b"v", &bob.phone);
+            assert!(
+                valid(&bob.validator.validate_durable(&data).await),
+                "after a cut that accepts it, the role-less key's Data in range"
+            );
+
+            let flat = bob_of(LAPTOP, u64::MAX, (PAST, EXPIRED), true, |c| c).await;
+            let data = signed(notes.clone().append_sequence_num(2), b"v", &flat.phone);
+            assert!(
+                valid(&flat.validator.validate_durable(&data).await),
+                "a namespace with no role layout judges a role-less key without clocks"
+            );
         }
 
         /// Bob with `DataRequiresCut member` and a phone whose only certificate

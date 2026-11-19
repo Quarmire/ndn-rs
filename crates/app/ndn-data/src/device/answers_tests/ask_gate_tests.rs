@@ -238,3 +238,31 @@ async fn a_relay_is_served_when_the_policy_names_its_role() {
         other => panic!("not NotServed: {}", describe(&other)),
     }
 }
+
+/// Round-8 L4: in a namespace whose context declares the role layout, a device named
+/// `/<ns>/<device>` has no role the policy could name, so it is not served as the person's own;
+/// a device with a role is, and a flat namespace (nothing listed) serves a role-less one as
+/// before (`a_relay_is_served_when_the_policy_names_its_role` and the other cases of this file).
+#[tokio::test]
+async fn a_role_less_device_is_not_served_in_a_namespace_that_declares_the_role_layout() {
+    let mut w = World::new().with_role_layout();
+    let (ev, calls, _) = counting(Duration::ZERO);
+    let laptop = alice_with_data(&mut w, knowing(vec![ev])).await;
+    let phone = w.start("/alice/phone", knowing(vec![])).await;
+    let member = w.start("/alice/member/phone", knowing(vec![])).await;
+    let ask = AnswerAsk::pure(newest(&laptop, &plan()).await, sum_v(1));
+    assert!(matches!(
+        told(&member, &laptop, &ask, None).await,
+        Told::Answer(_)
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    match told(&phone, &laptop, &ask, None).await {
+        Told::Refused(AskRefusal::NotServed) => {}
+        other => panic!("not NotServed: {}", describe(&other)),
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "nothing was evaluated for a device that is not served"
+    );
+}

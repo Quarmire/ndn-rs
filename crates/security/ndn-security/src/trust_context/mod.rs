@@ -1425,17 +1425,44 @@ impl SignedTrustContext {
         (identity.has_prefix(&self.namespace) && identity.len() >= ns + 2)
             .then(|| key.components()[ns].value.as_ref())
     }
+    /// Whether `key` (a key, certificate or device name) names a device of
+    /// this namespace **with no role**, `/<ns>/<device>`, in a namespace that
+    /// declares the role layout: its context lists a role in
+    /// [`data_requires_cut`](Self::data_requires_cut), which every namespace
+    /// `ndn-fwd init` makes does. There such a name is no device the CA issued
+    /// (its role policy issues `/<ns>/<role>/<device>` and nothing else): it
+    /// is a key the root signed by hand, and is judged as the strictest role
+    /// is — it is not served as one of the namespace's own devices
+    /// (ndn-data's `AnswerConfig::ask_roles` has no role to match) and the lapsed rule
+    /// applies to it ([`requires_cut_for`](Self::requires_cut_for)). A flat
+    /// namespace (nothing listed) has no role layout to hold names to, so
+    /// `false`. The namespace's own keys (`/<ns>/KEY/..`) and the CA's
+    /// (`/<ns>/CA/KEY/..`: `CA` is reserved, no device is so named) are no
+    /// device.
+    pub fn is_role_less_device(&self, key: &Name) -> bool {
+        if self.data_requires_cut.is_empty() {
+            return false;
+        }
+        let identity = key_identity(&crate::cert_name::key_name_of(key));
+        let ns = self.namespace.len();
+        identity.has_prefix(&self.namespace)
+            && identity.len() == ns + 1
+            && identity.components()[ns].value.as_ref() != b"CA"
+    }
     /// Whether Data signed by `key` (a key or certificate name) needs a cut
     /// once its certificate lapsed: its device role
     /// ([`role_of`](Self::role_of)) is listed in
-    /// [`data_requires_cut`](Self::data_requires_cut).
+    /// [`data_requires_cut`](Self::data_requires_cut), or it names a device
+    /// with no role in a namespace that declares the role layout
+    /// ([`is_role_less_device`](Self::is_role_less_device)): such a name has no
+    /// role to leave unlisted, so it is held to the rule too.
     pub fn requires_cut_for(&self, key: &Name) -> bool {
         !self.data_requires_cut.is_empty()
-            && self.role_of(key).is_some_and(|role| {
+            && (self.role_of(key).is_some_and(|role| {
                 self.data_requires_cut
                     .iter()
                     .any(|listed| listed.as_bytes() == role)
-            })
+            }) || self.is_role_less_device(key))
     }
     /// The source trust-bundle's SHA-256 implicit digest, if this context was
     /// projected from one (the F9 provenance hint).
@@ -3607,11 +3634,38 @@ mod tests {
         assert!(guest.requires_cut_for(&n("/home/bob/guest/ann/KEY/1")));
         assert!(guest.requires_cut_for(&n("/home/bob/guest/ann/KEY/1/CA/v=1")));
         assert!(!guest.requires_cut_for(&n("/home/bob/member/ann/KEY/1")));
-        assert!(
-            !guest.requires_cut_for(&n("/home/bob/guest/KEY/1")),
-            "no device"
-        );
+        assert!(!guest.requires_cut_for(&n("/home/bob/KEY/1")), "no device");
         assert!(!guest.requires_cut_for(&n("/home/alice/guest/ann/KEY/1")));
+    }
+
+    /// Round-8 L4: a namespace that declares the role layout (its context lists
+    /// a role in DataRequiresCut) has no device without a role. A key named
+    /// `/<ns>/<device>/KEY/..` is judged by the lapsed rule too, so it does not
+    /// escape "refused until ended for every role"; the namespace's own keys
+    /// (`/<ns>/KEY/..`, the CA's `/<ns>/CA/KEY/..`) are no device. A flat
+    /// namespace (nothing listed) judges every key as before.
+    #[test]
+    fn a_role_less_device_key_is_judged_by_the_lapsed_rule_in_a_role_layout_namespace() {
+        let layout =
+            SignedTrustContext::hierarchical(n("/home/bob")).with_data_requires_cut("member");
+        assert!(layout.requires_cut_for(&n("/home/bob/laptop/KEY/1")));
+        assert!(layout.requires_cut_for(&n("/home/bob/laptop/KEY/1/CA/v=1")));
+        assert!(layout.is_role_less_device(&n("/home/bob/laptop")));
+        assert!(layout.is_role_less_device(&n("/home/bob/laptop/KEY/1")));
+        // A role not listed is still judged by its role alone.
+        assert!(!layout.requires_cut_for(&n("/home/bob/guest/ann/KEY/1")));
+        assert!(!layout.is_role_less_device(&n("/home/bob/guest/ann")));
+        // The namespace's own keys and the CA's are no device.
+        for own in ["/home/bob/KEY/root", "/home/bob/CA/KEY/ca"] {
+            assert!(!layout.requires_cut_for(&n(own)), "{own}");
+            assert!(!layout.is_role_less_device(&n(own)), "{own}");
+        }
+        // Another namespace's keys are no device of this one.
+        assert!(!layout.requires_cut_for(&n("/home/alice/laptop/KEY/1")));
+        // Flat layout: nothing listed, nothing judged.
+        let flat = SignedTrustContext::hierarchical(n("/home/bob"));
+        assert!(!flat.requires_cut_for(&n("/home/bob/laptop/KEY/1")));
+        assert!(!flat.is_role_less_device(&n("/home/bob/laptop")));
     }
 
     /// `covers`: a later cut that only adds accepts everything the earlier

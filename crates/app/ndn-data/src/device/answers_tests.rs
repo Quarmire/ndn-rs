@@ -130,6 +130,19 @@ impl World {
         }
     }
 
+    /// Every person's context declares the role layout, as one `ndn-fwd init` made does (it
+    /// lists a role in DataRequiresCut): a device with no role in its name is no device of it.
+    fn with_role_layout(mut self) -> World {
+        for p in &mut self.people {
+            let ctx = SignedTrustContext::hierarchical(p.ns.clone())
+                .with_version(1)
+                .with_data_requires_cut("member");
+            assert!(ctx.add_anchor(p.anchor.clone()));
+            p.ctx = Arc::new(ctx);
+        }
+        self
+    }
+
     async fn start(&mut self, device: &str, tune: impl FnOnce(Config) -> Config) -> Device {
         self.start_on(device, Arc::new(MemoryStore::new()), tune)
             .await

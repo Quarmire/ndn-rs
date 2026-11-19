@@ -1409,8 +1409,10 @@ pub struct AnswerConfig {
     /// that are served: the role is the name component after the namespace
     /// (`/<ns>/<role>/<device>`), and a device of another role (a guest's short-lived key; a
     /// node, which is a relay) is refused [`AskRefusal::NotServed`]. Add `node` to serve a relay
-    /// of the person's. A device whose name carries no role (a namespace that does not use the
-    /// role layout) has none to refuse and is served. Default `admin` and `member`.
+    /// of the person's. A device whose name carries no role is served only where the namespace
+    /// does not use the role layout (its trust context lists no role in `DataRequiresCut`, so
+    /// there is no role to refuse); in a namespace that does, a role-less name is no device its
+    /// CA issued and is refused [`AskRefusal::NotServed`] too. Default `admin` and `member`.
     pub ask_roles: Vec<String>,
 }
 

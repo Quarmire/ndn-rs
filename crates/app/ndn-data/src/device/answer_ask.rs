@@ -322,11 +322,15 @@ impl Inner {
     }
 
     /// Whether the role of `asker`, a device of this device's namespace, is one
-    /// [`crate::AnswerConfig::ask_roles`] serves. A name that carries no role has none to refuse.
+    /// [`crate::AnswerConfig::ask_roles`] serves. A name that carries no role is served only in a
+    /// namespace that does not declare the role layout (its context lists no role in
+    /// DataRequiresCut: a flat namespace has no role to refuse); where it does, a name with no
+    /// role is no device the namespace's CA issued, so it is not served as one of the person's
+    /// own ([`SignedTrustContext::is_role_less_device`](ndn_security::SignedTrustContext::is_role_less_device)).
     fn role_served(&self, asker: &Name) -> bool {
         let context = self.validator.keyring().context_for(asker);
         match context.role_of(asker) {
-            None => true,
+            None => !context.is_role_less_device(asker),
             Some(role) => self
                 .config
                 .answers

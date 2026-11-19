@@ -723,12 +723,29 @@ value = 1*OCTET      ; UTF-8, a role name
 Repeatable, one role per entry. A device key's **role** is the component
 right after the namespace of the selected context (§6.1) in its name,
 `/<ns>/<role>/<dev>/KEY/<k>`, for a key whose identity has at least two
-components after the namespace. Any other key — the root or a recovery
-key, `/<ns>/KEY/<k>`, or `/<ns>/<x>/KEY/<k>` — has no role, and no entry
-applies to it.
+components after the namespace. The keys of the namespace itself — the root
+or a recovery key, `/<ns>/KEY/<k>`, and the CA's, `/<ns>/CA/KEY/<k>` (`CA`
+is reserved: no device is so named) — have no role, and no entry applies to
+them.
 
-For a key whose role the context lists, Data the key signs is accepted
-under the durable rule (§6.3) only:
+A key whose identity has **exactly one** component after the namespace,
+`/<ns>/<dev>/KEY/<k>`, is a **device with no role**. What is done with it
+depends on whether the namespace declares the role layout, and the context
+says so by listing at least one role: where it does, the namespace's CA issues
+only `/<ns>/<role>/<dev>` (ndn-cert's role policy), so a role-less device key
+is one the root signed by hand, and it is held to the rule **as the strictest
+role is**: the Data it signs is accepted only on the conditions below, as if
+its role were listed, so a key outside the roles cannot escape the lapsed
+rule. Where the context lists no role (a flat namespace, or one that
+predates the rule), there is no layout to hold a name to, and no entry applies
+to the key (ndn-rs: `SignedTrustContext::is_role_less_device`,
+`requires_cut_for`). A device with no role is likewise not served as one of
+the person's own by an ask for an answer in a namespace that declares the
+role layout (answers.md §15.7).
+
+For a key whose role the context lists, or that is a device with no role in a
+namespace that lists any, Data the key signs is accepted under the durable rule
+(§6.3) only:
 
 1. while some certificate of the key that the node holds, with the same
    public key as the certificate that verifies the Data, is inside its
