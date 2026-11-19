@@ -471,7 +471,9 @@ A relay the namespace advertises: every device that holds the context
 learns it without local configuration. Repeatable, one entry per relay.
 
 - **Name** (a complete `0x07` TLV): the relay's device name, normally
-  `/<ns>/node/<device>`.
+  `/<ns>/node/<device>` (a device is named `/<namespace>/<role>/<device>`: one
+  component for the role, here `node`, one for the device; its certificate
+  `/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`, ndn-link.md §7.1).
 - **RelayKey** (`0x0422`, 32 octets): the relay's expected fingerprint, the
   SHA-256 of its public key as its certificate carries it. REQUIRED when the
   device is not under the namespace (a community or hosted relay), which a

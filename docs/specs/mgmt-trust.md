@@ -535,6 +535,8 @@ A punch refused for an admission reason carries that refusal's detail
 | `down-dialling` | — | — | — | — | dialling |
 | `dial-failed` | — | — | — | `retry_secs`; cause (`link-*`) | the last dial failed; dialled again after `retry_secs` |
 | `peer-shutting-down` | — | — | — | — | the other device closed the link: it is shutting down |
+| `offline` | — | — | — | — | this device is offline (`Links::set_online(false)`): it made no link and no attempt, and links again when it is back online (a watcher is told `Next::WhenOnline`) |
+| `no-path` | — | — | — | `device` | every address kept for the remembered device failed, and no relay both devices use is linked; the device reaches this one when it dials this device's current address, or when both link to a relay (a watcher is told `Next::WaitingForAddress`) |
 | `link-no-key` | — | — | — | `error` | this device has no usable link key |
 | `link-tls` | — | — | — | `error` | the TLS handshake failed |
 | `link-connect` | — | — | — | `error` | the connection could not be made |
@@ -571,8 +573,9 @@ A punch refused for an admission reason carries that refusal's detail
 | `not-served-uncertified` | — | — | — | `device`, `namespace`, `own`?, `listed`?, `roots`? | the relay holds the namespace's trust context but no certificate in it, and does not serve it |
 | `not-served-unlisted` | — | — | — | `listed`, `device`, `namespace`, `root`, `own`? | the namespace's root is not listed by this relay |
 | `not-served-own` | — | — | — | `device`, `namespace`, `root`, `own`? | this relay serves its own namespaces only |
-| `grant-ended` | — | — | — | `key`, `namespaces`, `until`, `ended` (`expired`, `revoked`, `replaced`) | the grant of a link to this key (ndn-link §8.7) ended: the close sentence of a link it admitted, and a cause appended to the refusal of the key's next link; the inviter invites the person again |
+| `grant-ended` | — | — | — | `key`, `namespaces`, `folder`, `until`, `ended` (`expired`, `revoked`, `replaced`) | the last grant entry of a link to this key (ndn-link §8.7) ended — `folder` and `until` are those of the entry that ended last: the close sentence of a link it admitted, and a cause appended to the refusal of the key's next link; the inviter invites the person again |
 | `grant-unmatched` | — | — | — | `key`, `namespaces`, `shown` | (appended to a not-served refusal) the key is granted a link as a person of `namespaces`, and the certificates it showed are of `shown`, none of them listed |
+| `let-go` | — | — | — | `folder`, `record` | a members record of `folder` leaves this device's person out (ndn-link §8.8): the close sentence of the departure link — the inviter carried the record `record` to the person and closed the link — and the cause of `LinkState::Down` on both sides; the person asks whoever invited them to invite them again |
 | `enrollment-links-full` | — | — | — | `links`, `from_source`, `max`, `max_per_source` | the relay's enrollment links are full; the device dials again by itself |
 | `enrollment-possible` | — | — | — | `namespaces` | (appended to a not-served refusal) a device enrolls in these namespaces over this relay while its hello holds no certificate of another namespace |
 | `path-not-taken` | — | — | — | `session` | the other device did not take the dialled direct path as one |
@@ -587,14 +590,14 @@ A punch refused for an admission reason carries that refusal's detail
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
 | `no-certificate` | — | — | — | — | the hello carries no certificate |
-| `not-device-certificate` | — | — | — | `certificate`, `namespace` | not a device certificate of the namespace |
+| `not-device-certificate` | — | — | — | `certificate`, `namespace`, `expected` | not a device certificate of the namespace: its name is not `<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>` (the role one component naming what the device does there, such as `member`). `certificate` is the name as received (control and invisible characters removed, at most 200 characters, `…` at the cut); `expected` is the shape under the namespace (`/home/<role>/<device>`). The sentence says the shape, the name received, and what to do: issue the device's certificate under that shape (ndn-link §7.1) |
 | `certificate-expired` | — | — | — | `certificate` | outside its validity period: the device renews it (host term) |
 | `certificate-unauthenticated` | — | — | — | `certificate`, `namespace` | not signed by a key of the namespace |
 | `certificate-invalid` | — | — | — | `certificate`, `namespace`, `version`, `error` | does not validate in the held trust context |
 | `certificate-chain-unknown` | — | — | — | `certificate` | its issuer chain was not sent and is not known here |
 | `foreign-no-root` | — | — | — | `certificate` | of a namespace not held, and the hello carries no root to check it against |
 | `foreign-root-no-namespace` | — | — | — | `root` | the root certificate names no namespace |
-| `foreign-not-device-certificate` | — | — | — | `certificate`, `namespace`, `root` | not a device certificate of its root's namespace |
+| `foreign-not-device-certificate` | — | — | — | `certificate`, `namespace`, `root`, `expected` | not a device certificate of its root's namespace: the same refusal, with the root certificate named (`root`, cleaned and shortened as `certificate` is); `expected` is the shape under that root's namespace |
 | `foreign-root-invalid-namespace` | — | — | — | `root` | the root names no valid namespace |
 | `foreign-root-expired` | — | — | — | `root` | the root certificate is outside its validity period |
 | `foreign-certificate-invalid` | — | — | — | `certificate`, `root`, `error` | does not validate against its root |

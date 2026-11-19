@@ -326,8 +326,8 @@ same as ndf-rs's `record::personal_root` gives for that key.
   with `[security] identity` or `ndn-fwd node-identity <identity>` (the PIB
   default; applies at the next start).
 - Membership (**have**): per held namespace the device is *following*
-  (adopted, verify only), *member* (a valid, unrevoked device certificate;
-  with its role) or *owner* (holds the root key). `security/memberships`
+  (adopted, verify only), *member* (a valid, unrevoked device certificate,
+  named `/<namespace>/<role>/<device>/KEY/…`; with its role) or *owner* (holds the root key). `security/memberships`
   answers a JSON list of `{namespace, version, relation, role, identity,
   key, valid_until, node_identity, root_fingerprint}`; each change (adopted,
   enrolled, renewed, revoked, root-changed) is a `membership-changed` event
@@ -701,13 +701,21 @@ Consequences:
 
 - **Identified by keys.** Each end of a QUIC link presents its NDN device
   key in the TLS handshake (raw public keys); no addresses, host names or
-  certificate files identify a device. Config names a peer by device name
-  (`[[peer]] device`) or by its key's fingerprint (`[[peer]] key`).
+  certificate files identify a device. A device is named
+  `/<namespace>/<role>/<device>` (one component for the role, such as
+  `member`, one for the device) and its certificate
+  `/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`; any other
+  shape identifies no device ([ndn-link.md](ndn-link.md) §7.1). Config names a
+  peer by device name (`[[peer]] device`) or by its key's fingerprint
+  (`[[peer]] key`).
 - **Admitted from held trust contexts or expected fingerprints.** A link is
-  admitted when the peer's device certificate validates in a namespace this
-  device holds (not revoked, within validity, its role allowed), or when its
-  key is one a `[[peer]] key` expects — for another namespace or before
-  enrollment. Otherwise it is closed with a reason saying what to do.
+  admitted when the peer's device certificate (of that shape) validates in a
+  namespace this device holds (not revoked, within validity, its role
+  allowed), or when its key is one a `[[peer]] key` expects — for another
+  namespace or before enrollment. Otherwise it is closed with a reason
+  saying what to do; for a certificate of another shape, the reason says the
+  shape expected, the name received and that the device's certificate is to
+  be issued under that shape.
 - **Link policy lives in the trust context** (`LINK_POLICY`): which roles
   may link, which may relay, whether a relay admits an unknown device on
   an enrollment link that carries only its enrollment (CA endpoints, trust
