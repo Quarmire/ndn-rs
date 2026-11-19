@@ -814,13 +814,11 @@ impl Inner {
         if m.epoch.is_some() && !self.admits_record(st, m, &self.device, &self.ns) {
             return None;
         }
-        Some(
-            if m.writers.iter().any(|p| self.writer.key().has_prefix(p)) {
-                Role::Writer
-            } else {
-                Role::Reader
-            },
-        )
+        Some(if m.lists_writer(self.writer.key()) {
+            Role::Writer
+        } else {
+            Role::Reader
+        })
     }
 
     /// What the record in force for `note`'s folder makes of the note and of
@@ -1348,7 +1346,8 @@ impl Device {
     /// the folder and its owner, this device's role in the record in force and
     /// the other writers' namespaces (this device's own namespace and every
     /// namespace above or below it left out, at most
-    /// [`JOINED_WRITERS_MAX`]). Sorted by folder, then inviter.
+    /// [`JOINED_WRITERS_MAX`]). Sorted by folder, then inviter (the order of
+    /// `Name` and of the key's octets).
     ///
     /// Derived on every call from signed durable data and the device's MAC'd
     /// mirror notes: nothing is cached, so a record that adds a writer or ends
@@ -1578,6 +1577,80 @@ mod tests {
         assert_eq!(
             GrantNote::decode(&Bytes::from(cleared), &KEY),
             Err(Unread::Check)
+        );
+    }
+
+    fn mirror(role: Role, ended: bool) -> MirrorNote {
+        MirrorNote {
+            key: [5; 32],
+            owner: n("/alice"),
+            folder: n("/alice/32=data/notebook"),
+            role,
+            ended,
+        }
+    }
+
+    #[test]
+    fn a_mirror_note_reads_back_as_written() {
+        for role in [Role::Reader, Role::Writer] {
+            for ended in [false, true] {
+                let note = mirror(role, ended);
+                assert_eq!(
+                    MirrorNote::decode(&note.encode(&KEY), &KEY),
+                    Ok(note),
+                    "a {role:?} mirror note (ended: {ended}) did not read back"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mirror_note_changed_or_under_another_key_does_not_read() {
+        let bytes = mirror(Role::Reader, false).encode(&KEY);
+        // The flags, the role, the key and a name each changed after the MAC.
+        for at in [1, 2, 3, MIRROR_HEAD + 5, bytes.len() - MAC_LEN - 3] {
+            let mut b = bytes.to_vec();
+            b[at] ^= 1;
+            assert_eq!(
+                MirrorNote::decode(&Bytes::from(b), &KEY),
+                Err(Unread::Check),
+                "a change at {at} passed"
+            );
+        }
+        assert_eq!(MirrorNote::decode(&bytes, &[8; 32]), Err(Unread::Check));
+    }
+
+    #[test]
+    fn an_inviters_note_does_not_read_as_a_mirror_nor_the_reverse() {
+        let granted = note(false, None).encode(&KEY);
+        let mirrored = mirror(Role::Writer, false).encode(&KEY);
+        assert_eq!(MirrorNote::decode(&granted, &KEY), Err(Unread::Form));
+        assert_eq!(GrantNote::decode(&mirrored, &KEY), Err(Unread::Form));
+
+        // Whatever the version octet says, the MAC is of its own kind: a mirror
+        // note's body sealed as an inviter's note does not check as a mirror, nor
+        // an inviter's body sealed as a mirror's as an inviter's.
+        let mut body = mirrored[..mirrored.len() - MAC_LEN].to_vec();
+        let as_grant = {
+            let check = mac_of(&KEY, &body).finalize().into_bytes();
+            body.extend_from_slice(&check);
+            Bytes::from(body)
+        };
+        assert_eq!(
+            MirrorNote::decode(&as_grant, &KEY),
+            Err(Unread::Check),
+            "a mirror body under the inviter note's MAC read as a mirror"
+        );
+        let mut body = granted[..granted.len() - MAC_LEN].to_vec();
+        let as_mirror = {
+            let check = mirror_mac_of(&KEY, &body).finalize().into_bytes();
+            body.extend_from_slice(&check);
+            Bytes::from(body)
+        };
+        assert_eq!(
+            GrantNote::decode(&as_mirror, &KEY),
+            Err(Unread::Check),
+            "an inviter's body under the mirror note's MAC read as an inviter's note"
         );
     }
 }

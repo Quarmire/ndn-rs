@@ -1,6 +1,8 @@
 //! The device's side of introductions (spec §19): offers and use marks in
-//! the log, the asks it answers, and the joins it makes. Types, bytes and
-//! proofs are [`crate::intro`]'s.
+//! the log, the asks it answers, and the joins it makes (a join ends by keeping
+//! the joiner's end of the grant, the mirror note of `grants.rs`, and by
+//! telling the host and the joined-folder watchers). Types, bytes and proofs are
+//! [`crate::intro`]'s.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};

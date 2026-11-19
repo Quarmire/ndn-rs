@@ -167,7 +167,8 @@ pub struct JoinedFolder {
     /// derives them, minus this device's own namespace and every namespace
     /// above or below it (a hostile inviter's record cannot make this device
     /// route its own names, or a broad parent of them, toward the inviter);
-    /// only namespaces; sorted; at most [`JOINED_WRITERS_MAX`].
+    /// only namespaces; sorted (the order of `Name`, the canonical one); at
+    /// most [`JOINED_WRITERS_MAX`], the first of them.
     pub writers: Vec<Name>,
 }
 

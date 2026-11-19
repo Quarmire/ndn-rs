@@ -3208,3 +3208,7 @@ async fn a_writer_below_a_namespace_unlocks_only_its_own_namespace_not_the_broad
         );
     }
 }
+
+// ---- round 9: the mirror grant, the joiner's end of a grant (spec §19.8) -----------------------
+
+mod mirror_tests;
