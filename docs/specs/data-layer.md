@@ -5485,11 +5485,19 @@ no end), i16 (round 6, §19.8: a held members record signed by another
 device of the inviter's person that leaves a granted person out ends that
 grant, once, and the other person's stays; after a restart of the inviter
 `Device::grants` lists the same grants less the ended, and the host is told
-nothing again) and i17 (round 6, §19.8 rule 6: a held record signed by
+nothing again), i17 (round 6, §19.8 rule 6: a held record signed by
 another device that demotes a granted writer to a reader changes the grant:
 `Device::grants` lists it as a reader's, the host is told it again, once,
 with the reader's role and never that it ended, and after a restart the
-grant is the reader's and the host is told nothing again). Their feature is
+grant is the reader's and the host is told nothing again), i18 (round 7,
+rule 13: two offers to one person are two grants, and a record that leaves
+them out of one folder ends that folder's grant alone), i19 (rules 14 and
+15: a person let go while offline takes the record that let them go, and
+their device then lists them no more and takes no more writing), i20 (rule
+16: two writers invited apart read each other's pages through the inviter)
+and i21 (round 7 fix, rule 16: a member let go and invited again joins the
+sealed folder — the walk descends into the folder's node while the new
+admission is pending — and writes and is read again). Their feature is
 `Introduction`; their provider surface is
 `Provider::link_grants` and `Provider::link_key`, and a plan may give a
 device a policy of no grants (`Plan::no_link_grants`).
@@ -6274,7 +6282,7 @@ Device::end_grant_in(&self, key: &[u8; 32], folder: &Name)
     -> Result<bool, DataError>                                                // async
 Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
     -> Result<Option<Grant>, DataError>                                       // async
-Device::take_departure(&self, folder: &Name, record: &Name)
+Device::take_departure(&self, from: &Name, folder: &Name, record: &Name)
     -> Result<(), DataError>                                                  // async
 IntroductionSurface::grant_carries(&self, folder: &Name, name: &Name) -> bool
 ndn_data::{folder_carries, writer_carries, departure_carries}
@@ -6438,14 +6446,22 @@ ndn_data::{folder_carries, writer_carries, departure_carries}
     `<signer device>/32=log/<folder>/seq=<n>` — and the date after which the
     mark is no longer shown (`until`, by this device's clock, the end's time
     plus `departure_for`). The record is chosen so that the choice depends
-    only on the records held: among the records of the **highest revision**
-    held, the one — lowest signer key first — whose own writers and readers
-    leave the person's namespace out; when none does (the merge removed the
+    only on the records held, and is **the record that first left the person
+    out of the run that stands**: reading the revisions held from the highest
+    down, while a revision holds a record whose own writers and readers leave
+    the person's namespace out (lowest signer key first), that record is the
+    candidate; the run ends at the first revision below whose records all list
+    the namespace — where the person was last a member — and the lowest
+    revision of the run is the record. A later record of the run that leaves
+    them out too may list others admitted since (a membership the person must
+    not be handed), and a record that readmits them ends the run and is never
+    named (let go again by a later record, the person is let go by that one).
+    When no record leaves the person out by its own lists (the merge removed the
     person through a cut: one record removed the writer, another the reader),
-    the highest-revision record, lowest signer first, that carries a cut of a
-    prefix of the namespace; when no held record does either, **no mark is
-    made** and the link layer just closes (a fallback that is never an open
-    link). A mark is made **only when a held record ends the grant**:
+    the same over the records that carry a cut of a prefix of the namespace,
+    from the highest revision that has one; when no held record does either,
+    **no mark is made** and the link layer just closes (a fallback that is
+    never an open link). A mark is made **only when a held record ends the grant**:
     `Device::end_grant` and `end_grant_in` (the host's end, which no record
     lets the person go by) make none, and a host that wants none for any end
     sets `departure_for` to `Duration::ZERO`. The note's version is **3** (rule
@@ -6465,21 +6481,28 @@ ndn_data::{folder_carries, writer_carries, departure_carries}
     pieces `<record>/seg=<i>` and `<record>/32=manifest/seg=<k>`, its cut
     manifests `<record>/32=cut/seg=<i>`, nothing else) is what a link layer's
     departure link filters by (ndn-link.md §8.8).
-15. **The departed person's side** (round 7). `Device::take_departure(folder,
-    record)` is what the person's host calls when its link layer was told, by
-    the inviter's, which record let it go (`Departure`, ndn-link.md §8.8). It
+15. **The departed person's side** (round 7). `Device::take_departure(from,
+    folder, record)` is what the person's host calls when its link layer was
+    told, by the inviter's, which record let it go (`Departure`, ndn-link.md
+    §8.8). `from` is the **authenticated device of the peer that told it**
+    (the link layer's: a full link, whose peer's certificate validated in a
+    namespace this device holds; never an enrollment or introduction link). It
     fetches `record` by name, from the link it came over or from the devices of
     its namespace, and takes it **as any held record**: the signature and chain
     are validated, the record is merged and judged as ever, so this device's
     own folder then no longer lists it, it withdraws what it wrote after the
     cut and takes no more writing there. **The name carries no authority**; the
     call MUST refuse (`DataError::BadRequest`, saying why and what to do)
-    unless (a) `folder` is a folder name, (b) `record` is a log entry whose
-    subject is `folder`, (c) this device holds a members record line of
-    `folder` (it is, or was, a member), (d) the record's device lies under a
-    namespace this device holds a trust context of, and (e) what is fetched is
-    a members record of `folder`'s line. A record already held is `Ok` at
-    once. At most **one take of a folder is in flight** and at most **six begin
+    unless (a) `folder` is a folder name, (a2) `from` lies under the
+    namespace of `folder` (`<namespace>/32=data[/<path>]`: only a device of the
+    folder's own namespace lets a member go of it; checked first, so a refusal
+    costs the fetch slot and the minute's bound nothing), (b) `record` is a log
+    entry whose subject is `folder`, (c) this device holds a members record
+    line of `folder` (it is, or was, a member), (d) the record's device lies
+    under a namespace this device holds a trust context of, and (e) what is
+    fetched is a members record of `folder`'s line. A record already held is
+    `Ok` at once (for a `from` that passed (a2)). At most **one take of a folder
+    is in flight** and at most **six begin
     a minute** (the device's clock; a bound on a hostile inviter's stream of
     hints, not a correctness rule): the call is `DataError::NotReady` — ask
     again — for either, and when the record could not be fetched. Correctness
@@ -6488,43 +6511,77 @@ ndn_data::{folder_carries, writer_carries, departure_carries}
 16. **Co-writers** (round 7). `IntroductionSurface::grant_carries(folder, name)`
     is what a link layer asks, per packet, for a grant link:
     `folder_carries(folder, name)` or `writer_carries(folder,
-    writers_in_force(folder), name)`, the writers read **live, on every call**,
+    writer_namespaces(folder), name)`, the writers read **live, on every call**,
     from the members record in force for `folder` (no cache), so a writer the
     record no longer lists drops out at the next call and one it lists appears
-    at the next. `writer_carries` adds only the **summary root**
-    (`<D>/32=summary/<W>/32=root`, with or without its head) of each listed
-    writer's namespace `W` — `W` is the namespace of a writer prefix `p` when
-    `p` is `W` or lies under it, the folder's own namespace excluded (it is
-    `folder_carries`'s) — so that a writer who was invited by an invitation of
+    at the next. The namespace `W` of a writer prefix `p` is **derived by the
+    device, once, for every use** (`IntroductionSurface::writer_namespaces`):
+    the namespace of the trust context governing `p` here (for a person's
+    self-certifying name, the person's namespace once adopted for a folder),
+    or `p` itself when no context is held; kept when `p` is `W` or lies under
+    it, the folder's own namespace excluded (it is `folder_carries`'s). The
+    data-layer functions take these namespaces, never the writers' names, and
+    match a name's namespace **whole**: a writer `/home/carol/member/x`, for
+    which no context is held, unlocks the root and the sync group of
+    `/home/carol/member/x` — never of the broader `/home` its name merely
+    starts with (round 7 review L6: the summary roots and sync groups were
+    matched by prefix of the writer's name, so they disagreed with the
+    namespaces whose trust context, sync group and certificate names the link
+    layer carries). `writer_carries` adds only the **summary root**
+    (`<D>/32=summary/<W>/32=root`, with or without its head) of each such
+    namespace `W`, so that a writer who was invited by an invitation of
     its own can walk to the other writers' devices through this device's copy.
     A walk asks a device that answers for a writer for that writer's root
     wrapped as a held packet (`<H>/32=held/<D>/32=summary/<W>/32=root`): such a
     name is carried when the root it wraps is, nested to the depth
     `folder_carries` unwraps held names to, and not deeper. The member also
     needs to hear the other writers' devices, which it learns from their
-    namespaces' sync groups, so `writer_sync(folder, writers, name)` adds
-    `<W>/32=sync[/…]` for each listed writer's namespace `W` (both ways; the
+    namespaces' sync groups, so `writer_sync(folder, namespaces, name)` adds
+    `<W>/32=sync[/…]` for each such namespace `W` (both ways; the
     folder's own namespace's group is the host's), derived from the record on
     every call like the roots. To validate what those writers wrote the member
     also needs their device certificates, so the link layer carries, for the
-    namespaces `IntroductionSurface::writer_namespaces(folder)` lists (the
-    namespace of each writer prefix of the record in force, read live; the
-    folder's own excluded), the namespace's **sync group, trust context and key
-    and certificate names** as it carries them for the grants' own namespaces
-    (ndn-link.md §8.7 rules 10 and 13): public by design, bounded to listed
-    writers, and out at the next packet when the record drops the writer. A
-    device that was **let go** of a sealed folder — the record in force for it
-    lists the device neither as a writer nor in the audience, **and** a held
-    record of that folder's line admits it (at some revision): it was a member
-    and a later record leaves it out — does not descend into that folder's
-    summary node when it walks the inviter's summary (it reads and writes
-    nothing new there, and a link layer that let it go no longer carries the
-    node), so the namespace's other folders are not held back as "not walked".
-    A **joiner not yet admitted** is never let go: the sealed record it holds
-    from before the offer admitted it lists it nowhere, no held record of the
-    line admits it, and the revision that does is still to be fetched from that
-    node, so its walk MUST descend. The rule reads signed, durable data held
-    here (the line's records), no flag and no clock.
+    same namespaces `writer_namespaces(folder)` lists, the namespace's **sync
+    group, trust context and key and certificate names** as it carries them
+    for the grants' own namespaces (ndn-link.md §8.7 rules 10 and 13): public
+    by design, bounded to listed writers, and out at the next packet when the
+    record drops the writer. A device that was **let go** of a sealed folder —
+    the record in force for it lists the device neither as a writer nor in the
+    audience, **and** a held record of that folder's line admits it (at some
+    revision): it was a member and a later record leaves it out — does not
+    descend into that folder's summary node when it walks the inviter's summary
+    (it reads and writes nothing new there, and a link layer that let it go no
+    longer carries the node), so the namespace's other folders are not held back
+    as "not walked". A **joiner not yet admitted** is never let go: the sealed
+    record it holds from before the offer admitted it lists it nowhere, no held
+    record of the line admits it, and the revision that does is still to be
+    fetched from that node, so its walk MUST descend. **A device invited again
+    is not let go either while the new admission is pending** (round 7 review
+    M1): it holds the record that once admitted it (r1) and the record that
+    left it out (r2, in force), so the rule above would skip the one node that
+    lists the record the new offer admits it by (r3), and its join would stay
+    `NotReady` for good. The join keeps a durable **joined note** per folder
+    (the offer's date, the revision the answer says admitted the device, the
+    role: for a writer *and* a reader); the admission is **pending** while the
+    note exists and the folder's record in force here is of a revision below the
+    one the answer named (none held counts as below), or, when the answer named
+    none, while the offer's own date has not passed. A record held at the named
+    revision or above settles it either way: it admits the device, or it is the
+    removal that undid the admission and the device is let go once more. The
+    note ends with the join (`join` returns once the record that admits the
+    device, the epoch's key and the walks are held). **A join waiting for its
+    record while the admission is pending also makes the walks of the folder's
+    namespace descend again, once, as the wait begins**: a walk that ended
+    before (a notice of the inviter's new entries heard while the answer was
+    still on its way) skipped the folder's node as one let go of and recorded
+    the inviter's root as taken in full, and the same root again is answered
+    with nothing walked; the record would never be fetched while the root stood.
+    The device forgets, for every device of the namespace, the root and the
+    nodes on the way to the folder, and a walk under way since before records
+    none as taken (not again at every round of the wait: that would keep a walk
+    from ever recording its progress). The rules read signed, durable data held
+    here (the line's records and the note), no flag and, where the answer named
+    a revision, no clock.
     Nothing of a writer outside the folder is added: the other writers'
     entries, pieces, heads, cut manifests and summary nodes of the folder are
     already carried because the *collection* is under the folder, whatever
@@ -6542,8 +6599,13 @@ Threat notes (round 7):
   signed data any reader of the folder can fetch.
 - **A hostile inviter cannot make a person fetch an arbitrary name:**
   `take_departure` accepts only a members record name of a folder the person is
-  a member of, under a namespace they hold, and validates what comes back (rule
-  15); the bounds on in-flight and per minute cap the cost.
+  a member of, under a namespace they hold, told by a device of the folder's
+  own namespace, and validates what comes back (rule 15); the bounds on
+  in-flight and per minute cap the cost. **A connected peer of another
+  namespace** (a stranger, another person, a device of the person's own
+  namespace) is refused before it can hold the folder's fetch slot or drain the
+  minute's bound: only a device of the folder's namespace lets a member go of
+  it.
 - **A mark is not a way back in.** It names one log entry and its pieces and cut
   (rule 14); it expires; it is looked up only for a key whose note's MAC
   passed. An edited store cannot add, clear or move a mark (rule 11).
