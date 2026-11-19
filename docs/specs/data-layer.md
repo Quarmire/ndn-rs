@@ -5715,7 +5715,9 @@ The **code** is a trust-envelope `intro` link
 ([trust-envelope.md](trust-envelope.md)): the inviter's namespace, its
 anchor fingerprint (SHA-256 of its root anchor's public key), the offer's
 name, the secret, the inviter's link hint (below), and as many relay hints
-— the relays the inviter's trust context advertises, by device name — as
+— the relays the inviter's trust context advertises, by device name
+(`/<namespace>/<role>/<device>`, §3; its certificate is
+`/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`) — as
 keep the link within one QR code; the secret, the offer and the
 fingerprint are never dropped. The same code as **words**: the offer's
 name, then 24 BIP39 English words encoding the secret followed by the
@@ -6229,7 +6231,7 @@ X25519-to-ChaCha20-Poly1305 wrap.
   for a retry or when the policy makes none, and no grant is made from an
   address or a name: only the asker's key that the exchange proved.
 
-### 19.8 Grants — round 6
+### 19.8 Grants — rounds 6 and 7
 
 An offer that admits a person can make the host's link layer link with that
 person, with no change of the host's serving policy: an inviter that keeps
@@ -6249,17 +6251,33 @@ pub struct Grant {
     pub role: Role,            // the role the record in force gives it NOW
     pub until: Option<Timestamp>, // the inviter's clock; None: no date
 }
+pub struct Departure {         // round 7: a person let go by a held record
+    pub key: [u8; 32],         // the person's device key (the grant's key)
+    pub namespaces: Vec<Name>,
+    pub folder: Name,
+    pub record: Name,          // <signer device>/32=log/<folder>/seq=<n>
+    pub until: Timestamp,      // this device's clock: not shown after it
+}
 trait Introducer {
-    fn grant(&self, grant: &Grant) {}          // default: nothing
-    fn revoke_grant(&self, key: &[u8; 32]) {}  // default: nothing
+    fn grant(&self, grant: &Grant) {}                      // default: nothing
+    fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {} // names the folder; default: nothing
+    fn departure(&self, departure: &Departure) {}          // just before revoke_grant; default: nothing
 }
 IntroPolicy { grant_for: Option<Duration>
     /* None (default): no date; Some(d): also ends d after the admission;
-       Some(ZERO): no grant is made */, .. }
-Device::grants(&self) -> Vec<Grant>
+       Some(ZERO): no grant is made */,
+    departure_for: Duration /* default 7 days; ZERO: no mark */, .. }
+Device::grants(&self) -> Vec<Grant>                       // one per live note
+Device::departures(&self) -> Vec<Departure>
 Device::end_grant(&self, key: &[u8; 32]) -> Result<bool, DataError>             // async
+Device::end_grant_in(&self, key: &[u8; 32], folder: &Name)
+    -> Result<bool, DataError>                                                // async
 Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
     -> Result<Option<Grant>, DataError>                                       // async
+Device::take_departure(&self, folder: &Name, record: &Name)
+    -> Result<(), DataError>                                                  // async
+IntroductionSurface::grant_carries(&self, folder: &Name, name: &Name) -> bool
+ndn_data::{folder_carries, writer_carries, departure_carries}
 ```
 
 1. **When it is made.** A device MUST make a grant when it answers an ask
@@ -6290,8 +6308,10 @@ Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
    calls `Introducer::grant` once, and only then sends the answer. A note is
    the device's own and never served or published. **No TLV-TYPE is
    registered or used for it:** its value is a fixed-width local form (a
-   version octet (2), flags (ended, dated), the role, `until`, the key
-   digest, three length-prefixed Names, then the 32-octet MAC), like the
+   version octet (3; a version 2 note, written before departure marks, is
+   still read as one with no mark), flags (ended, dated, marked), the role,
+   `until`, the key digest, three length-prefixed Names, on a marked note the
+   mark's date and its record Name (rule 14), then the 32-octet MAC), like the
    other notes under `/localhost/ndn-data/intro/`. A note this version does
    not read, or whose MAC does not check, is ignored, and the device logs
    which and why (a person whose note is ignored has no grant: offer the
@@ -6322,27 +6342,31 @@ Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
    is the same after a restart, less what ended. While no record of the
    folder is held no grant is in force. A host that links installs the grants
    at start and after each restart (the device does not call `grant` again
-   by itself for a grant whose role did not change).
+   by itself for a grant whose role did not change). One `Grant` is listed
+   for each live note (rule 13).
 7. **It ends** at its date, if it has one (the link layer judges it by its
    own clock; the device does not announce a lapse), when the host ends it
-   (rule 9), or when a members record held for the grant's folder leaves the
-   namespace out as both writer and reader. The device checks this on every
-   record it takes for a folder, and at start, whoever of the folder's owner
-   namespace signed it, not only the offering device. It MUST then call
-   `Introducer::revoke_grant` once with the key **first** — in memory, and
-   the safe direction, so that a slow or failing flush never delays the link
-   layer's end — and only then mark the note ended durably: a stop in
-   between leaves a note not yet ended, which the next start judges again
-   (the host revokes again, harmlessly), never a link that outlives its
-   removal for want of a flush. An ended grant never returns: a person
-   readmitted by a later record is no longer granted by the old offer (they
-   join again with a new code). A record that drops the person also closes
-   the offers that person used (§19.7).
-8. **The host's part.** `grant` and `revoke_grant` are called from the
-   device's tasks and MUST NOT block or call back into the device. A host
+   (rule 9), or when a members record held for **the grant's own folder**
+   leaves the namespace out as both writer and reader (each note is judged
+   against the record in force for its folder, so a person left out of one
+   folder keeps the grants of their other folders: rule 13). The device checks
+   this on every record it takes for a folder, and at start, whoever of the
+   folder's owner namespace signed it, not only the offering device. It MUST
+   then call, **in memory and first**, `Introducer::departure` (rule 14, when
+   a mark is made) and then `Introducer::revoke_grant` once with the key and
+   the folder — the safe direction, so that a slow or failing flush never
+   delays the link layer's end — and only then mark the note ended (with its
+   departure mark) durably: a stop in between leaves a note not yet ended,
+   which the next start judges again (the host revokes again, harmlessly),
+   never a link that outlives its removal for want of a flush. An ended grant
+   never returns: a person readmitted by a later record is no longer granted
+   by the old offer (they join again with a new code). A record that drops
+   the person also closes the offers that person used (§19.7).
+8. **The host's part.** `grant`, `revoke_grant` and `departure` are called from
+   the device's tasks and MUST NOT block or call back into the device. A host
    whose link key is not the key the device knows (the asker's *device* key)
    adopts the grant itself with the link key it knows. A host with no link
-   layer ignores both.
+   layer ignores all three.
 9. **The host ends a grant.** `Device::end_grant(key)` marks every grant
    note of that key not yet ended as ended, durably (behind the store
    barrier, before it returns), so a restart does not bring it back; it
@@ -6352,6 +6376,8 @@ Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
    removing them is a members record, which also ends the grant. A host that
    only calls the link layer's own revoke (`Links::revoke_grant`) has made an
    in-memory change that a restart undoes; ndn-link's `LinkHints` calls this.
+    `Device::end_grant_in(key, folder)` ends only the grants of that key of
+    one folder (the person's other folders' stand) and makes no mark.
 10. <a id="renew"></a>**The host renews a grant.** `Device::renew_grant(key,
     until)` sets the date of every grant of that key not ended **and** that a
     held members record still admits the person for — one past its old date
@@ -6384,12 +6410,156 @@ Device::renew_grant(&self, key: &[u8; 32], until: Option<Timestamp>)
     says (the record, not the note, is the judge, and the end is told again),
     and no note can name a person whose key no use mark names. What rollback
     can bring back is a grant the *host* ended while a record still admits
-    the person, or an older date: end it again.
+    the person, or an older date: end it again. A **departure mark** is inside
+    the MAC (rule 14): it can be neither added to a note the host ended, nor
+    cleared from one a record ended, nor moved (its date extended), without
+    the note failing its check and being ignored.
 12. **Faulty networks.** A lost answer is the joiner's retry (rule 4); a
-    grant is made once per admission, on a clean or a faulty network.
+    grant is made once per admission, on a clean or a faulty network; a
+    departure's record is fetched by name like any record, asked again under
+    loss (§17.1).
+13. **A set of grants per person** (round 7). Each admission makes a note of its
+    own, so two offers — of two folders, or of one — to the same key make two
+    grants of one key that differ in `folder`, and [`Device::grants`] lists
+    **one `Grant` per live note**, sorted by key, then folder. The device
+    judges **each note against the members record in force for that note's
+    folder** (rule 7): a record that leaves the person out of folder `F` ends
+    `F`'s grant and `F`'s note and no other, and `Introducer::revoke_grant(key,
+    F)` names `F`. A host's link layer MUST therefore keep, per key, a **set of
+    (folder, role) entries**: a grant adds the entry of its folder or replaces
+    the entry of the same folder, and never closes a link while another entry
+    of the key stands; a `revoke_grant(key, F)` ends the entry of `F` and
+    closes the key's links only when it was the last (ndn-link.md §8.7).
+14. **A person let go is told: the departure mark** (round 7). When a held
+    record ends a grant by leaving the person out (rule 7), and
+    `IntroPolicy::departure_for` is not zero (default seven days), the note
+    keeps a **departure mark**: the log entry name of a held members record of
+    the folder's line that leaves the person out —
+    `<signer device>/32=log/<folder>/seq=<n>` — and the date after which the
+    mark is no longer shown (`until`, by this device's clock, the end's time
+    plus `departure_for`). The record is chosen so that the choice depends
+    only on the records held: among the records of the **highest revision**
+    held, the one — lowest signer key first — whose own writers and readers
+    leave the person's namespace out; when none does (the merge removed the
+    person through a cut: one record removed the writer, another the reader),
+    the highest-revision record, lowest signer first, that carries a cut of a
+    prefix of the namespace; when no held record does either, **no mark is
+    made** and the link layer just closes (a fallback that is never an open
+    link). A mark is made **only when a held record ends the grant**:
+    `Device::end_grant` and `end_grant_in` (the host's end, which no record
+    lets the person go by) make none, and a host that wants none for any end
+    sets `departure_for` to `Duration::ZERO`. The note's version is **3** (rule
+    3): the mark is inside the MAC (rule 11). `Introducer::departure` is
+    called **once, just before `revoke_grant` of the same grant** (in memory,
+    before the note is durable, so a link layer that narrows its link at its
+    last entry's end already holds the mark), and never when no mark is made.
+    `Device::departures()` lists the marks **in force**: of ended notes whose
+    MAC checks and whose use mark bears them out, whose `until` has not passed
+    by the device's clock, and **not superseded** by a live grant of the same
+    key for the same folder (the person was invited again); sorted by key,
+    then folder. A host that links installs them at start
+    (`Introducer::departure` for each), as it installs the grants. Two notes
+    of one key keep a mark each. A mark's record is **named, never carried, by
+    the data layer**: `departure_carries(record, name)` (a pure function of two
+    names: the record's entry name with or without its implicit digest, its
+    pieces `<record>/seg=<i>` and `<record>/32=manifest/seg=<k>`, its cut
+    manifests `<record>/32=cut/seg=<i>`, nothing else) is what a link layer's
+    departure link filters by (ndn-link.md §8.8).
+15. **The departed person's side** (round 7). `Device::take_departure(folder,
+    record)` is what the person's host calls when its link layer was told, by
+    the inviter's, which record let it go (`Departure`, ndn-link.md §8.8). It
+    fetches `record` by name, from the link it came over or from the devices of
+    its namespace, and takes it **as any held record**: the signature and chain
+    are validated, the record is merged and judged as ever, so this device's
+    own folder then no longer lists it, it withdraws what it wrote after the
+    cut and takes no more writing there. **The name carries no authority**; the
+    call MUST refuse (`DataError::BadRequest`, saying why and what to do)
+    unless (a) `folder` is a folder name, (b) `record` is a log entry whose
+    subject is `folder`, (c) this device holds a members record line of
+    `folder` (it is, or was, a member), (d) the record's device lies under a
+    namespace this device holds a trust context of, and (e) what is fetched is
+    a members record of `folder`'s line. A record already held is `Ok` at
+    once. At most **one take of a folder is in flight** and at most **six begin
+    a minute** (the device's clock; a bound on a hostile inviter's stream of
+    hints, not a correctness rule): the call is `DataError::NotReady` — ask
+    again — for either, and when the record could not be fetched. Correctness
+    never depends on timing: the person's own folder keeps being judged by the
+    records it holds, whether it was told or not.
+16. **Co-writers** (round 7). `IntroductionSurface::grant_carries(folder, name)`
+    is what a link layer asks, per packet, for a grant link:
+    `folder_carries(folder, name)` or `writer_carries(folder,
+    writers_in_force(folder), name)`, the writers read **live, on every call**,
+    from the members record in force for `folder` (no cache), so a writer the
+    record no longer lists drops out at the next call and one it lists appears
+    at the next. `writer_carries` adds only the **summary root**
+    (`<D>/32=summary/<W>/32=root`, with or without its head) of each listed
+    writer's namespace `W` — `W` is the namespace of a writer prefix `p` when
+    `p` is `W` or lies under it, the folder's own namespace excluded (it is
+    `folder_carries`'s) — so that a writer who was invited by an invitation of
+    its own can walk to the other writers' devices through this device's copy.
+    A walk asks a device that answers for a writer for that writer's root
+    wrapped as a held packet (`<H>/32=held/<D>/32=summary/<W>/32=root`): such a
+    name is carried when the root it wraps is, nested to the depth
+    `folder_carries` unwraps held names to, and not deeper. The member also
+    needs to hear the other writers' devices, which it learns from their
+    namespaces' sync groups, so `writer_sync(folder, writers, name)` adds
+    `<W>/32=sync[/…]` for each listed writer's namespace `W` (both ways; the
+    folder's own namespace's group is the host's), derived from the record on
+    every call like the roots. To validate what those writers wrote the member
+    also needs their device certificates, so the link layer carries, for the
+    namespaces `IntroductionSurface::writer_namespaces(folder)` lists (the
+    namespace of each writer prefix of the record in force, read live; the
+    folder's own excluded), the namespace's **sync group, trust context and key
+    and certificate names** as it carries them for the grants' own namespaces
+    (ndn-link.md §8.7 rules 10 and 13): public by design, bounded to listed
+    writers, and out at the next packet when the record drops the writer. A
+    device that was **let go** of a sealed folder — the record in force for it
+    lists the device neither as a writer nor in the audience, **and** a held
+    record of that folder's line admits it (at some revision): it was a member
+    and a later record leaves it out — does not descend into that folder's
+    summary node when it walks the inviter's summary (it reads and writes
+    nothing new there, and a link layer that let it go no longer carries the
+    node), so the namespace's other folders are not held back as "not walked".
+    A **joiner not yet admitted** is never let go: the sealed record it holds
+    from before the offer admitted it lists it nowhere, no held record of the
+    line admits it, and the revision that does is still to be fetched from that
+    node, so its walk MUST descend. The rule reads signed, durable data held
+    here (the line's records), no flag and no clock.
+    Nothing of a writer outside the folder is added: the other writers'
+    entries, pieces, heads, cut manifests and summary nodes of the folder are
+    already carried because the *collection* is under the folder, whatever
+    device wrote them. A prefix only a cut keeps is not a writer. A reader-role
+    grant gains nothing by it: the link layer's push scope stays the person's
+    own devices'.
 
-No wire TLV is added by this section: grants are local notes and host calls,
-and the registry (README) is unchanged.
+Threat notes (round 7):
+
+- **The departure as an oracle.** The mark is a hint of which name to fetch and
+  is only ever shown to a key whose handshake proved the key, whose identity
+  validates in a held namespace, and whose grant note — MAC'd — holds a mark. A
+  key with no note has no mark and is told nothing; one whose mark is expired
+  or used up is refused as a key whose grant ended with none. The record is
+  signed data any reader of the folder can fetch.
+- **A hostile inviter cannot make a person fetch an arbitrary name:**
+  `take_departure` accepts only a members record name of a folder the person is
+  a member of, under a namespace they hold, and validates what comes back (rule
+  15); the bounds on in-flight and per minute cap the cost.
+- **A mark is not a way back in.** It names one log entry and its pieces and cut
+  (rule 14); it expires; it is looked up only for a key whose note's MAC
+  passed. An edited store cannot add, clear or move a mark (rule 11).
+- **Writers' names widening the grant** (rule 16): only roots of namespaces the
+  record in force lists as writers of this folder, derived per packet, no
+  cache; a removed writer is out at the next packet; a name outside the folder
+  stays refused. The disclosure is the names, heads and digests a root signs
+  for anyone who asks; Bob learns the collections of Carol's namespace beside
+  the folder (names and counts, never a payload), as the folder's namespace
+  root already does for Alice's. The sync group, trust context and key and
+  certificate names of a listed writer's namespace cross too; they are public by
+  design (a hello already carries the chain), carry no data and name no
+  collection, and are bounded the same way (ndn-link.md §13.5).
+
+No wire TLV is added by this section: grants and marks are local notes and host
+calls, and the registry (README) is unchanged.
 
 ### 19.9 Host notes — round 6
 
@@ -6450,6 +6620,15 @@ of the host's**, not a data-layer record.
    memory `MemoryOptions::persist_addresses = false` (ndn-link §17C.6), which
    writes the notes without them; it does not make the rest secret, and a
    host that needs a note encrypted encrypts it before `put`.
+8. **The listening port** (round 7). The link memory keeps one more note, in
+   its area `link-memory`, key `listen-port`: the port the host's link socket
+   listens on, 2 octets, big-endian (ndn-link §17C.4, §17D.2), so a restarted
+   host listens where its peers last found it. It is a note as any other:
+   within rules 1 and 2, never served, a hint (a port below 1024 or 0 is never
+   bound again), in the clear like the addresses and under the same
+   `persist_addresses` option (off: it is not written, and one written
+   before is removed). The link memory's record notes carry the peer's
+   last-known port too (record version 2; version 1 notes are still read).
 
 No wire TLV is added by this section; the registry (README) is unchanged.
 
