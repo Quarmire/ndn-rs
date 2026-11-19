@@ -6677,9 +6677,23 @@ pub struct JoinedFolder {
     namespaces** the record lists — `writer_namespaces_of` (rule 16) **minus**
     the owner's, this device's own namespace and every namespace **above or
     below** it (a hostile inviter's record cannot make the joiner route its own
-    names, or `/` or a broad parent of them, toward the inviter), only names
-    that are namespaces, at most `JOINED_WRITERS_MAX` (16) in the order of
-    `Name`, sorted by folder then inviter. It is **derived on every call** from
+    names, or `/` or a broad parent of them, toward the inviter), **and minus
+    every name that could take a name from a better route of this device's
+    own.** A writer prefix in a record is free-form and the inviter's word, and
+    a forwarder takes the longest matching prefix first, so a route at a name
+    beats every shorter route for the names under it, whatever its cost. A name
+    `W` is therefore listed only when `IntroPolicy::refuses(W)` says nothing
+    against it (not the root, not `/localhost` or `/localhop`, not a broad
+    shared name such as `/user` or `/com`, not fewer than `min_components`);
+    **and** it names itself: it is the namespace of a trust context held here
+    (`namespace_of_name(W) == W`) or a self-certifying person's namespace
+    (`personal_namespace_of(W) == Some(W)`), never a free-form prefix (a writer
+    `/dave/member` of a `/dave` this device reaches without holding its context
+    is not listed); **and** it lies neither above nor below any namespace held
+    here or adopted for a folder, except an exact match (the same prefix, where
+    cost decides). Only names that are namespaces, at most `JOINED_WRITERS_MAX`
+    (16) in the order of `Name`, sorted by folder then inviter. It is **derived
+    on every call** from
     the record in force and the MAC'd note, never cached, and carries no
     authority: the link layer routes by it (ndn-link §8.7 rule 18: the prefix
     `W` of each writer namespace over the link of exactly that inviter, and,
@@ -6736,14 +6750,25 @@ Threat notes (round 9):
 - **Can a writer of a folder make Bob route a name he should not?** A writer
   cannot change the record: only devices of the folder's own namespace sign its
   members records (§19.4), and the device derives `writers` from the record in
-  force, whose signatures it verified. The owner can list any writer prefix;
-  the device never lists the joiner's own namespace or anything above or below
-  it, only namespaces, at most 16 a folder; the link layer routes only over the
-  inviter's identified link, at a cost above every real path, at most 64
-  namespaces (ndn-link §13.5). A hostile inviter can make Bob send Interests for
-  a *foreign* namespace toward her, where Bob had no route: she can blackhole
-  them, or answer with data Bob validates by that namespace's own trust, which
-  nothing she answers can fake.
+  force, whose signatures it verified. But the owner can list any writer
+  prefix, and **a route is not safe because its cost is high**: longest-prefix
+  match decides before cost, and cost decides only among routes for the same
+  prefix. The first round-9 filter (drop only Bob's own namespace and what lies
+  above or below it) let a record list `/com`, `/user`, `/localhop`,
+  `/localhost` or an unheld `/dave/member`, and Bob's Interests for those names
+  would have gone to the inviter's face instead of to the routes Bob already
+  had. The device now lists a name only when it names itself (a held context's
+  namespace or a self-certifying person's), is not refused by
+  `IntroPolicy::refuses`, and is neither above nor below a namespace held here
+  or adopted for a folder (rule 18). That is what makes longest-prefix match
+  safe here: every listed name is one Bob holds trust for or is a person he can
+  verify by its own name, and none shadows a route he has for another name. The
+  link layer adds that it never routes `/localhost`, `/localhop` or the root,
+  and that each inviter has an equal share of the 16 folders and 64 namespaces
+  (ndn-link §8.7 rule 18, §13.5). A hostile inviter can still make Bob send
+  Interests for a namespace Bob holds (or a self-certifying person) and the
+  names under it toward her: she can blackhole them, or answer with data Bob
+  validates by that namespace's own trust, which nothing she answers can fake.
 - **Can the inviter's link, as Bob holds it, be used by a different key?** No:
   the mirror holds one key (the one that signed the verified answer); the link
   is admitted only when the handshake proves that key *and* an identity that

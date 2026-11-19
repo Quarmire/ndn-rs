@@ -245,6 +245,16 @@ impl Joiner {
         }
     }
 
+    /// Bob now holds the trust context of `ns` (a person of its own, rooted in
+    /// a key of its own): the namespace a record's writer prefix names.
+    fn hold(&self, ns: &str) {
+        self.bob
+            .inner
+            .validator
+            .adopt_context(Person::new(ns).ctx)
+            .unwrap();
+    }
+
     fn writers(&self) -> Vec<Name> {
         let joined = self.bob.joined_folders();
         assert_eq!(joined.len(), 1, "{joined:?}");
@@ -330,6 +340,9 @@ async fn a_join_keeps_the_mirror_grant_lists_it_and_tells_the_host_once() {
 async fn joined_folders_lists_the_other_writers_but_never_this_devices_own_names() {
     // Bob's namespace is /home/bob: /home lies above it, its phone below.
     let j = Joiner::joined("/home/bob").await;
+    // Only the namespaces held here are routed (round-9 M1).
+    j.hold("/dave");
+    j.hold("/carol");
     j.deliver(j.listing(
         &[
             "/alice",
@@ -356,11 +369,59 @@ async fn joined_folders_lists_the_other_writers_but_never_this_devices_own_names
     assert_eq!(surface.joined_folders(), j.bob.joined_folders());
 }
 
+/// Spec §19.8 rule 18.1 (round-9 M1): a record is the inviter's word, and a
+/// writer prefix in it is free-form, so a route is made only for a name that names
+/// itself: the namespace of a trust context held here, or a self-certifying
+/// person. A reserved name, a broad shared one, a name no context held here
+/// covers, and any name strictly above or below a namespace held here (a longer
+/// route than the one already held) are none of them listed: each would win the
+/// forwarder's longest-prefix match over a better route of this device's own.
+#[tokio::test]
+async fn joined_folders_never_lists_a_name_the_inviter_picked_to_win_a_longer_match() {
+    use ndn_security::self_certifying::self_certifying_name;
+    let j = Joiner::joined("/home/bob").await;
+    // Held here: /dave and, under it, /dave/team; /carol.
+    j.hold("/dave");
+    j.hold("/dave/team");
+    j.hold("/carol");
+    let person = self_certifying_name(&[7u8; 32]);
+    let person_text = person.to_string();
+    j.deliver(j.listing(
+        &[
+            "/alice",
+            "/home/bob",
+            "/com",
+            "/user",
+            "/localhop",
+            "/localhost",
+            "/localhost/x",
+            "/frank/member/x",
+            "/erin/member",
+            "/dave/team/x",
+            "/carol",
+            &person_text,
+        ],
+        &["/alice", "/home/bob"],
+    ))
+    .await;
+    let mut expected = vec![n("/carol"), person];
+    expected.sort();
+    assert_eq!(
+        j.writers(),
+        expected,
+        "the inviter's record made a route for a reserved, broad, unheld or longer-than-held \
+         name: only the namespaces held here and a self-certifying person may be listed"
+    );
+}
+
 /// Spec §19.8: at most `JOINED_WRITERS_MAX` writers, the first of the sorted
 /// namespaces, however many the record lists.
 #[tokio::test]
 async fn joined_folders_lists_at_most_the_bound_of_writers_sorted() {
     let j = Joiner::joined("/bob").await;
+    for i in 1..=20 {
+        j.hold(&format!("/w{i:02}"));
+    }
     let many: Vec<String> = (1..=20).rev().map(|i| format!("/w{i:02}")).collect();
     let mut writers = vec!["/alice", "/bob"];
     writers.extend(many.iter().map(String::as_str));
@@ -433,6 +494,7 @@ async fn joined_changes_fires_when_the_list_changes_and_only_then() {
     j.bob.inner.settle().await;
     j.bob.inner.settle().await;
     quiet(&rx, "a settle with nothing new");
+    j.hold("/carol");
 
     j.deliver(j.listing(&["/alice", "/bob", "/carol"], &["/alice", "/bob", "/carol"]))
         .await;

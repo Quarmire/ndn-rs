@@ -353,6 +353,14 @@ impl Scopes {
         matches!(self.adopted.get(ns), Some(Adopted::Held { .. }))
     }
 
+    /// The namespaces adopted here for folders (in no order).
+    pub(super) fn adopted_namespaces(&self) -> impl Iterator<Item = &Name> {
+        self.adopted
+            .iter()
+            .filter(|(_, a)| matches!(a, Adopted::Held { .. }))
+            .map(|(ns, _)| ns)
+    }
+
     /// The store's [`scoped_prefix`] records read back at start: their
     /// newest versions are never gone back from, and their contexts are
     /// opened again ([`Inner::restore_scoped`]).

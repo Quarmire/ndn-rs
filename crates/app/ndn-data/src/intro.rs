@@ -166,9 +166,14 @@ pub struct JoinedFolder {
     /// [`IntroductionSurface::writer_namespaces`](crate::IntroductionSurface::writer_namespaces)
     /// derives them, minus this device's own namespace and every namespace
     /// above or below it (a hostile inviter's record cannot make this device
-    /// route its own names, or a broad parent of them, toward the inviter);
-    /// only namespaces; sorted (the order of `Name`, the canonical one); at
-    /// most [`JOINED_WRITERS_MAX`], the first of them.
+    /// route its own names, or a broad parent of them, toward the inviter), and
+    /// minus every name that could win a longer match over a route this device
+    /// has: only a name that names itself (the namespace of a trust context held
+    /// here, or a self-certifying person's), that [`IntroPolicy::refuses`] does
+    /// not refuse (no reserved or broad shared name) and that lies neither above
+    /// nor below a namespace held or adopted here (spec §19.8 rule 18); only
+    /// namespaces; sorted (the order of `Name`, the canonical one); at most
+    /// [`JOINED_WRITERS_MAX`], the first of them.
     pub writers: Vec<Name>,
 }
 

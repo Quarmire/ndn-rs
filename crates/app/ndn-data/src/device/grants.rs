@@ -43,6 +43,7 @@ use bytes::Bytes;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use ndn_packet::{Name, NameComponent};
+use ndn_security::self_certifying::personal_namespace_of;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -941,11 +942,33 @@ impl Inner {
     }
 
     /// The namespaces of the other writers of `folder` a link to its inviter
-    /// routes: [`Inner::writer_namespaces_of`] minus the owner's, this device's
-    /// own namespace and every namespace above or below it (a record cannot
-    /// divert this device's own names, nor `/` or a broad parent of them), only
-    /// namespaces, at most [`JOINED_WRITERS_MAX`], in order.
+    /// routes. The record is the inviter's word and a writer prefix in it is
+    /// free-form, and a forwarder takes the longest matching prefix before it
+    /// looks at cost, so a route is made only for a name that cannot take a name
+    /// away from a better route of this device's own: each of
+    /// [`Inner::writer_namespaces_of`]'s namespaces `w` is dropped when
+    ///
+    /// - it is not a namespace, is the owner's, or is this device's own or above
+    ///   or below it;
+    /// - [`IntroPolicy::refuses`](crate::intro::IntroPolicy::refuses) refuses it
+    ///   (a reserved name, a broad shared one such as `/com` or `/user`, one
+    ///   with too few components);
+    /// - it does not name itself: it is neither the namespace of a trust context
+    ///   held here nor a self-certifying person's, so `/dave/member` of a `/dave`
+    ///   this device reaches without holding its context is never routed;
+    /// - it lies strictly above or below a namespace held here or adopted for a
+    ///   folder (an exact match is the same prefix, where cost decides).
+    ///
+    /// At most [`JOINED_WRITERS_MAX`], in order.
     fn joined_writers(&self, st: &St, owner: &Name, folder: &Name) -> Vec<Name> {
+        let mut held: Vec<Name> = self
+            .validator
+            .keyring()
+            .contexts()
+            .iter()
+            .map(|c| c.namespace().clone())
+            .collect();
+        held.extend(st.scopes.adopted_namespaces().cloned());
         self.writer_namespaces_of(st, folder)
             .into_iter()
             .filter(|w| {
@@ -953,6 +976,12 @@ impl Inner {
                     && w != owner
                     && !w.has_prefix(&self.ns)
                     && !self.ns.has_prefix(w)
+                    && self.config.intro.refuses(w).is_none()
+                    && (self.namespace_of_name(w) == *w
+                        || personal_namespace_of(w).as_ref() == Some(w))
+                    && held
+                        .iter()
+                        .all(|h| h == w || !(w.has_prefix(h) || h.has_prefix(w)))
             })
             .take(JOINED_WRITERS_MAX)
             .collect()
@@ -1345,8 +1374,9 @@ impl Device {
     /// force still lists this device — its [`JoinedFolder`]: the inviter's key,
     /// the folder and its owner, this device's role in the record in force and
     /// the other writers' namespaces (this device's own namespace and every
-    /// namespace above or below it left out, at most
-    /// [`JOINED_WRITERS_MAX`]). Sorted by folder, then inviter (the order of
+    /// namespace above or below it left out, and every name that could win a
+    /// longer match over a route this device has: see [`JoinedFolder::writers`];
+    /// at most [`JOINED_WRITERS_MAX`]). Sorted by folder, then inviter (the order of
     /// `Name` and of the key's octets).
     ///
     /// Derived on every call from signed durable data and the device's MAC'd
