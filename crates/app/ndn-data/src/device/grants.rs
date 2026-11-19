@@ -1333,7 +1333,7 @@ impl Device {
     /// (it was changed in the store) is ignored.
     ///
     /// A host that links installs these at start
-    /// ([`Introducer::grant`](crate::intro::Introducer::grant) for each).
+    /// ([`Introducer::grant`] for each).
     pub fn grants(&self) -> Vec<Grant> {
         self.inner.live_grants()
     }
@@ -1378,7 +1378,7 @@ impl Device {
     /// of the key not yet ended (past its date or not), `false` if none. Tells
     /// the host nothing:
     /// the host that calls this ends its link layer's grant itself
-    /// ([`Introducer::revoke_grant`](crate::intro::Introducer::revoke_grant)
+    /// ([`Introducer::revoke_grant`]
     /// is for ends the device makes). The person stays a member of the
     /// folder: removing them is a members record, not this, and the host's end
     /// makes no departure mark (nor ever one for a mirror).
@@ -1411,7 +1411,7 @@ impl Device {
     /// (the person was invited again) is not listed. Sorted by key, then folder.
     ///
     /// A host that links installs these at start
-    /// ([`Introducer::departure`](crate::intro::Introducer::departure) for each).
+    /// ([`Introducer::departure`] for each).
     pub fn departures(&self) -> Vec<Departure> {
         self.inner.live_departures()
     }
@@ -1460,7 +1460,7 @@ impl Device {
     /// the grant as it now stands (the first, by offer, when several offers
     /// admitted the key), or `None` when there is none to renew. Tells the
     /// host nothing: the host that calls this installs the returned grant
-    /// ([`Introducer::grant`](crate::intro::Introducer::grant)).
+    /// ([`Introducer::grant`]).
     ///
     /// A **mirror** entry (the grant this device was given by joining) is never
     /// dated and is left untouched here: it has no date, it follows the members
