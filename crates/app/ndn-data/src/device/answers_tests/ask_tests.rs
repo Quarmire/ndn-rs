@@ -21,11 +21,16 @@ use crate::seal::AskKey;
 
 /// What an asker's device fetches over: its Interests are handed to `signer` as a forwarder
 /// would hand them, and what the signer answers comes back. Every Interest name is noted.
-struct Wire {
+pub(super) struct Wire {
     signer: std::sync::OnceLock<Device>,
     tx: futures::channel::mpsc::UnboundedSender<Bytes>,
     rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
     asked: std::sync::Mutex<Vec<Name>>,
+    /// While set, no ask for an answer is answered: the signer is silent.
+    pub(super) muted: AtomicBool,
+    /// The Content the signer replies to every ask for an answer with, instead of its own
+    /// reply.
+    pub(super) forced: std::sync::Mutex<Option<Bytes>>,
 }
 
 impl Wire {
@@ -36,6 +41,8 @@ impl Wire {
             tx,
             rx: futures::lock::Mutex::new(rx),
             asked: std::sync::Mutex::new(Vec::new()),
+            muted: AtomicBool::new(false),
+            forced: std::sync::Mutex::new(None),
         })
     }
 
@@ -68,10 +75,22 @@ impl Connection for Wire {
         let (params, lifetime) = (interest.app_parameters().cloned(), interest.lifetime());
         let by_prefix = interest.selectors().can_be_prefix;
         self.asked.lock().unwrap().push(name.clone());
+        let (muted, forced) = (
+            self.muted.load(Ordering::SeqCst),
+            self.forced.lock().unwrap().clone(),
+        );
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let reply = if parse_answer_ask_name(&name).is_some() {
-                signer.inner.answer_ask(&name, params, lifetime).await
+                match (muted, forced) {
+                    (true, _) => None,
+                    // A signer that says what the test wants it to say, signed as it signs.
+                    (false, Some(content)) => signer
+                        .inner
+                        .sign(DataBuilder::new(name.clone(), &content).freshness(Duration::ZERO))
+                        .ok(),
+                    (false, None) => signer.inner.answer_ask(&name, params, lifetime).await,
+                }
             } else {
                 signer.inner.packet_for(&name, by_prefix)
             };
@@ -90,7 +109,7 @@ impl Connection for Wire {
 }
 
 /// Start `asker` fetching over a [`Wire`] to `signer`.
-async fn wired(
+pub(super) async fn wired(
     w: &mut World,
     asker: &str,
     signer: &Device,
@@ -106,7 +125,7 @@ async fn wired(
 // ---- asks handed to the signer --------------------------------------------------------------
 
 /// What the signer said to one ask.
-enum Told {
+pub(super) enum Told {
     /// The signed answer packet.
     Answer(Box<Data>),
     Refused(AskRefusal),
@@ -115,7 +134,7 @@ enum Told {
 }
 
 /// An ask for `ask` from `asker`, built as it builds one, handed to `signer`'s answer to it.
-async fn told(
+pub(super) async fn told(
     asker: &Device,
     signer: &Device,
     ask: &AnswerAsk,
@@ -189,7 +208,7 @@ impl Evaluator for Counting {
 }
 
 /// `sum(1)` counting its evaluations: the evaluator, how many there were, whether one started.
-fn counting(delay: Duration) -> (Arc<dyn Evaluator>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+pub(super) fn counting(delay: Duration) -> (Arc<dyn Evaluator>, Arc<AtomicUsize>, Arc<AtomicBool>) {
     let (calls, started) = (
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicBool::new(false)),
@@ -203,7 +222,7 @@ fn counting(delay: Duration) -> (Arc<dyn Evaluator>, Arc<AtomicUsize>, Arc<Atomi
     (ev, calls, started)
 }
 
-fn serving(
+pub(super) fn serving(
     evals: Vec<Arc<dyn Evaluator>>,
     serve_asks: AskServing,
     asks_at_once: usize,
@@ -220,7 +239,7 @@ fn serving(
 }
 
 /// An asker's policy: trust and ask exactly `signer` for pure answers.
-fn asking(signer: &str, lifetime: Duration) -> impl FnOnce(Config) -> Config {
+pub(super) fn asking(signer: &str, lifetime: Duration) -> impl FnOnce(Config) -> Config {
     let policy = AnswerPolicy {
         pure: Signers::Devices(vec![n(signer)]),
         ..AnswerPolicy::default()
@@ -486,7 +505,7 @@ async fn a_signer_answers_pending_while_it_computes_and_the_answer_afterwards() 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-fn describe(t: &Told) -> String {
+pub(super) fn describe(t: &Told) -> String {
     match t {
         Told::Answer(_) => "an answer".into(),
         Told::Refused(r) => format!("{r:?}"),
@@ -497,7 +516,7 @@ fn describe(t: &Told) -> String {
 // ---- the signer: who is served, who is heard ----------------------------------------------------
 
 #[tokio::test]
-async fn a_signer_that_serves_no_asks_says_not_served_and_computes_nothing() {
+async fn a_signer_answers_only_the_namespaces_its_policy_serves_and_is_silent_to_the_rest() {
     let mut w = World::new();
     let (ev, calls, _) = counting(Duration::ZERO);
     let laptop = alice_with_data(&mut w, serving(vec![ev], AskServing::Off, 4)).await;
@@ -505,31 +524,22 @@ async fn a_signer_that_serves_no_asks_says_not_served_and_computes_nothing() {
         &mut w,
         "/alice/phone",
         &laptop,
-        asking("/alice/laptop", Duration::from_millis(600)),
+        asking("/alice/laptop", Duration::from_millis(300)),
     )
     .await;
+    // A signer that serves no asks does not reply at all, not even to its own person's device:
+    // an ask of a namespace it does not serve is not worth a certificate fetch or a refusal.
     let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
-    let refused = ask(&phone, &q).await.unwrap_err();
+    let silent = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
     assert!(
-        matches!(
-            &refused,
-            DataError::Answer {
-                why: AnswerRefusal::AskRefused {
-                    signer,
-                    why: AskRefusal::NotServed,
-                    said,
-                },
-                ..
-            } if *signer == n("/alice/laptop") && !said.is_empty()
-        ),
-        "{refused:?}"
+        matches!(&silent, DataError::NotReady { why, .. } if why.contains("lapsed")),
+        "{silent:?}"
     );
-    assert_eq!(refused.next(), NextStep::SetPolicy);
-    assert!(!refused.retry());
+    assert_eq!(silent.next(), NextStep::RetryLater);
     assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing was computed");
 
     // The default serves a person's own devices and no one else's, however well they prove who
-    // they are.
+    // they are: Bob's device gets no reply, Alice's phone its answer.
     let (ev, calls, _) = counting(Duration::ZERO);
     let mut w = World::new();
     let laptop = alice_with_data(&mut w, serving(vec![ev], AskServing::Own, 4)).await;
@@ -538,7 +548,7 @@ async fn a_signer_that_serves_no_asks_says_not_served_and_computes_nothing() {
     let ask = AnswerAsk::pure(newest(&laptop, &plan()).await, sum_v(1));
     assert!(matches!(
         told(&bob, &laptop, &ask, None).await,
-        Told::Refused(AskRefusal::NotServed)
+        Told::Silent
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(matches!(

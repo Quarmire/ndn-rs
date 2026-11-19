@@ -22,6 +22,8 @@ use crate::error::AnswerRefusal;
 use crate::events::{AnswerFault, EventDetail, EventKind, Meaning, ReadSetFault};
 use crate::layer::Share;
 
+mod ask_cost_tests;
+mod ask_gate_tests;
 mod ask_tests;
 mod budget_tests;
 

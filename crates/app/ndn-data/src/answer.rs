@@ -1386,15 +1386,32 @@ pub struct AnswerConfig {
     /// What is kept of others' answers. Default: 1,024 answers and 64 MiB per signer, 1 GiB in
     /// all.
     pub store: AnswerStore,
-    /// The most answers this device signs per second. Default 16.
+    /// The most answers this device signs per second for itself (a `get` that publishes,
+    /// `publish_answer`, `provide`). The asks of other devices have a rate of their own, half of
+    /// this (rounded up), counted apart, so asks never use up the device's own: past it an ask
+    /// is refused [`AskRefusal::Busy`]. Default 16.
     pub sign_per_second: u32,
     /// Whose asks for an answer this device answers (answers.md §15). Default
     /// [`AskServing::Own`].
     pub serve_asks: AskServing,
     /// The most asks for an answer this device works on at once, for all askers together; one
-    /// more is refused [`AskRefusal::Busy`] (each asker also has one in progress at most).
-    /// Default 4.
+    /// more is refused [`AskRefusal::Busy`] (each asker also has one in progress at most). The
+    /// signer's own namespace may use all of them. Devices of other namespaces together may use
+    /// half of them (rounded down) and one other namespace half of that (rounded up, at least
+    /// 1), so a collaborator who enrols many devices cannot keep the person's own devices
+    /// waiting. Default 4.
     pub asks_at_once: usize,
+    /// The most asks for an answer this device holds while it opens them and verifies their
+    /// proofs, which a stranger can seal as well as anyone: one more is dropped without a
+    /// reply, as an unauthenticated ask is. The asker asks again. Default 32.
+    pub asks_queued: usize,
+    /// The device roles ([`AskServing::Own`] and the own part of [`AskServing::OwnAndMembers`])
+    /// that are served: the role is the name component after the namespace
+    /// (`/<ns>/<role>/<device>`), and a device of another role (a guest's short-lived key; a
+    /// node, which is a relay) is refused [`AskRefusal::NotServed`]. Add `node` to serve a relay
+    /// of the person's. A device whose name carries no role (a namespace that does not use the
+    /// role layout) has none to refuse and is served. Default `admin` and `member`.
+    pub ask_roles: Vec<String>,
 }
 
 impl Default for AnswerConfig {
@@ -1416,6 +1433,8 @@ impl Default for AnswerConfig {
             sign_per_second: 16,
             serve_asks: AskServing::Own,
             asks_at_once: 4,
+            asks_queued: 32,
+            ask_roles: vec!["admin".into(), "member".into()],
         }
     }
 }
@@ -1428,11 +1447,13 @@ const DATA_TLV: u64 = 0x06;
 /// Whose asks for an answer a device answers ([`AnswerConfig::serve_asks`], answers.md §15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AskServing {
-    /// None: every ask is refused [`AskRefusal::NotServed`].
+    /// None: no ask is answered, and no reply is sent at all.
     Off,
-    /// Asks of devices of this device's own namespace.
+    /// Asks of devices of this device's own namespace (in a role of
+    /// [`AnswerConfig::ask_roles`]); a device of another namespace gets no reply.
     Own,
-    /// Own, and a device that is a listed writer or reader of every collection the ask reads.
+    /// Own, and a device that is a listed writer or reader of every collection the ask reads
+    /// (a device of a namespace this device holds no trust context for gets no reply).
     OwnAndMembers,
 }
 
@@ -1447,7 +1468,8 @@ pub enum AskRefusal {
         /// The first read the asker may not read.
         index: u64,
     },
-    /// 2: the signer works on as many asks as it may, or on one of the asker's already.
+    /// 2: the signer works on as many asks as it may, on one of the asker's already, or on as
+    /// many as the asker's namespace may; or the rate at which it signs for asks is spent.
     Busy {
         /// How long to wait before asking again.
         retry_after: Duration,
@@ -1462,9 +1484,12 @@ pub enum AskRefusal {
     CannotCheck,
     /// 5: the signer does not provide the function, or its host delivered no result in time.
     NotProvided,
-    /// 6: computing the answer would exceed the signer's budget.
+    /// 6: computing the answer would exceed the signer's budget, or the ask lists more reads of
+    /// merge states than the signer checks. Never a rate: that is `Busy`.
     OverBudget,
-    /// 7: the signer serves no asks from this asker ([`AskServing`]).
+    /// 7: the signer serves no asks from this asker: its role is not one of
+    /// [`AnswerConfig::ask_roles`], or it is of another namespace and no listed writer or reader
+    /// of every collection read ([`AskServing`]).
     NotServed,
 }
 
@@ -1543,7 +1568,8 @@ impl AskRefusal {
                  add the asker's device to its readers"
             ),
             AskRefusal::Busy { retry_after } => format!(
-                "the signer works on as many asks as it may, or on one of this asker's already; \
+                "the signer works on as many asks as it may, on one of this asker's already, on \
+                 as many as this asker's namespace may, or signs for asks as fast as it may; \
                  ask again after {} ms",
                 retry_after.as_millis()
             ),
@@ -1564,9 +1590,10 @@ impl AskRefusal {
             AskRefusal::OverBudget => "computing the answer would exceed the signer's budget; \
                  state a smaller read set, or raise Config::answers.budget on the signer"
                 .into(),
-            AskRefusal::NotServed => "the signer serves no asks from this device \
-                 (Config::answers.serve_asks there); name another signer in the policy, or set \
-                 serve_asks on the signer to include this device"
+            AskRefusal::NotServed => "the signer serves no asks from this device (its role, or \
+                 its namespace, is not one Config::answers.serve_asks and ask_roles name there); \
+                 name another signer in the policy, or set serve_asks or ask_roles on the signer \
+                 to include this device"
                 .into(),
         }
     }

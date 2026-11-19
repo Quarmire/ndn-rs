@@ -173,6 +173,16 @@ impl Evidence {
     }
 }
 
+/// Whose work an answer is signed for: the two have signing rates of their own
+/// (`Config::answers.sign_per_second`; asks get half of it, rounded up).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Signing {
+    /// This device's own: a `get` that publishes, `publish_answer`, `provide`.
+    Own,
+    /// An ask of another device (answers.md §15).
+    Asked,
+}
+
 /// What a device holds of answers: its own, others' it keeps for serving, the evidence it keeps.
 #[derive(Default)]
 pub(super) struct Book {
@@ -186,8 +196,12 @@ pub(super) struct Book {
     pieces: HashSet<Name>,
     /// `(answer name, signer's key)`: what evidence is kept against, never served nor taken again.
     evidence: HashMap<(Name, Name), Evidence>,
-    /// When this device signed its recent answers, for its signing rate.
+    /// When this device signed its recent answers for itself (a `get`, `publish_answer`,
+    /// `provide`), for its signing rate ([`Signing::Own`]).
     signed: VecDeque<Instant>,
+    /// When it signed its recent answers for the asks of others, which have a rate of their own
+    /// ([`Signing::Asked`]): what asks cost never drains the device's own.
+    signed_asked: VecDeque<Instant>,
     /// Counts recency of use.
     tick: u64,
     /// Octets kept (held and own, pieces included).
@@ -236,20 +250,27 @@ impl Book {
         self.served.contains(name)
     }
 
-    /// How many answers this device signed in the last second.
-    pub(super) fn signed_in_the_last_second(&mut self, now: Instant) -> usize {
-        while self
-            .signed
+    /// How many answers signed for `who` this device signed in the last second.
+    pub(super) fn signed_in_the_last_second(&mut self, now: Instant, who: Signing) -> usize {
+        let ring = self.ring(who);
+        while ring
             .front()
             .is_some_and(|t| now.saturating_duration_since(*t) >= std::time::Duration::from_secs(1))
         {
-            self.signed.pop_front();
+            ring.pop_front();
         }
-        self.signed.len()
+        ring.len()
     }
 
-    pub(super) fn note_signed(&mut self, now: Instant) {
-        self.signed.push_back(now);
+    pub(super) fn note_signed(&mut self, now: Instant, who: Signing) {
+        self.ring(who).push_back(now);
+    }
+
+    fn ring(&mut self, who: Signing) -> &mut VecDeque<Instant> {
+        match who {
+            Signing::Own => &mut self.signed,
+            Signing::Asked => &mut self.signed_asked,
+        }
     }
 
     /// A state a restart cannot reach but a kill between signing and the barrier does: the own

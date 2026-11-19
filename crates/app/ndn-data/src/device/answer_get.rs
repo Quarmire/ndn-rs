@@ -17,7 +17,7 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Name};
 
 use super::answer_reads::{EvalFail, Evaluated, ReadFail, VersionFact, add_epoch};
-use super::answers::Cause;
+use super::answers::{Cause, Signing};
 use super::heard::RELAYS_ASKED;
 use super::{Device, Inner, local};
 use crate::answer::{
@@ -71,6 +71,10 @@ fn answer_error(name: &Name, why: AnswerRefusal) -> DataError {
         why,
     }
 }
+
+/// What the refusal for signing too many answers in one second names
+/// ([`AnswerRefusal::OverBudget`]): a rate that passes with the second, not a size.
+pub(super) const SIGNED_PER_SECOND: &str = "answers signed per second";
 
 impl Inner {
     // ---- keys ---------------------------------------------------------------------------------
@@ -536,7 +540,12 @@ impl Inner {
     /// namespace, or a WRITER of every collection read by the records held (a reader of one is no
     /// writer: it could not have changed what the answer read), or a listed device.
     fn covers(&self, s: &Signers, signer: &Writer, reads: &ReadSet) -> bool {
-        let Some(device) = device_of(signer.key()) else {
+        self.covers_key(s, signer.key(), reads)
+    }
+
+    /// [`Self::covers`] for the signer key `key`.
+    fn covers_key(&self, s: &Signers, key: &Name, reads: &ReadSet) -> bool {
+        let Some(device) = device_of(key) else {
             return false;
         };
         if s.names(&device) {
@@ -559,10 +568,39 @@ impl Inner {
                 collections.peek().is_some()
                     && collections.all(|c| {
                         st.record_in_force(&c)
-                            .is_some_and(|m| self.writer_by(&st, &m, &c, signer.key()))
+                            .is_some_and(|m| self.writer_by(&st, &m, &c, key))
                     })
             }
         }
+    }
+
+    /// Of the devices `signers` (from [`Self::candidates`]), those this device's policy could
+    /// ever take an answer from for a question of `kind` by `by` over `reads` ([`Self::covers`]
+    /// of the policy's list, judged by the device's name as a key of it): an ask carries the
+    /// whole read set, so it is sent to no device whose answer would be refused anyway
+    /// (answers.md §13.14).
+    pub(super) fn askable(
+        &self,
+        kind: AnswerKind,
+        by: &Name,
+        reads: &ReadSet,
+        signers: Vec<Name>,
+    ) -> Vec<Name> {
+        let policy = &self.config.answers.policy;
+        signers
+            .into_iter()
+            .filter(|device| {
+                let key = device.clone().append("KEY").append("asked");
+                match kind {
+                    AnswerKind::Pure => self.covers_key(&policy.pure, &key, reads),
+                    AnswerKind::Provider => policy
+                        .providers
+                        .iter()
+                        .filter(|(f, _)| f == by)
+                        .any(|(_, s)| self.covers_key(s, &key, reads)),
+                }
+            })
+            .collect()
     }
 
     /// Whether this device takes `signer`'s answer on trust (answers.md §7.3, §9): its own
@@ -1096,6 +1134,7 @@ impl Inner {
                     r.keys.as_ref(),
                     &result,
                     r.id,
+                    Signing::Own,
                 )
                 .await
             {
@@ -1280,6 +1319,7 @@ impl Inner {
     /// the barrier and serve it (answers.md §6.2). Idempotent: an own answer at the id is not
     /// signed again; a provider keeps what it signed, so a different result at the id is
     /// [`AnswerRefusal::AlreadySigned`].
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn make_answer(
         self: &Arc<Self>,
         binding: &AnswerBinding,
@@ -1288,6 +1328,7 @@ impl Inner {
         keys: Option<&AudienceKeys>,
         result: &Bytes,
         id: [u8; 32],
+        who: Signing,
     ) -> Result<Name, DataError> {
         let name = wire::answer_name(&self.device, &id);
         let too_large = |what: &str, size: u64, limit: u64| {
@@ -1385,19 +1426,22 @@ impl Inner {
                 }
                 None => {
                     let now = crate::rt::Instant::now();
-                    if st.answer_book.signed_in_the_last_second(now)
-                        >= self.config.answers.sign_per_second as usize
-                    {
+                    let per_second = self.config.answers.sign_per_second as usize;
+                    let limit = match who {
+                        Signing::Own => per_second,
+                        Signing::Asked => per_second.div_ceil(2),
+                    };
+                    if st.answer_book.signed_in_the_last_second(now, who) >= limit {
                         Err(answer_error(
                             &name,
                             AnswerRefusal::OverBudget {
-                                what: "answers signed per second".into(),
+                                what: SIGNED_PER_SECOND.into(),
                             },
                         ))
                     } else {
                         let wire = self.sign(DataBuilder::new(name.clone(), &record))?;
                         self.keep_own(&mut st, &name, &id, binding.kind, digest, &wire, &pieces)?;
-                        st.answer_book.note_signed(now);
+                        st.answer_book.note_signed(now, who);
                         Ok(None)
                     }
                 }
@@ -1424,6 +1468,45 @@ impl Inner {
         self.serve_own(name);
         Ok(())
     }
+
+    /// [`Device::publish_answer`] for the pure question `ask`, named `question`: plan, evaluate,
+    /// sign within `who`'s signing rate, store behind the barrier and serve.
+    pub(super) async fn publish_question(
+        self: &Arc<Self>,
+        question: &Name,
+        ask: &AnswerAsk,
+        who: Signing,
+    ) -> Result<Name, DataError> {
+        if ask.kind != AnswerKind::Pure {
+            return Err(DataError::BadRequest {
+                name: question.clone(),
+                why: "a provider answer is signed with Device::provide, over the inputs the \
+                      function read and with its result; publish_answer is for pure questions"
+                    .into(),
+            });
+        }
+        if self.config.evaluators.get(&ask.by).is_none() {
+            return Err(DataError::CannotCheck {
+                name: question.clone(),
+                evaluator: ask.by.clone(),
+                why: "this program does not know the evaluator, so it cannot compute the \
+                      answer it would sign; run a program that knows it"
+                    .into(),
+            });
+        }
+        let r = self.resolve_question(question, ask, true).await?;
+        let result = r.computed.clone().expect("evaluated: run was asked for");
+        self.make_answer(
+            &r.binding,
+            &r.reads,
+            &r.epochs,
+            r.keys.as_ref(),
+            &result,
+            r.id,
+            who,
+        )
+        .await
+    }
 }
 
 impl Device {
@@ -1442,36 +1525,9 @@ impl Device {
     /// returned, not signed again. Returns `<this device>/32=answer/<id>`. The evaluator must be
     /// known here (`CannotCheck`). Over the limits of answers.md §10: `Answer{TooLarge}`.
     pub async fn publish_answer(&self, question: &Name) -> Result<Name, DataError> {
-        let inner = &self.inner;
         let (_, ask) = AnswerAsk::parse_with_x(question)?;
-        if ask.kind != AnswerKind::Pure {
-            return Err(DataError::BadRequest {
-                name: question.clone(),
-                why: "a provider answer is signed with Device::provide, over the inputs the \
-                      function read and with its result; publish_answer is for pure questions"
-                    .into(),
-            });
-        }
-        if inner.config.evaluators.get(&ask.by).is_none() {
-            return Err(DataError::CannotCheck {
-                name: question.clone(),
-                evaluator: ask.by.clone(),
-                why: "this program does not know the evaluator, so it cannot compute the \
-                      answer it would sign; run a program that knows it"
-                    .into(),
-            });
-        }
-        let r = inner.resolve_question(question, &ask, true).await?;
-        let result = r.computed.clone().expect("evaluated: run was asked for");
-        inner
-            .make_answer(
-                &r.binding,
-                &r.reads,
-                &r.epochs,
-                r.keys.as_ref(),
-                &result,
-                r.id,
-            )
+        self.inner
+            .publish_question(question, &ask, Signing::Own)
             .await
     }
 
@@ -1571,9 +1627,21 @@ impl Device {
             reads: inputs.digest(),
         };
         let id = seal::answer_id(&binding, keys.as_ref());
-        inner
-            .make_answer(&binding, &inputs, &epochs, keys.as_ref(), &result, id)
-            .await
+        let made = inner
+            .make_answer(
+                &binding,
+                &inputs,
+                &epochs,
+                keys.as_ref(),
+                &result,
+                id,
+                Signing::Own,
+            )
+            .await;
+        // The call a host was asked for is done, answered or not: asked again, it is delivered
+        // again ([`Device::provider_asks`]).
+        inner.st.lock().answer_asks.done(function, &binding.reads.0);
+        made
     }
 
     /// The newest this device holds of `collection` as an exact read, and how old it may be:

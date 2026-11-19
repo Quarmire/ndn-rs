@@ -5971,7 +5971,8 @@ most `Config::intro.asks_queued` asks at once (32 by default), verifying or
 waiting for their turn — one more gets no answer at once (a Nack), says so
 in its log, and its asker retries — and opens and verifies at most
 `Config::asks_verifying` at once (8 by default, the bound hold and audit
-asks' proofs share, §13), before any unwrapping. It
+asks' proofs share, §13; asks for an answer have a budget of their own of
+the same size, answers.md §15), before any unwrapping. It
 checks, in this order:
 
 1. **It opens**: the name's digest is its parameters', the content key

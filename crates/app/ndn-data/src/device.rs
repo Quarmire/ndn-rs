@@ -164,7 +164,9 @@ pub struct Config {
     /// How many askers' proofs this device verifies at once, whoever claims
     /// to ask — hold and audit asks' proofs (spec §13) and introduction
     /// asks, opened and verified (spec §19.4): what a crowd of strangers'
-    /// asks costs it at once; the rest wait their turn. At least 1.
+    /// asks costs it at once; the rest wait their turn. Asks for an answer
+    /// (spec answers.md §15) have a budget of their own of the same size, so a
+    /// crowd of them slows none of these. At least 1.
     pub asks_verifying: usize,
     /// How far ahead of this device's clock another device's may run, as
     /// this device judges it: a holder's signed `Expired` audit answer for a
@@ -2193,6 +2195,9 @@ struct St {
     quarantine: BTreeSet<Name>,
     /// Per asker device, its hold and audit asks this holder is working on.
     asks: HashMap<Name, usize>,
+    /// The asks for an answer this signer holds: queued, working, and the calls waiting for
+    /// its host ([`answer_ask::AnswerAsks`]).
+    answer_asks: answer_ask::AnswerAsks,
     /// Asker devices one of whose hold asks waits here for its other one
     /// to end ([`Inner::hold_slot`]).
     hold_waits: BTreeSet<Name>,
@@ -2289,6 +2294,9 @@ struct Inner {
     asking: Mutex<HashMap<(Name, Option<u64>), WalkAsk>>,
     /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
+    /// Proofs of asks for an answer being verified: a budget of their own, the size of
+    /// [`Config::asks_verifying`], so a crowd of those asks costs the others nothing.
+    answer_verifying: Semaphore,
     /// Asks for an answer being worked on, all askers together
     /// ([`AnswerConfig::asks_at_once`](crate::answer::AnswerConfig)).
     asks_at_once: Arc<Semaphore>,
@@ -7486,6 +7494,7 @@ impl Device {
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
                 asks: HashMap::new(),
+                answer_asks: answer_ask::AnswerAsks::default(),
                 hold_waits: BTreeSet::new(),
                 taking: BTreeSet::new(),
                 answers: Kept::new(ANSWERS_KEPT),
@@ -7516,6 +7525,7 @@ impl Device {
             rtt: Mutex::new(Rtt::default()),
             asking: Mutex::new(HashMap::new()),
             verifying: Semaphore::new(asks_verifying),
+            answer_verifying: Semaphore::new(asks_verifying),
             asks_at_once: Arc::new(Semaphore::new(asks_at_once)),
             provider_asks: Mutex::new(None),
             signatures: AtomicU64::new(0),
@@ -15952,16 +15962,10 @@ impl Inner {
     /// of `c` (spec §9): a held owner-signed record of `c` — or of the
     /// folder whose epoch it is ([`St::seal_subject`]) — names `e`, the
     /// readers those records list (or `e`'s creator) admit it, and so does
-    /// that subject's record in force when it seals.
+    /// that subject's record in force when it seals. Records not held
+    /// admit no one.
     fn may_hold(&self, st: &St, c: &Name, e: &Epoch, device: &Name, dns: &Name) -> bool {
-        let Some((epochs, record)) = st.line_of(&st.seal_subject(c, e)) else {
-            return false;
-        };
-        let Some(named) = epochs.get(e) else {
-            return false;
-        };
-        self.admits(st, &named.readers, Some(&e.creator), device, dns)
-            && record.is_some_and(|m| m.epoch.is_none() || self.admits_record(st, m, device, dns))
+        self.epoch_standing(st, c, e, device, dns) == answer_ask::Standing::In
     }
 
     /// Whether this device reads `c`.
@@ -18433,10 +18437,23 @@ impl Inner {
     /// `asker` that verifies to a trust anchor. At most
     /// [`Config::asks_verifying`] proofs are verified at once.
     async fn proves(&self, proof: &Data, asker: &Name, binding: &[u8; 32]) -> bool {
+        self.proves_with(&self.verifying, proof, asker, binding)
+            .await
+    }
+
+    /// [`Self::proves`], taking its turn from `turns`: asks for an answer have a budget of
+    /// their own.
+    async fn proves_with(
+        &self,
+        turns: &Semaphore,
+        proof: &Data,
+        asker: &Name,
+        binding: &[u8; 32],
+    ) -> bool {
         if *proof.name != wire::ask_name(asker, binding) {
             return false;
         }
-        let Ok(_turn) = self.verifying.acquire().await else {
+        let Ok(_turn) = turns.acquire().await else {
             return false;
         };
         self.verify(proof)

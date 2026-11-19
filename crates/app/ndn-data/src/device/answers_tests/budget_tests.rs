@@ -116,7 +116,7 @@ fn state_read(i: usize) -> ReadRef {
     }
 }
 
-fn many_states(count: usize) -> ReadSet {
+pub(super) fn many_states(count: usize) -> ReadSet {
     ReadSet::new((0..count).map(state_read)).unwrap()
 }
 
