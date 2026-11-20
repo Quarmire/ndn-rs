@@ -70,10 +70,19 @@ pub enum RouteNews {
 }
 
 /// The stream of routes coming up at a forwarder ([`Connection::routes`]):
-/// the engine RIB's [`RouteUp`]s, those on faces `accept` takes.
+/// the engine RIB's [`RouteUp`]s, those on faces `accept` takes, or the news
+/// of a forwarder's stream followed over IPC ([`IpcConnection`]).
 pub struct RouteEvents {
-    rx: broadcast::Receiver<RouteUp>,
-    accept: Arc<dyn Fn(FaceId) -> bool + Send + Sync>,
+    source: RouteSource,
+}
+
+enum RouteSource {
+    Engine {
+        rx: broadcast::Receiver<RouteUp>,
+        accept: Arc<dyn Fn(FaceId) -> bool + Send + Sync>,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    Pushed(tokio::sync::mpsc::Receiver<RouteNews>),
 }
 
 impl RouteEvents {
@@ -83,32 +92,52 @@ impl RouteEvents {
         accept: impl Fn(FaceId) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
-            rx,
-            accept: Arc::new(accept),
+            source: RouteSource::Engine {
+                rx,
+                accept: Arc::new(accept),
+            },
+        }
+    }
+
+    /// The news a task following a remote forwarder's stream pushes.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pushed(rx: tokio::sync::mpsc::Receiver<RouteNews>) -> Self {
+        Self {
+            source: RouteSource::Pushed(rx),
         }
     }
 
     /// The next news; `None` once the forwarder is gone.
     pub async fn next(&mut self) -> Option<RouteNews> {
-        loop {
-            match self.rx.recv().await {
-                Ok(up) if (self.accept)(up.face) => return Some(RouteNews::Up(up.prefix)),
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => return Some(RouteNews::Missed),
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
+        match &mut self.source {
+            RouteSource::Engine { rx, accept } => loop {
+                match rx.recv().await {
+                    Ok(up) if accept(up.face) => return Some(RouteNews::Up(up.prefix)),
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => return Some(RouteNews::Missed),
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            RouteSource::Pushed(rx) => rx.recv().await,
         }
     }
 
     /// The next news if some is waiting now; `None` when none is.
     pub fn next_ready(&mut self) -> Option<RouteNews> {
-        loop {
-            match self.rx.try_recv() {
-                Ok(up) if (self.accept)(up.face) => return Some(RouteNews::Up(up.prefix)),
-                Ok(_) => {}
-                Err(broadcast::error::TryRecvError::Lagged(_)) => return Some(RouteNews::Missed),
-                Err(_) => return None,
-            }
+        match &mut self.source {
+            RouteSource::Engine { rx, accept } => loop {
+                match rx.try_recv() {
+                    Ok(up) if accept(up.face) => return Some(RouteNews::Up(up.prefix)),
+                    Ok(_) => {}
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        return Some(RouteNews::Missed);
+                    }
+                    Err(_) => return None,
+                }
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            RouteSource::Pushed(rx) => rx.try_recv().ok(),
         }
     }
 }
@@ -161,16 +190,82 @@ pub trait Connection: Send + Sync {
     /// The routes that come up at this connection's forwarder (see
     /// [`RouteEvents`]), when it can tell: an embedded engine's connection
     /// ([`EngineAppExt::app_face`](crate::EngineAppExt::app_face)) can, as
-    /// its RIB announces every route that gets into the FIB. `None` (the
-    /// default) for one that cannot: [`IpcConnection`] has no such stream
-    /// (the daemon's `/localhost/nfd/rib/notifications` tells only the
-    /// registrations made through its management interface, not the routes
-    /// its link layer, its configuration or its routing protocols install),
-    /// and a bare [`InProcConnection`] knows no engine, only its own face.
-    /// A caller that wants to act on a face coming up and gets `None` keeps
-    /// its periodic work, which is correct and slower.
+    /// its RIB announces every route that gets into the FIB; so can
+    /// [`IpcConnection`], which follows the daemon's
+    /// `/localhost/nfd/rib/notifications` stream (local to the host, as every
+    /// `/localhost` name is: it is no way for a remote face to learn the
+    /// daemon's routes). Both tell only the routes on faces that reach off
+    /// the host. `None` (the default) for one that cannot: a bare
+    /// [`InProcConnection`] knows no engine, only its own face. A caller
+    /// that wants to act on a face coming up and gets `None` keeps its
+    /// periodic work, which is correct and slower.
     fn routes(&self) -> Option<RouteEvents> {
         None
+    }
+}
+
+/// How many [`RouteNews`] an [`IpcConnection`]'s follower of the daemon's
+/// stream holds for the one that takes them before it waits for room (the
+/// daemon's stream holds the events meanwhile, and says so when it dropped
+/// some).
+#[cfg(not(target_arch = "wasm32"))]
+const ROUTE_NEWS: usize = 64;
+
+/// How long one request of the daemon's route stream waits for an event
+/// before it is sent again.
+#[cfg(not(target_arch = "wasm32"))]
+const ROUTE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Follow the daemon's `/localhost/nfd/rib/notifications` stream on `client`
+/// (a management client of its own on the connection) and hand each route
+/// that came up to `news`: from the first notice (the stream's own number,
+/// nothing to tell) on, a `route-up` is a [`RouteNews::Up`], and a stream
+/// that lost events (it no longer holds the one asked for, or the daemon's
+/// feed fell behind) is a [`RouteNews::Missed`]. Ends when `news` is
+/// dropped, or when the daemon cannot be asked (the connection is gone, or
+/// it answers what this client cannot read): the receiver is then closed and
+/// its holder keeps its periodic work.
+#[cfg(not(target_arch = "wasm32"))]
+async fn follow_route_stream(
+    client: ndn_ipc::MgmtClient,
+    news: tokio::sync::mpsc::Sender<RouteNews>,
+) {
+    use ndn_ipc::events::{EventSubscription, Notice};
+    use ndn_mgmt_wire::events::RibEvent;
+
+    let mut stream = EventSubscription::<RibEvent>::resume(client, 0);
+    let mut started = false;
+    loop {
+        let notice = tokio::select! {
+            _ = news.closed() => return,
+            notice = stream.next(ROUTE_POLL) => notice,
+        };
+        let tell = match notice {
+            Ok(None) => None,
+            // Asking from 0 is answered at once with the number to follow
+            // from: the baseline. Any later one is an event the stream no
+            // longer holds.
+            Ok(Some(Notice::Resync { .. })) => {
+                std::mem::replace(&mut started, true).then_some(RouteNews::Missed)
+            }
+            Ok(Some(Notice::Event { event, .. })) => match event {
+                RibEvent::RouteUp { name, .. } => Some(match name.parse::<Name>() {
+                    Ok(prefix) => RouteNews::Up(prefix),
+                    Err(_) => RouteNews::Missed,
+                }),
+                RibEvent::RoutesMissed => Some(RouteNews::Missed),
+                RibEvent::Register { .. } | RibEvent::Unregister { .. } | RibEvent::Unknown => None,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "the daemon's route stream cannot be followed: routes coming up are not told");
+                return;
+            }
+        };
+        if let Some(tell) = tell
+            && news.send(tell).await.is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -208,6 +303,16 @@ impl Connection for IpcConnection {
             .register_prefix(prefix)
             .await
             .map_err(AppError::Connection)
+    }
+
+    /// The routes the daemon's RIB tells on
+    /// `/localhost/nfd/rib/notifications`, followed from now on by a task
+    /// that lives as long as the returned stream, over this connection's
+    /// own control face. Call it from within a Tokio runtime.
+    fn routes(&self) -> Option<RouteEvents> {
+        let (news, rx) = tokio::sync::mpsc::channel(ROUTE_NEWS);
+        crate::rt::spawn(follow_route_stream(self.client.event_client(), news));
+        Some(RouteEvents::pushed(rx))
     }
 }
 

@@ -1,6 +1,7 @@
 //! Subscribing to the daemon's change notifications — the trust stream
-//! (`/localhost/nfd/security/notifications`, [`TrustEvent`]) and the links
-//! stream (`/localhost/nfd/links/notifications`, [`LinkEvent`]) — instead
+//! (`/localhost/nfd/security/notifications`, [`TrustEvent`]), the links
+//! stream (`/localhost/nfd/links/notifications`, [`LinkEvent`]) and the
+//! rib stream (`/localhost/nfd/rib/notifications`, [`RibEvent`]) — instead
 //! of polling the listing verbs.
 //!
 //! A subscriber asks for events by sequence number and gets them in order;
@@ -37,7 +38,9 @@ use std::marker::PhantomData;
 use std::time::Duration;
 
 use ndn_cert::report::TrustEvent;
-use ndn_mgmt_wire::events::{LINKS_STREAM, LinkEvent, RESYNC_KIND, TRUST_STREAM};
+use ndn_mgmt_wire::events::{
+    LINKS_STREAM, LinkEvent, RESYNC_KIND, RIB_STREAM, RibEvent, TRUST_STREAM,
+};
 use serde::de::DeserializeOwned;
 
 use crate::forwarder_client::ForwarderError;
@@ -55,6 +58,10 @@ impl StreamEvent for TrustEvent {
 
 impl StreamEvent for LinkEvent {
     const MODULE: &'static [u8] = LINKS_STREAM;
+}
+
+impl StreamEvent for RibEvent {
+    const MODULE: &'static [u8] = RIB_STREAM;
 }
 
 /// What a stream answered.

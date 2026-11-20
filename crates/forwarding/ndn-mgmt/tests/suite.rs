@@ -32,6 +32,8 @@ mod local_operator_commands;
 mod ndnsd_adapter;
 #[path = "notifications.rs"]
 mod notifications;
+#[path = "rib_route_stream.rs"]
+mod rib_route_stream;
 #[path = "security_safebag_import.rs"]
 mod security_safebag_import;
 #[path = "security_v1_verbs.rs"]

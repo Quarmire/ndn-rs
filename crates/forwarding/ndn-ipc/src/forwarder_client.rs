@@ -315,6 +315,18 @@ impl ForwarderClient {
         self.dead.load(Ordering::Relaxed)
     }
 
+    /// A management client of its own on this connection's control face,
+    /// for following a change-notification stream
+    /// ([`EventSubscription`](crate::events::EventSubscription)): its
+    /// long-poll holds only its own receive lock, so [`Self::mgmt`]'s
+    /// commands (a prefix registration) do not wait behind it, and it
+    /// needs no second connection to the daemon. Its replies are routed by
+    /// the face's single reader, as `mgmt`'s are. It ends when this client
+    /// is dropped or the daemon goes away.
+    pub fn event_client(&self) -> MgmtClient {
+        MgmtClient::from_mux(Arc::clone(&self.control), Arc::clone(&self.mux))
+    }
+
     pub async fn probe_alive(&self) -> bool {
         if self.dead.load(Ordering::Relaxed) {
             return false;

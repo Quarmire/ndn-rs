@@ -36,7 +36,6 @@ use ndn_face::local::InProcFace;
 use ndn_face_local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
-use ndn_transport::face::ScopePolicy;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents};
@@ -166,15 +165,10 @@ impl Connection for EngineConnection {
     /// interface is not one.
     fn routes(&self) -> Option<RouteEvents> {
         let own = self.face_id;
-        let faces = self.engine.faces();
+        let engine = self.engine.clone();
         Some(RouteEvents::new(
             self.engine.rib().route_events(),
-            move |face| {
-                face != own
-                    && faces
-                        .get(face)
-                        .is_some_and(|f| f.kind().scope_policy() != ScopePolicy::AlwaysLocal)
-            },
+            move |face| face != own && engine.face_reaches_off_host(face),
         ))
     }
 }

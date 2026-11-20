@@ -23,8 +23,8 @@ use ndn_security::FilePib;
 use crate::MgmtAccessPolicy;
 use crate::{
     ApprovalMgmtBackend, BleMgmtBackend, CodingHandler, ComputeMgmtBackend, FaceEvent,
-    LogInspector, MgmtResponse, NotificationStream, RateLimitMgmtBackend, RouteEvent,
-    StrategyEvent, WtCertStatusBackend,
+    LogInspector, MgmtResponse, NotificationStream, RateLimitMgmtBackend, RibEvent, StrategyEvent,
+    WtCertStatusBackend,
 };
 
 /// The forwarder-config read surface the management handlers depend on.
@@ -156,7 +156,7 @@ pub struct MgmtContext<'a> {
     /// Notification streams mounted by [`crate::mount_management`].
     /// `None` in tests that bypass `mount_management`.
     pub face_events: Option<&'a Arc<NotificationStream<FaceEvent>>>,
-    pub route_events: Option<&'a Arc<NotificationStream<RouteEvent>>>,
+    pub route_events: Option<&'a Arc<NotificationStream<RibEvent>>>,
     pub strategy_events: Option<&'a Arc<NotificationStream<StrategyEvent>>>,
 }
 

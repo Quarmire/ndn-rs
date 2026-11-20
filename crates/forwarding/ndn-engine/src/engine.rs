@@ -375,6 +375,19 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.face_table)
     }
 
+    /// Whether `face` is one of this engine's whose far end can be told of
+    /// an app's state: a link, a tunnel, a radio — a kind whose scope is
+    /// not always local. A local application's face and a management
+    /// socket are not, and neither is a face this engine does not hold
+    /// (gone). The one filter of the routes that tell a face coming up
+    /// ([`Rib::route_events`]), whoever hands them on: an embedded app's
+    /// connection, the daemon's `/localhost/nfd/rib/notifications`.
+    pub fn face_reaches_off_host(&self, face: FaceId) -> bool {
+        self.inner.face_table.get(face).is_some_and(|f| {
+            f.kind().scope_policy() != ndn_transport::face::ScopePolicy::AlwaysLocal
+        })
+    }
+
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn pit(&self) -> Arc<Pit> {
         Arc::clone(&self.inner.pit)

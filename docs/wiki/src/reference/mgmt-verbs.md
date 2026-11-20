@@ -87,7 +87,7 @@ ContentType Nack carrying a 404 `ControlResponse`: read the dataset again.
 | `register` | Register a prefix (with origin, cost, expiry). |
 | `unregister` | Drop a registration. |
 | `list` | Stream `RibEntry` dataset. |
-| `events` | Notification stream of `RouteEvent`. |
+| `events` | Notification stream `/localhost/nfd/rib/notifications` of `RibEvent` JSON: `register`, `unregister`, `route-up` (a route came up on a face that reaches off the host), `routes-missed`. See mgmt-trust.md "Notifications". |
 
 `strategy-choice`:
 

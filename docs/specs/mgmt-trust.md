@@ -942,12 +942,13 @@ params too; a param shown `?` is set only when it applies.
 A client follows what changes on a device — approvals arriving and decided,
 invites, the trust-context versions it keeps, its membership in each trusted
 prefix (adopted, enrolled, renewed, revoked, root changed), its requests for
-an admin's approval ending, renewals failing, links — by subscribing to two
-change-notification streams instead of polling the listing verbs. There is
-one trust stream: every trust change of the device, whatever made it, is
-one event on it. The JSON types are `ndn_cert::report::TrustEvent` and
-`ndn_mgmt_wire::events::LinkEvent`; the daemon side is
-`ndn_mgmt::MgmtEvents`, the client side `ndn_ipc::events`.
+an admin's approval ending, renewals failing, links, routes — by subscribing
+to three change-notification streams instead of polling the listing verbs.
+There is one trust stream: every trust change of the device, whatever made
+it, is one event on it. The JSON types are `ndn_cert::report::TrustEvent`,
+`ndn_mgmt_wire::events::LinkEvent` and `ndn_mgmt_wire::events::RibEvent`; the
+daemon side is `ndn_mgmt::MgmtEvents` (and, for the routes, `ndn_mgmt`'s own
+stream of the RIB), the client side `ndn_ipc::events`.
 
 ### Streams
 
@@ -955,6 +956,7 @@ one event on it. The JSON types are `ndn_cert::report::TrustEvent` and
 |---|---|---|
 | trust | `/localhost/nfd/security/notifications` | approvals and invites at this node's CAs; trust-context versions, memberships, requests ended, renewals failed of this node |
 | links | `/localhost/nfd/links/notifications` | link states |
+| rib | `/localhost/nfd/rib/notifications` | routes registered and unregistered through `rib/register` and `rib/unregister`; routes that came up on a face that reaches off the host, however they got in; events lost |
 
 Each is an NFD-style notification stream: event number `N` is the Data
 `<prefix>/seq=N` (SequenceNumber name component), unsigned
@@ -978,6 +980,32 @@ ndn-data host follows trust contexts this way, without polling the PIB)
 reads the stored version once on the event; a version the daemon could
 not store is not there, and the next event or resync brings the
 subscriber up to date.
+
+Sources and kinds of the rib stream. `register` and `unregister`
+(`{"kind":"register","face_id":N,"origin":O,"name":"/prefix"}`) tell a
+registration made through `rib/register` or `rib/unregister`, on any face.
+`route-up` (`{"kind":"route-up","face_id":N,"name":"/prefix"}`) tells a route
+that now puts face `N` into the forwarder's FIB at `/prefix` and did not
+before — `ndn_engine::Rib::route_events`, which the engine publishes for
+every route that gets into the FIB by the RIB, whatever installed it (a
+link layer, configuration, a routing protocol, a registration); a route
+already there, one removed, and one written to the FIB directly are not
+told. Only a route on a face that reaches off the host (a link, a
+tunnel, a radio: a face kind whose scope is not always local,
+`ForwarderEngine::face_reaches_off_host`) is a `route-up`; a local
+application's or a management socket's route is not, the filter an embedded
+app's connection applies too. `routes-missed`
+(`{"kind":"routes-missed"}`) tells the daemon's feed of the RIB fell
+behind and lost some: any route may have come up. The stream is
+the host's: it is served under `/localhost` (the forwarder answers no
+remote face for a `/localhost` name) and under no `/localhop` name. This
+is the stream `ndn_app::IpcConnection::routes` follows, so the data layer
+on a daemon announces its sync group when a link for it comes up
+([data-layer.md](data-layer.md) §12, "A face comes up"); the client
+takes the resync of its first request as the stream's number to follow
+from and a later one as lost events. The `register`/`unregister`
+events were a text line before this stream was JSON like the others;
+nothing read them.
 
 ### Sequence numbers, ring and resync
 

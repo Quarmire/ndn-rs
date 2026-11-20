@@ -1,11 +1,12 @@
 //! `/localhost/nfd/rib/{register, unregister, list}` — application
-//! route registration onto the engine RIB. Publishes `RouteEvent`s on
-//! `/localhost/nfd/rib/notifications`.
+//! route registration onto the engine RIB. Publishes `RibEvent`s on
+//! `/localhost/nfd/rib/notifications` for the registrations made here; the
+//! routes that come up from any source are published by
+//! [`crate::forward_route_ups`].
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use web_time::Instant;
 
 use ndn_engine::{ForwarderEngine, RibRoute};
@@ -13,47 +14,15 @@ use ndn_mgmt_wire::{
     ControlParameters, ControlResponse,
     control_parameters::{origin, route_flags},
     control_response::status,
+    events::RibEvent,
     nfd_command::{module, verb},
     nfd_dataset,
 };
-use ndn_packet::Name;
 use ndn_transport::FaceId;
 
 use super::common::{is_management_face, is_reserved_name, resolve_face_id};
 use crate::MgmtResponse;
 use crate::module::{MgmtContext, MgmtModule};
-use crate::notification::NotificationEvent;
-
-/// RIB add/remove event.
-#[derive(Debug, Clone)]
-pub struct RouteEvent {
-    pub kind: RouteEventKind,
-    pub prefix: Name,
-    pub face_id: FaceId,
-    pub origin: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum RouteEventKind {
-    Register = 1,
-    Unregister = 2,
-}
-
-impl NotificationEvent for RouteEvent {
-    fn encode(&self) -> Bytes {
-        // v1 wire shape: `kind face_id=<id> origin=<o> name=<n>` text
-        // line. NFD-canonical `RibEntryChange` TLV is a follow-up.
-        let kind = match self.kind {
-            RouteEventKind::Register => "register",
-            RouteEventKind::Unregister => "unregister",
-        };
-        Bytes::from(format!(
-            "{kind} face_id={} origin={} name={}",
-            self.face_id.0, self.origin, self.prefix
-        ))
-    }
-}
 
 fn handle_rib(
     verb_name: &[u8],
@@ -211,19 +180,18 @@ impl MgmtModule for RibModule {
             && let Some(body) = cr.body.as_ref()
             && let (Some(prefix), Some(face_id)) = (body.name.clone(), body.face_id)
         {
-            let kind = if verb == verb::REGISTER {
-                Some(RouteEventKind::Register)
+            let (name, origin) = (prefix.to_string(), body.origin.unwrap_or(origin::APP));
+            if verb == verb::REGISTER {
+                stream.publish(RibEvent::Register {
+                    face_id,
+                    origin,
+                    name,
+                });
             } else if verb == verb::UNREGISTER {
-                Some(RouteEventKind::Unregister)
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
-                stream.publish(RouteEvent {
-                    kind,
-                    prefix,
-                    face_id: FaceId(face_id),
-                    origin: body.origin.unwrap_or(origin::APP),
+                stream.publish(RibEvent::Unregister {
+                    face_id,
+                    origin,
+                    name,
                 });
             }
         }

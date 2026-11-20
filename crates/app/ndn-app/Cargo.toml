@@ -58,6 +58,8 @@ serde_json     = { workspace = true, optional = true }
 ndn-packet     = { workspace = true, features = ["std"] }
 ndn-face = { workspace = true }
 ndn-ipc        = { workspace = true }
+# The `rib` notification stream's event type, for `IpcConnection::routes`.
+ndn-mgmt-wire  = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "rt", "time"] }
 
 # Browser: in-process face from ndn-face-local (no OS sockets) and

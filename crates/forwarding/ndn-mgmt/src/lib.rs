@@ -61,9 +61,8 @@ pub use modules::faces::provision::{
     FaceProvisioner, ProvisionError, ProvisionRequest, ProvisionedFace,
 };
 pub use modules::faces::{FaceEvent, FaceEventKind};
-pub use modules::rib::{RouteEvent, RouteEventKind};
 pub use modules::strategy::{StrategyEvent, StrategyEventKind, create_strategy_by_name};
-pub use ndn_mgmt_wire::events::{EventSink, LinkEvent};
+pub use ndn_mgmt_wire::events::{EventSink, LinkEvent, RibEvent};
 pub use ndn_mgmt_wire::{ControlInfo, ControlStats, ControlSurface};
 pub use notification::{NotificationEvent, NotificationStream};
 
@@ -165,11 +164,12 @@ pub fn mount_management(
     );
 
     let face_events = NotificationStream::<FaceEvent>::new(notifications_prefix(b"faces"));
-    let route_events = NotificationStream::<RouteEvent>::new(notifications_prefix(b"rib"));
+    let route_events = NotificationStream::<RibEvent>::new(notifications_prefix(b"rib"));
     let strategy_events =
         NotificationStream::<StrategyEvent>::new(notifications_prefix(b"strategy-choice"));
     Arc::clone(&face_events).install(engine, cancel.clone());
     Arc::clone(&route_events).install(engine, cancel.clone());
+    forward_route_ups(engine, Arc::clone(&route_events), &cancel);
     Arc::clone(&strategy_events).install(engine, cancel.clone());
     Arc::clone(&handles.events.trust).install(engine, cancel.clone());
     Arc::clone(&handles.events.links).install(engine, cancel.clone());
@@ -254,6 +254,49 @@ fn forward_trust_events(
                     missed,
                     "trust notifications fell behind; {missed} events were not published"
                 ),
+                Err(RecvError::Closed) => return,
+            }
+        }
+    }));
+}
+
+/// Tell the `/localhost/nfd/rib/notifications` stream the routes that come
+/// up in the engine's RIB ([`ndn_engine::Rib::route_events`]), however they
+/// got there — a link layer, configuration, a routing protocol,
+/// `rib/register` — so a client of the daemon learns a face carrying a
+/// prefix came up as an embedded app does. The forwarder stays generic: it
+/// names no protocol, and neither does the event.
+///
+/// Only a route on a face that is not always local
+/// ([`ForwarderEngine::face_reaches_off_host`]: a link, a tunnel, a radio)
+/// is told, the same filter an embedded app's connection applies: a local
+/// application's or a management socket's registration has no far end to
+/// tell anything to, and its face kind is not for any local client to
+/// learn from the stream. A feed that falls behind says so
+/// ([`RibEvent::RoutesMissed`]).
+fn forward_route_ups(
+    engine: &ForwarderEngine,
+    stream: Arc<NotificationStream<RibEvent>>,
+    cancel: &CancellationToken,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut ups = engine.rib().route_events();
+    let (engine, cancel) = (engine.clone(), cancel.clone());
+    engine.runtime().spawn(Box::pin(async move {
+        loop {
+            let up = tokio::select! {
+                _ = cancel.cancelled() => return,
+                up = ups.recv() => up,
+            };
+            match up {
+                Ok(up) if engine.face_reaches_off_host(up.face) => {
+                    stream.publish(RibEvent::RouteUp {
+                        face_id: up.face.0,
+                        name: up.prefix.to_string(),
+                    });
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => stream.publish(RibEvent::RoutesMissed),
                 Err(RecvError::Closed) => return,
             }
         }
@@ -900,7 +943,7 @@ pub async fn run_ndn_mgmt_handler(
     #[cfg(not(target_arch = "wasm32"))] pib: Option<Arc<FilePib>>,
     mgmt_handles: MgmtHandles,
     face_events: Arc<NotificationStream<FaceEvent>>,
-    route_events: Arc<NotificationStream<RouteEvent>>,
+    route_events: Arc<NotificationStream<RibEvent>>,
     strategy_events: Arc<NotificationStream<StrategyEvent>>,
 ) {
     let router = build_mgmt_router(&mgmt_handles.extra_modules);

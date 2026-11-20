@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_cert::report::TrustEvent;
-use ndn_mgmt_wire::events::{EventSink, LINKS_STREAM, LinkEvent, RESYNC_KIND, TRUST_STREAM};
+use ndn_mgmt_wire::events::{
+    EventSink, LINKS_STREAM, LinkEvent, RESYNC_KIND, RibEvent, TRUST_STREAM,
+};
 
 use crate::notification::{NotificationEvent, NotificationStream};
 
@@ -28,6 +30,16 @@ impl NotificationEvent for TrustEvent {
 }
 
 impl NotificationEvent for LinkEvent {
+    fn encode(&self) -> Bytes {
+        json(self)
+    }
+
+    fn resync(next: u64) -> Option<Bytes> {
+        Some(resync_content(next))
+    }
+}
+
+impl NotificationEvent for RibEvent {
     fn encode(&self) -> Bytes {
         json(self)
     }
