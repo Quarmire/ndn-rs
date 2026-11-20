@@ -9,7 +9,8 @@ use ndn_packet::tlv_type::SELF_CERTIFYING;
 
 use crate::intro::{
     Contact, HintCandidate, HintKind, HintRecord, IntroRefusal, SHORT_FINGERPRINT_LEN, ShortCode,
-    ShortError, hint_name, hint_prefix, hint_token, introduction_prefixes, parse_hint_name,
+    ShortError, hint_name, hint_prefix, hint_token, introduction_prefixes, keyed_fingerprint,
+    keyed_fingerprint_matches, parse_hint_name,
 };
 use crate::version::Timestamp;
 
@@ -393,21 +394,29 @@ fn refusals_say_what_is_wrong_and_what_to_do() {
     }
 }
 
-/// The fingerprint a code carries is a prefix or the whole; a key matches it
-/// when it begins with it.
+/// A code matches the anchor it names: the whole fingerprint equal to it, or
+/// the tag keyed by the code's secret — never the anchor's plain first
+/// octets, which are the same for every code of the namespace.
 #[test]
-fn a_code_matches_the_fingerprints_it_prefixes() {
+fn a_code_matches_the_anchor_it_names() {
     let fp = whole();
-    assert!(named().matches(&fp));
+    let keyed = code(
+        n("/alice/member/laptop"),
+        Some(v4()),
+        &keyed_fingerprint(&secret(), &fp),
+    );
+    assert!(keyed.matches(&fp));
     let mut other = fp;
-    other[9] ^= 1;
-    assert!(!named().matches(&other));
-    other = fp;
     other[31] ^= 1;
     assert!(
-        named().matches(&other),
-        "a prefix of 10 octets does not see the last"
+        !keyed.matches(&other),
+        "the tag binds the whole fingerprint, not a prefix of it"
     );
+    assert!(
+        !named().matches(&fp),
+        "the plain first ten octets are no tag"
+    );
+    assert!(code(n("/a/b"), None, &fp).matches(&fp));
     assert!(!code(n("/a/b"), None, &fp).matches(&other));
 }
 
@@ -483,9 +492,109 @@ fn hint_records_round_trip() {
     let record = offered();
     assert_eq!(HintRecord::decode(record.encode(), false).unwrap(), record);
     for why in [IntroRefusal::Expired, IntroRefusal::Closed] {
-        let gone = HintRecord::Gone(why);
+        let gone = HintRecord::Gone {
+            why,
+            credentials: vec![Bytes::from_static(&[0x06, 0x01, 0xAA])],
+        };
         assert_eq!(HintRecord::decode(gone.encode(), false).unwrap(), gone);
     }
+}
+
+/// A gone mark carries the inviter's credentials, so that it is verified as a
+/// record is; one without them, or with anything of a record beside them, is
+/// refused.
+#[test]
+fn a_gone_mark_carries_credentials_and_nothing_of_a_record() {
+    use ndn_tlv::TlvWriter;
+    let tlv = crate::wire::tlv::INTRO_HINT;
+    let creds = |w: &mut TlvWriter| w.write_tlv(crate::wire::tlv::CREDENTIALS, &[0x06, 0x01, 0xAA]);
+    let record = |fields: &dyn Fn(&mut TlvWriter)| {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv, |w| fields(w));
+        w.finish()
+    };
+    assert!(
+        HintRecord::decode(
+            record(&|w| w.write_tlv(crate::wire::tlv::HINT_GONE, &[4])),
+            false
+        )
+        .is_err(),
+        "a gone mark with no credentials is read as one that proves nothing"
+    );
+    assert!(
+        HintRecord::decode(
+            record(&|w| {
+                w.write_tlv(crate::wire::tlv::HINT_GONE, &[4]);
+                creds(w);
+                w.write_tlv(crate::wire::tlv::LINK_KEY, &[0x42; 32]);
+            }),
+            false
+        )
+        .is_err(),
+        "a gone mark carries nothing of a record but the credentials"
+    );
+    assert!(
+        HintRecord::decode(
+            record(&|w| {
+                w.write_tlv(crate::wire::tlv::HINT_GONE, &[4]);
+                creds(w);
+            }),
+            false
+        )
+        .is_ok()
+    );
+}
+
+/// The keyed fingerprint a named namespace's short code carries
+/// ([`keyed_fingerprint`]): ten octets that depend on the code's secret and on
+/// the whole anchor fingerprint, and are not the anchor's own octets; a
+/// verifier compares it in constant time and refuses a tag of another length.
+#[test]
+fn the_keyed_fingerprint_depends_on_the_secret_and_the_whole_anchor() {
+    let anchor = whole();
+    let tag = keyed_fingerprint(&secret(), &anchor);
+    assert_eq!(tag.len(), SHORT_FINGERPRINT_LEN);
+    assert_eq!(tag, keyed_fingerprint(&secret(), &anchor), "deterministic");
+    assert_ne!(
+        tag[..],
+        anchor[..SHORT_FINGERPRINT_LEN],
+        "not the plain truncation"
+    );
+    let mut other_secret = secret();
+    other_secret[15] ^= 1;
+    assert_ne!(
+        tag,
+        keyed_fingerprint(&other_secret, &anchor),
+        "another secret, another tag"
+    );
+    // An anchor that differs only past the first ten octets gives another tag:
+    // the whole fingerprint is bound, not a prefix of it.
+    let mut other_anchor = anchor;
+    other_anchor[31] ^= 1;
+    assert_ne!(
+        tag,
+        keyed_fingerprint(&secret(), &other_anchor),
+        "the last octet counts"
+    );
+
+    assert!(keyed_fingerprint_matches(&secret(), &anchor, &tag));
+    assert!(!keyed_fingerprint_matches(&other_secret, &anchor, &tag));
+    assert!(!keyed_fingerprint_matches(&secret(), &other_anchor, &tag));
+    assert!(
+        !keyed_fingerprint_matches(&secret(), &anchor, &anchor[..SHORT_FINGERPRINT_LEN]),
+        "the plain truncation of the anchor is no tag"
+    );
+    assert!(
+        !keyed_fingerprint_matches(&secret(), &anchor, &tag[..9]),
+        "short"
+    );
+    let mut long = tag.to_vec();
+    long.push(0);
+    assert!(
+        !keyed_fingerprint_matches(&secret(), &anchor, &long),
+        "long"
+    );
+    assert!(!keyed_fingerprint_matches(&secret(), &anchor, &[]), "empty");
 }
 
 /// A record without what it needs, with too much, or with another refusal
@@ -502,7 +611,10 @@ fn malformed_hint_records_are_refused() {
     assert!(HintRecord::decode(record(&|_| {}), false).is_err(), "empty");
     assert!(
         HintRecord::decode(
-            record(&|w| w.write_nested(crate::wire::tlv::HINT_GONE, |w| w.write_raw(&[0x01]))),
+            record(&|w| {
+                w.write_nested(crate::wire::tlv::HINT_GONE, |w| w.write_raw(&[0x01]));
+                w.write_tlv(crate::wire::tlv::CREDENTIALS, &[0x06, 0x01, 0xAA]);
+            }),
             false
         )
         .is_err(),
@@ -511,7 +623,10 @@ fn malformed_hint_records_are_refused() {
     for code in [1u8, 2, 5, 6, 9] {
         assert!(
             HintRecord::decode(
-                record(&|w| w.write_tlv(crate::wire::tlv::HINT_GONE, &[code])),
+                record(&|w| {
+                    w.write_tlv(crate::wire::tlv::HINT_GONE, &[code]);
+                    w.write_tlv(crate::wire::tlv::CREDENTIALS, &[0x06, 0x01, 0xAA]);
+                }),
                 false
             )
             .is_err(),

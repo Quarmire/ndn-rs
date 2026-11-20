@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::StreamExt;
 
-use super::super::hint::HintFault;
 use super::super::intro::{Fingerprint, open_credentials};
 use super::*;
-use crate::intro::Joined;
+use crate::intro::{Joined, keyed_fingerprint};
+
+mod proof;
 
 /// Packets waiting for one end.
 struct Queue {
@@ -63,6 +64,8 @@ struct Net {
     sent: std::sync::Mutex<Vec<Sent>>,
     /// Interests a link did not carry.
     refused: std::sync::Mutex<Vec<Name>>,
+    /// Interests the joiner's dialled link carried (whatever else could have).
+    over_link: std::sync::Mutex<Vec<Name>>,
     tamper: std::sync::Mutex<Option<Tamper>>,
     hint_interests: AtomicUsize,
 }
@@ -81,6 +84,7 @@ impl Net {
             joiner_calls: Arc::clone(joiner_calls),
             sent: std::sync::Mutex::new(Vec::new()),
             refused: std::sync::Mutex::new(Vec::new()),
+            over_link: std::sync::Mutex::new(Vec::new()),
             tamper: std::sync::Mutex::new(None),
             hint_interests: AtomicUsize::new(0),
         })
@@ -113,6 +117,9 @@ impl Net {
                 || crate::intro::introduction_prefixes(&self.device)
                     .iter()
                     .any(|p| name.has_prefix(p)));
+        if linked {
+            self.over_link.lock().unwrap().push(name.clone());
+        }
         if via_relay || linked || calls.adopted() || self.by_name.load(Ordering::SeqCst) {
             return true;
         }
@@ -465,6 +472,25 @@ fn hint_refusal(got: &Result<Joined, DataError>) -> String {
     }
 }
 
+/// The reason of a record that verifies — its signature checks under
+/// credentials that open — but is not the code's inviter's: no damage in
+/// flight, so `AskOwner`, and no retry.
+fn mismatch_refusal(got: &Result<Joined, DataError>) -> String {
+    match got {
+        Err(
+            e @ DataError::Introduction {
+                why: IntroRefusal::HintMismatch { why },
+                ..
+            },
+        ) => {
+            assert_eq!(e.next(), crate::error::NextStep::AskOwner, "{e}");
+            assert!(!e.retry(), "{e}");
+            why.clone()
+        }
+        other => panic!("not refused as a mismatch of a record that verifies: {other:?}"),
+    }
+}
+
 /// Nothing was dialled, asked or adopted by a join that was refused at the hint
 /// record: no dial but the first contact's, which was taken down; no Interest
 /// but for the hint; nothing of Alice's namespace held.
@@ -525,7 +551,16 @@ async fn an_offer_with_an_address_makes_a_short_code_that_fits_three_lines_and_r
     let read = crate::intro::ShortCode::parse(&short, false).expect("it reads back");
     assert_eq!(read.device, n("/alice/laptop"));
     assert_eq!(read.secret, rig.secret);
-    assert_eq!(read.fingerprint, alice_fingerprint(&rig)[..10]);
+    assert_eq!(
+        read.fingerprint,
+        keyed_fingerprint(&rig.secret, &alice_fingerprint(&rig)),
+        "a named namespace's code carries the fingerprint keyed by its secret"
+    );
+    assert_ne!(
+        read.fingerprint,
+        alice_fingerprint(&rig)[..10],
+        "not the anchor's plain first octets"
+    );
     assert!(
         rig.code.link.contains("ndn-trust://intro/"),
         "the link is still made"
@@ -568,9 +603,14 @@ async fn a_contact_that_makes_the_line_too_wide_gives_way_to_the_next_that_fits(
         .await;
         let fp = alice_fingerprint(&rig);
         let width = |contact| {
-            short_text(&rig, Some(contact), rig.secret, &fp[..10])
-                .chars()
-                .count()
+            short_text(
+                &rig,
+                Some(contact),
+                rig.secret,
+                &keyed_fingerprint(&rig.secret, &fp),
+            )
+            .chars()
+            .count()
         };
         let by_address = width(crate::intro::Contact::Address(worst.parse().unwrap()));
         let by_relay = width(crate::intro::Contact::Relay(n("/alice/node/relay")));
@@ -833,10 +873,13 @@ async fn a_closed_or_expired_offer_is_answered_by_a_signed_gone_mark() {
     let rig = Rig::new(Setup::address()).await;
     rig.laptop.close_offer(&rig.code.offer).await.unwrap();
     let data = served(&rig, &hint_of(&rig)).expect("a closed offer is answered");
-    assert_eq!(
+    assert!(matches!(
         record_of(&data),
-        crate::intro::HintRecord::Gone(IntroRefusal::Closed)
-    );
+        crate::intro::HintRecord::Gone {
+            why: IntroRefusal::Closed,
+            ..
+        }
+    ));
     let own = open_credentials(&rig.laptop.inner.credentials().unwrap())
         .await
         .unwrap();
@@ -849,10 +892,13 @@ async fn a_closed_or_expired_offer_is_answered_by_a_signed_gone_mark() {
     rig.skew
         .store(2 * 3_600_000, std::sync::atomic::Ordering::SeqCst);
     let data = served(&rig, &hint_of(&rig)).expect("an expired offer is answered");
-    assert_eq!(
+    assert!(matches!(
         record_of(&data),
-        crate::intro::HintRecord::Gone(IntroRefusal::Expired)
-    );
+        crate::intro::HintRecord::Gone {
+            why: IntroRefusal::Expired,
+            ..
+        }
+    ));
 }
 
 /// `hint_while_open = false`: the record is served until the device stops, past
@@ -919,10 +965,13 @@ async fn closing_an_offer_ends_the_record_at_once() {
         crate::intro::HintRecord::Offered { .. }
     ));
     rig.laptop.close_offer(&rig.code.offer).await.unwrap();
-    assert_eq!(
+    assert!(matches!(
         record_of(&served(&rig, &name).unwrap()),
-        crate::intro::HintRecord::Gone(IntroRefusal::Closed)
-    );
+        crate::intro::HintRecord::Gone {
+            why: IntroRefusal::Closed,
+            ..
+        }
+    ));
 }
 
 /// The token is kept durably and read back at a start: a restarted inviter
@@ -1077,7 +1126,7 @@ async fn a_short_code_with_no_contact_is_routed_by_name() {
     let rig = Rig::new(Setup::address()).await;
     rig.net.by_name.store(true, Ordering::SeqCst);
     let fp = alice_fingerprint(&rig);
-    let text = short_text(&rig, None, rig.secret, &fp[..10]);
+    let text = short_text(&rig, None, rig.secret, &keyed_fingerprint(&rig.secret, &fp));
     let joined = rig.phone.join(&text).await.expect("joins");
     assert_eq!(joined.folder, rig.folder);
     assert!(rig.phone_calls.first_dialled().is_empty());
@@ -1191,7 +1240,7 @@ async fn a_loopback_first_contact_is_refused_unless_the_joiners_policy_allows_it
             "127.0.0.1:4433".parse().unwrap(),
         )),
         rig.secret,
-        &fp[..10],
+        &keyed_fingerprint(&rig.secret, &fp),
     );
     let got = rig.phone.join(&text).await;
     assert!(
@@ -1215,7 +1264,7 @@ async fn a_loopback_first_contact_is_refused_unless_the_joiners_policy_allows_it
             "127.0.0.1:4433".parse().unwrap(),
         )),
         allowed.secret,
-        &fp[..10],
+        &keyed_fingerprint(&allowed.secret, &fp),
     );
     let _ = allowed.phone.join(&text).await;
     assert_eq!(
@@ -1276,7 +1325,12 @@ async fn a_joiner_that_cannot_fetch_the_hint_is_not_ready() {
     let rig = Rig::new(Setup::address()).await;
     rig.first_contact_answers();
     let fp = alice_fingerprint(&rig);
-    let text = short_text(&rig, Some(address()), [0x77; 16], &fp[..10]);
+    let text = short_text(
+        &rig,
+        Some(address()),
+        [0x77; 16],
+        &keyed_fingerprint(&[0x77; 16], &fp),
+    );
     let got = rig.phone.join(&text).await;
     assert!(matches!(got, Err(DataError::NotReady { .. })), "{got:?}");
     assert!(rig.laptop.inner.st.lock().intro.used.is_empty());
@@ -1356,7 +1410,7 @@ async fn a_code_of_another_anchor_is_refused_by_the_record() {
     rig.first_contact_answers();
     let text = short_text(&rig, Some(address()), rig.secret, &[0x42; 10]);
     let got = rig.phone.join(&text).await;
-    let why = hint_refusal(&got);
+    let why = mismatch_refusal(&got);
     assert!(why.starts_with("anchor"), "{why}");
     assert_nothing_went_further(&rig, Some(rig.inviter_key()));
 }
@@ -1547,7 +1601,7 @@ async fn a_packet_that_is_no_hint_record_or_is_named_otherwise_is_refused() {
     // itself, which would also hold for a transport that did.
     let rig = Rig::new(Setup::address()).await;
     let genuine = served(&rig, &hint_of(&rig)).unwrap();
-    let fingerprint = Fingerprint::Prefix(alice_fingerprint(&rig)[..10].to_vec());
+    let fingerprint = Fingerprint::Whole(alice_fingerprint(&rig));
     let other = crate::intro::hint_name(rig.laptop.name(), &[1; 16]);
     let got = rig
         .phone
@@ -1555,7 +1609,7 @@ async fn a_packet_that_is_no_hint_record_or_is_named_otherwise_is_refused() {
         .verify_hint(&genuine, &other, rig.laptop.name(), &fingerprint, None)
         .await;
     assert!(
-        matches!(&got, Err(HintFault::Bad(why)) if why.starts_with("wrong name")),
+        matches!(&got, Err(IntroRefusal::Hint { why }) if why.starts_with("wrong name")),
         "a record was taken for a name it does not carry"
     );
     let got = rig
@@ -1616,7 +1670,7 @@ async fn a_record_signed_by_another_device_of_the_namespace_is_refused() {
             .ok()
     });
     let got = rig.phone.join(rig.code.share()).await;
-    let why = hint_refusal(&got);
+    let why = mismatch_refusal(&got);
     assert!(why.starts_with("signer"), "{why}");
     assert_nothing_went_further(&rig, Some(rig.inviter_key()));
 }
@@ -1674,7 +1728,7 @@ async fn a_record_naming_another_offer_is_refused_before_the_ask() {
             .ok()
     });
     let got = rig.phone.join(rig.code.share()).await;
-    let why = hint_refusal(&got);
+    let why = mismatch_refusal(&got);
     assert!(why.starts_with("offer"), "{why}");
     let asked: Vec<Name> = rig
         .net
@@ -1716,4 +1770,136 @@ async fn a_short_code_of_a_device_under_a_held_namespace_of_another_anchor_dials
     );
     assert!(rig.phone_calls.first_dialled().is_empty());
     assert!(rig.net.sent().is_empty());
+}
+
+// ---- a first link of another key than the record's (M2) and the offer's signer (I1) -------------
+
+/// What a join through a party that answered the dial with a key of its own
+/// must leave: its link taken down before anything but the hint went over it,
+/// and no Interest of the join (the offer, the ask) carried by it.
+fn assert_first_link_of_a_party_gone(rig: &Rig, party: [u8; 32]) {
+    assert_eq!(
+        rig.phone_calls.undialled_keys(),
+        vec![party],
+        "the first link of a key the record does not name was not taken down"
+    );
+    assert!(
+        !rig.phone_calls.linked(),
+        "a link to the party at the address outlives the join"
+    );
+    let beyond: Vec<Name> = rig
+        .net
+        .over_link
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| !is_hint(n))
+        .cloned()
+        .collect();
+    assert!(
+        beyond.is_empty(),
+        "the party's link carried the join's Interests: {beyond:?}"
+    );
+}
+
+/// A party at the code's address answers the dial with a key of its own and
+/// relays the genuine record, which names the inviter's key; that key's dial
+/// is blocked. The join goes on by name, and the party's link is taken down as
+/// soon as the record shows it is not the inviter's: neither the offer fetch
+/// nor the ask goes over it, and it does not outlive the join.
+#[tokio::test]
+async fn a_first_link_of_another_key_than_the_records_is_taken_down_at_once() {
+    let rig = Rig::new(Setup::address()).await;
+    let party = [0xA7; 32];
+    *rig.phone_calls.first_dial.lock().unwrap() = Some(Ok(party));
+    rig.net.by_name.store(true, Ordering::SeqCst);
+    let joined = rig
+        .phone
+        .join(rig.code.share())
+        .await
+        .expect("joins by name");
+    assert_eq!(joined.folder, rig.folder);
+    assert_eq!(
+        rig.phone_calls.dialled(),
+        vec![n("/alice/laptop")],
+        "the record's key was not dialled"
+    );
+    assert_first_link_of_a_party_gone(&rig, party);
+}
+
+/// The same with a record that offers no address to dial: the join must not
+/// carry on over the party's link either.
+#[tokio::test]
+async fn a_first_link_of_another_key_than_a_record_with_no_address_is_not_used() {
+    let rig = Rig::new(Setup::address()).await;
+    let party = [0xA7; 32];
+    *rig.phone_calls.first_dial.lock().unwrap() = Some(Ok(party));
+    *rig.inviter_calls.hint.lock().unwrap() = None;
+    rig.net.by_name.store(true, Ordering::SeqCst);
+    let joined = rig
+        .phone
+        .join(rig.code.share())
+        .await
+        .expect("joins by name");
+    assert_eq!(joined.folder, rig.folder);
+    assert!(rig.phone_calls.dialled().is_empty(), "nothing to dial");
+    assert_first_link_of_a_party_gone(&rig, party);
+}
+
+/// A party on the path substitutes the offer's seal key and re-signs the entry
+/// with a key of its own, keeping the commitment: the hint's credentials show
+/// the entry is not signed by a key of the inviter's device, so it is refused
+/// before the ask is sealed to the substituted key.
+#[tokio::test]
+async fn an_offer_entry_the_hints_credentials_do_not_vouch_for_is_refused_before_the_ask() {
+    let rig = Rig::new(Setup::address()).await;
+    rig.first_contact_answers();
+    let own_seal_key = rig.phone.inner.st.lock().keys.recipient.public();
+    let attacker = Arc::clone(&rig.phone.inner);
+    let inviter = Arc::clone(&rig.laptop.inner);
+    rig.net.tamper(move |wire| {
+        let data = Data::decode(wire.clone()).ok()?;
+        if crate::wire::parse_held_name(&data.name).is_none() {
+            return Some(wire);
+        }
+        let entry = Data::decode(data.content()?.clone()).ok()?;
+        let Ok(crate::wire::Record::Intro(crate::intro::IntroRecord::Offer(mut offer))) =
+            crate::wire::decode_record(entry.content()?.clone())
+        else {
+            return Some(wire);
+        };
+        offer.seal_key = own_seal_key;
+        let forged = attacker
+            .sign(DataBuilder::new(
+                (*entry.name).clone(),
+                &crate::intro::IntroRecord::Offer(offer).encode(),
+            ))
+            .ok()?;
+        inviter
+            .sign(DataBuilder::new((*data.name).clone(), &forged))
+            .ok()
+    });
+    let got = rig.phone.join(rig.code.share()).await;
+    assert!(
+        matches!(
+            &got,
+            Err(DataError::Introduction {
+                why: IntroRefusal::Forged,
+                ..
+            })
+        ),
+        "{got:?}"
+    );
+    let asked: Vec<Name> = rig
+        .net
+        .sent()
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| crate::intro::parse_intro_name(n).is_some())
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "an ask was sent after the offer's signer was substituted: {asked:?}"
+    );
+    assert_eq!(rig.phone_calls.undialled_keys(), vec![rig.inviter_key()]);
 }

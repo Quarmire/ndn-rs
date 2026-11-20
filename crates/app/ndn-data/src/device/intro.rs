@@ -17,20 +17,22 @@ use ndn_security::safe_data::TrustPath;
 use ndn_security::self_certifying::self_certifying_digest;
 use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
-    anchor_fingerprint, public_key_digest,
+    VerifyOutcome, anchor_fingerprint, public_key_digest, verifier::verify_public_key_signature,
 };
 use ndn_trust_envelope::words::WORD_COUNT as WORDS_FORM_WORDS;
 use ndn_trust_envelope::{IntroWords, Introduction, TrustEnvelope};
+use subtle::ConstantTimeEq;
 
-use super::hint::{FirstContact, HintFault};
+use super::hint::FirstContact;
 use super::{Device, Held, Inner, St, Subject, check_collection, local, open_grant, owner_signed};
 use crate::collection::Epoch;
 use crate::error::DataError;
 use crate::intro::{
     AnswerBody, AskBody, Code, Contact, HINT_TOKEN_LEN, IntroAsk, IntroRecord, IntroRefusal,
     Introducer, Joined, JoinedFolder, LinkHint, Offer, OfferBody, Outcome, Role, SECRET_LEN,
-    ShortCode, UsedBody, answer_proof, answer_proves, ask_proof, ask_proves, commitment, hint_name,
-    hint_token, intro_name, intro_prefix, parse_hint_name, proof_key,
+    SHORT_FINGERPRINT_LEN, ShortCode, UsedBody, answer_proof, answer_proves, ask_proof, ask_proves,
+    commitment, hint_name, hint_token, intro_name, intro_prefix, keyed_fingerprint_matches,
+    parse_hint_name, proof_key,
 };
 use crate::layer::{ShareChange, Sharing};
 use crate::rt::Instant;
@@ -263,6 +265,42 @@ impl Opened {
         Some(public_key_digest(&cert.public_key))
     }
 
+    /// The key that signed `data`, when the signature is good by the public key
+    /// of a certificate these credentials chain to their anchor — judged by
+    /// that key's own chain and the signature alone, not by what the context's
+    /// schema lets the key sign ([`Self::signer`] adds that). A packet that is
+    /// not even that was damaged in flight or is nobody's; one that is, and
+    /// then fails the code's namespace, anchor or device, is authentic and not
+    /// the code's inviter's (spec §19.3 S5).
+    pub(super) async fn authentic_signer(&self, data: &Data) -> Option<Name> {
+        let info = data.sig_info()?;
+        let locator = info.key_locator_name()?;
+        let key = key_name_of(&locator);
+        let cert = match self.ctx.anchor_for(&key) {
+            Some(anchor) => anchor,
+            None => {
+                let cert = self.validator.cert_cache().get_valid(&key)?;
+                let own = Data::decode(cert.data_wire()?).ok()?;
+                match self.validator.validate_chain(&own).await {
+                    ValidationResult::Valid(safe)
+                        if !matches!(safe.trust_path(), TrustPath::DigestSha256) => {}
+                    _ => return None,
+                }
+                cert
+            }
+        };
+        matches!(
+            verify_public_key_signature(
+                info.sig_type,
+                data.signed_region(),
+                data.sig_value(),
+                &cert.public_key
+            ),
+            Ok(VerifyOutcome::Valid)
+        )
+        .then_some(key)
+    }
+
     /// The certificates on the chain from `key` to the context's anchor,
     /// as a chain walk picks them, named under `ns`: what a validator
     /// adopting the context takes of these credentials, and nothing else
@@ -327,26 +365,46 @@ impl Opened {
     }
 }
 
-/// The anchor fingerprint a code names: whole (a link, or a short code of
-/// 36 words), or its first octets (the words form's 16, a short code's 10).
+/// The anchor fingerprint a code names, as the code carries it, and how it is
+/// judged against the whole fingerprint of the anchor of verified credentials
+/// (spec §19.3, §19.7). Every comparison is in constant time.
 pub(super) enum Fingerprint {
+    /// All 32 octets: a link's, or a short code's of 36 words (a
+    /// self-certifying namespace, whose name it is). Compared whole.
     Whole([u8; 32]),
+    /// The first octets of the anchor's, as written: the old 24-word form's 16
+    /// (128 bits), plain. A prefix of a public value, compared as the prefix.
     Prefix(Vec<u8>),
+    /// A short code's 10 octets of a named namespace: the tag
+    /// ([`keyed_fingerprint`](crate::intro::keyed_fingerprint)) keyed by the
+    /// code's own secret, which the joiner recomputes from the verified
+    /// anchor's whole fingerprint.
+    Keyed {
+        secret: [u8; SECRET_LEN],
+        tag: [u8; SHORT_FINGERPRINT_LEN],
+    },
 }
 
 impl Fingerprint {
-    /// The fingerprint `octets` of a code: whole at 32 octets, else a prefix.
-    pub(super) fn of(octets: &[u8]) -> Self {
-        match <[u8; 32]>::try_from(octets) {
-            Ok(whole) => Fingerprint::Whole(whole),
-            Err(_) => Fingerprint::Prefix(octets.to_vec()),
+    /// The fingerprint `octets` of a short code made with `secret`: whole at
+    /// 32 octets, a keyed tag at [`SHORT_FINGERPRINT_LEN`], no other length.
+    pub(super) fn of(octets: &[u8], secret: &[u8; SECRET_LEN]) -> Option<Self> {
+        if let Ok(whole) = <[u8; 32]>::try_from(octets) {
+            return Some(Fingerprint::Whole(whole));
         }
+        <[u8; SHORT_FINGERPRINT_LEN]>::try_from(octets)
+            .ok()
+            .map(|tag| Fingerprint::Keyed {
+                secret: *secret,
+                tag,
+            })
     }
 
     pub(super) fn matches(&self, fp: &[u8; 32]) -> bool {
         match self {
-            Fingerprint::Whole(w) => w == fp,
-            Fingerprint::Prefix(p) => fp.starts_with(p),
+            Fingerprint::Whole(w) => bool::from(w.ct_eq(fp)),
+            Fingerprint::Prefix(p) => p.len() <= fp.len() && bool::from(fp[..p.len()].ct_eq(p)),
+            Fingerprint::Keyed { secret, tag } => keyed_fingerprint_matches(secret, fp, tag),
         }
     }
 }
@@ -424,11 +482,18 @@ fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
             let s = ShortCode::parse(code, local_candidates)
                 .map_err(|e| bad(Name::root(), e.to_string()))?;
             let namespace = self_certifying_namespace(&s.device, &s.fingerprint);
+            let fingerprint = Fingerprint::of(&s.fingerprint, &s.secret).ok_or_else(|| {
+                bad(
+                    Name::root(),
+                    "the code carries a fingerprint of neither 10 nor 32 octets: check the code"
+                        .into(),
+                )
+            })?;
             return Ok(Parsed {
                 offer: None,
                 device: s.device,
                 secret: s.secret,
-                fingerprint: Fingerprint::of(&s.fingerprint),
+                fingerprint,
                 namespace,
                 relays: Vec::new(),
                 link_hint: None,
@@ -957,6 +1022,7 @@ impl Inner {
                         st.intro.used.entry(body.offer).or_insert(by);
                     }
                     None => {
+                        super::hint::drop_hint_served(st, &body.offer);
                         st.intro.closed.insert(body.offer);
                     }
                 }
@@ -2042,7 +2108,7 @@ impl Device {
         let mut dialled: Option<LinkHint> = None;
         let mut linked_first = first.as_ref().and_then(|f| f.linked.clone());
         let joined: Result<Joined, DataError> = async {
-            let (offer, hints) = if let (Some(short), Some(first)) = (&code.short, &first) {
+            let (offer, hints, vouching) = if let (Some(short), Some(first)) = (&code.short, &first) {
                 // The hint record, fetched over the first contact and verified
                 // before anything else is sent (§3.4, §3.5).
                 let asked = hint_name(&device, &short.token);
@@ -2058,14 +2124,8 @@ impl Device {
                     .await
                 {
                     Ok(hinted) => hinted,
-                    Err(HintFault::Refused(why)) => {
+                    Err(why) => {
                         return Err(DataError::Introduction { offer: named, why });
-                    }
-                    Err(HintFault::Bad(why)) => {
-                        return Err(DataError::Introduction {
-                            offer: named,
-                            why: IntroRefusal::Hint { why },
-                        });
                     }
                 };
                 // The relays the Interests go through when no link carries
@@ -2079,25 +2139,31 @@ impl Device {
                 if hints.is_empty() {
                     hints = inner.hints(&[]);
                 }
-                // Dial as a code's link hint is: by the record's key and
-                // candidates, unless the first contact's link is that key's
-                // already.
-                let candidates = !hinted.link.candidates.is_empty();
+                // The first contact's link is kept only when the key it
+                // proved is the record's: the dial expected no key, so what
+                // answered may be any party on the path to the address, which
+                // relays the genuine record. A link of another key is taken
+                // down now, before the offer is fetched or the ask sent, and
+                // the join goes by the record's own dial, then relays, then by
+                // name; it is never the link's routes (spec §19.3).
                 let same = linked_first
                     .as_ref()
                     .is_some_and(|l| l.key == hinted.link.key);
-                if linked_first.is_some() && (same || !candidates) {
+                if !same && let Some(first_link) = linked_first.take() {
+                    introducer.undial(&first_link, &device);
+                }
+                // Dial as a code's link hint is: by the record's key and
+                // candidates, unless the first contact's link is that key's
+                // already.
+                if same {
                     hints.clear();
-                } else if candidates {
+                } else if !hinted.link.candidates.is_empty() {
                     match introducer
                         .dial(&hinted.link, &device, inner.config.first_look)
                         .await
                     {
                         Ok(()) => {
                             hints.clear();
-                            if let Some(first_link) = linked_first.take() {
-                                introducer.undial(&first_link, &device);
-                            }
                             dialled = Some(hinted.link);
                         }
                         Err(why) => {
@@ -2105,7 +2171,7 @@ impl Device {
                         }
                     }
                 }
-                (hinted.offer, hints)
+                (hinted.offer, hints, Some(hinted.opened))
             } else {
                 let offer = code.offer.clone().ok_or_else(|| {
                     local("a code that is neither a link, words nor a short code was read")
@@ -2129,7 +2195,7 @@ impl Device {
                         }
                     }
                 }
-                (offer, hints)
+                (offer, hints, None)
             };
             let forged = || DataError::Introduction {
                 offer: offer.clone(),
@@ -2160,15 +2226,32 @@ impl Device {
                     why: IntroRefusal::Unknown,
                 });
             };
+            // The offer entry must be signed by a key of the inviter's device
+            // that chains to the anchor the verified record's credentials
+            // carry, before the ask is sealed to the seal key it holds: with
+            // the commitment public, a party on the path could else
+            // substitute the seal key and read the ask. Nothing proves it
+            // for a link or words form (no record): the answer's credentials
+            // are checked after.
+            let by_device = |k: &Option<(Name, [u8; 32])>| {
+                k.as_ref()
+                    .is_some_and(|(k, _)| device_of(k).as_ref() == Some(&device))
+            };
+            if let Some(vouching) = &vouching
+                && !by_device(&vouching.signer(&entry).await)
+            {
+                return Err(forged());
+            }
             // A short code's secret is whole in the code (a checksum guards it
             // against a typo), so an offer that is not committed to it is
             // another offer than the code's: a record that names it, whoever
-            // signed it, is no record of this code's offer. Refused before the
-            // ask, which would only count a wrong try.
+            // signed it, is no record of this code's offer. Judged on an entry
+            // the record's credentials vouch for, and refused before the ask,
+            // which would only count a wrong try.
             if code.short.is_some() && ob.commitment != commitment(&code.secret) {
                 return Err(DataError::Introduction {
                     offer: offer.clone(),
-                    why: IntroRefusal::Hint {
+                    why: IntroRefusal::HintMismatch {
                         why: format!("offer: {offer} was not made with this code's secret"),
                     },
                 });
@@ -2243,10 +2326,6 @@ impl Device {
             let theirs = open_credentials(credentials).await.ok_or_else(forged)?;
             let inviter = theirs.ctx.namespace().clone();
             let signed = Data::decode(signed.clone()).map_err(|_| forged())?;
-            let by_device = |k: &Option<(Name, [u8; 32])>| {
-                k.as_ref()
-                    .is_some_and(|(k, _)| device_of(k).as_ref() == Some(&device))
-            };
             let signer = theirs.signer(&signed).await;
             if !code.fingerprint.matches(&theirs.fingerprint())
                 || code.namespace.as_ref().is_some_and(|ns| *ns != inviter)

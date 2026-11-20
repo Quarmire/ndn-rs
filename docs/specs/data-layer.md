@@ -4320,10 +4320,10 @@ the Data `<D>/32=hint/<token>` (§16.1), with the same reader rule.
 |---|---|---|
 | 0x05B0 | LinkKey | 32 octets: SHA-256 of the inviter device's public key as a certificate carries it (an Ed25519 key's 32 octets); the key a link handshake must prove (ndn-link.md §3.3); exactly once |
 | 0x05B2 | LinkCandidate | one octet of kind (0 host, 1 reflexive, 2 advertised, 3 mapped), the IP address (4 octets for IPv4, 16 for IPv6), the UDP port (2 octets, big-endian); 7 or 19 octets; repeatable, at most 8 kept, in order of preference (§19.2) |
-| 0x05B4 | IntroHint | a hint record's Content (§19.2), one TLV and nothing after it: `HintOffer`, `LinkKey`, `LinkCandidate`*, `HintRelay`*, `HintUntil`, `Credentials` (0x056F) in this order — or, for an offer no longer served, just `HintGone` |
+| 0x05B4 | IntroHint | a hint record's Content (§19.2), one TLV and nothing after it: `HintOffer`, `LinkKey`, `LinkCandidate`*, `HintRelay`*, `HintUntil`, `Credentials` (0x056F) in this order — or, for an offer no longer served, `HintGone` then `Credentials` and nothing else |
 | 0x05B6 | HintOffer | one Name TLV: the offer record's name; exactly once |
 | 0x05B8 | HintRelay | one Name TLV: a relay device that reaches the inviter; repeatable, at most 8 (a record with more is refused) |
-| 0x05BA | HintGone | NonNegativeInteger: 3 expired or 4 closed (the codes of `IntroRefused`); the only field of a gone mark |
+| 0x05BA | HintGone | NonNegativeInteger: 3 expired or 4 closed (the codes of `IntroRefused`); with `Credentials` (0x056F, the inviter's, as a record carries them) the whole of a gone mark, which is verified as a record is (§19.3 S5) |
 | 0x05BC | HintUntil | NonNegativeInteger: the offer's expiry in milliseconds; informational (the offer judges its own); exactly once |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
@@ -5849,7 +5849,7 @@ fit without them is `Local`. The measured sizes are in the table below.
 (`ShortCode::encode`, `ShortCode::parse`):
 
 ```
-short      = device SP [ contact SP ] word{20}     ; a named namespace: 10 octets of the fingerprint
+short      = device SP [ contact SP ] word{20}     ; a named namespace: 10 octets, the fingerprint keyed by the code's secret
            | device SP [ contact SP ] word{36}     ; the whole 32 octets of the fingerprint
 device     = an absolute NDN URI of the inviter's device D, not the root: /alice/member/laptop
 contact    = "[" IPv6 "]" ":" port                 ; [2001:db8::7]:4433
@@ -5877,7 +5877,8 @@ word       = a BIP39 English word, 11 bits
    prefix up to that component. A 36-word code without `161=*` is valid: the
    names are literal.
 3. **Words and checksum.** `payload = secret (16) ‖ fingerprint (10 or
-   32)`; the words encode `payload ‖ checksum (12 bits)`, eleven bits to a
+   32)`, the 10 octets being the **keyed fingerprint** (below); the words
+   encode `payload ‖ checksum (12 bits)`, eleven bits to a
    word (trust-envelope.md §5.8): 26 octets are 220 bits, **20 words**; 48
    octets are 396 bits, **36 words**. The checksum is the first 12 bits of
    SHA-256(`ndn-trust/intro-short/1` ‖ the **bound text** ‖ `0x00` ‖
@@ -5915,8 +5916,24 @@ facts: the secret (16 octets, never fetched, never on a wire in clear;
 and a shorter secret could be searched offline) and the anchor's
 fingerprint. The device name is in the text because the hint record is
 fetched at its name and an Interest is routed by it; the contact is the only
-way to reach the inviter before the record is held. The reason for 80 bits
-of fingerprint is in §19.7.
+way to reach the inviter before the record is held.
+
+**The fingerprint a short code carries.** A named namespace's code carries
+`keyed_fingerprint(secret, anchor) = HMAC-SHA256(key = secret,
+"ndn-data/intro/fp/1" ‖ anchor)[..10]`, `anchor` being the 32-octet
+fingerprint of the namespace's anchor (§19.6), not the first octets of
+`anchor` itself. It is the same number of octets and words as a plain
+truncation. The joiner computes it again from the whole fingerprint of the
+anchor the verified credentials carry and compares in constant time
+(`Mac::verify_truncated_left`; a tag of any other length is no match).
+The code of a self-certifying namespace carries the whole 32 octets: they
+are the namespace's name, not a truncation of it. A code made before the
+keyed fingerprint carries the plain first 10 octets, which no longer match
+any anchor: it is refused as an anchor mismatch that says so (§19.5). The
+old 24-word form, which a link and `Code::words` also give, carries a plain
+16-octet prefix, and is judged as a prefix of the anchor's fingerprint,
+compared in constant time. Why 80 keyed bits, and why 128 plain bits for
+the words form, are in §19.7.
 
 **The hint record.** What the joiner fetches by the code's first contact,
 and the only thing a short code's offer names: a record the inviter makes
@@ -5948,17 +5965,25 @@ and the only thing a short code's offer names: a record the inviter makes
    candidates are read as a link hint's are (§19.2 above: at most 8
    distinct dialable ones, loopback and link-local only under
    `local_candidates`).
-3. **Gone mark.** For an offer no longer served, the same Data holds just
-   `IntroHint { HintGone }`: 3 expired, 4 closed (any other refusal of the
-   offer is written as 4), signed alike. It carries nothing else and is a
-   clear refusal where there would be silence.
+3. **Gone mark.** For an offer no longer served, the same Data holds
+   `IntroHint { HintGone, Credentials }`: `HintGone` 3 expired, 4 closed (any
+   other refusal of the offer is written as 4), and the inviter's
+   credentials as a record carries them, signed alike. It carries nothing
+   else and is a clear refusal where there would be silence. Its Data has
+   **`FreshnessPeriod` 0**: a cache holds a record for `HINT_CACHE`, never a
+   mark, so a party on the path cannot leave a forged mark in a cache to
+   answer the joiner's retries. The joiner verifies a mark as it does a
+   record (§19.3 S5): a mark that does not verify is anyone's, and ends
+   nothing (§19.5 `GoneUnproven`). A reader refuses a mark without
+   credentials, or with anything else of a record.
 4. **On request.** The device makes the record when the Interest comes, from
    the host's link hint and the namespace's relays as they are then, so a
    restarted inviter or a moved address is current. It signs one record per
    token and keeps it 5 s, answering the same Data again while the offer's
-   state (record, or which gone mark) is unchanged; a change, a closing
-   mark included, is signed at once. A device with no introducer, or whose
-   credentials cannot be made, answers nothing.
+   state (record, or which gone mark) is unchanged (a gone mark too is kept
+   5 s by the inviter; its Data's `FreshnessPeriod` is 0, item 3); a change,
+   a closing mark included, is signed at once. A device with no introducer,
+   or whose credentials cannot be made, answers nothing.
 5. **Served while the offer is open.** The record is served while the offer
    is open (not expired by the device's clock, not closed: a closing mark
    held, or the overall wrong tries at the cap, §19.4 step 4), and a gone mark
@@ -5980,7 +6005,15 @@ and the only thing a short code's offer names: a record the inviter makes
    start for the offers it holds (a note not wrapped to the device's key is
    ignored, and its offer publishes no hint). The offer record and the log
    hold nothing of the hint. A hint record exists only for an offer that
-   was given a short code.
+   was given a short code. The token, one name per offer, and its durable
+   note stay for as long as the offer record is held — offers are never
+   pruned — because item 5 gives a gone mark to the token of a closed or
+   expired offer, across a restart too; what is kept of the **signed
+   packets** lives `HINT_CACHE` and no more: a packet older than that is
+   dropped whenever a hint Interest is answered or refused (an unknown
+   token's too), a token is kept, or an offer closes, and a closing
+   drops the packet kept for that offer's token at once. Nothing a prober
+   asks for grows what the device keeps.
 
 **The surface and the prefixes.** `IntroductionSurface::carries(name)`
 gains exactly one exact name family, `<D>/32=hint/<token>` of a token the
@@ -6018,13 +6051,16 @@ is published then.
 **`Introducer::dial_first`.** A short code's address first contact is dialled
 by `Introducer::dial_first(inviter, addr, within)`: **one** address, with **no
 key to expect** (a short code carries none); `Ok(key)` is the SHA-256 of the
-public key the handshake proved. Until the joiner holds the inviter's
-namespace the link routes only `introduction_prefixes(inviter)`, never the
-names the code claims for the device (ndn-link.md §13.3A). The address is a
-hint: whoever answers there is linked, and everything it serves is verified
-against the code (§19.3). The default dials nothing and refuses with a text
-that says the host has no link layer; the join then says the first contact
-could not be reached.
+public key the handshake proved. The dial sends an **empty hello** (no
+certificate, no membership: ndn-link.md §13.3A), and until the joiner holds
+the inviter's namespace the link routes only `introduction_prefixes(inviter)`,
+never the names the code claims for the device, and receives from the party
+answers under those prefixes and Interests under the joiner's own device names
+only. The address is a hint: whoever answers there is linked, and everything it
+serves is verified against the code (§19.3); a link whose key is not the
+verified record's is taken down at once (§19.3 S6). The default dials nothing
+and refuses with a text that says the host has no link layer; the join then
+says the first contact could not be reached.
 
 **Lengths (informative; measured, the same secret in each).** Characters of
 the one line of a short code (device name, contact, words), and of the
@@ -6245,11 +6281,25 @@ never the token.
   a namespace the code names (a 36-word code with `161=*`) over a whole
   fingerprint is judged as in step 4, `InviterConflict`; a device under a
   namespace this device trusts already, `InviterConflict` unless an anchor
-  of that namespace begins with the code's fingerprint.
+  of that namespace begins with the code's fingerprint. **What waits for the
+  record.** The refusals that need the inviter's namespace itself — the
+  policy's (`IntroPolicy::refuses`), a namespace that lies over or under one
+  this device trusts, one that overlaps this device's own through a prefix of
+  it — run before the dial only for a code that names the namespace (a link;
+  a 36-word code over a whole fingerprint). A short code names none: any
+  prefix of the device's name may be its namespace, so judging a prefix
+  would refuse an inviter whose namespace is longer. Those refusals run on
+  the verified record (S5 check 10), before the record's key is dialled and
+  before anything is asked. They disclose nothing of the joiner: the first
+  contact's hello is empty (S3).
 - **S3. Reach the first contact.** *An address:* `Introducer::dial_first(D,
   address, Config::first_look)` (§19.2), once. An error is `NotReady`
   (`RetryLater`), not a refusal of the code: the address may be wrong or the
-  inviter's device off. Whoever answers is linked with the three
+  inviter's device off. The dial sends an **empty hello** — no certificate,
+  no membership (ndn-link.md §13.3A): whoever holds the address learns
+  nothing of the joiner, and the inviter, which gives an introduction link to
+  a device with no certificate while an offer is open, still answers.
+  Whoever answers is linked with the three
   introduction prefixes of `D` as its only routes (ndn-link.md §13.3A), and
   the key it proved is the link's name, nothing more. An address dialled
   after the inviter's last offer expired meets no link (§19.2: the inviter
@@ -6270,53 +6320,98 @@ never the token.
   address first contact by name over its link; over a relay with the relay as
   ForwardingHint. None came: `NotReady` (`RetryLater`), and the first link,
   if any, is taken down.
-- **S5. Verify**, before anything else is sent, in this order; a failure is a
-  refusal (`Hint` is `RetryLater`, as `Forged` is: a record corrupted in
-  flight fails these checks as an impostor's does, and the host's retry
-  fetches it again; refused again, the first contact is not to be used), and
-  **nothing is dialled, asked or adopted**:
+- **S5. Verify**, before anything else is sent, in this order, and
+  **nothing is dialled, asked or adopted** on a failure. A failure is one of
+  two kinds, because only damage in flight is worth a retry. Up to the
+  signature (checks 1–4), a packet damaged in flight and an impostor's packet
+  fail alike, so the refusal is `Hint` (`RetryLater`, as `Forged` is: the
+  host's retry fetches it again). Once the signature is good — the packet is
+  authentic, made by a key that credentials which open vouch for — what fails
+  is no damage in flight but a record of another party: `HintMismatch`
+  (`AskOwner`, no retry: do not use this code's first contact; ask for a new
+  code):
   1. the Data's name is exactly the one asked, else `Hint` (`wrong name`);
-  2. its Content decodes as a hint record (§19.2), else `Hint` (`wrong
-     record`);
-  3. a gone mark is refused as it says, `Introduction` `Closed` or `Expired`,
-     and no further step runs (a gone mark carries no credentials to verify
-     with: §19.7);
-  4. its credentials open — a trust context signed by one of its own anchors,
-     valid now, then certificates (§19.4 step 2) — else `Hint` (`credentials`);
+  2. its Content decodes as a hint record or gone mark (§19.2), else `Hint`
+     (`wrong record`);
+  3. its credentials open — a trust context signed by one of its own anchors,
+     valid now, then certificates (§19.4 step 2) — else `Hint`
+     (`credentials`);
+  4. its signature is good by the public key of a certificate that the
+     credentials chain to their anchor (`Opened::authentic_signer`: the
+     signer's own chain and the signature, not the trust schema), else `Hint`
+     (`signer`);
   5. the context's namespace is a prefix of `D` and, when the code names one,
-     equals it, else `Hint` (`credentials`);
-  6. the anchor's fingerprint begins with the code's octets (the whole when it
-     carries 32), else `Hint` (`anchor`);
-  7. the record is signed by a key of device `D` that chains to that anchor
-     through the credentials' certificates, else `Hint` (`signer`);
-  8. the record's offer is a log entry of a folder of `D`, else `Hint`
-     (`offer`);
-  9. the namespace is judged as an inviter's (step 4), now that the
+     equals it, else `HintMismatch` (`namespace`);
+  6. the anchor's fingerprint is the code's: equal when the code carries 32
+     octets, the prefix when it carries the words form's 16, the keyed
+     fingerprint (§19.2) when it carries a short code's 10 — all in constant
+     time — else `HintMismatch` (`anchor`), whose text says that the code may
+     have been made before the keyed fingerprint and that the inviter has to
+     give a new one;
+  7. the signing key is a key of device `D`, and the context's trust schema
+     lets it sign this name, else `HintMismatch` (`signer`);
+  8. **a gone mark** that passed 3–7 ends the join as it says, `Introduction`
+     `Closed` or `Expired` (`AskOwner`), and no further step runs. A gone
+     mark that failed any of 3–7, or does not read, is `GoneUnproven`
+     (`RetryLater`) — "the first contact says the offer is closed but can't
+     prove it: retry, or ask the inviter" — never `Closed` or `Expired`:
+     anyone on the path can make a mark that proves nothing (§19.7);
+  9. the record's offer is a log entry of a folder of `D`, else
+     `HintMismatch` (`offer`);
+  10. the namespace is judged as an inviter's (step 4), now that the
      fingerprint is whole and proven, before the record's key is dialled:
      `InviterConflict`.
-- **S6. Dial** by the record's key and candidates. When the first contact's
-  link is up and is the record's key, or the record has no candidate, nothing
-  more is dialled and the Interests go by name over that link. Otherwise,
-  when the record has candidates, `Introducer::dial(record link, D,
-  Config::first_look)` as in step 0; on success the first link, which proved
-  no certificate, is `undial`led; an error is not a refusal, and the join
-  goes on by forwarding hints. The ForwardingHint of the Interests, when no
-  link carries them, is the first contact's relay, then the record's relays,
-  else the joiner's own namespace's relays (as in step 0).
+
+  **Retries are bounded.** `Hint` and `GoneUnproven` say `retry at most
+  3 times` (`HINT_RETRIES_MAX`), and a host that retries by itself on
+  `RetryLater` MUST stop there for the same code and tell the user to ask the
+  inviter for a new code: each retry dials the first contact again, and a
+  first contact that
+  damages the same record four joins in a row is broken or hostile. Three: one
+  retry meets a single corrupted packet intact, a second a burst, a third is
+  the margin. A user's own retries are not counted.
+- **S6. Keep or take down the first contact's link, then dial.** The first
+  contact's link was made with no key to expect, so whoever holds the address
+  completed its handshake: it is kept only when the key it proved is the
+  verified record's key. When it is, and nothing more is dialled, the
+  Interests go by name over that link. When it is not — whatever the record
+  offers: candidates or none — the link is `undial`led **at once**, before the
+  offer is fetched or the ask is sent, and it is used for nothing more: not
+  its routes, not a fallback if the dial below fails. Then, when the record
+  has candidates, `Introducer::dial(record link, D, Config::first_look)` as in
+  step 0; an error is not a refusal, and the join goes on by forwarding hints.
+  The ForwardingHint of the Interests, when no link carries them, is the
+  first contact's relay, then the record's relays, else the joiner's own
+  namespace's relays (as in step 0); none, routed by name. A link of a key
+  other than the record's therefore never outlives the verified record in any
+  join: a party at the address that relays the genuine record, and drops the
+  dial to the record's key, gets neither the offer fetch nor the ask, nor a
+  link or route once the join is over (§19.7).
 - **S7. The offer.** The offer's name now comes from the verified record. The
-  joiner fetches it (step 1) and, before it asks, refuses `Introduction {
-  Hint { why: "offer: <offer> was not made with this code's secret" } }` when
-  the offer's commitment is not the code's secret's: a short code's secret is
-  whole and checksummed, so a mismatch means the record named another offer,
-  and an ask would only count a wrong try. The link and the words form keep
-  step 3's order (a mistyped secret there is `WrongProof`). Then steps 2 to
-  6 run, every check of today's flow included: the answer proves the secret,
-  the commitment is the code's, the fingerprint matches the answer's
-  credentials, the device is under the inviter's namespace.
+  joiner fetches it (step 1) and, **before it seals the ask**, refuses
+  `Introduction { Forged }` (`RetryLater`) when the offer entry is not signed
+  by a key of device `D` that chains to the anchor of the record's verified
+  credentials (the record's opened credentials judge the entry as they judged
+  the record's own signature, S5 check 7): with the commitment public, a party
+  on the path could otherwise substitute the offer's `seal_key` together
+  with a commitment copied from the genuine entry, and read the ask. It then
+  refuses `Introduction { HintMismatch { why: "offer: <offer> was not made
+  with this code's secret" } }` when the offer's commitment is not the code's
+  secret's — judged only on an entry the record's credentials vouch for: a
+  short code's secret is whole and checksummed, so a mismatch means the record
+  named another offer, and an ask would only count a wrong try. The link and
+  the words form keep step 3's order (a mistyped secret there is `WrongProof`;
+  nothing vouches for the entry before the answer, whose credentials judge it
+  as step 3 says). Then steps 2 to 6 run, every check of today's flow
+  included: the answer proves the secret, the commitment is the code's, the
+  fingerprint matches the answer's credentials, the device is under the
+  inviter's namespace.
 - **S8. A join that fails** after a dial calls `Introducer::undial` for the
-  first contact's key and for the record's key, whichever it dialled, as
-  step 0 does: the first link, which proved no certificate, is not kept (it
-  is taken down by the key the handshake proved).
+  record's key, and for the first contact's key when that link is still up
+  (it is up only when it is the record's key, S6), as step 0 does: the first
+  link, which proved no certificate until the namespace is held, is not kept
+  (it is taken down by the key the handshake proved). A join that succeeds
+  keeps only a link whose key is the verified record's.
 
 Absent a dial that succeeded, the joiner's Interests carry a
 ForwardingHint: the relays the code names, else those its own namespace's
@@ -6440,7 +6535,9 @@ packet, and carries the answer proof.
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§19.4, the use) | `FixLocal` (renew the device's certificate when it is the last) | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer entry does not verify under the context the joiner holds (§19.3 step 5) | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
-| `Hint { why }` | what answered at a short code's first contact does not prove it is the inviter's, or the offer its record names was not made with the code's secret (§19.3, S5 and S7; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `anchor`, `signer`, `offer` — and says what is wrong. A record corrupted in flight fails these checks as an impostor's does and is intact the next time, as a corrupted answer is (`Forged`) | `RetryLater` (retry; refused again, do not use this code's first contact: ask for a new code) | yes |
+| `Hint { why }` | what answered at a short code's first contact came damaged or does not prove itself (§19.3 S5, checks 1–4; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `signer` (the signature is not good by a key the credentials chain to their anchor). Damage in flight fails these checks as an impostor's packet does, and the packet is intact the next time, as a corrupted answer is (`Forged`) | `RetryLater`: retry at most 3 times (`HINT_RETRIES_MAX`), then do not use this code's first contact: ask for a new code | yes, bounded |
+| `HintMismatch { why }` | a record that **verifies** (its signature is good by a key that credentials which open vouch for) but is not the inviter this code names (§19.3 S5, checks 5–7 and 9; S7; never on the wire; code 6): `why` begins with `namespace`, `anchor` (also: the code was made before the keyed fingerprint), `signer` (not a key of the code's device, or not one the schema lets sign this name) or `offer` (no log entry of a folder of the device, or not made with the code's secret). No damage in flight does this | `AskOwner` (do not use this code's first contact: ask for a new code) | no |
+| `GoneUnproven { why }` | a gone mark that fails any check of §19.3 S5 (3–7), or does not read: anyone on the path can make one (never on the wire; code 6) | `RetryLater`: retry at most 3 times, or ask the inviter | yes, bounded |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the
 offer waits. A code that does not parse is `BadRequest`; a host without an
@@ -6461,8 +6558,10 @@ until the record names it.
 | a device name that is no name | `BadRequest` | ``the code's device name `x` is not an NDN name (starting with /, not the root): check it against what you were given, or copy the code again whole`` |
 | the address does not answer the dial | `NotReady` (`RetryLater`) | `the first contact A did not answer (reason): check the address and that the inviter's device is on, then retry; or ask for a new code` |
 | the hint record is not fetched in its tries | `NotReady` (`RetryLater`) | `the inviter's hint for this offer was not fetched from the first contact (offline, wrong address or relay, a relay this device cannot reach, or the offer is closed): retry, check the code, or ask for a new code` |
-| a gone mark | `Introduction` `Closed` or `Expired` | the texts of the rows above |
-| the record does not verify | `Introduction` `Hint { why }` (`RetryLater`) | `what answered at the first contact does not prove it is the inviter's (why): retry; if it is refused again, do not use this code's first contact: ask the inviter for a new code, and check the code was copied whole` |
+| a gone mark that verifies | `Introduction` `Closed` or `Expired` | the texts of the rows above |
+| the record does not verify: damage or no proof | `Introduction` `Hint { why }` (`RetryLater`) | `what answered at the first contact does not prove it is the inviter's, or came damaged (why): retry at most 3 times; if it is refused every time, do not use this code's first contact: ask the inviter for a new code, and check the code was copied whole` |
+| the record verifies but is not the code's inviter's | `Introduction` `HintMismatch { why }` (`AskOwner`) | `what answered at the first contact proves itself, but not as the inviter this code names (why): this is not damage in flight and a retry will not change it: do not use this code's first contact, ask the inviter for a new code, and check the code was copied whole`; for `anchor`, `why` ends: `or the code was made before the keyed fingerprint: ask the inviter for a new one` |
+| a gone mark that does not verify | `Introduction` `GoneUnproven { why }` (`RetryLater`) | `the first contact says the offer is closed but can't prove it (why): retry, or ask the inviter; retry at most 3 times, then ask the inviter for a new code` |
 
 ### 19.6 Cryptography
 
@@ -6487,9 +6586,14 @@ SHA-256(`ndn-trust/intro-short/1` ‖ the bound text ‖ `0x00` ‖ payload)
 (§19.2). It detects a typo; it is no authenticator (it has no key, and
 anyone can compute it for a code of their own), and nothing is trusted on
 its account. The **fingerprint** is SHA-256 of the anchor's public key (an
-Ed25519 key's 32 raw octets, trust-envelope.md §4.4): a short code carries a
-prefix of it, or the whole, and the joiner compares what the credentials'
-anchor hashes to.
+Ed25519 key's 32 raw octets, trust-envelope.md §4.4). A short code of a named
+namespace carries not that but its **keyed fingerprint**: the first 10 octets
+of HMAC-SHA256 under the secret as key over `ndn-data/intro/fp/1` ‖ the
+whole 32-octet fingerprint (§19.2), which the joiner computes again from the
+anchor of the verified credentials and compares in constant time
+(`Mac::verify_truncated_left`). The whole fingerprint is carried plain by a
+self-certifying namespace's code and by a link, and a plain 16-octet prefix
+by the words form; they are compared in constant time too.
 
 ### 19.7 Threat notes
 
@@ -6646,32 +6750,47 @@ anchor hashes to.
 - **Short code: the first contact is a hint.** It reaches whoever holds the
   address or relay, and that party can serve what it likes; everything it
   serves is verified against the code (the fingerprint, the signer, the
-  offer: §19.3, S5) before anything is dialled, asked or adopted. The link
+  offer: §19.3, S5) before anything is dialled, asked or adopted, and the
+  offer entry it relays is verified by the record's credentials before the ask
+  is sealed to its seal key (S7). The link
   made to an address routes the three introduction prefixes of `D` and no
   other name, whatever namespace the party shows (ndn-link.md §13.3A), so a
   stranger at the address is never sent the Interests of a namespace the
-  joiner holds. A loopback or link-local first contact is refused unless
-  `IntroPolicy::local_candidates` (§19.2), as a link hint's candidates are.
-- **Short code: the party at the first contact learns who is joining (a
-  known limit).** A link hint pins the key: a dial to an address whose party
-  presents another key fails the handshake before any link message, so a
-  hostile address learns nothing of the joiner. A short code's address is
-  dialled with **no key to expect** (`Introducer::dial_first`), so whoever
-  answers there is sent the joiner's link hello: its certificate chain and
-  its memberships (ndn-link.md §5.2, §13.3A). They are public, signed data,
-  no secret (the secret travels only inside the sealed ask), but they tell
-  that party which person is joining, and from which IP address. An address
-  from a hostile code is therefore a way to learn who is joining, with no
-  key held. Nothing the party serves is trusted: it fails the fingerprint
-  check, and the link is taken down. What a person can do: use a short code
-  only as the inviter gave it; where its origin is in doubt, ask for the
-  full link, whose link hint pins the key (the hello is then sent only to
-  the device that proves it), or for a short code whose first contact is a
-  relay (nothing is dialled; the joiner's Interests go by name through a
-  relay its forwarder already reaches). A certificate-less hello is not a
-  free change (ndn-link.md §13.3A: an inviter that admits enrollment links
-  would class such a dialler as a relay link, which does not carry the
-  introduction), so it is not made.
+  joiner holds; and what the party sends in is bounded: answers under those
+  prefixes, and Interests only for the joiner's own device names (the
+  inviter fetches the joiner's seal key there), so it cannot make the
+  joiner's forwarder ask the joiner's other links for anything under the
+  joiner's identity (ndn-link.md §13.3 rule 3). A loopback or link-local
+  first contact is refused unless `IntroPolicy::local_candidates` (§19.2), as
+  a link hint's candidates are.
+- **Short code: the first contact's link does not outlive a wrong party.** The
+  dial expects no key, so anyone on the path to the address completes its
+  handshake with a key of their own and may relay the genuine hint record,
+  which names the inviter's key. Whenever the verified record's key is not the
+  link's, the join takes the link down at once and never sends the offer
+  fetch or the ask over it, whether the record offers an address (a party
+  that blocks the record's key only makes the dial fail, and the join goes by
+  the record's relays or by name) or none (S6). After a successful join no
+  link or route to such a party remains, so it keeps no path for `<D>/32=held`,
+  `=intro` or `=hint` Interests, and a link made again to it, once the joiner
+  holds the namespace, is refused when it shows no certificate (ndn-link.md
+  §13.3 rule 4).
+- **Short code: the party at the first contact learns nothing of who is
+  joining but the joiner's address.** A link hint pins the key: a dial to an
+  address whose party presents another key fails the handshake before any
+  link message. A short code's address is dialled with **no key to expect**
+  (`Introducer::dial_first`), so whoever answers there is a stranger, and the
+  dial's hello is **empty** (ndn-link.md §13.3A): no certificate chain, no
+  memberships. The party learns the joiner's IP address and that a joiner
+  with this code's address exists, nothing of its person, device or groups.
+  The inviter needs nothing more to answer: it gives an introduction link to
+  a device with no certificate while an offer is open (ndn-link.md §8.6),
+  also when it admits enrollment links (the link then carries both
+  errands), and the ask carries the joiner's credentials sealed to the
+  inviter's seal key. The full hello is sent once the joiner holds the
+  inviter's namespace, on the link made again to the party the join judged.
+  Namespace-level refusals that wait for the record (S2) therefore disclose
+  nothing either.
 - **Short code: probing.** The hint record's name is derived from the
   secret, so it is unguessable (128 bits) without the code, and the secret
   itself is in no name or wire. A prober who does not hold the code can
@@ -6698,14 +6817,24 @@ anchor hashes to.
   a wrong peer; a record of another offer is never accepted for this one. A
   genuine gone mark never turns back into a record: an offer is not
   reopened.
-- **Short code: a gone mark can only deny.** A gone mark has no credentials,
-  so the joiner cannot verify its signature; it takes the mark as it says. An
-  on-path party that answers the token's Interest (the token is in the
-  Interest) can therefore make a join report `Closed` or `Expired` for an
-  offer that is still open: a **denial**, as withholding the record is, never
-  an admission, since nothing is dialled, asked or adopted on a mark and the
-  offer's own answer alone judges the offer. The joiner retries, or asks for
-  a new code or the full link, which fetches no record.
+- **Short code: a gone mark proves itself, or ends nothing.** A gone mark
+  carries the inviter's credentials and is signed as a record is; the joiner
+  runs the same checks on it (§19.3 S5: the credentials open, the signature is
+  good under them, their namespace, anchor and signing device are the code's)
+  and only a mark that passes ends the join as it says (`Closed`, `Expired`:
+  `AskOwner`, for good). An on-path party that answers the token's Interest
+  (the token is in the Interest) with an unsigned mark, a mark signed by
+  another key, one carrying another namespace's or anchor's credentials or
+  none, gets `GoneUnproven`: `RetryLater`, "the first contact says the offer
+  is closed but can't prove it: retry, or ask the inviter", bounded to 3
+  retries (S5). It cannot make the user throw away a code that is still
+  valid. Nothing is dialled, asked or adopted on a mark either way, and the
+  offer's own answer alone judges the offer. The mark's Data has
+  `FreshnessPeriod` 0, so no cache keeps a forged mark to answer the retries;
+  the inviter signs a mark once per 5 s per state and no more (§19.2, item 4).
+  What an on-path party can still do is what it can always do: withhold the
+  record (the join says it could not fetch it), or replay an old genuine
+  mark of this very offer, which an offer that closed does not outgrow.
 - **Short code: a typo.** The 12-bit checksum covers the words, the device
   name and the first contact: a mistyped word, a digit of the port or a
   letter of the device name is refused with probability 1 − 2⁻¹² and never
@@ -6714,29 +6843,55 @@ anchor hashes to.
   mistyped address or relay is a first contact like any other (the party
   there is verified against the fingerprint, which a typo cannot make
   match).
-- **Short code: the fingerprint is 80 bits (named namespace) or whole.**
-  Impersonating the inviter to a joiner needs a trust context whose anchor
-  key's SHA-256 begins with the code's octets, and a hint record signed under
-  it. For 10 octets that is a key search with success probability 2⁻⁸⁰ per
-  key: 2⁸⁰ ≈ 1.2 × 10²⁴ key generations in expectation for one target (the
-  median is about 0.7 of that). Assumption, not a measurement: an attacker
-  who generates 10¹² keys per second, a rate chosen to favour the attacker;
-  one target then costs about 1.2 × 10¹² s, some 38 000 years (the shapes of
-  round 10 gave 3.8 × 10¹⁰ s, 1 200 years; that was 32 times too small).
-  An attacker holding the codes of N offers open at once, content with
-  impersonating any one, needs 2⁸⁰/N: for N = 2³⁰ (about 10⁹ offers), 2⁵⁰ ≈
-  1.1 × 10¹⁵ generations, about 1 100 s, 19 minutes at that rate. An offer
-  lives minutes to hours, so arithmetic alone does not exclude that
-  attacker; what stands in his way is that he needs each code first (a
-  bearer secret whose holder could use it himself, so the harm is bringing
-  the joiner to a namespace of his own) and the assumed rate. A party who
-  has only seen the token needs the secret too: the joiner refuses a record
-  whose offer is not committed to it (S7) and the answer proves it, 2¹²⁸
-  more. A self-certifying namespace takes all 32 octets (its name *is* the
-  fingerprint, so `161=*` writes it once, in the words), as a link does; the
-  words form keeps its 128 bits. The lengths that fill whole words with the
-  12-bit checksum are 10, 21 and 32 octets of fingerprint (16 + n ≡ 4 mod
-  11): 10 is the shortest, and each octet costs about 0.73 of a word.
+- **Short code: what the fingerprint is for, and what it costs to beat.** The
+  fingerprint ties the answer at the first contact to the inviter's namespace
+  before anything is dialled or asked: a party who has seen the code, or only
+  its token, cannot steer the joiner to a namespace of its own by a collision
+  worked out beforehand. A **named** namespace's code carries not the
+  anchor's own octets but `HMAC-SHA256(secret, "ndn-data/intro/fp/1" ‖
+  anchor)[..10]` (§19.2). A plain truncation of the anchor's SHA-256 would
+  have a **long-lived** target, the namespace's own fingerprint, the same for
+  every code it ever makes: one search for a key whose SHA-256 begins with
+  those 10 octets could be run offline, without a time limit, once, and its
+  result would serve every code of the namespace for good. The keyed tag has
+  no such target: it depends on the code's secret, which no one holds before
+  that code is made, and which a party who has seen only the token or the
+  address does not hold at all. So the search for a key *A′* whose tag under
+  this code's secret is the code's can start only **after the code has
+  leaked**; it serves **that one code** (a key found for it is useless for
+  any other code, of the namespace or another, and for any later one); and it
+  has to finish **within that offer's lifetime**, before the offer is used or
+  closed. Its success probability is 2⁻⁸⁰ per key, so 2⁸⁰ ≈ 1.2 × 10²⁴ key
+  generations in expectation (the median is about 0.7 of that). Assumption,
+  not a measurement: 10¹² keys per second, a rate chosen to favour the
+  attacker: one code then costs about 1.2 × 10¹² s, some 38 000 years, and an
+  offer's hour allows 3.6 × 10¹⁵ keys, a chance of about 3 × 10⁻⁹. The number
+  of offers open at once does not make one code cheaper to hit: each
+  candidate key must match *this* code's tag, computed with *this* code's
+  secret. An attacker who holds the secrets of N leaked codes and is content
+  with any one tests each candidate against N tags — N tag computations per
+  key, 2⁸⁰ in all — so only the number of key generations falls (to 2⁸⁰/N),
+  never the number of tag computations; and each such code is one he could
+  have used himself, so what he gains is only to bring that joiner to a
+  namespace of his own. The tag is not a second factor beside the secret:
+  everyone who holds the secret can compute it, and the joiner's answer is
+  proved by the secret alone (S7, the answer's proof, 2¹²⁸ more). A party who
+  has only seen the token needs the secret too, which the joiner refuses a
+  record without (S7). **A self-certifying namespace** takes all 32 octets
+  (its name *is* the fingerprint, so `161=*` writes it once, in the words), as
+  a link does: not a truncation, so there is nothing to search for. **The
+  words form** (24 words, also `Code::words`) carries a plain 16-octet prefix
+  of the anchor's fingerprint and is judged as a prefix, in constant time.
+  Its target is a namespace's long-lived fingerprint, so its search is offline
+  and unbounded in time, and multiple over namespaces; that is why it is 128
+  bits and not 80: 2¹²⁸ ≈ 3.4 × 10³⁸ key generations for one namespace, and
+  2⁹⁸ ≈ 3 × 10²⁹ against N = 2³⁰ namespaces, some 3 × 10¹⁷ s, about 10¹⁰
+  years, at the assumed rate. A code made before the keyed fingerprint carries
+  the plain 10 octets of a named namespace and is refused as an anchor
+  mismatch that says to ask for a new code (§19.5). The lengths that fill
+  whole words with the 12-bit checksum are 10, 21 and 32 octets of
+  fingerprint (16 + n ≡ 4 mod 11): 10 is the shortest, and each octet costs
+  about 0.73 of a word.
 - **A grant is authority to link, not to read** (round 6, §19.8). It is host
   visible and informs the link layer only: the folder's members record and
   the epoch keys still decide what a link is answered, so a grant never

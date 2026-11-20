@@ -1762,6 +1762,7 @@ dependencies = [
  "ndn-trust-envelope",
  "parking_lot",
  "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

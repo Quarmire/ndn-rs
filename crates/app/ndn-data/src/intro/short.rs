@@ -1,7 +1,7 @@
 //! The short code (spec §19.2): one line a person can read aloud or type.
 //!
 //! ```text
-//! short   = device SP [ contact SP ] word{20}      named: 10 octets of fingerprint
+//! short   = device SP [ contact SP ] word{20}      named: 10 octets of keyed fingerprint
 //!         | device SP [ contact SP ] word{36}      whole: 32 octets of fingerprint
 //! device  = an absolute NDN URI of the inviter's device: /alice/member/laptop
 //! contact = "[" IPv6 "]" ":" port | IPv4 ":" port | relay-name   (starts with "/")
@@ -9,7 +9,8 @@
 //! ```
 //!
 //! The words carry what cannot be fetched: the offer's secret (16 octets)
-//! and the anchor's fingerprint (10 octets, or the whole 32 when the
+//! and the anchor's fingerprint (10 octets of a tag keyed by the secret, or
+//! the whole 32 when the
 //! namespace is self-certifying) with a 12-bit checksum
 //! ([`ndn_trust_envelope::words::encode_checked`]) that also covers the text
 //! before the words — the device name and the first contact — so a typo
@@ -27,13 +28,15 @@ use std::net::SocketAddr;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::tlv_type::SELF_CERTIFYING;
 use ndn_trust_envelope::{ANCHOR_FINGERPRINT_LEN, words};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::{HintCandidate, HintKind, SECRET_LEN};
 
-/// Octets of anchor fingerprint a named namespace's short code carries
-/// (80 bits; spec §19.7 gives the reason). A self-certifying namespace's
-/// carries all [`ANCHOR_FINGERPRINT_LEN`].
+/// Octets of the keyed fingerprint ([`keyed_fingerprint`](super::keyed_fingerprint),
+/// an HMAC of the anchor's fingerprint under the code's secret) a named
+/// namespace's short code carries (80 bits; spec §19.7 gives the reason). A
+/// self-certifying namespace's carries all [`ANCHOR_FINGERPRINT_LEN`].
 pub const SHORT_FINGERPRINT_LEN: usize = 10;
 
 /// Words of a code with a [`SHORT_FINGERPRINT_LEN`]-octet fingerprint.
@@ -65,8 +68,11 @@ pub struct ShortCode {
     pub contact: Option<Contact>,
     /// The offer's secret. [`Debug`] never shows it.
     pub secret: [u8; SECRET_LEN],
-    /// The first [`SHORT_FINGERPRINT_LEN`] octets of the anchor's
-    /// fingerprint, or all [`ANCHOR_FINGERPRINT_LEN`].
+    /// The anchor's fingerprint as the code carries it: all
+    /// [`ANCHOR_FINGERPRINT_LEN`] octets (a self-certifying namespace, whose
+    /// name it is), or [`SHORT_FINGERPRINT_LEN`] octets of the tag
+    /// [`keyed_fingerprint`](super::keyed_fingerprint) makes of it with this
+    /// code's secret.
     pub fingerprint: Vec<u8>,
 }
 
@@ -345,9 +351,15 @@ impl ShortCode {
     }
 
     /// Whether `fingerprint`, the SHA-256 of an anchor's key, is the one this
-    /// code names: it begins with the code's octets (a prefix of 10, or the
-    /// whole).
+    /// code names: the whole 32 octets equal it, or the 10 octets are the tag
+    /// keyed by this code's secret ([`keyed_fingerprint`](super::keyed_fingerprint))
+    /// of it. Compared in constant time.
     pub fn matches(&self, fingerprint: &[u8; ANCHOR_FINGERPRINT_LEN]) -> bool {
-        fingerprint.starts_with(&self.fingerprint)
+        match <[u8; ANCHOR_FINGERPRINT_LEN]>::try_from(&self.fingerprint[..]) {
+            Ok(whole) => whole.ct_eq(fingerprint).into(),
+            Err(_) => {
+                super::keyed_fingerprint_matches(&self.secret, fingerprint, &self.fingerprint)
+            }
+        }
     }
 }

@@ -458,16 +458,41 @@ pub enum IntroRefusal {
         /// What it overlaps, and how.
         why: String,
     },
-    /// What answered at a short code's first contact does not prove it is the
-    /// inviter's: the hint record's name, credentials, anchor or signer
-    /// failed the checks of spec §19.3. Nothing was dialled, asked or
-    /// adopted. A retry: a record corrupted in flight fails the same checks
-    /// as an impostor's and is as likely to come intact the next time (as a
-    /// corrupted answer, [`Forged`](Self::Forged)); refused again, the first
-    /// contact is not to be used. Never on the wire (its code is that of a
-    /// conflict, which it is not; no peer sends it).
+    /// What answered at a short code's first contact came damaged, or does not
+    /// prove it is the inviter's: the hint record's name or content does not
+    /// read, its credentials do not open, or its signature does not verify
+    /// under them (spec §19.3). Nothing was dialled, asked or adopted. Damage
+    /// in flight shows as exactly this, and cannot be told from an impostor's
+    /// packet, so a retry is right — at most [`HINT_RETRIES_MAX`] times: a host
+    /// that retries by itself MUST stop there — and refused every time, the
+    /// first contact is not to be used. Never on the wire (its code is that
+    /// of a conflict, which it is not; no peer sends it).
     Hint {
-        /// Which check failed (wrong name, credentials, anchor, signer).
+        /// Which check failed (wrong name, record, credentials, signer).
+        why: String,
+    },
+    /// A hint record that **verifies** — its signature checks under credentials
+    /// that open — but is not the one this code names: its credentials are of
+    /// another namespace than the code's device is under, or carry another
+    /// anchor than the code's, or the record is signed by another device, or
+    /// names an offer that is no log entry of the code's device or was not made
+    /// with the code's secret. That is no damage in flight, the work of
+    /// whoever answered (or a code made before the keyed fingerprint), and
+    /// retrying cannot change it: ask the inviter for a new code. Never on the
+    /// wire.
+    HintMismatch {
+        /// Which check failed (namespace, anchor, signer, offer).
+        why: String,
+    },
+    /// A gone mark ([`HintRecord::Gone`]) that does not prove itself: it does
+    /// not read, or its credentials do not open, or its signature does not
+    /// verify under them as a key of the code's device chained to the code's
+    /// anchor. Anyone on the path can make such a mark, so it never ends a
+    /// code ([`Closed`](Self::Closed), [`Expired`](Self::Expired) are only
+    /// what a verified mark says): retry, at most [`HINT_RETRIES_MAX`] times,
+    /// then ask the inviter. Never on the wire.
+    GoneUnproven {
+        /// Which check failed.
         why: String,
     },
 }
@@ -512,9 +537,23 @@ impl std::fmt::Display for IntroRefusal {
             ),
             IntroRefusal::Hint { why } => write!(
                 f,
-                "what answered at the first contact does not prove it is the inviter's ({why}): \
-                 retry; if it is refused again, do not use this code's first contact: ask the \
-                 inviter for a new code, and check the code was copied whole"
+                "what answered at the first contact does not prove it is the inviter's, or came \
+                 damaged ({why}): retry at most {HINT_RETRIES_MAX} times; if it is refused every \
+                 time, do not use this code's first contact: ask the inviter for a new code, and \
+                 check the code was copied whole"
+            ),
+            IntroRefusal::HintMismatch { why } => write!(
+                f,
+                "what answered at the first contact proves itself, but not as the inviter this \
+                 code names ({why}): this is not damage in flight and a retry will not change \
+                 it: do not use this code's first contact, ask the inviter for a new code, and \
+                 check the code was copied whole"
+            ),
+            IntroRefusal::GoneUnproven { why } => write!(
+                f,
+                "the first contact says the offer is closed but can't prove it ({why}): retry, \
+                 or ask the inviter; retry at most {HINT_RETRIES_MAX} times, then ask the \
+                 inviter for a new code"
             ),
         }
     }
@@ -530,7 +569,9 @@ impl IntroRefusal {
             IntroRefusal::WrongProof { .. } => 5,
             IntroRefusal::Conflict
             | IntroRefusal::InviterConflict { .. }
-            | IntroRefusal::Hint { .. } => 6,
+            | IntroRefusal::Hint { .. }
+            | IntroRefusal::HintMismatch { .. }
+            | IntroRefusal::GoneUnproven { .. } => 6,
             IntroRefusal::Forged => 0,
         }
     }
@@ -929,10 +970,15 @@ pub trait Introducer: Send + Sync {
     /// until the joiner holds the inviter's namespace the link routes only
     /// [`introduction_prefixes`] of `inviter` — never the names the code
     /// claims for the device — so whoever answers at the address gets the
-    /// introduction's Interests and nothing else. The address is only a hint:
-    /// it may be answered by anyone, and everything it serves is verified
-    /// against the code. Within `within`; an error says why not. The host
-    /// ends the link with [`undial`](Self::undial) when the join fails.
+    /// introduction's Interests and nothing else, and what it may send in is
+    /// bounded (answers under those prefixes, Interests for the joiner's own
+    /// device names). The dial sends an **empty hello**: no certificate, no
+    /// membership. The address is only a hint: it may be answered by anyone,
+    /// and everything it serves is verified against the code. Within
+    /// `within`; an error says why not. The host ends the link with
+    /// [`undial`](Self::undial) when the join fails, and the join does so at
+    /// once when the verified hint record names another key than the one
+    /// returned.
     ///
     /// The default dials nothing: a host with no link layer says so, and the
     /// join says the first contact could not be reached.
@@ -951,14 +997,16 @@ pub trait Introducer: Send + Sync {
         })
     }
 
-    /// The join that dialled `inviter` by `hint` ([`dial`](Self::dial))
-    /// failed: take down what the dial made. What answered at the hint's key
-    /// proved nothing the join could check, so the link to it — which only
-    /// carried the introduction — is not kept; a link that was up before the
-    /// dial, or that has been identified since (the join went on, and this
-    /// host holds the inviter's namespace), is left as it is. Called once
-    /// for each failed join whose dial succeeded, before the join's error is
-    /// returned.
+    /// The join that dialled `inviter` by `hint` ([`dial`](Self::dial)) failed,
+    /// or a first contact's link ([`dial_first`](Self::dial_first)) proved a
+    /// key the verified hint record does not name: take down what the dial
+    /// made. What answered at the hint's key proved nothing the join could
+    /// check, so the link to it — which only carried the introduction — is not
+    /// kept; a link that was up before the dial, or that has been identified
+    /// since (the join went on, and this host holds the inviter's namespace),
+    /// is left as it is. Called once for each such link, before the join's
+    /// error is returned or, for a first contact of another key, before the
+    /// offer is fetched.
     ///
     /// The default does nothing: a host with no link layer dialled nothing.
     fn undial(&self, hint: &LinkHint, inviter: &Name) {
@@ -1326,8 +1374,20 @@ const HINT_LABEL: &[u8] = b"ndn-data/intro/hint/1";
 /// Octets of a hint token.
 pub const HINT_TOKEN_LEN: usize = 16;
 
-/// The most relays a hint record names.
-pub const HINT_RELAYS_MAX: usize = 8;
+/// The most relays a hint record names: the cap a compact link's decoder
+/// holds too, so one number bounds both.
+pub use ndn_trust_envelope::HINT_RELAYS_MAX;
+
+/// How often a host that retries a join by itself may retry it after a
+/// refusal that is worth a retry ([`IntroRefusal::Hint`],
+/// [`IntroRefusal::GoneUnproven`]): three. The join itself already fetches
+/// the record several times for packets that were lost; what a retry buys is
+/// a record that was corrupted in flight arriving intact, which one retry
+/// does for a single corrupted packet, a second for a burst, and a third is
+/// the margin. A path that damages the same record four joins in a row is not
+/// damage: the first contact is broken or hostile, and the next step is to
+/// ask the inviter for a new code. A user's own retries are not counted.
+pub const HINT_RETRIES_MAX: u32 = 3;
 
 /// The token a short code's hint record is named by: the first 16 octets of
 /// `HMAC-SHA256(key = secret, "ndn-data/intro/hint/1")`. Unguessable without
@@ -1340,6 +1400,44 @@ pub fn hint_token(secret: &[u8; SECRET_LEN]) -> [u8; HINT_TOKEN_LEN] {
     let mut token = [0u8; HINT_TOKEN_LEN];
     token.copy_from_slice(&tag[..HINT_TOKEN_LEN]);
     token
+}
+
+/// The label of a short code's keyed fingerprint.
+const FINGERPRINT_LABEL: &[u8] = b"ndn-data/intro/fp/1";
+
+/// The HMAC a short code's fingerprint is the first octets of.
+fn fingerprint_mac(secret: &[u8; SECRET_LEN], anchor: &[u8; 32]) -> HmacSha256 {
+    let mut m = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    m.update(FINGERPRINT_LABEL);
+    m.update(anchor);
+    m
+}
+
+/// The fingerprint a named namespace's short code carries: the first
+/// [`SHORT_FINGERPRINT_LEN`] octets of `HMAC-SHA256(key = secret,
+/// "ndn-data/intro/fp/1" ‖ anchor)`, `anchor` being the whole 32-octet
+/// fingerprint of the namespace's anchor. Keyed by the code's own secret, so a
+/// search for an anchor that collides with it can begin only once that code is
+/// known, and serves that one code (spec §19.7); not the anchor's own octets,
+/// which are public and the same for every code of the namespace.
+pub fn keyed_fingerprint(
+    secret: &[u8; SECRET_LEN],
+    anchor: &[u8; 32],
+) -> [u8; SHORT_FINGERPRINT_LEN] {
+    let tag = fingerprint_mac(secret, anchor).finalize().into_bytes();
+    let mut out = [0u8; SHORT_FINGERPRINT_LEN];
+    out.copy_from_slice(&tag[..SHORT_FINGERPRINT_LEN]);
+    out
+}
+
+/// Whether `tag` is the keyed fingerprint ([`keyed_fingerprint`]) of `anchor`
+/// under `secret`, compared in constant time; a tag of any length but
+/// [`SHORT_FINGERPRINT_LEN`] is not.
+pub fn keyed_fingerprint_matches(secret: &[u8; SECRET_LEN], anchor: &[u8; 32], tag: &[u8]) -> bool {
+    tag.len() == SHORT_FINGERPRINT_LEN
+        && fingerprint_mac(secret, anchor)
+            .verify_truncated_left(tag)
+            .is_ok()
 }
 
 /// `<device>/32=hint`: the prefix of a device's hint records, and what a
@@ -1400,8 +1498,17 @@ pub enum HintRecord {
     },
     /// The offer is no longer served: [`IntroRefusal::Expired`] or
     /// [`IntroRefusal::Closed`], the only refusals a hint record gives (any
-    /// other is written as `Closed`).
-    Gone(IntroRefusal),
+    /// other is written as `Closed`). It carries the inviter's credentials and
+    /// is signed as a record is, so that the joiner verifies it as it does a
+    /// record: a mark that does not verify is anyone's, and ends nothing
+    /// ([`IntroRefusal::GoneUnproven`]).
+    Gone {
+        /// Why the offer is not served.
+        why: IntroRefusal,
+        /// The inviter's signed trust context and the certificate chain of the
+        /// signing key, as a record carries them.
+        credentials: Vec<Bytes>,
+    },
 }
 
 impl HintRecord {
@@ -1425,13 +1532,14 @@ impl HintRecord {
                 write_nni(w, tlv::HINT_UNTIL, until.0);
                 write_credentials(w, credentials);
             }
-            HintRecord::Gone(why) => {
+            HintRecord::Gone { why, credentials } => {
                 let code = if matches!(why, IntroRefusal::Expired) {
                     IntroRefusal::Expired.code()
                 } else {
                     IntroRefusal::Closed.code()
                 };
                 write_nni(w, tlv::HINT_GONE, code);
+                write_credentials(w, credentials);
             }
         });
         w.finish()
@@ -1503,21 +1611,26 @@ impl HintRecord {
             if offer.is_some()
                 || key.is_some()
                 || until.is_some()
-                || credentials.is_some()
                 || !candidates.is_empty()
                 || !relays.is_empty()
             {
-                return Err(bad("a gone mark carries nothing else"));
+                return Err(bad("a gone mark carries nothing but its credentials"));
             }
-            return Ok(HintRecord::Gone(match code {
-                3 => IntroRefusal::Expired,
-                4 => IntroRefusal::Closed,
-                other => {
-                    return Err(bad(format!(
-                        "{other} is no gone mark (3 expired, 4 closed)"
-                    )));
-                }
-            }));
+            let credentials = credentials.ok_or_else(|| {
+                bad("a gone mark carries the inviter's credentials, which prove it")
+            })?;
+            return Ok(HintRecord::Gone {
+                why: match code {
+                    3 => IntroRefusal::Expired,
+                    4 => IntroRefusal::Closed,
+                    other => {
+                        return Err(bad(format!(
+                            "{other} is no gone mark (3 expired, 4 closed)"
+                        )));
+                    }
+                },
+                credentials,
+            });
         }
         Ok(HintRecord::Offered {
             offer: offer.ok_or_else(|| bad("a hint record names its offer"))?,

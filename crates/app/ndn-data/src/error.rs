@@ -18,7 +18,15 @@ use crate::version::{Keep, Timestamp, VersionId, Writer};
 pub enum NextStep {
     /// Nothing: the outcome is final and correct.
     None,
-    /// Ask again later, unchanged: no path or holder answered.
+    /// Ask again later, unchanged: no path or holder answered. A host that
+    /// retries by itself bounds the retries and then says what to do instead:
+    /// an introduction's refusals worth a retry ([`IntroRefusal::Hint`],
+    /// [`IntroRefusal::GoneUnproven`]) allow at most
+    /// [`HINT_RETRIES_MAX`](crate::intro::HINT_RETRIES_MAX), each retry
+    /// being a new dial of a first contact that may be hostile.
+    ///
+    /// [`IntroRefusal::Hint`]: crate::intro::IntroRefusal::Hint
+    /// [`IntroRefusal::GoneUnproven`]: crate::intro::IntroRefusal::GoneUnproven
     RetryLater,
     /// Ask the collection's owner: for membership, a reading key, or the
     /// re-admission of work a cut refused.
@@ -459,7 +467,12 @@ impl DataError {
                 matches!(why, Refusal::BadSignature | Refusal::Rollback)
             }
             DataError::Introduction { why, .. } => {
-                matches!(why, crate::intro::IntroRefusal::Forged)
+                matches!(
+                    why,
+                    crate::intro::IntroRefusal::Forged
+                        | crate::intro::IntroRefusal::Hint { .. }
+                        | crate::intro::IntroRefusal::GoneUnproven { .. }
+                )
             }
             DataError::Answer { why, .. } => match why {
                 AnswerRefusal::ReadsChanged(_) => true,
@@ -502,14 +515,15 @@ impl DataError {
             DataError::RuleUnknown { .. } => NextStep::UpdateProgram,
             DataError::Introduction { why, .. } => match why {
                 crate::intro::IntroRefusal::WrongProof { .. } => NextStep::FixRequest,
-                crate::intro::IntroRefusal::Forged | crate::intro::IntroRefusal::Hint { .. } => {
-                    NextStep::RetryLater
-                }
+                crate::intro::IntroRefusal::Forged
+                | crate::intro::IntroRefusal::Hint { .. }
+                | crate::intro::IntroRefusal::GoneUnproven { .. } => NextStep::RetryLater,
                 crate::intro::IntroRefusal::Conflict => NextStep::FixLocal,
                 crate::intro::IntroRefusal::Unknown
                 | crate::intro::IntroRefusal::Used
                 | crate::intro::IntroRefusal::Expired
                 | crate::intro::IntroRefusal::Closed
+                | crate::intro::IntroRefusal::HintMismatch { .. }
                 | crate::intro::IntroRefusal::InviterConflict { .. } => NextStep::AskOwner,
             },
             DataError::CannotCheck { .. } => NextStep::UpdateProgram,

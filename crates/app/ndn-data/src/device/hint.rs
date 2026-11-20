@@ -17,12 +17,12 @@ use ndn_packet::{Data, Name};
 use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
 use ndn_security::self_certifying::self_certifying_digest;
 
-use super::intro::{Fingerprint, OFFER_TRIES, local_name, open_credentials};
+use super::intro::{Fingerprint, OFFER_TRIES, Opened, local_name, open_credentials};
 use super::{Inner, local, open_grant};
 use crate::error::DataError;
 use crate::intro::{
     Contact, HINT_RELAYS_MAX, HintCandidate, HintKind, HintRecord, IntroRefusal, Introducer,
-    LINK_HINT_CANDIDATES_MAX, LinkHint, SECRET_LEN, SHORT_FINGERPRINT_LEN, ShortCode, hint_token,
+    LINK_HINT_CANDIDATES_MAX, LinkHint, SECRET_LEN, ShortCode, hint_token, keyed_fingerprint,
     parse_hint_name,
 };
 use crate::rt::Instant;
@@ -43,6 +43,30 @@ pub(super) struct HintServed {
     at: Instant,
     state: Option<IntroRefusal>,
     wire: Bytes,
+}
+
+/// What the inviter keeps of the packets it signed for hint tokens
+/// (`Intros::hint_served`) lives [`HINT_CACHE`] and no longer: whatever lapsed
+/// is dropped whenever a hint Interest is answered or refused, a token is kept,
+/// or an offer closes. What stays is the token of each own offer
+/// (`Intros::hints`, one token and one name), for as long as the offer is held:
+/// §19.5 serves a gone mark for the token of a closed or expired offer, which
+/// needs the token known, and the offers themselves are never pruned.
+pub(super) fn sweep_hint_served(st: &mut super::St) {
+    st.intro
+        .hint_served
+        .retain(|_, served| served.at.elapsed() < HINT_CACHE);
+}
+
+/// The offer `offer` closed: the packet kept for its token (the record it
+/// would answer again, within [`HINT_CACHE`]) is dropped at once, and the
+/// next ask signs the gone mark.
+pub(super) fn drop_hint_served(st: &mut super::St, offer: &Name) {
+    let intro = &mut st.intro;
+    intro
+        .hint_served
+        .retain(|token, _| intro.hints.get(token) != Some(offer));
+    sweep_hint_served(st);
 }
 
 /// Where the store keeps an own offer's hint token, wrapped to the device's
@@ -76,6 +100,7 @@ impl Inner {
             name,
             crate::wire::encode_grant(&ephemeral, &wrapped.to_bytes()),
         );
+        sweep_hint_served(st);
         st.intro.hints.insert(token, offer.clone());
         Ok(())
     }
@@ -121,7 +146,8 @@ impl Inner {
         }
         let now = (self.config.clock)();
         let (offer, until, state) = {
-            let st = self.st.lock();
+            let mut st = self.st.lock();
+            sweep_hint_served(&mut st);
             let offer = st.intro.hints.get(&token)?.clone();
             let ob = st.intro.offers.get(&offer)?;
             let spent = self.overall_tries(&offer).0 >= self.config.intro.wrong_tries_max;
@@ -145,11 +171,22 @@ impl Inner {
             (offer, ob.until, state)
         };
         let record = match state.clone() {
-            Some(why) => HintRecord::Gone(why),
+            Some(why) => HintRecord::Gone {
+                why,
+                credentials: self.credentials().ok()?,
+            },
             None => self.hint_offered(offer, until)?,
         };
+        // A record is held by a cache for [`HINT_CACHE`]; a gone mark not at all:
+        // a mark that a cache kept could outlive the inviter's say, and an
+        // impostor's would sit there too.
+        let fresh = if state.is_some() {
+            Duration::ZERO
+        } else {
+            HINT_CACHE
+        };
         let wire = self
-            .sign(DataBuilder::new(name.clone(), &record.encode()).freshness(HINT_CACHE))
+            .sign(DataBuilder::new(name.clone(), &record.encode()).freshness(fresh))
             .ok()?;
         self.st.lock().intro.hint_served.insert(
             token,
@@ -200,7 +237,8 @@ impl Inner {
     /// `hint` under `local_candidates`, else a relay of the namespace), or when
     /// the line is wider than `short_width`. The fingerprint is the whole `anchor`
     /// when this device's namespace is the self-certifying one it is the digest
-    /// of (the line then writes it `161=*`), else its first ten octets. An
+    /// of (the line then writes it `161=*`), else the 10 octets of the tag
+    /// [`keyed_fingerprint`] makes of it with the offer's `secret`. An
     /// address or relay that makes the line too wide gives way to the next.
     pub(super) fn short_code(
         &self,
@@ -254,7 +292,7 @@ impl Inner {
         let fingerprint = if whole {
             anchor.to_vec()
         } else {
-            anchor[..SHORT_FINGERPRINT_LEN].to_vec()
+            keyed_fingerprint(secret, anchor).to_vec()
         };
         let mut narrowest = usize::MAX;
         let tried = contacts.len();
@@ -309,17 +347,38 @@ pub(super) struct Hinted {
     pub(super) link: LinkHint,
     /// Relays to forward through when a dial fails.
     pub(super) relays: Vec<Name>,
+    /// The record's credentials, opened: what vouches, before anything is
+    /// sealed to it, for the offer entry the inviter's device serves.
+    pub(super) opened: Opened,
 }
 
-/// Why a hint record is not taken.
-pub(super) enum HintFault {
-    /// What the inviter or the join's judgment refuses with: a gone mark (the
-    /// offer is expired or closed), or an inviter's namespace this device cannot
-    /// take ([`IntroRefusal::InviterConflict`]).
-    Refused(IntroRefusal),
-    /// It does not prove the inviter's: the reason (a name, the credentials,
-    /// the anchor, the signer, the offer).
-    Bad(String),
+/// Which side of the line a failed check of a hint Data falls on: only damage
+/// in flight is worth a retry.
+enum Unproven {
+    /// A packet that is not what was asked for, does not read, whose
+    /// credentials do not open, or whose signature does not verify under them:
+    /// damage in flight shows as this, and so does an impostor's packet.
+    Damaged(String),
+    /// It verifies — its signature checks under credentials that open — but is
+    /// not the code's inviter's: another namespace, another anchor, another
+    /// device. No damage in flight does that.
+    Mismatch(String),
+}
+
+impl Unproven {
+    fn why(self) -> String {
+        match self {
+            Unproven::Damaged(why) | Unproven::Mismatch(why) => why,
+        }
+    }
+
+    /// The refusal of a hint record.
+    fn refusal(self) -> IntroRefusal {
+        match self {
+            Unproven::Damaged(why) => IntroRefusal::Hint { why },
+            Unproven::Mismatch(why) => IntroRefusal::HintMismatch { why },
+        }
+    }
 }
 
 impl Inner {
@@ -385,15 +444,80 @@ impl Inner {
         })
     }
 
+    /// The checks a hint Data — a record or a gone mark — passes before it is
+    /// believed, in the order that tells damage from a mismatch: its
+    /// `credentials` open (a trust context signed by one of its own anchors,
+    /// valid now); its signature is good by the public key of a certificate
+    /// those credentials chain to their anchor ([`Opened::authentic_signer`]);
+    /// and only then, the packet being authentic, that their namespace is the
+    /// one the code's `device` is under (and the `namespace` the code names,
+    /// when it does), that their anchor's fingerprint is the code's
+    /// `fingerprint`, that the signing key is one of `device`, and that the
+    /// context's schema lets it sign this name ([`Opened::signer`]). The
+    /// opened credentials and the anchor's whole fingerprint.
+    async fn prove_hint(
+        &self,
+        data: &Data,
+        credentials: &[Bytes],
+        device: &Name,
+        fingerprint: &Fingerprint,
+        namespace: Option<&Name>,
+    ) -> Result<(Opened, [u8; 32]), Unproven> {
+        let Some(opened) = open_credentials(credentials).await else {
+            return Err(Unproven::Damaged(
+                "credentials: they carry no trust context signed by one of its own anchors, or \
+                 no valid certificates"
+                    .into(),
+            ));
+        };
+        let Some(signer) = opened.authentic_signer(data).await else {
+            return Err(Unproven::Damaged(
+                "signer: its signature is not good by a key the credentials chain to their \
+                 anchor"
+                    .into(),
+            ));
+        };
+        let ns = opened.ctx.namespace().clone();
+        if !device.has_prefix(&ns) || namespace.is_some_and(|n| *n != ns) {
+            return Err(Unproven::Mismatch(format!(
+                "namespace: the credentials are of {ns}, which is not the namespace the code's \
+                 device {device} is under"
+            )));
+        }
+        let anchor = opened.fingerprint();
+        if !fingerprint.matches(&anchor) {
+            return Err(Unproven::Mismatch(
+                "anchor: the anchor its credentials carry is not the one the code names, or the \
+                 code was made before the keyed fingerprint: ask the inviter for a new one"
+                    .into(),
+            ));
+        }
+        if device_of(&signer).as_ref() != Some(device) {
+            return Err(Unproven::Mismatch(format!(
+                "signer: it is signed by {signer}, which is no key of {device}"
+            )));
+        }
+        if opened.signer(data).await.is_none_or(|(k, _)| k != signer) {
+            return Err(Unproven::Mismatch(format!(
+                "signer: the credentials' trust schema does not let {signer} sign {}",
+                data.name
+            )));
+        }
+        Ok((opened, anchor))
+    }
+
     /// Verify the hint record `data`, the answer to the Interest for `asked`, as
     /// the inviter's device `device` made it, against the code's `fingerprint`
     /// (and its `namespace`, when it names one) — before anything is dialled,
     /// asked or adopted (§3.5): the Data is named exactly as asked and decodes;
-    /// a gone mark is refused as it says; the credentials open (a trust
-    /// context signed by one of its own anchors, valid now); the anchor's
-    /// fingerprint is the code's; the namespace is judged as an inviter's
-    /// ([`Self::overlap`]); the record is signed by a key of `device` that
-    /// chains to that anchor; and the offer is a log entry of `device`.
+    /// it proves itself ([`Self::prove_hint`]), and a gone mark that does so
+    /// ends the code as it says ([`IntroRefusal::Closed`],
+    /// [`IntroRefusal::Expired`]) while one that does not is
+    /// [`IntroRefusal::GoneUnproven`], anyone's; the offer is a log entry of
+    /// `device`; and the namespace is judged as an inviter's
+    /// ([`Self::overlap`]). A failure before the signature verifies is
+    /// [`IntroRefusal::Hint`] (damage in flight cannot be told from it); one
+    /// after is [`IntroRefusal::HintMismatch`].
     pub(super) async fn verify_hint(
         &self,
         data: &Data,
@@ -401,19 +525,35 @@ impl Inner {
         device: &Name,
         fingerprint: &Fingerprint,
         namespace: Option<&Name>,
-    ) -> Result<Hinted, HintFault> {
-        let bad = |why: String| Err(HintFault::Bad(why));
+    ) -> Result<Hinted, IntroRefusal> {
+        let damaged = |why: &str| IntroRefusal::Hint { why: why.into() };
         if *data.name != *asked {
-            return bad("wrong name: the packet is not the record asked for".into());
+            return Err(damaged(
+                "wrong name: the packet is not the record asked for",
+            ));
         }
         let Some(record) = data
             .content()
             .and_then(|c| HintRecord::decode(c.clone(), self.config.intro.local_candidates).ok())
         else {
-            return bad("wrong record: its content is no hint record".into());
+            return Err(damaged("wrong record: its content is no hint record"));
         };
         let (offer, key, candidates, relays, credentials) = match record {
-            HintRecord::Gone(why) => return Err(HintFault::Refused(why)),
+            HintRecord::Gone { why, credentials } => {
+                // A mark proves itself as a record does, and only then ends the
+                // code as it says: any party on the path can make one that
+                // does not, so a mark that fails any check is no end of the
+                // code, whichever check it fails.
+                return match self
+                    .prove_hint(data, &credentials, device, fingerprint, namespace)
+                    .await
+                {
+                    Ok(_) => Err(why),
+                    Err(unproven) => Err(IntroRefusal::GoneUnproven {
+                        why: unproven.why(),
+                    }),
+                };
+            }
             HintRecord::Offered {
                 offer,
                 key,
@@ -423,53 +563,26 @@ impl Inner {
                 ..
             } => (offer, key, candidates, relays, credentials),
         };
-        let Some(opened) = open_credentials(&credentials).await else {
-            return bad(
-                "credentials: they carry no trust context signed by one of its own anchors, or \
-                 no valid certificates"
-                    .into(),
-            );
-        };
-        let ns = opened.ctx.namespace().clone();
-        if !device.has_prefix(&ns) || namespace.is_some_and(|n| *n != ns) {
-            return bad(format!(
-                "credentials: they are of {ns}, which is not the namespace the code's device \
-                 {device} is under"
-            ));
-        }
-        let anchor = opened.fingerprint();
-        if !fingerprint.matches(&anchor) {
-            return bad(
-                "anchor: the anchor its credentials carry is not the one the code names".into(),
-            );
-        }
-        let signer = opened.signer(data).await;
-        if signer
-            .as_ref()
-            .is_none_or(|(k, _)| device_of(k).as_ref() != Some(device))
-        {
-            return bad(format!(
-                "signer: its signature does not verify as a key of {device} chained to the \
-                 anchor"
-            ));
-        }
+        let (opened, anchor) = self
+            .prove_hint(data, &credentials, device, fingerprint, namespace)
+            .await
+            .map_err(Unproven::refusal)?;
         if !parse_log_name(&offer).is_some_and(|l| l.device == *device && l.subject.is_some()) {
-            return bad(format!(
-                "offer: {offer} is no log entry of a folder of {device}"
-            ));
+            return Err(IntroRefusal::HintMismatch {
+                why: format!("offer: {offer} is no log entry of a folder of {device}"),
+            });
         }
         // The inviter is proven the one the code names, so its namespace is
         // judged as an inviter's now, before anything is dialled.
+        let ns = opened.ctx.namespace().clone();
         if let Some(why) = self.overlap(&ns, &anchor) {
-            return Err(HintFault::Refused(IntroRefusal::InviterConflict {
-                inviter: ns,
-                why,
-            }));
+            return Err(IntroRefusal::InviterConflict { inviter: ns, why });
         }
         Ok(Hinted {
             offer,
             link: LinkHint { key, candidates },
             relays,
+            opened,
         })
     }
 }

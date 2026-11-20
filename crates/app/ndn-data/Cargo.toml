@@ -29,6 +29,8 @@ hkdf         = { workspace = true }
 zeroize      = "1"
 # Introductions: an ask's and an answer's proof of the offer's secret.
 hmac         = "0.13"
+# A code's fingerprint is compared in constant time (spec §19.7).
+subtle       = "2"
 getrandom    = { workspace = true }
 tracing      = { workspace = true }
 web-time     = { workspace = true }
