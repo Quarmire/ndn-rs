@@ -30,7 +30,7 @@ use ndn_packet::{Data, Name};
 use ndn_tlv::TlvReader;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
-use super::answer_get::{Opened, SIGNED_PER_SECOND};
+use super::answer_get::{Opened, Reading, SIGNED_PER_SECOND, evaluator_reading};
 use super::answer_reads::{STATE_READS_CHECKED_MAX, VersionFact};
 use super::answers::Signing;
 use super::{Device, Inner, St, local, rt};
@@ -284,9 +284,9 @@ impl Inner {
         };
         let content = match self.judge_answer_ask(&asker, ask, lifetime).await {
             Ok(packet) => packet,
-            Err(why) => {
-                tracing::debug!(me = %self.device, %asker, ?why, "an ask for an answer is refused");
-                AnswerAskRefusal::new(why).encode()
+            Err(refusal) => {
+                tracing::debug!(me = %self.device, %asker, why = ?refusal.why, "an ask for an answer is refused");
+                refusal.encode()
             }
         };
         self.sign(DataBuilder::new(name.clone(), &content).freshness(Duration::ZERO))
@@ -392,11 +392,11 @@ impl Inner {
         asker: &Name,
         ask: AnswerAsk,
         lifetime: Duration,
-    ) -> Result<Bytes, AskRefusal> {
+    ) -> Result<Bytes, AnswerAskRefusal> {
         let ns = self.namespace_of_name(asker);
         let own = ns == self.ns;
         if own && !self.role_served(asker) {
-            return Err(AskRefusal::NotServed);
+            return Err(AskRefusal::NotServed.into());
         }
         let hold = AskHold::take(self, asker, &ns).ok_or(AskRefusal::Busy {
             retry_after: RETRY_AFTER,
@@ -419,7 +419,7 @@ impl Inner {
                     // who may read the definition, which is held here to judge it.
                     self.fetched(&qname, &set).await?;
                     self.gate_reads(&gate, &set, true).await?;
-                    return Err(AskRefusal::CannotCheck);
+                    return Err(AskRefusal::CannotCheck.into());
                 }
             }
             (None, None) => {}
@@ -441,7 +441,10 @@ impl Inner {
                 self.compute_for_ask(hold, qname, stated, planned, wait)
                     .await
             }
-            AnswerKind::Provider => self.provider_for_ask(&ask, resolved.id, asker, wait).await,
+            AnswerKind::Provider => self
+                .provider_for_ask(&ask, resolved.id, asker, wait)
+                .await
+                .map_err(Into::into),
         }
     }
 
@@ -465,7 +468,7 @@ impl Inner {
         self: &Arc<Self>,
         qname: &Name,
         ask: &AnswerAsk,
-    ) -> Result<super::answer_get::Resolved, AskRefusal> {
+    ) -> Result<super::answer_get::Resolved, AnswerAskRefusal> {
         match rt::timeout(
             self.config.answers.budget.time,
             self.resolve_question(qname, ask, false),
@@ -475,12 +478,17 @@ impl Inner {
             Ok(resolved) => resolved.map_err(|e| self.ask_refusal(ask.kind, &e)),
             Err(_) => Err(AskRefusal::Pending {
                 retry_after: RETRY_AFTER,
-            }),
+            }
+            .into()),
         }
     }
 
     /// Read every read of `set`, within [`crate::Budget::time`] ([`Self::planned`]).
-    async fn fetched(self: &Arc<Self>, qname: &Name, set: &ReadSet) -> Result<(), AskRefusal> {
+    async fn fetched(
+        self: &Arc<Self>,
+        qname: &Name,
+        set: &ReadSet,
+    ) -> Result<(), AnswerAskRefusal> {
         let budget = self.config.answers.budget;
         match rt::timeout(budget.time, self.read_all(set, budget)).await {
             Ok(Ok(_)) => Ok(()),
@@ -489,7 +497,8 @@ impl Inner {
             }
             Err(_) => Err(AskRefusal::Pending {
                 retry_after: RETRY_AFTER,
-            }),
+            }
+            .into()),
         }
     }
 
@@ -498,7 +507,9 @@ impl Inner {
     /// ends, answered or not, and for no longer than [`crate::Budget::time`]; `Pending` if it
     /// is not done within `wait`, and a later ask finds the stored answer. `planned`: the asker
     /// left the reads to the signer, so a refusal that the reads are not the evaluator's means
-    /// the data moved since they were planned: `Pending`.
+    /// the data moved since they were planned: `Pending`. The evaluator's own refusal of a
+    /// definition or input is no such thing (the reads are exact versions, and an evaluation is
+    /// a pure function of them): it is `EvaluatorRefused`.
     async fn compute_for_ask(
         self: &Arc<Self>,
         hold: AskHold,
@@ -506,7 +517,7 @@ impl Inner {
         stated: AnswerAsk,
         planned: bool,
         wait: Duration,
-    ) -> Result<Bytes, AskRefusal> {
+    ) -> Result<Bytes, AnswerAskRefusal> {
         let (tx, rx) = oneshot::channel();
         let inner = Arc::clone(self);
         let time = self.config.answers.budget.time;
@@ -528,14 +539,20 @@ impl Inner {
             };
             let _ = tx.send(made);
         });
-        let pending = AskRefusal::Pending {
-            retry_after: RETRY_AFTER,
+        let pending = || {
+            AnswerAskRefusal::new(AskRefusal::Pending {
+                retry_after: RETRY_AFTER,
+            })
         };
         match rt::timeout(wait, rx).await {
-            Ok(Ok(Ok(name))) => self.answer_wire(&name).ok_or(pending),
-            Ok(Ok(Err(DataError::BadRequest { .. }))) if planned => Err(pending),
+            Ok(Ok(Ok(name))) => self.answer_wire(&name).ok_or_else(pending),
+            Ok(Ok(Err(DataError::BadRequest { why, .. })))
+                if planned && !matches!(evaluator_reading(&why), Some(Reading::Refused(_))) =>
+            {
+                Err(pending())
+            }
             Ok(Ok(Err(e))) => Err(self.ask_refusal(AnswerKind::Pure, &e)),
-            Ok(Err(_)) | Err(_) => Err(pending),
+            Ok(Err(_)) | Err(_) => Err(pending()),
         }
     }
 
@@ -611,11 +628,21 @@ impl Inner {
         self.answer_packet(name).flatten()
     }
 
-    /// What a failure of planning or computing is as a refusal of the ask.
-    fn ask_refusal(&self, kind: AnswerKind, e: &DataError) -> AskRefusal {
+    /// What a failure of planning or computing is as a refusal of the ask. A known evaluator's
+    /// refusal of the definition is `EvaluatorRefused`, with its words, which are shown to the
+    /// asker for this reason only ([`AnswerAskRefusal::said`]).
+    fn ask_refusal(&self, kind: AnswerKind, e: &DataError) -> AnswerAskRefusal {
         tracing::debug!(me = %self.device, "an ask for an answer failed here: {e}");
-        match e {
+        let why = match e {
             DataError::CannotCheck { .. } => AskRefusal::CannotCheck,
+            DataError::BadRequest { why, .. } if kind == AnswerKind::Pure => {
+                match evaluator_reading(why) {
+                    Some(Reading::Refused(words) | Reading::NotItsReads(words)) => {
+                        return AnswerAskRefusal::evaluator_refused(words);
+                    }
+                    None => AskRefusal::CannotCheck,
+                }
+            }
             // A rate that passes with the second is no size to state smaller.
             DataError::Answer {
                 why: AnswerRefusal::OverBudget { what },
@@ -642,7 +669,8 @@ impl Inner {
                 AnswerKind::Pure => AskRefusal::CannotCheck,
                 AnswerKind::Provider => AskRefusal::NotProvided,
             },
-        }
+        };
+        why.into()
     }
 
     /// The checks of the reads of an ask, none of which reads or computes: an asker outside this
@@ -963,8 +991,10 @@ impl Inner {
                         continue;
                     }
                     // What the signer says is its word, and a hostile signer's words reach the
-                    // user's terminal: this device says the reason's own, whatever came.
-                    let said = refusal.why.explain();
+                    // user's terminal: this device says the reason's own, whatever came, except
+                    // that an evaluator's refusal is shown as the evaluator's quoted words,
+                    // cleaned here ([`AnswerAskRefusal::said`]).
+                    let said = refusal.said();
                     return Err(answer_error(
                         question,
                         AnswerRefusal::AskRefused {

@@ -1181,7 +1181,11 @@ pub struct Definition {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     /// The definition or an input is not one this evaluator takes: a pure function of them,
-    /// the same on every device.
+    /// the same on every device. The text is shown to an asker the signer refused, as the
+    /// evaluator's own words ([`AskRefusal::EvaluatorRefused`], answers.md §15.6): say what is
+    /// wrong with the definition and how to fix it, in at most 512 characters, and never put the
+    /// contents of an input in it (the reply is not sealed, and a plan's inputs are judged against
+    /// the asker's audience after the plan).
     #[error("{0}")]
     Refused(String),
     /// A read outside the read set, or a read of the set that is never used (a recompute only).
@@ -1503,10 +1507,16 @@ pub enum AskRefusal {
     /// [`AnswerConfig::ask_roles`], or it is of another namespace and no listed writer or reader
     /// of every collection read ([`AskServing`]).
     NotServed,
+    /// 8: the signer's evaluator refused the definition (or the reads the question states): it
+    /// is no reading the evaluator takes. Unlike `CannotCheck`, the signer knows the evaluator;
+    /// the definition is what is wrong, so the next step is to fix it. The evaluator's reason
+    /// travels in the explanation ([`AnswerAskRefusal::evaluator_refused`]), and is shown to the
+    /// asker for this reason only ([`AnswerAskRefusal::said`]).
+    EvaluatorRefused,
 }
 
 impl AskRefusal {
-    /// The reason code on the wire, 1 to 7.
+    /// The reason code on the wire, 1 to 8.
     pub fn code(&self) -> u64 {
         match self {
             AskRefusal::NotAudience { .. } => 1,
@@ -1516,6 +1526,7 @@ impl AskRefusal {
             AskRefusal::NotProvided => 5,
             AskRefusal::OverBudget => 6,
             AskRefusal::NotServed => 7,
+            AskRefusal::EvaluatorRefused => 8,
         }
     }
 
@@ -1545,7 +1556,8 @@ impl AskRefusal {
             5 => none(AskRefusal::NotProvided),
             6 => none(AskRefusal::OverBudget),
             7 => none(AskRefusal::NotServed),
-            _ => Err(bad("an ask's refusal has a reason code from 1 to 7")),
+            8 => none(AskRefusal::EvaluatorRefused),
+            _ => Err(bad("an ask's refusal has a reason code from 1 to 8")),
         }
     }
 
@@ -1567,7 +1579,7 @@ impl AskRefusal {
             AskRefusal::CannotCheck | AskRefusal::NotProvided | AskRefusal::NotServed => {
                 NextStep::SetPolicy
             }
-            AskRefusal::OverBudget => NextStep::FixRequest,
+            AskRefusal::OverBudget | AskRefusal::EvaluatorRefused => NextStep::FixRequest,
         }
     }
 
@@ -1607,8 +1619,47 @@ impl AskRefusal {
                  name another signer in the policy, or set serve_asks or ask_roles on the signer \
                  to include this device"
                 .into(),
+            AskRefusal::EvaluatorRefused => "the signer's evaluator refused the definition; fix \
+                 the definition and ask again"
+                .into(),
         }
     }
+}
+
+/// The most characters of an evaluator's reason that are shown ([`AskRefusal::EvaluatorRefused`]).
+pub const EVALUATOR_REASON_MAX: usize = 512;
+
+/// What precedes, and what follows, the evaluator's reason in the explanation of
+/// [`AskRefusal::EvaluatorRefused`]: the reason is always inside these quotes.
+const REASON_HEAD: &str = "the signer's evaluator refused the definition, in its words: \"";
+const REASON_TAIL: &str = "\"; fix the definition and ask again";
+
+/// `raw` as the words of a signer's evaluator that may be shown (answers.md §15.9): no control
+/// character (every `char::is_control`: newlines, tabs, the escape of an ANSI sequence), no
+/// character that reorders the text around it (the bidirectional embeddings, overrides and
+/// isolates, which a signer could use to carry the closing quote elsewhere), no double quote
+/// (each is a single quote, so the words can never close the quotes they are shown in), and at
+/// most [`EVALUATOR_REASON_MAX`] characters: past that, the first `EVALUATOR_REASON_MAX - 1`
+/// and an ellipsis (the ellipsis is within the cap). Idempotent.
+fn evaluator_words(raw: &str) -> String {
+    // The marks and embeddings of bidirectional text, which reorder what surrounds them.
+    let reorders = |c: &char| matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let mut kept = raw
+        .chars()
+        .filter(|c| !c.is_control() && !reorders(c))
+        .map(|c| if c == '"' { '\'' } else { c })
+        .take(EVALUATOR_REASON_MAX + 1)
+        .collect::<Vec<char>>();
+    if kept.len() > EVALUATOR_REASON_MAX {
+        kept.truncate(EVALUATOR_REASON_MAX - 1);
+        kept.push('…');
+    }
+    kept.into_iter().collect()
+}
+
+/// `words` in the frame of an [`AskRefusal::EvaluatorRefused`] explanation.
+fn quoted(words: &str) -> String {
+    format!("{REASON_HEAD}{words}{REASON_TAIL}")
 }
 
 /// A signer's refusal of an ask, the Content of the reply Data (TLV 0x05DF, answers.md §15).
@@ -1623,12 +1674,55 @@ pub struct AnswerAskRefusal {
     pub explanation: String,
 }
 
+impl From<AskRefusal> for AnswerAskRefusal {
+    fn from(why: AskRefusal) -> Self {
+        AnswerAskRefusal::new(why)
+    }
+}
+
 impl AnswerAskRefusal {
     /// The refusal for `why`, with the explanation of [`AskRefusal::explain`].
     pub fn new(why: AskRefusal) -> Self {
         AnswerAskRefusal {
             explanation: why.explain(),
             why,
+        }
+    }
+
+    /// The refusal [`AskRefusal::EvaluatorRefused`] with the evaluator's `reason` in its
+    /// explanation, as the signer's quoted words: sanitised as [`Self::said`] does (no control
+    /// character, at most [`EVALUATOR_REASON_MAX`] characters), so that what the signer puts
+    /// on the wire is already what is shown.
+    pub fn evaluator_refused(reason: &str) -> Self {
+        AnswerAskRefusal {
+            why: AskRefusal::EvaluatorRefused,
+            explanation: quoted(&evaluator_words(reason)),
+        }
+    }
+
+    /// What the asker shows of this refusal (answers.md §15.9). For every reason but
+    /// [`AskRefusal::EvaluatorRefused`], the reason's own text ([`AskRefusal::explain`]): what
+    /// the signer wrote is a hostile or compromised signer's own words and is never shown. For
+    /// `EvaluatorRefused`, the evaluator's words as the signer gave them, cleaned again here
+    /// (control characters removed, at most [`EVALUATOR_REASON_MAX`] characters, double quotes
+    /// made single), and always inside this device's own frame, `the signer's evaluator refused
+    /// the definition, in its words: "…"; fix the definition and ask again`, so that nothing the
+    /// signer sent reads as this device's words. A refusal that gave no words is the reason's
+    /// own text.
+    pub fn said(&self) -> String {
+        if self.why != AskRefusal::EvaluatorRefused {
+            return self.why.explain();
+        }
+        let given = self
+            .explanation
+            .strip_prefix(REASON_HEAD)
+            .and_then(|e| e.strip_suffix(REASON_TAIL))
+            .unwrap_or(&self.explanation);
+        let words = evaluator_words(given);
+        if words.is_empty() || self.explanation == self.why.explain() {
+            self.why.explain()
+        } else {
+            quoted(&words)
         }
     }
 

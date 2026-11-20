@@ -180,13 +180,43 @@ async fn heard(
     match read_reply(&data).unwrap() {
         Reply::Packet(d) => Told::Answer(d),
         Reply::Refused(r) => {
-            assert_eq!(
-                r.explanation,
-                r.why.explain(),
-                "a refusal says why and what to do"
-            );
+            if r.why == AskRefusal::EvaluatorRefused {
+                // The one reason whose explanation carries the evaluator's words, quoted.
+                assert!(
+                    r.explanation.starts_with(
+                        "the signer's evaluator refused the definition, in its words: \""
+                    ),
+                    "{}",
+                    r.explanation
+                );
+            } else {
+                assert_eq!(
+                    r.explanation,
+                    r.why.explain(),
+                    "a refusal says why and what to do"
+                );
+            }
             Told::Refused(r.why)
         }
+    }
+}
+
+/// The refusal the signer gives to `ask` from `asker`, as it wrote it.
+pub(super) async fn refusal_told(
+    asker: &Device,
+    signer: &Device,
+    ask: &AnswerAsk,
+) -> AnswerAskRefusal {
+    let public = signer.inner.st.lock().keys.recipient.public();
+    let (name, params) = asker.inner.build_ask(signer.name(), &public, ask).unwrap();
+    let wire = signer
+        .inner
+        .answer_ask(&name, Some(params), None)
+        .await
+        .expect("the signer replies");
+    match read_reply(&Data::decode(wire).unwrap()).unwrap() {
+        Reply::Refused(r) => r,
+        Reply::Packet(_) => panic!("an answer, not a refusal"),
     }
 }
 
@@ -333,6 +363,7 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
         AskRefusal::NotProvided,
         AskRefusal::OverBudget,
         AskRefusal::NotServed,
+        AskRefusal::EvaluatorRefused,
     ];
     for (i, why) in all.into_iter().enumerate() {
         assert_eq!(why.code(), i as u64 + 1);
@@ -352,7 +383,14 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
             .retry_after(),
         Some(wait)
     );
-    // A code outside 1..=7, a number on a reason that carries none, and words that are not
+    // The evaluator's words travel in the explanation of code 8, and round-trip as written.
+    let evaluator = AnswerAskRefusal::evaluator_refused("SERVES is an address of one setting");
+    assert_eq!(evaluator.why.code(), 8);
+    assert_eq!(
+        AnswerAskRefusal::decode(evaluator.encode()).unwrap(),
+        evaluator
+    );
+    // A code outside 1..=8, a number on a reason that carries none, and words that are not
     // UTF-8 are refused.
     let value = |code: u8, param: u64, text: &[u8]| {
         let mut v = vec![code];
@@ -364,7 +402,9 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
     };
     assert!(AnswerAskRefusal::decode(value(4, 0, b"x")).is_ok());
     assert!(AnswerAskRefusal::decode(value(0, 0, b"x")).is_err());
-    assert!(AnswerAskRefusal::decode(value(8, 0, b"x")).is_err());
+    assert!(AnswerAskRefusal::decode(value(8, 0, b"x")).is_ok());
+    assert!(AnswerAskRefusal::decode(value(8, 1, b"x")).is_err());
+    assert!(AnswerAskRefusal::decode(value(9, 0, b"x")).is_err());
     assert!(AnswerAskRefusal::decode(value(4, 1, b"x")).is_err());
     assert!(AnswerAskRefusal::decode(value(4, 0, &[0xff, 0xfe])).is_err());
 

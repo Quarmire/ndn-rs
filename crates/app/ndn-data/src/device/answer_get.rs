@@ -827,18 +827,12 @@ impl Inner {
             EvalFail::Changed(m) => answer_error(name, AnswerRefusal::ReadsChanged(m)),
             EvalFail::Refused(m) => DataError::BadRequest {
                 name: name.clone(),
-                why: format!(
-                    "the evaluator refuses its definition or inputs: {m}; ask with a definition \
-                     it takes"
-                ),
+                why: format!("{REFUSES_HEAD}{m}{REFUSES_TAIL}"),
             },
             EvalFail::NotItsReads(m) if signed => answer_error(name, AnswerRefusal::ReadSet(m)),
             EvalFail::NotItsReads(m) => DataError::BadRequest {
                 name: name.clone(),
-                why: format!(
-                    "the stated reads are not the evaluator's reading of its definition: {m}; \
-                     state the reads it makes, or ask without stating them"
-                ),
+                why: format!("{NOT_ITS_READS_HEAD}{m}{NOT_ITS_READS_TAIL}"),
             },
             EvalFail::Over(what) => answer_error(name, AnswerRefusal::OverBudget { what }),
             EvalFail::TooLarge(r) => answer_error(name, r),
@@ -1662,5 +1656,36 @@ impl Device {
     /// device holds it now.
     pub fn read_ref(&self, got: &Got) -> Result<ReadRef, DataError> {
         self.inner.read_ref_of(got).map(|(r, _)| r)
+    }
+}
+
+/// How `eval_error` words the refusal of a known evaluator as a `BadRequest`, and what
+/// [`evaluator_reading`] takes back out of it: the one place the wording is made and read.
+const REFUSES_HEAD: &str = "the evaluator refuses its definition or inputs: ";
+const REFUSES_TAIL: &str = "; ask with a definition it takes";
+const NOT_ITS_READS_HEAD: &str =
+    "the stated reads are not the evaluator's reading of its definition: ";
+const NOT_ITS_READS_TAIL: &str = "; state the reads it makes, or ask without stating them";
+
+/// What a `BadRequest`'s text says of a known evaluator's reading of a definition, if it is
+/// one `eval_error` made.
+pub(super) enum Reading<'a> {
+    /// The evaluator refused its definition or inputs, in these words (its own).
+    Refused(&'a str),
+    /// The reads the question states are not the evaluator's reading: all of the text.
+    NotItsReads(&'a str),
+}
+
+/// The class of a `BadRequest`'s text that the evaluator's refusal made, `None` for any other.
+pub(super) fn evaluator_reading(why: &str) -> Option<Reading<'_>> {
+    if let Some(words) = why
+        .strip_prefix(REFUSES_HEAD)
+        .and_then(|w| w.strip_suffix(REFUSES_TAIL))
+    {
+        Some(Reading::Refused(words))
+    } else if why.starts_with(NOT_ITS_READS_HEAD) && why.ends_with(NOT_ITS_READS_TAIL) {
+        Some(Reading::NotItsReads(why))
+    } else {
+        None
     }
 }

@@ -85,9 +85,9 @@ pub mod wire;
 pub use answer::{
     AnswerAsk, AnswerAskBody, AnswerAskEnvelope, AnswerAskRefusal, AnswerBinding, AnswerConfig,
     AnswerKind, AnswerPolicy, AnswerStore, Answered, AskRefusal, AskServing, Budget, Definition,
-    EvalError, Evaluator, Evaluators, PlanError, Provenance, ProviderAsk, Publish, QUESTION_MAX,
-    READS_MAX, ReadRef, ReadSet, ReadView, Reads, SEAL_EPOCHS_MAX, Signers, answer_ask_name,
-    answer_ask_prefix, applied_digest, parse_answer_ask_name,
+    EVALUATOR_REASON_MAX, EvalError, Evaluator, Evaluators, PlanError, Provenance, ProviderAsk,
+    Publish, QUESTION_MAX, READS_MAX, ReadRef, ReadSet, ReadView, Reads, SEAL_EPOCHS_MAX, Signers,
+    answer_ask_name, answer_ask_prefix, applied_digest, parse_answer_ask_name,
 };
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{
