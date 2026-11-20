@@ -95,7 +95,7 @@ impl Rib {
     }
 
     /// The routes that come up from now on, as [`RouteUp`]s (see there).
-    /// Any number of subscribers; one that falls [`ROUTE_EVENTS`] behind
+    /// Any number of subscribers; one that falls 256 events behind
     /// is told it lagged and takes the newest.
     pub fn route_events(&self) -> broadcast::Receiver<RouteUp> {
         self.up.subscribe()
