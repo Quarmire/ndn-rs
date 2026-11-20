@@ -31,6 +31,8 @@ pub(super) struct Wire {
     /// The Content the signer replies to every ask for an answer with, instead of its own
     /// reply.
     pub(super) forced: std::sync::Mutex<Option<Bytes>>,
+    /// How many Interests for the signer's seal key packet are lost before one is answered.
+    pub(super) lose_seal_keys: AtomicUsize,
 }
 
 impl Wire {
@@ -43,6 +45,7 @@ impl Wire {
             asked: std::sync::Mutex::new(Vec::new()),
             muted: AtomicBool::new(false),
             forced: std::sync::Mutex::new(None),
+            lose_seal_keys: AtomicUsize::new(0),
         })
     }
 
@@ -75,6 +78,14 @@ impl Connection for Wire {
         let (params, lifetime) = (interest.app_parameters().cloned(), interest.lifetime());
         let by_prefix = interest.selectors().can_be_prefix;
         self.asked.lock().unwrap().push(name.clone());
+        if name == wire::seal_key_prefix(signer.name())
+            && self
+                .lose_seal_keys
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Ok(());
+        }
         let (muted, forced) = (
             self.muted.load(Ordering::SeqCst),
             self.forced.lock().unwrap().clone(),
@@ -865,4 +876,44 @@ async fn ask_answer_asks_the_named_device_and_says_what_to_do_when_it_cannot() {
         "it says what to do: {refused}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_lost_seal_key_packet_costs_a_pause_not_the_ask() {
+    // The signer's seal key packet is lost twice on its way: the asker asks for it again in
+    // place (as it asks for every small signed packet), and the ask goes out and is answered.
+    // Asked once, as it was, the first loss left the whole `ask_answer` `NotReady`.
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, serving(vec![sum(1)], AskServing::Own, 4)).await;
+    let (phone, wire) = wired(
+        &mut w,
+        "/alice/phone",
+        &laptop,
+        asking("/alice/laptop", Duration::from_millis(250)),
+    )
+    .await;
+    wire.lose_seal_keys.store(2, Ordering::SeqCst);
+    let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
+    let got = phone.ask_answer(&n("/alice/laptop"), &q).await;
+    assert!(matches!(got, Ok(Got::Answer(_))), "{got:?}");
+    assert_eq!(
+        wire.lose_seal_keys.load(Ordering::SeqCst),
+        0,
+        "both losses were met and asked past"
+    );
+
+    // A signer whose seal key packet never comes is still `NotReady` (retry later).
+    let (lone, wire) = wired(
+        &mut w,
+        "/alice/tablet",
+        &laptop,
+        asking("/alice/laptop", Duration::from_millis(250)),
+    )
+    .await;
+    wire.lose_seal_keys.store(usize::MAX, Ordering::SeqCst);
+    let never = lone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
+    assert!(
+        matches!(&never, DataError::NotReady { why, .. } if why.contains("seal key is not held yet")),
+        "{never:?}"
+    );
 }

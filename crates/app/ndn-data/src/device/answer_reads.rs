@@ -464,9 +464,11 @@ impl Inner {
     ) -> Result<ReadsChecked, ReadFail> {
         let inner = Arc::clone(self);
         let set = set.clone();
-        let ran = crate::rt::blocking(self.config.answers.budget.time, move |cancel| {
-            inner.check_reads_with(&set, cancel, &mut || {})
-        })
+        let ran = crate::rt::blocking(
+            self.config.answers.budget.time,
+            self.config.answers.inline_work,
+            move |cancel| inner.check_reads_with(&set, cancel, &mut || {}),
+        )
         .await;
         let over = |what: &str| {
             ReadFail::Data(DataError::Answer {
@@ -973,20 +975,24 @@ impl Inner {
         // only ever makes a refusal (answers.md §10).
         let contents = std::mem::take(&mut planner.contents);
         let evaluator = Arc::clone(ev);
-        let ran = crate::rt::blocking(budget.time, move |cancel| {
-            let (evaluated, used, outside) = {
-                let view = View {
-                    index: SetIndex::of(&set),
-                    contents: &contents,
-                    used: RefCell::new(HashSet::new()),
-                    outside: RefCell::new(None),
-                    cancel,
+        let ran = crate::rt::blocking(
+            budget.time,
+            self.config.answers.inline_work,
+            move |cancel| {
+                let (evaluated, used, outside) = {
+                    let view = View {
+                        index: SetIndex::of(&set),
+                        contents: &contents,
+                        used: RefCell::new(HashSet::new()),
+                        outside: RefCell::new(None),
+                        cancel,
+                    };
+                    let evaluated = evaluator.evaluate(&def, &view);
+                    (evaluated, view.used.take(), view.outside.take())
                 };
-                let evaluated = evaluator.evaluate(&def, &view);
-                (evaluated, view.used.take(), view.outside.take())
-            };
-            (evaluated, used, outside, set)
-        })
+                (evaluated, used, outside, set)
+            },
+        )
         .await;
         let (evaluated, used, outside, set) = match ran {
             Ok(x) => x,

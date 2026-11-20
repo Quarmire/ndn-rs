@@ -1414,6 +1414,15 @@ pub struct AnswerConfig {
     /// there is no role to refuse); in a namespace that does, a role-less name is no device its
     /// CA issued and is refused [`AskRefusal::NotServed`] too. Default `admin` and `member`.
     pub ask_roles: Vec<String>,
+    /// Run the checks of an ask's reads and the evaluations, which are CPU-bound and bounded by
+    /// [`Budget::time`] of wall-clock time, on the executor's own thread instead of the runtime's
+    /// blocking pool. For a simulation on a paused clock that must replay exactly: a pool
+    /// thread's finishing is an event of real time that lands among the tasks ready meanwhile,
+    /// wherever the machine's load puts it, so two runs can order two packets differently. A
+    /// host that serves traffic leaves it off: inline, the executor waits out each check and
+    /// evaluation (a check of the reads of one ask, an evaluation at most [`Budget::time`]).
+    /// Default `false`.
+    pub inline_work: bool,
 }
 
 impl Default for AnswerConfig {
@@ -1437,6 +1446,7 @@ impl Default for AnswerConfig {
             asks_at_once: 4,
             asks_queued: 32,
             ask_roles: vec!["admin".into(), "member".into()],
+            inline_work: false,
         }
     }
 }

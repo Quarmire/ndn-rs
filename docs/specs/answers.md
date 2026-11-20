@@ -409,6 +409,7 @@ Policy is read at the moment an answer is used and never cached across a change 
 | State reads in an ask (host) | `STATE_READS_CHECKED_MAX` (1,024) | `OverBudget` beyond it (§15.7). |
 | Provider asks queued (host) | 64 distinct calls | Calls awaiting the host on `Device::provider_asks` (§15.10); the same call waits once, and is delivered again after `Budget::time` without a result; one more distinct call is `NotProvided`. |
 | Asks sent (asker) | at most 3 attempts per signer on `Busy` or `Pending`, each waiting the stated `retry_after` (at most 10 s); at most 3 sends of one ask when nothing replies | §15.9. |
+| Where checks and evaluations run (host) | `inline_work` (default `false`: the runtime's blocking pool) | A simulation on a paused clock sets it, so the work runs on the executor's thread and a run replays exactly: a pool thread's finishing is an event of real time that lands among the tasks ready meanwhile. It changes no result and no bound (`Budget::time` still stops the work at its own checks). |
 
 The host's values are `Config::answers`; the layer enforces what is above, never a value that changes a result.
 
@@ -720,7 +721,7 @@ A refusal is told only to an authenticated asker (§15.4 step 2). It is signed D
 
 ### 15.8 The signer's seal key
 
-An asker seals to the signer's seal key, the packet `<D>/32=seal/<public key>` signed by `D`'s device key (data-layer.md §9, §16.1). A device answers an Interest for `<D>/32=seal` with CanBePrefix for its own `D` with that packet, so an asker that does not know the key fetches it by the device's name alone. The asker takes the key only from a packet that names `D` and is signed by a key of `D`, held already or fetched, never from the reply to an ask; a device whose key it cannot obtain is `NotReady` (`RetryLater`): "the signer's seal key is not held yet".
+An asker seals to the signer's seal key, the packet `<D>/32=seal/<public key>` signed by `D`'s device key (data-layer.md §9, §16.1). A device answers an Interest for `<D>/32=seal` with CanBePrefix for its own `D` with that packet, so an asker that does not know the key fetches it by the device's name alone. The asker takes the key only from a packet that names `D` and is signed by a key of `D`, held already or fetched, never from the reply to an ask; a device whose key it cannot obtain is `NotReady` (`RetryLater`): "the signer's seal key is not held yet". The packet is asked for as every small signed packet the layer needs is (data-layer.md §17.1: up to three rounds, a pause between them), not once: at 20 % loss in each direction a single Interest has a reply less than half the time, and a call that gave up on the first miss was `NotReady` for most of its callers' tries (conformance fault seeds 61, 77 and 115 of a20, a19 and a21 failed so, eight rounds in a row).
 
 ### 15.9 What the asker does
 

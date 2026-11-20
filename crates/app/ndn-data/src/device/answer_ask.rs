@@ -673,9 +673,11 @@ impl Inner {
             return Err(AskRefusal::OverBudget);
         }
         let (inner, gate, set) = (Arc::clone(self), gate.clone(), set.clone());
-        let ran = rt::blocking(self.config.answers.budget.time, move |cancel| {
-            inner.gate_reads_with(&gate, &set, held, cancel)
-        })
+        let ran = rt::blocking(
+            self.config.answers.budget.time,
+            self.config.answers.inline_work,
+            move |cancel| inner.gate_reads_with(&gate, &set, held, cancel),
+        )
         .await;
         match ran {
             Ok(Some(verdict)) => verdict,
@@ -814,9 +816,12 @@ impl Inner {
     }
 
     /// Fetch the seal key packet of `signer` by its name, verify it is the signer's, and keep
-    /// it in place of any held for the signer.
+    /// it in place of any held for the signer. Asked as every small signed packet the layer
+    /// needs is ([`Inner::fetch_owed`]: up to `FETCH_TRIES` rounds, a pause between them), not
+    /// once: a packet lost on a faulty link then costs a pause, not the whole of an
+    /// [`Device::ask_answer`], which has no other way to go on without the key.
     async fn fetch_seal_key(self: &Arc<Self>, signer: &Name) -> Option<[u8; 32]> {
-        let data = self.fetch(wire::seal_key_prefix(signer), true).await?;
+        let data = self.fetch_owed(wire::seal_key_prefix(signer), true).await?;
         let (device, public) = parse_seal_key_name(&data.name)?;
         if device != *signer || !self.seal_key_of(&data, &data.name, signer, &public).await {
             return None;

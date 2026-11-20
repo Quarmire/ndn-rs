@@ -57,14 +57,26 @@ pub(crate) enum Stopped {
 /// and what it returns is dropped). On wasm32, which has no threads, it runs inline and only
 /// its own checks of [`Cancel::cancelled`] bound it.
 ///
+/// `inline` runs the work on the caller's thread instead, as wasm32 does, for a simulation that
+/// must replay: the clock of a paused runtime does not advance while a pool thread works, but
+/// that thread's finishing is an event of real time that lands among the tasks ready meanwhile,
+/// wherever the machine's load puts it, so two runs of the same simulation can order two
+/// packets differently (and a link's fates, drawn in the order packets cross it, with them).
+/// Inline, the executor is held up for as long as the work takes, which the work's own checks
+/// of [`Cancel::cancelled`] bound.
+///
 /// The wall clock only ever makes this return [`Stopped`], which the callers turn into a
 /// refusal: it never decides what is true or trusted. It is the wall clock and not the
 /// runtime's clock (a paused or virtual runtime would run it out while the thread works).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn blocking<T: Send + 'static>(
     limit: Duration,
+    inline: bool,
     work: impl FnOnce(&Cancel) -> T + Send + 'static,
 ) -> Result<T, Stopped> {
+    if inline {
+        return run_inline(limit, work);
+    }
     use futures::channel::oneshot;
     use futures::future::{Either, select};
     use parking_lot::{Condvar, Mutex};
@@ -136,17 +148,63 @@ pub(crate) async fn blocking<T: Send + 'static>(
     }
 }
 
-/// [`blocking`] on wasm32: no threads, so inline; the work stops at its own checks of the
-/// deadline, and a result produced after it is discarded.
+/// [`blocking`] on wasm32: no threads, so inline (`inline` is moot).
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn blocking<T>(
     limit: Duration,
+    _inline: bool,
     work: impl FnOnce(&Cancel) -> T,
 ) -> Result<T, Stopped> {
+    run_inline(limit, work)
+}
+
+/// Run `work` here, on the caller's thread: it stops at its own checks of the deadline, and a
+/// result produced after it is discarded.
+fn run_inline<T>(limit: Duration, work: impl FnOnce(&Cancel) -> T) -> Result<T, Stopped> {
     let cancel = Cancel::within(limit);
     let out = work(&cancel);
     match cancel.cancelled() {
         true => Err(Stopped::Deadline),
         false => Ok(out),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn inline_work_runs_on_the_callers_thread_and_pooled_work_does_not() {
+        let here = std::thread::current().id();
+        let limit = Duration::from_secs(30);
+        let inline = blocking(limit, true, |_| std::thread::current().id()).await;
+        assert_eq!(
+            inline.ok(),
+            Some(here),
+            "inline work runs where it is called"
+        );
+        let pooled = blocking(limit, false, |_| std::thread::current().id()).await;
+        assert!(
+            pooled.is_ok_and(|id| id != here),
+            "pooled work runs on a thread of the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_work_over_its_time_is_refused_like_pooled_work() {
+        let limit = Duration::from_millis(20);
+        let slow = |cancel: &Cancel| {
+            while !cancel.cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(matches!(
+            blocking(limit, true, slow).await,
+            Err(Stopped::Deadline)
+        ));
+        assert!(matches!(
+            blocking(limit, false, slow).await,
+            Err(Stopped::Deadline)
+        ));
     }
 }
