@@ -7547,6 +7547,7 @@ impl Device {
             let _ = adopted_tx.send(Arc::clone(ctx));
         });
         inner.restore();
+        inner.restore_hints();
         // Every entry held is judged again by the durable rule against the
         // trust contexts held now (spec §8): a key above its signer may
         // have been revoked while the device was off.
@@ -15615,6 +15616,14 @@ impl Inner {
                     None => drop(responder),
                 }
             });
+            return;
+        }
+        if crate::intro::parse_hint_name(&name).is_some_and(|(d, _)| d == self.device) {
+            // The hint record of a short code (SHAPES-R10 §2), or its gone mark:
+            // made and signed on request, for a token this device holds; a
+            // token it does not is not answered.
+            let reply = self.hint_packet(&name);
+            self.reply(&name, responder, reply).await;
             return;
         }
         if let Some((holder, piece)) = parse_held_name(&name)
@@ -27092,6 +27101,8 @@ mod group_scale_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod intro_tests;
+
+mod hint;
 
 mod intro;
 pub use intro::IntroductionSurface;

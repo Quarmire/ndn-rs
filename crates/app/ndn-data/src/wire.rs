@@ -315,6 +315,24 @@ pub mod tlv {
     /// (0 host, 1 reflexive, 2 advertised, 3 mapped), the IP address (4
     /// octets for IPv4, 16 for IPv6), the UDP port (2 octets, big-endian).
     pub const LINK_CANDIDATE: u64 = 0x05B2;
+
+    // The hint record of a short code (spec §19.2): even numbers, in the same
+    // block, the content of a Data named `<device>/32=hint/<token>`.
+
+    /// A hint record: `HintOffer`, `LinkKey`, `LinkCandidate`s, `HintRelay`s,
+    /// `HintUntil`, `Credentials` — or, for an offer no longer served, just
+    /// a `HintGone`.
+    pub const INTRO_HINT: u64 = 0x05B4;
+    /// The offer the record is bound to: a `Name` (the offer record's name).
+    pub const HINT_OFFER: u64 = 0x05B6;
+    /// A relay device that reaches the inviter, repeatable (at most 8): a
+    /// `Name`.
+    pub const HINT_RELAY: u64 = 0x05B8;
+    /// NonNegativeInteger: 3 expired, 4 closed (the codes of
+    /// `IntroRefused`). The offer is no longer served.
+    pub const HINT_GONE: u64 = 0x05BA;
+    /// NonNegativeInteger: the offer's expiry, in milliseconds. Informational.
+    pub const HINT_UNTIL: u64 = 0x05BC;
 }
 
 /// Keyword components of the layer's names.

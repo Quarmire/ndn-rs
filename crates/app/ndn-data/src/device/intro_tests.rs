@@ -70,11 +70,39 @@ impl Person {
 
     /// `ns` rooted in the key `root` held by `mgr`.
     fn rooted(ns: &str, mgr: &SecurityManager, root: &Name) -> Person {
+        Person::rooted_with(ns, mgr, root, Vec::new())
+    }
+
+    /// `ns` rooted in a key of its own, its trust context advertising the
+    /// relay device `relay` (an endpoint to dial it at is part of the entry).
+    fn relayed(ns: &str, relay: &str) -> Person {
+        let mgr = SecurityManager::new();
+        let root = mgr
+            .generate_ed25519(n(ns).append("KEY").append("ns"))
+            .unwrap();
+        let relay = ndn_security::AdvertisedRelay {
+            device: n(relay),
+            key: None,
+            endpoints: vec!["relay.example.net:6363".to_string()],
+            preference: 0,
+        };
+        Person::rooted_with(ns, &mgr, &root, vec![relay])
+    }
+
+    /// [`rooted`](Self::rooted), the trust context advertising `relays`.
+    fn rooted_with(
+        ns: &str,
+        mgr: &SecurityManager,
+        root: &Name,
+        relays: Vec<ndn_security::AdvertisedRelay>,
+    ) -> Person {
         let signer = mgr.get_signer_sync(root).unwrap();
         let anchor = mgr
             .issue_self_signed(root, signer.public_key().unwrap(), VALIDITY_MS)
             .unwrap();
-        let ctx = SignedTrustContext::hierarchical(n(ns)).with_version(1);
+        let ctx = SignedTrustContext::hierarchical(n(ns))
+            .with_version(1)
+            .with_relays(relays);
         assert!(ctx.add_anchor(anchor));
         let signed = ctx.sign_into_data(signer.as_ref()).unwrap().raw().clone();
         Person {
@@ -105,7 +133,22 @@ impl Person {
 struct Calls {
     dialled: std::sync::Mutex<Vec<Name>>,
     undialled: std::sync::Mutex<Vec<Name>>,
+    /// The key of every link hint `undial` was given.
+    undialled_keys: std::sync::Mutex<Vec<[u8; 32]>>,
     dial_succeeds: std::sync::atomic::AtomicBool,
+    /// Every `dial_first`: the inviter and the address.
+    first_dialled: std::sync::Mutex<Vec<(Name, std::net::SocketAddr)>>,
+    /// What `dial_first` answers: the key the link proved, or why not;
+    /// `None`: a host with no link layer.
+    first_dial: std::sync::Mutex<Option<Result<[u8; 32], String>>>,
+    /// What `link_hint` gives: this host's key and its addresses.
+    hint: std::sync::Mutex<Option<crate::intro::LinkHint>>,
+    /// Whether a dial of this host's succeeded and was not taken down since:
+    /// a link a test's network carries introduction names over.
+    linked: std::sync::atomic::AtomicBool,
+    /// Whether this host adopted a namespace: its links carry every name of
+    /// it from then on.
+    adopted: std::sync::atomic::AtomicBool,
     granted: std::sync::Mutex<Vec<Grant>>,
     revoked: std::sync::Mutex<Vec<([u8; 32], Name)>>,
     departed: std::sync::Mutex<Vec<crate::intro::Departure>>,
@@ -120,6 +163,22 @@ impl Calls {
 
     fn undialled(&self) -> Vec<Name> {
         self.undialled.lock().unwrap().clone()
+    }
+
+    fn undialled_keys(&self) -> Vec<[u8; 32]> {
+        self.undialled_keys.lock().unwrap().clone()
+    }
+
+    fn first_dialled(&self) -> Vec<(Name, std::net::SocketAddr)> {
+        self.first_dialled.lock().unwrap().clone()
+    }
+
+    fn linked(&self) -> bool {
+        self.linked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn adopted(&self) -> bool {
+        self.adopted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn granted(&self) -> Vec<Grant> {
@@ -180,6 +239,10 @@ impl Introducer for Host {
         self.calls.departed.lock().unwrap().push(departure.clone());
     }
 
+    fn link_hint(&self) -> Option<crate::intro::LinkHint> {
+        self.calls.hint.lock().unwrap().clone()
+    }
+
     fn dial<'a>(
         &'a self,
         _hint: &'a crate::intro::LinkHint,
@@ -191,6 +254,11 @@ impl Introducer for Host {
             .calls
             .dial_succeeds
             .load(std::sync::atomic::Ordering::SeqCst);
+        if ok {
+            self.calls
+                .linked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Box::pin(async move {
             if ok {
                 Ok(())
@@ -200,8 +268,38 @@ impl Introducer for Host {
         })
     }
 
-    fn undial(&self, _hint: &crate::intro::LinkHint, inviter: &Name) {
+    fn dial_first<'a>(
+        &'a self,
+        inviter: &'a Name,
+        addr: std::net::SocketAddr,
+        _within: Duration,
+    ) -> crate::intro::FirstDialing<'a> {
+        self.calls
+            .first_dialled
+            .lock()
+            .unwrap()
+            .push((inviter.clone(), addr));
+        let got = self
+            .calls
+            .first_dial
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Err("this test host links nothing".to_string()));
+        if got.is_ok() {
+            self.calls
+                .linked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Box::pin(async move { got })
+    }
+
+    fn undial(&self, hint: &crate::intro::LinkHint, inviter: &Name) {
         self.calls.undialled.lock().unwrap().push(inviter.clone());
+        self.calls.undialled_keys.lock().unwrap().push(hint.key);
+        self.calls
+            .linked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> crate::intro::Adopting<'a> {
@@ -237,11 +335,18 @@ impl Introducer for Host {
                         .any(|a| Some(ndn_security::anchor_fingerprint(a.value())) == *fingerprint)
             });
             if held {
+                self.calls
+                    .adopted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(());
             }
             self.validator
                 .adopt_context(Arc::new(ctx))
-                .map_err(|refused| refused.to_string())
+                .map_err(|refused| refused.to_string())?;
+            self.calls
+                .adopted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         })
     }
 }
@@ -320,9 +425,55 @@ async fn start_policy(
     intro: IntroPolicy,
     store: Arc<dyn DataStore>,
 ) -> Device {
+    start_wired(
+        person,
+        device,
+        keys,
+        refuses,
+        hold,
+        clock,
+        calls,
+        intro,
+        store,
+        Arc::new(Unconnected),
+    )
+    .await
+}
+
+/// [`start_policy`] on the connection `conn` (the node's; the sync groups'
+/// is one that delivers nothing): a device other devices' Interests reach.
+#[allow(clippy::too_many_arguments)]
+async fn start_wired(
+    person: &Person,
+    device: &str,
+    keys: Option<Arc<SecurityManager>>,
+    refuses: &[&str],
+    hold: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    clock: Option<Clock>,
+    calls: Arc<Calls>,
+    intro: IntroPolicy,
+    store: Arc<dyn DataStore>,
+    conn: Arc<dyn Connection>,
+) -> Device {
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-    validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
+    if matches!(
+        ndn_security::self_certifying::self_certifying_digest(person.ctx.namespace()),
+        Ok(Some(_))
+    ) {
+        // A self-certifying namespace is held only from its genesis.
+        let genesis = ndn_security::self_certifying::Genesis::open_received(
+            &Data::decode(person.signed.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        validator
+            .keyring()
+            .adopt_genesis(&genesis, Arc::clone(genesis.context()))
+            .unwrap();
+    } else {
+        validator.adopt_context(Arc::clone(&person.ctx)).unwrap();
+    }
     let keys = match keys {
         Some(k) => k,
         None => {
@@ -342,11 +493,10 @@ async fn start_policy(
         hold,
         calls,
     };
-    let conn: Arc<dyn Connection> = Arc::new(Unconnected);
     Device::start(
         Transport {
-            node: Node::from_connection(Arc::clone(&conn)),
-            sync: conn,
+            node: Node::from_connection(conn),
+            sync: Arc::new(Unconnected),
         },
         device,
         keys,
@@ -3212,3 +3362,7 @@ async fn a_writer_below_a_namespace_unlocks_only_its_own_namespace_not_the_broad
 // ---- round 9: the mirror grant, the joiner's end of a grant (spec §19.8) -----------------------
 
 mod mirror_tests;
+
+// ---- round 10: the short code and its hint record (SHAPES-R10) ----------------------------------
+
+mod hint_tests;

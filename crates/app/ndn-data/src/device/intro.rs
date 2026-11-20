@@ -19,15 +19,18 @@ use ndn_security::{
     CertCache, Certificate, Keyring, SignedTrustContext, ValidationResult, Validator,
     anchor_fingerprint, public_key_digest,
 };
-use ndn_trust_envelope::{INTRO_WORDS_FINGERPRINT_LEN, IntroWords, Introduction, TrustEnvelope};
+use ndn_trust_envelope::words::WORD_COUNT as WORDS_FORM_WORDS;
+use ndn_trust_envelope::{IntroWords, Introduction, TrustEnvelope};
 
+use super::hint::{FirstContact, HintFault};
 use super::{Device, Held, Inner, St, Subject, check_collection, local, open_grant, owner_signed};
 use crate::collection::Epoch;
 use crate::error::DataError;
 use crate::intro::{
-    AnswerBody, AskBody, Code, IntroAsk, IntroRecord, IntroRefusal, Introducer, Joined,
-    JoinedFolder, LinkHint, Offer, OfferBody, Outcome, Role, SECRET_LEN, UsedBody, answer_proof,
-    answer_proves, ask_proof, ask_proves, commitment, intro_name, intro_prefix, proof_key,
+    AnswerBody, AskBody, Code, Contact, HINT_TOKEN_LEN, IntroAsk, IntroRecord, IntroRefusal,
+    Introducer, Joined, JoinedFolder, LinkHint, Offer, OfferBody, Outcome, Role, SECRET_LEN,
+    ShortCode, UsedBody, answer_proof, answer_proves, ask_proof, ask_proves, commitment, hint_name,
+    hint_token, intro_name, intro_prefix, parse_hint_name, proof_key,
 };
 use crate::layer::{ShareChange, Sharing};
 use crate::rt::Instant;
@@ -47,7 +50,7 @@ use crate::wire::{
 const ASK_TRIES: u32 = 8;
 
 /// How many times a join asks for the offer record: as often as it asks.
-const OFFER_TRIES: u32 = ASK_TRIES;
+pub(super) const OFFER_TRIES: u32 = ASK_TRIES;
 
 /// The longest certificate chain credentials carry, or are walked for.
 const CHAIN_MAX: usize = 8;
@@ -87,6 +90,13 @@ pub(super) struct Intros {
     pub(super) joined_changes: tokio::sync::watch::Sender<u64>,
     /// The list the generation stands for.
     pub(super) joined_seen: Vec<crate::intro::JoinedFolder>,
+    /// The own offers that publish a hint record, by their hint token
+    /// ([`hint_token`](crate::intro::hint_token) of their secret): an Interest
+    /// for `<D>/32=hint/<token>` is answered only for a token held here.
+    pub(super) hints: BTreeMap<[u8; 16], Name>,
+    /// The hint record last signed for each token, for a few seconds
+    /// ([`HINT_CACHE`](super::hint::HINT_CACHE)).
+    pub(super) hint_served: BTreeMap<[u8; 16], super::hint::HintServed>,
 }
 
 impl Intros {
@@ -102,6 +112,8 @@ impl Intros {
             departures_begun: std::collections::VecDeque::new(),
             joined_changes: tokio::sync::watch::channel(0).0,
             joined_seen: Vec::new(),
+            hints: BTreeMap::new(),
+            hint_served: BTreeMap::new(),
         }
     }
 }
@@ -167,8 +179,8 @@ fn accepted_name(offer: &Name) -> Name {
 /// trust context they carry, checked against its own anchor only, and a
 /// validator that holds that context alone and their certificates. Nothing
 /// of them is trusted by this device until its host adopts the context.
-struct Opened {
-    ctx: Arc<SignedTrustContext>,
+pub(super) struct Opened {
+    pub(super) ctx: Arc<SignedTrustContext>,
     anchor: Certificate,
     /// The trust context's signed Data, as the credentials carry it.
     context: Bytes,
@@ -180,7 +192,7 @@ struct Opened {
 /// Open `packets`: a signed trust context (its signature verified under
 /// one of its own anchors, valid now), then certificates. `None` when they
 /// are not that.
-async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
+pub(super) async fn open_credentials(packets: &[Bytes]) -> Option<Opened> {
     let (first, rest) = packets.split_first()?;
     if rest.len() > CHAIN_MAX {
         return None;
@@ -208,7 +220,7 @@ impl Opened {
     /// The key that signed `data` and its public key's digest, if `data`
     /// verifies by a chain of these certificates to this context's anchor
     /// (its schema obeyed, certificates valid now).
-    async fn signer(&self, data: &Data) -> Option<(Name, [u8; 32])> {
+    pub(super) async fn signer(&self, data: &Data) -> Option<(Name, [u8; 32])> {
         self.signer_by(&self.validator, data).await
     }
 
@@ -299,7 +311,7 @@ impl Opened {
     }
 
     /// SHA-256 of the anchor's public key.
-    fn fingerprint(&self) -> [u8; 32] {
+    pub(super) fn fingerprint(&self) -> [u8; 32] {
         anchor_fingerprint(&self.anchor)
     }
 
@@ -315,39 +327,90 @@ impl Opened {
     }
 }
 
-/// The anchor fingerprint a code names: whole (its link), or its first
-/// half (its words).
-enum Fingerprint {
+/// The anchor fingerprint a code names: whole (a link, or a short code of
+/// 36 words), or its first octets (the words form's 16, a short code's 10).
+pub(super) enum Fingerprint {
     Whole([u8; 32]),
-    Half([u8; INTRO_WORDS_FINGERPRINT_LEN]),
+    Prefix(Vec<u8>),
 }
 
 impl Fingerprint {
-    fn matches(&self, fp: &[u8; 32]) -> bool {
+    /// The fingerprint `octets` of a code: whole at 32 octets, else a prefix.
+    pub(super) fn of(octets: &[u8]) -> Self {
+        match <[u8; 32]>::try_from(octets) {
+            Ok(whole) => Fingerprint::Whole(whole),
+            Err(_) => Fingerprint::Prefix(octets.to_vec()),
+        }
+    }
+
+    pub(super) fn matches(&self, fp: &[u8; 32]) -> bool {
         match self {
             Fingerprint::Whole(w) => w == fp,
-            Fingerprint::Half(h) => fp[..INTRO_WORDS_FINGERPRINT_LEN] == h[..],
+            Fingerprint::Prefix(p) => fp.starts_with(p),
         }
     }
 }
 
 /// What a code says.
 struct Parsed {
-    offer: Name,
+    /// The offer's name. A short code does not carry it: the hint record it
+    /// names says it, verified (`None` until then).
+    offer: Option<Name>,
+    /// The inviter's device: the offer's, or the short code's.
+    device: Name,
     secret: [u8; SECRET_LEN],
     fingerprint: Fingerprint,
     namespace: Option<Name>,
     relays: Vec<String>,
     link_hint: Option<LinkHint>,
+    /// A short code's token and first contact.
+    short: Option<Short>,
 }
 
-/// Read a code: an `ndn-trust://intro/…` link (or its https mirror), or the
-/// words form (an offer name, then the words). A link hint's loopback and
-/// link-local addresses are dropped unless `local_candidates`
-/// ([`IntroPolicy::local_candidates`](crate::intro::IntroPolicy)).
+/// What a short code gives beside the device and the secret.
+struct Short {
+    /// The token the hint record is named by ([`hint_token`] of the secret).
+    token: [u8; HINT_TOKEN_LEN],
+    /// The first contact: an address to dial or a relay to hint through; none
+    /// when the Interests go by name.
+    contact: Option<Contact>,
+}
+
+/// The namespace a whole `fingerprint` names: the prefix of `device` up to
+/// its self-certifying component, when that component is it (a
+/// self-certifying namespace is named by its anchor's fingerprint).
+fn self_certifying_namespace(device: &Name, fingerprint: &[u8]) -> Option<Name> {
+    let at = device
+        .components()
+        .iter()
+        .position(|c| c.typ == ndn_packet::tlv_type::SELF_CERTIFYING)?;
+    let ns = Name::from_components(device.components()[..=at].iter().cloned());
+    matches!(self_certifying_digest(&ns), Ok(Some(d)) if d == fingerprint).then_some(ns)
+}
+
+/// Read a code: an `ndn-trust://intro/…` link (or its https mirror), the
+/// words form (an offer name, then 24 words), or a short code (a device name,
+/// perhaps a first contact, then 20 or 36 words: [`ShortCode`]). The number of
+/// words tells the last two apart. A link hint's loopback and link-local
+/// addresses are dropped unless `local_candidates`
+/// ([`IntroPolicy::local_candidates`](crate::intro::IntroPolicy)); a short
+/// code's are refused.
 fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
     let bad = |name: Name, why: String| DataError::BadRequest { name, why };
     let code = code.trim();
+    // The device of an offer's name: a log entry of a folder.
+    let offered = |offer: Name| {
+        let device = parse_log_name(&offer)
+            .filter(|l| l.subject.is_some())
+            .map(|l| l.device)
+            .ok_or_else(|| {
+                bad(
+                    offer.clone(),
+                    "the code's offer is no log entry of a folder: check the code".into(),
+                )
+            })?;
+        Ok::<_, DataError>((offer, device))
+    };
     let offer_of = |s: &str| {
         s.parse::<Name>().map_err(|_| {
             bad(
@@ -357,19 +420,40 @@ fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
         })
     };
     if code.starts_with('/') {
+        if ShortCode::word_count(code) != WORDS_FORM_WORDS {
+            let s = ShortCode::parse(code, local_candidates)
+                .map_err(|e| bad(Name::root(), e.to_string()))?;
+            let namespace = self_certifying_namespace(&s.device, &s.fingerprint);
+            return Ok(Parsed {
+                offer: None,
+                device: s.device,
+                secret: s.secret,
+                fingerprint: Fingerprint::of(&s.fingerprint),
+                namespace,
+                relays: Vec::new(),
+                link_hint: None,
+                short: Some(Short {
+                    token: hint_token(&s.secret),
+                    contact: s.contact,
+                }),
+            });
+        }
         let w = IntroWords::parse(code).map_err(|e| {
             bad(
                 Name::root(),
                 format!("the code's words do not read ({e}): check each word"),
             )
         })?;
+        let (offer, device) = offered(offer_of(&w.offer)?)?;
         return Ok(Parsed {
-            offer: offer_of(&w.offer)?,
+            offer: Some(offer),
+            device,
             secret: w.secret,
-            fingerprint: Fingerprint::Half(w.fingerprint),
+            fingerprint: Fingerprint::Prefix(w.fingerprint.to_vec()),
             namespace: None,
             relays: Vec::new(),
             link_hint: None,
+            short: None,
         });
     }
     match TrustEnvelope::from_uri(code) {
@@ -383,8 +467,10 @@ fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
                 })?),
                 None => None,
             };
+            let (offer, device) = offered(offer_of(&i.offer)?)?;
             Ok(Parsed {
-                offer: offer_of(&i.offer)?,
+                offer: Some(offer),
+                device,
                 secret: i.secret,
                 fingerprint: Fingerprint::Whole(i.fingerprint),
                 namespace,
@@ -393,6 +479,7 @@ fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
                     .link_hint
                     .as_deref()
                     .and_then(|v| LinkHint::decode(v, local_candidates).ok()),
+                short: None,
             })
         }
         Ok(other) => Err(bad(
@@ -406,8 +493,9 @@ fn parse_code(code: &str, local_candidates: bool) -> Result<Parsed, DataError> {
         Err(e) => Err(bad(
             Name::root(),
             format!(
-                "the code is neither an ndn-trust://intro link nor an offer name and words \
-                 ({e}): check what was scanned or typed"
+                "the code is neither an ndn-trust://intro link, nor a device name, address and \
+                 words (a short code), nor an offer name and 24 words ({e}): check what was \
+                 scanned or typed"
             ),
         )),
     }
@@ -877,7 +965,7 @@ impl Inner {
     }
 
     /// The host's introducer, or why there is none.
-    fn introducer(&self) -> Result<&Arc<dyn Introducer>, DataError> {
+    pub(super) fn introducer(&self) -> Result<&Arc<dyn Introducer>, DataError> {
         self.config.introducer.as_ref().ok_or_else(|| {
             local(
                 "introductions need the host's introducer (Config::introducer), which gives \
@@ -952,7 +1040,7 @@ impl Inner {
     /// Fetch `name` with the forwarding hint `hints` (none: by name), and
     /// `params` as its ApplicationParameters (`name` then gains their
     /// digest).
-    async fn fetch_hinted(
+    pub(super) async fn fetch_hinted(
         &self,
         name: Name,
         hints: &[Name],
@@ -985,7 +1073,7 @@ impl Inner {
     /// The own offer `offer`'s wrong tries counted toward
     /// [`IntroPolicy::wrong_tries_max`](crate::intro::IntroPolicy), and
     /// when the last one was counted.
-    fn overall_tries(&self, offer: &Name) -> (u32, u64) {
+    pub(super) fn overall_tries(&self, offer: &Name) -> (u32, u64) {
         let Some(b) = self.store.get(&tries_name(offer)) else {
             return (0, 0);
         };
@@ -1144,7 +1232,7 @@ impl Inner {
     /// device's own namespace or one over or under it; and every namespace
     /// it trusts — over or under one, or equal under another anchor. The
     /// same namespace under the same anchor is a party known already.
-    fn overlap(&self, ns: &Name, fingerprint: &[u8; 32]) -> Option<String> {
+    pub(super) fn overlap(&self, ns: &Name, fingerprint: &[u8; 32]) -> Option<String> {
         if let Some(why) = self.config.intro.refuses(ns) {
             return Some(why);
         }
@@ -1583,8 +1671,11 @@ impl IntroductionSurface {
     /// Whether an Interest for `name` may cross an introduction link: an
     /// ask (`<D>/32=intro/…`) while an offer is open, or the offer record
     /// itself (`<D>/32=held/<e>`, `e` an unexpired offer of this device's own
-    /// log). Another log entry, a summary root or any other packet this
-    /// device holds by name is not carried.
+    /// log), or the hint record of a short code (`<D>/32=hint/<token>`, the
+    /// token of one of this device's own offers: open, or closed or expired,
+    /// when its gone mark is the answer). Another log entry, a summary root, a
+    /// hint token this device does not hold or any other packet this device
+    /// holds by name is not carried.
     pub fn carries(&self, name: &Name) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
@@ -1593,6 +1684,9 @@ impl IntroductionSurface {
         let st = inner.st.lock();
         if name.has_prefix(&intro_prefix(&inner.device)) {
             return inner.offers_open(&st, now);
+        }
+        if let Some((device, token)) = parse_hint_name(name) {
+            return device == inner.device && st.intro.hints.contains_key(&token);
         }
         parse_held_name(name).is_some_and(|(holder, piece)| {
             holder == inner.device
@@ -1720,7 +1814,12 @@ impl Device {
     /// commitment to a fresh secret and this device's seal key — goes into
     /// the own log, the offer's proof key into the store wrapped to this
     /// device's recipient key; the code is returned once both are durable.
-    /// Nothing secret is published.
+    /// The code is the compact link, the words, and — when
+    /// [`IntroPolicy::short_code`](crate::intro::IntroPolicy) is on, the host
+    /// gives a first contact and the line fits — a short code, whose hint
+    /// token is kept the same way and whose hint record is then served
+    /// ([`Code::short_why`] says why a code has no short form, and then
+    /// nothing of a hint is published). Nothing secret is published.
     pub async fn offer(&self, folder: &Name, offer: Offer) -> Result<Code, DataError> {
         let inner = &self.inner;
         check_collection(folder)?;
@@ -1823,21 +1922,45 @@ impl Device {
         // The host's link hint: this device's key and where to dial it,
         // kept within one QR by dropping what does not fit (spec §19.2).
         let hint = inner.introducer()?.link_hint();
-        let link = LinkHint::code_link(intro, hint.as_ref()).ok_or_else(|| {
-            local(format!(
-                "the offer's link does not fit one QR even without relay hints or a link hint \
+        let link =
+            LinkHint::code_link(intro, hint.as_ref(), &inner.config.intro).ok_or_else(|| {
+                local(format!(
+                    "the offer's link does not fit one QR even without relay hints or a link hint \
                  (the offer name {name} is too long): offer a folder of a shorter name"
-            ))
-        })?;
+                ))
+            })?;
+        // The short code, and with it the hint record it names: made only when
+        // the host gives a first contact and the line fits (§1, §2); its token
+        // durable before the code is shown.
+        let (short, short_why) =
+            match inner.short_code(&name, &secret, &own.fingerprint(), hint.as_ref())? {
+                Ok(text) => (Some(text), None),
+                Err(why) => (None, Some(why)),
+            };
+        if short.is_some() && !inner.barrier().await {
+            return Err(local(
+                "the device stopped before the offer's hint was durable: make a new offer",
+            ));
+        }
         Ok(Code {
             offer: name,
             link,
             words,
+            short,
+            short_why,
         })
     }
 
-    /// Join the folder a code offers (spec §19.3): `code` is the link (or
-    /// its https mirror) or the words form. Fetch the offer from the
+    /// Join the folder a code offers (spec §19.3): `code` is a short code
+    /// (a device name, a first contact, 20 or 36 words), the compact link (or
+    /// its https mirror), an old text link or the words form (an offer's name
+    /// and 24 words). A short code is judged before anything is dialled, its
+    /// first contact reached (an address dialled with no key to expect, or a
+    /// relay named as the Interests' forwarding hint), and the hint record
+    /// `<D>/32=hint/<token>` fetched and verified against the code — the
+    /// credentials open, the anchor is the code's, the signer a key of `D`,
+    /// the offer a log entry of `D` — before anything else is sent; a link or
+    /// words form fetches no hint. Then fetch the offer from the
     /// offering device, send it an ask sealed to its seal key, carrying this
     /// device's credentials and a proof of the secret bound to its key;
     /// check the answer against the code (bound to this key, proving the
@@ -1864,32 +1987,23 @@ impl Device {
     pub async fn join(&self, code: &str) -> Result<Joined, DataError> {
         let inner = &self.inner;
         let code = parse_code(code, inner.config.intro.local_candidates)?;
-        let offer = code.offer.clone();
-        let bad = |why: &str| DataError::BadRequest {
-            name: offer.clone(),
-            why: why.into(),
-        };
-        let forged = || DataError::Introduction {
-            offer: offer.clone(),
-            why: IntroRefusal::Forged,
-        };
-        let log = parse_log_name(&offer)
-            .filter(|l| l.subject.is_some())
-            .ok_or_else(|| bad("the code's offer is no log entry of a folder: check the code"))?;
-        let device = log.device.clone();
+        let device = code.device.clone();
+        // What a refusal names before the offer is known (a short code's hint
+        // record says it): the offer, else the inviter's device.
+        let named = code.offer.clone().unwrap_or_else(|| device.clone());
         if device == inner.device || device.has_prefix(&inner.ns) {
-            return Err(bad(
-                "the code offers a folder of this device's own namespace: it is yours already",
-            ));
+            return Err(DataError::BadRequest {
+                name: named,
+                why: "the code offers a folder of this device's own namespace: it is yours \
+                      already"
+                    .into(),
+            });
         }
         // What the code says is judged before anything is dialled or asked
         // (spec §19.3): the dial gives whoever holds the key a link, and a
         // code's device name is only what it claims.
         if let Some(why) = inner.refuse_before_dial(&code, &device) {
-            return Err(DataError::Introduction {
-                offer: offer.clone(),
-                why,
-            });
+            return Err(DataError::Introduction { offer: named, why });
         }
         let introducer = Arc::clone(inner.introducer()?);
         let credentials = inner.credentials()?;
@@ -1905,31 +2019,123 @@ impl Device {
                 "the device key {me} gives no public key, so an answer cannot be bound to it"
             ))
         })?;
-        // The code's link hint, dialled before any Interest (spec §19.3,
-        // step 0): on success the Interests go by name over that link; any
-        // failure leaves the relay hints (or routing by name) as before.
-        let mut hints = inner.hints(&code.relays);
-        let mut dialled = None;
-        if let Some(hint) = &code.link_hint {
-            match introducer
-                .dial(hint, &device, inner.config.first_look)
-                .await
-            {
-                Ok(()) => {
-                    hints.clear();
-                    dialled = Some(hint);
-                }
-                Err(why) => {
-                    tracing::debug!(%offer, "the code's link hint was not dialled: {why}")
-                }
-            }
-        }
-        let pk = proof_key(&code.secret, &offer);
-        // A join that fails after its dial takes the dial's link down
+        // A short code's first contact, reached before any Interest (spec
+        // §19.3 step 3): an address is dialled with no key to expect, a relay
+        // is the Interests' forwarding hint, and no contact leaves them to be
+        // routed by name.
+        let first = match &code.short {
+            Some(Short {
+                contact: Some(contact),
+                ..
+            }) => Some(inner.first_contact(&introducer, &device, contact).await?),
+            Some(_) => Some(FirstContact {
+                hints: Vec::new(),
+                linked: None,
+            }),
+            None => None,
+        };
+        // A join that fails after a dial takes the dial's link down
         // ([`Introducer::undial`]): what answered at the hint's key proved
         // nothing, and the link is kept only once the inviter's namespace is
-        // held and the link identified.
+        // held and the link identified. The first contact's link, which
+        // proved no certificate, is not kept either.
+        let mut dialled: Option<LinkHint> = None;
+        let mut linked_first = first.as_ref().and_then(|f| f.linked.clone());
         let joined: Result<Joined, DataError> = async {
+            let (offer, hints) = if let (Some(short), Some(first)) = (&code.short, &first) {
+                // The hint record, fetched over the first contact and verified
+                // before anything else is sent (§3.4, §3.5).
+                let asked = hint_name(&device, &short.token);
+                let data = inner.fetch_hint(&device, &asked, first).await?;
+                let hinted = match inner
+                    .verify_hint(
+                        &data,
+                        &asked,
+                        &device,
+                        &code.fingerprint,
+                        code.namespace.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(hinted) => hinted,
+                    Err(HintFault::Refused(why)) => {
+                        return Err(DataError::Introduction { offer: named, why });
+                    }
+                    Err(HintFault::Bad(why)) => {
+                        return Err(DataError::Introduction {
+                            offer: named,
+                            why: IntroRefusal::Hint { why },
+                        });
+                    }
+                };
+                // The relays the Interests go through when no link carries
+                // them: the one the code named, then the record's.
+                let mut hints = first.hints.clone();
+                for relay in &hinted.relays {
+                    if !hints.contains(relay) {
+                        hints.push(relay.clone());
+                    }
+                }
+                if hints.is_empty() {
+                    hints = inner.hints(&[]);
+                }
+                // Dial as a code's link hint is: by the record's key and
+                // candidates, unless the first contact's link is that key's
+                // already.
+                let candidates = !hinted.link.candidates.is_empty();
+                let same = linked_first
+                    .as_ref()
+                    .is_some_and(|l| l.key == hinted.link.key);
+                if linked_first.is_some() && (same || !candidates) {
+                    hints.clear();
+                } else if candidates {
+                    match introducer
+                        .dial(&hinted.link, &device, inner.config.first_look)
+                        .await
+                    {
+                        Ok(()) => {
+                            hints.clear();
+                            if let Some(first_link) = linked_first.take() {
+                                introducer.undial(&first_link, &device);
+                            }
+                            dialled = Some(hinted.link);
+                        }
+                        Err(why) => {
+                            tracing::debug!(offer = %hinted.offer, "the hint record's link hint was not dialled: {why}")
+                        }
+                    }
+                }
+                (hinted.offer, hints)
+            } else {
+                let offer = code.offer.clone().ok_or_else(|| {
+                    local("a code that is neither a link, words nor a short code was read")
+                })?;
+                // The code's link hint, dialled before any Interest (spec
+                // §19.3, step 0): on success the Interests go by name over that
+                // link; any failure leaves the relay hints (or routing by name)
+                // as before.
+                let mut hints = inner.hints(&code.relays);
+                if let Some(hint) = &code.link_hint {
+                    match introducer
+                        .dial(hint, &device, inner.config.first_look)
+                        .await
+                    {
+                        Ok(()) => {
+                            hints.clear();
+                            dialled = Some(hint.clone());
+                        }
+                        Err(why) => {
+                            tracing::debug!(%offer, "the code's link hint was not dialled: {why}")
+                        }
+                    }
+                }
+                (offer, hints)
+            };
+            let forged = || DataError::Introduction {
+                offer: offer.clone(),
+                why: IntroRefusal::Forged,
+            };
+            let pk = proof_key(&code.secret, &offer);
             // The offer, as the offering device serves its own log entry.
             let held = wire::held_name(&device, &offer);
             let mut wrapped = None;
@@ -1954,6 +2160,19 @@ impl Device {
                     why: IntroRefusal::Unknown,
                 });
             };
+            // A short code's secret is whole in the code (a checksum guards it
+            // against a typo), so an offer that is not committed to it is
+            // another offer than the code's: a record that names it, whoever
+            // signed it, is no record of this code's offer. Refused before the
+            // ask, which would only count a wrong try.
+            if code.short.is_some() && ob.commitment != commitment(&code.secret) {
+                return Err(DataError::Introduction {
+                    offer: offer.clone(),
+                    why: IntroRefusal::Hint {
+                        why: format!("offer: {offer} was not made with this code's secret"),
+                    },
+                });
+            }
 
             // The ask.
             let nonce = inner.nonce();
@@ -2114,10 +2333,10 @@ impl Device {
             })
         }
         .await;
-        if joined.is_err()
-            && let Some(hint) = dialled
-        {
-            introducer.undial(hint, &device);
+        if joined.is_err() {
+            for link in [dialled, linked_first].into_iter().flatten() {
+                introducer.undial(&link, &device);
+            }
         }
         joined
     }

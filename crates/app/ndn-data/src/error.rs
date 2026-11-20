@@ -508,7 +508,8 @@ impl DataError {
                 | crate::intro::IntroRefusal::Used
                 | crate::intro::IntroRefusal::Expired
                 | crate::intro::IntroRefusal::Closed
-                | crate::intro::IntroRefusal::InviterConflict { .. } => NextStep::AskOwner,
+                | crate::intro::IntroRefusal::InviterConflict { .. }
+                | crate::intro::IntroRefusal::Hint { .. } => NextStep::AskOwner,
             },
             DataError::CannotCheck { .. } => NextStep::UpdateProgram,
             DataError::Answer { why, .. } => why.next(),

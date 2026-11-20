@@ -4,8 +4,11 @@
 //! record in its own log naming the folder, the [`Role`] it grants, its
 //! expiry, the wrong tries it allows, a commitment to a secret and the
 //! device's seal key. The [`Code`] carries the offer's name, the secret and
-//! the owner's anchor fingerprint, as an `ndn-trust://intro/…` link
-//! ([`ndn_trust_envelope::Introduction`]) or as words. The joiner's device
+//! the owner's anchor fingerprint, as a compact `ndn-trust://intro/…` link
+//! ([`ndn_trust_envelope::Introduction`]), as words, or as a **short code**
+//! ([`ShortCode`]): a line of 20 or 36 words after the inviter's device name
+//! and a first contact, whose offer is named by a signed [`HintRecord`] the
+//! inviter serves at [`hint_name`]. The joiner's device
 //! ([`Device::join`]) fetches the offer, sends an **ask** sealed to the
 //! offering device carrying its own anchor link and a proof of the secret
 //! bound to its key, and takes the **answer**: the folder, the role and the
@@ -16,8 +19,8 @@
 //! the folder. [`IntroPolicy`] is what a device allows of it.
 //!
 //! This module holds the types, the bytes ([`IntroRecord`], [`IntroAsk`],
-//! [`AskBody`], [`AnswerBody`]) and the proofs; the exchange itself is the
-//! device's.
+//! [`AskBody`], [`AnswerBody`], [`HintRecord`]), the short code's text and the
+//! proofs; the exchange itself is the device's.
 //!
 //! [`Device::offer`]: crate::Device::offer
 //! [`Device::join`]: crate::Device::join
@@ -39,6 +42,9 @@ use crate::wire::{
     self, NONCE_LEN, WireError, bad, each, is_device_comps, is_kw, kw, name_of, read_digest,
     read_name, read_nni, read_nonce, read_writer, tlv, write_name, write_nni,
 };
+
+mod short;
+pub use short::{Contact, SHORT_FINGERPRINT_LEN, ShortCode, ShortError};
 
 /// Octets of an offer's secret ([`ndn_trust_envelope::INTRO_SECRET_LEN`]).
 pub const SECRET_LEN: usize = ndn_trust_envelope::INTRO_SECRET_LEN;
@@ -265,6 +271,31 @@ pub struct IntroPolicy {
     /// called) and the link just closes. The host's own
     /// [`Device::end_grant`](crate::Device::end_grant) never makes a mark.
     pub departure_for: Duration,
+    /// Whether an offer also makes a **short code** ([`Code::short`], spec
+    /// §19.2) and publishes the hint record it names. On by default; off:
+    /// an offer gives its link and words alone. A short code is made only
+    /// when the host gives a first contact (a dialable candidate in its link
+    /// hint, or a relay of the namespace) and the line fits `short_width`.
+    pub short_code: bool,
+    /// The most characters a short code's one line may have: 294, three
+    /// lines of 98 columns. A longer one is not made, and
+    /// [`Code::short_why`] says why: longer names are the owner's choice,
+    /// and the full link still works.
+    pub short_width: usize,
+    /// Whether a hint record is served only while its offer is open (not
+    /// expired, not closed); afterwards a gone mark answers for the same
+    /// token. On by default: a cache must not hold an address past its use.
+    /// Off: the record is served until the device stops. Either way the offer
+    /// answers by its own rules, so a hint that outlives its offer joins no
+    /// one.
+    pub hint_while_open: bool,
+    /// The most of the link hint's candidate addresses a **full link**
+    /// carries (default 3): a code is typed, scanned and sent, and a hint is
+    /// a few addresses of one device. The hint record serves all of them
+    /// ([`LINK_HINT_CANDIDATES_MAX`]).
+    pub code_candidates: usize,
+    /// The most relay devices a **full link** names (default 2), by name.
+    pub code_relays: usize,
 }
 
 impl IntroPolicy {
@@ -294,6 +325,11 @@ impl IntroPolicy {
             local_candidates: false,
             grant_for: None,
             departure_for: DEPARTURE_FOR,
+            short_code: true,
+            short_width: 294,
+            hint_while_open: true,
+            code_candidates: 3,
+            code_relays: 2,
         }
     }
 
@@ -346,6 +382,14 @@ pub struct Code {
     /// The offer's name and 24 words: the secret and the anchor
     /// fingerprint's first half.
     pub words: String,
+    /// The **short code**, one line a person can read aloud or type
+    /// ([`ShortCode`]): the inviter's device name, a first contact, and 20
+    /// or 36 words. `None` when [`short_why`](Self::short_why) says why.
+    pub short: Option<String>,
+    /// Why there is no short code, when `short` is `None`: policy off, no
+    /// first contact the host can give, or a line past
+    /// [`IntroPolicy::short_width`]. `None` when there is one.
+    pub short_why: Option<String>,
 }
 
 impl std::fmt::Debug for Code {
@@ -353,6 +397,13 @@ impl std::fmt::Debug for Code {
         f.debug_struct("Code")
             .field("offer", &self.offer)
             .finish_non_exhaustive()
+    }
+}
+
+impl Code {
+    /// What to show: the short code when there is one, else the link.
+    pub fn share(&self) -> &str {
+        self.short.as_deref().unwrap_or(&self.link)
     }
 }
 
@@ -407,6 +458,15 @@ pub enum IntroRefusal {
         /// What it overlaps, and how.
         why: String,
     },
+    /// What answered at a short code's first contact does not prove it is the
+    /// inviter's: the hint record's name, credentials, anchor or signer
+    /// failed the checks of spec §19.3. Nothing was dialled, asked or
+    /// adopted. Never on the wire (its code is that of a conflict, which it
+    /// is not; no peer sends it).
+    Hint {
+        /// Which check failed (wrong name, credentials, anchor, signer).
+        why: String,
+    },
 }
 
 impl std::fmt::Display for IntroRefusal {
@@ -447,6 +507,12 @@ impl std::fmt::Display for IntroRefusal {
                  speak for another: nothing of it was adopted; do not use this code, and ask \
                  whoever sent it for a code from a namespace of their own"
             ),
+            IntroRefusal::Hint { why } => write!(
+                f,
+                "what answered at the first contact does not prove it is the inviter's ({why}): \
+                 do not use this code's first contact; ask the inviter for a new code, and \
+                 check the code was copied whole"
+            ),
         }
     }
 }
@@ -459,7 +525,9 @@ impl IntroRefusal {
             IntroRefusal::Expired => 3,
             IntroRefusal::Closed => 4,
             IntroRefusal::WrongProof { .. } => 5,
-            IntroRefusal::Conflict | IntroRefusal::InviterConflict { .. } => 6,
+            IntroRefusal::Conflict
+            | IntroRefusal::InviterConflict { .. }
+            | IntroRefusal::Hint { .. } => 6,
             IntroRefusal::Forged => 0,
         }
     }
@@ -522,7 +590,7 @@ impl HintCandidate {
     /// unspecified, a multicast or the broadcast address, not port 0, and,
     /// unless `include_local`, not a loopback or link-local one. A code from
     /// a stranger is not made to send datagrams to those.
-    fn dialable(&self, include_local: bool) -> bool {
+    pub(crate) fn dialable(&self, include_local: bool) -> bool {
         let ip = self.addr.ip().to_canonical();
         self.addr.port() != 0
             && !ip.is_unspecified()
@@ -568,24 +636,7 @@ impl LinkHint {
     /// [`encode`](Self::encode) with at most `keep` candidates.
     fn encode_first(&self, keep: usize) -> Bytes {
         let mut w = TlvWriter::new();
-        w.write_tlv(tlv::LINK_KEY, &self.key);
-        let mut seen: Vec<&HintCandidate> = Vec::new();
-        for c in &self.candidates {
-            if seen.len() == keep.min(LINK_HINT_CANDIDATES_MAX) {
-                break;
-            }
-            if !c.dialable(true) || seen.contains(&c) {
-                continue;
-            }
-            seen.push(c);
-            let mut value = vec![c.kind.code()];
-            match c.addr.ip() {
-                IpAddr::V4(ip) => value.extend_from_slice(&ip.octets()),
-                IpAddr::V6(ip) => value.extend_from_slice(&ip.octets()),
-            }
-            value.extend_from_slice(&c.addr.port().to_be_bytes());
-            w.write_tlv(tlv::LINK_CANDIDATE, &value);
-        }
+        write_link_hint(&mut w, &self.key, &self.candidates, keep);
         w.finish()
     }
 
@@ -610,29 +661,8 @@ impl LinkHint {
                     key = Some(read_digest(&v)?);
                 }
                 tlv::LINK_CANDIDATE => {
-                    let ip_len = match v.len() {
-                        7 => 4,
-                        19 => 16,
-                        n => {
-                            return Err(bad(format!(
-                                "a link candidate is 7 or 19 octets (kind, address, port), not {n}"
-                            )));
-                        }
-                    };
-                    let Some(kind) = HintKind::from_code(v[0]) else {
-                        return Ok(true);
-                    };
-                    let ip = if ip_len == 4 {
-                        IpAddr::from(<[u8; 4]>::try_from(&v[1..5]).expect("4 octets"))
-                    } else {
-                        IpAddr::from(<[u8; 16]>::try_from(&v[1..17]).expect("16 octets"))
-                    };
-                    let port = u16::from_be_bytes([v[1 + ip_len], v[2 + ip_len]]);
-                    let c = HintCandidate {
-                        kind,
-                        addr: SocketAddr::new(ip, port),
-                    };
-                    if c.dialable(include_local)
+                    if let Some(c) = read_candidate(&v)?
+                        && c.dialable(include_local)
                         && candidates.len() < LINK_HINT_CANDIDATES_MAX
                         && !candidates.contains(&c)
                     {
@@ -651,12 +681,23 @@ impl LinkHint {
     }
 
     /// The link of an offer's code carrying `hint`, within one QR: the
-    /// secret, the offer and the fingerprint are never dropped; relay hints
-    /// go first (all of them), then the hint's last candidates one by one,
-    /// then the hint itself. `None` when even those do not fit.
-    pub(crate) fn code_link(intro: Introduction, hint: Option<&LinkHint>) -> Option<String> {
+    /// secret, the offer and the fingerprint are never dropped; at most
+    /// [`IntroPolicy::code_relays`] relay hints are named and at most
+    /// [`IntroPolicy::code_candidates`] candidates carried; relay hints go
+    /// first (all of them), then the hint's last candidates one by one, then
+    /// the hint itself. `None` when even those do not fit.
+    pub(crate) fn code_link(
+        mut intro: Introduction,
+        hint: Option<&LinkHint>,
+        policy: &IntroPolicy,
+    ) -> Option<String> {
+        intro.relays.truncate(policy.code_relays);
         if let Some(hint) = hint.filter(|h| !h.candidates.is_empty()) {
-            let most = hint.candidates.len().min(LINK_HINT_CANDIDATES_MAX);
+            let most = hint
+                .candidates
+                .len()
+                .min(LINK_HINT_CANDIDATES_MAX)
+                .min(policy.code_candidates);
             for keep in (1..=most).rev() {
                 let link = TrustEnvelope::Intro(Introduction {
                     link_hint: Some(hint.encode_first(keep)),
@@ -676,12 +717,78 @@ impl LinkHint {
     }
 }
 
+/// A link hint's TLVs into `w`: `key`, then each of the first `keep` (at most
+/// [`LINK_HINT_CANDIDATES_MAX`]) dialable distinct `candidates` once, in
+/// order. The inviter's own gathering chose which addresses to offer, so
+/// loopback and link-local ones are written as they are.
+fn write_link_hint(w: &mut TlvWriter, key: &[u8; 32], candidates: &[HintCandidate], keep: usize) {
+    w.write_tlv(tlv::LINK_KEY, key);
+    let mut seen: Vec<&HintCandidate> = Vec::new();
+    for c in candidates {
+        if seen.len() == keep.min(LINK_HINT_CANDIDATES_MAX) {
+            break;
+        }
+        if !c.dialable(true) || seen.contains(&c) {
+            continue;
+        }
+        seen.push(c);
+        let mut value = [0u8; 19];
+        value[0] = c.kind.code();
+        let len = match c.addr.ip() {
+            IpAddr::V4(ip) => {
+                value[1..5].copy_from_slice(&ip.octets());
+                7
+            }
+            IpAddr::V6(ip) => {
+                value[1..17].copy_from_slice(&ip.octets());
+                19
+            }
+        };
+        value[len - 2..len].copy_from_slice(&c.addr.port().to_be_bytes());
+        w.write_tlv(tlv::LINK_CANDIDATE, &value[..len]);
+    }
+}
+
+/// One `LinkCandidate`'s value: the candidate it names, `None` for a kind
+/// this version does not know, an error for a length that is no address.
+fn read_candidate(v: &[u8]) -> Result<Option<HintCandidate>, WireError> {
+    let ip_len = match v.len() {
+        7 => 4,
+        19 => 16,
+        n => {
+            return Err(bad(format!(
+                "a link candidate is 7 or 19 octets (kind, address, port), not {n}"
+            )));
+        }
+    };
+    let Some(kind) = HintKind::from_code(v[0]) else {
+        return Ok(None);
+    };
+    let ip = if ip_len == 4 {
+        IpAddr::from(<[u8; 4]>::try_from(&v[1..5]).expect("4 octets"))
+    } else {
+        IpAddr::from(<[u8; 16]>::try_from(&v[1..17]).expect("16 octets"))
+    };
+    let port = u16::from_be_bytes([v[1 + ip_len], v[2 + ip_len]]);
+    Ok(Some(HintCandidate {
+        kind,
+        addr: SocketAddr::new(ip, port),
+    }))
+}
+
 /// The future of an [`Introducer::dial`].
 #[cfg(not(target_arch = "wasm32"))]
 pub type Dialing<'a> = futures::future::BoxFuture<'a, Result<(), String>>;
 /// The future of an [`Introducer::dial`].
 #[cfg(target_arch = "wasm32")]
 pub type Dialing<'a> = futures::future::LocalBoxFuture<'a, Result<(), String>>;
+
+/// The future of an [`Introducer::dial_first`]: the key the link proved.
+#[cfg(not(target_arch = "wasm32"))]
+pub type FirstDialing<'a> = futures::future::BoxFuture<'a, Result<[u8; 32], String>>;
+/// The future of an [`Introducer::dial_first`]: the key the link proved.
+#[cfg(target_arch = "wasm32")]
+pub type FirstDialing<'a> = futures::future::LocalBoxFuture<'a, Result<[u8; 32], String>>;
 
 /// The future of an [`Introducer::adopt`].
 #[cfg(not(target_arch = "wasm32"))]
@@ -779,7 +886,9 @@ pub trait Introducer: Send + Sync {
     /// (at most [`LINK_HINT_CANDIDATES_MAX`] are kept, in this order), so a
     /// joiner with no routes and no daemon dials this device by key. `None`
     /// (the default): the code carries no hint; a host that listens for
-    /// links gives one. The layer calls it once per [`Device::offer`].
+    /// links gives one. The layer calls it once per [`Device::offer`] and once
+    /// for each hint record it makes on request ([`HintRecord`]), so a
+    /// restarted host or a moved address is always current.
     ///
     /// [`Device::offer`]: crate::Device::offer
     fn link_hint(&self) -> Option<LinkHint> {
@@ -805,6 +914,36 @@ pub trait Introducer: Send + Sync {
             Err(format!(
                 "this host has no link layer to dial {inviter} with (Introducer::dial): route to \
                  it, or run the device on a host that dials link hints"
+            ))
+        })
+    }
+
+    /// Dial the inviter's device `inviter` at the **one address** a short
+    /// code names (spec §19.3 step 0, short form), with **no key to expect**:
+    /// the code carries none, the hint record fetched over this link names it.
+    /// `Ok(key)` once a link is up, `key` being the SHA-256 of the public key
+    /// the handshake proved (the fingerprint of ndn-link's `KeyFingerprint`);
+    /// until the joiner holds the inviter's namespace the link routes only
+    /// [`introduction_prefixes`] of `inviter` — never the names the code
+    /// claims for the device — so whoever answers at the address gets the
+    /// introduction's Interests and nothing else. The address is only a hint:
+    /// it may be answered by anyone, and everything it serves is verified
+    /// against the code. Within `within`; an error says why not. The host
+    /// ends the link with [`undial`](Self::undial) when the join fails.
+    ///
+    /// The default dials nothing: a host with no link layer says so, and the
+    /// join says the first contact could not be reached.
+    fn dial_first<'a>(
+        &'a self,
+        inviter: &'a Name,
+        addr: SocketAddr,
+        within: Duration,
+    ) -> FirstDialing<'a> {
+        let _ = (addr, within);
+        Box::pin(async move {
+            Err(format!(
+                "this host has no link layer to dial {inviter} with (Introducer::dial_first): \
+                 route to it, or run the device on a host that dials link hints"
             ))
         })
     }
@@ -1163,10 +1302,240 @@ pub fn parse_intro_name(name: &Name) -> Option<Name> {
 }
 
 /// The name prefixes a stranger's link to `device` carries (spec §19.2): the
-/// offer fetch `<device>/32=held` and the ask `<device>/32=intro`, and
-/// nothing else of the device.
-pub fn introduction_prefixes(device: &Name) -> [Name; 2] {
-    [wire::held_prefix(device), intro_prefix(device)]
+/// offer fetch `<device>/32=held`, the ask `<device>/32=intro` and a short
+/// code's hint record `<device>/32=hint`, and nothing else of the device.
+pub fn introduction_prefixes(device: &Name) -> [Name; 3] {
+    [
+        wire::held_prefix(device),
+        intro_prefix(device),
+        hint_prefix(device),
+    ]
+}
+
+// ---- the hint record --------------------------------------------------------------------------
+
+/// The keyword of a hint record's name: `<D>/32=hint/<token>`.
+const HINT: &[u8] = b"hint";
+
+/// The label a hint token is derived under.
+const HINT_LABEL: &[u8] = b"ndn-data/intro/hint/1";
+
+/// Octets of a hint token.
+pub const HINT_TOKEN_LEN: usize = 16;
+
+/// The most relays a hint record names.
+pub const HINT_RELAYS_MAX: usize = 8;
+
+/// The token a short code's hint record is named by: the first 16 octets of
+/// `HMAC-SHA256(key = secret, "ndn-data/intro/hint/1")`. Unguessable without
+/// the secret (128 bits), and reveals nothing of it: the secret is never in a
+/// name.
+pub fn hint_token(secret: &[u8; SECRET_LEN]) -> [u8; HINT_TOKEN_LEN] {
+    let mut m = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    m.update(HINT_LABEL);
+    let tag = m.finalize().into_bytes();
+    let mut token = [0u8; HINT_TOKEN_LEN];
+    token.copy_from_slice(&tag[..HINT_TOKEN_LEN]);
+    token
+}
+
+/// `<device>/32=hint`: the prefix of a device's hint records, and what a
+/// stranger's link to the device carries beside the offer fetch and the ask
+/// ([`introduction_prefixes`]).
+pub fn hint_prefix(device: &Name) -> Name {
+    device.clone().append_component(kw(HINT))
+}
+
+/// A hint record's name: `<device>/32=hint/<token>`.
+pub fn hint_name(device: &Name, token: &[u8; HINT_TOKEN_LEN]) -> Name {
+    hint_prefix(device).append(token)
+}
+
+/// The device and token a hint name `<device>/32=hint/<token>` names; `None`
+/// for any other name (a hint prefix, a longer name, a token of another
+/// length).
+pub fn parse_hint_name(name: &Name) -> Option<(Name, [u8; HINT_TOKEN_LEN])> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, HINT))?;
+    let token = comps.get(at + 1)?;
+    (is_device_comps(&comps[..at])
+        && at + 2 == comps.len()
+        && token.typ == tlv_type::GENERIC_NAME_COMPONENT)
+        .then(|| <[u8; HINT_TOKEN_LEN]>::try_from(&token.value[..]).ok())
+        .flatten()
+        .map(|token| (name_of(&comps[..at]), token))
+}
+
+/// A hint record (spec §19.2): the content of the Data named
+/// `<device>/32=hint/<token>` ([`hint_name`]), signed by the device key. What
+/// the joiner needs to dial the inviter after a short code's first contact:
+/// the key, where to try it, relays by name and the credentials that let it
+/// verify the signer with nothing but the code's fingerprint — or a mark
+/// that the offer is no longer served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HintRecord {
+    /// The offer is served.
+    Offered {
+        /// The offer's name: the record is bound to it, under the device's
+        /// signature, at a name only the secret's holder can ask for.
+        offer: Name,
+        /// SHA-256 of the device's public key: what the dial must prove
+        /// ([`LinkHint::key`]).
+        key: [u8; 32],
+        /// Where to try, most promising first, at most
+        /// [`LINK_HINT_CANDIDATES_MAX`] (reachability hints only).
+        candidates: Vec<HintCandidate>,
+        /// Devices that relay to the inviter, by name, at most
+        /// [`HINT_RELAYS_MAX`].
+        relays: Vec<Name>,
+        /// The offer's expiry. Informational: the offer judges its own.
+        until: Timestamp,
+        /// The inviter's signed trust context and the certificate chain of
+        /// the signing key, as an answer carries them
+        /// ([`Outcome::Accepted`]'s credentials).
+        credentials: Vec<Bytes>,
+    },
+    /// The offer is no longer served: [`IntroRefusal::Expired`] or
+    /// [`IntroRefusal::Closed`], the only refusals a hint record gives (any
+    /// other is written as `Closed`).
+    Gone(IntroRefusal),
+}
+
+impl HintRecord {
+    /// Its TLV, a hint Data's Content.
+    pub fn encode(&self) -> Bytes {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv::INTRO_HINT, |w| match self {
+            HintRecord::Offered {
+                offer,
+                key,
+                candidates,
+                relays,
+                until,
+                credentials,
+            } => {
+                w.write_nested(tlv::HINT_OFFER, |w| write_name(w, offer));
+                write_link_hint(w, key, candidates, LINK_HINT_CANDIDATES_MAX);
+                for relay in relays.iter().take(HINT_RELAYS_MAX) {
+                    w.write_nested(tlv::HINT_RELAY, |w| write_name(w, relay));
+                }
+                write_nni(w, tlv::HINT_UNTIL, until.0);
+                write_credentials(w, credentials);
+            }
+            HintRecord::Gone(why) => {
+                let code = if matches!(why, IntroRefusal::Expired) {
+                    IntroRefusal::Expired.code()
+                } else {
+                    IntroRefusal::Closed.code()
+                };
+                write_nni(w, tlv::HINT_GONE, code);
+            }
+        });
+        w.finish()
+    }
+
+    /// Read a hint Data's Content. Candidates are read as a link hint's are
+    /// ([`LinkHint::decode`]): loopback and link-local addresses are passed
+    /// over unless `include_local` ([`IntroPolicy::local_candidates`]). An
+    /// error says what is wrong.
+    pub fn decode(content: Bytes, include_local: bool) -> Result<Self, WireError> {
+        let mut r = TlvReader::new(content);
+        let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+        if typ != tlv::INTRO_HINT || !r.is_empty() {
+            return Err(bad("a hint record is one IntroHint"));
+        }
+        let (mut offer, mut key, mut until, mut credentials, mut gone) =
+            (None, None, None, None, None);
+        let mut candidates: Vec<HintCandidate> = Vec::new();
+        let mut relays: Vec<Name> = Vec::new();
+        each(value, |t, v| {
+            match t {
+                tlv::HINT_OFFER => {
+                    if offer.replace(read_wrapped_name(v)?).is_some() {
+                        return Err(bad("a hint record names one offer"));
+                    }
+                }
+                tlv::LINK_KEY => {
+                    if key.replace(read_digest(&v)?).is_some() {
+                        return Err(bad("a hint record names one key"));
+                    }
+                }
+                tlv::LINK_CANDIDATE => {
+                    if let Some(c) = read_candidate(&v)?
+                        && c.dialable(include_local)
+                        && candidates.len() < LINK_HINT_CANDIDATES_MAX
+                        && !candidates.contains(&c)
+                    {
+                        candidates.push(c);
+                    }
+                }
+                tlv::HINT_RELAY => {
+                    if relays.len() == HINT_RELAYS_MAX {
+                        return Err(bad(format!(
+                            "a hint record names at most {HINT_RELAYS_MAX} relays"
+                        )));
+                    }
+                    relays.push(read_wrapped_name(v)?);
+                }
+                tlv::HINT_UNTIL => {
+                    if until.replace(Timestamp(read_nni(&v)?)).is_some() {
+                        return Err(bad("a hint record has one expiry"));
+                    }
+                }
+                tlv::CREDENTIALS => {
+                    if credentials.replace(read_credentials(v)?).is_some() {
+                        return Err(bad("a hint record has one set of credentials"));
+                    }
+                }
+                tlv::HINT_GONE => {
+                    if gone.replace(read_nni(&v)?).is_some() {
+                        return Err(bad("a hint record has one gone mark"));
+                    }
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if let Some(code) = gone {
+            if offer.is_some()
+                || key.is_some()
+                || until.is_some()
+                || credentials.is_some()
+                || !candidates.is_empty()
+                || !relays.is_empty()
+            {
+                return Err(bad("a gone mark carries nothing else"));
+            }
+            return Ok(HintRecord::Gone(match code {
+                3 => IntroRefusal::Expired,
+                4 => IntroRefusal::Closed,
+                other => {
+                    return Err(bad(format!(
+                        "{other} is no gone mark (3 expired, 4 closed)"
+                    )));
+                }
+            }));
+        }
+        Ok(HintRecord::Offered {
+            offer: offer.ok_or_else(|| bad("a hint record names its offer"))?,
+            key: key.ok_or_else(|| bad("a hint record names its key"))?,
+            candidates,
+            relays,
+            until: until.ok_or_else(|| bad("a hint record names the offer's expiry"))?,
+            credentials: credentials
+                .ok_or_else(|| bad("a hint record carries the inviter's credentials"))?,
+        })
+    }
+}
+
+/// The name a `HintOffer` or `HintRelay` wraps: one Name TLV.
+fn read_wrapped_name(value: Bytes) -> Result<Name, WireError> {
+    let mut r = TlvReader::new(value);
+    let (typ, inner) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
+    if typ != tlv_type::NAME || !r.is_empty() {
+        return Err(bad("a hint's name is one Name"));
+    }
+    read_name(inner)
 }
 
 // ---- the answer -------------------------------------------------------------------------------
@@ -1867,18 +2236,30 @@ mod tests {
         }
     }
 
+    /// A policy that caps neither candidates nor relays: these tests are
+    /// about what fits one QR, not about the defaults of a full link.
+    fn uncapped() -> IntroPolicy {
+        IntroPolicy {
+            code_candidates: LINK_HINT_CANDIDATES_MAX,
+            code_relays: usize::MAX,
+            ..IntroPolicy::new()
+        }
+    }
+
     /// The code's size, with and without a full hint of the most candidates,
     /// IPv6 (the longest), beside several relay hints: within one QR with
     /// room to spare, so the bound on candidates is what keeps it there.
     #[test]
     fn a_code_with_a_full_link_hint_stays_within_one_qr() {
-        let offer = "/home/alice/laptop/32=log/home/alice/32=data/notebook/seq=12".to_string();
+        let offer =
+            "/home/alice/laptop/keyword=log/home/alice/keyword=data/notebook/seq=12".to_string();
         let hint = LinkHint {
             key: [0x42; 32],
             candidates: (0..LINK_HINT_CANDIDATES_MAX as u16).map(host6).collect(),
         };
-        let without = LinkHint::code_link(code_with(offer.clone(), 4), None).unwrap();
-        let with = LinkHint::code_link(code_with(offer.clone(), 4), Some(&hint)).unwrap();
+        let without = LinkHint::code_link(code_with(offer.clone(), 4), None, &uncapped()).unwrap();
+        let with =
+            LinkHint::code_link(code_with(offer.clone(), 4), Some(&hint), &uncapped()).unwrap();
         let max = ndn_trust_envelope::qr::MAX_TEXT_LEN;
         assert!(without.len() < with.len() && with.len() <= max / 2);
         eprintln!(
@@ -1897,6 +2278,42 @@ mod tests {
         );
     }
 
+    /// A full link carries at most the policy's candidates and relays
+    /// (3 and 2 by default), the first ones, and the policy's own numbers
+    /// when it gives others.
+    #[test]
+    fn a_full_link_carries_the_policys_candidates_and_relays() {
+        let offer = "/home/alice/laptop/keyword=log/home/alice/keyword=data/notebook/seq=12";
+        let hint = LinkHint {
+            key: [0x42; 32],
+            candidates: (0..LINK_HINT_CANDIDATES_MAX as u16).map(host6).collect(),
+        };
+        let read = |policy: &IntroPolicy| {
+            let link =
+                LinkHint::code_link(code_with(offer.into(), 5), Some(&hint), policy).unwrap();
+            let Ok(TrustEnvelope::Intro(i)) = TrustEnvelope::from_uri(&link) else {
+                panic!("an introduction link");
+            };
+            let hint = i.link_hint.map(|h| LinkHint::decode(&h, false).unwrap());
+            (hint.map_or(0, |h| h.candidates.len()), i.relays)
+        };
+        let (candidates, relays) = read(&IntroPolicy::new());
+        assert_eq!(candidates, 3);
+        assert_eq!(relays, code_with(offer.into(), 5).relays[..2]);
+        let (candidates, relays) = read(&IntroPolicy {
+            code_candidates: 5,
+            code_relays: 4,
+            ..IntroPolicy::new()
+        });
+        assert_eq!((candidates, relays.len()), (5, 4));
+        let (candidates, relays) = read(&IntroPolicy {
+            code_candidates: 0,
+            code_relays: 0,
+            ..IntroPolicy::new()
+        });
+        assert_eq!((candidates, relays.len()), (0, 0), "no hint, no relays");
+    }
+
     /// An offer name that leaves room for few candidates keeps the first
     /// ones that fit and drops the relays first; one that leaves room for
     /// none drops the hint and still gives a code; the secret, offer and
@@ -1912,10 +2329,12 @@ mod tests {
         let mut trimmed = None;
         for pad in (1400..1700).step_by(4) {
             let offer = format!(
-                "/home/alice/laptop/32=log/home/alice/32=data/{}/seq=12",
+                "/home/alice/laptop/keyword=log/home/alice/keyword=data/{}/seq=12",
                 "n".repeat(pad)
             );
-            let Some(link) = LinkHint::code_link(code_with(offer.clone(), 40), Some(&hint)) else {
+            let Some(link) =
+                LinkHint::code_link(code_with(offer.clone(), 40), Some(&hint), &uncapped())
+            else {
                 break;
             };
             assert!(
@@ -1943,3 +2362,6 @@ mod tests {
         assert!(trimmed.is_some(), "no offer name length trimmed the hint");
     }
 }
+
+#[cfg(test)]
+mod short_tests;
