@@ -379,3 +379,41 @@ fn names_that_are_not_canonical_uris_fail_the_check() {
         );
     }
 }
+
+/// The conformance cases' inputs: namespace `/alice`, device
+/// `/alice/member/laptop`, folder `/alice/32=data/notebook`, an offer
+/// `<device>/32=log/<folder>/seq=1`, a named anchor, two relays by name.
+fn conformance(candidates: &[(u8, &[u8], u16)], relays: usize) -> Introduction {
+    Introduction {
+        namespace: Some("/alice".into()),
+        fingerprint: [0xA5; ANCHOR_FINGERPRINT_LEN],
+        offer: "/alice/member/laptop/keyword=log/alice/keyword=data/notebook/seq=1".into(),
+        secret: [0x3C; 16],
+        link_hint: Some(hint(candidates)),
+        relays: (0..relays)
+            .map(|i| format!("/alice/node/relay-{}", (b'a' + i as u8) as char))
+            .collect(),
+    }
+}
+
+/// Exact lengths of the links for a named namespace, with a hint and no
+/// relays or two. The pre-change figures are those of the same inputs
+/// written with the old text tags (namespace, offer and relays as URI text,
+/// measured once, not kept as an encoder).
+#[test]
+fn compact_links_of_a_named_namespace_have_these_lengths() {
+    for (what, intro, compact, old_text) in [
+        ("3 IPv4, no relays", conformance(&V4, 0), 298, 321),
+        ("3 IPv6, no relays", conformance(&V6, 0), 346, 372),
+        ("3 IPv6, 2 relays", conformance(&V6, 2), 405, 436),
+    ] {
+        let link = TrustEnvelope::Intro(intro.clone()).to_uri();
+        assert_eq!(link.len(), compact, "{what}");
+        assert!(compact < old_text, "{what}: {compact} against {old_text}");
+        assert_eq!(
+            TrustEnvelope::from_uri(&link).unwrap(),
+            TrustEnvelope::Intro(intro),
+            "{what}"
+        );
+    }
+}
