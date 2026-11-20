@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use web_time::Instant;
 
 use dashmap::DashMap;
@@ -28,6 +29,28 @@ impl RibRoute {
     }
 }
 
+/// A face that carries `prefix` now and did not before: what
+/// [`Rib::route_events`] tells (generic: it names no protocol).
+///
+/// Told once the route is in the FIB ([`Rib::apply_to_fib`]), so a packet
+/// sent on hearing it finds it. It is told for a route added at `prefix`
+/// and for a RIB entry beneath it that now inherits the face from a
+/// `CHILD_INHERIT` route at `prefix`, once per (prefix, face); never for a
+/// route that was already there (a changed cost, the same route added
+/// again), for one removed, or for a face the FIB wrote directly
+/// ([`Fib::add_nexthop`], as an application's own registration on an
+/// embedded engine does). The origin of the route is not told: an inherited
+/// face has none of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteUp {
+    pub prefix: Name,
+    pub face: FaceId,
+}
+
+/// How many [`RouteUp`]s a subscriber that does not keep up can be behind
+/// before it is told it missed some (`broadcast::error::RecvError::Lagged`).
+const ROUTE_EVENTS: usize = 256;
+
 /// The Routing Information Base.
 ///
 /// # RIB-to-FIB computation
@@ -48,6 +71,7 @@ impl RibRoute {
 /// unregistration, its face going down, its expiry, or a flush.
 pub struct Rib {
     routes: DashMap<Name, Vec<RibRoute>>,
+    up: broadcast::Sender<RouteUp>,
     readvertise: Mutex<Readvertise>,
 }
 
@@ -65,8 +89,16 @@ impl Rib {
     pub fn new() -> Self {
         Self {
             routes: DashMap::new(),
+            up: broadcast::channel(ROUTE_EVENTS).0,
             readvertise: Mutex::new(Readvertise::default()),
         }
+    }
+
+    /// The routes that come up from now on, as [`RouteUp`]s (see there).
+    /// Any number of subscribers; one that falls [`ROUTE_EVENTS`] behind
+    /// is told it lagged and takes the newest.
+    pub fn route_events(&self) -> broadcast::Receiver<RouteUp> {
+        self.up.subscribe()
     }
 
     fn readvertise_state(&self) -> std::sync::MutexGuard<'_, Readvertise> {
@@ -297,8 +329,12 @@ impl Rib {
     /// Recompute the FIB for `prefix` **and every RIB descendant** — a change
     /// to a `CHILD_INHERIT`/`CAPTURE` route at `prefix` changes what its
     /// more-specific RIB entries inherit.
+    ///
+    /// Each face a recomputed entry carries that it did not carry before is
+    /// told to the subscribers of [`Self::route_events`], after the entry is
+    /// in the FIB.
     pub fn apply_to_fib(&self, prefix: &Name, fib: &Fib) {
-        fib.set_nexthops(prefix, self.effective_nexthops(prefix));
+        self.install(prefix, fib);
         let descendants: Vec<Name> = self
             .routes
             .iter()
@@ -306,7 +342,31 @@ impl Rib {
             .filter(|k| k != prefix && k.has_prefix(prefix))
             .collect();
         for d in descendants {
-            fib.set_nexthops(&d, self.effective_nexthops(&d));
+            self.install(&d, fib);
+        }
+    }
+
+    /// Write `prefix`'s computed nexthops to the FIB and tell the faces
+    /// that are new there ([`RouteUp`]).
+    fn install(&self, prefix: &Name, fib: &Fib) {
+        let nexthops = self.effective_nexthops(prefix);
+        let before = fib.get(prefix);
+        let came_up: Vec<FaceId> = nexthops
+            .iter()
+            .map(|n| n.face_id)
+            .filter(|face| {
+                !before
+                    .as_ref()
+                    .is_some_and(|e| e.nexthops.iter().any(|n| n.face_id == *face))
+            })
+            .collect();
+        fib.set_nexthops(prefix, nexthops);
+        for face in came_up {
+            // No subscriber is no one to tell.
+            let _ = self.up.send(RouteUp {
+                prefix: prefix.clone(),
+                face,
+            });
         }
     }
 
@@ -730,5 +790,94 @@ mod tests {
         let affected = rib.drain_expired(Instant::now());
         assert_eq!(affected.len(), 1);
         assert_eq!(rib.dump().len(), 1);
+    }
+
+    /// What `rx` holds now, oldest first.
+    fn told(rx: &mut broadcast::Receiver<RouteUp>) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        while let Ok(up) = rx.try_recv() {
+            out.push((up.prefix.to_string(), up.face.0));
+        }
+        out
+    }
+
+    /// A route added on a face is told once, when it is in the FIB (never
+    /// before: a packet sent on hearing it must find it); the same route
+    /// again, a changed cost, and a route removed are not told.
+    #[test]
+    fn a_route_added_on_a_face_is_told_once_and_a_removed_one_is_not() {
+        let rib = Rib::new();
+        let fib = Fib::new();
+        let mut rx = rib.route_events();
+
+        rib.add(&nn("/a/b"), flagged(1, 10, 0));
+        assert!(told(&mut rx).is_empty(), "not told before it is in the FIB");
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        assert_eq!(told(&mut rx), vec![("/a/b".to_string(), 1)], "told once");
+        assert_eq!(faces_at(&fib, "/a/b"), vec![1], "in the FIB when told");
+
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        rib.add(&nn("/a/b"), flagged(1, 20, 0));
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        assert!(
+            told(&mut rx).is_empty(),
+            "the same route again, or at another cost, is not a route that came up"
+        );
+
+        rib.add(&nn("/a/b"), flagged(2, 10, 0));
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        assert_eq!(
+            told(&mut rx),
+            vec![("/a/b".to_string(), 2)],
+            "a second face: that face alone"
+        );
+
+        rib.remove(&nn("/a/b"), FaceId(1), 255);
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        assert!(told(&mut rx).is_empty(), "a route removed is not told");
+        rib.add(&nn("/a/b"), flagged(1, 10, 0));
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        assert_eq!(
+            told(&mut rx),
+            vec![("/a/b".to_string(), 1)],
+            "a face that left and came back comes up again"
+        );
+    }
+
+    /// A RIB entry beneath a prefix whose `CHILD_INHERIT` route is added
+    /// now carries that face too: told for it, at its own prefix.
+    #[test]
+    fn an_entry_beneath_that_inherits_the_face_is_told_at_its_own_prefix() {
+        const CHILD_INHERIT: u64 = 1;
+        let rib = Rib::new();
+        let fib = Fib::new();
+        rib.add(&nn("/a/b"), flagged(2, 10, 0));
+        rib.apply_to_fib(&nn("/a/b"), &fib);
+        let mut rx = rib.route_events();
+
+        rib.add(&nn("/a"), flagged(1, 10, CHILD_INHERIT));
+        rib.apply_to_fib(&nn("/a"), &fib);
+        let mut got = told(&mut rx);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("/a".to_string(), 1), ("/a/b".to_string(), 1)],
+            "the face is up at /a and, inherited, at /a/b"
+        );
+    }
+
+    /// A face the FIB was given directly (an application's own registration
+    /// on an embedded engine) is no route that came up, and a route the RIB
+    /// then holds for a face the FIB already carries is not either.
+    #[test]
+    fn a_face_written_to_the_fib_directly_is_not_told() {
+        let rib = Rib::new();
+        let fib = Fib::new();
+        let mut rx = rib.route_events();
+        fib.add_nexthop(&nn("/a/32=sync"), FaceId(9), 0);
+        assert!(told(&mut rx).is_empty());
+        rib.add(&nn("/a/32=sync"), flagged(9, 0, 0));
+        rib.apply_to_fib(&nn("/a/32=sync"), &fib);
+        assert!(told(&mut rx).is_empty(), "face 9 was there already");
     }
 }

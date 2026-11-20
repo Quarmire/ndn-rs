@@ -69,7 +69,7 @@ pub mod subscriber;
 pub mod blocking;
 
 pub use app_face::OutboundRequest;
-pub use connection::{Connection, InProcConnection, LpInfo};
+pub use connection::{Connection, InProcConnection, LpInfo, RouteEvents, RouteNews};
 // IpcConnection talks to an external `ndn-fwd` over a Unix socket (ndn-ipc).
 #[cfg(not(target_arch = "wasm32"))]
 pub use cert_fetch::{
@@ -92,14 +92,14 @@ pub use publisher::{Publisher, PublisherConfig};
 pub use queryable::{Query, Queryable};
 pub use reflexive::random_reflexive_name;
 pub mod node;
-pub use ndn_transport::DEFAULT_FACE_SOCKET;
+pub use ndn_transport::{DEFAULT_FACE_SOCKET, FaceId};
 pub use node::{ConnectionProvider, Node, ObjectServeGuard};
 pub use responder::Responder;
 pub use security::KeyChain;
 pub use signing::DataSigner;
 pub use subscriber::{Sample, Subscriber, SubscriberConfig};
 
-pub use ndn_engine::{ForwarderEngine, ShutdownHandle};
+pub use ndn_engine::{ForwarderEngine, RouteUp, ShutdownHandle};
 // The native engine builder is std/tokio-multithread; the browser uses the
 // single-threaded WasmEngineBuilder. Both yield a `ForwarderEngine` that the
 // EngineAppExt registration surface drives identically.

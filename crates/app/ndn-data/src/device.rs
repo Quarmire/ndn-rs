@@ -7609,6 +7609,11 @@ impl Device {
                 }
             }
         });
+        // A face that carries a joined group coming up announces it (spec
+        // §12): when the forwarder's connection can tell its routes.
+        if let Some(routes) = inner.sync.routes() {
+            rt::spawn(Inner::run_face_up(Arc::downgrade(&inner), routes));
+        }
 
         let serving = Arc::downgrade(&inner);
         let guard = inner
@@ -27132,6 +27137,11 @@ mod events_tests;
 mod signal;
 
 mod heard;
+
+mod face_up;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod face_up_tests;
 
 mod stage;
 

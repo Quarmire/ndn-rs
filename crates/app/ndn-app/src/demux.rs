@@ -423,6 +423,10 @@ impl Connection for DemuxConnection {
         self.inner.register_prefix(prefix).await
     }
 
+    fn routes(&self) -> Option<crate::RouteEvents> {
+        self.inner.routes()
+    }
+
     fn replies(&self) -> Option<Replies> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut table = self.pending.lock();

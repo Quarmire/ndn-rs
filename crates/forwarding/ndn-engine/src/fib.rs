@@ -136,6 +136,11 @@ impl Fib {
         self.trie.load().lpm_with_depth(name)
     }
 
+    /// The entry at exactly `prefix` (no longest-prefix match), if any.
+    pub fn get(&self, prefix: &Name) -> Option<Arc<FibEntry>> {
+        self.trie.load().get(prefix)
+    }
+
     pub fn add_nexthop(&self, prefix: &Name, face_id: FaceId, cost: u32) {
         // `rcu` retries the closure on a concurrent swap, so the
         // read-modify-write is atomic (the prior trie did this per-leaf; the

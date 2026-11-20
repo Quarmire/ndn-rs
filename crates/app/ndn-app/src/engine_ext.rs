@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ndn_engine::{Fib, ForwarderEngine};
+use ndn_engine::ForwarderEngine;
 // Same `InProcFace` type on both targets; the wasm path imports it straight
 // from `ndn-face-local` to avoid `ndn-face`'s OS-socket transports.
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,9 +36,10 @@ use ndn_face::local::InProcFace;
 use ndn_face_local::InProcFace;
 use ndn_packet::Name;
 use ndn_transport::FaceId;
+use ndn_transport::face::ScopePolicy;
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{Connection, InProcConnection, LpInfo};
+use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents};
 use crate::error::AppError;
 use crate::node::ConnectionProvider;
 use crate::{Consumer, Node, Producer};
@@ -114,7 +115,7 @@ impl EngineFaceProvider {
         self.engine.add_face(face, self.cancel.child_token());
         Arc::new(EngineConnection {
             inner: InProcConnection::new(handle),
-            fib: self.engine.fib(),
+            engine: self.engine.clone(),
             face_id,
         })
     }
@@ -132,7 +133,7 @@ impl ConnectionProvider for EngineFaceProvider {
 /// round trip. Send/recv delegate to the wrapped [`InProcConnection`].
 struct EngineConnection {
     inner: InProcConnection,
-    fib: Arc<Fib>,
+    engine: ForwarderEngine,
     face_id: FaceId,
 }
 
@@ -151,8 +152,30 @@ impl Connection for EngineConnection {
     }
 
     async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
-        self.fib.add_nexthop(prefix, self.face_id, 0);
+        // The FIB directly, not the RIB: this face's own registration is
+        // no route that came up on another face ([`Connection::routes`]).
+        self.engine.fib().add_nexthop(prefix, self.face_id, 0);
         Ok(())
+    }
+
+    /// The engine RIB's routes that come up on a face that is not this one
+    /// and not a local application's or a management socket's (the kinds
+    /// whose scope is always local): a link, a tunnel, a radio. Those are
+    /// the faces whose far end can be told of this app's state; an
+    /// application registering its own prefix through the management
+    /// interface is not one.
+    fn routes(&self) -> Option<RouteEvents> {
+        let own = self.face_id;
+        let faces = self.engine.faces();
+        Some(RouteEvents::new(
+            self.engine.rib().route_events(),
+            move |face| {
+                face != own
+                    && faces
+                        .get(face)
+                        .is_some_and(|f| f.kind().scope_policy() != ScopePolicy::AlwaysLocal)
+            },
+        ))
     }
 }
 
@@ -179,7 +202,7 @@ impl EngineAppExt for ForwarderEngine {
         self.add_face(face, cancel);
         Arc::new(EngineConnection {
             inner: InProcConnection::new(handle),
-            fib: self.fib(),
+            engine: self.clone(),
             face_id,
         })
     }

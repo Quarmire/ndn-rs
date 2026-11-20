@@ -73,7 +73,7 @@ pub use path_control::{
 };
 pub use readvertise::{ReadvertiseDestination, ReadvertisedPrefixes, should_readvertise};
 pub use replay_guard_config::ReplayGuardConfig;
-pub use rib::{Rib, RibRoute};
+pub use rib::{Rib, RibRoute, RouteUp};
 pub use routing::{
     ConfigError, ConfigUpdate, LsdbEntry, NeighborInfo, RoutingHandle, RoutingManager,
     RoutingProtocol, RoutingProtocolStatus,

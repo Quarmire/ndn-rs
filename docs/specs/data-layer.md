@@ -2893,6 +2893,50 @@ out only once the entries it announces are durable (§4.2). So it stays
 above anything an earlier run of the same key announced, a power loss
 included.
 
+**A face comes up (normative).** A device announces its state vector in a
+group again (the announcement a join makes) when a route that covers the
+group's prefix `<O>/32=sync` — at the group, at `O`, or above — comes up
+on a face that is not a local application's (round 11, a commit made
+while no link was up). An announcement of a change made with no link
+reached no one, and the group's next period is half a minute on; the
+link coming up is when someone can hear it. Every group the device
+joined that the route covers is announced, whether or not the device
+has anything of its own to tell in it: the vector carries the devices it
+heard, an announcement that brings a member nothing newer is answered by
+no one, and one that finds a member behind (or ahead) is how each end of
+the new link learns what it missed. The announcement is the one `hail`
+and `herald` send: an outgoing Sync Interest, which sets no device
+heard (§13.5) and no freshness (§15, a read is confirmed only by a Sync
+Interest that arrived); suppression is the driver's, and the
+announcement restarts the group's period as a join does.
+
+- *Trigger.* The forwarder's RIB tells every face a route has newly put
+  into its FIB at a prefix (`ndn_engine::Rib::route_events`, a
+  `RouteUp { prefix, face }`: generic, it names no protocol; told after
+  the route is installed, so the announcement finds it; a route that was
+  already there, one removed, and a face the FIB was given directly are
+  not told). An embedded engine's connection (`ndn_app::Connection::routes`,
+  given by `app_face`) hands the device those on faces that are not its
+  own, not a local application's and not a management socket's — the kinds
+  whose scope is always local — so the device's own registration of its
+  group (a FIB write on its own face) and a local application's route
+  through the management interface announce nothing. The device
+  subscribes through the `sync` connection it already holds.
+- *Coalescing.* A batch of routes that arrive together announces a group
+  once, however many of them cover it; and at most once a second per group:
+  the first at once, a later one at the end of the second since the
+  last, once however many came meanwhile, so the last face up is told and a
+  link that flaps costs two announcements, not one per route. A subscriber
+  that fell behind and lost events announces every group joined.
+- *Over IPC.* A connection to an external forwarder over its Unix socket
+  has no such stream: the daemon's `/localhost/nfd/rib/notifications`
+  tells only the registrations made through its management interface, not
+  the routes its link layer, configuration or routing protocols install.
+  There the periodic announcement alone runs, as before, and the change
+  announced run of §17.1 still covers the group once a member is heard.
+- *Decides nothing.* The announcement only moves the time a member
+  learns of a change; what it fetches is judged as always (invariant 1).
+
 The group needs no configuration, and no forwarder treats its name
 specially: a forwarder carries it with an ordinary strategy choice and
 ordinary routes, which the libraries that already know the namespace's
@@ -5547,7 +5591,7 @@ resurrected; a writer demoted to a reader is granted as a reader at once and
 the host told again once; and the host is told of an end before it is
 durable (a frozen disk does not delay it).
 
-Answers: cases `a1`–`a22` (answers.md §14); case `c12` is rewritten over a
+Answers: cases `a1`–`a23` (answers.md §14); case `c12` is rewritten over a
 provider answer.
 
 ### 18.1 Faulty mode

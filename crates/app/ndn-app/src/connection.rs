@@ -3,8 +3,12 @@
 //! through an [`InProcHandle`]; [`IpcConnection`] talks to an external
 //! `ndn-fwd` over Unix socket via [`ForwarderClient`].
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use ndn_engine::RouteUp;
+use tokio::sync::broadcast;
 
 // `InProcHandle` is the same type on both targets — `ndn-face` simply
 // re-exports it from `ndn-face-local`. The wasm path imports it directly so it
@@ -55,6 +59,60 @@ pub(crate) fn lp_info_from_wire(wire: &Bytes) -> LpInfo {
     }
 }
 
+/// What a [`RouteEvents`] stream tells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteNews {
+    /// A route toward `prefix` came up on a face other than the
+    /// connection's own and not a local application's.
+    Up(Name),
+    /// The stream fell behind and lost some: any route may have come up.
+    Missed,
+}
+
+/// The stream of routes coming up at a forwarder ([`Connection::routes`]):
+/// the engine RIB's [`RouteUp`]s, those on faces `accept` takes.
+pub struct RouteEvents {
+    rx: broadcast::Receiver<RouteUp>,
+    accept: Arc<dyn Fn(FaceId) -> bool + Send + Sync>,
+}
+
+impl RouteEvents {
+    /// The `RouteUp`s of `rx` on faces `accept` takes.
+    pub fn new(
+        rx: broadcast::Receiver<RouteUp>,
+        accept: impl Fn(FaceId) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            rx,
+            accept: Arc::new(accept),
+        }
+    }
+
+    /// The next news; `None` once the forwarder is gone.
+    pub async fn next(&mut self) -> Option<RouteNews> {
+        loop {
+            match self.rx.recv().await {
+                Ok(up) if (self.accept)(up.face) => return Some(RouteNews::Up(up.prefix)),
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => return Some(RouteNews::Missed),
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// The next news if some is waiting now; `None` when none is.
+    pub fn next_ready(&mut self) -> Option<RouteNews> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(up) if (self.accept)(up.face) => return Some(RouteNews::Up(up.prefix)),
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_)) => return Some(RouteNews::Missed),
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
 /// Transport-agnostic packet pipe between an app
 /// ([`Consumer`](crate::Consumer) / [`Producer`](crate::Producer)) and a
 /// forwarder — an embedded engine via [`InProcConnection`] or an external
@@ -97,6 +155,21 @@ pub trait Connection: Send + Sync {
     ///
     /// [`DemuxConnection`]: crate::DemuxConnection
     fn replies(&self) -> Option<Replies> {
+        None
+    }
+
+    /// The routes that come up at this connection's forwarder (see
+    /// [`RouteEvents`]), when it can tell: an embedded engine's connection
+    /// ([`EngineAppExt::app_face`](crate::EngineAppExt::app_face)) can, as
+    /// its RIB announces every route that gets into the FIB. `None` (the
+    /// default) for one that cannot: [`IpcConnection`] has no such stream
+    /// (the daemon's `/localhost/nfd/rib/notifications` tells only the
+    /// registrations made through its management interface, not the routes
+    /// its link layer, its configuration or its routing protocols install),
+    /// and a bare [`InProcConnection`] knows no engine, only its own face.
+    /// A caller that wants to act on a face coming up and gets `None` keeps
+    /// its periodic work, which is correct and slower.
+    fn routes(&self) -> Option<RouteEvents> {
         None
     }
 }
@@ -203,5 +276,106 @@ mod tests {
             Some(FaceId(42)),
             "incoming_face_id must reflect the ingress face from the tag-bag"
         );
+    }
+
+    /// A face of a kind that is no local application's, as a link is.
+    struct Link(FaceId);
+
+    impl Transport for Link {
+        fn id(&self) -> FaceId {
+            self.0
+        }
+        fn kind(&self) -> ndn_transport::FaceKind {
+            ndn_transport::FaceKind::Quic
+        }
+        async fn send_bytes(&self, _wire: Bytes) -> Result<(), ndn_transport::FaceError> {
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, ndn_transport::FaceError> {
+            std::future::pending().await
+        }
+    }
+
+    fn route(face: FaceId) -> ndn_engine::RibRoute {
+        ndn_engine::RibRoute {
+            face_id: face,
+            origin: 255,
+            cost: 0,
+            flags: 1,
+            expires_at: None,
+        }
+    }
+
+    /// An embedded engine's connection tells the routes that come up on a
+    /// link and none of its own registration, nor a local application's
+    /// (through the RIB, as the management interface does): a storm of
+    /// local registrations is no face coming up for a sync group.
+    #[tokio::test]
+    async fn an_engine_connection_tells_a_link_coming_up_and_not_local_registrations() {
+        use crate::EngineAppExt;
+        let (engine, _shutdown) = ndn_engine::EngineBuilder::new(Default::default())
+            .build()
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let conn = engine.app_face(cancel.child_token());
+        let mut routes = conn.routes().expect("an engine's connection tells routes");
+        let group = ndn_packet::name!("/alice/32=sync");
+
+        // Its own registration: the FIB, no RIB route.
+        conn.register_prefix(&group).await.unwrap();
+        assert_eq!(routes.next_ready(), None, "its own registration");
+
+        // Another application's, through the RIB.
+        let (face, _handle) = InProcFace::new(engine.faces().alloc_id(), 4);
+        let local = face.id();
+        engine.add_face(face, cancel.child_token());
+        engine.rib().add(&group, route(local));
+        engine.rib().apply_to_fib(&group, &engine.fib());
+        assert_eq!(routes.next_ready(), None, "a local application's route");
+
+        // A link's.
+        let link = engine.faces().alloc_id();
+        engine.add_face(Link(link), cancel.child_token());
+        engine.rib().add(&group, route(link));
+        engine.rib().apply_to_fib(&group, &engine.fib());
+        assert_eq!(
+            routes.next_ready(),
+            Some(RouteNews::Up(group.clone())),
+            "a link's route"
+        );
+        assert_eq!(routes.next_ready(), None, "told once");
+
+        // A route toward a face the engine does not hold is nobody's link.
+        engine.rib().add(&group, route(FaceId(9999)));
+        engine.rib().apply_to_fib(&group, &engine.fib());
+        assert_eq!(routes.next_ready(), None, "a face that is gone");
+        cancel.cancel();
+    }
+
+    /// A subscriber that falls behind is told it missed some, not left
+    /// believing it has seen everything.
+    #[tokio::test]
+    async fn a_subscriber_that_falls_behind_is_told_it_missed_some() {
+        let (tx, rx) = broadcast::channel(2);
+        let mut routes = RouteEvents::new(rx, |_| true);
+        for i in 0..5u64 {
+            let _ = tx.send(RouteUp {
+                prefix: ndn_packet::name!("/a"),
+                face: FaceId(i),
+            });
+        }
+        assert_eq!(routes.next().await, Some(RouteNews::Missed));
+        assert!(matches!(routes.next().await, Some(RouteNews::Up(_))));
+        drop(tx);
+        while routes.next().await.is_some() {}
+    }
+
+    /// A connection that knows no engine tells no routes: its holder keeps
+    /// its periodic work.
+    #[test]
+    fn a_bare_in_process_connection_tells_no_routes() {
+        let (_face, handle) = InProcFace::new(FaceId(1), 4);
+        assert!(InProcConnection::new(handle).routes().is_none());
     }
 }
