@@ -4122,6 +4122,7 @@ both from the NDN naming conventions.
 | asker's proof (inside a hold, audit or introduction ask or answer, never fetched) | `<A>/32=ask/<binding>`, empty Content, FreshnessPeriod 0 | the asker's device key |
 | offer, use mark (§19.1) | `<D>/32=log/<F>/seq=<n>` | device key |
 | introduction ask and answer (§19) | Interest `<D>/32=intro/<ParametersSha256Digest>`, ApplicationParameters `IntroAsk`; answer named the same, Content `IntroAnswer` | DigestSha256 (the answer carries the offering device's proof inside) |
+| hint record of a short code (§19.2) | `<D>/32=hint/<token>`, `token` one GenericNameComponent of 16 octets, Content `IntroHint`, FreshnessPeriod 5 s; made on request, only for a token of one of `D`'s own offers | device key |
 | signal run header (§20; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, `S` a folder or collection, the run id one GenericNameComponent of 16 octets, no FreshnessPeriod | device key |
 
 `<buckets>` is a GenericNameComponent whose octets are the buckets taken
@@ -4202,11 +4203,16 @@ Every name parses one way, and a reader MUST refuse one that does not:
   parameters, not the name: its credentials take a few KB, and a link reads
   an Interest's name from its first fragment. An ask whose digest is not
   its parameters' is no ask.
+- **Hint record.** `D` is the components before the first `32=hint`, a device
+  name; exactly one GenericNameComponent of 16 octets follows, the token
+  (HMAC-SHA256 of the offer's secret, §19.6), and nothing after it. A longer
+  name, a token of another length or a token that is any other component type
+  is no hint record.
 
 ### 16.2 TLV-TYPE numbers
 
 The data layer uses 0x0520–0x057F, 0x05B0–0x05BF for an introduction
-code's link hint (below), and 0x05E0–0x05FE for the records a device keeps
+code's link hint and a short code's hint record (below), and 0x05E0–0x05FE for the records a device keeps
 of its events in its own store, which are never on the wire (§21.7), registered in
 [README.md](README.md#tlv-type-numbers). A number is even unless the notes
 below say it is odd: a decoder MUST skip an unknown even TLV inside these records
@@ -4300,18 +4306,25 @@ readers pass over (and fields they must not).
 | 0x0567 | IntroAnswer | Name (offer), Writer (the asker key), Digest (its public key's digest), then Name (folder), Role, optional Revision (0x052A: the members revision in force on the offering device once the asker was admitted; the joiner's note of the admission lets go at a held record of that revision or later that leaves it out, §19.3 step 6; an answer without it releases the note on expiry only), Credentials, Asker (the offering device's proof), Proof — or IntroRefused, with no Proof; an answer's Content (§19.3, §19.4) |
 | 0x0569 | Role | NonNegativeInteger: 0 reader, 1 writer |
 | 0x056B | Tries | NonNegativeInteger: in an offer, the wrong tries that close it (≥ 1); in a refusal, those left |
-| 0x056D | IntroRefused | NonNegativeInteger: 1 unknown, 2 used, 3 expired, 4 closed, 5 wrong proof (then Tries, left), 6 conflict |
+| 0x056D | IntroRefused | NonNegativeInteger: 1 unknown, 2 used, 3 expired, 4 closed, 5 wrong proof (then Tries, left), 6 conflict (the code a joiner's own `Hint` refusal, §19.5, would have: it is never sent) |
 | 0x056F | Credentials | octets: whole Data packets, a signed trust context then the certificates of its signer key's chain to that context's anchor, at most 8 |
 
-The link hint of an introduction code (§19.2) uses two even numbers of the
+The introduction code's link hint (§19.2) uses two even numbers of the
 block 0x05B0–0x05BF. They are the value of the `intro` envelope's
 `LinkHint` field (0x0478, [trust-envelope.md](trust-envelope.md)), not of a
-log record; a reader skips an unknown even TLV among them.
+log record; a reader skips an unknown even TLV among them. A short code's
+hint record (§19.2) uses five more of the block, all even: the Content of
+the Data `<D>/32=hint/<token>` (§16.1), with the same reader rule.
 
 | Type | Name | Value |
 |---|---|---|
 | 0x05B0 | LinkKey | 32 octets: SHA-256 of the inviter device's public key as a certificate carries it (an Ed25519 key's 32 octets); the key a link handshake must prove (ndn-link.md §3.3); exactly once |
 | 0x05B2 | LinkCandidate | one octet of kind (0 host, 1 reflexive, 2 advertised, 3 mapped), the IP address (4 octets for IPv4, 16 for IPv6), the UDP port (2 octets, big-endian); 7 or 19 octets; repeatable, at most 8 kept, in order of preference (§19.2) |
+| 0x05B4 | IntroHint | a hint record's Content (§19.2), one TLV and nothing after it: `HintOffer`, `LinkKey`, `LinkCandidate`*, `HintRelay`*, `HintUntil`, `Credentials` (0x056F) in this order — or, for an offer no longer served, just `HintGone` |
+| 0x05B6 | HintOffer | one Name TLV: the offer record's name; exactly once |
+| 0x05B8 | HintRelay | one Name TLV: a relay device that reaches the inviter; repeatable, at most 8 (a record with more is refused) |
+| 0x05BA | HintGone | NonNegativeInteger: 3 expired or 4 closed (the codes of `IntroRefused`); the only field of a gone mark |
+| 0x05BC | HintUntil | NonNegativeInteger: the offer's expiry in milliseconds; informational (the offer judges its own); exactly once |
 
 Slice 3's numbers are odd — critical — because the even ones of the block
 are taken and because a reader that does not know them must not pass over
@@ -5723,26 +5736,46 @@ members record of `F` is held:
    an introducer (`Local`, naming the setting).
 2. Draws a fresh 16-octet secret from the device's entropy, wraps the
    proof key into its store, signs the offer into its log.
-3. Returns the code only once the offer and the wrapped proof key are
-   durable (§4.2): before, a power loss could take the record and give its
-   seq to another.
+3. Returns the code only once the offer, the wrapped proof key and, when
+   there is a short code, its wrapped hint token are durable (§4.2): before,
+   a power loss could take the record and give its seq to another.
 
-The **code** is a trust-envelope `intro` link
-([trust-envelope.md](trust-envelope.md)): the inviter's namespace, its
-anchor fingerprint (SHA-256 of its root anchor's public key), the offer's
-name, the secret, the inviter's link hint (below), and as many relay hints
-— the relays the inviter's trust context advertises, by device name
-(`/<namespace>/<role>/<device>`, §3; its certificate is
-`/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`) — as
-keep the link within one QR code; the secret, the offer and the
-fingerprint are never dropped. The same code as **words**: the offer's
-name, then 24 BIP39 English words encoding the secret followed by the
-fingerprint's first 16 octets (its checksum catches a mistyped word); the
-words carry no hint and no relay.
+The **code** has three forms, which `offer` makes together (`Code { offer,
+link, words, short, short_why }`; `Code::share()` is the short code when
+there is one, else the link: what a host shows):
+
+- the **link**, a trust-envelope `intro` link
+  ([trust-envelope.md](trust-envelope.md)) or its https mirror, in the
+  compact form below: the inviter's namespace, its anchor fingerprint
+  (SHA-256 of its root anchor's public key, whole), the offer's name, the
+  secret, the inviter's link hint (below), and as many relay hints — the
+  relays the inviter's trust context advertises, by device name
+  (`/<namespace>/<role>/<device>`, §3; its certificate is
+  `/<namespace>/<role>/<device>/KEY/<key-id>/<issuer>/<version>`) — as
+  `IntroPolicy::code_relays` allows and one QR holds; the secret, the offer
+  and the fingerprint are never dropped;
+- the **words form**: the offer's name, then 24 BIP39 English words
+  encoding the secret followed by the fingerprint's first 16 octets (its
+  checksum catches a mistyped word); the words carry no hint and no relay;
+- the **short code**: one line, the inviter's device name, a first contact
+  and 20 or 36 words. It names no offer: a signed hint record the inviter
+  serves does (below).
+
+`join` tells them apart by the text alone, before it does anything else
+(§19.3). A text that starts with `/` is the words form when the number of
+words after its first token is exactly 24 (a second token that starts with
+`/`, `[` or a digit is a first contact and is not counted), and a short code
+otherwise; a short code with a count other than 20 or 36 is refused, saying
+how many words it found and which counts exist (§19.5). Any other text is
+read as a link. The three forms of one offer carry the same secret and
+fingerprint (the short code's, a prefix of it for a named namespace); the
+link and the words form are made always, the short code only when the
+conditions below hold.
 
 The **link hint** is what lets a joiner with no daemon, no route and no
 peer entry reach the inviter's device by its key. A host that listens for
-links gives it (`Introducer::link_hint`, once per `offer`): the device's
+links gives it (`Introducer::link_hint`, once per `offer` and once for each
+hint record made on request, below): the device's
 **link key** — SHA-256 of its public key as a certificate carries it, 32
 octets, the fingerprint a link handshake proves (ndn-link.md §3.3) — and
 at most `LINK_HINT_CANDIDATES_MAX` = 8 **candidates**, the addresses of its
@@ -5773,20 +5806,257 @@ offer of the device has not expired by its clock — a closed offer counts,
 since it still answers the writer it admitted until it expires. With no
 offer open, a stranger is refused a link as any device nobody knows. Over
 the link it **carries** an Interest only for the ask (`<D>/32=intro/…`),
-while open, and for the offer's own record (`<D>/32=held/<e>`, `e` an
-unexpired offer in the device's own log): no other log entry, summary root
+while open, for the offer's own record (`<D>/32=held/<e>`, `e` an
+unexpired offer in the device's own log), and for a short code's hint
+record (`<D>/32=hint/<token>`, `token` that of one of the device's own
+offers with a short code, whether the offer is open, closed or expired:
+the answer is then its gone mark): no other log entry, summary root
 or packet the device holds by name crosses it, though the device serves
-them to its members. This replaces serving the whole `<D>/32=held` and
-`<D>/32=intro` prefixes for good.
+them to its members, and no other name of the `32=hint` family (the prefix
+alone, a token the device does not hold). This replaces serving the whole
+`<D>/32=held` and `<D>/32=intro` prefixes for good. A link is made only
+while an offer is open (above), so a joiner that dials after the last offer
+expired meets no link, not a gone mark (§19.3).
 
-The code stays within one QR (`ndn_trust_envelope::qr::MAX_TEXT_LEN` =
-2331 characters). A hint costs 34 octets and 9 (IPv4) or 21 (IPv6) per
-candidate, a third more as base64url: eight IPv6 candidates take a code of
-388 characters (four relay hints, a namespace and an offer name of 60
-characters) to 686 (measured in `intro::tests`). When a code does not fit,
-the maker drops relay hints first, all of them, then the hint's last
-candidates one by one, then the hint itself; an offer name so long that
-the code does not fit without them is `Local`.
+**The full link, compact.** One encoder writes the link's body
+([trust-envelope.md](trust-envelope.md) §4.3): the inviter's namespace once,
+as a Name (`IntroNamespaceWire`, 0x0490) and not as text; the offer's name
+(`IntroOfferWire`, 0x0492) and each relay (`IntroRelayWire`, 0x0494, in the
+order of the trust context) as a **relative name** — one octet `k`, how many
+leading components it shares with the namespace, then its remaining
+components as wire — so a self-certifying component is 34 octets, not 96
+characters of escapes, and appears once beside its repeats; the secret and the
+whole fingerprint; the link hint (0x0478, as above), at most
+`IntroPolicy::code_candidates` candidates (default 3, the first ones); and
+at most `IntroPolicy::code_relays` relays (default 2), **by name, not by
+key**: a key alone gives a joiner nothing to route or dial by, and a relay's
+name is what a ForwardingHint is. The names a link carries are in the
+canonical text of `Name` (`Introduction::check`; the data layer's keyword
+`32=log` is written `keyword=log`). The old text tags (Namespace 0x0489,
+Offer 0x0475, RelayHint 0x0476) are read, never written: a link made before
+this form still joins, to the strings it carried. A joiner needs no hint
+record from a link: the link names the offer and, with its link hint, the
+key to dial.
+
+The link stays within one QR (`ndn_trust_envelope::qr::MAX_TEXT_LEN` = 2331
+characters). A hint costs 34 octets and 9 (IPv4) or 21 (IPv6) per
+candidate, a third more as base64url. When a link does not fit, the maker
+drops relay hints first, all of them, then the hint's last candidates one
+by one, then the hint itself; an offer name so long that the link does not
+fit without them is `Local`. The measured sizes are in the table below.
+
+**The short code.** One line a person can read aloud or type
+(`ShortCode::encode`, `ShortCode::parse`):
+
+```
+short      = device SP [ contact SP ] word{20}     ; a named namespace: 10 octets of the fingerprint
+           | device SP [ contact SP ] word{36}     ; the whole 32 octets of the fingerprint
+device     = an absolute NDN URI of the inviter's device D, not the root: /alice/member/laptop
+contact    = "[" IPv6 "]" ":" port                 ; [2001:db8::7]:4433
+           | IPv4 ":" port                         ; 192.0.2.7:4433
+           | relay-name                            ; an absolute NDN URI, starting with "/"
+word       = a BIP39 English word, 11 bits
+```
+
+1. **Tokens.** Whitespace of any amount separates the tokens. The first is
+   the device. The second is the contact when it starts with `/`, `[` or an
+   ASCII digit — no word of the list does — else there is none. All the rest
+   are words, and exactly 20 or 36 of them. Case and spacing do not matter
+   in the words; a device or relay name is case-sensitive.
+2. **`161=*`.** A component written `161=*` (type 0xA1, the single octet `*`)
+   stands, in the device name and in a relay name, for the self-certifying
+   component equal to the anchor's whole fingerprint: the 32 octets are in
+   the words, not written a second time as 96 characters of escapes. It is
+   valid only with 36 words; with 20 it is refused (`Placeholder`, below). A
+   writer MUST write `161=*` for every self-certifying component of the
+   device and of a relay name that equals the whole fingerprint, and writes
+   the whole fingerprint exactly when the device's namespace is the
+   self-certifying one it is the digest of; it MUST refuse a name that has a
+   literal `161=*` component. A reader that finds `161=*` reads the name with
+   the fingerprint in its place and names the namespace as the device's
+   prefix up to that component. A 36-word code without `161=*` is valid: the
+   names are literal.
+3. **Words and checksum.** `payload = secret (16) ‖ fingerprint (10 or
+   32)`; the words encode `payload ‖ checksum (12 bits)`, eleven bits to a
+   word (trust-envelope.md §5.8): 26 octets are 220 bits, **20 words**; 48
+   octets are 396 bits, **36 words**. The checksum is the first 12 bits of
+   SHA-256(`ndn-trust/intro-short/1` ‖ the **bound text** ‖ `0x00` ‖
+   payload). The bound text is the canonical text of what precedes the words:
+   the device name re-rendered from the parsed Name (each component as
+   `Name` writes it, `161=*` where item 2 says), then, when there is a
+   contact, one space and the contact re-rendered (a parsed socket address in
+   its standard form, or a relay name as the device). So spelling that parses
+   to the same name and address (case of hex digits, an expanded IPv6
+   address) does not matter, and **a typo anywhere** — a word, a digit of the
+   port, a letter of the device name — is caught with probability 1 − 2⁻¹².
+   Words of the 24-word form are unchanged and still read.
+4. **No correction.** 12 bits cannot single out one repair among the
+   20 × 2047 single-word edits (about ten of them satisfy the checksum), so
+   a typo is refused with the text that names what to check, never repaired.
+5. **The contact.** An address MUST NOT have port 0, be unspecified,
+   multicast or (IPv4) the broadcast address: the code is then refused
+   (`Contact`). A loopback (`127.0.0.0/8`, `::1`) or link-local
+   (`169.254.0.0/16`, `fe80::/10`) address is refused (`Local`) unless
+   `IntroPolicy::local_candidates` is on: a code from a stranger is not made
+   to send datagrams to services on the joiner's own machine or link, as for
+   a link hint. A relay is a device name; nothing is dialled for it.
+6. **Order of refusals.** The reader refuses, in this order, a device name
+   that is no name (`Device`), a contact that is neither (`Contact`), a word
+   count other than 20 or 36 (`Words`), `161=*` with 20 words
+   (`Placeholder`), a word off the list (`UnknownWord`, by position among the
+   words, from 1), a checksum that does not match the words, the device name
+   and the contact (`Checksum`), an address no device can dial (`Contact`),
+   and a loopback or link-local address (`Local`). Each is a `BadRequest` of
+   the joiner's `join`, before anything is dialled, with the text of §19.5.
+
+The words are the one thing that cannot be fetched beside the code's few
+facts: the secret (16 octets, never fetched, never on a wire in clear;
+128 bits stay, because an offer's commitment is public in the inviter's log,
+and a shorter secret could be searched offline) and the anchor's
+fingerprint. The device name is in the text because the hint record is
+fetched at its name and an Interest is routed by it; the contact is the only
+way to reach the inviter before the record is held. The reason for 80 bits
+of fingerprint is in §19.7.
+
+**The hint record.** What the joiner fetches by the code's first contact,
+and the only thing a short code's offer names: a record the inviter makes
+**on request** and signs.
+
+1. **Name.** `<D>/32=hint/<token>` (§16.1), `token = HMAC-SHA256(key =
+   secret, "ndn-data/intro/hint/1")[..16]` (`hint_token`; `hint_name`,
+   `hint_prefix`, `parse_hint_name`; `HINT_TOKEN_LEN` = 16). It is
+   unguessable without the code (128 bits of an HMAC key), and it reveals
+   nothing of the secret, which is never in a name or on a wire. The offer's
+   own name is not used: its `seq` is guessable.
+2. **Data.** Signed by the device key, as it signs every packet it serves,
+   with `FreshnessPeriod` 5 s (`HINT_CACHE`): a cache does not hold an
+   address past the time the device would give it. Its Content is one
+   `IntroHint` (0x05B4, §16.2): `HintOffer` (0x05B6), the offer's name, so
+   that the signed record is bound to the offer at a name only the secret's
+   holder can ask for; `LinkKey` (0x05B0) and at most
+   `LINK_HINT_CANDIDATES_MAX` (8) `LinkCandidate` (0x05B2), the host's
+   current `Introducer::link_hint` (with no hint from the host: the
+   device's own key and no candidate); `HintRelay` (0x05B8), the device
+   names of the relays the namespace's trust context advertises, in its
+   order, at most `HINT_RELAYS_MAX` (8); `HintUntil` (0x05BC), the offer's
+   expiry, informational; and `Credentials` (0x056F), the inviter's signed
+   trust context and the certificate chain of the signing key, as an answer
+   carries them, which is what lets the joiner verify the signer with
+   nothing but the code's fingerprint. A reader skips an unknown even TLV;
+   it refuses a record that repeats a field, names no offer, key, expiry or
+   credentials, has more than 8 relays, or has content after the `IntroHint`;
+   candidates are read as a link hint's are (§19.2 above: at most 8
+   distinct dialable ones, loopback and link-local only under
+   `local_candidates`).
+3. **Gone mark.** For an offer no longer served, the same Data holds just
+   `IntroHint { HintGone }`: 3 expired, 4 closed (any other refusal of the
+   offer is written as 4), signed alike. It carries nothing else and is a
+   clear refusal where there would be silence.
+4. **On request.** The device makes the record when the Interest comes, from
+   the host's link hint and the namespace's relays as they are then, so a
+   restarted inviter or a moved address is current. It signs one record per
+   token and keeps it 5 s, answering the same Data again while the offer's
+   state (record, or which gone mark) is unchanged; a change, a closing
+   mark included, is signed at once. A device with no introducer, or whose
+   credentials cannot be made, answers nothing.
+5. **Served while the offer is open.** The record is served while the offer
+   is open (not expired by the device's clock, not closed: a closing mark
+   held, or the overall wrong tries at the cap, §19.4 step 4), and a gone mark
+   after, when `IntroPolicy::hint_while_open` is on (the default). With it off
+   the record is served until the device stops, with no gone mark. Either
+   way the offer answers by its own rules (§19.4): a hint that outlives its
+   offer joins no one.
+6. **Unknown tokens.** An Interest for a hint name of this device whose token
+   is not one of its own offers' is answered as every unanswerable name is,
+   by a Nack (`NoRoute`): the same for every token a prober can try, so
+   nothing of any token is revealed, and a joiner with a mistyped but
+   checksummed code fails its tries at once. Over an introduction link such
+   an Interest is not even carried (above). A name of another device is not
+   answered either.
+7. **What the device keeps.** `offer` makes the token from the secret, wraps
+   it to the device's recipient key under a local name beside the offer's
+   proof key (the same kind of note: a writer of the store cannot make one
+   read), and keeps `token → offer` in memory, rebuilt from the store at
+   start for the offers it holds (a note not wrapped to the device's key is
+   ignored, and its offer publishes no hint). The offer record and the log
+   hold nothing of the hint. A hint record exists only for an offer that
+   was given a short code.
+
+**The surface and the prefixes.** `IntroductionSurface::carries(name)`
+gains exactly one exact name family, `<D>/32=hint/<token>` of a token the
+device holds (above); nothing else widens. `introduction_prefixes(D)`
+returns three names, `[<D>/32=held, <D>/32=intro, <D>/32=hint]`: what a link
+dialled for an introduction routes, and no other name of `D`
+(ndn-link.md §13.3 rule 3, §13.3A).
+
+**When a short code is made.** `offer` makes the short code, and with it
+publishes the hint record, only when `IntroPolicy::short_code` is on (the
+default), the host gives a first contact and the line fits
+`IntroPolicy::short_width` characters (default 294: three lines of 98
+columns, counted in characters with the spaces). The first contacts are, in
+order, the dialable candidates of the host's link hint (loopback and
+link-local ones only under `local_candidates`), then the namespace's relays
+(up to 8), and the first whose line fits is taken: a longer address or name
+gives way to the next. With none, `Code::short` is `None` and
+`Code::short_why` says why, naming what to do (give the link, or the words
+with the offer's name): policy off (`IntroPolicy::short_code`); no first
+contact; or the device name and the number of first contacts tried, and
+that the line would be at least so many characters, past `short_width`. A
+longer name is the owner's choice; the link still works. Nothing of a hint
+is published then.
+
+**Policy.** `IntroPolicy` gains five fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `short_code` | `true` | make a short code and publish its hint record |
+| `short_width` | 294 | the most characters of a short code's line |
+| `hint_while_open` | `true` | serve the record only while the offer is open, a gone mark after |
+| `code_candidates` | 3 | the most link-hint candidates a full link carries (the record serves all 8) |
+| `code_relays` | 2 | the most relays a full link names |
+
+**`Introducer::dial_first`.** A short code's address first contact is dialled
+by `Introducer::dial_first(inviter, addr, within)`: **one** address, with **no
+key to expect** (a short code carries none); `Ok(key)` is the SHA-256 of the
+public key the handshake proved. Until the joiner holds the inviter's
+namespace the link routes only `introduction_prefixes(inviter)`, never the
+names the code claims for the device (ndn-link.md §13.3A). The address is a
+hint: whoever answers there is linked, and everything it serves is verified
+against the code (§19.3). The default dials nothing and refuses with a text
+that says the host has no link layer; the join then says the first contact
+could not be reached.
+
+**Lengths (informative; measured, the same secret in each).** Characters of
+the one line of a short code (device name, contact, words), and of the
+compact link (`ndn-trust://intro/…`), with the names of the code's tests:
+
+| Short code | Characters | Words |
+|---|---:|---:|
+| IPv4 `192.0.2.7:4433`, `/alice/member/laptop` (named) | 167 | 20 |
+| IPv6 `[2001:db8:1234:5678:9abc:def0:1234:5678]:65535` (the longest), named | 201 | 20 |
+| relay `/alice/node/relay`, named | 171 | 20 |
+| no contact, named | 154 | 20 |
+| IPv4, `/user/161=*/member/laptop` (self-certifying) | 273 | 36 |
+| IPv6 `[2001:db8:1:2:3:4:5:6]:4433`, self-certifying | 288 | 36 |
+| relay `/user/161=*/node/relay`, self-certifying | 281 | 36 |
+| the longest IPv6, self-certifying | 305, over `short_width`: no short code | 36 |
+
+| Compact link | Characters |
+|---|---:|
+| named, no hint, no relays | 202 |
+| named, 2 relays | 293 |
+| self-certifying, no hint, no relays | 285 |
+| self-certifying, 3 IPv4 candidates | 388 |
+| self-certifying, 3 IPv6 candidates | 436 |
+| self-certifying, 3 IPv6 candidates, 2 relays | 489 |
+| self-certifying, 2 IPv4 and 1 IPv6 candidate, 2 relays (the text encoding wrote 1056) | 457 |
+
+Words average about 5 characters, so a different secret moves each figure by
+a few characters. The checksum, for the fixed corpus of the code's tests (a
+payload of 26 octets, then 48): of 40 940 substitutions of one word, 8 went
+undetected (chance expects 10), and of 73 692, 22 (chance 18); of 19 and 35
+adjacent swaps, none; of 304 single-character edits of the device name and
+address, none.
 
 `close_offer(offer)` on the device that made the offer signs its closing
 mark and returns once it is durable: the offer admits no one new — every
@@ -5799,11 +6069,12 @@ lost. A record the offering device signs that drops the namespace an
 offer's user was admitted as closes the offer the same way (§19.7). What
 the offer granted stays until a members record removes it. Another
 device's offer, or a name that is no offer held, is `BadRequest`; closing a
-closed offer does nothing more.
+closed offer does nothing more. The hint record of a closed offer is its
+gone mark (above).
 
 ### 19.3 Joining
 
-`join(code)`, the link (or its https mirror) or the words. Before it dials,
+`join(code)`, a short code, the link (or its https mirror) or the words. Before it dials,
 fetches or asks anything, the code is judged — the dial gives whoever holds
 the code's key a link, and the device name a code claims is only a claim:
 
@@ -5813,7 +6084,7 @@ the code's key a link, and the device name a code claims is only a claim:
 - A device `D` under a namespace this device already trusts is refused
   `InviterConflict { inviter: <that namespace>, why }` (`AskOwner`: do not
   use the code) unless the code names that very namespace, or none, and its
-  fingerprint is one of that namespace's anchors this device holds: the
+  fingerprint — or the prefix of one a short code or the words carry — is that of one of that namespace's anchors this device holds: the
   same anchor is a party known already, and a second invitation from it is
   welcome. Without the exception a code could claim a device of a namespace
   this device trusts, and the link, with that namespace's Interests, would
@@ -5868,7 +6139,7 @@ Then:
    adopts nothing: it names the offer, this device's key and its digest;
    its `Proof` verifies under the proof key the code's secret yields; its
    credentials open (§19.4, step 2) to a context whose anchor fingerprint
-   is the code's (whole, or its first half for words), whose namespace is
+   is the code's (whole for a link and a 36-word short code, a prefix for the words and a 20-word short code), whose namespace is
    the code's (when it names one) and a prefix of `D`; the inviter's proof
    packet `<D>/32=ask/<binding>`, the binding SHA-256 of the intro-answer
    label (§16.1) and the answer's fields before it, and the offer record
@@ -5876,7 +6147,7 @@ Then:
    that chains to that anchor through those certificates; the offer's
    commitment is the code's secret's; the folder and role are the offer's.
 4. **The inviter's namespace is no other's**, judged by this device (the
-   words name none, so it is judged here for them too): not the root, not
+   words and a short code of a named namespace name none, so it is judged here for them too): not the root, not
    one the policy refuses (`Config::intro`, §19.4 step 10), not this
    device's own namespace nor under or over it, not under or over any
    namespace this device trusts, and not one it trusts under another
@@ -5955,6 +6226,94 @@ Then:
    for the same things; it never
    answers "already used" to the device it admitted. A reader waits for the
    record over `F` and, sealed, the key, the same; it needs no walk to read.
+
+**Joining by a short code.** A short code names no offer and no key, so steps 0
+and 1 above are replaced by the steps below, in this order; steps 2 to 6 then
+run as written, with the offer's name from the verified record. A link or the
+words form fetches no hint record. Until the record has named it, a refusal
+or a `NotReady` carries the inviter's device name in place of the offer's,
+never the token.
+
+- **S1. Read** the code (§19.2). A code that does not read is a `BadRequest`
+  (§19.5) and nothing is dialled, fetched or asked. A 36-word code whose
+  device name has the self-certifying component equal to the fingerprint
+  also names its namespace, the device's prefix through that component, so
+  that it is judged as a link that names one is.
+- **S2. Judge before any dial**, as above, with a fingerprint that may be a
+  prefix: a device of this device's own namespace is `BadRequest` ("the code
+  offers a folder of this device's own namespace: it is yours already");
+  a namespace the code names (a 36-word code with `161=*`) over a whole
+  fingerprint is judged as in step 4, `InviterConflict`; a device under a
+  namespace this device trusts already, `InviterConflict` unless an anchor
+  of that namespace begins with the code's fingerprint.
+- **S3. Reach the first contact.** *An address:* `Introducer::dial_first(D,
+  address, Config::first_look)` (§19.2), once. An error is `NotReady`
+  (`RetryLater`), not a refusal of the code: the address may be wrong or the
+  inviter's device off. Whoever answers is linked with the three
+  introduction prefixes of `D` as its only routes (ndn-link.md §13.3A), and
+  the key it proved is the link's name, nothing more. An address dialled
+  after the inviter's last offer expired meets no link (§19.2: the inviter
+  refuses it as any device nobody knows), so the join reports the first
+  contact did not answer. *A relay:* nothing is dialled; the relay's device
+  name is the ForwardingHint of the fetch below. **Decision: a relay by
+  name, not by key.** A key alone gives the joiner nothing to route or dial
+  by, and 32 octets would cost 24 words; a name is what a ForwardingHint is
+  and what the joiner's forwarder already routes through a relay it uses.
+  The relay serves nothing new: it forwards `<D>/32=hint/<token>` toward `D`
+  as it forwards the offer fetch and the ask, and the inviter's link to it
+  carries those names because the surface says so (§19.2). The joiner's
+  forwarder MUST reach the relay's name (a relay it is linked to, or a name
+  its routes cover), the precondition of every relay fallback (below); a
+  join that cannot says so. *No contact:* the Interests go by name.
+- **S4. Fetch** the record `<D>/32=hint/<token>` (§16.1), as often as the
+  offer is fetched (step 1: up to 8 tries of `Config::lifetime`): over an
+  address first contact by name over its link; over a relay with the relay as
+  ForwardingHint. None came: `NotReady` (`RetryLater`), and the first link,
+  if any, is taken down.
+- **S5. Verify**, before anything else is sent, in this order; a failure is a
+  refusal, and **nothing is dialled, asked or adopted**:
+  1. the Data's name is exactly the one asked, else `Hint` (`wrong name`);
+  2. its Content decodes as a hint record (§19.2), else `Hint` (`wrong
+     record`);
+  3. a gone mark is refused as it says, `Introduction` `Closed` or `Expired`,
+     and no further step runs (a gone mark carries no credentials to verify
+     with: §19.7);
+  4. its credentials open — a trust context signed by one of its own anchors,
+     valid now, then certificates (§19.4 step 2) — else `Hint` (`credentials`);
+  5. the context's namespace is a prefix of `D` and, when the code names one,
+     equals it, else `Hint` (`credentials`);
+  6. the anchor's fingerprint begins with the code's octets (the whole when it
+     carries 32), else `Hint` (`anchor`);
+  7. the record is signed by a key of device `D` that chains to that anchor
+     through the credentials' certificates, else `Hint` (`signer`);
+  8. the record's offer is a log entry of a folder of `D`, else `Hint`
+     (`offer`);
+  9. the namespace is judged as an inviter's (step 4), now that the
+     fingerprint is whole and proven, before the record's key is dialled:
+     `InviterConflict`.
+- **S6. Dial** by the record's key and candidates. When the first contact's
+  link is up and is the record's key, or the record has no candidate, nothing
+  more is dialled and the Interests go by name over that link. Otherwise,
+  when the record has candidates, `Introducer::dial(record link, D,
+  Config::first_look)` as in step 0; on success the first link, which proved
+  no certificate, is `undial`led; an error is not a refusal, and the join
+  goes on by forwarding hints. The ForwardingHint of the Interests, when no
+  link carries them, is the first contact's relay, then the record's relays,
+  else the joiner's own namespace's relays (as in step 0).
+- **S7. The offer.** The offer's name now comes from the verified record. The
+  joiner fetches it (step 1) and, before it asks, refuses `Introduction {
+  Hint { why: "offer: <offer> was not made with this code's secret" } }` when
+  the offer's commitment is not the code's secret's: a short code's secret is
+  whole and checksummed, so a mismatch means the record named another offer,
+  and an ask would only count a wrong try. The link and the words form keep
+  step 3's order (a mistyped secret there is `WrongProof`). Then steps 2 to
+  6 run, every check of today's flow included: the answer proves the secret,
+  the commitment is the code's, the fingerprint matches the answer's
+  credentials, the device is under the inviter's namespace.
+- **S8. A join that fails** after a dial calls `Introducer::undial` for the
+  first contact's key and for the record's key, whichever it dialled, as
+  step 0 does: the first link, which proved no certificate, is not kept (it
+  is taken down by the key the handshake proved).
 
 Absent a dial that succeeded, the joiner's Interests carry a
 ForwardingHint: the relays the code names, else those its own namespace's
@@ -6078,10 +6437,29 @@ packet, and carries the answer proof.
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§19.4, the use) | `FixLocal` (renew the device's certificate when it is the last) | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer entry does not verify under the context the joiner holds (§19.3 step 5) | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
+| `Hint { why }` | what answered at a short code's first contact does not prove it is the inviter's, or the offer its record names was not made with the code's secret (§19.3, S5 and S7; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `anchor`, `signer`, `offer` — and says what is wrong | `AskOwner` (do not use this code's first contact; ask for a new code) | no |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the
 offer waits. A code that does not parse is `BadRequest`; a host without an
 introducer, or one that refuses an adoption, is `Local`.
+
+A short code adds the refusals below (§19.2, §19.3). Each says why and what
+to do; `D` is the inviter's device name, which stands for the offer's name
+until the record names it.
+
+| Situation | Error | Says (the text a program shows) |
+|---|---|---|
+| a word count other than 20 or 36 | `BadRequest` (the root) | `the code has N words; a short code has 20 or 36 words, today's words form 24: the code was cut off or has extra words: copy it again whole` |
+| a word off the list | `BadRequest` | `word N is not a BIP39 English word: check word N` (N from 1, among the words) |
+| the checksum does not match | `BadRequest` | `the code does not read (a word, the address or the device name is mistyped, or two words are swapped): check each against what you were given; the inviter's device name and address are part of the check` |
+| a first contact that is neither an address nor a relay's name, or no device can dial it | `BadRequest` | ``the code's first contact `x` is neither a dialable address (`192.0.2.7:4433`, `[2001:db8::7]:4433`) nor a relay's name (starting with /): check it against what you were given`` |
+| `161=*` with 20 words | `BadRequest` | ``the device name uses `161=*`, the whole fingerprint, which only a 36-word code carries: the code was cut off, or copied from a code of another shape; copy it again whole`` |
+| a loopback or link-local first contact, `local_candidates` off | `BadRequest` | ``the code's first contact A is an address of this machine or its link; this device does not dial one from a code (`IntroPolicy::local_candidates`): ask for a code with an address of the inviter's device that can be reached from here, or allow it in the policy for two devices of one machine`` |
+| a device name that is no name | `BadRequest` | ``the code's device name `x` is not an NDN name (starting with /, not the root): check it against what you were given, or copy the code again whole`` |
+| the address does not answer the dial | `NotReady` (`RetryLater`) | `the first contact A did not answer (reason): check the address and that the inviter's device is on, then retry; or ask for a new code` |
+| the hint record is not fetched in its tries | `NotReady` (`RetryLater`) | `the inviter's hint for this offer was not fetched from the first contact (offline, wrong address or relay, a relay this device cannot reach, or the offer is closed): retry, check the code, or ask for a new code` |
+| a gone mark | `Introduction` `Closed` or `Expired` | the texts of the rows above |
+| the record does not verify | `Introduction` `Hint { why }` | `what answered at the first contact does not prove it is the inviter's (why): do not use this code's first contact; ask the inviter for a new code, and check the code was copied whole` |
 
 ### 19.6 Cryptography
 
@@ -6096,6 +6474,19 @@ its public key digest ‖ the nonce; the answer proof, over
 `ndn-data/intro/answer/1` ‖ every field of the acceptance before `Proof`.
 Proofs are compared in constant time. Asks are sealed with §9's
 X25519-to-ChaCha20-Poly1305 wrap.
+
+A short code adds two derivations and one checksum. The **hint token** is the
+first 16 octets of HMAC-SHA256 under the secret as key over
+`ndn-data/intro/hint/1`: an HMAC output reveals nothing of a 128-bit key, so
+the name made of it is unguessable without the code and tells nothing of
+it. The **checksum** of a short code's words is the first 12 bits of
+SHA-256(`ndn-trust/intro-short/1` ‖ the bound text ‖ `0x00` ‖ payload)
+(§19.2). It detects a typo; it is no authenticator (it has no key, and
+anyone can compute it for a code of their own), and nothing is trusted on
+its account. The **fingerprint** is SHA-256 of the anchor's public key (an
+Ed25519 key's 32 raw octets, trust-envelope.md §4.4): a short code carries a
+prefix of it, or the whole, and the joiner compares what the credentials'
+anchor hashes to.
 
 ### 19.7 Threat notes
 
@@ -6155,7 +6546,9 @@ X25519-to-ChaCha20-Poly1305 wrap.
   ebbs.
 - **Inviter impersonation.** An acceptance must prove the secret and be
   signed by the offering device under the anchor whose fingerprint the code
-  carries (128 bits of it in the words form); a party that served a
+  carries (128 bits of it in the words form, 80 in the short code of a named
+  namespace, the whole 32 octets in a link and in the short code of a
+  self-certifying one: see the note on the short code's fingerprint below); a party that served a
   substituted offer and opened the ask learns the joiner's public
   credentials, cannot answer as the inviter, and can at most relay the ask
   to the real inviter — whose answer admits exactly the joiner. A refusal
@@ -6222,6 +6615,10 @@ X25519-to-ChaCha20-Poly1305 wrap.
   of its listening socket (its interfaces', reflexive and advertised ones),
   to whoever sees it: the screen showing the QR, the message carrying it.
   A host that does not want that gives no hint (`Introducer::link_hint`).
+  A short code shows the device's name and one first contact (an address or
+  a relay's name) and no key; the hint record behind it shows the key, up to
+  8 addresses and the relays to whoever holds the code, while the offer is
+  open (below).
 - **The hint's lifetime is the offer's.** The addresses are those of the
   moment the offer was made; once the offer expires (or is closed to
   everyone new) the code admits nobody, whatever the addresses say. A joiner
@@ -6232,6 +6629,111 @@ X25519-to-ChaCha20-Poly1305 wrap.
   slots and rates (ndn-link.md §8.6): what that link lets a stranger send is
   what any party can already ask of the device by name, and the ask is
   judged and bounded as §19.4 says.
+- **Short code: a relay or a man in the middle cannot substitute addresses.**
+  The hint record is signed by `D`'s device key, chained to the anchor the
+  code's fingerprint names, named by the secret's token and naming the offer.
+  A changed byte fails the signature; an unrelated record fails the name or
+  the signer check; a record of another offer of `D` is a different name and,
+  presented under this token, names an offer that is not committed to the
+  secret, refused before the ask (§19.3, S7); and nothing is dialled before
+  all of that passed (S5). A relay or an on-path party may *withhold* the
+  record (the join says it could not fetch it) or *replay* an old genuine
+  one (below); it cannot make the joiner dial an address of its choosing, nor
+  trust a key it chooses.
+- **Short code: the first contact is a hint.** It reaches whoever holds the
+  address or relay, and that party can serve what it likes; everything it
+  serves is verified against the code (the fingerprint, the signer, the
+  offer: §19.3, S5) before anything is dialled, asked or adopted. The link
+  made to an address routes the three introduction prefixes of `D` and no
+  other name, whatever namespace the party shows (ndn-link.md §13.3A), so a
+  stranger at the address is never sent the Interests of a namespace the
+  joiner holds. A loopback or link-local first contact is refused unless
+  `IntroPolicy::local_candidates` (§19.2), as a link hint's candidates are.
+- **Short code: the party at the first contact learns who is joining (a
+  known limit).** A link hint pins the key: a dial to an address whose party
+  presents another key fails the handshake before any link message, so a
+  hostile address learns nothing of the joiner. A short code's address is
+  dialled with **no key to expect** (`Introducer::dial_first`), so whoever
+  answers there is sent the joiner's link hello: its certificate chain and
+  its memberships (ndn-link.md §5.2, §13.3A). They are public, signed data,
+  no secret (the secret travels only inside the sealed ask), but they tell
+  that party which person is joining, and from which IP address. An address
+  from a hostile code is therefore a way to learn who is joining, with no
+  key held. Nothing the party serves is trusted: it fails the fingerprint
+  check, and the link is taken down. What a person can do: use a short code
+  only as the inviter gave it; where its origin is in doubt, ask for the
+  full link, whose link hint pins the key (the hello is then sent only to
+  the device that proves it), or for a short code whose first contact is a
+  relay (nothing is dialled; the joiner's Interests go by name through a
+  relay its forwarder already reaches). A certificate-less hello is not a
+  free change (ndn-link.md §13.3A: an inviter that admits enrollment links
+  would class such a dialler as a relay link, which does not carry the
+  introduction), so it is not made.
+- **Short code: probing.** The hint record's name is derived from the
+  secret, so it is unguessable (128 bits) without the code, and the secret
+  itself is in no name or wire. A prober who does not hold the code can
+  neither fetch nor test for a record: an Interest for an unknown token is a
+  Nack, the same for every token (§19.2), and over an introduction link it
+  is not carried at all; a known token answers only its record or its gone
+  mark. The offer's own name, whose `seq` is guessable, is not used.
+- **Short code: the record's lifetime, and what it reveals.** While the
+  offer is open the record shows the key, up to 8 addresses and up to 8
+  relays that the inviter would give to anyone holding the code; an on-path
+  observer of the Interest learns the token and so can fetch the record
+  until the offer closes (that observer already sees where the traffic goes),
+  and a cache holds it at most its `FreshnessPeriod`, 5 s. Closed or
+  expired: a gone mark, nothing more. The record is made on request from the
+  host's current hint, so it names no address the host has since lost; it is
+  not in the log and not served after the device stops. With
+  `hint_while_open` off it is served until the device stops, which is a
+  longer exposure of the addresses, not a longer admission (the offer
+  answers by its own rules).
+- **Short code: replay of an old record.** The record is bound to the offer
+  by its name and content; its `HintUntil` and a signature give no time the
+  joiner checks. An old genuine record of this offer shows stale addresses,
+  which costs a failed dial within its bound (the dial proves the key), never
+  a wrong peer; a record of another offer is never accepted for this one. A
+  genuine gone mark never turns back into a record: an offer is not
+  reopened.
+- **Short code: a gone mark can only deny.** A gone mark has no credentials,
+  so the joiner cannot verify its signature; it takes the mark as it says. An
+  on-path party that answers the token's Interest (the token is in the
+  Interest) can therefore make a join report `Closed` or `Expired` for an
+  offer that is still open: a **denial**, as withholding the record is, never
+  an admission, since nothing is dialled, asked or adopted on a mark and the
+  offer's own answer alone judges the offer. The joiner retries, or asks for
+  a new code or the full link, which fetches no record.
+- **Short code: a typo.** The 12-bit checksum covers the words, the device
+  name and the first contact: a mistyped word, a digit of the port or a
+  letter of the device name is refused with probability 1 − 2⁻¹² and never
+  tried (§19.2). The 1 in 4096 that passes meets the other checks: a
+  mistyped secret is an unknown token (a Nack, so the tries end at once), a
+  mistyped address or relay is a first contact like any other (the party
+  there is verified against the fingerprint, which a typo cannot make
+  match).
+- **Short code: the fingerprint is 80 bits (named namespace) or whole.**
+  Impersonating the inviter to a joiner needs a trust context whose anchor
+  key's SHA-256 begins with the code's octets, and a hint record signed under
+  it. For 10 octets that is a key search with success probability 2⁻⁸⁰ per
+  key: 2⁸⁰ ≈ 1.2 × 10²⁴ key generations in expectation for one target (the
+  median is about 0.7 of that). Assumption, not a measurement: an attacker
+  who generates 10¹² keys per second, a rate chosen to favour the attacker;
+  one target then costs about 1.2 × 10¹² s, some 38 000 years (the shapes of
+  round 10 gave 3.8 × 10¹⁰ s, 1 200 years; that was 32 times too small).
+  An attacker holding the codes of N offers open at once, content with
+  impersonating any one, needs 2⁸⁰/N: for N = 2³⁰ (about 10⁹ offers), 2⁵⁰ ≈
+  1.1 × 10¹⁵ generations, about 1 100 s, 19 minutes at that rate. An offer
+  lives minutes to hours, so arithmetic alone does not exclude that
+  attacker; what stands in his way is that he needs each code first (a
+  bearer secret whose holder could use it himself, so the harm is bringing
+  the joiner to a namespace of his own) and the assumed rate. A party who
+  has only seen the token needs the secret too: the joiner refuses a record
+  whose offer is not committed to it (S7) and the answer proves it, 2¹²⁸
+  more. A self-certifying namespace takes all 32 octets (its name *is* the
+  fingerprint, so `161=*` writes it once, in the words), as a link does; the
+  words form keeps its 128 bits. The lengths that fill whole words with the
+  12-bit checksum are 10, 21 and 32 octets of fingerprint (16 + n ≡ 4 mod
+  11): 10 is the shortest, and each octet costs about 0.73 of a word.
 - **A grant is authority to link, not to read** (round 6, §19.8). It is host
   visible and informs the link layer only: the folder's members record and
   the epoch keys still decide what a link is answered, so a grant never

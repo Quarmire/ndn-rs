@@ -106,7 +106,7 @@ Envelopes use NDN Packet Format v0.3 TLV framing.
 
 ### 4.2 Registry
 
-All types are in the range `0x0470`–`0x048F`. This range was chosen to stay clear of the
+All types are in the range `0x0470`–`0x049F` (`0x0490`–`0x049F` since round 10, for the compact `intro` body). This range was chosen to stay clear of the
 trust-context range `0x0410`–`0x041F`. The types have meaning only inside an envelope.
 
 | Type | Name | Where | Value | Used by kinds |
@@ -116,8 +116,8 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0472` | Kind | in Envelope | 1 byte: kind code (§3) | all |
 | `0x0473` | Body | in Envelope | nested: the body fields below | all |
 | `0x0474` | DeviceName | in Body | UTF-8 device name (one name component) | invite (optional): the device name the inviter suggests, a hint and not a constraint. Even type, so a reader that does not know it skips it. |
-| `0x0475` | Offer | in Body | NDN name string: the offer record's name, `<D>/32=log/<F>/seq=<n>` | intro |
-| `0x0476` | RelayHint | in Body, repeatable | NDN name string: the device name of a relay that reaches the inviter | intro (optional) |
+| `0x0475` | Offer | in Body | NDN name string: the offer record's name, `<D>/keyword=log/<F>/seq=<n>` (the canonical text of the data layer's keyword `32=log`, §4.4). **Read only**: a producer writes OfferWire (`0x0492`) | intro (old links) |
+| `0x0476` | RelayHint | in Body, repeatable | NDN name string: the device name of a relay that reaches the inviter. **Read only**: a producer writes RelayWire (`0x0494`) | intro (old links) |
 | `0x0477` | Secret | in Body | exactly 16 bytes: the offer's secret | intro |
 | `0x0478` | LinkHint | in Body | octets: the inviter's link hint — its device key and where to dial it — as [data-layer.md](data-layer.md) §19.2 encodes it (TLVs 0x05B0, 0x05B2, [README](README.md#tlv-type-numbers)); this format carries them and judges none of them. Even type: a reader that does not know it skips it | intro (optional) |
 | `0x0479`–`0x0480` | — | — | unassigned | — |
@@ -129,13 +129,19 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0486` | TtlSecs | in Body | u64 | invite (optional), capability (required) |
 | `0x0487` | PrincipalPubkey | in Body | opaque bytes | delegation |
 | `0x0488` | KeyName | in Body | NDN name string | bag |
-| `0x0489` | Namespace | in Body | NDN name string | anchor, bag, capability, intro |
+| `0x0489` | Namespace | in Body | NDN name string. For an `intro` **read only**: a producer writes NamespaceWire (`0x0490`) | anchor, bag, capability; intro (old links) |
 | `0x048A` | ScopePattern | in Body, repeatable | UTF-8 string | capability |
 | `0x048B` | Nonce | in Body | opaque bytes | capability |
 | `0x048C` | Grant | in Body | opaque bytes (NDN Data wire of a certificate) | capability |
 | `0x048D` | Direction | in Body | 1 byte: `00` request, `01` grant | capability |
 | `0x048E` | AnchorFingerprint | in Body | exactly 32 bytes | anchor, invite, bag, intro |
 | `0x048F` | ContextData | in Body | full NDN Data wire of the signed trust context | anchor |
+| `0x0490` | NamespaceWire | in Body | the inviter's namespace as a Name's value: its components (type, length, value each), without an outer Name TLV (§4.4) | intro (optional; replaces Namespace) |
+| `0x0491` | — | — | unassigned | — |
+| `0x0492` | OfferWire | in Body | a relative name (§4.4): the offer record's name | intro (replaces Offer) |
+| `0x0493` | — | — | unassigned | — |
+| `0x0494` | RelayWire | in Body, repeatable | a relative name (§4.4): the device name of a relay that reaches the inviter | intro (optional; replaces RelayHint) |
+| `0x0495`–`0x049F` | — | — | unassigned | — |
 
 ### 4.3 Structure and canonical order
 
@@ -159,7 +165,7 @@ and `*` a field that repeats zero or more times.
 | recovery | Wire |
 | bag | KeyName, Wire, Namespace?, AnchorFingerprint? |
 | capability | Direction, Namespace, ScopePattern*, TtlSecs, Nonce?, Grant? |
-| intro | Namespace?, AnchorFingerprint, Offer, Secret, LinkHint?, RelayHint* |
+| intro | NamespaceWire?, AnchorFingerprint, OfferWire, Secret, LinkHint?, RelayWire* |
 
 Further producer rules:
 - **anchor.** A producer MUST include at least one of AnchorFingerprint, ContextData or Wire.
@@ -171,12 +177,20 @@ Further producer rules:
   - A request MUST carry a Nonce of 16 bytes (`CAPABILITY_NONCE_LEN`) from a
     cryptographically secure RNG, fresh for every request.
   - A grant SHOULD carry the Nonce of the request it answers.
-- **intro.** A producer SHOULD include Namespace. The Secret is 16 bytes from a
+- **intro.** A producer MUST write the compact form above: no text field. It MUST NOT
+  write Namespace (`0x0489`), Offer (`0x0475`) or RelayHint (`0x0476`) in an `intro`: a
+  parser still reads them (§6.3), so a link made before round 10 joins, to the strings it
+  carried. A producer SHOULD include NamespaceWire. The Secret is 16 bytes from a
   cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). LinkHint, when
-  present, comes once, after Secret. RelayHint elements keep their order: the relays the
-  inviter's trust context advertises, in its order.
+  present, comes once, after Secret. RelayWire elements keep their order: the relays the
+  inviter's trust context advertises, in its order, at most the producer's policy allows
+  (data-layer.md §19.2: `IntroPolicy::code_relays`, 2 by default). The names MUST be
+  canonical NDN URIs (§4.4), which the wire form reads back as exactly these strings: a
+  producer MUST NOT encode an introduction whose names are not (`Introduction::check` says
+  which field; the reference encoder panics on one, as documented, and `qr_uri` answers
+  `None`).
 - **No other fields.** A producer MUST NOT emit fields not listed for the kind, and MUST NOT
-  emit a field twice, ScopePattern and RelayHint excepted.
+  emit a field twice, ScopePattern, RelayHint and RelayWire excepted.
 
 ### 4.4 Value encodings
 
@@ -197,6 +211,28 @@ Further producer rules:
     GenericNameComponents whose bytes are ASCII letters, digits, `-`, `_`, `.` and `~`, or be
     exactly a self-certifying namespace `/user/<h>` (`<h>` of TLV-TYPE `0xA1`, 32 octets,
     written `161=%xx…`; [trust-context.md](trust-context.md) §4.5).
+- **NamespaceWire.** The value is the namespace's components as a Name's value (each: type,
+  length, value), no outer Name TLV. A parser reads it to the canonical URI text of that
+  name (what `Name` displays); a value that is not a sequence of components is
+  Malformed("introduction name is not a Name").
+- **Relative name (OfferWire, RelayWire).** One octet `k`, then the remaining components as a
+  Name's value. The name is the first `k` components of the namespace followed by those. A
+  producer MUST write `k` as the number of leading components the name shares with the
+  namespace (at most 255; 0 when no namespace is written), so a self-certifying component
+  (type `0xA1`, 32 octets: 34 octets on the wire, not 96 characters of `161=%xx…`) that
+  the name shares with the namespace is not written again. A parser MUST refuse a value with
+  no `k` octet (Malformed("relative name has no shared count")), a `k` above the namespace's
+  number of components, or above 0 when the body has no namespace (Malformed("relative name
+  shares more than its namespace")), and a rest that is not a sequence of components
+  (Malformed("introduction name is not a Name")); it reads the name to its canonical URI text.
+  The namespace is the one of Namespace or NamespaceWire, whichever the body has; a text
+  namespace that is not an NDN URI is Malformed("introduction namespace is not an NDN URI"),
+  raised when a relative name needs it.
+  Because a relative name and NamespaceWire are read back as `Name`'s text, a keyword component
+  of the data layer (type 32) reads as `keyword=…`: the offer's `32=log` is `keyword=log`
+  (`Name` parses both spellings). The strings of an `Introduction` are therefore canonical
+  text, and `Introduction::check` refuses any that is not; links made before round 10 read to
+  the spelling they carried.
 - **UTF-8 string (Token, ScopePattern).** UTF-8 bytes, no terminator. A parser MUST reject
   invalid UTF-8.
   - The token grammar is `<role>-<secret>[-until<unix-secs>]` ([ndncert-extensions.md](ndncert-extensions.md)).
@@ -349,13 +385,16 @@ Producer rules:
 
   The consumer then fetches the context by name. That needs a link and a route to a node
   that serves the context ([ndn-link.md](ndn-link.md)).
-- **Long introductions.** If the `trust-uri` of an `intro` exceeds the limit, the producer
-  MUST drop RelayHint elements from the end, keeping the longest prefix of them that fits
-  (`TrustEnvelope::qr_uri`); Namespace, AnchorFingerprint, Offer and Secret are never dropped,
-  and LinkHint is kept whole. A LinkHint that still does not fit is shortened by its maker,
-  who knows its encoding (data-layer.md §19.2: candidates from the end, then the hint), and
-  `qr_uri` then answers for the shorter one. A joiner without hints reaches the inviter
-  through its own namespace's relays ([data-layer.md](data-layer.md) §19.3).
+- **Long introductions.** The compact form (§4.3) is the only one written. If the `trust-uri`
+  of an `intro` exceeds the limit, the producer MUST drop RelayWire elements from the end,
+  keeping the longest prefix of them that fits (`TrustEnvelope::qr_uri`); NamespaceWire,
+  AnchorFingerprint, OfferWire and Secret are never dropped, and LinkHint is kept whole. A
+  LinkHint that still does not fit is shortened by its maker, who knows its encoding
+  (data-layer.md §19.2: candidates from the end, then the hint), and `qr_uri` then answers for
+  the shorter one; the maker also caps the candidates and relays it offers by policy before
+  this (data-layer.md §19.2). `qr_uri` answers `None` for an introduction whose names fail
+  `Introduction::check`. A joiner without hints reaches the inviter through its own
+  namespace's relays ([data-layer.md](data-layer.md) §19.3).
 - Other kinds have no fallback: the producer refuses to render them, as it refuses an
   `intro` that does not fit without relay hints and a link hint.
 
@@ -422,6 +461,33 @@ fingerprint it is shown against them (128 bits of second-preimage resistance). I
 envelope: a parser of the forms of §5.2 refuses it, and a consumer that takes a code reads a
 text starting with `/` as words.
 
+**Checked words** (`words::encode_checked`, `words::decode_checked`) are the second codec, for
+the **short introduction code** (data-layer.md §19.2; the short code is a one-line text, not an
+envelope: a parser of the forms of §5.2 refuses it, and a consumer tells it from the 24-word
+form by its word count). They carry a payload of any length ≡ 4 (mod 11) octets (4, 15, 26,
+37, 48, …) with a 12-bit checksum that also covers a **bound text** the caller chooses (the
+short code binds the inviter's device name and first contact):
+
+- **Writing.** A payload of another length is refused (PayloadLength). The bit string is the
+  payload's octets, then the 12-bit checksum, big-endian; its length, `8·len + 12`, is a
+  multiple of 11. Each group of 11 bits, from the first, is an index (0–2047) into the BIP39
+  English list, and the words are joined by single spaces: 26 octets are 20 words, 48 octets
+  36.
+- **Checksum.** The first 12 bits of SHA-256(`ndn-trust/intro-short/1` ‖ the bound text's
+  UTF-8 octets ‖ `0x00` ‖ payload): the first octet of the digest, then the high 4 bits of
+  the second.
+- **Reading.** Whitespace separates the words; case and spacing do not matter. A parser MUST
+  refuse, in this order: a number of words that is not ≡ 4 (mod 8) (4, 12, 20, 28, 36, …,
+  BadCount); the first word off the list, by its position from 1 (UnknownWord), before the
+  checksum is judged; a checksum that does not match the payload and the bound text
+  (Checksum). A different bound text always fails the checksum, so the text the words are
+  bound to cannot be changed or mistyped unseen.
+- **Strength.** The checksum catches a typo, it does not authenticate: it has no key, and
+  anyone can compute it. A wrong word, or two words swapped, passes with probability
+  2⁻¹² (measured, data-layer.md §19.2).
+
+The 24-word codec above is unchanged, and the words form of an `intro` is still read.
+
 ## 6. Decoding and validation
 
 A parser MUST behave as follows. The error names are the reference implementation's. A parser
@@ -471,8 +537,12 @@ that the Kind defines (§4.3) is validated as it is read, and the first failure 
 - AnchorFingerprint: exactly 32 bytes, else Malformed("anchor fingerprint length").
 - Direction: exactly 1 byte, else Malformed("capability direction length").
 - Secret: exactly 16 bytes, else Malformed("introduction secret length").
-- A second occurrence of any field but ScopePattern and RelayHint: Malformed("repeated field").
-  ScopePattern and RelayHint accumulate in order. LinkHint's octets are not read here.
+- A second occurrence of any field but ScopePattern, RelayHint and RelayWire:
+  Malformed("repeated field"). ScopePattern, RelayHint and RelayWire accumulate in order.
+  Namespace and NamespaceWire are one field, as are Offer and OfferWire: a body with both of a
+  pair is Malformed("repeated field"). LinkHint's octets are not read here. NamespaceWire's
+  value is read here (Malformed("introduction name is not a Name")); a relative name is
+  resolved in pass 2.
 
 A field that the Kind does not define is unrecognized, whether its type is unassigned or
 defined for another kind (evolvability rule). For example:
@@ -489,7 +559,7 @@ defined for another kind (evolvability rule). For example:
 | recovery | Wire present (may be empty) | MissingField("recovery bundle") |
 | bag | KeyName, Wire present | MissingField("key name" / "safebag") |
 | capability | Direction present and `00` or `01`; Namespace, TtlSecs present | MissingField("direction") / Malformed("capability direction") / MissingField("capability namespace" / "capability ttl") |
-| intro | AnchorFingerprint, Offer, Secret present | MissingField("anchor fingerprint" / "offer" / "secret") |
+| intro | AnchorFingerprint, Secret present, and one of Offer or OfferWire; each relative name then resolves against the namespace (§4.4) | MissingField("anchor fingerprint" / "offer" / "secret"); the errors of §4.4 for a relative name |
 
 An `anchor` that carries both ContextData and Wire decodes with both fields set. Consumers
 use ContextData (§7.1).
@@ -499,6 +569,8 @@ use ContextData (§7.1).
 For every envelope the producer rules allow, decoding and then re-encoding MUST give the
 original bytes, and encoding and then decoding MUST give the original value. The vectors in §8
 are canonical. A conforming producer MUST reproduce them byte for byte from the stated values.
+
+One exception: an `intro` that carries the old text fields (Namespace, Offer, RelayHint) is not one a producer may write (§4.3). It decodes to the same value and re-encodes in the compact form, so it does not round-trip byte for byte; its decoded value round-trips.
 
 ## 7. Consumer checks (per kind)
 
@@ -598,16 +670,19 @@ These payload formats are outside this spec (§10, Q14).
 
 1. Offer MUST parse as an NDN Name that is a data-layer log entry of a folder,
    `<D>/32=log/<F>/seq=<n>`; `D` is the device it asks. An offer of the joiner's own namespace
-   is refused.
+   is refused. A **short code** is no envelope and carries no Offer: its offer is the one the
+   inviter's signed hint record names, checked as data-layer.md §19.3 says.
 2. Namespace, when present, MUST parse as a Name; the inviter's trust context the answer
    carries MUST root exactly it, and in any case a prefix of `D`.
 3. AnchorFingerprint is the expected fingerprint: the inviter's context MUST be signed by an
    anchor whose fingerprint equals it (in the words form, whose first 16 octets equal the 16
-   given, §5.8). The consumer adopts that context through its host only once the answer proves
-   the Secret and is signed by `D` under that anchor.
-4. Secret is used only to derive the offer's proof key; it is never sent, logged or kept.
-5. RelayHint elements are reachability hints: the joiner's Interests carry them as their
-   ForwardingHint, and nothing they say is trusted.
+   given, §5.8; in a short code of a named namespace, whose first 10 octets equal the 10
+   given, data-layer.md §19.2). The consumer adopts that context through its host only once
+   the answer proves the Secret and is signed by `D` under that anchor.
+4. Secret is used only to derive the offer's proof key (and, for a short code, its hint
+   token); it is never sent, logged or kept.
+5. RelayWire (and the old RelayHint) elements are reachability hints: the joiner's Interests
+   carry them as their ForwardingHint, and nothing they say is trusted.
 6. LinkHint is a reachability hint too: its key is what the joiner's dial proves, its
    addresses are where to try, and nothing in it is trusted for anything else (data-layer.md
    §19.7). One that does not read is ignored, and the join goes on without it.
