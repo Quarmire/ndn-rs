@@ -184,7 +184,8 @@ Further producer rules:
   cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). LinkHint, when
   present, comes once, after Secret. RelayWire elements keep their order: the relays the
   inviter's trust context advertises, in its order, at most the producer's policy allows
-  (data-layer.md §19.2: `IntroPolicy::code_relays`, 2 by default). The names MUST be
+  (data-layer.md §19.2: `IntroPolicy::code_relays`, 2 by default), and never more than
+  `HINT_RELAYS_MAX` (8, §6.5). The names MUST be
   canonical NDN URIs (§4.4), which the wire form reads back as exactly these strings: a
   producer MUST NOT encode an introduction whose names are not (`Introduction::check` says
   which field; the reference encoder panics on one, as documented, and `qr_uri` answers
@@ -392,8 +393,9 @@ Producer rules:
   LinkHint that still does not fit is shortened by its maker, who knows its encoding
   (data-layer.md §19.2: candidates from the end, then the hint), and `qr_uri` then answers for
   the shorter one; the maker also caps the candidates and relays it offers by policy before
-  this (data-layer.md §19.2). `qr_uri` answers `None` for an introduction whose names fail
-  `Introduction::check`. A joiner without hints reaches the inviter through its own
+  this (data-layer.md §19.2). `qr_uri` writes at most `HINT_RELAYS_MAX` relays (§6.5), answers
+  `None` for an introduction whose link hint is over `LINK_HINT_MAX`, and `None` for one whose
+  names fail `Introduction::check`. A joiner without hints reaches the inviter through its own
   namespace's relays ([data-layer.md](data-layer.md) §19.3).
 - Other kinds have no fallback: the producer refuses to render them, as it refuses an
   `intro` that does not fit without relay hints and a link hint.
@@ -504,6 +506,7 @@ types.
 
 ### 6.1 Outer element
 
+0. A buffer over `ENVELOPE_MAX` octets is refused first, unread: TooLarge("envelope") (§6.5).
 1. Read one TLV from the start of the buffer. An empty or truncated buffer, or a malformed
    VAR-NUMBER, gives Truncated.
 2. If its type is not `0x0470`, the result is BadTag(type).
@@ -538,11 +541,12 @@ that the Kind defines (§4.3) is validated as it is read, and the first failure 
 - Direction: exactly 1 byte, else Malformed("capability direction length").
 - Secret: exactly 16 bytes, else Malformed("introduction secret length").
 - A second occurrence of any field but ScopePattern, RelayHint and RelayWire:
-  Malformed("repeated field"). ScopePattern, RelayHint and RelayWire accumulate in order.
+  Malformed("repeated field"). ScopePattern, RelayHint and RelayWire accumulate in order, up to
+  the limits of §6.5.
   Namespace and NamespaceWire are one field, as are Offer and OfferWire: a body with both of a
-  pair is Malformed("repeated field"). LinkHint's octets are not read here. NamespaceWire's
-  value is read here (Malformed("introduction name is not a Name")); a relative name is
-  resolved in pass 2.
+  pair is Malformed("repeated field"). LinkHint's octets are not read here, only counted
+  (§6.5). NamespaceWire's value is judged for its size (§6.5) and read here
+  (Malformed("introduction name is not a Name")); a relative name is resolved in pass 2.
 
 A field that the Kind does not define is unrecognized, whether its type is unassigned or
 defined for another kind (evolvability rule). For example:
@@ -571,6 +575,43 @@ original bytes, and encoding and then decoding MUST give the original value. The
 are canonical. A conforming producer MUST reproduce them byte for byte from the stated values.
 
 One exception: an `intro` that carries the old text fields (Namespace, Offer, RelayHint) is not one a producer may write (§4.3). It decodes to the same value and re-encodes in the compact form, so it does not round-trip byte for byte; its decoded value round-trips.
+
+### 6.5 Limits
+
+A parser MUST refuse an input over any limit below, before it does work that grows with the
+input (a copy, a base64 decode, text built from names). A refusal says what is too large or too
+many and that the sender must make a new link or code: nothing is decoded in part. The limits
+are constants of the reference implementation and part of the format: every producer stays
+within them (§4.3), so a parser may rely on them.
+
+| Limit | Value | Refusal | Judged |
+|---|---|---|---|
+| Envelope (`ENVELOPE_MAX`) | 262144 octets (256 KiB) | TooLarge("envelope") | on the TLV octets, before they are copied or read |
+| Link text | 349526 characters: the base64url length (§5.1) of `ENVELOPE_MAX` octets | TooLarge("link text") | on the payload of every text form (§5.2, including the legacy `ndn-ctx:1:`), after surrounding whitespace is removed, before it is decoded |
+| Name (`NAME_WIRE_MAX`) | 8800 octets of wire: the NDN packet limit | TooLarge("introduction namespace" / "offer" / "relay") | on NamespaceWire's value; on the namespace once a text Namespace is read as a name; on a relative name's own components; and on the whole name a relative name stands for (the shared components and its own), each before the name's text is built |
+| Relays (`HINT_RELAYS_MAX`) | 8 elements: RelayWire and RelayHint together | TooMany("relays") | when the ninth is read, before it is kept |
+| Scope patterns (`SCOPE_PATTERNS_MAX`) | 64 | TooMany("scope patterns") | when the 65th is read |
+| LinkHint (`LINK_HINT_MAX`) | 1024 octets | TooLarge("link hint") | on the value, which is not read otherwise |
+
+Why these bounds:
+- A relative name that shares the namespace stands for a name as long as the namespace, and
+  is a few octets on the wire. Without the relay and name limits a link of 100 KB whose
+  namespace is one 50 KB component and which carries 10000 relays made a parser build
+  about 1.5 GB of text before any check. With them, what a link makes a parser allocate is at
+  most a constant (about 240 KB beyond the copy of the envelope: the offer and 8 relays, each
+  at most 3 characters per octet of an 8800-octet name).
+- 256 KiB holds every envelope a device makes: an inline anchor is one signed context Data
+  (about 2 KB for `/home/bob`, 8800 octets at most), a SafeBag or kit bag about 1 KB, a
+  recovery bundle (public history) 128 contexts of 2 KB, the longest version walk of
+  [recovery-kit.md](recovery-kit.md). A QR code holds at most 2331 characters (§5.6).
+- The relay limit is the data layer's `HINT_RELAYS_MAX` ([data-layer.md](data-layer.md) §19):
+  one value in both. An introduction names at most 2 relays by policy (§4.3).
+- The link hint is opaque here; its limit is far above the data layer's encoding (a 32-octet
+  key and at most 8 candidates, about 220 octets) and keeps what a decoder copies bounded.
+
+A producer MUST NOT write an envelope over a limit. `qr_uri` writes at most `HINT_RELAYS_MAX`
+relays of an introduction and answers `None` for one whose link hint is over `LINK_HINT_MAX`
+(§5.6): it never shows a link a parser refuses.
 
 ## 7. Consumer checks (per kind)
 
@@ -676,8 +717,9 @@ These payload formats are outside this spec (§10, Q14).
    carries MUST root exactly it, and in any case a prefix of `D`.
 3. AnchorFingerprint is the expected fingerprint: the inviter's context MUST be signed by an
    anchor whose fingerprint equals it (in the words form, whose first 16 octets equal the 16
-   given, §5.8; in a short code of a named namespace, whose first 10 octets equal the 10
-   given, data-layer.md §19.2). The consumer adopts that context through its host only once
+   given, §5.8; in a short code of a named namespace, whose keyed fingerprint — the first 10
+   octets of HMAC-SHA256 under the code's secret over the anchor's whole fingerprint — equals
+   the 10 given, data-layer.md §19.2). The consumer adopts that context through its host only once
    the answer proves the Secret and is signed by `D` under that anchor.
 4. Secret is used only to derive the offer's proof key (and, for a short code, its hint
    token); it is never sent, logged or kept.
@@ -911,6 +953,11 @@ means the decode succeeds.
   shown again; the fresh Nonce lets a granting device notice (§7.4).
 - **Kind token.** A URI whose token disagrees with its Kind is refused (§5.2), so a link
   cannot be routed to one flow while carrying another kind.
+- **Size and amplification.** A relative name is a few octets on the wire and stands for a name
+  as long as its namespace, so a small link can describe a very large amount of text. The
+  decoder bounds the envelope, every name and the number of relays before it builds
+  anything from them (§6.5): a link cannot make a parser allocate more than a constant, and
+  a refusal costs a few kilobytes.
 
 ## 10. Open questions
 

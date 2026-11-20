@@ -54,12 +54,20 @@
 //! evolvability rule for anything it does not recognize in its place
 //! (an unknown child, or a field another kind uses): ignored when its type
 //! is non-critical (even and above 31), refused when it is critical.
+//!
+//! It is bounded as strictly: an envelope over [`ENVELOPE_MAX`], a name over
+//! [`NAME_WIRE_MAX`] (the namespace, a relative name's rest, and the name a
+//! relative name stands for), more than [`HINT_RELAYS_MAX`] relays, more than
+//! [`SCOPE_PATTERNS_MAX`] scope patterns and a link hint over
+//! [`LINK_HINT_MAX`] are refused ([`EnvelopeError::TooLarge`],
+//! [`EnvelopeError::TooMany`]) before the work that scales with them, so a
+//! small link cannot make a device allocate more than a constant.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
-use ndn_tlv::{TlvReader, TlvWriter};
+use ndn_tlv::{TlvReader, TlvWriter, varu64_size};
 use thiserror::Error;
 
 pub mod qr;
@@ -115,6 +123,41 @@ pub const INTRO_SECRET_LEN: usize = 16;
 /// How many octets of the anchor fingerprint an introduction's words form
 /// carries (the first half: 128-bit second-preimage resistance).
 pub const INTRO_WORDS_FINGERPRINT_LEN: usize = 16;
+
+/// The most octets an envelope may have, as TLV: the decoder refuses a larger
+/// one before it copies or reads it (a link's base64url text is judged before
+/// it is decoded), so what a link can make a device allocate is bounded by a
+/// constant. The largest kinds a device makes: an inline anchor (one signed
+/// context Data: 2 KB measured for `/home/bob`, never more than an NDN packet,
+/// [`NAME_WIRE_MAX`]), a SafeBag or kit bag (about 1 KB), and a recovery bundle
+/// (public history: its format is not fixed by a spec in this repo, but 128
+/// contexts of 2 KB, the longest version walk of recovery-kit.md, fit in it).
+/// 256 KiB holds all of these with room to spare.
+pub const ENVELOPE_MAX: usize = 256 * 1024;
+
+/// The most octets of wire a name of an envelope may have: the NDN packet
+/// limit (`MAX_NDN_PACKET_SIZE`, 8800), since a name that cannot be in one
+/// packet cannot be a name of anything fetched. Judged for a namespace, for a
+/// relative name's own components, and for the whole name a relative name
+/// stands for (shared components and its own), before any text is built.
+pub const NAME_WIRE_MAX: usize = 8800;
+
+/// The most relays an introduction names: the data layer's relay bound
+/// (`ndn_data::HINT_RELAYS_MAX`, which is this value), far above what a code
+/// carries (`IntroPolicy::code_relays`, 2 by default). Each relay stands for a
+/// name as long as the namespace, so the count is what bounds what the
+/// relays of one link make a device build.
+pub const HINT_RELAYS_MAX: usize = 8;
+
+/// The most scope patterns a capability names. A pairing grants a handful;
+/// the decoder refuses a count no device writes.
+pub const SCOPE_PATTERNS_MAX: usize = 64;
+
+/// The most octets of link hint an introduction carries. The hint is opaque
+/// here: this crate never reads it. The data layer's encoding is a 32-octet
+/// key and at most `LINK_HINT_CANDIDATES_MAX` (8) candidates of 23 octets, about
+/// 220 octets; the limit leaves room for fields a later hint adds.
+pub const LINK_HINT_MAX: usize = 1024;
 
 const SCHEME: &str = "ndn-trust://";
 const MIRROR_SCHEME: &str = "https://";
@@ -602,8 +645,10 @@ impl TrustEnvelope {
         }
     }
 
-    /// Decode the TLV container (trust-envelope.md §6).
+    /// Decode the TLV container (trust-envelope.md §6). An envelope over
+    /// [`ENVELOPE_MAX`] is refused before it is copied or read.
     pub fn decode(wire: &[u8]) -> Result<Self, EnvelopeError> {
+        check_envelope_len(wire.len())?;
         let mut outer = TlvReader::new(Bytes::copy_from_slice(wire));
         let (typ, body) = outer.read_tlv().map_err(|_| EnvelopeError::Truncated)?;
         if typ != T_ENVELOPE {
@@ -693,7 +738,15 @@ impl TrustEnvelope {
                 T_PRINCIPAL_PUBKEY => set_once(&mut principal_pubkey, v)?,
                 T_KEY_NAME => set_once(&mut key_name, read_str(&v)?)?,
                 T_NAMESPACE => set_once(&mut namespace, read_str(&v)?)?,
-                T_SCOPE_PATTERN => scope_patterns.push(read_str(&v)?),
+                T_SCOPE_PATTERN => {
+                    if scope_patterns.len() == SCOPE_PATTERNS_MAX {
+                        return Err(EnvelopeError::TooMany {
+                            what: "scope patterns",
+                            limit: SCOPE_PATTERNS_MAX,
+                        });
+                    }
+                    scope_patterns.push(read_str(&v)?)
+                }
                 T_NONCE => set_once(&mut nonce, v)?,
                 T_GRANT => set_once(&mut grant, v)?,
                 T_DIRECTION => {
@@ -714,10 +767,35 @@ impl TrustEnvelope {
                         .try_into()
                         .map_err(|_| EnvelopeError::Malformed("introduction secret length"))?,
                 )?,
-                T_LINK_HINT => set_once(&mut link_hint, v)?,
-                T_RELAY_HINT => relay_items.push(Ok(read_str(&v)?)),
-                T_RELAY_WIRE => relay_items.push(Err(v)),
-                T_NAMESPACE_WIRE => set_once(&mut namespace, read_wire_name(v)?.to_string())?,
+                T_LINK_HINT => {
+                    if v.len() > LINK_HINT_MAX {
+                        return Err(EnvelopeError::TooLarge {
+                            what: "link hint",
+                            len: v.len(),
+                            limit: LINK_HINT_MAX,
+                        });
+                    }
+                    set_once(&mut link_hint, v)?
+                }
+                T_RELAY_HINT | T_RELAY_WIRE => {
+                    // Before the item is kept: what the relays copy of the
+                    // namespace is bounded by how many there are.
+                    if relay_items.len() == HINT_RELAYS_MAX {
+                        return Err(EnvelopeError::TooMany {
+                            what: "relays",
+                            limit: HINT_RELAYS_MAX,
+                        });
+                    }
+                    relay_items.push(if t == T_RELAY_HINT {
+                        Ok(read_str(&v)?)
+                    } else {
+                        Err(v)
+                    });
+                }
+                T_NAMESPACE_WIRE => {
+                    check_name_len("introduction namespace", v.len())?;
+                    set_once(&mut namespace, read_wire_name(v)?.to_string())?
+                }
                 _ => unreachable!("every type in body_fields() has an arm"),
             }
         }
@@ -777,22 +855,27 @@ impl TrustEnvelope {
                 // carried it.
                 let needs_base = offer_wire.is_some() || relay_items.iter().any(Result::is_err);
                 let base = match (&namespace, needs_base) {
-                    (Some(ns), true) => Some(ns.parse::<Name>().map_err(|_| {
-                        EnvelopeError::Malformed("introduction namespace is not an NDN URI")
-                    })?),
+                    (Some(ns), true) => {
+                        let base = ns.parse::<Name>().map_err(|_| {
+                            EnvelopeError::Malformed("introduction namespace is not an NDN URI")
+                        })?;
+                        // Judged before any relative name copies it.
+                        check_name_len("introduction namespace", wire_len(base.components()))?;
+                        Some(base)
+                    }
                     _ => None,
                 };
                 let offer = match (offer, offer_wire) {
                     (Some(_), Some(_)) => return Err(EnvelopeError::Malformed("repeated field")),
                     (Some(text), None) => text,
-                    (None, Some(wire)) => resolve_relative(&wire, base.as_ref())?,
+                    (None, Some(wire)) => resolve_relative("offer", &wire, base.as_ref())?,
                     (None, None) => return Err(need("offer")),
                 };
                 let relays = relay_items
                     .into_iter()
                     .map(|r| match r {
                         Ok(text) => Ok(text),
-                        Err(wire) => resolve_relative(&wire, base.as_ref()),
+                        Err(wire) => resolve_relative("relay", &wire, base.as_ref()),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 TrustEnvelope::Intro(Introduction {
@@ -831,13 +914,28 @@ impl TrustEnvelope {
     /// the same anchor by reference (namespace, expected fingerprint and
     /// version, no context: the adopting device fetches the context by name);
     /// for an introduction that does not, the same with as many of its
-    /// relay hints, in order, as fit (its link hint stays whole: its maker,
+    /// relay hints, in order, as fit (at most [`HINT_RELAYS_MAX`], what a
+    /// decoder takes; its link hint stays whole: its maker,
     /// which knows the encoding, offers a smaller one). `None` when none
-    /// fits, and for an introduction whose names fail
-    /// [`Introduction::check`] (they cannot be written).
+    /// fits, for an introduction whose names fail
+    /// [`Introduction::check`] (they cannot be written), and for one whose
+    /// link hint is over [`LINK_HINT_MAX`] (a decoder refuses it).
     pub fn qr_uri(&self) -> Option<String> {
-        if matches!(self, TrustEnvelope::Intro(i) if i.check().is_err()) {
-            return None;
+        if let TrustEnvelope::Intro(i) = self {
+            if i.check().is_err()
+                || i.link_hint
+                    .as_ref()
+                    .is_some_and(|h| h.len() > LINK_HINT_MAX)
+            {
+                return None;
+            }
+            if i.relays.len() > HINT_RELAYS_MAX {
+                return TrustEnvelope::Intro(Introduction {
+                    relays: i.relays[..HINT_RELAYS_MAX].to_vec(),
+                    ..i.clone()
+                })
+                .qr_uri();
+            }
         }
         let uri = self.to_uri();
         if uri.len() <= qr::MAX_TEXT_LEN {
@@ -886,9 +984,7 @@ impl TrustEnvelope {
                 return Err(EnvelopeError::MalformedUri);
             }
             let version = ver.parse().map_err(|_| EnvelopeError::MalformedUri)?;
-            let content = B64
-                .decode(b64.trim())
-                .map_err(|_| EnvelopeError::BadBase64)?;
+            let content = decode_b64(b64)?;
             return Ok(TrustEnvelope::Anchor {
                 namespace: None,
                 fingerprint: None,
@@ -920,9 +1016,7 @@ impl TrustEnvelope {
             return Err(EnvelopeError::UnknownScheme);
         };
 
-        let wire = B64
-            .decode(b64.trim())
-            .map_err(|_| EnvelopeError::BadBase64)?;
+        let wire = decode_b64(b64)?;
         let envelope = Self::decode(&wire)?;
         if token != envelope.kind().as_str() {
             return Err(EnvelopeError::KindMismatch {
@@ -994,10 +1088,40 @@ fn read_wire_name(value: Bytes) -> Result<Name, EnvelopeError> {
     Name::decode(value).map_err(|_| EnvelopeError::Malformed("introduction name is not a Name"))
 }
 
+/// How many octets `components` take as a Name's value: each one's type,
+/// length and value.
+fn wire_len<'a>(components: impl IntoIterator<Item = &'a NameComponent>) -> usize {
+    components
+        .into_iter()
+        .map(|c| varu64_size(c.typ) + varu64_size(c.value.len() as u64) + c.value.len())
+        .sum()
+}
+
+/// A name's wire form must fit a packet ([`NAME_WIRE_MAX`]); `what` is the
+/// field, for the refusal.
+fn check_name_len(what: &'static str, len: usize) -> Result<(), EnvelopeError> {
+    if len > NAME_WIRE_MAX {
+        return Err(EnvelopeError::TooLarge {
+            what,
+            len,
+            limit: NAME_WIRE_MAX,
+        });
+    }
+    Ok(())
+}
+
 /// The URI of the name a relative name stands for: its shared leading
-/// components of `base` (the namespace), then its own.
-fn resolve_relative(value: &Bytes, base: Option<&Name>) -> Result<String, EnvelopeError> {
-    let (&shared, _) = value.split_first().ok_or(EnvelopeError::Malformed(
+/// components of `base` (the namespace), then its own. `what` is the field
+/// (`"offer"`, `"relay"`), for a refusal. The sizes are judged before any text
+/// is built: the value's own rest first, then the whole name, so a relative
+/// name that shares a long namespace costs what the name it stands for may,
+/// never more.
+fn resolve_relative(
+    what: &'static str,
+    value: &Bytes,
+    base: Option<&Name>,
+) -> Result<String, EnvelopeError> {
+    let (&shared, rest) = value.split_first().ok_or(EnvelopeError::Malformed(
         "relative name has no shared count",
     ))?;
     let shared = usize::from(shared);
@@ -1010,8 +1134,38 @@ fn resolve_relative(value: &Bytes, base: Option<&Name>) -> Result<String, Envelo
             ));
         }
     };
+    check_name_len(what, rest.len())?;
     let tail = read_wire_name(value.slice(1..))?;
+    check_name_len(what, wire_len(prefix) + rest.len())?;
     Ok(Name::from_components(prefix.iter().chain(tail.components()).cloned()).to_string())
+}
+
+/// An envelope of `len` octets must not be over [`ENVELOPE_MAX`].
+fn check_envelope_len(len: usize) -> Result<(), EnvelopeError> {
+    if len > ENVELOPE_MAX {
+        return Err(EnvelopeError::TooLarge {
+            what: "envelope",
+            len,
+            limit: ENVELOPE_MAX,
+        });
+    }
+    Ok(())
+}
+
+/// The octets of a link's base64url payload. Its text is judged before it is
+/// decoded: the longest text of an envelope of [`ENVELOPE_MAX`] octets, so a
+/// link too long to hold one costs nothing and what decodes fits the limit.
+fn decode_b64(text: &str) -> Result<Vec<u8>, EnvelopeError> {
+    let text = text.trim();
+    let limit = (ENVELOPE_MAX * 4).div_ceil(3);
+    if text.len() > limit {
+        return Err(EnvelopeError::TooLarge {
+            what: "link text",
+            len: text.len(),
+            limit,
+        });
+    }
+    B64.decode(text).map_err(|_| EnvelopeError::BadBase64)
 }
 
 /// A one-byte field value; any other length is refused.
@@ -1060,6 +1214,20 @@ pub enum EnvelopeError {
     UnknownCritical(u64),
     #[error("the link says it is a {uri:?} link, but it carries a {envelope} envelope")]
     KindMismatch { uri: String, envelope: &'static str },
+    #[error(
+        "the {what} is {len} octets, over the limit of {limit}: a trust link this large is not one \
+         a device made; ask the sender for a new link or code"
+    )]
+    TooLarge {
+        what: &'static str,
+        len: usize,
+        limit: usize,
+    },
+    #[error(
+        "the link carries more than {limit} {what}: a trust link with so many is not one a \
+         device made; ask the sender for a new link or code"
+    )]
+    TooMany { what: &'static str, limit: usize },
 }
 
 #[cfg(test)]
@@ -1673,6 +1841,33 @@ mod tests {
             ..intro(0)
         });
         assert_eq!(huge.qr_uri(), None);
+    }
+
+    /// What `qr_uri` shows, a decoder takes: at most `HINT_RELAYS_MAX`
+    /// relays, and no link hint over `LINK_HINT_MAX` (none is shown).
+    #[test]
+    fn what_qr_uri_shows_decodes() {
+        let many = TrustEnvelope::Intro(intro(HINT_RELAYS_MAX + 12));
+        assert!(many.to_uri().len() <= qr::MAX_TEXT_LEN, "it would fit a QR");
+        assert!(matches!(
+            TrustEnvelope::from_uri(&many.to_uri()),
+            Err(EnvelopeError::TooMany { .. })
+        ));
+        let TrustEnvelope::Intro(kept) = TrustEnvelope::from_uri(&many.qr_uri().unwrap()).unwrap()
+        else {
+            panic!("an introduction");
+        };
+        assert_eq!(kept.relays[..], intro(HINT_RELAYS_MAX).relays[..]);
+
+        let big_hint = TrustEnvelope::Intro(Introduction {
+            link_hint: Some(Bytes::from(vec![0x5A; LINK_HINT_MAX + 1])),
+            ..intro(0)
+        });
+        assert!(
+            big_hint.to_uri().len() <= qr::MAX_TEXT_LEN,
+            "it would fit a QR"
+        );
+        assert_eq!(big_hint.qr_uri(), None, "but no decoder takes it");
     }
 
     /// A reader that knows no link hint (an even type) skips it; the type is
