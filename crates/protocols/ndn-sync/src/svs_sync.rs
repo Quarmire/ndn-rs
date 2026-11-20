@@ -571,7 +571,19 @@ async fn svs_task(
             wake = wake.min(now + PENDING_RETRY);
         }
 
+        // `biased`, so two ready branches at the same (virtual) instant are taken in
+        // the same order every run: `select!` otherwise picks among them from an RNG a
+        // paused runtime does not seed, and the order of Sync Interests on a link (and
+        // so what a seeded fault layer does to each) changed from process to process.
+        // Order: shutdown; the timer; what the local application hands in (acks,
+        // publications); then what the network sends. None starves another: the
+        // timer is re-armed to a later deadline each time it fires, so it cannot stay
+        // ready; the local channels are fed only by the application, which awaits
+        // their bounded capacity; and the network, the only source an outsider can
+        // flood, comes last, so a flood delays inbound work, never the node's own
+        // announcements or its application's publications.
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => break,
 
             // Portable `sleep_until(wake)`. On wake, emit only if the *periodic*
@@ -583,14 +595,14 @@ async fn svs_task(
                 }
             }
 
-            Some(raw) = recv.recv() => { gc.on_inbound(&raw, &send).await; }
+            Some((key, seq)) = ack_rx.recv() => { gc.on_ack(&key, seq).await; }
 
             Some((pub_name, mapping)) = publish_rx.recv() => {
                 let _ = pub_name;
                 gc.on_publish(mapping, &send).await;
             }
 
-            Some((key, seq)) = ack_rx.recv() => { gc.on_ack(&key, seq).await; }
+            Some(raw) = recv.recv() => { gc.on_inbound(&raw, &send).await; }
         }
     }
 }

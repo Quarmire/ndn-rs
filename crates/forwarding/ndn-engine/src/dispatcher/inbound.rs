@@ -172,6 +172,7 @@ pub(crate) async fn run_face_reader(
                 drop(tx);
                 drop(face);
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {}
                     _ = runtime.sleep(APP_FACE_DRAIN) => {}
                 }

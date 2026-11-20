@@ -119,6 +119,7 @@ pub fn spawn_status_watch(
                 }
             };
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return,
                 _ = p.requests_changed.notified() => {}
                 _ = tokio::time::sleep(read_again.unwrap_or(RETRY_MAX)), if read_again.is_some() => {}
@@ -181,6 +182,7 @@ pub async fn wait_for_decision(
                     return Waited::Unreadable(e);
                 }
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return Waited::Unreadable(e),
                     _ = tokio::time::sleep(RETRY_MAX) => continue,
                 }
@@ -220,6 +222,7 @@ pub async fn wait_for_decision(
         };
         let asked = Instant::now();
         let status = tokio::select! {
+            biased;
             _ = cancel.cancelled() => return still_pending(request, not_reached),
             status = ndn_identity::request_status_via_engine(
                 p.engine(),
@@ -319,6 +322,7 @@ pub async fn wait_for_decision(
         if let Some(pause) = pause {
             retry = (retry * 2).min(RETRY_MAX);
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return still_pending(request, not_reached),
                 _ = tokio::time::sleep(pause) => {}
             }

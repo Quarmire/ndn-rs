@@ -13,7 +13,7 @@
 //!   entry with the longer name
 //!   (`PSync/detail/state.hpp:27`, `segment-publisher.cpp:37`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,13 +71,13 @@ pub(crate) fn append_seq(prefix: &Name, seq: u64) -> Name {
 pub(crate) struct ProducerBase {
     node: PSyncNode,
     /// prefix (sans seq) → latest seq.
-    prefixes: HashMap<Name, u64>,
+    prefixes: BTreeMap<Name, u64>,
     /// IBLT hash → the full `<prefix>/<seq>` name (relay-capable).
-    hash2name: HashMap<u32, Name>,
+    hash2name: BTreeMap<u32, Name>,
     /// `<prefix>/<seq>` name → IBLT hash (for erase).
-    name2hash: HashMap<Name, u32>,
+    name2hash: BTreeMap<Name, u32>,
     /// Optional per-name application mapping (in-process fast-path).
-    mappings: HashMap<u32, Bytes>,
+    mappings: BTreeMap<u32, Bytes>,
     /// Cumulative element count carried in the Sync Interest
     /// (C++ `m_numOwnElements`; drives the decode-failure heuristic).
     pub(crate) num_own_elements: u64,
@@ -87,10 +87,10 @@ impl ProducerBase {
     pub(crate) fn new(ibf_count: usize) -> Self {
         Self {
             node: PSyncNode::new(ibf_count),
-            prefixes: HashMap::new(),
-            hash2name: HashMap::new(),
-            name2hash: HashMap::new(),
-            mappings: HashMap::new(),
+            prefixes: BTreeMap::new(),
+            hash2name: BTreeMap::new(),
+            name2hash: BTreeMap::new(),
+            mappings: BTreeMap::new(),
             num_own_elements: 0,
         }
     }
@@ -146,7 +146,7 @@ impl ProducerBase {
         }
     }
 
-    pub(crate) fn names_for_hashes(&self, hashes: &std::collections::HashSet<u32>) -> Vec<Name> {
+    pub(crate) fn names_for_hashes(&self, hashes: &BTreeSet<u32>) -> Vec<Name> {
         hashes
             .iter()
             .filter_map(|h| self.hash2name.get(h).cloned())
@@ -162,13 +162,7 @@ impl ProducerBase {
         self.node.build_ibf()
     }
 
-    pub(crate) fn reconcile(
-        &self,
-        peer: &Ibf,
-    ) -> Option<(
-        std::collections::HashSet<u32>,
-        std::collections::HashSet<u32>,
-    )> {
+    pub(crate) fn reconcile(&self, peer: &Ibf) -> Option<(BTreeSet<u32>, BTreeSet<u32>)> {
         self.node.reconcile(peer)
     }
 
@@ -284,9 +278,9 @@ async fn psync_task(
     cancel: CancellationToken,
 ) {
     let mut pb = ProducerBase::new(config.ibf_count);
-    let mut pending: HashMap<Name, PendingEntry> = HashMap::new();
+    let mut pending: BTreeMap<Name, PendingEntry> = BTreeMap::new();
     // Producer: segments of large Sync Data we've sent, served on re-fetch.
-    let mut seg_store: HashMap<Name, Bytes> = HashMap::new();
+    let mut seg_store: BTreeMap<Name, Bytes> = BTreeMap::new();
     // Consumer: in-flight segment fetches keyed by segment name.
     let seg_pending: SegPending = Arc::new(Mutex::new(HashMap::new()));
     // Reassembled multi-segment replies flow back here from spawned fetchers.
@@ -297,6 +291,10 @@ async fn psync_task(
         let interval = config.sync_interval + jitter;
 
         tokio::select! {
+            // `biased` (see `svs_task`): same order every run. Shutdown, the timer
+            // (re-armed each pass, so it cannot starve the others), the node's own
+            // reassemblies and publications, then the network.
+            biased;
             _ = cancel.cancelled() => break,
 
             _ = rt::sleep(interval) => {
@@ -308,6 +306,13 @@ async fn psync_task(
             // A spawned reassembly finished: learn its names like any reply.
             Some(names) = reasm_rx.recv() => {
                 apply_learned(&mut pb, &names, &update_tx, &mut pending, &send, &mut seg_store, &config).await;
+            }
+
+            Some((pub_name, mapping)) = publish_rx.recv() => {
+                if pb.apply(&pub_name, mapping).is_some() {
+                    satisfy_pending(&mut pending, &pb, &send, &mut seg_store, &config).await;
+                    send_sync_interest(&group, &pb, &send).await;
+                }
             }
 
             Some(inbound) = recv.recv() => {
@@ -348,13 +353,6 @@ async fn psync_task(
                     handle_sync_interest(&group, &raw, &config, &pb, &mut pending, &send, &mut seg_store, reply).await;
                 }
             }
-
-            Some((pub_name, mapping)) = publish_rx.recv() => {
-                if pb.apply(&pub_name, mapping).is_some() {
-                    satisfy_pending(&mut pending, &pb, &send, &mut seg_store, &config).await;
-                    send_sync_interest(&group, &pb, &send).await;
-                }
-            }
         }
     }
 }
@@ -367,9 +365,9 @@ async fn apply_learned(
     pb: &mut ProducerBase,
     names: &[Name],
     update_tx: &mpsc::Sender<SyncUpdate>,
-    pending: &mut HashMap<Name, PendingEntry>,
+    pending: &mut BTreeMap<Name, PendingEntry>,
     send: &mpsc::Sender<Bytes>,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     config: &PSyncConfig,
 ) {
     let mut advanced = false;
@@ -449,6 +447,8 @@ fn seg_express(send: mpsc::Sender<Bytes>, pending: SegPending) -> crate::transfe
                 return None;
             }
             let res = tokio::select! {
+                // A reply that arrived by the deadline counts: it is polled before the timeout.
+                biased;
                 r = rx => r.ok(),
                 _ = rt::sleep(Duration::from_secs(2)) => None,
             };
@@ -481,7 +481,7 @@ async fn send_state_segmented(
     interest_name: &Name,
     names: &[Name],
     config: &PSyncConfig,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     send: &mpsc::Sender<Bytes>,
 ) {
     let segs = segment_sync_data(interest_name, names, config.max_segment_size);
@@ -511,9 +511,9 @@ async fn handle_sync_interest(
     raw: &[u8],
     config: &PSyncConfig,
     pb: &ProducerBase,
-    pending: &mut HashMap<Name, PendingEntry>,
+    pending: &mut BTreeMap<Name, PendingEntry>,
     send: &mpsc::Sender<Bytes>,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     reply: Option<oneshot::Sender<Bytes>>,
 ) {
     let Some((peer_ibf, num_elems, interest_name)) =
@@ -581,10 +581,10 @@ async fn handle_sync_interest(
 /// Walk held Sync Interests; satisfy any whose recomputed diff now yields
 /// names we can send (audit #3).
 async fn satisfy_pending(
-    pending: &mut HashMap<Name, PendingEntry>,
+    pending: &mut BTreeMap<Name, PendingEntry>,
     pb: &ProducerBase,
     send: &mpsc::Sender<Bytes>,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     config: &PSyncConfig,
 ) {
     let mut satisfied: Vec<Name> = Vec::new();
@@ -990,6 +990,87 @@ mod tests {
             "duplicate plain name is a no-op"
         );
         assert_eq!(pb.node.len(), 1);
+    }
+
+    /// What a producer offers, and in what order, depends on its set alone: not on the order
+    /// names were learned in, and not on a per-process hash seed. (The order of names in a Sync
+    /// Data is on the wire, and so is what a seeded fault layer meets first.)
+    #[test]
+    fn offered_names_do_not_depend_on_insertion_order_or_hash_seed() {
+        let names: Vec<Name> = (0..24u64)
+            .map(|i| append_seq(&format!("/peer/{i}/NAME").parse().unwrap(), 1 + i))
+            .collect();
+        let mut forward = ProducerBase::new(80);
+        let mut backward = ProducerBase::new(80);
+        for n in &names {
+            forward.apply(n, None);
+        }
+        for n in names.iter().rev() {
+            backward.apply(n, None);
+        }
+        let empty = ProducerBase::new(80).build_ibf();
+        let (we_have, _) = forward.reconcile(&empty).expect("decodes");
+        let (we_have_too, _) = backward.reconcile(&empty).expect("decodes");
+        assert_eq!(forward.names_for_hashes(&we_have).len(), names.len());
+        assert_eq!(
+            forward.names_for_hashes(&we_have),
+            backward.names_for_hashes(&we_have_too),
+            "the names a reconcile offers are in one order"
+        );
+        assert_eq!(
+            forward.state_names(),
+            backward.state_names(),
+            "the whole set is offered in one order"
+        );
+    }
+
+    /// Held Sync Interests satisfied by one publication are answered in the order of their
+    /// names, not in the order a hash table happens to hold them.
+    #[tokio::test]
+    async fn held_interests_are_answered_in_name_order() {
+        let mut pb = ProducerBase::new(80);
+        pb.apply(&append_seq(&"/peer/x/NAME".parse().unwrap(), 3), None);
+        let held: Vec<Name> = ["e", "b", "d", "a", "c", "g", "f"]
+            .iter()
+            .map(|c| format!("/g/sync/{c}").parse().unwrap())
+            .collect();
+        let peer_ibf = ProducerBase::new(80).build_ibf();
+        // The map's type is `satisfy_pending`'s parameter's.
+        let mut pending = held
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    PendingEntry {
+                        peer_ibf: peer_ibf.clone(),
+                        expires_at: Instant::now() + PENDING_LIFETIME,
+                    },
+                )
+            })
+            .collect();
+        let (send, mut sent) = mpsc::channel(64);
+        let mut seg_store = Default::default();
+        satisfy_pending(
+            &mut pending,
+            &pb,
+            &send,
+            &mut seg_store,
+            &PSyncConfig::default(),
+        )
+        .await;
+        let mut answered = Vec::new();
+        while let Ok(wire) = sent.try_recv() {
+            let data = ndn_packet::Data::decode(wire).expect("Sync Data");
+            answered.push(
+                held.iter()
+                    .find(|h| data.name.has_prefix(h))
+                    .expect("answers a held Interest")
+                    .clone(),
+            );
+        }
+        let mut in_order = held.clone();
+        in_order.sort();
+        assert_eq!(answered, in_order);
     }
 
     #[test]

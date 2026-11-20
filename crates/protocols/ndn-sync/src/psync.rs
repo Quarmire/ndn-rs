@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use crate::murmur3::{N_HASH, N_HASHCHECK, murmur3_u32};
 
@@ -120,10 +120,10 @@ impl Ibf {
 
     /// Eppstein peeling. `Some((self_only, other_only))` on success,
     /// `None` when the difference is too large to decode.
-    pub fn decode(&self) -> Option<(HashSet<u32>, HashSet<u32>)> {
+    pub fn decode(&self) -> Option<(BTreeSet<u32>, BTreeSet<u32>)> {
         let mut cells = self.cells.clone();
-        let mut positive = HashSet::new();
-        let mut negative = HashSet::new();
+        let mut positive = BTreeSet::new();
+        let mut negative = BTreeSet::new();
 
         loop {
             let pure_idx = cells.iter().position(|c| c.is_pure());
@@ -161,14 +161,14 @@ fn iblt_update(cells: &mut [IbfCell], plus_or_minus: i32, key: u32) {
 /// Tracks a local set of `u32` content hashes and an IBLT over them.
 /// `expected_entries = 80` matches the C++ `FullProducer` default.
 pub struct PSyncNode {
-    local_set: HashSet<u32>,
+    local_set: BTreeSet<u32>,
     expected_entries: usize,
 }
 
 impl PSyncNode {
     pub fn new(expected_entries: usize) -> Self {
         Self {
-            local_set: HashSet::new(),
+            local_set: BTreeSet::new(),
             expected_entries: expected_entries.max(3),
         }
     }
@@ -204,7 +204,7 @@ impl PSyncNode {
 
     /// `Some((self_only, peer_only))` or `None` when the difference is
     /// too large to decode.
-    pub fn reconcile(&self, peer_ibf: &Ibf) -> Option<(HashSet<u32>, HashSet<u32>)> {
+    pub fn reconcile(&self, peer_ibf: &Ibf) -> Option<(BTreeSet<u32>, BTreeSet<u32>)> {
         self.build_ibf().subtract(peer_ibf).decode()
     }
 }

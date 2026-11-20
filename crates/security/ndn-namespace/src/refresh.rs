@@ -296,6 +296,7 @@ pub fn spawn_periodic(p: Arc<Participant>, period: Duration, cancel: Cancellatio
     tokio::spawn(async move {
         let fetched = fetched_namespaces(&p);
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return,
             _ = faces_up(p.engine(), &fetched, period.min(FIRST_CHECK_LATEST)) => {}
         }
@@ -307,6 +308,7 @@ pub fn spawn_periodic(p: Arc<Participant>, period: Duration, cancel: Cancellatio
                 tracing::warn!(target: "security", error = %e.reason, "trust-context refresh failed");
             }
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(period) => {}
             }

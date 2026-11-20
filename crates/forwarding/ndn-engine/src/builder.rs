@@ -894,6 +894,7 @@ impl EngineBuilder {
                     loop {
                         let sleep = runtime_for_tick.sleep(tick_dur);
                         tokio::select! {
+                            biased;
                             _ = cancel_clone.cancelled() => break,
                             _ = sleep => {
                                 // Monotonic instant via the runtime seam (a virtual runtime

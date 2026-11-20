@@ -63,6 +63,7 @@ pub async fn serve_object_stream(
             let mut seg: u64 = 0;
             while seg <= last {
                 let permit = tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return,
                     p = budget.acquire() => match p {
                         Ok(p) => p,

@@ -266,6 +266,7 @@ impl SvsPubSub {
         rt::spawn(async move {
             loop {
                 let update = tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => break,
                     u = updates.recv() => match u {
                         Some(u) => u,
@@ -387,6 +388,8 @@ async fn resolve_via_query(
     }
 
     let reply = tokio::select! {
+        // A reply that arrived by the deadline counts: it is polled before the timeout.
+        biased;
         r = rx => r.ok(),
         _ = rt::sleep(timeout) => None,
     };
@@ -412,6 +415,7 @@ fn spawn_interpose(
     rt::spawn(async move {
         loop {
             let raw = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 pkt = net_in.recv() => match pkt {
                     Some(p) => p,

@@ -312,6 +312,7 @@ pub fn spawn_periodic(
         let mut wait = FIRST_CHECK_AFTER;
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(wait) => {}
                 _ = p.certificates_changed.notified() => {}

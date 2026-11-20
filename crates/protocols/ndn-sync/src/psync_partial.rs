@@ -22,7 +22,7 @@
 //! the producer's IBF/name set is the same bounded `ProducerBase` the
 //! Full producer uses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -123,18 +123,26 @@ async fn partial_producer_task(
     cancel: CancellationToken,
 ) {
     let mut pb = ProducerBase::new(config.ibf_count);
-    let mut seg_store: HashMap<Name, Bytes> = HashMap::new();
-    let mut pending: HashMap<Name, PartialPending> = HashMap::new();
+    let mut seg_store: BTreeMap<Name, Bytes> = BTreeMap::new();
+    let mut pending: BTreeMap<Name, PartialPending> = BTreeMap::new();
     let hello_comp = NameComponent::generic(Bytes::from_static(HELLO));
     let sync_comp = NameComponent::generic(Bytes::from_static(SYNC));
 
     loop {
         tokio::select! {
+            // `biased` (see `svs_task`): shutdown, the expiry timer, local publications, then the network.
+            biased;
             _ = cancel.cancelled() => break,
 
             _ = rt::sleep(Duration::from_secs(1)) => {
                 let now = rt::Instant::now();
                 pending.retain(|_, e| e.expires_at > now);
+            }
+
+            Some((pub_name, mapping)) = publish_rx.recv() => {
+                if pb.apply(&pub_name, mapping).is_some() {
+                    satisfy_partial_pending(&pb, &config, &mut pending, &mut seg_store, &send).await;
+                }
             }
 
             Some(inbound) = recv.recv() => {
@@ -161,12 +169,6 @@ async fn partial_producer_task(
                     _ => {}
                 }
             }
-
-            Some((pub_name, mapping)) = publish_rx.recv() => {
-                if pb.apply(&pub_name, mapping).is_some() {
-                    satisfy_partial_pending(&pb, &config, &mut pending, &mut seg_store, &send).await;
-                }
-            }
         }
     }
 }
@@ -176,7 +178,7 @@ async fn serve_hello(
     sync_prefix: &Name,
     pb: &ProducerBase,
     config: &PSyncPartialConfig,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     send: &mpsc::Sender<Bytes>,
 ) {
     let names = pb.state_names();
@@ -194,8 +196,8 @@ async fn serve_sync(
     suffix: &[NameComponent],
     pb: &ProducerBase,
     config: &PSyncPartialConfig,
-    pending: &mut HashMap<Name, PartialPending>,
-    seg_store: &mut HashMap<Name, Bytes>,
+    pending: &mut BTreeMap<Name, PartialPending>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     send: &mpsc::Sender<Bytes>,
 ) {
     // suffix = [sync, count, fpp, bits, ibf]
@@ -262,8 +264,8 @@ async fn serve_sync(
 async fn satisfy_partial_pending(
     pb: &ProducerBase,
     config: &PSyncPartialConfig,
-    pending: &mut HashMap<Name, PartialPending>,
-    seg_store: &mut HashMap<Name, Bytes>,
+    pending: &mut BTreeMap<Name, PartialPending>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     send: &mpsc::Sender<Bytes>,
 ) {
     let mut satisfied: Vec<Name> = Vec::new();
@@ -394,6 +396,7 @@ async fn partial_consumer_task(
         if subs.is_empty() {
             // Idle until the first subscription (or cancellation).
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 maybe = subscribe_rx.recv() => match maybe {
                     Some(prefix) => { if subs.insert(prefix.clone()) { bf.insert(&prefix); current_ibf = None; } }
@@ -537,6 +540,7 @@ async fn recv_matching(
     tokio::pin!(deadline);
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return None,
             _ = &mut deadline => return None,
             maybe = recv.recv() => {
@@ -564,7 +568,7 @@ async fn publish_segments(
     base: &Name,
     names: &[Name],
     config: &PSyncPartialConfig,
-    seg_store: &mut HashMap<Name, Bytes>,
+    seg_store: &mut BTreeMap<Name, Bytes>,
     send: &mpsc::Sender<Bytes>,
 ) {
     let content = build_psync_content(names);

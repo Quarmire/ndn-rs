@@ -229,6 +229,7 @@ impl Publisher {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_send.cancelled() => break,
                     Some(pkt) = net_out_rx.recv() => {
                         let _ = conn_send.send(pkt).await;
@@ -243,6 +244,7 @@ impl Publisher {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_recv.cancelled() => break,
                     pkt = conn_recv.recv() => match pkt {
                         Some(raw) => {

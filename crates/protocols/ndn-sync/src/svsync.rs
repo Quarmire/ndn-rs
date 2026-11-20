@@ -479,6 +479,7 @@ impl SvSync {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_fwd.cancelled() => break,
                     pkt = core_out_rx.recv() => match pkt {
                         Some(p) => { let _ = net_out_fwd.send(p).await; }
@@ -1012,6 +1013,7 @@ fn spawn_demux(
     rt::spawn(async move {
         loop {
             let raw = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 pkt = net_in.recv() => match pkt {
                     Some(p) => p,
@@ -1109,6 +1111,8 @@ async fn express_once(
     }
 
     let res = tokio::select! {
+        // A reply that arrived by the deadline counts: it is polled before the timeout.
+        biased;
         r = rx => r.ok(),
         _ = rt::sleep(timeout) => None,
     };

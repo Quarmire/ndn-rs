@@ -493,6 +493,10 @@ where
 {
     tokio::pin!(a, b);
     tokio::select! {
+        // Both sources answering at the same instant: `a` wins, every run, rather than
+        // whichever an unseeded RNG polls first. Neither can starve the other: each is
+        // polled once until one is ready, then the other is awaited to the end.
+        biased;
         found = &mut a => match found {
             Err(miss) => then_ask(miss, b).await,
             data => data,

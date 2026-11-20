@@ -202,6 +202,7 @@ impl Subscriber {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_send.cancelled() => break,
                     Some(pkt) = net_send_rx.recv() => { let _ = conn_send.send(pkt).await; }
                 }
@@ -213,6 +214,7 @@ impl Subscriber {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_recv.cancelled() => break,
                     pkt = conn_recv.recv() => match pkt {
                         Some(raw) => { if raw.first() == Some(&0x05) { let _ = net_recv_tx.send(raw.into()).await; } }
@@ -227,6 +229,7 @@ impl Subscriber {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = task_cancel.cancelled() => break,
                     Some(update) = sync_handle.recv() => {
                         for seq in update.low_seq..=update.high_seq {
@@ -301,6 +304,7 @@ impl Subscriber {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_send.cancelled() => break,
                     Some(pkt) = net_out_rx.recv() => {
                         let _ = conn_send.send(pkt).await;
@@ -316,6 +320,7 @@ impl Subscriber {
         rt::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_recv.cancelled() => break,
                     pkt = conn_recv.recv() => match pkt {
                         Some(raw) => {
@@ -337,6 +342,7 @@ impl Subscriber {
             let _svsync = svsync_fetch;
             loop {
                 tokio::select! {
+                    biased;
                     _ = task_cancel.cancelled() => break,
                     Some(update) = updates.recv() => {
                         for seq in update.low_seq..=update.high_seq {

@@ -235,6 +235,7 @@ impl Groups {
             .map(|held| held.namespace().clone())
             .collect();
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return,
             _ = faces_up(admin.engine(), &namespaces, self.svs.sync_interval) => {}
         }
@@ -252,6 +253,7 @@ impl Groups {
         }
         loop {
             let kept = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return,
                 kept = self.kept.recv() => match kept {
                     Some(kept) => kept,
@@ -602,6 +604,7 @@ fn pump(
     tokio::spawn(async move {
         loop {
             let pkt = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 pkt = face.recv() => match pkt {
                     Some(pkt) => pkt,
