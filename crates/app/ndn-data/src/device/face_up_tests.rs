@@ -26,7 +26,7 @@ impl Tell {
     }
 
     /// The Interests sent so far into the group of namespace `ns`.
-    fn into_group(&self, ns: &str) -> usize {
+    fn sent_in_group(&self, ns: &str) -> usize {
         let group = sync_group(&n(ns));
         self.sent
             .lock()
@@ -73,7 +73,7 @@ async fn started(tell: &Arc<Tell>) -> Device {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        tell.into_group("/alice") >= 1,
+        tell.sent_in_group("/alice") >= 1,
         "the join announcement went out"
     );
     dev
@@ -83,11 +83,11 @@ async fn started(tell: &Arc<Tell>) -> Device {
 /// at `limit`: `what` says what was expected.
 async fn until_sent(tell: &Tell, ns: &str, count: usize, limit: Duration, what: &str) {
     let began = Instant::now();
-    while tell.into_group(ns) < count {
+    while tell.sent_in_group(ns) < count {
         assert!(
             began.elapsed() < limit,
             "{what}: {} Interests sent into the group of {ns}, {count} expected within {limit:?}",
-            tell.into_group(ns)
+            tell.sent_in_group(ns)
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -100,7 +100,7 @@ async fn a_route_that_covers_a_joined_group_announces_it_at_once() {
     for prefix in ["/alice/32=sync", "/alice", "/"] {
         let tell = Tell::new(16);
         let dev = started(&tell).await;
-        let before = tell.into_group("/alice");
+        let before = tell.sent_in_group("/alice");
         tell.up(prefix);
         until_sent(
             &tell,
@@ -112,7 +112,7 @@ async fn a_route_that_covers_a_joined_group_announces_it_at_once() {
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
-            tell.into_group("/alice"),
+            tell.sent_in_group("/alice"),
             before + 1,
             "one announcement for the route at {prefix}"
         );
@@ -127,7 +127,7 @@ async fn a_route_that_covers_a_joined_group_announces_it_at_once() {
 async fn a_route_that_covers_no_joined_group_announces_nothing() {
     let tell = Tell::new(16);
     let dev = started(&tell).await;
-    let before = tell.into_group("/alice");
+    let before = tell.sent_in_group("/alice");
     for prefix in [
         "/bob",
         "/bob/32=sync",
@@ -139,7 +139,7 @@ async fn a_route_that_covers_no_joined_group_announces_nothing() {
     }
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(
-        tell.into_group("/alice"),
+        tell.sent_in_group("/alice"),
         before,
         "nothing was announced for a route that covers no group joined"
     );
@@ -153,7 +153,7 @@ async fn a_route_that_covers_no_joined_group_announces_nothing() {
 async fn a_flapping_link_announces_a_group_at_most_once_a_second() {
     let tell = Tell::new(64);
     let dev = started(&tell).await;
-    let before = tell.into_group("/alice");
+    let before = tell.sent_in_group("/alice");
     let began = Instant::now();
     for _ in 0..10 {
         tell.up("/alice/32=sync");
@@ -166,7 +166,7 @@ async fn a_flapping_link_announces_a_group_at_most_once_a_second() {
     );
     // Within the second: the first, at once.
     assert_eq!(
-        tell.into_group("/alice"),
+        tell.sent_in_group("/alice"),
         before + 1,
         "within the second of the first route: one announcement"
     );
@@ -181,7 +181,7 @@ async fn a_flapping_link_announces_a_group_at_most_once_a_second() {
     .await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(
-        tell.into_group("/alice"),
+        tell.sent_in_group("/alice"),
         before + 2,
         "two announcements for the flapping, no more"
     );
@@ -196,7 +196,7 @@ async fn a_route_above_every_group_announces_each_group_joined() {
     let dev = started(&tell).await;
     dev.inner.join(&n("/bob")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (alice, bob) = (tell.into_group("/alice"), tell.into_group("/bob"));
+    let (alice, bob) = (tell.sent_in_group("/alice"), tell.sent_in_group("/bob"));
     assert!(bob >= 1, "the join announcement of the second group");
     tell.up("/");
     until_sent(
@@ -210,7 +210,7 @@ async fn a_route_above_every_group_announces_each_group_joined() {
     until_sent(&tell, "/bob", bob + 1, Duration::from_millis(500), "bob").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        (tell.into_group("/alice"), tell.into_group("/bob")),
+        (tell.sent_in_group("/alice"), tell.sent_in_group("/bob")),
         (alice + 1, bob + 1)
     );
 
@@ -227,7 +227,7 @@ async fn a_route_above_every_group_announces_each_group_joined() {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
-        tell.into_group("/alice"),
+        tell.sent_in_group("/alice"),
         alice + 1,
         "not announced for /bob's route"
     );
@@ -242,7 +242,7 @@ async fn a_subscriber_that_missed_routes_announces_every_group_joined() {
     let dev = started(&tell).await;
     dev.inner.join(&n("/bob")).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (alice, bob) = (tell.into_group("/alice"), tell.into_group("/bob"));
+    let (alice, bob) = (tell.sent_in_group("/alice"), tell.sent_in_group("/bob"));
     // No await between the sends: the device's task cannot take any.
     for i in 0..8 {
         tell.up(&format!("/elsewhere/{i}"));
