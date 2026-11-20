@@ -303,15 +303,18 @@ fn signed_by(device: &Device, who: &str) -> Data {
 #[tokio::test]
 async fn a_member_that_renews_before_expiry_keeps_its_data_accepted_across_the_old_not_after() {
     let ns = namespace(|ns| {
-        Box::new(RolePolicy::new(ns).with_validity(Role::Member, Duration::from_secs(3)))
+        Box::new(RolePolicy::new(ns).with_validity(Role::Member, Duration::from_secs(6)))
     })
     .await;
     let phone = enroll(&ns, "member", "member-aa", "phone", 1).await;
     let tablet = enroll(&ns, "member", "member-bb", "tablet", 2).await;
     let old = cert_of(&phone.cert);
     // Validity periods are stored to the second: renewing later gives a
-    // later NotAfter.
-    std::thread::sleep(Duration::from_millis(1_100));
+    // later NotAfter, and a device enrolled a moment after the phone may be
+    // enrolled in the next second, so its NotAfter is up to a second later
+    // than the phone's. Renewing two seconds on puts the renewed NotAfter
+    // past both.
+    std::thread::sleep(Duration::from_millis(2_100));
     let renewed = renew(&ns, &phone)
         .await
         .expect("a current member certificate renews");
@@ -337,15 +340,16 @@ async fn a_member_that_renews_before_expiry_keeps_its_data_accepted_across_the_o
         );
     }
 
-    // Past the old certificate's NotAfter (the reader's clock), before the
-    // renewed one's.
+    // Past the old certificates' NotAfter (the reader's clock; the tablet's
+    // may be a second after the phone's), before the renewed one's.
     let now_ns = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
     };
-    while now_ns() <= old.valid_until {
+    let both_lapsed = old.valid_until.max(cert_of(&tablet.cert).valid_until);
+    while now_ns() <= both_lapsed {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
