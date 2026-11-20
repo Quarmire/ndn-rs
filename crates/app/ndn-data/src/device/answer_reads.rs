@@ -616,11 +616,13 @@ pub(super) enum EvalFail {
     Conflict(String),
     /// A read no longer holds here.
     Changed(String),
-    /// The evaluator refuses its definition or its inputs.
-    Refused(String),
+    /// The evaluator refuses its definition or its inputs, and the reads it had made when it did:
+    /// its words may quote any of them, so they are for an asker who may read every one
+    /// ([`Inner::admitted_words`]).
+    Refused(String, Vec<ReadRef>),
     /// The reads are not the evaluator's reading of its definition (a recompute), or its plan
-    /// and its evaluation disagree.
-    NotItsReads(String),
+    /// and its evaluation disagree; and the reads it had made, as for `Refused`.
+    NotItsReads(String, Vec<ReadRef>),
     /// Over the host's budget.
     Over(String),
     /// Over a limit of answers.
@@ -741,7 +743,7 @@ impl Reads for Planner<'_> {
                          outside it"
                     );
                     Err(self.failed(
-                        EvalFail::NotItsReads(why.clone()),
+                        EvalFail::NotItsReads(why.clone(), self.read.clone()),
                         DataError::BadRequest {
                             name: collection.clone(),
                             why,
@@ -769,7 +771,7 @@ impl Reads for Planner<'_> {
         {
             let why = "the plan reads a version or state outside the read set".to_string();
             return Err(self.failed(
-                EvalFail::NotItsReads(why.clone()),
+                EvalFail::NotItsReads(why.clone(), self.read.clone()),
                 DataError::BadRequest {
                     name: r.collection().unwrap_or_else(|_| Name::root()),
                     why,
@@ -928,8 +930,10 @@ impl Inner {
             }
             return Err(match e {
                 PlanError::Data(e) => EvalFail::Data(e),
-                PlanError::Eval(EvalError::Refused(m)) => EvalFail::Refused(m),
-                PlanError::Eval(EvalError::NotItsReads(m)) => EvalFail::NotItsReads(m),
+                PlanError::Eval(EvalError::Refused(m)) => EvalFail::Refused(m, planner.read),
+                PlanError::Eval(EvalError::NotItsReads(m)) => {
+                    EvalFail::NotItsReads(m, planner.read)
+                }
             });
         }
         let set = match replay {
@@ -940,13 +944,16 @@ impl Inner {
             // Every read of the set was read by the plan.
             let read: BTreeSet<&ReadRef> = planner.read.iter().collect();
             if let Some(missing) = set_replayed.reads().iter().find(|r| !read.contains(r)) {
-                return Err(EvalFail::NotItsReads(format!(
-                    "the plan never reads {}, which the read set lists",
-                    match missing {
-                        ReadRef::Version { name, .. } => name.to_string(),
-                        ReadRef::State { collection, .. } => collection.to_string(),
-                    }
-                )));
+                return Err(EvalFail::NotItsReads(
+                    format!(
+                        "the plan never reads {}, which the read set lists",
+                        match missing {
+                            ReadRef::Version { name, .. } => name.to_string(),
+                            ReadRef::State { collection, .. } => collection.to_string(),
+                        }
+                    ),
+                    planner.read,
+                ));
             }
         }
         let age = match planner.unconfirmed {
@@ -1007,11 +1014,13 @@ impl Inner {
         };
         let result = match evaluated {
             Ok(r) => r,
-            Err(EvalError::Refused(m)) => return Err(EvalFail::Refused(m)),
-            Err(EvalError::NotItsReads(m)) => return Err(EvalFail::NotItsReads(m)),
+            Err(EvalError::Refused(m)) => return Err(EvalFail::Refused(m, set.reads().to_vec())),
+            Err(EvalError::NotItsReads(m)) => {
+                return Err(EvalFail::NotItsReads(m, set.reads().to_vec()));
+            }
         };
         if let Some(why) = outside {
-            return Err(EvalFail::NotItsReads(why));
+            return Err(EvalFail::NotItsReads(why, set.reads().to_vec()));
         }
         // Each read of the set, the definition aside, was used by the evaluation.
         if let Some(unused) = set
@@ -1019,13 +1028,16 @@ impl Inner {
             .iter()
             .find(|r| *r != definition && !used.contains(*r))
         {
-            return Err(EvalFail::NotItsReads(format!(
-                "the evaluation never uses {}, which the read set lists",
-                match unused {
-                    ReadRef::Version { name, .. } => name.to_string(),
-                    ReadRef::State { collection, .. } => collection.to_string(),
-                }
-            )));
+            return Err(EvalFail::NotItsReads(
+                format!(
+                    "the evaluation never uses {}, which the read set lists",
+                    match unused {
+                        ReadRef::Version { name, .. } => name.to_string(),
+                        ReadRef::State { collection, .. } => collection.to_string(),
+                    }
+                ),
+                set.reads().to_vec(),
+            ));
         }
         if result.len() as u64 > budget.result_bytes {
             return Err(EvalFail::Over("octets of the result".into()));

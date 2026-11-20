@@ -21,22 +21,38 @@ use std::time::Duration;
 pub(crate) struct Cancel {
     raised: Arc<AtomicBool>,
     /// The wall clock at which the work is over time: never when the limit does not fit.
-    deadline: Option<web_time::Instant>,
+    wall: Option<web_time::Instant>,
+    /// The runtime's clock at which the work is over time (inline work): never when the limit
+    /// does not fit.
+    runtime: Option<Instant>,
 }
 
 impl Cancel {
     /// A cancellation that is raised `limit` of wall-clock time from now.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn within(limit: Duration) -> Self {
         Cancel {
             raised: Arc::new(AtomicBool::new(false)),
-            deadline: web_time::Instant::now().checked_add(limit),
+            wall: web_time::Instant::now().checked_add(limit),
+            runtime: None,
+        }
+    }
+
+    /// A cancellation that is raised `limit` of the runtime's time from now: the wall clock's
+    /// on a runtime in real time, none passing on a paused one.
+    pub(crate) fn within_runtime(limit: Duration) -> Self {
+        Cancel {
+            raised: Arc::new(AtomicBool::new(false)),
+            wall: None,
+            runtime: Instant::now().checked_add(limit),
         }
     }
 
     /// Whether the work is over its time: it should stop, and its result is not used.
     pub(crate) fn cancelled(&self) -> bool {
         self.raised.load(Ordering::Relaxed)
-            || self.deadline.is_some_and(|d| web_time::Instant::now() >= d)
+            || self.wall.is_some_and(|d| web_time::Instant::now() >= d)
+            || self.runtime.is_some_and(|d| Instant::now() >= d)
     }
 }
 
@@ -50,7 +66,7 @@ pub(crate) enum Stopped {
     NoThread,
 }
 
-/// Run `work`, CPU-bound and synchronous, within `limit` of wall-clock time, without holding
+/// Run `work`, CPU-bound and synchronous, within `limit` of time, without holding
 /// up the executor: on the runtime's blocking pool (its own thread when there is no tokio
 /// runtime), with a watchdog that raises [`Cancel`] at the deadline
 /// and ends the wait (the work is abandoned: it stops at its next [`Cancel::cancelled`] check,
@@ -65,9 +81,15 @@ pub(crate) enum Stopped {
 /// Inline, the executor is held up for as long as the work takes, which the work's own checks
 /// of [`Cancel::cancelled`] bound.
 ///
-/// The wall clock only ever makes this return [`Stopped`], which the callers turn into a
-/// refusal: it never decides what is true or trusted. It is the wall clock and not the
-/// runtime's clock (a paused or virtual runtime would run it out while the thread works).
+/// The clock only ever makes this return [`Stopped`], which the callers turn into a refusal:
+/// it never decides what is true or trusted. Pooled work is cancelled by the wall clock (a
+/// paused or virtual runtime's clock would stand still while the thread works, and its
+/// watchdog could never fire). Inline work is cancelled by the **runtime's** clock: on a
+/// paused or virtual runtime, which a simulation runs on, it stands still while the work
+/// runs, so how long the machine takes (its load) never turns the work into a refusal, and a
+/// run replays exactly; on a runtime in real time it is the wall clock. What bounds inline work
+/// on a paused runtime is its own bound of work (a read set is capped, an evaluator's own
+/// checks of [`Cancel::cancelled`] follow the runtime's clock), not a time that is not passing.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn blocking<T: Send + 'static>(
     limit: Duration,
@@ -158,10 +180,11 @@ pub(crate) async fn blocking<T>(
     run_inline(limit, work)
 }
 
-/// Run `work` here, on the caller's thread: it stops at its own checks of the deadline, and a
-/// result produced after it is discarded.
+/// Run `work` here, on the caller's thread: it stops at its own checks of the deadline, which
+/// is the runtime's clock's ([`Cancel::within_runtime`]), and a result produced after it is
+/// discarded.
 fn run_inline<T>(limit: Duration, work: impl FnOnce(&Cancel) -> T) -> Result<T, Stopped> {
-    let cancel = Cancel::within(limit);
+    let cancel = Cancel::within_runtime(limit);
     let out = work(&cancel);
     match cancel.cancelled() {
         true => Err(Stopped::Deadline),
@@ -187,6 +210,23 @@ mod tests {
         assert!(
             pooled.is_ok_and(|id| id != here),
             "pooled work runs on a thread of the pool"
+        );
+    }
+
+    /// Round-11 I2: inline work, which a simulation on a paused clock sets, is over its time by
+    /// the runtime's clock, which stands still while the work runs: a loaded machine that takes
+    /// the wall clock past the limit does not turn the work into a refusal.
+    #[tokio::test(start_paused = true)]
+    async fn inline_work_is_not_over_its_time_by_the_wall_clock_on_a_paused_runtime() {
+        let limit = Duration::from_millis(20);
+        let slow = |cancel: &Cancel| {
+            std::thread::sleep(Duration::from_millis(80));
+            (7, cancel.cancelled())
+        };
+        let out = blocking(limit, true, slow).await;
+        assert!(
+            matches!(out, Ok((7, false))),
+            "inline work over a paused clock: {out:?}"
         );
     }
 

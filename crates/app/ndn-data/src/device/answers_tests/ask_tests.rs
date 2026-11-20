@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use ndn_app::AppError;
+use ndn_security::confidentiality::ContentKey;
 
 use super::super::answer_ask::{Reply, read_reply};
 use super::*;
@@ -15,7 +16,7 @@ use crate::answer::{
     AnswerAskBody, AnswerAskEnvelope, AnswerAskRefusal, AskRefusal, AskServing, answer_ask_name,
     answer_ask_prefix, parse_answer_ask_name,
 };
-use crate::seal::AskKey;
+use crate::seal::{AskKey, open_ask_keyed};
 
 // ---- a connection to the signer -------------------------------------------------------------
 
@@ -31,6 +32,9 @@ pub(super) struct Wire {
     /// The Content the signer replies to every ask for an answer with, instead of its own
     /// reply.
     pub(super) forced: std::sync::Mutex<Option<Bytes>>,
+    /// The refusal the signer replies to every ask for an answer with, instead of its own
+    /// reply, sealed under the ask's own content key as a signer's is.
+    pub(super) forced_refusal: std::sync::Mutex<Option<AnswerAskRefusal>>,
     /// How many Interests for the signer's seal key packet are lost before one is answered.
     pub(super) lose_seal_keys: AtomicUsize,
 }
@@ -45,6 +49,7 @@ impl Wire {
             asked: std::sync::Mutex::new(Vec::new()),
             muted: AtomicBool::new(false),
             forced: std::sync::Mutex::new(None),
+            forced_refusal: std::sync::Mutex::new(None),
             lose_seal_keys: AtomicUsize::new(0),
         })
     }
@@ -86,21 +91,42 @@ impl Connection for Wire {
         {
             return Ok(());
         }
-        let (muted, forced) = (
+        let (muted, forced, forced_refusal) = (
             self.muted.load(Ordering::SeqCst),
             self.forced.lock().unwrap().clone(),
+            self.forced_refusal.lock().unwrap().clone(),
         );
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let reply = if parse_answer_ask_name(&name).is_some() {
-                match (muted, forced) {
-                    (true, _) => None,
+                match (muted, forced, forced_refusal) {
+                    (true, ..) => None,
                     // A signer that says what the test wants it to say, signed as it signs.
-                    (false, Some(content)) => signer
+                    (false, Some(content), _) => signer
                         .inner
                         .sign(DataBuilder::new(name.clone(), &content).freshness(Duration::ZERO))
                         .ok(),
-                    (false, None) => signer.inner.answer_ask(&name, params, lifetime).await,
+                    // The same, a refusal sealed under the key of the very ask that came.
+                    (false, None, Some(refusal)) => {
+                        let envelope = AnswerAskEnvelope::decode(params.unwrap()).unwrap();
+                        let aad = answer_ask_prefix(signer.name()).encode_to_tlv();
+                        let (_, key) = open_ask_keyed(
+                            &signer.inner.st.lock().keys.recipient,
+                            &aad,
+                            &envelope.ephemeral,
+                            &envelope.key,
+                            &envelope.sealed,
+                        )
+                        .expect("the ask opens at the signer");
+                        signer
+                            .inner
+                            .sign(
+                                DataBuilder::new(name.clone(), &refusal.encode(&key, &name))
+                                    .freshness(Duration::ZERO),
+                            )
+                            .ok()
+                    }
+                    (false, None, None) => signer.inner.answer_ask(&name, params, lifetime).await,
                 }
             } else {
                 signer.inner.packet_for(&name, by_prefix)
@@ -152,16 +178,38 @@ pub(super) async fn told(
     lifetime: Option<Duration>,
 ) -> Told {
     let public = signer.inner.st.lock().keys.recipient.public();
-    let (name, params) = asker.inner.build_ask(signer.name(), &public, ask).unwrap();
-    heard(asker, signer, &name, params, lifetime).await
+    let (name, params, key) = asker.inner.build_ask(signer.name(), &public, ask).unwrap();
+    heard_with(asker, signer, &name, params, &key, lifetime).await
 }
 
-/// `params` handed to `signer` as the Interest `name`: what it replies.
+/// [`heard_with`] for an ask whose content key the asker does not hold (a crafted one): what
+/// the signer replies, none of whose words are read.
 async fn heard(
     asker: &Device,
     signer: &Device,
     name: &Name,
     params: Bytes,
+    lifetime: Option<Duration>,
+) -> Told {
+    heard_with(
+        asker,
+        signer,
+        name,
+        params,
+        &ContentKey::generate(),
+        lifetime,
+    )
+    .await
+}
+
+/// `params` handed to `signer` as the Interest `name`: what it replies, read as the asker whose
+/// ask `key` is the content key of reads it.
+async fn heard_with(
+    asker: &Device,
+    signer: &Device,
+    name: &Name,
+    params: Bytes,
+    key: &ContentKey,
     lifetime: Option<Duration>,
 ) -> Told {
     let Some(wire) = signer.inner.answer_ask(name, Some(params), lifetime).await else {
@@ -177,7 +225,7 @@ async fn heard(
             .is_ok_and(|w| { wire::device_of(w.key()).as_ref() == Some(signer.name()) }),
         "the reply is signed by the signer's device key"
     );
-    match read_reply(&data).unwrap() {
+    match read_reply(&data, key).unwrap() {
         Reply::Packet(d) => Told::Answer(d),
         Reply::Refused(r) => {
             if r.why == AskRefusal::EvaluatorRefused {
@@ -208,13 +256,13 @@ pub(super) async fn refusal_told(
     ask: &AnswerAsk,
 ) -> AnswerAskRefusal {
     let public = signer.inner.st.lock().keys.recipient.public();
-    let (name, params) = asker.inner.build_ask(signer.name(), &public, ask).unwrap();
+    let (name, params, key) = asker.inner.build_ask(signer.name(), &public, ask).unwrap();
     let wire = signer
         .inner
         .answer_ask(&name, Some(params), None)
         .await
         .expect("the signer replies");
-    match read_reply(&Data::decode(wire).unwrap()).unwrap() {
+    match read_reply(&Data::decode(wire).unwrap(), &key).unwrap() {
         Reply::Refused(r) => r,
         Reply::Packet(_) => panic!("an answer, not a refusal"),
     }
@@ -365,17 +413,21 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
         AskRefusal::NotServed,
         AskRefusal::EvaluatorRefused,
     ];
+    let (key, reply) = (ContentKey::generate(), n("/alice/laptop/32=ask-answer/x"));
     for (i, why) in all.into_iter().enumerate() {
         assert_eq!(why.code(), i as u64 + 1);
         let refusal = AnswerAskRefusal::new(why);
         assert!(!refusal.explanation.is_empty(), "{why:?} says why");
-        let tlv = refusal.encode();
+        let tlv = refusal.encode(&key, &reply);
         assert_eq!(
             ndn_tlv::TlvReader::new(tlv.clone()).read_tlv().unwrap().0,
             tlv::ANSWER_ASK_REFUSAL,
             "TLV-TYPE 0x05DF"
         );
-        assert_eq!(AnswerAskRefusal::decode(tlv).unwrap(), refusal);
+        assert_eq!(
+            AnswerAskRefusal::decode(tlv, &key, &reply).unwrap(),
+            refusal
+        );
     }
     assert_eq!(
         AnswerAskRefusal::new(AskRefusal::Busy { retry_after: wait })
@@ -383,13 +435,27 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
             .retry_after(),
         Some(wait)
     );
-    // The evaluator's words travel in the explanation of code 8, and round-trip as written.
+    // The evaluator's words travel sealed in the explanation of code 8, and round-trip as
+    // written for the ask's key and the reply's name, and for no other.
     let evaluator = AnswerAskRefusal::evaluator_refused("SERVES is an address of one setting");
     assert_eq!(evaluator.why.code(), 8);
+    let sealed = evaluator.encode(&key, &reply);
     assert_eq!(
-        AnswerAskRefusal::decode(evaluator.encode()).unwrap(),
+        AnswerAskRefusal::decode(sealed.clone(), &key, &reply).unwrap(),
         evaluator
     );
+    for (other_key, other_reply) in [
+        (&ContentKey::generate(), &reply),
+        (&key, &n("/alice/laptop/32=ask-answer/y")),
+    ] {
+        assert_eq!(
+            AnswerAskRefusal::decode(sealed.clone(), other_key, other_reply)
+                .unwrap()
+                .explanation,
+            AskRefusal::EvaluatorRefused.explain(),
+            "words that do not open are the fixed text"
+        );
+    }
     // A code outside 1..=8, a number on a reason that carries none, and words that are not
     // UTF-8 are refused.
     let value = |code: u8, param: u64, text: &[u8]| {
@@ -400,13 +466,14 @@ fn the_envelope_its_body_and_every_refusal_round_trip_and_nothing_else_decodes()
         w.write_tlv(tlv::ANSWER_ASK_REFUSAL, &v);
         w.finish()
     };
-    assert!(AnswerAskRefusal::decode(value(4, 0, b"x")).is_ok());
-    assert!(AnswerAskRefusal::decode(value(0, 0, b"x")).is_err());
-    assert!(AnswerAskRefusal::decode(value(8, 0, b"x")).is_ok());
-    assert!(AnswerAskRefusal::decode(value(8, 1, b"x")).is_err());
-    assert!(AnswerAskRefusal::decode(value(9, 0, b"x")).is_err());
-    assert!(AnswerAskRefusal::decode(value(4, 1, b"x")).is_err());
-    assert!(AnswerAskRefusal::decode(value(4, 0, &[0xff, 0xfe])).is_err());
+    let decode = |v: Bytes| AnswerAskRefusal::decode(v, &key, &reply);
+    assert!(decode(value(4, 0, b"x")).is_ok());
+    assert!(decode(value(0, 0, b"x")).is_err());
+    assert!(decode(value(8, 0, b"x")).is_ok());
+    assert!(decode(value(8, 1, b"x")).is_err());
+    assert!(decode(value(9, 0, b"x")).is_err());
+    assert!(decode(value(4, 1, b"x")).is_err());
+    assert!(decode(value(4, 0, &[0xff, 0xfe])).is_err());
 
     // The ask's name: the signer's, the keyword, the digest of the parameters it carries.
     let signer = n("/alice/laptop");

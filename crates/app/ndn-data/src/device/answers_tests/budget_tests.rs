@@ -202,19 +202,24 @@ async fn an_evaluation_over_its_time_is_refused_and_is_told_to_stop() {
     // and the case waits for that told, not for any number of milliseconds, so a machine starved
     // of CPU or threads only makes the case slower, never wrong.
     let (told, stopped) = tokio::sync::oneshot::channel::<()>();
+    let started = Arc::new(AtomicBool::new(false));
     let told = std::sync::Mutex::new(Some(told));
-    let hook = move |view: &dyn ReadView| {
-        let give_up = std::time::Instant::now() + Duration::from_secs(60);
-        while std::time::Instant::now() < give_up {
-            if view.cancelled() {
-                if let Some(told) = told.lock().unwrap().take() {
-                    let _ = told.send(());
+    let hook = {
+        let started = Arc::clone(&started);
+        move |view: &dyn ReadView| {
+            started.store(true, Ordering::SeqCst);
+            let give_up = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < give_up {
+                if view.cancelled() {
+                    if let Some(told) = told.lock().unwrap().take() {
+                        let _ = told.send(());
+                    }
+                    return Err(EvalError::Refused("cancelled".into()));
                 }
-                return Err(EvalError::Refused("cancelled".into()));
+                std::thread::sleep(Duration::from_millis(1));
             }
-            std::thread::sleep(Duration::from_millis(1));
+            Ok(())
         }
-        Ok(())
     };
     let tiny = Budget {
         time: Duration::from_millis(20),
@@ -223,7 +228,16 @@ async fn an_evaluation_over_its_time_is_refused_and_is_told_to_stop() {
     let mut w = World::new();
     let laptop = laptop_with(&mut w, probe(1, 1, hook), tiny).await;
     let q = probe_question(&laptop, 1).await;
-    let e = ask(&laptop, &q).await.unwrap_err();
+    // A machine so loaded that the 20 ms ran out before the evaluation began refuses the ask
+    // with no evaluation to stop (the gate's own read is over its time first): ask again, so
+    // that what the case guards, the cancel reaching a running evaluation, is what is checked.
+    let mut e = ask(&laptop, &q).await.unwrap_err();
+    for _ in 0..50 {
+        if started.load(Ordering::SeqCst) {
+            break;
+        }
+        e = ask(&laptop, &q).await.unwrap_err();
+    }
     assert!(
         matches!(
             &e,
@@ -238,7 +252,12 @@ async fn an_evaluation_over_its_time_is_refused_and_is_told_to_stop() {
     );
     tokio::time::timeout(Duration::from_secs(60), stopped)
         .await
-        .expect("the evaluation was never told to stop")
+        .unwrap_or_else(|_| {
+            panic!(
+                "the evaluation was never told to stop (it started: {})",
+                started.load(Ordering::SeqCst)
+            )
+        })
         .expect("the evaluation ended without seeing the cancel");
 }
 

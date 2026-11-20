@@ -26,6 +26,7 @@ mod ask_cost_tests;
 mod ask_gate_tests;
 mod ask_refusal_tests;
 mod ask_tests;
+mod ask_words_tests;
 mod budget_tests;
 
 const VALIDITY_MS: u64 = 365 * 24 * 3600 * 1000;

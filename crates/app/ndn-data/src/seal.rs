@@ -172,6 +172,11 @@ impl AskKey {
         })
     }
 
+    /// The content key, which the signer's reply seals its words under ([`seal_words`]).
+    pub(crate) fn reply_key(&self) -> ContentKey {
+        self.ck.clone()
+    }
+
     /// Seal `plain` under the content key, bound to `aad`.
     pub(crate) fn seal(self, plain: &[u8], aad: &[u8]) -> SealedAsk {
         SealedAsk {
@@ -200,10 +205,38 @@ pub(crate) fn open_ask(
     key: &[u8],
     sealed: &[u8],
 ) -> Option<Vec<u8>> {
+    open_ask_keyed(recipient, aad, ephemeral, key, sealed).map(|(plain, _)| plain)
+}
+
+/// [`open_ask`], with the ask's content key besides, which the signer seals its reply's words
+/// under ([`seal_words`]).
+pub(crate) fn open_ask_keyed(
+    recipient: &RecipientKey,
+    aad: &[u8],
+    ephemeral: &[u8; 32],
+    key: &[u8],
+    sealed: &[u8],
+) -> Option<(Vec<u8>, ContentKey)> {
     let ck = recipient
         .unwrap_ck(ephemeral, &Sealed::from_bytes(key).ok()?, aad)
         .ok()?;
-    ck.open(&Sealed::from_bytes(sealed).ok()?, aad).ok()
+    let plain = ck.open(&Sealed::from_bytes(sealed).ok()?, aad).ok()?;
+    Some((plain, ck))
+}
+
+/// Seal the words of a refusal under the ask's content key `ck`, bound to the name of the reply
+/// that carries them (answers.md §15.6): `nonce ‖ tag ‖ ciphertext`, ChaCha20-Poly1305.
+pub(crate) fn seal_words(ck: &ContentKey, reply: &Name, words: &str) -> Bytes {
+    ck.seal(words.as_bytes(), &reply.encode_to_tlv()).to_bytes()
+}
+
+/// The words [`seal_words`] sealed under `ck` for the reply `reply`; `None` if `sealed` is not
+/// `ck`'s, not this reply's, or not UTF-8.
+pub(crate) fn open_words(ck: &ContentKey, reply: &Name, sealed: &[u8]) -> Option<String> {
+    let plain = ck
+        .open(&Sealed::from_bytes(sealed).ok()?, &reply.encode_to_tlv())
+        .ok()?;
+    String::from_utf8(plain).ok()
 }
 
 // ---- answers (answers.md §5) --------------------------------------------------------------------

@@ -31,7 +31,7 @@ use ndn_packet::Name;
 use ndn_packet::tlv_type::IMPLICIT_SHA256;
 
 use crate::wire::{
-    is_data_name, is_kw, is_namespace, log_name, namespace_of, parse_audit_ask_name,
+    LAYOUT_ROLES, is_data_name, is_kw, is_namespace, log_name, namespace_of, parse_audit_ask_name,
     parse_cut_bytes_name, parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name,
     parse_hold_ask_name, parse_log_name, parse_piece_name, parse_seal_key_name,
     parse_signal_run_name, parse_summary_name,
@@ -54,9 +54,11 @@ const HELD_DEPTH: u8 = 2;
 ///   `folder`, of a collection under it, or **on the way** to it (an
 ///   ancestor: the walk from the root passes through them);
 /// - a signal run header of a scope under `folder`;
-/// - a seal key (`<D>/32=seal/<public key>`: a public key, named by the
-///   device that holds it) and a folder epoch's grant of a collection under
-///   `folder`;
+/// - a seal key of a device of the folder's own namespace
+///   (`<W>/<role>/<device>/32=seal/<public key>`: a public key, named by the
+///   device that holds it; a device of another namespace is a listed writer's,
+///   [`writer_carries`]'s while the record lists her) and a folder epoch's grant
+///   of a collection under `folder`;
 /// - a custody ask (hold, audit) and a held packet (`<H>/32=held/<name>`)
 ///   about a name carried by these rules.
 ///
@@ -74,9 +76,12 @@ pub fn folder_carries(folder: &Name, name: &Name) -> bool {
 /// with or without its head) of each namespace `W` in `namespaces` — the
 /// namespaces of the writer prefixes the folder's members record in force
 /// lists — so that a writer who never met another walks to the other's devices
-/// through this device's copy. Only the root: a root's nodes and pages of the
-/// folder, and every entry, piece, head and cut manifest of a collection under
-/// the folder, whatever device wrote it, are [`folder_carries`]'s already;
+/// through this device's copy; and the **seal keys**
+/// (`<W>/<role>/<device>/32=seal/<key>`) of the devices of each listed `W`, so
+/// that a writer can ask the other's device (ndn-link §8.7 rule 20). Nothing
+/// else: a root's nodes and pages of the folder, and every entry, piece, head
+/// and cut manifest of a collection under the folder, whatever device wrote
+/// it, are [`folder_carries`]'s already;
 /// nothing of a writer's outside the folder is added (not an entry of her other
 /// collections, not a node of her other folders), and the folder's own
 /// namespace's root is [`folder_carries`]'s, not added again. `false` for a
@@ -106,11 +111,33 @@ fn writer_root(folder: &Name, namespaces: &[Name], name: &Name, held_depth: u8) 
         return held_depth > 0 && writer_root(folder, namespaces, &inner, held_depth - 1);
     }
     let Some(summary) = parse_summary_name(name) else {
-        return false;
+        // The seal key `<W>/<role>/<device>/32=seal/<key>` of a device of a listed
+        // writer's namespace: the key a signer is asked for (ndn-link §8.7 rule 20).
+        return parse_seal_key_name(name).is_some_and(|(device, _)| {
+            namespaces.iter().any(|ns| {
+                namespace_of(folder).as_ref() != Some(ns) && device_of_namespace(&device, ns)
+            })
+        });
     };
     // A root's subject is a namespace; a node's or page's is a data name.
     let ns = &summary.subject;
     is_namespace(ns) && namespace_of(folder).as_ref() != Some(ns) && namespaces.contains(ns)
+}
+
+/// Whether `device` is a device name of `namespace`: `<W>/<role>/<device>`,
+/// exactly two components below the namespace, the first a generic component
+/// that names a role of the layout (ndn-link §8.7 rule 20), never one under
+/// another namespace that merely starts like it.
+fn device_of_namespace(device: &Name, namespace: &Name) -> bool {
+    device.len() == namespace.len() + 2
+        && device.has_prefix(namespace)
+        && device
+            .components()
+            .get(namespace.len())
+            .is_some_and(|role| {
+                role.typ == ndn_packet::tlv_type::NAME_COMPONENT
+                    && LAYOUT_ROLES.contains(&role.value.as_ref())
+            })
 }
 
 /// Whether a packet named `name` is traffic of the **sync group** of a listed
@@ -209,8 +236,8 @@ fn carries(folder: &Name, name: &Name, held_depth: u8) -> bool {
     if let Some(run) = parse_signal_run_name(name) {
         return within(folder, &run.scope);
     }
-    if parse_seal_key_name(name).is_some() {
-        return true;
+    if let Some((device, _)) = parse_seal_key_name(name) {
+        return namespace_of(folder).is_some_and(|own| device_of_namespace(&device, &own));
     }
     if let Some((_, ask)) = parse_grant_name(name) {
         return within(folder, &ask.collection);
@@ -419,6 +446,25 @@ mod tests {
             &folder,
             &crate::wire::seal_key_name(&device, &[7; 32])
         ));
+        // A seal key of a device of any other namespace (a stranger's, or a
+        // writer's, whom `writer_carries` adds only while the record lists her)
+        // does not cross a link of this folder, whatever the key; nor does a name
+        // whose device is not `<W>/<role>/<device>`.
+        for other in [
+            n("/carol/member/laptop"),
+            n("/bob/member/phone"),
+            n("/alicia/member/laptop"),
+            n("/alice/member/laptop/nested"),
+            n("/alice/member"),
+            n("/alice/stranger/laptop"),
+        ] {
+            let seal = crate::wire::seal_key_name(&other, &[7; 32]);
+            assert!(
+                !folder_carries(&folder, &seal),
+                "the seal key {seal} of a device outside the folder's namespace crossed the \
+                 folder's link"
+            );
+        }
         let run = signal_run_name(&device, &folder, &[1; RUN_ID_LEN]);
         assert!(folder_carries(&folder, &run));
         let other = signal_run_name(&device, &n("/alice/32=data/diary"), &[1; RUN_ID_LEN]);
@@ -498,9 +544,8 @@ mod tests {
             node_name(&device, &n("/bob/32=data/diary"), 4),
             page_name(&device, &n("/bob/32=data/diary"), &[1], 4),
             node_name(&device, &data_folder(&n("/bob")), 4),
-            // A snapshot, a seal, the sync group, and names of no layer.
+            // A snapshot, the sync group, and names of no layer.
             log_name(&bob, None, 3),
-            crate::wire::seal_key_name(&bob, &[3; 32]),
             n("/bob/32=sync"),
             n("/bob/member/phone"),
         ] {
@@ -520,6 +565,40 @@ mod tests {
             &namespaces,
             &root_name(&device, &n("/bob"), 4)
         ));
+    }
+
+    #[test]
+    fn the_seal_keys_of_a_listed_writers_devices_are_added_and_no_others() {
+        let folder = folder();
+        let namespaces = namespaces();
+        let seal = |device: &str| crate::wire::seal_key_name(&n(device), &[3; 32]);
+        // `<W>/<role>/<device>/32=seal/<key>` of a listed namespace.
+        for listed in ["/bob/member/phone", "/carol/admin/tablet"] {
+            let name = seal(listed);
+            assert!(writer_carries(&folder, &namespaces, &name), "{name}");
+            assert!(
+                !writer_carries(&folder, &[], &name),
+                "{name} crossed with no writer listed"
+            );
+        }
+        for other in [
+            // A namespace the record does not list, and one a listed name merely starts.
+            "/dave/member/phone",
+            "/bobby/member/phone",
+            // Not `<W>/<role>/<device>`: deeper or shallower.
+            "/bob/member/phone/nested",
+            "/bob/member",
+            // A role the layout does not name.
+            "/bob/stranger/phone",
+            // The folder's own namespace is `folder_carries`'s, not added again.
+            "/alice/member/laptop",
+        ] {
+            let name = seal(other);
+            assert!(
+                !writer_carries(&folder, &namespaces, &name),
+                "the seal key {name} of a device the record does not list crossed"
+            );
+        }
     }
 
     #[test]

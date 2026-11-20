@@ -3,10 +3,15 @@
 //! keeps of what was adopted.
 
 use super::super::*;
-use super::{Adopted, SCOPE_PER_SUBJECT, Scopes};
+use super::{Adopted, DevicePacket, SCOPE_PER_SUBJECT, Scopes, device_packet};
+use crate::answer::{ReadRef, ReadSet};
+use crate::collection::Accepted;
 use crate::intro::{Adopting, Introducer, Scoping};
 use crate::layer::Share;
+use crate::wire::CutBody;
 use ndn_app::AppError;
+use ndn_foundation_types::Hash;
+use ndn_packet::NameComponent;
 use ndn_security::self_certifying::{Genesis, personal_namespace_of, self_certifying_name};
 use ndn_security::{ScopedContext, TrustSchema};
 use ndn_sync::MemoryStore;
@@ -670,4 +675,352 @@ async fn a_burst_of_records_refreshes_an_adopted_namespace_once_per_pause() {
     );
     let (asks, _) = scopes.asks_due(held, t0 + REFRESH_PAUSE_MAX);
     assert_eq!(asks.len(), 1, "the deferred refresh, once");
+}
+
+// ---- a listed writer's own devices (spec §6.3) ------------------------------------------------
+
+/// A device of a person's namespace: its key, certified by the person's
+/// root key, which a context of the namespace anchors.
+struct Phone {
+    name: Name,
+    key: Name,
+    keys: SecurityManager,
+    cert: ndn_security::Certificate,
+}
+
+impl Phone {
+    /// `<ns>/<role>/<label>`, its key certified by `issuer` of `authority`.
+    async fn new(
+        authority: &SecurityManager,
+        ns: &Name,
+        issuer: &Name,
+        role: &str,
+        label: &str,
+    ) -> Phone {
+        let name = ns.clone().append(role).append(label);
+        let keys = SecurityManager::new();
+        let key = keys
+            .generate_ed25519(name.clone().append("KEY").append("1"))
+            .unwrap();
+        let public = keys.get_signer_sync(&key).unwrap().public_key().unwrap();
+        let cert = authority
+            .certify(&key, public, issuer, 365 * 24 * 3600 * 1000)
+            .await
+            .unwrap();
+        Phone {
+            name,
+            key,
+            keys,
+            cert,
+        }
+    }
+
+    /// A packet named `name` with `content`, signed by this device's key.
+    fn signs(&self, name: &Name, content: &[u8]) -> Data {
+        let signer = self.keys.get_signer_sync(&self.key).unwrap();
+        let wire = DataBuilder::new(name.clone(), content).sign_sync(
+            signer.sig_type(),
+            Some(&self.key),
+            |region| signer.sign_sync(region).unwrap(),
+        );
+        Data::decode(wire).unwrap()
+    }
+}
+
+/// A members record of `folder()` at `revision` listing `writers`, and
+/// the prefixes `cuts` as removed by a cut.
+fn folder_record(revision: u64, writers: Vec<Name>, cuts: Vec<Name>) -> Record {
+    Record::Members(MembersBody {
+        collection: folder(),
+        folder: true,
+        revision,
+        rule: Rule::Log,
+        writers,
+        readers: Vec::new(),
+        cuts: cuts
+            .into_iter()
+            .map(|of| CutBody {
+                of,
+                accept: Accepted::new(),
+            })
+            .collect(),
+        epoch: None,
+        key_check: None,
+        since: None,
+        parent: None,
+    })
+}
+
+/// Alice's device takes `record` as its owner's `seq`th entry.
+fn take_record(dev: &Device, seq: u64, record: Record) {
+    let (phone, f) = (n("/alice/phone"), folder());
+    let name = log_name(&phone, Some(&f), seq);
+    let k = key(&phone);
+    let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
+        ndn_packet::SignatureType::SignatureEd25519,
+        Some(&k),
+        |_| Bytes::from_static(&[0; 64]),
+    );
+    let mut st = dev.inner.st.lock();
+    dev.inner
+        .take(&mut st, name.clone(), packet, Writer::new(k), record, false);
+    assert_eq!(st.refused.get(&name), None, "the record is taken");
+}
+
+/// Alice's device, whose folder's first record lists `carol` as a writer
+/// and which has adopted her by name; her `phones` are known to it.
+async fn adopting(carol: &Carol, phones: &[&Phone]) -> Device {
+    let host = Arc::new(Host::default());
+    let (k1, a1) = &carol.k1;
+    host.serve(&[&carol.version(1, &[a1], k1, None).await]);
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let dev = laptop(&host, &store).await;
+    for p in phones {
+        dev.inner.validator.cert_cache().insert(p.cert.clone());
+    }
+    take_record(
+        &dev,
+        1,
+        folder_record(1, vec![n("/alice"), carol.ns.clone()], Vec::new()),
+    );
+    dev.inner.settle().await;
+    assert!(
+        until(|| adopted_version(&dev, &carol.ns).is_some(), 30).await,
+        "precondition: Carol is adopted for the folder"
+    );
+    dev
+}
+
+/// What a device of a writer a record lists is taken for, and nothing of
+/// hers beyond: its seal key, the reply to an ask, an answer and an asker's
+/// proof verify, each only as that very device's own packet and only for a
+/// role her context names; a seal key whose content is another key, one
+/// signed by another device of her namespace, a device a role deeper or
+/// under a role the layout has none of, and her log entries about anything
+/// else, do not.
+#[tokio::test(start_paused = true)]
+async fn a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_does() {
+    let carol = Carol::new();
+    let (k1, _) = &carol.k1;
+    let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
+    let tablet = Phone::new(&carol.mgr, &carol.ns, k1, "member", "tablet").await;
+    let dev = adopting(&carol, &[&phone, &tablet]).await;
+    let pk = [9u8; 32];
+    let seal = wire::seal_key_name(&phone.name, &pk);
+    let packet = phone.signs(&seal, &wire::encode_seal_key(&pk));
+
+    assert_eq!(
+        device_packet(&seal),
+        Some((carol.ns.clone(), phone.name.clone(), DevicePacket::SealKey))
+    );
+    let verified = dev.inner.verify(&packet).await;
+    assert_eq!(
+        verified.as_ref().map(|w| w.key().clone()),
+        Ok(phone.key.clone()),
+        "the seal key of her own device verifies: {verified:?}"
+    );
+    assert!(
+        dev.inner
+            .seal_key_of(&packet, &seal, &phone.name, &pk)
+            .await,
+        "and is the device's seal key"
+    );
+
+    // The reply, an answer and the asker's proof, each by the same device.
+    for (what, name) in [
+        (
+            "a reply",
+            crate::answer::answer_ask_name(&phone.name, b"parameters"),
+        ),
+        ("an answer", wire::answer_name(&phone.name, &[1; 32])),
+        ("an asker's proof", wire::ask_name(&phone.name, &[2; 32])),
+    ] {
+        let verified = dev.inner.verify(&phone.signs(&name, b"x")).await;
+        assert!(verified.is_ok(), "{what} of her own device: {verified:?}");
+    }
+
+    // Another key under the seal key's name: the content names another key.
+    let other = phone.signs(&seal, &wire::encode_seal_key(&[8; 32]));
+    assert!(
+        !dev.inner.seal_key_of(&other, &seal, &phone.name, &pk).await,
+        "a seal key packet whose content is not the key its name carries is not that key's"
+    );
+    // Signed by another device of her namespace.
+    for name in [
+        seal.clone(),
+        wire::answer_name(&phone.name, &[1; 32]),
+        crate::answer::answer_ask_name(&phone.name, b"parameters"),
+        wire::ask_name(&phone.name, &[2; 32]),
+    ] {
+        let forged = tablet.signs(&name, &wire::encode_seal_key(&pk));
+        assert_eq!(
+            dev.inner.verify(&forged).await.map(|w| w.key().clone()),
+            Err(Refusal::BadSignature),
+            "{name} signed by another device of her namespace"
+        );
+    }
+    // Names that are no device's: one component too many, a role the layout
+    // has none of, her log entry about the folder (that is `about`'s, and
+    // is judged by what her record lists), and another folder's.
+    let nested = phone
+        .name
+        .clone()
+        .append("lamp")
+        .append_component(wire::kw(b"seal"))
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(&pk)));
+    let stranger = wire::seal_key_name(&carol.ns.clone().append("stranger").append("phone"), &pk);
+    for name in [nested, stranger] {
+        assert!(
+            dev.inner.judge_device_packet(&name).is_none(),
+            "{name} is no packet of a device"
+        );
+        assert_eq!(
+            dev.inner
+                .verify(&phone.signs(&name, &wire::encode_seal_key(&pk)))
+                .await
+                .map(|w| w.key().clone()),
+            Err(Refusal::BadSignature),
+            "{name}"
+        );
+    }
+    let entry = log_name(&phone.name, Some(&f_other()), 1);
+    assert!(!scoped_judge(&dev, &entry));
+    assert_eq!(
+        dev.inner
+            .verify(&phone.signs(&entry, b"x"))
+            .await
+            .map(|w| w.key().clone()),
+        Err(Refusal::BadSignature),
+        "her log entry about a folder no record lists her for"
+    );
+    dev.shutdown();
+}
+
+fn f_other() -> Name {
+    n("/alice/32=data/other")
+}
+
+/// A person no record lists is no signer: her device's seal key does not
+/// verify, though it is her genesis-bound chain, and no view is adopted for
+/// her; a namespace a record keeps only by a removal cut is adopted and no
+/// more a writer.
+#[tokio::test(start_paused = true)]
+async fn a_person_no_record_lists_as_a_writer_has_no_device_packet_judged() {
+    let carol = Carol::new();
+    let (k1, _) = &carol.k1;
+    let dave_mgr = SecurityManager::new();
+    let dave = person(&dave_mgr, 0xd0);
+    let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
+    let daves = Phone::new(&dave_mgr, &dave.0, &dave.1, "member", "phone").await;
+    let dev = adopting(&carol, &[&phone, &daves]).await;
+    let pk = [9u8; 32];
+    let seal = wire::seal_key_name(&daves.name, &pk);
+    assert!(dev.inner.judge_device_packet(&seal).is_none());
+    assert_eq!(
+        dev.inner
+            .verify(&daves.signs(&seal, &wire::encode_seal_key(&pk)))
+            .await
+            .map(|w| w.key().clone()),
+        Err(Refusal::BadSignature),
+        "a device of a namespace no record lists"
+    );
+
+    // Carol only kept by a cut: listed, adopted, no writer.
+    take_record(
+        &dev,
+        2,
+        folder_record(2, vec![n("/alice")], vec![carol.ns.clone()]),
+    );
+    dev.inner.settle().await;
+    let seal = wire::seal_key_name(&phone.name, &pk);
+    assert!(
+        dev.inner.judge_device_packet(&seal).is_none(),
+        "a namespace kept only by a removal cut is no writer"
+    );
+    assert_eq!(
+        dev.inner
+            .verify(&phone.signs(&seal, &wire::encode_seal_key(&pk)))
+            .await
+            .map(|w| w.key().clone()),
+        Err(Refusal::BadSignature),
+    );
+    dev.shutdown();
+}
+
+/// An answer of a listed writer's device is of what the records list her
+/// for: every read's collection lies under a subject whose record in force
+/// lists her as a writer.
+#[tokio::test(start_paused = true)]
+async fn an_answer_of_a_listed_writers_device_reads_only_what_its_record_lists() {
+    let carol = Carol::new();
+    let (k1, _) = &carol.k1;
+    let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
+    let dev = adopting(&carol, &[&phone]).await;
+    let read = |collection: Name| ReadRef::Version {
+        name: log_name(&n("/alice/laptop"), Some(&collection), 1),
+        digest: Hash([1; 32]),
+    };
+    let set = |collections: &[Name]| {
+        ReadSet::new(collections.iter().cloned().map(read)).expect("a read set")
+    };
+    let inside = folder().append("plan");
+    assert_eq!(
+        dev.inner
+            .reads_listed_for(&carol.ns, &set(std::slice::from_ref(&inside))),
+        Ok(())
+    );
+    let refused = dev
+        .inner
+        .reads_listed_for(&carol.ns, &set(&[inside, f_other().append("plan")]));
+    assert!(
+        refused.as_ref().is_err_and(|why| why.contains("other/plan")
+            && why.contains("as a writer")
+            && why.contains("ask a signer of")),
+        "one read of a collection no record lists her for refuses the answer, saying why: {refused:?}"
+    );
+    dev.shutdown();
+}
+
+/// A writer's seal key is kept only while a record in force lists her:
+/// the record that drops her drops it, nothing of hers is verified after,
+/// and a key arriving late is not kept.
+#[tokio::test(start_paused = true)]
+async fn a_removed_writers_seal_key_is_dropped_with_the_record_that_listed_her() {
+    let carol = Carol::new();
+    let (k1, _) = &carol.k1;
+    let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
+    let dev = adopting(&carol, &[&phone]).await;
+    let pk = [9u8; 32];
+    let seal = wire::seal_key_name(&phone.name, &pk);
+    let packet = phone.signs(&seal, &wire::encode_seal_key(&pk));
+    assert!(
+        dev.inner
+            .seal_key_of(&packet, &seal, &phone.name, &pk)
+            .await
+    );
+    assert!(
+        dev.inner.st.lock().keep_seal_key(&seal, pk, true),
+        "kept while listed"
+    );
+    assert_eq!(dev.inner.st.lock().seal_keys.get(&seal), Some(&pk));
+
+    // The owner's next record lists her no more.
+    take_record(&dev, 2, folder_record(2, vec![n("/alice")], Vec::new()));
+    dev.inner.settle().await;
+    assert_eq!(
+        dev.inner.st.lock().seal_keys.get(&seal),
+        None,
+        "the seal key is dropped with the record that listed her"
+    );
+    assert!(
+        !dev.inner.st.lock().keep_seal_key(&seal, pk, true),
+        "and a key arriving late is not kept"
+    );
+    assert!(
+        !dev.inner
+            .seal_key_of(&packet, &seal, &phone.name, &pk)
+            .await,
+        "nor verified again"
+    );
+    dev.shutdown();
 }

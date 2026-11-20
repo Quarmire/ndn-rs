@@ -445,6 +445,10 @@ pub(crate) fn is_device_comps(comps: &[NameComponent]) -> bool {
     !comps.is_empty() && comps.iter().all(is_plain)
 }
 
+/// The roles of the namespace layout (`/<ns>/<role>/<device>`): the device
+/// roles every namespace's certificate authority issues (`ndn_cert::Role`).
+pub(crate) const LAYOUT_ROLES: [&[u8]; 4] = [b"admin", b"member", b"node", b"guest"];
+
 /// Why a name is not a data-layer name `<namespace>/32=data/<path>`: each
 /// says what to do instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

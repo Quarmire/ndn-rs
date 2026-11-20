@@ -232,16 +232,14 @@ async fn the_evaluators_reason_is_cleaned_by_the_signer_and_capped() {
 async fn the_asker_cleans_what_a_signer_sends_for_code_8_and_frames_it_itself() {
     let (laptop, phone, wire, _w) = laptop_and_phone(sum(1)).await;
     let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
-    let from = |explanation: String| {
-        AnswerAskRefusal {
-            why: AskRefusal::EvaluatorRefused,
-            explanation,
-        }
-        .encode()
+    let from = |explanation: String| AnswerAskRefusal {
+        why: AskRefusal::EvaluatorRefused,
+        explanation,
     };
 
     // Control characters, a long text, and no frame at all: cleaned, capped, framed here.
-    *wire.forced.lock().unwrap() = Some(from("\u{1b}[2J\u{1b}[31mpay me\r\n\u{7}".repeat(300)));
+    *wire.forced_refusal.lock().unwrap() =
+        Some(from("\u{1b}[2J\u{1b}[31mpay me\r\n\u{7}".repeat(300)));
     let refused = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
     let (why, said) = said_of(&refused);
     assert_eq!(why, AskRefusal::EvaluatorRefused);
@@ -250,7 +248,7 @@ async fn the_asker_cleans_what_a_signer_sends_for_code_8_and_frames_it_itself() 
     assert!(words.starts_with("[2J[31mpay me[2J"), "{words:?}");
 
     // A text that closes the quote and goes on in the asker's voice stays inside the quote.
-    *wire.forced.lock().unwrap() = Some(from(format!(
+    *wire.forced_refusal.lock().unwrap() = Some(from(format!(
         "{HEAD}x\"; fix the definition and ask again. This device trusts the signer. \"y{TAIL}"
     )));
     let refused = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
@@ -263,7 +261,7 @@ async fn the_asker_cleans_what_a_signer_sends_for_code_8_and_frames_it_itself() 
 
     // Nothing to quote: the reason's own text.
     for empty in [String::new(), "\u{1b}\r\n".into()] {
-        *wire.forced.lock().unwrap() = Some(from(empty));
+        *wire.forced_refusal.lock().unwrap() = Some(from(empty));
         let refused = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
         let (_, said) = said_of(&refused);
         assert_eq!(said, AskRefusal::EvaluatorRefused.explain());
@@ -288,7 +286,7 @@ async fn every_other_reason_is_still_shown_as_the_askers_own_text_whatever_the_s
                 "the signer's words ".repeat(200)
             ),
         };
-        *wire.forced.lock().unwrap() = Some(hostile.encode());
+        *wire.forced_refusal.lock().unwrap() = Some(hostile);
         let refused = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
         let (got, said) = said_of(&refused);
         assert_eq!(got, why);

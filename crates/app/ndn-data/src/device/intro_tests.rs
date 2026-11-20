@@ -3208,6 +3208,9 @@ async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
     let carol_sync = n("/carol/32=sync/vector");
     let dave_sync = n("/dave/32=sync/vector");
     let dave_root = root_name(&device, &n("/dave"), 4);
+    // The exact seal key name of a device of Carol's namespace and of Dave's.
+    let carol_seal = crate::wire::seal_key_name(&n("/carol/member/laptop"), &[5; 32]);
+    let dave_seal = crate::wire::seal_key_name(&n("/dave/member/laptop"), &[5; 32]);
     // A name of Carol's outside the folder: an entry of her other collection.
     let carol_other = log_name(
         &n("/carol/member/laptop"),
@@ -3224,6 +3227,10 @@ async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
     assert!(
         !surface.grant_carries(&folder, &carol_root),
         "a stranger's root crossed"
+    );
+    assert!(
+        !surface.grant_carries(&folder, &carol_seal),
+        "a stranger's seal key crossed"
     );
     assert!(surface.grant_carries(&folder, &carol_entry));
 
@@ -3269,6 +3276,14 @@ async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
         "a writer's name outside the folder crossed"
     );
     assert!(surface.grant_carries(&folder, &carol_entry));
+    assert!(
+        surface.grant_carries(&folder, &carol_seal),
+        "a listed writer's seal key was not carried"
+    );
+    assert!(
+        !surface.grant_carries(&folder, &dave_seal),
+        "an unlisted namespace's seal key crossed"
+    );
 
     // A record without Carol: her root is out at the next call, her entry of
     // the folder (a name of the collection) is still carried.
@@ -3300,6 +3315,10 @@ async fn grant_carries_follows_the_writers_the_record_in_force_lists() {
         Vec::new()
     );
     assert!(surface.grant_carries(&folder, &carol_entry));
+    assert!(
+        !surface.grant_carries(&folder, &carol_seal),
+        "a removed writer's seal key is still carried"
+    );
 
     // A folder this device holds no record of lists no writer.
     assert!(!surface.grant_carries(&n("/alice/32=data/diary"), &carol_root));

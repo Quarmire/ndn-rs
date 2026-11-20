@@ -1923,9 +1923,59 @@ gesture beyond the owner's records.
   namespace, the folders above `S`). Every other packet of `P` — about
   another folder, about a collection of `P`'s own, about the device's own
   collections — is judged by the device's validator, which refuses it
-  while `P` is not held (trust-context.md §4.5.6 note 4). `P` is no
+  while `P` is not held (trust-context.md §4.5.6 note 4), but for the
+  packets of one device of a listed writer below. `P` is no
   namespace of a name here (§3): a device of `P` owns nothing at the
   reader, so no members record `P` signs is taken.
+- **A listed writer's own devices (round 11).** One more kind of packet of
+  `P` is judged by the adopted context, so that two writers who never met
+  can ask each other for answers (answers.md §15): the packets of **one
+  device** of `P` that the ask exchange is made of, and exactly these, by
+  name — `<P>/<role>/<dev>/32=seal/<pk>` (the device's seal key, `<pk>` its
+  32 octets), `<P>/<role>/<dev>/32=ask-answer/<ParametersSha256>` (the
+  reply to an ask), `<P>/<role>/<dev>/32=answer/<id>` (an answer) and
+  `<P>/<role>/<dev>/32=ask/<binding>` (the proof an asker sends with its
+  ask, §13.2) — with exactly two components, `<role>` and `<dev>`, between
+  `P` and the keyword, and `<role>` a role `P`'s context names: one of the
+  layout's (`admin`, `member`, `node`, `guest`) or one the context lists in
+  `DataRequiresCut` or its link policy. The device does this
+  (`judge_device_packet`, apart from the scope above, whose names it does
+  not widen) only while **a members record in force here lists `P` as a
+  writer** — a writer prefix of a record of any subject; a prefix a removal
+  cut alone keeps is no writer — and `P` is adopted. The signature is then
+  checked as every signature of `P` is, by the adopted context and its
+  chain, with `P`'s revocations and the every-role `DataRequiresCut` rule
+  applied, and it MUST be a key of **that very device**
+  (`device_of(key) = <P>/<role>/<dev>`): a packet signed by another device
+  of `P` is refused, whatever its name says. Of what verifies:
+  - **a seal key** is taken only if its content is the `<pk>` its name
+    carries, and is kept (as any verified seal key is, §9) only while a
+    record in force lists `P` as a writer: the record that drops `P` drops
+    every seal key kept for its devices (at once, under the same lock as
+    the record), and one that arrives after is not kept;
+  - **a reply** is taken only by the asker whose Interest it answers (its
+    name is the Interest's, answers.md §15.5), as before;
+  - **an answer** is taken only after it is opened, and only if every read's
+    collection lies under a subject whose record in force lists `P` as a
+    writer: otherwise it is refused `Untrusted`, saying which read and what
+    to do, and no evidence is raised against the device for it;
+  - **an asker's proof** authenticates the device for the signer that
+    serves its namespace (`OwnAndMembers`): the asker's namespace is `P`
+    when no context of it is held and it is adopted and a record lists it
+    as a writer; what it may then ask is decided as for any asker
+    (answers.md §15.4 steps 3 to 5), by the records.
+
+  Why it is safe. Nothing vouches for a key but a certificate chain to the
+  genesis `P` hashes: only `P`'s owner can make a key that verifies here,
+  and a record's owner already named `P` a writer, so a signer of answers
+  for the subject. A copied seal key gives the copier nothing: the ask's
+  associated data binds the signer's name, and the proof's binding the
+  signer's device and the ephemeral key. A grant is made only to the
+  epoch's audience, as it was (§9: the seal key only tells where to wrap).
+  What stays: `P`'s owner may make devices at will, as for any listed
+  writer. Nothing else of `P` is judged by this: not a log entry about a
+  subject no record lists it for, not a head, a summary or a snapshot
+  outside the scope, not a members record (`P` is no owner here).
 - **Never replaces, never seen.** A context of `P` the node holds is used
   as is: while it is held, adopted before the folder's or after, it judges
   `P`'s names everywhere, and the folder's is released. The folder's is
@@ -2922,18 +2972,48 @@ announcement restarts the group's period as a join does.
   group (a FIB write on its own face) and a local application's route
   through the management interface announce nothing. The device
   subscribes through the `sync` connection it already holds.
-- *Coalescing.* A batch of routes that arrive together announces a group
-  once, however many of them cover it; and at most once a second per group:
-  the first at once, a later one at the end of the second since the
-  last, once however many came meanwhile, so the last face up is told and a
-  link that flaps costs two announcements, not one per route. A subscriber
-  that fell behind and lost events announces every group joined.
+- *Coalescing and the total bound.* A batch of routes that arrive together
+  announces a group once, however many of them cover it; at most once a
+  second per group: the first at once, a later one at the end of the second
+  since the last, once however many came meanwhile, so the last face up is
+  told and a link that flaps costs two announcements, not one per route;
+  and at most **32 announcements in any second across every group**
+  (`TOTAL_PER_SECOND`, a sliding window of the last second's announcements,
+  not a refilling bucket, so no second holds more than 32). A subscriber
+  that fell behind and lost events announces every group joined, and so
+  does a route at `/` or above every group: with 300 groups joined that is
+  32 at once and the rest in the seconds that follow (about 9 s for 300),
+  each waiting for room in the window and none dropped, so the commit of
+  any group is still shared; a group the cap defers past its own period of
+  half a minute (over 960 groups at once) is announced by that period as
+  any group is, which is enough: the periodic announcement already shares
+  a commit with whoever is heard, and this one only moves the time. The
+  total bound is chosen over sending only on the face that came up
+  because the device has one send: its packet goes through its single
+  sync connection and the forwarder's strategy picks the faces (multicast
+  for a group), so a per-face send would need one the sync driver
+  (`MultiSvs`) does not have, would not bound a batch whose events were
+  lost (no face is named), and would still announce every group a route
+  covers, only on one face; a gate on the one send bounds every case.
 - *Over IPC.* A connection to an external forwarder over its Unix socket
-  has no such stream: the daemon's `/localhost/nfd/rib/notifications`
-  tells only the registrations made through its management interface, not
-  the routes its link layer, configuration or routing protocols install.
-  There the periodic announcement alone runs, as before, and the change
-  announced run of §17.1 still covers the group once a member is heard.
+  (`ndn_app::IpcConnection`) tells the same routes by following the
+  daemon's `/localhost/nfd/rib/notifications` stream (`ndn_ipc::events`;
+  `ndn_mgmt_wire::events::RibEvent`; mgmt-trust.md "Notifications"). The
+  daemon publishes there each `RouteUp` of its RIB on a face that is not
+  always local (a link, a tunnel, a radio: the filter of the embedded
+  connection, `ForwarderEngine::face_reaches_off_host`), however the route
+  got in (its link layer, configuration, a routing protocol, a
+  registration through its management interface), as a `route-up` event,
+  and a `routes-missed` event when its own feed fell behind. A
+  client behind the stream's ring is told to resync, which it takes as
+  lost events too. The stream is local to the host (`/localhost`: no
+  remote face is answered, and nothing serves it under `/localhop`), and
+  tells no local application's or management socket's route. The
+  connection follows it over its own control face, so its prefix
+  registrations do not wait behind the long-poll; if the daemon cannot be
+  followed (the connection is gone) the periodic announcement alone
+  runs, and the change announced run of §17.1 still covers the group
+  once a member is heard.
 - *Decides nothing.* The announcement only moves the time a member
   learns of a change; what it fetches is judged as always (invariant 1).
 
@@ -5639,7 +5719,19 @@ the default seed and two more, each with `--check-determinism`.
   several groups or collections at one moment — announcements, their
   re-announcements, fetches, asks — it starts in name order, never in a
   hash table's per-process order, and the random bytes it draws (keys,
-  nonces) change what it sends, never its order or timing.
+  nonces) change what it sends, never its order or timing. A task that
+  waits on several sources at once (its shutdown, a timer, what the
+  application hands in, what the network sends) polls them in one fixed
+  order, `biased`, so two ready at the same virtual instant are taken in
+  the same order in every process, never in the order the runtime's
+  unseeded random draw picks. The order is shutdown, timers, what the
+  node's own application hands in, then the network, so a flood from the
+  network delays inbound work and nothing else; a timer is re-armed to a
+  later deadline each time it fires, so none stays ready to starve the
+  rest. The sets a Sync reply is made from (PSync's held Interests,
+  stored segments, and the names a reconcile offers) are ordered by name
+  or hash, so the names in a Sync Data and the Interests answered by one
+  publication come out in one order.
   The JSON report records the network (`network`: `mode` — `clean`,
   `faulty` or `faults` — the profile as run and its seed) and, for each
   case, the profile it ran under (`faults`).
@@ -7261,7 +7353,15 @@ pub struct JoinedFolder {
     layer carries). `writer_carries` adds only the **summary root**
     (`<D>/32=summary/<W>/32=root`, with or without its head) of each such
     namespace `W`, so that a writer who was invited by an invitation of
-    its own can walk to the other writers' devices through this device's copy.
+    its own can walk to the other writers' devices through this device's copy,
+    and the **seal keys** of their devices (the exact name
+    `<W>/<role>/<device>/32=seal/<public key>`: exactly two components below
+    `W`, the first a role of the layout), so that one can ask the other's
+    device (ndn-link.md §8.7 rule 20). `folder_carries` carries a seal key
+    only of a device of the folder's own namespace in that same exact form,
+    not of every device's (round 11 review I1: the clause carried the
+    seal key of any namespace's device, so a stranger's crossed a link whose
+    record did not list her).
     A walk asks a device that answers for a writer for that writer's root
     wrapped as a held packet (`<H>/32=held/<D>/32=summary/<W>/32=root`): such a
     name is carried when the root it wraps is, nested to the depth

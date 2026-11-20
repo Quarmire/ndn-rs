@@ -135,16 +135,20 @@ async fn more_reads_of_states_than_are_checked_are_refused_without_the_state_loc
     );
 }
 
+/// What of the queue the asks whose asker's certificate is not held may take (round 11 M2(b)): a
+/// quarter of `asks_queued`, at least one.
 #[tokio::test]
-async fn the_asks_held_while_they_are_opened_are_bounded_and_the_rest_are_dropped() {
+async fn asks_whose_askers_certificate_is_not_held_take_a_quarter_of_the_queue_at_most() {
     let mut w = World::new();
     let laptop = alice_with_data(&mut w, serving(vec![sum(1)], AskServing::Own, 4)).await;
     let _fetched = fetching_nothing(&w, "/alice/laptop");
     let ask = AnswerAsk::pure(newest(&laptop, &plan()).await, sum_v(1));
     let cap = laptop.inner.config.answers.asks_queued;
+    let share = (cap / 4).max(1);
 
     // Strangers of the signer's own namespace, whose proofs wait for a certificate that never
-    // comes, more of them than the signer holds: the rest are dropped without a reply, at once.
+    // comes, more of them than the signer holds: those past the share are dropped without a
+    // reply, at once.
     let mut set = flood(
         &laptop,
         &ask,
@@ -156,8 +160,13 @@ async fn the_asks_held_while_they_are_opened_are_bounded_and_the_rest_are_droppe
         assert!(done.unwrap().is_none());
         dropped += 1;
     }
-    assert_eq!(dropped, 8, "the asks past the {cap} held are dropped");
-    assert_eq!(laptop.inner.st.lock().answer_asks.queued(), cap);
+    assert_eq!(
+        dropped,
+        cap + 8 - share,
+        "the asks past the {share} held for askers whose certificate is not held are dropped"
+    );
+    assert_eq!(laptop.inner.st.lock().answer_asks.queued(), share);
+    assert_eq!(laptop.inner.st.lock().answer_asks.uncached(), share);
     set.abort_all();
     while set.join_next().await.is_some() {}
     assert_eq!(
@@ -165,6 +174,95 @@ async fn the_asks_held_while_they_are_opened_are_bounded_and_the_rest_are_droppe
         0,
         "what was held is let go"
     );
+    assert_eq!(laptop.inner.st.lock().answer_asks.uncached(), 0);
+}
+
+#[tokio::test]
+async fn the_asks_held_while_they_are_opened_are_bounded_and_the_rest_are_dropped() {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, serving(vec![sum(1)], AskServing::Own, 4)).await;
+    let phone = w.start("/alice/phone", knowing(vec![])).await;
+    let ask = AnswerAsk::pure(newest(&laptop, &plan()).await, sum_v(1));
+    let cap = laptop.inner.config.answers.asks_queued;
+
+    // Every permit of the proofs is held elsewhere, so the asks of Alice's phone, whose
+    // certificate the signer holds, wait for their turn in the queue: more of them than the
+    // signer holds, and the rest are dropped without a reply, at once.
+    let turns = laptop
+        .inner
+        .answer_verifying
+        .acquire_many(laptop.inner.config.asks_verifying as u32)
+        .await
+        .unwrap();
+    let public = laptop.inner.st.lock().keys.recipient.public();
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..cap + 8 {
+        let (name, params, _key) = phone.inner.build_ask(laptop.name(), &public, &ask).unwrap();
+        let laptop = laptop.clone();
+        set.spawn(async move { laptop.inner.answer_ask(&name, Some(params), None).await });
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut dropped = 0;
+    while let Some(done) = set.try_join_next() {
+        assert!(done.unwrap().is_none());
+        dropped += 1;
+    }
+    assert_eq!(dropped, 8, "the asks past the {cap} held are dropped");
+    assert_eq!(laptop.inner.st.lock().answer_asks.queued(), cap);
+    assert_eq!(
+        laptop.inner.st.lock().answer_asks.uncached(),
+        0,
+        "a known device's ask takes no place of the others'"
+    );
+    drop(turns);
+    set.abort_all();
+    while set.join_next().await.is_some() {}
+    assert_eq!(
+        laptop.inner.st.lock().answer_asks.queued(),
+        0,
+        "what was held is let go"
+    );
+}
+
+/// Round-11 M2(b): Bob's flood of asks that claim made-up devices of Alice's namespace (which
+/// `Own` serves) and carry junk proofs parks every one of them on a certificate fetch that never
+/// comes. They share a quarter of the queue and one verify permit, so Alice's own phone, whose
+/// certificate the laptop holds, is still answered.
+#[tokio::test]
+async fn a_flood_of_ghost_claims_does_not_stop_a_known_device_from_being_answered() {
+    let mut w = World::new();
+    let laptop = alice_with_data(&mut w, serving(vec![sum(1)], AskServing::Own, 4)).await;
+    let phone = w.start("/alice/phone", knowing(vec![])).await;
+    let _fetched = fetching_nothing(&w, "/alice/laptop");
+    let ask = AnswerAsk::pure(newest(&laptop, &plan()).await, sum_v(1));
+    let cap = laptop.inner.config.answers.asks_queued;
+
+    // More ghosts than the queue holds, all at once, so that without the split they fill the
+    // queue and every verify permit.
+    let mut set = flood(
+        &laptop,
+        &ask,
+        (0..cap * 2).map(|i| n(&format!("/alice/ghost{i}"))),
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let phone_told = tokio::time::timeout(
+        Duration::from_secs(5),
+        told(&phone, &laptop, &ask, Some(Duration::from_secs(4))),
+    )
+    .await;
+    match phone_told {
+        Ok(Told::Answer(_)) => {}
+        Ok(other) => panic!(
+            "Alice's own phone is not answered while ghosts flood: {}; queued {}",
+            describe(&other),
+            laptop.inner.st.lock().answer_asks.queued()
+        ),
+        Err(_) => panic!("Alice's own phone waited on the ghosts' certificate fetches"),
+    }
+    set.abort_all();
+    while set.join_next().await.is_some() {}
+    assert_eq!(laptop.inner.st.lock().answer_asks.queued(), 0);
+    assert_eq!(laptop.inner.st.lock().answer_asks.uncached(), 0);
 }
 
 #[tokio::test]

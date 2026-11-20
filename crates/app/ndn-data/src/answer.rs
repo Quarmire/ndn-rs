@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::{Hash, Name, NameComponent, tlv_type};
+use ndn_security::confidentiality::ContentKey;
 use ndn_tlv::{TlvReader, TlvWriter};
 use sha2::{Digest, Sha256};
 
@@ -81,7 +82,8 @@ pub mod tlv {
     /// ([`AnswerAskEnvelope`](super::AnswerAskEnvelope)).
     pub const ANSWER_ASK_ENVELOPE: u64 = 0x05DE;
     /// A signer's refusal of an ask, the reply's Content: a reason code, a number and an
-    /// explanation ([`AnswerAskRefusal`](super::AnswerAskRefusal)).
+    /// explanation ([`AnswerAskRefusal`](super::AnswerAskRefusal)); for code 8 the explanation
+    /// is sealed under the ask's content key.
     pub const ANSWER_ASK_REFUSAL: u64 = 0x05DF;
 }
 
@@ -1184,8 +1186,9 @@ pub enum EvalError {
     /// the same on every device. The text is shown to an asker the signer refused, as the
     /// evaluator's own words ([`AskRefusal::EvaluatorRefused`], answers.md §15.6): say what is
     /// wrong with the definition and how to fix it, in at most 512 characters, and never put the
-    /// contents of an input in it (the reply is not sealed, and a plan's inputs are judged against
-    /// the asker's audience after the plan).
+    /// contents of an input in it (the signer tells the words only to an asker who may read
+    /// every read the evaluator had made, and seals them on the wire, but an evaluator that
+    /// quotes an input leaves its other readers' data in an error message).
     #[error("{0}")]
     Refused(String),
     /// A read outside the read set, or a read of the set that is never used (a recompute only).
@@ -1634,20 +1637,84 @@ pub const EVALUATOR_REASON_MAX: usize = 512;
 const REASON_HEAD: &str = "the signer's evaluator refused the definition, in its words: \"";
 const REASON_TAIL: &str = "\"; fix the definition and ask again";
 
+/// The format characters (Unicode general category `Cf`) that [`evaluator_words`] drops, as
+/// inclusive ranges of Unicode 16 (no table crate is in the dependency tree, and one is not
+/// worth adding for this): invisible, they let a signer hide text, join or split it, or
+/// reorder what surrounds it. Ranges that hold unassigned code points beside the `Cf` ones
+/// (U+2060..U+206F, U+E0000..U+E007F) are dropped whole, as they are future format characters
+/// at worst.
+const FORMAT_CHARACTERS: &[(char, char)] = &[
+    ('\u{ad}', '\u{ad}'),       // soft hyphen
+    ('\u{600}', '\u{605}'),     // Arabic number signs
+    ('\u{61c}', '\u{61c}'),     // Arabic letter mark (a bidirectional mark)
+    ('\u{6dd}', '\u{6dd}'),     // Arabic end of ayah
+    ('\u{70f}', '\u{70f}'),     // Syriac abbreviation mark
+    ('\u{890}', '\u{891}'),     // Arabic pound and piastre marks above
+    ('\u{8e2}', '\u{8e2}'),     // Arabic disputed end of ayah
+    ('\u{180e}', '\u{180e}'),   // Mongolian vowel separator
+    ('\u{200b}', '\u{200f}'),   // zero-width space, (non-)joiners, direction marks
+    ('\u{202a}', '\u{202e}'),   // bidirectional embeddings and overrides
+    ('\u{2060}', '\u{206f}'),   // word joiner, invisible operators, isolates, deprecated
+    ('\u{feff}', '\u{feff}'),   // byte order mark, zero-width no-break space
+    ('\u{fff9}', '\u{fffb}'),   // interlinear annotation
+    ('\u{110bd}', '\u{110bd}'), // Kaithi number sign
+    ('\u{110cd}', '\u{110cd}'), // Kaithi number sign above
+    ('\u{13430}', '\u{1343f}'), // Egyptian hieroglyph format controls
+    ('\u{1bca0}', '\u{1bca3}'), // shorthand format controls
+    ('\u{1d173}', '\u{1d17a}'), // musical symbol format controls
+    ('\u{e0000}', '\u{e007f}'), // tag characters
+];
+
+/// Characters that look like the double quote `"` that frames the words, which
+/// [`evaluator_words`] makes single quotes: the typographic double quotes (U+201C to U+201F),
+/// the double and reversed double primes (U+2033, U+2036), the fullwidth quotation mark
+/// (U+FF02), the CJK double prime quotes (U+301D to U+301F), the Hebrew gershayim (U+05F4),
+/// the modifier letter double prime and double acute accent (U+02BA, U+02DD), the heavy
+/// ornament quotes (U+275D, U+275E), U+2E42, and the decorative quotes U+1F676 to U+1F678.
+fn double_quote_lookalike(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\u{201c}'..='\u{201f}'
+            | '\u{2033}'
+            | '\u{2036}'
+            | '\u{ff02}'
+            | '\u{301d}'..='\u{301f}'
+            | '\u{5f4}'
+            | '\u{2ba}'
+            | '\u{2dd}'
+            | '\u{275d}'
+            | '\u{275e}'
+            | '\u{2e42}'
+            | '\u{1f676}'..='\u{1f678}'
+    )
+}
+
+/// Whether `c` is dropped from the words of an evaluator: a control character (every
+/// `char::is_control`: newlines, tabs, the escape of an ANSI sequence), a format character
+/// ([`FORMAT_CHARACTERS`]), or the line and paragraph separators (U+2028, U+2029), which a
+/// graphical host shows as line breaks.
+fn dropped_from_words(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}')
+        || FORMAT_CHARACTERS
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&c))
+}
+
 /// `raw` as the words of a signer's evaluator that may be shown (answers.md §15.9): no control
-/// character (every `char::is_control`: newlines, tabs, the escape of an ANSI sequence), no
-/// character that reorders the text around it (the bidirectional embeddings, overrides and
-/// isolates, which a signer could use to carry the closing quote elsewhere), no double quote
-/// (each is a single quote, so the words can never close the quotes they are shown in), and at
-/// most [`EVALUATOR_REASON_MAX`] characters: past that, the first `EVALUATOR_REASON_MAX - 1`
-/// and an ellipsis (the ellipsis is within the cap). Idempotent.
+/// character, no format character (which includes every one that reorders the text around it,
+/// the bidirectional marks, embeddings and isolates, which a signer could use to carry the
+/// closing quote elsewhere, and the zero-width and tag characters that hide text), no line or
+/// paragraph separator, no double quote or look-alike of one (each is a single quote, so the
+/// words can never close the quotes they are shown in, nor read as if they had), and at most
+/// [`EVALUATOR_REASON_MAX`] characters: past that, the first `EVALUATOR_REASON_MAX - 1`
+/// and an ellipsis (the ellipsis is within the cap). Idempotent. A host shows the result as
+/// what it is, an untrusted signer's words, quoted.
 fn evaluator_words(raw: &str) -> String {
-    // The marks and embeddings of bidirectional text, which reorder what surrounds them.
-    let reorders = |c: &char| matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     let mut kept = raw
         .chars()
-        .filter(|c| !c.is_control() && !reorders(c))
-        .map(|c| if c == '"' { '\'' } else { c })
+        .filter(|&c| !dropped_from_words(c))
+        .map(|c| if double_quote_lookalike(c) { '\'' } else { c })
         .take(EVALUATOR_REASON_MAX + 1)
         .collect::<Vec<char>>();
     if kept.len() > EVALUATOR_REASON_MAX {
@@ -1665,7 +1732,9 @@ fn quoted(words: &str) -> String {
 /// A signer's refusal of an ask, the Content of the reply Data (TLV 0x05DF, answers.md §15).
 /// Its value is the reason code as a one-octet NonNegativeInteger, the one number the reason
 /// carries ([`AskRefusal`]) as an eight-octet NonNegativeInteger, and, to the end, the
-/// explanation in UTF-8: why, and what to do.
+/// explanation: in UTF-8 (why, and what to do) for every reason but
+/// [`AskRefusal::EvaluatorRefused`], whose explanation holds the evaluator's words and is
+/// sealed under the ask's content key for the reply's name ([`Self::encode`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnswerAskRefusal {
     /// The reason.
@@ -1691,8 +1760,9 @@ impl AnswerAskRefusal {
 
     /// The refusal [`AskRefusal::EvaluatorRefused`] with the evaluator's `reason` in its
     /// explanation, as the signer's quoted words: sanitised as [`Self::said`] does (no control
-    /// character, at most [`EVALUATOR_REASON_MAX`] characters), so that what the signer puts
-    /// on the wire is already what is shown.
+    /// or format character, no line or paragraph separator, double quotes and their
+    /// look-alikes made single, at most [`EVALUATOR_REASON_MAX`] characters), so that what the
+    /// signer puts on the wire (sealed, [`Self::encode`]) is already what is shown.
     pub fn evaluator_refused(reason: &str) -> Self {
         AnswerAskRefusal {
             why: AskRefusal::EvaluatorRefused,
@@ -1704,8 +1774,9 @@ impl AnswerAskRefusal {
     /// [`AskRefusal::EvaluatorRefused`], the reason's own text ([`AskRefusal::explain`]): what
     /// the signer wrote is a hostile or compromised signer's own words and is never shown. For
     /// `EvaluatorRefused`, the evaluator's words as the signer gave them, cleaned again here
-    /// (control characters removed, at most [`EVALUATOR_REASON_MAX`] characters, double quotes
-    /// made single), and always inside this device's own frame, `the signer's evaluator refused
+    /// (control and format characters and the line and paragraph separators removed, at most
+    /// [`EVALUATOR_REASON_MAX`] characters, double quotes and their look-alikes made single),
+    /// and always inside this device's own frame, `the signer's evaluator refused
     /// the definition, in its words: "…"; fix the definition and ask again`, so that nothing the
     /// signer sent reads as this device's words. A refusal that gave no words is the reason's
     /// own text.
@@ -1726,17 +1797,31 @@ impl AnswerAskRefusal {
         }
     }
 
-    /// The `AnswerAskRefusal` TLV (0x05DF).
-    pub fn encode(&self) -> Bytes {
-        let mut v = Vec::with_capacity(9 + self.explanation.len());
+    /// The `AnswerAskRefusal` TLV (0x05DF) of the reply named `reply`. The explanation of
+    /// [`AskRefusal::EvaluatorRefused`], which carries the evaluator's words, is sealed under
+    /// `key`, the ask's own content key, bound to `reply`, so the words cross the network
+    /// readable by the asker and the signer alone; every other reason's explanation is the
+    /// fixed text of [`AskRefusal::explain`] and travels in the clear.
+    pub fn encode(&self, key: &ContentKey, reply: &Name) -> Bytes {
+        let sealed;
+        let explanation = if self.why == AskRefusal::EvaluatorRefused {
+            sealed = crate::seal::seal_words(key, reply, &self.explanation);
+            &sealed[..]
+        } else {
+            self.explanation.as_bytes()
+        };
+        let mut v = Vec::with_capacity(9 + explanation.len());
         v.push(self.why.code() as u8);
         v.extend_from_slice(&self.why.param().to_be_bytes());
-        v.extend_from_slice(self.explanation.as_bytes());
+        v.extend_from_slice(explanation);
         tlv_of(tlv::ANSWER_ASK_REFUSAL, &v)
     }
 
-    /// Decode one `AnswerAskRefusal` TLV, exactly.
-    pub fn decode(tlv: Bytes) -> Result<Self, WireError> {
+    /// Decode one `AnswerAskRefusal` TLV, exactly, the content of the reply `reply` to the ask
+    /// whose content key is `key`. A code-8 explanation that does not open under `key` for
+    /// `reply` (a signer that sent words in the clear, sealed them under another key, or
+    /// garbage) is the fixed text of [`AskRefusal::explain`], never the octets that came.
+    pub fn decode(tlv: Bytes, key: &ContentKey, reply: &Name) -> Result<Self, WireError> {
         let value = unwrap_tlv(tlv, tlv::ANSWER_ASK_REFUSAL, "an AnswerAskRefusal")?;
         let (Some(code), Some(param)) = (
             value.first().copied(),
@@ -1746,13 +1831,15 @@ impl AnswerAskRefusal {
                 "an ask's refusal is a reason code, a number and an explanation",
             ));
         };
-        let explanation = std::str::from_utf8(&value[9..])
-            .map_err(|_| bad("an ask's refusal explains itself in UTF-8"))?
-            .to_owned();
-        Ok(AnswerAskRefusal {
-            why: AskRefusal::of(u64::from(code), u64::from_be_bytes(param))?,
-            explanation,
-        })
+        let why = AskRefusal::of(u64::from(code), u64::from_be_bytes(param))?;
+        let explanation = if why == AskRefusal::EvaluatorRefused {
+            crate::seal::open_words(key, reply, &value[9..]).unwrap_or_else(|| why.explain())
+        } else {
+            std::str::from_utf8(&value[9..])
+                .map_err(|_| bad("an ask's refusal explains itself in UTF-8"))?
+                .to_owned()
+        };
+        Ok(AnswerAskRefusal { why, explanation })
     }
 }
 

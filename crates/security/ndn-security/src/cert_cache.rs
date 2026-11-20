@@ -285,6 +285,13 @@ impl CertCache {
         )
     }
 
+    /// Whether a certificate vouched for is cached under `name` (see [`get`](Self::get)),
+    /// whatever its validity period: a lookup in what is held, never a fetch, and never
+    /// true for an unverified certificate, which anyone who is asked may have served.
+    pub fn holds_vouched(&self, name: &Name) -> bool {
+        self.matching(name).any(|(_, vouched)| vouched)
+    }
+
     /// The certificates `name` resolves to, each with whether it is vouched
     /// for.
     fn matching(&self, name: &Name) -> impl Iterator<Item = (Certificate, bool)> + '_ {
@@ -804,5 +811,19 @@ mod tests {
         );
         assert!(cache.drop_unverified(&newer));
         assert!(cache.get(&key).is_none() && cache.all(&key).is_empty());
+    }
+
+    /// `holds_vouched` is what the cache holds as vouched for, never a fetched copy.
+    #[test]
+    fn only_a_certificate_vouched_for_is_held_as_vouched() {
+        let cache = CertCache::new();
+        let key: Name = "/a/KEY/k".parse().unwrap();
+        assert!(!cache.holds_vouched(&key));
+        let fetched = cert("/a/KEY/k/self/v=1", 1, u64::MAX);
+        assert!(cache.insert_unverified(fetched.clone()));
+        assert!(cache.all(&key).len() == 1 && !cache.holds_vouched(&key));
+        cache.insert(cert("/a/KEY/k/self/v=2", 2, 5)); // vouched for, and long expired
+        assert!(cache.holds_vouched(&key));
+        assert!(!cache.holds_vouched(&"/a/KEY/other".parse().unwrap()));
     }
 }

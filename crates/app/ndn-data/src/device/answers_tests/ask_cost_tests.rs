@@ -315,7 +315,7 @@ async fn a_refusal_the_signer_words_is_never_shown_as_it_came() {
         why: AskRefusal::NotServed,
         explanation: "\u{1b}[2J\u{1b}[31mpay me\r\n\u{7}".repeat(300),
     };
-    *wire.forced.lock().unwrap() = Some(hostile.encode());
+    *wire.forced_refusal.lock().unwrap() = Some(hostile);
     let q = pure_question(newest(&laptop, &plan()).await, &sum_v(1));
     let refused = phone.ask_answer(&n("/alice/laptop"), &q).await.unwrap_err();
     let text = refused.to_string();

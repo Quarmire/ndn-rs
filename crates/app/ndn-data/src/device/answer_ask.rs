@@ -27,6 +27,7 @@ use bytes::Bytes;
 use ndn_app::Consumer;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Name};
+use ndn_security::confidentiality::ContentKey;
 use ndn_tlv::TlvReader;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
@@ -41,7 +42,7 @@ use crate::answer::{
 use crate::collection::Epoch;
 use crate::error::{AnswerRefusal, DataError};
 use crate::layer::{Age, Answer, Got};
-use crate::seal::{AskKey, open_ask};
+use crate::seal::{AskKey, open_ask_keyed};
 use crate::wire::{self, device_of, parse_seal_key_name};
 
 /// How long an asker is told to wait before asking again when the signer is busy or the answer
@@ -93,6 +94,9 @@ pub(super) struct AnswerAsks {
     /// Asks held while they are opened and their proofs verified
     /// ([`crate::AnswerConfig::asks_queued`]).
     queued: usize,
+    /// Of those, the asks whose asker's key has no certificate held here, so that fetching one
+    /// may be what they wait for: at most [`uncached_queued`] of them.
+    uncached: usize,
     /// Asks being worked on whose asker is of another namespace than this device's.
     foreign: usize,
     /// The same, for each such namespace.
@@ -108,6 +112,12 @@ impl AnswerAsks {
     #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
         self.queued
+    }
+
+    /// Asks held while opened whose asker's certificate is not held, for the cases.
+    #[cfg(test)]
+    pub(super) fn uncached(&self) -> usize {
+        self.uncached
     }
 
     /// Count one more ask in progress of a device of the namespace `ns`, another than this
@@ -155,13 +165,50 @@ impl AnswerAsks {
     }
 }
 
+/// The most asks held while opened that wait on a proof whose key has no certificate held: a
+/// quarter of `asks_queued`, at least one (answers.md §15.3).
+fn uncached_queued(asks_queued: usize) -> usize {
+    (asks_queued / 4).max(1)
+}
+
 /// One ask held while it is opened and its proof verified, let go as it is dropped.
-struct AskQueued<'a>(&'a Inner);
+struct AskQueued<'a> {
+    inner: &'a Inner,
+    /// Whether it also holds one of the places of the asks whose asker's certificate is not
+    /// held ([`uncached_queued`]).
+    uncached: bool,
+}
+
+impl AskQueued<'_> {
+    /// Hold one of the places of the asks whose asker's certificate is not held, if one is
+    /// free; `false` when the share is taken.
+    fn hold_uncached(&mut self) -> bool {
+        if self.uncached {
+            return true;
+        }
+        let mut st = self.inner.st.lock();
+        let share = uncached_queued(self.inner.config.answers.asks_queued);
+        if st.answer_asks.uncached >= share {
+            tracing::debug!(
+                me = %self.inner.device,
+                held = st.answer_asks.uncached,
+                "an ask for an answer whose asker's certificate is not held is not answered: its share of Config::answers.asks_queued is taken"
+            );
+            return false;
+        }
+        st.answer_asks.uncached += 1;
+        self.uncached = true;
+        true
+    }
+}
 
 impl Drop for AskQueued<'_> {
     fn drop(&mut self) {
-        let mut st = self.0.st.lock();
+        let mut st = self.inner.st.lock();
         st.answer_asks.queued = st.answer_asks.queued.saturating_sub(1);
+        if self.uncached {
+            st.answer_asks.uncached = st.answer_asks.uncached.saturating_sub(1);
+        }
     }
 }
 
@@ -268,10 +315,10 @@ impl Inner {
             return None;
         };
         let opened = {
-            let _queued = self.queue_answer_ask()?;
-            rt::timeout(lifetime, self.open_answer_ask(params)).await
+            let mut queued = self.queue_answer_ask()?;
+            rt::timeout(lifetime, self.open_answer_ask(params, &mut queued)).await
         };
-        let (asker, ask) = match opened {
+        let (asker, ask, reply_key) = match opened {
             Ok(Ok(opened)) => opened,
             Ok(Err(why)) => {
                 tracing::debug!(me = %self.device, %name, "an ask for an answer is not answered: {why}");
@@ -286,7 +333,7 @@ impl Inner {
             Ok(packet) => packet,
             Err(refusal) => {
                 tracing::debug!(me = %self.device, %asker, why = ?refusal.why, "an ask for an answer is refused");
-                refusal.encode()
+                refusal.encode(&reply_key, name)
             }
         };
         self.sign(DataBuilder::new(name.clone(), &content).freshness(Duration::ZERO))
@@ -306,7 +353,28 @@ impl Inner {
             return None;
         }
         st.answer_asks.queued += 1;
-        Some(AskQueued(self))
+        Some(AskQueued {
+            inner: self,
+            uncached: false,
+        })
+    }
+
+    /// Whether the key an ask's proof names has a certificate vouched for held here (or is a
+    /// trust anchor of the context that judges the proof): a lookup in the certificates this
+    /// device holds, made before any slot or permit is taken for verifying, and never a
+    /// fetch. A certificate fetched and not vouched for yet does not count: whoever is asked
+    /// for one may serve it.
+    fn proof_key_held(&self, proof: &Data) -> bool {
+        let Some(key) = proof.sig_info().and_then(|s| s.key_locator_name()) else {
+            return false;
+        };
+        let judge = self.judge_any(&proof.name);
+        judge.cert_cache().holds_vouched(&key)
+            || judge
+                .keyring()
+                .context_for(&proof.name)
+                .anchor_for(&key)
+                .is_some()
     }
 
     /// Whether the serving policy ([`AskServing`]) serves devices of the namespace `ns`: this
@@ -346,8 +414,9 @@ impl Inner {
     async fn open_answer_ask(
         self: &Arc<Self>,
         params: Bytes,
-    ) -> Result<(Name, AnswerAsk), &'static str> {
-        let (envelope, body) = {
+        queued: &mut AskQueued<'_>,
+    ) -> Result<(Name, AnswerAsk, ContentKey), &'static str> {
+        let (envelope, body, reply_key) = {
             let _verifying = self
                 .answer_verifying
                 .acquire()
@@ -355,7 +424,7 @@ impl Inner {
                 .map_err(|_| "this device stopped")?;
             let envelope = AnswerAskEnvelope::decode(params).map_err(|_| "no envelope")?;
             let aad = answer_ask_prefix(&self.device).encode_to_tlv();
-            let plain = open_ask(
+            let (plain, reply_key) = open_ask_keyed(
                 &self.st.lock().keys.recipient,
                 &aad,
                 &envelope.ephemeral,
@@ -365,24 +434,36 @@ impl Inner {
             .ok_or("the envelope does not open")?;
             let body =
                 AnswerAskBody::decode(Bytes::from(plain)).map_err(|_| "the body is malformed")?;
-            (envelope, body)
+            (envelope, body, reply_key)
         };
         // Who the proof claims, unverified: nothing is fetched for a device of a namespace this
         // device does not serve.
         let (proof, claimed) = Self::claimed_asker(&body.proof)
             .filter(|(_, claimed)| *claimed == body.asker)
             .ok_or("its proof is not a packet signed by the device that asks")?;
-        if !self.serves_namespace(&self.namespace_of_name(&claimed)) {
+        if !self.serves_namespace(&self.asker_namespace(&claimed)) {
             return Err("the asker is of no namespace this device serves");
         }
         let binding = AnswerAskBody::binding(&self.device, &body.ask, &envelope.ephemeral);
-        if !self
-            .proves_with(&self.answer_verifying, &proof, &claimed, &binding)
-            .await
-        {
+        // A proof whose key has a certificate held here verifies from what is held; any other
+        // may wait on a fetch, so those take the one turn and the share of the queue meant for
+        // them, and a crowd of them cannot keep the known devices waiting.
+        let turns = if self.proof_key_held(&proof) {
+            &self.answer_verifying
+        } else if queued.hold_uncached() {
+            &self.answer_uncached_verifying
+        } else {
+            return Err(
+                "as many asks whose asker's certificate is not held here as \
+                 Config::answers.asks_queued allows (a quarter of it) are waiting already; the \
+                 asker asks again once they are done, and holds its certificate here after the \
+                 first fetch of it",
+            );
+        };
+        if !self.proves_with(turns, &proof, &claimed, &binding).await {
             return Err("its proof does not verify as the asker's, for this ask");
         }
-        Ok((claimed, body.ask))
+        Ok((claimed, body.ask, reply_key))
     }
 
     /// Steps 3 to 7: what the signer answers an authenticated asker: the answer packet, or why
@@ -393,7 +474,7 @@ impl Inner {
         ask: AnswerAsk,
         lifetime: Duration,
     ) -> Result<Bytes, AnswerAskRefusal> {
-        let ns = self.namespace_of_name(asker);
+        let ns = self.asker_namespace(asker);
         let own = ns == self.ns;
         if own && !self.role_served(asker) {
             return Err(AskRefusal::NotServed.into());
@@ -414,11 +495,14 @@ impl Inner {
             (None, Some(definition)) => {
                 let set = ReadSet::new([definition.clone()]).expect("one read");
                 self.gate_reads(&gate, &set, false).await?;
+                // The definition is read and judged again as held before anything is planned
+                // over it, whether this signer knows the evaluator or not: what the evaluator
+                // says of it, and what `CannotCheck` says of which evaluators this signer
+                // knows, are for an asker who may read it. (The reads the plan makes past it
+                // are judged in `planned`, as they are made.)
+                self.fetched(&qname, &set).await?;
+                self.gate_reads(&gate, &set, true).await?;
                 if ask.kind == AnswerKind::Pure && self.config.evaluators.get(&ask.by).is_none() {
-                    // `CannotCheck` tells which evaluators this signer knows: only to an asker
-                    // who may read the definition, which is held here to judge it.
-                    self.fetched(&qname, &set).await?;
-                    self.gate_reads(&gate, &set, true).await?;
                     return Err(AskRefusal::CannotCheck.into());
                 }
             }
@@ -426,7 +510,7 @@ impl Inner {
         }
         // The id: planning reads, never evaluating. The reads that come of it are the ones
         // computed, so they are the ones judged, whoever chose them.
-        let resolved = self.planned(&qname, &ask).await?;
+        let resolved = self.planned(&gate, &qname, &ask).await?;
         self.gate_reads(&gate, &resolved.reads, true).await?;
         if let Some(packet) = self.own_answer_wire(&resolved.id) {
             return Ok(packet);
@@ -463,23 +547,57 @@ impl Inner {
     /// Plan the question, within [`crate::Budget::time`]: reads of versions not held are
     /// fetched, which takes as long as the network does, and the caps the ask holds are not
     /// kept for longer. `Pending` when it is not done: what was fetched is held, and the
-    /// asker's next ask goes on from there.
+    /// asker's next ask goes on from there. A known evaluator's refusal while planning is
+    /// told with its words only as [`Self::admitted_words`] allows.
     async fn planned(
         self: &Arc<Self>,
+        gate: &Gate,
         qname: &Name,
         ask: &AnswerAsk,
     ) -> Result<super::answer_get::Resolved, AnswerAskRefusal> {
         match rt::timeout(
             self.config.answers.budget.time,
-            self.resolve_question(qname, ask, false),
+            self.resolve_reading(qname, ask, false),
         )
         .await
         {
-            Ok(resolved) => resolved.map_err(|e| self.ask_refusal(ask.kind, &e)),
+            Ok(Ok(resolved)) => Ok(resolved),
+            Ok(Err(failed)) => {
+                let refusal = self.ask_refusal(ask.kind, &failed.error);
+                Err(self.admitted_words(gate, refusal, failed.read).await)
+            }
             Err(_) => Err(AskRefusal::Pending {
                 retry_after: RETRY_AFTER,
             }
             .into()),
+        }
+    }
+
+    /// `refusal`, with the evaluator's words if it has any ([`AskRefusal::EvaluatorRefused`])
+    /// only if the asker is of the audience of every one of `read`, the reads the evaluator
+    /// had made when it spoke: its words quote what it read (a parse error quotes the value),
+    /// and the asker, who may have left the reads to this signer, never chose them. If it is not
+    /// of the audience of one, the refusal says so (`NotAudience`, `NotServed`: the reads are
+    /// held, as they were just read, so this is what [`Self::gate_reads`] says of them again); any
+    /// other verdict, and a refusal that carries no reads, gets the fixed text of the reason.
+    async fn admitted_words(
+        self: &Arc<Self>,
+        gate: &Gate,
+        refusal: AnswerAskRefusal,
+        read: Vec<ReadRef>,
+    ) -> AnswerAskRefusal {
+        if refusal.why != AskRefusal::EvaluatorRefused {
+            return refusal;
+        }
+        let fixed = || AnswerAskRefusal::new(AskRefusal::EvaluatorRefused);
+        let set = match ReadSet::new(read) {
+            Ok(set) if !set.reads().is_empty() => set,
+            _ => return fixed(),
+        };
+        match self.gate_reads(gate, &set, true).await {
+            Ok(()) => refusal,
+            Err(why @ (AskRefusal::NotAudience { .. } | AskRefusal::NotServed)) => why.into(),
+            Err(_) => fixed(),
         }
     }
 
@@ -857,8 +975,11 @@ impl Inner {
         let mut st = self.st.lock();
         st.seal_keys
             .retain(|name| parse_seal_key_name(name).is_none_or(|(device, _)| device != *signer));
-        st.seal_keys.insert((*data.name).clone(), public);
-        Some(public)
+        // Not kept, and not used, when the listing of a writer's namespace that it
+        // verified by went while it was fetched.
+        let unheld = self.namespace_unheld(&data.name);
+        st.keep_seal_key(&data.name, public, unheld)
+            .then_some(public)
     }
 
     /// Send `params` to `prefix` and wait for the reply: one lifetime.
@@ -878,13 +999,14 @@ impl Inner {
 
     /// The ask for `ask` sealed to the seal key `public` of `signer`, as it is sent: the name of
     /// its Interest, digest included, and the Interest's ApplicationParameters. Its proof is this
-    /// device's, bound to the ask and to the ephemeral key it is sealed with.
+    /// device's, bound to the ask and to the ephemeral key it is sealed with; and the ask's own
+    /// content key, which the signer seals the words of its refusal under.
     pub(super) fn build_ask(
         &self,
         signer: &Name,
         public: &[u8; 32],
         ask: &AnswerAsk,
-    ) -> Result<(Name, Bytes), DataError> {
+    ) -> Result<(Name, Bytes, ContentKey), DataError> {
         let aad = answer_ask_prefix(signer).encode_to_tlv();
         let key = AskKey::to(public, &aad)
             .map_err(|e| local(format!("the ask could not be sealed to {signer}: {e}")))?;
@@ -900,6 +1022,7 @@ impl Inner {
             asker: self.device.clone(),
             proof,
         };
+        let reply_key = key.reply_key();
         let sealed = key.seal(&body.encode(), &aad);
         let params = AnswerAskEnvelope {
             ephemeral: sealed.ephemeral,
@@ -907,7 +1030,7 @@ impl Inner {
             sealed: sealed.sealed,
         }
         .encode();
-        Ok((answer_ask_name(signer, &params), params))
+        Ok((answer_ask_name(signer, &params), params, reply_key))
     }
 
     /// One ask of `signer` for the answer to `ask`, sent until a reply comes (the same
@@ -938,7 +1061,7 @@ impl Inner {
             },
         };
         loop {
-            let (name, params) = self.build_ask(signer, &public, ask)?;
+            let (name, params, reply_key) = self.build_ask(signer, &public, ask)?;
             for _ in 0..ASK_SENDS {
                 let Some(data) = self.send_ask(answer_ask_prefix(signer), &params).await else {
                     continue;
@@ -954,7 +1077,7 @@ impl Inner {
                     tracing::debug!(me = %self.device, %signer, "a reply to an ask for an answer is not the signer's: dropped");
                     continue;
                 }
-                return Ok(Some(read_reply(&data).map_err(|why| {
+                return Ok(Some(read_reply(&data, &reply_key).map_err(|why| {
                     answer_error(question, AnswerRefusal::Malformed(why))
                 })?));
             }
@@ -1097,8 +1220,9 @@ impl Inner {
     }
 }
 
-/// Read a reply's Content: the answer packet, or a refusal.
-pub(super) fn read_reply(data: &Data) -> Result<Reply, String> {
+/// Read a reply's Content: the answer packet, or a refusal, whose words (code 8) open under
+/// `key`, the content key of the ask this reply answers, for the reply's name.
+pub(super) fn read_reply(data: &Data, key: &ContentKey) -> Result<Reply, String> {
     let content = data
         .content()
         .cloned()
@@ -1107,7 +1231,7 @@ pub(super) fn read_reply(data: &Data) -> Result<Reply, String> {
         .read_tlv()
         .map_err(|e| format!("the reply to an ask is not a TLV: {e:?}"))?;
     match typ {
-        tlv::ANSWER_ASK_REFUSAL => AnswerAskRefusal::decode(content)
+        tlv::ANSWER_ASK_REFUSAL => AnswerAskRefusal::decode(content, key, &data.name)
             .map(Reply::Refused)
             .map_err(|e| e.to_string()),
         // The content of a packet is a Data TLV.

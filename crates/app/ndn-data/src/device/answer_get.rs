@@ -52,6 +52,24 @@ pub(super) struct Opened {
     pub(super) pieces: Vec<Piece>,
 }
 
+/// A question that did not resolve: the error `get` of it answers, and, for a known evaluator's
+/// refusal, the reads the evaluator had made when it refused, which its words may quote (empty
+/// for any other failure). A signer says the words only to an asker who may read all of them
+/// ([`Inner::admitted_words`](super::Inner)).
+pub(super) struct Unresolved {
+    pub(super) error: DataError,
+    pub(super) read: Vec<ReadRef>,
+}
+
+impl From<DataError> for Unresolved {
+    fn from(error: DataError) -> Self {
+        Unresolved {
+            error,
+            read: Vec::new(),
+        }
+    }
+}
+
 /// A question resolved up to its binding and id (answers.md §7.2 steps 1 to 4).
 pub(super) struct Resolved {
     pub(super) kind: AnswerKind,
@@ -172,7 +190,7 @@ impl Inner {
             });
         };
         // 1. The signature, by the trust context as a log entry's is.
-        let signer = match self.verify(&data).await {
+        let (signer, vouched_for) = match self.verify_scoped(&data).await {
             Ok(w) => w,
             Err(Refusal::OutsideCut(_)) => {
                 return Err(refuse(AnswerRefusal::Untrusted {
@@ -287,6 +305,12 @@ impl Inner {
         // 4. The binding against the name, the read set and the epochs.
         let body = match Body::decode(plain) {
             Ok(b) => b,
+            // A device of a writer taken on a record's listing is no evidence-raiser
+            // outside what that listing covers: a malformed read set is refused as
+            // that packet, nothing kept against its signer.
+            Err(AnswerRefusal::ReadSet(why)) if vouched_for.is_some() => {
+                return Err(refuse(AnswerRefusal::ReadSet(why)));
+            }
             Err(AnswerRefusal::ReadSet(why)) => {
                 return Err(evidence(
                     AnswerFault::ReadSet(ReadSetFault::NotCanonical),
@@ -296,6 +320,13 @@ impl Inner {
             }
             Err(e) => return Err(refuse(e)),
         };
+        // An answer of a writer's device taken on a record's listing is of what that
+        // listing covers: every read's collection lies under a subject whose record
+        // in force lists the writer (spec §6.3).
+        if let Some(ns) = &vouched_for {
+            self.reads_listed_for(ns, &body.reads)
+                .map_err(|why| refuse(AnswerRefusal::Untrusted { why }))?;
+        }
         let readset = body.binding.reads.0;
         if body.binding.kind != record.kind {
             return Err(refuse(AnswerRefusal::Malformed(
@@ -717,17 +748,40 @@ impl Inner {
 
     // ---- resolving a question -----------------------------------------------------------------
 
-    /// Steps 1 to 4 of answers.md §7.2 for a question already parsed: the read set (stated, or
-    /// planned by the evaluator), the epochs and audience key, the binding and the id. `run`:
-    /// evaluate as well as plan (a recompute), so [`Resolved::computed`] is the result.
+    /// [`Self::resolve_reading`], whose failure is the error `get` of the question answers.
     pub(super) async fn resolve_question(
         self: &Arc<Self>,
         qname: &Name,
         ask: &AnswerAsk,
         run: bool,
     ) -> Result<Resolved, DataError> {
+        self.resolve_reading(qname, ask, run)
+            .await
+            .map_err(|u| u.error)
+    }
+
+    /// Steps 1 to 4 of answers.md §7.2 for a question already parsed: the read set (stated, or
+    /// planned by the evaluator), the epochs and audience key, the binding and the id. `run`:
+    /// evaluate as well as plan (a recompute), so [`Resolved::computed`] is the result. A
+    /// failure that is a known evaluator's refusal says which reads it had made
+    /// ([`Unresolved::read`]), as a signer needs to judge whom its words may go to.
+    pub(super) async fn resolve_reading(
+        self: &Arc<Self>,
+        qname: &Name,
+        ask: &AnswerAsk,
+        run: bool,
+    ) -> Result<Resolved, Unresolved> {
         let budget = self.config.answers.budget;
-        let fail = |f: EvalFail| self.eval_error(qname, f, false);
+        let fail = |f: EvalFail| {
+            let read = match &f {
+                EvalFail::Refused(_, read) | EvalFail::NotItsReads(_, read) => read.clone(),
+                _ => Vec::new(),
+            };
+            Unresolved {
+                error: self.eval_error(qname, f, false),
+                read,
+            }
+        };
         let (reads, epochs, computed, age) = match ask.kind {
             AnswerKind::Provider => {
                 let set = ask.reads.clone().ok_or_else(|| DataError::BadRequest {
@@ -754,7 +808,8 @@ impl Inner {
                             why: "this program does not know the evaluator, so it cannot make \
                                   the reads; state the reads, or run a program that knows it"
                                 .into(),
-                        });
+                        }
+                        .into());
                     }
                     (None, Some(ev)) => {
                         let e = self
@@ -777,7 +832,8 @@ impl Inner {
                                       states: an evaluator reads its definition like any other \
                                       input; add it to the read set"
                                     .into(),
-                            });
+                            }
+                            .into());
                         }
                         match ev {
                             Some(ev) if run => {
@@ -825,12 +881,12 @@ impl Inner {
             EvalFail::Data(e) => e,
             EvalFail::Conflict(m) => answer_error(name, AnswerRefusal::ReadSet(m)),
             EvalFail::Changed(m) => answer_error(name, AnswerRefusal::ReadsChanged(m)),
-            EvalFail::Refused(m) => DataError::BadRequest {
+            EvalFail::Refused(m, _) => DataError::BadRequest {
                 name: name.clone(),
                 why: format!("{REFUSES_HEAD}{m}{REFUSES_TAIL}"),
             },
-            EvalFail::NotItsReads(m) if signed => answer_error(name, AnswerRefusal::ReadSet(m)),
-            EvalFail::NotItsReads(m) => DataError::BadRequest {
+            EvalFail::NotItsReads(m, _) if signed => answer_error(name, AnswerRefusal::ReadSet(m)),
+            EvalFail::NotItsReads(m, _) => DataError::BadRequest {
                 name: name.clone(),
                 why: format!("{NOT_ITS_READS_HEAD}{m}{NOT_ITS_READS_TAIL}"),
             },
@@ -1038,7 +1094,7 @@ impl Inner {
                 .map_err(|f| {
                     // The signed answer's read set is not the evaluator's reading of its
                     // definition: evidence against its signer, and the answer is refused.
-                    if let EvalFail::NotItsReads(_) | EvalFail::Refused(_) = &f {
+                    if let EvalFail::NotItsReads(..) | EvalFail::Refused(..) = &f {
                         self.blame(&signed, ReadSetFault::NotItsReads);
                     }
                     if let EvalFail::Conflict(_) = &f {
@@ -1046,7 +1102,7 @@ impl Inner {
                     }
                     let is_signed = !signed.is_empty();
                     let f = match f {
-                        EvalFail::Refused(m) if is_signed => EvalFail::NotItsReads(m),
+                        EvalFail::Refused(m, read) if is_signed => EvalFail::NotItsReads(m, read),
                         f => f,
                     };
                     self.eval_error(asked, f, is_signed)

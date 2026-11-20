@@ -2297,6 +2297,11 @@ struct Inner {
     /// Proofs of asks for an answer being verified: a budget of their own, the size of
     /// [`Config::asks_verifying`], so a crowd of those asks costs the others nothing.
     answer_verifying: Semaphore,
+    /// The one turn at verifying a proof of an ask for an answer whose asker's key has no
+    /// certificate held here: verifying it may wait on a certificate fetch, so those proofs
+    /// share this one permit and none of [`Self::answer_verifying`], which askers with a
+    /// certificate held take their turns from (answers.md §15.3).
+    answer_uncached_verifying: Semaphore,
     /// Asks for an answer being worked on, all askers together
     /// ([`AnswerConfig::asks_at_once`](crate::answer::AnswerConfig)).
     asks_at_once: Arc<Semaphore>,
@@ -4209,6 +4214,11 @@ impl St {
         // The persons' namespaces it lists are adopted for it (spec §6.3),
         // within the caps; what is left out is told.
         let excess = self.scopes.note(&subject, line.own.as_ref());
+        // A seal key kept on the strength of a record that listed a writer is
+        // dropped with it, whichever record listed it last: the key's device
+        // is asked for nothing more until it is vouched for again.
+        let scopes = &self.scopes;
+        self.seal_keys.retain(|name| !scopes.vouches_no_more(name));
         let groups = |m: &Members| -> Vec<Name> {
             m.readers
                 .iter()
@@ -4463,6 +4473,21 @@ impl St {
             .into_iter()
             .filter(|p| !writers.iter().chain(&inherited).any(|w| p.has_prefix(w)))
             .collect()
+    }
+
+    /// Keep `public` as the verified seal key packet `name` of its device;
+    /// `unheld`: this device holds no context of the device's namespace
+    /// ([`Inner::namespace_unheld`]). The seal key of a device of such a
+    /// namespace is kept only while a record in force lists the writer
+    /// ([`Scopes::writes`], spec §6.3): `false`, and nothing kept, when none
+    /// does — the listing the packet verified by went with the record that
+    /// dropped it, whenever the packet arrived.
+    fn keep_seal_key(&mut self, name: &Name, public: [u8; 32], unheld: bool) -> bool {
+        if unheld && !self.scopes.writes(name) {
+            return false;
+        }
+        self.seal_keys.insert(name.clone(), public);
+        true
     }
 
     /// Whose record names epoch `e` that a version of `c`, or an ask
@@ -7526,6 +7551,7 @@ impl Device {
             asking: Mutex::new(HashMap::new()),
             verifying: Semaphore::new(asks_verifying),
             answer_verifying: Semaphore::new(asks_verifying),
+            answer_uncached_verifying: Semaphore::new(1),
             asks_at_once: Arc::new(Semaphore::new(asks_at_once)),
             provider_asks: Mutex::new(None),
             signatures: AtomicU64::new(0),
@@ -10518,19 +10544,44 @@ impl Inner {
     /// by this clock is [`Refusal::Lapsed`]: kept by no decision, since only
     /// the clock refuses it.
     async fn verify(&self, data: &Data) -> Result<Writer, Refusal> {
+        self.verify_scoped(data).await.map(|(writer, _)| writer)
+    }
+
+    /// [`Self::verify`], saying of what it verified whether it is a packet of
+    /// one device of a writer's namespace taken on the strength of a members
+    /// record listing that writer, which this device does not hold
+    /// ([`Self::judge_device_packet`]): the namespace, for the caller to limit
+    /// what it uses the packet for (an answer's reads, spec §6.3). Such a
+    /// packet verifies only when its signing key is of the device its name is
+    /// under, and no other device of the namespace.
+    async fn verify_scoped(&self, data: &Data) -> Result<(Writer, Option<Name>), Refusal> {
         let key = data
             .sig_info()
             .and_then(|s| s.key_locator_name())
             .ok_or(Refusal::BadSignature)?;
         // A person's namespace adopted for a folder judges its packets
-        // about that folder alone (spec §6.3); the device's own validator
-        // every other packet.
-        let judge = self.judge(&data.name);
+        // about that folder alone (spec §6.3), and the seal key, the reply
+        // and the answers of a device of a writer the folder's record lists
+        // no others; the device's own validator every other packet.
+        let device_packet = self.judge_device_packet(&data.name);
+        let judge = match &device_packet {
+            Some(d) => Arc::clone(&d.judge),
+            None => self.judge(&data.name),
+        };
         match judge.validate_durable(data).await {
             ValidationResult::Valid(safe)
                 if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
             {
-                Ok(Writer::new((*key).clone()))
+                if let Some(d) = &device_packet
+                    && device_of(&key).as_ref() != Some(&d.device)
+                {
+                    tracing::debug!(name = %data.name, key = %key, "not verified: it is signed by a key of another device than the one its name is under");
+                    return Err(Refusal::BadSignature);
+                }
+                Ok((
+                    Writer::new((*key).clone()),
+                    device_packet.map(|d| d.namespace),
+                ))
             }
             // The signing key itself (not an issuer above it) is revoked.
             ValidationResult::Invalid(TrustError::Revoked { name, .. })
@@ -16071,7 +16122,10 @@ impl Inner {
             }
         }
         let mut st = self.st.lock();
-        st.seal_keys.insert(ask.seal_key.clone(), public);
+        if !st.keep_seal_key(&ask.seal_key, public, self.namespace_unheld(&ask.seal_key)) {
+            tracing::debug!(%asker, "grant not answered: no record in force lists the asker's writer any more");
+            return None;
+        }
         // Checked again: the records may have moved during the fetch.
         let key = self.grant_key(&st, c, e, &asker, &asker_ns)?;
         // Another Interest of the same ask (a re-expression, spec §17.1)
@@ -16131,7 +16185,8 @@ impl Inner {
             let mut st = inner.st.lock();
             st.seal_learning.remove(&seal_key);
             if got {
-                st.seal_keys.insert(seal_key, public);
+                let unheld = inner.namespace_unheld(&seal_key);
+                st.keep_seal_key(&seal_key, public, unheld);
             }
         });
     }
