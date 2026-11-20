@@ -502,14 +502,15 @@ impl DataError {
             DataError::RuleUnknown { .. } => NextStep::UpdateProgram,
             DataError::Introduction { why, .. } => match why {
                 crate::intro::IntroRefusal::WrongProof { .. } => NextStep::FixRequest,
-                crate::intro::IntroRefusal::Forged => NextStep::RetryLater,
+                crate::intro::IntroRefusal::Forged | crate::intro::IntroRefusal::Hint { .. } => {
+                    NextStep::RetryLater
+                }
                 crate::intro::IntroRefusal::Conflict => NextStep::FixLocal,
                 crate::intro::IntroRefusal::Unknown
                 | crate::intro::IntroRefusal::Used
                 | crate::intro::IntroRefusal::Expired
                 | crate::intro::IntroRefusal::Closed
-                | crate::intro::IntroRefusal::InviterConflict { .. }
-                | crate::intro::IntroRefusal::Hint { .. } => NextStep::AskOwner,
+                | crate::intro::IntroRefusal::InviterConflict { .. } => NextStep::AskOwner,
             },
             DataError::CannotCheck { .. } => NextStep::UpdateProgram,
             DataError::Answer { why, .. } => why.next(),

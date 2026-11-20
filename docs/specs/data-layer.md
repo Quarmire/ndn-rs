@@ -6271,7 +6271,10 @@ never the token.
   ForwardingHint. None came: `NotReady` (`RetryLater`), and the first link,
   if any, is taken down.
 - **S5. Verify**, before anything else is sent, in this order; a failure is a
-  refusal, and **nothing is dialled, asked or adopted**:
+  refusal (`Hint` is `RetryLater`, as `Forged` is: a record corrupted in
+  flight fails these checks as an impostor's does, and the host's retry
+  fetches it again; refused again, the first contact is not to be used), and
+  **nothing is dialled, asked or adopted**:
   1. the Data's name is exactly the one asked, else `Hint` (`wrong name`);
   2. its Content decodes as a hint record (§19.2), else `Hint` (`wrong
      record`);
@@ -6437,7 +6440,7 @@ packet, and carries the answer proof.
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§19.4 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§19.4, the use) | `FixLocal` (renew the device's certificate when it is the last) | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§19.3 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer entry does not verify under the context the joiner holds (§19.3 step 5) | `AskOwner` (do not use the code) | no |
 | `Forged` | an acceptance fails a check of §19.3, step 3 (never on the wire) | `RetryLater` | yes |
-| `Hint { why }` | what answered at a short code's first contact does not prove it is the inviter's, or the offer its record names was not made with the code's secret (§19.3, S5 and S7; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `anchor`, `signer`, `offer` — and says what is wrong | `AskOwner` (do not use this code's first contact; ask for a new code) | no |
+| `Hint { why }` | what answered at a short code's first contact does not prove it is the inviter's, or the offer its record names was not made with the code's secret (§19.3, S5 and S7; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `anchor`, `signer`, `offer` — and says what is wrong. A record corrupted in flight fails these checks as an impostor's does and is intact the next time, as a corrupted answer is (`Forged`) | `RetryLater` (retry; refused again, do not use this code's first contact: ask for a new code) | yes |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the
 offer waits. A code that does not parse is `BadRequest`; a host without an
@@ -6459,7 +6462,7 @@ until the record names it.
 | the address does not answer the dial | `NotReady` (`RetryLater`) | `the first contact A did not answer (reason): check the address and that the inviter's device is on, then retry; or ask for a new code` |
 | the hint record is not fetched in its tries | `NotReady` (`RetryLater`) | `the inviter's hint for this offer was not fetched from the first contact (offline, wrong address or relay, a relay this device cannot reach, or the offer is closed): retry, check the code, or ask for a new code` |
 | a gone mark | `Introduction` `Closed` or `Expired` | the texts of the rows above |
-| the record does not verify | `Introduction` `Hint { why }` | `what answered at the first contact does not prove it is the inviter's (why): do not use this code's first contact; ask the inviter for a new code, and check the code was copied whole` |
+| the record does not verify | `Introduction` `Hint { why }` (`RetryLater`) | `what answered at the first contact does not prove it is the inviter's (why): retry; if it is refused again, do not use this code's first contact: ask the inviter for a new code, and check the code was copied whole` |
 
 ### 19.6 Cryptography
 

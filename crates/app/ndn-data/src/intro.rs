@@ -461,8 +461,11 @@ pub enum IntroRefusal {
     /// What answered at a short code's first contact does not prove it is the
     /// inviter's: the hint record's name, credentials, anchor or signer
     /// failed the checks of spec §19.3. Nothing was dialled, asked or
-    /// adopted. Never on the wire (its code is that of a conflict, which it
-    /// is not; no peer sends it).
+    /// adopted. A retry: a record corrupted in flight fails the same checks
+    /// as an impostor's and is as likely to come intact the next time (as a
+    /// corrupted answer, [`Forged`](Self::Forged)); refused again, the first
+    /// contact is not to be used. Never on the wire (its code is that of a
+    /// conflict, which it is not; no peer sends it).
     Hint {
         /// Which check failed (wrong name, credentials, anchor, signer).
         why: String,
@@ -510,8 +513,8 @@ impl std::fmt::Display for IntroRefusal {
             IntroRefusal::Hint { why } => write!(
                 f,
                 "what answered at the first contact does not prove it is the inviter's ({why}): \
-                 do not use this code's first contact; ask the inviter for a new code, and \
-                 check the code was copied whole"
+                 retry; if it is refused again, do not use this code's first contact: ask the \
+                 inviter for a new code, and check the code was copied whole"
             ),
         }
     }

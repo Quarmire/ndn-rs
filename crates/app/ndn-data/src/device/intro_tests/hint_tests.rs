@@ -1398,12 +1398,24 @@ async fn tampered(
     });
     let got = rig.phone.join(rig.code.share()).await;
     let why = hint_refusal(&got);
-    let shown = got.unwrap_err().to_string();
-    assert!(
-        shown.contains("do not use this code's first contact")
-            && shown.contains("ask the inviter for a new code"),
-        "the refusal does not say what to do: {shown}"
+    let err = got.unwrap_err();
+    assert_eq!(
+        err.next(),
+        crate::error::NextStep::RetryLater,
+        "a record corrupted in flight is a retry, as a corrupted answer is"
     );
+    let shown = err.to_string();
+    for says in [
+        "retry",
+        "do not use this code's first contact",
+        "ask the inviter for a new code",
+        "copied whole",
+    ] {
+        assert!(
+            shown.contains(says),
+            "the refusal does not say {says:?}: {shown}"
+        );
+    }
     assert_nothing_went_further(&rig, Some(rig.inviter_key()));
     (rig, why)
 }
@@ -1465,6 +1477,46 @@ async fn a_record_with_flipped_credentials_is_refused() {
     })
     .await;
     assert!(why.starts_with("credentials"), "{why}");
+}
+
+/// A record corrupted in flight is the same cause as a corrupted answer
+/// (`Forged`, retry): the first join is refused as a hint that does not verify
+/// and told to retry, nothing dialled further, and the host's retry — the record
+/// now intact — joins.
+#[tokio::test]
+async fn a_record_corrupted_once_joins_on_the_hosts_retry() {
+    let rig = Rig::new(Setup::address()).await;
+    rig.first_contact_answers();
+    let corrupt = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&corrupt);
+    rig.net.tamper(move |wire| {
+        let Ok(data) = Data::decode(wire.clone()) else {
+            return Some(wire);
+        };
+        if !is_hint(&data.name) || !flag.swap(false, Ordering::SeqCst) {
+            return Some(wire);
+        }
+        let sig = data.sig_value();
+        let at = sig.as_ptr() as usize - wire.as_ptr() as usize + sig.len() - 1;
+        let mut v = wire.to_vec();
+        v[at] ^= 1;
+        Some(Bytes::from(v))
+    });
+    let got = rig.phone.join(rig.code.share()).await;
+    let why = hint_refusal(&got);
+    assert!(why.starts_with("signer"), "{why}");
+    assert_eq!(
+        got.unwrap_err().next(),
+        crate::error::NextStep::RetryLater,
+        "a record corrupted in flight is a retry, as a corrupted answer is"
+    );
+    assert_nothing_went_further(&rig, Some(rig.inviter_key()));
+    let joined = rig
+        .phone
+        .join(rig.code.share())
+        .await
+        .expect("the retry joins");
+    assert_eq!(joined.folder, rig.folder);
 }
 
 /// A record under the token's name that no hint is: another content.
