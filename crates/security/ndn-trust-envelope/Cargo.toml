@@ -11,6 +11,10 @@ classification = "spec"
 
 [dependencies]
 ndn-tlv   = { workspace = true }
+ndn-foundation-types = { workspace = true, features = ["std"] }
+# `words`: the checksum of a checked code (the audited RustCrypto SHA-256 the
+# rest of the tree uses).
+sha2      = { workspace = true }
 bytes     = { workspace = true, features = ["std"] }
 base64    = { workspace = true }
 thiserror = { workspace = true }

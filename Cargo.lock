@@ -2271,8 +2271,10 @@ dependencies = [
  "base64",
  "bip39",
  "bytes",
+ "ndn-foundation-types",
  "ndn-tlv",
  "qrcode",
+ "sha2 0.11.0",
  "thiserror",
  "zeroize",
 ]

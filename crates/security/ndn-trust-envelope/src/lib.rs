@@ -16,8 +16,8 @@
 //! | [`intro`](TrustKind::Intro) | in | join a folder by a one-use offer (data layer) |
 //!
 //! This crate is the *authority layer*: it never names a host, link, session, or
-//! address. It only carries names (as strings), anchor fingerprints, and
-//! signed-Data wire blobs.
+//! address. It only carries names (as strings; an introduction's, as wire
+//! relative to its namespace), anchor fingerprints, and signed-Data wire blobs.
 //!
 //! An [`Anchor`](TrustEnvelope::Anchor) is either *inline* (the context's
 //! **signed** NDN Data, `context_data`) or *by reference* (namespace + the
@@ -58,6 +58,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use bytes::Bytes;
+use ndn_foundation_types::{Name, NameComponent};
 use ndn_tlv::{TlvReader, TlvWriter};
 use thiserror::Error;
 
@@ -90,6 +91,12 @@ const T_GRANT: u64 = 0x048C;
 const T_DIRECTION: u64 = 0x048D;
 const T_ANCHOR_FINGERPRINT: u64 = 0x048E; // anchor / invite: SHA-256 of the root anchor pubkey
 const T_CONTEXT_DATA: u64 = 0x048F; // anchor: the signed trust-context Data (full wire)
+
+// The compact introduction (trust-envelope.md §5.7): names as wire, not text. Even, so a
+// reader that does not know them skips them.
+const T_NAMESPACE_WIRE: u64 = 0x0490; // intro: the inviter's namespace, a Name's components
+const T_OFFER_WIRE: u64 = 0x0492; // intro: the offer's name relative to the namespace
+const T_RELAY_WIRE: u64 = 0x0494; // intro: a relay's name relative to the namespace (repeatable)
 
 /// Length of an anchor fingerprint (SHA-256 of the anchor's public key).
 pub const ANCHOR_FINGERPRINT_LEN: usize = 32;
@@ -203,11 +210,14 @@ impl TrustKind {
             ],
             TrustKind::Intro => &[
                 T_NAMESPACE,
+                T_NAMESPACE_WIRE,
                 T_ANCHOR_FINGERPRINT,
                 T_OFFER,
+                T_OFFER_WIRE,
                 T_SECRET,
                 T_LINK_HINT,
                 T_RELAY_HINT,
+                T_RELAY_WIRE,
             ],
         }
     }
@@ -262,6 +272,14 @@ pub struct Capability {
 /// A one-use offer of a folder, as its code carries it (data-layer.md §19):
 /// what the holder needs to join. The secret is the whole of what makes the
 /// code worth stealing; [`Debug`] never shows it.
+///
+/// The names are strings in this API and wire in the link: the compact form
+/// ([`TrustEnvelope::encode`]) writes the namespace once as a Name and the
+/// offer and each relay as a name relative to it, so a self-certifying
+/// component is 34 octets, not 96 characters of escapes. A name must be an
+/// NDN URI in its canonical text ([`check`](Self::check)): `Name`'s
+/// `to_string()` always is. A link made before this form (text tags) still
+/// reads, to the strings it carried.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Introduction {
     /// The inviter's namespace, as an NDN URI (e.g. `/home/alice`).
@@ -270,7 +288,7 @@ pub struct Introduction {
     /// answer's trust context must be signed by.
     pub fingerprint: [u8; ANCHOR_FINGERPRINT_LEN],
     /// The offer record's name, as an NDN URI
-    /// (`<device>/32=log/<folder>/seq=<n>`).
+    /// (`<device>/keyword=log/<folder>/seq=<n>`).
     pub offer: String,
     /// The offer's secret.
     pub secret: [u8; INTRO_SECRET_LEN],
@@ -323,6 +341,34 @@ impl std::fmt::Debug for IntroWords {
 }
 
 impl Introduction {
+    /// Whether every name of this introduction can be carried: the
+    /// namespace, the offer and each relay must be NDN URIs in their canonical
+    /// text (what `Name`'s `Display` writes), so the compact form
+    /// ([`TrustEnvelope::encode`]), which writes them as wire, reads back as
+    /// exactly these strings. Names made from a `Name`'s `to_string()` always
+    /// pass. [`TrustEnvelope::encode`] and everything made of it panic on a
+    /// name that fails: check what did not come from a `Name`. The error says
+    /// which field.
+    pub fn check(&self) -> Result<(), EnvelopeError> {
+        let canonical = |s: &str| s.parse::<Name>().is_ok_and(|n| n.to_string() == s);
+        if self.namespace.as_deref().is_some_and(|s| !canonical(s)) {
+            return Err(EnvelopeError::Malformed(
+                "introduction namespace is not a canonical NDN URI",
+            ));
+        }
+        if !canonical(&self.offer) {
+            return Err(EnvelopeError::Malformed(
+                "introduction offer is not a canonical NDN URI",
+            ));
+        }
+        if !self.relays.iter().all(|s| canonical(s)) {
+            return Err(EnvelopeError::Malformed(
+                "introduction relay is not a canonical NDN URI",
+            ));
+        }
+        Ok(())
+    }
+
     /// The words form: the offer's name, then [`words::WORD_COUNT`] words
     /// encoding the secret followed by the fingerprint's first half.
     pub fn to_words(&self) -> zeroize::Zeroizing<String> {
@@ -534,17 +580,23 @@ impl TrustEnvelope {
                 }
             }
             TrustEnvelope::Intro(i) => {
-                if let Some(ns) = &i.namespace {
-                    w.write_tlv(T_NAMESPACE, ns.as_bytes());
+                let namespace = i.namespace.as_deref().map(|s| uri_name(s, "namespace"));
+                if let Some(ns) = &namespace {
+                    w.write_nested(T_NAMESPACE_WIRE, |w| write_components(w, ns.components()));
                 }
                 w.write_tlv(T_ANCHOR_FINGERPRINT, &i.fingerprint);
-                w.write_tlv(T_OFFER, i.offer.as_bytes());
+                write_relative(
+                    w,
+                    T_OFFER_WIRE,
+                    &uri_name(&i.offer, "offer"),
+                    namespace.as_ref(),
+                );
                 w.write_tlv(T_SECRET, &i.secret);
                 if let Some(hint) = &i.link_hint {
                     w.write_tlv(T_LINK_HINT, hint);
                 }
                 for r in &i.relays {
-                    w.write_tlv(T_RELAY_HINT, r.as_bytes());
+                    write_relative(w, T_RELAY_WIRE, &uri_name(r, "relay"), namespace.as_ref());
                 }
             }
         }
@@ -612,8 +664,11 @@ impl TrustEnvelope {
         let mut device: Option<String> = None;
         let mut offer: Option<String> = None;
         let mut secret: Option<[u8; INTRO_SECRET_LEN]> = None;
-        let mut relays: Vec<String> = Vec::new();
         let mut link_hint: Option<Bytes> = None;
+        let mut offer_wire: Option<Bytes> = None;
+        // Relays in the order they came, each as text (old links) or as a
+        // relative name (the compact form).
+        let mut relay_items: Vec<Result<String, Bytes>> = Vec::new();
 
         let fields = kind.body_fields();
         let mut r = TlvReader::new(body);
@@ -652,6 +707,7 @@ impl TrustEnvelope {
                 )?,
                 T_DEVICE_NAME => set_once(&mut device, read_str(&v)?)?,
                 T_OFFER => set_once(&mut offer, read_str(&v)?)?,
+                T_OFFER_WIRE => set_once(&mut offer_wire, v)?,
                 T_SECRET => set_once(
                     &mut secret,
                     v.as_ref()
@@ -659,7 +715,9 @@ impl TrustEnvelope {
                         .map_err(|_| EnvelopeError::Malformed("introduction secret length"))?,
                 )?,
                 T_LINK_HINT => set_once(&mut link_hint, v)?,
-                T_RELAY_HINT => relays.push(read_str(&v)?),
+                T_RELAY_HINT => relay_items.push(Ok(read_str(&v)?)),
+                T_RELAY_WIRE => relay_items.push(Err(v)),
+                T_NAMESPACE_WIRE => set_once(&mut namespace, read_wire_name(v)?.to_string())?,
                 _ => unreachable!("every type in body_fields() has an arm"),
             }
         }
@@ -714,14 +772,38 @@ impl TrustEnvelope {
                 nonce: nonce.unwrap_or_default(),
                 grant,
             }),
-            TrustKind::Intro => TrustEnvelope::Intro(Introduction {
-                namespace,
-                fingerprint: fingerprint.ok_or(need("anchor fingerprint"))?,
-                offer: offer.ok_or(need("offer"))?,
-                secret: secret.ok_or(need("secret"))?,
-                link_hint,
-                relays,
-            }),
+            TrustKind::Intro => {
+                // Relative names resolve against the namespace, whichever form
+                // carried it.
+                let needs_base = offer_wire.is_some() || relay_items.iter().any(Result::is_err);
+                let base = match (&namespace, needs_base) {
+                    (Some(ns), true) => Some(ns.parse::<Name>().map_err(|_| {
+                        EnvelopeError::Malformed("introduction namespace is not an NDN URI")
+                    })?),
+                    _ => None,
+                };
+                let offer = match (offer, offer_wire) {
+                    (Some(_), Some(_)) => return Err(EnvelopeError::Malformed("repeated field")),
+                    (Some(text), None) => text,
+                    (None, Some(wire)) => resolve_relative(&wire, base.as_ref())?,
+                    (None, None) => return Err(need("offer")),
+                };
+                let relays = relay_items
+                    .into_iter()
+                    .map(|r| match r {
+                        Ok(text) => Ok(text),
+                        Err(wire) => resolve_relative(&wire, base.as_ref()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                TrustEnvelope::Intro(Introduction {
+                    namespace,
+                    fingerprint: fingerprint.ok_or(need("anchor fingerprint"))?,
+                    offer,
+                    secret: secret.ok_or(need("secret"))?,
+                    link_hint,
+                    relays,
+                })
+            }
         })
     }
 
@@ -751,8 +833,12 @@ impl TrustEnvelope {
     /// for an introduction that does not, the same with as many of its
     /// relay hints, in order, as fit (its link hint stays whole: its maker,
     /// which knows the encoding, offers a smaller one). `None` when none
-    /// fits.
+    /// fits, and for an introduction whose names fail
+    /// [`Introduction::check`] (they cannot be written).
     pub fn qr_uri(&self) -> Option<String> {
+        if matches!(self, TrustEnvelope::Intro(i) if i.check().is_err()) {
+            return None;
+        }
         let uri = self.to_uri();
         if uri.len() <= qr::MAX_TEXT_LEN {
             return Some(uri);
@@ -861,6 +947,71 @@ fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), EnvelopeError> {
     }
     *slot = Some(value);
     Ok(())
+}
+
+/// The name a URI names, for an introduction's field `what`.
+///
+/// # Panics
+///
+/// When `uri` is not a name: [`Introduction::check`] says so first.
+fn uri_name(uri: &str, what: &str) -> Name {
+    uri.parse().unwrap_or_else(|e| {
+        panic!(
+            "the introduction's {what} `{uri}` is not an NDN URI ({e}): \
+             Introduction::check refuses it before it is encoded"
+        )
+    })
+}
+
+/// `components` as a Name's value: each one's type, length and value.
+fn write_components(w: &mut TlvWriter, components: &[NameComponent]) {
+    for c in components {
+        w.write_tlv(c.typ, &c.value);
+    }
+}
+
+/// `name` as a relative name under `tag`: one octet, how many of its leading
+/// components `base` has the same (at most 255), then the others as a Name's
+/// value. A self-certifying component is 34 octets here, not 96 characters of
+/// escapes, and is not written again when `base` has it.
+fn write_relative(w: &mut TlvWriter, tag: u64, name: &Name, base: Option<&Name>) {
+    let shared = base.map_or(0, |b| {
+        b.components()
+            .iter()
+            .zip(name.components())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(usize::from(u8::MAX))
+    });
+    w.write_nested(tag, |w| {
+        w.write_raw(&[shared as u8]);
+        write_components(w, &name.components()[shared..]);
+    });
+}
+
+/// The Name a `NamespaceWire` value is: components, no outer Name TLV.
+fn read_wire_name(value: Bytes) -> Result<Name, EnvelopeError> {
+    Name::decode(value).map_err(|_| EnvelopeError::Malformed("introduction name is not a Name"))
+}
+
+/// The URI of the name a relative name stands for: its shared leading
+/// components of `base` (the namespace), then its own.
+fn resolve_relative(value: &Bytes, base: Option<&Name>) -> Result<String, EnvelopeError> {
+    let (&shared, _) = value.split_first().ok_or(EnvelopeError::Malformed(
+        "relative name has no shared count",
+    ))?;
+    let shared = usize::from(shared);
+    let prefix = match base {
+        Some(base) if shared <= base.len() => &base.components()[..shared],
+        None if shared == 0 => &[],
+        _ => {
+            return Err(EnvelopeError::Malformed(
+                "relative name shares more than its namespace",
+            ));
+        }
+    };
+    let tail = read_wire_name(value.slice(1..))?;
+    Ok(Name::from_components(prefix.iter().chain(tail.components()).cloned()).to_string())
 }
 
 /// A one-byte field value; any other length is refused.
@@ -1398,7 +1549,7 @@ mod tests {
         Introduction {
             namespace: Some("/home/alice".into()),
             fingerprint: [0xA5; ANCHOR_FINGERPRINT_LEN],
-            offer: "/home/alice/laptop/32=log/home/alice/32=data/notes/seq=12".into(),
+            offer: "/home/alice/laptop/keyword=log/home/alice/keyword=data/notes/seq=12".into(),
             secret: [0x3C; INTRO_SECRET_LEN],
             link_hint: None,
             relays: (0..relays)
@@ -1451,7 +1602,7 @@ mod tests {
             }
         }
         let body = body.unwrap();
-        for (drop, why) in [(T_SECRET, "secret"), (T_OFFER, "offer")] {
+        for (drop, why) in [(T_SECRET, "secret"), (T_OFFER_WIRE, "offer")] {
             let mut w = TlvWriter::new();
             let mut fields = TlvReader::new(body.clone());
             while !fields.is_empty() {
@@ -1538,3 +1689,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod compact_tests;
