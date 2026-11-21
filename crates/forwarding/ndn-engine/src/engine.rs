@@ -1266,10 +1266,28 @@ pub(crate) async fn run_face_sender(
 
                 // Reliability frames canonically per packet (TxSequence +
                 // piggybacked Acks + retx tracking) and is low-volume, so it
-                // bypasses cross-item batching. (A reliable face ignores
-                // `intent` headers — its only traffic is header-less control.)
+                // bypasses cross-item batching. It frames a *bare* packet: an
+                // item whose intent is a Nack or carries LP headers is framed
+                // as the intent says and goes out as it is, with no TxSequence
+                // (a Nack lost is an Interest asked again; reframed through
+                // `frame` it would leave as the Interest it wraps).
                 if lp_reliability_feature.as_ref().is_some_and(|f| f.is_enabled()) {
-                    let wires = lp_reliability_feature.as_ref().unwrap().frame(&first.0);
+                    let h = &first.2.headers;
+                    let plain = first.2.nack.is_none()
+                        && h.pit_token.is_none()
+                        && h.congestion_mark.is_none()
+                        && h.incoming_face_id.is_none()
+                        && h.next_hop_face_id.is_none()
+                        && h.cache_policy.is_none();
+                    let wires = if plain {
+                        lp_reliability_feature.as_ref().unwrap().frame(&first.0)
+                    } else {
+                        vec![frame_with_intent(
+                            &first.0,
+                            &first.2,
+                            face.kind().uses_lp_framing(),
+                        )]
+                    };
                     bump(&wires);
                     if let Err(e) = face.send_batch(&wires, Some(first.1)).await
                         && handle_send_error(e)
