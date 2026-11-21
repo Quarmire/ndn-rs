@@ -166,7 +166,6 @@ impl Tree {
     }
 
     /// The writer's highest seq in the namespace.
-    #[cfg(test)]
     pub(crate) fn head(&self) -> u64 {
         self.root.head
     }
